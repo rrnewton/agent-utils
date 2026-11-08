@@ -3538,6 +3538,7 @@ mod tests {
             "src/core/speech",
             "src/view/channel/scrollkeep.ts",
             "src/view/channel/folding.ts",
+            "src/view/channel/channelrows.ts",
         ])
     }
 
@@ -3558,11 +3559,11 @@ mod tests {
             "web/voice.js still renders a parenthesised plural"
         );
         assert!(
-            VOICE_JS.contains("function channelSummary("),
+            voice_source().contains("function channelSummary("),
             "the count helper is what keeps the fetch window from being read as a channel total"
         );
         assert!(
-            VOICE_JS.contains("complete !== true"),
+            voice_source().contains("complete !== true"),
             "a server too old to send `complete` must be treated as unknown, not as complete"
         );
         // How a message's time is worded moved into the presentation module (`#624

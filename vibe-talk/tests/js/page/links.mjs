@@ -1673,7 +1673,7 @@ test("`#890 voice-page-linked-highlight`: the message a page opens on stays mark
   assert.match(escEntry.parentNode.text(), /takes the mark off a linked message/, "the ? list does not say Esc puts the mark out");
 
   // NEGATIVE CONTROL: with the rows drawn without the mark, the list drawn again loses it.
-  const bare = await openedOnLink({ script: brokenScript("  linkedMark.drawOn(li, messages.map((one) => String(one.id)));\n", "") });
+  const bare = await openedOnLink({ script: await brokenModule([{ file: "src/view/channel/channelrows.ts", find: "    deps.drawLinkedOn(li, messages.map((one) => String(one.id)));\n", replace: "" }]) });
   assert.deepStrictEqual(linkedIds(bare), ["204"], "the control lost the mark before any drawing");
   bare.el("thread-select").value = "flat";
   await bare.el("thread-select").dispatch("change");

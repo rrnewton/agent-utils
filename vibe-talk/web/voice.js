@@ -16387,58 +16387,10 @@ function stillToDo(message, done = doneState().archived) {
   return !done.has(String(message.id)) && !isNoise(message) && !hiddenEmpty(message);
 }
 
-// --- empty messages ---------------------------------------------------------------------------
-//
-// `#386 hide-empty-messages`. The owner, 2026-10-19: "there is a BLANK message from the coding
-// agent... I want to have a checked-by-default box in that same settings area that completely
-// filters out empty messages." A row with a time, Reply and Done over nothing says nothing and still
-// asks to be dealt with.
-//
-// WHAT EMPTY IS (`emptyMessage`): no text but white space, no reaction, and not the root of a thread
-// anyone has answered or may have — that row is the way into its replies and where its line between
-// the columns starts. A file posted with no words is NOT empty: the server writes each file into the
-// text as a line naming it (`#313 slack-file-posts`), so the message has text, and is drawn, counted
-// and read as any other. (A Discord message's attachments and embeds are not carried into the message
-// at all, so one that is only a file reaches the page with no text, and was drawn as a blank row
-// before this; it is left out with the rest until `#387 discord-file-posts`.)
-//
-// WHAT HIDING IT DOES, while the switch is on (`hiddenEmpty`): no row in any view — every list is
-// drawn through `glom`, which leaves it out, and the one appender that adds a live row alone,
-// `appendChannelRow`, holds it back — so nothing can read it aloud, which reads rows; not in the list
-// a view counts in its heading and settles the reader by, so it is not "new" at the foot; not unread
-// (`stillToDo`), so no count, tally or Hide read list has it; no offer to jump to it, and nothing
-// relayed into a call. The store keeps it, as it keeps every message, so turning the switch off
-// draws it again from what is held, with no read.
-
-/** Is `message` one with nothing in it to show? See "WHAT EMPTY IS" above. */
-function emptyMessage(message) {
-  if (!message || !BLANK_TEXT.test(String(message.content || ""))) return false;
-  if (Array.isArray(message.reactions) && message.reactions.some((reaction) => reaction && reaction.count > 0)) return false;
-  return !mayLeadToReplies(message);
-}
 
 /**
- * Whether `message` is, or may be, the root of a thread somebody has answered: by its own record, a
- * root whose count is not known counting as answered; by the store's summary of a thread it is the
- * root of, for a copy that arrived without its record; or by a reply to it the store holds. Asked
- * only of a message with no text, which is rare, so the store's lists are read through each time.
- */
-function mayLeadToReplies(message) {
-  const thread = message.thread;
-  if (thread && thread.is_root === true && thread.reply_count !== 0) return true;
-  const id = String(message.id);
-  // A reply's thread is its siblings' too: only a root's own thread holds replies to it.
-  const own = thread && thread.is_root === true ? threadOf(message) : null;
-  return channelStore.current().threads.some((summary) => summary && summary.root && String(summary.root.id) === id &&
-      summary.reply_count !== 0) ||
-    channelStore.current().messages.some((held) => held.thread && held.thread.is_root !== true &&
-      (String(held.thread.root_message_id) === id || (own !== null && threadOf(held) === own)));
-}
-
-/**
- * Are empty messages left out? ON unless the reader has turned it off: on at first, and applied as the
- * device keeps it as the page loads, where ABSENT MEANS ON: the default is the behaviour, not merely the
- * initial value. One owner in web/src/core/settings/switches.ts (`#624 voice-page-modularity`).
+ * Are empty messages left out? ON unless the reader has turned it off (`#386 hide-empty-messages`).
+ * One owner in web/src/core/settings/switches.ts (`#624 voice-page-modularity`).
  *
  * @type {import("./src/core/settings/index.ts").KeptSwitch}
  */
@@ -16449,12 +16401,19 @@ const hideEmptySwitch = createKeptSwitch({
   render: (on) => messagePreferences.hideEmpty.render(on),
 });
 
-/** Is `message` left out of the page: empty, while the reader has said to hide those? */
-function hiddenEmpty(message) {
-  return hideEmptySwitch.on() && emptyMessage(message);
-}
+/**
+ * Is the combining on? ON unless the reader has turned it off. One owner in
+ * web/src/core/settings/switches.ts (`#624 voice-page-modularity`).
+ *
+ * @type {import("./src/core/settings/index.ts").KeptSwitch}
+ */
+const combineSwitch = createKeptSwitch({
+  setting: DEVICE_SETTINGS.combineMessages,
+  deviceSettings: () => deviceSettings(),
+  initial: true,
+  render: (on) => messagePreferences.combine.render(on),
+});
 readAloudOwner().initializeReadSteerOffset();
-
 
 // What a finger or the mouse does on a row — a tap, a hold, a swipe — and the one claim a gesture puts on
 // the click behind it are web/src/view/channel's (`createRowGestures`: SWIPE_START_PX, SWIPE_COMMIT_PX,
@@ -16483,889 +16442,84 @@ const rowGestures = createRowGestures({
   },
 });
 const { tapRow, actOnRow, foldOnTap, swipeable } = rowGestures;
-
-// --- two messages that are really one -----------------------------------------------------------
-//
-// A coding agent writes past Discord's 2000-character limit and its client splits the post in two.
-// The second half continues mid-sentence — often mid-WORD — and arrives a fraction of a second
-// after the first. Read as two rows it is unreadable, and worse, it doubles the length of a backlog
-// that this view exists to let somebody work through.
-//
-// So the two are DRAWN as one. Only drawn: everything below the render is untouched, and that is
-// the load-bearing decision here rather than a nicety.
-//
-//   * THE DATA MODEL STAYS ONE-TO-ONE with Discord. The server knows nothing about this, no
-//     combined id is ever invented, and no id this file made up can reach a route — every id sent
-//     anywhere is one Discord really issued. A row simply carries a LIST of them (`data-ids`)
-//     instead of one, and every act on the row is performed on the whole list.
-//   * THE RULE IS TEMPORAL AND NOTHING ELSE. Consecutive, same author, and within
-//     `GLOM_WINDOW_MS` of the PREVIOUS message in the group — not of the group's start, so a
-//     genuine burst of five chatty messages joins the same way a split one does, which is the
-//     honest reading of "these were sent as one act". Nothing here parses English: no split-word
-//     detection, no capitalisation test, no length ratio. Those were deliberately deferred, and
-//     the reason to defer them is that each one can be WRONG about a message, whereas a clock
-//     cannot be wrong about when a message was sent.
-//   * A HUMAN ALMOST NEVER SENDS TWICE IN FIVE SECONDS, which is what makes the window safe. When
-//     they do, the two lines are shown together and nothing has been lost — they are still two
-//     rows' worth of text, in order, one after the other.
-//
-// The three places this gets DELICATE, all of them because they key off identity:
-//
-//   * READ STATE IS THE `every`, NOT THE `some`. A row is shown as dealt with only when every
-//     message in it is. A group that somehow ends up half-read shows as UNREAD, because the other
-//     way round hides a message nobody has seen behind one they have.
-//   * AN ACT ON THE ROW IS AN ACT ON ALL OF IT. Archive, unarchive, read aloud, the bulk clear:
-//     each one takes `data-ids` and not `data-id`, or the trailing overflow is left behind in the
-//     queue with nothing on screen able to reach it.
-//   * A REPLY GOES TO THE FIRST. The group is a primary message with a tail, and Discord will
-//     thread the answer under whichever id it is given; the first is the one a reader means.
-//   * A THREAD'S ROOT MAY HEAD A ROW, NEVER JOIN ONE. A long post to Slack or Google Chat is its
-//     first part in the channel and the rest as replies in that part's thread, seconds apart, so
-//     the first part is a root before anyone answers it: the root and its author's replies inside
-//     the window are one post. A root joining the row above would bury its thread inside another
-//     message, and a reply in some other thread is never part of it (`#463 slack-text-fidelity`).
-
-/**
- * Is the combining on? ON unless the reader has turned it off: on at first, and applied as the device keeps
- * it as the page loads, where ABSENT MEANS ON: the default is the behaviour, not merely the initial value.
- *
- * A setting rather than a fixed behaviour because the view's other purpose is being able to point
- * at a REAL message, and a reader chasing "did that message exist" wants the rows exactly as
- * Discord has them.
- *
- * One owner in web/src/core/settings/switches.ts (`#624 voice-page-modularity`).
- *
- * @type {import("./src/core/settings/index.ts").KeptSwitch}
- */
-const combineSwitch = createKeptSwitch({
-  setting: DEVICE_SETTINGS.combineMessages,
-  deviceSettings: () => deviceSettings(),
-  initial: true,
-  render: (on) => messagePreferences.combine.render(on),
+// Drawing a channel row is web/src/view/channel's now (`createChannelRows`, `#624
+// voice-page-modularity`): empty messages, split posts as one, the row and everything on it,
+// its menu, marking read through it, copying, and the channel summary line. Opening a reply
+// stays the page's and is handed in.
+const channelRows = createChannelRows({
+  byId: el,
+  inThisColumn,
+  threadOf,
+  heldThreads: () => channelStore.current().threads,
+  heldMessages: () => channelStore.current().messages,
+  hideEmptyOn: () => hideEmptySwitch.on(),
+  combineOn: () => combineSwitch.on(),
+  listedMessages,
+  preservingScroll,
+  renderChannelRows,
+  renderScrollTools,
+  renderBodyInto,
+  headingOf,
+  restatedMarked,
+  headingLength,
+  headingPieces,
+  replyArrow,
+  pinned: () => rowDrawing.pinned(),
+  main: () => rowDrawing.main(),
+  foldable,
+  tapRow,
+  sayRowShortcut,
+  openReply,
+  takeQuote: (button) => takeQuote(button),
+  draftMarker,
+  replyingTo,
+  markReplying,
+  addThreadDecoration,
+  providerName: () => channelDirectory.providerName(),
+  upstreamReadMark: () => providerFacts.upstreamReadMark(),
+  scheduleBackSync,
+  guardQuietly,
+  markReadUpstream,
+  storedSlackOpen: () => deviceSettings().get(DEVICE_SETTINGS.slackOpen),
+  isPinnedId,
+  togglePin,
+  toggleBookmarkAt,
+  copyDeepLink,
+  toggleArchived,
+  markNotNoise,
+  swipeable,
+  searchable,
+  anchorsIn,
+  drawLinkedOn: (li, ids) => linkedMark.drawOn(li, ids),
+  idsOf,
+  archived: () => doneState().archived,
+  onTheirWay: () => [...doneSaving.keys()],
+  flashDone,
+  unflashDone,
+  dismissMessages,
+  throughBump,
+  doneSaved,
+  doneHeldHere,
+  selectedChannelId,
+  setStatus,
+  currentChannelId: () => currentChannelId(),
+  channels: () => channelDirectory.channels(),
+  providers: () => channelDirectory.providers(),
+  serviceLabel,
+  providerOfChannel,
+  chatServiceName,
+  copyRefused: COPY_REFUSED,
+  replyButtonTitle: REPLY_BUTTON_TITLE,
+  historyReach,
+  closeOpenMenu,
+  clipboard: () => navigator.clipboard,
 });
-
-/**
- * A list of messages, oldest first, as the list of ROWS to draw.
- *
- * Every message appears exactly once, in order, in exactly one group — so the row count changes
- * and nothing else does. Save an empty one while the reader hides those (`#386
- * hide-empty-messages`), which is in none: every list is drawn through here, so none draws it.
- */
-function glom(messages) {
-  const groups = [];
-  for (const message of messages) {
-    if (hiddenEmpty(message)) continue;
-    const last = groups[groups.length - 1];
-    if (last && joinsGroup(last[last.length - 1], message, combineSwitch.on())) {
-      last.push(message);
-    } else {
-      groups.push([message]);
-    }
-  }
-  return groups;
-}
-
-/**
- * Redraw the channel list from the messages already on screen, under the current grouping.
- *
- * What the setting needs and a re-read cannot give it: turning combining on or off must not cost a
- * round trip, must not lose the walk-back the reader has done, and must not move them. Everything
- * needed is already here — the rows carry their own messages — so this is a regroup, not a fetch.
- */
-function regroupChannelRows() {
-  const list = el("discord-log");
-  const messages = listedMessages();
-  preservingScroll(() => {
-    list.replaceChildren(...glom(messages).map(discordNode));
-    renderChannelRows();
-  });
-  renderScrollTools();
-}
-
-/**
- * What a channel row IS before anything can be done with it: its identity, its author line and its
- * text. Takes a group, never a bare message.
- *
- * Everything a reader can DO to a row — fold, reply, mark, swipe — is added by `discordNode`.
- *
- * @param {Array<object>} messages the row's constituents, oldest first, at least one.
- */
-function channelRowFrame(messages) {
-  const message = messages[0];
-  const li = document.createElement("li");
-  // `#56 message-hover-highlight`. A class of its own rather than styling `#discord-log li`
-  // directly: the treatment must not be able to reach `#transcript` rows, and the behavioural
-  // suite needs something on a REAL rendered row to assert the stylesheet's hook exists.
-  li.className = "discord-message";
-  // `#65 scrollback-paging`. Which message this row IS, readable without parsing the row's text.
-  // The newest page and the older walk both put rows in the same list, and telling one from the
-  // other is a comparison of snowflakes.
-  li.setAttribute("data-id", String(message.id));
-  // ...and EVERY message it stands for, which is the same thing on an ordinary row and the whole
-  // of the combining on a glommed one. Every act performed on the row reads this rather than
-  // `data-id`; see the section note above.
-  li.setAttribute("data-ids", messages.map((m) => String(m.id)).join(" "));
-  // The message objects themselves, for the two things attributes cannot carry: deciding whether
-  // an arriving message joins this row, and redrawing the list when the setting is flipped.
-  li.messages = messages;
-  // The reply pointer, on the row, as the ATTRIBUTE the inbox pass reads. It lives here rather
-  // than in a side map because the row is already the page's record of which message this is, and
-  // a second structure keyed by id would have to be kept in step with a list that is rebuilt from
-  // three different places. Absent when this message answers nothing.
-  //
-  // `data-reply-to` is the ROW'S OWN, which is the first constituent's — that is the row's
-  // identity, and it decides whether the row is drawn as an answer. `data-answers` is every
-  // pointer the row carries, which is what the census of "who has been answered" needs: a message
-  // combined into this row still answered whatever it answered, and reading only the first would
-  // quietly stop dimming that question.
-  if (message.reply_to) {
-    li.setAttribute("data-reply-to", String(message.reply_to));
-  }
-  li.setAttribute(
-    "data-answers",
-    messages
-      .map((m) => (m.reply_to ? String(m.reply_to) : ""))
-      .filter(Boolean)
-      .join(" ")
-  );
-  // WHO, as the snowflake, so the speaker pass has something stable to key on. The display name
-  // rides along only so Settings can show a recognisable label beside the id; nothing is ever
-  // decided from it, because it is chosen by whoever owns the account.
-  li.setAttribute("data-author-id", String(message.author_id || ""));
-  li.setAttribute("data-author", String(message.author || ""));
-  li.setAttribute("data-author-bot", message.author_is_bot ? "true" : "false");
-  const meta = document.createElement("div");
-  meta.className = "meta";
-  // A REPLY SAYS SO, to a screen reader, first in the meta line.
-  //
-  // Words, and nothing drawn. The glyph that used to be drawn here was a small "↩" beside the
-  // time, and the owner's verdict on it was "useless" (`#204 reply-arrow`): on the channel a reply
-  // is shown by the arrow `discordNode` puts in the gutter to its left, which also takes the reader
-  // to what it answers. These words are for a screen reader, which hears no arrow, so that it hears
-  // what the row is.
-  if (message.reply_to) {
-    const said = document.createElement("span");
-    said.className = "reply-said sr-only";
-    said.textContent = "reply. ";
-    meta.append(said);
-  }
-  const author = document.createElement("span");
-  // An author name is channel data too, and a display name can be anything at all.
-  author.textContent = message.author_is_bot ? `${message.author} (bot)` : String(message.author);
-  // `#260 timestamp-hover`. The hour and minute on the row, and the day they were on in its tooltip.
-  // Every list draws its rows here — Main, All, a thread, the right column, the cards, Pinned.
-  // `#729 vt-older-message-dates`: "Fri 03:23 PM" for a day of the week before, "10/30 03:23 PM" before that.
-  const timeLabel = messageTimeLabel(message);
-  const timeSaid = shortLocalTime(message);
-  const stamp = timeNode("msg-time", messageDate(message), timeLabel, timeSaid);
-  // THE MESSAGE ID IS NOT PRINTED ON THE ROW. It is a nineteen-digit number that no reader reads,
-  // on every row, on a screen 393 pixels wide. It is still the thing that lets the operator say
-  // "that message does not exist", so it moved to the details sheet a press-and-hold opens — see
-  // `showMessageDetails`.
-  author.className = "msg-author";
-  // `#206 pin-message`. The pinned chip, beside the time: in words, because a lone glyph is the
-  // marker the owner rejected. Built hidden on every row; `renderChannelRows` shows it.
-  const pinChip = document.createElement("span");
-  pinChip.className = "pin-chip";
-  pinChip.hidden = true;
-  pinChip.textContent = "Pinned";
-  // `#320 slack-edited-mark`. "(edited)" after the time, when the provider says the message changed.
-  const edited = editedMark(messages);
-  meta.append(author, stamp, ...(edited ? [edited] : []), pinChip);
-  const body = document.createElement("div");
-  body.className = "body";
-  // THE COMBINED BODY, and it is the only thing the reader sees of the grouping: each part as the
-  // server rendered it, one block after the other. The second half of a split post begins
-  // mid-sentence, and the block edge is the seam that keeps it from reading as one mangled
-  // sentence.
-  renderBodyInto(body, messages);
-  // `#242 rich-headers`. The first message's heading, beside the time and ahead of the row's
-  // buttons, and the words it restates marked for hiding — only when they really are marked.
-  const heading = headingOf(message);
-  const firstBody = body.children[0];
-  if (heading && firstBody && restatedMarked(firstBody)) {
-    firstBody.setAttribute("data-rh", "");
-    // The header line holds the time as well: a day before it (`#729`) takes room the heading had.
-    li.setAttribute("data-rh-len", headingLength(heading, [...timeLabel].length - [...timeSaid].length));
-    meta.append(headingPieces(heading));
-  }
-  li.append(meta, body);
-  // Two forms of the same words, for two different jobs: `content` is the SOURCE, which a copy
-  // keeps (`#198 copy-message-text`), and `text` is what the row SAYS, which is what the fold
-  // measures and the search matches. `#217 markdown-blocks`.
-  const text = renderedText(body);
-  // `#219 emoji-reactions`. Under the text, on a line of its own, and never in `.meta`, whose line
-  // the row's controls already fill on a phone. See `reactionStrip`.
-  const reactions = reactionStrip(messages);
-  if (reactions) li.append(reactions);
-  return { li, meta, body, content: combinedContent(messages), text, reactions };
-}
-
-// --- edited messages ------------------------------------------------------------------------------
-//
-// `#320 slack-edited-mark`. A message its author changed after sending it says so, as Slack and
-// Discord both mark one: "(edited)" in the row's meta line, straight after the time and in the time's
-// own muted ink and size, because it is a fact about the message and not part of what it says.
-//
-//   * ONLY WHERE THE PROVIDER SAYS SO. `edited_timestamp` is the provider's own record of the last
-//     edit — Slack's `edited.ts`, Discord's `edited_timestamp` — and absent is "not reported", which
-//     is drawn as every message was before edits were carried: with no mark.
-//   * WHEN, ON HOVER AND IN THE DETAILS SHEET. Its tooltip is the time of the last edit in the words
-//     the time's own tooltip uses, worded again at hover by `freshenDayTitle` so a page left open
-//     overnight does not say "Today" the morning after; a phone, which has no hover, reads it in the
-//     sheet a press-and-hold opens (`toggleMessageDetails`).
-//   * A COMBINED ROW IS EDITED WHEN ANY OF ITS MESSAGES IS, and its mark says the latest edit.
-//   * NOT READ ALOUD, NOT SEARCHED. The voice reads the message's words; "edited" is not one of them.
-//     A screen reader meets it as the word it is, after the time.
-//   * A LIVE COPY NEVER TAKES IT AWAY. A copy from the stream that does not say when the message was
-//     edited keeps the edit time the store held (`foldLiveMessage`), as it keeps the reactions.
-
-/**
- * The mark after a row's time, or null when none of its messages was edited: a `<time>` holding the
- * last edit, titled with it, or a plain span when no edit says a readable time. Text only.
- *
- * @param {Array<object>} messages
- */
-function editedMark(messages) {
-  const edited = rowEdited(messages);
-  if (edited === null) return null;
-  const mark = document.createElement(edited.at === null ? "span" : "time");
-  mark.className = EDITED_MARK;
-  mark.textContent = "(edited)";
-  if (edited.at !== null) {
-    mark.setAttribute("datetime", edited.at.toISOString());
-    mark.setAttribute("title", editedTitle(edited.at));
-  } else {
-    mark.setAttribute("title", "Edited");
-  }
-  return mark;
-}
-
-// --- reactions ------------------------------------------------------------------------------------
-//
-// `#219 emoji-reactions`. The owner: "I just want to see them appear. I don't care about seeing who
-// reacted and I don't care about reacting IN vibe-chat (yet)." What it is for, first: the chat
-// bridge acknowledges each message it takes with an emoji, and with a second one once the message
-// has reached the agent's transcript, and other tools acknowledge with one of their own. Seeing
-// those here is seeing a message arrive.
-//
-//   * A STRIP OF CHIPS UNDER THE TEXT, each the emoji and how many reacted with it. Read-only, and
-//     spans rather than buttons, so a tap on one is a tap on the row: `tapRow` passes over only
-//     controls and links. Text only — a custom emoji is its name between colons — because drawing
-//     its image would be this page's first request to a third party.
-//   * A COMBINED ROW HAS ONE STRIP, each emoji counted over all of its messages. The row is one act
-//     of writing and is acted on as one; the sum keeps an acknowledgement missing from one of its
-//     messages visible as a lower count, 👀 2 beside ✅ 1, which the largest count would hide.
-//   * A LIVE COPY NEVER WIPES THEM. The stream's copy of a message carries no reactions and can land
-//     after the read that brought them, so `foldLiveMessage` keeps the held ones.
-//   * NOT SEARCHED AND NOT READ ALOUD. A search for "eyes" is not a search for 👀.
-//   * THE OWNER'S OWN IS MARKED. `#312 slack-reactions`. Where the provider says the owner is among
-//     those who reacted (`owner_reacted`, which Slack reports), the chip is drawn in the accent, as
-//     Slack draws your own, and says so to a screen reader. Still a label: nothing here reacts.
-
-/**
- * The strip of chips under a row's text, or null when the row has no reactions. `textContent`
- * only: every emoji and every name in it is channel data.
- */
-function reactionStrip(messages) {
-  const tallies = rowReactions(messages);
-  if (tallies.length === 0) return null;
-  const strip = document.createElement("div");
-  strip.className = "reactions";
-  strip.setAttribute("role", "group");
-  strip.setAttribute("aria-label", "Reactions");
-  for (const tally of tallies) {
-    const chip = document.createElement("span");
-    chip.className = ["reaction", tally.custom ? "reaction-custom" : "", tally.own ? "reaction-own" : ""]
-      .filter(Boolean).join(" ");
-    const emoji = document.createElement("span");
-    emoji.className = "reaction-emoji";
-    emoji.textContent = reactionText(tally);
-    const count = document.createElement("span");
-    count.className = "reaction-count";
-    count.textContent = String(tally.count);
-    chip.append(emoji, count);
-    if (tally.own) {
-      // Said, not only coloured: the accent alone tells a screen reader nothing.
-      chip.title = "You reacted";
-      const mine = document.createElement("span");
-      mine.className = "sr-only";
-      mine.textContent = "including you";
-      chip.append(mine);
-    }
-    strip.append(chip);
-  }
-  return strip;
-}
-
-/**
- * One ROW: one message, or several drawn as one. Takes a group, never a bare message.
- *
- * @param {Array<object>} messages the row's constituents, oldest first, at least one.
- */
-function discordNode(messages) {
-  const message = messages[0];
-  const { li, meta, body, content, text, reactions } = channelRowFrame(messages);
-  // `#204 reply-arrow`. FIRST in the row, ahead of the meta line, so a screen reader meets the way
-  // to what this answers before the row's own words — and drawn by web/voice.css in the gutter to
-  // the row's left, where nothing else on the row is. Not in the Pinned list (`#206 pin-message`):
-  // that is a flat list of what was kept, drawn without the reply gutter, and what a pin answers is
-  // the channel's business — the jump walks the channel's own views, which are not on screen there.
-  if (message.reply_to && !rowDrawing.pinned() && !rowDrawing.main()) li.replaceChildren(replyArrow(li), ...li.children);
-  // The SAME call the voice transcript makes, on the same arguments, so the two lists cannot end
-  // up with two idioms for the one behaviour. `#47 scrollback-stability`. The one extra argument
-  // is the message id, which is what `#49 cached-summaries` keys a summary under — the transcript
-  // has none to give, so it gets no summary line and the two lists still share one definition of
-  // "long enough to fold".
-  // EVERY row, foldable or not. See `tapRow`.
-  //
-  // Measured on the COMBINED text, because that is what the row is showing: a pair of messages
-  // each just under the fold threshold is a wall of text once they are drawn as one.
-  //
-  // The summary is keyed under the FIRST id — that is the row's identity everywhere else too —
-  // but it DESCRIBES the whole group. The other ids ride along so the server can join them back
-  // into the one piece of writing they were before Discord's length limit cut them up; summarising
-  // the primary alone would describe the half that stops mid-sentence, and the tail alone is the
-  // least summarisable text in the channel.
-  const fold = foldable(li, meta, body, text, String(message.id), messages.slice(1).map((m) => String(m.id)));
-  tapRow(li, fold);
-  // `#224 keyboard-shortcuts`. Each of the row's buttons that has a key says so, to a screen reader.
-  if (fold) sayRowShortcut(fold, "fold");
-  // `#219 emoji-reactions`. Moved below the summary `foldable` may have added, which can stand in
-  // for the text: the reactions belong to the message, whichever of the two is showing.
-  if (reactions) li.append(reactions);
-  // `#51 reply-view`. Every raw message can be answered, and the affordance is on the row rather
-  // than in a menu — Discord's own idiom, and the thing that makes a reply a REPLY rather than a
-  // loose message.
-  //
-  // Its accessible name carries NO channel data. An author string is written by whoever is in the
-  // channel and a display name can be anything at all; the row already shows the author and the
-  // id, and a button that repeats them into an attribute buys nothing worth the question of
-  // whether that attribute is a sink.
-  const reply = document.createElement("button");
-  reply.className = "reply-button";
-  reply.setAttribute("type", "button");
-  reply.setAttribute("title", REPLY_BUTTON_TITLE);
-  reply.textContent = "Reply";
-  // A closure over the message OBJECTS, not over their ids: an id would be looked up again later
-  // against a list that the next poll may have replaced.
-  //
-  // THE ANSWER GOES TO THE FIRST CONSTITUENT. A glommed row is a primary message with a tail
-  // hanging off it, and threading a reply under the tail would put the answer under a fragment.
-  //
-  // `#267 quote-reply`. With words of this message selected it is Quote reply, and the reply opens
-  // with them quoted. The same screen and the same routing: only the box's first lines differ.
-  reply.addEventListener("click", inThisColumn(() => openReply(messages, li, takeQuote(reply))));
-  sayRowShortcut(reply, "reply-button");
-  // `#377 compact-collapsed-rows`. The row's controls, held together at the end of the header line:
-  // where the line has no room for them beside the name and the time they move to the next line as
-  // one, never leaving Done alone on a line of its own; and where the list is narrow, a collapsed row
-  // shows only its Thread tag and ⋯ among them (web/voice.css).
-  const acts = document.createElement("span");
-  acts.className = "row-acts";
-  meta.append(acts);
-  // `#193 compose-draft-loss`. Beside it, the reply still being written to this message, if any.
-  acts.append(draftMarker(messages, li), reply);
-  // `#277 reply-in-column`. Drawn again while a reply to it is open at the foot of this column, it is
-  // still edged as the message being answered.
-  if (replyingTo(messages[0])) markReplying(li, true);
-  // `#228 reply-visible`. Held on the row, as its messages are, so that the pass which says how many
-  // replies each row has (`renderReplyCounts`) finds the button without walking the row's text.
-  li.replyButton = reply;
-  // A row of the Pinned filter offers the way into its message's thread whatever view is under it.
-  addThreadDecoration(acts, message, li, rowDrawing.pinned() || rowDrawing.main());
-  // A provider write, distinct from the reversible local Done/archive below. Most providers do
-  // not expose this operation, so the server advertises it explicitly and the control stays out
-  // of the interface unless the selected provider supports it.
-  const upstreamRead = document.createElement("button");
-  upstreamRead.className = "upstream-read-button";
-  upstreamRead.setAttribute("type", "button");
-  // NAMED FOR WHAT IT CHANGES. It moves the chat service's OWN read marker — visible in that
-  // service's app — and only for the whole conversation: Google Chat lets a thread's read state be
-  // read but not set. The owner took it for this app's own read tracking, which is Done.
-  const service = channelDirectory.providerName() || "the chat service";
-  upstreamRead.setAttribute(
-    "title",
-    `Move ${service}'s own read marker for the whole space to this message, so ${service} shows ` +
-      "it and everything before it as read. This app's Done is separate."
-  );
-  // `#206 pin-message`. SHORT on screen, under the "Mark read" caption of the group it sits in;
-  // WHOLE to a screen reader, which hears the item without the caption beside it.
-  upstreamRead.textContent = `In ${service} only · whole space`;
-  upstreamRead.setAttribute("aria-label", `Mark read in ${service} only · whole space`);
-  upstreamRead.hidden = !providerFacts.upstreamReadMark();
-  // A combined row stands for every constituent in order. Marking through the NEWEST one includes
-  // the complete row; using its first id would leave an invisible tail unread upstream.
-  const upstreamBoundary = messages[messages.length - 1];
-  // `row-more-menu`. Rarely used, and the widest label on the row, so it lives under a "⋯" menu
-  // rather than taking a line of the row's width: room the thread tag's reply count needs. The menu
-  // is the home for further per-message options. Copy is always one of them, so the menu is always
-  // offered; the provider's read marker joins it only where the server advertises that write.
-  //
-  // `#206 pin-message` ORDERED it, at the owner's word: Copy text first, then Pin, then the two
-  // that mark read, grouped under a caption of their own.
-  const more = document.createElement("span");
-  more.className = "row-more";
-  const moreButton = document.createElement("button");
-  moreButton.className = "row-more-button";
-  moreButton.setAttribute("type", "button");
-  moreButton.setAttribute("aria-label", "More options for this message");
-  moreButton.setAttribute("aria-expanded", "false");
-  moreButton.setAttribute("title", "More options");
-  moreButton.textContent = "⋯";
-  const menu = document.createElement("span");
-  menu.className = "row-more-menu";
-  menu.hidden = true;
-  const setMenu = (open) => {
-    menu.hidden = !open;
-    moreButton.setAttribute("aria-expanded", open ? "true" : "false");
-    // ONE menu open at a time: opening this one closes whichever was open, and a tap anywhere
-    // outside it, or Escape, closes it — what a phone's own pop-up menus do.
-    if (open) rowMenus.opened({ root: more, close: closeMenu, button: moreButton });
-    else rowMenus.closed(closeMenu);
-    // `#304 back-gesture-in-app`. An open menu is a level, with an entry of its own.
-    scheduleBackSync();
-  };
-  const closeMenu = () => setMenu(false);
-  moreButton.addEventListener("click", inThisColumn(() => setMenu(menu.hidden)));
-  sayRowShortcut(moreButton, "row-more-button");
-  upstreamRead.addEventListener("click", inThisColumn(() => {
-    setMenu(false);
-    guardQuietly(() => markReadUpstream(String(upstreamBoundary.id)))();
-  }));
-  // `#198 copy-message-text`. The row's whole text as written — every constituent of a combined
-  // row, in order, which is what the reader sees as one message — so it can be pasted elsewhere.
-  // The source text rather than what the row draws: a pasted message should keep its own markup.
-  const copy = document.createElement("button");
-  copy.className = "row-copy-button";
-  copy.setAttribute("type", "button");
-  copy.setAttribute("title", "Copy this message's text to the clipboard");
-  copy.textContent = "Copy text";
-  sayRowShortcut(copy, "row-copy-button");
-  copy.addEventListener("click", inThisColumn(() => {
-    setMenu(false);
-    guardQuietly(() => copyMessageText(content))();
-  }));
-  // `#408 copy-upstream-link`, as `#409 open-upstream-link` leaves it. The message's own
-  // address in the service it came from, formed by the server and carried on the message:
-  // offered only where one came back, never shown disabled for a message with none. The FIRST
-  // constituent's, as the row's reply is: a combined row is one post in parts, and its link
-  // lands at its start.
-  //
-  // A real link that opens the address, as the row's own links are (`linkList`). A new tab,
-  // which in the installed app leaves the app for the browser — or the service's own app, where
-  // the address hands over to one — rather than navigating this page away; and being a genuine
-  // link it keeps the browser's own right-click and copy-link-address where the browser offers
-  // them (a right-button press reaches an unprevented `contextmenu` on the anchor with the menu
-  // still open: tests/open_upstream_link_browser.py). The click handler only shuts the menu; the
-  // opening is the link's, never a script's say-so. The Copy item under it (`#461`) and the l key
-  // (`copyLinkFromKeyboard`) copy the same address where no such browser menu can be counted on.
-  const upstreamUrl = upstreamUrlOf(message);
-  let openLink = null;
-  let copyLink = null;
-  if (upstreamUrl !== null) {
-    const linkService = upstreamServiceName(message);
-    // `#481 slack-app-deep-link`: where this device opens Slack links in the app and the
-    // message carries an app address, the link goes there instead — by its slack:// address,
-    // with no target for a browser to leave a blank tab in. Copies below still take the web
-    // address, the one that can be sent to anybody.
-    const appUrl = upstreamAppUrlOf(message);
-    const opensInApp = appUrl !== null && storedSlackOpen() === "app";
-    const opensAt = opensInApp ? appUrl : upstreamUrl;
-    openLink = document.createElement("a");
-    openLink.className = "row-open-link-button";
-    openLink.setAttribute("href", opensAt);
-    if (!opensInApp) {
-      openLink.setAttribute("target", "_blank");
-      openLink.setAttribute("rel", "noopener noreferrer");
-    }
-    openLink.setAttribute("title", `Open this message in ${linkService}: ${opensAt}`);
-    openLink.textContent = `Open in ${linkService}`;
-    sayRowShortcut(openLink, "row-open-link-button");
-    openLink.addEventListener("click", inThisColumn(() => setMenu(false)));
-    // Space presses it, as it presses every other item in the menu: a browser presses a button
-    // with Space and scrolls at a link, and in a menu the item is the item, whichever it is.
-    // On the upstroke, as a button's own press lands.
-    openLink.addEventListener("keydown", (event) => {
-      if (event.key === " " && !event.ctrlKey && !event.metaKey && !event.altKey) event.preventDefault();
-    });
-    openLink.addEventListener("keyup", inThisColumn((event) => {
-      if (event.key !== " " || event.ctrlKey || event.metaKey || event.altKey) return;
-      event.preventDefault();
-      openLink.click();
-    }));
-    // `#461 upstream-link-native`. The copy as its own item again, beside the link it copies.
-    // Where the browser gives the link its own right-click or long-press menu the item is a
-    // second way to the same clipboard; where it does not — a long press that only taps through
-    // on a phone, an installed app with no link menu of its own — it is the only one. The same
-    // copy the l key makes (`copyUpstreamLink`), of the same address.
-    copyLink = document.createElement("button");
-    copyLink.className = "row-copy-link-button";
-    copyLink.setAttribute("type", "button");
-    copyLink.setAttribute("title", `Copy this message's address in ${linkService} to the clipboard: ${upstreamUrl}`);
-    copyLink.textContent = `Copy ${linkService} link`;
-    sayRowShortcut(copyLink, "row-copy-link-button");
-    copyLink.addEventListener("click", inThisColumn(() => {
-      setMenu(false);
-      guardQuietly(() => copyUpstreamLink(upstreamUrl, linkService))();
-    }));
-  }
-  // `#202 read-through-here`. What the owner reached for the read marker to do: grey everything up
-  // to and including this row IN THIS APP — the same Done a row's own button records — so that with
-  // Hide read on, doing it on the newest row leaves an empty list. Where the provider's own marker
-  // can be moved too, it is, so the chat service's app agrees.
-  const readThrough = document.createElement("button");
-  readThrough.className = "row-read-through-button";
-  readThrough.setAttribute("type", "button");
-  readThrough.textContent = providerFacts.upstreamReadMark() ? `Through here · also in ${service}` : "Through here";
-  readThrough.setAttribute(
-    "aria-label",
-    providerFacts.upstreamReadMark() ? `Mark read through here · also in ${service}` : "Mark read through here"
-  );
-  readThrough.setAttribute(
-    "title",
-    "Mark this message and every message above it in this list as Done here" +
-      (providerFacts.upstreamReadMark() ? `, and move ${service}'s own read marker for the whole space.` : ".")
-  );
-  sayRowShortcut(readThrough, "row-read-through-button");
-  readThrough.addEventListener("click", inThisColumn(() => {
-    setMenu(false);
-    guardQuietly(() => markReadThroughHere(li, String(upstreamBoundary.id)))();
-  }));
-  // `#206 pin-message`. Pin or unpin EVERY message the row stands for, as Done archives every one:
-  // pinning half of a split post would keep the half that stops mid-sentence. Its word is set by
-  // `renderChannelRows`, with the chip, so the two cannot disagree.
-  const pinItem = document.createElement("button");
-  pinItem.className = "row-pin-button";
-  pinItem.setAttribute("type", "button");
-  pinItem.setAttribute(
-    "title",
-    "Pin this message on this server, for every device; find it again with the Pinned filter beside " +
-      `the search glass. ${service}'s own pinned messages are not changed.`
-  );
-  pinItem.textContent = messages.some((m) => isPinnedId(m.id)) ? "Unpin message" : "Pin message";
-  sayRowShortcut(pinItem, "row-pin-button");
-  pinItem.addEventListener("click", inThisColumn(() => {
-    setMenu(false);
-    guardQuietly(() => togglePin(messages))();
-  }));
-  // `#240 reading-bookmark`. The line above this message, or, on the message right under it, away.
-  // Its word is set by `placeBookmarkLine`, which knows where the line is.
-  const bookmarkItem = document.createElement("button");
-  bookmarkItem.className = "row-bookmark-button";
-  bookmarkItem.setAttribute("type", "button");
-  bookmarkItem.setAttribute(
-    "title",
-    "Your place in this channel, kept on this server for every device: a line above this message. " +
-      "Nothing is marked Done."
-  );
-  bookmarkItem.textContent = "Bookmark above";
-  sayRowShortcut(bookmarkItem, "row-bookmark-button");
-  bookmarkItem.addEventListener("click", inThisColumn(() => {
-    setMenu(false);
-    toggleBookmarkAt(li);
-  }));
-  // The two that mark read, as ONE group: a caption, and the items under it. `role="group"` with the
-  // caption's words as its name, so a screen reader announces the grouping the eye sees.
-  const readGroup = document.createElement("span");
-  readGroup.className = "row-more-group";
-  readGroup.setAttribute("role", "group");
-  readGroup.setAttribute("aria-label", "Mark read");
-  const readCaption = document.createElement("span");
-  readCaption.className = "row-more-caption";
-  readCaption.setAttribute("aria-hidden", "true");
-  readCaption.textContent = "Mark read";
-  readGroup.append(readCaption, readThrough, upstreamRead);
-  // `#462 webapp-deep-links`. This app's own address for the message, beside its service's:
-  // it opens the app on the message, highlighted, on any server reading the same upstream.
-  // Always offered — it needs no upstream address to have come back.
-  const deepCopy = document.createElement("button");
-  deepCopy.className = "row-copy-deep-link-button";
-  deepCopy.setAttribute("type", "button");
-  deepCopy.setAttribute("title", "Copy a link that opens this app on this message");
-  deepCopy.textContent = "Copy vibe-talk link";
-  // `#889 voice-page-copy-link-key`. Its chord, Ctrl+L (Cmd+L), said on it as the other copies' are.
-  sayRowShortcut(deepCopy, "row-copy-deep-link-button");
-  deepCopy.addEventListener("click", inThisColumn(() => {
-    setMenu(false);
-    guardQuietly(() => copyDeepLink(message))();
-  }));
-  // Copy text first, then the ways to the message in its service where it has one — open it,
-  // copy its address — then its address here, then Pin: the copies and the links together,
-  // ahead of the acts that change anything.
-  menu.append(copy, ...(openLink ? [openLink] : []), ...(copyLink ? [copyLink] : []), deepCopy, pinItem, bookmarkItem, readGroup);
-  more.append(moreButton, menu);
-  acts.append(more);
-  // `#50 todo-view`. The non-gestural way to say "dealt with", and the one a keyboard can reach.
-  // On EVERY channel row rather than only on rows built while the mode is on: the mode is a
-  // filter over the same list, and a control that exists in one rendering and not another is a
-  // second code path waiting to disagree with the first.
-  const done = document.createElement("button");
-  done.className = "done-button";
-  done.setAttribute("type", "button");
-  done.setAttribute(
-    "title",
-    "Mark as dealt with here. This does not change the source chat service."
-  );
-  done.textContent = "Done";
-  // VISIBLE IN BOTH MODES. It used to be hidden outside the To do filter, from a time when the
-  // channel view said nothing at all about the archive: there was no archived row on screen, so
-  // there was nothing to act on. The channel view greys archived rows now, so the row in front of
-  // the reader is exactly the row that may need putting back — and hiding its only
-  // keyboard-reachable control would leave the swipe as the sole way in, which is the one thing
-  // this section refuses to do. `renderChannelRows` decides which of the two acts it offers.
-  //
-  // EVERY constituent, not the row's identity: archiving a row that leaves half of itself in the
-  // queue is the failure mode a display-layer grouping has to be built against.
-  const ids = messages.map((m) => String(m.id));
-  done.addEventListener("click", inThisColumn(() => guardQuietly(() => toggleArchived(ids, li))()));
-  sayRowShortcut(done, "done-button");
-  // `#196 auto-read-noise`. The rescue for a rule that caught a message by mistake: ONE message,
-  // recorded on the server, leaving the rule to go on catching the placeholders it is right about.
-  // On every row and shown only on a noise row by `renderChannelRows`, for the reason Done is on
-  // every row — a control that exists in one rendering and not another is a second code path.
-  const rescue = document.createElement("button");
-  rescue.className = "not-noise-button";
-  rescue.setAttribute("type", "button");
-  rescue.setAttribute(
-    "title",
-    "This is a real message. Stop reading it automatically; the rule stays as it is."
-  );
-  rescue.textContent = "Not noise";
-  rescue.hidden = !messages.every(isNoise);
-  rescue.addEventListener("click", inThisColumn(() => guardQuietly(() => markNotNoise(ids))()));
-  acts.append(rescue, done);
-  // `#84 reply-aware-dismissal`. THE SWIPE `#50` deferred, and it drives the same act the Done button does
-  // rather than a second notion of "dealt with": one dismissal, recorded on the server, reachable
-  // by gesture OR by a control a keyboard can get to. That ordering was `#50`'s condition for the
-  // gesture layer and it still holds — the gesture is a second way in, never the only one.
-  swipeable(li, messages);
-  // `#129 message-search`. THE COMBINED TEXT, for the same reason the fold is measured on it: a
-  // glommed row is one row to the reader, and a filter that matched only its first constituent
-  // would hide a row that visibly contains the word they typed. The author name goes in because
-  // "everything the bot said" is a search a reader performs, and the id does not, because it is
-  // not on the row — see the note above about where the snowflake lives.
-  //
-  // `#217 markdown-blocks`. What the row SAYS, not its Markdown source: a word split by emphasis
-  // marks is one word on screen, and a mention is found by the `@id` it is drawn as. With the
-  // address of every link it draws, which the source held and the drawn text does not, so a pasted
-  // address still finds its row.
-  searchable(li, message.author, text, ...anchorsIn(body).map((link) => link.href));
-  // `#890 voice-page-linked-highlight`. The linked message, marked on every drawing of its row.
-  linkedMark.drawOn(li, messages.map((one) => String(one.id)));
-  return li;
-}
-
-/**
- * The one row ⋯ menu that is open, as `{root, close, button}` (`button` being the ⋯ that opened it),
- * or null. `#202 read-through-here`. One owner in web/src/view/channel/rowmenu.ts (`#624
- * voice-page-modularity`).
- */
-const rowMenus = createRowMenus();
-
-// Whether a node is inside another (`nodeWithin`) is web/src/view/dom's.
-
-/** A tap anywhere outside the open ⋯ menu (or its button) closes it. */
-function closeRowMenuOutside(event) {
-  const menu = rowMenus.open();
-  if (menu && !nodeWithin(menu.root, event && event.target)) menu.close();
-}
-
-/**
- * Escape closes the open ⋯ menu, and returns whether there was one. Asked first by `onEscape`.
- *
- * `#224 keyboard-shortcuts`. With the focus on an item in the menu, the focus goes back to the ⋯
- * that opened it, as a menu's does: the item has just been hidden, and a focus left on a hidden
- * item is a focus on nothing, where the scroll keys would have nowhere to go.
- */
-function closeRowMenuOnEscape(event) {
-  if (!event || event.key !== "Escape") return false;
-  // The one way a menu closes, which the back gesture's takes too (`#304 back-gesture-in-app`).
-  return closeOpenMenu("menu:row");
-}
-
-/**
- * Most ids one dismissal request carries; the server refuses a larger batch. A thousand since
- * `#240 reading-bookmark`, so a long Done through here is one request rather than eleven.
- */
-const DISMISS_BATCH = 1000;
-
-/**
- * Mark this row and every row above it in the list as Done here, and — where the provider allows
- * it — move the provider's own read marker for the whole space through the row's newest message.
- *
- * The rows ON SCREEN, in the view on screen, are the set: in All that includes thread replies, in a
- * thread only that thread, under the Pinned filter the pins. Rows already Done are left out of the
- * count. `#202 read-through-here`.
- */
-async function markReadThroughHere(row, upstreamId) {
-  // The row's OWN list: the channel's, or the Pinned filter's, where "above it" means the pins above.
-  // With replies gathered (`#215 reply-coalesce`) it is still the rows ABOVE IT ON THE SCREEN, the
-  // stack included, because that is what the item says it does and what the reader is looking at.
-  // Gathering itself marks nothing. `#407 unpack-row-parity`: a thread unpacked under its card is that
-  // thread's list, as in the thread: other threads' rows above it in the cards are not "above it".
-  // `#419 threads-view-main-messages`: and a main-channel message among the cards is the main channel's:
-  // only Main's messages above it there are "above it", not the threads' rows between them.
-  const thread = row.getAttribute("data-unpack-thread");
-  const main = row.hasAttribute("data-main-row");
-  const rows = [...(row.parentNode || el("discord-log")).children]
-    .filter((one) => (main ? one.hasAttribute("data-main-row") : thread === null || one.getAttribute("data-unpack-thread") === thread));
-  const at = rows.indexOf(row);
-  if (at < 0) return;
-  const covered = rows.slice(0, at + 1).flatMap(idsOf);
-  const ids = covered.filter((id) => !doneState().archived.has(id));
-  const channel = String(selectedChannelId());
-  // `#327 done-races-remaining`. What the chat service's marker would pass, beyond the rows on
-  // screen: a Done, or a put back, still on its way whose row is off the list — under Hide read a
-  // Done takes its row off at once, and no order the page holds in every view says where it stood.
-  // Every write on its way at the press is waited for: one above the boundary only delays the
-  // mark, or declines it for the reader to ask again, and never moves it wrongly. Taken now, at
-  // the press: by the time this act's own Done is saved, which is queued behind it, that write
-  // has been answered and is no longer on its way to be found.
-  const onTheirWay = [...doneSaving.keys()];
-  const waitingFor = [...new Set([...covered, ...onTheirWay])];
-  // `#245 done-feedback`. Drawn on the row it was asked from: the boundary is the row the reader is on.
-  if (ids.length) {
-    flashDone(row);
-    try {
-      // `#240 reading-bookmark`. A bookmark at or above the row slides below it, with the Done.
-      await dismissMessages({ messages: ids }, throughBump(row));
-    } catch (error) {
-      unflashDone(row);
-      throw error;
-    }
-  }
-  let upstream = false;
-  const service = channelDirectory.providerName() || "the chat service";
-  const count = `${ids.length} message${ids.length === 1 ? "" : "s"}`;
-  if (providerFacts.upstreamReadMark() && upstreamId) {
-    // `#327 done-races-remaining`. The chat service's marker, which cannot be moved back, is moved only
-    // once every message it covers is Done with its Done saved, as Shift+E and a sent reply wait
-    // (`doneSaved`): a Done still on its way of a row drawn Done already, which this leaves out of its own,
-    // and a put back made meanwhile (Undo, a row's own button) are waited for, and all of them looked at
-    // again by what the page holds (`doneHeldHere`). One refused or put back, the marker is not moved.
-    // The wait is for `waitingFor`: the rows covered, and a write on its way at the press for a
-    // message the marker would pass whose row Hide read had already taken off the list.
-    if (!(await doneSaved(waitingFor, () => String(selectedChannelId()) === channel && doneHeldHere(waitingFor)))) {
-      if (String(selectedChannelId()) === channel) {
-        const why = "a Done it covers was refused or undone";
-        setStatus(ids.length > 0 && doneHeldHere(ids) ? `Marked ${count} read here, not in ${service}: ${why}.`
-          : `Not marked read in ${service}: ${why}.`);
-      }
-      return;
-    }
-    await markReadUpstream(upstreamId);
-    upstream = true;
-  }
-  // Short enough for one line on a phone: the status line cuts a long sentence off.
-  setStatus(upstream ? `Marked ${count} read here and in ${service}.` : `Marked ${count} read.`);
-}
-
-// A message's own addresses in its service, web (`upstreamUrlOf`) and app (`upstreamAppUrlOf`), each read
-// only in the one shape its href may take, are web/src/present/rows's (`#624 voice-page-modularity`).
-
-/**
- * Where this device opens Slack links: in Slack's app or in the browser (`#481
- * slack-app-deep-link`). Kept on the device and never synced, as Screen and keys' choices are:
- * whether the app is installed is this device's own business, and no page can tell without
- * asking it to open — so the browser is the shipped default, and choosing the app is the
- * owner's word that it is there. Anything stored that is neither word is the browser.
- */
-function storedSlackOpen() {
-  // A browser refusing storage reads as a browser tab (`DEVICE_SETTINGS.slackOpen.refused`).
-  return deviceSettings().get(DEVICE_SETTINGS.slackOpen);
-}
-
-/**
- * The service a message's own link points into, by name: its channel's provider's, for the
- * "Open in …" words. `#408 copy-upstream-link`.
- *
- * The provider of the channel the message was served in, or of the channel on screen where that
- * names none the page knows (a thread's own channel, a pin's): rows on screen belong to the
- * channel on screen. Last, the deployment's name, which with one provider is that provider's.
- *
- * @param {any} message
- */
-function upstreamServiceName(message) {
-  for (const id of [message && message.channel_id, currentChannelId()]) {
-    if (!id) continue;
-    const channel = channelDirectory.channels().find((candidate) => String(candidate.id) === String(id));
-    const key = channel && typeof channel.provider === "string" ? channel.provider : null;
-    // The channel picker's own words for the service (`serviceLabel`), which tell two services
-    // of one name apart by their key: two workspaces both called Slack must not offer the same
-    // label over different links.
-    if (key && channelDirectory.providers().has(key)) return serviceLabel(key);
-    const provider = providerOfChannel(id);
-    if (provider && typeof provider.name === "string" && provider.name.trim()) return provider.name.trim();
-  }
-  // No described provider for the channel: with several services the deployment's joined name
-  // ("Slack and Google Chat") names neither, so the item stays generic rather than wrong.
-  return channelDirectory.providers().size > 1 ? "the chat service" : chatServiceName();
-}
-
-/**
- * Put a message's own address in its service on the clipboard, and say whether it went.
- * `#408 copy-upstream-link`.
- */
-async function copyUpstreamLink(url, service) {
-  const copied = await writeClipboardText(String(url || ""));
-  setStatus(copied ? `Copied the link in ${service}.` : COPY_REFUSED);
-  return copied;
-}
-
-/**
- * Put a message's text on the clipboard, and say whether it went. `#198 copy-message-text`.
- */
-async function copyMessageText(text) {
-  const copied = await writeClipboardText(String(text || ""));
-  setStatus(copied ? "Copied the message text." : COPY_REFUSED);
-  return copied;
-}
-
-/**
- * Put `value` on the clipboard as plain text; whether it went (web/src/view/dom `copyText`: the
- * asynchronous Clipboard API, else a hidden textarea's copy; `#624 voice-page-modularity`). False when
- * neither works, for the caller to say so.
- *
- * @param {string} value
- */
-function writeClipboardText(value) {
-  return copyText(value, () => navigator.clipboard);
-}
-
-// `#62 message-count-accuracy`, carried across from the older page at `/` (gone since `#302
-// root-is-the-app`), where it was fixed first.
-//
-// The length of what the server returned is the FETCH WINDOW, not a channel total. Discord gives a
-// bot no message count for a guild text channel, so the number is the channel's own only when the
-// server reports `complete` — the fetch came back short, meaning there is nothing older. Otherwise
-// no digit is shown at all: a confidently wrong count is worse than no count, and this one was
-// wrong in the direction that makes the bridge look like it is losing messages.
-//
-// `!== true` rather than `=== false`, so a server too old to send the field is treated as unknown.
-// It takes the label so every branch reads as a whole sentence. Appending " from <channel>" to a
-// summary that already ends in a clause produced "older ones are not loaded from lead team".
-//
-// `#578 search-status-clarity`. A total only where every message of the view is loaded (`historyReach`):
-// on All, the reads reaching its first top-level message is not enough while threads there lack replies
-// All never brought — the "112 messages" the owner was shown on 2026-10-25 (`#521 server-side-search`).
-// How far back the rest runs with no gaps is said by the search's own lines, which change as a walk
-// reads; this line holds still at the head of the list, where a change of height moves every row.
-function channelSummary(count, complete, label) {
-  const reach = historyReach();
-  if (complete === true && reach.start && reach.topLevel && !reach.whole) {
-    const lacking = reach.threads - reach.full;
-    return `${label} — back to the first message; ${lacking} thread${lacking === 1 ? " here has" : "s here have"} ` +
-      "replies not loaded";
-  }
-  if (complete !== true || !reach.whole) {
-    return `${label} — the most recent messages; older ones are not loaded`;
-  }
-  if (count === 0) {
-    return `no messages in ${label}`;
-  }
-  return `${count} message${count === 1 ? "" : "s"} from ${label}`;
-}
+const {
+  rowMenus, emptyMessage, hiddenEmpty, glom, regroupChannelRows, channelRowFrame,
+  discordNode, closeRowMenuOutside, closeRowMenuOnEscape, markReadThroughHere,
+  storedSlackOpen, upstreamServiceName, copyUpstreamLink, copyMessageText,
+  writeClipboardText, channelSummary,
+} = channelRows;
 
 // --- walking back through the channel -----------------------------------------------------------
 //

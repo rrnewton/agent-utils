@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 
 import { CHANNEL, CSS_CODE, DISCORD_POLL_MS, DONE_FLASH_FADE_MS, DONE_FLASH_HOLD_MS, HTML,
-  HTML_CODE, KEYMAP_TABLE, LINE_PX, PAGE_ELEMENTS, RUN_TAIL, SCRIPT, SCRIPT_CODE, SCROLL_VIEWPORT_PX,
+  HTML_CODE, KEYMAP_TABLE, LINE_PX, PAGE_ELEMENTS, RUN_TAIL, PAGE_CODE, SCRIPT, SCRIPT_CODE, SCROLL_VIEWPORT_PX,
   SHORT_MESSAGE, UNPACK_STORAGE, asksFor, atBottomOf, backlog, bid, bodyOf, bookmarkAt, bookmarkRow,
   brokenModule, brokenScript, brokenScriptEach, builtSince, cardIds, cardRow, channelRow, chooseReadMode, compose,
   cssBlock, cssRules, deliver, doneButton, elidedOf, enterRunThread, failedSend, fillTranscript,
@@ -1599,8 +1599,8 @@ test("NO KEY MARKS EVERY MESSAGE ABOVE ONE READ ANY MORE: not Shift+E, nor any k
   // In the table the keys are answered from, nothing names the act, its ⋯ item, or the backlog's clear.
   assert.doesNotMatch(KEYMAP_TABLE, /markReadThroughHere|throughHere|row-read-through-button|clearBacklog|clear-backlog/,
     "a key still reaches Done through here or Clear the backlog");
-  // Done through here's one caller is its ⋯ item's click: the definition and that call, nothing else.
-  assert.equal([...SCRIPT_CODE.matchAll(/\bmarkReadThroughHere\(/g)].length, 2,
+  // Done through here's one caller is its ⋯ item's click: its interface, definition and that call.
+  assert.equal([...PAGE_CODE.matchAll(/\bmarkReadThroughHere\(/g)].length, 3,
     "Done through here has a caller besides its ⋯ item");
   // Every chord of every binding in the table, pressed on the newest of six unread messages: nothing
   // marks more than that one message, and nothing marks through a boundary.
@@ -2899,7 +2899,7 @@ test("`#301 semicolon-expand-cycle` x `#226 page-energy-profile`: NOTHING THE PA
   // Neither a fixture too small to see it nor a list this test does not read: THE CONTROL keeps a list of
   // folds beside the rows again, never pruned, and the test names it.
   const kept = brokenScript("const folding = createFolding({", "const foldsKept = [];\nconst folding = createFolding({")
-    .replace("  const fold = foldable(li, meta, body, text,", "  foldsKept.push(li);\n  const fold = foldable(li, meta, body, text,");
+    .replace("  foldable,\n  tapRow,", "  foldable: (li, meta, body, text, id, also) => { foldsKept.push(li); return foldable(li, meta, body, text, id, also); },\n  tapRow,");
   assert.ok(kept.includes("foldsKept.push(li)"), "the control no longer finds where a fold is made");
   const leaky = await run(kept);
   assert.equal(leaky.grew.length, 1, `the control grew ${leaky.grew.join(", ")}`);

@@ -143,3 +143,5 @@ export { createTimelineView } from "./readcore.ts";
 export type { TimelineAbandonedRead, TimelineColumn, TimelineColumnSteps, TimelineEntryState, TimelineFoldRead, TimelineLoadState, TimelineOlderPages, TimelineReadOptions, TimelineReaderLike, TimelineRows, TimelineSelection, TimelineView, TimelineViewDependencies } from "./readcore.ts";
 export { COLLAPSE_OVER_CHARS, FOLD_LESS, FOLD_LISTS, FOLD_MORE, SCROLLBACK_PX, SUMMARY_LOOKAHEAD_PX, createFolding } from "./folding.ts";
 export type { FoldEntry, FoldPane, Folding, FoldingDependencies, ScrollPlace, ScrollToolsPass } from "./folding.ts";
+export { DISMISS_BATCH, createChannelRows } from "./channelrows.ts";
+export type { ChannelRows, ChannelRowsDependencies } from "./channelrows.ts";

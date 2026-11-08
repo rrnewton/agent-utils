@@ -3007,12 +3007,13 @@ test("`#326 refused-undo-restores-done`: a put back from its row that the server
 const COPY_TAKES_STORE = ["  if (providerFacts.threading() && channelStore.current().channel === String(selectedChannelId())) {\n    for (const id of readLedger.writtenIds()) {",
   "  if (false) {\n    for (const id of readLedger.writtenIds()) {"];
 /** The wait of Through here for a Done on its way on a row it covers, for a negative control. */
-const THROUGH_WAITS = [
-  "    if (!(await doneSaved(waitingFor, () => String(selectedChannelId()) === channel && doneHeldHere(waitingFor)))) {",
-  "    if (false) {"];
+const THROUGH_WAITS = { file: "src/view/channel/channelrows.ts",
+  find: "      if (!(await deps.doneSaved(waitingFor, () => String(deps.selectedChannelId()) === channel && deps.doneHeldHere(waitingFor)))) {",
+  replace: "      if (false) {" };
 /** Through here waiting only for the rows on screen, as first written, for a negative control. */
-const THROUGH_WAITS_ON_SCREEN = ["  const waitingFor = [...new Set([...covered, ...onTheirWay])];\n",
-  "  const waitingFor = covered;\n"];
+const THROUGH_WAITS_ON_SCREEN = { file: "src/view/channel/channelrows.ts",
+  find: "    const waitingFor = [...new Set([...covered, ...onTheirWay])];\n",
+  replace: "    const waitingFor = covered;\n" };
 /** The look of a confirmed send at its message once its own Done is saved, for a negative control. */
 const SENT_LOOKS_AGAIN = ["  return doneSaved(ids, () => String(selectedChannelId()) === channel && doneHeldHere(ids));\n}\n",
   "  return true;\n}\n"];
@@ -3141,9 +3142,9 @@ test("`#327 done-races-remaining`: Through here waits for a Done still on its wa
   }
   // THE CONTROL: without the wait, the chat service is asked after a refused Done it covers, and asked at
   // once, while the Done is still on its way, when Through here has nothing of its own to write.
-  const late = await throughWhileSaving(STORE_REFUSES(), 2, brokenScript(...THROUGH_WAITS));
+  const late = await throughWhileSaving(STORE_REFUSES(), 2, await brokenModule([THROUGH_WAITS]));
   assert.deepStrictEqual(late.asked, [late.ids[2]], "without the wait the chat service was not asked after the refusal, so this test cannot see it");
-  const early = await throughWhileSaving(STORE_REFUSES(), 0, brokenScript(...THROUGH_WAITS));
+  const early = await throughWhileSaving(STORE_REFUSES(), 0, await brokenModule([THROUGH_WAITS]));
   assert.deepStrictEqual(early.whileSaving, [{ message_id: early.ids[0] }],
     "without the wait the chat service was not asked while the Done was on its way, so this test cannot see it");
 });
@@ -3203,7 +3204,7 @@ test("`#327 done-races-remaining`: under Hide read, Through here also waits for 
 
   // THE CONTROL: waiting only for the rows on screen, as first written, the marker passes the
   // message whose Done was refused.
-  const control = await throughWhileSavingHidden(STORE_REFUSES(), brokenScript(...THROUGH_WAITS_ON_SCREEN));
+  const control = await throughWhileSavingHidden(STORE_REFUSES(), await brokenModule([THROUGH_WAITS_ON_SCREEN]));
   assert.equal(control.page.dealtWith.has(control.id), false, "the premise is the held Done refused");
   assert.deepStrictEqual(control.asked, [control.boundary],
     "waiting only for the rows on screen the chat service was not asked, so this test cannot see it");
@@ -3410,7 +3411,7 @@ test("`#327 done-races-remaining`: Through here whose own Done is undone while i
   assert.ok(kept.page.requests.findIndex((one) => one.endsWith("/upstream-read")) > restored,
     "the chat service was asked before the Undo was answered");
   // THE CONTROL: without the wait and the look, the marker moves through what the reader put back.
-  const control = await undoWhileThroughSaving(null, brokenScript(...THROUGH_WAITS));
+  const control = await undoWhileThroughSaving(null, await brokenModule([THROUGH_WAITS]));
   assert.deepStrictEqual(control.asked, [control.ids[2]], "without the wait the chat service was not asked, so this test cannot see it");
 });
 
