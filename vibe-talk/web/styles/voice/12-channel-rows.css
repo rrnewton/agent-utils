@@ -333,3 +333,49 @@
   row-gap: 0.15rem;
 }
 
+/*
+ * `#1063 collapsed-card-reaction-overlay`. A COLLAPSED card is laid out as if it had no
+ * reactions, and its strip is drawn over the foot of the card instead: at the lower-right
+ * corner, on the elision note's line ("(~N more words)"), whose right side the short note
+ * leaves free. The strip keeps everything it had on its own row — the same chips at the same
+ * size, still labels a tap on which is a tap on the row — it simply takes no height, so a
+ * reacted collapsed card is exactly as tall as an unreacted one.
+ *
+ * COLLAPSED ONLY, BY THE FOLD'S OWN SWITCH. The rule keys off `data-collapsed`, which the fold
+ * already maintains, so opening the message puts the strip back on its own row under the whole
+ * text with no code of this feature's running, and folding it again overlays it again. A card
+ * whose text a summary stands in for (`data-summarised`) has no elision line to share, and at
+ * zero collapsed lines there is no elision line at all: both keep the separate row, stated
+ * here rather than left to the measuring code, so no frame is ever drawn wrong there.
+ *
+ * NEVER OVER TEXT. Only a small strip is marked `reactions-overlay` at draw time (few chips,
+ * no custom-emoji names), and once the row is on the page the drawer measures it against the
+ * note, the clamped text's last drawn line, and anything else at the card's foot, unmarking it
+ * — back to the separate row below — the moment it would cover any of them
+ * (`settleReactionOverlay`, web/src/view/channel/channelrows.ts). `flex-wrap` is off while
+ * overlaid because a wrapped second line of chips would leave the note's line and ride up over
+ * the text; a strip too wide for one line is exactly the measured fallback's case. The offsets
+ * are the row's own padding (`.messages li`, web/style.css), so the chips' foot stands where
+ * the note's does until the measuring pins their top to the note line's, a frame later.
+ */
+#side-log li.discord-message[data-collapsed="true"]:not([data-summarised="true"]) > .reactions.reactions-overlay,
+#side-cards li.discord-message[data-collapsed="true"]:not([data-summarised="true"]) > .reactions.reactions-overlay,
+#discord-log li.discord-message[data-collapsed="true"]:not([data-summarised="true"]) > .reactions.reactions-overlay,
+#pinned-log li.discord-message[data-collapsed="true"]:not([data-summarised="true"]) > .reactions.reactions-overlay {
+  position: absolute;
+  right: 0.7rem;
+  bottom: 0.6rem;
+  max-width: calc(100% - 1.4rem);
+  margin-top: 0;
+  flex-wrap: nowrap;
+}
+
+:root[data-collapsed-lines="0"] #side-log li.discord-message > .reactions.reactions-overlay,
+:root[data-collapsed-lines="0"] #side-cards li.discord-message > .reactions.reactions-overlay,
+:root[data-collapsed-lines="0"] #discord-log li.discord-message > .reactions.reactions-overlay,
+:root[data-collapsed-lines="0"] #pinned-log li.discord-message > .reactions.reactions-overlay {
+  position: static;
+  margin-top: 0.35rem;
+  flex-wrap: wrap;
+}
+

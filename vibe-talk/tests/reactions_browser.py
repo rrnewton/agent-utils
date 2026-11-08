@@ -21,6 +21,12 @@ one, with each strip brought to the middle of the list in turn:
   or better against what is behind it, in both schemes, the owner's own included; and each of the
   owner's chips is outlined in another colour than the chips beside it.
 
+`#1063 collapsed-card-reaction-overlay`: the channel also holds a long folded message with the
+acknowledged two and its unreacted twin. The folded one's chips sit overlaid at its lower right,
+on the "(~N more words)" line — clear of the note and under none of the text — and its row is
+exactly as tall as the twin's; the folded eight keep their own row below that line; opening the
+folded two puts their strip back on its own row under the whole text.
+
 Pass --screenshots DIR to keep a PNG of each size and scheme for review.
 """
 
@@ -98,6 +104,11 @@ MESSAGES: list[Json] = [
     message(6, "Release notes thread.", "coder", [{"emoji": "👍", "count": 2, "owner_reacted": True}],
             thread=ROOT),
     message(7, "Notes: three fixes and one new flag.", "coder", thread={**ROOT, "is_root": False}),
+    # `#1063 collapsed-card-reaction-overlay`: a folded card with two reactions, and its twin
+    # with none — same words, same author — whose height the reacted one must match exactly.
+    # Long enough that the fold still hides words, and says so, at a desk's width too.
+    message(8, LONG * 3, "coder", ACKNOWLEDGED),
+    message(9, LONG * 3, "coder"),
 ]
 # The combined post's second half needs an id of its own.
 MESSAGES[5]["id"] = "205"
@@ -331,6 +342,70 @@ STRIPS_JS = """async () => {
     return {problems, shown};
 }"""
 
+# `#1063 collapsed-card-reaction-overlay`: the folded two (208) overlaid on their elision line,
+# their unreacted twin (209) no taller for it, the folded eight (203) on their own row below
+# theirs — and, once opened by its fold control and folded again, 208's strip back under the
+# whole text in between. Answers the problems found.
+OVERLAY_JS = """async () => {
+    const problems = [];
+    const frames = () => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)));
+    const rowOf = (id) => document.querySelector(`#discord-log > li[data-id="${id}"]`);
+    const noteOf = (row) => [...row.querySelectorAll(':scope > .elided > span')]
+        .find((span) => span.getBoundingClientRect().width > 0);
+    await frames();
+    const two = rowOf('208');
+    const twin = rowOf('209');
+    const many = rowOf('203');
+    for (const [id, row] of [['208', two], ['209', twin], ['203', many]]) {
+        if (!row) problems.push(`${id}: the row is not drawn`);
+        else if (row.getAttribute('data-collapsed') !== 'true') problems.push(`${id}: the row is not folded`);
+    }
+    if (problems.length) return {problems};
+    const strip = two.querySelector(':scope > .reactions');
+    if (!strip.classList.contains('reactions-overlay')) {
+        problems.push('208: two reactions on a folded card were not overlaid');
+    } else if (getComputedStyle(strip).position !== 'absolute') {
+        problems.push(`208: the overlaid strip computes ${getComputedStyle(strip).position}, not absolute`);
+    }
+    const note = noteOf(two);
+    if (!note) problems.push('208: no elision note is drawn');
+    else {
+        const s = strip.getBoundingClientRect();
+        const n = note.getBoundingClientRect();
+        const e = two.querySelector(':scope > .elided').getBoundingClientRect();
+        const b = two.querySelector(':scope > .body').getBoundingClientRect();
+        if (s.top < b.bottom - 0.5) problems.push('208: the chips ride up over the clamped text');
+        if (Math.abs(s.top - e.top) > 1) problems.push('208: the chips are not on the elision line');
+        if (s.left < n.right + 4) problems.push('208: the chips cover or crowd the elision note');
+        if (s.bottom > two.getBoundingClientRect().bottom + 0.5) problems.push('208: the chips spill below the card');
+    }
+    const tall = Math.abs(two.getBoundingClientRect().height - twin.getBoundingClientRect().height);
+    if (tall > 1) problems.push(`208 is ${tall.toFixed(1)}px taller than its unreacted twin 209`);
+    if (twin.querySelector(':scope > .reactions')) problems.push('209: the unreacted twin drew a strip');
+    const wide = many.querySelector(':scope > .reactions');
+    if (wide.classList.contains('reactions-overlay') || getComputedStyle(wide).position === 'absolute') {
+        problems.push('203: eight reactions were overlaid instead of keeping their row');
+    } else {
+        const line = many.querySelector(':scope > .elided');
+        if (line && wide.getBoundingClientRect().top < line.getBoundingClientRect().bottom - 0.5) {
+            problems.push('203: the kept row of chips is not below the elision line');
+        }
+    }
+    const fold = two.querySelector('.fold');
+    fold.click();
+    await frames();
+    if (two.getAttribute('data-collapsed') !== 'false') problems.push('208: its fold control did not open it');
+    else if (getComputedStyle(strip).position === 'absolute') {
+        problems.push('208: opened, its strip is still overlaid instead of on its own row');
+    } else if (strip.getBoundingClientRect().top < two.querySelector(':scope > .body').getBoundingClientRect().bottom - 0.5) {
+        problems.push('208: opened, its strip is not under the whole text');
+    }
+    fold.click();
+    await frames();
+    if (two.getAttribute('data-collapsed') !== 'true') problems.push('208: its fold control did not fold it again');
+    return {problems};
+}"""
+
 PROFILES = (("phone", 412, 915, True), ("phone-360", 360, 800, True), ("desktop", 1280, 800, False))
 # A chip's text: the emoji, the count, and for the owner's own, what a screen reader is told.
 EXPECTED = [
@@ -339,6 +414,7 @@ EXPECTED = [
     "203: 👍3including you 🎉1 :ship-it-and-go-home-early-today:2 👀1 ✅1 🚀12 ❤️1 😄1",
     "204: 👀2 ✅1",
     "206: 👍2including you",
+    "208: 👀1 ✅1",
 ]
 
 
@@ -389,6 +465,9 @@ def walk(chromium: BrowserType, args: argparse.Namespace, url: str, label: str, 
             problems = found.get("problems")
             check(problems == [], f"{label}, {scheme}: {problems}")
             check(found.get("shown") == EXPECTED, f"{label}, {scheme}: the strips showed {found.get('shown')}")
+            folded = page.evaluate(OVERLAY_JS)
+            check(isinstance(folded, dict), f"{label}, {scheme}: the overlay measurement answered {folded!r}")
+            check(folded.get("problems") == [], f"{label}, {scheme}: {folded.get('problems')}")
             if args.screenshots:
                 page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = 0; }")
                 page.screenshot(path=str(args.screenshots / f"{label}-reactions-{scheme}.png"), full_page=False)

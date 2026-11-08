@@ -6118,6 +6118,18 @@ const TUNING_BANDS = {
     "how long a Hang up keeps the voice socket open for the text of an answer still on its way " +
     "(#649 voice-agent-tools). Under two seconds a bridge that sends the text when it hears quit " +
     "is cut off; past eight a call the owner ended holds the bridge's session that much longer"],
+  // `#1063 collapsed-card-reaction-overlay`.
+  REACTION_OVERLAY_MAX_CHIPS: [2, 4,
+    "the most ordinary reaction chips a collapsed card may try on its elision line. Under two, " +
+    "the bridge's ordinary 👀/✅ acknowledgement pair in the owner's screenshot never overlays; " +
+    "past four, five emoji-and-count chips and even a short elision note generally leave no " +
+    "clear room on a 360px line, so the draw-time screen no longer selects only strips that " +
+    "can plausibly share that line before the measured fallback"],
+  REACTION_OVERLAY_GAP_PX: [4, 24,
+    "the clear CSS pixels kept between the elision note and overlaid reaction chips. Under " +
+    "four, subpixel rounding can make the note and first pill touch and read as one element " +
+    "even when their boxes do not overlap; past a couple of dozen, the spare room itself uses " +
+    "enough of a 360px line that strips with plainly visible room are put back on their own row"],
 };
 
 /** The fold control on a rendered message, or undefined when it has none. */
@@ -8515,7 +8527,7 @@ async function tapKind(page, kind) {
 // acknowledged message carries exactly those two.
 
 const ACKNOWLEDGED = [{ emoji: "👀", count: 1 }, { emoji: "✅", count: 1 }];
-const reactionStripOf = (li) => li.children.find((node) => node.className === "reactions");
+const reactionStripOf = (li) => li.children.find((node) => node.hasClass("reactions"));
 /** A row's chips as the reader sees them, "👀 1", or null when the row has no strip. */
 function chipsOf(li) {
   const strip = reactionStripOf(li);

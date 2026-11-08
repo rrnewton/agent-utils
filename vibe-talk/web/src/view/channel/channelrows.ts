@@ -10,7 +10,7 @@ import {
   BLANK_TEXT, combinedContent, isNoise, joinsGroup, reactionText, rowEdited,
   rowReactions, upstreamAppUrlOf, upstreamUrlOf,
 } from "../../present/rows/index.ts";
-import { copyText, nodeWithin } from "../dom/index.ts";
+import { classWords, copyText, nodeWithin, setClassWord } from "../dom/index.ts";
 import { editedTitle, messageDate, messageTimeLabel, shortLocalTime } from "../../present/time/index.ts";
 import { createRowMenus } from "./rowmenu.ts";
 import type { RowMenus } from "./rowmenu.ts";
@@ -274,6 +274,118 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
     return strip;
   }
 
+  /**
+   * `#1063 collapsed-card-reaction-overlay`. The most chips a collapsed card's strip may hold and
+   * still be tried on its elision line: past this the strip keeps its own row at draw time, before
+   * any measuring. A custom emoji's chip (its `:name:` as text) is never tried either: its width
+   * is the name's, and names run long.
+   */
+  const REACTION_OVERLAY_MAX_CHIPS = 4;
+
+  /** The clear room, in CSS pixels, the overlay keeps between the elision note and the chips. */
+  const REACTION_OVERLAY_GAP_PX = 8;
+
+  /**
+   * Whether `strip` may be tried overlaid at all: few enough chips, and none of them a custom
+   * emoji's. The measured pass below has the last word; this only keeps a strip that cannot
+   * plausibly share one line from ever being drawn over text, even for a frame.
+   */
+  /** Whether `element` wears the class `word` (the page's elements are read by `className`). */
+  const wears = (element: Element, word: string): boolean => classWords(element).includes(word);
+
+  function reactionOverlayCandidate(strip: HTMLElement): boolean {
+    const chips = [...strip.children];
+    return chips.length >= 1 && chips.length <= REACTION_OVERLAY_MAX_CHIPS &&
+      !chips.some((chip) => wears(chip, "reaction-custom"));
+  }
+
+  /** The one watcher for every overlaid strip's row, made where the browser has one to give. */
+  let reactionOverlayWatch: ResizeObserver | null = null;
+
+  /**
+   * `#1063 collapsed-card-reaction-overlay`. Measure an overlaid strip against what it shares
+   * the card's foot with, and put it back on its own row — by taking `reactions-overlay` off it,
+   * which is all the separate row ever was — if it covers anything: the elision note (with
+   * `REACTION_OVERLAY_GAP_PX` to spare), the clamped text's last drawn line (the words
+   * themselves, read with a range, since the body's box is the whole width however short that
+   * line falls), or any other drawn block under the text (a summary line, a reply count, a
+   * search excerpt). Only ever takes the overlay away, never gives it, so a row cannot flicker
+   * between the two: a redraw decides again. No layout to read (no width yet, or no layout
+   * engine behind the page) is no evidence either way, and settles nothing.
+   *
+   * The strip is first pinned with its top on the elision line's top, replacing the stylesheet's
+   * foot-of-the-card anchor: the chips are a few pixels taller than that line, and what does not
+   * fit in it belongs in the card's bottom padding below, never over the clamped text above. The
+   * pin is redone at every measuring, so a width or fold change that moves the line moves it.
+   */
+  function settleReactionOverlay(li: ChannelRow, strip: HTMLElement, elided: HTMLElement): void {
+    if (!wears(strip, "reactions-overlay")) return;
+    if (li.getAttribute("data-collapsed") !== "true" || elided.hidden) return;
+    strip.style.top = `${elided.offsetTop}px`;
+    strip.style.bottom = "auto";
+    const row = li.getBoundingClientRect();
+    const drawn = strip.getBoundingClientRect();
+    if (row.width < 1 || drawn.width < 1 || drawn.height < 1) return;
+    const covers = (box: DOMRect, spare = 0): boolean =>
+      Math.min(drawn.right, box.right) - Math.max(drawn.left - spare, box.left) > 0.5 &&
+      Math.min(drawn.bottom, box.bottom) - Math.max(drawn.top, box.top) > 0.5;
+    let covered = drawn.left < row.left - 0.5 || drawn.right > row.right + 0.5;
+    const note = [...elided.children].find((span) => span.getBoundingClientRect().width > 0);
+    if (!note) covered = true;
+    else if (covers(note.getBoundingClientRect(), REACTION_OVERLAY_GAP_PX)) covered = true;
+    if (!covered) {
+      for (const block of li.children) {
+        if (block === strip || block === elided || wears(block, "meta")) continue;
+        if (!block.getClientRects().length) continue;
+        if (wears(block, "body")) {
+          if (typeof document.createRange !== "function") continue;
+          const bodyBox = block.getBoundingClientRect();
+          const range = document.createRange();
+          range.selectNodeContents(block);
+          // The clamp's hidden lines still have boxes, below the body's own: only a line the
+          // reader can see, ending under the chips, is covered text.
+          covered = [...range.getClientRects()].some((line) => line.top < bodyBox.bottom - 0.5 && covers(line));
+        } else {
+          covered = covers(block.getBoundingClientRect());
+        }
+        if (covered) break;
+      }
+    }
+    if (covered) {
+      setClassWord(strip, "reactions-overlay", false);
+      strip.style.top = "";
+      strip.style.bottom = "";
+      if (reactionOverlayWatch) reactionOverlayWatch.unobserve(li);
+    }
+  }
+
+  /**
+   * Put a collapsed card's strip on its elision line (`#1063 collapsed-card-reaction-overlay`):
+   * mark it for the stylesheet, then, once the row is on the page and whenever its width
+   * changes, let `settleReactionOverlay` measure it. A browser with no frames settles nothing
+   * and keeps the overlay only where the stylesheet's own guards allow it.
+   */
+  function overlayReactions(li: ChannelRow, strip: HTMLElement, elided: HTMLElement): void {
+    setClassWord(strip, "reactions-overlay", true);
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(() => settleReactionOverlay(li, strip, elided));
+    }
+    if (typeof ResizeObserver === "function") {
+      if (!reactionOverlayWatch) {
+        reactionOverlayWatch = new ResizeObserver((seen) => {
+          for (const { target } of seen) {
+            const row = target as ChannelRow;
+            const held = [...row.children].find((kid) => wears(kid, "reactions-overlay")) as HTMLElement | undefined;
+            const line = [...row.children].find((kid) => wears(kid, "elided")) as HTMLElement | undefined;
+            if (held && line) settleReactionOverlay(row, held, line);
+            else if (reactionOverlayWatch) reactionOverlayWatch.unobserve(row);
+          }
+        });
+      }
+      reactionOverlayWatch.observe(li);
+    }
+  }
+
   const rowMenus: RowMenus = createRowMenus();
 
   function discordNode(messages: Message[]): ChannelRow {
@@ -284,6 +396,13 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
     deps.tapRow(li, fold);
     if (fold) deps.sayRowShortcut(fold as Element, "fold");
     if (reactions) li.append(reactions);
+    // `#1063 collapsed-card-reaction-overlay`: a folded card is laid out as if it had no
+    // reactions, and a small strip goes over its elision line instead of taking a line of its
+    // own. The fold's entry holds that line; with no line to share, the strip keeps its row.
+    const elided = (li.foldEntry as { elided?: HTMLElement | null } | undefined)?.elided;
+    if (fold && reactions && elided && reactionOverlayCandidate(reactions)) {
+      overlayReactions(li, reactions, elided);
+    }
     const reply = document.createElement("button");
     reply.className = "reply-button";
     reply.setAttribute("type", "button");

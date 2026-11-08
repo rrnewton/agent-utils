@@ -1,11 +1,12 @@
 ---
 title: 'collapsed-card-reaction-overlay: a collapsed card puts its reactions on the elision line, in its lower-right corner'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: mu-reactcorner
 created_at: 2026-11-08T13:31:00.000000000+00:00
-updated_at: 2026-11-08T13:31:00.000000000+00:00
+updated_at: 2026-11-08T13:52:05.000000000+00:00
+closed_at: 2026-11-08T13:52:05.000000000+00:00
 ---
 
 # Description
@@ -84,3 +85,23 @@ elision-word-count`; the strip is `#219 emoji-reactions` /
 `#312 slack-reactions`. Stays clear of `#1052
 post-to-main`'s reserved reply ranges and of `#1057
 newest-count-chip`'s `folding.ts` / `scrollkeep.ts`.
+
+## Resolution
+
+[muse watermelon-full-preview] Delivered in the commit that
+closes this issue. A collapsed card with at most four
+ordinary (non-custom) reaction chips draws its strip
+absolutely at the lower right, pinned to the elision line's
+top so the chips' extra height goes into the card's bottom
+padding, never over the clamped text; after drawing and on
+every width change the strip is measured against the note
+(with 8px to spare), the clamped text's last drawn line, and
+any other block at the card's foot, and any overlap puts it
+back on its own row (demotion only). Summarised cards and
+zero collapsed lines keep the separate row by stylesheet.
+Verified: page suite rows 195/195 and reading-state 176/176;
+`reactions_browser.py` at 412px, 360px and 1280px, dark and
+light — folded two overlaid exactly as tall as their
+unreacted twin, folded eight on their own row, opening the
+fold restores the row. Unverified: no physical phone; the
+browser check's Android viewports stand in for it.

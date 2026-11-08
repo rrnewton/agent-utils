@@ -4182,10 +4182,50 @@ test("a folded row keeps its reactions under whatever stands for its text, the s
   const rows = await showDiscord(page, [message({ id: "100", content: longMessage(), reactions: ACKNOWLEDGED })]);
   assert.equal(rows[0].getAttribute("data-collapsed"), "true", "the fixture is not folded");
   const order = rows[0].children.map((node) => node.className);
-  assert.equal(order[order.length - 1], "reactions", `the strip is not the row's last line: ${order}`);
-  assert.ok(order.indexOf("summary") >= 0 && order.indexOf("summary") < order.indexOf("reactions"),
+  const at = (name) => rows[0].children.findIndex((node) => node.hasClass(name));
+  assert.equal(rows[0].children[rows[0].children.length - 1], reactionStripOf(rows[0]),
+    `the strip is not the row's last line: ${order}`);
+  assert.ok(at("summary") >= 0 && at("summary") < at("reactions"),
     `the summary that can stand in for the text sits below the reactions: ${order}`);
   assert.deepStrictEqual(chipsOf(rows[0]), ["👀 1", "✅ 1"]);
+});
+
+test("a collapsed card overlays a small strip on its elision line; a wide or custom one keeps its row", async () => {
+  // `#1063 collapsed-card-reaction-overlay`. The owner: collapsed cards waste a whole line on
+  // their reactions; lay the card out as if it had none and put the chips in its lower-right
+  // corner, on the "(~N more words)" line. This suite has no layout engine, so it pins the
+  // marking and the draw-time half of the fallback (few chips, no custom names — and only ever
+  // folded); the measured half and the geometry are the browser check's.
+  const page = newPage();
+  await signIn(page);
+  const many = ["👍", "🎉", "👀", "✅", "🚀"].map((emoji) => ({ emoji, count: 1 }));
+  const rows = await showDiscord(page, [
+    message({ id: "100", content: longMessage("overlay"), reactions: ACKNOWLEDGED }),
+    message({ id: "101", content: longMessage("toowide"), reactions: many }),
+    message({ id: "102", content: longMessage("named"), reactions: [{ emoji: "party-parrot", custom: true, count: 1 }] }),
+    message({ id: "103", content: "short and open", reactions: ACKNOWLEDGED }),
+  ]);
+  const overlaid = rows.map((li) => reactionStripOf(li)?.hasClass("reactions-overlay"));
+  assert.deepStrictEqual(overlaid, [true, false, false, false],
+    "only the folded card with two ordinary reactions is overlaid");
+  // The strip itself is untouched by being overlaid: same chips, same group, same place in the
+  // row's reading order (last), so reading aloud reaches it exactly where it did.
+  const strip = reactionStripOf(rows[0]);
+  assert.equal(strip.getAttribute("role"), "group");
+  assert.equal(strip.getAttribute("aria-label"), "Reactions");
+  assert.deepStrictEqual(chipsOf(rows[0]), ["👀 1", "✅ 1"]);
+  assert.equal(rows[0].children[rows[0].children.length - 1], strip, "the overlaid strip changed its order in the row");
+  // The stylesheet does the collapsing: absolutely at the card's foot, on one line, and only
+  // while the fold's own switch says collapsed — opening the card is the separate row again.
+  const over = cssBlock('#discord-log li.discord-message[data-collapsed="true"]:not([data-summarised="true"]) > .reactions.reactions-overlay');
+  assert.match(over, /position: absolute/);
+  assert.match(over, /right: 0\.7rem/);
+  assert.match(over, /bottom: 0\.6rem/);
+  assert.match(over, /flex-wrap: nowrap/, "a wrapped second line of chips would ride up over the text");
+  assert.match(over, /margin-top: 0/, "the overlaid strip still takes the separate row's gap");
+  // At zero collapsed lines there is no elision line to share: the separate row, by stylesheet.
+  const zero = cssBlock(':root[data-collapsed-lines="0"] #discord-log li.discord-message > .reactions.reactions-overlay');
+  assert.match(zero, /position: static/);
 });
 
 test("under the Links filter a row's reactions go with its text", async () => {
