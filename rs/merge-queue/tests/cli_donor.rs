@@ -54,6 +54,14 @@ fn own_revision() -> String {
     commit
 }
 
+/// Write a donor job as a donor or the sweep would: atomically, so a
+/// concurrent reader in the run never sees a truncated file.
+fn write_job(path: &Path, job: &Value) {
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, serde_json::to_string_pretty(job).unwrap()).unwrap();
+    std::fs::rename(&tmp, path).unwrap();
+}
+
 fn job_path(fx: &Fixture, id: &str) -> PathBuf {
     state_dir(fx)
         .join("donor")
@@ -189,6 +197,17 @@ fn finish(run: Child) -> (Option<i32>, Value, String) {
         report,
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
+}
+
+/// Sets a donor-loop done flag when dropped, so a panic inside a donor
+/// thread scope cannot deadlock the scope join on donor threads that run
+/// until the flag is set.
+struct DoneOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for DoneOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[test]
@@ -388,6 +407,12 @@ fn a_dead_donor_loses_its_lease_and_its_late_receipt_is_refused() {
             .unwrap();
     assert!(other["job"].is_null(), "{other}");
     std::thread::sleep(Duration::from_secs(3));
+    // The ghost's grant has expired (its expiry is stored, so this cannot
+    // revive it); give the live donor a lease it cannot outrun mid-work, so
+    // `attempts` counts claims, not scheduling luck under load.
+    set_config(&fx, |config| {
+        config["donors"] = serde_json::json!({"lease_secs": 600})
+    });
     let out = donor(&fx, &clone, "d1", &[]);
     assert!(
         out.status.success(),
@@ -1068,7 +1093,7 @@ fn a_donor_built_from_another_revision_gives_the_job_back_and_nothing_is_ejected
     let mut job: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     let elsewhere = "0".repeat(40);
     job["tool"]["merge_queue"] = serde_json::json!({"commit": elsewhere});
-    std::fs::write(&path, serde_json::to_string_pretty(&job).unwrap()).unwrap();
+    write_job(&path, &job);
     let out = donor(&fx, &clone, "d1", &[]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("gave back"), "{stderr}");
@@ -2089,7 +2114,7 @@ fn an_outside_cancellation_refuses_the_batch_and_the_run_goes_on() {
     job["state"] = Value::String("cancelled".to_owned());
     job["lease"] = Value::Null;
     job["history"] = serde_json::json!(["cancelled outside this run (test)"]);
-    std::fs::write(&path, serde_json::to_string_pretty(&job).unwrap()).unwrap();
+    write_job(&path, &job);
     let (code, report, stderr) = finish(run);
     // Exit 3 is the refusal code (retry later), as for a could-not-run
     // bound: not the run-ending error this used to be.
@@ -2160,6 +2185,7 @@ fn kept_stale_roots_keep_their_donor_jobs_and_decide_after_a_landing() {
         .collect();
     let done = std::sync::atomic::AtomicBool::new(false);
     let (code, report, stderr) = std::thread::scope(|scope| {
+        let _done_on_drop = DoneOnDrop(&done);
         for (clone, name) in &clones {
             scope.spawn(|| {
                 while !done.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2251,7 +2277,7 @@ fn set_lease(fx: &Fixture, id: &str, held: bool) {
         job["state"] = Value::String("queued".to_owned());
         job["lease"] = Value::Null;
     }
-    std::fs::write(&path, serde_json::to_string_pretty(&job).unwrap()).unwrap();
+    write_job(&path, &job);
 }
 
 #[test]
@@ -2319,6 +2345,7 @@ fn kept_stale_roots_keep_only_running_roots_and_rebuild_unstarted_ones_on_the_ne
     ];
     let done = std::sync::atomic::AtomicBool::new(false);
     let (code, report, stderr) = std::thread::scope(|scope| {
+        let _done_on_drop = DoneOnDrop(&done);
         for (n, clone) in clones.iter().enumerate() {
             let (fx, done) = (&fx, &done);
             scope.spawn(move || {

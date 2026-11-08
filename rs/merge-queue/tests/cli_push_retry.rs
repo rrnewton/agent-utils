@@ -203,9 +203,19 @@ fn a_head_stop_logs_at_once_and_detaches_the_in_flight_validation() {
     fx.commit_all("seed tests");
     git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
     let validated = fx.root.join("validated");
+    // The slow change holds on a gate file, not a sleep: whether the run
+    // detaches is then this test's observation (it exits while the gate is
+    // still closed), never a race between a duration and host speed.
+    let release_slow = fx.root.join("release-slow");
+    // The slow validation records its own completion, so the oracle below
+    // can tell a detached exit (no completion yet) from one that merely
+    // waited for the gate's self-expiry to finish the validation.
+    let slow_done = fx.root.join("slow-done");
     let validator = format!(
-        "echo run >> '{}'; if [ -f tests/slow ]; then sleep 30; fi; exit 0",
-        validated.display()
+        "echo run >> '{validated}'; if [ -f tests/slow ]; then i=0; while [ ! -f '{gate}' ] && [ $i -lt 2400 ]; do sleep 0.05; i=$((i+1)); done; echo done >> '{done}'; fi; exit 0",
+        validated = validated.display(),
+        gate = release_slow.display(),
+        done = slow_done.display()
     );
     fx.mq_ok(&[
         "init",
@@ -228,14 +238,56 @@ fn a_head_stop_logs_at_once_and_detaches_the_in_flight_validation() {
     fx.branch("b", &[("tests/slow", "slow\n")]);
     fx.mq_ok(&["submit", "1", "--head", "a"]);
     fx.mq_ok(&["submit", "2", "--head", "b"]);
-    let started = std::time::Instant::now();
-    let out = fx.mq(&["run"]);
-    let elapsed = started.elapsed();
+    // Run in the background: the oracle is that it exits at all while the
+    // slow validation is still gated, not how fast the host gets there.
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_merge-queue"));
+    command
+        .args(["run"])
+        .current_dir(fx.queue())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env_remove("MERGE_QUEUE_STATE");
+    for (key, value) in [
+        ("GIT_AUTHOR_NAME", "Dev"),
+        ("GIT_AUTHOR_EMAIL", "dev@example.com"),
+        ("GIT_COMMITTER_NAME", "Dev"),
+        ("GIT_COMMITTER_EMAIL", "dev@example.com"),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+        ("TESTTMP", "1"),
+    ] {
+        command.env(key, value);
+    }
+    let run = command.spawn().unwrap();
+    // Both validations have started: the slow one is parked on the gate.
+    let start = std::time::Instant::now();
+    while count(&validated) < 2 {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(240),
+            "the slow validation never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(run.wait_with_output());
+    });
+    let out = match rx.recv_timeout(std::time::Duration::from_secs(240)) {
+        Ok(out) => out.unwrap(),
+        Err(_) => {
+            // Unblock the parked validation so nothing outlives the test.
+            std::fs::write(&release_slow, "go\n").unwrap();
+            let _ = rx.recv();
+            panic!("run parked behind the slow validation instead of detaching it");
+        }
+    };
     assert_eq!(out.status.code(), Some(3), "{out:?}");
     assert!(
-        elapsed < std::time::Duration::from_secs(25),
-        "run parked behind the slow validation for {elapsed:?}"
+        !slow_done.exists(),
+        "the run waited out the slow validation instead of detaching it"
     );
+    // Let a detached slow validation finish instead of outliving the test.
+    std::fs::write(&release_slow, "go\n").unwrap();
     let events = latest_events(&fx);
     let stopped_at = events
         .lines()

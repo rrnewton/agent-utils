@@ -127,6 +127,14 @@ fn set_config(fx: &Fixture, edit: impl FnOnce(&mut Value)) {
     std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
 }
 
+/// Write a donor job as a donor or the sweep would: atomically, so a
+/// concurrent reader in the run never sees a truncated file.
+fn write_job(path: &Path, job: &Value) {
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&tmp, serde_json::to_string_pretty(job).unwrap()).unwrap();
+    std::fs::rename(&tmp, path).unwrap();
+}
+
 fn job_path(fx: &Fixture, id: &str) -> PathBuf {
     fx.queue()
         .join(".git")
@@ -150,7 +158,7 @@ fn set_lease(fx: &Fixture, id: &str, held: bool) {
         job["state"] = Value::String("queued".to_owned());
         job["lease"] = Value::Null;
     }
-    std::fs::write(&path, serde_json::to_string_pretty(&job).unwrap()).unwrap();
+    write_job(&path, &job);
 }
 
 /// Which change of `changes` the donor job `job` validates (one change per batch).
@@ -173,6 +181,17 @@ fn change_of(fx: &Fixture, job: &Value, changes: &[(&str, i64)]) -> Option<i64> 
         .map(|(_, pr)| *pr)
 }
 
+/// Sets a donor-loop done flag when dropped, so a panic inside a donor
+/// thread scope cannot deadlock the scope join on donor threads that run
+/// until the flag is set.
+struct DoneOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for DoneOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 #[test]
 fn a_stale_cancelled_root_is_recomposed_on_the_new_base_not_retried() {
     // Three disjoint roots on one base. a lands and moves the base while
@@ -184,7 +203,13 @@ fn a_stale_cancelled_root_is_recomposed_on_the_new_base_not_retried() {
     fx.write("tests/t0", "ok\n");
     fx.commit_all("seed tests");
     git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
-    let runner = r#"if [ -f tests/b ]; then sleep 8; fi; for t in $(ls tests); do printf '{"id":"%s","outcome":"pass"}\n' "$t" >> "$MQ_RESULTS"; done; exit 0"#;
+    // b's validation holds on a gate file, not a sleep: how long a stays in
+    // flight is then this test's choice, not the host's scheduler's.
+    let release_b = fx.root.join("release-b");
+    let runner = format!(
+        r#"if [ -f tests/b ]; then i=0; while [ ! -f '{release}' ] && [ $i -lt 2400 ]; do sleep 0.05; i=$((i+1)); done; fi; for t in $(ls tests); do printf '{{"id":"%s","outcome":"pass"}}\n' "$t" >> "$MQ_RESULTS"; done; exit 0"#,
+        release = release_b.display()
+    );
     fx.mq_ok(&[
         "init",
         "--remote",
@@ -192,7 +217,7 @@ fn a_stale_cancelled_root_is_recomposed_on_the_new_base_not_retried() {
         "--validator",
         "command",
         "--validator-run",
-        runner,
+        &runner,
         "--offload",
         "decide",
         "--refusal-max-retries",
@@ -244,6 +269,7 @@ fn a_stale_cancelled_root_is_recomposed_on_the_new_base_not_retried() {
     ];
     let done = std::sync::atomic::AtomicBool::new(false);
     let (code, report, stderr) = std::thread::scope(|scope| {
+        let _done_on_drop = DoneOnDrop(&done);
         for (n, clone) in clones.iter().enumerate() {
             let (fx, done) = (&fx, &done);
             let name = format!("d{}", n + 1);
@@ -284,9 +310,22 @@ fn a_stale_cancelled_root_is_recomposed_on_the_new_base_not_retried() {
                 })
             },
         );
-        // a is landing (or landed): give c's job back, so the next claim
-        // sweeps it as stale on the moved base.
+        // Give c's job back only once a has actually landed, so the next
+        // claim must sweep it as stale on the moved base. Released on the
+        // donors-running signal alone, c was claimed and validated on the
+        // old base whenever a's landing took longer than that signal
+        // (the load-sensitive flake this sequencing removes).
+        wait_for("change 1 to land", Duration::from_secs(120), || {
+            item_status(&fx, 1) == "landed"
+        });
         set_lease(&fx, &job_c, false);
+        // Release b at once: the run decides flights in order, so c is
+        // recomposed only after b (ahead of it) decides. Waiting for the
+        // recomposed c job before releasing b is a cycle that hangs the
+        // test until b's gate expires on its own. Nothing depends on b
+        // staying in flight past this point: c's claim sweeps stale
+        // because a has landed and moved the base, whenever it happens.
+        std::fs::write(&release_b, "go\n").unwrap();
         let outcome = finish(run);
         done.store(true, std::sync::atomic::Ordering::Relaxed);
         outcome
@@ -379,6 +418,7 @@ exit $rc"#,
     let run = spawn_run(&fx, &[]);
     let done = std::sync::atomic::AtomicBool::new(false);
     let (code, report, stderr) = std::thread::scope(|scope| {
+        let _done_on_drop = DoneOnDrop(&done);
         scope.spawn(|| {
             while !done.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = donor_run(&fx, &clone, "d1", "1");
@@ -452,7 +492,7 @@ fn cancel_job_as_stale(fx: &Fixture, id: &str) {
     job["history"] = serde_json::json!([
         "cancelled: stale: the base moved to deadbeef, which its candidate does not contain"
     ]);
-    std::fs::write(&path, serde_json::to_string_pretty(&job).unwrap()).unwrap();
+    write_job(&path, &job);
 }
 
 #[test]

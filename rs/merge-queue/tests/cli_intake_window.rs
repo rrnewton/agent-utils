@@ -390,19 +390,25 @@ fn a_change_a_failing_batch_sends_back_is_planned_again_with_a_request_taken_in_
 /// in-flight batch, and it lands in the same run.
 #[test]
 fn an_ejected_change_resubmitted_at_a_new_head_is_validated_in_the_same_run() {
+    // The waits below are liveness bounds on event-based oracles, not
+    // relative-timing assertions: the whole test takes ~3s solo, but under
+    // full-gate CPU contention one daemon cycle chain (probe, plan, intake,
+    // validation spawns) has been observed taking over the old 60s bound.
+    // 240s is ~4x that observed worst case; the sequencing itself is gated
+    // on statuses and validator starts throughout.
     let (fx, started, gates) = setup("intake-resubmit-new-head");
     fx.branch("a", &[("tests/a", "FAIL\n")]);
     fx.mq_ok(&["submit", "1", "--head", "a"]);
     fx.branch("b", &[("tests/b", "ok\n")]);
     fx.mq_ok(&["submit", "2", "--head", "b"]);
     let mut daemon = Daemon::start(&fx);
-    wait_for("both batches to validate", Duration::from_secs(30), || {
+    wait_for("both batches to validate", Duration::from_secs(240), || {
         started_lines(&started).len() == 2
     });
     // Change 1 fails and is ejected; change 2 (stacked on it) stays gated.
     open(&gates, 1);
     open(&gates, 2);
-    wait_for("change 1 to be ejected", Duration::from_secs(60), || {
+    wait_for("change 1 to be ejected", Duration::from_secs(240), || {
         status(&fx, 1) == "ejected"
     });
     // Resubmit change 1 at a fixed head while change 2 is still in flight.
@@ -412,11 +418,11 @@ fn an_ejected_change_resubmitted_at_a_new_head_is_validated_in_the_same_run() {
     // It validates again beside change 2 in this same run.
     wait_for(
         "change 1 to validate at its new head",
-        Duration::from_secs(60),
+        Duration::from_secs(240),
         || started_lines(&started).len() >= 3,
     );
     open(&gates, 3);
-    assert_eq!(daemon.exit_code(Duration::from_secs(90)), Some(0));
+    assert_eq!(daemon.exit_code(Duration::from_secs(240)), Some(0));
     let reports = reports(&fx);
     assert_eq!(reports.len(), 1, "{reports:?}");
     assert_eq!(status(&fx, 1), "landed");
