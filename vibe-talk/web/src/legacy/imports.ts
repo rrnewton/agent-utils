@@ -117,7 +117,7 @@ export { createSerialQueue, sentenceStart } from "../foundation/index.ts";
 export { briefAge, fullLocalAt, fullLocalTime, stamp } from "../present/time/index.ts";
 
 export { doneReadWords, failureWords, localReadWords, messagesWords, reachBackWords, reachClause, readableCause, refusalSentence, refusalWords, searchMomentWords, serviceReadWords } from "../present/notices/index.ts";
-export { LINK_KINDS_KEY, READ_MODES, READ_MODE_KEY, READ_MODE_SAID, THREADS_UNPACKED_KEY, THREAD_CARD_STATES_KEY, THREAD_ORDERS, THREAD_ORDER_KEY, THREAD_ORDER_NAMES, cardGapWords, cardRunText, collapsedLinesWords, combinedContent, countOf, createCardPacking, createLinkKinds, createReadMode, createReadRuns, createThreadOrder, editedDrawn, forgetElisionCounts, gapWords, inThreadOrder, isNoise, mainRunsAmong, messageLook, quoteBlock, rawTextOf, reactionsDrawn, readRunText, renderedHtmlOf, replyMarkerName, rowEdited, savedReadMode, threadOrderAfter, undoLabel, undoName, upstreamUrlOf } from "../present/rows/index.ts";
+export { LINK_KINDS_KEY, READ_MODES, READ_MODE_KEY, READ_MODE_SAID, THREADS_UNPACKED_KEY, THREAD_CARD_STATES_KEY, THREAD_ORDERS, THREAD_ORDER_KEY, THREAD_ORDER_NAMES, cardGapWords, cardRunText, collapsedLinesWords, combinedContent, countOf, createCardPacking, createLinkKinds, createReadMode, createReadRuns, createThreadOrder, editedDrawn, forgetElisionCounts, gapWords, inThreadOrder, isNoise, mainRunsAmong, messageLook, quoteBlock, rawTextOf, reactionsDrawn, renderedHtmlOf, replyMarkerName, rowEdited, savedReadMode, threadOrderAfter, undoLabel, undoName, upstreamUrlOf } from "../present/rows/index.ts";
 export { COLUMN_IDS, DAY_TITLED, PULL_WAIT_MS, QUOTE_REPLY_TITLE, anchorOfRow, authorPasses, cardRunIds, createArming, createCardFlight, createCardPlaces, createCardsDrawn, createColumnLinks, createColumnWork, createColumns, createFilterChanges, createFootRooms, createLayoutShown, createLinkedMark, createPackSlides, createPullToRefresh, createQuoting, createReplyState, createRowDrawing, createRowGestures, createScrollKeeping, createThreadHues, createUnderLists, createUnpackWatch, fillCardText, foldedTextLine, freshenDayTitle, fromGatheredThread, gutterPiece, idsOf, isMessageRow, markCardLayout, messageTop, mountChannelViewControls, mountFilterChips, mountKeptSends, mountListControls, mountListGestures, mountListKeepers, mountListWatch, mountReadingJumps, mountReplyBox, mountSideControls, mountSideListControls, notNoiseButtonOf, pointerOn, quoteLabelFits, renderedText, rowIn, rowMessages, rowShown, rowTimeTabStop, sameCardPlace, setArrowReach, setMarkerLift, shownRowFor, stackUnder, standingRow } from "../view/channel/index.ts";
 
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";
@@ -177,7 +177,7 @@ export { createAbandonedReads, createTimelineReader } from "../core/sync/index.t
 export { DISCORD_PAGE_LIMIT, OLDER_TRIGGER_PX, createOlderPager } from "../core/channels/index.ts";
 export { isThreadRoot, readLook, unpackHeldMessages, unpackMessages, unpackReadSignature } from "../core/channels/index.ts";
 export { staleWords } from "../present/rows/index.ts";
-export { MESSAGE_CACHE_ROWS, createMessageCache, tokenFingerprint } from "../core/channels/index.ts";
+export { MESSAGE_CACHE_ROWS, tokenFingerprint } from "../core/channels/index.ts";
 // view/documents (documents-view-client)
 export { createDocumentsView, createViewSelector } from "../view/documents/index.ts";
 export { createTimelineView } from "../view/channel/index.ts";
@@ -194,3 +194,4 @@ export { createPinnedMessages, createServerSearchCopy } from "../view/channel/in
 export { createChannelSend } from "../view/composer/index.ts";
 export { createDraftQueries, createOutboxLoads } from "../core/outbox/index.ts";
 export { createThreadList } from "../view/channel/index.ts";
+export { createOfflineCache, createReadRunLines, createThreadStrip } from "../view/channel/index.ts";

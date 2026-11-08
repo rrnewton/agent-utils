@@ -2134,7 +2134,7 @@ const searchRows = createSearchRows({
   searchKey: () => searchKey(),
   viewKey: () => viewKey(),
   runDaysOf: (row) => runDaysOf(row),
-  placeInReadRun,
+  placeInReadRun: (row, role, count) => placeInReadRun(row, role, count),
   readRunCount: (row) => readRunCount(row),
   changing: () => filterChanges.changing(),
   currentFilterHold,
@@ -2747,7 +2747,7 @@ const rowLinksOwner = createRowLinks({
   selectionView: () => selection().view,
   selectionThreadId: () => selection().threadId || "",
   keepingFilterPlace,
-  liftingHideRead,
+  liftingHideRead: (change) => liftingHideRead(change),
   renderScrollTools,
   inOtherColumn,
   requestVisibleSummaries,
@@ -4428,18 +4428,12 @@ voiceCall().initializePageInstance();
 // credential read these rows, and anything that disagrees with it — another token, no token, a
 // refusal — deletes the whole envelope rather than filtering it. Messages that credential can no
 // longer read must not stay on the device.
-
-/**
- * The device's saved copy of the channels' rows (web/src/core/channels `createMessageCache`,
- * `#624 voice-page-modularity`), over the device's storage looked up on use, scoped to the token
- * saved as it stands on each use. Here where the envelope it keeps stood.
- */
-const messageCache = createMessageCache({
-  storage: deviceStorageOnUse(),
-  token,
+const messageCache = createOfflineCache({
+  storage: () => deviceStorageOnUse(),
+  token: () => token,
   channels: () => channelDirectory.channels(),
   stillToDo: (message, done) => stillToDo(message, /** @type {any} */ (done)),
-});
+}).cache;
 
 /**
  * A column's own record of its reads' state (`#624 voice-page-modularity`, plan step 15, as
@@ -6303,7 +6297,7 @@ const threadList = createThreadList({
   isCursorRefusal,
   refreshFailed,
   saveChannelScope,
-  syncUnreadReplies,
+  syncUnreadReplies: () => syncUnreadReplies(),
   renderSideFreshness,
   sideCardReplies,
   sideCardUnread,
@@ -6794,219 +6788,42 @@ function drawThreadChips(row, tally, inMain, inAll = false) {
   if (chip.hidden) chip.hidden = false;
 }
 
-// --- a thread's strip in All, and selecting a thread there ------------------------------------------
-//
-// `#299 all-thread-strip`. The owner, 2026-10-14: "In the interleaved All view I would like a little
-// color strip along the left edge of the rectangular messages that are messages in threads. Not the
-// curved style of the thread cards, just the normal message view but with a color accent on the left.
-// Somewhat thicker than the normal border so it is clickable. But when this border is clicked instead
-// of drilling INTO the thread (like clicking the existing "(Thread(N))" button) I want it to just
-// SELECT that thread, dimming all messages that are not part of the thread but keeping us in the
-// global view."
-//
-//   * WHICH ROWS. Every row of All whose message is in a thread somebody has answered — its root, its
-//     replies, the replies gathered under the root — by the rule its tag is coloured by (the "open"
-//     state of `paintThreadBadge`): a thread nobody has answered spends no colour (`#252
-//     thread-button-state`), and on a provider that names a thread for every message that would be a
-//     strip on every row. Main, a thread, the Pinned filter and the right column have none. Every row
-//     of All keeps the strip's lane (web/voice.css), so a strip that comes with a first reply moves
-//     nothing.
-//   * WHAT IT IS. A button on the row's left edge (`.thread-strip`): a bar in its thread's colour,
-//     thicker than a border, inside a hit area wider still and the row's full height. Its name is
-//     "Select this thread", and it is pressed while its thread is the one selected.
-//   * WHAT IT DOES. It selects its thread IN ALL, which stays All: the rows not in the thread dim and
-//     lose their colour, their strips go grey, and the thread's own rows are drawn at full strength —
-//     the read ones still drained, so what is read still shows. Only attributes are written: nothing
-//     scrolls, nothing is read from the server or marked, and no row is drawn again. A second press,
-//     Esc or t lets go; another thread's strip, or t on another thread's message, moves it.
-//   * PER CHANNEL, FOR THE SESSION, AND ALL'S OWN: kept apart from the thread list's highlighted card
-//     (`#279 thread-card-focus`). Shared, a card highlighted for a thread with no message in All would
-//     leave all of All dimmed with nothing at full strength. Opening the thread by its Thread(N) and
-//     coming back finds it still selected; so do the read mode, the search, Hide read and older pages.
-//   * A READ ROW KEEPS ITS STRIP'S COLOUR. A row with a strip recedes in its box (`#204 reply-arrow`'s
-//     veil and per-child filter), the strip exempt, as a reply's arrow is: else every read message's
-//     strip would be grey before anything was selected, and the selection would not stand out.
-
-/**
- * By channel, the thread selected in All by its strip (`#299 all-thread-strip`), for this session.
- *
- * @type {Map<string, string>}
- */
-const allThreadFocus = new Map();
-
-/** The thread selected in All on the channel on screen, or null. */
-function allThreadSelected() {
-  return allThreadFocus.get(String(selectedChannelId())) || null;
-}
-
-/** Whether the rows being drawn are All's, which only the left column shows: the only rows with strips. */
-function drawingAll() {
-  return !columnWork.side() && selection().view === "flat";
-}
-
-/**
- * Say on the column's list which view its rows are (`data-view`), for web/voice.css to keep the lane
- * of All's strips on every row of All, a strip or none. Written only when it changes.
- */
-function markListView() {
-  const list = el("discord-log");
-  if (list.getAttribute("data-view") !== selection().view) list.setAttribute("data-view", selection().view);
-}
-
-/**
- * Give `row` its strip in thread `id`'s colour or, with `id` null, take it away: hidden, so a row that
- * has one again later makes no second button. Written only where it changes, as every pass over the
- * rows asks. Whether it is pressed is the selection's (`paintAllThreadFocus`).
- *
- * @param {HTMLElement} row
- * @param {string | null} id
- */
-function paintThreadStrip(row, id) {
-  const held = /** @type {any} */ (row).threadStrip || null;
-  if (id === null) {
-    if (held && !held.hidden) held.hidden = true;
-    if (row.hasAttribute("data-thread-strip")) row.removeAttribute("data-thread-strip");
-    return;
-  }
-  const strip = held || threadStrip(row);
-  const hue = String(threadHue(id));
-  if (strip.style.getPropertyValue("--thread-hue") !== hue) strip.style.setProperty("--thread-hue", hue);
-  if (strip.hidden) strip.hidden = false;
-  if (!row.hasAttribute("data-thread-strip")) row.setAttribute("data-thread-strip", "");
-}
-
-/**
- * Make `row`'s strip: its first part, after a reply's arrow where it has one, so a screen reader meets
- * the way to what the row answers first. Put in with `insertBefore`, which moves nothing else in the
- * row: a strip that comes with a first reply never takes the focus off a button of the row.
- *
- * @param {HTMLElement} row
- */
-function threadStrip(row) {
-  const strip = document.createElement("button");
-  strip.className = "thread-strip";
-  strip.setAttribute("type", "button");
-  strip.setAttribute("aria-label", "Select this thread");
-  strip.setAttribute("aria-pressed", "false");
-  strip.setAttribute("title", "Select this thread: the messages not in it dim. Again, or Esc, lets go");
-  sayRowShortcut(strip, "thread-strip");
-  // Its thread is read when it is pressed, as the tag's is.
-  strip.addEventListener("click", inThisColumn(() => {
-    const id = threadOf(rowMessages(row)[0]);
-    if (id) toggleAllThreadFocus(id);
-  }));
-  const first = /** @type {HTMLElement | null} */ (row.firstChild);
-  const arrow = first && String(first.className || "").split(/\s+/).includes("reply-jump") ? first : null;
-  row.insertBefore(strip, arrow ? arrow.nextSibling : first);
-  /** @type {any} */ (row).threadStrip = strip;
-  return strip;
-}
-
-/**
- * Draw the thread selected in All on its rows: `data-focus-thread` on the list, `data-thread-in` on
- * every row with a message in it, and its strips pressed. Only attributes, and only where they change.
- * Run at the end of every pass over the rows, and by a press. A thread the store no longer holds a
- * message of is let go, so All is never all dimmed with nothing at full strength.
- */
-function paintAllThreadFocus() {
-  if (columnWork.side()) return;
-  const list = el("discord-log");
-  const channel = String(selectedChannelId());
-  let id = selection().view === "flat" ? allThreadSelected() : null;
-  if (id !== null && channelStore.current().channel === channel && !channelStore.current().messages.some((message) => threadOf(message) === id)) {
-    allThreadFocus.delete(channel);
-    id = null;
-  }
-  if (id === null) {
-    if (list.hasAttribute("data-focus-thread")) list.removeAttribute("data-focus-thread");
-  } else if (list.getAttribute("data-focus-thread") !== id) {
-    list.setAttribute("data-focus-thread", id);
-  }
-  for (const row of /** @type {HTMLElement[]} */ ([...list.children])) {
-    const held = rowMessages(row);
-    const within = id !== null && held.some((message) => threadOf(message) === id);
-    if (row.hasAttribute("data-thread-in") !== within) {
-      if (within) row.setAttribute("data-thread-in", "");
-      else row.removeAttribute("data-thread-in");
-    }
-    const strip = /** @type {any} */ (row).threadStrip;
-    if (!strip) continue;
-    const pressed = id !== null && held.length > 0 && threadOf(held[0]) === id ? "true" : "false";
-    if (strip.getAttribute("aria-pressed") !== pressed) strip.setAttribute("aria-pressed", pressed);
-  }
-}
-
-/**
- * A strip pressed, or t: thread `id` selected in All, or let go when it was the one selected. Says
- * what it did, and how many of the messages here are the thread's.
- *
- * @param {string} id
- */
-function toggleAllThreadFocus(id) {
-  const channel = String(selectedChannelId());
-  const letting = allThreadFocus.get(channel) === id;
-  if (letting) allThreadFocus.delete(channel);
-  else allThreadFocus.set(channel, id);
-  paintAllThreadFocus();
-  if (letting) {
-    setStatus("Thread selection cleared.");
-    return;
-  }
-  const rows = /** @type {HTMLElement[]} */ ([...el("discord-log").children]);
-  const here = rows.flatMap(idsOf).length;
-  const mine = rows.filter((row) => row.hasAttribute("data-thread-in")).flatMap(idsOf).length;
-  setStatus(`Thread selected: ${threadName(knownThreadChoice(id, null))} — ${mine} of ${here} messages here. Esc clears it.`);
-}
-
-/**
- * Esc: the thread selected in All let go, while All is what is on screen. Whether there was one, for
- * Esc to stop there; the next Esc does what it does in All.
- */
-function clearAllThreadFocus() {
-  return inColumn(columns.main, () => {
-    if (!channelOnScreen() || layoutShown.threadList() || pinsView().only || selection().view !== "flat") return false;
-    const channel = String(selectedChannelId());
-    if (!allThreadFocus.has(channel)) return false;
-    allThreadFocus.delete(channel);
-    paintAllThreadFocus();
-    setStatus("Thread selection cleared.");
-    return true;
-  });
-}
-
-/**
- * t: the selected message's strip pressed — its thread selected in All, or let go. Nothing on a message
- * with no strip (no thread, nobody's thread yet, or not in All), so the key is left to the browser.
- */
-function threadStripFromKeyboard(target) {
-  const { row, took } = rowForAct(target);
-  const strip = row ? /** @type {any} */ (row).threadStrip : null;
-  if (!strip || strip.hidden) return took;
-  strip.click();
-  return true;
-}
-
-/**
- * Bring Main up to date with its threads' replies after something changed them that redrew no row:
- * a reply arriving, a read of All or of a thread landing behind Main, or coming back to Main held
- * from earlier. Under Hide read a root may have to come back or go, which is a redraw; otherwise the
- * pass over the rows redraws the chips and decides the runs again.
- */
-function syncUnreadReplies() {
-  if (!providerFacts.threading() || selection().view !== "main" || channelStore.current().channel !== String(selectedChannelId())) return;
-  if (hidingRead()) {
-    const keeps = readFilterKeeps();
-    const wanted = timelineRows().messages.filter((message) => !hiddenEmpty(message) && keeps(message))
-      .map((message) => String(message.id)).sort().join(" ");
-    // `#410 inline-reply-editor`. Less a gathered thread's replies, which are its thread's, not Main's.
-    const drawn = [...el("discord-log").children].filter((row) => !fromGatheredThread(row)).flatMap(idsOf).sort().join(" ");
-    if (wanted !== drawn) {
-      renderCachedTimeline();
-      return;
-    }
-  }
-  renderChannelRows();
-}
+// A thread's strip in All, and selecting a thread there, are web/src/view/channel's now
+// (`createThreadStrip`, `#624 voice-page-modularity`): the strip on each row, the selection it
+// makes, and Main brought up to date with its threads' replies.
+const threadStripOwner = createThreadStrip({
+  byId: el,
+  inThisColumn,
+  inColumn,
+  mainColumn: () => columns.main,
+  side: () => columnWork.side(),
+  selection: () => selection(),
+  selectedChannelId,
+  heldMessages: () => channelStore.current().messages,
+  threadHue,
+  sayRowShortcut,
+  setStatus,
+  threadName,
+  knownThreadChoice,
+  channelOnScreen,
+  layoutThreadList: () => layoutShown.threadList(),
+  pinsOnly: () => pinsView().only,
+  rowForAct,
+  threading: () => providerFacts.threading(),
+  hidingRead: () => hidingRead(),
+  readFilterKeeps,
+  renderCachedTimeline: () => renderCachedTimeline(),
+  renderChannelRows,
+  hiddenEmpty: (m) => hiddenEmpty(m),
+  drawnIds: () => [...el("discord-log").children].flatMap(idsOf),
+  fromGatheredThread,
+  canonChannel: () => channelStore.current().channel,
+  timelineMessages: () => timelineRows().messages,
+});
+const {
+  allThreadSelected, drawingAll, markListView, paintThreadStrip, paintAllThreadFocus,
+  toggleAllThreadFocus, clearAllThreadFocus, threadStripFromKeyboard, syncUnreadReplies,
+} = threadStripOwner;
 
 /**
  * Whether message id `id` is at or after position `from`. Both are ids in the order the server keeps
@@ -11498,7 +11315,7 @@ const serverSearchCopy = createServerSearchCopy({
   scheduleServerSearch: () => scheduleServerSearch(),
   cardsOnScreen,
   inColumn,
-  syncUnreadReplies,
+  syncUnreadReplies: () => syncUnreadReplies(),
   saveChannelScope,
   renderSideColumn,
   serviceWords: () => serviceWords(),
@@ -11809,174 +11626,31 @@ const readModes = createReadMode({ storage: () => deviceStorage() });
 // mode, and the read run before it is a line only under Fold read. Show read shows what is read:
 // a mode that said "Show read" while hiding messages on entry would be a button that lies, and the
 // owner's root, "… 45 read messages …", first unread is Fold read's own drawing.
-
-/**
- * The runs of read messages, and the ones the reader has opened, per view (`viewKey`), as the ids of
- * the messages in them: web/src/present/rows (`createReadRuns`), which says why ids and when they are
- * forgotten.
- */
+// The read modes' lines and places are web/src/view/channel's now (`createReadRunLines`,
+// `#624 voice-page-modularity`): whether Hide read is leaving read messages out, the collapsed
+// run's line, and the rows a redraw replaced. The runs themselves stay readcore's.
 const readRuns = createReadRuns();
 
-
-/**
- * The messages the reader folded away one by one (Shift+O, `#480 fold-one-message-key`), per view
- * as `readRuns` keeps opened runs: ids, so a redraw draws them folded again, in any read mode — a
- * thread being worked through keeps the parts closed up until their line is opened, which takes
- * them out of this set (`openReadRun`). In memory only, as an opened run is: a reload lays the
- * thread out afresh.
- */
-const foldedOnes = new Map();
-
-/** The folded-away ids of the view `key` names, or an empty set. */
-function foldedOneIds(key) {
-  return foldedOnes.get(key) || new Set();
-}
-
-/*
- * How many rows the last pass left in collapsed runs. At zero, outside Fold read, there is
- * nothing to undo, and a pass — which runs with every redraw and every filter change — is free.
- **/
-// Kept per column: `listState().runRows` (`freshListState`, `#624 voice-page-modularity`).
-
-
-
-/** Is `row` the root of the thread on screen? By identity, never by position: older replies may not be loaded. */
-function isOpenThreadRoot(row, rootId) {
-  if (selection().view !== "thread" || !selection().threadId) return false;
-  const thread = String(selection().threadId);
-  return rowMessages(row).some((message) => String(message.id) === rootId || String(message.id) === thread ||
-    (threadOf(message) === thread && message.thread.is_root === true));
-}
-
-/** The id of the open thread's root as its summary names it, or null. */
-function openThreadRootId() {
-  if (selection().view !== "thread" || !selection().threadId) return null;
-  const summary = channelStore.current().threads.find((held) => String(held.id) === String(selection().threadId)) || selection().thread;
-  return summary && summary.root ? String(summary.root.id) : null;
-}
-
-
-/**
- * Whether Hide read is leaving read messages out of the list now. `#262 search-load-older`: not while a
- * filter chooses rows on a provider with threads, where Hide read steps aside as Fold read does
- * (`readRunsSuspended`) — an old match is read by definition, and a search that walks back under Hide
- * read would draw almost nothing of what it read and say it had searched it. The read mode the reader
- * chose is untouched, and closing the search brings it back. Without threads Hide read is a read of
- * its own (`loadTodo`), and stays in force.
- */
-const hidingRead = () => readModes.hiding() && !(providerFacts.threading() && readRunsSuspended());
-
-/**
- * Run `change`, a change of the filters, and draw each column again from what it holds when it made Hide
- * read step aside or come back (`hidingRead`): once per such change, never per keystroke.
- *
- * @template T
- * @param {() => T} change
- * @returns {T}
- */
-function liftingHideRead(change) {
-  const was = hidingRead();
-  const result = change();
-  if (hidingRead() !== was) eachColumn(renderCachedTimeline);
-  return result;
-}
-
-/**
- * The line a collapsed run is drawn as, on the run's first row: made once per row and kept on it.
- * The row's own content is hidden behind it by web/voice.css, so the row is still the message it
- * was — every act that finds a row by its ids still finds it — and the list holds only messages.
- */
-function readRunLine(row) {
-  if (row.readRunLine) return row.readRunLine;
-  const line = document.createElement("button");
-  line.className = "read-run";
-  line.setAttribute("type", "button");
-  // No `aria-expanded`: the line is not a disclosure that stays to say it is open. It goes, and the
-  // run is drawn in its place.
-  line.addEventListener("click", inThisColumn((event) => {
-    // The row's own tap would fold it or read it aloud; this tap is the line's alone.
-    if (event) event.stopPropagation();
-    // A keyboard on the line is left on nothing as it goes, and falls back to the start of the page.
-    // It moves to the run's first message instead, which is where the line was. Only a keyboard's
-    // focus, the kind drawn as a ring: a tap or a click focuses the line too, and a row holding the
-    // focus is lit as if under the pointer — a read message drawn as though it were not.
-    const focused = document.activeElement === line && line.matches(":focus-visible");
-    openReadRun(row);
-    // `#407 unpack-row-parity`. A run in an unpacked block is opened by drawing the block again: the
-    // row it was is the new one standing for the same message; and a run over the cards by drawing them
-    // again (`#432 read-mode-unify`).
-    const now = row.parentNode ? row : liveUnpackedRow(row) || liveCardRow(row);
-    if (focused && now) {
-      now.setAttribute("tabindex", "-1");
-      now.focus({ preventScroll: true });
-    }
-  }));
-  row.replaceChildren(line, ...row.children);
-  row.readRunLine = line;
-  return line;
-}
-
-/** What the line on `row` says now, or "" when it has none. */
-function readRunWords(row) {
-  return row.readRunLine ? String(row.readRunLine.textContent) : "";
-}
-
-/** The days a collapsed run's line says, kept on its first row by `drawSeams` (`#250 date-separators`). */
-const runDaysOf = (row) => String(row.runDays || "");
-
-/** How many messages the collapsed run `row` heads stands for. */
-const readRunCount = (row) => readRunRows(row).reduce((sum, one) => sum + idsOf(one).length, 0);
-
-/** Put one row in its place in a run: "head" (drawn as the line), "member" (hidden), or null (shown). */
-function placeInReadRun(row, role, count) {
-  if (role === null) {
-    if (row.hasAttribute("data-read-run")) row.removeAttribute("data-read-run");
-    if (row.hidden) row.hidden = false;
-    if (row.readRunLine && !row.readRunLine.hidden) row.readRunLine.hidden = true;
-    return;
-  }
-  row.setAttribute("data-read-run", role);
-  row.hidden = role === "member";
-  if (role !== "head") return;
-  const line = readRunLine(row);
-  const words = readRunText(count, runDaysOf(row));
-  if (line.textContent !== words) line.textContent = words;
-  line.setAttribute("title", `Show ${count === 1 ? "this read message" : `these ${count} read messages`}`);
-  line.hidden = false;
-}
-
-
-
-
-/**
- * The row now standing in the cards for `row`, a card or a Main row a redraw of the cards took away (an
- * opened run of read threads, `#432 read-mode-unify`): the new one of the same kind and id, or null.
- *
- * @param {Element} row
- * @returns {HTMLElement | null}
- */
-function liveCardRow(row) {
-  const card = row.hasAttribute("data-card");
-  if (!card && !row.hasAttribute("data-main-row")) return null;
-  const id = row.getAttribute("data-id");
-  return /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]).find((one) =>
-    one.getAttribute("data-id") === id && one.hasAttribute(card ? "data-card" : "data-main-row")) || null;
-}
-
-/**
- * The row now standing in the cards for `row`, an unpacked row a redraw of its block took away: the
- * new row of the same thread holding its first message, or null. `#407 unpack-row-parity`.
- *
- * @param {Element} row
- * @returns {HTMLElement | null}
- */
-function liveUnpackedRow(row) {
-  const thread = row.getAttribute("data-unpack-thread");
-  const [first] = idsOf(row);
-  if (thread === null || !first) return null;
-  return /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]).find((one) =>
-    one.getAttribute("data-unpack-thread") === thread && idsOf(one).includes(first)) || null;
-}
+const readRunLines = createReadRunLines({
+  byId: el,
+  leftById: leftEl,
+  inThisColumn,
+  selection: () => selection(),
+  threads: () => channelStore.current().threads,
+  hiding: () => readModes.hiding(),
+  suspended: () => readRunsSuspended(),
+  threading: () => providerFacts.threading(),
+  eachColumnRenderCached: () => eachColumn(renderCachedTimeline),
+  openReadRun: (row) => openReadRun(row),
+  readRunRows: (row) => readRunRows(row),
+  threadIdOf: (message) => threadOf(message),
+  selectionThread: () => selection().thread,
+});
+const {
+  hidingRead, liftingHideRead, readRunLine, readRunWords, runDaysOf, readRunCount,
+  placeInReadRun, isOpenThreadRoot, openThreadRootId, foldedOneIds, liveUnpackedRow, liveCardRow,
+} = readRunLines;
+const foldedOnes = readRunLines.foldedOnes;
 
 
 /**
