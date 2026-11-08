@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -116,3 +117,15 @@ def test_calibrated_budget_scales_with_spawn_latency_but_never_past_the_cap() ->
     # so calibration cannot talk a real slowdown into a pass (#1067).
     assert calibrated_budget(0.1, [10.0], probes=6, cap_s=5.0) == 5.0
     assert 6 * 6.0 > calibrated_budget(0.1, [10.0], probes=6, cap_s=5.0)
+
+
+def test_stdin_child_reads_its_payload_from_a_temp_file_fd() -> None:
+    # `run_tolerant` takes a stdin fd, not `input=`: the MCP differential
+    # feeds its payload through a rewound temp file, so pin that the child
+    # reads exactly those bytes to EOF from its stdin (#1067).
+    child = "import sys\nsys.stdout.write(sys.stdin.read().upper())"
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdin_file:
+        stdin_file.write("hello\nstdin\n")
+        stdin_file.seek(0)
+        done = run_tolerant([PY, "-c", child], timeout_s=5, stdin=stdin_file.fileno())
+    assert (done.returncode, done.stdout) == (0, "HELLO\nSTDIN\n")

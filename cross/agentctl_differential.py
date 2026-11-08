@@ -28,6 +28,7 @@ from herdr_agent_differential import (
     SENDER_HEADER,
     _stop_recovery_arguments,
     guarded_path, init_case_repository, with_case_git, without_ambient_executables,
+    TIMEOUT_SECONDS, _tree_cpu_seconds, run_tolerant,
 )
 
 _COMMON = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
@@ -161,8 +162,21 @@ def _fixture_process_alive(process_id: object) -> bool:
     return close >= 0 and process_stat[close + 2:].split(maxsplit=1)[0] != "Z"
 
 
-def _retire_fixture_processes(case: PairCase) -> None:
-    """Stop only custom children created by this differential's private Herdr fixtures."""
+def _retire_fixture_processes(case: PairCase, report: Report | None = None) -> None:
+    """Stop only custom children created by this differential's private Herdr fixtures.
+
+    Exit is awaited, bounded by CPU progress (#1067
+    cross-differential-load-aware): pane close must make these fixtures
+    exit, so success is the observed exit and the bounds only decide
+    failure. The old 2 s budget is now spent as CPU - a fixture still
+    burning it is progressing, and load delays its exit slice, not the
+    verdict - while a fixture that burns the whole CPU budget without
+    exiting, or is still alive at the failure deadline, is stuck, not
+    starved. Callers with a `Report` get a labelled check. The
+    report-less form stays for `agentctl_nested_records`, which imports
+    this helper and is outside this change's files; there a stuck
+    fixture still raises rather than passing silently.
+    """
     process_ids: list[int] = []
     for root in (case.python_root, case.rust_root):
         state = _state(root)
@@ -174,22 +188,40 @@ def _retire_fixture_processes(case: PairCase) -> None:
             [str(root / "fake-herdr"), "pane", "close", "w1:p1"],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-    deadline = time.monotonic() + 2
-    while process_ids and time.monotonic() < deadline:
-        remaining: list[int] = []
-        for process_id in process_ids:
-            try:
-                process_stat = Path(f"/proc/{process_id}/stat").read_text(encoding="utf-8")
-            except (FileNotFoundError, ProcessLookupError):
-                continue
-            close = process_stat.rfind(")")
-            if close < 0 or process_stat[close + 2:].split(maxsplit=1)[0] != "Z":
-                remaining.append(process_id)
-        process_ids = remaining
+    remaining = list(process_ids)
+    deadline = time.monotonic() + TIMEOUT_SECONDS
+    burned_cpu = 0.0
+    last_cpu: float | None = None
+    while remaining and time.monotonic() < deadline:
+        remaining = [process_id for process_id in remaining
+                     if _fixture_process_alive(process_id)]
+        if not remaining:
+            break
+        cpu_now = 0.0
+        sampled = False
+        for process_id in remaining:
+            measured = _tree_cpu_seconds(process_id)
+            if measured is not None:
+                cpu_now += measured
+                sampled = True
+        if sampled:
+            if last_cpu is not None and cpu_now > last_cpu:
+                burned_cpu += cpu_now - last_cpu
+            last_cpu = cpu_now
+            if burned_cpu > 2.0:
+                break
+        time.sleep(0.05)
+    remaining = [process_id for process_id in remaining
+                 if _fixture_process_alive(process_id)]
+    if report is not None:
         if process_ids:
-            time.sleep(0.01)
-    if process_ids:
-        raise AssertionError(f"fixture custom processes did not exit: {process_ids!r}")
+            report.require(
+                f"retire/{case.python_root.parent.parent.name}",
+                not remaining,
+                f"fixture custom processes did not exit: {remaining!r}",
+            )
+    elif remaining:
+        raise AssertionError(f"fixture custom processes did not exit: {remaining!r}")
 
 
 def _start(harness: Harness, report: Report, case: PairCase, label: str,
@@ -760,10 +792,20 @@ def _profiles(harness: Harness, report: Report) -> None:
             _change(case, {
                 "custom_post_error": True, "custom_submitted": False, "custom_draft": "",
             })
-            _pair(harness, report, case, "primary/profile/watermelon/redraw-refusal", (
+            # No exact stdout comparison here (#1067
+            # cross-differential-load-aware): the failure JSON's reason
+            # depends on whether a redraw read lands before the 0.05
+            # working expiry, so under load the editions can split the
+            # reason while agreeing on the refusal. What is compared is
+            # rc 76 from both, plus the quarantine asserted just below;
+            # the 0.05 budget is meant to expire and keeps its literal.
+            redraw_outcomes = harness.invoke(case, (
                 "send", "worker", "must remain uncertain", "--message-id", "muse-error",
                 "--working-timeout", "0.05", *_COMMON,
-            ), 76)
+            ))
+            report.require("primary/profile/watermelon/redraw-refusal",
+                           all(outcome.returncode == 76 for outcome in redraw_outcomes),
+                           f"expected rc 76; python={redraw_outcomes[0]!r} rust={redraw_outcomes[1]!r}")
             report.require("primary/profile/watermelon/redraw-quarantine", all(
                 (root / "registry/agents/worker/queue/failed/muse-error.json").is_file()
                 for root in (case.python_root, case.rust_root)
@@ -772,10 +814,15 @@ def _profiles(harness: Harness, report: Report) -> None:
                 "custom_post_error": False, "custom_clear_without_submit": True,
                 "custom_submitted": False, "custom_draft": "",
             })
-            _pair(harness, report, case, "primary/profile/watermelon/repeated-redraw", (
+            # Same split as redraw-refusal just above: rc 76 from both
+            # editions, no exact failure-stdout comparison (#1067).
+            repeated_outcomes = harness.invoke(case, (
                 "send", "worker", prompt, "--message-id", "muse-repeat",
                 "--working-timeout", "0.05", *_COMMON,
-            ), 76)
+            ))
+            report.require("primary/profile/watermelon/repeated-redraw",
+                           all(outcome.returncode == 76 for outcome in repeated_outcomes),
+                           f"expected rc 76; python={repeated_outcomes[0]!r} rust={repeated_outcomes[1]!r}")
             report.require("primary/profile/watermelon/repeated-quarantine", all(
                 (root / "registry/agents/worker/queue/failed/muse-repeat.json").is_file()
                 for root in (case.python_root, case.rust_root)
@@ -895,7 +942,7 @@ def _profile_resume(harness: Harness, report: Report) -> None:
                        all(not _submitted(root)
                            for root in (mismatch.python_root, mismatch.rust_root)),
                        "a startup brief reached a contradictory conversation")
-        _retire_fixture_processes(mismatch)
+        _retire_fixture_processes(mismatch, report)
 
         raw_selector = ("--resume", "other-conversation") if kind == "claude" else ("resume", "other-conversation")
         duplicate = configured_case(kind, "duplicate", raw=raw_selector)
@@ -1441,7 +1488,7 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
                            and not _state(root).get("closed")
                            for root in (wrong_process.python_root, wrong_process.rust_root)),
                    f"unobserved wrong-process launch was incorrectly retired: {stopped!r}")
-    _retire_fixture_processes(wrong_process)
+    _retire_fixture_processes(wrong_process, report)
 
     wrong_identity = harness.case(
         "primary-custom-wrong-kernel-identity", {"wrong_custom_process_identity": True}
@@ -1461,7 +1508,7 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
                            and not _state(root).get("closed")
                            for root in (wrong_identity.python_root, wrong_identity.rust_root)),
                    f"unobserved wrong-kernel launch was incorrectly retired: {stopped!r}")
-    _retire_fixture_processes(wrong_identity)
+    _retire_fixture_processes(wrong_identity, report)
 
     trust = harness.case("primary-muse-trust", {"screen": "Do you trust this workspace? yes / no"})
     outcomes = harness.invoke(trust, (
@@ -1503,7 +1550,7 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
             ),
             f"Muse exit between text and Enter submitted to a replacement: {outcomes!r}",
         )
-        _retire_fixture_processes(exited)
+        _retire_fixture_processes(exited, report)
 
 
 def _herdr_093_compatibility(harness: Harness, report: Report) -> None:
@@ -1514,9 +1561,17 @@ def _herdr_093_compatibility(harness: Harness, report: Report) -> None:
         "foreground_argv_mode": "missing",
     }
     case = harness.case("primary-herdr-093-codex", unknown)
+    # First calibrated positive start (#1067 cross-differential-load-aware):
+    # compared now is still the full startup proof sequence, but inside
+    # max(nominal, spawns x measured spawn) capped at 5 s - the harness
+    # measures scratch-fake spawn latency in this run (see
+    # `calibrated_budget`). An injected slowdown still fails: a per-probe
+    # delay beyond cap/probes expires the budget however slow the host
+    # measures, and only success-expecting literals are calibrated;
+    # every refuse/expire case below keeps its literal value.
     started, _ = _pair(harness, report, case, "primary/herdr-093/codex/start", (
         "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
-        "--startup-timeout", "0.1", "--brief", "compatibility brief", *_COMMON,
+        "--startup-timeout", harness.startup_timeout(0.1, probes=10), "--brief", "compatibility brief", *_COMMON,
     ))
     status = _json(started)
     report.require("primary/herdr-093/codex/raw-status-and-once",
@@ -1554,7 +1609,7 @@ def _herdr_093_compatibility(harness: Harness, report: Report) -> None:
             "stop", "worker", *_COMMON,
         ))
     else:
-        _retire_fixture_processes(case)
+        _retire_fixture_processes(case, report)
 
     refused: tuple[tuple[str, Mapping[str, object]], ...] = (
         ("busy", {"composer_busy": True}),
@@ -1597,14 +1652,14 @@ def _herdr_093_compatibility(harness: Harness, report: Report) -> None:
                 encoding="utf-8")).get("lifecycle") == "launch_failed"
             for root in (failed.python_root, failed.rust_root)),
             f"{label} caused a startup retry, input, or a running record")
-        _retire_fixture_processes(failed)
+        _retire_fixture_processes(failed, report)
 
     for mode in ("missing", "null", "empty"):
         muse = harness.case(f"primary-herdr-093-muse-{mode}", {
             "foreground_argv_mode": mode,
         })
         if _start(harness, report, muse, f"primary/herdr-093/muse/{mode}/start",
-                  "--harness", "muse", "--startup-timeout", "0.2"):
+                  "--harness", "muse", "--startup-timeout", harness.startup_timeout(0.2, probes=12)):
             report.require(f"primary/herdr-093/muse/{mode}/kernel-pin", all(
                 _valid_foreign_shell_identity(json.loads(
                     (root / "registry/agents/worker/agent.json").read_text(encoding="utf-8")
@@ -1625,7 +1680,7 @@ def _herdr_093_compatibility(harness: Harness, report: Report) -> None:
                 "stop", "worker", *_COMMON,
             ))
         else:
-            _retire_fixture_processes(muse)
+            _retire_fixture_processes(muse, report)
 
     malformed: tuple[tuple[str, Mapping[str, object]], ...] = (
         ("wrong-kernel", {"foreground_argv_mode": "missing",
@@ -1640,15 +1695,19 @@ def _herdr_093_compatibility(harness: Harness, report: Report) -> None:
             "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
             "--harness", "muse", "--startup-timeout", "0.05", *_COMMON,
         ))
+        # No cross-edition rc equality here (#1067
+        # cross-differential-load-aware): whether the malformed argv is
+        # read before the 0.05 startup expiry decides 69 vs 75, so load
+        # splits the failure class per edition without splitting the
+        # refusal - each edition must still refuse with launch_failed.
         report.require(f"primary/herdr-093/muse/refuse-{label}",
-                       outcomes[0].returncode == outcomes[1].returncode
-                       and outcomes[0].returncode in (69, 75)
+                       all(outcome.returncode in (69, 75) for outcome in outcomes)
                        and all(_submitted(root) == []
                                and json.loads((root / "registry/agents/worker/agent.json").read_text(
                                    encoding="utf-8")).get("lifecycle") == "launch_failed"
                                for root in (failed.python_root, failed.rust_root)),
                        f"{label} became a verified Muse launch: {outcomes!r}")
-        _retire_fixture_processes(failed)
+        _retire_fixture_processes(failed, report)
 
 
 def _muse_adoption(harness: Harness, report: Report) -> None:
@@ -1681,7 +1740,7 @@ def _muse_adoption(harness: Harness, report: Report) -> None:
                         for call in _fixture_calls(root))
             for root in (refused.python_root, refused.rust_root)),
             "unanchored Muse adoption saved a record or changed the foreign runtime")
-        _retire_fixture_processes(refused)
+        _retire_fixture_processes(refused, report)
     for label, with_session in (("native-session", True), ("sessionless", False)):
         case = harness.case(f"primary-muse-adoption-{label}", {
             "harness": "muse", "custom_reported": True,
@@ -1707,7 +1766,7 @@ def _muse_adoption(harness: Harness, report: Report) -> None:
                            for root in (case.python_root, case.rust_root)),
                        f"adoption changed ownership or omitted mandatory Muse pins: {record!r}")
         if adopted.returncode != 0:
-            _retire_fixture_processes(case)
+            _retire_fixture_processes(case, report)
             continue
         _pair(harness, report, case, f"primary/adopt/muse/{label}/send", (
             "send", "foreign", "foreign Muse literal mentions Auto-review\nsecond line",
@@ -1758,7 +1817,7 @@ def _muse_adoption(harness: Harness, report: Report) -> None:
                                and len(list((root / "registry/archive").glob("*/agent.json"))) == 1
                                for root in (case.python_root, case.rust_root)),
                        f"foreign Muse unregister closed or discarded its runtime: {result!r}")
-        _retire_fixture_processes(case)
+        _retire_fixture_processes(case, report)
 
 
 def _muse14_status(harness: Harness, report: Report) -> None:
@@ -1777,7 +1836,7 @@ def _muse14_status(harness: Harness, report: Report) -> None:
         "--cwd", "<ROOT>", "--harness", "muse", "--session", "session-1", *_COMMON,
     ))
     if adopted.returncode != 0:
-        _retire_fixture_processes(case)
+        _retire_fixture_processes(case, report)
         return
     divider, footer = "─" * 40 + "\n", "kiki · xhigh · /work · YOLO\n"
     idle = f"old transcript\n{divider}❯\n{divider}{footer}"
@@ -1820,13 +1879,13 @@ def _muse14_status(harness: Harness, report: Report) -> None:
                    f"fixture error in primary/muse14: the stand-in Muse of the {' and '.join(gone)} "
                    "edition exited before the drain, so the drain compared nothing")
     if gone:
-        _retire_fixture_processes(case)
+        _retire_fixture_processes(case, report)
         return
     _pair(harness, report, case, "primary/muse14/resumed-drain", ("drain", "foreign", *_COMMON))
     report.require("primary/muse14/delivered-once-in-order", all(
         _submitted(root) == ["held while staged"]
         for root in (case.python_root, case.rust_root)), "held Muse input was lost, repeated or reordered")
-    _retire_fixture_processes(case)
+    _retire_fixture_processes(case, report)
 
 
 def _muse_busy_followup(harness: Harness, report: Report) -> None:
@@ -1851,7 +1910,7 @@ def _muse_busy_followup(harness: Harness, report: Report) -> None:
         "--cwd", "<ROOT>", "--harness", "muse", "--session", "session-1", *_COMMON,
     ))
     if adopted.returncode != 0:
-        _retire_fixture_processes(case)
+        _retire_fixture_processes(case, report)
         return
     _change(case, {"status": "working", "custom_busy": True})
     prompt = "hold: stop after the current step"
@@ -1877,7 +1936,7 @@ def _muse_busy_followup(harness: Harness, report: Report) -> None:
                        and (root / "registry/agents/foreign/queue/processed/busy.json").is_file()
                        for root in (case.python_root, case.rust_root)),
                    "the idle drain lost or repeated the busy-time prompt")
-    _retire_fixture_processes(case)
+    _retire_fixture_processes(case, report)
 
 
 def _handoff_and_pending(harness: Harness, report: Report) -> None:
@@ -2319,7 +2378,7 @@ def _adopted_generation(harness: Harness, report: Report, label: str) -> PairCas
         "--cwd", "<ROOT>", "--harness", "codex", *_COMMON,
     ))
     if any(outcome.returncode != 0 for outcome in outcomes):
-        _retire_fixture_processes(case)
+        _retire_fixture_processes(case, report)
         return None
     return case
 
@@ -2372,7 +2431,7 @@ def _dead_adopted_retirement(harness: Harness, report: Report) -> None:
             target.chmod(0o600)
         originals.append(_artifact_bytes(directory))
         digests.append(hashlib.sha256(path.read_bytes()).hexdigest())
-    _retire_fixture_processes(case)
+    _retire_fixture_processes(case, report)
     _change(case, {
         "closed": False, "closed_panes": [], "empty_shell": True,
         "fixture_shell_pid": harness.replacement_shell.pid,
@@ -2515,7 +2574,7 @@ def _dead_adopted_retirement(harness: Harness, report: Report) -> None:
                   for index, root in enumerate((guarded.python_root, guarded.rust_root))),
                        f"{label} record was retired or queried Herdr: {outcomes!r}")
         _change(guarded, {"offline": False})
-        _retire_fixture_processes(guarded)
+        _retire_fixture_processes(guarded, report)
 
 
 def _managed_dead_recovery(harness: Harness, report: Report) -> None:
@@ -3047,7 +3106,7 @@ def _identity_and_rename(harness: Harness, report: Report) -> None:
                        and not list((root / "registry" / ".renames").glob("*.json"))
                        and _state(root).get("tab_label") == "lead",
                        f"crashed={crashed!r} blocked={blocked!r} finished={finished!r} history={history!r}")
-    _retire_fixture_processes(case)
+    _retire_fixture_processes(case, report)
 
 
 def _invalid_cli(harness: Harness, report: Report) -> None:
@@ -3552,10 +3611,18 @@ def _mcp_invoke(harness: Harness, case: PairCase, payload: str) -> tuple[Outcome
         environment["AGENTCTL_MUSE_BIN"] = str(root / "fake-muse-runtime")
         environment["XDG_CONFIG_HOME"] = str(root / "xdg-config")
         try:
-            completed = subprocess.run(
-                [*command, *argv], input=payload, timeout=30, cwd=root, env=environment,
-                capture_output=True, encoding="utf-8", errors="replace",
-            )
+            # Through `run_tolerant` like every paired invoke (#1067
+            # cross-differential-load-aware): the budget is spent as CPU
+            # progress, not raw wall, and the process group is cleaned
+            # up on timeout. It takes a stdin fd rather than `input=`,
+            # so the payload rides a temp file rewound to its start.
+            with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdin_file:
+                stdin_file.write(payload)
+                stdin_file.seek(0)
+                completed = run_tolerant(
+                    [*command, *argv], timeout_s=TIMEOUT_SECONDS, cwd=root, env=environment,
+                    stdin=stdin_file.fileno(), encoding="utf-8", errors="replace",
+                )
             outcome = Outcome(completed.returncode, completed.stdout, completed.stderr)
         except subprocess.TimeoutExpired as error:
             outcome = Outcome(124, _decode_timeout(error.stdout),
