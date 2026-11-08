@@ -87,6 +87,24 @@ fact, no agent-to-agent chat, no new agent without your say-so (§8.4).
 11. Voice labels: **none** in v1 (recommended) / **read** (agent can say them) / **write-gated**?
 12. Server-side helper for delegated questions: **session-context only** now (recommended) / **+ research service** / **neither**?
 
+**Next-morning addendum (§8.5 + linked doc, replies 223–228).** Workstream
+slugs surface in messages as clickable `#hashtags`; PR/issue names join the
+glossary as their own kind, feeding mu-prnames' deterministic name cache
+through its curated-file seam (never a second cache). Where the shared
+vocabulary lives and how coding agents converge on it — recommended:
+vibe-talk publishes a versioned glossary snapshot that the chat bridge injects
+(top-K, epoch-stamped) while rendering stays deterministic — is designed in
+[shared vocabulary](../2026-11-08-shared-vocabulary/README.md), including the
+shared-summarization-component question and where glossary terms should
+bootstrap from (recommended: the human-visible chat layer is authoritative;
+PR/code output anchors identities; raw transcripts only propose).
+
+13. Hashtag chips on messages (click = filter): **design-only** for now (recommended with Labels) / **build-soon**?
+14. Vocabulary home first step: **vibe-talk snapshot** (recommended) / **standalone component** first?
+15. Vocabulary block injected for coding agents via the chat bridge: **yes, behind a flag** (recommended) / **no**?
+16. Bootstrap authority for new terms: **chat** (recommended) / **transcripts** / **code**?
+17. wrkviz incremental ingest polls (still zero-token, batch summarize): **later** (recommended) / **now**?
+
 Everything after this section is the backup: §1 entry + overlay, §2 selectors,
 §3 unread + cards, §4 glossary, §5 pipeline, §6 voice, §7 plan, appendices with
 the full inventory, draft prompts and wireframes.
@@ -1412,6 +1430,91 @@ artifact). The research service *consumes* briefings to answer questions; making
 it also *produce* them would give overview facts two writers and couple their
 freshness to a question-answering session's lifetime. Shared store, separate
 jobs: pipeline writes facts, research reads them, voice speaks them.
+
+### 8.5 Hashtags and PR/issue names (replies 223–224)
+
+**Workstream slugs as clickable hashtags.** §8.1's machine workstream labels
+render in message rows as `#<slug>` chips (the `#` is presentation, appended at
+render to the same chip, gold Pinned excepted). Clicking one filters to that
+label — v1 the kept-messages list for the label, later the phase-2
+`label:<slug>` search (§8.1); in the voice overview the same chip is the card's
+name, so the word you tap is the word you say. Determinism rule: a hashtag is
+drawn **only from a stored assignment**, never parsed out of message text — an
+agent typing `#anything` in prose mints nothing, highlights nothing, and cannot
+hijack a filter. (Typed hashtags could later *suggest* a label through the
+§4.3 gate; they never render as one directly.) Spoken form never says "hashtag
+runner-reliability"; voice uses the glossary sentence/gloss (§4.5). Owner
+labels keep plain chip text without `#` in v1, so the sigil reliably means
+"machine workstream" at a glance; revisit only if that distinction proves
+invisible in use (Q13).
+
+**PR/issue names as a glossary kind.** Add `kind: pr` beside `thread`,
+`workstream` and `term` (§4.2). The owner, reply 224:
+
+> "if we want to be uniform about naming the practice of referring to PRs by
+> name rather than just number should be part of the deterministic
+> infrastructure rather than expecting for agents to remember it"
+
+- *Identity* is `(owner, repo, number)` — storage key `pr:<owner>/<repo>#<n>`,
+  normalised exactly as mu-prnames' cache normalises (lowercase owner/repo,
+  leading zeros off). A bare number is never an identity: per-repo sequences
+  collide by construction, and plain-text `#N` without a link names no repo
+  (the cache's P2 per-channel-default-repo question stays theirs).
+- *Name* is two-layered: the glossary's curated **slug** (short, stable, the
+  `#<number> <slug>` form the repo's own convention already demands of agents)
+  wins; beneath it the cache's fetched, shortened GitHub title. Until a slug is
+  curated the two differ (title fragment in the link, maybe a slug in prose) —
+  accepted v1 divergence, closed by curation, never by letting the model
+  reconcile them at render.
+- *Collisions across kinds* are distinguished by kind, never merged by
+  spelling: the same word may be a thread slug (`th:<channel>/<id>`), a
+  workstream (`ws:<slug>`) and a PR slug (`pr:…#N`). Storage keys carry the kind
+  prefix; UI separates by chip shape (`#slug` workstream, plain thread name,
+  `REPO#N slug` link label); voice disambiguates in words on first use in a
+  call ("the merge-queue pull request" vs "the merge-queue workstream") and
+  bare thereafter (§4.5's glossing budget applies). Search/hashtag results
+  group by kind. Coinage must still avoid a *live same-kind* collision
+  (§5.2); cross-kind sameness is allowed and expected (a workstream and its
+  biggest PR wanting the same words is normal).
+- *Renames.* A GitHub title change refreshes only the fetched layer on the
+  cache's TTL terms (open 24 h, closed 30 d in the in-flight design); the
+  glossary slug does not move — especially once used with you (§4.5). A repo
+  rename/transfer aliases the old `owner/repo` key to the new one forever, the
+  slug-rename rule one level up. A curated slug deliberately changed by you is
+  an owner rename: old slug stays an alias, first later mention says so.
+- *Discussions caveat (inherited).* The cache key omits thread kind and
+  discussions are unanswerable on its issues endpoint, so today a curated
+  discussion name would also display for a same-number pull/issue. Until the
+  cache key gains kind, the glossary refuses `pr` entries for discussions
+  (proposals queue with that reason stated) rather than naming the wrong
+  thread confidently.
+- *Minting.* A PR/issue entry is created deterministically on first reference
+  (identity only, no model); its slug is proposed — never auto-minted — from,
+  in evidence order: a curated/owner name, the title's own leading `<slug>:`
+  prefix where the repo convention supplies one (exact-rule candidate), then
+  model suggestion at weekly discovery. Acceptance is the §4.2 gate as usual.
+
+**Seam to mu-prnames' cache — use it, don't duplicate it.** The in-flight
+`#1058 pr-name-enrichment` work (unlanded at writing: issue + implementation on
+its lane branch) already designs the takeover point: a curated-names JSON file
+(`[render] pr_names_file`, `"OWNER/REPO#N" → "name"`) that wins over every
+fetched title, suppresses fetching, feeds the spoken form, and is never written
+by the server — "that file is the seam a later glossary takes over". The
+glossary therefore **exports** its accepted `pr` slugs to that file at each
+epoch roll (§4.4) and on owner correction; fetch policy, TTLs, shortening,
+render/spoken shapes and the persisted fetched-title cache all stay
+mu-prnames' alone. Two deltas to agree with that lane when the export is built:
+curated reload without restart must advance the cache generation (or rendered
+bodies keep old names), and later file-sharing consumers must read the curated
+layer too or they will show title fragments where vibe-talk shows slugs.
+Two-way flow: fetched titles are *evidence* back into the glossary — title
+prefixes and repeated references feed coinage proposals (§4.3); fetched state
+(open/closed) never enters glossary identity.
+
+Where the vocabulary itself should live, how coding agents (not just readers)
+converge on it, whether summarization should become one shared component, and
+which of transcripts / chat / code output should bootstrap terms are designed
+in the companion doc: [shared vocabulary](../2026-11-08-shared-vocabulary/README.md).
 
 ## Appendix A. Inventory: existing code and prompts (path:line)
 
