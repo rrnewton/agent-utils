@@ -1525,10 +1525,12 @@ function commonAncestor(a, b) {
  * `SANITIZER`), and the values it allows where it restricts them. Anything else is refused. A
  * link's `title` is the address of a link the server gave a short label
  * (`#227 github-link-abbrev`), and its `data-msg` what a link to a chat message names
- * (`#543 in-app-message-links`).
+ * (`#543 in-app-message-links`). `data-doc` likewise: the document key a link the
+ * server recognizes opens in the reader (`#1073 documents-in-app-links`), marked
+ * in after the sanitize as `data-msg` is.
  */
 const SANITIZED_ATTRIBUTES = new Map([
-  ["a", new Set(["href", "title", "target", "rel", "data-msg"])],
+  ["a", new Set(["href", "title", "target", "rel", "data-msg", "data-doc"])],
   ["ol", new Set(["start", "class"])],
   ["ul", new Set(["class"])],
   ["li", new Set(["class"])],

@@ -25,6 +25,13 @@ export interface DocumentsViewDependencies {
   onStatus?(text: string): unknown;
   /** The open levels changed (a document opened or closed): sync the history. */
   onLevelChange?(): unknown;
+  /**
+   * The reader's Back button was pressed (`#1082 documents-back-chain`): the
+   * page's navigation pops its top back level, the same pop the back gesture
+   * takes, so a document opened from a channel returns there. Where the page
+   * wires none, the view pops its own chain one step.
+   */
+  onBack?(): unknown;
   /** Jump to the message that mentioned a document. */
   onJumpToMention?(mention: import("./types.ts").DocumentMention): unknown;
 }
@@ -33,8 +40,17 @@ export interface DocumentsViewDependencies {
 export interface DocumentsView {
   /** Show the list (refreshing it) or, with `key`, open that document. */
   show(key?: string): Promise<void>;
-  /** Back from the reader to the list; stops any reading. */
+  /**
+   * Back from the reader one step (`#1082 documents-back-chain`): to the
+   * previous document in the open chain, or to the list at the chain's start;
+   * stops any reading where it reaches the list. The history's close of a
+   * `document` level and the view's own way back both take this one step.
+   */
   showList(): void;
+  /** The same one step back as `showList`, under its Back name. */
+  back(): void;
+  /** How many documents are open in the chain (0 on the list): its back levels. */
+  depth(): number;
   /** Whether the reader (rather than the list) is up. */
   reading(): boolean;
   /** The document open in the reader while it is up, else null (`#1040`). */
@@ -51,13 +67,46 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
   let readingNow = false;
   let wired = false;
   let liveTimer = 0;
+  /**
+   * The open chain (`#1082 documents-back-chain`): every document opened
+   * through this view, the reader's current one last, each with the shared
+   * scroller's place when the next document opened over it. Back pops one.
+   * Only the chain's depth leaves the view (as back levels, through the
+   * page's wiring); where the chain's first document was opened from — a
+   * channel, the list — is the page navigation's jump, not the view's.
+   */
+  let chain: { key: string; scrollTop: number }[] = [];
+
+  /** The shared scroller's place now, or 0 where it cannot be read. */
+  function scrollTopNow(): number {
+    try {
+      const top = deps.byId("scroll-area").scrollTop;
+      return typeof top === "number" && Number.isFinite(top) ? top : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** Put the shared scroller back at `top`, where it can be written. */
+  function restoreScrollTop(top: number): void {
+    try {
+      deps.byId("scroll-area").scrollTop = top;
+    } catch {
+      // A host without the scroller keeps the reader where it opened.
+    }
+  }
 
   const reader = createDocumentsReader({
     api: deps.api,
     byId: deps.byId,
     speak: deps.speak,
     stopSpeaking: deps.stopSpeaking,
-    onBack: () => showList(),
+    onBack: () => {
+      // The same pop as the gesture, where the page wired its navigation;
+      // the view's own one step where it did not.
+      if (deps.onBack) deps.onBack();
+      else back();
+    },
     onStatus: deps.onStatus,
     // A document opened from a document (`#1081 documents-relative-links`)
     // goes through this same `openDocument` entry a list tap uses — the one
@@ -100,9 +149,11 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     panel.hidden = false;
   }
 
-  function showList(redraw = true): void {
+  /** To the list, the chain forgotten: a view switch here, never a Back step. */
+  function toList(redraw = true): void {
     const wasReading = readingNow;
     readingNow = false;
+    chain = [];
     if (wasReading) deps.onLevelChange?.();
     reader.close();
     deps.byId("docs-reader").hidden = true;
@@ -111,7 +162,42 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     if (redraw) void list.refresh().catch(() => undefined);
   }
 
+  /**
+   * One step back: the previous document, reopened at its scroller place, or
+   * the list at the chain's start. This is what the history closing one
+   * `document` level does, so gesture and button walk the same chain.
+   */
+  function back(): void {
+    if (!readingNow || chain.length <= 1) {
+      toList();
+      return;
+    }
+    chain.pop();
+    const previous = chain[chain.length - 1] as { key: string; scrollTop: number };
+    // The depth changed before the reopen lands, so its entry syncs at once.
+    deps.onLevelChange?.();
+    // Stop the reading of the document being left, as reaching the list does.
+    reader.close();
+    void (async () => {
+      try {
+        await reader.open(previous.key);
+      } catch {
+        // The reader already said what happened; stay on the reader so Back works.
+      }
+      if (readingNow && chain[chain.length - 1] === previous) restoreScrollTop(previous.scrollTop);
+    })();
+  }
+
   async function openDocument(key: string): Promise<void> {
+    const current = readingNow ? chain[chain.length - 1] : undefined;
+    if (current) {
+      // The place a Back to this document returns to.
+      current.scrollTop = scrollTopNow();
+      // Reopening the document already open adds no step of its own.
+      if (current.key !== key) chain.push({ key, scrollTop: 0 });
+    } else {
+      chain = [{ key, scrollTop: 0 }];
+    }
     deps.byId("docs-list-view").hidden = true;
     deps.byId("docs-reader").hidden = false;
     readingNow = true;
@@ -211,14 +297,18 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
         await openDocument(key);
         return;
       }
-      showList(false);
+      // Shown with no document named — a switch to this view: the list, the
+      // chain forgotten, however the reader was last left.
+      toList(false);
       try {
         await list.refresh();
       } catch (error) {
         deps.onStatus?.(error instanceof Error ? error.message : "Could not load the documents.");
       }
     },
-    showList,
+    showList: back,
+    back,
+    depth: () => (readingNow ? Math.max(1, chain.length) : 0),
     reading: () => readingNow,
     current(): OpenDocument | null {
       return readingNow ? reader.current() : null;

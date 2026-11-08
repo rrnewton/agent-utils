@@ -795,6 +795,7 @@ const shellNavigation = createPageNavigation({
   closeSettings: () => closeSettings(),
   closeReply: () => closeReply(),
   documentOpen: () => documentsView.reading(),
+  documentDepth: () => documentsView.depth(),
   closeDocument: () => documentsView.showList(),
   threadListBack: () => threadListBack(),
   leaveThread: () => leaveThread(),
@@ -1053,6 +1054,7 @@ const documentsView = createDocumentsView({
   },
   onStatus: (text) => setStatus(text),
   onLevelChange: () => shellNavigation.scheduleBackSync(),
+  onBack: () => shellNavigation.documentBack(),
   onJumpToMention: (mention) => {
     void shellNavigation.jumpToSentMessage({
       service: "discord",

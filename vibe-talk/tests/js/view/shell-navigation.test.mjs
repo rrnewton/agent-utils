@@ -34,11 +34,20 @@ function makeNavigation(state) {
     layoutFit: () => true, listBefore: () => ({ layout: "one" }), sideThreadsHas: () => false,
     replyDocked: () => state.replyDocked,
     rowMenuOpen: () => null, promptsOpen: () => false, actionMenuOpen: () => false,
-    closeSpeedPopover: () => {}, setPromptsOpen: () => {}, setActionMenuOpen: () => {},
+    closeSpeedPopover: () => { calls.push("closeSpeed"); state.hidden.add("speed-popover"); },
+    setPromptsOpen: () => {}, setActionMenuOpen: () => {},
     closeDismissedPopout: () => false, focusList: () => {}, sidePane: () => "side", focusLost: () => false,
     closeSideThread: () => {}, closeHelp: () => calls.push("closeHelp"), closeSettings: () => calls.push("closeSettings"),
     closeReply: () => calls.push("closeReply"), threadListBack: () => calls.push("listBack"),
-    leaveThread: () => calls.push("leaveThread"), showScreen: () => {}, showHelp: () => {}, showView: () => {},
+    // The Documents view as the page wires it (`#1082 documents-back-chain`): an
+    // open chain `state.docs` (keys, current last); opening over one pushes,
+    // closing pops one step. `documentDepth` omitted where a test says unwired.
+    documentOpen: () => state.docs.length > 0,
+    ...(state.noDocDepth ? {} : { documentDepth: () => state.docs.length }),
+    closeDocument: () => { calls.push("closeDocument"); state.docs.pop(); },
+    openDocument: (key) => { calls.push(["openDocument", key]); state.view = "docs"; state.docs.push(key); },
+    leaveThread: () => calls.push("leaveThread"), showScreen: () => {}, showHelp: () => {},
+    showView: (name) => { calls.push(["showView", name]); state.view = name; },
     helpEntries: () => [], threadListOffered: () => true, threadStillKnown: () => true, threading: () => true,
     chooseView: (which) => calls.push(["chooseView", which]), selectSideThread: () => {},
     openThreadFromList: () => {}, chooseOneColumn: (choice) => calls.push(["oneColumn", choice.view]),
@@ -48,7 +57,7 @@ function makeNavigation(state) {
     seekMessage: async () => {}, rowHolding: () => null, answeredElsewhere: () => false,
     providerNameOf: () => "discord", providerName: () => "discord", threadOf: () => null,
     setStatus: (text) => calls.push(["status", text]), showError: (text) => calls.push(["error", text]),
-    guardQuietly: (run) => () => run(), settleFocus: () => {}, replyOnScreen: () => false,
+    guardQuietly: (run) => (...args) => run(...args), settleFocus: () => {}, replyOnScreen: () => false,
     setLinkedMark: () => {}, cardsCycle: () => false, rowShown: () => true, visibleList: () => ({ children: [] }),
     rowOnScreen: () => true, eachColumn: (act) => act(), openReadRun: () => {}, setSearchOpen: () => {},
     finishPackSlide: () => {}, headOfList: () => 0, renderScrollTools: () => {}, revealRow: () => {},
@@ -67,6 +76,7 @@ function makeNavigation(state) {
 
 const freshState = () => ({
   screen: "main", view: "discord", channel: "C1", layout: "one", sideMode: "cards", sideThread: null,
+  docs: [], noDocDepth: false,
   selection: { view: "main", threadId: null, origin: null }, replyDocked: false,
   hidden: new Set(["speed-popover", "dismissed-send-popout"]), timers: [], search: "",
   history: { state: null, replaced: [], replaceState(state, _title, url) { this.replaced.push(url); } },
@@ -89,6 +99,65 @@ test("`#624` shell navigation: with nothing noted, Ctrl/Cmd+[ closes the top lev
   const { nav, calls } = makeNavigation(state);
   assert.equal(nav.placeFromKeyboard(-1), true);
   assert.deepStrictEqual(calls.filter((call) => call === "leaveThread"), ["leaveThread"]);
+});
+
+test("`#1082 documents-back-chain`: the chain's depth is its levels, menus on top; unwired, one document is one level", () => {
+  const state = freshState();
+  state.view = "docs";
+  state.docs = ["doc-a", "doc-b"];
+  state.hidden.delete("speed-popover");
+  const { nav, calls } = makeNavigation(state);
+  assert.deepStrictEqual(nav.backLevels(), ["document", "document", "menu:pace"],
+    "two open documents are not two levels, or a menu is not on top of them");
+  nav.documentBack();
+  assert.deepStrictEqual(calls.filter((call) => call === "closeSpeed"), ["closeSpeed"],
+    "Back did not close the menu first");
+  assert.deepStrictEqual(state.docs, ["doc-a", "doc-b"], "closing the menu popped a document too");
+  const unwired = freshState();
+  unwired.view = "docs";
+  unwired.docs = ["doc-a", "doc-b"];
+  unwired.noDocDepth = true;
+  assert.deepStrictEqual(makeNavigation(unwired).nav.backLevels(), ["document"],
+    "without the depth wired, an open document is not its one old level");
+});
+
+test("`#1082 documents-back-chain`: channel -> document is a jump, a second document stacks over it, and Back walks both steps home", async () => {
+  const state = freshState();
+  const { nav, calls } = makeNavigation(state);
+  nav.jumpToDocumentLink("doc-a");
+  assert.equal(state.view, "docs", "the jump did not open the document");
+  assert.equal(nav.linkJumps.top()?.doc, "doc-a", "the jump does not carry its document");
+  assert.deepStrictEqual(nav.backLevels(), ["jump"], "the document is a level beside its jump, not the jump's own");
+  // A second document opened through the view's open path: one more level.
+  state.docs.push("doc-b");
+  assert.deepStrictEqual(nav.backLevels(), ["jump", "document"]);
+  // Back (the button takes documentBack, the gesture closes the same levels):
+  // the document step first, still reading A, still in Documents.
+  nav.documentBack();
+  assert.deepStrictEqual(state.docs, ["doc-a"], "the first Back did not return to the first document");
+  assert.equal(state.view, "docs");
+  assert.deepStrictEqual(nav.backLevels(), ["jump"]);
+  // Back again: the jump, to the channel the reader came from.
+  nav.documentBack();
+  for (let i = 0; i < 10; i += 1) await Promise.resolve();
+  assert.equal(state.view, "discord", "the second Back did not return to the channel's view");
+  assert.deepStrictEqual(state.docs, [], "returning to the channel left a document open");
+  assert.equal(nav.linkJumps.top(), undefined, "the returned jump is still taken");
+  assert.deepStrictEqual(nav.backLevels(), []);
+  assert.ok(calls.some((call) => Array.isArray(call) && call[0] === "status" && call[1] === "Back where you were."),
+    "the return did not put the reader back on their spot");
+});
+
+test("`#1082 documents-back-chain`: list -> document -> Back is the list's own step, no jump taken", () => {
+  const state = freshState();
+  state.view = "docs";
+  state.docs = ["doc-a"];
+  const { nav, calls } = makeNavigation(state);
+  assert.deepStrictEqual(nav.backLevels(), ["document"]);
+  nav.documentBack();
+  assert.deepStrictEqual(calls.filter((call) => call === "closeDocument"), ["closeDocument"]);
+  assert.deepStrictEqual(state.docs, [], "Back from a list-opened document did not reach the list");
+  assert.equal(nav.linkJumps.top(), undefined, "a list open was taken for a jump");
 });
 
 test("`#624` shell navigation: syncDeepLinkAddress writes the standing place's query once", () => {

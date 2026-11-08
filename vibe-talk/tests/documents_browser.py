@@ -336,7 +336,10 @@ def main() -> int:
                 page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
                 check(page.locator("#pane-docs").is_visible(), "Back from the mention jump left the Documents view")
 
-                # A document link in a message opens the reader in-app (reply 220).
+                # A document link in a message opens the reader in-app (reply
+                # 220), and Back returns to that channel and message, not to
+                # the Documents list (#1082 documents-back-chain). A doc-to-doc
+                # step joins this walk with #1081's in-reader links.
                 page.tap("#view-switch")
                 page.tap("#view-switch")
                 page.wait_for_function("() => !document.getElementById('pane-discord').hidden", timeout=20_000)
@@ -344,7 +347,22 @@ def main() -> int:
                 page.tap("#discord-log a[data-doc]")
                 page.wait_for_function("() => !document.getElementById('docs-reader').hidden", timeout=20_000)
                 check(page.locator("#pane-docs").is_visible(), "the document link did not open the reader in-app")
-                page.tap("#doc-back")
+                page.go_back()
+                page.wait_for_function("() => !document.getElementById('pane-discord').hidden", timeout=20_000)
+                check(page.locator("#pane-docs").is_hidden(),
+                      "Back from a channel-opened document landed on the documents list")
+                page.wait_for_function(
+                    """() => {
+                      const link = document.querySelector('#discord-log a[data-doc]');
+                      const root = document.getElementById('scroll-area');
+                      if (!link || !root) return false;
+                      const at = link.getBoundingClientRect();
+                      const within = root.getBoundingClientRect();
+                      return at.bottom > within.top && at.top < within.bottom;
+                    }""",
+                    timeout=20_000)
+                # On to the list again for the row checks below.
+                page.tap("#view-switch")
                 page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
 
                 # The index document (`#1081`): its relative links render as

@@ -26,6 +26,8 @@ export interface LinkJump {
   readonly spot: LinkSpot;
   readonly below: readonly string[];
   landed: string[] | null;
+  /** The document this jump opened (`#1082 documents-back-chain`), where it opened one. */
+  readonly doc?: string;
 }
 
 /** The jumps' commands and questions. */

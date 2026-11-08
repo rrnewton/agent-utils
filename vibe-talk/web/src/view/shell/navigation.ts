@@ -133,6 +133,8 @@ export interface NavLinkJump {
   readonly spot: NavLinkSpot;
   readonly below: readonly string[];
   landed: string[] | null;
+  /** The document this jump opened (`#1082 documents-back-chain`), where it opened one. */
+  readonly doc?: string;
 }
 
 /** The jumps' owner, as created by `core/navigation`'s `createLinkJumps`. */
@@ -206,7 +208,13 @@ export interface PageNavigationDependencies<Column, ThreadLike, Pane> {
   closeReply(): void;
   /** Whether a document is open in the Documents view (its back level). */
   documentOpen(): boolean;
-  /** Close the open document, back to its list. */
+  /**
+   * How many documents are open in the Documents view's chain
+   * (`#1082 documents-back-chain`), where the page wires it: one back level
+   * each. Unwired, an open document counts as the one level it always was.
+   */
+  documentDepth?(): number;
+  /** Close the open document one step: the previous one, or its list. */
   closeDocument(): void;
   threadListBack(): void;
   leaveThread(): void;
@@ -338,6 +346,8 @@ export interface PageNavigation {
   withLinkJumps(levels: string[]): string[];
   arriveOnChannel(channel: string): void;
   arriveAtPlace(place: NavChannelPlace): void;
+  jumpToDocumentLink(key: string, from?: Element | null): void;
+  documentBack(): void;
   jumpToMessageLink(ref: MessageLinkRef): Promise<void>;
   jumpToSentMessage(ref: MessageLinkRef): Promise<void>;
   returnFromLinkJump(): void;
@@ -479,8 +489,16 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
    * and a reply open in a list. Nothing on the call's view, which waits in front of them.
    */
   function channelLevels(): string[] {
-    // A document open in the Documents view is a level of its own.
-    if (deps.screens().view() === "docs") return deps.documentOpen() ? ["document"] : [];
+    // Each document open in the Documents view's chain is a level of its own
+    // (`#1082 documents-back-chain`): the view owns the chain, this only asks
+    // its depth, and each level's close is the view's one step back. Menus
+    // still go on top of them all, in `screenLevelsNow`.
+    if (deps.screens().view() === "docs") {
+      const wired = deps.documentDepth ? deps.documentDepth() : -1;
+      const depth = Number.isFinite(wired) && wired >= 0 ? Math.floor(wired) : deps.documentOpen() ? 1 : 0;
+      const count = depth > 0 ? depth : deps.documentOpen() ? 1 : 0;
+      return Array.from({ length: count }, () => "document");
+    }
     if (deps.screens().view() !== "discord") return [];
     const levels: string[] = [];
     if (deps.layoutColumns()) {
@@ -526,6 +544,22 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
     else if (tag === "thread") deps.leaveThread();
     else if (tag === "document") deps.closeDocument();
     else if (tag === "jump") returnFromLinkJump();
+  }
+
+  /**
+   * The reader's own Back button (`#1082 documents-back-chain`): the same pop
+   * the gesture takes — the top level, whatever it is (a menu first, then a
+   * document step, then the jump that opened the chain from a channel). With
+   * nothing open over the document, its close is the fallback.
+   */
+  function documentBack(): void {
+    const levels = backLevels();
+    if (levels.length === 0) {
+      deps.closeDocument();
+      return;
+    }
+    closeBackLevel(levels[levels.length - 1] as string);
+    scheduleBackSync();
   }
 
   /** Put the history in step with what is open, at the end of the task that changed it (`BackStack.schedule`). */
@@ -1026,7 +1060,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
             const tap = event as { ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean; altKey?: boolean; button?: number; preventDefault?: () => void };
             if (tap.ctrlKey || tap.metaKey || tap.shiftKey || tap.altKey || (tap.button || 0) > 0) return;
             if (typeof tap.preventDefault === "function") tap.preventDefault();
-            deps.openDocument(docKey);
+            jumpToDocumentLink(docKey, kid);
           }));
           kid.setAttribute("data-in-app", "");
           kid.setAttribute("title", `Opens here — ${String(kid.getAttribute("href") || "")}`);
@@ -1086,6 +1120,69 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
   /** The levels a Back would close, with the jumps taken by links among them (`LinkJumps.levels`). */
   function withLinkJumps(levels: string[]): string[] {
     return linkJumps.levels(levels);
+  }
+
+  /**
+   * Where to come back to from a document link tapped at `from`
+   * (`#1082 documents-back-chain`): the jump spot, with its anchor the linking
+   * message itself where the row holding the link can be named, at its height
+   * now — so Back puts that message back on screen, not merely near it.
+   */
+  function documentLinkSpot(from: Element | null): NavLinkSpot {
+    const base = linkJumpSpot();
+    let node: Element | null = from;
+    for (let depth = 0; node && depth < 12; depth += 1) {
+      let id: string | null = null;
+      try {
+        id = node.getAttribute("data-context-id") || deps.idsOf(node as HTMLElement)[0] || null;
+      } catch (_error) {
+        id = null;
+      }
+      if (id) {
+        let offset = base.offset;
+        try {
+          offset = node.getBoundingClientRect().top - deps.listPlaceTop(el("scroll-area"));
+        } catch (_error) {
+          // Unmeasured, the eye's own anchor height is still the spot to keep.
+        }
+        return { ...base, pinned: false, anchor: id, offset };
+      }
+      node = node.parentElement || (node.parentNode as unknown as Element | null);
+    }
+    return base;
+  }
+
+  /**
+   * Open document `key` from a message (`#1082 documents-back-chain`): a link
+   * jump like a message link's — the spot taken first, the jump one level
+   * from the tap, the document the level it landed on — so Back returns to
+   * the channel and the linking message instead of the documents list. Off
+   * the channel's view there is no spot to take: the document just opens, as
+   * it always did.
+   */
+  function jumpToDocumentLink(key: string, from?: Element | null): void {
+    if (deps.screens().screen() !== "main" || deps.screens().view() !== "discord") {
+      deps.openDocument(key);
+      return;
+    }
+    const spot = documentLinkSpot(from ?? null);
+    const under = linkJumps.top();
+    // A jump still under way when this one is taken: what it had opened is its own.
+    if (under && under.landed === null) under.landed = screenLevelsNow();
+    const jump: NavLinkJump = { spot, below: backLevels(), landed: null, doc: key };
+    linkJumps.take(jump);
+    scheduleBackSync();
+    try {
+      deps.openDocument(key);
+    } finally {
+      // Landed, in the reader or on its failure: what is open now — the
+      // document's levels — is the jump's, and a further document opened
+      // from it is a level over the jump.
+      if (jump.landed === null && linkJumps.holds(jump)) {
+        jump.landed = screenLevelsNow();
+        scheduleBackSync();
+      }
+    }
   }
 
   /** Wait for the channel on screen to have read the view it shows, or to be left; false when it was left. */
@@ -1259,7 +1356,19 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
       return;
     }
     const place = spot.place;
-    if (!place || deps.screens().screen() !== "main" || deps.screens().view() !== "discord") return;
+    if (!place || deps.screens().screen() !== "main") return;
+    // `#1082 documents-back-chain`. A jump into a document comes back from the
+    // Documents view: close its chain (each close is one step, so close until
+    // none is open), put the channel's view back up, and read the channel it
+    // names where it is already the chosen one, as a jump entering it does.
+    if (deps.screens().view() === "docs") {
+      for (let step = 0; step < 16 && deps.documentOpen(); step += 1) deps.closeDocument();
+      deps.settleUiState();
+      deps.showView("discord");
+      if (String(deps.selectedChannelId() || "") === place.channel) {
+        await deps.readEnteredChannel(deps.viewRestored());
+      }
+    } else if (deps.screens().view() !== "discord") return;
     if (!deps.channels().some((channel) => String(channel.id) === place.channel)) return;
     if (String(deps.selectedChannelId()) !== place.channel) {
       arriveOnChannel(place.channel);
@@ -1301,7 +1410,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
     noteDeepLinkReaderMove, deepLinkReaderMoved, deepLinkRefOf, deepLinkFromAddress, deepLinkFor,
     syncDeepLinkAddress, linkedRowShown, landOnDeepLink, waitForDeepLink, applyDeepLink, copyDeepLink,
     keepsInApp, messageLinkLabel, wireMessageLinks, onMessageLinkTap, linkJumpSpot, withLinkJumps,
-    arriveOnChannel, arriveAtPlace, jumpToMessageLink, jumpToSentMessage, returnFromLinkJump,
+    arriveOnChannel, arriveAtPlace, jumpToDocumentLink, documentBack, jumpToMessageLink, jumpToSentMessage, returnFromLinkJump,
     putBackOnSpot,
   };
 }

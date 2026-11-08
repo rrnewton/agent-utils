@@ -38,6 +38,14 @@ function linkMessage(id, href, mark, text = href) {
 const msgMark = (channel, message, thread = "") =>
   ["discord", channel, message, thread].map((part) => encodeURIComponent(part)).join(":");
 
+/** A message whose body is one document link, marked `data-doc` as the server marks one (`#1073`). */
+function docLinkMessage(id, key, href) {
+  return message({
+    id, content: `read ${href}`,
+    content_html: `<p>read <a href="${href}" data-doc="${key}" ${MSG_LINK_ATTRS}>the guide</a></p>\n`,
+  });
+}
+
 /** The first link drawn in `row`. */
 const linkIn = (row) => row.descendants().find((node) => node.tagName === "a");
 
@@ -165,6 +173,78 @@ test("`#543 in-app-message-links`: a tap jumps to a reply — its thread opens o
   await deaf.browserBack();
   await deaf.settle();
   assert.equal(deaf.el("thread-heading").hidden, false, "the control without a return closed the thread anyway");
+});
+
+test("`#1082 documents-back-chain`: a document link in a message opens the reader as ONE jump entry, and Back returns to the channel on the linking message, not to the documents list", async () => {
+  const key = "github:octo/widgets@main:docs/guide.md";
+  const href = "https://github.com/octo/widgets/blob/main/docs/guide.md";
+  const page = newPage(new Map(), SCRIPT, (p) => p.enableHistory());
+  page.documents = [{ key, title: "The guide", content: "# The guide\n\nAll the words.\n", outline: ["The guide"] }];
+  // `linkedThreadData`'s tall channel, its message-link swapped for a document one.
+  const data = linkedThreadData();
+  const at = data.messages.findIndex((m) => m.id === "300");
+  const stamp = data.messages[at].timestamp;
+  data.messages[at] = docLinkMessage("300", key, href);
+  data.messages[at].timestamp = stamp;
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await page.settle();
+  const area = page.el("scroll-area");
+  const row = rowWithId(page, "300");
+  assert.ok(row, "fixture: the message with the document link is not drawn");
+  area.scrollTop += row.getBoundingClientRect().top - area.getBoundingClientRect().top - 40;
+  await area.dispatch("scroll");
+  await page.settle();
+  const before = { length: page.history.length, top: rowWithId(page, "300").getBoundingClientRect().top };
+  assert.ok(area.scrollTop > 0, "fixture: the reader is not scrolled up to the link");
+
+  const tap = await tapLink(page, linkIn(rowWithId(page, "300")));
+  assert.equal(tap.prevented, true, "the document link was left to the browser");
+  await untilDeepLink(page, () => !page.el("docs-reader").hidden && page.el("doc-title").text().includes("The guide"));
+  assert.equal(page.tab(), "docs", "the document link did not open the Documents view");
+  assert.equal(page.history.length - before.length, 1, "the document jump did not push exactly one entry");
+  assert.deepStrictEqual(backFacts(page), { depth: 1, tag: "jump" }, "the document open is not one jump level over the channel");
+
+  await page.browserBack();
+  await untilDeepLink(page, () => !page.el("pane-discord").hidden && statusText(page) === "Back where you were.");
+  assert.equal(page.left, false, "Back from the document left the app");
+  assert.equal(page.tab(), "discord", "Back landed on the documents list, not the channel it came from");
+  assert.deepStrictEqual(backFacts(page), { depth: 0, tag: "top" });
+  const back = rowWithId(page, "300");
+  assert.ok(back, "the linking message is not drawn after Back");
+  assert.ok(Math.abs(back.getBoundingClientRect().top - before.top) <= 1,
+    `Back put the linking message at ${back.getBoundingClientRect().top}, not ${before.top}`);
+});
+
+test("`#1082 documents-back-chain`: list -> document -> Back lands on the list, and a further Back is the browser's as ever", async () => {
+  const page = newPage(new Map(), SCRIPT, (p) => p.enableHistory());
+  page.documents = [{ key: "paste:listed", title: "Listed report", content: "# Listed report\n\nWords.\n", outline: ["Listed report"] }];
+  await signIn(page);
+  await page.el("view-switch").click();
+  await page.settle();
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(page.tab(), "docs", "fixture: the switch did not reach Documents");
+  let card;
+  for (let tries = 0; tries < 10 && !card; tries += 1) {
+    await page.settle();
+    card = page.el("documents-list").querySelectorAll(".doc-card")[0];
+  }
+  assert.ok(card, "fixture: no document card was drawn");
+  await card.click();
+  await page.settle();
+  await untilDeepLink(page, () => !page.el("docs-reader").hidden);
+  assert.deepStrictEqual(backFacts(page), { depth: 1, tag: "document" }, "a list open is not its one document level");
+
+  await page.browserBack();
+  await untilDeepLink(page, () => !page.el("docs-list-view").hidden && page.el("docs-reader").hidden);
+  assert.equal(page.tab(), "docs", "Back from a list-opened document left the Documents view");
+  assert.equal(page.left, false);
+  assert.deepStrictEqual(backFacts(page), { depth: 0, tag: "top" });
+  await page.browserBack();
+  assert.equal(page.left, true, "a Back past the chain's start did not behave as Back does at the top");
 });
 
 test("`#543 in-app-message-links`: JUMPS STACK — a link in the landed reply jumps on to a root in Main's view, two entries deep; Back returns to the reply in its thread, and Back again to All, one jump at a time", async () => {

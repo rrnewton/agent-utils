@@ -155,6 +155,28 @@ test("`#624 voice-page-modularity`: a jump is a level over what was open, a late
   assert.equal(ownLevel("menu:x") && ownLevel("help") && !ownLevel("thread"), true);
 });
 
+test("`#1082 documents-back-chain`: a document jump absorbs its document, and a second document is a level over it", () => {
+  const { createLinkJumps } = NAVIGATION;
+  const jumps = createLinkJumps();
+  const spot = { place: null, column: "main", pinned: false, anchor: "m1", offset: 0, focus: null };
+  // Channel -> document A: the jump carries its document, lands on its level.
+  const jump = { spot, below: [], landed: null, doc: "doc-a" };
+  jumps.take(jump);
+  assert.deepStrictEqual(jumps.levels(["document"]), ["jump"],
+    "while the document opens, it is the jump's, not a level of its own");
+  jump.landed = ["document"];
+  assert.deepStrictEqual(jumps.levels(["document"]), ["jump"], "the landed document stays the jump's one level");
+  // Document B opens from A: the chain is two document levels deep, one over the jump.
+  assert.deepStrictEqual(jumps.levels(["document", "document"]), ["jump", "document"],
+    "the second document is not a level over the jump");
+  assert.deepStrictEqual(jumps.levels(["document", "document", "menu:pace"]), ["jump", "document", "menu:pace"],
+    "a menu is not on top of the chain");
+  // B closed: back to the jump alone, its document still named for the return.
+  assert.deepStrictEqual(jumps.levels(["document"]), ["jump"]);
+  assert.equal(jumps.undo(), jump);
+  assert.equal(jump.doc, "doc-a");
+});
+
 test("`#624 voice-page-modularity`: the Back entries push one per level opened, go back through those closed, and a Back closes down to its entry", async () => {
   const { createBackStack, BACK_STATE_KEY, BACK_TRAVERSAL_MS } = NAVIGATION;
   const entries = [{ state: null }];

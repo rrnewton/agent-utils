@@ -34,6 +34,7 @@ const SELECTOR = await load("src/view/documents/selector.ts");
 const RENDER = await load("src/view/documents/render.ts");
 const LIST = await load("src/view/documents/list.ts");
 const READER = await load("src/view/documents/reader.ts");
+const VIEW = await load("src/view/documents/index.ts");
 
 function requireModule(loaded, entry) {
   assert.ok(loaded.mod, `${entry} did not load: ${loaded.error ? loaded.error.message : "unknown error"}`);
@@ -1073,4 +1074,113 @@ test("documents reader: an unindexed key falls through to fetch, other failures 
   }
   assert.deepEqual(refused, [`GET /api/v1/documents/${encodeURIComponent(key)}`]);
   assert.deepEqual(statuses, ["Could not load the document."]);
+});
+
+// ---- 6. the back chain (`#1082 documents-back-chain`) -----------------------------------------
+//
+// The view owns the open chain; only its depth leaves as back levels. Driven
+// through the view's single open entry (`show(key)`), the way a list tap, a
+// deep link and a later in-reader link all open: each open stacks, `back()`
+// (and `showList()`, the history's close of one `document` level) pops one
+// step, and showing the view with no key — a view switch — forgets it all.
+
+async function withDocumentsView(options, run) {
+  const mod = requireModule(VIEW, "src/view/documents/index.ts");
+  assert.equal(typeof mod.createDocumentsView, "function", "documents does not export createDocumentsView");
+  const els = {};
+  const byId = (id) => {
+    if (!els[id]) {
+      const el = readerEl("div");
+      el.querySelectorAll = () => [];
+      el.scrollTop = 0;
+      el.value = "";
+      els[id] = el;
+    }
+    return els[id];
+  };
+  const docs = {
+    "doc-a": { title: "Doc A", content: "# Doc A\n\nAlpha.\n" },
+    "doc-b": { title: "Doc B", content: "# Doc B\n\nBeta.\n" },
+  };
+  const opened = [];
+  const api = async (path) => {
+    if (String(path).startsWith("/api/v1/documents?")) return { documents: [], total: 0, revision: 1 };
+    const one = /^\/api\/v1\/documents\/([^/?]+)$/.exec(String(path));
+    if (one) {
+      const doc = docs[decodeURIComponent(one[1])];
+      if (!doc) throw new Error("no such document");
+      opened.push(one[1]);
+      return { document: { title: doc.title }, content: doc.content, outline: [] };
+    }
+    return {};
+  };
+  const view = mod.createDocumentsView({
+    api, byId, speak: () => {}, ...(options.onBack ? { onBack: options.onBack } : {}),
+  });
+  const savedDocument = globalThis.document;
+  globalThis.document = { createElement: (tag) => { const el = readerEl(tag); el.querySelectorAll = () => []; return el; } };
+  try {
+    await run({ view, els, byId, opened });
+  } finally {
+    view.unmount();
+    if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
+  }
+}
+
+test("documents view: opens stack, back() walks them one step at a time, the list ends the chain", async () => {
+  await withDocumentsView({}, async ({ view, byId }) => {
+    await view.show("doc-a");
+    assert.equal(view.reading(), true);
+    assert.equal(view.depth(), 1);
+    assert.equal(view.current()?.key, "doc-a");
+    byId("scroll-area").scrollTop = 120;
+    await view.show("doc-b");
+    assert.equal(view.depth(), 2, "a document opened from a document did not stack");
+    assert.equal(view.current()?.key, "doc-b");
+    // Reopening the document already open adds no step.
+    await view.show("doc-b");
+    assert.equal(view.depth(), 2, "reopening the current document stacked it again");
+    view.showList();
+    await flush([]);
+    assert.equal(view.reading(), true, "the first back step left the reader");
+    assert.equal(view.depth(), 1);
+    assert.equal(view.current()?.key, "doc-a", "the first back step did not reopen the previous document");
+    assert.equal(byId("scroll-area").scrollTop, 120, "the previous document did not come back at its place");
+    view.showList();
+    await flush([]);
+    assert.equal(view.reading(), false, "back at the chain's start did not reach the list");
+    assert.equal(view.depth(), 0);
+    assert.equal(byId("docs-list-view").hidden, false);
+    assert.equal(byId("docs-reader").hidden, true);
+  });
+});
+
+test("documents view: showing it with no key (a view switch) forgets the chain", async () => {
+  await withDocumentsView({}, async ({ view }) => {
+    await view.show("doc-a");
+    await view.show("doc-b");
+    assert.equal(view.depth(), 2);
+    await view.show();
+    assert.equal(view.reading(), false, "a switch to the view did not land on the list");
+    assert.equal(view.depth(), 0, "the chain survived a switch to the list");
+    await view.show("doc-a");
+    assert.equal(view.depth(), 1, "an open after the switch did not start a new chain");
+  });
+});
+
+test("documents view: the reader's Back button takes the page's pop where wired, the view's step where not", async () => {
+  const pops = [];
+  await withDocumentsView({ onBack: () => pops.push("pop") }, async ({ view, byId }) => {
+    await view.show("doc-a");
+    dispatchClick(byId("doc-back"));
+    assert.deepEqual(pops, ["pop"], "the Back button did not take the page navigation's pop");
+    assert.equal(view.depth(), 1, "the view popped its own chain under the page's pop");
+  });
+  await withDocumentsView({}, async ({ view, byId }) => {
+    await view.show("doc-a");
+    await view.show("doc-b");
+    dispatchClick(byId("doc-back"));
+    await flush([]);
+    assert.equal(view.current()?.key, "doc-a", "unwired, the Back button did not pop one document step");
+  });
 });
