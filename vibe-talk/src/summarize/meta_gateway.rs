@@ -59,14 +59,24 @@ pub const BACKEND: &str = "meta-gateway";
 
 /// The whole request body. THERE IS NO `tools`, `tool_choice` OR `temperature` FIELD, and there
 /// must never be: see the module doc.
+///
+/// The budget is sent as `max_completion_tokens`, the one spelling both gateway families this
+/// backend has been measured against accept: current Azure-hosted reasoning deployments refuse
+/// `max_tokens` outright ("use max_completion_tokens instead"), while the gateway Spark is
+/// served from accepts either. The operator's setting keeps its `max_tokens` name — it is the
+/// budget either way — and only the wire spelling follows the gateways. There is deliberately
+/// no per-model branch: switching models stays a `base_url` and `model` change in
+/// configuration, never a code path.
 #[derive(Debug, Serialize)]
 pub struct ChatRequest<'a> {
     /// The model to ask, exactly as configured.
     pub model: &'a str,
-    /// The output budget, reasoning included: see the module doc.
-    pub max_tokens: u32,
-    /// How hard the model reasons before writing, as the gateway spells it.
-    pub reasoning_effort: &'a str,
+    /// The output budget ([`LlmConfig::max_tokens`]), reasoning included: see the module doc.
+    pub max_completion_tokens: u32,
+    /// How hard the model reasons before writing, as the gateway spells it. Absent when the
+    /// section says `reasoning_effort = "off"`, for a model that refuses the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<&'a str>,
     /// Exactly two turns: the instruction, then the fenced channel text.
     pub messages: [ChatTurn<'a>; 2],
 }
@@ -86,8 +96,8 @@ impl<'a> ChatRequest<'a> {
     pub fn new(config: &'a LlmConfig, system: &'a str, prompt: &'a str) -> Self {
         Self {
             model: &config.model,
-            max_tokens: config.max_tokens,
-            reasoning_effort: config.reasoning_effort.as_str(),
+            max_completion_tokens: config.max_tokens,
+            reasoning_effort: config.reasoning_effort.sent(),
             messages: [
                 ChatTurn {
                     role: "system",

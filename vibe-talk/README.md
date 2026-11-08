@@ -2366,7 +2366,7 @@ base_url = "https://models.gateway.example/v1"     # required: no gateway addres
 model = "my-gateway-model"                         # required: no model name is built in either
 client_identity_file = "/path/to/identity.pem"     # certificate chain + private key; required
 ca_bundle_file = "/path/to/private-root.pem"       # only if the gateway chains to a private root
-# reasoning_effort = "low"                         # the default; minimal|low|medium|high|xhigh|max
+# reasoning_effort = "low"                         # the default; minimal|low|medium|high|xhigh|max|off
 # max_tokens = 2048                                # this backend's default; reasoning spends it too
 
 [summaries.llm.extra_headers]
@@ -2385,6 +2385,51 @@ name here, and `reasoning_effort` is refused there: a section copied from one ba
 other fails loudly instead of half-applying. A section with no `backend` at all keeps meaning
 the Messages API summariser, byte for byte — including its cache keys.
 
+### Switching models is configuration only
+
+The backend and the model are switches in this section, never code paths: the gateway client
+sends `model` exactly as written to `{base_url}/chat/completions`, and the three configurations
+below are complete sections (an overlay naming `[summaries.llm]` replaces the section whole, so
+write all of it). Switching re-derives summaries under the new cache key as rows are viewed;
+thread names are kept.
+
+A Spark-class reasoning model on a chat-completions gateway, at the default effort:
+
+```toml
+[summaries.llm]
+backend = "meta_gateway"
+base_url = "https://models.gateway.example/v1"
+model = "muse-spark-1.3-internal"
+client_identity_file = "/path/to/identity.pem"
+ca_bundle_file = "/path/to/private-root.pem"
+reasoning_effort = "low"                         # the default; "minimal" is faster, "off" omits the field
+max_tokens = 2048                                # this backend's default; reasoning spends it too
+```
+
+Back to a small Messages model — the pre-existing path, unchanged (the Vertex spelling of the
+same switch is the gateway section above):
+
+```toml
+[summaries.llm]
+dialect = "anthropic"
+api_key_file = "/run/secrets/anthropic-api-key"
+model = "claude-haiku-4-5"                       # the default
+```
+
+Another vendor's reasoning model on its own chat-completions gateway is the same backend with
+two lines changed — measured working this way against a `gpt-6-luna` deployment, whose gateway
+requires the `max_completion_tokens` spelling this client already sends:
+
+```toml
+[summaries.llm]
+backend = "meta_gateway"
+base_url = "https://other.gateway.example/openai/v1"
+model = "gpt-6-luna"
+client_identity_file = "/path/to/identity.pem"
+ca_bundle_file = "/path/to/private-root.pem"
+reasoning_effort = "low"                         # or "off" for a model that refuses the field
+```
+
 ### Every setting
 
 | Setting | Default | Notes |
@@ -2393,7 +2438,7 @@ the Messages API summariser, byte for byte — including its cache keys.
 | `dialect` | `anthropic` | `messages_api` only: `anthropic` or `vertex` |
 | `base_url` | per dialect | `https://` only; plain `http://` is accepted for a loopback address (a local mock or sidecar). No credentials, query or fragment. **Required for `meta_gateway`** |
 | `model` | `claude-haiku-4-5` | letters, digits, `-`, `.`, `_`, `@`. Never taken from `summaries.model`. **Required for `meta_gateway`** (no default) |
-| `reasoning_effort` | `low` | `meta_gateway` only: `minimal`, `low`, `medium`, `high`, `xhigh` or `max` |
+| `reasoning_effort` | `low` | `meta_gateway` only: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `off` (send no effort field, for a model that refuses one) |
 | `project`, `region` | — | Vertex only, and required there |
 | `api_key_file` | — | **required for `anthropic`**; on `vertex`, sent only when set; refused on `meta_gateway` |
 | `bearer_token_file` | — | Vertex only; re-read on every call |

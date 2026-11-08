@@ -736,6 +736,11 @@ pub enum ReasoningEffort {
     Xhigh,
     /// The most the gateway accepts.
     Max,
+    /// Send no `reasoning_effort` field at all, for a gateway model that refuses one (a model
+    /// that does not reason separately, whose gateway rejects the parameter rather than
+    /// ignoring it). Deliberately not spelled as an effort level the gateway might read as
+    /// one: this server omits the key, it does not ask for no reasoning.
+    Off,
 }
 
 impl ReasoningEffort {
@@ -743,7 +748,9 @@ impl ReasoningEffort {
     /// message, little enough that the answer is not mostly reasoning.
     pub const DEFAULT: Self = Self::Low;
 
-    /// The spelling sent to the gateway and folded into the cache key.
+    /// The spelling in the configuration file and the cache key. For every level but
+    /// [`ReasoningEffort::Off`] it is also the spelling sent to the gateway; see
+    /// [`ReasoningEffort::sent`].
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -753,6 +760,17 @@ impl ReasoningEffort {
             Self::High => "high",
             Self::Xhigh => "xhigh",
             Self::Max => "max",
+            Self::Off => "off",
+        }
+    }
+
+    /// The `reasoning_effort` value to SEND, or `None` to omit the field
+    /// ([`ReasoningEffort::Off`]).
+    #[must_use]
+    pub fn sent(self) -> Option<&'static str> {
+        match self {
+            Self::Off => None,
+            level => Some(level.as_str()),
         }
     }
 }

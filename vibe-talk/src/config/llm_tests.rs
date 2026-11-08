@@ -527,6 +527,16 @@ fn a_meta_gateway_section_takes_its_own_defaults_and_no_other() {
     let llm = cfg.summaries.llm.expect("read");
     assert_eq!(llm.reasoning_effort, ReasoningEffort::Minimal);
     assert_eq!(llm.max_tokens, 512);
+    // …or no effort field at all, for a gateway model that refuses one.
+    let cfg = load(
+        "[summaries.llm]\nbackend = \"meta_gateway\"\n\
+         base_url = \"https://models.gateway.example/v1\"\nmodel = \"test-gateway-model\"\n\
+         reasoning_effort = \"off\"\nclient_identity_file = \"/run/secrets/identity.pem\"\n",
+    )
+    .expect("valid");
+    let llm = cfg.summaries.llm.expect("read");
+    assert_eq!(llm.reasoning_effort, ReasoningEffort::Off);
+    assert_eq!(llm.reasoning_effort.sent(), None);
     // …and the backend the section always meant still says so in so many words, with the
     // Messages defaults an existing deployment already runs on.
     let cfg =

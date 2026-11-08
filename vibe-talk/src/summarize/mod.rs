@@ -907,6 +907,17 @@ mod tests {
             "changing llm.reasoning_effort moved a messages_api cache key, though that backend \
              never sends it"
         );
+        // `off` is a wording choice of the gateway backend's too: no field sent is a different
+        // ask from any level sent, and the answers differ accordingly.
+        let gateway_off = with_llm(|l| {
+            l.backend = crate::config::LlmBackend::MetaGateway;
+            l.reasoning_effort = crate::config::ReasoningEffort::Off;
+        });
+        assert_ne!(
+            gateway_base,
+            policy_version(&gateway_off, meta_gateway::BACKEND),
+            "switching llm.reasoning_effort off left a meta_gateway cache key unchanged"
+        );
     }
 
     #[test]

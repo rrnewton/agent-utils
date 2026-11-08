@@ -225,10 +225,13 @@ async fn one_gateway_call_with_no_tools_and_no_credential_header() {
         );
     }
     assert_eq!(body["model"], "test-gateway-model");
+    // The one budget spelling both measured gateway families accept; the other is refused
+    // outright by current Azure-hosted deployments, so its absence is asserted too.
     assert_eq!(
-        body["max_tokens"],
+        body["max_completion_tokens"],
         crate::config::DEFAULT_META_GATEWAY_MAX_TOKENS
     );
+    assert!(!body.contains_key("max_tokens"), "{body:?}");
     assert_eq!(body["reasoning_effort"], "low");
     let turns = body["messages"].as_array().expect("messages");
     assert_eq!(turns.len(), 2, "one instruction and one user turn");
@@ -361,7 +364,20 @@ fn the_endpoint_is_the_chat_completions_path_under_the_base() {
     );
     let body = serde_json::to_value(ChatRequest::new(&config, "sys", "prompt")).expect("JSON");
     let object = body.as_object().expect("a JSON object");
-    for absent in ["tools", "tool_choice", "temperature"] {
+    for absent in ["tools", "tool_choice", "temperature", "max_tokens"] {
         assert!(!object.contains_key(absent), "{absent:?} in {object:?}");
     }
+    assert!(object.contains_key("max_completion_tokens"), "{object:?}");
+    assert!(object.contains_key("reasoning_effort"), "{object:?}");
+    // `off` omits the field entirely: a model that refuses the parameter is a configuration
+    // away, not a code path.
+    let off = LlmConfig {
+        reasoning_effort: ReasoningEffort::Off,
+        ..crate::summarize::tests::llm()
+    };
+    let body = serde_json::to_value(ChatRequest::new(&off, "sys", "prompt")).expect("JSON");
+    assert!(
+        !body.as_object().unwrap().contains_key("reasoning_effort"),
+        "off still sent an effort: {body:?}"
+    );
 }

@@ -4,7 +4,7 @@ status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-11-07T21:41:55.000000000+00:00
-updated_at: 2026-11-07T22:22:34.000000000+00:00
+updated_at: 2026-11-08T01:37:11.000000000+00:00
 closed_at: 2026-11-07T22:22:34.000000000+00:00
 ---
 
@@ -56,3 +56,5 @@ Quality read (mu-spark judging): Spark's message answers fit the brief — one s
 5. Thread: staged rollout (internal Monday, ten percent Wednesday 10:00). Spark: `sync-rollout-plan` / "starting with internal accounts Monday, then ten percent Wednesday at 10:00 with flag rollback and error-rate graphs at each step." Haiku: `sync-rollout-schedule` / "Wednesday morning launch for internal accounts, then ten percent…" — the Wednesday step attached to the wrong cohort.
 
 Unverified here: gateway behaviour under sustained production rate (the client-side limit and 429 handling are the shipped ones, tested against a local mock), and long-run certificate rotation in service (the reload is the Messages backend's, likewise mock-tested; the live switch is the coordinator's deploy, not this change's). No live configuration was edited and nothing was restarted.
+
+Addendum (owner follow-up, same day): switching stays configuration-only, and a second vendor's model was probed to prove it. The owner approved Spark at low effort and asked that it stay swappable — back to a Haiku-class Messages model or on to `gpt-6-luna` if available. It is available, with one wire difference: Luna is not on the Spark gateway (its model list holds only that gateway family's models; the id answers model-not-found), but its own per-model chat-completions gateway answers this server's existing client identity directly — tiny prompt and five of the sample inputs all succeeded at the shipped prompts, p50 1.20 s at low effort. Its deployment refuses `max_tokens` and requires `max_completion_tokens`; the Spark gateway accepts both spellings and honours the new one identically, so the client now sends the one spelling both take, and `reasoning_effort = "off"` omits the effort field for any future model that refuses it. No per-model branch was added: `model` is sent exactly as written, and the Haiku switch-back remains the `messages_api` backend. The README's Summaries section carries all three complete overlay blocks.
