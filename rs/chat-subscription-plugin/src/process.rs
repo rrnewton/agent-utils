@@ -884,12 +884,32 @@ fn child_report_status(descriptor: i32, status: u8) {
     }
 }
 
-fn supervisor_wait_forever() -> ! {
+/// How often a supervisor checks that its host is still alive.
+const SUPERVISOR_HOST_CHECK: libc::timespec = libc::timespec {
+    tv_sec: 0,
+    tv_nsec: 500_000_000,
+};
+
+/// Hold the process group for as long as the host `host` lives, then take the group down.
+///
+/// The host kills this group itself when it cleans up. A host that is killed outright
+/// (SIGKILL, or a parent-death signal from its own launcher) never gets to, and a supervisor
+/// that only paused, with every blockable signal masked and no parent-death coupling, then
+/// lived on under init forever, holding the plugin's group, its working directory and whatever
+/// it ran from (#1061 chat-launch-outer-kill-leak). So the supervisor watches for its parent to
+/// change -- the kernel reparents it the moment the host process exits, whichever of the host's
+/// threads launched it -- and then kills its own group, itself included, as the host would
+/// have. It holds no descriptor for this.
+fn supervisor_wait_for_host(host: libc::pid_t) -> ! {
     loop {
-        // SAFETY: pause has no pointer arguments. Signals only cause the loop to retry; SIGKILL
-        // terminates the supervisor without returning.
+        // SAFETY: getppid, kill and nanosleep take scalar arguments or a pointer to the static
+        // interval above; all are async-signal-safe, as this post-clone child requires.
         unsafe {
-            libc::pause();
+            if libc::syscall(libc::SYS_getppid) != libc::c_long::from(host) {
+                libc::kill(0, libc::SIGKILL);
+                libc::_exit(137);
+            }
+            libc::nanosleep(&SUPERVISOR_HOST_CHECK, std::ptr::null_mut());
         }
     }
 }
@@ -1051,9 +1071,10 @@ where
             child_report_status(ready_writer, SUPERVISOR_PARENT_DEATH_FAILED);
             unsafe { libc::_exit(124) };
         }
-        // Establish a durable group leader before creating the executable child. This supervisor
-        // never exits voluntarily: the host therefore kills a still-owned PGID before any reaper
-        // can release and recycle that numeric identity.
+        // Establish a durable group leader before creating the executable child. While the host
+        // lives this supervisor never exits voluntarily: the host therefore kills a still-owned
+        // PGID before any reaper can release and recycle that numeric identity. If the host dies
+        // first, the supervisor kills the group itself (`supervisor_wait_for_host`).
         // SAFETY: setpgid with zero arguments targets this freshly cloned process.
         if unsafe { libc::setpgid(0, 0) } < 0 {
             child_report_status(ready_writer, SUPERVISOR_GROUP_FAILED);
@@ -1095,7 +1116,7 @@ where
         // SAFETY: release_child was preserved solely for this one-byte handshake.
         unsafe { libc::close(release_child) };
         child_report_status(ready_writer, SUPERVISOR_READY);
-        supervisor_wait_forever();
+        supervisor_wait_for_host(parent_process_id);
     }
 
     let process_id = u32::try_from(result).unwrap_or_else(|_| {
@@ -4093,6 +4114,7 @@ mod tests {
     const AUTOREAP_MARKER_ENV: &str = "CHAT_SUBSCRIPTION_AUTOREAP_MARKER";
     const SPAWN_RACE_HELPER_ENV: &str = "CHAT_SUBSCRIPTION_SPAWN_RACE_HELPER";
     const SIGNAL_MASK_HELPER_ENV: &str = "CHAT_SUBSCRIPTION_SIGNAL_MASK_HELPER";
+    const KILLED_HOST_MARKER_ENV: &str = "CHAT_SUBSCRIPTION_KILLED_HOST_MARKER";
     const TRANSFER_FAILURE_HELPER_ENV: &str = "CHAT_SUBSCRIPTION_TRANSFER_FAILURE_HELPER";
 
     extern "C" fn inherited_signal_handler(_signal: libc::c_int) {
@@ -4569,6 +4591,91 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// #1061 chat-launch-outer-kill-leak: a host killed outright never cleans up its plugin's
+    /// process group, and its supervisor, which masks every blockable signal and keeps no
+    /// parent-death coupling, then lived on under init for days. It must take the group down
+    /// itself once its host is gone.
+    #[test]
+    fn a_supervisor_takes_its_group_down_when_its_host_is_killed() {
+        if let Some(marker) = std::env::var_os(KILLED_HOST_MARKER_ENV) {
+            let mut command = Command::new("/bin/sleep");
+            command.arg("600");
+            let child = ProcessPluginChild::spawn_with_registry(command, CleanupRegistry::new(1))
+                .expect("spawn the plugin under a supervisor");
+            let plugin = child.plugin.as_ref().expect("plugin child").id();
+            fs::write(&marker, format!("{} {plugin}", child.id())).expect("record identities");
+            loop {
+                thread::sleep(Duration::from_secs(60));
+            }
+        }
+
+        let marker = std::env::temp_dir().join(format!(
+            "chat-subscription-killed-host-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&marker);
+        let mut host = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "process::tests::a_supervisor_takes_its_group_down_when_its_host_is_killed",
+                "--nocapture",
+            ])
+            .env(KILLED_HOST_MARKER_ENV, &marker)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start the host");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let recorded = loop {
+            if let Ok(text) = fs::read_to_string(&marker) {
+                if let Some((supervisor, plugin)) = text.split_once(' ') {
+                    break [supervisor.parse::<u32>(), plugin.parse::<u32>()];
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the host never recorded its supervisor"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        let [Ok(supervisor), Ok(plugin)] = recorded else {
+            panic!("unreadable identities in {}", marker.display());
+        };
+        let started = |pid: u32| {
+            fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| stat.rsplit_once(')').map(|(_, rest)| rest.to_owned()))
+                .and_then(|rest| rest.split_whitespace().nth(19).map(str::to_owned))
+        };
+        let identities = [(supervisor, started(supervisor)), (plugin, started(plugin))];
+        assert!(
+            identities.iter().all(|(_, start)| start.is_some()),
+            "{identities:?}"
+        );
+        host.kill().expect("kill the host outright");
+        host.wait().expect("reap the host");
+        // Alive: the same process (same start time) and not a zombie.
+        let alive = |(pid, start): &(u32, Option<String>)| {
+            started(*pid) == *start
+                && !fs::read_to_string(format!("/proc/{pid}/status"))
+                    .is_ok_and(|status| status.lines().any(|line| line.starts_with("State:\tZ")))
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while identities.iter().any(alive) {
+            if Instant::now() >= deadline {
+                for (pid, start) in &identities {
+                    if started(*pid) == *start {
+                        // SAFETY: kill takes scalar arguments; the pid is verified by start time.
+                        unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) };
+                    }
+                }
+                panic!("the plugin group outlived its killed host: {identities:?}");
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        fs::remove_file(marker).expect("remove the host marker");
     }
 
     #[test]

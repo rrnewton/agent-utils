@@ -624,7 +624,10 @@ def test_killing_outer_pytest_leaves_no_chat_run(tmp_path: Path) -> None:
     env["CHAT_LAUNCH_MARKER"] = str(marker)
     env["PYTHONPATH"] = str(AU_ROOT / "py") + os.pathsep + env.get("PYTHONPATH", "")
     outer = subprocess.Popen(
-        [sys.executable, "-m", "pytest", str(helper), "-x", "-q", "-p", "no:cacheprovider"],
+        # The inner run's temporary tree goes under this test's, so every process it starts
+        # names this test's tree and `survivors` below can find it.
+        [sys.executable, "-m", "pytest", str(helper), "-x", "-q", "-p", "no:cacheprovider",
+         "--basetemp", str(tmp_path / "inner")],
         cwd=tmp_path,
         env=env,
         stdout=subprocess.PIPE,
@@ -632,23 +635,47 @@ def test_killing_outer_pytest_leaves_no_chat_run(tmp_path: Path) -> None:
         text=True,
         start_new_session=True,
     )
+    record: dict[str, object] = {}
+
+    def survivors() -> list[int]:
+        # Every process still naming this fixture's tree: the bridge, the harness, the launcher,
+        # and anything they started, such as the subscription plugin's supervisor, which carries
+        # the bridge's command line (#1061 chat-launch-outer-kill-leak: one lived for two days).
+        found = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit() or int(entry.name) == os.getpid():
+                continue
+            try:
+                cmdline = (entry / "cmdline").read_bytes()
+                state = next(
+                    (line for line in (entry / "status").read_text().splitlines()
+                     if line.startswith("State:")),
+                    "",
+                )
+            except OSError:
+                continue
+            if str(tmp_path).encode() in cmdline and "zombie" not in state:
+                found.append(int(entry.name))
+        return found
+
     try:
         assert _wait_for(lambda: marker.exists(), 300), "outer pytest never launched its fixture"
         record = json.loads(marker.read_text())
         outer.kill()  # SIGKILL to the pytest process only, as a killed gate step does.
         outer.wait(timeout=30)
-
-        def gone() -> bool:
-            if Path(f"/proc/{record['bridge_pid']}").exists():
-                return False
-            if Path(f"/proc/{record['harness_pid']}").exists():
-                return False
-            if Path(f"/proc/{record['launcher_pid']}").exists():
-                return False
-            return True
-
-        assert _wait_for(gone, 30), f"fixture children survived the outer kill: {record}"
+        assert _wait_for(lambda: not survivors(), 30), (
+            f"fixture processes survived the outer kill: {survivors()} ({record})"
+        )
     finally:
         if outer.poll() is None:
             outer.kill()
             outer.wait(timeout=30)
+        # Whatever the verdict, nothing this test started outlives it. Each pid is checked to
+        # still name this test's temporary tree just before it is killed, so a reused pid is
+        # never hit.
+        for pid in survivors():
+            try:
+                if str(tmp_path).encode() in Path(f"/proc/{pid}/cmdline").read_bytes():
+                    os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
