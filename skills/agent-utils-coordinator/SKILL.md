@@ -49,7 +49,13 @@ created from.
    permission settings; profiles are owner policy.
 3. Give a complete brief: the goal and why, the slot and branch, how to validate, where to record
    findings, how to report back, and when to stop.
-4. Use a fresh agent name for a fresh task.
+4. Use a fresh agent for a fresh task. A new major task gets a new agent started from a handoff
+   brief. Never repurpose an idle agent by sending it an unrelated task. If an earlier agent's
+   context matters, have it write a handoff brief, stop it, and start the new agent from that
+   brief. A stopped session stays resumable by ID. Reviewers are allocated per pull request: one
+   fresh reviewer agent per pull request. It stays for that pull request's later heads and is
+   stopped when the pull request lands or closes. Context from one review is mostly noise for
+   the next.
 
 Start, message, read, and stop agents only through `agentctl`, never with raw terminal-multiplexer
 commands. `agentctl send` opens every prompt with a sender header
