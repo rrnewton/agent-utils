@@ -75,3 +75,109 @@ export function createColumnWork<C extends WorkedColumn>(columns: { readonly mai
     },
   };
 }
+
+/** The elements of the channel's pane, and the right column's that stand in for each. */
+export const COLUMN_IDS = {
+  "scroll-area": "side-scroll",
+  "pane-discord": "side-pane",
+  "channel-summary": "side-summary",
+  "summary-note": "side-summary-note",
+  "inbox-note": "side-inbox-note",
+  "clear-backlog": "side-clear-backlog",
+  "load-older": "side-older",
+  "search-older-note": "side-search-older-note",
+  "timeline-notice": "side-notice",
+  "channel-loading": "side-loading",
+  "thread-list": "side-thread-list",
+  "discord-log": "side-log",
+  "pinned-log": "side-pinned-log",
+  "outgoing-log": "side-outgoing-log",
+  "channel-composer": "side-composer",
+  "channel-compose-text": "side-compose-text",
+  "channel-send": "side-send",
+  "channel-compose-state": "side-compose-state",
+  "search-empty": "side-search-empty",
+  "scroll-tools": "side-tools",
+  "jump-newest": "side-jump-newest",
+  "jump-newest-label": "side-jump-newest-label",
+  // `#277 reply-in-column`. Where a reply opened in the column is written, at the column's foot.
+  "column-reply": "side-reply",
+};
+
+/** What a search of one column counted, for the count in the bar. */
+export interface ColumnSearchCount {
+  matched: number;
+  loaded: number;
+  tally: unknown;
+  pinned: boolean;
+}
+
+/** One column's own records, by field group (`#624 voice-page-modularity`, plan step 15). */
+export interface PageColumn<Older, Arrows, Load, Entry, Pins, Tools, Filter, List, Rows, Selection, Composer, Done, Place, Gather> extends WorkedColumn {
+  name: string;
+  searched: ColumnSearchCount | null;
+  searchWalk: unknown;
+  searchNote: { key: string; text: string } | null;
+  older: Older;
+  arrows: Arrows;
+  load: Load;
+  entry: Entry;
+  pins: Pins;
+  tools: Tools;
+  filter: Filter;
+  list: List;
+  rows: Rows;
+  selection: Selection;
+  composer: Composer;
+  done: Done;
+  place: Place;
+  gather: Gather;
+}
+
+/** The right column: a page column, and what it shows. */
+export interface SidePageColumn<Older, Arrows, Load, Entry, Pins, Tools, Filter, List, Rows, Selection, Composer, Done, Place, Gather>
+  extends PageColumn<Older, Arrows, Load, Entry, Pins, Tools, Filter, List, Rows, Selection, Composer, Done, Place, Gather> {
+  mode: "list" | "thread";
+  fromCards: boolean;
+}
+
+/** A fresh record of each field group, as the page makes them. */
+export interface ColumnFreshMakers<Older, Arrows, Load, Entry, Pins, Tools, Filter, List, Rows, Selection, Composer, Done, Place, Gather> {
+  older(): Older;
+  arrows(): Arrows;
+  load(): Load;
+  entry(): Entry;
+  pins(): Pins;
+  tools(): Tools;
+  filter(): Filter;
+  list(): List;
+  rows(): Rows;
+  selection(view?: string): Selection;
+  composer(): Composer;
+  done(): Done;
+  place(): Place;
+  gather(): Gather;
+}
+
+/**
+ * The two columns, each with its own fresh records: Main on the left, and on the right the list of
+ * threads or one thread. Nothing is shared between them; a record made for one is never the other's.
+ */
+export function createColumns<Older, Arrows, Load, Entry, Pins, Tools, Filter, List, Rows, Selection, Composer, Done, Place, Gather>(
+  fresh: ColumnFreshMakers<Older, Arrows, Load, Entry, Pins, Tools, Filter, List, Rows, Selection, Composer, Done, Place, Gather>,
+): {
+  main: PageColumn<Older, Arrows, Load, Entry, Pins, Tools, Filter, List, Rows, Selection, Composer, Done, Place, Gather>;
+  side: SidePageColumn<Older, Arrows, Load, Entry, Pins, Tools, Filter, List, Rows, Selection, Composer, Done, Place, Gather>;
+} {
+  const column = (name: string, selection: Selection): PageColumn<Older, Arrows, Load, Entry, Pins, Tools, Filter, List, Rows, Selection, Composer, Done, Place, Gather> => ({
+    name, left: false, searched: null, searchWalk: null, searchNote: null,
+    older: fresh.older(), arrows: fresh.arrows(), load: fresh.load(), entry: fresh.entry(),
+    pins: fresh.pins(), tools: fresh.tools(), filter: fresh.filter(), list: fresh.list(),
+    rows: fresh.rows(), selection, composer: fresh.composer(), done: fresh.done(),
+    place: fresh.place(), gather: fresh.gather(),
+  });
+  return {
+    main: column("main", fresh.selection("main")),
+    side: { ...column("side", fresh.selection()), mode: "list", fromCards: false },
+  };
+}

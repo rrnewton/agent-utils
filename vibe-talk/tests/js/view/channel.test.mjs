@@ -1664,3 +1664,23 @@ test("quoteSelectionNow opens the quick reply for held words, and does nothing w
   assert.equal(quoting.quickReplyOpen(), true);
   assert.equal(byIdMap.get("quick-reply-quote").textContent, "held words");
 });
+
+test("`#624 voice-page-modularity`: the two columns are made fresh, each with its own records, the right one a list not from cards", () => {
+  const { createColumns, COLUMN_IDS } = CHANNEL_VIEW;
+  let made = 0;
+  const fresh = () => ({ n: ++made });
+  const columns = createColumns({
+    older: fresh, arrows: fresh, load: fresh, entry: fresh, pins: fresh, tools: fresh,
+    filter: fresh, list: fresh, rows: fresh, selection: (view = "thread") => ({ view }), composer: fresh,
+    done: fresh, place: fresh, gather: fresh,
+  });
+  assert.equal(columns.main.name, "main");
+  assert.equal(columns.side.name, "side");
+  assert.deepStrictEqual([columns.side.mode, columns.side.fromCards, columns.side.left], ["list", false, false]);
+  assert.equal(columns.main.selection.view, "main");
+  assert.equal(columns.side.selection.view, "thread");
+  assert.notEqual(columns.main.older, columns.side.older, "the columns shared a record");
+  assert.equal(made, 26, "a field group was made twice or not at all");
+  assert.equal(COLUMN_IDS["scroll-area"], "side-scroll");
+  assert.equal(COLUMN_IDS["column-reply"], "side-reply");
+});

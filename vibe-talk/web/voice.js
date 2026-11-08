@@ -108,33 +108,8 @@ const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
 // makes the right column the one worked on, runs, and puts the left column back before it returns. Nothing is left pointing at the right column between
 // one event and the next, so code that never heard of a second column keeps meaning the left one.
 
-/** The elements of the channel's pane, and the right column's that stand in for each. */
-const COLUMN_IDS = {
-  "scroll-area": "side-scroll",
-  "pane-discord": "side-pane",
-  "channel-summary": "side-summary",
-  "summary-note": "side-summary-note",
-  "inbox-note": "side-inbox-note",
-  "clear-backlog": "side-clear-backlog",
-  "load-older": "side-older",
-  "search-older-note": "side-search-older-note",
-  "timeline-notice": "side-notice",
-  "channel-loading": "side-loading",
-  "thread-list": "side-thread-list",
-  "discord-log": "side-log",
-  "pinned-log": "side-pinned-log",
-  "outgoing-log": "side-outgoing-log",
-  "channel-composer": "side-composer",
-  "channel-compose-text": "side-compose-text",
-  "channel-send": "side-send",
-  "channel-compose-state": "side-compose-state",
-  "search-empty": "side-search-empty",
-  "scroll-tools": "side-tools",
-  "jump-newest": "side-jump-newest",
-  "jump-newest-label": "side-jump-newest-label",
-  // `#277 reply-in-column`. Where a reply opened in the column is written, at the column's foot.
-  "column-reply": "side-reply",
-};
+/** The elements of the channel's pane, and the right column's that stand in for each: one owner in
+ * web/src/view/channel/columnwork.ts (`COLUMN_IDS`, `#624 voice-page-modularity`). */
 
 /**
  * The two columns. `left` says the column has been worked on and left since it was last made afresh
@@ -160,7 +135,8 @@ const COLUMN_IDS = {
  * shows as Done (`freshDoneState`, `doneState`) and where its list stands against its newest message
  * (`freshScrollPlace`, `scrollPlace`) and what is gathered in its list (`freshGatherState`,
  * `gatherState`; `#624 voice-page-modularity`, plan step 15): every field group a column keeps, each
- * on the column itself.
+ * on the column itself. One owner in web/src/view/channel/columnwork.ts (`createColumns`), made here
+ * from the page's fresh records.
  *
  * @typedef {{matched: number, loaded: number, tally: any, pinned: boolean}} SearchCount
  * @typedef {{name: string, left: boolean, searched: SearchCount | null,
@@ -174,17 +150,13 @@ const COLUMN_IDS = {
  *   place: ReturnType<typeof freshScrollPlace>, gather: ReturnType<typeof freshGatherState>}} ColumnFields
  * @type {{main: ColumnFields, side: ColumnFields & {mode: "list" | "thread", fromCards: boolean}}}
  */
-const columns = {
-  main: { name: "main", left: false, searched: null, searchWalk: null, searchNote: null, older: freshOlderPages(), arrows: freshReplyArrows(),
-    load: freshLoadState(), entry: freshEntryState(), pins: freshPinsView(), tools: freshScrollTools(),
-    filter: freshFilterState(), list: freshListState(), rows: freshTimelineRows(), selection: freshSelection("main"),
-    composer: freshComposerState(), done: freshDoneState(), place: freshScrollPlace(), gather: freshGatherState() },
-  side: { name: "side", left: false, searched: null, searchWalk: null, searchNote: null, mode: "list", fromCards: false,
-    older: freshOlderPages(), arrows: freshReplyArrows(), load: freshLoadState(), entry: freshEntryState(),
-    pins: freshPinsView(), tools: freshScrollTools(), filter: freshFilterState(), list: freshListState(),
-    rows: freshTimelineRows(), selection: freshSelection(), composer: freshComposerState(), done: freshDoneState(),
-    place: freshScrollPlace(), gather: freshGatherState() },
-};
+const columns = createColumns({
+  older: () => freshOlderPages(), arrows: () => freshReplyArrows(), load: () => freshLoadState(),
+  entry: () => freshEntryState(), pins: () => freshPinsView(), tools: () => freshScrollTools(),
+  filter: () => freshFilterState(), list: () => freshListState(), rows: () => freshTimelineRows(),
+  selection: (view) => freshSelection(view), composer: () => freshComposerState(),
+  done: () => freshDoneState(), place: () => freshScrollPlace(), gather: () => freshGatherState(),
+});
 /**
  * The column the code is working on now — the left one, except inside `inColumn` — and whether that is the
  * right one, for `el`, which asks on every call: one owner in web/src/view/channel/columnwork.ts (`#624

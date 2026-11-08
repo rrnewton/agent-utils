@@ -249,6 +249,8 @@ declare const createBookmarkLines: LegacyImports["createBookmarkLines"];
 declare const createRowGestures: LegacyImports["createRowGestures"];
 declare const createCardPlaces: LegacyImports["createCardPlaces"];
 declare const createColumnWork: LegacyImports["createColumnWork"];
+declare const createColumns: LegacyImports["createColumns"];
+declare const COLUMN_IDS: LegacyImports["COLUMN_IDS"];
 declare const createReplyState: LegacyImports["createReplyState"];
 declare const createSummaryWatch: LegacyImports["createSummaryWatch"];
 declare const createFilterChanges: LegacyImports["createFilterChanges"];
