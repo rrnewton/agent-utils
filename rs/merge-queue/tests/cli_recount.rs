@@ -439,6 +439,77 @@ fn a_decrease_larger_than_declared_is_refused() {
     assert!(r.get("pin_decreases").is_none(), "{r}");
 }
 
+const REMOVAL_SEED: &str = "pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[\n    (\"gone.a\", 10),\n    (\"gone.b\", 10),\n    (\"test.alpha\", 10),\n    (\"test.beta\", 5),\n];\n";
+const REMOVAL_KEPT: &str = "pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[\n    (\"test.alpha\", 10),\n    (\"test.beta\", 5),\n];\n";
+
+fn removal_fixture(tag: &str) -> Fixture {
+    let fx = Fixture::new(tag);
+    fx.write(PIN, REMOVAL_SEED);
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        RUNNER,
+        "--max-batch",
+        "4",
+        "--recount-pins",
+    ]);
+    fx
+}
+
+#[test]
+fn a_declared_mass_removal_lands_and_is_recorded() {
+    let fx = removal_fixture("recount-removal-declared");
+    branch_with_message(
+        &fx,
+        "b",
+        &[(PIN, REMOVAL_KEPT), ("tests/b", "ok\n")],
+        "Remove gone pins for census gating\n\nCount-Pin-Removed: gone.* 2 census gating\n",
+    );
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1]], "{r}");
+    let landed_pin = git(&fx.remote(), &["show", &format!("main:{PIN}")]);
+    assert!(!landed_pin.contains("gone."), "{landed_pin}");
+    assert_eq!(
+        r["pin_removals"],
+        serde_json::json!([{
+            "pr": 1,
+            "pattern": "gone.*",
+            "removed": 2,
+            "reason": "census gating"
+        }]),
+        "{r}"
+    );
+}
+
+#[test]
+fn an_undeclared_mass_removal_names_every_pin_in_one_refusal() {
+    let fx = removal_fixture("recount-removal-undeclared");
+    branch_with_message(
+        &fx,
+        "b",
+        &[(PIN, REMOVAL_KEPT), ("tests/b", "ok\n")],
+        "Remove gone pins\n",
+    );
+    fx.mq_ok(&["submit", "1", "--head", "b"]);
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert!(landed(&r).is_empty(), "{r}");
+    let reason = r["recount_skips"][0]["reason"].as_str().unwrap();
+    for pin in ["gone.a", "gone.b"] {
+        assert!(
+            reason.contains(&format!("Count-Pin-Removed: {pin} <reason>")),
+            "{reason}"
+        );
+    }
+}
+
 /// Push `name` from `from` with one commit writing `files` under `message`.
 fn stacked_branch(fx: &Fixture, name: &str, from: &str, files: &[(&str, &str)], message: &str) {
     git(&fx.dev(), &["checkout", "-q", "-B", name, from]);

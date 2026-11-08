@@ -397,6 +397,9 @@ pub struct RunReport {
     /// Pin decreases changes declared and their batches accepted.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pin_decreases: Vec<PinDecrease>,
+    /// Pin removals changes declared and their batches accepted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pin_removals: Vec<PinRemoval>,
     /// Pinned commits of other repositories resolved to the descendant (`pins`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pin_resolutions: Vec<crate::pins::Resolution>,
@@ -444,6 +447,20 @@ pub struct PinDecrease {
     pub occurrence: usize,
     /// How much the pin went down.
     pub amount: u64,
+    /// Why, as the trailer says.
+    pub reason: String,
+}
+
+/// A pin removal a change declared and its batch accepted (see
+/// [`crate::recount::REMOVAL_TRAILER`]).
+#[derive(Clone, Debug, Serialize)]
+pub struct PinRemoval {
+    /// Change that declared it.
+    pub pr: i64,
+    /// Pin name or glob, as declared.
+    pub pattern: String,
+    /// Pin entries removed under this declaration.
+    pub removed: usize,
     /// Why, as the trailer says.
     pub reason: String,
 }
@@ -2842,6 +2859,7 @@ impl<'a> Runner<'a> {
                     BTreeMap<(String, usize), u64>,
                     String,
                     String,
+                    Vec<crate::recount::HonouredRemoval>,
                 );
                 let versions = (|| -> Result<Versions, String> {
                     let mergebase = self
@@ -2903,10 +2921,25 @@ impl<'a> Runner<'a> {
                     };
                     let from_text = self.git.show_file(&reference, crate::recount::PIN_PATH)?;
                     let head_text = self.git.show_file(&head, crate::recount::PIN_PATH)?;
-                    let delta = crate::recount::change_deltas(
+                    // Removal declarations ride the head commit message, like
+                    // decrease declarations; reading them needs the message only
+                    // when the pin file actually changed across this change.
+                    let (removals, unreadable_removals) = if base_text.is_some()
+                        && from_text.is_some()
+                        && head_text.is_some()
+                        && from_text != head_text
+                    {
+                        let message = self.git.message(&head)?;
+                        crate::recount::declared_removals(&message)
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
+                    let (delta, honoured_removals) = crate::recount::change_deltas(
                         base_text.as_deref(),
                         from_text.as_deref(),
                         head_text.as_deref(),
+                        &removals,
+                        &unreadable_removals,
                     )?;
                     Ok((
                         delta,
@@ -2914,15 +2947,17 @@ impl<'a> Runner<'a> {
                         crate::recount::values(head_text.as_deref()),
                         reference,
                         label,
+                        honoured_removals,
                     ))
                 })();
-                let (full, from_values, head_values, from, from_label) = match versions {
-                    Ok(versions) => versions,
-                    Err(detail) => {
-                        skips.push((*pr, format!("recount-pins refused: {detail}")));
-                        continue;
-                    }
-                };
+                let (full, from_values, head_values, from, from_label, honoured_removals) =
+                    match versions {
+                        Ok(versions) => versions,
+                        Err(detail) => {
+                            skips.push((*pr, format!("recount-pins refused: {detail}")));
+                            continue;
+                        }
+                    };
                 // A head that contains an earlier accepted change's head carries that change's
                 // pin edits too, so it is measured against the nearest such head; a head that an
                 // earlier change already contains adds nothing. Several nearest heads, none
@@ -3036,6 +3071,7 @@ impl<'a> Runner<'a> {
                             &reference,
                             &head_values,
                         )?;
+                        self.record_pin_removals(*pr, &honoured_removals)?;
                         accepted.insert(*pr, delta);
                         earlier.push((*pr, full, head_values, from));
                     }
@@ -3644,6 +3680,36 @@ impl<'a> Runner<'a> {
                 let mut items = lock(&self.items);
                 if let Some(item) = items.get_mut(&pr) {
                     item.log("count-pin-decrease", detail);
+                    self.state.save_item(item)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Record the pin removals change `pr` declared and its batch accepted: in the run
+    /// report, the run's events and the change's history.
+    fn record_pin_removals(
+        &self,
+        pr: i64,
+        honoured: &[crate::recount::HonouredRemoval],
+    ) -> Result<(), String> {
+        for removal in honoured {
+            let detail = format!(
+                "declared removal of pin(s) matching {:?} ({} entries) accepted: {}",
+                removal.declaration.pattern, removal.removed, removal.declaration.reason
+            );
+            self.event("count-pin-removed", &format!("#{pr}: {detail}"));
+            lock(&self.report).pin_removals.push(PinRemoval {
+                pr,
+                pattern: removal.declaration.pattern.clone(),
+                removed: removal.removed,
+                reason: removal.declaration.reason.clone(),
+            });
+            if !self.simulating() {
+                let mut items = lock(&self.items);
+                if let Some(item) = items.get_mut(&pr) {
+                    item.log("count-pin-removed", detail);
                     self.state.save_item(item)?;
                 }
             }
@@ -9285,6 +9351,15 @@ pub fn render_report(report: &RunReport) -> String {
             out.push_str(&format!(
                 "- #{}: `{}` (occurrence {}) down {}: {}\n",
                 decrease.pr, decrease.pin, decrease.occurrence, decrease.amount, decrease.reason
+            ));
+        }
+    }
+    if !report.pin_removals.is_empty() {
+        out.push_str("\n## Declared pin removals\n\n");
+        for removal in &report.pin_removals {
+            out.push_str(&format!(
+                "- #{}: `{}` removed {}: {}\n",
+                removal.pr, removal.pattern, removal.removed, removal.reason
             ));
         }
     }

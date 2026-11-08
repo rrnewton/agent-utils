@@ -34,7 +34,7 @@
 //! never changes a count: the counts come from the pin values in the commits, and a trailer on a
 //! stacked change for a decrease the other change makes matches nothing and is ignored.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Repository-relative path of the generated pin file.
 pub const PIN_PATH: &str = "ci/manifest-plan/src/validation_dag_static.rs";
@@ -145,6 +145,9 @@ pub fn values(text: Option<&str>) -> BTreeMap<(String, usize), u64> {
     text.map_or_else(BTreeMap::new, |text| by_key(&parse_pins(text).pins))
 }
 
+/// One change's per-key pin deltas and the removal declarations it honoured.
+pub type ChangeDeltas = (BTreeMap<(String, usize), i64>, Vec<HonouredRemoval>);
+
 /// Validate one change's three versions and return its per-key deltas.
 /// `None` texts mean the pin file is absent at that version. A change that
 /// does not touch the pins yields empty deltas and no refusal.
@@ -153,16 +156,24 @@ pub fn values(text: Option<&str>) -> BTreeMap<(String, usize), u64> {
 /// the head: a name whose occurrences the head left exactly as at the merge base yields
 /// nothing, whatever the base did to it since; with `b == m == h`, each occurrence's delta is
 /// `head - mergebase`; a name absent at both the base and the merge base is new in the head and
-/// its delta is the head's value. Any other count change is ambiguous and refuses.
+/// its delta is the head's value. With `b == m` the head may also remove the
+/// whole name when a removal declaration covers it (returned among the honoured removals).
+/// Any other count change — a partial shrink, added occurrences of an existing name, or a
+/// count the base also changed since the merge base — is ambiguous and refuses, naming
+/// every problem in one refusal. (Occurrence identity is positional: the queue cannot
+/// tell an appended occurrence from one inserted ahead of the others, so increases of an
+/// existing name stay refused, deliberately asymmetric with whole-name removals.)
 pub fn change_deltas(
     base: Option<&str>,
     mergebase: Option<&str>,
     head: Option<&str>,
-) -> Result<BTreeMap<(String, usize), i64>, String> {
+    removals: &[Removal],
+    unreadable_removals: &[String],
+) -> Result<ChangeDeltas, String> {
     let head_text = head.unwrap_or("");
     let mb_text = mergebase.unwrap_or("");
     if head_text == mb_text {
-        return Ok(BTreeMap::new());
+        return Ok((BTreeMap::new(), Vec::new()));
     }
     let (Some(base_text), Some(mb), Some(hd)) = (base, mergebase, head) else {
         let missing = if base.is_none() {
@@ -186,6 +197,10 @@ pub fn change_deltas(
         }
     }
     let mut deltas = BTreeMap::new();
+    let mut problems: Vec<String> = Vec::new();
+    // Whole names gone at the head, with their merge-base counts, for the
+    // removal-declaration accounting after the loop.
+    let mut removed_names: Vec<(&String, usize)> = Vec::new();
     for name in &names {
         let count = |pins: &[Pin]| pins.iter().filter(|p| &p.name == name).count();
         let (b, m, h) = (count(&base_pins), count(&mb_pins), count(&head_pins));
@@ -215,11 +230,106 @@ pub fn change_deltas(
             }
             continue;
         }
-        return Err(format!(
+        if b == m && h == 0 {
+            // The whole name is gone: a removal, declared or not (accounted below).
+            removed_names.push((name, m));
+            continue;
+        }
+        problems.push(format!(
             "occurrence-count mismatch for pin {name:?}: base {b}, merge base {m}, head {h}"
         ));
     }
-    Ok(deltas)
+    let honoured = check_removals(&removed_names, removals, unreadable_removals, &mut problems);
+    if problems.is_empty() {
+        Ok((deltas, honoured))
+    } else if problems.len() == 1 {
+        Err(problems.pop().unwrap())
+    } else {
+        Err(format!(
+            "{} pin occurrence-count problems are refused:\n- {}",
+            problems.len(),
+            problems.join("\n- ")
+        ))
+    }
+}
+
+/// Account whole-name removals against the removal declarations: an exact-name
+/// declaration covers its name first (its count, when present, must equal the
+/// entries removed); a glob then covers what remains, its required count
+/// naming the total entries it removes. Every uncovered removal and every
+/// count mismatch joins `problems`, in the order the names were seen.
+fn check_removals(
+    removed_names: &[(&String, usize)],
+    removals: &[Removal],
+    unreadable: &[String],
+    problems: &mut Vec<String>,
+) -> Vec<HonouredRemoval> {
+    let unread = if unreadable.is_empty() {
+        String::new()
+    } else {
+        format!(" (unreadable trailer(s): {})", unreadable.join(" | "))
+    };
+    let mut honoured = Vec::new();
+    let mut covered: BTreeSet<&str> = BTreeSet::new();
+    for (name, entries) in removed_names {
+        let Some(declaration) = removals
+            .iter()
+            .find(|removal| !removal.is_glob() && removal.covers(name))
+        else {
+            continue;
+        };
+        covered.insert(name.as_str());
+        match declaration.count {
+            Some(count) if count != *entries => problems.push(format!(
+                "pin {name:?} is removed ({entries} entries), but the head commit declares {count} removed (`{REMOVAL_TRAILER}: {} {count} {}`); a removal count must match exactly",
+                declaration.pattern, declaration.reason
+            )),
+            _ => honoured.push(HonouredRemoval {
+                declaration: declaration.clone(),
+                removed: *entries,
+            }),
+        }
+    }
+    for declaration in removals.iter().filter(|removal| removal.is_glob()) {
+        let matched: Vec<(&String, usize)> = removed_names
+            .iter()
+            .filter(|(name, _)| !covered.contains(name.as_str()) && declaration.covers(name))
+            .map(|(name, entries)| (*name, *entries))
+            .collect();
+        if matched.is_empty() {
+            continue;
+        }
+        // Covered either way: a count mismatch names the declaration once,
+        // not once per matched name as if undeclared.
+        for (name, _) in &matched {
+            covered.insert(name.as_str());
+        }
+        let removed: usize = matched.iter().map(|(_, entries)| *entries).sum();
+        match declaration.count {
+            Some(count) if count == removed => {
+                honoured.push(HonouredRemoval {
+                    declaration: declaration.clone(),
+                    removed,
+                });
+            }
+            other => problems.push(format!(
+                "pins matching {:?} remove {removed} entries, but the head commit declares {} (`{REMOVAL_TRAILER}: {} {} {}`); a glob removal count must match exactly",
+                declaration.pattern,
+                other.map_or_else(|| "no count".to_owned(), |count| count.to_string()),
+                declaration.pattern,
+                other.unwrap_or(0),
+                declaration.reason
+            )),
+        }
+    }
+    for (name, entries) in removed_names {
+        if !covered.contains(name.as_str()) {
+            problems.push(format!(
+                "occurrence-count mismatch for pin {name:?}: base {entries}, merge base {entries}, head 0; an undeclared removal is refused{unread}: declare an intended one with a `{REMOVAL_TRAILER}: {name} <reason>` trailer on the head commit"
+            ));
+        }
+    }
+    honoured
 }
 
 /// Trailer a change's head commit carries to declare an intended pin decrease:
@@ -281,6 +391,119 @@ pub fn declared_decreases(message: &str) -> (Vec<Decrease>, Vec<String>) {
     (declared, unreadable)
 }
 
+/// Trailer a change's head commit carries to declare an intended pin removal:
+/// `Count-Pin-Removed: <pin> <reason>`, or with a glob and the exact number of
+/// entries it removes, `Count-Pin-Removed: <glob> <count> <reason>`. A removal
+/// declares a whole pin name gone; there is no occurrence form (a partial
+/// occurrence-count shrink stays refused — which occurrence went is ambiguous).
+pub const REMOVAL_TRAILER: &str = "Count-Pin-Removed";
+
+/// One declared pin removal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Removal {
+    /// Pin name, or a glob (`*` matches any characters) over pin names.
+    pub pattern: String,
+    /// Entries the declaration says are removed: required for a glob, optional
+    /// for an exact name (where it must equal that name's merge-base count).
+    pub count: Option<usize>,
+    /// Why, as the trailer says.
+    pub reason: String,
+}
+
+impl Removal {
+    /// Whether the pattern is a glob rather than one pin name.
+    pub fn is_glob(&self) -> bool {
+        self.pattern.contains('*')
+    }
+
+    /// Whether this declaration names `name` for removal.
+    pub fn covers(&self, name: &str) -> bool {
+        if self.is_glob() {
+            glob_matches(&self.pattern, name)
+        } else {
+            self.pattern == name
+        }
+    }
+}
+
+/// `*`-glob matching for pin names: each `*` matches any run of characters.
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    let mut rest = name;
+    let mut segments = pattern.split('*').peekable();
+    let Some(first) = segments.next() else {
+        return name.is_empty();
+    };
+    if !rest.starts_with(first) {
+        return false;
+    }
+    rest = &rest[first.len()..];
+    while let Some(segment) = segments.next() {
+        if segments.peek().is_none() {
+            return rest.ends_with(segment);
+        }
+        match rest.find(segment) {
+            Some(at) => rest = &rest[at + segment.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
+/// A removal declaration one change honoured, with how many entries it removed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HonouredRemoval {
+    /// The declaration, as written.
+    pub declaration: Removal,
+    /// Pin entries it removed.
+    pub removed: usize,
+}
+
+/// The removals `message` declares, and every [`REMOVAL_TRAILER`] line it could not read.
+pub fn declared_removals(message: &str) -> (Vec<Removal>, Vec<String>) {
+    let mut declared = Vec::new();
+    let mut unreadable = Vec::new();
+    for line in message.lines().map(str::trim) {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case(REMOVAL_TRAILER) {
+            continue;
+        }
+        let parsed = parse_removal(value.trim());
+        match parsed {
+            Some(removal) => declared.push(removal),
+            None => unreadable.push(line.to_owned()),
+        }
+    }
+    (declared, unreadable)
+}
+
+fn parse_removal(value: &str) -> Option<Removal> {
+    let mut parts = value.splitn(2, char::is_whitespace);
+    let pattern = parts.next()?;
+    if pattern.is_empty() || pattern.contains(':') {
+        return None;
+    }
+    let rest = parts.next().unwrap_or("").trim();
+    let mut rest_parts = rest.splitn(2, char::is_whitespace);
+    let first = rest_parts.next().filter(|token| !token.is_empty())?;
+    let tail = rest_parts.next().map(str::trim).unwrap_or("");
+    let glob = pattern.contains('*');
+    let (count, reason) = match first.parse::<usize>() {
+        Ok(count) if count > 0 && !tail.is_empty() => (Some(count), tail),
+        _ if glob => return None,
+        _ => (None, rest),
+    };
+    if reason.is_empty() {
+        return None;
+    }
+    Some(Removal {
+        pattern: pattern.to_owned(),
+        count,
+        reason: reason.to_owned(),
+    })
+}
+
 /// `delta` less `earlier`, per key, without the keys that come to zero: the delta of a change
 /// stacked on one whose own delta is `earlier`.
 pub fn subtract(
@@ -297,7 +520,9 @@ pub fn subtract(
 
 /// Check every decrease in a change's `delta` against the decreases its head commit declares:
 /// each needs a declaration of exactly its amount for exactly its pin. Returns the declarations
-/// the change honours, or why it is refused, naming the values the delta is measured from and
+/// the change honours, or why it is refused — every problem in one refusal, in delta order,
+/// so one round trip names everything the author must declare — naming the values the delta
+/// is measured from and
 /// to (`mb_values` at `reference`, "the merge base" or the head of the change it is stacked on,
 /// and `head_values`) and the value the pin would resolve to on the batch so far (`running`,
 /// defaulting to `base`).
@@ -313,6 +538,7 @@ pub fn check_decreases(
     unreadable: &[String],
 ) -> Result<Vec<Decrease>, String> {
     let mut honoured = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
     for ((name, index), d) in delta {
         if *d >= 0 {
             continue;
@@ -343,7 +569,7 @@ pub fn check_decreases(
                 honoured.push(decrease.clone())
             }
             Some(decrease) => {
-                return Err(format!(
+                problems.push(format!(
                     "{values}, but the head commit declares a decrease of {} ({DECREASE_TRAILER}: {pin} {} {}); a decrease must match its declaration exactly",
                     decrease.amount, decrease.amount, decrease.reason
                 ));
@@ -354,14 +580,24 @@ pub fn check_decreases(
                 } else {
                     format!(" (unreadable trailer(s): {})", unreadable.join(" | "))
                 };
-                return Err(format!(
+                problems.push(format!(
                     "{values}, below the base; an undeclared decrease is refused{unread}: declare an intended one with a `{DECREASE_TRAILER}: {pin} {} <reason>` trailer on the head commit, or rebase a head whose pin is stale against its merge base",
                     d.unsigned_abs()
                 ));
             }
         }
     }
-    Ok(honoured)
+    if problems.is_empty() {
+        Ok(honoured)
+    } else if problems.len() == 1 {
+        Err(problems.pop().unwrap())
+    } else {
+        Err(format!(
+            "{} pin decreases are refused:\n- {}",
+            problems.len(),
+            problems.join("\n- ")
+        ))
+    }
 }
 
 /// Batch values: `base + sum(deltas)` per key.
@@ -446,8 +682,12 @@ mod unit {
         let mb = "(\"p\", 100),\n";
         let head_a = "(\"p\", 103),\n";
         let head_b = "(\"p\", 102),\n";
-        let da = change_deltas(Some(base), Some(mb), Some(head_a)).unwrap();
-        let db = change_deltas(Some(base), Some(mb), Some(head_b)).unwrap();
+        let da = change_deltas(Some(base), Some(mb), Some(head_a), &[], &[])
+            .unwrap()
+            .0;
+        let db = change_deltas(Some(base), Some(mb), Some(head_b), &[], &[])
+            .unwrap()
+            .0;
         let base_pins = parse_pins(base).pins;
         let values = candidate_values(&base_pins, &[&da, &db]);
         assert_eq!(values[&("p".to_owned(), 0)], 105);
@@ -458,7 +698,9 @@ mod unit {
         let base = "(\"p\", 100),\n";
         let mb = "(\"p\", 100),\n";
         let head = "(\"p\", 101),\n(\"new.cases\", 7),\n";
-        let delta = change_deltas(Some(base), Some(mb), Some(head)).unwrap();
+        let delta = change_deltas(Some(base), Some(mb), Some(head), &[], &[])
+            .unwrap()
+            .0;
         assert_eq!(delta[&("new.cases".to_owned(), 0)], 7);
         assert_eq!(delta[&("p".to_owned(), 0)], 1);
         let values = candidate_values(&parse_pins(base).pins, &[&delta]);
@@ -475,7 +717,9 @@ mod unit {
         let base = "(\"p\", 100),\n(\"new.cases\", 7),\n";
         let mb = "(\"p\", 99),\n";
         let head = "(\"p\", 102),\n";
-        let delta = change_deltas(Some(base), Some(mb), Some(head)).unwrap();
+        let delta = change_deltas(Some(base), Some(mb), Some(head), &[], &[])
+            .unwrap()
+            .0;
         assert_eq!(delta.len(), 1, "{delta:?}");
         assert_eq!(delta[&("p".to_owned(), 0)], 3);
         let values = candidate_values(&parse_pins(base).pins, &[&delta]);
@@ -485,18 +729,20 @@ mod unit {
         let base = "(\"p\", 100),\n";
         let mb = "(\"p\", 99),\n(\"gone\", 4),\n";
         let head = "(\"p\", 102),\n(\"gone\", 4),\n";
-        let delta = change_deltas(Some(base), Some(mb), Some(head)).unwrap();
+        let delta = change_deltas(Some(base), Some(mb), Some(head), &[], &[])
+            .unwrap()
+            .0;
         assert_eq!(delta.len(), 1, "{delta:?}");
         // But a change that edits a pin whose occurrences the base changed is ambiguous.
         let head = "(\"p\", 102),\n(\"gone\", 5),\n";
-        assert!(change_deltas(Some(base), Some(mb), Some(head))
+        assert!(change_deltas(Some(base), Some(mb), Some(head), &[], &[])
             .unwrap_err()
             .contains("occurrence-count mismatch for pin \"gone\": base 0, merge base 1, head 1"));
         // And a pin both the base and the head introduced is too.
         let base = "(\"p\", 100),\n(\"twin\", 1),\n";
         let mb = "(\"p\", 99),\n";
         let head = "(\"p\", 99),\n(\"twin\", 2),\n";
-        assert!(change_deltas(Some(base), Some(mb), Some(head))
+        assert!(change_deltas(Some(base), Some(mb), Some(head), &[], &[])
             .unwrap_err()
             .contains("occurrence-count mismatch for pin \"twin\": base 1, merge base 0, head 1"));
     }
@@ -510,8 +756,11 @@ mod unit {
             Some("(\"p\", 10),\n(\"q\", 4),\n"),
             Some("(\"p\", 10),\n(\"q\", 4),\n"),
             Some("(\"p\", 8),\n(\"q\", 5),\n"),
+            &[],
+            &[],
         )
-        .unwrap();
+        .unwrap()
+        .0;
         let running = BTreeMap::new();
         let check = |message: &str| {
             let (declared, unreadable) = declared_decreases(message);
@@ -562,12 +811,65 @@ mod unit {
     }
 
     #[test]
+    fn every_undeclared_decrease_is_named_in_one_refusal() {
+        // Four pins drop by 2; q declares its decrease exactly, so the one
+        // refusal names p, r and s in order, each with its trailer, and
+        // never lists the declared q.
+        let all = "(\"p\", 10),\n(\"q\", 10),\n(\"r\", 10),\n(\"s\", 10),\n";
+        let dropped = "(\"p\", 8),\n(\"q\", 8),\n(\"r\", 8),\n(\"s\", 8),\n";
+        let base = values(Some(all));
+        let mb = values(Some(all));
+        let head = values(Some(dropped));
+        let delta = change_deltas(Some(all), Some(all), Some(dropped), &[], &[])
+            .unwrap()
+            .0;
+        let (declared, unreadable) =
+            declared_decreases("x\n\nCount-Pin-Decrease: q 2 two tests move\n");
+        let refused = check_decreases(
+            &delta,
+            &base,
+            &BTreeMap::new(),
+            &mb,
+            "the merge base",
+            &head,
+            &declared,
+            &unreadable,
+        )
+        .unwrap_err();
+        assert!(
+            refused.starts_with("3 pin decreases are refused"),
+            "{refused}"
+        );
+        let mut at = 0;
+        for pin in ["p", "r", "s"] {
+            let trailer = format!("Count-Pin-Decrease: {pin} 2 <reason>");
+            let found = refused[at..]
+                .find(&trailer)
+                .unwrap_or_else(|| panic!("missing {trailer:?} in order: {refused}"));
+            at += found + trailer.len();
+        }
+        assert!(!refused.contains("Count-Pin-Decrease: q"), "{refused}");
+    }
+
+    #[test]
     fn a_stacked_change_counts_only_its_own_delta() {
         // #1 adds pin "new" and lowers p by 2; #2, stacked on #1, adds 1 to p and bumps "new".
         let base = "(\"p\", 10),\n";
-        let first = change_deltas(Some(base), Some(base), Some("(\"p\", 8),\n(\"new\", 3),\n"));
-        let second = change_deltas(Some(base), Some(base), Some("(\"p\", 9),\n(\"new\", 4),\n"));
-        let (first, second) = (first.unwrap(), second.unwrap());
+        let first = change_deltas(
+            Some(base),
+            Some(base),
+            Some("(\"p\", 8),\n(\"new\", 3),\n"),
+            &[],
+            &[],
+        );
+        let second = change_deltas(
+            Some(base),
+            Some(base),
+            Some("(\"p\", 9),\n(\"new\", 4),\n"),
+            &[],
+            &[],
+        );
+        let (first, second) = (first.unwrap().0, second.unwrap().0);
         let own = subtract(&second, &first);
         assert_eq!(
             own,
@@ -600,17 +902,112 @@ mod unit {
     }
 
     #[test]
+    fn removal_trailers_parse_exact_glob_and_counts() {
+        let (declared, unreadable) = declared_removals(
+            "Subject\n\nCount-Pin-Removed: gone.a census gating\nCount-Pin-Removed: gone.* 56 census gating\ncount-pin-removed: exact 2 two entries go\nCount-Pin-Removed: no-count-*\nCount-Pin-Removed: occ:1 partial\n",
+        );
+        assert_eq!(
+            declared,
+            vec![
+                Removal {
+                    pattern: "gone.a".into(),
+                    count: None,
+                    reason: "census gating".into(),
+                },
+                Removal {
+                    pattern: "gone.*".into(),
+                    count: Some(56),
+                    reason: "census gating".into(),
+                },
+                Removal {
+                    pattern: "exact".into(),
+                    count: Some(2),
+                    reason: "two entries go".into(),
+                },
+            ]
+        );
+        // A glob without its count, and an occurrence form, cannot be read.
+        assert_eq!(unreadable.len(), 2, "{unreadable:?}");
+    }
+
+    #[test]
+    fn declared_removals_land_and_undeclared_ones_are_all_named() {
+        let all = "(\"gone.a\", 10),\n(\"gone.b\", 10),\n(\"kept\", 10),\n(\"part\", 10),\n(\"part\", 20),\n";
+        let kept_only = "(\"kept\", 10),\n(\"part\", 10),\n(\"part\", 20),\n";
+        // Declared by glob with the exact entry count: honoured, no deltas.
+        let (removals, unreadable) =
+            declared_removals("x\n\nCount-Pin-Removed: gone.* 2 census gating\n");
+        let (delta, honoured) = change_deltas(
+            Some(all),
+            Some(all),
+            Some(kept_only),
+            &removals,
+            &unreadable,
+        )
+        .unwrap();
+        assert!(delta.is_empty(), "{delta:?}");
+        assert_eq!(honoured.len(), 1, "{honoured:?}");
+        assert_eq!(honoured[0].removed, 2);
+        // Undeclared: one refusal naming both, each with its trailer line.
+        let refused = change_deltas(Some(all), Some(all), Some(kept_only), &[], &[]).unwrap_err();
+        assert!(
+            refused.starts_with("2 pin occurrence-count problems are refused"),
+            "{refused}"
+        );
+        for pin in ["gone.a", "gone.b"] {
+            assert!(
+                refused.contains(&format!("Count-Pin-Removed: {pin} <reason>")),
+                "{refused}"
+            );
+        }
+        // A glob whose count does not match is refused once, naming the count.
+        let (removals, unreadable) =
+            declared_removals("x\n\nCount-Pin-Removed: gone.* 3 census gating\n");
+        let refused = change_deltas(
+            Some(all),
+            Some(all),
+            Some(kept_only),
+            &removals,
+            &unreadable,
+        )
+        .unwrap_err();
+        assert!(refused.contains("remove 2 entries"), "{refused}");
+        // A partial occurrence shrink stays refused, declared or not.
+        let partial = "(\"gone.a\", 10),\n(\"gone.b\", 10),\n(\"kept\", 10),\n(\"part\", 10),\n";
+        let (removals, unreadable) =
+            declared_removals("x\n\nCount-Pin-Removed: gone.* 2 census gating\n");
+        let refused =
+            change_deltas(Some(all), Some(all), Some(partial), &removals, &unreadable).unwrap_err();
+        assert!(
+            refused.contains("occurrence-count mismatch for pin \"part\""),
+            "{refused}"
+        );
+        // Added occurrences of an existing name stay refused: occurrence
+        // identity is positional, so an append cannot be told from an insert.
+        let appended =
+            "(\"gone.a\", 10),\n(\"gone.b\", 10),\n(\"kept\", 11),\n(\"part\", 10),\n(\"part\", 20),\n(\"part\", 30),\n";
+        let refused = change_deltas(Some(all), Some(all), Some(appended), &[], &[]).unwrap_err();
+        assert!(
+            refused.contains("occurrence-count mismatch for pin \"part\""),
+            "{refused}"
+        );
+    }
+
+    #[test]
     fn occurrence_mismatch_and_missing_refuse() {
         let base = "(\"p\", 1),\n(\"p\", 2),\n";
         let mb = "(\"p\", 1),\n";
         let head = "(\"p\", 5),\n";
-        assert!(change_deltas(Some(base), Some(mb), Some(head))
+        assert!(change_deltas(Some(base), Some(mb), Some(head), &[], &[])
             .unwrap_err()
             .contains("occurrence-count mismatch"));
-        assert!(change_deltas(None, Some(mb), Some(head))
+        assert!(change_deltas(None, Some(mb), Some(head), &[], &[])
             .unwrap_err()
             .contains("missing"));
         // Untouched pins never refuse, even with no pin file at all.
-        assert!(change_deltas(None, None, None).unwrap().is_empty());
+        assert!(change_deltas(None, None, None, &[], &[])
+            .unwrap()
+            .0
+            .is_empty());
     }
 }
