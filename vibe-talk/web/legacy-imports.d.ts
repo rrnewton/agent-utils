@@ -264,8 +264,6 @@ declare const createCardPlaces: LegacyImports["createCardPlaces"];
 declare const createColumnWork: LegacyImports["createColumnWork"];
 declare const createReplyState: LegacyImports["createReplyState"];
 declare const createSummaryWatch: LegacyImports["createSummaryWatch"];
-declare const createLastPane: LegacyImports["createLastPane"];
-declare const createRowMenus: LegacyImports["createRowMenus"];
 declare const createFilterChanges: LegacyImports["createFilterChanges"];
 declare const createRowDrawing: LegacyImports["createRowDrawing"];
 declare const createUnderLists: LegacyImports["createUnderLists"];
