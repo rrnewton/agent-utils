@@ -2681,7 +2681,7 @@ def _act_reply_long_target(driver: Driver) -> None:
         # replaced it with the drag, and a drag to the top of the list is itself the gesture that
         # loads older messages, which is not what this state is about. `loadDiscord` is what the
         # released pull ends up calling, so this takes the same path with none of the scrolling.
-        driver.page.evaluate("async () => { await window.loadDiscord(); }")
+        driver.page.evaluate("async () => { await timelineView.loadDiscord(); }")
         driver.page.wait_for_function(
             "() => [...document.querySelectorAll('#discord-log > li')]"
             ".some((n) => n.textContent.includes('in full, because you asked'))",
@@ -2960,8 +2960,8 @@ def _act_live_message(driver: Driver) -> None:
         "(() => { window.__loadedBefore = "
         "document.querySelectorAll('#discord-log > li').length; "
         "window.__refreshes = 0; "
-        "const real = window.loadDiscord; "
-        "window.loadDiscord = function (...args) { window.__refreshes += 1; "
+        "const real = timelineView.loadDiscord; "
+        "timelineView.loadDiscord = function (...args) { window.__refreshes += 1; "
         "return real.apply(this, args); }; "
                 "return window.__loadedBefore; })()"
     )

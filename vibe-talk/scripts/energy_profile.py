@@ -1393,7 +1393,7 @@ def scenario_p(rig: Rig, opts: argparse.Namespace, out: list[Json]) -> None:
     time.sleep(opts.settle)
     cdp = rig.cdp
     assert cdp is not None
-    poll = "loadDiscord({keepPosition: true, reason: 'poll'}).then(() => true)"
+    poll = "timelineView.loadDiscord({keepPosition: true, reason: 'poll'}).then(() => true)"
 
     def polls() -> Json:
         for _ in range(opts.polls):

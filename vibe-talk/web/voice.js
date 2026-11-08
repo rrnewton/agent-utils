@@ -963,7 +963,7 @@ const messagePreferences = mountMessagePreferences({
       } else if (hideEmptySwitch.on() && !readModes.hiding()) {
         regroupChannelRows();
       } else {
-        guardQuietly(() => (readModes.hiding() ? loadTodo : loadDiscord)({ keepPosition: true, ownAct: true, readAs: "mutation" }))();
+        guardQuietly(() => (readModes.hiding() ? loadTodo : (options) => timelineView.loadDiscord(options))({ keepPosition: true, ownAct: true, readAs: "mutation" }))();
       }
   },
   applyCombineMessages: (on) => combineSwitch.apply(on),
@@ -4367,7 +4367,7 @@ function onVisibility() {
         if (owed === "mutation") refreshAfterLiveMutation();
         else {
           const since = replayLedger.started();
-          await loadDiscord({ keepPosition: true, reason: "visible" });
+          await timelineView.loadDiscord({ keepPosition: true, reason: "visible" });
           await readSideColumn("visible", since);
         }
       } finally {
@@ -5559,7 +5559,7 @@ function keepReaderPlace(place) {
  */
 async function readBehindSwitch() {
   try {
-    await loadDiscord({ keepPosition: true, quiet: true, ownAct: true, reason: "enter" });
+    await timelineView.loadDiscord({ keepPosition: true, quiet: true, ownAct: true, reason: "enter" });
   } catch (error) {
     if (!(error && error.shownInPill)) throw error;
   }
@@ -5748,7 +5748,7 @@ async function changeChannelView(view, threadId = null, summary = null, origin =
   el("channel-summary").replaceChildren();
   if (channelReads.busy()) renderChannelLoading(true);
   scrollToNewest();
-  await loadDiscord({ reason: "enter" });
+  await timelineView.loadDiscord({ reason: "enter" });
 }
 
 /**
@@ -9739,7 +9739,7 @@ const ownReadApply = mountOwnReadApply({
   request: (path, options) => api(path, options),
   setStatus: (text) => setStatus(text),
   selectedChannel: () => selectedChannelId(),
-  reloadChannel: (options) => loadDiscord(options),
+  reloadChannel: (options) => timelineView.loadDiscord(options),
   guard: (run) => guardQuietly(run),
   setTimeout: (run, ms) => setTimeout(run, ms),
   clearTimeout: (timer) => clearTimeout(timer),
@@ -10330,7 +10330,7 @@ const pullToRefresh = createPullToRefresh({
   undeferOlder: () => {
     olderPages().deferred = false;
   },
-  loadDiscord: (options) => loadDiscord(options),
+  loadDiscord: (options) => timelineView.loadDiscord(options),
   newestId: () => listState().newestId,
   setStatus: (text) => setStatus(text),
   channelContextKey: () => channelContextKey(),
@@ -11766,7 +11766,7 @@ function setReadMode(mode) {
     } else if (readModes.hiding() !== wasHiding) {
       // A read of another route, which keeps the reader's place as a refresh does and is placed again
       // when it lands. What it brings is the reader's own act, not something that arrived.
-      return (readModes.hiding() ? loadTodo : loadDiscord)({ keepPosition: true, ownAct: true, readAs: "enter" });
+      return (readModes.hiding() ? loadTodo : (options) => timelineView.loadDiscord(options))({ keepPosition: true, ownAct: true, readAs: "enter" });
     } else {
       // Show read and Fold read are the same read of the channel, drawn two ways.
       applyReadRuns();
@@ -11854,7 +11854,7 @@ const noiseSettings = mountNoiseRules({
   status: (text) => setStatus(text),
   tally: () => noiseTally(),
   selectedChannel: () => selectedChannelId(),
-  reloadChannel: () => loadDiscord({ keepPosition: true, readAs: "mutation" }),
+  reloadChannel: () => timelineView.loadDiscord({ keepPosition: true, readAs: "mutation" }),
 });
 
 /**
@@ -15163,7 +15163,7 @@ async function readSideColumn(reason, since = null) {
   if (!sideColumnUp()) return;
   if (columns.side.mode === "thread") {
     await inColumn(columns.side, () => (since !== null && answeredSince(since, reason)
-      ? undefined : loadDiscord({ keepPosition: true, reason, readAs: "side" })));
+      ? undefined : timelineView.loadDiscord({ keepPosition: true, reason, readAs: "side" })));
   } else {
     await refreshThreadDirectory();
   }
@@ -15511,12 +15511,6 @@ const packControls = createPackControls({
   linkedMarkDrawOn: (row) => linkedMark.drawOn(row), searchable, threadName, keyContext,
 });
 const { renderUnpackToggle, setUnpackMode, setCardState, cycleCardState, packThread, packFromKeyboard, unpackFromKeyboard, cardRow, sideCard, countSideCard, cardState, packButton } = packControls;
-// The page's re-read by name, for the walks and captures that call and wrap it in the page
-// (scripts/screenshots.py, energy_profile.py): a global declaration, as it always was, so a
-// wrapper on window.loadDiscord still sees every read this script asks for. The read itself
-// is the timeline view's (web/src/view/channel `createTimelineView`).
-async function loadDiscord(options) { return timelineView.loadDiscord(options); }
-
 /**
  * Remember the newest read requested while another channel read is in flight.
  *
@@ -15914,7 +15908,7 @@ const mutationRefresh = createMutationRefresh({
   busy: () => channelReads.busy(),
   read: async () => {
     const since = replayLedger.started();
-    await loadDiscord({ keepPosition: true, reason: "mutation" });
+    await timelineView.loadDiscord({ keepPosition: true, reason: "mutation" });
 
 
     // An edit may be in the thread on the right. `#229 desktop-two-column`.
@@ -15931,7 +15925,7 @@ const mutationRefresh = createMutationRefresh({
  */
 const channelRefresh = createChannelRefresh({
   channelReads: /** @type {any} */ (channelReads), channelPoll, hiddenStream: /** @type {any} */ (hiddenStream), columnWork, columns, inColumn,
-  loadDiscord: (options) => loadDiscord(options), loadTimeline,
+  loadDiscord: (options) => timelineView.loadDiscord(options), loadTimeline,
   foldLateTimelinePage, renderChannelLoading, queuePlaceUnplaced,
   loadStateGeneration: () => loadState().generation, selectedChannelId,
   readModesHiding: () => readModes.hiding(), refreshQuietly,
@@ -15956,7 +15950,7 @@ const { queueDiscordLoad, finishDiscordLoad, currentDiscordLoad, stopDiscordPoll
  */
 const liveStream = createLiveStream({
   channelStore, selectedChannelId, providerFacts,
-  loadDiscord: (options) => loadDiscord(options), refreshQuietly, setStatus,
+  loadDiscord: (options) => timelineView.loadDiscord(options), refreshQuietly, setStatus,
   noteLiveEvent: (channel, fromTail) => abandonedReads.noteLiveEvent(channel, fromTail),
   contractIs: (name, value) => VibeTalkContract.is(/** @type {any} */ (name), value),
   watchAllAttached: () => watchAll.attached(),
@@ -17727,7 +17721,7 @@ function readEnteredChannel(keepPosition) {
     try {
       // A return finds the channel's store as it was left, so it asks only for what changed.
       const since = replayLedger.started();
-      await loadDiscord(keepPosition ? { keepPosition: true, reason: "visible" } : { reason: "enter" });
+      await timelineView.loadDiscord(keepPosition ? { keepPosition: true, reason: "visible" } : { reason: "enter" });
       // ...and the right column's thread, or its list of threads. `#229 desktop-two-column`.
       await readSideColumn(keepPosition ? "visible" : "enter", since);
     } finally {
@@ -17815,7 +17809,7 @@ function changeSelectedChannel() {
   // A stream follows ONE channel, and a cursor from the old one means nothing in the new one —
   // the same reason the walk-back cursor is dropped two lines above.
   startChannelStream(selectedChannelId());
-  return loadDiscord(saved && screens.view() === "discord" ? { keepPosition: true, reason: "enter" } : { reason: "enter" });
+  return timelineView.loadDiscord(saved && screens.view() === "discord" ? { keepPosition: true, reason: "enter" } : { reason: "enter" });
 }
 // The channel box's listeners (`#349 channel-settings-all`, `#355 provider-grouped-channels`, `#232
 // upstream-mark-read`, `#602 history-settings-and-limits`, `#39 channel-alias`, `#208

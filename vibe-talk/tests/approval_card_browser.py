@@ -2059,7 +2059,7 @@ ROOM_JS = """() => {
 # Point 15: the live feed's read of the channel, as the message a send posted brings it, and whether the room
 # made for the card was still kept when the read had drawn it.
 LIVE_READ_JS = """async () => {
-  await loadDiscord({ keepPosition: true, reason: 'live' });
+  await timelineView.loadDiscord({ keepPosition: true, reason: 'live' });
   return document.getElementById('screen-main').hasAttribute('data-draft');
 }"""
 
