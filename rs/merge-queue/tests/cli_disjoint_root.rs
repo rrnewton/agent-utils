@@ -589,6 +589,81 @@ fn plan_intake_names_disjoint_roots_on_the_base() {
     );
 }
 
+/// With root stacking configured, plan-intake must not forecast a root on
+/// the base for batches the fill loop will stack on a prioritized head:
+/// it leaves their parents decided at launch, and the actual builds stack.
+#[test]
+fn plan_intake_leaves_likely_stacked_roots_undecided() {
+    let (fx, started, gates) = gated_setup("intake-root-stack-names");
+    let config_path = fx.queue().join(".git/merge-queue/config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["roots"] = serde_json::json!(3);
+    config["root_stack_min_pass_percent"] = serde_json::json!(50);
+    std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a", "--prioritized"]);
+    let mut daemon = Daemon::start(&fx);
+    wait_for("change 1 to validate", &started, |lines| {
+        lines.iter().any(|line| line == "a_t0_")
+    });
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    fx.mq_ok(&["submit", "3", "--head", "c"]);
+    wait_for("both arrivals to stack beside #1", &started, |lines| {
+        lines.iter().any(|line| line == "a_b_t0_") && lines.iter().any(|line| line == "a_b_c_t0_")
+    });
+    assert!(
+        started_lines(&started)
+            .iter()
+            .all(|line| line != "b_t0_" && line != "c_t0_"),
+        "neither arrival validated as a root: {:?}",
+        started_lines(&started)
+    );
+    for set in ["a_t0_", "a_b_t0_", "a_b_c_t0_"] {
+        open(&gates, set);
+    }
+    assert_eq!(daemon.exit_code(Duration::from_secs(120)), Some(0));
+    for pr in [1, 2, 3] {
+        assert_eq!(status(&fx, pr), "landed");
+    }
+    let report = latest_report(&fx);
+    for pr in [2, 3] {
+        let runs = batch_validations(&report, pr);
+        assert_eq!(runs.len(), 1, "{report}");
+        assert_ne!(runs[0]["parent"], report["base_start"], "{report}");
+    }
+    let runs_dir = fx.queue().join(".git/merge-queue/runs");
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(runs_dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.join("events.jsonl").is_file())
+        .collect();
+    dirs.sort();
+    let events = std::fs::read_to_string(dirs.pop().unwrap().join("events.jsonl")).unwrap();
+    let planned: Vec<String> = events
+        .lines()
+        .filter_map(|line| {
+            let event: Value = serde_json::from_str(line).unwrap();
+            (event["kind"] == "plan-intake").then(|| event["detail"].as_str().unwrap().to_owned())
+        })
+        .collect();
+    assert!(
+        planned
+            .iter()
+            .any(|detail| detail.contains("#2 (parent decided at launch)")),
+        "{planned:?}"
+    );
+    assert!(
+        planned
+            .iter()
+            .all(|detail| { !detail.contains("#2 (root on") && !detail.contains("#3 (root on") }),
+        "{planned:?}"
+    );
+}
+
 /// A held (INFRA-BLOCKED, not validating further) front item must not block
 /// the greens behind it: the disjoint root built on the base lands in the
 /// same run, and the stacked change behind the held item is rebuilt without

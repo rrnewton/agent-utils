@@ -5944,7 +5944,10 @@ impl<'a> Runner<'a> {
     /// taken below the stack gate, dependencies spread over several flights,
     /// a root deferred behind a green root) are counted, not named: their
     /// parents are decided when they launch, and the build events name them
-    /// then.
+    /// then. A would-be root under `root_stack_min_pass_percent` is likewise
+    /// left undecided: whether it stacks depends on predicted pass and
+    /// flight results at launch, which this snapshot cannot forecast
+    /// without claiming a parent it may not get.
     fn describe_planned_batches(
         &self,
         batches: &VecDeque<Vec<i64>>,
@@ -5964,6 +5967,7 @@ impl<'a> Runner<'a> {
             Root,
             Stacked(Vec<i64>),
             Waiting,
+            Undecided,
         }
         let base = lock(&self.base).clone();
         let root_on = if base.is_empty() {
@@ -6107,6 +6111,13 @@ impl<'a> Runner<'a> {
                         Some(at) => Kind::Stacked(sim[at].prs.clone()),
                         None => Kind::Root,
                     }
+                } else if rooted0
+                    && view.stack_allowed
+                    && self.config.root_stack_min_pass_percent > 0
+                {
+                    // The fill loop may stack this root on a likely
+                    // landing batch instead; launch will decide.
+                    Kind::Undecided
                 } else if rooted0 {
                     Kind::Root
                 } else if let Some(later) = expanded[index + 1..]
@@ -6124,6 +6135,10 @@ impl<'a> Runner<'a> {
                 }
             };
             match kind {
+                Kind::Undecided => {
+                    undecided(index, &mut described);
+                    break 'batches;
+                }
                 Kind::Waiting => {
                     described.push(format!(
                         "{} (waiting for its dependencies to land)",
