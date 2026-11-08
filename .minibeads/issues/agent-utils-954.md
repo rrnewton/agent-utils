@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-remove-batch-salvage-budget: remove-agent-batch''s 60 s per-item budget runs out in salvage of slots with many nested submodules'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-wrkslots
-created_at: 2026-11-06T19:14:11.000000000+00:00
-updated_at: 2026-11-06T23:40:00.000000000+00:00
+created_at: 2026-11-06T19:14:11+00:00
+updated_at: 2026-11-08T18:40:43.868887625+00:00
+closed_at: 2026-11-08T18:40:43.868887484+00:00
 ---
 
 # Description

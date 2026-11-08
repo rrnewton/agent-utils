@@ -22093,6 +22093,7 @@ def _salvage_fingerprint(
     *,
     source: Path | None,
     mirror: Path | None,
+    detached_ok: bool = False,
 ) -> tuple[object, ...]:
     """Read cheaply what _salvage_candidate's answer for a clean checkout depends on.
 
@@ -22134,6 +22135,14 @@ def _salvage_fingerprint(
     replacements = vcs._run(
         path, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/replace/"]
     ).stdout
+    if detached_ok:
+        # A submodule candidate is judged detached: which branch (if
+        # any) names its HEAD is not content salvage preserves, and a
+        # nested submodule whose superproject sits off its recorded
+        # branch could read attached in one pass and detached in the
+        # next with identical content (#955). HEAD itself, read above,
+        # still names the content exactly.
+        branch = "HEAD"
     return (
         toplevel,
         git_directory,
@@ -22169,6 +22178,7 @@ def _salvage_fingerprint_or_none(
     *,
     source: Path | None,
     mirror: Path | None,
+    detached_ok: bool = False,
 ) -> tuple[object, ...] | None:
     """_salvage_fingerprint, or None when it cannot be read.
 
@@ -22178,7 +22188,13 @@ def _salvage_fingerprint_or_none(
 
     try:
         return _salvage_fingerprint(
-            config, checkout, path, vcs, source=source, mirror=mirror
+            config,
+            checkout,
+            path,
+            vcs,
+            source=source,
+            mirror=mirror,
+            detached_ok=detached_ok,
         )
     except Refusal:
         return None
@@ -22269,14 +22285,26 @@ def _salvage_candidate(
         )
         if (
             _salvage_fingerprint_or_none(
-                config, checkout, path, vcs, source=source, mirror=mirror
+                config,
+                checkout,
+                path,
+                vcs,
+                source=source,
+                mirror=mirror,
+                detached_ok=allow_detached,
             )
             == cached.fingerprint
         ):
             return cached.facts
     memo.pop(key, None)
     before = _salvage_fingerprint_or_none(
-        config, checkout, path, vcs, source=source, mirror=None
+        config,
+        checkout,
+        path,
+        vcs,
+        source=source,
+        mirror=None,
+        detached_ok=allow_detached,
     )
     facts = _salvage_candidate_uncached(
         config,
@@ -22298,7 +22326,13 @@ def _salvage_candidate(
     if before is None or (facts.aliased and mirror is None):
         return facts
     after = _salvage_fingerprint_or_none(
-        config, checkout, path, vcs, source=source, mirror=mirror
+        config,
+        checkout,
+        path,
+        vcs,
+        source=source,
+        mirror=mirror,
+        detached_ok=allow_detached,
     )
     # The mirror's two entries are read only afterwards, once the facts name it.
     if after is not None and _fingerprint_without_mirror(

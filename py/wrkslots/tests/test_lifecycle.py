@@ -21561,6 +21561,74 @@ def test_recursive_submodule_fixture_detects_shared_deinitialization(
     )
 
 
+def test_agent_remove_with_nested_submodule_off_recorded_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#955: a nested submodule checked out off the branch its
+    superproject records salvages and removes; the fingerprint must
+    not depend on which branch name (if any) points at its HEAD."""
+
+    project, repository, _remote = make_project(tmp_path)
+    _component_head, leaf_head = add_recursive_submodules(tmp_path, project, repository)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    target = checkout(project)
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    # A second leaf commit exists upstream; the slot's leaf fetches
+    # and checks it out, so the nested submodule sits at a commit its
+    # superproject does not record, detached from any branch the
+    # superproject names.
+    leaf_source = tmp_path / "leaf-source"
+    (leaf_source / "second.txt").write_text("second\n", encoding="utf-8")
+    git(leaf_source, "add", "second.txt")
+    git(leaf_source, "commit", "-m", "leaf second")
+    git(leaf_source, "push", "origin", "main")
+    leaf_second = git(leaf_source, "rev-parse", "HEAD").stdout.strip()
+    leaf = target / "component" / "leaf"
+    git(leaf, "fetch", "-q", "origin")
+    git(leaf, "checkout", "-q", leaf_second)
+    assert git(leaf, "rev-parse", "HEAD").stdout.strip() == leaf_second
+    assert leaf_second != leaf_head
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stderr
+    assert "changed after salvage" not in removed.stderr
+    assert not target.exists()
+    assert active_slots(project) == []
+
+
+def test_agent_remove_refuses_a_real_edit_after_salvage(
+    tmp_path: Path,
+) -> None:
+    """#955: an edit made between salvage and its recheck is still
+    refused as changed after salvage."""
+
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    target = checkout(project)
+    # Salvage and its journal complete, then the remove is interrupted
+    # before any deletion (after-finish-journal), leaving the recheck
+    # for recovery -- the same seam as the other changed-after-salvage
+    # tests.  The edit lands after journaling, in the real tree the
+    # recheck derives from, not before the first derivation.
+    prepare_removal_journal(project)
+    leaf_file = target / "component" / "leaf" / "leaf.txt"
+    leaf_file.write_text("edited after salvage\n", encoding="utf-8")
+
+    refused = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+
+    assert refused.returncode == 3, refused.stderr
+    assert "changed after salvage" in refused.stderr
+    assert target.is_dir()
+    assert len(active_slots(project)) == 1
+
+
 def test_clean_agent_remove_with_recursive_submodules_preserves_peers_and_config(
     tmp_path: Path,
 ) -> None:

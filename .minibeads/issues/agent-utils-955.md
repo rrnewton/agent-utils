@@ -1,11 +1,12 @@
 ---
 title: 'wrkslots-remove-nested-fingerprint-drift: remove says a nested submodule changed after salvage when nothing touched the dead slot'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-wrkslots
-created_at: 2026-11-06T19:14:11.000000000+00:00
-updated_at: 2026-11-06T19:14:11.000000000+00:00
+created_at: 2026-11-06T19:14:11+00:00
+updated_at: 2026-11-08T18:40:43.872181867+00:00
+closed_at: 2026-11-08T18:40:43.872181567+00:00
 ---
 
 # Description
