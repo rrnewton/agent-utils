@@ -1533,6 +1533,91 @@ fn a_restarted_donor_resumes_probing_and_clears_its_host_fault() {
     );
 }
 
+/// #1059: a stale-base refusal is the job's fault, not the host's. The
+/// donor must not probe (its probe here would fail), must not pause or
+/// record a host fault, and the queue must record the refusal cause —
+/// not the teardown line printed after it — with no could-not-run
+/// strike. The same donor then takes the job normally once it can run.
+#[test]
+fn a_stale_base_refusal_neither_probes_nor_pauses_the_donor() {
+    let fx = Fixture::new("donor-stale-base-refusal");
+    let run_cmd = format!(
+        "if [ -n \"$MQ_PROBE\" ]; then echo probe >> {}; exit 1; fi; \
+         if [ -f {} ]; then exit 0; fi; \
+         echo 'MQ_COULD_NOT_RUN_SCOPE: job stale-base target does not contain the job base'; \
+         echo COULD_NOT_RUN; \
+         echo 'validate-run: RETIRE-RETAINED run may still use slot s1'; exit 75",
+        fx.root.join("probes").display(),
+        fx.root.join("validation-ok").display(),
+    );
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        &run_cmd,
+        "--offload",
+        "decide",
+    ]);
+    fx.branch("a", &[("a.txt", "a\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let clone = donor_clone(&fx, "donor-host");
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    let out = donor(&fx, &clone, "d1", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        probe_count(&fx),
+        0,
+        "a job-caused stale-base refusal is never probed"
+    );
+    assert!(
+        !host_pause_path(&clone).exists(),
+        "the donor must not self-pause for a stale job"
+    );
+    assert!(
+        host_faults(&fx).get("d1").is_none(),
+        "no host fault for a stale job: {}",
+        host_faults(&fx)
+    );
+    let job = jobs(&fx).into_iter().next().unwrap();
+    assert!(
+        job.get("could_not_run")
+            .is_none_or(|entries| entries.as_array().is_some_and(Vec::is_empty)),
+        "no could-not-run strike for a stale job: {job}"
+    );
+    let history = job["history"].to_string();
+    assert!(
+        history.contains("target does not contain the job base"),
+        "the queue keeps the refusal cause: {history}"
+    );
+    assert!(
+        !history.contains("RETIRE-RETAINED"),
+        "the teardown line must not hide the cause: {history}"
+    );
+    // The next job is taken normally by the same donor.
+    std::fs::write(fx.root.join("validation-ok"), "").unwrap();
+    let out = donor(&fx, &clone, "d1", &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (code, report, run_stderr) = finish(run);
+    assert_eq!(code, Some(0), "{run_stderr}");
+    assert_eq!(
+        report["landed"][0]["prs"],
+        serde_json::json!([1]),
+        "{report}"
+    );
+}
+
 /// Escalated variant: a restarted donor whose probe passes arms exactly the
 /// trial the queue allows; the fault stays recorded until that trial's
 /// admitted validation, which a further restart mid-pause must produce.

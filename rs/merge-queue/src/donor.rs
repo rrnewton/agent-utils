@@ -425,6 +425,14 @@ pub struct Receipt {
     /// queue re-derives the same fact in `tool_check`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_warnings: Vec<String>,
+    /// Why admission refused, as the one cause line the donor picked from
+    /// the full runner log before cutting `log_tail` (#1059): a refusal's
+    /// cause can sit far above a verbose teardown, outside the tail the
+    /// queue would otherwise search. Only set on a refused receipt.
+    /// Receipts written before this field existed parse without it, and
+    /// the queue then picks the cause from `log_tail` as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_cause: Option<String>,
     /// The donor's merge-queue version.
     pub merge_queue_version: String,
     /// Selection actually run, when the runner collapsed the requested one.
@@ -1807,20 +1815,66 @@ impl Store {
         if receipt.refused || receipt.exit == Some(crate::validate::REFUSAL_EXIT) {
             // Validation never ran: no verdict in either mode, so the job goes back to the
             // queue. A donor that keeps answering this way is left out of it.
-            let last = crate::validate::refusal_line(&receipt.log_tail)
+            // The recorded detail names the refusal's cause (#1059): the
+            // donor's own pick from its full log when its receipt carries
+            // one, else the cause picked from the log tail — never the
+            // teardown line a wrapper prints after refusing.
+            let cause_field = receipt
+                .refusal_cause
+                .as_deref()
+                .map(str::trim)
+                .filter(|cause| !cause.is_empty());
+            let cause = cause_field
                 .map(crate::validate::cut_line)
+                .or_else(|| {
+                    crate::validate::refusal_cause(&receipt.log_tail).map(crate::validate::cut_line)
+                })
                 .unwrap_or("");
             let detail = format!(
                 "exit {}{}",
                 receipt
                     .exit
                     .map_or_else(|| "none".to_owned(), |code| code.to_string()),
-                if last.is_empty() {
+                if cause.is_empty() {
                     String::new()
                 } else {
-                    format!(", last output: {last}")
+                    format!(", cause: {cause}")
                 }
             );
+            // A stale-base refusal (the structured job-scope marker; see
+            // `validate::STALE_BASE_TOKEN`) says the job itself is stale:
+            // like a job `sweep_stale` cancels, it is not a donor failure,
+            // so it records no could-not-run strike and no host fault.
+            // The job is queued again for the sweep to cancel (or, if the
+            // base settles, to run), and the donor is neither probed nor
+            // paused for it (donor side, in `Worker::validate`).
+            let stale_job = crate::validate::stale_base_refusal(&receipt.log_tail).is_some()
+                || cause_field
+                    .is_some_and(|field| crate::validate::stale_base_refusal(field).is_some());
+            if stale_job {
+                job.lease = None;
+                job.state = if job.candidate_gone.is_some() {
+                    JobState::Cancelled
+                } else {
+                    JobState::Queued
+                };
+                job.history.push(format!(
+                    "{}: {} on {} refused a stale job ({detail}); no verdict, no strike, {}",
+                    now(),
+                    receipt.donor.name,
+                    receipt.donor.host,
+                    if job.state == JobState::Queued {
+                        "queued again"
+                    } else {
+                        "cancelled (the queue no longer wants the candidate)"
+                    }
+                ));
+                self.write(&job)?;
+                return Err(format!(
+                    "the receipt says the job is stale ({detail}); no verdict, no strike, \
+                     the job is queued again for the stale sweep"
+                ));
+            }
             // A could-not-run refusal for one candidate is not, by itself, a
             // host fault: it depends on the candidate's commits as often as
             // on the host. The job is queued again and counted below; the
@@ -3564,6 +3618,14 @@ impl Worker<'_> {
                 } else {
                     unattested_warnings(&job.tool.tools, &ran.printed_tool_identity)
                 },
+                // Pick the cause from the full log, before the tail cut
+                // below can leave it above a verbose teardown (#1059).
+                refusal_cause: if ran.refused {
+                    crate::validate::refusal_cause(&log_text)
+                        .map(|line| crate::validate::cut_line(line).to_owned())
+                } else {
+                    None
+                },
                 merge_queue_version: env!("CARGO_PKG_VERSION").to_owned(),
                 effective_selection: ran.effective_selection.clone(),
                 exit: ran.exit,
@@ -3591,9 +3653,15 @@ impl Worker<'_> {
                 // failing probe records a host fault (queue-side, via the
                 // `donor host-fault` route) and pauses claiming. A busy
                 // admission refusal is never probed and never a fault.
+                // Neither is a stale-base refusal (#1059): the validator
+                // marked the job itself stale, so probing this healthy
+                // host for it would only hold the job and risk pausing a
+                // good donor; the queue's stale sweep settles the job.
+                let stale_job = crate::validate::stale_base_refusal(&log_text).is_some();
                 let host_scope =
                     crate::validate::could_not_run_scope(&log_text).is_some_and(|(host, _)| host);
-                let probe_failed = !crate::validate::could_not_run_busy(&log_text)
+                let probe_failed = !stale_job
+                    && !crate::validate::could_not_run_busy(&log_text)
                     && !self.probe_host_validator(&job.validator);
                 if probe_failed || host_scope {
                     let reason = crate::validate::could_not_run_scope(&log_text)
@@ -4276,6 +4344,93 @@ mod unit {
             after.could_not_run[0].contains("pinned image not present"),
             "{after:?}"
         );
+    }
+
+    #[test]
+    fn a_stale_base_refusal_costs_no_strike_and_names_its_cause() {
+        // #1059: the validator refused because the job itself is stale
+        // (exit 75 plus the structured stale-base scope line). Like a
+        // job the stale sweep cancels, that is not a donor failure: no
+        // could-not-run strike, no host fault, and the recorded detail
+        // is the refusal cause, not the teardown line printed after it.
+        let mut store = Store::new(&temp("stale-base-refusal"));
+        store.could_not_run_limit = 99;
+        publish(&store, "c1");
+        let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        let error = store
+            .report(
+                &claimed.id,
+                &token,
+                refused_receipt(
+                    &claimed,
+                    "d1",
+                    "MQ_COULD_NOT_RUN_SCOPE: job stale-base target does not contain \
+                     the job base\nCOULD_NOT_RUN\nvalidate-run: RETIRE-RETAINED \
+                     run may still use slot s1",
+                ),
+            )
+            .unwrap_err();
+        assert!(error.contains("stale"), "{error}");
+        assert!(
+            error.contains("target does not contain the job base"),
+            "{error}"
+        );
+        assert!(!error.contains("RETIRE-RETAINED"), "{error}");
+        let after = store.read(&claimed.id).unwrap();
+        assert_eq!(after.state, JobState::Queued, "{after:?}");
+        assert!(
+            after.could_not_run.is_empty(),
+            "a stale job is not a donor failure: {after:?}"
+        );
+        assert!(after.declined_by.is_empty(), "{after:?}");
+        let history = after.history.join("\n");
+        assert!(
+            history.contains("target does not contain the job base"),
+            "{history}"
+        );
+        assert!(!history.contains("RETIRE-RETAINED"), "{history}");
+        assert!(store.host_fault_list().is_empty());
+        // The next job is taken normally by the same donor.
+        publish(&store, "c2");
+        assert!(store.claim("d1", "h1", 1).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_stale_cause_carried_on_the_receipt_survives_a_cut_tail() {
+        // #1059: a new donor picks the cause from its full log onto the
+        // receipt, so the queue still classifies and records it when
+        // the scope line fell above the log tail's cut. A receipt
+        // written before the field existed parses without it.
+        let mut store = Store::new(&temp("stale-cause-field"));
+        store.could_not_run_limit = 99;
+        publish(&store, "c1");
+        let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        let mut receipt = refused_receipt(
+            &claimed,
+            "d1",
+            "validate-run: RETIRE-RETAINED run may still use slot s1",
+        );
+        receipt.refusal_cause = Some(
+            "MQ_COULD_NOT_RUN_SCOPE: job stale-base target does not contain the job base"
+                .to_owned(),
+        );
+        let mut old: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&receipt).unwrap()).unwrap();
+        old.as_object_mut().unwrap().remove("refusal_cause");
+        let old: Receipt = serde_json::from_value(old).unwrap();
+        assert_eq!(old.refusal_cause, None);
+        let error = store.report(&claimed.id, &token, receipt).unwrap_err();
+        assert!(error.contains("stale"), "{error}");
+        assert!(
+            error.contains("target does not contain the job base"),
+            "{error}"
+        );
+        assert!(!error.contains("RETIRE-RETAINED"), "{error}");
+        let after = store.read(&claimed.id).unwrap();
+        assert!(after.could_not_run.is_empty(), "{after:?}");
+        assert!(store.host_fault_list().is_empty());
     }
 
     fn refused_receipt(job: &Job, donor: &str, log_tail: &str) -> Receipt {

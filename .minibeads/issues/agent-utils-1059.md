@@ -1,11 +1,12 @@
 ---
 title: 'merge-queue-donor-job-refusal: a job-caused could-not-run is not a donor fault, and the queue keeps its cause'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-donorref
-created_at: 2026-11-08T13:15:00.000000000+00:00
-updated_at: 2026-11-08T13:15:00.000000000+00:00
+created_at: 2026-11-08T13:15:00+00:00
+updated_at: 2026-11-08T13:42:27.409465023+00:00
+closed_at: 2026-11-08T13:42:27.409464613+00:00
 ---
 
 # Description
@@ -35,3 +36,11 @@ The consumer is changing its validator so that in queue mode it checks "target c
 # Notes
 
 Reported 2026-11-08 by a consumer's queue operator, relayed by the lead coordinator; evidence (donor job record and run events) kept on the lead's host. Related: #1045, #1049, #1051.
+
+## Resolution
+
+Items (1) and (2) delivered in this change; item (3) is filed as #1062 merge-queue-validator-admission-line (landed as 357b407a).
+
+The stale-base marker is the structured scope line `MQ_COULD_NOT_RUN_SCOPE: job stale-base <cause>` with exit 75: the fixed `stale-base` token starting the job-scope reason, never free text (`validate::STALE_BASE_TOKEN`, documented in the user guide's could-not-run section). Queue side, `Store::report` classifies that refusal as a stale job before any counting: no could-not-run strike, no host fault, no donor exclusion; the job is queued again for the stale sweep, matching `sweep_stale`. Donor side, `Worker::validate` never probes and never self-pauses for it. For (2), `validate::refusal_cause` picks the stale scope line, else the first `REFUSED` line, else the first scope line, else the last line as before; a donor picks the cause from its full log onto the new optional receipt field `refusal_cause` so a verbose teardown cannot push the cause above the log tail's cut, and the queue prefers that field. Receipts without the field (and validators without the marker) keep the previous behaviour in every donor/queue combination. There is no Python edition of this code; the change is Rust only (`rs/merge-queue` plus the user guide).
+
+Tests: `validate` units for the token and cause order, `donor` units for the no-strike report and the receipt-carried cause (including parsing a receipt written before the field existed), and the `cli_donor` end-to-end `a_stale_base_refusal_neither_probes_nor_pauses_the_donor` (probe never run, no pause or fault, cause recorded, next job lands). The whole-crate run is confirmed by the gate on the delivering commit.

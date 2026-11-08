@@ -1098,6 +1098,18 @@ donor is faulted, a decide-mode run keeps waiting instead of spending its claim 
 with any eligible donor known but healthy, the normal claim timeout applies even if it
 never claims.
 
+**A stale job is not a donor fault either.** A validator that refuses because the
+candidate does not contain the base it requires prints
+`MQ_COULD_NOT_RUN_SCOPE: job stale-base <cause>` with its exit-75 refusal (the fixed
+`stale-base` token starts the job-scope reason; that structured line, not free text, is
+the marker). The job itself is at fault, exactly as when the stale sweep cancels it:
+the queue records no could-not-run strike and no host fault, the donor never probes
+and never pauses for it, and the job is queued again for the stale sweep to settle.
+The recorded refusal detail names the refusal's cause line — the scope line, else the
+first `REFUSED` line — which a donor picks from its full log onto the receipt, so a
+wrapper's teardown lines printed after the refusal never hide why it refused. A
+validator that prints no such line keeps the generic could-not-run treatment above.
+
 A probe pass followed by a launch refusal whose own probe then fails is a flap cycle,
 not a recovery: the donor's probe back-off keeps doubling (60 s to 5 min) across such
 cycles instead of resetting, and only an admitted validation resets it. After `host_fault_escalate_after` consecutive

@@ -47,21 +47,52 @@ pub const NO_RECORDED_RESULT: &str = "red with no recorded test result";
 /// never the change's: it costs the job no strike. No line means job scope.
 pub const COULD_NOT_RUN_SCOPE_MARKER: &str = "MQ_COULD_NOT_RUN_SCOPE";
 
-/// Parse a [`COULD_NOT_RUN_SCOPE_MARKER`] line from runner output: `(is_host, reason)`.
-pub fn could_not_run_scope(log_text: &str) -> Option<(bool, String)> {
-    for line in log_text.lines() {
-        let Some(rest) = line.trim().strip_prefix(COULD_NOT_RUN_SCOPE_MARKER) else {
-            continue;
-        };
-        let rest = rest.trim_start_matches(':').trim();
-        if let Some(reason) = rest.strip_prefix("host") {
-            return Some((true, reason.trim().to_owned()));
-        }
-        if let Some(reason) = rest.strip_prefix("job") {
-            return Some((false, reason.trim().to_owned()));
-        }
+/// First token of a job-scope refusal reason that says the job itself is
+/// stale — its candidate does not contain the base the validator requires
+/// (`MQ_COULD_NOT_RUN_SCOPE: job stale-base <cause>`, with exit 75). This
+/// structured line is the stable stale-base marker (#1059): such a refusal
+/// is the job's fault, never the donor host's, so it records no strike,
+/// is never probed, and never pauses the donor — the same rule the stale
+/// sweep applies when it cancels a stale job. Validators that print no
+/// scope line keep the generic could-not-run treatment.
+pub const STALE_BASE_TOKEN: &str = "stale-base";
+
+/// Parse one [`COULD_NOT_RUN_SCOPE_MARKER`] line: `(is_host, reason)`.
+fn scope_of_line(line: &str) -> Option<(bool, &str)> {
+    let rest = line.trim().strip_prefix(COULD_NOT_RUN_SCOPE_MARKER)?;
+    let rest = rest.trim_start_matches(':').trim();
+    if let Some(reason) = rest.strip_prefix("host") {
+        return Some((true, reason.trim()));
+    }
+    if let Some(reason) = rest.strip_prefix("job") {
+        return Some((false, reason.trim()));
     }
     None
+}
+
+/// Parse a [`COULD_NOT_RUN_SCOPE_MARKER`] line from runner output: `(is_host, reason)`.
+pub fn could_not_run_scope(log_text: &str) -> Option<(bool, String)> {
+    log_text
+        .lines()
+        .find_map(scope_of_line)
+        .map(|(host, reason)| (host, reason.to_owned()))
+}
+
+/// The stale-base scope line of a refusal's output, when the validator
+/// marked the refusal with the structured [`STALE_BASE_TOKEN`] (job scope
+/// only: a host-scope line is a host fault even if its reason names the
+/// token). Returns the whole trimmed line, which carries the cause.
+pub fn stale_base_refusal(log_text: &str) -> Option<&str> {
+    log_text.lines().map(str::trim).find(|line| {
+        scope_of_line(line).is_some_and(|(host, reason)| {
+            !host
+                && reason.split_whitespace().next().is_some_and(|token| {
+                    token
+                        .trim_end_matches([':', ',', ';'])
+                        .eq_ignore_ascii_case(STALE_BASE_TOKEN)
+                })
+        })
+    })
 }
 
 /// Whether a refusal's output says admission was busy rather than unable: the
@@ -86,17 +117,34 @@ pub fn could_not_run_busy(log_text: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
-/// The line of a refusal's log that names why it refused: the first line
-/// holding `REFUSED`, else the last non-empty line. A wrapper's cleanup
-/// lines (`validate-lock RELEASED`, `box FREE`) otherwise bury the reason
-/// as the log's last line.
-pub fn refusal_line(log_text: &str) -> Option<&str> {
+/// The line of a refusal's log that names why it refused — its cause, in
+/// the order a reader would trust: the structured stale-base scope line,
+/// else the first line holding `REFUSED`, else the first scope line, else
+/// (for a validator that marks nothing) the last non-empty line. A
+/// wrapper's teardown lines (`validate-lock RELEASED`, a retained slot)
+/// print after the refusal and would otherwise bury the reason as the
+/// log's last line (#1059).
+pub fn refusal_cause(log_text: &str) -> Option<&str> {
+    if let Some(line) = stale_base_refusal(log_text) {
+        return Some(line);
+    }
     let lines: Vec<&str> = log_text.lines().map(str::trim).collect();
     lines
         .iter()
         .copied()
         .find(|line| line.contains("REFUSED"))
+        .or_else(|| {
+            lines
+                .iter()
+                .copied()
+                .find(|line| scope_of_line(line).is_some())
+        })
         .or_else(|| lines.iter().rev().copied().find(|line| !line.is_empty()))
+}
+
+/// [`refusal_cause`], under its older name.
+pub fn refusal_line(log_text: &str) -> Option<&str> {
+    refusal_cause(log_text)
 }
 
 /// A log line cut to at most 200 chars, for a reason quoted in a receipt
@@ -844,8 +892,8 @@ fn cannot_execute(
         std::env::var("PATH").unwrap_or_default()
     );
     if finished.spawn_error.is_none() {
-        if let Some(line) = refusal_line(log_text) {
-            detail.push_str(&format!("; last output: {}", cut_line(line)));
+        if let Some(line) = refusal_cause(log_text) {
+            detail.push_str(&format!("; cause: {}", cut_line(line)));
         }
     }
     Some(detail)
@@ -1772,6 +1820,53 @@ mod unit {
         );
         assert_eq!(refusal_line(""), None);
         assert_eq!(refusal_line("  \n\n"), None);
+    }
+
+    #[test]
+    fn stale_base_refusal_needs_the_job_scope_token() {
+        // #1059: the marker is the structured job-scope line whose
+        // reason starts with the stale-base token — never free text.
+        assert_eq!(
+            stale_base_refusal(
+                "MQ_COULD_NOT_RUN_SCOPE: job stale-base target lacks the base\nCOULD_NOT_RUN\n"
+            ),
+            Some("MQ_COULD_NOT_RUN_SCOPE: job stale-base target lacks the base")
+        );
+        assert!(stale_base_refusal("MQ_COULD_NOT_RUN_SCOPE: job stale-base: moved").is_some());
+        assert_eq!(
+            stale_base_refusal("MQ_COULD_NOT_RUN_SCOPE: host stale-base wedged"),
+            None,
+            "host scope stays a host fault even when its reason names the token"
+        );
+        assert_eq!(
+            stale_base_refusal("MQ_COULD_NOT_RUN_SCOPE: job wedged"),
+            None
+        );
+        assert_eq!(
+            stale_base_refusal("target lacks the fresh base\nCOULD_NOT_RUN\n"),
+            None,
+            "free text alone is not the marker"
+        );
+        assert_eq!(stale_base_refusal(""), None);
+    }
+
+    #[test]
+    fn refusal_cause_prefers_the_cause_over_the_teardown() {
+        // #1059: teardown lines print after the refusal; the cause wins.
+        let stale = "MQ_COULD_NOT_RUN_SCOPE: job stale-base target lacks the base\n\
+                     COULD_NOT_RUN\nvalidate-run: RETIRE-RETAINED may still use slot s1\n";
+        assert_eq!(
+            refusal_cause(stale),
+            Some("MQ_COULD_NOT_RUN_SCOPE: job stale-base target lacks the base")
+        );
+        let host = "MQ_COULD_NOT_RUN_SCOPE: host wedged\nCOULD_NOT_RUN\nbox FREE\n";
+        assert_eq!(
+            refusal_cause(host),
+            Some("MQ_COULD_NOT_RUN_SCOPE: host wedged"),
+            "a scope line is a structured cause, ahead of the last line"
+        );
+        let refused = "REFUSED: no image\nvalidate-lock RELEASED\n";
+        assert_eq!(refusal_cause(refused), Some("REFUSED: no image"));
     }
 
     #[test]
