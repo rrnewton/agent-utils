@@ -173,7 +173,7 @@ def test_timing_browser_steps_hold_every_browser_slot() -> None:
     config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
     by_tag = config.by_tag()
     tag = "vibe-talk.check.read-aloud-blocks-browser"
-    assert by_tag[tag].hint.resources.get("browser") == 4, tag
+    assert by_tag[tag].hint.resources.get("browser") == config.resource_caps["browser"], tag
 
 
 def test_screenshot_shards_cover_every_profile_once() -> None:
@@ -1122,7 +1122,7 @@ def test_a_browser_check_split_into_parts_runs_every_part_once() -> None:
 
 
 def test_the_timeline_redraw_budget_holds_every_browser_slot() -> None:
-    # `#474 browser-lane-critical-path`: the browser cap went from 1 to 4. The redraw budget is a
+    # `#474 browser-lane-critical-path`: the browser cap went from 1 to 4 (and to 8 on 2026-11-07). The redraw budget is a
     # timing, so it still runs with no other browser step beside it, whatever the cap is.
     cfg = dag_from_path(REPO_ROOT / "validation.dag.yaml")
     benchmark = cfg.by_tag()["timeline.browser.benchmark"]

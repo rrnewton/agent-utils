@@ -22,8 +22,8 @@
 #
 # THE BROWSER CAP IS THE POINT OF THE `resource_caps` BLOCK. Playwright is the only genuinely
 # expensive thing here — a real Chromium per run — and a pile of them at once on a laptop is how a
-# test suite becomes the reason the laptop is unusable. `browser: 4` is a semaphore: any number of
-# steps may DECLARE the resource, and at most four hold it at a time.
+# test suite becomes the reason the laptop is unusable. `browser: 8` is a semaphore: any number of
+# steps may DECLARE the resource, and at most eight hold it at a time.
 #
 # It was 1 until `#474 browser-lane-critical-path` (2026-10-23). The browser steps then ran one after
 # another, and their sum was nearly all of a 2470s gate. They are latency-bound, not
@@ -39,6 +39,10 @@
 # fixed one per shard collided whenever two gates photographed at once (#1037 shots-port-collision). It also writes its PNGs under
 # vibe-talk/debug/screenshots/, a new stamped directory each run. The lane at 1 and at 4 was compared check by check.
 #
+# It went from 4 to 8 on 2026-11-07: two paired page-only runs on a 316-core host took 869/840 s at 4
+# and 500/450 s at 8 (-42%/-46%), with no failed step at either cap, the cap-8 runs starting at equal
+# or higher load. The timing checks that hold every slot still run alone among browsers.
+#
 # HOW TO RUN IT
 #
 #   dagrun run --dag vibe-talk/tests.dag.yaml
@@ -49,9 +53,9 @@
 description: vibe-talk fmt, lint, unit, PWA, offline-cache, page and screenshot suites, boxed
 
 resource_caps:
-  # A real browser. Four at a time, however many steps ask for it. validation/timeline.dag.yaml
+  # A real browser. Eight at a time, however many steps ask for it. validation/timeline.dag.yaml
   # states the same number: the composed graph refuses two fragments that disagree.
-  browser: 4
+  browser: 8
 
 steps:
   # ---- the cheap gates, which need nothing built ------------------------------------------------
@@ -551,7 +555,7 @@ steps:
       # Holds every browser slot in its gate (the fold-latency pattern):
       # its boundary gaps are measured on the audio clock and sibling
       # browser steps starve them under multi-gate load.
-      resources: {browser: 4}
+      resources: {browser: 8}
       # 78 s median on 2026-11-07 (#998: blocks of at least 2.5 s and
       # the two underrun control reads), ~10 CPU-seconds.
       est_duration_s: 80
@@ -1975,7 +1979,7 @@ steps:
     hint:
       # A latency budget measures the page, so it owns every browser slot,
       # like timeline.browser.benchmark.
-      resources: {browser: 4}
+      resources: {browser: 8}
       est_duration_s: 25
 
   # `#459 pack-keeps-card-still` and `#460 pack-gap-slide` in the browser engine, at 1280x800 with a mouse and
