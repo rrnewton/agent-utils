@@ -1,10 +1,12 @@
 ---
 title: 'chat-launch-outer-kill-leak: the outer-kill chat launch test can leave a chat run alive for days'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 created_at: 2026-11-08T13:40:00.000000000+00:00
-updated_at: 2026-11-08T13:40:00.000000000+00:00
+assignee: cl-start
+updated_at: 2026-11-08T17:30:00.000000000+00:00
+closed_at: 2026-11-08T17:30:00.000000000+00:00
 ---
 
 # Description
@@ -28,3 +30,17 @@ On 2026-11-08 a slot could not be removed: its disk image would not unmount ("De
 # Notes
 
 Found by the devbig030 coordinator while removing a stale slot; filed at the lead's request. Give it to whichever lane next touches py/tests/test_agentctl_chat_launch_rust.py or the chat launcher. Related: #857 (closed), the tmux test-server leak check in validation.
+
+## Resolution
+
+Landed as d83ae91c "chat-subscription-plugin: a supervisor takes its group down when its host dies" (cl-start; gated as 072a1475: main phase 56/56; exclusive phase 5/6, with cross.agentctl.differential-1 timing out on the Python edition's Muse send under load, as in #1067, and passing its solo rerun).
+
+- Mechanism: the leaked `chat run` was not the bridge but chat-subscription-plugin's atomic supervisor. It is a clone of `chat run`, so it shows the same command line; it is single-threaded, leads the plugin's process group, masks every blockable signal (hence "ignores SIGTERM"), sits in pause(), and clears its parent-death signal once the host owns it. Its host kills the group during cleanup. A host killed outright, here by the launcher's parent-death SIGKILL after the outer pytest was killed, never cleans up, so the supervisor lived on under init.
+- The test missed it: test_killing_outer_pytest_leaves_no_chat_run checked only the bridge, harness and launcher pids, so it passed while leaking one supervisor on every run. 30 of 30 runs passed and left 30 orphans.
+- Fix: the supervisor checks getppid() every 0.5 s; the kernel reparents it the moment the host process exits. It then kills its own process group, itself included, and holds no descriptor for this. After the fix: 30 of 30 runs with 0 orphans, plus 20 consecutive runs beside a running shared gate with 0 orphans.
+- Tests:
+  - New a_supervisor_takes_its_group_down_when_its_host_is_killed: a host subprocess is SIGKILLed, and its supervisor and plugin must be gone within 10 s.
+  - test_killing_outer_pytest_leaves_no_chat_run now gives the inner pytest a --basetemp under its own tree, asserts that no process naming that tree survives, and on any exit kills exactly the survivors, each re-checked by cmdline.
+  - Both fail with the fix disabled and pass with it.
+- On the SIGTERM criterion: the process that ignored SIGTERM was the supervisor, which masks signals by design; it now exits by itself once its host is gone, and the new test covers that.
+
