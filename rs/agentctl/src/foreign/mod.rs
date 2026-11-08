@@ -5,8 +5,10 @@
 //! Slice B3-1 covers the shared ownership/identity core types in
 //! [`ownership`]; slice B3-2 adds the kernel evidence they are checked
 //! against ([`procstat`] plus the procfs readers in [`ownership`]); slice
-//! B3-3 adds pidfd pinning and `stop_process` in [`ownership`]. No CLI
-//! wiring yet.
+//! B3-3 adds pidfd pinning and `stop_process` in [`ownership`]; slice B3-4
+//! starts the registry in [`registry`] with the layout and the
+//! active-harness bridge. No CLI wiring yet.
 
 pub mod ownership;
 pub mod procstat;
+pub mod registry;
