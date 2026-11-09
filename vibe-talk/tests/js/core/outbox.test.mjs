@@ -759,3 +759,35 @@ test("`#1052 post-to-main`: dispatch does not place a ticked top-level reply, an
   assert.equal(entry.postToMain, true);
   assert.equal(entry.wire.postToMain, true);
 });
+
+test("`#624 voice-page-modularity`: the outbox composition makes the store, the dismissed sends and the Undo together, and the connection coming back resumes retries", () => {
+  const { createOutboxComposition } = OUTBOX;
+  const log = [];
+  const storage = () => ({ getItem: () => null, setItem: () => {}, removeItem: () => {} });
+  const composition = createOutboxComposition({
+    storage,
+    makeRoom: () => log.push("room"),
+    keepsOwnPosts: () => false,
+    now: () => 123,
+    lookup: (id) => ({ id }),
+    channelLabel: (id) => id,
+    styled: () => ({}),
+    writeClipboard: async () => true,
+    copyRefused: () => "refused",
+    putBackDismissed: (id) => log.push(`putback:${id}`),
+    scheduleBackSync: () => {},
+    mountDismissedSends: (deps) => { log.push(["mount", typeof deps.store]); return { render() {}, open() {}, close: () => true, trapTab() {}, copy: async () => {}, restore() {} }; },
+    clock: { now: () => 0, setTimeout: () => 0, clearTimeout: () => {} },
+    sendUndoEnded: () => log.push("undo-ended"),
+    resumeRetries: () => log.push("resume"),
+  });
+  assert.ok(composition.outbox, "the composition made no outbox");
+  assert.equal(composition.outbox.size(), 0);
+  assert.equal(composition.outgoingObservations.size, 0);
+  assert.equal(composition.outgoingFromSaved(null), null, "nothing saved read back as an entry");
+  assert.ok(composition.dismissedSends, "the composition made no dismissed sends");
+  assert.ok(composition.sendUndo, "the composition made no send Undo");
+  assert.deepStrictEqual(log, [["mount", "function"]]);
+  composition.resumeOnOnline();
+  assert.equal(log.at(-1), "resume", "the connection coming back did not resume retries");
+});

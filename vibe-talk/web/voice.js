@@ -1362,23 +1362,32 @@ function composerState() {
 // `#195 send-resilience`. When a send whose answer was lost goes out again on its own, and the waits
 // before it, are web/src/core/outbox's (`nextRetryAt`, `#624 voice-page-modularity`).
 /**
- * The outbox: every send this page has not seen through, by id, in the order written, how often it has
- * changed, and the device's copy (web/src/core/outbox `createOutboxStore`, `#624
- * voice-page-modularity`). The entries are this page's objects, changed in place as a send goes on.
+ * The outbox composition state — the outbox, what each send has been observed doing, a saved
+ * entry as the live outbox holds it, the sends dismissed from it and their Settings view, and
+ * the dismissal the Undo chip takes back — is web/src/core/outbox's now (`createOutboxComposition`,
+ * the step 17 composition root's outbox half, `#624 voice-page-modularity`). Made here, in the
+ * page's order, beside the send service it feeds.
  *
- * @type {import("./src/core/outbox/index.ts").OutboxStore<any>}
+ * @type {import("./src/core/outbox/index.ts").OutboxComposition}
  */
-const outbox = createOutboxStore({
-  storage: deviceStorageOnUse(),
+const outboxComposition = createOutboxComposition({
+  storage: () => deviceStorageOnUse(),
   makeRoom: () => messageCache.dropMessageCache(),
   keepsOwnPosts: (channel) => storeKeepsOwnPosts(channel),
+  now: () => Date.now(),
+  lookup: (id) => el(id),
+  channelLabel: (id) => channelLabel(id),
+  styled: (tag, className, text) => styled(tag, className, text),
+  writeClipboard: (text) => writeClipboardText(text),
+  copyRefused: () => COPY_REFUSED,
+  putBackDismissed: (id) => sendTakeBack.putBack(id),
+  scheduleBackSync: () => scheduleBackSync(),
+  mountDismissedSends: (deps) => mountDismissedSends(/** @type {any} */ (deps)),
+  clock: clockOnUse(),
+  sendUndoEnded: () => sendTakeBack.renderUndo(),
+  resumeRetries: () => outboxDispatch.resumeRetries(),
 });
-const outgoingObservations = new Map();
-
-/** A saved entry as the live outbox holds it (web/src/core/outbox `outgoingFromSaved`). */
-function outgoingFromSaved(held) {
-  return entryFromSaved(held, Date.now);
-}
+const { outbox, outgoingObservations, outgoingFromSaved, dismissedSends, dismissedSendsView, sendUndo } = outboxComposition;
 
 // The attempt in progress for each send, whoever waits for its attempt to end and the credential it
 // was queued under, one pass at a time over the outbox, every automatic retry's hold and timer, and
@@ -1547,35 +1556,6 @@ const { answeredRow, doneWhereNotDrawn, answeredDone, doneHeldHere, markAnswered
 // web/src/present/settings's (`DISMISSED_LABEL_CHARS`, `#624 voice-page-modularity`).
 const CHANNEL_DRAFT_REFUSED = "This browser could not save the draft. Keep this page open until you send it.";
 /**
- * The sends dismissed from the outbox, newest first, each with when it was dismissed, and the device's
- * copy of them (web/src/core/outbox `createDismissedSends`, `#624 voice-page-modularity`).
- *
- * @type {import("./src/core/outbox/index.ts").DismissedSends<any>}
- */
-const dismissedSends = createDismissedSends({
-  storage: deviceStorageOnUse(),
-  now: () => Date.now(),
-  makeRoom: () => messageCache.dropMessageCache(),
-  decode: (saved) => outgoingFromSaved(saved),
-});
-/**
- * `#348 settings-dynamic-lists`. Settings' Recently dismissed and the pop-out over it, with the dismissed
- * send the pop-out shows (web/src/view/settings `mountDismissedSends`, `#624 voice-page-modularity`).
- * Made here, beside the sends it lists; its wiring is under "the pop-out over Recently dismissed".
- *
- * @type {import("./src/view/settings/index.ts").DismissedSendsView}
- */
-const dismissedSendsView = mountDismissedSends({
-  lookup: (id) => el(id),
-  store: () => dismissedSends,
-  channelLabel: (id) => channelLabel(id),
-  styled: (tag, className, text) => styled(tag, className, text),
-  writeClipboard: (text) => writeClipboardText(text),
-  copyRefused: () => COPY_REFUSED,
-  putBack: (id) => sendTakeBack.putBack(id),
-  scheduleBackSync: () => scheduleBackSync(),
-});
-/**
  * `#443 undo-key-general`. The order undoable acts were done in, for the one undo key to take the
  * newest back first. Every offer an Undo chip makes is stamped from this as it is made — a Done
  * (`lastDismissal`), a send dismissed from the outbox (`sendUndo`), a bookmark taken away
@@ -1587,13 +1567,6 @@ const undoStamps = createUndoStamps();
 function nextUndoAt() {
   return undoStamps.next();
 }
-
-/**
- * The dismissal the Undo chip takes back while it is up: the entry's id, its wait for an automatic
- * send if it had one, its stamp, and the chip's timer (web/src/core/outbox `createSendUndo`, `#624
- * voice-page-modularity`).
- */
-const sendUndo = createSendUndo({ clock: clockOnUse(), ended: () => sendTakeBack.renderUndo() });
 
 function showView(name) {
   // `#277 reply-in-column`. The call's view is one list, with no column for a reply to be open in.
@@ -14259,7 +14232,7 @@ const { queue: queueOutgoingMessage, retry: retryOutgoingMessage, schedule: sche
 // The browser's own word that the connection is back. Guarded because a page loaded without a
 // full window — some harnesses build one by hand — has no `window.addEventListener`.
 if (typeof window.addEventListener === "function") {
-  window.addEventListener("online", () => outboxDispatch.resumeRetries());
+  window.addEventListener("online", () => outboxComposition.resumeOnOnline());
 }
 /**
  * Taking a send back (web/src/view/channel `createSendTakeBack`, `#624 voice-page-modularity`):
@@ -14295,7 +14268,7 @@ const { edit: editOutgoingMessage, dismiss: dismissOutgoingMessage, endUndo: end
 const outboxRows = createOutboxRows({
   el, leftEl, selectedChannelId,
   outgoingThreadOf: (entry) => outgoingThreadOf(entry),
-  entries: () => outbox.values(),
+  entries: () => /** @type {any} */ (outbox.values()),
   removeEntry: (id) => outbox.remove(id),
   forgetObservations: (id) => { outgoingObservations.delete(id); },
   receiptRetires: /** @type {any} */ (sentReceiptRetires), blockerOf: (entry) => /** @type {any} */ (outgoingBlocker(/** @type {any} */ (entry))), inPlaceDrawn: outgoingInPlaceDrawn,

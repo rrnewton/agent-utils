@@ -28,6 +28,8 @@ export {
   waitingItsTurn,
 } from "./state.ts";
 export type { ReceiptView, SendState } from "./state.ts";
+export { createOutboxComposition } from "./composition.ts";
+export type { DismissedViewLike, OutboxComposition, OutboxCompositionDependencies } from "./composition.ts";
 export { createOutboxStore } from "./store.ts";
 export type { OutboxDependencies, OutboxEntry, OutboxStore } from "./store.ts";
 export { DRAFTS_KEY, createReplyDrafts } from "./replydrafts.ts";
