@@ -4,7 +4,7 @@ status: open
 priority: 2
 issue_type: bug
 created_at: 2026-11-09T02:30:00.000000000+00:00
-updated_at: 2026-11-09T02:42:29.000000000+00:00
+updated_at: 2026-11-09T17:30:00.000000000+00:00
 assignee: cl-wrkid
 ---
 
@@ -111,3 +111,22 @@ Implementation, Python (cl-wrkid, 2026-11-08):
 Rust parity gap (recorded, not mirrored): `remove_write.rs` runs its one pre-fence `assert_slot_unused` under its mutation locks (~1869). Moving it out safely needs what Python has after the fence, a rollback of the fence when the after-fence scan refuses. Rust instead leaves the FINISH journal for `wrkslots recover`, so the race this change tolerates would turn into a recovery-required state there. Rust remove is still fixture-only (`require_fixture`) and refuses image slots and owner consent. For the Rust wrkslots owner via the coordinator: add the after-fence rollback, then move the scan before the locks with a record re-check, as in Python.
 
 Remaining before closing: the daytime load measurement of the lock hold with this change (image-slot `before_image_fence` hold measured separately), and validation admission's shared read lock (second design option), if the measurement still shows admission waiting.
+
+Measurement 2, with the change (cl-wrkid, 2026-11-09 daytime, main at 2ae788cf, no added load, host load 41-93, no gate running). Method as in measurement 1: one Python `wrkslots remove` of a verified-dead agent (worktree) slot on the remove-differential fixture, with `_locked` and the phases wrapped in timers; three runs, the third with every scan made 5 s slower through the census churn seam. Logs: /tmp/cl-wrkid-1108b/ on devbig030.
+
+| phase | run 1 | run 2 | run 3 (+5 s per scan) | locks |
+|---|---|---|---|---|
+| shared lsof census | 8.88 s | 8.27 s | 8.86 s | none |
+| unlocked use pass (fresh scan) | 3.57 s | 3.56 s | 8.73 s | none |
+| registry locks held (ACTIVE, ACTIVE.<machine>.json) | **2.03 s** | **1.99 s** | **2.05 s** | held |
+| of which the locked whole-record re-check (`_assert_unlocked_record_current`) | <0.01 s | <0.01 s | <0.01 s | held |
+| of which the path fence | 0.54 s | 0.54 s | 0.51 s | held |
+| after-fence scan and deletion (`_finish_remove_paths`) | 4.92 s | 4.96 s | 9.99 s | none |
+| final registry update | 0.03 s | 0.03 s | 0.04 s | held |
+
+The worktree-slot lock hold is now about 2 s and does not grow with scan time. Before the change it was 8.5 s, growing to 18.7 s with the same slowdown (measurement 1). The rest of the hold is the cheap checks and the fence.
+
+Image-backed slots, measured separately: their `before_image_fence` check (`observe_image_before_fence`, which runs `_observe_slot_use_once`: lsof +D plus the direct /proc scan) stays under the locks, per the lead. That call, timed alone five times on a one-file scratch directory: 11.64, 11.52, 12.16, 11.54, 11.44 s at load 42-93, about 8 s lsof and 3.5 s direct scan, matching the remove runs' census and scan times. This is a lower bound for a real image slot, whose lsof +D also walks every file of the slot's checkouts. No image slot was created: mounting one needs root, which this lane did not use. So an image-slot removal holds the registry locks for about 2 s plus 11.5 s or more, and that grows with host load as lsof does. It dominates the hold, about 85% at this load.
+
+Proposal (for the lead): the hold is solved for worktree slots, and image slots, the common case on both hosts, still hold the locks for the whole lsof. By the lead's rule ("if it dominates under load, the follow-up must first stop new entrants and only then run an unlocked lsof"), that follow-up is due: under the locks, fence first (stop new entrants by path) and release; then run lsof against the old mount, plus the remount, outside the locks, with the after-fence checks staying decisive. Two ways to track it: (a) close #1108 with this measurement as its Resolution, for worktree slots and the measurements, and file the image follow-up as a new P1 issue; or (b) keep #1108 open for it. Recommendation: (a), since the follow-up is a separate design (it changes the image fence's order and needs its own safety argument); #1108's validation-admission read-lock option can be dropped unless admission still waits once both are in.
+
