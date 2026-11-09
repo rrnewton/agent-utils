@@ -464,11 +464,12 @@ Solo on 2026-11-09 (Chromium 149.0.7827.55): all five files pass whole.
   `quiet()` before a screenshot, and its late-read frame counts are timed
   subjects.
 
-Still to do: batch 7 (navigation), and the last group — `scroll_stability`
-(whose `held()` "only N frames sampled" check is itself load-sensitive:
-the fix is to wait for both its wall window and its frame count, never
-either alone), the read-aloud files, and the remaining small files
-(`reply_marks_read` has no `settled()` of its own to convert).
+Still to do then: batch 7 (navigation), and the last group —
+`scroll_stability` (whose `held()` "only N frames sampled" check is itself
+load-sensitive: the fix is to wait for both its wall window and its frame
+count, never either alone), the read-aloud files, and the remaining small
+files (`reply_marks_read` has no `settled()` of its own to convert). All
+done since: batch 7, the read-aloud pair, and batch 10b below.
 
 Solo on 2026-11-09 (Chromium 149.0.7827.55): all five files pass whole.
 
@@ -538,3 +539,29 @@ betray itself. The rest is scroll baselines and paint after exact waits.
 card-kinds poll) are as they were.
 
 Solo on 2026-11-09 (Chromium 149.0.7827.55): both files pass whole.
+
+## Batch 10b, 2026-11-09 (mu-settle)
+
+[muse watermelon] `scroll_stability_browser.py`. Its two frame watches
+failed on shape under gate load: "only N frames were sampled" in the
+holding window, twice on other batches' gates (2026-11-08 and batch 2
+here). The window and the frames are both the evidence — the glide the
+watch outwaits is a wall-clock timer, and the samples are one per painted
+frame, there to catch motion — so `Reader.held()` and `resort_walk`'s
+answer now wait for both: the full hold (or 1200 ms quiet) *and* more
+than ten frames sampled, within a ten-second deadline, before the watch
+is unwound and every per-sample check runs as before. A starved frame
+rate extends the observation — more frames that could convict — instead
+of failing the count; nothing about what counts as moved changed.
+
+That closes the sweep: every `vibe-talk/tests` browser file that called
+`settled()` (or kept its own frame wait in `fold_latency`,
+`reply_continuity`, `view_switch`, `search_whose`, `link_url_chip`,
+`thread_card_fit`'s 150 ms, the collapsed/compact 150 ms tails,
+`read_modes`' landing, and `scroll_stability`'s frame watches) has
+been reviewed, and its converted and kept waits are recorded batch by
+batch in these Notes. `reply_marks_read_browser.py` was reviewed too: it
+has no fixed-frame wait of its own.
+
+Solo on 2026-11-09 (Chromium 149.0.7827.55): scroll_stability and the
+column-overscroll step that shares it pass whole.

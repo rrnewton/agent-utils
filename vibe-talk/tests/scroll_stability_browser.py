@@ -585,8 +585,19 @@ class Reader:
     def held(self, before: tuple[str, float], why: str, hold_ms: int = GLIDE_HOLD_MS,
              list_id: str = "discord-log", foot: bool = False) -> None:
         """Wait `hold_ms`, then: at every frame since `watch`, the row the reader was on was the first on
-        screen of `list_id`, within a pixel of where it was -- and with `foot`, the list was at its foot."""
+        screen of `list_id`, within a pixel of where it was -- and with `foot`, the list was at its foot.
+
+        The window and the frames are both the evidence (`#1118 browser-fixed-frame-settle`): the
+        glide this outwaits is a wall-clock timer, so the window is never shortened, and the
+        samples are one per painted frame, so under gate load `hold_ms` alone can hold too few
+        of them to judge. Wait for both -- the window out, and more than ten frames sampled,
+        within a forgiving deadline -- so a starved frame rate extends the observation (more
+        frames that could convict) instead of failing the sample count."""
         self.page.wait_for_timeout(hold_ms)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not self.page.evaluate(
+                "() => window.__scrollWatch && window.__scrollWatch.samples.length > 10"):
+            self.page.wait_for_timeout(25)
         self.frames(2)
         samples = self.page.evaluate(UNWATCH_JS)
         self.check(len(samples) > 10, f"{why}: only {len(samples)} frames were sampled")
@@ -1274,6 +1285,12 @@ def resort_walk(reader: Reader) -> None:
         reader.check(api.timeline_requests() > reads, f"{why}: the page never read the channel behind the message")
         reader.wait_for("() => window.__timelineReads === 0", f"{why}: the read behind the message never came back")
         reader.quiet(1200)
+        # As in Reader.held: the quiet window and the sampled frames are both the evidence, so
+        # a starved frame rate extends the observation instead of failing the count (`#1118`).
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not page.evaluate(
+                "() => window.__scrollWatch && window.__scrollWatch.samples.length > 10"):
+            page.wait_for_timeout(25)
         samples = page.evaluate(UNWATCH_JS)
         before = dict((card, at) for card, at, _ in cards)
         reader.check(len(samples) > 10, f"{why}: only {len(samples)} frames were sampled")
