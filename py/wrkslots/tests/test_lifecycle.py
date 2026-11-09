@@ -9586,9 +9586,13 @@ def test_ownerless_validation_rechecks_an_adopted_transient_holder_before_policy
         assert "ownerless linked validation checkout recovery is disabled" in stderr
         assert "live process" not in stderr
         assert lsof_calls == 3
-        # A namespace init may retain the exited child as a zombie for the
-        # restarted /proc pass; the host init can reap it before enumeration.
-        assert generation_reads in {2, 3}
+        # The holder is released at the second read, so there are at least two.
+        # Every later read is a listing of /proc while the exited holder still
+        # lingers as a zombie (a namespace init may retain it; the host init can
+        # reap it first).  The census lists /proc again until a listing adds
+        # nothing (#1102), so on a busy host, where births keep adding
+        # generations, it takes more listings; its own listing bound caps them.
+        assert 2 <= generation_reads <= 2 + wrkslots._CENSUS_LISTING_ROUNDS
         assert holder.stdin is not None and holder.stdin.closed
         assert select.select([adopted_pidfd], [], [], 1)[0] == [adopted_pidfd]
         assert target.is_dir()
