@@ -104,10 +104,15 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
     thread.start()
     try:
         with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-typing-scroll-") as profile:
-            context = chromium.launch_persistent_context(
-                profile, headless=True, executable_path=args.browser_executable,
-                viewport={"width": width, "height": height}, color_scheme="dark",
-                **({"device_scale_factor": 2.625, "is_mobile": True, "has_touch": True} if touch else {}))
+            if touch:
+                context = chromium.launch_persistent_context(
+                    profile, headless=True, executable_path=args.browser_executable,
+                    viewport={"width": width, "height": height}, color_scheme="dark",
+                    device_scale_factor=2.625, is_mobile=True, has_touch=True)
+            else:
+                context = chromium.launch_persistent_context(
+                    profile, headless=True, executable_path=args.browser_executable,
+                    viewport={"width": width, "height": height}, color_scheme="dark")
             version = context.browser.version if context.browser else "Chromium"
             page = context.pages[0]
             errors: list[str] = []
