@@ -1709,7 +1709,10 @@ def test_audit_follows_a_leader_that_exits_after_the_listing_like_python(
                     result = _rust(root, census_state=tmp_path / "rust-census.json")
                     assert result.returncode == 0, result.stderr
                     payload = _scrub(json.loads(result.stdout))
-                assert calls.read_text().strip() == "1", edition
+                # The seam fired, so the leader exited after the listing.  A
+                # census attempt discarded for other host motion runs the seam
+                # again, a no-op past its first call.
+                assert int(calls.read_text()) >= 1, edition
             finally:
                 child.kill()
                 child.wait(timeout=10)
