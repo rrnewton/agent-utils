@@ -14,7 +14,10 @@ before the edition cutover.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import difflib
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -780,3 +783,203 @@ def test_remove_records_the_same_liveness_line_as_python(tmp_path: Path) -> None
         assert expected[0]["detail_truncated"] is True
         assert "\\x01\u00e9 yyy" in str(expected[0]["detail"])
         assert _liveness_evidence(rust_root) == expected
+
+
+# #1121 finish-journal-live-remover: the finish journal names the removing
+# process as its top-level owner, so a classifier reads a live removal (one
+# deleting its fenced tree outside the lock) as busy, not as interrupted by
+# the removed slot's dead owner.
+_INTERRUPTED_REMOVE = """
+import sys
+sys.path.insert(0, sys.argv[1])
+from wrkslots import cli
+sys.exit(cli.main([
+    "--project-root", sys.argv[2], "remove", "slot-a",
+    "--coordinator-pid", sys.argv[3], "--expected-generation", "1",
+]))
+"""
+
+
+def _interrupted_python_remove(root: Path) -> tuple[Path, dict[str, object]]:
+    """Kill a Python remove of slot-a right after it wrote its finish journal."""
+
+    env = dict(os.environ)
+    env["WRKSLOTS_TEST_INTERRUPT"] = "after-finish-journal"
+    result = subprocess.run(
+        [sys.executable, "-c", _INTERRUPTED_REMOVE, str(AU_ROOT / "py"), str(root), str(os.getpid())],
+        capture_output=True, text=True, check=False, timeout=900, env=env,
+    )
+    assert result.returncode == 86, result.stderr
+    path = root / "worktrees" / "ACTIVE.node-a.journal"
+    journal: dict[str, object] = json.loads(path.read_text())
+    return path, journal
+
+
+def _classify_both(root: Path) -> tuple[tuple[int, str, str], subprocess.CompletedProcess[str]]:
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = wrkslots_cli.main(
+            [
+                "--project-root", str(root), "--machine", "node-a",
+                "classify-create-journals", "slot-c", "--agent", "agent-other",
+                "--slot-type", "agent", "--format", "json",
+            ]
+        )
+    rust = subprocess.run(
+        [
+            str(rust_wrkslotsd()), "classify-create-journals", "slot-c",
+            "--agent", "agent-other", "--slot-type", "agent",
+            "--machine", "node-a", "--root", str(root), "--format", "json",
+        ],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
+    )
+    return (rc, out.getvalue(), err.getvalue()), rust
+
+
+def test_finish_journal_classifies_by_its_remover_in_both_editions(tmp_path: Path) -> None:
+    root = _fixture(tmp_path / "project")
+    path, journal = _interrupted_python_remove(root)
+    record = cast(dict[str, object], journal["record"])
+    remover = cast(dict[str, object], journal["owner"])
+    slot_owner = cast(dict[str, object], record["owner"])
+    assert remover["pid"] != slot_owner["pid"]
+    assert set(remover) == {"pid", "start_ticks", "boot_id", "host_id", "cgroup_path"}
+
+    # The remover was killed: interrupted, as before.
+    (rc, _out, err), rust = _classify_both(root)
+    assert rc == 3 and "interrupted" in err, err
+    # The Rust edition reports this refusal as a host fault, exit 1.
+    assert rust.returncode not in (0, 75) and "interrupted" in rust.stderr, rust.stderr
+
+    # A live remover, with the slot's owner dead: busy (75), kind finish.
+    # Written as a remover writes it, so the event log carries it too.
+    config = wrkslots_cli._load_config(str(root), "node-a")
+    journal["owner"] = _identity_obj(os.getpid())
+    wrkslots_cli._write_journal(config, journal, journal_path=path)
+    (rc, out, err), rust = _classify_both(root)
+    assert rc == 75, err
+    assert json.loads(out)["busy"]["kind"] == "finish"
+    assert json.loads(out)["busy"]["pid"] == os.getpid()
+    assert rust.returncode == 75, rust.stderr
+    assert json.loads(rust.stdout)["busy"]["kind"] == "finish"
+    assert json.loads(rust.stdout)["busy"]["pid"] == os.getpid()
+
+    # A journal from before #1121 has no owner: read, and classified exactly
+    # as before, by the slot's dead owner.
+    del journal["owner"]
+    wrkslots_cli._write_journal(config, journal, journal_path=path)
+    (rc, _out, err), rust = _classify_both(root)
+    assert rc == 3 and "interrupted" in err, err
+    assert rust.returncode not in (0, 75) and "interrupted" in rust.stderr, rust.stderr
+
+
+def _finish_journals(root: Path) -> list[dict[str, object]]:
+    """Every finish journal a removal recorded in its event log, in order."""
+
+    journals: list[dict[str, object]] = []
+    for event_path in sorted((root / "worktrees" / "EVENTS.node-a").iterdir()):
+        event: dict[str, object] = json.loads(event_path.read_text())
+        payload = cast(dict[str, object], event["payload"])
+        if event["kind"] == "operation-progress-recorded":
+            journal = cast(dict[str, object], payload["journal"])
+            if journal.get("kind") == "finish":
+                journals.append(journal)
+    return journals
+
+
+def _scrub_finish_journal(journal: dict[str, object]) -> str:
+    """The journal as written, minus what differs per process and per run."""
+
+    copy: dict[str, object] = json.loads(json.dumps(journal))
+    copy["finished_at"] = "T"
+    copy["archive_id"] = "ID"
+    copy["fenced"] = re.sub(r"[0-9a-f]{32}$", "UUID", str(copy["fenced"]))
+    owner = cast(dict[str, object], copy["owner"])
+    owner["pid"] = owner["start_ticks"] = "REMOVER"
+    record = cast(dict[str, object], copy["record"])
+    _scrub_doc({"slots": [record]})
+    # Each fixture root records its own dead slot owner.
+    for key in ("owner", "coordinator_lease"):
+        identity = record.get(key)
+        if isinstance(identity, dict):
+            identity["pid"] = identity["start_ticks"] = "SLOT-OWNER"
+    for item in cast(list[dict[str, object]], copy.get("salvage", [])):
+        item["source_head"] = item["salvage_commit"] = "HEAD"
+    return json.dumps(copy, indent=2, sort_keys=True)
+
+
+def test_remove_writes_the_same_finish_journal_as_python(tmp_path: Path) -> None:
+    """#1121: both editions write equivalent finish journals, owner included."""
+
+    with _own_fs(tmp_path) as base:
+        rust_root, oracle_root = _pair(base)
+        assert _python_remove(oracle_root) == 0
+        result = _rust_remove(rust_root)
+        assert result.returncode == 0, result.stderr
+        rust_journals = _finish_journals(rust_root)
+        oracle_journals = _finish_journals(oracle_root)
+        assert rust_journals and len(rust_journals) == len(oracle_journals)
+        for rust_journal, oracle_journal in zip(rust_journals, oracle_journals):
+            left, right = _scrub_finish_journal(rust_journal), _scrub_finish_journal(oracle_journal)
+            assert left == right, "\n".join(difflib.unified_diff(right.splitlines(), left.splitlines(), "python", "rust", lineterm=""))
+        # Each names its own remover: this process in Python, the binary in Rust.
+        assert cast(dict[str, object], oracle_journals[0]["owner"])["pid"] == os.getpid()
+        assert cast(dict[str, object], rust_journals[0]["owner"])["pid"] != os.getpid()
+
+
+def test_recovery_rewrites_the_finish_journal_owner(tmp_path: Path) -> None:
+    """#1121: a resumed finish journal names the resuming process."""
+
+    with _own_fs(tmp_path) as base:
+        root = _fixture(base / "project")
+        _path, journal = _interrupted_python_remove(root)
+        remover = cast(dict[str, object], journal["owner"])["pid"]
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            rc = wrkslots_cli.main(
+                ["--project-root", str(root), "recover", "--coordinator-pid", str(os.getpid())]
+            )
+        assert rc == 0
+        owners = [cast(dict[str, object], item["owner"])["pid"] for item in _finish_journals(root)]
+        assert owners[0] == remover
+        assert owners[-1] == os.getpid()
+        assert not (root / "worktrees" / "ACTIVE.node-a.journal").exists()
+
+
+def test_an_older_reader_refuses_only_an_outstanding_owner_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1121's upgrade exposure, measured with a stand-in for an older reader.
+
+    A reader from before #1121 checks finish-journal keys exactly and does not
+    know ``owner``.  While a finish journal carrying it is outstanding, its
+    audit and recover refuse ("unknown owner"), so only a newer pin can recover
+    that journal after a crash; status and doctor are unaffected, and
+    mutations refuse as they already do while any journal is outstanding.  Once
+    the removal completed, nothing changes for it: the event log keeps the
+    journal, but only an outstanding one is checked.
+    """
+
+    with _own_fs(tmp_path) as base:
+        outstanding = _fixture(base / "outstanding")
+        _interrupted_python_remove(outstanding)
+        completed = _fixture(base / "completed")
+        assert _python_remove(completed) == 0
+        monkeypatch.setattr(
+            wrkslots_cli, "_FINISH_JOURNAL_OPTIONAL",
+            wrkslots_cli._FINISH_JOURNAL_OPTIONAL - {"owner"},
+        )
+
+        def run(root: Path, *argv: str) -> tuple[int, str]:
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = wrkslots_cli.main(["--project-root", str(root), *argv])
+            return rc, err.getvalue()
+
+        pid = str(os.getpid())
+        assert run(outstanding, "status") == (0, "")
+        assert run(outstanding, "doctor") == (0, "")
+        for argv in (("audit",), ("recover", "--coordinator-pid", pid)):
+            rc, err = run(outstanding, *argv)
+            assert rc == 3 and "finish journal has invalid fields: unknown owner" in err, (argv, err)
+        assert run(completed, "status") == (0, "")
+        assert run(completed, "audit")[0] == 0

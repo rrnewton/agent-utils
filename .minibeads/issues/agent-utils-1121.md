@@ -1,10 +1,10 @@
 ---
 title: 'finish-journal-live-remover: a live removal''s finish journal reads as interrupted, not busy, during out-of-lock deletion'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-09T11:00:09.000000000+00:00
-updated_at: 2026-11-09T11:00:09.000000000+00:00
+updated_at: 2026-11-09T12:00:00.000000000+00:00
 ---
 
 # Description
@@ -75,3 +75,16 @@ Python change needs the Rust writer for the differential to stay exact.
 
 P1: it hits every validate-run caller. Filed by the devbig030 coordinator from
 the lead's relay, 2026-11-09.
+
+Overlap with #914 wrkslots-dead-seal-journal (cl-wrkid, 2026-11-09): the two compose. #914 lets a provably dead actor's validate-batch-seal journal and its paired finish journal self-recover. Until now a finish journal had no remover identity to prove dead: its actor is the string "coordinator", and the only identity in it was the removed slot's owner. The new top-level owner is exactly the identity #914 needs: a live owner reads busy (75) and must be waited out, and a dead one lets #914 recover the pair. A legacy finish journal without owner gives #914 nothing to prove dead, so it keeps today's refusal. #914's issue file records the same.
+
+## Resolution
+
+Done in both editions in one landing (cl-wrkid, 2026-11-09). Python: `_finish_journal_payload` writes `owner`, the removing process's identity (pid, start_ticks, boot_id, host_id, cgroup_path); `_recover_finish` rewrites it to the recovering process before resuming, so a resumed journal names its resumer (only when the journal file exists: a journal rebuilt from the event history must not gain a file, which `_prepared_finish_journal` takes as proof that the removal began; `test_finish_recovery_without_a_journal_still_refuses_a_pruned_admin_checkout` guards that); `owner` is in `_FINISH_JOURNAL_OPTIONAL` and validated as an identity (`_finish_journal_owner`). Rust: the remove writer in remove_write.rs writes the same field, and journal_state.rs accepts and validates it. Rust never resumes a finish journal (it leaves that to the Python edition), so it has no resumer to change. `_live_journal_owner` was unchanged in both, as the Design said.
+
+Tests (py/wrkslots/tests/test_remove_write_rust.py): `test_finish_journal_classifies_by_its_remover_in_both_editions` (a killed remover reads interrupted; a live remover with a dead record.owner reads busy, 75, kind finish, in both editions; a legacy journal without owner is read and refused as interrupted, as before); `test_remove_writes_the_same_finish_journal_as_python` (every finish journal each edition records is identical apart from per-process and per-run values; owner keys included); `test_recovery_rewrites_the_finish_journal_owner`; `test_an_older_reader_refuses_only_an_outstanding_owner_journal`.
+
+Upgrade exposure (accepted by the lead, 2026-11-09; measured with a stand-in for an older reader, in the last test, and stated in the USER_GUIDE and the commit message): while a newer pin has a finish journal outstanding, an older pin's audit, recover and classify-create-journals refuse with "finish journal has invalid fields: unknown owner", until the removal completes or, after a crash, a newer recover finishes it (an older recover cannot). status and doctor are unaffected; mutations refuse as they already do while any journal is outstanding; a completed removal leaves nothing an older pin refuses. Not measured: a real older pin. The stand-in removes only the key from the reader's optional list. A tolerant extension slot for journal readers is a separate P3 follow-up, filed by the coordinator.
+
+Unrelated parity gap seen while testing: for an interrupted journal the Rust classify-create-journals exits 1 ("host fault") where Python exits 3. Both name it interrupted. Left as is.
+

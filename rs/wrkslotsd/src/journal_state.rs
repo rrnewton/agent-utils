@@ -446,12 +446,19 @@ fn finish_shape(
             "nested_git_evidence",
             "archive_nested_cache_repositories",
             "removing",
+            // The removing process (#1121); journals written before it have none.
+            "owner",
         ],
         "finish journal",
     )?;
     let record = record_from_obj(&raw["record"], "finish journal.record")?;
     if record.machine != machine || record.slot != slot {
         return Err("finish journal record does not match its shard or slot".to_owned());
+    }
+    if let Some(owner) = raw.get("owner") {
+        if crate::active_state::identity_from_obj(owner, "finish journal.owner")?.is_none() {
+            return Err("finish journal.owner must name the removing process".to_owned());
+        }
     }
     if is_finish_path
         && (record.slot_type != "validate"

@@ -296,6 +296,8 @@ _FINISH_JOURNAL_OPTIONAL = frozenset(
         "nested_git_evidence",
         "archive_nested_cache_repositories",
         "removing",
+        # The removing process (#1121); journals written before it have none.
+        "owner",
     }
 )
 _LEGACY_VALIDATE_JOURNAL_REQUIRED = frozenset(
@@ -9896,6 +9898,7 @@ def _validate_journal_shape(
         record = _record_from_obj(raw["record"], "finish journal.record")
         if record.machine != machine or record.slot != slot:
             raise StateError("finish journal record does not match its shard or slot")
+        _finish_journal_owner(raw)
         if path == _finish_journal_path(config, slot, machine) and (
             record.slot_type != "validate"
             or raw.get("validate_complete") is not True
@@ -40953,6 +40956,25 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _finish_journal_owner(raw: Mapping[str, object]) -> ProcessIdentity | None:
+    """The removing process a finish journal names, or None for a journal from before #1121.
+
+    remove writes its own identity here, and a recovery that resumes the
+    journal writes its own, so while the remover runs a classifier reads the
+    journal as busy, and once it has died, as interrupted.  Without it the
+    first identity a classifier found was the removed slot's owner, dead by
+    the time a slot is retired, and a live removal deleting its fenced tree
+    outside the lock read as interrupted.
+    """
+
+    if "owner" not in raw:
+        return None
+    owner = _identity_from_obj(raw["owner"], "finish journal.owner")
+    if owner is None:
+        raise StateError("finish journal.owner must name the removing process")
+    return owner
+
+
 def _finish_journal_payload(
     config: Config,
     record: ActiveRecord,
@@ -40999,6 +41021,7 @@ def _finish_journal_payload(
         "salvage": [dict(item) for item in finish.salvage],
         "validate_complete": finish.validate_complete,
         "record": _record_to_obj(record),
+        "owner": _identity_to_obj(_read_process_identity(os.getpid())),
     }
     if finish.private_cleanup is not None:
         payload["private_census_identity"] = list(
@@ -49390,6 +49413,7 @@ def _recover_finish(
     _exact_keys(
         raw, _FINISH_JOURNAL_REQUIRED, _FINISH_JOURNAL_OPTIONAL, "finish journal"
     )
+    _finish_journal_owner(raw)
     record = _record_from_obj(raw["record"], "finish journal.record")
     if record.machine != config.machine:
         raise StateError("finish journal record belongs to a different machine")
@@ -49702,6 +49726,14 @@ def _recover_finish(
     selected_live_use_recheck = live_use_recheck or _LiveUseRecheckBudget()
     if phase not in ("prepared", "fenced", "removed"):
         raise StateError(f"unknown finish journal phase {phase!r}")
+    # This process is the remover now (#1121): a classifier reads the journal
+    # as busy while it runs and as interrupted if it dies.  Only a journal
+    # whose file exists is rewritten: one rebuilt from the event history must
+    # not gain a file, which `_prepared_finish_journal` would take as proof
+    # that the removal began.
+    if path.is_file():
+        journal["owner"] = _identity_to_obj(_read_process_identity(os.getpid()))
+        _write_journal(config, journal, journal_path=path)
     if phase in ("prepared", "fenced"):
         private_cleanup: _PrivateCleanupContext | None = None
         if private_identity is not None:

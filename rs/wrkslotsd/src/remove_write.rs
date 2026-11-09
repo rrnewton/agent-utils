@@ -2342,6 +2342,7 @@ pub(crate) fn remove_slot(
                 .unwrap_or_else(|_| fenced_name.clone())
         })
         .unwrap_or_else(|| fenced_name.clone());
+    let remover = crate::status_state::read_process_identity(i64::from(std::process::id()))?;
     let mut journal = json!({
         "schema": 2,
         "kind": "finish",
@@ -2359,6 +2360,15 @@ pub(crate) fn remove_slot(
         "salvage": salvage,
         "validate_complete": false,
         "record": current,
+        // The removing process (#1121): a classifier reads the journal as
+        // busy while it runs, not interrupted by the removed slot's owner.
+        "owner": {
+            "pid": remover.pid,
+            "start_ticks": remover.start_ticks,
+            "boot_id": remover.boot_id,
+            "host_id": remover.host_id,
+            "cgroup_path": remover.cgroup_path,
+        },
     });
     write_journal(&cfg, &selected, &journal)?;
     let fenced_path = cfg.root.join(

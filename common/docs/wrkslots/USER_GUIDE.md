@@ -323,6 +323,12 @@ is not an interrupted mutation: `classify-create-journals` reports it as retryab
 waits and retries instead of losing its job. A dead or
 indeterminate owner keeps the hard `interrupted ... cannot coexist` refusal.
 
+A removal's `finish` journal names the removing process as its owner (#1121), and a `recover`
+that resumes the journal names itself instead. So while `remove` deletes the fenced slot with the
+registry lock released, the journal reads as busy; if the remover dies, it reads as interrupted. A
+`finish` journal written by an older wrkslots has no owner. It is still read, and classified as
+before by the removed slot's recorded owner, which is usually dead, so it reads as interrupted.
+
 A registered row whose slot directory is absent -- `lstat` reports that nothing exists at the path
 -- is reported as `RECOVERABLE` rather than `BLOCKED` when absence is its only remaining reason
 after the same liveness, owner, heartbeat, handoff, and process/path census checks that make a
@@ -2794,6 +2800,15 @@ Create and removal journals contain the exact paths, Git identities, completed s
 receipts, and remaining work. If the mutable journal view is missing, `recover` reconstructs the
 pending operation from the append-only history. Recovery rechecks every destructive precondition;
 it does not trust the earlier participant's conclusion.
+
+**Upgrading past #1121 (finish journals name their remover).** Readers check a journal's fields
+exactly, and a wrkslots older than this change does not know the `finish` journal's `owner` field.
+Do not run two wrkslots versions on one registry across this upgrade. While a newer version has a
+removal's `finish` journal outstanding, an older version's `audit`, `recover` and
+`classify-create-journals` refuse with `finish journal has invalid fields: unknown owner`. That
+lasts until the removal completes, or, after a crash, until a newer `recover` finishes it: an older
+`recover` cannot. `status` and `doctor` are unaffected, and mutations refuse as they always do while
+a journal is outstanding. A completed removal leaves nothing an older version refuses.
 
 ## Quarantine a stranded create journal
 

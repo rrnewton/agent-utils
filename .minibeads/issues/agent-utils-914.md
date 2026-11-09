@@ -32,3 +32,6 @@ updated_at: 2026-11-06T01:30:32.061784973+00:00
 # Notes
 
 Reported by the lead on 2026-11-05 at 8:19 PM ET (P1), from a consumer team's third host-wide wedge of the day. Follow-up to #912 (dead-actor journal) and related to #885 (orphaned create journal). The exact outputs are in the lead's host notes; ask through the coordinator. Assigned to mu-wrkslots, right after #910.
+
+Composes with #1121 finish-journal-live-remover (2026-11-09): a finish journal now names its removing process as top-level `owner` (a resuming `recover` rewrites it to itself). That is the identity this issue needs to prove the paired finish journal's actor dead: a live owner reads busy and must be waited out, and a dead one may self-recover with the seal journal. A legacy finish journal without `owner` gives nothing to prove dead and keeps today's refusal.
+
