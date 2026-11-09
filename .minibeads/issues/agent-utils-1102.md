@@ -4,7 +4,7 @@ status: open
 priority: 1
 issue_type: bug
 created_at: 2026-11-09T00:17:46.000000000+00:00
-updated_at: 2026-11-09T09:50:00.000000000+00:00
+updated_at: 2026-11-09T11:30:00.000000000+00:00
 assignee: cl-wrkid
 ---
 
@@ -81,9 +81,15 @@ Vanished-PID half, part 2 (cl-wrkid, 2026-11-09), per the lead's two safety poin
 
 Tests: `test_leaders_that_exit_before_their_readers_are_followed_and_block` (three children, each the only user of its own slot through a surviving thread's cwd, a leader exiting before each check; privileged and same-UID lanes; on the previous census both lanes refused "relevant process evidence changed during three liveness attempts", now all three slots BLOCK and the first is named by its thread), `test_audit_follows_a_leader_that_exits_after_the_listing_like_python` (both editions through the churn seam; previous Rust: not BLOCKED), `test_find_census_counts_a_descriptor_that_keeps_vanishing_as_gone`, `test_find_census_still_refuses_other_entries_that_keep_vanishing`; the two zombie-leader "discards_the_attempt" tests are renamed `_is_followed`.
 
-Still open after part 2:
+Still open after part 2 (both small items done in part 3, below):
 - the same-UID census's own diagnostics (`_same_uid_indeterminate_processes`) still discard its scan for a vanished descriptor of a live process; it keeps positive matches and allows 3 discards, and the load reproduction never hit it;
 - a surviving thread that executes a new program (taking its leader's PID) still discards the attempt: its new program has a generation the census already read, so re-listing alone would not read it;
 - question for the owner (not probed: the root probe was declined at night): what root's find reports for a zombie leader's /proc/PID/fd. As this user it is "Permission denied", which the privileged census refuses outright, not as churn. A leader exiting between the census's check of it and find's walk would hit that if root sees the same; the tests here drive the exit before the check;
 - acceptance criterion 3 (repeated audits and removals at load above 100 no longer refuse for churn) needs the load reproduction rerun on this code.
+
+Part 3 (cl-wrkid, 2026-11-09), the two small items:
+- The remove path's same-UID census reads through the same bounded re-read as the privileged one (`_census_output_rereading_live_entries`, shared by both): entries that vanish from a live process mid-find or mid-grep are read again for just that process, at most `_LIVE_ENTRY_REPROBES` times; a descriptor still gone is gone, any other entry still discards the scan. Test: `test_same_uid_census_rereads_a_live_process_whose_entry_vanished` (fd and cwd); the missing-path control tests now expect the same re-reads in both lanes.
+- A surviving thread that executes a new program is followed inside the re-listing censuses: `_assert_thread_kept_its_identity` records the leader's PID (so the round cannot close) and the leader's exact generation in `_REREAD_GENERATIONS`, which the census forgets having read, so the next listing reads the new program even if that generation was read before the leader exited. Rust did not need the forgetting: its read of the leader while it still ran showed what the group then shared. It did have a narrower gap: a thread listed under a zombie leader and then read after its execve showed nothing, and the revived leader was read only by a next listing that a closing round could skip. `admit_threads` now reads a leader that runs again in the same listing. Tests: `test_threads_that_execute_before_their_readers_are_followed_and_block` (three children, both Python lanes; on the previous census both refused "changed during three liveness attempts"); `test_a_thread_that_executes_after_the_snapshot_is_followed` (renamed). The Rust race needs an execve between the task listing and the thread read, which no seam reaches; it is covered by reading, not by a test.
+
+Remaining: acceptance criterion 3 (the load rerun, when the gate queue is empty), and the owner question about root's view of a zombie leader's fd directory.
 

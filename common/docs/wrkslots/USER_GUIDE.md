@@ -282,8 +282,10 @@ process it has not read, until a listing adds nothing that could use a slot. A p
 thread has exited (with `pthread_exit`) while its other threads still run is live: its threads
 keep its working directory, open files and mappings, so the census reads each one at
 `/proc/PID/task/TID` and names it in the reason as `thread TID of process PID (whose main thread
-has exited)`. A file that a running process closes while the census walks its descriptors is gone:
-the census reads that process again, at most twice, and then accepts that the descriptor is gone.
+has exited)`. If such a thread then executes a new program, which takes over its process's PID,
+the census reads that program under the PID. A file that a running process closes while the census
+walks its descriptors is gone: the census reads that process again, at most twice, and then accepts
+that the descriptor is gone.
 The census still refuses (the row reads `UNKNOWN`) when its time budget runs out, when it lists
 `/proc` 64 times without closing, or when other evidence changes three times in a row.
 

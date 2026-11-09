@@ -652,14 +652,14 @@ def test_leaders_that_exit_before_their_readers_are_followed_and_block(
 
 @_REAL_CENSUS_COMMANDS
 @pytest.mark.parametrize("lane", ("privileged", "same-uid"))
-def test_a_thread_that_executes_after_the_snapshot_discards_the_attempt(
+def test_a_thread_that_executes_after_the_snapshot_is_followed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str,
 ) -> None:
     """execve from the thread moves it to its leader's PID and start ticks.
 
     The thread's own ID then vanishes from every reader while the new
     program, at the leader's PID, keeps the thread's working directory in the
-    slot.  The attempt that observed the thread is discarded, and the retry
+    slot.  The census follows the leader's PID (#1102), and its next listing
     reports the new program.
     """
 
@@ -717,6 +717,97 @@ def test_an_executed_thread_is_neither_vanished_nor_active(tmp_path: Path) -> No
             cli._process_observation_is_active(observed)
         with pytest.raises(cli._ProcessEvidenceChanged, match="executed a new program"):
             cli._recheck_thread_group_observations((observed,), _budget())
+        # Inside a census that lists /proc again, the leader's PID is followed.
+        followed: list[int] = []
+        reread: set[tuple[int, int]] = set()
+        token = cli._FOLLOWED_VANISHED_HOLDERS.set(followed)
+        reread_token = cli._REREAD_GENERATIONS.set(reread)
+        try:
+            assert not cli._process_observation_is_active(observed)
+            cli._recheck_thread_group_observations((observed,), _budget())
+        finally:
+            cli._REREAD_GENERATIONS.reset(reread_token)
+            cli._FOLLOWED_VANISHED_HOLDERS.reset(token)
+        assert followed == [child.leader] * 2
+        # The new program carries the leader's generation: read it again.
+        assert reread == {(child.leader, observed.leader_start_ticks)}
+
+
+@_REAL_CENSUS_COMMANDS
+@pytest.mark.parametrize("lane", ("privileged", "same-uid"))
+def test_threads_that_execute_before_their_readers_are_followed_and_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str,
+) -> None:
+    """A surviving thread executes a new program that keeps its cwd in the slot: BLOCKED (#1102).
+
+    Three children whose leaders have exited, each the only user of its own
+    slot through its surviving thread's working directory.  A thread executes
+    a new program, which takes over its leader's PID, each time the census is
+    about to check the generations a listing gave it, so the first thread
+    vanishes before anything reads it.  Each such execve used to discard the
+    census attempt, and three refused it; now the census follows the
+    leader's PID, a later listing reads the new program there, and every
+    slot is BLOCKED.
+    """
+
+    slots = [tmp_path / f"slot-{index}" for index in range(3)]
+    for slot in slots:
+        slot.mkdir()
+        (slot / "held").write_bytes(b"held by the surviving thread\n")
+    with ExitStack() as stack:
+        children = [stack.enter_context(_started(slot, "cwd")) for slot in slots]
+        threads = [_ready(child)[0] for child in children]
+        for child in children:
+            _exit_leader(child)
+        proc_root = _proc_root(tmp_path, *(child.pid for child in children))
+        waiting = list(zip(children, threads))
+        real_preflight = cli._preflight_process_observations
+
+        def preflight_after_an_execve(
+            processes: Sequence[cli._AbsentProcessObservation],
+            budget: cli._ReadOnlyCommandBudget,
+            *,
+            replaced_generations_are_gone: bool = False,
+        ) -> tuple[cli._AbsentProcessObservation, ...]:
+            if waiting:
+                _exec_from_thread(*waiting.pop(0))
+            return real_preflight(
+                processes, budget, replaced_generations_are_gone=replaced_generations_are_gone
+            )
+
+        monkeypatch.setattr(cli, "_preflight_process_observations", preflight_after_an_execve)
+        monkeypatch.setattr(cli, "_run_root_owned_command", _root_owned_as_same_uid())
+        if lane == "same-uid":
+            real_observations = cli._same_uid_process_observations
+            monkeypatch.setattr(
+                cli, "_same_uid_process_observations",
+                lambda budget: real_observations(budget, proc_root),
+            )
+            census = cli._capture_same_uid_process_path_census(slots, budget=_budget())
+        else:
+            real_snapshot = cli._absent_validate_process_snapshot
+            monkeypatch.setattr(
+                cli, "_absent_validate_process_snapshot",
+                lambda include_owner_cgroups=True: real_snapshot(
+                    proc_root, include_owner_cgroups=include_owner_cgroups
+                ),
+            )
+            census = cli._capture_process_path_census(
+                slots, budget=_budget(), include_owner_cgroups=False
+            )
+        assert not waiting
+        for slot in slots:
+            with pytest.raises(cli.Refusal, match=rf"uses slot {re.escape(str(slot))}: "):
+                census.assert_slot_unused(slot, None)
+        # The first thread executed before anything read it: only the new
+        # program, at its leader's PID, can have shown the slot.
+        with pytest.raises(
+            cli.Refusal, match=rf"^live process {children[0].pid} uses slot "
+        ):
+            census.assert_slot_unused(slots[0], None)
+    matched = {(pid, slot) for pid, slot, _kind, _detail in census.matches}
+    assert {(child.pid, str(slot)) for child, slot in zip(children, slots)} <= matched
+    assert (threads[0], str(slots[0])) not in matched
 
 
 @pytest.mark.parametrize("program", ("find", "grep"))

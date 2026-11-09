@@ -51380,6 +51380,65 @@ def test_find_census_still_refuses_other_entries_that_keep_vanishing(
         terminate_process(other)
 
 
+class _ScriptedSameUidReads:
+    """Stand-in for the same-UID find/grep runner: find answers from ``finds``, grep matches
+    nothing; records the /proc PIDs each find named (#1102)."""
+
+    def __init__(self, finds: Sequence[tuple[int, bytes, bytes]]) -> None:
+        self.finds = list(finds)
+        self.pids: list[set[int]] = []
+
+    def __call__(
+        self,
+        program: Path,
+        arguments: Sequence[str],
+        *,
+        budget: object,
+        input_data: bytes | None = None,
+    ) -> tuple[int, bytes, bytes]:
+        if program.name != "find":
+            return (1, b"", b"")
+        self.pids.append(
+            {int(match) for match in re.findall(r"^/proc/([0-9]+)", "\n".join(arguments), re.M)}
+        )
+        return self.finds[min(len(self.pids), len(self.finds)) - 1]
+
+
+@pytest.mark.parametrize("entry", ("fd/9", "cwd"))
+def test_same_uid_census_rereads_a_live_process_whose_entry_vanished(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str,
+) -> None:
+    """The remove path's same-UID census re-reads just that process, as the privileged one does (#1102).
+
+    A descriptor still gone after the re-reads was closed and counts as gone; any other entry
+    still discards the scan.
+    """
+    slot, user, other, observed = _live_census_pair(tmp_path)
+    holder = f"/proc/{user.pid}/cwd\0{slot}\0".encode()
+    vanished = f"/usr/bin/find: '/proc/{other.pid}/{entry}': No such file or directory\n".encode()
+    reads = _ScriptedSameUidReads([(1, holder, vanished), (1, b"", vanished)])
+    monkeypatch.setattr(wrkslots, "_run_same_uid_command", reads)
+    budget = wrkslots._ReadOnlyCommandBudget.start(
+        timeout_seconds=60, stdout_limit=1024 * 1024, stderr_limit=64 * 1024,
+    )
+    try:
+        if entry == "cwd":
+            with pytest.raises(wrkslots._ProcessEvidenceChanged, match="same-UID find census produced"):
+                wrkslots._same_uid_batched_path_matches(
+                    tuple(observed.values()), {slot: "slot01"}, budget
+                )
+        else:
+            matches, indeterminate = wrkslots._same_uid_batched_path_matches(
+                tuple(observed.values()), {slot: "slot01"}, budget
+            )
+            assert [pid for pid, *_rest in matches] == [user.pid]
+            assert indeterminate == ()
+        assert reads.pids == [{user.pid, other.pid}, *[{other.pid}] * wrkslots._LIVE_ENTRY_REPROBES]
+    finally:
+        terminate_process(user)
+        terminate_process(other)
+
+
 def test_maps_census_rereads_only_a_live_process_whose_maps_vanished(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -51766,7 +51825,8 @@ def test_missing_path_census_discards_attempt_before_complete_reobservation(
 ) -> None:
     capture, calls = missing_path_census_control(monkeypatch, lane, "once")
     census = capture()
-    first_find = ["find"] * (1 + wrkslots._LIVE_ENTRY_REPROBES) if lane == "privileged" else ["find"]
+    # Both lanes read a live process again within the attempt (#996, same-UID since #1102).
+    first_find = ["find"] * (1 + wrkslots._LIVE_ENTRY_REPROBES)
     assert calls == [
         # Both censuses close with an inventory that adds nothing (#1102).
         "snapshot", *first_find, "snapshot", "find", "grep", "mount", "snapshot",
@@ -51784,7 +51844,7 @@ def test_missing_path_census_refuses_after_three_complete_attempts(
     with pytest.raises(wrkslots.Refusal, match="three liveness attempts") as refused:
         capture()
     assert not isinstance(refused.value, wrkslots._ProcessEvidenceChanged)
-    reads = 1 + wrkslots._LIVE_ENTRY_REPROBES if lane == "privileged" else 1
+    reads = 1 + wrkslots._LIVE_ENTRY_REPROBES
     assert calls == ["snapshot", *["find"] * reads] * 3
 
 
@@ -51799,12 +51859,10 @@ def test_missing_path_census_preserves_shared_attempt_budgets(
     assert not isinstance(refused.value, wrkslots._ProcessEvidenceChanged)
     if bound == "time":
         assert calls == ["snapshot", "find"]
-    elif lane == "privileged":
-        # Re-reading the live process's maps (#996) exhausts the shared grep pattern input.
-        assert calls == ["snapshot", "find", "grep"]
     else:
-        # The second real command wrapper exhausts the shared grep pattern input.
-        assert calls == ["snapshot", "find", "grep", "snapshot", "find"]
+        # Re-reading the live process's maps (#996, same-UID since #1102) exhausts the shared
+        # grep pattern input.
+        assert calls == ["snapshot", "find", "grep"]
 
 
 @pytest.mark.parametrize("lane", ("privileged", "same-uid"))

@@ -742,12 +742,27 @@ impl SnapshotReads<'_> {
     }
 
     /// Read every surviving thread of `leader` not read yet.
+    ///
+    /// A thread that executes a new program takes over the leader's
+    /// PID and start time, and its own ID vanishes: a thread listed
+    /// here and then read after its execve shows nothing. So once the
+    /// threads are read, a leader that runs again is read too, in this
+    /// listing, unless that generation was already read while it ran
+    /// (that read showed what the group then shared). The check costs
+    /// one stat read, and also catches an execve that came before the
+    /// thread listing (#1102).
     fn admit_threads(&mut self, leader: i64) -> Result<()> {
         for (tid, start) in surviving_threads(leader)? {
             if self.read.get(&tid) == Some(&start) {
                 continue;
             }
             self.admit(read_process_links(tid, Some(leader)), start);
+        }
+        let base = PathBuf::from("/proc").join(leader.to_string());
+        if let Some((start, state)) = process_stat(&base) {
+            if !is_terminal_state(state) && self.read.get(&leader) != Some(&start) {
+                self.admit(read_process_links(leader, None), start);
+            }
         }
         Ok(())
     }

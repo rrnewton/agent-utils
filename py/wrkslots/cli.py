@@ -1119,7 +1119,7 @@ class _ProcessEvidenceChanged(Refusal):
 class _LiveEntriesVanished(_ProcessEvidenceChanged):
     """Only live processes of their observed generation lost /proc entries mid-walk (#996).
 
-    A privileged reader walked a process's fd, cwd or root entries, or its maps, while that
+    A reader walked a process's fd, cwd or root entries, or its maps, while that
     process, still running as the same generation, closed a file or moved: ordinary churn on a
     busy host.  ``pids`` names those processes, so the reader can read just them again instead of
     the census discarding the whole attempt.  Every other caller discards it as before.
@@ -62858,13 +62858,13 @@ def _process_generation_is_current(process: _AbsentProcessObservation) -> bool:
 def _process_observation_is_active(process: _AbsentProcessObservation) -> bool:
     """Return whether the observed generation still names a non-zombie process.
 
-    Two answers would hide a holder.  A surviving thread that vanished because
-    it executed a new program under its leader's PID raises
-    _ProcessEvidenceChanged, and the attempt is discarded; a fresh snapshot
-    observes the new program in its place.  A leader that became a zombie
-    while its other threads still run is followed inside a census that lists
-    /proc again (see `_assert_leader_released_its_threads`) and otherwise
-    discards the attempt the same way.
+    Two answers would hide a holder: a leader that became a zombie while its
+    other threads still run, and a surviving thread that vanished because it
+    executed a new program under its leader's PID.  Inside a census that lists
+    /proc again both are followed (`_assert_leader_released_its_threads`,
+    `_assert_thread_kept_its_identity`); anywhere else they raise
+    _ProcessEvidenceChanged, and a fresh snapshot observes the threads, or the
+    new program, in their place.
     """
 
     pid_dir = Path("/proc") / str(process.pid)
@@ -62911,7 +62911,7 @@ def _assert_leader_released_its_threads(
 
 
 def _assert_thread_kept_its_identity(process: _AbsentProcessObservation) -> None:
-    """Refuse the attempt if an observed surviving thread became its leader by execve.
+    """Follow, or refuse, an observed surviving thread that became its leader by execve.
 
     execve from a thread of a group whose leader has exited moves that
     thread to the leader's PID with the leader's start ticks (de_thread), so
@@ -62919,6 +62919,13 @@ def _assert_thread_kept_its_identity(process: _AbsentProcessObservation) -> None
     thread's working directory and descriptors.  The leader's PID cannot be
     running again under the leader's generation any other way: the leader
     stays a zombie until its group is gone, and only then is it reaped.
+
+    Inside a census that lists /proc again (#1102) the leader's PID is
+    recorded in `_FOLLOWED_VANISHED_HOLDERS`, so the round cannot close the
+    census, and the leader's generation in `_REREAD_GENERATIONS`, so the
+    census forgets having read it and its next listing reads the new
+    program, which carries that generation.  Anywhere else the attempt is
+    discarded.
     """
 
     if process.leader_pid is None:
@@ -62929,6 +62936,12 @@ def _assert_thread_kept_its_identity(process: _AbsentProcessObservation) -> None
         and leader.start_ticks == process.leader_start_ticks
         and leader.state not in _ZOMBIE_STATES
     ):
+        followed = _FOLLOWED_VANISHED_HOLDERS.get()
+        reread = _REREAD_GENERATIONS.get()
+        if followed is not None and reread is not None:
+            followed.append(process.leader_pid)
+            reread.add((process.leader_pid, leader.start_ticks))
+            return
         raise _ProcessEvidenceChanged(
             f"thread {process.pid} of exited process {process.leader_pid} executed a "
             f"new program, which now runs as PID {process.leader_pid}"
@@ -63129,6 +63142,8 @@ def _same_uid_indeterminate_processes(
     )
     indeterminate: dict[int, _AbsentProcessObservation] = {}
     changed_diagnostic: str | None = None
+    changed_pids: set[int] = set()
+    descriptors_only = True
     motion: list[_ProcessEvidenceChanged] = []
     for line in lines:
         if program == "find" and _long_path_diagnostic_is_foreign(
@@ -63144,6 +63159,10 @@ def _same_uid_indeterminate_processes(
                 )
             if _observation_is_active_deferring_motion(process, motion):
                 changed_diagnostic = line
+                changed_pids.add(process.pid)
+                descriptors_only = descriptors_only and bool(
+                    _FIND_MISSING_DESCRIPTOR_RE.fullmatch(line)
+                )
             continue
         denied = permission_pattern.fullmatch(line)
         process = (
@@ -63157,8 +63176,10 @@ def _same_uid_indeterminate_processes(
     if motion:
         raise motion[0]
     if changed_diagnostic is not None:
-        raise _ProcessEvidenceChanged(
-            f"same-UID {program} census produced diagnostics: {changed_diagnostic}"
+        raise _LiveEntriesVanished(
+            f"same-UID {program} census produced diagnostics: {changed_diagnostic}",
+            changed_pids,
+            descriptors_only=descriptors_only,
         )
     return tuple(indeterminate.values())
 
@@ -63170,11 +63191,19 @@ def _same_uid_indeterminate_processes(
 # gone (it can no longer use the path), and whatever replaced it, or a child
 # it handed a reference to before it exited, is a generation the next listing
 # reads.  So is a thread-group leader that exited while its threads still run
-# (`_assert_leader_released_its_threads`): the next listing reads the threads.
-# A round that recorded anything here cannot close its census, so the next
-# listing always comes.  Callers that do not list again keep the refusal.
+# (`_assert_leader_released_its_threads`): the next listing reads the threads;
+# and a surviving thread that executed a new program, which now runs under its
+# leader's PID (`_assert_thread_kept_its_identity`).  A round that recorded
+# anything cannot close its census, so the next listing always comes.
+# Callers that do not list again keep the refusal.
 _FOLLOWED_VANISHED_HOLDERS: contextvars.ContextVar[list[int] | None] = (
     contextvars.ContextVar("wrkslots_followed_vanished_holders", default=None)
+)
+# Set beside it: generations the census must read again although it read them
+# before.  A thread's execve gives the new program its leader's PID and start
+# ticks, a generation the census may have read while the leader ran.
+_REREAD_GENERATIONS: contextvars.ContextVar[set[tuple[int, int]] | None] = (
+    contextvars.ContextVar("wrkslots_reread_generations", default=None)
 )
 
 
@@ -63270,8 +63299,9 @@ def _absent_validate_find_match(
     return matches[0] if matches else None
 
 
-#: How many times one privileged batch re-reads the live processes whose entries vanished while it
-#: walked them, before the attempt is discarded as for any other evidence change (#996).
+#: How many times one privileged or same-UID batch re-reads the live processes whose entries
+#: vanished while it walked them, before the attempt is discarded as for any other evidence
+#: change (#996), or, for descriptors, they count as closed (#1102).
 _LIVE_ENTRY_REPROBES = 2
 
 
@@ -63284,6 +63314,42 @@ def _privileged_census_output(
     target_devices: AbstractSet[int],
 ) -> bytes:
     """Return everything one privileged ``program`` batch read over ``processes``.
+
+    See `_census_output_rereading_live_entries`, which this runs with the
+    privileged diagnostics check.
+    """
+
+    def diagnose(
+        returncode: int, stderr: bytes, selected: Mapping[int, _AbsentProcessObservation],
+    ) -> tuple[_AbsentProcessObservation, ...]:
+        _allow_only_vanished_process_diagnostics(
+            program, returncode, stderr, selected, target_devices=target_devices
+        )
+        return ()
+
+    output, _indeterminate = _census_output_rereading_live_entries(
+        program, run, reprobe, processes, diagnose
+    )
+    return output
+
+
+def _census_output_rereading_live_entries(
+    program: str,
+    run: Callable[[], tuple[int, bytes, bytes]],
+    reprobe: Callable[[Mapping[int, _AbsentProcessObservation]], tuple[int, bytes, bytes]],
+    processes: Mapping[int, _AbsentProcessObservation],
+    diagnose: Callable[
+        [int, bytes, Mapping[int, _AbsentProcessObservation]],
+        tuple[_AbsentProcessObservation, ...],
+    ],
+) -> tuple[bytes, tuple[_AbsentProcessObservation, ...]]:
+    """Return everything one ``program`` batch read over ``processes``, and what it could not read.
+
+    ``diagnose(returncode, stderr, selected)`` checks one read's diagnostics: it returns the
+    processes whose entries the reader may not read (the same-UID census sends them to its
+    privileged fallback; the privileged check returns none), raises `_LiveEntriesVanished` for
+    entries that vanished from processes still running, and raises anything else as a refusal.
+    Both the privileged and the same-UID census read through here (#1102).
 
     ``run()`` runs the batch and ``reprobe(selected)`` runs the same reader over just
     ``selected``; each returns its exit status, output and diagnostics.  When the only diagnostics are entries that vanished
@@ -63313,26 +63379,27 @@ def _privileged_census_output(
     """
 
     outputs: list[bytes] = []
+    indeterminate: dict[int, _AbsentProcessObservation] = {}
     selected = processes
     for attempt in range(_LIVE_ENTRY_REPROBES + 1):
         returncode, stdout, stderr = run() if attempt == 0 else reprobe(selected)
         outputs.append(stdout)
         try:
-            _allow_only_vanished_process_diagnostics(
-                program, returncode, stderr, selected, target_devices=target_devices
+            indeterminate.update(
+                (process.pid, process) for process in diagnose(returncode, stderr, selected)
             )
         except _LiveEntriesVanished as exc:
             if attempt == _LIVE_ENTRY_REPROBES:
                 if exc.descriptors_only:
-                    return b"".join(outputs)
+                    return b"".join(outputs), tuple(indeterminate.values())
                 raise
             selected = {pid: selected[pid] for pid in sorted(exc.pids) if pid in selected}
             if not selected:
                 raise
             outputs = [_without_records_of(program, output, selected) for output in outputs]
             continue
-        return b"".join(outputs)
-    raise AssertionError("unreachable privileged census re-probe")
+        return b"".join(outputs), tuple(indeterminate.values())
+    raise AssertionError("unreachable census re-probe")
 
 
 def _without_records_of(program: str, output: bytes, pids: Iterable[int]) -> bytes:
@@ -63621,6 +63688,39 @@ def _same_uid_direct_path_processes(
     return tuple(direct), tuple(indeterminate)
 
 
+def _rerun_same_uid_find(
+    selected: Mapping[int, _AbsentProcessObservation],
+    *,
+    suffix: Sequence[str],
+    budget: _ReadOnlyCommandBudget,
+) -> tuple[int, bytes, bytes]:
+    """Run the same-UID link reader again over just ``selected`` (#1102)."""
+
+    batches = list(
+        _argument_batches(("-P",), _process_symlink_roots(tuple(selected.values())), suffix)
+    )
+    if len(batches) != 1:
+        raise Refusal("same-UID find census re-probe does not fit one command")
+    return _run_same_uid_command(Path("/usr/bin/find"), batches[0], budget=budget)
+
+
+def _rerun_same_uid_grep(
+    selected: Mapping[int, _AbsentProcessObservation],
+    *,
+    pattern_input: bytes,
+    budget: _ReadOnlyCommandBudget,
+) -> tuple[int, bytes, bytes]:
+    """Run the same-UID maps reader again over just ``selected`` (#1102)."""
+
+    files = [str(Path("/proc") / str(pid) / "maps") for pid in selected]
+    batches = list(_argument_batches(("-F", "-H", "-f", "-", "--"), files, ()))
+    if len(batches) != 1:
+        raise Refusal("same-UID grep census re-probe does not fit one command")
+    return _run_same_uid_command(
+        Path("/usr/bin/grep"), batches[0], input_data=pattern_input, budget=budget
+    )
+
+
 def _same_uid_batched_path_matches(
     processes: Sequence[_AbsentProcessObservation],
     targets: Mapping[Path, str],
@@ -63660,13 +63760,19 @@ def _same_uid_batched_path_matches(
         batch_processes = {
             pid: observed_by_pid[pid] for pid in batch_pids if pid in observed_by_pid
         }
-        returncode, stdout, stderr = _run_same_uid_command(
-            Path("/usr/bin/find"), arguments, budget=budget
+        stdout, unreadable = _census_output_rereading_live_entries(
+            "find",
+            functools.partial(
+                _run_same_uid_command, Path("/usr/bin/find"), arguments, budget=budget
+            ),
+            functools.partial(_rerun_same_uid_find, suffix=find_suffix, budget=budget),
+            batch_processes,
+            functools.partial(
+                _same_uid_indeterminate_processes, "find",
+                target_devices=_target_devices(targets),
+            ),
         )
-        for process in _same_uid_indeterminate_processes(
-            "find", returncode, stderr, batch_processes,
-            target_devices=_target_devices(targets),
-        ):
+        for process in unreadable:
             indeterminate[process.pid] = process
         find_chunks.append(stdout)
     matches.extend(
@@ -63695,16 +63801,25 @@ def _same_uid_batched_path_matches(
             batch_processes = {
                 pid: observed_by_pid[pid] for pid in batch_pids if pid in observed_by_pid
             }
-            returncode, stdout, stderr = _run_same_uid_command(
-                Path("/usr/bin/grep"),
-                arguments,
-                input_data=pattern_input,
-                budget=budget,
+            stdout, unreadable = _census_output_rereading_live_entries(
+                "grep",
+                functools.partial(
+                    _run_same_uid_command,
+                    Path("/usr/bin/grep"),
+                    arguments,
+                    input_data=pattern_input,
+                    budget=budget,
+                ),
+                functools.partial(
+                    _rerun_same_uid_grep, pattern_input=pattern_input, budget=budget
+                ),
+                batch_processes,
+                functools.partial(
+                    _same_uid_indeterminate_processes, "grep",
+                    target_devices=_target_devices(targets),
+                ),
             )
-            for process in _same_uid_indeterminate_processes(
-                "grep", returncode, stderr, batch_processes,
-                target_devices=_target_devices(targets),
-            ):
+            for process in unreadable:
                 indeterminate[process.pid] = process
             maps_chunks.append(stdout)
     except _ProcessEvidenceChanged as exc:
@@ -63912,6 +64027,7 @@ def _capture_same_uid_process_path_census_following(
     handled: set[tuple[int, int]] = set()
     scanned: list[_AbsentProcessObservation] = []
     found: dict[tuple[int, str, str, str], None] = {}
+    reread = _REREAD_GENERATIONS.get()
     discarded = 0
     relevant: tuple[_AbsentProcessObservation, ...] = ()
     relevant_rounds = 0
@@ -63941,6 +64057,11 @@ def _capture_same_uid_process_path_census_following(
                 "same-UID process evidence changed during three liveness attempts"
             )
         handled.update((process.pid, process.start_ticks) for process in unscanned)
+        if reread:
+            # A thread's execve: its new program carries a generation
+            # already scanned (`_REREAD_GENERATIONS`).
+            handled -= reread
+            reread.clear()
         if not relevant:
             proven_rounds += 1
             if proven_rounds >= 2:
@@ -63975,11 +64096,13 @@ def _capture_process_path_census(
     """
 
     token = _FOLLOWED_VANISHED_HOLDERS.set([])
+    reread_token = _REREAD_GENERATIONS.set(set())
     try:
         return _capture_process_path_census_following(
             slot_paths, budget=budget, include_owner_cgroups=include_owner_cgroups
         )
     finally:
+        _REREAD_GENERATIONS.reset(reread_token)
         _FOLLOWED_VANISHED_HOLDERS.reset(token)
 
 
@@ -63995,9 +64118,11 @@ def _capture_same_uid_process_path_census(
     """
 
     token = _FOLLOWED_VANISHED_HOLDERS.set([])
+    reread_token = _REREAD_GENERATIONS.set(set())
     try:
         return _capture_same_uid_process_path_census_following(slot_paths, budget=budget)
     finally:
+        _REREAD_GENERATIONS.reset(reread_token)
         _FOLLOWED_VANISHED_HOLDERS.reset(token)
 
 @dataclasses.dataclass(frozen=True)
@@ -65126,10 +65251,14 @@ def _census_appearing_generations(
     observed = list(processes)
     found = list(matches)
     followed = _FOLLOWED_VANISHED_HOLDERS.get()
+    reread = _REREAD_GENERATIONS.get()
     proven_rounds = 0 if matches else 1
     unsettling: list[int] = []
     for _round in range(_CENSUS_LISTING_ROUNDS - 1):
         budget.remaining_seconds()
+        if reread:
+            read -= reread
+            reread.clear()
         followed_before = 0 if followed is None else len(followed)
         listed = (
             _absent_validate_process_snapshot()
