@@ -1,6 +1,6 @@
 ---
 title: "worktrees-image-at-slots-dir: mount the worktrees image at worktrees_dir with slot subvolumes as top-level entries and no binds"
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-11-09T20:45:00.000000000+00:00
@@ -119,3 +119,39 @@ ordering (fence first, then shared salvage bundles). Quota facts verified by
 the adopter on kernel 7.1.3 with btrfs-progs 6.7 (no mode flip on plain
 enable; qgroup limit enforces under simple quotas; disable drops limits;
 pre-switch data uncounted).
+
+## Resolution
+
+`mount_at: binds|worktrees_dir` and `quota_mode: simple|full` landed inside
+`worktrees_image`. Direct mode mounts and classifies at `worktrees_dir`,
+chowns the image root, keeps validation slots at
+`<worktrees_dir>/validate/<slot>` (agent name `validate` reserved), and
+`ensure_binds` returns before any record I/O; create makes the subvolume at
+the slot path and removal fences by rename and deletes it with `btrfs
+subvolume delete`, recognising an interrupted removal at an empty
+subvolume root. `wrkslots worktrees-image migrate-layout --to direct|binds`
+switches layouts under the removal census (dead owner, no hold, nobody in
+any slot, no validation slots, no unknown slots-directory entries),
+reclaims the host original beneath each bind on the way to direct, and
+rewrites `mount_at` only after the new mount holds every slot. Quotas are
+enabled with `--simple` only on a file system that does not yet account
+(falling back to a plain enable), mounts never flip an existing mode, and
+`worktrees-image status` reports the active mode from `qgroup show` plus
+the superblock `SIMPLE_QUOTA` flag. Every checkout born in the image (both
+layouts) gets `git worktree lock --reason "in worktrees image"` at create
+and migrate; the Git removal wrapper drops only that exact lock, a foreign
+lock still refuses, and `worktrees-image status` and doctor
+(`worktrees-image-lock-missing`, advisory, never gating the slot's own
+lifecycle) report a missing one. Rust readers parse and validate both new
+keys with Python's error strings (the live `validate-config` output and the
+pure-core settings); Rust handlers stay Python-only at dispatch as before.
+Tests: fixture coverage of settings, quota apply/report, the direct
+fence/remove cycle, `ensure_binds` record-freedom, lock prune/foreign-lock
+behaviour, census refusal and a faked migrate-layout round trip, plus two
+real loop-mounted btrfs tests (direct lifecycle with simple quotas; a real
+binds-to-direct-to-binds round trip). Gate: shared phase green after
+rerunning the four failed steps (one rustfmt hunk of mine, two 60-second
+item budgets starved by concurrent gates and solo-proven five times, one
+untouched browser latency check); the five exclusive cross steps were
+stopped unadmitted by the coordinator for the owner's scroll fix and
+passed in the authorized exclusive-only rerun.
