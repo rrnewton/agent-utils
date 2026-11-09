@@ -663,6 +663,239 @@ pub(crate) fn settings_to_obj(settings: &SandboxSettings) -> Value {
     })
 }
 
+fn py_json_string(text: &str) -> String {
+    // Python `json.dumps` default escaping (ensure_ascii=True).
+    let mut out = String::from("\"");
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch if (ch as u32) < 0x7f => out.push(ch),
+            ch => {
+                let mut buffer = [0_u16; 2];
+                for unit in ch.encode_utf16(&mut buffer) {
+                    out.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn render_value(value: &Value, indent: usize) -> String {
+    match value {
+        Value::Object(map) => {
+            if map.is_empty() {
+                return "{}".to_string();
+            }
+            let pad = "  ".repeat(indent + 1);
+            let close = "  ".repeat(indent);
+            // Keys arrive in the caller's insertion order for the
+            // objects built here (serde_json preserves it in this
+            // crate's maps only when constructed in order; the
+            // settings object below is rendered by explicit order,
+            // so this branch serves nested env/limits maps whose
+            // Python order is key-sorted by construction).
+            let parts: Vec<String> = map
+                .iter()
+                .map(|(key, item)| {
+                    format!(
+                        "{pad}{}: {}",
+                        py_json_string(key),
+                        render_value(item, indent + 1)
+                    )
+                })
+                .collect();
+            format!("{{\n{}\n{close}}}", parts.join(",\n"))
+        }
+        Value::Array(items) => {
+            if items.is_empty() {
+                return "[]".to_string();
+            }
+            let rendered: Vec<String> = items
+                .iter()
+                .map(|item| render_value(item, indent + 1))
+                .collect();
+            // Python renders short scalar lists multi-line too under
+            // indent=2; match its one-item-per-line form.
+            let pad = "  ".repeat(indent + 1);
+            let close = "  ".repeat(indent);
+            let parts: Vec<String> = rendered.iter().map(|item| format!("{pad}{item}")).collect();
+            format!("[\n{}\n{close}]", parts.join(",\n"))
+        }
+        Value::String(text) => py_json_string(text),
+        other => other.to_string(),
+    }
+}
+
+fn opt_string(value: &Option<String>) -> Value {
+    value.clone().map_or(Value::Null, Value::String)
+}
+
+fn render_limits(limits: &SandboxLimits) -> String {
+    // Python emits limits keys in dataclass field order, and each
+    // quota object as {slot_prefix, cpu_quota} in that order.
+    let quotas = if limits.slot_cpu_quotas.is_empty() {
+        "[]".to_string()
+    } else {
+        let parts: Vec<String> = limits
+            .slot_cpu_quotas
+            .iter()
+            .map(|(prefix, quota)| {
+                format!(
+                    "      {{\n        \"slot_prefix\": {},\n        \"cpu_quota\": {}\n      }}",
+                    py_json_string(prefix),
+                    py_json_string(quota)
+                )
+            })
+            .collect();
+        format!("[\n{}\n    ]", parts.join(",\n"))
+    };
+    let fields: Vec<(&str, String)> = vec![
+        (
+            "memory_max",
+            render_value(&opt_string(&limits.memory_max), 2),
+        ),
+        (
+            "memory_high",
+            render_value(&opt_string(&limits.memory_high), 2),
+        ),
+        ("cpu_quota", render_value(&opt_string(&limits.cpu_quota), 2)),
+        (
+            "tasks_max",
+            render_value(&limits.tasks_max.map_or(Value::Null, Value::from), 2),
+        ),
+        (
+            "io_weight",
+            render_value(&limits.io_weight.map_or(Value::Null, Value::from), 2),
+        ),
+        (
+            "all_slots_memory_max",
+            render_value(&opt_string(&limits.all_slots_memory_max), 2),
+        ),
+        (
+            "all_slots_cpu_quota",
+            render_value(&opt_string(&limits.all_slots_cpu_quota), 2),
+        ),
+        ("slot_cpu_quotas", quotas),
+    ];
+    let parts: Vec<String> = fields
+        .iter()
+        .map(|(key, value)| format!("    {}: {}", py_json_string(key), value))
+        .collect();
+    format!("{{\n{}\n  }}", parts.join(",\n"))
+}
+
+/// Render the settings in the exact key order Python's
+/// `settings_to_obj` dict uses (a sorted map would not match).
+pub(crate) fn render_settings_json(settings: &SandboxSettings) -> String {
+    let strings = |items: &[String]| -> Value {
+        Value::Array(
+            items
+                .iter()
+                .map(|item| Value::String(item.clone()))
+                .collect(),
+        )
+    };
+    // env appears in the settings' own pair order, as Python's
+    // dict(env) does; a map would sort the names.
+    let env = if settings.env.is_empty() {
+        "{}".to_string()
+    } else {
+        let parts: Vec<String> = settings
+            .env
+            .iter()
+            .map(|(key, value)| format!("    {}: {}", py_json_string(key), py_json_string(value)))
+            .collect();
+        format!("{{\n{}\n  }}", parts.join(",\n"))
+    };
+    let fields: Vec<(&str, String)> = vec![
+        (
+            "isolation",
+            render_value(&Value::String(settings.isolation.clone()), 1),
+        ),
+        (
+            "home",
+            render_value(&Value::String(settings.home.clone()), 1),
+        ),
+        (
+            "home_shared",
+            render_value(&strings(&settings.home_shared), 1),
+        ),
+        (
+            "home_private",
+            render_value(&strings(&settings.home_private), 1),
+        ),
+        (
+            "home_private_files",
+            render_value(&strings(&settings.home_private_files), 1),
+        ),
+        (
+            "home_hidden",
+            render_value(&strings(&settings.home_hidden), 1),
+        ),
+        (
+            "home_expose",
+            render_value(&strings(&settings.home_expose), 1),
+        ),
+        ("outputs", render_value(&strings(&settings.outputs), 1)),
+        (
+            "read_write",
+            render_value(&strings(&settings.read_write), 1),
+        ),
+        ("env", env),
+        (
+            "tmp_size",
+            render_value(&Value::String(settings.tmp_size.clone()), 1),
+        ),
+        (
+            "protect_system",
+            render_value(&Value::Bool(settings.protect_system), 1),
+        ),
+        (
+            "coordinator_writable",
+            render_value(&Value::String(settings.coordinator_writable.clone()), 1),
+        ),
+        ("limits", render_limits(&settings.limits)),
+    ];
+    let parts: Vec<String> = fields
+        .iter()
+        .map(|(key, value)| format!("  {}: {}", py_json_string(key), value))
+        .collect();
+    format!("{{\n{}\n}}\n", parts.join(",\n"))
+}
+
+/// `wrkslots sandbox show-config` (#1101): the dispatch-shaped
+/// handler. Input is the raw `sandbox` section (absent = defaults,
+/// mirroring `_parse_sandbox_settings`); output is
+/// `(exit, stdout, stderr)` byte-identical to the Python edition,
+/// whose settings validation failure is a load refusal (exit 3).
+pub(crate) fn sandbox_show_config(raw_section: Option<&Value>) -> (i32, String, String) {
+    let settings = match raw_section {
+        None => SandboxSettings::default(),
+        Some(raw) => match settings_from_obj(raw) {
+            Ok(settings) => settings,
+            Err(message) => {
+                return (
+                    3,
+                    String::new(),
+                    format!(
+                        "REFUSED: {message}\nREMEDY: run 'wrkslots sandbox --help', correct the named condition, then rerun 'wrkslots sandbox' with the required arguments\n"
+                    ),
+                );
+            }
+        },
+    };
+    (0, render_settings_json(&settings), String::new())
+}
+
 /// The `sandbox` section for a new project, mirroring Python
 /// `default_config_obj`.
 pub(crate) fn default_config_obj() -> Value {
@@ -711,6 +944,34 @@ pub(crate) fn merge_defaults(existing: &Value) -> Result<(Value, Vec<String>), S
 
 #[cfg(test)]
 mod tests {
+    const DRIVER: &str = r####"import argparse, io, json, os, sys
+from contextlib import redirect_stderr, redirect_stdout
+sys.path.insert(0, os.environ["WRKSLOTS_PY_ROOT"])
+from wrkslots import cli, imagecmd, sandbox
+
+case = sys.argv[1]
+raw_cases = {
+    "default": None,
+    "custom": {
+        "isolation": "root",
+        "env": {"ALPHA": "~/x", "ZED": "1"},
+        "limits": {"memory_max": "32G", "cpu_quota": "800%",
+                   "slot_cpu_quotas": [{"slot_prefix": "wide", "cpu_quota": "3200%"}]},
+        "home_expose": ["bin"],
+    },
+    "invalid": {"isolation": "namespace"},
+}
+raw = raw_cases[case]
+full = {} if raw is None else {"sandbox": raw}
+try:
+    settings = cli._parse_sandbox_settings(full)
+except cli.Refusal as exc:
+    remedy = cli._refusal_remedy(argparse.Namespace(command="sandbox"), exc)
+    sys.stdout.write(f"3\n---STDERR---\nREFUSED: {exc}\nREMEDY: {remedy}\n")
+    sys.exit(0)
+print = lambda *a, **k: sys.stdout.write(" ".join(str(x) for x in a) + "\n")
+sys.stdout.write("0\n" + json.dumps(sandbox.settings_to_obj(settings), indent=2) + "\n---STDERR---\n")
+"####;
     use super::*;
 
     #[test]
@@ -791,5 +1052,54 @@ mod tests {
         assert!(settings_from_obj(&json!({"isolation": "namespace"})).is_err());
         let renamed = settings_from_obj(&json!({"memory_max": "32G"})).expect_err("renamed");
         assert!(renamed.contains("limits.memory_max"), "{renamed}");
+    }
+
+    /// Oracle differential (#1101): Python `_parse_sandbox_settings`
+    /// plus `settings_to_obj` as a subprocess vs `sandbox_show_config`
+    /// on the same raw section, byte-for-byte including the refusal.
+    #[test]
+    fn show_config_matches_python_oracle() {
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("repo root")
+            .to_path_buf();
+        let dir =
+            std::env::temp_dir().join(format!("wrkslotsd-show-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let driver_path = dir.join("driver.py");
+        std::fs::write(&driver_path, DRIVER).expect("driver");
+        let cases: Vec<(&str, Option<Value>)> = vec![
+            ("default", None),
+            (
+                "custom",
+                Some(json!({
+                    "isolation": "root",
+                    "env": {"ALPHA": "~/x", "ZED": "1"},
+                    "limits": {"memory_max": "32G", "cpu_quota": "800%",
+                               "slot_cpu_quotas": [{"slot_prefix": "wide", "cpu_quota": "3200%"}]},
+                    "home_expose": ["bin"]
+                })),
+            ),
+            ("invalid", Some(json!({"isolation": "namespace"}))),
+        ];
+        for (case, raw) in &cases {
+            let output = std::process::Command::new("python3")
+                .arg(&driver_path)
+                .arg(case)
+                .env("WRKSLOTS_PY_ROOT", repo.join("py"))
+                .output()
+                .expect("python oracle runs");
+            let text = String::from_utf8(output.stdout).expect("utf8");
+            let (head, rest) = text.split_once('\n').expect("exit line");
+            let (stdout, stderr) = rest.split_once("---STDERR---\n").expect("marker");
+            let expected = (
+                head.trim().parse::<i32>().expect("exit"),
+                stdout.to_string(),
+                stderr.to_string(),
+            );
+            assert_eq!(sandbox_show_config(raw.as_ref()), expected, "case {case}");
+        }
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 }
