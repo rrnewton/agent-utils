@@ -11,7 +11,7 @@ updated_at: 2026-11-09T21:22:57.000000000+00:00
 
 Python #1152 worktrees-image-host-scope (3f0d04c2) scopes the
 worktrees_image section to named hosts. Rust currently refuses
-any config using `machines`, so dev-hermit cannot commit such a
+any config using `machines`, so a consumer cannot commit such a
 section. Required parity:
 
 - `machines` is validated on every host (non-empty list of unique
