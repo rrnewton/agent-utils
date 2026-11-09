@@ -1,10 +1,10 @@
 ---
 title: 'merge-queue-operator-hold: an operator host fault a probe pass cannot clear, and priority changes for changes already in flight'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-09T00:44:51.000000000+00:00
-updated_at: 2026-11-09T00:44:51.000000000+00:00
+updated_at: 2026-11-09T10:33:00.000000000+00:00
 ---
 
 # Description
@@ -105,3 +105,33 @@ cli_intake_window (gated in-flight batches) and cli_intake
 (recorded/next-writer paths).
 
 ## Resolution
+
+Landed on main as 63ad52e8ca298f56bba9161da21c6892a9af4ce9 (gated commit 1cb88128, files byte-identical after replay).
+
+`donor host-fault --operator` records an operator hold in
+host-faults.json: `note_probe_pass` leaves it entirely alone
+(no clear, no escalated trial), an admitted validation does not
+clear it, and only plain `donor clear-fault` lifts it —
+`clear-fault --probe-passed` records the probe outcome, replies
+`held_by_operator` and changes nothing. `host_fault_details`
+and the `donor fault` reply carry the flag, and `donor status`
+plus the serve heartbeat render `held by operator: <reason>`.
+The new `prioritize` verb edits a queued change's numeric
+priority and/or prioritized flag in place (`--clear` restores
+the defaults; a landed change is refused), directly under the
+lock or as a recorded `Prioritize` intake request that a run
+applies at its next intake point even for a change in flight
+(`apply_priorities` ahead of the busy-filtered apply, and a
+waiting prioritization opens the intake round with a full
+window), so the next plan orders by it without disturbing the
+batch running. Tests: an operator fault surviving both probe
+paths until cleared (donor.rs unit + cli_donor end-to-end incl.
+status text and the fault JSON), prioritize in place and when
+recorded (cli_intake), and prioritizing in flight reordering
+the next plan (cli_intake_window), all written failing first.
+Gate: full gate on 1cb88128 — shared 238 passed with one
+failure in untouched timeline.browser.functional (dev-server
+port already in use on the shared host), exclusive phase 7/7
+passed, rust.merge-queue.test clean at 603 passed / 0 failed;
+the timeline step passed its solo exclusive rerun (ledger
+rerun_passed).

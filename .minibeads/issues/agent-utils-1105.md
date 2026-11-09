@@ -1,10 +1,10 @@
 ---
 title: 'merge-queue-claim-revision: refuse a donor claim whose merge-queue revision differs from the queue host'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-09T01:22:18.000000000+00:00
-updated_at: 2026-11-09T01:22:18.000000000+00:00
+updated_at: 2026-11-09T10:33:00.000000000+00:00
 ---
 
 # Description
@@ -73,3 +73,28 @@ revision gate. Tests: a `claim_refusal` unit test in donor.rs
 plus cli_donor claim coverage.
 
 ## Resolution
+
+Landed on main as 481c57791b0a463b1ee9e1ff6ea1cac3f8917673 (gated commit 4aca6c96, files byte-identical after replay).
+
+`donor claim` declares the donor binary's own revision via
+`--revision COMMIT [--revision-dirty]`; the queue host refuses
+a mismatched or unusable declaration before noting or leasing
+anything, through `claim_refusal` around `revision_mismatch`
+(same wording as the receipt path), replying
+`{"job": null, "refused": "..."}` on an additive
+`Claimed.refused` field that old and new binaries both parse.
+The donor run loop declares on every claim and, on a refusal,
+logs it, backs off like a tool mismatch and does not read it
+as an empty queue. A claim with no declaration (an older donor)
+claims exactly as before; a new donor against an older queue
+leases nothing on its refused claim, as with `--drain` and
+`--reports-admission` before it. Tests: `claim_refusal` admits
+only undeclared or matching revisions (donor.rs unit), and an
+end-to-end sequence — old-style claim leases, mismatched
+declaration refused with the job still queued, matching
+declaration (dirty test build declared dirty) leases
+(cli_donor) — both failing on the old code first. Gate: full
+gate on 4aca6c96, shared phase 239 passed / 0 failed
+(rust.merge-queue.test 605/0); the exclusive cross
+differentials were stopped under the merge-queue-only waiver
+(ledger failed_steps empty, verdict fail only from that stop).
