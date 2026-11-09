@@ -9,7 +9,9 @@
 //! loader it never activates (mounts) image-backed slots; on a `worktree`
 //! project (the default) the loaders agree exactly.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde_json::{json, Map, Value};
 
@@ -18,6 +20,9 @@ use crate::yamlconfig;
 type Result<T> = std::result::Result<T, String>;
 
 const SCHEMA: i64 = 2;
+/// The wrkslots version this build is, as `min_wrkslots_version` names it;
+/// always the Python edition's `wrkslots.__version__` (#1109).
+pub(crate) const WRKSLOTS_VERSION: &str = "0.7.0";
 const REQUIRED: [&str; 7] = [
     "schema",
     "worktrees_dir",
@@ -27,7 +32,7 @@ const REQUIRED: [&str; 7] = [
     "heartbeat_ttl_seconds",
     "liveness_command",
 ];
-const OPTIONAL: [&str; 17] = [
+const OPTIONAL: [&str; 19] = [
     "liveness_batch_command",
     "max_active_slots",
     "layout",
@@ -45,7 +50,106 @@ const OPTIONAL: [&str; 17] = [
     "image",
     "sandbox",
     "worktrees_image",
+    "min_wrkslots_version",
+    "ignorable_keys",
 ];
+
+/// Unknown keys this process has already warned it ignores (#1109).
+static WARNED_IGNORED_KEYS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+fn version_tuple(text: &str, label: &str) -> Result<(u64, u64, u64)> {
+    let invalid = || {
+        format!(
+            "{label} must be a version MAJOR.MINOR.PATCH, such as {WRKSLOTS_VERSION}; found {}",
+            crate::storage_state::py_repr(text)
+        )
+    };
+    let parts: Vec<&str> = text.split('.').collect();
+    if parts.len() != 3 {
+        return Err(invalid());
+    }
+    let mut numbers = [0u64; 3];
+    for (slot, part) in numbers.iter_mut().zip(&parts) {
+        let digits = !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+        if !digits || (part.len() > 1 && part.starts_with('0')) {
+            return Err(invalid());
+        }
+        *slot = part.parse().map_err(|_| invalid())?;
+    }
+    Ok((numbers[0], numbers[1], numbers[2]))
+}
+
+/// The key names a configuration's `ignorable_keys` lists, validated.
+pub(crate) fn ignorable_keys(raw: &Map<String, Value>) -> Result<BTreeSet<String>> {
+    let Some(listed) = raw.get("ignorable_keys") else {
+        return Ok(BTreeSet::new());
+    };
+    let not_names = || "configuration.ignorable_keys must be a list of key names".to_string();
+    let items = listed.as_array().ok_or_else(not_names)?;
+    let mut names = BTreeSet::new();
+    for item in items {
+        let name = item.as_str().ok_or_else(not_names)?;
+        let shaped = !name.is_empty()
+            && name.len() <= 64
+            && name.as_bytes()[0].is_ascii_lowercase()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_');
+        if !shaped {
+            return Err(format!(
+                "configuration.ignorable_keys: invalid key name {}; use lowercase letters, digits and '_', starting with a letter",
+                crate::storage_state::py_repr(name)
+            ));
+        }
+        if !names.insert(name.to_string()) {
+            return Err("configuration.ignorable_keys must not contain duplicates".to_string());
+        }
+    }
+    Ok(names)
+}
+
+/// Apply `min_wrkslots_version` and `ignorable_keys` (#1109); see the
+/// Python edition's `_forward_compatible_config`.
+fn forward_compatible(raw: &Map<String, Value>, path: &Path) -> Result<Map<String, Value>> {
+    if let Some(value) = raw.get("min_wrkslots_version") {
+        let required = as_str(value, "configuration.min_wrkslots_version")?;
+        if version_tuple(required, "configuration.min_wrkslots_version")?
+            > version_tuple(WRKSLOTS_VERSION, "wrkslots version")?
+        {
+            return Err(format!(
+                "configuration {} requires wrkslots {required} or later (min_wrkslots_version); this is wrkslots {WRKSLOTS_VERSION}. Run a newer wrkslots for this project",
+                path.display()
+            ));
+        }
+    }
+    let ignorable = ignorable_keys(raw)?;
+    let ignored: Vec<&String> = raw
+        .keys()
+        .filter(|key| {
+            !REQUIRED.contains(&key.as_str())
+                && !OPTIONAL.contains(&key.as_str())
+                && ignorable.contains(*key)
+        })
+        .collect();
+    if !ignored.is_empty() {
+        let mut warned = WARNED_IGNORED_KEYS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for key in &ignored {
+            if warned.insert((*key).clone()) {
+                eprintln!(
+                    "WARNING: wrkslots {WRKSLOTS_VERSION} ignores configuration key {key} in {}: it does not know the key, and ignorable_keys lists it",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(raw
+        .iter()
+        .filter(|(key, _)| !ignored.contains(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect())
+}
 
 fn name_valid(value: &str) -> bool {
     !value.is_empty()
@@ -1045,6 +1149,7 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
     let raw = document
         .as_object()
         .ok_or_else(|| format!("configuration must be a mapping: {}", path.display()))?;
+    let raw = &forward_compatible(raw, &path)?;
     exact_keys(raw, "configuration").map_err(|error| {
         format!(
             "{error} in {}. Migrate it with `wrkslots init --repair` (it refuses to change any field that already has a conflicting value).",

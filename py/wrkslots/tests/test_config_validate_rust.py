@@ -13,6 +13,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from wrkslots import __version__ as wrkslots_version
 from wrkslots import cli as wrkslots_cli
 from wrkslots import sandbox as sandbox_module
 
@@ -146,3 +147,130 @@ def test_validate_config_refusals_name_the_same_problem(tmp_path: Path, extra: s
     result = _rust(root)
     assert result.returncode == 1
     assert fragment in result.stderr
+
+
+# #1109 wrkslots-config-forward-compat: ignorable_keys and min_wrkslots_version.
+
+
+@pytest.fixture
+def fresh_ignore_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each test sees the one-per-process warning for every key it ignores."""
+
+    monkeypatch.setattr(wrkslots_cli, "_WARNED_IGNORED_CONFIG_KEYS", set())
+
+
+def _ignore_warning(root: Path, key: str) -> str:
+    return (
+        f"WARNING: wrkslots {wrkslots_version} ignores configuration key {key} in "
+        f"{root / '.wrkslots.yml'}: it does not know the key, and ignorable_keys lists it"
+    )
+
+
+@pytest.mark.usefixtures("fresh_ignore_warnings")
+def test_a_listed_unknown_key_is_ignored_with_a_warning_by_both(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _root(
+        tmp_path,
+        "ignorable_keys: [future_key, max_active_slots]\n"
+        "future_key: {anything: [1, 2]}\n"
+        "max_active_slots: 4\n"
+        "min_wrkslots_version: 0.7.0\n",
+    )
+    expected = _expected(root)
+    assert expected["max_active_slots"] == 4
+    assert capsys.readouterr().err.splitlines() == [_ignore_warning(root, "future_key")]
+    result = _rust(root)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == expected
+    assert result.stderr.splitlines() == [_ignore_warning(root, "future_key")]
+
+
+@pytest.mark.usefixtures("fresh_ignore_warnings")
+def test_an_older_reader_ignores_only_the_listed_key_it_does_not_know(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A reader from before ``identity`` (#1096), modelled by removing the key it knows."""
+
+    monkeypatch.setattr(
+        wrkslots_cli, "OPTIONAL_CONFIG_KEYS", wrkslots_cli.OPTIONAL_CONFIG_KEYS - {"identity"}
+    )
+    identity = "identity: {name: Slot Bot, email: slot-bot@example.invalid}\n"
+    listed = _root(tmp_path / "listed", "ignorable_keys: [identity]\n" + identity)
+    config = wrkslots_cli._load_config(str(listed), None)
+    assert config.identity is None
+    assert capsys.readouterr().err.splitlines() == [_ignore_warning(listed, "identity")]
+    # The same file read by this build, which knows the key, uses it silently.
+    monkeypatch.undo()
+    monkeypatch.setattr(wrkslots_cli, "_WARNED_IGNORED_CONFIG_KEYS", set())
+    assert wrkslots_cli._load_config(str(listed), None).identity is not None
+    assert capsys.readouterr().err == ""
+
+    monkeypatch.setattr(
+        wrkslots_cli, "OPTIONAL_CONFIG_KEYS", wrkslots_cli.OPTIONAL_CONFIG_KEYS - {"identity"}
+    )
+    unlisted = _root(tmp_path / "unlisted", identity)
+    with pytest.raises(wrkslots_cli.StateError, match="invalid fields: unknown identity"):
+        wrkslots_cli._load_config(str(unlisted), None)
+
+
+@pytest.mark.usefixtures("fresh_ignore_warnings")
+@pytest.mark.parametrize(
+    ("extra", "fragment"),
+    [
+        # A typo is never ignored, whatever ignorable_keys lists.
+        (
+            "ignorable_keys: [future_key]\nmax_active_slot: 3\n",
+            "configuration has invalid fields: unknown max_active_slot",
+        ),
+        ("future_key: 1\n", "configuration has invalid fields: unknown future_key"),
+        ("ignorable_keys: future_key\n", "configuration.ignorable_keys must be a list of key names"),
+        ("ignorable_keys: [7]\n", "configuration.ignorable_keys must be a list of key names"),
+        (
+            "ignorable_keys: [Future-Key]\n",
+            "configuration.ignorable_keys: invalid key name 'Future-Key'",
+        ),
+        (
+            "ignorable_keys: [future_key, future_key]\n",
+            "configuration.ignorable_keys must not contain duplicates",
+        ),
+        (
+            "min_wrkslots_version: '1.0'\n",
+            "configuration.min_wrkslots_version must be a version MAJOR.MINOR.PATCH",
+        ),
+        (
+            "min_wrkslots_version: 01.0.0\n",
+            "configuration.min_wrkslots_version must be a version MAJOR.MINOR.PATCH",
+        ),
+        ("min_wrkslots_version: 1\n", "configuration.min_wrkslots_version must be a string"),
+    ],
+)
+def test_forward_compat_refusals_name_the_same_problem(
+    tmp_path: Path, extra: str, fragment: str
+) -> None:
+    root = _root(tmp_path, extra)
+    with pytest.raises(wrkslots_cli.StateError) as caught:
+        wrkslots_cli._load_config(str(root), None)
+    assert fragment in str(caught.value)
+    result = _rust(root)
+    assert result.returncode == 1
+    assert fragment in result.stderr
+
+
+@pytest.mark.usefixtures("fresh_ignore_warnings")
+def test_a_newer_min_wrkslots_version_refuses_naming_both_versions(tmp_path: Path) -> None:
+    """Checked before the keys, so an unknown key does not hide the version."""
+
+    root = _root(tmp_path, "min_wrkslots_version: 99.0.0\nfuture_key: 1\n")
+    message = (
+        f"configuration {root / '.wrkslots.yml'} requires wrkslots 99.0.0 or later "
+        f"(min_wrkslots_version); this is wrkslots {wrkslots_version}. Run a newer "
+        "wrkslots for this project"
+    )
+    with pytest.raises(wrkslots_cli.StateError) as caught:
+        wrkslots_cli._load_config(str(root), None)
+    assert str(caught.value) == message
+    result = _rust(root)
+    assert result.returncode == 1
+    # The Rust edition names the same version as the Python package.
+    assert message in result.stderr, result.stderr

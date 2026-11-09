@@ -549,8 +549,16 @@ OPTIONAL_CONFIG_KEYS = frozenset(
         "image",
         "sandbox",
         "worktrees_image",
+        "min_wrkslots_version",
+        "ignorable_keys",
     }
 )
+#: A wrkslots version as min_wrkslots_version names it: MAJOR.MINOR.PATCH.
+_VERSION_PATTERN = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+#: A top-level configuration key name, as ignorable_keys lists it.
+_CONFIG_KEY_NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
+#: Unknown keys this process has already warned it ignores (#1109).
+_WARNED_IGNORED_CONFIG_KEYS: set[str] = set()
 #: The comment above each key of the optional ``identity`` section (#1096).
 IDENTITY_DOCS: dict[str, str] = {
     "name": "user.name for commits made in new slots.",
@@ -572,6 +580,16 @@ REQUIRED_CONFIG_KEYS = frozenset(
 #: tables beside their own defaults (sandbox.SETTING_DOCS, slotimage.IMAGE_DOCS).
 CONFIG_KEY_DOCS: dict[str, str] = {
     "schema": f"Configuration schema version ({SCHEMA}). Written by init; do not edit.",
+    "min_wrkslots_version": (
+        "Oldest wrkslots version (MAJOR.MINOR.PATCH) that may read this file. Raise it only "
+        "when a key this file relies on for correctness is newer than some reader; an older "
+        "reader then refuses, naming the version. Absent means any version that knows every key."
+    ),
+    "ignorable_keys": (
+        "Optional keys a wrkslots that does not know them may ignore, with a warning, instead "
+        "of refusing the file. List a new key here when it only adds behaviour; a key that is "
+        "not listed (a typo, for example) still refuses."
+    ),
     "machine": (
         "Machine shard name: state files are ACTIVE.<machine>.json and EVENTS.<machine>. "
         "Defaults to the short host name at init; WRKSLOTS_MACHINE or --machine overrides it."
@@ -3942,7 +3960,10 @@ def _repaired_config(
             changes.append(f"{key} {have!r} -> {want!r}")
             continue
         conflicts.append(f"{key}: file has {have!r}, command line says {want!r}")
-    unknown = sorted(set(repaired) - set(payload) - OPTIONAL_CONFIG_KEYS)
+    # A key the file lets an older reader ignore is kept as it is (#1109).
+    unknown = sorted(
+        set(repaired) - set(payload) - OPTIONAL_CONFIG_KEYS - _config_ignorable_keys(repaired)
+    )
     if unknown:
         conflicts.append(
             "unknown field(s) this build does not understand: " + ", ".join(unknown)
@@ -4005,10 +4026,80 @@ def _discover_root(explicit: str | None) -> Path:
     raise Refusal(f"no {CONFIG_NAME} found; run 'wrkslots init' from the project root")
 
 
+def _version_tuple(text: str, label: str) -> tuple[int, int, int]:
+    match = _VERSION_PATTERN.fullmatch(text)
+    if match is None:
+        raise StateError(
+            f"{label} must be a version MAJOR.MINOR.PATCH, such as {VERSION}; found {text!r}"
+        )
+    major, minor, patch = (int(part) for part in match.groups())
+    return major, minor, patch
+
+
+def _config_ignorable_keys(raw: Mapping[str, object]) -> frozenset[str]:
+    """The key names a configuration's ``ignorable_keys`` lists, validated."""
+
+    if "ignorable_keys" not in raw:
+        return frozenset()
+    listed = raw["ignorable_keys"]
+    if not isinstance(listed, list) or not all(isinstance(name, str) for name in listed):
+        raise StateError("configuration.ignorable_keys must be a list of key names")
+    names = [str(name) for name in listed]
+    for name in names:
+        if _CONFIG_KEY_NAME_PATTERN.fullmatch(name) is None:
+            raise StateError(
+                f"configuration.ignorable_keys: invalid key name {name!r}; use lowercase "
+                "letters, digits and '_', starting with a letter"
+            )
+    if len(set(names)) != len(names):
+        raise StateError("configuration.ignorable_keys must not contain duplicates")
+    return frozenset(names)
+
+
+def _forward_compatible_config(
+    raw: Mapping[str, object], path: Path
+) -> Mapping[str, object]:
+    """Apply ``min_wrkslots_version`` and ``ignorable_keys`` (#1109).
+
+    Every other key is still checked exactly afterwards, so a key this build
+    does not know refuses unless the file lists it in ``ignorable_keys``: a
+    typo is never silently ignored.  A listed key that this build does not
+    know is dropped here, with one warning per key and process, so nothing
+    after this reads it.  ``min_wrkslots_version`` is checked first, so a
+    reader older than the file requires refuses with that version, whatever
+    keys the file has.
+    """
+
+    if "min_wrkslots_version" in raw:
+        required = _as_str(raw["min_wrkslots_version"], "configuration.min_wrkslots_version")
+        if _version_tuple(required, "configuration.min_wrkslots_version") > _version_tuple(
+            VERSION, "wrkslots version"
+        ):
+            raise StateError(
+                f"configuration {path} requires wrkslots {required} or later "
+                f"(min_wrkslots_version); this is wrkslots {VERSION}. Run a newer "
+                "wrkslots for this project"
+            )
+    ignorable = _config_ignorable_keys(raw)
+    known = REQUIRED_CONFIG_KEYS | OPTIONAL_CONFIG_KEYS
+    ignored = sorted(key for key in raw if key not in known and key in ignorable)
+    for key in ignored:
+        if key not in _WARNED_IGNORED_CONFIG_KEYS:
+            _WARNED_IGNORED_CONFIG_KEYS.add(key)
+            print(
+                f"WARNING: wrkslots {VERSION} ignores configuration key {key} in {path}: "
+                "it does not know the key, and ignorable_keys lists it",
+                file=sys.stderr,
+            )
+    if not ignored:
+        return raw
+    return {key: value for key, value in raw.items() if key not in ignored}
+
+
 def _load_config(explicit_root: str | None, machine_override: str | None) -> Config:
     root = _discover_root(explicit_root)
     path = root / CONFIG_NAME
-    raw = _read_config(path)
+    raw = _forward_compatible_config(_read_config(path), path)
     try:
         _exact_keys(raw, set(REQUIRED_CONFIG_KEYS), OPTIONAL_CONFIG_KEYS, "configuration")
     except StateError as exc:

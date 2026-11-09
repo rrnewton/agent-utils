@@ -128,6 +128,34 @@ wrkslots config convert --to yaml      # or: --to json
 
 `init --config-format json` still creates a JSON file.
 
+### New keys and older readers
+
+Every reader checks the top-level keys exactly: a key it does not know refuses the file, even for
+read-only `status`, so a misspelt key is never silently ignored. When several checkouts of
+different ages read one shared file, two keys let a new key roll out without upgrading every
+reader first:
+
+- `ignorable_keys`: the optional keys a reader that does not know them may ignore. Such a reader
+  drops the key, prints one warning naming it and its own version, and goes on; a key that is
+  not listed still refuses. List a new key here when it only adds behaviour, such as `identity`.
+- `min_wrkslots_version`: the oldest wrkslots (`MAJOR.MINOR.PATCH`, as `wrkslots --version`
+  prints it) that may read the file. Raise it when the file relies on a key for correctness, so
+  that ignoring the key would be wrong. An older reader then refuses, naming both versions. It is
+  checked before the keys, so it names the version even when the file also has keys that reader
+  does not know.
+
+```yaml
+min_wrkslots_version: 0.7.0
+ignorable_keys: [identity]
+identity: {name: Slot Bot, email: slot-bot@example.invalid}
+```
+
+Both keys are understood from wrkslots 0.7.0 on. A reader older than that refuses either of them
+like any other unknown key, so start using them only once every reader of the file is 0.7.0 or
+later. From then on, an additive key needs only an `ignorable_keys` entry, and a correctness key
+needs a `min_wrkslots_version` raised to the release that introduced it. `init --repair` keeps
+listed keys it does not know as they are.
+
 ## Coordinator assignment and creation
 
 An agent name must be one the session tooling can register: a lowercase letter, then lowercase
