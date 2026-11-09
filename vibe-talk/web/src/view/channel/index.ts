@@ -134,6 +134,8 @@ export type { ReadingJumps, ReadingJumpsDependencies } from "./readingjumps.ts";
 export { createReplySession } from "./replysession.ts";
 export type { ReplyColumnLike, ReplyDraftStoreLike, ReplyMessageLike, ReplySession, ReplySessionDependencies } from "./replysession.ts";
 export { createReplyArrows, freshReplyArrows, REPLY_LANDING_GAP_PX } from "./replyarrows.ts";
+export { createReplyGathering, freshGatherState, freshListState } from "./gathering.ts";
+export type { Gathering, GatheringDependencies, GatherMessage, GatherState, GatherThreadChoice, ListState, ReplyLinks } from "./gathering.ts";
 export type { ReplyArrows, ReplyArrowsDependencies, ReplyArrowsState, ReplyArrowRow, ReplyJumpTicket } from "./replyarrows.ts";
 export { createColumnReplies } from "./columnreplies.ts";
 export type { ColumnReplies, ColumnRepliesDependencies, ColumnReplyEntry } from "./columnreplies.ts";

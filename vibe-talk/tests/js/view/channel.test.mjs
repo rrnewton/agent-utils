@@ -1845,3 +1845,58 @@ test("`#624 voice-page-modularity`: a column's reply arrows start fresh, and a l
   assert.equal(owner.landOnAnswered("nope", "m2"), false, "a jump landed on a row that is not on screen");
   assert.equal(freshReplyArrows().countsDrawn, false, "a fresh column shared its arrows record");
 });
+
+test("`#624 voice-page-modularity`: replies are gathered by pointer and by thread, to any depth, and a fresh column gathers nothing", () => {
+  const { createReplyGathering, freshGatherState, freshListState } = CHANNEL_VIEW;
+  assert.deepStrictEqual(freshGatherState(), { gathered: null });
+  assert.deepStrictEqual(freshListState(), { rowsGathered: false, outgoingKey: "", newestId: null, runRows: 0, backlog: 0 });
+  const gatherRecord = freshGatherState();
+  const listRecord = freshListState();
+  const owner = createReplyGathering({
+    el: () => ({ children: [] }),
+    inThisColumn: (fn) => fn,
+    threading: () => true,
+    selection: () => ({ view: "flat", threadId: null }),
+    channelContextKey: () => "ctx",
+    knownThreadChoice: () => null,
+    selectedChannelId: () => "C1",
+    channelCanon: () => ({ channel: "C1", scope: null, messages: [] }),
+    loadCanon: () => {},
+    heldMessage: () => null,
+    heldThreadRecord: (message) => (message.thread ? { id: "t1", is_root: message.thread.is_root === true } : null),
+    rowMessages: () => [],
+    glom: (messages) => [ [...messages] ],
+    discordNode: () => ({}),
+    unpackMessages: () => [], unpackHeldMessages: () => null, unpackNeedsRead: () => false,
+    queueUnpackRead: () => {}, unpackFilter: () => null,
+    layoutColumns: () => false, sideColumn: () => null,
+    openThread: () => {}, searchOpen: () => false, setSearchOpen: () => {},
+    seekMessage: async () => {}, rowHolding: () => null,
+    setStatus: () => {}, renderChannelRows: () => {}, renderScrollTools: () => {},
+    countOf: (n) => `${n} replies`,
+    hidingRead: () => false,
+    threadReplies: () => ({}),
+    timelineRows: () => ({ messages: [] }),
+    renderJumpNewest: () => {}, renderReplyCounts: () => {}, measureReplyArrows: () => {},
+    cardRow: () => null, finishPackSlide: () => {}, glideBehavior: () => "auto",
+    threadHue: () => "", openThreadRootId: () => null, openThreadChoice: () => null,
+    rootInward: () => false, isOpenThreadRoot: () => false,
+    replyArrows: () => ({ settling: null }),
+    takeClaimedClick: () => false,
+    drawnTop: () => 0, floatingClearance: () => 0,
+    activeGather: () => gatherRecord, activeList: () => listRecord,
+  });
+  const messages = [
+    { id: "a" },
+    { id: "b", reply_to: "a" },
+    { id: "c", reply_to: "b" },
+    { id: "d" },
+    { id: "e", thread: { id: "t1", is_root: true } },
+    { id: "f", thread: { id: "t1", is_root: false } },
+  ];
+  assert.deepStrictEqual([...owner.repliesTo("a", messages)].sort(), ["b", "c"],
+    "a reply's replies were not gathered with it");
+  assert.deepStrictEqual([...owner.repliesTo("e", messages)].sort(), ["f"],
+    "a thread's replies were not gathered under its root");
+  assert.equal(owner.gatheredParent(), null, "a fresh column already had a gathering");
+});

@@ -187,7 +187,7 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
   // And what its list has drawn.
   same("inColumn(columns.side, () => { listState().backlog = 3; })");
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.list.backlog, listState().backlog])")), [3, 0]);
-  assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshListState())")),
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(page.preludeBinding("freshListState")())),
     { rowsGathered: false, outgoingKey: "", newestId: null, runRows: 0, backlog: 0 });
   // And the rows its list was drawn from: a fresh pair of lists for each column.
   assert.equal(same("columns.side.rows.messages !== columns.main.rows.messages"), true, "the columns shared one list of rows");
@@ -205,7 +205,8 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
     [{ jumpWanted: 3, inScrollback: true }, false, false, 2, 2]);
   // And what is gathered in its list; and nothing is swapped through the module any more.
   assert.equal(same("inColumn(columns.side, () => gatherState()) === columns.side.gather && gatherState() === columns.main.gather"), true);
-  assert.deepStrictEqual(JSON.parse(same("JSON.stringify([freshGatherState(), typeof COLUMN_STATE])")), [{ gathered: null }, "undefined"]);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(page.preludeBinding("freshGatherState")())), { gathered: null });
+  assert.equal(same("typeof COLUMN_STATE"), "undefined", "a column record is still swapped through the legacy script");
   // A column put aside has been worked on and left; the one taken up has not.
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.left, inColumn(columns.side, () => [columns.side.left, columns.main.left])])")),
     [true, [false, true]]);
