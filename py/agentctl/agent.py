@@ -1232,11 +1232,15 @@ def queue_only(
             root, target, max_artifact_bytes=max_artifact_bytes,
             allow_legacy_workspace_binding=True,
         )
-        identifier, superseded = _enqueue_outcome(
+        superseded: list[str] = []
+        enqueue_kwargs: dict[str, object] = {}
+        if supersede_key is not None:
+            enqueue_kwargs = {"supersede_key": supersede_key, "superseded_out": superseded}
+        identifier = _enqueue(
             root, text, message_id=message_id,
             serialize=message_id is not None or supersede_key is not None,
-            supersede_key=supersede_key,
             max_artifact_bytes=max_artifact_bytes,
+            **enqueue_kwargs,  # type: ignore[arg-type]
         )
         return QueueResult(
             message_id=identifier, delivered=(), quarantined=(),
@@ -1329,12 +1333,17 @@ def _enqueue(
     *,
     message_id: str | None,
     serialize: bool,
+    supersede_key: str | None = None,
+    superseded_out: list[str] | None = None,
     max_artifact_bytes: int | None = None,
 ) -> str:
-    identifier, _superseded = _enqueue_outcome(
+    identifier, superseded = _enqueue_outcome(
         root, text, message_id=message_id, serialize=serialize,
+        supersede_key=supersede_key,
         max_artifact_bytes=max_artifact_bytes,
     )
+    if superseded_out is not None:
+        superseded_out.extend(superseded)
     return identifier
 
 
@@ -2528,11 +2537,15 @@ def _send(
     # and terminal-artifact inspection resolve any cross-sender consumption safely.
     # A caller-selected ID can move out of inbox while another caller is checking
     # it. Serialize that check with delivery, so the same ID cannot be recreated.
-    identifier, superseded = _enqueue_outcome(
+    superseded: list[str] = []
+    enqueue_kwargs: dict[str, object] = {}
+    if supersede_key is not None:
+        enqueue_kwargs = {"supersede_key": supersede_key, "superseded_out": superseded}
+    identifier = _enqueue(
         root, text, message_id=message_id,
         serialize=message_id is not None or supersede_key is not None,
-        supersede_key=supersede_key,
         max_artifact_bytes=max_artifact_bytes,
+        **enqueue_kwargs,  # type: ignore[arg-type]
     )
     result = drain(client, target, root, max_artifact_bytes=max_artifact_bytes,
                    atomic_policy=atomic_policy,
