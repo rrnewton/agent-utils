@@ -38636,6 +38636,82 @@ def _audit_validate_batch_seal_evidence(
     return tuple(targets), tuple(errors)
 
 
+#: How many entries audit counts under one non-slot entry before it reports
+#: the entry's size as unknown (#1113).
+_NON_SLOT_ENTRY_SIZE_ENTRIES = 100_000
+
+
+def _non_slot_entry_bytes(path: Path) -> int | None:
+    """Allocated bytes of a slots-root entry that is not a slot (#1113).
+
+    Counts the entry and everything below it without following symbolic
+    links or crossing onto another device.  None when it holds more than
+    _NON_SLOT_ENTRY_SIZE_ENTRIES entries or cannot be read: the size is
+    then unknown, never zero.
+    """
+
+    try:
+        top = os.lstat(path)
+    except OSError:
+        return None
+    total = top.st_blocks * 512
+    counted = 1
+    pending = [path] if stat.S_ISDIR(top.st_mode) else []
+    while pending:
+        directory = pending.pop()
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    counted += 1
+                    if counted > _NON_SLOT_ENTRY_SIZE_ENTRIES:
+                        return None
+                    info = entry.stat(follow_symlinks=False)
+                    total += info.st_blocks * 512
+                    if stat.S_ISDIR(info.st_mode) and info.st_dev == top.st_dev:
+                        pending.append(Path(entry.path))
+        except OSError:
+            return None
+    return total
+
+
+def _audit_slot_root_listing(
+    config: Config,
+) -> tuple[set[tuple[str, str]], list[tuple[str, Path]]]:
+    """The slot directories audit considers, and the entries no slot can be (#1113).
+
+    A directory whose name does not match NAME_RE (a dot directory such as
+    ``.pytest_cache``, or a removal's ``.<slot>.fenced.*`` tree) can never be
+    a slot, so it is not reported as an unregistered slot; it is returned
+    separately, with its slot type, so audit can list it once.
+    """
+
+    slots: set[tuple[str, str]] = set()
+    others: list[tuple[str, Path]] = []
+    for slot_type, root in _slot_roots(config).items():
+        if not root.exists():
+            continue
+        try:
+            for entry in root.iterdir():
+                if not (
+                    entry.is_dir()
+                    and not entry.is_symlink()
+                    and not entry.name.startswith("EVENTS.")
+                    and not _is_representation_directory(config, entry)
+                    and not (
+                        slot_type == "agent"
+                        and entry == _validate_slots_directory(config)
+                    )
+                ):
+                    continue
+                if NAME_RE.fullmatch(entry.name) is None:
+                    others.append((slot_type, entry))
+                else:
+                    slots.add((slot_type, entry.name))
+        except OSError as exc:
+            raise Refusal(f"cannot enumerate worktree slots in {root}: {exc}") from exc
+    return slots, sorted(others, key=lambda item: (item[0], item[1].name))
+
+
 def _cmd_audit(args: argparse.Namespace) -> int:
     if args.cache_work_limit < 1:
         raise Refusal("--cache-work-limit must be positive")
@@ -38807,25 +38883,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
             "slot_paths": len(records) if census_needed else 0,
         },
     )
-    on_disk: set[tuple[str, str]] = set()
-    for slot_type, root in _slot_roots(config).items():
-        if not root.exists():
-            continue
-        try:
-            on_disk.update(
-                (slot_type, entry.name)
-                for entry in root.iterdir()
-                if entry.is_dir()
-                and not entry.is_symlink()
-                and not entry.name.startswith("EVENTS.")
-                and not _is_representation_directory(config, entry)
-                and not (
-                    slot_type == "agent"
-                    and entry == _validate_slots_directory(config)
-                )
-            )
-        except OSError as exc:
-            raise Refusal(f"cannot enumerate worktree slots in {root}: {exc}") from exc
+    on_disk, non_slot_entries = _audit_slot_root_listing(config)
     registered = {(record.slot_type, record.slot) for record in records}
     snapshot_on_disk = set(on_disk)
     rows: list[dict[str, object]] = []
@@ -39224,25 +39282,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     current_seal_error_map = {
         (machine, name): error for machine, name, error in current_seal_errors
     }
-    current_on_disk: set[tuple[str, str]] = set()
-    for slot_type, root in _slot_roots(config).items():
-        if not root.exists():
-            continue
-        try:
-            current_on_disk.update(
-                (slot_type, entry.name)
-                for entry in root.iterdir()
-                if entry.is_dir()
-                and not entry.is_symlink()
-                and not entry.name.startswith("EVENTS.")
-                and not _is_representation_directory(config, entry)
-                and not (
-                    slot_type == "agent"
-                    and entry == _validate_slots_directory(config)
-                )
-            )
-        except OSError as exc:
-            raise Refusal(f"cannot enumerate worktree slots in {root}: {exc}") from exc
+    current_on_disk, _current_non_slot = _audit_slot_root_listing(config)
     current_registered = {
         (record.slot_type, record.slot) for record in current_record_list
     }
@@ -39597,6 +39637,12 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         for name in _first_seen_names([str(row["slot"]) for row in unknown])
         if name not in attention_name_set
     ]
+    # One verdict per row (#1107): a row the gate counts as unknown says
+    # UNKNOWN in both formats, not BLOCKED.
+    unknown_name_set = set(unknown_names)
+    for row in unknown:
+        if str(row["slot"]) in unknown_name_set:
+            row["verdict"] = "UNKNOWN"
     if attention_names:
         gate_state = "actionable"
         summary = f"{len(attention_names)} worktree slot(s) need coordinator attention"
@@ -39623,6 +39669,15 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         "remote_refs_refreshed": False,
         "disk": disk,
         "slots": sorted_rows,
+        "non_slot_entries": [
+            {
+                "slot_type": slot_type,
+                "name": path.name,
+                "path": str(path),
+                "bytes": _non_slot_entry_bytes(path),
+            }
+            for slot_type, path in non_slot_entries
+        ],
         "foreign_shards": foreign_notes,
         "metrics": metrics.to_obj(),
     }
@@ -39648,6 +39703,19 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                 release_obj = _as_mapping(release_value, "audit owner_release")
                 detail += f"; {release_obj['summary']}"
             print(f"{label}: {row['slot']}: {detail}")
+        non_slot = _as_list(payload["non_slot_entries"], "audit non_slot_entries")
+        if non_slot:
+            print(
+                "non-slot entries in the slots root (no slot can have these names; "
+                "inspect or delete them):"
+            )
+            for item in non_slot:
+                entry = _as_mapping(item, "audit non-slot entry")
+                size = entry["bytes"]
+                print(
+                    f"  {entry['slot_type']} {entry['name']}: "
+                    f"{'size unknown' if size is None else f'{size} bytes'}"
+                )
         _print_foreign_shard_notes(foreign_notes)
         if args.gate:
             print(f"state={gate_state}")

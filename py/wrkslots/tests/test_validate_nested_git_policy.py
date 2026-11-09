@@ -159,7 +159,8 @@ def test_audit_and_validation_removal_agree_on_one_tree(
 
     row = _audit_row(project, monkeypatch, capsys)
 
-    assert row["verdict"] == "BLOCKED"
+    # #1107: what the census found leaves the expired row's state unknown.
+    assert row["verdict"] == "UNKNOWN"
     error = row["cache_error"]
     assert isinstance(error, str) and error.startswith(refusal), error
     assert row["reasons"] == [f"cache inspection failed: {error}"]

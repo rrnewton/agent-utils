@@ -35017,7 +35017,8 @@ def test_audit_reports_deletable_blocked_held_and_the_leak_invariant(
     assert uncertain["running_agent_count"] == 3
     assert uncertain["leak"] is False
     uncertain_rows = {row["slot"]: row for row in uncertain["slots"]}
-    assert uncertain_rows["slot01"]["verdict"] == "BLOCKED"
+    # #1107: the gate cannot classify it, and its one verdict says so.
+    assert uncertain_rows["slot01"]["verdict"] == "UNKNOWN"
     assert any(
         "occupancy scan failed" in reason
         for reason in uncertain_rows["slot01"]["reasons"]
@@ -35228,7 +35229,8 @@ def test_audit_default_cache_setup_failure_preserves_lifecycle_rows(
         assert rows[slot]["cache_bytes"] is None
         assert rows[slot]["cache_status"] == "error"
         assert "default audit cache storage is unavailable" in rows[slot]["cache_error"]
-    assert rows["cached"]["verdict"] == "BLOCKED"
+    # #1107: an unclassifiable row's one verdict matches unknown_slots below.
+    assert rows["cached"]["verdict"] == "UNKNOWN"
     assert rows["held"]["verdict"] == "HELD"
     assert any("retain evidence" in reason for reason in rows["held"]["reasons"])
     assert rows["empty"]["verdict"] == "DELETABLE"
@@ -35366,7 +35368,8 @@ def test_audit_cache_ancestor_swap_stays_blocked(
     assert swapped is True
     assert row["cache_bytes"] is None
     assert row["cache_status"] == "error"
-    assert row["verdict"] == "BLOCKED"
+    # #1107: not deletable; the expired row's reclaim state is unknown.
+    assert row["verdict"] == "UNKNOWN"
     assert "build" in row["cache_error"]
     assert row["reasons"] == [f"cache inspection failed: {row['cache_error']}"]
 
@@ -47849,7 +47852,8 @@ def test_audit_reports_an_absent_agent_directory_as_recoverable_not_unsafe(
         "--coordinator-authorized --coordinator-pid <coordinator-pid>'"
     ]
     occupied = rows["ordinary-file"]
-    assert occupied["verdict"] == "BLOCKED", occupied["reasons"]
+    # #1107: what occupies the path cannot be classified: UNKNOWN, not removable.
+    assert occupied["verdict"] == "UNKNOWN", occupied["reasons"]
     reasons = " ".join(occupied["reasons"])
     assert f"slot directory is missing or unsafe: {root / 'ordinary-file'}" in reasons
     assert "recover-absent" not in reasons

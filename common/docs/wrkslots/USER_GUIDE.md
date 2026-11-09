@@ -269,6 +269,19 @@ interrupted, or unregistered slots; exits 2 when an expired slot cannot be class
 evidence is unavailable; and exits 0 only when neither condition exists. The output names the
 affected slots and the next command. It never converts an unknown result into permission to remove.
 
+Each row has one verdict, the same in the JSON `verdict` field and on the text line (#1107). A row
+the gate counts in `unknown_slots` (an expired slot whose owner or liveness evidence is unavailable,
+whose process census failed, or whose cache census found something it could not settle, with no
+live lane proven) reads `UNKNOWN` in both, not `BLOCKED`; a slot whose name is also an attention
+slot keeps its own verdict.
+
+Only names a slot can have (`NAME_RE`: a letter or digit, then up to 63 letters, digits, `.`, `_`
+or `-`) are slot candidates (#1113). A directory in a slots root under any other name, such as
+`.pytest_cache`, `_scratch` or a removal's `.<slot>.fenced.*` tree, is never reported as an
+unregistered slot. Audit lists each one once instead: JSON `non_slot_entries` (`slot_type`,
+`name`, `path`, and `bytes`, allocated bytes without following symlinks or crossing devices, or
+null past 100000 entries), and in text a section headed `non-slot entries in the slots root`.
+
 `status`, `doctor` and `audit` report the same `liveness_state` and `liveness_detail` for a
 row -- the answer of the row's one liveness authority (the validation run for a validation row,
 the registered liveness command for an agent row) -- beside `owner_state`, which is only the

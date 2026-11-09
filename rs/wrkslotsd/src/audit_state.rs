@@ -6246,6 +6246,8 @@ pub(crate) fn parse_audit(
     // On-disk slot directories.
     let validate_root = crate::storage_state::managed_root(&cfg).join("validate");
     let mut on_disk: BTreeSet<(String, String)> = BTreeSet::new();
+    // Directories no slot can be (#1113): listed once, not as slots.
+    let mut non_slot_entries: Vec<(String, PathBuf)> = Vec::new();
     for (slot_type, root_path) in [
         ("agent", cfg.worktrees.clone()),
         ("validate", validate_root.clone()),
@@ -6272,10 +6274,15 @@ pub(crate) fn parse_audit(
                 continue;
             }
             if path.is_dir() && !path.is_symlink() {
-                on_disk.insert((slot_type.to_string(), name));
+                if crate::config_validate::validate_name(&name, "slot").is_err() {
+                    non_slot_entries.push((slot_type.to_string(), path));
+                } else {
+                    on_disk.insert((slot_type.to_string(), name));
+                }
             }
         }
     }
+    non_slot_entries.sort_by(|a, b| (&a.0, a.1.file_name()).cmp(&(&b.0, b.1.file_name())));
     let registered: BTreeSet<(String, String)> = records
         .iter()
         .map(|record| {
@@ -6767,7 +6774,10 @@ pub(crate) fn parse_audit(
             if slot_type == "agent" && path == validate_root {
                 continue;
             }
-            if path.is_dir() && !path.is_symlink() {
+            if path.is_dir()
+                && !path.is_symlink()
+                && crate::config_validate::validate_name(&name, "slot").is_ok()
+            {
                 current_on_disk.insert((slot_type.to_string(), name));
             }
         }
@@ -7118,20 +7128,19 @@ pub(crate) fn parse_audit(
             .collect(),
     );
     let attention_set: BTreeSet<&String> = attention.iter().collect();
-    let unknown: Vec<String> = first_seen_names(
-        rows.iter()
-            .filter(|row| {
-                let verdict = row
-                    .get("verdict")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                verdict == "UNKNOWN"
-                    || (verdict == "BLOCKED"
-                        && row.get("heartbeat_expired").and_then(Value::as_bool) == Some(true)
-                        && (
-                            // Neither authority can say whether the lane
-                            // is in use.
-                            (!matches!(
+    // Whether a row's reclaim state is undetermined: the gate's unknown set.
+    let indeterminate = |row: &Value| -> bool {
+        let verdict = row
+            .get("verdict")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        verdict == "UNKNOWN"
+            || (verdict == "BLOCKED"
+                && row.get("heartbeat_expired").and_then(Value::as_bool) == Some(true)
+                && (
+                    // Neither authority can say whether the lane
+                    // is in use.
+                    (!matches!(
                                 row.get("owner_state").and_then(Value::as_str),
                                 Some("live" | "dead")
                             ) && !matches!(
@@ -7170,8 +7179,11 @@ pub(crate) fn parse_audit(
                                     })
                                 },
                             )
-                        ))
-            })
+                ))
+    };
+    let unknown: Vec<String> = first_seen_names(
+        rows.iter()
+            .filter(|row| indeterminate(row))
             .map(|row| {
                 row.get("slot")
                     .and_then(Value::as_str)
@@ -7183,6 +7195,26 @@ pub(crate) fn parse_audit(
     .into_iter()
     .filter(|name| !attention_set.contains(name))
     .collect();
+    // One verdict per row (#1107): a row the gate counts as unknown says
+    // UNKNOWN in both formats, not BLOCKED.
+    let unknown_set: BTreeSet<&String> = unknown.iter().collect();
+    let relabel: Vec<bool> = rows
+        .iter()
+        .map(|row| {
+            indeterminate(row)
+                && row
+                    .get("slot")
+                    .and_then(Value::as_str)
+                    .is_some_and(|slot| unknown_set.contains(&slot.to_string()))
+        })
+        .collect();
+    for (row, relabel) in rows.iter_mut().zip(relabel) {
+        if relabel {
+            if let Some(object) = row.as_object_mut() {
+                object.insert("verdict".to_string(), json!("UNKNOWN"));
+            }
+        }
+    }
     let (gate_state, summary) = if !attention.is_empty() {
         (
             "actionable",
@@ -7219,8 +7251,55 @@ pub(crate) fn parse_audit(
         "remote_refs_refreshed": false,
         "disk": disk,
         "slots": rows,
+        "non_slot_entries": non_slot_entries
+            .iter()
+            .map(|(slot_type, path)| {
+                json!({
+                    "slot_type": slot_type,
+                    "name": path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    "path": path.display().to_string(),
+                    "bytes": non_slot_entry_bytes(path),
+                })
+            })
+            .collect::<Vec<_>>(),
         "foreign_shards": foreign_notes,
     }))
+}
+
+/// How many entries audit counts under one non-slot entry before it reports
+/// the entry's size as unknown (#1113).
+const NON_SLOT_ENTRY_SIZE_ENTRIES: usize = 100_000;
+
+/// Allocated bytes of a slots-root entry that is not a slot (#1113); see the
+/// Python edition's `_non_slot_entry_bytes`.
+fn non_slot_entry_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let top = std::fs::symlink_metadata(path).ok()?;
+    let mut total = top.blocks() * 512;
+    let mut counted = 1usize;
+    let mut pending: Vec<PathBuf> = if top.is_dir() {
+        vec![path.to_path_buf()]
+    } else {
+        Vec::new()
+    };
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).ok()? {
+            let entry = entry.ok()?;
+            counted += 1;
+            if counted > NON_SLOT_ENTRY_SIZE_ENTRIES {
+                return None;
+            }
+            let info = std::fs::symlink_metadata(entry.path()).ok()?;
+            total += info.blocks() * 512;
+            if info.is_dir() && info.dev() == top.dev() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    Some(total)
 }
 
 /// The Python `audit` command's output and exit code: the
@@ -7332,6 +7411,32 @@ pub(crate) fn audit_cli(
                 ));
             }
             out.push_str(&format!("{label}: {}: {}\n", field("slot"), detail));
+        }
+    }
+    if let Some(entries) = payload
+        .get("non_slot_entries")
+        .and_then(Value::as_array)
+        .filter(|entries| !entries.is_empty())
+    {
+        out.push_str(
+            "non-slot entries in the slots root (no slot can have these names; inspect or delete them):\n",
+        );
+        for entry in entries {
+            let size = entry.get("bytes").and_then(Value::as_u64).map_or_else(
+                || "size unknown".to_string(),
+                |bytes| format!("{bytes} bytes"),
+            );
+            out.push_str(&format!(
+                "  {} {}: {size}\n",
+                entry
+                    .get("slot_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ));
         }
     }
     if let Some(notes) = payload.get("foreign_shards").and_then(Value::as_array) {

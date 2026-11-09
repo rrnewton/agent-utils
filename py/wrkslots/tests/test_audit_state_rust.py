@@ -163,6 +163,11 @@ def _scrub(payload: dict[str, object]) -> dict[str, object]:
                 # between the two editions' measurements); the cache
                 # test asserts the magnitude separately.
                 row["cache_bytes"] = "counted"
+    entries = payload.get("non_slot_entries")
+    if isinstance(entries, list):
+        for entry in entries:
+            if isinstance(entry, dict) and isinstance(entry.get("bytes"), int):
+                entry["bytes"] = "counted"
     return payload
 
 
@@ -797,7 +802,10 @@ def test_audit_census_nested_git_matches_python(tmp_path: Path) -> None:
     actual = _check(root, tmp_path)
     row = _rows(actual)[0]
     assert row["cache_status"] == "error"
-    assert row["verdict"] == "BLOCKED"
+    # #1107: the gate cannot tell this expired row's reclaim state, so its one
+    # verdict is UNKNOWN, as unknown_slots says.
+    assert row["verdict"] == "UNKNOWN"
+    assert actual["unknown_slots"] == ["slot-a"]
     assert "nested Git metadata" in str(row["cache_error"])
     # #1106: what the census found still decides; it is no size shortfall.
     assert row["size_known"] is False
@@ -1867,3 +1875,87 @@ def test_audit_size_unknown_text_matches_python(tmp_path: Path) -> None:
     )
     assert slot_lines(stream.getvalue()) == [expected]
     assert slot_lines(rust.stdout) == [expected]
+
+
+def _text_audits(root: Path, tmp_path: Path) -> tuple[str, str]:
+    """Both editions' human audit output for one fixture."""
+
+    args = argparse.Namespace(
+        project_root=str(root), machine=None, format="human", gate=False,
+        cache_census_state=str(tmp_path / "python-text-census.json"),
+        cache_work_limit=100000, cache_wall_seconds=60.0, cache_plan_total_seconds=30.0,
+        wait_lock=0.0,
+    )
+    stream = io.StringIO()
+    with contextlib.redirect_stdout(stream):
+        assert wrkslots_cli._cmd_audit(args) == 0
+    rust = subprocess.run(
+        [
+            str(rust_wrkslotsd()), "audit-text", "--root", str(root),
+            "--cache-census-state", str(tmp_path / "rust-text-census.json"),
+            "--cache-wall-seconds", "60",
+        ],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
+    )
+    assert rust.returncode == 0, rust.stderr
+    return stream.getvalue(), rust.stdout
+
+
+def test_audit_text_labels_match_the_json_verdicts(tmp_path: Path) -> None:
+    """#1107: one verdict per row, the same in both formats and both editions."""
+
+    root = _cache_fixture(tmp_path)
+    nested = root / "worktrees" / "slot-a" / "repo" / "cache" / "nested" / ".git"
+    nested.mkdir(parents=True)
+    (nested / "HEAD").write_text("ref: refs/heads/main\n")
+    payload = _check(root, tmp_path)
+    labels = {str(row["slot"]): str(row["verdict"]) for row in _rows(payload)}
+    assert labels == {"slot-a": "UNKNOWN"}
+    for text in _text_audits(root, tmp_path):
+        printed = {
+            line.split(": ")[1]: line.split(": ")[0].split(" (")[0]
+            for line in text.splitlines()
+            if line.count(": ") >= 2 and not line.startswith(" ")
+        }
+        assert printed == labels, text
+
+
+def test_audit_non_slot_entries_match_python(tmp_path: Path) -> None:
+    """#1113: names no slot can have are listed once, never as unregistered slots."""
+
+    root = _fixture(tmp_path)
+    worktrees = root / "worktrees"
+    (worktrees / ".pytest_cache" / "v" / "cache").mkdir(parents=True)
+    (worktrees / ".pytest_cache" / "v" / "cache" / "lastfailed").write_text("{}\n")
+    (worktrees / "_scratch").mkdir()
+    (worktrees / "_scratch" / "notes.txt").write_text("x" * 5000)
+    (worktrees / "stray").mkdir()
+    payload = _check(root, tmp_path)
+    rows = {str(row["slot"]): row for row in _rows(payload)}
+    assert set(rows) == {"slot-a", "stray"}
+    assert rows["stray"]["owner_state"] == "unregistered"
+    assert payload["non_slot_entries"] == [
+        {
+            "slot_type": "agent", "name": ".pytest_cache",
+            "path": str(worktrees / ".pytest_cache"), "bytes": "counted",
+        },
+        {
+            "slot_type": "agent", "name": "_scratch",
+            "path": str(worktrees / "_scratch"), "bytes": "counted",
+        },
+    ]
+    python_text, rust_text = _text_audits(root, tmp_path)
+
+    def section(text: str) -> list[str]:
+        lines = text.splitlines()
+        start = lines.index(
+            "non-slot entries in the slots root (no slot can have these names; "
+            "inspect or delete them):"
+        )
+        return lines[start:start + 3]
+
+    assert section(python_text) == section(rust_text)
+    assert section(python_text)[1].startswith("  agent .pytest_cache: ")
+    assert section(python_text)[2].startswith("  agent _scratch: ")
+    assert section(python_text)[2].endswith(" bytes")
+
