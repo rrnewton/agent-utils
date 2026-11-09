@@ -12001,6 +12001,7 @@ application.track(mountListKeepers({
   voiceCall: () => voiceCall(),
   keepWrittenBox: (area, seen, now) => keepWrittenBox(area, seen, now),
   writingIn: (area) => boxBeingWritten(area) !== null,
+  footTop: (area) => footTop(area),
   atBottom: (...args) => atBottom(...args),
   followFoot: (area) => followFoot(area),
   sideColumnUp: () => sideColumnUp(),

@@ -106,17 +106,18 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
    * counting jumps, so a moment's end is only its own; `readerMoved`, a touch, a press or a wheel since
    * the jump, which ends that moment at once. `inset`, the room a composer keeps under itself for the
    * keyboard (`renderKeyboardInset`); `lastFit`, what the last jump measured, for the readout;
-   * `fittedArea`, the list the fitted composer stands in, whose height that room is part of
+   * `fittedArea`, the list the fitted composer stands in, whose height that room is part of,
+   * and `fittedRoom`, all of it past the rows' foot (the inset and any row parked under the box)
    * (`roomIn`); `inputDue`, a whole-composer completion already waiting for its task.
    */
   const onScreenKeyboard: {
     up: boolean; shown: boolean; tallest: Map<number, number>; width: number; turnedAt: number | null;
     fitted: Element | null; fittedHeight: number; settling: boolean; generation: number; readerMoved: boolean;
     inset: number; lastFit: { target: number; moved: number; field: string } | null;
-    fittedArea: HTMLElement | null; inputDue: boolean;
+    fittedArea: HTMLElement | null; fittedRoom: number; inputDue: boolean;
   } = { up: false, shown: false, tallest: new Map(), width: -1, turnedAt: null, fitted: null,
     fittedHeight: 0, settling: false, generation: 0, readerMoved: false, inset: 0, lastFit: null,
-    fittedArea: null, inputDue: false };
+    fittedArea: null, fittedRoom: 0, inputDue: false };
 
   /** Whether the readout is drawn; see `showKeyboardDebug`. */
   let keyboardDebug = false;
@@ -167,6 +168,7 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
       if (fit) startKeyboardFit(fit, height);
       else {
         onScreenKeyboard.fittedArea = null;
+        onScreenKeyboard.fittedRoom = 0;
         renderKeyboardInset(0);
       }
     } else if (fit && Math.abs(height - onScreenKeyboard.fittedHeight) >= 1) {
@@ -245,7 +247,7 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
    * keys at rest, and the reader scrolls the list further down to it, which the room under the composer
    * (`keyboardInset`) leaves exactly the scroll for. The list is the one the composer is in.
    */
-  function composerFit(field: Element | null): { area: HTMLElement; foot: Element } | null {
+  function composerFit(field: Element | null): { area: HTMLElement; foot: Element; composer: HTMLElement } | null {
     const parts = field && KEYBOARD_FIT_PARTS[field.id];
     if (!parts) return null;
     const composer = deps.lookup(parts[0]);
@@ -254,7 +256,7 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
     if (style.getPropertyValue("--keyboard-fit").trim() !== "on") return null;
     const area = ["scroll-area", "side-scroll"].map((id) => deps.lookup(id)).find((list) => nodeWithin(list, composer));
     if (!area) return null;
-    return { area, foot: field as Element };
+    return { area, foot: field as Element, composer };
   }
 
   /**
@@ -268,6 +270,11 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
     if (!where) return;
     const { area, foot } = where;
     onScreenKeyboard.fittedArea = area;
+    // The room past the rows' foot is all the list keeps below the foot: the keyboard's inset
+    // and, with the foot the box itself (#1135), the row parked under it. Measured here, where
+    // both rects are already read, so the foot's measures never pay for it per scroll.
+    onScreenKeyboard.fittedRoom = Math.max(onScreenKeyboard.inset,
+      Math.round(where.composer.getBoundingClientRect().bottom - foot.getBoundingClientRect().bottom));
     const viewport = deps.viewport();
     const keysTop = viewport ? (Number(viewport.offsetTop) || 0) + (Number(viewport.height) || 0) : deps.innerHeight() || 0;
     const target = Math.min(area.getBoundingClientRect().bottom, keysTop);
@@ -367,7 +374,7 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
     },
     roomIn(area) {
       return onScreenKeyboard.fitted !== null && area === onScreenKeyboard.fittedArea
-        ? onScreenKeyboard.inset : 0;
+        ? onScreenKeyboard.fittedRoom : 0;
     },
     showKeyboardDebug,
     renderKeyboardDebug,

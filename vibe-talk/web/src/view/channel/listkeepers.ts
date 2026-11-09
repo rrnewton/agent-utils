@@ -54,6 +54,8 @@ export interface ListKeepersDependencies<Column> extends SizeWatching {
   keepWrittenBox(area: HTMLElement, seen: UnderListNote | null, now: UnderListNote): boolean;
   /** Whether a box in `area` is being written in (`boxBeingWritten`): its reader focused there. */
   writingIn(area: HTMLElement): boolean;
+  /** The scroll position of the rows' foot of `area` (`footTop`), where the page measures it. */
+  footTop?(area: HTMLElement): number;
   /** Whether `area` is within `slack` px of its foot (the page's slack by default), and taking it to its foot. */
   atBottom(area: HTMLElement, slack?: number): boolean;
   followFoot(area: HTMLElement): void;
@@ -90,7 +92,7 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
   const {
     el, leftEl, screens, underLists, cardsDrawn, columns, layoutShown, heightUnderLists, quickReplyHolds, placeQuickReply,
     entryLandingHolds, entryState, placeEntryLanding, keepFilterHold, heldFilterRow, searchWalkAnchored, voiceCall,
-    keepWrittenBox, writingIn, atBottom, followFoot, sideColumnUp, sideShowing, fitOverextend, holdOverscrollReader, channelContextKey,
+    keepWrittenBox, writingIn, footTop, atBottom, followFoot, sideColumnUp, sideShowing, fitOverextend, holdOverscrollReader, channelContextKey,
     pinsView, measureReplyArrows,
   } = deps;
   const inColumn = <T>(column: Column, act: () => T): T => deps.inColumn(column, act);
@@ -310,7 +312,10 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
       const context = contextOf();
       if (was && was.foot && was.width === area.clientWidth && was.height === area.clientHeight
           && was.context === context && !atBottom(area, 1) && free()) {
-        followFoot(area);
+        // To the rows' foot, not past it: room the keyboard keeps under the composer (a row
+        // parked under the box, #1135) stays below the keys, where the reader left it.
+        if (footTop) area.scrollTop = footTop(area);
+        else followFoot(area);
       }
       if (was) note(was.foot, context);
     });

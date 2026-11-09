@@ -134,8 +134,10 @@ test("`#624 voice-page-modularity`: a focused field with the visual viewport a k
 test("`#1144 scrollback-typing-jump`: typed at the foot, the jump is made whole after the caret's reveal, and the room is the fitted list's", () => {
   const { createOnScreenKeyboard } = VIEW_COMPOSER;
   const root = { clientWidth: 412, clientHeight: 915, setAttribute: () => {}, getAttribute: () => null, style: { setProperty: () => {} } };
-  const area = { id: "scroll-area", scrollTop: 100, getBoundingClientRect: () => ({ top: 0, bottom: 915 }) };
-  const composer = { id: "channel-composer", parentNode: area };
+  const area = { id: "scroll-area", scrollTop: 100, getBoundingClientRect: () => ({ top: 0, bottom: 900 }) };
+  // The foot is the box itself (#1135): its row stands 52px below it, inside the composer.
+  const composer = { id: "channel-composer", parentNode: area,
+    getBoundingClientRect: () => ({ top: 793, bottom: 931 + (100 - area.scrollTop) }) };
   const field = { tagName: "TEXTAREA", id: "channel-compose-text", type: "textarea", isContentEditable: false,
     getClientRects: () => [{}], getBoundingClientRect: () => ({ top: 793, bottom: 879 + (100 - area.scrollTop) }) };
   const els = {
@@ -158,7 +160,8 @@ test("`#1144 scrollback-typing-jump`: typed at the foot, the jump is made whole 
   });
   keyboard.noteKeyboard();
   assert.equal(area.scrollTop, 100, "the fit as the keyboard came up left the foot on the keys");
-  assert.equal(keyboard.roomIn(area), 36, "the list's 36px under the keys' top is the keyboard's room");
+  assert.equal(keyboard.roomIn(area), 52,
+    "the room past the rows' foot is the inset and the row parked under the box, so rest on the box reads pinned (#1144)");
   assert.equal(keyboard.roomIn(els["side-scroll"]), 0, "no room is the keyboard's in another list");
   // The browser reveals the caret alone (the list left with the box part-shown), then the key is noted.
   area.scrollTop = 90;
