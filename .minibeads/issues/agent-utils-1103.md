@@ -1,10 +1,10 @@
 ---
 title: 'merge-queue-landed-intake-cleanup: recorded requests survive the landing that moots them, and a withdrawn flight late result is logged as lost'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-09T00:22:13.000000000+00:00
-updated_at: 2026-11-09T00:22:13.000000000+00:00
+updated_at: 2026-11-09T05:07:26.000000000+00:00
 ---
 
 # Description
@@ -104,3 +104,35 @@ convention. Second in the intake chain after #1087
 merge-queue-stranded-intake.
 
 ## Resolution
+
+Landed on main as 8f44249dd786b9d6a23cd29bfa3c985fe317c0ff (gated commit 7ad4fad8, tree-identical).
+
+`record_landed` now drops each landed change's still-waiting
+intake entries through `intake::drop_pending_for`, one intake
+event naming what was dropped, and a recorded submit whose item
+is already Landed drops at apply with "already landed as"
+instead of re-queueing it. A `mark-exact` requirement is exempt
+from the landing drop — the first gate run caught its deletion
+through cli_peers, whose peer-lands-mid-cycle flow applies the
+requirement after the landing — so it alone survives to its
+apply. Flights dropped by `drop_withdrawn_flights` are recorded
+with their reasons, and a result arriving for one is discarded
+as `result-discarded` (flight and reason named, no verdict
+taken); a result for a flight the run never knew still logs
+`result-lost`. The guide's run-directory section now divides the
+three discard kinds with #1100's `flight-discarded`: discard
+paths record at the drop, only a withdrawn flight can still
+report afterwards, and no flight takes two kinds. Tests: a
+resubmission recorded in flight dropped at landing
+(cli_intake_window), a recorded submit for a landed change
+dropped at the next writer (cli_intake), a late result for a
+withdrawn flight discarded with its reason
+(cli_withdrawn_batches), all written failing first, plus the
+existing cli_peers mark-exact case as the exemption's guard.
+Gate: first full gate on 25226aaf (239 steps) failed only
+rust.merge-queue.test on that mark-exact case; the fix was
+treated as an amendment — rebased onto main with #1100, then
+one exclusive rerun ticket on the exact landed tree
+(rust.merge-queue.test whole crate, rust-clippy, rust format,
+client-names; 6 steps incl. deps) passed, documented in the
+gate ledger as rerun_passed for 7ad4fad8.
