@@ -141,6 +141,8 @@ export { createThreadEntry, freshEntryState } from "./threadentry.ts";
 export { createTwoColumns } from "./twocolumns.ts";
 export { createSideCards } from "./sidecards.ts";
 export { createFilterPlace, freshFilterState } from "./filterplace.ts";
+export { createLiveState } from "./livestate.ts";
+export type { LiveFollowSwitch, LiveState, LiveStateDependencies, LiveStorage } from "./livestate.ts";
 export type { FilterAnchor, FilterHold, FilterMark, FilterPane, FilterPlace, FilterPlaceDependencies, FilterState } from "./filterplace.ts";
 export type { CardParts, SideCard, SideCards, SideCardsDependencies, SideChoice, SideTally } from "./sidecards.ts";
 export type { LayoutChoiceLike, LayoutColumn, LayoutName, LayoutShownLike, LeftColumnPlace, ListBefore, OneColumnView, ReaderPlace, TwoColumns, TwoColumnsDependencies } from "./twocolumns.ts";

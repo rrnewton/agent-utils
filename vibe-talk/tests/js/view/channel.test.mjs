@@ -2188,3 +2188,41 @@ test("`#624 voice-page-modularity`: a filter change keeps the reader's message w
   assert.equal(record.hold, null, "the reader's own act did not let the hold go");
   assert.equal(freshFilterState().hold, null, "a fresh column shared its filter hold");
 });
+
+test("`#624 voice-page-modularity`: the relay mode is read, drawn and switched from the module alone", () => {
+  const { createLiveState } = CHANNEL_VIEW;
+  const stored = new Map();
+  const status = [];
+  const calls = [];
+  const els = new Map();
+  const el = (id) => {
+    if (!els.has(id)) els.set(id, { attrs: new Map(), textContent: "", title: "", value: "",
+      setAttribute(name, value) { this.attrs.set(name, String(value)); } });
+    return els.get(id);
+  };
+  const owner = createLiveState({
+    deviceStorage: () => ({ getItem: (k) => stored.get(k) ?? null, setItem: (k, v) => stored.set(k, v) }),
+    el,
+    setStatus: (text) => status.push(text),
+    renderChannelFreshness: () => calls.push("fresh"),
+    connectionLive: () => calls.push("live"),
+    liveFollow: { start: (id, from) => calls.push(["start", id, from]), stop: () => calls.push("stop"),
+      whenAttached: (then) => { calls.push("wait"); then(); } },
+  });
+  assert.equal(owner.relayMode(), "gist", "an absent choice did not fall through to the default");
+  stored.set(owner.RELAY_KEY, "off");
+  assert.equal(owner.relayMode(), "off", "an old off did not stay off");
+  stored.set(owner.RELAY_KEY, "on");
+  assert.equal(owner.relayMode(), "gist", "an old on did not fall through to summarizing");
+  owner.chooseReadNew("full");
+  assert.equal(stored.get(owner.RELAY_KEY), "full");
+  assert.equal(el("read-new").attrs.get("data-mode"), "full");
+  assert.equal(el("read-new-label").textContent, "Full");
+  assert.equal(el("relay-to-agent").value, "full");
+  assert.deepStrictEqual(status, ["New messages: read out in full during a call"]);
+  owner.renderLiveState();
+  owner.startChannelStream("c1");
+  owner.whenLiveAttached(() => calls.push("then"));
+  owner.stopChannelStream();
+  assert.deepStrictEqual(calls, ["fresh", "live", ["start", "c1", null], "wait", "then", "stop"]);
+});
