@@ -499,13 +499,58 @@ fn muse_editor_holds_paste(editor: &str, text: &str) -> bool {
         == Some(muse_paste_length(text))
 }
 
+/// Whether `command` (already normalized) is one bare slash command: `/`, an ASCII letter,
+/// then ASCII letters, digits, `_`, `:` or `-`, with no arguments. The same name shape as
+/// `sender_header::is_slash_command`, narrowed to the argument-free form.
+fn is_bare_slash_command(command: &str) -> bool {
+    let Some(name) = command.strip_prefix('/') else {
+        return false;
+    };
+    !command.contains(' ')
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'-'))
+}
+
+/// Whether the editor holds a bare slash command under its open command menu.
+///
+/// Measured live on Muse 1.4.16 (#1136 raw-message-bridge): a pasted bare slash command
+/// opens the command menu under the editor line (`❯ /help` over `/help  Show help`), so
+/// the editor is the command plus its slash-led menu rows, never the command alone, and
+/// Enter runs the menu's first row. Staged only when the first menu row is the typed
+/// command itself: a mere prefix, or a menu led by another command, would run something
+/// else, so it refuses. A command with arguments stages as literal text or as its
+/// placeholder, as before.
+fn muse_editor_holds_slash_command(editor: &str, text: &str) -> bool {
+    let command = normalize(text);
+    if !is_bare_slash_command(&command) {
+        return false;
+    }
+    let Some(segments) = muse_editor_segments(editor) else {
+        return false;
+    };
+    if segments.len() < 2 || segments[0] != command {
+        return false;
+    }
+    let rows = &segments[1..];
+    rows.iter().all(|row| row.starts_with('/'))
+        && rows[0].split(' ').next() == Some(command.as_str())
+}
+
 /// Require the whole editor to be this paste after pinning the live Muse process.
 ///
 /// The editor shows the literal text, or, for a long paste, only Muse's placeholder with the
-/// paste's exact character count. Delivery proves the editor empty before its one paste.
+/// paste's exact character count, or a bare slash command under its open menu. Delivery
+/// proves the editor empty before its one paste.
 pub(crate) fn muse_verified_process_paste_is_exact_composer(screen: &str, text: &str) -> bool {
     muse_composer_regions(screen, false).is_some_and(|(_, editor)| {
-        muse_editor_matches(&editor, text, true) || muse_editor_holds_paste(&editor, text)
+        muse_editor_matches(&editor, text, true)
+            || muse_editor_holds_paste(&editor, text)
+            || muse_editor_holds_slash_command(&editor, text)
     })
 }
 
@@ -545,7 +590,10 @@ pub(crate) fn muse_verified_process_paste_drawn(screen: &str, text: &str) -> Mus
     if segments.is_empty() {
         return MusePasteDrawn::Nothing;
     }
-    if muse_editor_matches(&editor, text, true) || muse_editor_holds_paste(&editor, text) {
+    if muse_editor_matches(&editor, text, true)
+        || muse_editor_holds_paste(&editor, text)
+        || muse_editor_holds_slash_command(&editor, text)
+    {
         return MusePasteDrawn::Whole;
     }
     let wanted = normalize(text);
@@ -1458,6 +1506,56 @@ mod tests {
             muse_verified_process_paste_drawn(&frame(&whole), &brief),
             MusePasteDrawn::Whole
         );
+    }
+
+    #[test]
+    fn a_bare_slash_command_under_its_open_menu_is_the_staged_paste() {
+        // Measured live on Muse 1.4.16 (#1136 raw-message-bridge): a pasted bare slash
+        // command opens the command menu under the editor line, so the editor is the
+        // command plus its menu rows, never the command alone; Enter runs the menu's
+        // first row. Only that shape, with the typed command as the first row, is staged.
+        let divider = "─".repeat(40);
+        let frame =
+            |editor: &str| format!("{divider}\n{editor}\n{divider}\nm · xhigh · /w · YOLO\n");
+        let menu = frame("❯ /help\n  /help  Show help");
+        assert!(muse_verified_process_paste_is_exact_composer(
+            &menu, "/help"
+        ));
+        assert_eq!(
+            muse_verified_process_paste_drawn(&menu, "/help"),
+            MusePasteDrawn::Whole
+        );
+        // The command alone (menu already closed) is still the literal paste.
+        assert!(muse_verified_process_paste_is_exact_composer(
+            &frame("❯ /help"),
+            "/help"
+        ));
+        // A mere prefix names no command: Enter would run the highlighted row, not this.
+        assert!(!muse_verified_process_paste_is_exact_composer(
+            &frame("❯ /h\n  /help  Show help"),
+            "/h"
+        ));
+        // The typed command must be the menu's first row, the one Enter runs.
+        assert!(!muse_verified_process_paste_is_exact_composer(
+            &frame("❯ /help\n  /history  Show history\n  /help  Show help"),
+            "/help"
+        ));
+        // A command with arguments is not staged by its menu; it stages as literal text
+        // or, when long, as its placeholder, as before.
+        assert!(!muse_verified_process_paste_is_exact_composer(
+            &frame("❯ /goal clear\n  /goal  Set the goal"),
+            "/goal clear"
+        ));
+        // Ordinary text that merely stands over slash-led rows is not a command.
+        assert!(!muse_verified_process_paste_is_exact_composer(
+            &frame("❯ hello\n  /help  Show help"),
+            "hello"
+        ));
+        // A menu row that does not open with a slash is not the command menu.
+        assert!(!muse_verified_process_paste_is_exact_composer(
+            &frame("❯ /model\n  watermelon-full-preview"),
+            "/model"
+        ));
     }
 
     #[test]

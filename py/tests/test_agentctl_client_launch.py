@@ -281,6 +281,36 @@ def test_a_paste_muse_wraps_inside_a_word_or_a_path_is_still_the_exact_editor() 
         frame("❯ break/at/odd/\n  places"), "break/at/odd/placez")
 
 
+def test_a_bare_slash_command_under_its_open_menu_is_the_staged_paste() -> None:
+    # Measured live on Muse 1.4.16 (#1136 raw-message-bridge): a pasted bare slash
+    # command opens the command menu under the editor line, so the editor is the
+    # command plus its menu rows, never the command alone; Enter runs the menu's
+    # first row. Only that shape, with the typed command as the first row, is staged.
+    def frame(editor: str) -> str:
+        return ("─" * 40 + "\n" + editor + "\n" + "─" * 40 + "\n"
+                "m · xhigh · /w · YOLO\n")
+    assert muse_verified_process_paste_is_exact_composer(
+        frame("❯ /help\n  /help  Show help"), "/help")
+    # The command alone (menu already closed) is still the literal paste.
+    assert muse_verified_process_paste_is_exact_composer(
+        frame("❯ /help"), "/help")
+    # A mere prefix names no command: Enter would run the highlighted row, not this.
+    assert not muse_verified_process_paste_is_exact_composer(
+        frame("❯ /h\n  /help  Show help"), "/h")
+    # The typed command must be the menu's first row, the one Enter runs.
+    assert not muse_verified_process_paste_is_exact_composer(
+        frame("❯ /help\n  /history  Show history\n  /help  Show help"), "/help")
+    # A command with arguments is not staged by its menu.
+    assert not muse_verified_process_paste_is_exact_composer(
+        frame("❯ /goal clear\n  /goal  Set the goal"), "/goal clear")
+    # Ordinary text over slash-led rows is not a command.
+    assert not muse_verified_process_paste_is_exact_composer(
+        frame("❯ hello\n  /help  Show help"), "hello")
+    # A menu row that does not open with a slash is not the command menu.
+    assert not muse_verified_process_paste_is_exact_composer(
+        frame("❯ /model\n  watermelon-full-preview"), "/model")
+
+
 def test_resumed_headerless_frame_with_startup_warnings_is_idle() -> None:
     # #946: a resumed Muse scrolls its header off screen and prints the
     # abnormal-end and effort-fallback warnings; the pinned-process proof

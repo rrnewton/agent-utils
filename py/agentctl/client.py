@@ -487,16 +487,56 @@ def _muse_editor_holds_paste(editor: str, text: str) -> bool:
     return match is not None and int(match.group(1)) == _muse_paste_length(text)
 
 
+def _is_bare_slash_command(command: str) -> bool:
+    """Whether ``command`` (already normalized) is one bare slash command.
+
+    ``/``, an ASCII letter, then ASCII letters, digits, ``_``, ``:`` or ``-``, with no
+    arguments: the same name shape as the sender header's slash command, narrowed to the
+    argument-free form.
+    """
+    if " " in command or not command.startswith("/"):
+        return False
+    name = command[1:]
+    return bool(name) and name[0].isascii() and name[0].isalpha() and all(
+        value.isascii() and (value.isalnum() or value in "_:-") for value in name
+    )
+
+
+def _muse_editor_holds_slash_command(editor: str, text: str) -> bool:
+    """Whether the editor holds a bare slash command under its open command menu.
+
+    Measured live on Muse 1.4.16 (#1136 raw-message-bridge): a pasted bare slash command
+    opens the command menu under the editor line (``❯ /help`` over ``/help  Show help``), so
+    the editor is the command plus its slash-led menu rows, never the command alone, and
+    Enter runs the menu's first row. Staged only when the first menu row is the typed
+    command itself: a mere prefix, or a menu led by another command, would run something
+    else, so it refuses. A command with arguments stages as literal text or as its
+    placeholder, as before.
+    """
+    command = " ".join(text.split())
+    if not _is_bare_slash_command(command):
+        return False
+    segments = _muse_editor_segments(editor)
+    if segments is None or len(segments) < 2 or segments[0] != command:
+        return False
+    rows = segments[1:]
+    return all(row.startswith("/") for row in rows) and (
+        rows[0].split(" ")[0] == command
+    )
+
+
 def muse_verified_process_paste_is_exact_composer(screen: str, text: str) -> bool:
     """Require the whole editor to be this paste after pinning the live Muse process.
 
     The editor shows the literal text, or, for a long paste, only Muse's placeholder with the
-    paste's exact character count. Delivery proves the editor empty before its one paste.
+    paste's exact character count, or a bare slash command under its open menu. Delivery
+    proves the editor empty before its one paste.
     """
     regions = _muse_composer_regions(screen, require_header=False)
     return regions is not None and (
         _muse_editor_matches(regions[1], text, exact=True)
         or _muse_editor_holds_paste(regions[1], text)
+        or _muse_editor_holds_slash_command(regions[1], text)
     )
 
 
