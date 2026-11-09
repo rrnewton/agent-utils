@@ -26128,13 +26128,15 @@ def test_reclaim_shares_live_use_recheck_across_pre_and_post_fence(
     )
 
     assert rc == 0, capsys.readouterr().err
-    # Before the fence: once before salvage and once immediately before the
-    # fence (the check _begin_finish used to repeat seconds earlier, within
-    # the same lock hold, is gone); after it: once at the fenced path.
-    assert len(observed) == 3
-    assert [path for path, _budget in observed[:2]] == [canonical] * 2
-    assert observed[2][0].parent == canonical.parent
-    assert observed[2][0].name.startswith(".slot01.fenced.1.")
+    # Before the fence: once before the registry locks, where the /proc scan
+    # runs (#1108), then under them once before salvage and once immediately
+    # before the fence, which re-read that scan's evidence (the check
+    # _begin_finish used to repeat seconds earlier, within the same lock
+    # hold, is gone); after it: once at the fenced path.
+    assert len(observed) == 4
+    assert [path for path, _budget in observed[:3]] == [canonical] * 3
+    assert observed[3][0].parent == canonical.parent
+    assert observed[3][0].name.startswith(".slot01.fenced.1.")
     assert all(budget is observed[0][1] for _path, budget in observed)
 
 
@@ -57078,7 +57080,8 @@ def test_remove_agent_batch_shares_lsof_before_the_fence_and_scans_proc_after_it
     assert len(shared_calls) == 1
     assert len(shared_calls[0]) == 3
     assert payload["shared_process_censuses"] == 1
-    assert payload["fresh_process_scans"] == 2 * 3
+    # One fresh /proc scan per item, before its registry locks (#1108).
+    assert payload["fresh_process_scans"] == 3
 
 
 def single_remove(project: Path, slot: str, *extra: str) -> tuple[int, str]:
@@ -57747,9 +57750,19 @@ def test_agent_batch_context_serves_only_checks_at_the_unfenced_slot_path(
         return value
 
     def observe(value: wrkslots._AgentRemoveBatchContext, path: Path) -> object:
-        return value.observe(path, None, canonical_path=canonical, capture_generation=False)
+        return value.observe_unlocked(
+            path, None, canonical_path=canonical, capture_generation=False
+        )
 
     assert observe(context(), canonical) is None
+    assert fresh_paths == [canonical]
+    # Under the registry locks the check reads only that evidence and runs no
+    # scan, and only for a slot its unlocked pass covered (#1108).
+    locked = context()
+    with pytest.raises(wrkslots.StateError, match="without the unlocked process scan"):
+        locked.observe(canonical, None, canonical_path=canonical, capture_generation=False)
+    locked.unlocked_records[canonical] = cast(wrkslots.ActiveRecord, None)
+    locked.observe(canonical, None, canonical_path=canonical, capture_generation=False)
     assert fresh_paths == [canonical]
     with pytest.raises(wrkslots.StateError, match="checks only the unfenced slot path"):
         observe(context(), fenced)
@@ -58229,6 +58242,7 @@ def test_remove_agent_batch_removes_disk_image_slots(
         canonical_path: Path | None = None,
         after_fence: bool = False,
         before_image_fence: bool = False,
+        unlocked: bool = False,
         strict_lsof_warnings: bool = False,
     ) -> wrkslots._LiveUseObservation | None:
         # The batch routes its own checks through this entry point, and its
@@ -58243,7 +58257,7 @@ def test_remove_agent_batch_removes_disk_image_slots(
                 ignore_current_process=ignore_current_process,
                 capture_generation=capture_generation, agent_batch=agent_batch,
                 canonical_path=canonical_path, after_fence=after_fence,
-                before_image_fence=before_image_fence,
+                before_image_fence=before_image_fence, unlocked=unlocked,
                 strict_lsof_warnings=strict_lsof_warnings)
         return None
 
@@ -58405,6 +58419,7 @@ def test_remove_agent_batch_refuses_before_fencing_when_the_image_check_outlasts
         canonical_path: Path | None = None,
         after_fence: bool = False,
         before_image_fence: bool = False,
+        unlocked: bool = False,
         strict_lsof_warnings: bool = False,
     ) -> wrkslots._LiveUseObservation | None:
         # The batch routes its own checks through this entry point, and its
@@ -58419,7 +58434,7 @@ def test_remove_agent_batch_refuses_before_fencing_when_the_image_check_outlasts
                 ignore_current_process=ignore_current_process,
                 capture_generation=capture_generation, agent_batch=agent_batch,
                 canonical_path=canonical_path, after_fence=after_fence,
-                before_image_fence=before_image_fence,
+                before_image_fence=before_image_fence, unlocked=unlocked,
                 strict_lsof_warnings=strict_lsof_warnings)
         return None
 
@@ -61440,3 +61455,196 @@ def test_remove_killed_after_the_fence_is_finished_by_recover(
     assert recovered.returncode == 0, recovered.stderr
     assert active_slots(project) == []
     assert not slot_dir.exists()
+
+
+def in_process_remove(project: Path, slot: str = "slot01") -> tuple[int, str]:
+    stderr = io.StringIO()
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+        returncode = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove",
+                slot,
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--expected-generation",
+                "1",
+            ]
+        )
+    return returncode, stderr.getvalue()
+
+
+@pytest.mark.skipif(wrkslots._lsof_executable() is None, reason="needs lsof")
+def test_agent_remove_runs_no_process_scan_under_the_registry_locks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1108: every /proc scan of an agent removal runs while no registry lock is held.
+
+    Validation admission waits for those locks, so a scan under them, which
+    takes minutes on a loaded host, held admission for as long.  The fresh
+    scan runs once, before the locks; the scan after the path fence runs
+    after them.
+    """
+
+    project, _repository, _slots = dead_agent_batch_project(tmp_path, count=1)
+    held = [0]
+    real_locks = wrkslots._mutation_locks
+
+    @contextlib.contextmanager
+    def tracked_locks(
+        config: wrkslots.Config, wait_seconds: float, *, deadline: float | None = None
+    ) -> Iterator[None]:
+        with real_locks(config, wait_seconds, deadline=deadline):
+            held[0] += 1
+            try:
+                yield
+            finally:
+                held[0] -= 1
+
+    scans: list[tuple[str, int]] = []
+
+    def tracked(name: str) -> None:
+        real = getattr(wrkslots, name)
+
+        def scan(*args: object, **kwargs: object) -> object:
+            scans.append((name, held[0]))
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(wrkslots, name, scan)
+
+    monkeypatch.setattr(wrkslots, "_mutation_locks", tracked_locks)
+    for name in (
+        "_capture_agent_remove_batch_census",
+        "_agent_batch_fresh_use",
+        "_agent_batch_fenced_use",
+        "_lsof_slot_use",
+        "_proc_generations",
+        "_absent_validate_process_snapshot",
+    ):
+        tracked(name)
+
+    returncode, stderr = in_process_remove(project)
+
+    assert returncode == 0, stderr
+    assert not checkout(project, "slot01").exists()
+    names = [name for name, _held in scans]
+    assert names.count("_agent_batch_fresh_use") == 1, scans
+    assert "_agent_batch_fenced_use" in names, scans
+    assert [scan for scan in scans if scan[1]] == [], scans
+
+
+@pytest.mark.skipif(wrkslots._lsof_executable() is None, reason="needs lsof")
+def test_agent_remove_refuses_a_process_that_enters_after_its_unlocked_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1108: a process that enters between the unlocked scan and the fence stops removal.
+
+    It starts under the registry locks, after the scan that ran before them,
+    so no check before the fence looks for it.  The path fence keeps its
+    working directory in the renamed tree, the scan after the fence finds it
+    there, and the fence is rolled back: the slot is back at its path, its
+    record and contents untouched.
+    """
+
+    project, _repository, _slots = dead_agent_batch_project(tmp_path, count=1)
+    tree = checkout(project, "slot01")
+    entered: list[subprocess.Popen[bytes]] = []
+    real_recheck = wrkslots._assert_unlocked_record_current
+
+    def enter_then_recheck(
+        config: wrkslots.Config,
+        agent_batch: wrkslots._AgentRemoveBatchContext,
+        record: wrkslots.ActiveRecord,
+    ) -> None:
+        entered.append(
+            subprocess.Popen(["sleep", "300"], cwd=tree, start_new_session=True)
+        )
+        real_recheck(config, agent_batch, record)
+
+    monkeypatch.setattr(wrkslots, "_assert_unlocked_record_current", enter_then_recheck)
+    try:
+        returncode, stderr = in_process_remove(project)
+    finally:
+        for process in entered:
+            process.kill()
+            process.wait()
+
+    assert returncode == 3, stderr
+    assert len(entered) == 1
+    assert f"live process {entered[0].pid} uses slot" in stderr, stderr
+    # The process was found in the fenced tree, after the fence.
+    assert ".fenced." in stderr, stderr
+    assert (tree / "task.txt").is_file()
+    assert active_slot_names(project) == ["slot01"]
+    assert registry_journals(project) == []
+
+
+@pytest.mark.skipif(wrkslots._lsof_executable() is None, reason="needs lsof")
+def test_agent_remove_refuses_an_adopt_during_its_unlocked_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1108: a slot adopted while remove scans without the lock is not removed.
+
+    The slot has no recorded owner and an expired heartbeat, so it is
+    removable when the unlocked pass reads it.  An adopt then binds a live
+    owner before remove takes the registry locks; the re-check under them
+    finds the record changed and refuses before any fence.
+    """
+
+    project, _repository, _slots = dead_agent_batch_project(tmp_path, count=1)
+    config = wrkslots._load_config(str(project), "testhost")
+    state = wrkslots._load_active(config)
+    record = state.slots[0]
+    expired = (
+        dt.datetime.now(dt.timezone.utc)
+        - dt.timedelta(seconds=record.heartbeat_ttl_seconds + 1)
+    ).isoformat(timespec="seconds")
+    wrkslots._write_active_state(
+        config,
+        wrkslots._replace_record(
+            state, replace(record, owner=None, heartbeat_at=expired)
+        ),
+        action="test-owner-unrecorded",
+        slot=record.slot,
+    )
+    adopted: list[int] = []
+    real_pass = wrkslots._remove_unlocked_use_pass
+
+    def scan_then_adopt(
+        config: wrkslots.Config,
+        slot: str,
+        agent_batch: wrkslots._AgentRemoveBatchContext,
+        live_use_recheck: wrkslots._LiveUseRecheckBudget,
+    ) -> None:
+        real_pass(config, slot, agent_batch, live_use_recheck)
+        with contextlib.redirect_stdout(io.StringIO()):
+            adopted.append(
+                wrkslots.main(
+                    [
+                        "--project-root",
+                        str(project),
+                        "adopt",
+                        "slot01",
+                        "--agent",
+                        "codex-1",
+                        "--owner-pid",
+                        str(os.getpid()),
+                        "--expected-generation",
+                        "1",
+                    ]
+                )
+            )
+
+    monkeypatch.setattr(wrkslots, "_remove_unlocked_use_pass", scan_then_adopt)
+    returncode, stderr = in_process_remove(project)
+
+    assert adopted == [0]
+    assert returncode == 3, stderr
+    assert (
+        "slot slot01 changed in the registry while remove checked it for process "
+        "use without the registry lock (changed: heartbeat_at, owner)"
+    ) in stderr, stderr
+    assert (checkout(project, "slot01") / "task.txt").is_file()
+    assert active_slot_names(project) == ["slot01"]
+    assert registry_journals(project) == []

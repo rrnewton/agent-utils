@@ -21238,6 +21238,7 @@ def _assert_slot_unused(
     canonical_path: Path | None = None,
     after_fence: bool = False,
     before_image_fence: bool = False,
+    unlocked: bool = False,
     strict_lsof_warnings: bool = False,
 ) -> None:
     # A stale image copy this command discards is invisible to the path checks
@@ -21260,6 +21261,7 @@ def _assert_slot_unused(
                 canonical_path,
                 after_fence=after_fence,
                 before_image_fence=before_image_fence,
+                unlocked=unlocked,
             ),
         )
         if observation is None:
@@ -21289,6 +21291,7 @@ def _observe_slot_use_once(
     canonical_path: Path | None = None,
     after_fence: bool = False,
     before_image_fence: bool = False,
+    unlocked: bool = False,
     strict_lsof_warnings: bool = False,
 ) -> _LiveUseObservation | None:
     try:
@@ -21330,12 +21333,20 @@ def _observe_slot_use_once(
                 canonical_path=canonical_path,
                 capture_generation=capture_generation,
             )
-        return agent_batch.observe(
+        if unlocked:
+            return agent_batch.observe_unlocked(
+                slot_path,
+                record,
+                canonical_path=slot_path if canonical_path is None else canonical_path,
+                capture_generation=capture_generation,
+            )
+        agent_batch.observe(
             slot_path,
             record,
             canonical_path=slot_path if canonical_path is None else canonical_path,
             capture_generation=capture_generation,
         )
+        return None
     if census is not None:
         census.assert_slot_unused(
             slot_path,
@@ -43625,6 +43636,15 @@ def _cmd_remove_in_scope(
     scoped_validation_finish = bool(args.validate_complete) and (
         private_cleanup is None or private_cleanup.scoped_finish
     )
+    # An agent removal scans /proc for use of the slot here, before the
+    # registry locks (#1108); a refusal is reported where the use check under
+    # the lock used to refuse, for the same reason as single_refusal.
+    unlocked_refusal: Refusal | None = None
+    if agent_batch is not None and single_refusal is None:
+        try:
+            _remove_unlocked_use_pass(config, args.slot, agent_batch, live_use_recheck)
+        except Refusal as exc:
+            unlocked_refusal = exc
     if private_cleanup is None and not bool(args.validate_complete):
         # Network work happens here, before the registry lock, not under it.
         _prefetch_remote_containment(
@@ -43656,6 +43676,12 @@ def _cmd_remove_in_scope(
         state = _load_active(config, require_repository=False)
         record = _find_record(state, args.slot)
         _expected_generation(record, args.expected_generation)
+        if (
+            agent_batch is not None
+            and single_refusal is None
+            and unlocked_refusal is None
+        ):
+            _assert_unlocked_record_current(config, agent_batch, record)
         _prepare_state_home_reclaim(
             config, record.slot_type, record.slot, _GitVcs()
         )
@@ -43882,7 +43908,9 @@ def _cmd_remove_in_scope(
                         # (28f01ef0) uses; every other storage-side guard
                         # (owner generation, time-to-live, handoff, direct
                         # use, salvage) still runs unchanged below.
-                        _assert_pane_verdict_slot_unused(config, record, agent_batch)
+                        _assert_pane_verdict_slot_unused(
+                            config, record, agent_batch, unlocked_refusal
+                        )
                         if attest_agent is not None:
                             print(
                                 "NOTE: --attest-agent-stopped was not needed: the "
@@ -43988,6 +44016,8 @@ def _cmd_remove_in_scope(
                 )
         if single_refusal is not None:
             raise single_refusal
+        if unlocked_refusal is not None:
+            raise unlocked_refusal
         if single_item and agent_batch is not None:
             if (
                 time.monotonic() - agent_batch.captured_at
@@ -45988,9 +46018,11 @@ def _run_item_scan(
 class _AgentRemoveBatchContext:
     """The process-use evidence and item budget of one agent removal batch.
 
-    Before an item's path fence, ``observe`` serves its use checks at the
-    unfenced slot path from the shared lsof scan and a fresh /proc scan.
-    After the fence, ``observe_fenced`` serves the checks that guard deletion
+    Before an item takes the registry locks, ``observe_unlocked`` checks its
+    unfenced slot path against the shared lsof scan and runs a fresh /proc
+    scan; under the locks, ``observe`` serves the use checks before the path
+    fence from that evidence and runs no scan (#1108
+    remove-lock-hold-starves-validate).  After the fence, ``observe_fenced`` serves the checks that guard deletion
     with one /proc scan that compares identities with the fenced tree, and
     runs the ordinary lsof check of the fenced path when that scan cannot
     decide.
@@ -46005,7 +46037,9 @@ class _AgentRemoveBatchContext:
     ``item_seconds`` is the budget of each item's work before deletion (see
     _AGENT_REMOVE_BATCH_ITEM_SECONDS), and ``last_seconds_before_deletion``
     is how long the last item held the registry lock before it began
-    deleting, or None when it did not reach deletion.
+    deleting, or None when it did not reach deletion.  ``unlocked_records``
+    maps the current item's slot path to the registry record its unlocked
+    pass read; the removal refuses under the locks when the record changed.
 
     ``image_targets`` names the image-backed targets.  The fence of such a
     slot mounts its image again, possibly from another device, so the
@@ -46030,6 +46064,7 @@ class _AgentRemoveBatchContext:
     shared_census_seconds: float = 0.0
     fresh_scan_count: int = 0
     fresh_scan_seconds: float = 0.0
+    unlocked_records: dict[Path, ActiveRecord] = dataclasses.field(default_factory=dict)
     fenced_scan_count: int = 0
     fenced_scan_seconds: float = 0.0
     fenced_lsof_fallbacks: list[str] = dataclasses.field(default_factory=list)
@@ -46113,14 +46148,7 @@ class _AgentRemoveBatchContext:
         finally:
             self.image_lsof_check_seconds += time.monotonic() - started
 
-    def observe(
-        self,
-        check_path: Path,
-        record: ActiveRecord | None,
-        *,
-        canonical_path: Path,
-        capture_generation: bool,
-    ) -> _LiveUseObservation | None:
+    def _assert_shared_evidence(self, check_path: Path, canonical_path: Path) -> None:
         if check_path != canonical_path:
             raise StateError(
                 f"an agent removal batch checks only the unfenced slot path "
@@ -46143,6 +46171,25 @@ class _AgentRemoveBatchContext:
             )
         _set_item_phase("process census")
         self.census.assert_slot_unused(canonical_path, None)
+
+    def observe_unlocked(
+        self,
+        check_path: Path,
+        record: ActiveRecord | None,
+        *,
+        canonical_path: Path,
+        capture_generation: bool,
+    ) -> _LiveUseObservation | None:
+        """Check an item's unfenced slot before the registry locks are taken.
+
+        The shared lsof evidence, then one fresh /proc scan for use that
+        began after it.  This is an early refusal with the ordinary messages,
+        made outside the locks because they protect the registry record, not
+        process use; the decisive check is the scan after the path fence
+        (see _remove_unlocked_use_pass).
+        """
+
+        self._assert_shared_evidence(check_path, canonical_path)
         started = time.monotonic()
         self.fresh_scan_count += 1
         try:
@@ -46154,6 +46201,29 @@ class _AgentRemoveBatchContext:
             )
         finally:
             self.fresh_scan_seconds += time.monotonic() - started
+
+    def observe(
+        self,
+        check_path: Path,
+        record: ActiveRecord | None,
+        *,
+        canonical_path: Path,
+        capture_generation: bool,
+    ) -> None:
+        """Serve a use check before the path fence, under the registry locks.
+
+        No /proc scan runs here (#1108): the item's fresh scan ran in its
+        unlocked pass, and this re-checks only that the slot directory is
+        still the one the shared evidence covered.
+        """
+
+        del record, capture_generation
+        self._assert_shared_evidence(check_path, canonical_path)
+        if canonical_path not in self.unlocked_records:
+            raise StateError(
+                f"slot {canonical_path} reached its use check under the registry "
+                "lock without the unlocked process scan of this agent removal"
+            )
 
     def observe_fenced(
         self,
@@ -46230,6 +46300,7 @@ class _AgentBatchUseCheck(TypedDict, total=False):
     canonical_path: Path
     after_fence: bool
     before_image_fence: bool
+    unlocked: bool
 
 
 def _agent_batch_use_check(
@@ -46238,6 +46309,7 @@ def _agent_batch_use_check(
     *,
     after_fence: bool = False,
     before_image_fence: bool = False,
+    unlocked: bool = False,
 ) -> _AgentBatchUseCheck:
     """Keywords that route one slot-use check through an agent removal batch.
 
@@ -46246,7 +46318,8 @@ def _agent_batch_use_check(
     installed for it.  ``after_fence`` marks a check of the fenced path,
     whose ``canonical_path`` names the slot's unfenced path, and
     ``before_image_fence`` the lsof check of an image-backed slot made just
-    before its fence.
+    before its fence, and ``unlocked`` the check an item makes before it takes
+    the registry locks.
     """
 
     if agent_batch is None:
@@ -46258,6 +46331,8 @@ def _agent_batch_use_check(
         keywords["after_fence"] = True
     if before_image_fence:
         keywords["before_image_fence"] = True
+    if unlocked:
+        keywords["unlocked"] = True
     return keywords
 
 
@@ -46274,9 +46349,9 @@ def _single_remove_agent_batch(
     slot: on a 33 GB slot of 68,888 entries, at load average about 260,
     one run took 9 to 18 seconds.  A batch of one
     instead runs that single ``lsof +D`` here, before the lock is taken, and
-    uses remove-agent-batch's checks under the lock: before the path fence, a
-    fresh /proc scan and a check that the slot directory is the one lsof
-    covered; after the fence, the /proc scan that compares identities with
+    uses remove-agent-batch's checks: a fresh /proc scan, also before the lock
+    (#1108); under the lock, before the path fence, a check that the slot
+    directory is the one lsof covered; after the fence, the /proc scan that compares identities with
     the fenced tree, which falls back to the ordinary lsof check only when it
     cannot decide.  The item budget (_AGENT_REMOVE_BATCH_ITEM_SECONDS) bounds
     the work before the first deletion, except the stretches it names.
@@ -46317,6 +46392,79 @@ def _single_remove_agent_batch(
     )
     context.capture([slot_path])
     return context
+
+
+def _remove_unlocked_use_pass(
+    config: Config,
+    slot: str,
+    agent_batch: _AgentRemoveBatchContext,
+    live_use_recheck: _LiveUseRecheckBudget,
+) -> None:
+    """Check an agent slot for process use before the registry locks (#1108).
+
+    The registry locks protect the registry record, not process use: an
+    agent does not take them to enter a slot, so a /proc scan proves the same
+    inside them or outside.  This pass reads the record without the lock and
+    runs the item's /proc scan, an early refusal with the ordinary messages.
+    Under the locks, _assert_unlocked_record_current refuses when the record
+    changed meanwhile (an adopt, transfer, heartbeat or release), and the use
+    checks there read only this evidence.  A process that starts using the
+    slot after this scan still holds the tree when the path fence renames it,
+    so the scan after the fence, which runs unlocked and decides, finds it
+    and the fence is rolled back; the full argument is in #1108.
+
+    The scan judges cgroup membership only for an owner that is not live: a
+    live owner either consented or released (and the check under the lock
+    drops the same comparison) or the removal refuses under the lock anyway.
+    """
+
+    agent_batch.unlocked_records = {}
+    state = _load_active(config, require_repository=False)
+    record = next((item for item in state.slots if item.slot == slot), None)
+    if record is None:
+        # The locked pass refuses the missing slot with its usual message.
+        return
+    slot_path = _slot_directory(config, slot, record.slot_type)
+    use_record = record
+    if record.owner is not None and _process_state(record.owner)[0] == "live":
+        use_record = dataclasses.replace(record, owner=None)
+    _assert_slot_unused(
+        slot_path,
+        use_record,
+        live_use_recheck=live_use_recheck,
+        **_agent_batch_use_check(agent_batch, slot_path, unlocked=True),
+    )
+    agent_batch.unlocked_records[slot_path] = record
+
+
+def _assert_unlocked_record_current(
+    config: Config, agent_batch: _AgentRemoveBatchContext, record: ActiveRecord
+) -> None:
+    """Refuse when ``record`` changed since its removal's unlocked pass (#1108).
+
+    Runs under the registry locks, which are then held through the path
+    fence, so no adopt, transfer, heartbeat, release or new record can come
+    between this check and the fence.
+    """
+
+    slot_path = _slot_directory(config, record.slot, record.slot_type)
+    unlocked = agent_batch.unlocked_records.get(slot_path)
+    if unlocked == record:
+        return
+    if unlocked is None:
+        change = "it was not in the registry when that check began"
+    else:
+        changed = sorted(
+            field.name
+            for field in dataclasses.fields(record)
+            if getattr(unlocked, field.name) != getattr(record, field.name)
+        )
+        change = f"changed: {', '.join(changed)}"
+    raise Refusal(
+        f"slot {record.slot} changed in the registry while remove checked it for "
+        f"process use without the registry lock ({change}). state: REFUSED -- no "
+        "checkout was salvaged or removed. remedy: retry the remove"
+    )
 
 
 def _removal_journal_candidate(config: Config, slot: str) -> Path | None:
@@ -56989,6 +57137,7 @@ def _assert_pane_verdict_slot_unused(
     config: Config,
     record: ActiveRecord,
     agent_batch: _AgentRemoveBatchContext | None,
+    unlocked_refusal: Refusal | None = None,
 ) -> None:
     """Refuse only if a live process references ``record``'s slot (#993).
 
@@ -57000,11 +57149,15 @@ def _assert_pane_verdict_slot_unused(
     the same target-naming match the absent-row census uses. A match
     refuses, naming the process; no match means the pane verdict is
     not evidence about this slot and removal proceeds to its ordinary
-    guards.
+    guards.  ``unlocked_refusal`` is the refusal of an agent removal's
+    use check before the registry locks (#1108), which stands for that
+    direct-use check.
     """
 
     slot_path = _slot_directory(config, record.slot, record.slot_type)
     try:
+        if unlocked_refusal is not None:
+            raise unlocked_refusal
         _assert_slot_unused(slot_path, None, agent_batch=agent_batch)
     except Refusal as exc:
         raise Refusal(

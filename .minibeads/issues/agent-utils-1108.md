@@ -87,3 +87,27 @@ Process safety therefore rests on the fence plus the after-fence scan; registry 
 
 Open point for the lead: image-backed slots. Their fence remounts the image, and a process still inside the OLD mount is invisible to the after-fence identity scan, so the table's last row does not cover them. Today a lsof check (`before_image_fence`) runs right before that rename, under the locks. Moving it out of the lock reopens that window for image slots only. Proposal: keep it under the lock for image-backed slots and measure its cost there; or, if every scan must leave the lock, re-run it after the fence against the old mount's device before deletion. Needs the lead's choice.
 
+
+Image-backed slots (the lead, 2026-11-08, answering the open point): option (a). The `before_image_fence` lsof check stays under the registry locks. Neither a mount-generation re-check nor a re-run after the fence can catch a NEW opener that arrives between an unlocked lsof and the fence, and image slots are the common case on both hosts, so correctness wins. Its hold gets its own line in the #1108 measurements. If it dominates under load, the follow-up must first stop new entrants and only then run an unlocked lsof (fence first, then lsof plus the remount); a generation check is not enough.
+
+Implementation, Python (cl-wrkid, 2026-11-08):
+
+- Unlocked pass: `_remove_unlocked_use_pass`. Before the locks, an agent removal (a remove-agent-batch item, or an ordinary remove run as a batch of one) reads its record without the lock. It checks the shared lsof evidence and runs the item's single fresh /proc scan (`_AgentRemoveBatchContext.observe_unlocked`). A refusal is raised where the locked use check used to refuse, so messages and their order do not change.
+  - The scan compares owner cgroups only when the owner is not live. A live owner has either consented or released, in which case the locked check drops the same comparison, or the locked pass refuses the removal anyway.
+- Under the locks: `_assert_unlocked_record_current` runs right after the generation check and refuses when the record differs in any field from the one the unlocked pass read. The message names the changed fields. This catches an adopt, transfer, heartbeat, release, hold-bound change, or a record that appeared.
+  - The locks are then held through the fence, so the re-check and the fence form one step.
+  - Both pre-fence use checks (the precondition check and the one in `_begin_or_resume_path_fence`) now only re-read that evidence: the lsof coverage and the slot directory identity. No /proc scan runs under the locks on this path.
+  - `fresh_process_scans` in remove-agent-batch output is now one per item instead of two.
+- After the fence: unchanged and decisive. The fenced scan runs unlocked, with #1102 re-listing; a refusal rolls the fence back.
+- Still under the locks:
+  - image-backed slots' `before_image_fence` lsof check (the decision above);
+  - the ordinary checks of removals that do not run as an agent batch (image-backed single removes, `--no-lock-budget`, hosts without lsof, validation and private-cleanup removals);
+  - the #993 unattributed-pane case's argv/environ naming scan, which depends on the registered-liveness answer taken under the lock. Moving it needs that answer before the lock too; follow-up if the measurement shows it matters.
+- Tests (py/wrkslots/tests/test_lifecycle.py):
+  - `test_agent_remove_runs_no_process_scan_under_the_registry_locks`: every scanner (shared lsof census, fresh scan, fenced scan, lsof, /proc listings, process snapshot) is called while no `_mutation_locks` hold is open, and the fresh scan runs exactly once. The lock-wait bound follows from this: the hold no longer contains a scan, and its size under load is the daytime measurement.
+  - `test_agent_remove_refuses_a_process_that_enters_after_its_unlocked_scan` (required test 1): a process starts in the slot under the locks, after the unlocked scan. The after-fence scan names it at the fenced path, the fence is rolled back, and the slot, record and journals are as before.
+  - `test_agent_remove_refuses_an_adopt_during_its_unlocked_scan` (required test 2): an ownerless, expired slot is adopted after the unlocked pass; remove refuses under the locks with `changed: heartbeat_at, owner`.
+
+Rust parity gap (recorded, not mirrored): `remove_write.rs` runs its one pre-fence `assert_slot_unused` under its mutation locks (~1869). Moving it out safely needs what Python has after the fence, a rollback of the fence when the after-fence scan refuses. Rust instead leaves the FINISH journal for `wrkslots recover`, so the race this change tolerates would turn into a recovery-required state there. Rust remove is still fixture-only (`require_fixture`) and refuses image slots and owner consent. For the Rust wrkslots owner via the coordinator: add the after-fence rollback, then move the scan before the locks with a record re-check, as in Python.
+
+Remaining before closing: the daytime load measurement of the lock hold with this change (image-slot `before_image_fence` hold measured separately), and validation admission's shared read lock (second design option), if the measurement still shows admission waiting.
