@@ -1900,3 +1900,34 @@ test("`#624 voice-page-modularity`: replies are gathered by pointer and by threa
     "a thread's replies were not gathered under its root");
   assert.equal(owner.gatheredParent(), null, "a fresh column already had a gathering");
 });
+
+test("`#624 voice-page-modularity`: a new collapsed-lines count is put on between the scroll keepers, and off the main screen it is simply put on", () => {
+  const { createReadingColumn } = CHANNEL_VIEW;
+  const log = [];
+  let screen = "settings";
+  const owner = createReadingColumn({
+    foldsOf: () => [],
+    setFolded: () => {}, isFolded: () => true,
+    collapsedLines: { current: () => 3, apply: (value) => { log.push(`apply:${value}`); return 5; } },
+    savedCollapsedLines: (n) => log.push(`saved:${n}`),
+    stepCollapsedLinesPreference: (d) => log.push(`step:${d}`),
+    screen: () => screen,
+    mainColumn: () => "main", sideColumn: () => "side",
+    inColumn: (column, act) => { log.push(`in:${column}`); return act(); },
+    captureScroll: () => { log.push("capture"); return "mark"; },
+    restoreScroll: () => log.push("restore"),
+    sideShowing: () => false,
+    keepingCardPlace: (act) => { log.push("cards"); act(); },
+    defaultCollapsedLines: 3,
+    documentById: () => null,
+  });
+  assert.equal(owner.collapsedLinesChanged("5"), 5, "off the main screen the count was not put on at once");
+  assert.deepStrictEqual(log, ["apply:5", "saved:5"]);
+  log.length = 0;
+  screen = "main";
+  assert.equal(owner.collapsedLinesChanged("7"), 5);
+  assert.deepStrictEqual(log, ["in:main", "capture", "cards", "apply:7", "saved:5", "in:main", "restore"],
+    "on the main screen the count was not put on between the scroll keepers");
+  owner.stepCollapsedLines(-1);
+  assert.equal(log[log.length - 1], "step:-1", "the slider's step did not go through the preference");
+});

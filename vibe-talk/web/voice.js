@@ -2124,6 +2124,28 @@ const {
   holdingScrollTools, renderScrollTools, setAllFolded, foldStepFromKeyboard,
 } = folding;
 
+/** The reading column's line count is web/src/view/channel's now (`createReadingColumn`,
+ * `#624 voice-page-modularity`). */
+const readingColumn = createReadingColumn({
+  foldsOf: (list) => foldsOf(list),
+  setFolded: (entry, folded) => setFolded(entry, folded),
+  isFolded: (entry) => isFolded(entry),
+  collapsedLines,
+  savedCollapsedLines: (count) => messagePreferences.collapsedLines.saved(count),
+  stepCollapsedLinesPreference: (direction) => messagePreferences.collapsedLines.step(direction),
+  screen: () => screens.screen(),
+  mainColumn: () => columns.main,
+  sideColumn: () => columns.side,
+  inColumn: (column, act) => inColumn(column, act),
+  captureScroll: () => captureScroll(),
+  restoreScroll: (mark) => restoreScroll(mark),
+  sideShowing: () => sideShowing(),
+  keepingCardPlace: (act) => keepingCardPlace(act),
+  defaultCollapsedLines: DEFAULT_COLLAPSED_LINES,
+  documentById: (id) => document.getElementById(id),
+});
+const { refreshElisionLines, collapsedLinesChanged, stepCollapsedLines } = readingColumn;
+
 // Searching what is on screen, and the lines between rows, are web/src/view/channel's now
 // (`createSearchRows`, `#624 voice-page-modularity`): the language on the page, the filter's
 // pass, the hits drawn, and the seams. The field itself stays instantiated here, where the
@@ -4152,70 +4174,8 @@ const textSize = mountTextSize({
 // `data-collapsed-lines`) and keeping it, read back, are `collapsedLines`'s: web/src/core/settings
 // (`#624 voice-page-modularity`).
 
-/**
- * Work every drawn fold's hidden-word count out again under the count now in force. A label made
- * at three lines and left at eight would claim words the reader can see — the one thing the label
- * may never do (`#244 elision-word-count`) — and a channel redraw would only mend the channel's
- * rows, on the next poll, and the transcript's never. So the rows on the page are recounted where
- * they stand, from what each draws (`foldedTextLine`), and put back through `setFolded` so the
- * new line is shown exactly where the old one was.
- */
-function refreshElisionLines() {
-  forgetElisionCounts();
-  // And the rows unpacked under their cards, and Main's among them (`#404`, `#419`): drawn into
-  // the cards' list rather than a column's log, so `FOLD_LISTS` never names them, and a label left
-  // there is a label claiming words a raised count has put on the screen.
-  for (const id of [...FOLD_LISTS, "side-cards"]) {
-    for (const entry of foldsOf(document.getElementById(id))) {
-      const fresh = foldedTextLine(entry.body, entry.foldText, collapsedLines.current());
-      const old = entry.elided;
-      if (old && fresh) old.replaceWith(fresh);
-      else if (old && !fresh) old.remove();
-      else if (!old && fresh && entry.body.parentNode) {
-        entry.body.parentNode.insertBefore(fresh, entry.body.nextSibling);
-      }
-      entry.elided = fresh;
-      setFolded(entry, isFolded(entry));
-    }
-  }
-}
-
-/**
- * Apply a new count and say, in Settings, whether it will survive a reload. Every collapsed row
- * on the page changes height at once, so the change is made between the scroll keepers: both
- * columns' lists (`captureScroll` and `restoreScroll`, `#47 scrollback-stability`) and, while the
- * right column or the Threads view shows the thread cards instead of a thread, the cards' own
- * (`keepingCardPlace`) — every raw card and every unpacked row under it changes height too. A
- * reader scrolled up any list keeps the message or card they are on, and a reader at the newest
- * line stays on it. Off the main screen — the slider's own home in Settings — there is no list on
- * screen to hold, and the count is simply put on.
- */
-function collapsedLinesChanged(value) {
-  const apply = () => {
-    const n = collapsedLines.apply(value);
-    refreshElisionLines();
-    messagePreferences.collapsedLines.saved(n);
-    return n;
-  };
-  if (screens.screen() !== "main") return apply();
-  /** @type {Array<[ColumnFields, ReturnType<typeof captureScroll>]>} */
-  const held = [[columns.main, inColumn(columns.main, captureScroll)]];
-  if (sideShowing()) held.push([columns.side, inColumn(columns.side, captureScroll)]);
-  let n = DEFAULT_COLLAPSED_LINES;
-  keepingCardPlace(() => { n = apply(); });
-  for (const [column, mark] of held) inColumn(column, () => restoreScroll(mark));
-  return n;
-}
-
-/**
- * One line fewer (-1) or more (+1): what the slider's − and + do, through `collapsedLinesChanged`,
- * the slider's own path, as `textSize.step` steps the text size.
- *
- * @param {1 | -1} direction
- */
-function stepCollapsedLines(direction) {
-  messagePreferences.collapsedLines.step(direction);
-}
+// The count's work — recounting every drawn fold under it, and putting a new one on between
+// the scroll keepers — is web/src/view/channel's now (`createReadingColumn`, `#624`).
 
 // --- thread card lines (#522 thread-card-max-lines) -----------------------------------------------
 //
