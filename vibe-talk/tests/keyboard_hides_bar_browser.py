@@ -32,10 +32,16 @@ threads), from one loopback origin. At 393x852 by touch, in All at the foot of t
   the keys.
 
 `#575 mobile-keyboard-compose`, at 393x852 after all that and again at 412x915 (the owner's Android phone),
-in a thread and in Main (`compose_walk`): the keyboard up leaves the box's foot on the keyboard's top, Send
-gone (the keyboard's own key sends) and a new-line key in the box's corner, whose tap writes a new line and
-keeps the focus, after which the keyboard's Enter sends both lines once; with Enter to send off, Send stays
-as the last thing on the keys' top and Enter is a new line.
+in a thread and in Main (`compose_walk`): the keyboard up leaves the box's foot on the keyboard's top and
+a new-line key in the box's corner, whose tap writes a new line and keeps the focus, after which the
+keyboard's Enter sends both lines once; with Enter to send off, Enter is a new line.
+
+`#1135 raw-message-page`, in `compose_walk` and alone at 360x740 (`raw_walk`): the row under the box —
+Send raw message, Cancel and Send — stays drawn under the keys at rest, and scrolling the list further
+down brings it whole above them, with Enter to send on or off. Ticking Send raw message and tapping Send
+posts the words with `raw` set and unticks the box; Cancel with words asks "Discard this draft?" and Yes
+empties the box and drops the focus. At the list's very end (a send, the reader's wheel down) the row,
+not the box, stands on the keys.
 
 `#610 mobile-keyboard-compose`, Safari's way at 390x664 by touch (`ios_walk`): the layout keeps its full height
 and only the visual viewport shrinks and pans, as WebKit does, played to the page by a stand-in
@@ -78,6 +84,8 @@ if TYPE_CHECKING:
 PHONE = (393, 852)
 # `#575 mobile-keyboard-compose`: the owner's Android phone, whose screenshot this walk was written from.
 ANDROID = (412, 915)
+# `#1135 raw-message-page`: the narrow end of the phones this page is held to.
+SMALL = (360, 740)
 DESK = (1280, 800)
 # `#610 mobile-keyboard-compose`: an iPhone's Safari with its toolbars, and the visual viewport its keyboard leaves
 # (the keys, the suggestion strip and the floating Done control taken off the 664px).
@@ -147,6 +155,8 @@ STATE_JS = """() => {
         said: document.documentElement.getAttribute('data-keyboard'),
         bar: drawn('control-bar'), dock: drawn('dock'), dockBox: rect('dock'), paneShown: shown,
         list: rect('scroll-area'), box: rect('channel-compose-text'), send: rect('channel-send'),
+        cancel: rect('channel-cancel'), raw: rect('channel-raw'), discard: drawn('channel-discard'),
+        rawChecked: (document.getElementById('channel-raw') || {}).checked === true,
         newline: rect('channel-newline'), state: rect('channel-compose-state'),
         gap: area.scrollHeight - area.scrollTop - area.clientHeight,
         viewport: window.visualViewport ? window.visualViewport.height : window.innerHeight,
@@ -181,6 +191,7 @@ def main() -> int:
     with sync_playwright() as playwright:
         report.append(walk(playwright.chromium, args, "phone", *PHONE, touch=True))
         report.append(walk(playwright.chromium, args, "android", *ANDROID, touch=True, walker=compose_walk))
+        report.append(walk(playwright.chromium, args, "small", *SMALL, touch=True, walker=raw_walk))
         report.append(walk(playwright.chromium, args, "ios", *IPHONE, touch=True, walker=ios_walk,
                            init_script=IOS_VIEWPORT_JS))
         report.append(walk(playwright.chromium, args, "desk", *DESK, touch=False))
@@ -273,19 +284,37 @@ def bars_gone(desk: Desk, found: Json, when: str) -> None:
 
 
 def flush(desk: Desk, found: Json, when: str) -> None:
-    """`#575 mobile-keyboard-compose`: the box whole on screen with its foot on the keyboard's top, Send gone (the
-    keyboard's own key sends) and the new-line key drawn in the box's corner."""
+    """`#575 mobile-keyboard-compose`, `#1135 raw-message-page`: the box whole on screen with its foot on the
+    keyboard's top, the new-line key drawn in the box's corner, and the row under the box still drawn
+    below the keys, a scroll away (Send no longer goes while the keyboard's key sends)."""
     viewport = number(found, "viewport")
     desk.check(number(found, "box", "top") >= 0, f"{when}: the box's top is off screen: {found}")
     desk.check(abs(number(found, "box", "bottom") - viewport) <= 1,
                f"{when}: the box's foot is not on the keyboard's top, {viewport - number(found, 'box', 'bottom'):.0f}px "
                f"wasted between them: {found}")
-    desk.check(found["send"] is None, f"{when}: Send is still drawn, though the keyboard's key sends: {found}")
+    desk.check(found["send"] is not None, f"{when}: the row under the box is not drawn: {found}")
+    desk.check(number(found, "send", "bottom") > viewport,
+               f"{when}: the resting place already shows the row, so the box is not resting on the keys: {found}")
     desk.check(found["newline"] is not None, f"{when}: no new-line key: {found}")
     key, box = found["newline"], found["box"]
     assert isinstance(key, dict) and isinstance(box, dict)
     desk.check(box["top"] <= key["top"] and key["bottom"] <= box["bottom"] and box["left"] <= key["left"]
                and key["right"] <= box["right"], f"{when}: the new-line key is not in the box's corner: {found}")
+
+
+def revealed(desk: Desk, found: Json, when: str) -> None:
+    """`#1135 raw-message-page`: scrolled to it, the whole row under the box stands above the keys:
+    Send raw message, Cancel and Send each whole on screen, the row's foot on the keyboard's top."""
+    viewport = number(found, "viewport")
+    for part in ("raw", "cancel", "send"):
+        desk.check(found[part] is not None, f"{when}: #{part} of the row is not drawn: {found}")
+        desk.check(number(found, part, "top") >= 0, f"{when}: #{part} is cut off at the top: {found}")
+        desk.check(number(found, part, "bottom") <= viewport + 1,
+                   f"{when}: #{part} is still under the keys: {found}")
+    # The room the composer and the list keep under the row at the very end (its margin, the list's
+    # own end padding) is the most it may stand over the keys.
+    desk.check(viewport - number(found, "send", "bottom") <= FOOT_SLACK_PX,
+               f"{when}: the revealed row floats {viewport - number(found, 'send', 'bottom'):.0f}px over the keys: {found}")
 
 
 def phone_walk(desk: Desk) -> None:
@@ -305,10 +334,11 @@ def phone_walk(desk: Desk) -> None:
     desk.check(found["said"] != "open", f"a focused box alone was taken for a keyboard: {found}")
     bars_up(desk, found, "focused, no keyboard")
 
-    # The keyboard up: both bars gone, the list with their room, the box and Send on screen, at the foot.
+    # The keyboard up: both bars gone, the list with their room, the box resting on the keys with the
+    # row under it still to scroll to (`#1135 raw-message-page`), so scroll is left past the rest.
     found = keyboard(desk, True)
     bars_gone(desk, found, "keyboard up")
-    desk.check(number(found, "gap") <= FOOT_SLACK_PX, f"keyboard up: the reader was moved off the foot: {found}")
+    desk.check(number(found, "gap") > 0, f"keyboard up: no scroll left past the resting box to its row: {found}")
     flush(desk, found, "keyboard up")
     above = page.evaluate("""() => { const rows = [...document.querySelectorAll('#discord-log > li[data-id]')];
         const r = rows[rows.length - 1].getBoundingClientRect(); return {top: r.top, bottom: r.bottom}; }""")
@@ -477,17 +507,23 @@ def posted(api: ReplyColumnsApi) -> list[str]:
         return [str(reply.get("text", "")) for reply in api.replies]
 
 
+def posted_bodies(api: ReplyColumnsApi) -> list[Json]:
+    with api.lock:
+        return [dict(reply) for reply in api.replies]
+
+
 def compose_walk(desk: Desk, api: ReplyColumnsApi) -> None:
     """`#575 mobile-keyboard-compose`. The owner, 2026-10-27, on Android and iOS: a tap in the box left Send and
     "some useless white space" between it and the keyboard, whose own send key makes Send needless; and
     no way to write a new line, since the keyboard's Shift does not turn its send key into a return.
 
     In a thread (the box saying "Reply in this thread…", as in the owner's screenshot) and in Main: the
-    keyboard up leaves the box's foot on the keyboard's top, Send gone, and a new-line key in the box's
-    corner. A tap on that key writes a new line where the caret is, keeps the focus and the keyboard,
-    sends nothing; the keyboard's Enter then sends both lines once. The keyboard down: Send back, the key
-    gone. With Enter to send off: the keyboard's key a return (`enterkeyhint`), Send kept as the last
-    thing above the keys, its foot on their top, no new-line key, and Enter a new line that sends nothing."""
+    keyboard up leaves the box's foot on the keyboard's top, the row under it drawn below the keys
+    (`#1135 raw-message-page`), and a new-line key in the box's corner. A tap on that key writes a new
+    line where the caret is, keeps the focus and the keyboard, sends nothing; the keyboard's Enter then
+    sends both lines once. The keyboard down: the new-line key gone. With Enter to send off: the
+    keyboard's key a return (`enterkeyhint`), no new-line key, Enter a new line that sends nothing, and
+    the reader's scroll to the foot reveals the row whole above the keys."""
     page = desk.page
     before = len(posted(api))
     thread = page.evaluate("""() => [...document.getElementById('thread-select').options]
@@ -530,7 +566,9 @@ def compose_walk(desk: Desk, api: ReplyColumnsApi) -> None:
     desk.check(found["send"] is not None and found["newline"] is None,
                f"keyboard down: Send not back, or the new-line key still drawn: {found}")
 
-    # Main, with Enter to send off: the keyboard's key is a return, so Send stays, at the keys' top.
+    # Main, with Enter to send off: the keyboard's key is a return. The box still rests on the keys
+    # (`#1135 raw-message-page` supersedes Send standing there), and scrolling to the foot reveals
+    # the row — Send included, which is now how a return-key writer sends.
     page.select_option("#thread-select", "main")
     desk.wait_for("() => document.getElementById('channel-compose-text').placeholder.startsWith('Message the main')",
                   "choosing Main did not make the box Main's")
@@ -543,11 +581,17 @@ def compose_walk(desk: Desk, api: ReplyColumnsApi) -> None:
     found = keyboard(desk, True)
     bars_gone(desk, found, "Enter to send off, keyboard up")
     viewport = number(found, "viewport")
-    desk.check(found["send"] is not None and abs(number(found, "send", "bottom") - viewport) <= 1,
-               f"Enter to send off, keyboard up: Send is not the last thing on the keys' top: {found}")
+    desk.check(abs(number(found, "box", "bottom") - viewport) <= 1,
+               f"Enter to send off, keyboard up: the box does not rest on the keys' top: {found}")
     desk.check(number(found, "box", "top") >= 0, f"Enter to send off, keyboard up: the box's top is off screen: {found}")
+    desk.check(found["send"] is not None and number(found, "send", "bottom") > viewport,
+               f"Enter to send off, keyboard up: the row is not drawn below the keys at rest: {found}")
     desk.check(found["newline"] is None, f"Enter to send off, keyboard up: a new-line key beside a return key: {found}")
     desk.shot("13-enter-off-keyboard-up")
+    # The reader's own scroll, not the page's: a wheel, which ends the jump's moment as a touch does.
+    wheel(desk, 600)
+    revealed(desk, state(desk), "Enter to send off, scrolled to the foot")
+    desk.shot("14-enter-off-row-revealed")
     sent = len(posted(api))
     page.keyboard.type("one")
     page.keyboard.press("Enter")
@@ -561,9 +605,66 @@ def compose_walk(desk: Desk, api: ReplyColumnsApi) -> None:
                   "box.dispatchEvent(new InputEvent('input', {bubbles: true})); }")
     page.evaluate("() => document.getElementById('enter-sends').click()")
     keyboard(desk, False)
-    desk.notes.append(f"in a thread with the keyboard up the box's foot is {abs(wasted):.0f}px from the keys, Send gone, "
-                      "the corner key's new line and Enter sending both lines once; with Enter to send off Send stays "
-                      "on the keys' top")
+    desk.notes.append(f"in a thread with the keyboard up the box's foot is {abs(wasted):.0f}px from the keys with its "
+                      "row drawn below them, the corner key's new line and Enter sending both lines once; with Enter "
+                      "to send off the box still rests on the keys and the foot reveals the row")
+    raw_walk(desk, api)
+
+
+def raw_walk(desk: Desk, api: ReplyColumnsApi) -> None:
+    """`#1135 raw-message-page`. In Main with the keyboard up: the box rests on the keys, the reader's
+    own scroll reveals Send raw message, Cancel and Send whole above them; a ticked send posts `raw`
+    and unticks itself; Cancel with words asks first and Yes empties the box and drops the focus."""
+    page = desk.page
+    page.select_option("#thread-select", "main")
+    desk.wait_for("() => document.getElementById('channel-compose-text').placeholder.startsWith('Message the main')",
+                  "choosing Main did not make the box Main's")
+    to_foot(desk)
+    page.tap("#channel-compose-text")
+    found = keyboard(desk, True)
+    bars_gone(desk, found, "raw, keyboard up")
+    flush(desk, found, "raw, keyboard up")
+    desk.check(found["rawChecked"] is False, f"raw: the checkbox starts ticked: {found}")
+    desk.shot("15-raw-resting")
+    page.keyboard.type("/compact")
+    wheel(desk, 600)
+    revealed(desk, state(desk), "raw, scrolled to the row")
+    desk.shot("16-raw-revealed")
+    before = len(posted(api))
+    page.tap("#channel-raw-row")
+    desk.wait_for("() => document.getElementById('channel-raw').checked === true", "the tap did not tick Send raw message")
+    page.tap("#channel-send")
+    for _ in range(50):
+        if len(posted(api)) > before:
+            break
+        page.wait_for_timeout(100)
+    desk.check(posted(api)[before:] == ["/compact"], f"the revealed Send did not post the words: {posted(api)[before:]}")
+    body = posted_bodies(api)[-1]
+    desk.check(body.get("raw") is True, f"a ticked send did not carry raw: {body}")
+    desk.wait_for("() => document.getElementById('channel-raw').checked === false", "the checkbox stayed ticked after the send")
+    desk.shot("17-raw-sent")
+
+    # Cancel: words ask first, on No; Yes empties the box, sends nothing and drops the focus.
+    page.tap("#channel-compose-text")
+    keyboard(desk, True)
+    page.keyboard.type("do not send this")
+    sent = len(posted(api))
+    wheel(desk, 600)
+    page.tap("#channel-cancel")
+    desk.wait_for("() => document.getElementById('channel-discard').hidden === false", "Cancel with words did not ask")
+    found = state(desk)
+    desk.check(found["discard"] is True and found["active"] == "channel-discard-no",
+               f"the discard question is not up standing on No: {found}")
+    desk.shot("18-cancel-asks")
+    page.tap("#channel-discard-yes")
+    desk.wait_for("() => document.getElementById('channel-compose-text').value === ''", "Yes left the words in the box")
+    found = state(desk)
+    desk.check(found["discard"] is False, f"the discard question stayed up: {found}")
+    desk.check(found["active"] != "channel-compose-text", f"Yes left the focus in the box: {found}")
+    desk.check(len(posted(api)) == sent, f"discarding sent: {posted(api)[sent:]}")
+    keyboard(desk, False)
+    desk.notes.append(f"raw at {desk.width}px: the box resting on the keys, the wheel revealing Send raw message, "
+                      "Cancel and Send whole, a ticked send posting raw and unticking, Cancel asking and Yes clearing")
 
 
 def ios_place(desk: Desk) -> Json:
@@ -571,9 +672,10 @@ def ios_place(desk: Desk) -> Json:
     found = desk.page.evaluate("""() => {
         const v = window.visualViewport, area = document.getElementById('scroll-area');
         const box = document.getElementById('channel-compose-text').getBoundingClientRect();
+        const send = document.getElementById('channel-send').getBoundingClientRect();
         const list = area.getBoundingClientRect();
         return {said: document.documentElement.getAttribute('data-keyboard'), top: v.offsetTop,
-            keys: v.offsetTop + v.height, boxTop: box.top, boxBottom: box.bottom, listBottom: list.bottom,
+            keys: v.offsetTop + v.height, boxTop: box.top, boxBottom: box.bottom, sendBottom: send.bottom, listBottom: list.bottom,
             scroll: area.scrollTop, furthest: area.scrollHeight - area.clientHeight,
             room: getComputedStyle(document.documentElement).getPropertyValue('--keyboard-inset').trim(),
             bar: document.getElementById('control-bar').getClientRects().length > 0,
@@ -593,6 +695,27 @@ def ios_flush(desk: Desk, found: Json, when: str, *, above: float = 0) -> None:
                f"{when}: the box's foot is {number(found, 'boxBottom') - number(found, 'keys'):.0f}px from the "
                f"keyboard's top: {found}")
     desk.check(number(found, "boxTop") >= number(found, "top"), f"{when}: the box's top is above the screen: {found}")
+
+
+def ios_row_flush(desk: Desk, found: Json, when: str) -> None:
+    """`#1135 raw-message-page`: at the list's very end the row under the box, not the box, stands on
+    the visual viewport's foot, the box whole above it."""
+    desk.check(found["said"] == "open", f"{when}: the page did not hear the keyboard: {found}")
+    gap = number(found, "keys") - number(found, "sendBottom")
+    desk.check(-1 <= gap <= FOOT_SLACK_PX,
+               f"{when}: the row's foot is {number(found, 'sendBottom') - number(found, 'keys'):.0f}px from the "
+               f"keyboard's top at the list's end: {found}")
+    desk.check(number(found, "boxTop") >= number(found, "top"), f"{when}: the box's top is above the screen: {found}")
+    desk.check(number(found, "boxBottom") < number(found, "keys"), f"{when}: the box is under the keys at the end: {found}")
+
+
+def wait_ios_row(desk: Desk, why: str) -> None:
+    """Wait until the row stands where `ios_row_flush` will hold it, by the same measurements."""
+    desk.wait_for("() => { const v = window.visualViewport; "
+                  "const s = document.getElementById('channel-send').getBoundingClientRect(); "
+                  f"const gap = v.offsetTop + v.height - s.bottom; "
+                  f"return document.documentElement.getAttribute('data-keyboard') === 'open' && gap >= -1 && gap <= {FOOT_SLACK_PX}; }}",
+                  why)
 
 
 def wait_ios_flush(desk: Desk, why: str, *, above: float = 0) -> None:
@@ -655,17 +778,18 @@ def ios_walk(desk: Desk, api: ReplyColumnsApi) -> None:
     desk.check(abs(number(after, "scroll") - number(up, "scroll")) <= 1,
                f"a pan after the reader scrolled took them back to the box: {up} -> {after}")
     desk.check(after["room"] == room, f"the room under the box changed as the viewport panned: {room} -> {after}")
-    # Back down: the list's end is the box on the keys, as wherever the page goes to the foot (a send).
+    # Back down: the list's end is the row under the box on the keys (`#1135 raw-message-page`), as
+    # wherever the page goes to the foot (a send); the box stands whole above it.
     page.evaluate(f"() => window.__iosPan({IOS_PAN_PX})")
     wheel(desk, 2000)
     down = ios_place(desk)
     desk.check(number(down, "scroll") >= number(down, "furthest") - 1, f"the reader's wheel did not reach the end: {down}")
-    ios_flush(desk, down, "scrolled back to the end", above=END_PADDING_PX)
+    ios_row_flush(desk, down, "scrolled back to the end")
     page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop -= 400; a.scrollTop = a.scrollHeight; }")
-    wait_ios_flush(desk, "sent to the foot by the page: the box's foot is not on the keyboard's top", above=END_PADDING_PX)
-    ios_flush(desk, ios_place(desk), "sent to the foot by the page", above=END_PADDING_PX)
+    wait_ios_row(desk, "sent to the foot by the page: the row's foot is not on the keyboard's top")
+    ios_row_flush(desk, ios_place(desk), "sent to the foot by the page")
     desk.shot("3-ios-back-at-the-end")
-    # A message sent with the keyboard's own key: the page goes to the newest, and the box stays on the keys.
+    # A message sent with the keyboard's own key: the page goes to the newest, the row on the keys.
     before = len(posted(api))
     page.keyboard.type("from the phone")
     page.keyboard.press("Enter")
@@ -674,8 +798,8 @@ def ios_walk(desk: Desk, api: ReplyColumnsApi) -> None:
             break
         page.wait_for_timeout(100)
     desk.check(posted(api)[before:] == ["from the phone"], f"the keyboard's Enter did not send: {posted(api)[before:]}")
-    wait_ios_flush(desk, "after a send: the box's foot is not on the keyboard's top", above=END_PADDING_PX)
-    ios_flush(desk, ios_place(desk), "after a send", above=END_PADDING_PX)
+    wait_ios_row(desk, "after a send: the row's foot is not on the keyboard's top")
+    ios_row_flush(desk, ios_place(desk), "after a send")
     desk.shot("4-ios-after-send")
     page.evaluate("() => window.__iosClose()")
     page.evaluate("() => document.activeElement && document.activeElement.blur()")
@@ -703,8 +827,9 @@ def ios_walk(desk: Desk, api: ReplyColumnsApi) -> None:
     page.evaluate("() => document.activeElement && document.activeElement.blur()")
     desk.settled()
     desk.notes.append(f"Safari's way: the box's foot on the visual viewport's foot as the keyboard comes up and after a "
-                      f"{IOS_PAN_PX}px pan, with {room} of room, as the list's end; the reader's wheel goes up and back down "
-                      "to it, and a pan after that moves nothing; with innerHeight leaving out the keyboard it lands on the keys too")
+                      f"{IOS_PAN_PX}px pan, with {room} of room; the reader's wheel goes up and back down to the list's "
+                      "end, where the row under the box stands on the keys, and a pan after that moves nothing; with "
+                      "innerHeight leaving out the keyboard it lands on the keys too")
 
 
 def desk_walk(desk: Desk) -> None:
