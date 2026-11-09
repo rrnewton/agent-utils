@@ -164,9 +164,25 @@ if [[ "$TOOL" == "wrkviz" && -n "${WRKVIZ_ENGINE:-}" ]]; then
     WRKVIZ_OPTIN="1"
 fi
 
+# herdr-subagents edition-switch opt-in (#545 herdr-subagents-port):
+# HERDR_SUBAGENTS_ENGINE is the per-tool trial switch for the Rust edition
+# growing in rs/agentctl (foreign module). It wins over the generic
+# overrides for this tool only, and it bypasses the mirror-state guard
+# below: the Rust edition is not yet a parity mirror, it is an explicit
+# opt-in whose covered commands run at parity and whose remaining
+# commands refuse by name. Unset or empty keeps the Python primary. The
+# default flips only by changing validation/editions.json, never by this
+# variable becoming common.
+SUBAGENTS_OPTIN=""
+if [[ "$TOOL" == "herdr-subagents" && -n "${HERDR_SUBAGENTS_ENGINE:-}" ]]; then
+    ENGINE="$HERDR_SUBAGENTS_ENGINE"
+    ENGINE_VAR="HERDR_SUBAGENTS_ENGINE"
+    SUBAGENTS_OPTIN="1"
+fi
+
 # An explicit request for the mirror edition is honoured only at parity. A paused, archived, or
 # absent mirror refuses by name and state instead of silently running stale code.
-if [[ -z "$WRKSLOTS_OPTIN" && -z "$WRKVIZ_OPTIN" && -n "$ENGINE_VAR" && -n "$ED_PRIMARY" && -n "$ED_MIRROR_STATE" ]]; then
+if [[ -z "$WRKSLOTS_OPTIN" && -z "$WRKVIZ_OPTIN" && -z "$SUBAGENTS_OPTIN" && -n "$ENGINE_VAR" && -n "$ED_PRIMARY" && -n "$ED_MIRROR_STATE" ]]; then
     case "$ENGINE" in
         python|py) REQUESTED="python" ;;
         rust|rs) REQUESTED="rust" ;;

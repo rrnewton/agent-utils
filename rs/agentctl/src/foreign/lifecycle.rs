@@ -733,6 +733,376 @@ pub fn terminate_runner_at(
     Ok(stopped || harness_stopped)
 }
 
+/// Whether the recorded tmux window exists (missing binary means no window).
+fn tmux_target_exists(target: &str) -> bool {
+    let Some((session, name)) = target.split_once(':') else {
+        return false;
+    };
+    if session.is_empty() || name.is_empty() {
+        return false;
+    }
+    let output = std::process::Command::new("tmux")
+        .args([
+            "list-windows",
+            "-t",
+            &format!("={session}"),
+            "-F",
+            "#{window_name}",
+        ])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line == name),
+        _ => false,
+    }
+}
+
+/// Whether the recorded presentation exists (headless backends only here).
+pub fn window_exists(record: &AgentRecord) -> bool {
+    if record.mode == "tui" {
+        return false;
+    }
+    if record.backend == "tmux" {
+        return tmux_target_exists(&record.tmux_target);
+    }
+    if record.tmux_target.is_empty() {
+        return false;
+    }
+    // Herdr presentation probing arrives with its presentation slice;
+    // a recorded target with no probe is not positive evidence.
+    false
+}
+
+/// True if the agent was created so recently its runner may not have recorded
+/// its pid yet — do not reap it as dead in that window.
+pub fn within_startup_grace(record: &AgentRecord) -> bool {
+    if record.runner_pid.is_some() {
+        return false;
+    }
+    let Ok(created) = chrono::DateTime::parse_from_rfc3339(&record.created_at) else {
+        return false;
+    };
+    let age = chrono::Local::now().signed_duration_since(created.with_timezone(&chrono::Local));
+    age.num_seconds() < 20
+}
+
+/// Require a registered agent whose runner still names the same process.
+pub fn require_live_agent_at(
+    base: &Path,
+    proc_root: &Path,
+    name: &str,
+) -> Result<AgentRecord, ForeignOwnershipError> {
+    let name = super::registry::require_valid_name(name)?;
+    let registry = super::registry::read_registry_at(base)?;
+    let Some(record) = registry.get(name).cloned() else {
+        return Err(ForeignOwnershipError {
+            code: "unknown_agent",
+            message: format!("unknown agent '{name}'; run subagent_status to list live agents"),
+        });
+    };
+    if record.mode == "tui" {
+        return Err(ForeignOwnershipError {
+            code: "tui_not_yet_in_rust",
+            message: format!(
+                "agent '{name}' runs in TUI mode, which this edition does not operate yet"
+            ),
+        });
+    }
+    if runner_identity_alive_at(proc_root, &record)? {
+        return Ok(record);
+    }
+    if record.runner_pid.is_none() && within_startup_grace(&record) && window_exists(&record) {
+        return Ok(record);
+    }
+    if record.runner_pid.is_none() {
+        return Err(ForeignOwnershipError {
+            code: "dead_runner",
+            message: format!("agent '{name}' has no runner pid after startup grace"),
+        });
+    }
+    Err(ForeignOwnershipError {
+        code: "dead_runner",
+        message: format!(
+            "agent '{name}' runner pid {} is not alive or was reused",
+            record.runner_pid.unwrap_or_default()
+        ),
+    })
+}
+
+/// Queued turn identity and transcript location returned by a send.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SendResult {
+    /// Agent name.
+    pub name: String,
+    /// Allocated sequence number.
+    pub seq: i64,
+    /// Per-turn model override.
+    pub model: Option<String>,
+    /// Transcript location (display string).
+    pub transcript: String,
+    /// Worker mode.
+    pub mode: String,
+    /// Herdr pane owning an interactive TUI.
+    pub presentation_pane: Option<String>,
+    /// Earlier sequences quarantined during TUI delivery.
+    pub quarantined: Vec<i64>,
+}
+
+/// Queue a prompt for a live headless worker (its next turn).
+pub fn send_message_to_agent_at(
+    base: &Path,
+    proc_root: &Path,
+    name: &str,
+    text: &str,
+    model: Option<&str>,
+) -> Result<SendResult, ForeignOwnershipError> {
+    if text.is_empty() {
+        return Err(ForeignOwnershipError {
+            code: "empty_message",
+            message: "message must not be empty".to_string(),
+        });
+    }
+    let record = require_live_agent_at(base, proc_root, name)?;
+    let seq = enqueue_message_at(base, name, text, model)?;
+    Ok(SendResult {
+        name: record.name.clone(),
+        seq,
+        model: model.map(str::to_owned),
+        transcript: transcript_path_at(base, name)?.display().to_string(),
+        mode: record.mode.clone(),
+        presentation_pane: record.presentation_pane.clone(),
+        quarantined: Vec::new(),
+    })
+}
+
+/// Result of clearing a live agent's harness conversation context.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResetResult {
+    /// Agent name.
+    pub name: String,
+    /// Session id before the reset.
+    pub previous_session_id: Option<String>,
+    /// Transcript location (display string).
+    pub transcript: String,
+}
+
+fn new_uuid4() -> String {
+    let mut bytes = [0_u8; 16];
+    let filled = std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut bytes))
+        .is_ok();
+    if !filled {
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = ((ns >> ((index % 8) * 8)) & 0xff) as u8;
+        }
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    )
+}
+
+/// Clear one idle headless agent's harness session without disturbing its warm slot.
+pub fn reset_agent_context_at(
+    base: &Path,
+    name: &str,
+) -> Result<ResetResult, ForeignOwnershipError> {
+    let name = super::registry::require_valid_name(name)?.to_string();
+    let transcript_file = transcript_path_at(base, &name)?;
+    let previous = with_registry_lock_at(base, |agents| {
+        let Some(record) = agents.get_mut(&name) else {
+            return Err(ForeignOwnershipError {
+                code: "unknown_agent",
+                message: format!("unknown agent '{name}'"),
+            });
+        };
+        if record.mode == "tui" {
+            return Err(ForeignOwnershipError {
+                code: "tui_reset_unsupported",
+                message: "interactive TUI context is owned by its visible Codex process; use /new or /resume in that tab".to_string(),
+            });
+        }
+        if record.status == "busy" || pending_count_at(base, &name)? > 0 {
+            return Err(ForeignOwnershipError {
+                code: "agent_busy",
+                message: format!(
+                    "agent '{name}' has an active or queued turn; reset it at an idle task boundary"
+                ),
+            });
+        }
+        let previous = record.session_id.clone();
+        record.session_id = if record.harness == "muse" {
+            Some(new_uuid4())
+        } else {
+            None
+        };
+        if let Some(parent) = transcript_file.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| io_error("create transcript dir", parent, &error))?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&transcript_file)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, b"=== CONTEXT RESET ===\n"))
+            .map_err(|error| io_error("append reset marker", &transcript_file, &error))?;
+        Ok(previous)
+    })?;
+    Ok(ResetResult {
+        name,
+        previous_session_id: previous,
+        transcript: transcript_file.display().to_string(),
+    })
+}
+
+/// Worker output with its requested read mode.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadResult {
+    /// Agent name.
+    pub name: String,
+    /// Requested read mode.
+    pub mode: String,
+    /// Output text.
+    pub text: String,
+}
+
+/// Read durable headless turn output, rejecting unsupported boundaries.
+/// TUI scrollback arrives with its presentation slice and refuses by name.
+pub fn read_agent_output_at(
+    base: &Path,
+    name: &str,
+    mode: &str,
+    since_turn: Option<i64>,
+    tail: Option<i64>,
+) -> Result<ReadResult, ForeignOwnershipError> {
+    let bad = |message: &str| ForeignOwnershipError {
+        code: "bad_read_mode",
+        message: message.to_string(),
+    };
+    if !matches!(mode, "all" | "last" | "since_turn" | "tail") {
+        return Err(bad("mode must be one of: all, last, since_turn, tail"));
+    }
+    if mode == "since_turn" && since_turn.is_none() {
+        return Err(bad("since_turn mode requires since_turn"));
+    }
+    if mode == "tail" && tail.is_none() {
+        return Err(bad("tail mode requires tail"));
+    }
+    let name = super::registry::require_valid_name(name)?;
+    let registry = super::registry::read_registry_at(base)?;
+    if let Some(record) = registry.get(name) {
+        if record.mode == "tui" {
+            if record.presentation_pane.is_none() {
+                return Err(ForeignOwnershipError {
+                    code: "tui_pane_missing",
+                    message: format!("TUI agent '{name}' has no recorded Herdr pane"),
+                });
+            }
+            if since_turn.is_some() {
+                return Err(ForeignOwnershipError {
+                    code: "tui_since_turn_unsupported",
+                    message: format!(
+                        "TUI agent '{name}' has no durable turn-boundary capture; since_turn cannot be honored for an interactive TUI backend. Use mode=\"tail\" (optionally with an explicit `tail` line count) instead."
+                    ),
+                });
+            }
+            if mode == "last" {
+                return Err(ForeignOwnershipError {
+                    code: "tui_last_unsupported",
+                    message: format!(
+                        "TUI agent '{name}' cannot identify \"the last answer\" distinctly from scrollback; mode=\"last\" is not supported for an interactive TUI backend. Use mode=\"tail\" (optionally with an explicit `tail` line count) instead."
+                    ),
+                });
+            }
+            return Err(ForeignOwnershipError {
+                code: "tui_read_not_ported",
+                message: format!(
+                    "reading TUI agent '{name}' scrollback is not yet in this edition"
+                ),
+            });
+        }
+    }
+    let transcript_file = transcript_path_at(base, name)?;
+    if !registry.contains_key(name) && !transcript_file.exists() {
+        return Err(ForeignOwnershipError {
+            code: "unknown_agent",
+            message: format!("unknown agent '{name}' and no archived transcript"),
+        });
+    }
+    let no_transcript = |code: &'static str| ForeignOwnershipError {
+        code,
+        message: format!("no transcript yet for '{name}'"),
+    };
+    let text = match mode {
+        "last" => {
+            let path = last_message_path_at(base, name)?;
+            if !path.exists() {
+                return Err(ForeignOwnershipError {
+                    code: "no_completed_turn",
+                    message: format!("no completed turn yet for '{name}' (no last-message.txt)"),
+                });
+            }
+            std::fs::read_to_string(&path).map_err(|e| io_error("read last message", &path, &e))?
+        }
+        "since_turn" => {
+            let since = since_turn.unwrap_or_default();
+            if !transcript_file.exists() {
+                return Err(no_transcript("no_transcript"));
+            }
+            let content = std::fs::read_to_string(&transcript_file)
+                .map_err(|e| io_error("read transcript", &transcript_file, &e))?;
+            let marker = format!("===TURN {since} START");
+            let lines: Vec<&str> = content.lines().collect();
+            match lines.iter().position(|line| line.starts_with(&marker)) {
+                Some(index) => format!("{}\n", lines[index..].join("\n")),
+                None => {
+                    return Err(ForeignOwnershipError {
+                        code: "turn_not_found",
+                        message: format!("turn {since} not found in '{name}' transcript"),
+                    })
+                }
+            }
+        }
+        "tail" => {
+            let tail = tail.unwrap_or_default();
+            if tail < 0 {
+                return Err(bad("tail must be non-negative"));
+            }
+            if !transcript_file.exists() {
+                return Err(no_transcript("no_transcript"));
+            }
+            let content = std::fs::read_to_string(&transcript_file)
+                .map_err(|e| io_error("read transcript", &transcript_file, &e))?;
+            let lines: Vec<&str> = content.lines().collect();
+            let selected: &[&str] = if tail == 0 {
+                &[]
+            } else {
+                &lines[lines.len().saturating_sub(tail as usize)..]
+            };
+            format!("{}\n", selected.join("\n"))
+        }
+        _ => {
+            if !transcript_file.exists() {
+                return Err(no_transcript("no_transcript"));
+            }
+            std::fs::read_to_string(&transcript_file)
+                .map_err(|e| io_error("read transcript", &transcript_file, &e))?
+        }
+    };
+    Ok(ReadResult {
+        name: name.to_string(),
+        mode: mode.to_string(),
+        text,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

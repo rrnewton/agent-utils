@@ -39,5 +39,9 @@ path = "src/main.rs"
 name = "herdr-agent"
 path = "src/legacy_main.rs"
 
+[[bin]]
+name = "herdr-subagents"
+path = "src/herdr_subagents_main.rs"
+
 [lints]
 workspace = true

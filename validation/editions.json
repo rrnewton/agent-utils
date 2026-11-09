@@ -90,9 +90,9 @@
         "state": "absent"
       },
       "parity_check": null,
-      "rust_entrypoint": null,
+      "rust_entrypoint": "rs/bin/herdr-subagents",
       "python_entrypoint": "py/bin/herdr-subagents",
-      "note": "Headless foreign-harness workers; the Rust agentctl refuses headless workers with a pointer to this Python edition."
+      "note": "Headless foreign-harness workers; the Rust edition is an explicit HERDR_SUBAGENTS_ENGINE opt-in whose covered commands run at parity and whose remaining commands refuse by name. The Rust agentctl refuses headless workers with a pointer to this edition."
     },
     {
       "name": "parallel-experiment-runner",

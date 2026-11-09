@@ -12,7 +12,9 @@
 //! in [`ownership`] and the runner dispatch core in [`runner`]. No CLI
 //! wiring yet.
 
+pub mod cli;
 pub mod daemon;
+pub mod help_texts;
 pub mod lifecycle;
 pub mod ownership;
 pub mod procstat;

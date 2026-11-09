@@ -39,6 +39,7 @@
         "rs/agentctl/",
         "rs/bin/agentctl",
         "rs/bin/herdr-agent",
+        "rs/bin/herdr-subagents",
         "rs/chat-subscription-fake/",
         "rs/chat-subscription-plugin/",
         "rs/chat-subscription-slack/",

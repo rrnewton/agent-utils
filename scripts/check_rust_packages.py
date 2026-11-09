@@ -70,8 +70,9 @@ CRATES: tuple[Crate, ...] = (
         (("herdr-run", "src/embedded_userguide.md"),),
     ),
     Crate(
-        "agentctl", ("agentctl", "herdr-agent"), "agentctl",
-        (("agentctl", "src/embedded_userguide.md"), ("herdr-agent", "src/embedded_agent_userguide.md")),
+        "agentctl", ("agentctl", "herdr-agent", "herdr-subagents"), "agentctl",
+        (("agentctl", "src/embedded_userguide.md"), ("herdr-agent", "src/embedded_agent_userguide.md"),
+         ("herdr-subagents", "src/embedded_userguide.md")),
         ("src/embedded_quickstart.md", "src/embedded_agentctl_skill.md"),
     ),
 )

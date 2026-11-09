@@ -13,6 +13,7 @@ use std::io::Write as _;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -1284,6 +1285,259 @@ pub fn with_registry_lock_at<T>(
     let value = operation(lock.agents_mut())?;
     lock.save()?;
     Ok(value)
+}
+
+/// Supported harness identifiers.
+pub const SUPPORTED_HARNESSES: [&str; 3] = ["codex", "agy", "muse"];
+/// The default harness.
+pub const DEFAULT_HARNESS: &str = "codex";
+
+/// Return a supported harness identifier or a structured operation error.
+pub fn require_supported_harness(harness: &str) -> Result<&str, ForeignOwnershipError> {
+    if SUPPORTED_HARNESSES.contains(&harness) {
+        Ok(harness)
+    } else {
+        Err(registry_error(
+            "unsupported_harness",
+            format!(
+                "unsupported harness {}; supported harnesses: {}",
+                python_repr(harness),
+                SUPPORTED_HARNESSES.join(", ")
+            ),
+        ))
+    }
+}
+
+/// The persisted default-backend config (`BASE/backend.json`).
+pub fn backend_config_path(base: &Path) -> PathBuf {
+    base.join("backend.json")
+}
+
+/// The versioned, checkout-wide subagent defaults path
+/// (`$HERDR_SUBAGENTS_PROJECT_DEFAULTS`, else `BASE/project_defaults.json`).
+pub fn project_defaults_path(base: &Path) -> PathBuf {
+    match std::env::var("HERDR_SUBAGENTS_PROJECT_DEFAULTS") {
+        Ok(path) if !path.is_empty() => {
+            expand_home(PathBuf::from(path), std::env::var_os("HOME").as_deref())
+        }
+        _ => base.join("project_defaults.json"),
+    }
+}
+
+fn load_json_object(
+    path: &Path,
+    code: &'static str,
+    label: &str,
+) -> Result<serde_json::Map<String, Value>, ForeignOwnershipError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(serde_json::Map::new())
+        }
+        Err(error) => return Err(registry_io(&format!("read {label}"), path, &error)),
+    };
+    let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+        registry_error(
+            code,
+            format!("{label} {} is not valid JSON: {error}", path.display()),
+        )
+    })?;
+    value.as_object().cloned().ok_or_else(|| {
+        registry_error(
+            code,
+            format!("{label} {} must contain a JSON object", path.display()),
+        )
+    })
+}
+
+fn load_backend_config_at(
+    base: &Path,
+) -> Result<serde_json::Map<String, Value>, ForeignOwnershipError> {
+    load_json_object(
+        &backend_config_path(base),
+        "backend_config_invalid",
+        "backend config",
+    )
+}
+
+fn load_project_defaults_at(
+    base: &Path,
+) -> Result<serde_json::Map<String, Value>, ForeignOwnershipError> {
+    load_json_object(
+        &project_defaults_path(base),
+        "project_defaults_invalid",
+        "project defaults",
+    )
+}
+
+fn run_bounded(argv: &[String], timeout: Duration) -> Option<std::process::Output> {
+    let mut child = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// True only when the configured Herdr socket answers a status request.
+pub fn herdr_available() -> bool {
+    let herdr_bin = std::env::var("HERDR_BIN").unwrap_or_else(|_| "herdr".to_string());
+    let found = Path::new(&herdr_bin).is_file()
+        || std::env::var_os("PATH").is_some_and(|paths| {
+            std::env::split_paths(&paths).any(|dir| dir.join(&herdr_bin).is_file())
+        });
+    if !found {
+        return false;
+    }
+    run_bounded(&[herdr_bin, "status".to_string()], Duration::from_secs(3)).is_some_and(|output| {
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout).contains("status: running")
+    })
+}
+
+fn auto_detect_backend_at(base: &Path) -> Result<String, ForeignOwnershipError> {
+    if let Ok(policy_path) = std::env::var("HERDR_SUBAGENTS_POLICY") {
+        if !policy_path.is_empty() {
+            // Consumer policies are dynamic-language modules the Rust
+            // edition cannot load; refuse rather than silently ignore one.
+            let resolved = expand_home(
+                PathBuf::from(&policy_path),
+                std::env::var_os("HOME").as_deref(),
+            );
+            return Err(registry_error(
+                "policy_invalid",
+                format!(
+                    "cannot load subagent policy {}: dynamic policy modules are not supported by this edition",
+                    resolved.display()
+                ),
+            ));
+        }
+    }
+    let _ = base;
+    let socket = std::env::var("HERDR_SOCKET_PATH").unwrap_or_default();
+    if std::env::var_os("HERDR_ENV").is_some()
+        && !socket.is_empty()
+        && Path::new(&socket).exists()
+        && herdr_available()
+    {
+        return Ok("herdr".to_string());
+    }
+    Ok("tmux".to_string())
+}
+
+/// Resolve backend with call argument, environment, config, then detection.
+pub fn selected_backend_at(
+    base: &Path,
+    explicit: Option<&str>,
+) -> Result<String, ForeignOwnershipError> {
+    if let Some(explicit) = explicit {
+        return Ok(require_supported_backend(explicit)?.to_string());
+    }
+    if let Ok(env_backend) = std::env::var("SUBAGENTS_BACKEND") {
+        return Ok(require_supported_backend(&env_backend)?.to_string());
+    }
+    if let Some(configured) = load_backend_config_at(base)?.get("backend").cloned() {
+        let Some(configured) = configured.as_str() else {
+            return Err(registry_error(
+                "backend_config_invalid",
+                format!(
+                    "backend config {} has a non-string backend",
+                    backend_config_path(base).display()
+                ),
+            ));
+        };
+        return Ok(require_supported_backend(configured)?.to_string());
+    }
+    auto_detect_backend_at(base)
+}
+
+/// The selected backend under the default foreign base.
+pub fn selected_backend(explicit: Option<&str>) -> Result<String, ForeignOwnershipError> {
+    selected_backend_at(&foreign_base(), explicit)
+}
+
+/// Persist the chosen backend for subsequent commands using this state directory.
+pub fn set_default_backend_at(base: &Path, backend: &str) -> Result<String, ForeignOwnershipError> {
+    let backend = require_supported_backend(backend)?.to_string();
+    let mut config = load_backend_config_at(base)?;
+    config.insert("backend".into(), Value::String(backend.clone()));
+    std::fs::create_dir_all(base).map_err(|error| registry_io("create", base, &error))?;
+    write_durable_json(&backend_config_path(base), &Value::Object(config))
+        .map_err(|error| registry_io("write backend config", &backend_config_path(base), &error))?;
+    Ok(backend)
+}
+
+/// Resolve mode: per-agent argument, environment, project, then headless.
+/// Returns the mode plus a warning to print when a configured TUI fell back.
+pub fn selected_mode_at(
+    base: &Path,
+    harness: &str,
+    explicit: Option<&str>,
+    backend: Option<&str>,
+) -> Result<(String, Option<String>), ForeignOwnershipError> {
+    let harness = require_supported_harness(harness)?;
+    if let Some(explicit) = explicit {
+        return Ok((require_supported_mode(explicit)?.to_string(), None));
+    }
+    let source: String;
+    let mode = if let Ok(env_mode) = std::env::var("SUBAGENTS_MODE") {
+        source = "SUBAGENTS_MODE".to_string();
+        require_supported_mode(&env_mode)?.to_string()
+    } else {
+        let defaults = load_project_defaults_at(base)?;
+        let Some(configured_modes) = defaults.get("harness_modes") else {
+            return Ok((HEADLESS_MODE.to_string(), None));
+        };
+        let Some(configured_modes) = configured_modes.as_object() else {
+            return Err(registry_error(
+                "project_defaults_invalid",
+                format!(
+                    "project defaults {} has a non-object harness_modes",
+                    project_defaults_path(base).display()
+                ),
+            ));
+        };
+        let Some(configured) = configured_modes.get(harness) else {
+            return Ok((HEADLESS_MODE.to_string(), None));
+        };
+        let Some(configured) = configured.as_str() else {
+            return Err(registry_error(
+                "project_defaults_invalid",
+                format!(
+                    "project defaults {} has a non-string mode for {}",
+                    project_defaults_path(base).display(),
+                    python_repr(harness)
+                ),
+            ));
+        };
+        source = format!("project default for {harness}");
+        require_supported_mode(configured)?.to_string()
+    };
+    let resolved_backend = selected_backend_at(base, backend)?;
+    if mode == TUI_MODE && resolved_backend != "herdr" {
+        return Ok((
+            HEADLESS_MODE.to_string(),
+            Some(format!(
+                "warning: {source} selected mode 'tui', but backend '{resolved_backend}' does not support it; using 'headless'"
+            )),
+        ));
+    }
+    Ok((mode, None))
 }
 
 #[cfg(test)]
