@@ -1279,6 +1279,35 @@ pass listing unrepaired findings it has not reported in the last hour.
 `--once` runs a single pass and exits 0 when every check passed, 1 otherwise;
 `--check-only` repairs, remounts, and sends nothing.
 
+Watch settings read on every pass live in `REGISTRY/watch.json` (schema
+`agentctl-watch/v1`): `duties`, `herdr_unit`, `timers`,
+`bare_shell_grace_seconds` (default 600), and `close_bare_shells` (default
+true). The same keys in `restore.json` still work as a fallback with a
+warning naming `watch.json`; a key set in both files is refused naming both
+paths. `restore.json` is read once per boot by `restore`, which ignores
+`watch.json`; it still gives watch its `coordinator` and `units`. Each duty
+— `notify`, `status_requests`, `tab_hygiene`, `unit_repair`, `herdr`,
+`slot_images`, `restore_check`, `queue_drain` — defaults on, exactly as
+before duties existed. An off duty is `skipped-by-config` in every pass
+(including `--check-only`), never healthy and never repaired or alerted;
+`status_requests` is owned by the notifier (`watch-agents`) in this phase
+and gates nothing watch itself does yet. `--duty NAME=on|off` (repeatable)
+overrides config for one run; an unknown duty name is refused. For example,
+`--duty unit_repair=off` keeps tab hygiene and notices while never
+restarting an owner-managed bridge unit (units and timers). `health.json`
+includes the effective `duties`, and a config-level `half-duty` warning
+names a missing `unit_repair`/`notify` half with its remedy; unit presence
+is not probed for that warning.
+
+```json
+{
+  "schema": "agentctl-watch/v1",
+  "duties": {"unit_repair": false},
+  "herdr_unit": "herdr-server.service",
+  "timers": [{"unit": "health-tick.timer", "max_age_seconds": 5400}]
+}
+```
+
 ### Refresh long-running services onto a compiled build (Rust edition)
 
 A chat bridge (`chat run`), the agent watcher (`watch-agents`), and a headless

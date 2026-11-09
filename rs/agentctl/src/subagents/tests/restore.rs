@@ -3023,3 +3023,184 @@ fn a_claude_transcript_verdict_needs_a_real_configuration_directory() {
     assert_eq!(verdict(&[empty, full], "/w", "s-1"), Some(true));
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn watch_unit_repair_off_skips_units_but_still_drains_queues() {
+    // #1145 Phase 1: unit_repair off never starts/resets a unit, hygiene-adjacent
+    // queue drain still runs, and the duty is skipped-by-config.
+    let fixture = Fixture::new();
+    fixture
+        .client
+        .fresh_presentations
+        .store(true, Ordering::Relaxed);
+    fixture
+        .manager()
+        .start(
+            "lane",
+            &fixture.root,
+            StartOptions {
+                harness: "codex".to_owned(),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    fixture
+        .manager()
+        .queue_identified("lane", "queued while idle", None, Some("duty-1"))
+        .unwrap();
+    let host = ScriptedHost::new();
+    host.answer("show bridge.service", 0, "ActiveState=inactive\n", "");
+    let mut cfg = config(&fixture, None);
+    cfg.duties.apply_override("unit_repair=off").unwrap();
+    let findings = watch_pass(&fixture, &host, &cfg);
+    assert!(
+        findings.iter().any(|r| r["check"] == "duty"
+            && r["subject"] == "unit_repair"
+            && r["skipped"] == "skipped-by-config"),
+        "{findings:?}"
+    );
+    assert!(
+        findings
+            .iter()
+            .all(|r| r["check"] != "unit" && r["check"] != "timer"),
+        "{findings:?}"
+    );
+    assert!(!changed_anything(&host), "{:?}", host.commands());
+    assert!(
+        host.commands()
+            .iter()
+            .all(|c| !c.contains("show bridge.service")),
+        "{:?}",
+        host.commands()
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|r| r["check"] == "herdr" && r["ok"] == true),
+        "{findings:?}"
+    );
+    assert!(
+        fixture
+            .manager()
+            .pending_prompts("lane")
+            .unwrap()
+            .is_empty(),
+        "queue still drained"
+    );
+    // half-duty detection: notify on, unit_repair off
+    assert!(
+        findings.iter().any(|r| r["check"] == "duties"
+            && r["warning"] == "half-duty"
+            && r["detail"].as_str().unwrap().contains("unit_repair")),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn watch_duties_each_off_skips_only_its_block() {
+    // Each duty off independently: skipped row present, herdr row present unless herdr off.
+    for duty in ["herdr", "slot_images", "restore_check", "queue_drain"] {
+        let fixture = Fixture::new();
+        let host = ScriptedHost::new();
+        host.answer("show bridge.service", 0, "ActiveState=active\n", "");
+        let mut cfg = config(&fixture, Some("coordinator"));
+        cfg.duties.apply_override(&format!("{duty}=off")).unwrap();
+        let findings = watch_pass(&fixture, &host, &cfg);
+        assert!(
+            findings.iter().any(|r| r["check"] == "duty"
+                && r["subject"] == duty
+                && r["skipped"] == "skipped-by-config"),
+            "{duty}: {findings:?}"
+        );
+        match duty {
+            "herdr" => assert!(
+                findings.iter().all(|r| r["check"] != "herdr"),
+                "{findings:?}"
+            ),
+            "restore_check" => assert!(
+                findings.iter().all(|r| r["check"] != "restore"),
+                "{findings:?}"
+            ),
+            "queue_drain" => assert!(
+                findings.iter().all(|r| r["check"] != "queue"),
+                "{findings:?}"
+            ),
+            _ => assert!(
+                findings.iter().all(|r| r["check"] != "slot-images"),
+                "{findings:?}"
+            ),
+        }
+        if duty != "herdr" {
+            assert!(
+                findings.iter().any(|r| r["check"] == "herdr"),
+                "{duty}: {findings:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn watch_notify_off_and_tab_hygiene_off_report_skipped_in_health() {
+    let fixture = Fixture::new();
+    fixture
+        .manager()
+        .start(
+            "coordinator",
+            &fixture.root,
+            StartOptions {
+                harness: "claude".to_owned(),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let host = ScriptedHost::new();
+    host.answer("show bridge.service", 0, "ActiveState=active\n", "");
+    let mut cfg = config(&fixture, Some("coordinator"));
+    cfg.duties.apply_override("notify=off").unwrap();
+    cfg.duties.apply_override("tab_hygiene=off").unwrap();
+    cfg.duties.apply_override("status_requests=off").unwrap();
+    let health = crate::restore::watch(
+        &fixture.client,
+        &fixture.root.join("registry"),
+        &host,
+        &cfg,
+        &WatchOptions {
+            interval: Duration::from_secs(60),
+            once: true,
+            check_only: true,
+            wrkslots: None,
+            state_dir: Some(fixture.root.join("watch")),
+            queue_stale: Duration::from_secs(600),
+        },
+    )
+    .unwrap();
+    assert_eq!(health["duties"]["notify"], false, "{health}");
+    assert_eq!(health["duties"]["unit_repair"], true, "{health}");
+    for duty in ["notify", "tab_hygiene", "status_requests"] {
+        assert!(
+            health["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["check"] == "duty"
+                    && r["subject"] == duty
+                    && r["skipped"] == "skipped-by-config"),
+            "{duty}: {health}"
+        );
+    }
+    assert_eq!(health["notice"]["sent"], false);
+    assert!(
+        health["notice"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("notify"),
+        "{health}"
+    );
+    let sq = health["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["subject"] == "status_requests")
+        .unwrap();
+    assert!(sq["detail"].as_str().unwrap().contains("notifier"), "{sq}");
+}

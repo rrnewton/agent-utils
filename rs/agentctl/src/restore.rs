@@ -28,7 +28,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -42,6 +42,148 @@ pub const CONFIG_FILE: &str = "restore.json";
 pub const CONFIG_SCHEMA: &str = "agentctl-restore/v1";
 /// Schema of the per-boot report.
 pub const REPORT_SCHEMA: &str = "agentctl-restore-report/v1";
+/// Watch settings file inside the registry, read on every watch pass (#1145).
+pub const WATCH_CONFIG_FILE: &str = "watch.json";
+/// Schema of the watch configuration.
+pub const WATCH_CONFIG_SCHEMA: &str = "agentctl-watch/v1";
+/// Keys whose home is `watch.json`; still read from `restore.json` as fallback.
+pub const WATCH_KEYS: [&str; 5] = [
+    "duties",
+    "herdr_unit",
+    "timers",
+    "bare_shell_grace_seconds",
+    "close_bare_shells",
+];
+/// Per-duty switches for `agentctl watch` (#1145 Phase 1).
+pub const DUTY_NAMES: [&str; 8] = [
+    "notify",
+    "status_requests",
+    "tab_hygiene",
+    "unit_repair",
+    "herdr",
+    "slot_images",
+    "restore_check",
+    "queue_drain",
+];
+
+/// Parse one `--duty NAME=on|off` override; unknown names refused.
+pub fn parse_duty_override(spec: &str) -> Result<(String, bool)> {
+    let (name, value) = spec
+        .split_once('=')
+        .ok_or_else(|| fail(format!("duty override {spec:?} is not NAME=on|off")))?;
+    if !DUTY_NAMES.contains(&name) {
+        return Err(fail(format!(
+            "unknown duty {name:?}; duties are {}",
+            DUTY_NAMES.join(", ")
+        )));
+    }
+    match value {
+        "on" => Ok((name.to_owned(), true)),
+        "off" => Ok((name.to_owned(), false)),
+        _ => Err(fail(format!(
+            "duty override {spec:?}: value must be on or off"
+        ))),
+    }
+}
+
+/// Watch duties, each defaulting on (today's behaviour). Unknown keys refused.
+/// `status_requests` is accepted but owned by the notifier (`watch-agents`) in
+/// Phase 1: it gates nothing `watch` itself does yet.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchDuties {
+    /// Coordinator alerting about unrepaired findings.
+    #[serde(default = "default_true")]
+    pub notify: bool,
+    /// Status-request pages; notifier-owned in Phase 1 (see type docs).
+    #[serde(default = "default_true")]
+    pub status_requests: bool,
+    /// Canonical tab order and bare-shell closing.
+    #[serde(default = "default_true")]
+    pub tab_hygiene: bool,
+    /// Reset/start configured units and restart/start timers.
+    #[serde(default = "default_true")]
+    pub unit_repair: bool,
+    /// Herdr server check and start of `herdr_unit`.
+    #[serde(default = "default_true")]
+    pub herdr: bool,
+    /// Slot image status/remount.
+    #[serde(default = "default_true")]
+    pub slot_images: bool,
+    /// This boot's restore report check.
+    #[serde(default = "default_true")]
+    pub restore_check: bool,
+    /// Typing queued prompts and stale-queue findings.
+    #[serde(default = "default_true")]
+    pub queue_drain: bool,
+}
+impl Default for WatchDuties {
+    fn default() -> Self {
+        Self {
+            notify: true,
+            status_requests: true,
+            tab_hygiene: true,
+            unit_repair: true,
+            herdr: true,
+            slot_images: true,
+            restore_check: true,
+            queue_drain: true,
+        }
+    }
+}
+impl WatchDuties {
+    /// Whether duty `name` is on.
+    pub fn enabled(&self, name: &str) -> bool {
+        match name {
+            "notify" => self.notify,
+            "status_requests" => self.status_requests,
+            "tab_hygiene" => self.tab_hygiene,
+            "unit_repair" => self.unit_repair,
+            "herdr" => self.herdr,
+            "slot_images" => self.slot_images,
+            "restore_check" => self.restore_check,
+            "queue_drain" => self.queue_drain,
+            _ => false,
+        }
+    }
+    /// Apply one `NAME=on|off` override.
+    pub fn apply_override(&mut self, spec: &str) -> Result<()> {
+        let (name, on) = parse_duty_override(spec)?;
+        match name.as_str() {
+            "notify" => self.notify = on,
+            "status_requests" => self.status_requests = on,
+            "tab_hygiene" => self.tab_hygiene = on,
+            "unit_repair" => self.unit_repair = on,
+            "herdr" => self.herdr = on,
+            "slot_images" => self.slot_images = on,
+            "restore_check" => self.restore_check = on,
+            "queue_drain" => self.queue_drain = on,
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+    /// Duties as a JSON object for `health.json`.
+    pub fn as_json(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
+
+/// `<registry>/watch.json` (schema `agentctl-watch/v1`).
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct WatchFile {
+    schema: String,
+    #[serde(default)]
+    duties: Option<WatchDuties>,
+    #[serde(default)]
+    herdr_unit: Option<String>,
+    #[serde(default)]
+    timers: Option<Vec<TimerWatch>>,
+    #[serde(default)]
+    bare_shell_grace_seconds: Option<u64>,
+    #[serde(default)]
+    close_bare_shells: Option<bool>,
+}
 
 type Result<T> = std::result::Result<T, AgentError>;
 
@@ -197,6 +339,9 @@ pub struct RestoreConfig {
     /// exactly as before this key existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_brief: Option<String>,
+    /// Watch duties (#1145 Phase 1); home is `watch.json`, read here as fallback.
+    #[serde(default)]
+    pub duties: WatchDuties,
     /// Top-level keys this build does not know, named in a warning and otherwise ignored.
     #[serde(flatten)]
     pub(crate) unknown: UnknownKeys,
@@ -227,6 +372,86 @@ impl RestoreConfig {
             );
         }
         config.validate(&path)?;
+        Ok(config)
+    }
+
+    /// Effective configuration for `agentctl watch`: `restore.json` plus
+    /// `watch.json` (#1145). `watch.json` wins per key; a watch key set in both
+    /// files is refused naming both paths; keys only in `restore.json` still
+    /// work with one warning naming `watch.json` as their home. `restore`
+    /// itself uses [`Self::load`] and ignores `watch.json`.
+    pub fn load_for_watch(registry: &Path) -> Result<Self> {
+        let restore_path = registry.join(CONFIG_FILE);
+        let watch_path = registry.join(WATCH_CONFIG_FILE);
+        let keys_in = |path: &Path| -> Vec<&'static str> {
+            let Ok(text) = fs::read_to_string(path) else {
+                return Vec::new();
+            };
+            let Ok(doc) = serde_json::from_str::<Value>(&text) else {
+                return Vec::new();
+            };
+            WATCH_KEYS
+                .iter()
+                .copied()
+                .filter(|k| doc.get(*k).is_some())
+                .collect()
+        };
+        let restore_keys = keys_in(&restore_path);
+        let mut config = Self::load(registry)?;
+        let watch_text = match fs::read_to_string(&watch_path) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(fail(format!("cannot read {}: {e}", watch_path.display()))),
+        };
+        let Some(watch_text) = watch_text else {
+            if !restore_keys.is_empty() {
+                eprintln!("agentctl: warning: watch settings ({}) are in {}; their home is now {} (schema {WATCH_CONFIG_SCHEMA}); move them there", restore_keys.join(", "), restore_path.display(), watch_path.display());
+            }
+            return Ok(config);
+        };
+        let watch_keys = keys_in(&watch_path);
+        for key in &watch_keys {
+            if restore_keys.contains(key) {
+                return Err(fail(format!("{key} is set in both {} and {}; keep it in one file ({WATCH_CONFIG_FILE} is its home)", watch_path.display(), restore_path.display())));
+            }
+        }
+        if !restore_keys.is_empty() {
+            eprintln!("agentctl: warning: watch settings ({}) are in {}; their home is now {} (schema {WATCH_CONFIG_SCHEMA}); move them there", restore_keys.join(", "), restore_path.display(), watch_path.display());
+        }
+        let watch: WatchFile = serde_json::from_str(&watch_text)
+            .map_err(|e| fail(format!("invalid {}: {e}", watch_path.display())))?;
+        if watch.schema != WATCH_CONFIG_SCHEMA {
+            return Err(fail(format!(
+                "invalid {} (schema must be {WATCH_CONFIG_SCHEMA})",
+                watch_path.display()
+            )));
+        }
+        // Presence comes from the raw document, so an explicit null/absent
+        // distinction for herdr_unit is not needed: Some in file wins.
+        if watch_keys.contains(&"duties") {
+            if let Some(d) = watch.duties {
+                config.duties = d;
+            }
+        }
+        if watch_keys.contains(&"herdr_unit") {
+            config.herdr_unit = watch.herdr_unit;
+        }
+        if watch_keys.contains(&"timers") {
+            if let Some(t) = watch.timers {
+                config.timers = t;
+            }
+        }
+        if watch_keys.contains(&"bare_shell_grace_seconds") {
+            if let Some(v) = watch.bare_shell_grace_seconds {
+                config.bare_shell_grace_seconds = v;
+            }
+        }
+        if watch_keys.contains(&"close_bare_shells") {
+            if let Some(v) = watch.close_bare_shells {
+                config.close_bare_shells = v;
+            }
+        }
+        config.validate(&watch_path)?;
         Ok(config)
     }
 
@@ -308,6 +533,7 @@ impl RestoreConfig {
             bare_shell_grace_seconds: default_bare_shell_grace(),
             close_bare_shells: default_true(),
             resume_brief: None,
+            duties: WatchDuties::default(),
             unknown: UnknownKeys::default(),
         }
     }
@@ -2634,6 +2860,29 @@ fn unchecked(check: &str, subject: &str, reason: impl Into<String>, repair: Valu
     })
 }
 
+/// A duty switched off by config/flag (#1145): never healthy, never repaired,
+/// never alerted (`ok` null, excluded from the health `ok` roll-up).
+fn skipped(duty: &str) -> Value {
+    let extra = if duty == "status_requests" {
+        "; status_requests is owned by the notifier (watch-agents) in Phase 1 and gates nothing watch itself does yet"
+    } else {
+        ""
+    };
+    json!({"check": "duty", "subject": duty, "ok": Value::Null, "skipped": "skipped-by-config",
+        "detail": format!("skipped-by-config: duty {duty} is off{extra}"), "repair": Value::Null})
+}
+fn ensure_skipped(findings: &mut Vec<Value>, duties: &WatchDuties) {
+    for duty in DUTY_NAMES {
+        if !duties.enabled(duty)
+            && !findings
+                .iter()
+                .any(|r| r["check"] == "duty" && r["subject"] == duty)
+        {
+            findings.push(skipped(duty));
+        }
+    }
+}
+
 /// Parse `systemctl show --timestamp=unix` `KEY=VALUE` lines.
 fn properties(text: &str) -> BTreeMap<String, String> {
     text.lines()
@@ -2940,8 +3189,13 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
     timer_repaired_at: &mut BTreeMap<String, f64>,
 ) -> Vec<Value> {
     let mut findings = Vec::new();
+    let duties = &config.duties;
+    // `herdr_up` is still probed when the herdr duty is off: queue_drain and
+    // the coordinator check need to know, but nothing is started or reported.
     let herdr_up = client.panes().is_ok();
-    if herdr_up {
+    if !duties.herdr {
+        findings.push(skipped("herdr"));
+    } else if herdr_up {
         findings.push(finding("herdr", "server", true, "answers", Value::Null));
     } else {
         let repair = config.herdr_unit.as_deref().filter(|_| !options.check_only).map(|unit| {
@@ -2961,117 +3215,122 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
             repair.unwrap_or(Value::Null),
         ));
     }
-    for unit in &config.units {
-        let state = match active_state(host, unit) {
-            Err(reason) => {
-                findings.push(unchecked("unit", unit, reason, Value::Null));
-                continue;
-            }
-            Ok(state) if state == "active" => {
-                findings.push(finding("unit", unit, true, "active", Value::Null));
-                continue;
-            }
-            Ok(state) => state,
-        };
-        // A unit that is activating or reloading, or a manager mid-reload, settles in seconds.
-        host.sleep(SYSTEMCTL_RETRY_DELAY);
-        let state = match active_state(host, unit) {
-            Err(reason) => {
-                findings.push(unchecked(
-                    "unit",
-                    unit,
-                    format!("{unit} was {state}, then {reason}"),
-                    Value::Null,
-                ));
-                continue;
-            }
-            Ok(now) if now == "active" => {
+    if !duties.unit_repair {
+        findings.push(skipped("unit_repair"));
+    } else {
+        for unit in &config.units {
+            let state = match active_state(host, unit) {
+                Err(reason) => {
+                    findings.push(unchecked("unit", unit, reason, Value::Null));
+                    continue;
+                }
+                Ok(state) if state == "active" => {
+                    findings.push(finding("unit", unit, true, "active", Value::Null));
+                    continue;
+                }
+                Ok(state) => state,
+            };
+            // A unit that is activating or reloading, or a manager mid-reload, settles in seconds.
+            host.sleep(SYSTEMCTL_RETRY_DELAY);
+            let state = match active_state(host, unit) {
+                Err(reason) => {
+                    findings.push(unchecked(
+                        "unit",
+                        unit,
+                        format!("{unit} was {state}, then {reason}"),
+                        Value::Null,
+                    ));
+                    continue;
+                }
+                Ok(now) if now == "active" => {
+                    findings.push(finding(
+                        "unit",
+                        unit,
+                        true,
+                        format!(
+                            "active ({state} {}s earlier)",
+                            SYSTEMCTL_RETRY_DELAY.as_secs()
+                        ),
+                        Value::Null,
+                    ));
+                    continue;
+                }
+                Ok(now) => now,
+            };
+            if options.check_only {
                 findings.push(finding(
                     "unit",
                     unit,
-                    true,
-                    format!(
-                        "active ({state} {}s earlier)",
-                        SYSTEMCTL_RETRY_DELAY.as_secs()
-                    ),
+                    false,
+                    format!("not active ({state})"),
                     Value::Null,
                 ));
                 continue;
             }
-            Ok(now) => now,
-        };
-        if options.check_only {
-            findings.push(finding(
-                "unit",
-                unit,
-                false,
-                format!("not active ({state})"),
-                Value::Null,
-            ));
-            continue;
+            let _ = systemctl(host, "reset-failed", unit);
+            let started = systemctl(host, "start", unit);
+            let repair = json!({"action": format!("systemctl --user reset-failed {unit} && systemctl --user start {unit}"), "status": started.status});
+            findings.push(match active_state(host, unit) {
+                Ok(now) if now == "active" => {
+                    finding("unit", unit, true, format!("was {state}; started"), repair)
+                }
+                Ok(now) => finding(
+                    "unit",
+                    unit,
+                    false,
+                    format!("not active ({now}): {}", started.stderr.trim()),
+                    repair,
+                ),
+                Err(reason) => unchecked(
+                    "unit",
+                    unit,
+                    format!("{unit} was {state} and was started, then {reason}"),
+                    repair,
+                ),
+            });
         }
-        let _ = systemctl(host, "reset-failed", unit);
-        let started = systemctl(host, "start", unit);
-        let repair = json!({"action": format!("systemctl --user reset-failed {unit} && systemctl --user start {unit}"), "status": started.status});
-        findings.push(match active_state(host, unit) {
-            Ok(now) if now == "active" => {
-                finding("unit", unit, true, format!("was {state}; started"), repair)
-            }
-            Ok(now) => finding(
-                "unit",
-                unit,
-                false,
-                format!("not active ({now}): {}", started.stderr.trim()),
-                repair,
-            ),
-            Err(reason) => unchecked(
-                "unit",
-                unit,
-                format!("{unit} was {state} and was started, then {reason}"),
-                repair,
-            ),
-        });
-    }
-    for timer in &config.timers {
-        let problem = match timer_problem(host, timer) {
-            Err(reason) => {
-                findings.push(unchecked("timer", &timer.unit, reason, Value::Null));
+        for timer in &config.timers {
+            let problem = match timer_problem(host, timer) {
+                Err(reason) => {
+                    findings.push(unchecked("timer", &timer.unit, reason, Value::Null));
+                    continue;
+                }
+                Ok(None) => {
+                    findings.push(match service_failure(host, timer) {
+                        Err(reason) => unchecked("timer", &timer.unit, reason, Value::Null),
+                        Ok(Some(failure)) => {
+                            finding("timer", &timer.unit, false, failure, Value::Null)
+                        }
+                        Ok(None) => finding(
+                            "timer",
+                            &timer.unit,
+                            true,
+                            "keeps its schedule",
+                            Value::Null,
+                        ),
+                    });
+                    continue;
+                }
+                Ok(Some(problem)) => problem,
+            };
+            if options.check_only {
+                findings.push(finding(
+                    "timer",
+                    &timer.unit,
+                    false,
+                    problem.detail.clone(),
+                    Value::Null,
+                ));
                 continue;
             }
-            Ok(None) => {
-                findings.push(match service_failure(host, timer) {
-                    Err(reason) => unchecked("timer", &timer.unit, reason, Value::Null),
-                    Ok(Some(failure)) => finding("timer", &timer.unit, false, failure, Value::Null),
-                    Ok(None) => finding(
-                        "timer",
-                        &timer.unit,
-                        true,
-                        "keeps its schedule",
-                        Value::Null,
-                    ),
-                });
-                continue;
-            }
-            Ok(Some(problem)) => problem,
-        };
-        if options.check_only {
-            findings.push(finding(
-                "timer",
-                &timer.unit,
-                false,
-                problem.detail.clone(),
-                Value::Null,
-            ));
-            continue;
-        }
-        // One repair per timer per max_age window (#961): after a start, the service's
-        // success timestamp has a full window to move before the timer is kicked again, and
-        // a timer that has never run gets exactly one start, not one per pass.
-        if let Some(last_repair) = timer_repaired_at
-            .get(&timer.unit)
-            .filter(|last| host.now() - *last < timer.max_age_seconds as f64)
-        {
-            let mut row = finding(
+            // One repair per timer per max_age window (#961): after a start, the service's
+            // success timestamp has a full window to move before the timer is kicked again, and
+            // a timer that has never run gets exactly one start, not one per pass.
+            if let Some(last_repair) = timer_repaired_at
+                .get(&timer.unit)
+                .filter(|last| host.now() - *last < timer.max_age_seconds as f64)
+            {
+                let mut row = finding(
                 "timer",
                 &timer.unit,
                 false,
@@ -3083,79 +3342,84 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
                 ),
                 Value::Null,
             );
-            row["cooldown"] = json!(true);
-            findings.push(row);
-            continue;
-        }
-        timer_repaired_at.insert(timer.unit.clone(), host.now());
-        let mut repair: Vec<String> = Vec::new();
-        match problem.kind {
-            TimerProblemKind::ScheduleBroken => {
-                let _ = systemctl(host, "restart", &timer.unit);
-                repair.push(format!("systemctl --user restart {}", timer.unit));
+                row["cooldown"] = json!(true);
+                findings.push(row);
+                continue;
             }
-            TimerProblemKind::Stale => match triggered_service(host, timer) {
-                Ok(Some(service)) => {
-                    let _ = systemctl(host, "start", &service);
-                    repair.push(format!("systemctl --user start {service}"));
-                }
-                _ => {
+            timer_repaired_at.insert(timer.unit.clone(), host.now());
+            let mut repair: Vec<String> = Vec::new();
+            match problem.kind {
+                TimerProblemKind::ScheduleBroken => {
                     let _ = systemctl(host, "restart", &timer.unit);
                     repair.push(format!("systemctl --user restart {}", timer.unit));
                 }
-            },
-        }
-        let mut remaining = timer_problem(host, timer);
-        if problem.kind == TimerProblemKind::ScheduleBroken && matches!(remaining, Ok(Some(_))) {
-            // A timer whose only trigger counts from its service's last run has no base until
-            // that service runs once in this service manager.
-            if let Ok(triggers) = show(host, &timer.unit, &["Triggers"]) {
-                if let Some(service) = triggers.get("Triggers").filter(|value| unit_name(value)) {
-                    let _ = systemctl(host, "start", service);
-                    repair.push(format!("systemctl --user start {service}"));
-                    remaining = timer_problem(host, timer);
+                TimerProblemKind::Stale => match triggered_service(host, timer) {
+                    Ok(Some(service)) => {
+                        let _ = systemctl(host, "start", &service);
+                        repair.push(format!("systemctl --user start {service}"));
+                    }
+                    _ => {
+                        let _ = systemctl(host, "restart", &timer.unit);
+                        repair.push(format!("systemctl --user restart {}", timer.unit));
+                    }
+                },
+            }
+            let mut remaining = timer_problem(host, timer);
+            if problem.kind == TimerProblemKind::ScheduleBroken && matches!(remaining, Ok(Some(_)))
+            {
+                // A timer whose only trigger counts from its service's last run has no base until
+                // that service runs once in this service manager.
+                if let Ok(triggers) = show(host, &timer.unit, &["Triggers"]) {
+                    if let Some(service) = triggers.get("Triggers").filter(|value| unit_name(value))
+                    {
+                        let _ = systemctl(host, "start", service);
+                        repair.push(format!("systemctl --user start {service}"));
+                        remaining = timer_problem(host, timer);
+                    }
                 }
             }
-        }
-        let remaining = match remaining {
-            Ok(None) => service_failure(host, timer).map(|failure| {
-                failure.map(|detail| TimerProblem {
-                    detail,
-                    kind: TimerProblemKind::Stale,
-                })
-            }),
-            other => other,
-        };
-        findings.push(match remaining {
-            Ok(None) => finding(
-                "timer",
-                &timer.unit,
-                true,
-                format!("{}; repaired", problem.detail),
-                json!({"actions": repair}),
-            ),
-            Ok(Some(still)) => finding(
-                "timer",
-                &timer.unit,
-                false,
-                still.detail,
-                json!({"actions": repair}),
-            ),
-            Err(reason) => unchecked(
-                "timer",
-                &timer.unit,
-                format!(
-                    "{}; repaired with {}, then {reason}",
-                    problem.detail,
-                    repair.join(" && ")
+            let remaining = match remaining {
+                Ok(None) => service_failure(host, timer).map(|failure| {
+                    failure.map(|detail| TimerProblem {
+                        detail,
+                        kind: TimerProblemKind::Stale,
+                    })
+                }),
+                other => other,
+            };
+            findings.push(match remaining {
+                Ok(None) => finding(
+                    "timer",
+                    &timer.unit,
+                    true,
+                    format!("{}; repaired", problem.detail),
+                    json!({"actions": repair}),
                 ),
-                json!({"actions": repair}),
-            ),
-        });
+                Ok(Some(still)) => finding(
+                    "timer",
+                    &timer.unit,
+                    false,
+                    still.detail,
+                    json!({"actions": repair}),
+                ),
+                Err(reason) => unchecked(
+                    "timer",
+                    &timer.unit,
+                    format!(
+                        "{}; repaired with {}, then {reason}",
+                        problem.detail,
+                        repair.join(" && ")
+                    ),
+                    json!({"actions": repair}),
+                ),
+            });
+        }
     }
     let project = registry.parent().unwrap_or(registry);
     // Any wrkslots command remounts, so a check-only pass leaves slot images alone.
-    if let Some(wrkslots) = options.wrkslots.as_deref().filter(|_| !options.check_only) {
+    if !duties.slot_images {
+        findings.push(skipped("slot_images"));
+    } else if let Some(wrkslots) = options.wrkslots.as_deref().filter(|_| !options.check_only) {
         let images = remount_slot_images(host, Some(wrkslots), project);
         let ok = images["action"] == "ran";
         findings.push(finding(
@@ -3166,7 +3430,9 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
             images,
         ));
     }
-    if let Ok(boot_id) = host.boot_id() {
+    if !duties.restore_check {
+        findings.push(skipped("restore_check"));
+    } else if let Ok(boot_id) = host.boot_id() {
         let complete = read_boot_report(registry, config, &boot_id)
             .is_some_and(|(_path, report)| report["complete"] == true);
         let early = host
@@ -3192,6 +3458,11 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
     // queue-only prompt is typed by this pass — at once for an idle agent, at the
     // next tool boundary for a working Muse or Claude Code agent — and one
     // still pending past the stale threshold is a finding naming its age.
+    // The re-pin inside is record maintenance, not a duty; only typing/stale
+    // reporting (the drain loop) is gated by queue_drain.
+    if !duties.queue_drain {
+        findings.push(skipped("queue_drain"));
+    }
     if herdr_up {
         if let Ok(manager) = ManagedAgents::new(client, registry) {
             // R1b on the watch pass too: a harness hand-restarted in its
@@ -3211,7 +3482,11 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
                 }
             }
             let now_millis = (host.now() * 1000.0) as u64;
-            for row in manager.drain_pending(options.queue_stale, options.check_only, now_millis) {
+            for row in if duties.queue_drain {
+                manager.drain_pending(options.queue_stale, options.check_only, now_millis)
+            } else {
+                Vec::new()
+            } {
                 let name = row["name"].as_str().unwrap_or("?").to_owned();
                 let age = row["oldest_seconds"]
                     .as_u64()
@@ -3264,6 +3539,18 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
                 Value::Null,
             ));
         }
+    }
+    // Half-duty detection (#1145, config-level only in Phase 1: unit presence
+    // is not probed beyond what the blocks above already query).
+    if !(duties.unit_repair && duties.notify) {
+        let missing: Vec<&str> = ["unit_repair", "notify"]
+            .into_iter()
+            .filter(|d| !duties.enabled(d))
+            .collect();
+        findings.push(json!({"check": "duties", "subject": "repair-notify-pair", "ok": Value::Null,
+            "warning": "half-duty",
+            "detail": format!("repair-notify pair incomplete: missing {} (config-level check; unit presence not probed); remedy: set the missing duty true under duties in {WATCH_CONFIG_FILE} or pass --duty NAME=on", missing.join(", ")),
+            "repair": Value::Null}));
     }
     findings
 }
@@ -3645,7 +3932,7 @@ pub fn watch<A: ManagedApi + ?Sized>(
         // close unclaimed bare shells idle past the grace period, and keep
         // managed workspaces' tabs in canonical order. Best-effort; a
         // failure is a finding, never a watch failure.
-        if !pass_options.check_only {
+        if !pass_options.check_only && config.duties.tab_hygiene {
             findings.extend(hygiene_pass(
                 client,
                 registry,
@@ -3655,7 +3942,10 @@ pub fn watch<A: ManagedApi + ?Sized>(
                 &mut closed_bare_shells,
             ));
         }
-        let notice = if options.check_only {
+        ensure_skipped(&mut findings, &config.duties);
+        let notice = if !config.duties.notify {
+            json!({"sent": false, "reason": "notify duty off (skipped-by-config)"})
+        } else if options.check_only {
             json!({"sent": false, "reason": "check only"})
         } else {
             alert(client, registry, config, host, &findings, &mut alerted)
@@ -3695,7 +3985,8 @@ pub fn watch<A: ManagedApi + ?Sized>(
             "schema": "agentctl-watch-health/v1",
             "checked_at": host.now(),
             "boot_id": host.boot_id().ok(),
-            "ok": findings.iter().all(|row| row["ok"] == true),
+            "duties": config.duties.as_json(),
+            "ok": findings.iter().filter(|row| row.get("skipped").is_none()).all(|row| row["ok"] == true),
             "warnings": warnings,
             "findings": findings,
             "notice": notice,
@@ -3978,5 +4269,84 @@ mod tests {
         .unwrap();
         assert_eq!(config.unknown_paths(), ["scheduled[0].surprise"]);
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn watch_json_loads_precedence_conflict_and_fallback() {
+        let dir = std::env::temp_dir().join(format!("watch-json-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Fallback: settings only in restore.json.
+        fs::write(dir.join("restore.json"), r#"{"schema":"agentctl-restore/v1","coordinator":"coordinator","herdr_unit":"a.service","timers":[{"unit":"t.timer","max_age_seconds":60}],"duties":{"notify":false}}"#).unwrap();
+        let cfg = RestoreConfig::load_for_watch(&dir).unwrap();
+        assert_eq!(cfg.herdr_unit.as_deref(), Some("a.service"));
+        assert!(!cfg.duties.notify && cfg.duties.unit_repair);
+        assert_eq!(
+            RestoreConfig::load(&dir).unwrap().herdr_unit.as_deref(),
+            Some("a.service")
+        );
+        // Precedence: watch.json disjoint keys win; restore keys stay.
+        fs::write(dir.join("watch.json"), r#"{"schema":"agentctl-watch/v1","bare_shell_grace_seconds":7,"close_bare_shells":false}"#).unwrap();
+        let cfg = RestoreConfig::load_for_watch(&dir).unwrap();
+        assert_eq!(cfg.bare_shell_grace_seconds, 7);
+        assert!(!cfg.close_bare_shells);
+        assert_eq!(
+            cfg.herdr_unit.as_deref(),
+            Some("a.service"),
+            "restore fallback per key"
+        );
+        // Restore command ignores watch.json.
+        assert_eq!(
+            RestoreConfig::load(&dir).unwrap().bare_shell_grace_seconds,
+            600
+        );
+        // Both-files refusal naming both paths.
+        fs::write(
+            dir.join("watch.json"),
+            r#"{"schema":"agentctl-watch/v1","herdr_unit":"b.service"}"#,
+        )
+        .unwrap();
+        let err = RestoreConfig::load_for_watch(&dir).unwrap_err().to_string();
+        assert!(
+            err.contains("watch.json")
+                && err.contains("restore.json")
+                && err.contains("herdr_unit"),
+            "{err}"
+        );
+        // Unknown duty refused in either file; unknown flag refused.
+        fs::remove_file(dir.join("watch.json")).unwrap();
+        fs::write(
+            dir.join("restore.json"),
+            r#"{"schema":"agentctl-restore/v1","duties":{"bogus":true}}"#,
+        )
+        .unwrap();
+        assert!(RestoreConfig::load(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("bogus"));
+        fs::write(
+            dir.join("restore.json"),
+            r#"{"schema":"agentctl-restore/v1"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join("watch.json"),
+            r#"{"schema":"agentctl-watch/v1","duties":{"nope":false}}"#,
+        )
+        .unwrap();
+        assert!(RestoreConfig::load_for_watch(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("nope"));
+        assert!(parse_duty_override("bogus=off").is_err());
+        assert!(parse_duty_override("unit_repair=maybe").is_err());
+        assert_eq!(
+            parse_duty_override("unit_repair=off").unwrap(),
+            ("unit_repair".to_owned(), false)
+        );
+        let mut duties = WatchDuties::default();
+        duties.apply_override("unit_repair=off").unwrap();
+        assert!(!duties.unit_repair && duties.notify);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
