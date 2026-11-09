@@ -1,10 +1,11 @@
 ---
 title: 'wrkslots-census-churn-tolerant: one process-use census semantics for both editions, tolerant of vanished PIDs, never blind to appearing ones'
 status: open
-priority: 2
+priority: 1
 issue_type: bug
 created_at: 2026-11-09T00:17:46.000000000+00:00
-updated_at: 2026-11-09T00:17:46.000000000+00:00
+updated_at: 2026-11-09T01:03:25.000000000+00:00
+assignee: cl-wrkid
 ---
 
 # Description
@@ -13,6 +14,18 @@ The two editions prove "no process uses this slot path" differently, and the dif
 
 - Python (`_capture_process_path_census`, and the remove-path scans behind `_assert_slot_unused`) is strict: three attempts in one fixed wall budget (60 s for the audit census, 30 s for a remove scan) that never resets, and an attempt is discarded when any live process's /proc entries change mid-walk. On a loaded host it refuses, and every row or removal that needed it fails closed: audit rows become UNKNOWN, removals refuse. Gate logs on both hosts show it under load averages of 100-235 ("relevant process evidence changed during three liveness attempts", "the /proc scan before the path fence exceeded its 30-second bound"); it is the shared cause of #1084 audit-census-reserve-flake and #1091 audit-lock-free-row-flake, and of the remove/reclaim/recover test flakes in the same shards. Real audits and removals on a busy host fail the same way.
 - Rust (`capture_process_snapshot`, rs/wrkslotsd/src/remove_write.rs) lists /proc once, reads each listed PID, and silently skips entries that vanish. It never refuses for churn, but a process that appears after the listing is never seen: it can report a slot unused while a new process works in it. That is fail-open.
+
+Until this lands, audit's DELETABLE is ADVISORY under load: nothing removes on audit alone (wrkslots remove re-checks slot use itself, below), and no automation may treat DELETABLE as proof that a slot is unused.
+
+Scope (the lead, 2026-11-08): P1; the appearing-PID half first, in BOTH editions; one owner (cl-wrkid) for the Python census and the Rust snapshot. Covers every slot-use check, not only audit:
+
+| Path | Python | Rust | What closes the appearing-PID window today |
+|---|---|---|---|
+| audit | `_capture_process_path_census` once, then `census.assert_slot_unused` per row | `capture_process_snapshot` once per audit | nothing: one listing, so a PID that appears after it is missed (DELETABLE is advisory) |
+| remove / reclaim (ordinary) | `_assert_slot_unused`: lsof (one kernel-wide pass, same listing window) plus a direct /proc scan (`proc_root.iterdir()`), before the path fence; the fence renames the slot; the same check again after the fence (`_finish_remove_paths`, `after_fence=True`) | `assert_slot_unused` = one `capture_process_snapshot` before the fence (remove_write.rs ~1762) and one after it (~2094); no lsof | the fence plus the after-fence check: a process that appeared between the two checks is listed by the second; one that enters only by the old path cannot after the rename. Still open: a process that appears after the after-fence listing holding a descriptor it inherited from a listed process that exited (the vanished parent is tolerated, the appearing child is not listed) |
+| remove-validate-batch, private cleanup recovery (`_recover_finish`), frozen terminal removal | private-cleanup fence (mode 0700, identity) FIRST, then `_capture_process_path_census` (shared census) and, for frozen removal, a fresh same-UID census | not ported | the private fence stops entry by path before the census lists; the inherited-descriptor case above stays open |
+
+No path removes on a census alone without a fence, but every fenced path still rests on a single listing per check, so the fix applies to all of them: the shared census (audit and batch paths), the direct /proc scan in `_observe_slot_use_once`, the same-UID census, and Rust's `capture_process_snapshot` (audit and remove).
 
 # Design
 
