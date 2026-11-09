@@ -7,7 +7,7 @@ Description=Restore the agentctl coordinator team after boot
 Requires=herdr-server.service
 After=herdr-server.service
 # A refused restore (exit 75, temporary failure) retries a bounded number of
-# times instead of giving up for the boot (#7 boot-restore-retry).
+# times instead of giving up for the boot (#975 boot-restore-retry).
 StartLimitIntervalSec=1800
 StartLimitBurst=5
 
@@ -18,6 +18,9 @@ ExecStart=@AGENTCTL@ --registry @REGISTRY@ --herdr-bin @HERDR@ restore --boot
 TimeoutStartSec=1800
 Restart=on-failure
 RestartSec=60
+# Exit 74 means the restore completed except for refused lanes named in the
+# report; retrying cannot revive them, so it counts as success (#948).
+SuccessExitStatus=74
 StandardOutput=journal
 StandardError=journal
 

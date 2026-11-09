@@ -1075,8 +1075,10 @@ record instead. A dry run never completes; its `would_complete` says whether the
 same run would.
 
 The report is `REPORT_DIR/BOOT_ID.json` (default
-`$XDG_STATE_HOME/agentctl/restore`). Exit status is 0 when the restore completed
-with no refusal, 75 otherwise. `--boot` marks the report as the boot unit's run.
+`REGISTRY/restore-reports`). Exit status is 0 when the restore completed
+with no refusal, 74 when it completed except for refused lanes (named in
+`refused_lanes`; not a failure a boot unit should retry), 75 otherwise.
+`--boot` marks the report as the boot unit's run.
 
 The configuration is `REGISTRY/restore.json`; every key is optional except the
 schema. A key it does not know, at the top or inside an `also_registered`,

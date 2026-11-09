@@ -161,7 +161,7 @@ pub struct RestoreConfig {
     /// Seconds to wait for the Herdr server (default 300).
     #[serde(default = "default_herdr_wait")]
     pub herdr_wait_seconds: u64,
-    /// Directory for per-boot reports (default `$XDG_STATE_HOME/agentctl/restore`).
+    /// Directory for per-boot reports (default `REGISTRY/restore-reports`).
     #[serde(default)]
     pub report_dir: Option<PathBuf>,
     /// The unit that runs the Herdr server, which the watch starts when Herdr is down.
@@ -563,7 +563,13 @@ pub struct RestoreOptions {
     pub herdr_bin: PathBuf,
 }
 
-/// The default report directory: `$XDG_STATE_HOME/agentctl/restore`, else under the home.
+/// The XDG state report directory: `$XDG_STATE_HOME/agentctl/restore`, else under
+/// the home. New reports default to the registry's own `restore-reports/` instead
+/// (#975 boot-restore-retry: one host state directory shared by every registry made
+/// two teams' same-boot reports overwrite each other, and the boot evidence belonged
+/// with the registry it describes); this location is still read so a report written
+/// by an older build in the same boot counts, and the watch/health state paths are
+/// derived from its parent.
 pub fn default_report_dir() -> Option<PathBuf> {
     std::env::var_os("XDG_STATE_HOME")
         .filter(|value| !value.is_empty())
@@ -577,15 +583,43 @@ pub fn default_report_dir() -> Option<PathBuf> {
         .map(|state| state.join("agentctl/restore"))
 }
 
-fn report_path(config: &RestoreConfig, boot_id: &str) -> Result<PathBuf> {
+fn report_path(registry: &Path, config: &RestoreConfig, boot_id: &str) -> PathBuf {
     let directory = config
         .report_dir
         .clone()
-        .or_else(default_report_dir)
-        .ok_or_else(|| {
-            fail("no report directory: set report_dir in restore.json, XDG_STATE_HOME, or HOME")
-        })?;
-    Ok(directory.join(format!("{boot_id}.json")))
+        .unwrap_or_else(|| registry.join("restore-reports"));
+    directory.join(format!("{boot_id}.json"))
+}
+
+/// Where a report for this boot may already live under the pre-#975 default.
+/// An explicit `report_dir` names the one location, so there is no fallback read.
+fn legacy_report_path(config: &RestoreConfig, boot_id: &str) -> Option<PathBuf> {
+    if config.report_dir.is_some() {
+        return None;
+    }
+    default_report_dir().map(|directory| directory.join(format!("{boot_id}.json")))
+}
+
+fn read_boot_report_from(primary: &Path, legacy: Option<&Path>) -> Option<(PathBuf, Value)> {
+    if let Some(report) = read_report(primary) {
+        return Some((primary.to_path_buf(), report));
+    }
+    let legacy = legacy?;
+    read_report(legacy).map(|report| (legacy.to_path_buf(), report))
+}
+
+/// This boot's existing report and where it was found: the current location
+/// first, then the XDG state one, so a same-boot report from an older build
+/// still satisfies the already-restored and watch checks.
+fn read_boot_report(
+    registry: &Path,
+    config: &RestoreConfig,
+    boot_id: &str,
+) -> Option<(PathBuf, Value)> {
+    read_boot_report_from(
+        &report_path(registry, config, boot_id),
+        legacy_report_path(config, boot_id).as_deref(),
+    )
 }
 
 /// Read a previous report for this boot, if one exists and parses.
@@ -628,6 +662,18 @@ fn write_report(path: &Path, report: &Value) -> Result<()> {
         .map_err(|error| fail(format!("cannot write {}: {error}", temporary.display())))?;
     fs::rename(&temporary, path)
         .map_err(|error| fail(format!("cannot publish {}: {error}", path.display())))
+}
+
+/// Best-effort evidence for a restore that failed before its final report
+/// (#975: at boot the journal may be unreadable, so this file is the only
+/// record of why nothing came back). Never marks the boot complete, so the
+/// already-restored check and the unit's bounded retry still apply.
+fn write_partial_report(path: &Path, report: &Value, finished_at: f64, error: &str) {
+    let mut partial = report.clone();
+    partial["complete"] = json!(false);
+    partial["error"] = json!(error);
+    partial["finished_at"] = json!(finished_at);
+    let _ = write_report(path, &partial);
 }
 
 fn strings(values: &[&str]) -> Vec<String> {
@@ -1593,9 +1639,9 @@ pub fn restore<A: ManagedApi + ?Sized>(
     lock.lock_exclusive()
         .map_err(|error| fail(format!("cannot take the restore lock: {error}")))?;
     let boot_id = host.boot_id()?;
-    let path = report_path(config, &boot_id)?;
+    let path = report_path(registry, config, &boot_id);
     if !options.force && !options.dry_run {
-        if let Some(previous) = read_report(&path) {
+        if let Some((previous_path, previous)) = read_boot_report(registry, config, &boot_id) {
             if previous["complete"] == true {
                 // #1132: replay the recorded outcomes (rows, refusals and
                 // completion fields) labelled as a replay, so a rerun can
@@ -1633,13 +1679,32 @@ pub fn restore<A: ManagedApi + ?Sized>(
                     object.insert("boot_id".to_owned(), json!(boot_id));
                     object.insert("action".to_owned(), json!("already-restored"));
                     object.insert("replayed".to_owned(), json!(true));
-                    object.insert("report".to_owned(), json!(path));
+                    object.insert("report".to_owned(), json!(previous_path));
                 }
                 return Ok(replayed);
             }
         }
     }
-    let names = registered_names(registry)?;
+    let names = match registered_names(registry) {
+        Ok(names) => names,
+        Err(error) => {
+            if !options.dry_run {
+                write_partial_report(
+                    &path,
+                    &json!({
+                        "schema": REPORT_SCHEMA,
+                        "boot_id": boot_id,
+                        "started_at": host.now(),
+                        "dry_run": false,
+                        "report": path,
+                    }),
+                    host.now(),
+                    &error.to_string(),
+                );
+            }
+            return Err(error);
+        }
+    };
     let boots = anchored_boots(registry, &names);
     let mut report = json!({
         "schema": REPORT_SCHEMA,
@@ -1729,7 +1794,15 @@ pub fn restore<A: ManagedApi + ?Sized>(
         }
     }
     let herdr_ready = certificate_ok && report["herdr"]["ready"] == true;
-    let manager = ManagedAgents::new(client, registry)?;
+    let manager = match ManagedAgents::new(client, registry) {
+        Ok(manager) => manager,
+        Err(error) => {
+            if !options.dry_run {
+                write_partial_report(&path, &report, host.now(), &error.to_string());
+            }
+            return Err(error);
+        }
+    };
     let mut coordinator_ok = config.coordinator.is_none();
     if herdr_ready {
         if let Some(name) = config.coordinator.as_deref() {
@@ -2570,10 +2643,8 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
         ));
     }
     if let Ok(boot_id) = host.boot_id() {
-        let complete = report_path(config, &boot_id)
-            .ok()
-            .and_then(|path| read_report(&path))
-            .is_some_and(|report| report["complete"] == true);
+        let complete = read_boot_report(registry, config, &boot_id)
+            .is_some_and(|(_path, report)| report["complete"] == true);
         let early = host
             .boot_time()
             .is_some_and(|boot| host.now() - (boot as f64) < RESTORE_GRACE_SECONDS as f64);
@@ -3074,6 +3145,27 @@ pub fn watch<A: ManagedApi + ?Sized>(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn boot_report_read_prefers_the_registry_location_and_falls_back_to_legacy() {
+        // #975: a same-boot report written by an older build under the XDG
+        // default still counts, but the registry location wins when both exist.
+        let directory =
+            std::env::temp_dir().join(format!("restore-reports-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let primary = directory.join("primary.json");
+        let legacy = directory.join("legacy.json");
+        assert!(read_boot_report_from(&primary, Some(&legacy)).is_none());
+        fs::write(&legacy, "{\"complete\": true, \"where\": \"legacy\"}").unwrap();
+        let (path, report) = read_boot_report_from(&primary, Some(&legacy)).unwrap();
+        assert_eq!(path, legacy);
+        assert_eq!(report["where"], "legacy");
+        fs::write(&primary, "{\"complete\": false, \"where\": \"primary\"}").unwrap();
+        let (path, report) = read_boot_report_from(&primary, Some(&legacy)).unwrap();
+        assert_eq!(path, primary);
+        assert_eq!(report["where"], "primary");
+        fs::remove_dir_all(&directory).unwrap();
+    }
 
     #[test]
     fn profile_roles_reads_each_profiles_role_and_tolerates_absence() {

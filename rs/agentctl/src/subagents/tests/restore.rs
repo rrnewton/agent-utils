@@ -221,6 +221,67 @@ fn restore_remounts_first_revives_then_starts_units_and_is_idempotent() {
 }
 
 #[test]
+fn restore_default_report_lives_under_the_registry_in_its_own_subdirectory() {
+    // #975 boot-restore-retry: with no report_dir configured, the per-boot
+    // report defaults to REGISTRY/restore-reports/, so the boot evidence
+    // sits with the registry it describes and two registries on one host
+    // cannot overwrite each other's same-boot report.
+    let fixture = Fixture::new();
+    let _old = dead_agent(&fixture);
+    let host = ScriptedHost::new();
+    let registry = fixture.root.join("registry");
+    let document = json!({"schema": "agentctl-restore/v1", "startup_delay_seconds": 0});
+    fs::write(registry.join("restore.json"), document.to_string()).unwrap();
+    let config = RestoreConfig::load(&registry).unwrap();
+    assert!(config.report_dir.is_none());
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(report["complete"], true, "{report}");
+    let path = registry
+        .join("restore-reports")
+        .join(format!("{BOOT}.json"));
+    assert_eq!(
+        report["report"].as_str().unwrap(),
+        path.to_str().unwrap(),
+        "{report}"
+    );
+    assert_eq!(
+        crate::restore::read_report(&path).unwrap()["complete"],
+        true
+    );
+    let again = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(again["action"], "already-restored");
+}
+
+#[test]
+fn restore_early_failure_still_writes_a_partial_report() {
+    // #975: a restore that cannot even list the registry must still leave
+    // its evidence in the report file; at boot the journal may be the only
+    // other record and it may be unreadable. The partial report never
+    // counts as complete, so a retry still runs the restore.
+    let fixture = Fixture::new();
+    let host = ScriptedHost::new();
+    let registry = fixture.root.join("registry");
+    fs::create_dir_all(&registry).unwrap();
+    // `agents` as a regular file makes listing the registry fail.
+    fs::write(registry.join("agents"), "not a directory").unwrap();
+    let document = json!({"schema": "agentctl-restore/v1"});
+    fs::write(registry.join("restore.json"), document.to_string()).unwrap();
+    let config = RestoreConfig::load(&registry).unwrap();
+    assert!(restore(&fixture.client, &registry, &host, &config, &options(None)).is_err());
+    let path = registry
+        .join("restore-reports")
+        .join(format!("{BOOT}.json"));
+    let partial = crate::restore::read_report(&path).expect("a partial report was written");
+    assert_eq!(partial["complete"], false, "{partial}");
+    assert!(
+        partial["error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty()),
+        "{partial}"
+    );
+}
+
+#[test]
 fn restore_refuses_an_ambiguous_muse_lane_per_lane_and_carries_on() {
     // #948 conditions 1, 2 and 4: one dead Muse lane has no recorded
     // session and the store holds two for its cwd, so its row refuses

@@ -706,6 +706,8 @@ mod tests {
         assert!(files[1].1.contains("Restart=on-failure"));
         assert!(files[1].1.contains("StartLimitBurst=5"));
         assert!(files[1].1.contains("StandardError=journal"));
+        // Completed-except-refused-lanes (74) is success, never retried.
+        assert!(files[1].1.contains("SuccessExitStatus=74"));
         assert!(files[2].1.contains("watch\n"));
         assert!(!files[2].1.contains("After=herdr-server.service"));
         assert!(files[3].1.contains("After=herdr-server.service"));
