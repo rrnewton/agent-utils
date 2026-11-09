@@ -1589,8 +1589,8 @@ def test_registry_discovery_walks_from_a_slot_to_the_harness_registry(tmp_path: 
     registry.mkdir(parents=True)
     deep.mkdir(parents=True)
     (slot / ".git").write_text("gitdir: ../elsewhere\n", encoding="utf-8")
-    assert cli.resolve_registry(".agentctl", cwd=slot, environ={}) == str(registry)
-    assert cli.resolve_registry(".agentctl", cwd=deep, environ={}) == str(registry)
+    assert cli.resolve_registry(".agentctl", cwd=slot, environ={}, home=tmp_path) == str(registry)
+    assert cli.resolve_registry(".agentctl", cwd=deep, environ={}, home=tmp_path) == str(registry)
     # The environment outranks discovery, and an explicit registry outranks both.
     elsewhere = str(tmp_path / "elsewhere" / ".agentctl")
     assert cli.resolve_registry(
@@ -1599,8 +1599,51 @@ def test_registry_discovery_walks_from_a_slot_to_the_harness_registry(tmp_path: 
         elsewhere, cwd=slot, environ={"AGENTCTL_REGISTRY": "/ignored"}) == elsewhere
     # An empty environment value is unset, so discovery still applies.
     assert cli.resolve_registry(
-        ".agentctl", cwd=slot, environ={"AGENTCTL_REGISTRY": ""}) == str(registry)
+        ".agentctl", cwd=slot, environ={"AGENTCTL_REGISTRY": ""}, home=tmp_path) == str(registry)
     # No registry in any ancestor keeps the historical default.
     bare = tmp_path / "bare" / "sub"
     bare.mkdir(parents=True)
-    assert cli.resolve_registry(".agentctl", cwd=bare, environ={}) == ".agentctl"
+    assert cli.resolve_registry(".agentctl", cwd=bare, environ={}, home=tmp_path) == ".agentctl"
+
+
+def test_registry_discovery_stops_before_the_home_directory(tmp_path: Path) -> None:
+    """#1169: ~/.agentctl is the plugin home, never a project registry. A checkout
+    under home keeps the historical default; a harness below home is still found."""
+    home = tmp_path / "home"
+    repo = home / "work" / "some-repo"
+    project = home / "work" / "project"
+    (home / ".agentctl").mkdir(parents=True)
+    repo.mkdir(parents=True)
+    (project / ".agentctl").mkdir(parents=True)
+    assert cli.resolve_registry(".agentctl", cwd=repo, environ={}, home=home) == ".agentctl"
+    assert cli.resolve_registry(
+        ".agentctl", cwd=project / "sub", environ={}, home=home) == str(project / ".agentctl")
+
+
+def test_registry_discovery_without_a_home_checks_only_the_working_directory(
+    tmp_path: Path,
+) -> None:
+    """#1169: with HOME unset or empty there is no boundary to stop at, so discovery
+    checks only the working directory instead of walking to the filesystem root."""
+    outer = tmp_path / "outer"
+    inner = outer / "inner"
+    (outer / ".agentctl").mkdir(parents=True)
+    inner.mkdir()
+    assert cli.resolve_registry(".agentctl", cwd=inner, environ={}, home=None) == ".agentctl"
+    (inner / ".agentctl").mkdir()
+    assert cli.resolve_registry(
+        ".agentctl", cwd=inner, environ={}, home=None) == str(inner / ".agentctl")
+
+
+def test_registry_discovery_stops_at_a_symlinked_or_slashed_home(tmp_path: Path) -> None:
+    """#1169: HOME spelled with a trailing slash, or through a symlink, still stops
+    the walk: comparison is by resolved path."""
+    home = tmp_path / "home"
+    repo = home / "work" / "some-repo"
+    (home / ".agentctl").mkdir(parents=True)
+    repo.mkdir(parents=True)
+    slashed = Path(str(home) + "/")
+    assert cli.resolve_registry(".agentctl", cwd=repo, environ={}, home=slashed) == ".agentctl"
+    alias = tmp_path / "home-alias"
+    alias.symlink_to(home, target_is_directory=True)
+    assert cli.resolve_registry(".agentctl", cwd=repo, environ={}, home=alias) == ".agentctl"

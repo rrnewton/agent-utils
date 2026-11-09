@@ -231,24 +231,51 @@ pub fn find_registry(given: &Path) -> PathBuf {
     let Ok(start) = std::env::current_dir() else {
         return given.to_path_buf();
     };
-    find_registry_from(&start, given)
+    find_registry_from(
+        &start,
+        given,
+        home_from(std::env::var_os("HOME")).as_deref(),
+    )
+}
+
+/// The user's home directory, when `HOME` names one. The ancestor walk stops before it:
+/// `~/.agentctl` is the plugin home (the `AGENTCTL_HOME` default), never a project registry,
+/// so a command anywhere under home must not silently join it (#1169).
+fn home_from(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value.filter(|home| !home.is_empty()).map(PathBuf::from)
 }
 
 /// [`find_registry`] from an explicit start directory, so tests need not move the process.
 /// The walk is lexical — `ancestors` never consults mounts or the Git worktree a directory
 /// belongs to — so it crosses the bind mount and worktree boundaries of a wrkslots slot and
 /// reaches the harness registry above it (#1169 slot-registry-discovery). A Git-root lookup
-/// could not: a slot is its own worktree, so its toplevel is the slot itself.
+/// could not: a slot is its own worktree, so its toplevel is the slot itself. The walk stops
+/// before `home` (see [`home_from`]), comparing canonical paths so a trailing slash or a
+/// symlink in `HOME` still stops it; with no home to stop at it checks only `start` itself
+/// rather than walking to the filesystem root and picking up a stray `/.agentctl`.
 #[must_use]
-pub fn find_registry_from(start: &Path, given: &Path) -> PathBuf {
+pub fn find_registry_from(start: &Path, given: &Path, home: Option<&Path>) -> PathBuf {
     if given != Path::new(".agentctl") {
         return given.to_path_buf();
     }
-    start
-        .ancestors()
-        .map(|directory| directory.join(".agentctl"))
-        .find(|candidate| candidate.is_dir())
-        .unwrap_or_else(|| given.to_path_buf())
+    let stop = home.map(|home| fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf()));
+    for (depth, directory) in start.ancestors().enumerate() {
+        match &stop {
+            Some(home) => {
+                let here = fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
+                if here == *home {
+                    break;
+                }
+            }
+            None if depth > 0 => break,
+            None => {}
+        }
+        let candidate = directory.join(".agentctl");
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+    given.to_path_buf()
 }
 
 /// The registry every command uses, with one precedence: an explicit `--registry` wins; then
@@ -256,19 +283,27 @@ pub fn find_registry_from(start: &Path, given: &Path) -> PathBuf {
 /// nearest `.agentctl` in the working directory's ancestors ([`find_registry_from`]); with no
 /// registry in any ancestor the default stands, exactly as before discovery existed.
 #[must_use]
-pub fn resolve_registry(
-    given: &Path,
-    environment: &dyn Fn(&str) -> Option<String>,
-) -> PathBuf {
+pub fn resolve_registry(given: &Path, environment: &dyn Fn(&str) -> Option<String>) -> PathBuf {
     let Ok(start) = std::env::current_dir() else {
         return given.to_path_buf();
     };
-    resolve_registry_from(&start, given, environment(REGISTRY_VARIABLE).as_deref())
+    let home = home_from(environment("HOME").map(std::ffi::OsString::from));
+    resolve_registry_from(
+        &start,
+        given,
+        environment(REGISTRY_VARIABLE).as_deref(),
+        home.as_deref(),
+    )
 }
 
 /// [`resolve_registry`] from an explicit start directory and environment value.
 #[must_use]
-pub fn resolve_registry_from(start: &Path, given: &Path, environment: Option<&str>) -> PathBuf {
+pub fn resolve_registry_from(
+    start: &Path,
+    given: &Path,
+    environment: Option<&str>,
+    home: Option<&Path>,
+) -> PathBuf {
     if given != Path::new(".agentctl") {
         return given.to_path_buf();
     }
@@ -277,7 +312,7 @@ pub fn resolve_registry_from(start: &Path, given: &Path, environment: Option<&st
             return PathBuf::from(value);
         }
     }
-    find_registry_from(start, given)
+    find_registry_from(start, given, home)
 }
 
 /// A bridge that a lookup considered: its state directory, the registry it serves, where it was
@@ -932,25 +967,80 @@ mod tests {
         let deep = slot.join("rs/agentctl/src");
         fs::create_dir_all(&deep).expect("deep directory");
         let default = Path::new(".agentctl");
-        assert_eq!(resolve_registry_from(&slot, default, None), harness);
-        assert_eq!(resolve_registry_from(&deep, default, None), harness);
+        assert_eq!(
+            resolve_registry_from(&slot, default, None, Some(&root)),
+            harness
+        );
+        assert_eq!(
+            resolve_registry_from(&deep, default, None, Some(&root)),
+            harness
+        );
         // The environment outranks discovery, and an explicit registry outranks both.
         let env_registry = root.join("elsewhere/.agentctl");
         assert_eq!(
-            resolve_registry_from(&slot, default, Some(env_registry.to_str().unwrap())),
+            resolve_registry_from(&slot, default, Some(env_registry.to_str().unwrap()), None),
             env_registry
         );
         assert_eq!(
-            resolve_registry_from(&slot, &env_registry, Some("/ignored")),
+            resolve_registry_from(&slot, &env_registry, Some("/ignored"), None),
             env_registry
         );
         // An empty environment value is unset, so discovery still applies.
-        assert_eq!(resolve_registry_from(&slot, default, Some("")), harness);
-        // No registry in any ancestor keeps the historical default.
+        assert_eq!(
+            resolve_registry_from(&slot, default, Some(""), Some(&root)),
+            harness
+        );
+        // No registry in any ancestor keeps the default `.agentctl` (a /tmp fixture).
         let bare = root.join("bare/sub");
         fs::create_dir_all(&bare).expect("bare directory");
         assert_eq!(
-            resolve_registry_from(&bare, default, None),
+            resolve_registry_from(&bare, default, None, None),
+            PathBuf::from(".agentctl")
+        );
+        // The walk stops before home: ~/.agentctl is the plugin home, never a project
+        // registry, so a checkout under home keeps the default `.agentctl` — while a
+        // harness below home is still found.
+        let home = root.join("home");
+        let repo = home.join("work/some-repo");
+        let project = home.join("work/project");
+        fs::create_dir_all(home.join(".agentctl")).expect("home registry");
+        fs::create_dir_all(&repo).expect("repo");
+        fs::create_dir_all(project.join(".agentctl")).expect("project registry");
+        assert_eq!(
+            resolve_registry_from(&repo, default, None, Some(&home)),
+            PathBuf::from(".agentctl")
+        );
+        assert_eq!(
+            resolve_registry_from(&project.join("sub"), default, None, Some(&home)),
+            project.join(".agentctl")
+        );
+        // With no home to stop at, discovery checks only the start directory instead
+        // of walking to the root: an ancestor registry is not picked up, while one
+        // in the start directory itself is.
+        let outer = root.join("outer/.agentctl");
+        let inner = root.join("outer/inner");
+        fs::create_dir_all(&outer).expect("outer registry");
+        fs::create_dir_all(&inner).expect("inner directory");
+        assert_eq!(
+            resolve_registry_from(&inner, default, None, None),
+            PathBuf::from(".agentctl")
+        );
+        fs::create_dir_all(inner.join(".agentctl")).expect("inner registry");
+        assert_eq!(
+            resolve_registry_from(&inner, default, None, None),
+            inner.join(".agentctl")
+        );
+        // A home spelled with a trailing slash, or through a symlink, still stops
+        // the walk: comparison is by canonical path.
+        let slashed = PathBuf::from(format!("{}/", home.display()));
+        assert_eq!(
+            resolve_registry_from(&repo, default, None, Some(&slashed)),
+            PathBuf::from(".agentctl")
+        );
+        let alias = root.join("home-alias");
+        std::os::unix::fs::symlink(&home, &alias).expect("home symlink");
+        assert_eq!(
+            resolve_registry_from(&repo, default, None, Some(&alias)),
             PathBuf::from(".agentctl")
         );
         fs::remove_dir_all(&root).expect("cleanup");

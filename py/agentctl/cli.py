@@ -36,6 +36,7 @@ def guide(document: str) -> int:
 
 def resolve_registry(
     registry: str, *, cwd: Path | None = None, environ: Mapping[str, str] | None = None,
+    home: Path | None = None,
 ) -> str:
     """Resolve the registry every command uses (#1169 slot-registry-discovery).
 
@@ -47,14 +48,33 @@ def resolve_registry(
     belongs to — so it crosses a wrkslots slot's bind mount and worktree
     boundaries and reaches the harness registry above it. A Git-root lookup
     could not: a slot is its own worktree, so its toplevel is the slot itself.
+
+    The walk stops before the user's home directory: ``~/.agentctl`` is the
+    plugin home (the ``AGENTCTL_HOME`` default), never a project registry, so a
+    command anywhere under home must not silently join it. Comparison is by
+    resolved path, so a trailing slash or a symlink in ``HOME`` still stops
+    the walk. With no home to stop at (``HOME`` unset or empty) only the
+    working directory itself is checked, rather than walking to the filesystem
+    root and picking up a stray ``/.agentctl``.
     """
     if registry != ".agentctl":
         return registry
-    override = (os.environ if environ is None else environ).get("AGENTCTL_REGISTRY")
+    environment = os.environ if environ is None else environ
+    override = environment.get("AGENTCTL_REGISTRY")
     if override:
         return override
     start = Path.cwd() if cwd is None else cwd
-    for directory in (start, *start.parents):
+    stop = home
+    if stop is None:
+        named = environment.get("HOME")
+        stop = Path(named) if named else None
+    resolved_stop = stop.resolve() if stop is not None else None
+    for depth, directory in enumerate((start, *start.parents)):
+        if resolved_stop is None:
+            if depth > 0:
+                break
+        elif directory.resolve() == resolved_stop:
+            break
         candidate = directory / ".agentctl"
         if candidate.is_dir():
             return str(candidate)
