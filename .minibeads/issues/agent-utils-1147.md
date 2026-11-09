@@ -1,6 +1,6 @@
 ---
 title: 'worktrees-image-bind-record-race: bind-record updates are an unlocked read-modify-write with a fixed temp name'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-09T17:35:00.000000000+00:00
@@ -34,3 +34,9 @@ not rewrite the record when nothing changed.
 # Notes
 
 Order of the worktrees-image set: #1147 (records race), #1148 (silent mount failure), #1149 (migrate original), then #1150 (migrate liveness) and #1151 (help and small items). Rust parity follows in the Rust worktrees-image handlers.
+
+## Resolution
+
+One locked mutation path in `worktreesimage.py`: `_update_bind_records` takes an exclusive flock on `<control>/.worktrees-image.json.lock` (0600), loads, mutates and writes only when the records changed. The write uses a unique temp name (`.worktrees-image.json.tmp.<pid>.<uuid>`, O_EXCL), fsyncs the file, renames, then fsyncs the directory. `bind_slot`, `unbind_slot`, `relocate_bind`, `save_bind_records` and `save_binds` all funnel through it; readers stay lock-free because the rename is atomic. Tests: six real processes hammering bind/unbind lose no entry and leave no temp file; a source audit proves no unlocked writer remains; unchanged records (including an all-mounted `ensure_binds`) are not rewritten.
+
+Crash ordering is unchanged (mounts outside the lock). Bind (mount, then record): a crash between leaves an unrecorded mount that `ensure_binds` ignores and the mount census counts as foreign use until unmounted; a retried bind records it. Unbind (unmount, then record): a crash between leaves a record saying bound with the subvolume intact, and the next config load re-binds it, so an interrupted remove retries from the bound state. Relocate (unmount, rename, mount, then record): before the rename `ensure_binds` re-binds at the old target; after it, the fenced-sibling guard leaves the slot to recovery. A record that outlives its subvolume is now skipped by `ensure_binds` (test): it fails no config load, re-creates nothing, and blocks no other bind. Rust parity: the Rust worktrees-image handlers must mirror the locked read-modify-write, unique temp name, both fsyncs, the no-write-when-unchanged rule, and the missing-subvolume skip (filed with the landing PUSH).

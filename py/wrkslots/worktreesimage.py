@@ -23,11 +23,15 @@ slots can never be created silently on the host underneath the mount.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import fcntl
+import json
 import os
 import subprocess
+import uuid
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
-from typing import Sequence
 
 from wrkslots import slotimage
 
@@ -422,13 +426,15 @@ class BindRecord:
 
 
 def load_bind_records(control: Path) -> dict[str, BindRecord]:
-    """Recorded binds with their mount identity (the earlier string form included)."""
+    """Recorded binds with their mount identity (the earlier string form included).
+
+    Lock-free: writers rename a complete file into place, so a reader
+    sees the whole old record or the whole new one, never a mixture.
+    """
 
     path = record_path(control)
     if not path.is_file():
         return {}
-    import json
-
     value = json.loads(path.read_text(encoding="utf-8"))
     binds = value.get("binds") if isinstance(value, dict) else None
     if not isinstance(binds, dict):
@@ -456,13 +462,44 @@ def load_binds(control: Path) -> dict[str, str]:
     return {slot: record.subvolume for slot, record in load_bind_records(control).items()}
 
 
-def save_bind_records(control: Path, records: dict[str, BindRecord]) -> None:
-    """Persist the bind records atomically beside the registry."""
+#: The flock file serialising every bind-record read-modify-write.
+RECORD_LOCK_NAME = ".worktrees-image.json.lock"
 
-    import json
+
+@contextlib.contextmanager
+def _records_lock(control: Path) -> Iterator[None]:
+    """Hold the one flock that serialises bind-record mutations.
+
+    Every writer reads, modifies and writes under this lock, so two
+    concurrent wrkslots processes (migrate, create, a config load
+    re-establishing binds) can never drop each other's entries. Mounts
+    stay outside the lock: no writer holds it across a sudo mount.
+    """
+
+    control.mkdir(parents=True, exist_ok=True)
+    lock_path = control / RECORD_LOCK_NAME
+    descriptor = os.open(
+        lock_path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600
+    )
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _write_bind_records(control: Path, records: dict[str, BindRecord]) -> None:
+    """Write ``records`` durably; the caller holds the records lock.
+
+    A unique temp name per writer, fsync of the file before the rename
+    and of the directory after it: a crash leaves the old record or the
+    new one, never a torn file, and never a shared temp to clobber.
+    """
 
     path = record_path(control)
-    temporary = path.with_name(path.name + ".tmp")
     payload = {
         "binds": {
             slot: {
@@ -473,19 +510,52 @@ def save_bind_records(control: Path, records: dict[str, BindRecord]) -> None:
             for slot, record in sorted(records.items())
         }
     }
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    descriptor = os.open(
+        temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o644
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    directory = os.open(control, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _update_bind_records(
+    control: Path,
+    mutate: Callable[[dict[str, BindRecord]], dict[str, BindRecord]],
+) -> dict[str, BindRecord]:
+    """The only record-mutation path: lock, load, mutate, write if changed."""
+
+    with _records_lock(control):
+        before = load_bind_records(control)
+        after = mutate(dict(before))
+        if after != before:
+            _write_bind_records(control, after)
+        return after
+
+
+def save_bind_records(control: Path, records: dict[str, BindRecord]) -> None:
+    """Persist the bind records atomically beside the registry."""
+
+    _update_bind_records(control, lambda _current: dict(records))
 
 
 def save_binds(control: Path, binds: dict[str, str]) -> None:
     """Persist the bind record atomically beside the registry."""
 
-    import json
-
-    path = record_path(control)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps({"binds": binds}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    save_bind_records(
+        control, {slot: BindRecord(subvolume=sub) for slot, sub in binds.items()}
+    )
 
 
 def mount_id_at(mount_point: Path, mountinfo: Path = Path("/proc/self/mountinfo")) -> int | None:
@@ -508,18 +578,28 @@ def mount_id_at(mount_point: Path, mountinfo: Path = Path("/proc/self/mountinfo"
 
 
 def bind_slot(control: Path, mount_dir: Path, slot: str, slot_path: Path) -> None:
-    """Bind a slot's image subvolume at its original real path; record it."""
+    """Bind a slot's image subvolume at its original real path; record it.
+
+    Crash order (mount, then record): a crash between them leaves a
+    mounted bind with no record. ``ensure_binds`` ignores it (nothing
+    recorded), the mount census counts it as foreign use of the slot
+    path until it is unmounted, and a retried bind records it.
+    """
 
     source = mount_dir / slot
     if not source.is_dir():
         raise WorktreesImageError(f"slot subvolume is missing: {source}")
     slot_path.mkdir(parents=True, exist_ok=True)
     _run(["mount", "--bind", str(source), str(slot_path)], sudo=True)
-    records = load_bind_records(control)
-    records[slot] = BindRecord(
-        subvolume=slot, mount_id=mount_id_at(slot_path), target=str(slot_path)
-    )
-    save_bind_records(control, records)
+    mount_id = mount_id_at(slot_path)
+
+    def record(records: dict[str, BindRecord]) -> dict[str, BindRecord]:
+        records[slot] = BindRecord(
+            subvolume=slot, mount_id=mount_id, target=str(slot_path)
+        )
+        return records
+
+    _update_bind_records(control, record)
 
 
 def relocate_bind(control: Path, mount_dir: Path, slot: str, source: Path, destination: Path) -> None:
@@ -529,25 +609,34 @@ def relocate_bind(control: Path, mount_dir: Path, slot: str, source: Path, desti
     mount point renamed, and the subvolume bound again at the destination.
     A failed unmount changes nothing: the slot, its mount and its record all
     stay at ``source``, so the caller refuses and a retry starts clean.
+
+    Crash order (unmount, rename, mount, then record): before the rename
+    the record still names ``source`` and ``ensure_binds`` re-binds there,
+    healing the move away. After the rename the record still names the
+    old target while the fenced destination exists, and the fenced-sibling
+    guard in ``ensure_binds`` leaves the slot alone for recovery.
     """
 
-    records = load_bind_records(control)
-    record = records.get(slot)
-    if record is None:
+    current = load_bind_records(control).get(slot)
+    if current is None:
         raise WorktreesImageError(f"slot {slot} has no recorded worktrees-image bind")
     _run(["umount", str(source)], sudo=True)
     try:
         source.rename(destination)
     except OSError:
-        _run(["mount", "--bind", str(mount_dir / record.subvolume), str(source)], sudo=True)
+        _run(["mount", "--bind", str(mount_dir / current.subvolume), str(source)], sudo=True)
         raise
-    _run(["mount", "--bind", str(mount_dir / record.subvolume), str(destination)], sudo=True)
-    records[slot] = BindRecord(
-        subvolume=record.subvolume,
-        mount_id=mount_id_at(destination),
-        target=str(destination),
-    )
-    save_bind_records(control, records)
+    _run(["mount", "--bind", str(mount_dir / current.subvolume), str(destination)], sudo=True)
+    mount_id = mount_id_at(destination)
+
+    def relocate(records: dict[str, BindRecord]) -> dict[str, BindRecord]:
+        fresh = records.get(slot, current)
+        records[slot] = BindRecord(
+            subvolume=fresh.subvolume, mount_id=mount_id, target=str(destination)
+        )
+        return records
+
+    _update_bind_records(control, relocate)
 
 
 def umount_point(path: Path) -> None:
@@ -557,12 +646,23 @@ def umount_point(path: Path) -> None:
 
 
 def unbind_slot(control: Path, slot: str, slot_path: Path) -> None:
-    """Unmount a slot's bind and drop its record (original stays beneath)."""
+    """Unmount a slot's bind and drop its record (original stays beneath).
+
+    Crash order (unmount, then record): a crash between them leaves a
+    record saying bound with nothing mounted and the subvolume intact,
+    and the next config load's ``ensure_binds`` re-binds it, so a remove
+    interrupted here retries from the bound state. A record that
+    outlives its subvolume (deleted outside this order) is skipped by
+    ``ensure_binds``, never re-created and never a load failure.
+    """
 
     _run(["umount", str(slot_path)], sudo=True)
-    records = load_bind_records(control)
-    records.pop(slot, None)
-    save_bind_records(control, records)
+
+    def drop(records: dict[str, BindRecord]) -> dict[str, BindRecord]:
+        records.pop(slot, None)
+        return records
+
+    _update_bind_records(control, drop)
 
 
 def ensure_binds(control: Path, mount_dir: Path, slots_dir: Path) -> list[str]:
@@ -590,6 +690,12 @@ def ensure_binds(control: Path, mount_dir: Path, slots_dir: Path) -> list[str]:
         ):
             continue
         if target in mounted_points:
+            continue
+        if not (mount_dir / record.subvolume).is_dir():
+            # The record outlived its subvolume (a remove deleted the
+            # subvolume outside unbind's crash order). Skip it: do not
+            # fail every config load, do not re-create the slot path or
+            # subvolume, and do not block the remaining binds.
             continue
         bind_slot(control, mount_dir, slot, target)
         actions.append(f"bound slot {slot} from the worktrees image")

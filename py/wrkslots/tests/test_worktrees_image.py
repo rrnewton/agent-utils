@@ -536,3 +536,130 @@ def test_create_guard_allows_mounted_and_disabled(tmp_path: Path) -> None:
     disabled = _config(tmp_path, "disabled")
     object.__setattr__(disabled, "worktrees_image", None)
     cli._require_worktrees_image_mounted(disabled, "create a slot")
+
+
+def _bind_worker(control: str, mount_dir: str, slots_dir: str, slot: str, rounds: int) -> None:
+    """One concurrent writer: fake mounts, real record file and flock."""
+
+    def fake_run(
+        argv: list[str], *, sudo: bool = False
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    def fake_mount_id(
+        mount_point: Path, mountinfo: Path = Path("/proc/self/mountinfo")
+    ) -> int | None:
+        return 4242
+
+    worktreesimage._run = fake_run
+    worktreesimage.mount_id_at = fake_mount_id
+    control_path, mount_path = Path(control), Path(mount_dir)
+    slot_path = Path(slots_dir) / slot
+    for _ in range(rounds):
+        worktreesimage.bind_slot(control_path, mount_path, slot, slot_path)
+        worktreesimage.unbind_slot(control_path, slot, slot_path)
+    worktreesimage.bind_slot(control_path, mount_path, slot, slot_path)
+
+
+def test_concurrent_bind_writers_never_lose_entries(tmp_path: Path) -> None:
+    import multiprocessing
+
+    control = tmp_path / "worktrees"
+    mount_dir = worktreesimage.image_mount_dir(control)
+    slots_dir = tmp_path / "slots"
+    slots = [f"w{i}" for i in range(6)]
+    for slot in slots:
+        (mount_dir / slot).mkdir(parents=True)
+    context = multiprocessing.get_context("fork")
+    workers = [
+        context.Process(
+            target=_bind_worker,
+            args=(str(control), str(mount_dir), str(slots_dir), slot, 15),
+        )
+        for slot in slots
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=60)
+        assert worker.exitcode == 0
+    assert worktreesimage.load_binds(control) == {slot: slot for slot in slots}
+    assert list(control.glob(".worktrees-image.json.tmp.*")) == []
+    lock = control / worktreesimage.RECORD_LOCK_NAME
+    assert lock.is_file() and oct(lock.stat().st_mode & 0o777) == "0o600"
+
+
+def test_no_unlocked_record_writer_remains() -> None:
+    import inspect
+
+    for function in (
+        worktreesimage.bind_slot,
+        worktreesimage.unbind_slot,
+        worktreesimage.relocate_bind,
+        worktreesimage.save_bind_records,
+    ):
+        assert "_update_bind_records" in inspect.getsource(function), function.__name__
+    assert "save_bind_records" in inspect.getsource(worktreesimage.save_binds)
+    module = inspect.getsource(worktreesimage)
+    assert 'path.name + ".tmp"' not in module  # the old fixed temp name
+    assert module.count("os.replace(temporary, path)") == 1  # one write path
+
+
+def test_unchanged_records_are_not_rewritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control = tmp_path / "worktrees"
+    control.mkdir(parents=True)
+    records = {"s1": worktreesimage.BindRecord(subvolume="s1", mount_id=5)}
+    worktreesimage.save_bind_records(control, records)
+    path = worktreesimage.record_path(control)
+    before = (path.read_bytes(), path.stat().st_mtime_ns)
+    worktreesimage.save_bind_records(control, dict(records))
+    assert (path.read_bytes(), path.stat().st_mtime_ns) == before
+
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "s1").mkdir(parents=True)
+    slots_dir = tmp_path / "slots"
+    target = slots_dir / "s1"
+    monkeypatch.setattr(
+        slotimage,
+        "mount_table",
+        lambda: [
+            slotimage.MountEntry(mount_point=target, fstype="btrfs", source="/dev/loop0")
+        ],
+    )
+    fake = _FakeMounts()
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    assert worktreesimage.ensure_binds(control, mount_dir, slots_dir) == []
+    assert fake.calls == []
+    assert (path.read_bytes(), path.stat().st_mtime_ns) == before
+
+
+def test_ensure_binds_skips_a_record_whose_subvolume_is_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Remove crashed (or deleted) outside unbind's crash order: the record
+    # still says bound but the subvolume is gone. Config load must not
+    # fail, must not re-create the slot path, and must still bind others.
+    control = tmp_path / "worktrees"
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "ok").mkdir(parents=True)
+    slots_dir = tmp_path / "slots"
+    worktreesimage.save_bind_records(
+        control,
+        {
+            "gone": worktreesimage.BindRecord(
+                subvolume="gone", target=str(slots_dir / "gone")
+            ),
+            "ok": worktreesimage.BindRecord(
+                subvolume="ok", target=str(slots_dir / "ok")
+            ),
+        },
+    )
+    fake = _FakeMounts()
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    monkeypatch.setattr(slotimage, "mount_table", lambda: [])
+    actions = worktreesimage.ensure_binds(control, mount_dir, slots_dir)
+    assert actions == ["bound slot ok from the worktrees image"]
+    assert not (slots_dir / "gone").exists()
+    assert set(worktreesimage.load_binds(control)) == {"gone", "ok"}
