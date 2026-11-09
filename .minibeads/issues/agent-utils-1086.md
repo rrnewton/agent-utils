@@ -1,11 +1,12 @@
 ---
 title: 'validate-run-authority-budget: a donor entry-authority refusal at 9.7 s on a loaded host — budget too tight or real authority gap?'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-wrkslots
 created_at: 2026-11-08T19:47:11.000000000+00:00
-updated_at: 2026-11-08T19:47:11.000000000+00:00
+updated_at: 2026-11-09T11:38:48.000000000+00:00
+closed_at: 2026-11-09T11:38:48.000000000+00:00
 ---
 
 # Description
@@ -218,3 +219,49 @@ Lead's answers to the plan's design questions:
 
 Sequencing: survey note Mon 2026-11-09 noon ET, implementation PUSH
 Tue 2026-11-10 6 PM ET. This issue stays open for (c).
+
+## Resolution
+
+Closed: everything this issue asks for has landed.
+
+- The donor record for the 2026-11-08 18:55:37Z job was quoted from the
+  queue record: host-scope could-not-run (exit 75, requeued, no red, no
+  strike); no correction was needed. The recovered full refusal line
+  shows the split the Acceptance Criteria asked for: 9.720 s in
+  create-journal classification, 0.000 s waiting for registry locks.
+- Verdict: a real authority gap, not a budget expiry. A stranded CREATE
+  journal whose slot conflicts with an archive record (named by
+  elimination; the journal bytes were not captured before hand-removal)
+  made the host-wide classification refuse every unrelated slot.
+- (a)+(b) landed as 82623501: the reproduction is kept as tests, and
+  every per-journal classification refusal now names its journal
+  (absolute path, slot, agent, age), says it is a host fault, keeps the
+  inner site text, and gives the recover remedy, in both editions. No
+  budget or retry bounds changed.
+- (c) conditions landed as 13154a49 (Notes) and implementation as
+  3a4873d6: the explicit `quarantine-journal` operator command
+  (dry-run default, `--yes` echoing the dry run's path and sha256),
+  the `operation-quarantined` tombstone closing the EVENTS pending
+  entry in the same journaled step as the move into `quarantine/`,
+  doctor and audit visibility, report-only retention, and the user
+  guide's hand-restore steps, with differential tests covering the
+  crash window and the restore in both editions.
+
+Unverified or by-design limits, none of which leaves this issue's asks
+undelivered:
+
+- The incident's specific second condition is named by elimination
+  from the recorded facts, not from the original journal bytes, which
+  were removed by hand before capture. Post-(b) refusals name the
+  journal and inner site directly, so no future incident needs
+  elimination.
+- Quarantine has not yet been exercised against a live production
+  stranded journal; verification is from temporary-registry fixtures
+  and real classification/recover subprocess probes.
+- The Rust quarantine writer is fixture-only until the writer cutover;
+  the soak dispatcher deliberately routes the new command to the
+  Python edition on live registries.
+- V1 has no restore command and no pruning, by approved design; the
+  tested hand restore shows a restore command is not needed yet.
+- Quarantine covers scoped CREATE journals only; a legacy standalone
+  create journal refuses here and points at `wrkslots recover`.
