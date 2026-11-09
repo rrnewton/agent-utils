@@ -471,7 +471,7 @@ impl std::fmt::Display for ClassifyError {
             ClassifyError::Blocked { first, .. } => {
                 write!(
                     formatter,
-                    "interrupted validation-batch seal recorded in {first}; run 'wrkslots recover' first"
+                    "interrupted validation-batch seal recorded in {first}; run 'wrkslots recover' first; list blocking journals with 'wrkslots classify-create-journals --all-kinds'"
                 )
             }
             ClassifyError::Other(message) => write!(formatter, "{message}"),
@@ -479,17 +479,34 @@ impl std::fmt::Display for ClassifyError {
     }
 }
 
-/// Name the journal that blocks host-wide classification (#1086),
-/// mirroring `_journal_classification_refusal`: absolute path, slot,
-/// agent and age best-effort from the journal bytes, inner reason kept.
-fn journal_refusal(path: &Path, inner: &str) -> String {
-    let absolute = if path.is_absolute() {
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()
             .map(|cwd| cwd.join(path))
             .unwrap_or_else(|_| path.to_path_buf())
-    };
+    }
+}
+
+/// Whole seconds since the journal file last changed, if readable.
+fn journal_age_seconds(path: &Path) -> Option<u64> {
+    let modified = std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()?;
+    Some(
+        modified
+            .elapsed()
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0),
+    )
+}
+
+/// Name the journal that blocks host-wide classification (#1086),
+/// mirroring `_journal_classification_refusal`: absolute path, slot,
+/// agent and age best-effort from the journal bytes, inner reason kept.
+fn journal_refusal(path: &Path, inner: &str) -> String {
+    let absolute = absolute_path(path);
     let parsed: Option<Value> = std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok());
@@ -512,17 +529,215 @@ fn journal_refusal(path: &Path, inner: &str) -> String {
         })
         .unwrap_or("unknown")
         .to_string();
-    let age = match std::fs::metadata(path).and_then(|meta| meta.modified()) {
-        Ok(modified) => match modified.elapsed() {
-            Ok(elapsed) => format!("{}s", elapsed.as_secs()),
-            Err(_) => "0s".to_string(),
-        },
-        Err(_) => "unknown".to_string(),
+    let age = match journal_age_seconds(path) {
+        Some(seconds) => format!("{seconds}s"),
+        None => "unknown".to_string(),
     };
     format!(
         "host fault: journal {} (slot {slot:?}, agent {agent:?}, age={age}) blocks create-journal classification: {inner}. remedy: recover or discard the named journal with 'wrkslots recover', then rerun classify-create-journals",
         absolute.display()
     )
+}
+
+/// First parseable owner identity, in `live_journal_owner` order but
+/// without its task-scope or liveness filtering, mirroring
+/// `_journal_report_identity`: the report names dead owners too.
+fn report_identity(raw: &Map<String, Value>) -> Option<crate::status_state::Identity> {
+    let record = raw.get("record").and_then(Value::as_object);
+    let candidates: Vec<&Value> = vec![
+        raw.get("owner").unwrap_or(&Value::Null),
+        record.and_then(|r| r.get("owner")).unwrap_or(&Value::Null),
+        raw.get("actor").unwrap_or(&Value::Null),
+        raw.get("coordinator_lease").unwrap_or(&Value::Null),
+        record
+            .and_then(|r| r.get("coordinator_lease"))
+            .unwrap_or(&Value::Null),
+        raw.get("coordinator").unwrap_or(&Value::Null),
+    ];
+    for candidate in candidates {
+        if !candidate.is_object() {
+            continue;
+        }
+        if let Some(identity) = crate::status_state::identity_from_value(candidate) {
+            return Some(identity);
+        }
+    }
+    None
+}
+
+/// One best-effort report row, mirroring `_all_journal_row` (#1098):
+/// never validates or refuses; unreadable journals keep unknown fields.
+fn all_journal_row(cfg: &Cfg, path: &Path, seal: bool) -> Value {
+    let parsed: Option<Value> = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let raw: Map<String, Value> = parsed
+        .as_ref()
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let record = raw.get("record").and_then(Value::as_object);
+    let text = |key: &str| -> Option<String> {
+        raw.get(key)
+            .and_then(Value::as_str)
+            .or_else(|| record.and_then(|r| r.get(key)).and_then(Value::as_str))
+            .map(str::to_owned)
+    };
+    let kind = text("kind").unwrap_or_else(|| {
+        if seal {
+            "validate-batch-seal".to_string()
+        } else {
+            "unknown".to_string()
+        }
+    });
+    let identity = if raw.is_empty() {
+        None
+    } else {
+        report_identity(&raw)
+    };
+    let owner_state = match &identity {
+        Some(identity) => process_state(Some(identity)).0,
+        None => "unknown".to_string(),
+    };
+    let mut targets: Vec<String> = Vec::new();
+    let blocks = if seal {
+        if let Ok(parsed) = crate::audit_state::read_seal_json(path)
+            .and_then(|value| crate::audit_state::seal_journal(cfg, path, &value))
+        {
+            targets = parsed.1.iter().map(|(slot, _g, _p)| slot.clone()).collect();
+        }
+        if seal_orphaned(cfg, path) {
+            "none"
+        } else {
+            "lifecycle"
+        }
+    } else if raw.is_empty() {
+        "unknown"
+    } else if kind == "create" {
+        "create-same-slot-agent-path"
+    } else if owner_state == "live" {
+        "concurrent-mutations"
+    } else {
+        "disjoint-create-only"
+    };
+    json!({
+        "age_seconds": journal_age_seconds(path),
+        "agent": text("agent"),
+        "blocks": blocks,
+        "journal": absolute_path(path).to_string_lossy(),
+        "kind": kind,
+        "machine": text("machine"),
+        "owner_pid": identity.as_ref().map(|identity| identity.pid),
+        "owner_state": owner_state,
+        "slot": text("slot"),
+        "targets": targets,
+    })
+}
+
+/// Report every lifecycle journal, read-only, mirroring
+/// `_cmd_classify_all_journals` (#1098). Seals are listed for every
+/// shard, as in the Python report; other journals follow #873 scoping.
+fn classify_all_journals(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    format_json: bool,
+    all_machines: bool,
+) -> std::result::Result<String, ClassifyError> {
+    let (cfg, _selected) = load_cfg(root, machine_override)?;
+    let foreign_notes: Vec<Value> = if all_machines {
+        Vec::new()
+    } else {
+        crate::global_state::foreign_shard_notes(&cfg.control, &cfg.machine)?
+    };
+    let machines: Option<BTreeSet<String>> = if all_machines {
+        None
+    } else {
+        Some(BTreeSet::from([cfg.machine.clone()]))
+    };
+    let mut rows: Vec<Value> = Vec::new();
+    for path in outstanding(&cfg.control, machines.as_ref())? {
+        rows.push(all_journal_row(&cfg, &path, false));
+    }
+    for path in crate::heartbeat_write::seal_paths(&cfg) {
+        rows.push(all_journal_row(&cfg, &path, true));
+    }
+    rows.sort_by(|a, b| {
+        a.get("journal")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .cmp(b.get("journal").and_then(Value::as_str).unwrap_or_default())
+    });
+    let blocking = rows
+        .iter()
+        .any(|row| row.get("blocks").and_then(Value::as_str) != Some("none"));
+    if format_json {
+        let payload = json!({
+            "blocking": blocking,
+            "foreign_shards": foreign_notes,
+            "journals": rows,
+            "schema": 2,
+        });
+        return Ok(format!(
+            "{}\n",
+            crate::batch_text::py_compact_pub(&sort_keys(&payload))
+        ));
+    }
+    let blocked_count = rows
+        .iter()
+        .filter(|row| row.get("blocks").and_then(Value::as_str) != Some("none"))
+        .count();
+    let mut out = format!(
+        "ALL JOURNALS: journals={} blocking={}\n",
+        rows.len(),
+        blocked_count
+    );
+    for row in &rows {
+        let field = |key: &str| -> String {
+            row.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or("-")
+                .to_string()
+        };
+        let age = match row.get("age_seconds").and_then(Value::as_u64) {
+            Some(seconds) => format!("{seconds}s"),
+            None => "unknown".to_string(),
+        };
+        let targets: Vec<String> = row
+            .get("targets")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let target_text = if targets.is_empty() {
+            "-".to_string()
+        } else {
+            targets.join(",")
+        };
+        let owner_pid = match row.get("owner_pid").and_then(Value::as_i64) {
+            Some(pid) => pid.to_string(),
+            None => "-".to_string(),
+        };
+        out.push_str(&format!(
+            "JOURNAL: kind={} slot={} agent={} owner_pid={} owner_state={} age={} blocks={} targets={} journal={}\n",
+            field("kind"),
+            field("slot"),
+            field("agent"),
+            owner_pid,
+            field("owner_state"),
+            age,
+            field("blocks"),
+            target_text,
+            field("journal"),
+        ));
+    }
+    out.push_str(&crate::global_state::foreign_shard_note_lines(
+        &foreign_notes,
+    ));
+    Ok(out)
 }
 
 /// Whether the seal at `path` was left by a process proven dead,
@@ -1143,15 +1358,25 @@ fn classify_one(
 }
 
 /// Classify outstanding create journals for the requested slot.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn classify_create_journals(
     root: Option<&Path>,
     machine_override: Option<&str>,
-    slot: &str,
+    slot: Option<&str>,
     slot_type: &str,
-    agent: &str,
+    agent: Option<&str>,
     format_json: bool,
     all_machines: bool,
+    all_kinds: bool,
 ) -> std::result::Result<String, ClassifyError> {
+    if all_kinds {
+        return classify_all_journals(root, machine_override, format_json, all_machines);
+    }
+    let (Some(slot), Some(agent)) = (slot, agent) else {
+        return Err(ClassifyError::Other(
+            "classify-create-journals requires SLOT and --agent (or --all-kinds to list every lifecycle journal)".to_string(),
+        ));
+    };
     // Pre-scan (#992): a non-create journal with a live owner is a
     // retryable busy result, not an interrupted refusal. Shape-invalid
     // journals are left for the inner classification to report.

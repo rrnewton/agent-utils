@@ -468,7 +468,7 @@ fn refuse_partial_state_inner(control: &Path, allow_validate_batch_seals: bool) 
     seals.sort();
     if let Some(first) = seals.first() {
         return Err(format!(
-            "interrupted validation-batch seal recorded in {}; run 'wrkslots recover' first",
+            "interrupted validation-batch seal recorded in {}; run 'wrkslots recover' first; list blocking journals with 'wrkslots classify-create-journals --all-kinds'",
             first.display()
         ));
     }

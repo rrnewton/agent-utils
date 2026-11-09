@@ -915,11 +915,14 @@ pub(crate) enum Lifecycle {
     },
     /// Classify outstanding create journals without locks or writes, printing the Python output
     ClassifyCreateJournals {
-        /// Requested slot name the journals must be unrelated to
-        slot: String,
-        /// Requested agent name the journals must be unrelated to
+        /// Requested slot name the journals must be unrelated to (not needed with --all-kinds)
+        slot: Option<String>,
+        /// Requested agent name the journals must be unrelated to (not needed with --all-kinds)
         #[arg(long, value_name = "NAME")]
-        agent: String,
+        agent: Option<String>,
+        /// Report every lifecycle journal (kind, slot, agent, owner PID/state, age, blocks) instead of classifying creates (#1098)
+        #[arg(long)]
+        all_kinds: bool,
         /// Slot type: agent or validate
         #[arg(long, value_name = "TYPE", default_value = "agent")]
         slot_type: String,
@@ -3043,6 +3046,7 @@ pub fn run() -> u8 {
             Lifecycle::ClassifyCreateJournals {
                 slot,
                 agent,
+                all_kinds,
                 slot_type,
                 format,
                 all_machines,
@@ -3051,11 +3055,12 @@ pub fn run() -> u8 {
             } => match crate::classify_journals::classify_create_journals(
                 root.as_deref(),
                 machine.as_deref(),
-                &slot,
+                slot.as_deref(),
                 &slot_type,
-                &agent,
+                agent.as_deref(),
                 format == "json",
                 all_machines,
+                all_kinds,
             ) {
                 Ok(text) => {
                     print!("{text}");
@@ -3068,7 +3073,7 @@ pub fn run() -> u8 {
                         print!("{payload}");
                     }
                     eprintln!(
-                        "wrkslotsd: interrupted validation-batch seal recorded in {first}; run 'wrkslots recover' first"
+                        "wrkslotsd: interrupted validation-batch seal recorded in {first}; run 'wrkslots recover' first; list blocking journals with 'wrkslots classify-create-journals --all-kinds'"
                     );
                     return 3;
                 }

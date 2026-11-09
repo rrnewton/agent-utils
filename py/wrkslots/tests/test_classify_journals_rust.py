@@ -562,3 +562,224 @@ def test_orphan_archive_claim_refusal_names_journal_in_both_editions(
         return re.sub(r"age=\d+s", "age=Ns", text)
 
     assert scrub(result.stderr, rust_root) == scrub(err.splitlines()[0], oracle_root)
+
+
+def _python_main_all_kinds(root: Path, fmt: str = "json") -> tuple[int, str, str]:
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = wrkslots_cli.main(
+            [
+                "--project-root", str(root), "--machine", "node-a",
+                "classify-create-journals", "--all-kinds", "--format", fmt,
+            ]
+        )
+    return rc, out.getvalue(), err.getvalue()
+
+
+def _rust_all_kinds(root: Path, fmt: str = "json") -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            str(rust_wrkslotsd()), "classify-create-journals", "--all-kinds",
+            "--machine", "node-a", "--root", str(root), "--format", fmt,
+        ],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
+        env=dict(os.environ),
+    )
+
+
+def _scrub_report(text: str, root: Path) -> str:
+    text = _norm(text, root)
+    text = re.sub(r'"age_seconds": \d+', '"age_seconds": 0', text)
+    return re.sub(r"age=\d+s", "age=Ns", text)
+
+
+def _snapshot(root: Path) -> dict[str, tuple[bytes, int, int]]:
+    return {
+        path.relative_to(root).as_posix(): (
+            path.read_bytes(),
+            path.stat(follow_symlinks=False).st_ino,
+            path.stat(follow_symlinks=False).st_mtime_ns,
+        )
+        for path in root.rglob("*")
+        if path.is_file() and not path.is_symlink()
+    }
+
+
+def _row(payload: dict[str, object], kind: str) -> dict[str, object]:
+    rows = payload["journals"]
+    assert isinstance(rows, list)
+    return next(row for row in rows if row["kind"] == kind)
+
+
+def test_all_kinds_reports_create_and_live_seal_read_only_in_both_editions(
+    tmp_path: Path,
+) -> None:
+    # #1098: one interrupted create plus one live validation-batch seal.
+    rust_root = _fixture(tmp_path / "rust")
+    oracle_root = _fixture(tmp_path / "oracle")
+    _interrupted(rust_root)
+    _interrupted(oracle_root)
+    _write_seal(rust_root, _live_identity(os.getpid()))
+    _write_seal(oracle_root, _live_identity(os.getpid()))
+    oracle_before = _snapshot(oracle_root)
+    rc, out, err = _python_main_all_kinds(oracle_root)
+    assert rc == 0, err
+    assert _snapshot(oracle_root) == oracle_before
+    payload = json.loads(out)
+    assert payload["blocking"] is True
+    create_row = _row(payload, "create")
+    assert create_row["slot"] == "slot-b"
+    assert create_row["agent"] == "agent-new"
+    assert create_row["owner_pid"] == os.getpid()
+    assert create_row["owner_state"] == "live"
+    assert create_row["blocks"] == "create-same-slot-agent-path"
+    assert isinstance(create_row["age_seconds"], int)
+    assert os.path.isabs(str(create_row["journal"]))
+    seal_row = _row(payload, "validate-batch-seal")
+    assert seal_row["owner_pid"] == os.getpid()
+    assert seal_row["owner_state"] == "live"
+    assert seal_row["blocks"] == "lifecycle"
+    assert seal_row["targets"] == ["target"]
+    rust_before = _snapshot(rust_root)
+    result = _rust_all_kinds(rust_root)
+    assert result.returncode == 0, result.stderr
+    assert _snapshot(rust_root) == rust_before
+    assert _scrub_report(result.stdout, rust_root) == _scrub_report(out, oracle_root)
+    rc_h, out_h, err_h = _python_main_all_kinds(oracle_root, fmt="human")
+    assert rc_h == 0, err_h
+    assert "ALL JOURNALS: journals=2" in out_h
+    assert "kind=create" in out_h and "kind=validate-batch-seal" in out_h
+    result_h = _rust_all_kinds(rust_root, fmt="human")
+    assert result_h.returncode == 0, result_h.stderr
+    assert _scrub_report(result_h.stdout, rust_root) == _scrub_report(
+        out_h, oracle_root
+    )
+
+
+def _write_finish_journal(root: Path, owner: dict[str, object]) -> Path:
+    active = root / "worktrees" / "ACTIVE.node-a.json"
+    document = json.loads(active.read_text(encoding="utf-8"))
+    record = document["slots"][0]
+    record["owner"] = owner
+    record["coordinator_lease"] = owner
+    journal = root / "worktrees" / "FINISH.6.node-a.6.slot-a.journal"
+    journal.write_text(
+        json.dumps(
+            {
+                "schema": wrkslots_cli.SCHEMA,
+                "kind": "finish",
+                "machine": "node-a",
+                "slot": "slot-a",
+                "record": record,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return journal
+
+
+def test_all_kinds_reports_import_and_finish_in_both_editions(
+    tmp_path: Path,
+) -> None:
+    rust_root = _transfer_fixture(tmp_path / "rust", None)
+    oracle_root = _transfer_fixture(tmp_path / "oracle", None)
+    dead = _dead_identity()
+    _write_import_journal(rust_root, dead)
+    _write_import_journal(oracle_root, dead)
+    live = _live_identity(os.getpid())
+    _write_finish_journal(rust_root, live)
+    _write_finish_journal(oracle_root, live)
+    rc, out, err = _python_main_all_kinds(oracle_root)
+    assert rc == 0, err
+    payload = json.loads(out)
+    import_row = _row(payload, "import-existing")
+    assert import_row["slot"] == "slot-a"
+    assert import_row["owner_pid"] == dead["pid"]
+    assert import_row["owner_state"] == "dead"
+    assert import_row["blocks"] == "disjoint-create-only"
+    finish_row = _row(payload, "finish")
+    assert finish_row["slot"] == "slot-a"
+    assert finish_row["agent"] == "agent-slot-a"
+    assert finish_row["owner_pid"] == os.getpid()
+    assert finish_row["owner_state"] == "live"
+    assert finish_row["blocks"] == "concurrent-mutations"
+    result = _rust_all_kinds(rust_root)
+    assert result.returncode == 0, result.stderr
+    assert _scrub_report(result.stdout, rust_root) == _scrub_report(out, oracle_root)
+
+
+def test_all_kinds_reports_dead_seal_as_nonblocking_in_both_editions(
+    tmp_path: Path,
+) -> None:
+    rust_root = _fixture(tmp_path / "rust")
+    oracle_root = _fixture(tmp_path / "oracle")
+    dead = _dead_identity()
+    _write_seal(rust_root, dead)
+    _write_seal(oracle_root, dead)
+    rc, out, err = _python_main_all_kinds(oracle_root)
+    assert rc == 0, err
+    payload = json.loads(out)
+    assert payload["blocking"] is False
+    seal_row = _row(payload, "validate-batch-seal")
+    assert seal_row["owner_state"] == "dead"
+    assert seal_row["blocks"] == "none"
+    result = _rust_all_kinds(rust_root)
+    assert result.returncode == 0, result.stderr
+    assert _scrub_report(result.stdout, rust_root) == _scrub_report(out, oracle_root)
+
+
+def test_adopt_refusal_names_live_seal_and_the_all_kinds_report(
+    tmp_path: Path,
+) -> None:
+    oracle_root = _fixture(tmp_path / "oracle")
+    seal = _write_seal(oracle_root, _live_identity(os.getpid()))
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = wrkslots_cli.main(
+            [
+                "--project-root", str(oracle_root), "--machine", "node-a",
+                "adopt", "slot-a", "--agent", "agent-new",
+                "--owner-pid", str(os.getpid()), "--expected-generation", "1",
+            ]
+        )
+    assert rc == 3, err.getvalue()
+    assert seal.name in err.getvalue()
+    assert "classify-create-journals --all-kinds" in err.getvalue()
+    # The default classify seal refusal keeps its text and gains the pointer,
+    # in both editions.
+    rc_c, _out_c, err_c = _python_main_classify(oracle_root)
+    assert rc_c == 3, err_c
+    assert "interrupted validation-batch seal recorded" in err_c
+    assert "classify-create-journals --all-kinds" in err_c
+    rust_root = _fixture(tmp_path / "rust")
+    _write_seal(rust_root, _live_identity(os.getpid()))
+    result = _rust_classify(rust_root, fmt="json")
+    assert result.returncode == 3, result.stderr
+    assert "interrupted validation-batch seal recorded" in result.stderr
+    assert "classify-create-journals --all-kinds" in result.stderr
+
+
+def test_classify_without_slot_or_agent_requires_all_kinds(
+    tmp_path: Path,
+) -> None:
+    oracle_root = _fixture(tmp_path / "oracle")
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = wrkslots_cli.main(
+            [
+                "--project-root", str(oracle_root), "--machine", "node-a",
+                "classify-create-journals", "--slot-type", "agent",
+            ]
+        )
+    assert rc == 3, err.getvalue()
+    assert "requires SLOT and --agent" in err.getvalue()
+    result = subprocess.run(
+        [
+            str(rust_wrkslotsd()), "classify-create-journals",
+            "--machine", "node-a", "--root", str(oracle_root), "--format", "json",
+        ],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
+        env=dict(os.environ),
+    )
+    assert result.returncode == 1, result.stderr
+    assert "requires SLOT and --agent" in result.stderr

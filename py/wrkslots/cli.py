@@ -10925,6 +10925,14 @@ def _classify_create_journal(
     )
 
 
+def _journal_age_seconds(path: Path) -> int | None:
+    """Whole seconds since the journal file last changed, if readable."""
+    try:
+        return max(0, int(time.time() - path.stat().st_mtime))
+    except OSError:
+        return None
+
+
 def _journal_classification_refusal(path: Path, error: Refusal) -> Refusal:
     """Name the journal that blocks host-wide classification (#1086).
 
@@ -10950,10 +10958,8 @@ def _journal_classification_refusal(path: Path, error: Refusal) -> Refusal:
             named_agent = record.get("agent")
         if isinstance(named_agent, str):
             agent = named_agent
-    try:
-        age = f"{max(0, int(time.time() - path.stat().st_mtime))}s"
-    except OSError:
-        age = "unknown"
+    seconds = _journal_age_seconds(path)
+    age = f"{seconds}s" if seconds is not None else "unknown"
     message = (
         f"host fault: journal {path.absolute()} "
         f"(slot {slot!r}, agent {agent!r}, age={age}) blocks "
@@ -10966,6 +10972,153 @@ def _journal_classification_refusal(path: Path, error: Refusal) -> Refusal:
     if type(error) is Refusal:
         return Refusal(message, remedy=error.remedy)
     return error
+
+
+def _journal_report_identity(
+    raw: Mapping[str, object],
+) -> ProcessIdentity | None:
+    """First parseable owner identity, in `_live_journal_owner` order.
+
+    The report names who owns a journal and that process's plain state;
+    unlike `_live_journal_owner` it applies no task-scope or liveness
+    filtering, so a dead or scope-ended owner is still named.
+    """
+    record = raw.get("record")
+    record_map: Mapping[str, object] = record if isinstance(record, Mapping) else {}
+    for candidate in (
+        raw.get("owner"),
+        record_map.get("owner"),
+        raw.get("actor"),
+        raw.get("coordinator_lease"),
+        record_map.get("coordinator_lease"),
+        raw.get("coordinator"),
+    ):
+        if not isinstance(candidate, Mapping):
+            continue
+        try:
+            identity = _identity_from_obj(candidate, "journal owner")
+        except (Refusal, StateError, KeyError, TypeError, ValueError):
+            continue
+        if identity is not None:
+            return identity
+    return None
+
+
+def _all_journal_row(
+    config: Config, path: Path, *, seal: bool
+) -> dict[str, object]:
+    """One best-effort report row for a lifecycle journal (#1098).
+
+    Never validates or refuses: an unreadable journal is reported with
+    unknown fields so the operator still sees it. ``blocks`` is a token:
+    ``lifecycle`` (a live validation-batch seal blocks slot lifecycle
+    commands), ``none`` (an orphaned seal), ``create-same-slot-agent-path``
+    (a create journal), ``concurrent-mutations`` (a live non-create
+    mutation), ``disjoint-create-only`` (a dead or indeterminate
+    non-create journal), or ``unknown`` (unreadable).
+    """
+    try:
+        parsed: object = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        parsed = None
+    raw: Mapping[str, object] = parsed if isinstance(parsed, dict) else {}
+    record = raw.get("record")
+    record_map: Mapping[str, object] = record if isinstance(record, Mapping) else {}
+
+    def text(*values: object) -> str | None:
+        for value in values:
+            if isinstance(value, str):
+                return value
+        return None
+
+    kind = text(raw.get("kind")) or ("validate-batch-seal" if seal else "unknown")
+    identity = _journal_report_identity(raw) if raw else None
+    owner_state = _process_state(identity)[0] if identity is not None else "unknown"
+    targets: list[str] = []
+    if seal:
+        try:
+            _seal_raw, parsed_targets = _validate_batch_seal_journal(
+                config, path, _read_json(path, "validation-batch seal journal")
+            )
+            targets = [slot for slot, _gen, _target in parsed_targets]
+        except (Refusal, StateError):
+            targets = []
+        blocks = (
+            "none" if _validate_batch_seal_orphaned(config, path)[0] else "lifecycle"
+        )
+    elif not raw:
+        blocks = "unknown"
+    elif kind == "create":
+        blocks = "create-same-slot-agent-path"
+    elif owner_state == "live":
+        blocks = "concurrent-mutations"
+    else:
+        blocks = "disjoint-create-only"
+    return {
+        "age_seconds": _journal_age_seconds(path),
+        "agent": text(raw.get("agent"), record_map.get("agent")),
+        "blocks": blocks,
+        "journal": str(path.absolute()),
+        "kind": kind,
+        "machine": text(raw.get("machine"), record_map.get("machine")),
+        "owner_pid": identity.pid if identity is not None else None,
+        "owner_state": owner_state,
+        "slot": text(raw.get("slot"), record_map.get("slot")),
+        "targets": targets,
+    }
+
+
+def _cmd_classify_all_journals(
+    args: argparse.Namespace, config: Config
+) -> int:
+    """Report every lifecycle journal, read-only (#1098).
+
+    Lists create, finish, standalone, and validation-batch-seal journals
+    with owner PID, liveness, age, and what each blocks. Seals are listed
+    for every shard, matching `_refuse_partial_state`, which any seal
+    blocks; other journals follow the local-machine default (#873).
+    """
+    all_machines = bool(getattr(args, "all_machines", False))
+    machines = None if all_machines else frozenset({config.machine})
+    foreign_notes = [] if all_machines else _foreign_shard_notes(config)
+    rows = [
+        _all_journal_row(config, path, seal=False)
+        for path in _outstanding_journals(config, machines)
+    ]
+    rows += [
+        _all_journal_row(config, path, seal=True)
+        for path in _validate_batch_seal_journals(config)
+    ]
+    rows.sort(key=lambda row: str(row["journal"]))
+    blocking = any(row["blocks"] != "none" for row in rows)
+    payload = {
+        "blocking": blocking,
+        "foreign_shards": foreign_notes,
+        "journals": rows,
+        "schema": 2,
+    }
+    if args.format == "json":
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        blocked_count = sum(row["blocks"] != "none" for row in rows)
+        print(f"ALL JOURNALS: journals={len(rows)} blocking={blocked_count}")
+        for row in rows:
+            age_seconds = row["age_seconds"]
+            age = f"{age_seconds}s" if isinstance(age_seconds, int) else "unknown"
+            targets = row["targets"]
+            target_text = (
+                ",".join(targets) if isinstance(targets, list) and targets else "-"
+            )
+            print(
+                f"JOURNAL: kind={row['kind']} slot={row['slot'] or '-'} "
+                f"agent={row['agent'] or '-'} "
+                f"owner_pid={row['owner_pid'] if row['owner_pid'] is not None else '-'} "
+                f"owner_state={row['owner_state']} age={age} "
+                f"blocks={row['blocks']} targets={target_text} "
+                f"journal={row['journal']}"
+            )
+        _print_foreign_shard_notes(foreign_notes)
+    return 0
 
 
 def _classify_create_journals(
@@ -26913,7 +27066,8 @@ def _refuse_partial_state(
         if seal_journals:
             raise Refusal(
                 f"interrupted validation-batch seal recorded in {seal_journals[0]}; "
-                "run 'wrkslots recover' first"
+                "run 'wrkslots recover' first; list blocking journals with "
+                "'wrkslots classify-create-journals --all-kinds'"
             )
 
 
@@ -28885,7 +29039,14 @@ def _cmd_classify_create_journals(args: argparse.Namespace) -> int:
     """Classify existing create journals without locks, authorization, or writes."""
 
     config = _load_config(args.project_root, args.machine)
+    if getattr(args, "all_kinds", False):
+        return _cmd_classify_all_journals(args, config)
     slot_type = _require_slot_type(args, "create-journal classification")
+    if args.slot is None or args.agent is None:
+        raise Refusal(
+            "classify-create-journals requires SLOT and --agent "
+            "(or --all-kinds to list every lifecycle journal)"
+        )
     slot = _validate_name(args.slot, "slot")
     agent = _validate_name(args.agent, "agent")
     try:
@@ -68130,9 +68291,26 @@ usage or audit gate unknown, 3 fail-closed refusal.
         ),
         formatter_class=_HelpFormatter,
     )
-    classify_create.add_argument("slot", help="prospective slot name")
-    classify_create.add_argument("--slot-type", choices=SLOT_TYPES, required=True)
-    classify_create.add_argument("--agent", required=True, metavar="AGENT")
+    classify_create.add_argument(
+        "slot",
+        nargs="?",
+        default=None,
+        help="prospective slot name (not needed with --all-kinds)",
+    )
+    classify_create.add_argument("--slot-type", choices=SLOT_TYPES)
+    classify_create.add_argument("--agent", metavar="AGENT")
+    classify_create.add_argument(
+        "--all-kinds",
+        action="store_true",
+        help=(
+            "report every lifecycle journal instead of classifying creates for "
+            "one slot: kind, slot, agent, owner PID and state "
+            "(live/dead/indeterminate/unknown), age, and blocks token "
+            "(lifecycle, none, create-same-slot-agent-path, "
+            "concurrent-mutations, disjoint-create-only, unknown). SLOT, "
+            "--slot-type, and --agent are not needed. Read-only (#1098)"
+        ),
+    )
     classify_create.add_argument(
         "--all-machines",
         action="store_true",
