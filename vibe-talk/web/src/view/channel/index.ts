@@ -142,6 +142,8 @@ export { createTwoColumns } from "./twocolumns.ts";
 export { createSideCards } from "./sidecards.ts";
 export { createFilterPlace, freshFilterState } from "./filterplace.ts";
 export { createLiveState } from "./livestate.ts";
+export { createDoneAct, freshDoneState } from "./doneact.ts";
+export type { DismissalOffer, DoneAct, DoneActDependencies, DoneLedger, DoneState } from "./doneact.ts";
 export type { LiveFollowSwitch, LiveState, LiveStateDependencies, LiveStorage } from "./livestate.ts";
 export type { FilterAnchor, FilterHold, FilterMark, FilterPane, FilterPlace, FilterPlaceDependencies, FilterState } from "./filterplace.ts";
 export type { CardParts, SideCard, SideCards, SideCardsDependencies, SideChoice, SideTally } from "./sidecards.ts";

@@ -2269,3 +2269,53 @@ test("`#624 voice-page-modularity`: the relay mode is read, drawn and switched f
   owner.stopChannelStream();
   assert.deepStrictEqual(calls, ["fresh", "live", ["start", "c1", null], "wait", "then", "stop"]);
 });
+
+test("`#624 voice-page-modularity`: Done's state, saving wait and refused-write settle, from the module alone", async () => {
+  const { createDoneAct, freshDoneState } = CHANNEL_VIEW;
+  const a = freshDoneState(); const b = freshDoneState();
+  a.archived.add("m1");
+  assert.equal(b.archived.size, 0, "a fresh column shared its Done set");
+  let timer = 0;
+  const clock = { setTimeout: () => ++timer, clearTimeout: () => {}, now: () => 0 };
+  const noop = () => {};
+  const owner = createDoneAct({
+    api: async () => ({}), clockOnUse: () => clock, dismissStatus: noop, doneHeldHere: () => false,
+    doneSettlesHere: () => null, el: () => ({ children: [], hidden: false }),
+    followDoneEverywhere: noop, guardQuietly: (fn) => fn, heldDonePart: (h) => h,
+    hidingRead: () => false, holdingMessage: (fn) => fn(), holdingReplyArrows: (fn) => fn(),
+    idsOf: () => [], inColumn: (_c, fn) => fn(), inOtherColumn: (fn) => fn(),
+    listState: () => ({ backlog: 0, rowsGathered: false }), listedMessages: () => [],
+    loadTodo: async () => {}, markHeldDone: () => null, messageText: () => "", nextUndoAt: () => 0,
+    pinsView: () => ({ only: false }), readSpeaksFor: () => true, refreshAfterLiveMutation: noop,
+    renderCachedTimeline: noop, renderChannelRows: noop, renderChannelSeam: noop,
+    renderReadModeControl: noop, renderReplyLinks: noop, renderScrollTools: noop, renderSideColumn: noop,
+    retryingWrite: (fn) => fn(), rowMessages: () => [], saveChannelScope: noop,
+    selectedChannelId: () => "c1", selection: () => ({ view: "flat" }), sendBookmark: noop,
+    setStatus: noop, settleHeldDone: noop, singleDoneBump: () => null, stageBookmark: () => null,
+    statusSays: () => false, syncUnreadReplies: noop, threadForMessageId: () => null,
+    timeOf: () => 0, todoSummary: () => null, token: () => "t", tokenFingerprint: () => "f",
+    undoLabel: () => "Undo", undoName: () => "", voiceTranscript: () => ({ CLEAR_ARMED_MS: 100 }),
+    writeInBatches: async () => [], channelStore: () => ({ current: () => ({ channel: "c1", dismissed: new Set() }) }),
+    providerFacts: { threading: () => false },
+    columnWork: () => ({ active: () => ({ done: a }), side: () => false }),
+    columns: () => ({ side: { mode: "thread" } }),
+    readModes: () => ({ hiding: () => false, mode: () => "show" }),
+    readLedger: () => ({ writtenIds: () => [] }),
+    lastDismissal: () => ({ current: () => null, set: noop }),
+    inboxLedger: () => ({ add: () => 1, settle: noop, beat: noop, takeLeftOver: () => [] }),
+  });
+  assert.equal(owner.doneState(), a, "doneState was not the column's own record");
+  owner.noteArchived({ dismissed: ["m2"] }, false);
+  assert.deepStrictEqual([...a.archived].sort(), ["m1", "m2"]);
+  const settle = owner.noteDoneSaving(["m1"]);
+  let answered = null;
+  const waiting = owner.doneSaved(["m1"]).then((v) => { answered = v; });
+  await Promise.resolve();
+  assert.equal(answered, null, "doneSaved answered before the write settled");
+  settle();
+  await waiting;
+  assert.equal(answered, true, "doneSaved did not answer Done once settled");
+  owner.noteInboxWrite(["m3"]); owner.noteInboxWrite(["m3"]);
+  const stands = owner.settleInboxWrite(["m3"], true, new Set());
+  assert.deepStrictEqual([...stands], ["m3"], "a refused write with a later one on its way took the act back");
+});

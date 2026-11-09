@@ -185,7 +185,7 @@ test("THE SWIPE DRIVES THE SAME DISMISSAL THE DONE BUTTON DOES, NOT A SECOND ONE
   // ...and that shared act is the SERVER's, both ways. The swipe archives an ordinary row and puts
   // an archived one back, so the gesture is its own undo on the row in front of the reader.
   assert.match(
-    SCRIPT_CODE,
+    PAGE_CODE,
     /async function toggleArchived\([\s\S]*?restoreMessages\([\s\S]*?dismissMessages\(/,
     "the shared act does not reach both the dismissal and the restoration"
   );

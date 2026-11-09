@@ -1530,7 +1530,7 @@ test("SHIFT+E PRESSED WHILE A DONE IS STILL BEING SAVED asks the chat service on
       "without the wait no read was said, so this test cannot see it");
   }
   const unlooked = await readCollapseWhileSaving(failing, "Shift+E",
-    brokenScript("if (saving.length === 0) return done();", "if (saving.length === 0) return true;"));
+    await brokenModule([{ file: "src/view/channel/doneact.ts", find: "      if (saving.length === 0) return done();", replace: "      if (saving.length === 0) return true;" }]));
   assert.deepStrictEqual(unlooked.whileSaving, [], "the control waited no longer");
   assert.deepStrictEqual(unlooked.asked, ["3"],
     "waiting without looking again asked nothing after the failed Done, so this test cannot see it");

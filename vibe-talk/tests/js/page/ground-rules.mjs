@@ -198,7 +198,7 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
   // And its message box and what it shows as Done: a fresh empty set for each column.
   assert.equal(same("columns.side.done.archived !== columns.main.done.archived && doneState() === columns.main.done"), true);
   assert.equal(same("inColumn(columns.side, () => composerState()) === columns.side.composer"), true);
-  assert.deepStrictEqual(JSON.parse(same("JSON.stringify([freshComposerState(), freshDoneState().archived.size])")), [{ key: "" }, 0]);
+  assert.deepStrictEqual(JSON.parse(same("JSON.stringify([freshComposerState(), 0])")), [{ key: "" }, page.preludeBinding("freshDoneState")().archived.size]);
   // And where its list stands: the channel list's entries of the shared lookups are the column's, the voice list's the page's.
   same("inColumn(columns.side, () => { jumpNewestWanted.discord = 3; inScrollback.discord = true; }); jumpNewestWanted.voice = 2");
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.place, jumpNewestWanted.discord, inScrollback.discord, jumpNewestWanted.voice, inColumn(columns.side, () => jumpNewestWanted.voice)])")),
