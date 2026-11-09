@@ -802,12 +802,31 @@ pub fn require_live_agent_at(
         });
     };
     if record.mode == "tui" {
-        return Err(ForeignOwnershipError {
-            code: "tui_not_yet_in_rust",
-            message: format!(
-                "agent '{name}' runs in TUI mode, which this edition does not operate yet"
-            ),
-        });
+        let Some(pane) = record.presentation_pane.clone() else {
+            return Err(ForeignOwnershipError {
+                code: "tui_pane_missing",
+                message: format!("TUI agent '{name}' has no recorded Herdr pane"),
+            });
+        };
+        let probe = herdr_tui_probe_at(proc_root, &pane);
+        if let Some(error) = &probe.error {
+            return Err(ForeignOwnershipError {
+                code: "tui_probe_failed",
+                message: format!(
+                    "could not confirm TUI agent '{name}' within {}s: {error}",
+                    herdr_api_timeout()
+                        .min(Duration::from_secs(1))
+                        .as_secs_f64()
+                ),
+            });
+        }
+        if !probe.codex_alive {
+            return Err(ForeignOwnershipError {
+                code: "dead_tui",
+                message: format!("TUI agent '{name}' has no live Codex process in pane {pane}"),
+            });
+        }
+        return Ok(record);
     }
     if runner_identity_alive_at(proc_root, &record)? {
         return Ok(record);
@@ -864,7 +883,20 @@ pub fn send_message_to_agent_at(
         });
     }
     let record = require_live_agent_at(base, proc_root, name)?;
+    if record.mode == "tui" && model.is_some() {
+        return Err(ForeignOwnershipError {
+            code: "tui_model_override_unsupported",
+            message:
+                "per-message --model is not supported for an interactive TUI; use /model in its tab"
+                    .to_string(),
+        });
+    }
     let seq = enqueue_message_at(base, name, text, model)?;
+    let quarantined = if record.mode == "tui" {
+        deliver_tui_messages_at(base, &record)?
+    } else {
+        Vec::new()
+    };
     Ok(SendResult {
         name: record.name.clone(),
         seq,
@@ -872,7 +904,7 @@ pub fn send_message_to_agent_at(
         transcript: transcript_path_at(base, name)?.display().to_string(),
         mode: record.mode.clone(),
         presentation_pane: record.presentation_pane.clone(),
-        quarantined: Vec::new(),
+        quarantined,
     })
 }
 
@@ -1021,11 +1053,28 @@ pub fn read_agent_output_at(
                     ),
                 });
             }
-            return Err(ForeignOwnershipError {
-                code: "tui_read_not_ported",
-                message: format!(
-                    "reading TUI agent '{name}' scrollback is not yet in this edition"
-                ),
+            let pane = record.presentation_pane.clone().unwrap_or_default();
+            let scrollback = read_tui_recent_scrollback(&pane)?;
+            let text = if mode == "all" {
+                scrollback
+            } else {
+                let lines: Vec<&str> = scrollback.lines().collect();
+                let tail = tail.unwrap_or(500);
+                let selected: &[&str] = if tail <= 0 {
+                    &[]
+                } else {
+                    &lines[lines.len().saturating_sub(tail as usize)..]
+                };
+                let mut text = selected.join("\n");
+                if !selected.is_empty() {
+                    text.push('\n');
+                }
+                text
+            };
+            return Ok(ReadResult {
+                name: name.to_string(),
+                mode: mode.to_string(),
+                text,
             });
         }
     }
@@ -2294,6 +2343,275 @@ fn message_seqs(dir: &Path) -> Result<Vec<i64>, ForeignOwnershipError> {
         .iter()
         .map(|path| Message::from_path(path).map(|message| message.seq))
         .collect()
+}
+
+fn shared_tui_client() -> Result<crate::client::HerdrClient, ForeignOwnershipError> {
+    crate::client::HerdrClient::with_executable("direct", Path::new(&herdr_bin())).map_err(
+        |error| ForeignOwnershipError {
+            code: "tui_delivery_failed",
+            message: error.to_string(),
+        },
+    )
+}
+
+fn shared_tui_target(record: &AgentRecord) -> crate::agent::Target {
+    crate::agent::Target {
+        pane_id: record.presentation_pane.clone(),
+        session_agent: record.session_id.as_ref().map(|_| record.harness.clone()),
+        session_value: record.session_id.clone(),
+        expected_agent: Some(record.harness.clone()),
+        expected_workspace: Some(herdr_workspace_label()),
+        expected_cwd: Some(PathBuf::from(&record.cwd)),
+    }
+}
+
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn record_tui_delivery_failure(
+    path: &Path,
+    error: &ForeignOwnershipError,
+) -> Result<i64, ForeignOwnershipError> {
+    let bytes = std::fs::read(path).map_err(|e| io_error("read TUI message", path, &e))?;
+    let mut raw: Value = serde_json::from_slice(&bytes).map_err(|e| ForeignOwnershipError {
+        code: "tui_inbox_corrupt",
+        message: format!("cannot parse TUI message {}: {e}", path.display()),
+    })?;
+    let Some(obj) = raw.as_object_mut() else {
+        return Err(ForeignOwnershipError {
+            code: "tui_inbox_corrupt",
+            message: format!(
+                "TUI inbox message {} has an invalid delivery-attempt count",
+                path.display()
+            ),
+        });
+    };
+    let attempts = obj
+        .get("tui_delivery_attempts")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    if attempts < 0 {
+        return Err(ForeignOwnershipError {
+            code: "tui_inbox_corrupt",
+            message: format!(
+                "TUI inbox message {} has an invalid delivery-attempt count",
+                path.display()
+            ),
+        });
+    }
+    let attempts = attempts + 1;
+    obj.insert("tui_delivery_attempts".into(), attempts.into());
+    obj.insert(
+        "tui_delivery_error".into(),
+        Value::String(error.message.clone()),
+    );
+    obj.insert("tui_delivery_failed_at".into(), Value::String(now_iso()));
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(
+        &tmp,
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&raw).unwrap_or_default()
+        ),
+    )
+    .map_err(|e| io_error("record TUI delivery failure", &tmp, &e))?;
+    std::fs::rename(&tmp, path).map_err(|e| io_error("publish TUI delivery failure", path, &e))?;
+    Ok(attempts)
+}
+
+fn quarantine_tui_message(
+    base: &Path,
+    name: &str,
+    path: &Path,
+    error: &ForeignOwnershipError,
+    attempts: Option<i64>,
+) -> Result<i64, ForeignOwnershipError> {
+    let recorded = match attempts {
+        Some(attempts) => attempts,
+        None => record_tui_delivery_failure(path, error)?,
+    };
+    let message = Message::from_path(path)?;
+    let dest = failed_dir_at(base, name)?.join(
+        path.file_name()
+            .map(|file| file.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    );
+    std::fs::rename(path, &dest).map_err(|e| io_error("quarantine TUI message", path, &e))?;
+    let preview = format!(
+        "attempts={recorded}; moved to {}; delivery error: {}",
+        dest.display(),
+        error
+            .message
+            .chars()
+            .rev()
+            .take(400)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>()
+    );
+    write_event_at(
+        base,
+        "tui_message_quarantined",
+        name,
+        Some(message.seq),
+        None,
+        Some(&preview),
+    )?;
+    Ok(message.seq)
+}
+
+/// Deliver queued prompts to a live TUI through the shared transport.
+/// Returns quarantined sequence numbers.
+pub fn deliver_tui_messages_at(
+    base: &Path,
+    record: &AgentRecord,
+) -> Result<Vec<i64>, ForeignOwnershipError> {
+    let mut quarantined: Vec<i64> = Vec::new();
+    loop {
+        let Some(pending) = next_pending_message_at(base, &record.name)? else {
+            return Ok(quarantined);
+        };
+        let message = Message::from_path(&pending)?;
+        if message.model.is_none() {
+            break;
+        }
+        let error = ForeignOwnershipError {
+            code: "tui_model_override_unsupported",
+            message:
+                "per-message --model is not supported for an interactive TUI; use /model in its tab"
+                    .to_string(),
+        };
+        quarantined.push(quarantine_tui_message(
+            base,
+            &record.name,
+            &pending,
+            &error,
+            None,
+        )?);
+    }
+    let client = shared_tui_client()?;
+    let options = crate::agent::DrainOptions {
+        ready_timeout: Duration::try_from_secs_f64(
+            env_f64("SUBAGENTS_TUI_DELIVERY_WAIT", 900.0).max(0.0),
+        )
+        .unwrap_or_default(),
+        working_timeout: Duration::from_millis(env_u64(
+            "SUBAGENTS_TUI_SUBMIT_WORKING_TIMEOUT_MS",
+            5000,
+        )),
+        max_attempts: env_u64("SUBAGENTS_TUI_DELIVERY_MAX_ATTEMPTS", 2),
+        ..crate::agent::DrainOptions::default()
+    };
+    let root = agent_dir_at(base, &record.name)?;
+    let result = crate::agent::drain(&client, &shared_tui_target(record), &root, options).map_err(
+        |error| ForeignOwnershipError {
+            code: "tui_delivery_failed",
+            message: error.to_string(),
+        },
+    )?;
+    for identifier in &result.delivered {
+        let seq: i64 = identifier.parse().unwrap_or(-1);
+        with_registry_lock_at(base, |agents| {
+            if let Some(current) = agents.get_mut(&record.name) {
+                current.status = "busy".to_string();
+                current.last_turn_at = Some(now_iso());
+            }
+            Ok(())
+        })?;
+        write_event_at(
+            base,
+            "tui_turn_submitted",
+            &record.name,
+            Some(seq),
+            None,
+            None,
+        )?;
+    }
+    for identifier in &result.quarantined {
+        let seq: i64 = identifier.parse().unwrap_or(-1);
+        quarantined.push(seq);
+        write_event_at(
+            base,
+            "tui_message_quarantined",
+            &record.name,
+            Some(seq),
+            None,
+            Some("shared delivery marked the prompt possibly submitted; inspect failed artifact"),
+        )?;
+    }
+    if let Some(blocked) = &result.blocked {
+        return Err(ForeignOwnershipError {
+            code: "tui_not_idle",
+            message: format!(
+                "TUI agent '{}' delivery remains queued without consuming a retry: {blocked}",
+                record.name
+            ),
+        });
+    }
+    Ok(quarantined)
+}
+
+fn clear_tui_composer(record: &AgentRecord) -> Result<(), ForeignOwnershipError> {
+    // Herdr exposes no input-state API; never destroys a draft it cannot
+    // prove is empty.
+    Err(ForeignOwnershipError {
+        code: "tui_composer_clear_unsupported",
+        message: format!(
+            "cannot safely clear TUI agent '{}'s visible composer; Herdr has no draft-state API. Ask the human to clear or submit their draft, then retry the inbox.",
+            record.name
+        ),
+    })
+}
+
+/// Retry a TUI inbox after optionally (refusing to unsafely) clear its composer.
+pub fn drain_tui_inbox_at(
+    base: &Path,
+    proc_root: &Path,
+    name: &str,
+    clear_composer: bool,
+) -> Result<TuiInboxResult, ForeignOwnershipError> {
+    let record = require_live_agent_at(base, proc_root, name)?;
+    if record.mode != "tui" {
+        return Err(ForeignOwnershipError {
+            code: "not_tui_agent",
+            message: format!("agent '{name}' is not an interactive TUI"),
+        });
+    }
+    if clear_composer {
+        clear_tui_composer(&record)?;
+    }
+    deliver_tui_messages_at(base, &record)?;
+    tui_inbox_snapshot_at(base, &record.name)
+}
+
+fn read_tui_recent_scrollback(pane_id: &str) -> Result<String, ForeignOwnershipError> {
+    let payload = herdr_call(
+        &[
+            "agent", "read", pane_id, "--source", "recent", "--lines", "500", "--format", "text",
+        ],
+        Some(herdr_api_timeout()),
+    )?;
+    payload
+        .get("read")
+        .and_then(|read| read.get("text"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| ForeignOwnershipError {
+            code: "herdr_api_invalid",
+            message: "Herdr did not return TUI scrollback text".to_string(),
+        })
 }
 
 /// Inspect queued and quarantined message sequence numbers without delivery.

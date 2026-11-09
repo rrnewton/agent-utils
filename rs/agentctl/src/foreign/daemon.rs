@@ -1280,8 +1280,6 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // CODEX_BIN is read per turn; tests asserting argv[0] call codex_bin() too.
-        std::env::set_var("CODEX_BIN", &fake);
         enqueue_message_at(&base, "worker-1", "do the thing", None).unwrap();
         let gate = gate_double(&base);
         let mut handle = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1293,6 +1291,7 @@ mod tests {
             .env("AGENTCTL_B37_DAEMON_CHILD", "1")
             .env("AGENTCTL_B37_BASE", &base)
             .env("AGENTCTL_B37_GATE", &gate.gate_prefix[0])
+            .env("CODEX_BIN", &fake)
             .spawn()
             .expect("spawn daemon test process");
         // Wait for the turn to complete (processed file + idle status).

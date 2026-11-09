@@ -743,8 +743,34 @@ fn inbox_command(args: &[String]) -> i32 {
         );
     }
     if parsed.has("--drain") {
-        eprintln!("herdr-subagents: the Rust edition has not ported 'inbox --drain' yet");
-        return 2;
+        return match super::lifecycle::drain_tui_inbox_at(
+            &foreign_base(),
+            Path::new("/proc"),
+            &parsed.positionals[0],
+            parsed.has("--clear-composer"),
+        ) {
+            Ok(result) => {
+                let show = |seqs: &[i64]| {
+                    if seqs.is_empty() {
+                        "none".to_string()
+                    } else {
+                        format!(
+                            "[{}]",
+                            seqs.iter()
+                                .map(i64::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    }
+                };
+                println!("agent: {}", result.name);
+                println!("pending: {}", show(&result.pending));
+                println!("quarantined: {}", show(&result.quarantined));
+                println!("failed messages: {}", result.failed_dir);
+                0
+            }
+            Err(error) => operation_die(&error),
+        };
     }
     match super::lifecycle::tui_inbox_snapshot_at(&foreign_base(), &parsed.positionals[0]) {
         Ok(result) => {
