@@ -52,6 +52,7 @@ import mimetypes
 import os
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -518,17 +519,31 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
         if shots is not None:
             page.screenshot(path=str(shots / f"read-modes-{size}-{name}.png"))
 
+    def stable_measure() -> dict[str, object]:
+        """Measure once the answer and root stand where the entry landed them (`#1118`): poll
+        until two measures 50 ms apart agree, instead of a fixed landing wait."""
+        last: object = None
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            found = measure(page)
+            landed = (found["answer"], found["root"])
+            if landed == last:
+                return found
+            last = landed
+            page.wait_for_timeout(50)
+        return measure(page)
+
     def settled_entry() -> dict[str, object]:
         page.select_option("#thread-select", f"thread:{THREAD_ID}")
         page.wait_for_function(
             f"() => {{ const row = document.querySelector('#discord-log > li[data-id=\"{ANSWER_ID}\"]');"
             " return row && row.dataset.collapsed === 'false'; }", timeout=10_000)
-        page.wait_for_timeout(400)
-        return measure(page)
+        return stable_measure()
 
     def back_to_all() -> None:
         page.select_option("#thread-select", "flat")
-        page.wait_for_timeout(300)
+        page.wait_for_function("() => document.getElementById('discord-log').getAttribute('data-view') === 'flat'",
+                               timeout=10_000)
 
     def cycle_to(label: str) -> None:
         def named() -> object:
@@ -537,8 +552,11 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
         for _tap in range(3):
             if named() == label:
                 return
+            was = named()
             tap(page, "#todo-filter", touch)
-            page.wait_for_timeout(250)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and named() == was:
+                page.wait_for_timeout(25)
         check(named() == label, f"the cycle never reached {label}")
 
     page.fill("#api-token", TOKEN)
@@ -546,7 +564,8 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     page.wait_for_function("() => !document.getElementById('screen-main').hidden", timeout=10_000)
     page.click("#view-switch")
     page.wait_for_function("() => document.querySelectorAll('#discord-log > li').length > 10", timeout=10_000)
-    page.wait_for_timeout(300)
+    page.wait_for_function("() => document.getElementById('todo-filter-label').textContent === 'Show read'",
+                           timeout=10_000)
 
     # Show read, the default: the entry lands on the answer, unfolded, under the pill.
     m = measure(page)
@@ -627,6 +646,7 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     before = measure(page)
     page.keyboard.press("Enter")
     page.wait_for_function("() => !document.querySelector('#discord-log > li[data-read-run]')", timeout=5_000)
+    page.wait_for_function(f"() => document.activeElement?.dataset?.id === '{first_id}'", timeout=5_000)
     page.wait_for_timeout(250)
     keyed = measure(page)
     check(keyed["focusedRow"] == first_id,
@@ -659,7 +679,9 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     page.wait_for_function(
         f"() => !!document.querySelector('#discord-log > li[data-id=\"{ROOT_ID}\"] > .thread-unread:not([hidden])')",
         timeout=10_000)
-    page.wait_for_timeout(300)
+    page.wait_for_function(
+        f"() => document.querySelector('#discord-log > li[data-id=\"{ROOT_ID}\"] .thread-unread')?.textContent === '4 unread'",
+        timeout=10_000)
     main_js: object = page.evaluate(MAIN_JS, ROOT_ID)
     check(isinstance(main_js, dict), f"{size}: Main measured nothing: {main_js!r}")
     assert isinstance(main_js, dict)
@@ -712,8 +734,7 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     page.wait_for_function(
         f"() => {{ const row = document.querySelector('#discord-log > li[data-id=\"{ANSWER_ID}\"]');"
         " return row && row.dataset.collapsed === 'false'; }", timeout=10_000)
-    page.wait_for_timeout(400)
-    m = measure(page)
+    m = stable_measure()
     check(m["firstShown"] == ANSWER_ID, f"{size}: the count opened the thread at {m['firstShown']}, not the answer")
     floating = number(m, "floating")
     top = number(m, "answer", "start")
@@ -778,8 +799,16 @@ def held_walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed:
     # with every row held.
     page.wait_for_function(f"() => document.querySelector('#discord-log > li[data-id=\"{ROOT_ID}\"]')",
                            timeout=15_000)
-    page.wait_for_timeout(400)
+    last: object = None
+    deadline = time.monotonic() + 10
     m = measure(page)
+    while time.monotonic() < deadline:
+        m = measure(page)
+        landed_now = (m["root"], m["line"], m["answer"])
+        if landed_now == last:
+            break
+        last = landed_now
+        page.wait_for_timeout(50)
     floating = number(m, "floating")
     found = {"root": number(m, "root", "start"), "line": number(m, "line", "top"), "answer": number(m, "answer", "top")}
     check(floating <= found["root"] <= floating + 16,

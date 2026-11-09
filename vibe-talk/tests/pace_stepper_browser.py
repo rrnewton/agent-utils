@@ -80,7 +80,10 @@ def walk(desk: Desk, api: VoicesApi, touch: bool) -> None:
 
     for _ in range(3):
         press(page, "#read-speed-up", touch)
-    desk.settled()
+    desk.wait_for("() => document.getElementById('read-speed-box').value === '130%' "
+                  "&& document.getElementById('read-speed-label').textContent === '130%' "
+                  "&& localStorage.getItem('vibe-talk.voice.read-speed') === '130'",
+                  "+ three times did not step the pace to 130%")
     desk.check(box(page) == "130%", f"+ three times gave {box(page)!r}, not 130%")
     stored = page.evaluate("() => localStorage.getItem('vibe-talk.voice.read-speed')")
     desk.check(stored == "130", f"the pace was stored as {stored!r}")

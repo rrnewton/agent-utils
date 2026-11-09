@@ -432,3 +432,42 @@ would hang at their deliberate bounds: fewer at 0, more past 8, the chord
 in the message box); and the negative windows.
 
 Solo on 2026-11-09 (Chromium 149.0.7827.55): all five files pass whole.
+
+## Batch 10a, 2026-11-09 (mu-settle)
+
+[muse watermelon] `offline_cache_browser.py`, `pace_stepper_browser.py`,
+`send_double_check_browser.py`, `stale_live_read_browser.py` and
+`read_modes_browser.py`.
+
+- offline-cache: of its five `settled()`-shaped waits, four are page-side
+  JS helpers (programmatic scrolls, and a ResizeObserver rendering-update
+  wait that is explicitly not frame counting) — all kept as geometry. The
+  one Python `settled` is nested in its own `empty_walk`, used by nobody
+  else; its two under-pinned call sites now also wait, through that walk's
+  existing `until`, until the list stands at its newest line — the very
+  predicate (`at_newest`) the checks then assert. Nothing the forty
+  importing walks use changed.
+- pace-stepper: three presses up now wait for the box, its label and the
+  stored pace to say 130%; the mid-read pace change's re-read is left to
+  its ticket polls, which time the page's own settle debounce.
+- send-double-check: the mid-send ticks wait for their exact classes, and
+  the tap readout for the server's time in its text.
+- read-modes: `settled_entry`'s fixed 400 ms landing wait is now a
+  stability poll — measure until the answer and root stand unchanged
+  between two measures 50 ms apart (10 s bound, the last measure judged
+  either way) — and the same for a count tap's landing and a held thread's
+  read landing. Back-to-All waits for All's own view mark, the mode cycle
+  waits for the label to change rather than 250 ms a tap, the opening wait
+  names Show read, Enter on the run line waits for the focus it then
+  asserts, and Main waits for its kept question's "4 unread".
+- stale-live-read: no conversion; its one settle follows its condition
+  `quiet()` before a screenshot, and its late-read frame counts are timed
+  subjects.
+
+Still to do: batch 7 (navigation), and the last group — `scroll_stability`
+(whose `held()` "only N frames sampled" check is itself load-sensitive:
+the fix is to wait for both its wall window and its frame count, never
+either alone), the read-aloud files, and the remaining small files
+(`reply_marks_read` has no `settled()` of its own to convert).
+
+Solo on 2026-11-09 (Chromium 149.0.7827.55): all five files pass whole.

@@ -4697,6 +4697,8 @@ def empty_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
             page.click("#view-switch")
             until("() => document.querySelectorAll('#discord-log > li[data-id]').length === 4", "the channel did not open")
+            until("() => { const a = document.getElementById('scroll-area'); return a.scrollHeight - a.scrollTop - a.clientHeight <= 24; }",
+                  "the channel did not open at its newest line")
             settled()
             check(at_newest(), f"{shape}: the channel did not open at its newest line")
             tap("#search-toggle")
@@ -4732,6 +4734,8 @@ def empty_walk(chromium: BrowserType, args: argparse.Namespace, label: str, widt
             until("() => document.getElementById('search-empty').hidden"
                   " && Boolean(document.querySelector('#discord-log > li[data-id=\"200\"]').offsetParent)",
                   "undoing the filter did not bring the first row back")
+            until("() => { const a = document.getElementById('scroll-area'); return a.scrollHeight - a.scrollTop - a.clientHeight <= 24; }",
+                  "the rows came back with the reader short of the newest line")
             settled()
             check(at_newest(), f"{shape}: the rows came back with the reader short of the newest line")
             check(not errors, f"{shape}: the page threw: {errors}")

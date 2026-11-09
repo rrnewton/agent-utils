@@ -72,8 +72,9 @@ def main() -> int:
             page.wait_for_selector("#channel-compose-text", state="visible", timeout=10_000)
             page.fill("#channel-compose-text", "A message held mid-send for the ticks.")
             page.click("#channel-send")
-            desk.wait_for("() => document.querySelector('.outgoing-message .send-tick[data-tick=\"server\"]') !== null",
-                          "the Sending card has no server tick")
+            desk.wait_for("() => [...document.querySelectorAll('.outgoing-message .send-tick')]"
+                          ".map((t) => t.className).join() === 'send-tick ok,send-tick'",
+                          "the Sending card's ticks are not the server's done and the service's waiting")
             desk.settled()
             states = page.evaluate("""() => [...document.querySelectorAll('.outgoing-message .send-tick')]
                 .map((t) => t.className)""")
@@ -81,7 +82,8 @@ def main() -> int:
             desk.shot("1-mid-send")
             # Tap readout: durations, no clock times.
             page.evaluate("() => document.querySelector('.outgoing-message .send-ticks').click()")
-            desk.settled()
+            desk.wait_for("() => (document.querySelector('.outgoing-message .send-times')?.textContent || '').includes('server 120 ms')",
+                          "the tap readout did not show the server's time")
             shown = page.evaluate("() => document.querySelector('.outgoing-message .send-times')?.textContent || ''")
             check("server 120 ms" in shown and "total" in shown, f"tap readout wrong: {shown}")
             check(":" not in shown.split("total")[0].replace("server", ""), f"tap readout has a clock time: {shown}")
