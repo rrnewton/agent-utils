@@ -548,6 +548,11 @@ struct Candidate {
     tip: String,
     /// Commit after each change, aligned with `prs`.
     prefixes: Vec<String>,
+    /// The base commit this batch is measured against (`MQ_BASE`): the
+    /// parent for a root batch, the root's parent for a stacked one
+    /// (#1111). Combining sets it to `parent`; the fill loop replaces
+    /// it with the base of the flight a stacked batch stands on.
+    base: String,
 }
 
 impl Candidate {
@@ -683,6 +688,10 @@ struct Job {
     commit: String,
     /// The commit `prs` were combined onto (the commit itself for `widen`).
     parent: String,
+    /// The batch's base commit (`MQ_BASE`): the base it was planned on,
+    /// recorded at planning (#1111). Equal to `parent` for a root batch;
+    /// for a stacked one, the base its stack stands on.
+    base: String,
     /// Where a batch sat in the speculation window when it started; `None` for every other
     /// purpose.
     speculation: Option<Speculation>,
@@ -2584,6 +2593,7 @@ impl<'a> Runner<'a> {
         Ok(Ok(Candidate {
             prs: held.prs(),
             parent: held.parent.clone(),
+            base: held.parent.clone(),
             tip: held.tip.clone(),
             prefixes: held.prefixes.clone(),
         }))
@@ -3525,6 +3535,7 @@ impl<'a> Runner<'a> {
             Candidate {
                 prs: kept,
                 parent: parent.to_owned(),
+                base: parent.to_owned(),
                 tip,
                 prefixes,
             },
@@ -4252,7 +4263,7 @@ impl<'a> Runner<'a> {
             .unwrap_or_default();
         // The validator is told what its candidate was built on, so a queue-mode
         // runner can diff against the job's own base (see MQ_PARENT, crate::validate).
-        extra.push((crate::validate::BASE_ENV.to_owned(), self.job_base()));
+        extra.push((crate::validate::BASE_ENV.to_owned(), job.base.clone()));
         extra.push((crate::validate::PARENT_ENV.to_owned(), job.parent.clone()));
         // A candidate validation may stop at its first red step (`validator.fail_fast`). The
         // complete run on the base (`widen`) never does: its record names every failure.
@@ -4416,21 +4427,13 @@ impl<'a> Runner<'a> {
         Ok((id, ran))
     }
 
-    /// The base a validation is measured against (and a donor job records):
-    /// the run's starting base once known, else the current base.
-    fn job_base(&self) -> String {
-        let report = lock(&self.report);
-        if report.base_start.is_empty() {
-            lock(&self.base).clone()
-        } else {
-            report.base_start.clone()
-        }
-    }
-
     /// Publish `job` for donors; returns the donor job id.
     fn publish(&self, donors: &Donors, job: &Job) -> Result<String, String> {
         let tree = self.git.tree_of(&job.commit)?;
-        let base = self.job_base();
+        // The donor job records the batch's own planned base, so the
+        // donor's validator and selection are measured against it
+        // exactly as the local validation is (#1111).
+        let base = &job.base;
         // Claim order (#1008): the job records whether any of its changes is
         // prioritized, and its batch's plan index, so a claim leases in plan
         // order instead of publication order. No planned batch matches a
@@ -4454,7 +4457,7 @@ impl<'a> Runner<'a> {
         let published = donors.store.publish(
             &job.commit,
             &tree,
-            &base,
+            base,
             &job.parent,
             &job.selection,
             &job.extra,
@@ -6718,6 +6721,7 @@ impl<'a> Runner<'a> {
                         let candidate = Candidate {
                             prs: job.prs.clone(),
                             parent: job.parent.clone(),
+                            base: job.base.clone(),
                             tip: job.commit.clone(),
                             prefixes: Vec::new(),
                         };
@@ -7401,9 +7405,19 @@ impl<'a> Runner<'a> {
                             }
                         };
                         started_prs.extend(prs.iter().copied());
-                        let candidate = self.build_and_eject(&parent, &prs, pending, "")?;
+                        let mut candidate = self.build_and_eject(&parent, &prs, pending, "")?;
                         if candidate.prs.is_empty() {
                             continue;
+                        }
+                        // MQ_BASE is the base this batch was planned on
+                        // (#1111): its parent for a root, else the base
+                        // recorded on the flight it stacks on. Combining
+                        // set it to the parent; a stacked batch inherits
+                        // the stack's bottom instead.
+                        if let Some(below) =
+                            flights.iter().find(|flight| flight.candidate.tip == parent)
+                        {
+                            candidate.base.clone_from(&below.candidate.base);
                         }
                         self.clear_stale_greens(&candidate.prs);
                         if let Some((green_base, landed_since)) = &stale_stack {
@@ -9356,7 +9370,7 @@ impl<'a> Runner<'a> {
                         ejection.found_by = validations.last().copied();
                     }
                     self.drop_dependents(culprit, pending);
-                    let rebuilt = self.build_and_eject(
+                    let mut rebuilt = self.build_and_eject(
                         &current.parent,
                         &current.prs,
                         pending,
@@ -9365,6 +9379,9 @@ impl<'a> Runner<'a> {
                     if rebuilt.prs.is_empty() {
                         return Ok(Some(BatchOutcome::Done));
                     }
+                    // The remainder is the same batch without the culprit,
+                    // measured against the same base as the original (#1111).
+                    rebuilt.base.clone_from(&current.base);
                     // Delta revalidation: the failed tests, the tests not yet seen passing, and
                     // whatever the removed change touched, within what the batch selected. Under
                     // the exact-commit rule nothing carries over: the remainder reruns it all.
@@ -9384,6 +9401,7 @@ impl<'a> Runner<'a> {
                             prs: rebuilt.prs.clone(),
                             commit: rebuilt.tip.clone(),
                             parent: rebuilt.parent.clone(),
+                            base: rebuilt.base.clone(),
                             speculation: None,
                             selection: delta.clone(),
                             peripheral: false,
@@ -9642,6 +9660,7 @@ impl<'a> Runner<'a> {
                 prs: search.candidate.prs[..*i].to_vec(),
                 commit: self.regenerated_prefix(&search.candidate, *i)?,
                 parent: search.candidate.parent.clone(),
+                base: search.candidate.base.clone(),
                 speculation: None,
                 selection: search.focus.clone(),
                 policy: "failed-tests".to_owned(),
@@ -9674,6 +9693,7 @@ impl<'a> Runner<'a> {
                 prs: open.iter().flat_map(|o| o.prs.clone()).collect(),
                 commit: base.clone(),
                 parent: base.clone(),
+                base: base.clone(),
                 speculation: None,
                 selection: Selection::All,
                 policy: "all".to_owned(),
@@ -10308,6 +10328,7 @@ fn batch_job(
         prs: candidate.prs.clone(),
         commit: candidate.tip.clone(),
         parent: candidate.parent.clone(),
+        base: candidate.base.clone(),
         speculation,
         selection: chosen.selection.clone(),
         policy: chosen.policy.clone(),

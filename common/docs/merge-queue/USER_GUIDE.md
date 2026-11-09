@@ -1218,8 +1218,12 @@ batch's extra tests too.
 - `$MQ_EXTRA_TESTS`: with `all`, the tests to run beyond the complete suite, space separated
   (see "Tests beyond the complete suite"; unset when there are none);
 - `$MQ_BASE`: the batch's base commit (full SHA) — the commit the candidate was planned and
-  measured against, as a donor job records it. A runner that diffs (a queue-mode validate)
-  should diff against this, never against its own checkout's main, which can be arbitrarily stale;
+  measured against, as a donor job records it. For a root batch that is the base it was
+  planned on, which is the current base at planning: a root planned after another batch
+  landed earlier in the same run is measured against the moved base, not the base the run
+  started on (for a stacked batch it is the base the whole stack stands on). A runner that
+  diffs (a queue-mode validate) should diff against this, never against its own checkout's
+  main, which can be arbitrarily stale;
 - `$MQ_PARENT`: the candidate's parent commit (full SHA): the base itself for a root batch, the
   stacked-on candidate for a stacked one;
 

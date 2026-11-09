@@ -1173,3 +1173,168 @@ fn a_stale_root_requeues_at_once_and_drops_only_its_descendants() {
         "item #6 was never discarded"
     );
 }
+
+/// Gated setup whose validator records the MQ_BASE/MQ_PARENT it was
+/// handed (and its checkout HEAD) per validation, and whose select
+/// command records the base it was measured against (#1111). With
+/// `roots`, that many disjoint-root slots are configured.
+fn env_setup(tag: &str, roots: Option<u64>) -> (Fixture, PathBuf, PathBuf, PathBuf, String) {
+    let fx = Fixture::new(tag);
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed tests");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    let base_start = fx.remote_main();
+    let started = fx.root.join("started");
+    let selects = fx.root.join("selects");
+    let gates = fx.root.join("gates");
+    std::fs::create_dir_all(&gates).unwrap();
+    let validator = format!(
+        r#"set=$(ls tests | tr '\n' _); echo "$set base=$MQ_BASE parent=$MQ_PARENT head=$(git rev-parse HEAD)" >> '{started}'
+i=0; while [ ! -e '{gates}'/"$set" ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done
+[ -e '{gates}'/"$set" ] || exit 1
+for t in $(ls tests); do printf '{{"id":"%s","outcome":"pass"}}\n' "$t" >> "$MQ_RESULTS"; done
+exit 0"#,
+        started = started.display(),
+        gates = gates.display()
+    );
+    let script = fx.root.join("validator.sh");
+    std::fs::write(&script, validator).unwrap();
+    let select = format!(
+        "echo \"head=$MQ_HEAD base=$MQ_BASE\" >> '{}'; git diff --name-only \"$MQ_BASE\" HEAD -- tests | sed 's|^tests/||'",
+        selects.display()
+    );
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        &format!("sh '{}'", script.display()),
+        "--select",
+        &select,
+        "--policy",
+        "path-routing",
+    ]);
+    if let Some(roots) = roots {
+        let config_path = fx.queue().join(".git/merge-queue/config.json");
+        let mut config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        config["roots"] = serde_json::json!(roots);
+        std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    }
+    (fx, started, selects, gates, base_start)
+}
+
+/// One recorded validation's (base, parent, head) by its test-set name.
+fn env_of(started: &Path, set: &str) -> (String, String, String) {
+    let line = started_lines(started)
+        .into_iter()
+        .find(|line| line.starts_with(&format!("{set} ")))
+        .unwrap_or_else(|| panic!("no started line for {set}: {:?}", started_lines(started)));
+    let field = |name: &str| {
+        line.split(' ')
+            .find_map(|part| part.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("no {name} in {line:?}"))
+            .to_owned()
+    };
+    (field("base"), field("parent"), field("head"))
+}
+
+/// A root planned after main moved mid-run is measured against the
+/// base it was planned on, not the run's starting base (#1111): its
+/// validator sees MQ_BASE == MQ_PARENT == the new base, and the
+/// selection command is measured against the same base.
+#[test]
+fn a_mid_run_root_is_measured_against_the_base_it_was_planned_on() {
+    let (fx, started, selects, gates, base_start) = env_setup("mid-run-root-base", Some(3));
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    let mut daemon = Daemon::start(&fx);
+    wait_for("both roots to validate", &started, |lines| {
+        lines.iter().any(|line| line.starts_with("a_t0_ "))
+            && lines.iter().any(|line| line.starts_with("b_t0_ "))
+    });
+    let (base, parent, _) = env_of(&started, "a_t0_");
+    assert_eq!(
+        (base.as_str(), parent.as_str()),
+        (base_start.as_str(), base_start.as_str())
+    );
+    // Change 1 lands alone; main moves while change 2 is in flight.
+    open(&gates, "a_t0_");
+    let start = Instant::now();
+    while status(&fx, 1) != "landed" {
+        assert!(
+            start.elapsed() < Duration::from_secs(60),
+            "change 1 never landed"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let new_base = fx.remote_main();
+    assert_ne!(new_base, base_start);
+    // A new root planned now stands on the moved base, and must be
+    // measured against it, not against where the run started.
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    fx.mq_ok(&["submit", "3", "--head", "c"]);
+    // Its candidate tree carries the landed change 1 as well.
+    wait_for("the mid-run root to validate", &started, |lines| {
+        lines.iter().any(|line| line.starts_with("a_c_t0_ "))
+    });
+    let (base, parent, head3) = env_of(&started, "a_c_t0_");
+    assert_eq!(parent, new_base, "started: {:?}", started_lines(&started));
+    assert_eq!(base, new_base, "started: {:?}", started_lines(&started));
+    let select_lines = std::fs::read_to_string(&selects).unwrap_or_default();
+    assert!(
+        select_lines
+            .lines()
+            .any(|line| line == format!("head={head3} base={new_base}")),
+        "selection not measured against the new base: {select_lines}"
+    );
+    for set in [
+        "a_t0_",
+        "b_t0_",
+        "c_t0_",
+        "a_b_t0_",
+        "a_c_t0_",
+        "b_c_t0_",
+        "a_b_c_t0_",
+        "t0_",
+    ] {
+        open(&gates, set);
+    }
+    assert_eq!(daemon.exit_code(Duration::from_secs(120)), Some(0));
+    for pr in 1..=3 {
+        assert_eq!(status(&fx, pr), "landed", "#{pr}");
+    }
+}
+
+/// A stacked batch keeps today's bases (#1111 does not move it):
+/// MQ_BASE is the base its stack stands on — here the run's starting
+/// base — and MQ_PARENT is the candidate beneath it.
+#[test]
+fn a_stacked_batch_keeps_the_stack_bottom_as_its_base() {
+    let (fx, started, _selects, gates, base_start) = env_setup("stacked-base", None);
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let mut daemon = Daemon::start(&fx);
+    wait_for("change 1 to validate", &started, |lines| {
+        lines.iter().any(|line| line.starts_with("a_t0_ "))
+    });
+    let (_, _, head1) = env_of(&started, "a_t0_");
+    fx.branch_from("b", "a", &[("tests/b", "ok\n")]);
+    fx.mq_ok(&["submit", "2", "--head", "b", "--after", "1"]);
+    wait_for("the stacked batch to validate", &started, |lines| {
+        lines.iter().any(|line| line.starts_with("a_b_t0_ "))
+    });
+    let (base, parent, _) = env_of(&started, "a_b_t0_");
+    assert_eq!(base, base_start, "started: {:?}", started_lines(&started));
+    assert_eq!(parent, head1, "started: {:?}", started_lines(&started));
+    for set in ["a_t0_", "b_t0_", "a_b_t0_", "t0_"] {
+        open(&gates, set);
+    }
+    assert_eq!(daemon.exit_code(Duration::from_secs(120)), Some(0));
+    assert_eq!(status(&fx, 1), "landed");
+    assert_eq!(status(&fx, 2), "landed");
+}

@@ -370,6 +370,155 @@ fn a_donor_validator_sees_the_job_base_and_candidate_parent() {
     );
 }
 
+/// A donor job for a root planned after main moved mid-run records
+/// the root's real base (#1111): base == parent == the new base,
+/// not the base the run started on, and the donor validator is
+/// handed that base.
+#[test]
+fn a_mid_run_root_donor_job_records_the_base_it_was_planned_on() {
+    let fx = Fixture::new("donor-mid-run-root-base");
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed tests");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    let base_start = fx.remote_main();
+    let marker = fx.root.join("donor-saw-env");
+    let gates = fx.root.join("gates");
+    std::fs::create_dir_all(&gates).unwrap();
+    let run_cmd = format!(
+        "set=$(ls tests | tr '\\n' _); echo \"base=$MQ_BASE parent=$MQ_PARENT\" >> {}; i=0; while [ ! -e '{}/'$set ] && [ $i -lt 1200 ]; do sleep 0.05; i=$((i+1)); done; exit 0",
+        marker.display(),
+        gates.display()
+    );
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        &run_cmd,
+        "--offload",
+        "decide",
+        "--max-batch",
+        "1",
+    ]);
+    set_config(&fx, |config| {
+        config["roots"] = serde_json::json!(3);
+    });
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    // Change 1 may validate at once; change 2 stays gated in flight.
+    std::fs::write(gates.join("a_t0_"), "").unwrap();
+    let clone = donor_clone(&fx, "donor-host");
+    let route_text = route(&fx);
+    let clone_text = clone.display().to_string();
+    let donor_daemon = command(
+        &fx.root,
+        &[
+            "donor",
+            "run",
+            "--queue",
+            &route_text,
+            "--clone",
+            &clone_text,
+            "--name",
+            "d1",
+            "--jobs",
+            "2",
+            "--poll-secs",
+            "1",
+        ],
+        &[],
+    )
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .unwrap();
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _donor_daemon = KillOnDrop(donor_daemon);
+    let run = spawn_run(&fx, &["--depth", "3"]);
+    wait_for(
+        "change 1 to land on a donor receipt",
+        Duration::from_secs(60),
+        || item_status(&fx, 1) == "landed",
+    );
+    let new_base = fx.remote_main();
+    assert_ne!(new_base, base_start);
+    // Change 2's stale root is rebuilt on the new base and claimed
+    // again (its validation writes the third marker line); only then
+    // is every later job on the new base change 3's.
+    wait_for(
+        "change 2 to rebuild on the new base",
+        Duration::from_secs(60),
+        || {
+            std::fs::read_to_string(&marker)
+                .map(|seen| seen.lines().count() >= 3)
+                .unwrap_or(false)
+        },
+    );
+    // A new root planned now stands on the moved base; its donor job
+    // must record that base, not where the run started. (Change 2's
+    // rebuilt root also stands on the new base, so name only jobs
+    // published from here on.)
+    let known: Vec<String> = jobs(&fx)
+        .iter()
+        .map(|job| job["id"].as_str().unwrap().to_owned())
+        .collect();
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    fx.mq_ok(&["submit", "3", "--head", "c"]);
+    wait_for(
+        "the mid-run root job to be published",
+        Duration::from_secs(60),
+        || {
+            jobs(&fx).iter().any(|job| {
+                job["parent"] == new_base.as_str()
+                    && !known.iter().any(|id| job["id"] == id.as_str())
+            })
+        },
+    );
+    let mid = jobs(&fx)
+        .into_iter()
+        .find(|job| {
+            job["parent"] == new_base.as_str() && !known.iter().any(|id| job["id"] == id.as_str())
+        })
+        .expect("a donor job recorded on the new base");
+    assert_eq!(mid["base"], new_base.as_str(), "{mid}");
+    for set in [
+        "a_t0_",
+        "b_t0_",
+        "c_t0_",
+        "a_b_t0_",
+        "a_c_t0_",
+        "b_c_t0_",
+        "a_b_c_t0_",
+        "t0_",
+    ] {
+        std::fs::write(gates.join(set), "").unwrap();
+    }
+    let (code, report, stderr) = finish(run);
+    assert_eq!(code, Some(0), "{stderr}");
+    for pr in 1..=3 {
+        assert_eq!(
+            item_status(&fx, pr),
+            "landed",
+            "#{pr}: {report} {stderr} jobs={:?}",
+            jobs(&fx)
+        );
+    }
+    let seen = std::fs::read_to_string(&marker).unwrap();
+    assert!(
+        seen.lines()
+            .any(|line| line == format!("base={new_base} parent={new_base}")),
+        "mid-run root donor run did not see the new base: {seen}"
+    );
+}
+
 #[test]
 fn a_dead_donor_loses_its_lease_and_its_late_receipt_is_refused() {
     let fx = Fixture::new("donor-dead");
