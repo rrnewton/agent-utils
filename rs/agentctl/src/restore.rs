@@ -142,6 +142,8 @@ pub struct RestoreConfig {
     pub exclude: Vec<String>,
     /// Desired state (#742): when present, only these agents (plus the coordinator) are
     /// restored; every other registered name stays retired, for example finished lanes.
+    /// When absent, the desired set is registry-derived (#1129): every record that was
+    /// running at shutdown, with `exclude` as the only hand-kept control.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agents: Option<Vec<String>>,
     /// User certificate file that must exist before any agent can start (#742): restore
@@ -1453,6 +1455,24 @@ fn anchored_boots(registry: &Path, names: &[String]) -> Vec<String> {
     boots
 }
 
+/// The recorded lifecycle of one agent, for registry-derived desired state (#1129).
+///
+/// An unreadable, unparseable, or lifecycle-less record is undecidable: the caller refuses
+/// it with this evidence instead of silently excluding it, because derivation cannot tell
+/// whether it was running at shutdown.
+fn derived_lifecycle(registry: &Path, name: &str) -> std::result::Result<String, String> {
+    let path = record_path(registry, name)
+        .ok_or_else(|| format!("{name} has no readable record path in either layout"))?;
+    let bytes =
+        fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let record: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("{} is not valid JSON: {error}", path.display()))?;
+    record["lifecycle"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{} records no lifecycle", path.display()))
+}
+
 fn notice_text(report: &Value, boot_time: Option<u64>, path: &Path) -> String {
     let rows = |key: &str| report[key].as_array().cloned().unwrap_or_default();
     let mut agents = rows("agents");
@@ -1522,6 +1542,13 @@ fn notice_text(report: &Value, boot_time: Option<u64>, path: &Path) -> String {
                 report["boot_id"].as_str().unwrap_or("?")
             )
         },
+        format!(
+            "Desired state: {}.",
+            match report["desired_state_source"].as_str() {
+                Some("pinned-list") => "pinned-list (restore.json agents, plus the coordinator)",
+                _ => "registry-derived (every record running at shutdown; restore.json exclude left alone)",
+            }
+        ),
         format!("Revived: {}.", list("revived", &pane)),
         format!(
             "STARTED FRESH, no memory of their previous conversation (give them their task again): {}.",
@@ -1802,6 +1829,8 @@ pub fn restore<A: ManagedApi + ?Sized>(
         "restart_detected": boots.iter().any(|boot| *boot != boot_id),
         "started_at": host.now(),
         "dry_run": options.dry_run,
+        // #1129: why each lane was in or out of the desired set.
+        "desired_state_source": if config.agents.is_some() { "pinned-list" } else { "registry-derived" },
         "report": path,
     });
     let project = registry.parent().unwrap_or(registry);
@@ -1917,6 +1946,33 @@ pub fn restore<A: ManagedApi + ?Sized>(
                 if !desired.iter().any(|wanted| wanted == name) {
                     agents.push(json!({"name": name, "action": "excluded", "reason": "not listed in restore.json agents (desired state)"}));
                     continue;
+                }
+            } else {
+                // Registry-derived desired state (#1129): only a record that was
+                // running at shutdown (or a launch_failed record the promote path
+                // can still prove live) is derived. Stopped, archived, and other
+                // lifecycles are skipped, never revived; an undecidable record is
+                // refused with its evidence, never silently excluded.
+                match derived_lifecycle(registry, name) {
+                    Err(evidence) => {
+                        agents.push(json!({
+                            "name": name,
+                            "action": "refused",
+                            "reason": format!("cannot derive desired state for {name}: {evidence}"),
+                        }));
+                        continue;
+                    }
+                    Ok(lifecycle) if lifecycle != "running" && lifecycle != "launch_failed" => {
+                        agents.push(json!({
+                            "name": name,
+                            "action": "skipped",
+                            "reason": format!(
+                                "lifecycle is {lifecycle}, not running at shutdown; registry-derived restore leaves it down"
+                            ),
+                        }));
+                        continue;
+                    }
+                    Ok(_) => {}
                 }
             }
             eprintln!("agentctl restore: restoring {name}");

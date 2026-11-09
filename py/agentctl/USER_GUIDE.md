@@ -1081,8 +1081,17 @@ In order, it:
 
 Names in `exclude` are left alone and not counted (the coordinator cannot be
 excluded); use it for a record that is not meant to come back, or stop that
-record instead. A dry run never completes; its `would_complete` says whether the
-same run would.
+record instead. The desired set is registry-derived by default: with no
+`agents` key in `restore.json`, every record that was running at shutdown is
+restored (the coordinator first), stopped records are reported as skipped, and
+a record whose shutdown liveness cannot be decided (unreadable, unparseable,
+or with no recorded lifecycle) is refused with its evidence. An explicit
+`agents` list is an opt-in pin instead: only those agents, plus the
+coordinator, are restored. The report and the coordinator's notice name the
+choice under `desired_state_source` (`registry-derived` or `pinned-list`).
+`restore --write-agents` materialises a pin from the live records; it is never
+a step a correct reboot requires. A dry run never completes; its
+`would_complete` says whether the same run would.
 
 The report is `REPORT_DIR/BOOT_ID.json` (default
 `REGISTRY/restore-reports`). Exit status is 0 when the restore completed

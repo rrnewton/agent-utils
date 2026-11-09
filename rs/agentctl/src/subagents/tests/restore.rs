@@ -133,6 +133,44 @@ fn dead_agent(fixture: &Fixture) -> AgentRecord {
     record
 }
 
+/// One more agent the reboot killed, under its own name (#1129).
+fn dead_named(fixture: &Fixture, name: &str) -> AgentRecord {
+    fixture
+        .client
+        .fresh_presentations
+        .store(true, Ordering::Relaxed);
+    fixture
+        .manager()
+        .start(
+            name,
+            &fixture.root,
+            StartOptions {
+                harness: "codex".to_owned(),
+                resume: Some(format!("{name}-conversation")),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let record = fixture.manager().load(name).unwrap();
+    fixture
+        .client
+        .dead_panes
+        .lock()
+        .unwrap()
+        .insert(record.pane_id.clone().unwrap());
+    fixture.client.started.store(false, Ordering::Relaxed);
+    record
+}
+
+fn agent_row<'a>(report: &'a Value, name: &str) -> &'a Value {
+    report["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == name)
+        .unwrap_or_else(|| panic!("no report row for {name}: {report}"))
+}
+
 #[test]
 fn restore_remounts_first_revives_then_starts_units_and_is_idempotent() {
     let fixture = Fixture::new();
@@ -1640,7 +1678,117 @@ fn restore_with_a_desired_agents_list_leaves_unlisted_records_retired() {
         report["agents"][0]["reason"],
         "not listed in restore.json agents (desired state)"
     );
+    // #1129: an explicit agents list is a pin, and the report names it.
+    assert_eq!(report["desired_state_source"], "pinned-list", "{report}");
     assert_eq!(fixture.manager().load("lane").unwrap().token, old.token);
+}
+
+#[test]
+fn restore_without_an_agents_key_derives_the_records_running_at_shutdown() {
+    // #1129 restore-registry-derived: no agents key means every record
+    // that was running at shutdown, coordinator first; a stopped record
+    // is reported skipped and never revived.
+    let fixture = Fixture::new();
+    dead_named(&fixture, "lead");
+    dead_named(&fixture, "alpha");
+    let mut beta = dead_named(&fixture, "beta");
+    beta.lifecycle = "stopped".to_owned();
+    fixture.manager().save(&beta).unwrap();
+    let host = ScriptedHost::new();
+    let registry = fixture.root.join("registry");
+    let config = config(&fixture, Some("lead"));
+    assert!(config.agents.is_none());
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(
+        report["desired_state_source"], "registry-derived",
+        "{report}"
+    );
+    assert_eq!(report["coordinator"]["action"], "revived", "{report}");
+    assert_eq!(agent_row(&report, "alpha")["action"], "revived", "{report}");
+    let beta_row = agent_row(&report, "beta");
+    assert_eq!(beta_row["action"], "skipped", "{report}");
+    assert!(
+        beta_row["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("registry-derived"),
+        "{beta_row}"
+    );
+    assert_eq!(fixture.manager().load("beta").unwrap().token, beta.token);
+    assert_eq!(report["refused"], 0, "{report}");
+}
+
+#[test]
+fn restore_derived_exclude_wins_over_a_running_record() {
+    // #1129: exclude is the only hand-kept control in derived mode.
+    let fixture = Fixture::new();
+    let old = dead_agent(&fixture);
+    let host = ScriptedHost::new();
+    let registry = fixture.root.join("registry");
+    let config = RestoreConfig {
+        exclude: vec!["lane".to_owned()],
+        ..config(&fixture, None)
+    };
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(
+        report["desired_state_source"], "registry-derived",
+        "{report}"
+    );
+    assert_eq!(agent_row(&report, "lane")["action"], "excluded", "{report}");
+    assert_eq!(fixture.manager().load("lane").unwrap().token, old.token);
+}
+
+#[test]
+fn restore_derived_refuses_a_record_whose_liveness_cannot_be_decided() {
+    // #1129: a corrupt record that would otherwise derive is refused
+    // with its evidence and counts toward exit 74, never silently
+    // excluded.
+    let fixture = Fixture::new();
+    dead_agent(&fixture);
+    let registry = fixture.root.join("registry");
+    let broken = registry.join("agents/broken");
+    fs::create_dir_all(&broken).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&broken, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    // A JSON object with no lifecycle: derivation cannot decide
+    // whether this record was running at shutdown.
+    fs::write(broken.join("agent.json"), "{\"name\":\"broken\"}").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(broken.join("agent.json"), fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let host = ScriptedHost::new();
+    let config = config(&fixture, None);
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    let row = agent_row(&report, "broken");
+    assert_eq!(row["action"], "refused", "{report}");
+    let reason = row["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("cannot derive") && reason.contains("broken"),
+        "{row}"
+    );
+    // Revive's registry-wide ownership proof loads every record, so the
+    // undecidable record also blocks its decidable sibling, by name and
+    // never silently: both rows refuse and count toward exit 74 until an
+    // operator repairs or removes the broken record.
+    let lane = agent_row(&report, "lane");
+    assert_eq!(lane["action"], "refused", "{report}");
+    assert!(
+        lane["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("broken"),
+        "{lane}"
+    );
+    assert_eq!(report["refused"], 2, "{report}");
+    assert_eq!(
+        report["refused_lanes"],
+        json!(["broken", "lane"]),
+        "{report}"
+    );
+    assert_eq!(restore_exit_code(&report, false), 74, "{report}");
 }
 
 #[test]
