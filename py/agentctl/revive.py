@@ -137,10 +137,21 @@ def _paths(manager: ManagedAgents, journal: dict[str, object]) -> tuple[Path, Pa
     return operation, operation / "new", manager.registry / "archive" / f"{journal['name']}-{journal['old_token']}"
 
 
-def _read_record(manager: ManagedAgents, path: Path, name: str, *, identity: tuple[int, int] | None = None,
+def _identity_matches(device: int, inode: int, identity: tuple[int | None, int]) -> bool:
+    # A journal identity carries no device (None): st_dev is not stable for
+    # the same filesystem across a reboot or remount (btrfs assigns anonymous
+    # device numbers per mount), so only the inode locates the pinned
+    # directory; the generation token plus record SHA-256 checked beside
+    # every journal comparison identify the generation itself. An identity
+    # read fresh in this run carries its device and stays strict.
+    expected_device, expected_inode = identity
+    return inode == expected_inode and (expected_device is None or device == expected_device)
+
+
+def _read_record(manager: ManagedAgents, path: Path, name: str, *, identity: tuple[int | None, int] | None = None,
                  digest: str | None = None) -> tuple[AgentRecord, bytes, tuple[int, int]]:
     with manager._pinned_parent_directory(path, label="revive record directory") as parent:
-        if identity is not None and (parent.device, parent.inode) != identity:
+        if identity is not None and not _identity_matches(parent.device, parent.inode, identity):
             raise AgentDeliveryError("revive record directory generation changed")
         pinned = _PinnedAgentDirectory(name, path, parent.descriptor, parent.device, parent.inode)
         content = manager._record_bytes(pinned)
@@ -168,9 +179,8 @@ def candidate_records(manager: ManagedAgents) -> list[AgentRecord]:
             raise AgentDeliveryError("old revive generation changed while reserving identities")
         records.append(old)
         path = candidate if os.path.lexists(candidate) else manager._directory(cast(str, journal["name"]))
-        record, _content, _candidate_identity = _read_record(manager, path, cast(str, journal["name"]), identity=(
-            cast(int, journal["new_directory_device"]), cast(int, journal["new_directory_inode"]),
-        ))
+        record, _content, _candidate_identity = _read_record(
+            manager, path, cast(str, journal["name"]), identity=_identity(journal, "new"))
         if record.token != journal["new_token"]:
             raise AgentDeliveryError("revive candidate token changed")
         if journal["ready_record_sha256"] is not None and _digest(_content) != journal["ready_record_sha256"]:
@@ -659,8 +669,11 @@ def _prepared_stopped(manager: ManagedAgents, journal: dict[str, object], old: A
     return content
 
 
-def _identity(journal: dict[str, object], prefix: str) -> tuple[int, int]:
-    return cast(int, journal[f"{prefix}_directory_device"]), cast(int, journal[f"{prefix}_directory_inode"])
+def _identity(journal: dict[str, object], prefix: str) -> tuple[int | None, int]:
+    # Journal boundary (#952): the recorded device is deliberately dropped;
+    # see _identity_matches. The field stays in the journal for schema
+    # compatibility with the Rust edition, which writes and validates it.
+    return None, cast(int, journal[f"{prefix}_directory_inode"])
 
 
 def _complete(manager: ManagedAgents, journal: dict[str, object]) -> dict[str, object]:

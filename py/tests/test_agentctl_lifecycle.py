@@ -2417,6 +2417,49 @@ def test_revive_oversized_journal_timestamp_refuses_control_without_a_traceback(
     assert registry_bytes(manager.registry) == before and len(fake.launched) == 2 and fake.closed == []
 
 
+@pytest.mark.parametrize("drift", ["device", "inode", "sha"])
+def test_revive_journal_survives_device_change_but_still_pins_inode_and_sha(
+    drift: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #952 revive-device-pin: a journal written before a reboot names the
+    # pre-reboot anonymous device (btrfs renumbers per mount). Rewriting only
+    # the journal devices simulates that remount: the revive must proceed,
+    # while a changed inode or record SHA must still refuse.
+    from agentctl import revive as recovery
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    real_write = recovery._write_journal
+    fired = False
+
+    def write(journal_manager: ManagedAgents, journal: dict[str, object]) -> None:
+        nonlocal fired
+        if not fired and journal["phase"] == "ready":
+            fired = True
+            raise AgentDeliveryError("injected interrupted ready publication")
+        real_write(journal_manager, journal)
+
+    monkeypatch.setattr(recovery, "_write_journal", write)
+    with pytest.raises(AgentDeliveryError):
+        manager.revive("worker")
+    assert fired is True
+    journal_path = manager.registry / ".revives" / f"{old.token}.json"
+    journal = json.loads(journal_path.read_bytes())
+    if drift == "device":
+        for key in ("old_directory_device", "new_directory_device"):
+            journal[key] += 100_000
+    elif drift == "inode":
+        journal["new_directory_inode"] += 1
+    else:
+        journal["old_record_sha256"] = "0" * 64
+    journal_path.write_text(json.dumps(journal), encoding="utf-8")
+    if drift == "device":
+        assert manager.revive("worker", expected_token=old.token)["revived"] is True
+        assert not journal_path.exists()
+    else:
+        with pytest.raises(AgentDeliveryError):
+            manager.revive("worker", expected_token=old.token)
+        assert journal_path.exists()
+
+
 def _stop_cli(
     edition: str, manager: ManagedAgents, monkeypatch: pytest.MonkeyPatch,
 ) -> Callable[[Sequence[str] | None], int]:
