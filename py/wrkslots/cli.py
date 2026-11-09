@@ -4125,6 +4125,26 @@ def _config_ignorable_keys(raw: Mapping[str, object]) -> frozenset[str]:
     return frozenset(names)
 
 
+def _assert_min_wrkslots_version(raw: Mapping[str, object], path: Path) -> None:
+    """Refuse a configuration whose ``min_wrkslots_version`` is newer than this build (#1109).
+
+    Every writer of an existing configuration calls this before it writes
+    (#1126): a build too old for the file must not change it.
+    """
+
+    if "min_wrkslots_version" not in raw:
+        return
+    required = _as_str(raw["min_wrkslots_version"], "configuration.min_wrkslots_version")
+    if _version_tuple(required, "configuration.min_wrkslots_version") > _version_tuple(
+        VERSION, "wrkslots version"
+    ):
+        raise StateError(
+            f"configuration {path} requires wrkslots {required} or later "
+            f"(min_wrkslots_version); this is wrkslots {VERSION}. Run a newer "
+            "wrkslots for this project"
+        )
+
+
 def _forward_compatible_config(
     raw: Mapping[str, object], path: Path
 ) -> Mapping[str, object]:
@@ -4139,16 +4159,7 @@ def _forward_compatible_config(
     keys the file has.
     """
 
-    if "min_wrkslots_version" in raw:
-        required = _as_str(raw["min_wrkslots_version"], "configuration.min_wrkslots_version")
-        if _version_tuple(required, "configuration.min_wrkslots_version") > _version_tuple(
-            VERSION, "wrkslots version"
-        ):
-            raise StateError(
-                f"configuration {path} requires wrkslots {required} or later "
-                f"(min_wrkslots_version); this is wrkslots {VERSION}. Run a newer "
-                "wrkslots for this project"
-            )
+    _assert_min_wrkslots_version(raw, path)
     ignorable = _config_ignorable_keys(raw)
     known = REQUIRED_CONFIG_KEYS | OPTIONAL_CONFIG_KEYS
     ignored = sorted(key for key in raw if key not in known and key in ignorable)
@@ -28431,6 +28442,9 @@ def _cmd_init(args: argparse.Namespace) -> int:
         _recover_config_write(config_path, payload)
         if config_path.exists() or config_path.is_symlink():
             existing = _read_config(config_path)
+            # Before any comparison or repair: a build too old for the file
+            # must leave it byte for byte as it is (#1126).
+            _assert_min_wrkslots_version(existing, config_path)
             if _canonical_config_payload(existing) != payload:
                 existing_worktrees = existing.get("worktrees_dir")
                 if isinstance(existing_worktrees, str):

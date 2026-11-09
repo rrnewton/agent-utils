@@ -28953,6 +28953,43 @@ def _repair(
     )
 
 
+@pytest.mark.parametrize("repair", (True, False))
+def test_init_too_old_for_the_configuration_changes_no_byte_of_it(
+    tmp_path: Path, repair: bool,
+) -> None:
+    """#1126 init-repair-version-gate-after-write: the version gate comes before any write.
+
+    The reported case: a configuration requiring a newer wrkslots, and an
+    init --repair that would change its slot cap.  It printed REPAIRED,
+    persisted the new cap, and only then refused for the version.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    config_path = project / ".wrkslots.yml"
+    document = dict(wrkslots._read_config(config_path))
+    document["min_wrkslots_version"] = "99.0.0"
+    document["max_active_slots"] = 1
+    wrkslots._write_config(config_path, document)
+    before = config_path.read_bytes()
+
+    if repair:
+        refused = _repair(project, "--max-active-slots", "2")
+    else:
+        refused = subprocess.run(
+            [
+                sys.executable, str(WRKSLOTS), "--machine", "testhost", "init", str(project),
+                "--worktrees-dir", "worktrees", "--liveness-command", "liveness.py",
+                "--max-active-slots", "2",
+            ],
+            text=True, capture_output=True, check=False,
+        )
+
+    assert refused.returncode == 3, refused.stderr
+    assert "requires wrkslots 99.0.0 or later" in refused.stderr
+    assert "REPAIRED" not in refused.stdout
+    assert config_path.read_bytes() == before
+
+
 def remove_event_history_to_simulate_older_build(
     project: Path, machine: str = "testhost"
 ) -> None:
