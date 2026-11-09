@@ -1347,7 +1347,7 @@ TARGET_JS = """({id, part}) => {
 }"""
 
 # `#204 reply-arrow`. Watch for a jump to land on the row holding message `id`, and remember that it
-# did: the light a landing leaves is gone after REPLY_LANDED_MS, and a walk that only looked for it
+# did: the light a landing leaves is gone after its lifetime, and a walk that only looked for it
 # could look too late on a loaded machine. Read back as `window.__landedOn`.
 LANDING_LATCH_JS = """(id) => {
     window.__landedOn = null;

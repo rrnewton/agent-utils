@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 
 import { ALICE, BASE_CSS, CHANNEL, CODER, CSS, CSS_CODE, DESKTOP_QUERY, DISCORD_POLL_MS,
   FakeElement, GATHERED, HOLD_MS, HTML_CODE, LINE_PX, MESSAGE_CACHE_KEY, MESSAGE_DAY, OWN, OWNER,
-  PULL_WAIT_MS, REPLY_DOUBLE_TAP_MS, REPLY_JUMP_PAGES, RETRY_FIRST_MS, RUN_TAIL, SCATTERED, SCRIPT,
+  PAGE_CODE, PULL_WAIT_MS, REPLY_DOUBLE_TAP_MS, REPLY_JUMP_PAGES, RETRY_FIRST_MS, RUN_TAIL, SCATTERED, SCRIPT,
   SCRIPT_CODE, SEND_UNDO_MS, SLOW_SEND, arrowStyle, assertMarkupContains, atBottomOf, backlog,
   bodyOf, bookmarkAt, bookmarkRow, bridgeReply, brokenModule, brokenScript, channelRow,
   chooseReadMode, conversation, cssBlock, cssBlockIn, cssRules, delayedReply, deliver,
@@ -556,7 +556,7 @@ test("both arrows are drawn as the issue asks, in the stylesheet", () => {
   assert.match(cssBlock('#discord-log .reply-jump[data-reply-style="adjacent"] .reply-jump-mark::after'),
     /top:\s*-0\.45rem/, "the head's point is not where the shaft's rise ends");
   // The shaft is where web/voice.js measures it from.
-  const shaft = Number(/^const REPLY_SHAFT_REM = ([\d.]+);$/m.exec(SCRIPT_CODE)?.[1]);
+  const shaft = Number(/^[ \t]*const REPLY_SHAFT_REM = ([\d.]+);$/m.exec(PAGE_CODE)?.[1]);
   assert.match(mark, new RegExp(`width:\\s*calc\\(${String(shaft).replace(".", "\\.")}rem \\+`),
     "the shaft is drawn somewhere other than where it is measured from");
   assert.match(cssBlock('#discord-log .reply-jump[data-reply-reach="side"] .reply-jump-mark::after'),
@@ -3329,7 +3329,7 @@ test("A CIRCLE AND AN ARROW AT ONE CORNER step aside for each other: the head ra
   assert.match(cssBlock('#discord-log .reply-jump[data-reply-reach="side"] .reply-jump-mark::after'), /top:\s*-0\.9rem/);
   assert.match(cssBlock("#discord-log li.discord-message[data-reply-lift] > .reply-marker"),
     /bottom:\s*calc\(-1px - var\(--reply-marker-target\) \/ 2 \+ 0\.7rem\)/, "a lifted circle is not lifted");
-  assert.ok(/^const REPLY_HUB_CLEAR_REM = 1\.1;$/m.test(SCRIPT_CODE), "the head's clearance from the circle has changed");
+  assert.ok(/^[ \t]*const REPLY_HUB_CLEAR_REM = 1\.1;$/m.test(PAGE_CODE), "the head's clearance from the circle has changed");
 });
 
 test("TAPPING THE CIRCLE lands on the reply, lit, the way the arrow lands on what it answers", async () => {

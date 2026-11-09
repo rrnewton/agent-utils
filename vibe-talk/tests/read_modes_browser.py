@@ -280,8 +280,8 @@ def handler_for(api: FakeApi, web_root: Path) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
-# Where things are, measured by the engine. `floatingLine` is the page's own `floatingClearance`
-# restated: the bottom of the freshness pill or the search glass, whichever is lower and showing.
+# Where things are, measured by the engine. `floatingLine` is the page's own clearance above
+# the list restated: the bottom of the freshness pill or the search glass, whichever is lower and showing.
 MEASURE_JS = """({root, answer}) => {
   const box = (node) => {
     if (!node) return null;

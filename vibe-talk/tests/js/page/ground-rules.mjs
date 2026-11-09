@@ -160,7 +160,7 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
   assert.equal(same("inColumn(columns.side, () => replyArrows()) === columns.side.arrows && replyArrows() === columns.main.arrows"), true);
   same("inColumn(columns.side, () => { replyArrows().held += 1; })");
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.arrows.held, replyArrows().held])")), [1, 0]);
-  assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshReplyArrows())")),
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(page.preludeBinding("freshReplyArrows")())),
     { back: null, landed: null, tap: null, settling: null, held: 0, owed: false, countsDrawn: false });
   // And its reads' state.
   assert.equal(same("inColumn(columns.side, () => loadState()) === columns.side.load && loadState() === columns.main.load"), true);

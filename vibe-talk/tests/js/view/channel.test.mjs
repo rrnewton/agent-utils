@@ -1797,3 +1797,51 @@ test("`#624 voice-page-modularity`: a reply that did not go is reported in the c
   assert.equal(owner.columnReplies.has("e1"), false, "a sent reply kept its column");
   assert.equal(owner.unseenColumnReply(), null);
 });
+
+test("`#624 voice-page-modularity`: a column's reply arrows start fresh, and a landed row is put out by the next landing", () => {
+  const { createReplyArrows, freshReplyArrows } = CHANNEL_VIEW;
+  const active = freshReplyArrows();
+  assert.deepStrictEqual(active, { back: null, landed: null, tap: null, settling: null, held: 0, owed: false, countsDrawn: false });
+  const log = [];
+  const rows = new Map();
+  const owner = createReplyArrows({
+    el: (id) => (id === "discord-log" ? { children: [...rows.values()] } : id === "scroll-area" ? { hidden: false, children: [], scrollTop: 0, clientHeight: 100, getBoundingClientRect: () => ({ top: 0, bottom: 100, height: 100 }) } : { hidden: true, children: [] }),
+    leftEl: () => ({ hidden: true, getBoundingClientRect: () => ({ top: 0, bottom: 0, height: 0 }) }),
+    inThisColumn: (fn) => fn,
+    guardQuietly: (fn) => fn,
+    gatherFromReply: () => log.push("gather"),
+    filterState: () => ({ hold: null }),
+    endFilterWalk: () => {}, endSearchWalks: () => {},
+    selectLanded: (row) => log.push(`select:${row.getAttribute("data-id")}`),
+    setSearchOpen: () => {}, openReadRun: () => {}, renderScrollTools: () => log.push("tools"),
+    setStatus: (text) => log.push(text),
+    channelContextKey: () => "ctx",
+    heldMessage: () => null,
+    inView: () => false,
+    selection: () => ({ view: "main", threadId: null }),
+    threading: () => true,
+    olderPages: () => ({ moreAbove: false, cursor: null }),
+    viewKey: () => "main",
+    channelCanon: () => ({ views: new Map() }),
+    selectedChannelId: () => "C1",
+    changeChannelView: async () => {},
+    channelReadsBusy: () => false,
+    loadOlder: () => null,
+    walkCursorOwed: () => false,
+    hidingRead: () => false,
+    timelineMessages: () => [],
+    hiddenEmpty: () => false,
+    readHiding: () => false,
+    layoutColumns: () => false,
+    columnSteps: () => ({ pause: () => {}, resume: () => {} }),
+    activeArrows: () => active,
+    replyJumpTicket: () => { let n = 0; return { current: () => n, bump: () => { n += 1; } }; },
+  });
+  const row = { getAttribute: (k) => (k === "data-ids" ? "m1" : k === "data-id" ? "m1" : null), setAttribute: () => {}, removeAttribute: () => log.push("unland"), className: "", children: [], getBoundingClientRect: () => ({ top: 10, bottom: 30, left: 0 }) };
+  rows.set("m1", row);
+  assert.equal(owner.rowHolding("m1"), row, "the row holding the message was not found");
+  assert.equal(owner.landOnAnswered("m1", "m2"), true, "the jump did not land on the row on screen");
+  assert.deepStrictEqual(log, ["select:m1", "tools", "Here is the message it answers."], "the landing did not light the row and say where it is");
+  assert.equal(owner.landOnAnswered("nope", "m2"), false, "a jump landed on a row that is not on screen");
+  assert.equal(freshReplyArrows().countsDrawn, false, "a fresh column shared its arrows record");
+});
