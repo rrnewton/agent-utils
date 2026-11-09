@@ -106,7 +106,7 @@ test("`#624 voice-page-modularity`: no top-level name of the legacy script or it
       }
     }
   }
-  assert.ok(names.size > 900 && DOM_GLOBALS.size > 500 && DOM_GLOBALS.has("navigation") && names.has("selectedChannelId"),
+  assert.ok(names.size > 800 && DOM_GLOBALS.size > 500 && DOM_GLOBALS.has("navigation") && names.has("selectedChannelId"),
     "the scan found too few names to mean anything");
   // The call's `stop` now belongs to its owner and no longer hides window.stop.
   const KNOWN = new Set();

@@ -2399,3 +2399,45 @@ test("`#624 voice-page-modularity`: a thread's count comes from its summary befo
   assert.equal(cover.notice, "", "All's notice came with Main's cover");
   assert.equal(cover.cursor, null, "Main kept All's forward cursor");
 });
+
+test("`#624 voice-page-modularity`: reply counts by pointer and the unanswered root, from the module alone", () => {
+  const { createReplyCounts } = CHANNEL_VIEW;
+  const canon = { channel: "c1", scope: null, dismissed: new Set(), views: new Map(), threads: [],
+    messages: [
+      { id: "r1", thread: { id: "t1", is_root: true, reply_count: 0, reply_count_exact: true, root_message_id: "r1" } },
+      { id: "a1", reply_to: "r1", timestamp: "2026-01-01T00:00:01Z", thread: { id: "t1", is_root: false, root_message_id: "r1" } },
+      { id: "a2", reply_to: "r1", timestamp: "2026-01-01T00:00:02Z" },
+    ] };
+  const noop = () => {};
+  const owner = createReplyCounts({
+    answeredElsewhere: () => false, cardSplit: () => false,
+    el: () => ({ children: [], hidden: false }), focusMinimally: noop,
+    gatherCount: () => ({ count: 0, exact: true }), guardQuietly: (fn) => fn,
+    hiddenEmpty: () => false, hidingRead: () => false,
+    idsOf: (row) => row.ids || [], inColumn: (_c, fn) => fn(), inThisColumn: (fn) => fn,
+    inView: () => false, knownChannel: () => null,
+    listState: () => ({ outgoingKey: "" }), openReadRun: noop, openThread: noop,
+    openThreadChoice: () => null, openThreadRootId: () => null, outgoingReplyKey: () => "",
+    paintThreadStrip: noop, pendingInto: () => 0, quoteLabelFits: () => true,
+    renderScrollTools: noop, replyArrows: () => ({ countsDrawn: false }), revealRow: noop,
+    rootInward: () => false, rowHolding: () => null, rowMessages: (row) => row.messages || [],
+    rowShown: () => true, seekMessage: async () => {}, selectedChannelId: () => "c1",
+    selection: () => ({ view: "main", threadId: null }), sentFromThisPage: () => false,
+    setSearchOpen: noop, setStatus: noop, shownNode: () => true,
+    stillToDo: () => true, threadCount: (n) => `${n}`, threadHue: () => "1",
+    threadReplyCount: () => null, timeOf: (m) => Date.parse(m && m.timestamp) || NaN,
+    viewKey: (view, threadId) => (view === "thread" && threadId ? `thread:${threadId}` : view),
+    channelStore: () => ({ current: () => canon }), providerFacts: { threading: () => true },
+    columns: () => ({ main: null, side: null }), layoutShown: () => ({ columns: () => false }),
+    outbox: () => ({ values: () => [] }), outboxDispatch: () => ({ retryPending: () => false }),
+    quoteOwner: () => ({ held: () => null }),
+  });
+  assert.equal(owner.unansweredRoot(canon.messages[0], 0, 0, null), true, "a root with a zero count was not unanswered");
+  assert.equal(owner.unansweredRoot(canon.messages[0], 0, 1, null), false, "a held reply left the root unanswered");
+  const rootRow = { ids: ["r1"], messages: [canon.messages[0]] };
+  const { replies } = owner.heldReplies([rootRow]);
+  // a1 names its own thread's root: the thread chips count it, not Reply (N). a2 is by pointer.
+  assert.deepStrictEqual([...(replies.get("r1") || new Map()).keys()], ["a2"], "the pointer count was not the main reply alone");
+  const tally = owner.replyTally();
+  assert.equal(tally.threads.get("t1").held, 1, "the tally did not hold the thread reply");
+});

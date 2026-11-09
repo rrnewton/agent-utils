@@ -144,6 +144,8 @@ export { createFilterPlace, freshFilterState } from "./filterplace.ts";
 export { createLiveState } from "./livestate.ts";
 export { createDoneAct, freshDoneState } from "./doneact.ts";
 export { createChannelViews } from "./channelviews.ts";
+export { createReplyCounts } from "./replycounts.ts";
+export type { ReplyCounts, ReplyCountsDependencies } from "./replycounts.ts";
 export type { DismissalOffer, DoneAct, DoneActDependencies, DoneLedger, DoneState } from "./doneact.ts";
 export type { LiveFollowSwitch, LiveState, LiveStateDependencies, LiveStorage } from "./livestate.ts";
 export type { ChannelViews, ChannelViewsDependencies, HeldViewContext, ReaderPlaceResult, ThreadRecordLike, ViewSelection } from "./channelviews.ts";

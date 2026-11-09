@@ -3057,7 +3057,7 @@ test("REPLY SAYS HOW MANY REPLIES A MESSAGE HAS: Reply, Reply (1), Reply (2), an
     assert.equal(button(id).getAttribute("title"), "Reply to this message");
   }
   // Short enough to leave the row's buttons on one line: four characters, at most five.
-  assert.ok(SCRIPT_CODE.includes("`Reply (${count})`"), "the count is not drawn as Reply (N)");
+  assert.ok(PAGE_CODE.includes("`Reply (${count})`"), "the count is not drawn as Reply (N)");
 });
 
 test("...a combined row counts the replies to any message it stands for, once each", async () => {
