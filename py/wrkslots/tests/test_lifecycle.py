@@ -50373,9 +50373,9 @@ def test_process_census_preflight_omits_proven_terminal_generation(
     )
     assert census.processes == ()
     assert census.matches == ()
-    # The same-UID census closes with a second inventory, which the omitted
+    # Both censuses close with a second inventory (#1102), which the omitted
     # generation does not reopen.
-    assert snapshots == (2 if lane == "same-uid" else 1)
+    assert snapshots == 2
 
 
 @pytest.mark.parametrize("lane", ("privileged", "same-uid"))
@@ -50445,7 +50445,8 @@ def test_process_census_preflight_discards_attempt_with_shared_bounds(
         assert calls == (
             ["snapshot", "identity", "snapshot"]
             if lane == "same-uid"
-            else ["snapshot", "identity", "snapshot", "find", "maps", "mount"]
+            # The closing inventory (#1102) adds nothing.
+            else ["snapshot", "identity", "snapshot", "find", "maps", "mount", "snapshot"]
         )
     else:
         with pytest.raises(wrkslots.Refusal, match="three liveness attempts" if scenario == "persistent" else "operation-wide time bound"):
@@ -50563,8 +50564,8 @@ def test_process_census_preflight_keeps_vanished_identity_in_every_observer(
         census = capture()
         assert census.processes == processes
         assert calls == [
-            "snapshot", "find", "maps", "mount:123", "mount:124",
-            *(["snapshot"] if lane == "same-uid" else []),
+            # Both censuses close with an inventory that adds nothing (#1102).
+            "snapshot", "find", "maps", "mount:123", "mount:124", "snapshot",
         ]
         if evidence.startswith("live"):
             with pytest.raises(wrkslots.Refusal, match="live process 124"):
@@ -51714,8 +51715,8 @@ def test_missing_path_census_discards_attempt_before_complete_reobservation(
     census = capture()
     first_find = ["find"] * (1 + wrkslots._LIVE_ENTRY_REPROBES) if lane == "privileged" else ["find"]
     assert calls == [
-        "snapshot", *first_find, "snapshot", "find", "grep", "mount",
-        *(["snapshot"] if lane == "same-uid" else []),
+        # Both censuses close with an inventory that adds nothing (#1102).
+        "snapshot", *first_find, "snapshot", "find", "grep", "mount", "snapshot",
     ]
     assert len(census.processes) == 1
     assert census.matches == ()

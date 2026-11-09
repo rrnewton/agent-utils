@@ -1510,13 +1510,17 @@ def test_audit_legacy_journal_differs_from_evidence_refuses(
     assert message in result.stderr
 
 
-def _churn_hook(tmp_path: Path, tag: str, slot: Path) -> tuple[str, Path]:
+def _churn_hook(
+    tmp_path: Path, tag: str, slot: Path, *, fire_at: int = 1
+) -> tuple[str, Path]:
     """A process to vanish, and a hook that kills it and starts one in ``slot``.
 
-    The census runs the hook once it has listed /proc (WRKSLOTS_TEST_CENSUS_CHURN):
-    the listed process is then gone, reaped by the subreaper, and a new process
-    whose working directory is inside the slot exists that the listing never saw.
-    Returns the hook command and the file the appearing process's PID is written to.
+    Each scan runs the hook once it has listed /proc (WRKSLOTS_TEST_CENSUS_CHURN);
+    on its ``fire_at``-th call the listed process is killed, reaped by the
+    subreaper, and a new process whose working directory is inside the slot
+    (or its fenced name, after a removal's path fence) starts, which that
+    listing never saw.  Returns the hook command and the file
+    the appearing process's PID is written to.
     """
 
     work = tmp_path / f"churn-{tag}"
@@ -1526,14 +1530,22 @@ def _churn_hook(tmp_path: Path, tag: str, slot: Path) -> tuple[str, Path]:
         capture_output=True, text=True, check=True, cwd=work, timeout=30,
     ).stdout.strip()
     appeared = work / "appeared.pid"
-    flag = work / "fired"
+    calls = work / "calls"
     hook = (
-        f"[ -e {flag} ] && exit 0; : > {flag}; "
+        f"n=$(($(cat {calls} 2>/dev/null || echo 0) + 1)); echo $n > {calls}; "
+        f"[ $n -eq {fire_at} ] || exit 0; "
         f"kill -KILL {vanishing}; "
         f"n=0; while kill -0 {vanishing} 2>/dev/null && [ $n -lt 500 ]; do sleep 0.01; n=$((n+1)); done; "
-        f"cd {slot} || exit 1; setsid sleep 300 </dev/null >/dev/null 2>&1 & echo $! > {appeared}"
+        # After a removal's path fence the checkout lives under a fenced name.
+        f"d={slot}; [ -d $d ] || d=$(find {slot.parent.parent} -maxdepth 4 -type d "
+        f"-name {slot.name} 2>/dev/null | head -n 1); cd \"$d\" || exit 1; "
+        f"setsid sleep 300 </dev/null >/dev/null 2>&1 & echo $! > {appeared}"
     )
     return hook, appeared
+
+
+def _seam_calls(hook_counter: Path) -> int:
+    return int(hook_counter.read_text()) if hook_counter.exists() else 0
 
 
 def _stop_appeared(appeared: Path) -> str:
@@ -1552,11 +1564,6 @@ def _churn_row(row: dict[str, object], pid: str) -> dict[str, object]:
 
 
 @pytest.mark.real_process_evidence
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1102 wrkslots-census-churn-tolerant: the Python census also misses a "
-    "process that appears after its /proc listing",
-)
 def test_audit_census_sees_appearing_pid_and_tolerates_vanished_pid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1577,39 +1584,37 @@ def test_audit_census_sees_appearing_pid_and_tolerates_vanished_pid(
 
 
 @pytest.mark.real_process_evidence
-@pytest.mark.xfail(
-    strict=True,
-    reason="#1102 wrkslots-census-churn-tolerant: neither edition's census sees a "
-    "process that appears after its /proc listing",
-)
 def test_audit_forced_churn_matches_python(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Both editions, one injected vanishing PID and one appearing PID: the same row (#1102)."""
+    """Both editions, one injected vanishing PID and one appearing PID: the same row (#1102).
 
-    rust_root = _fixture(tmp_path / "rust")
-    oracle_root = _fixture(tmp_path / "oracle")
-    hook, appeared = _churn_hook(
-        tmp_path, "python", oracle_root / "worktrees" / "slot-a" / "repo"
-    )
-    monkeypatch.setenv("WRKSLOTS_TEST_CENSUS_CHURN", hook)
-    try:
-        python_payload = _python(oracle_root, tmp_path)
-    finally:
-        python_pid = _stop_appeared(appeared)
-    hook, appeared = _churn_hook(
-        tmp_path, "rust", rust_root / "worktrees" / "slot-a" / "repo"
-    )
-    monkeypatch.setenv("WRKSLOTS_TEST_CENSUS_CHURN", hook)
-    try:
-        result = _rust(rust_root, census_state=tmp_path / "rust-census.json")
-    finally:
-        rust_pid = _stop_appeared(appeared)
-    assert result.returncode == 0, result.stderr
-    rust_row = _churn_row(_rows(_scrub(json.loads(result.stdout)))[0], rust_pid)
-    python_row = _churn_row(_rows(_scrub(python_payload))[0], python_pid)
-    assert rust_row["verdict"] == "BLOCKED", rust_row
-    assert rust_row == python_row
+    The editions word a slot user differently (a link path against the kind of
+    reference), so the reasons are compared for naming the appearing process.
+    """
+
+    root = _fixture(tmp_path)
+    slot = root / "worktrees" / "slot-a"
+    rows: list[dict[str, object]] = []
+    for edition in ("python", "rust"):
+        hook, appeared = _churn_hook(tmp_path, edition, slot / "repo")
+        monkeypatch.setenv("WRKSLOTS_TEST_CENSUS_CHURN", hook)
+        try:
+            if edition == "python":
+                payload = _scrub(_python(root, tmp_path))
+            else:
+                result = _rust(root, census_state=tmp_path / "rust-census.json")
+                assert result.returncode == 0, result.stderr
+                payload = _scrub(json.loads(result.stdout))
+        finally:
+            pid = _stop_appeared(appeared)
+        row = _rows(payload)[0]
+        reasons = [str(reason) for reason in cast(list[object], row["reasons"])]
+        assert row["verdict"] == "BLOCKED", (edition, row)
+        assert len(reasons) == 1, (edition, reasons)
+        assert reasons[0].startswith(f"live process {pid} uses slot {slot}"), (edition, reasons)
+        rows.append({**row, "reasons": None})
+    assert rows[0] == rows[1]
 
 
 def test_pinned_process_evidence_fails_loudly_when_a_process_uses_the_slot(
@@ -1627,3 +1632,100 @@ def test_pinned_process_evidence_fails_loudly_when_a_process_uses_the_slot(
     finally:
         process.kill()
         process.wait()
+
+
+def _many_slot_fixture(base: Path, count: int) -> Path:
+    """The single-slot fixture grown to ``count`` registered, removable slots."""
+
+    root = _fixture(base)
+    upstream = base / "upstream-repo"
+    active = root / "worktrees" / "ACTIVE.node-a.json"
+    document = json.loads(active.read_text())
+    template = document["slots"][0]
+    refspecs = []
+    for index in range(2, count + 1):
+        slot = f"slot-{index:02d}"
+        branch = f"suite/work-{index:02d}"
+        _git(
+            upstream, "worktree", "add", "-q", "-b", branch,
+            str(root / "worktrees" / slot / "repo"), "HEAD",
+        )
+        refspecs.append(branch)
+        record = json.loads(json.dumps(template))
+        record["slot"] = slot
+        record["agent"] = f"agent-{slot}"
+        record["checkouts"][0]["path"] = f"worktrees/{slot}/repo"
+        record["checkouts"][0]["branch"] = branch
+        document["slots"].append(record)
+    _git(upstream, "push", "-q", "origin", *refspecs)
+    active.write_text(json.dumps(document))
+    return root
+
+
+def _heavy_churn_hook(base: Path, tag: str, slot: Path, *, vanishing: int) -> tuple[str, Path]:
+    """Like _churn_hook, at scale: ``vanishing`` listed processes die, as many unrelated ones start.
+
+    One more process starts inside ``slot``.  The unrelated births are short-lived,
+    so some also vanish while a scan reads them.
+    """
+
+    work = base / f"churn-{tag}"
+    work.mkdir()
+    pids = subprocess.run(
+        [
+            "/bin/sh", "-c",
+            f"for i in $(seq {vanishing}); do setsid sleep 300 </dev/null >/dev/null 2>&1 & "
+            "echo $!; done",
+        ],
+        capture_output=True, text=True, check=True, cwd=work, timeout=60,
+    ).stdout.split()
+    appeared = work / "appeared.pid"
+    script = work / "hook.sh"
+    script.write_text(
+        f"[ -e {work}/fired ] && exit 0; : > {work}/fired\n"
+        f"kill -KILL {' '.join(pids)}\n"
+        f"for i in $(seq {vanishing}); do setsid sleep 0.$((i % 9 + 1)) </dev/null >/dev/null 2>&1 & done\n"
+        f"cd {slot} || exit 1\n"
+        f"setsid sleep 300 </dev/null >/dev/null 2>&1 & echo $! > {appeared}\n"
+    )
+    return f"/bin/sh {script}", appeared
+
+
+@pytest.mark.real_process_evidence
+def test_audit_heavy_churn_many_slots_matches_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1102 at a consumer's scale: 77 slots, 60 listed processes vanishing, 60 unrelated
+    births and one process appearing in one slot, all between a listing and its reads.
+
+    Both editions publish 76 slots DELETABLE and the used one BLOCKED, naming the
+    appearing process; neither refuses for churn (no UNKNOWN).
+    """
+
+    root = _many_slot_fixture(tmp_path, 77)
+    used = root / "worktrees" / "slot-40"
+    verdicts: list[dict[str, object]] = []
+    for edition in ("python", "rust"):
+        hook, appeared = _heavy_churn_hook(tmp_path, edition, used / "repo", vanishing=60)
+        monkeypatch.setenv("WRKSLOTS_TEST_CENSUS_CHURN", hook)
+        try:
+            if edition == "python":
+                payload = _python(root, tmp_path)
+            else:
+                result = _rust(root, census_state=tmp_path / "rust-census.json")
+                assert result.returncode == 0, result.stderr
+                payload = json.loads(result.stdout)
+        finally:
+            pid = _stop_appeared(appeared)
+        rows = {str(row["slot"]): row for row in _rows(payload)}
+        assert len(rows) == 77, edition
+        assert payload["unknown_slots"] == [], (edition, payload["unknown_slots"])
+        blocked = rows.pop("slot-40")
+        assert blocked["verdict"] == "BLOCKED", (edition, blocked)
+        reasons = cast(list[object], blocked["reasons"])
+        assert any(str(reason).startswith(f"live process {pid} uses slot {used}") for reason in reasons), (
+            edition, reasons,
+        )
+        assert {str(row["verdict"]) for row in rows.values()} == {"DELETABLE"}, edition
+        verdicts.append({slot: row["verdict"] for slot, row in rows.items()})
+    assert verdicts[0] == verdicts[1]

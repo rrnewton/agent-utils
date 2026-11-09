@@ -519,11 +519,23 @@ fn link_points_into(link: &Path, slot_path: &Path, slot_device: u64) -> Result<b
     observation_points_into(&observe_link(link), slot_path, slot_device)
 }
 
-/// Capture one shared process snapshot (a single attempt set; no
-/// whole-capture retry), excluding this process's ancestry and the
-/// coordinator. Enumeration failure stays fail-closed.
-pub(crate) fn capture_process_snapshot(coordinator_pid: i64) -> Result<ProcessSnapshot> {
-    let ignored = own_ancestry();
+/// Most listings of /proc one snapshot takes before it refuses
+/// (#1102 wrkslots-census-churn-tolerant). Each listing that is not
+/// proven settles at least one more target, so a snapshot of N
+/// targets closes within N + 2 listings unless processes keep
+/// changing faster than it can read them.
+const SNAPSHOT_LISTING_ROUNDS: usize = 64;
+
+/// A process generation's start time (clock ticks after boot), or
+/// None once it has exited.
+fn process_start_ticks(pid: i64) -> Option<u64> {
+    let raw = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+    let text = String::from_utf8_lossy(&raw);
+    let closing = text.rfind(") ")?;
+    text[closing + 2..].split_whitespace().nth(19)?.parse().ok()
+}
+
+fn list_proc() -> Result<Vec<String>> {
     let entries = std::fs::read_dir("/proc")
         .map_err(|error| format!("process use is indeterminate because /proc failed: {error}"))?;
     let mut names: Vec<String> = Vec::new();
@@ -533,42 +545,137 @@ pub(crate) fn capture_process_snapshot(coordinator_pid: i64) -> Result<ProcessSn
         })?;
         names.push(entry.file_name().to_string_lossy().into_owned());
     }
-    // Test seam (#1084, #1102 wrkslots-census-churn-tolerant): the
-    // forced-churn differential makes a listed process vanish and a new
-    // one appear between the listing and the reads.
-    if let Some(command) = std::env::var_os("WRKSLOTS_TEST_CENSUS_CHURN") {
-        let _ = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(command)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+    Ok(names)
+}
+
+fn read_process_links(pid: i64) -> ProcessLinks {
+    let base = PathBuf::from("/proc").join(pid.to_string());
+    let mut links: Vec<(&'static str, LinkObservation)> = Vec::new();
+    for (label, link) in [
+        ("working directory", base.join("cwd")),
+        ("executable", base.join("exe")),
+    ] {
+        links.push((label, observe_link(&link)));
     }
+    if let Ok(fds) = std::fs::read_dir(base.join("fd")) {
+        for fd in fds.flatten() {
+            links.push(("descriptor", observe_link(&fd.path())));
+        }
+    }
+    ProcessLinks { pid, links }
+}
+
+/// Capture one shared process snapshot for `targets`, excluding this
+/// process's ancestry and the coordinator. Enumeration failure stays
+/// fail-closed.
+///
+/// One semantics with the Python census (#1102): a process that exits
+/// while it is read cannot be using a target, so its missing entries
+/// are skipped; a process that appears after a listing must still be
+/// seen. After reading every listed process generation (PID and start
+/// time) the snapshot lists /proc again and reads each generation it
+/// has not read yet. A listing that adds no generation closes the
+/// snapshot; otherwise a listing is proven when none of its new
+/// generations uses, or may use, a target no earlier generation was
+/// already seen using, and two proven listings in a row close it. Unrelated births on a busy host therefore do not keep it
+/// open. Exhausting SNAPSHOT_LISTING_ROUNDS refuses.
+pub(crate) fn capture_process_snapshot(
+    coordinator_pid: i64,
+    targets: &[PathBuf],
+) -> Result<ProcessSnapshot> {
+    use std::os::unix::fs::MetadataExt as _;
+    let ignored = own_ancestry();
+    // A target that cannot be inspected is judged (and refused) by
+    // assert_slot_unused_snapshot; here it can settle nothing.
+    let devices: Vec<Option<u64>> = targets
+        .iter()
+        .map(|target| {
+            std::fs::metadata(target)
+                .ok()
+                .map(|metadata| metadata.dev())
+        })
+        .collect();
+    let mut settled = vec![false; targets.len()];
+    let mut read: std::collections::HashMap<i64, u64> = std::collections::HashMap::new();
     let mut processes: Vec<ProcessLinks> = Vec::new();
-    for name in names {
-        let Ok(pid) = name.parse::<i64>() else {
-            continue;
-        };
-        if ignored.contains(&pid) || pid == coordinator_pid {
-            continue;
-        }
-        let base = PathBuf::from("/proc").join(&name);
-        let mut links: Vec<(&'static str, LinkObservation)> = Vec::new();
-        for (label, link) in [
-            ("working directory", base.join("cwd")),
-            ("executable", base.join("exe")),
-        ] {
-            links.push((label, observe_link(&link)));
-        }
-        if let Ok(fds) = std::fs::read_dir(base.join("fd")) {
-            for fd in fds.flatten() {
-                links.push(("descriptor", observe_link(&fd.path())));
+    let mut proven_rounds = 0;
+    let mut unsettling: Vec<i64> = Vec::new();
+    for round in 0..SNAPSHOT_LISTING_ROUNDS {
+        let names = list_proc()?;
+        if round == 0 {
+            // Test seam (#1084, #1102 wrkslots-census-churn-tolerant): the
+            // forced-churn differential makes a listed process vanish and a
+            // new one appear between the listing and the reads.
+            if let Some(command) = std::env::var_os("WRKSLOTS_TEST_CENSUS_CHURN") {
+                let _ = std::process::Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(command)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
             }
         }
-        processes.push(ProcessLinks { pid, links });
+        unsettling.clear();
+        let mut added = 0usize;
+        for name in names {
+            let Ok(pid) = name.parse::<i64>() else {
+                continue;
+            };
+            if ignored.contains(&pid) || pid == coordinator_pid {
+                continue;
+            }
+            let Some(start) = process_start_ticks(pid) else {
+                continue;
+            };
+            if read.get(&pid) == Some(&start) {
+                continue;
+            }
+            let process = read_process_links(pid);
+            for (index, target) in targets.iter().enumerate() {
+                let Some(device) = devices[index] else {
+                    continue;
+                };
+                if settled[index] {
+                    continue;
+                }
+                let uses = process.links.iter().any(|(_label, observation)| {
+                    observation_points_into(observation, target, device).unwrap_or(true)
+                });
+                if uses {
+                    settled[index] = true;
+                    unsettling.push(pid);
+                }
+            }
+            processes.retain(|known| known.pid != pid);
+            processes.push(process);
+            read.insert(pid, start);
+            added += 1;
+        }
+        if round > 0 && added == 0 {
+            // Nothing appeared since the last listing: every later birth
+            // descends from a generation already read.
+            return Ok(ProcessSnapshot { processes });
+        }
+        if unsettling.is_empty() {
+            proven_rounds += 1;
+            if proven_rounds >= 2 {
+                return Ok(ProcessSnapshot { processes });
+            }
+        } else {
+            proven_rounds = 0;
+        }
     }
-    Ok(ProcessSnapshot { processes })
+    unsettling.sort_unstable();
+    unsettling.dedup();
+    Err(format!(
+        "process use is indeterminate because the process snapshot did not close within {SNAPSHOT_LISTING_ROUNDS} listings of /proc (most recently PIDs {})",
+        unsettling
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 /// Assert no process in `snapshot` uses `slot_path`.
@@ -616,7 +723,7 @@ pub(crate) fn assert_slot_unused_snapshot(
 }
 
 pub(crate) fn assert_slot_unused(slot_path: &Path, coordinator_pid: i64) -> Result<()> {
-    let snapshot = capture_process_snapshot(coordinator_pid)?;
+    let snapshot = capture_process_snapshot(coordinator_pid, &[slot_path.to_path_buf()])?;
     assert_slot_unused_snapshot(&snapshot, slot_path)
 }
 
@@ -2393,7 +2500,9 @@ mod link_tests {
             .current_dir(&slot)
             .spawn()
             .unwrap();
-        let snapshot = capture_process_snapshot(std::process::id() as i64).unwrap();
+        let snapshot =
+            capture_process_snapshot(std::process::id() as i64, &[slot.clone(), unused.clone()])
+                .unwrap();
         // One shared capture serves every slot check in an audit.
         assert!(assert_slot_unused_snapshot(&snapshot, &unused).is_ok());
         let error = assert_slot_unused_snapshot(&snapshot, &slot).unwrap_err();

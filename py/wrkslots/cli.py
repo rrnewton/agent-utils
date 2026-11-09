@@ -21353,7 +21353,11 @@ def _observe_slot_use_once(
         None,
     )
     direct_use_proven_absent = False
+    # lsof's absence proof covers only the processes that existed when it
+    # ran; a generation absent from this listing started after (#1102).
+    before_lsof: set[tuple[int, int | None]] = set()
     if lsof is not None and use_lsof:
+        before_lsof = _proc_generations(proc_root)
         # Existing callers keep the exact two-argument call.
         evidence, malformed_lsof, lsof_returncode = (
             _lsof_slot_use(lsof, slot_path, strict_warnings=True)
@@ -21414,6 +21418,7 @@ def _observe_slot_use_once(
         pid_dirs = [path for path in proc_root.iterdir() if path.name.isdigit()]
     except OSError as exc:
         raise Refusal(f"cannot inspect live processes: {exc}") from exc
+    _census_churn_for_test()
     current_pid = os.getpid()
     invoking_ancestry: set[int] = set()
     if ignore_invoking_ancestry:
@@ -21435,9 +21440,38 @@ def _observe_slot_use_once(
     # them), so its absence proof does not cover them.
     pending = sorted(pid_dirs, key=lambda item: int(item.name), reverse=True)
     surviving_threads: set[Path] = set()
-    while pending:
+    # Each generation (PID, start time) read, and those lsof never saw.
+    visited: set[tuple[int, int | None]] = set()
+    lsof_unseen: set[Path] = set()
+    relisted = False
+    while True:
+        if not pending:
+            # One listing cannot see a process born after it (#1102
+            # wrkslots-census-churn-tolerant): list again once and read every
+            # generation not read yet, in full.  A use found ends the scan, so
+            # two listings that complete without one close it, as the shared
+            # census and the Rust snapshot close.
+            if relisted or reported_use is not None or indeterminate_use is not None:
+                break
+            relisted = True
+            try:
+                relisting = [path for path in proc_root.iterdir() if path.name.isdigit()]
+            except OSError as exc:
+                raise Refusal(f"cannot inspect live processes: {exc}") from exc
+            for candidate in relisting:
+                if (int(candidate.name), _quiet_start_ticks(candidate)) not in visited:
+                    lsof_unseen.add(candidate)
+                    pending.append(candidate)
+            pending.sort(key=lambda item: int(item.name), reverse=True)
+            if not pending:
+                break
         pid_dir = pending.pop()
         pid = int(pid_dir.name)
+        if pid_dir not in surviving_threads:
+            visit_generation = (pid, _quiet_start_ticks(pid_dir))
+            visited.add(visit_generation)
+            if direct_use_proven_absent and visit_generation not in before_lsof:
+                lsof_unseen.add(pid_dir)
         # The ancestry holds thread-group IDs.  An ancestor whose main thread
         # has exited is skipped here as a whole, so its threads, which only a
         # visited leader adds, are never walked as foreign holders.
@@ -21487,7 +21521,11 @@ def _observe_slot_use_once(
             continue
         uses: list[str] | None
         try:
-            if direct_use_proven_absent and pid_dir not in surviving_threads:
+            if (
+                direct_use_proven_absent
+                and pid_dir not in surviving_threads
+                and pid_dir not in lsof_unseen
+            ):
                 mount_namespace = _mount_namespace(pid_dir)
                 if mount_namespace is None:
                     uses = []
@@ -21553,6 +21591,70 @@ def _observe_slot_use_once(
             )
         raise indeterminate_use
     return None
+
+
+class _ListingFollower:
+    """Lists /proc once more after a scan's first pass (#1102 wrkslots-census-churn-tolerant).
+
+    One listing cannot see a process born after it: one started in the slot,
+    or a child that inherited a held descriptor from a listed parent that then
+    exited.  A scan that stops at the first use visits every listed generation
+    (PID and start time); when its list runs out, ``relist`` returns the
+    generations a fresh listing adds, once.  Two listings that complete with no
+    use close the scan, as the shared census and the Rust snapshot close.
+    """
+
+    def __init__(self, proc_root: Path) -> None:
+        self.proc_root = proc_root
+        self.visited: set[tuple[int, int | None]] = set()
+        self.relisted = False
+
+    def visit(self, pid_dir: Path) -> None:
+        self.visited.add((int(pid_dir.name), _quiet_start_ticks(pid_dir)))
+
+    def relist(self) -> list[Path]:
+        if self.relisted:
+            return []
+        self.relisted = True
+        try:
+            listing = [path for path in self.proc_root.iterdir() if path.name.isdigit()]
+        except OSError as exc:
+            raise Refusal(f"cannot inspect live processes: {exc}") from exc
+        added = [
+            path
+            for path in listing
+            if (int(path.name), _quiet_start_ticks(path)) not in self.visited
+        ]
+        return sorted(added, key=lambda item: int(item.name), reverse=True)
+
+
+def _quiet_start_ticks(pid_dir: Path) -> int | None:
+    """A process directory's start time, or None when it cannot be read (gone).
+
+    Read straight from ``stat`` (field 22): this only tells generations apart
+    for the #1102 re-listing, and is not process evidence.
+    """
+
+    try:
+        raw = (pid_dir / "stat").read_bytes()
+    except OSError:
+        return None
+    closing = raw.rfind(b") ")
+    fields = raw[closing + 2 :].split() if closing >= 0 else []
+    try:
+        return int(fields[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def _proc_generations(proc_root: Path) -> set[tuple[int, int | None]]:
+    """Every process generation (PID, start time) listed under ``proc_root`` now."""
+
+    try:
+        entries = [path for path in proc_root.iterdir() if path.name.isdigit()]
+    except OSError as exc:
+        raise Refusal(f"cannot inspect live processes: {exc}") from exc
+    return {(int(entry.name), _quiet_start_ticks(entry)) for entry in entries}
 
 
 def _parse_timestamp(value: str, label: str) -> dt.datetime:
@@ -45224,6 +45326,7 @@ def _agent_batch_fresh_use(
         pid_dirs = [path for path in proc_root.iterdir() if path.name.isdigit()]
     except OSError as exc:
         raise Refusal(f"cannot inspect live processes: {exc}") from exc
+    _census_churn_for_test()
     current_pid = os.getpid()
     mount_verdicts = _MountTableVerdicts(slot_path)
     owner_cgroup = (
@@ -45237,8 +45340,10 @@ def _agent_batch_fresh_use(
     # Popped from the end, so the surviving threads of a zombie leader, pushed
     # back on top, are observed next; the shared lsof scan never saw them.
     pending = sorted(pid_dirs, key=lambda item: int(item.name), reverse=True)
-    while pending:
+    follower = _ListingFollower(proc_root)
+    while pending or (pending := follower.relist()):
         pid_dir = pending.pop()
+        follower.visit(pid_dir)
         pid = int(pid_dir.name)
         if pid == current_pid:
             continue
@@ -45608,6 +45713,7 @@ def _agent_batch_fenced_use(
         pid_dirs = [path for path in proc_root.iterdir() if path.name.isdigit()]
     except OSError as exc:
         raise Refusal(f"cannot inspect live processes: {exc}") from exc
+    _census_churn_for_test()
     current_pid = os.getpid()
     mount_verdicts = _MountTableVerdicts(fenced_path)
     owner_cgroup = (
@@ -45620,8 +45726,10 @@ def _agent_batch_fenced_use(
     # Popped from the end, so the surviving threads of a zombie leader, pushed
     # back on top, are observed next; the shared lsof scan never saw them.
     pending = sorted(pid_dirs, key=lambda item: int(item.name), reverse=True)
-    while pending:
+    follower = _ListingFollower(proc_root)
+    while pending or (pending := follower.relist()):
         pid_dir = pending.pop()
+        follower.visit(pid_dir)
         if stop.is_set():
             raise _ScanCancelled
         pid = int(pid_dir.name)
@@ -63835,6 +63943,93 @@ class _PreparedDeferredFinish:
     journal_path: Path
 
 
+# Most /proc listings one all-process census takes before it refuses
+# (#1102 wrkslots-census-churn-tolerant).  Each listing that is not proven
+# settles at least one more target, so a census of N targets closes within
+# N + 2 listings unless processes keep changing faster than it reads them.
+_CENSUS_LISTING_ROUNDS = 64
+
+
+def _census_appearing_generations(
+    processes: tuple[_AbsentProcessObservation, ...],
+    matches: tuple[tuple[int, str, str, str], ...],
+    targets: Mapping[Path, str],
+    budget: _ReadOnlyCommandBudget,
+    *,
+    include_owner_cgroups: bool,
+) -> tuple[tuple[_AbsentProcessObservation, ...], tuple[tuple[int, str, str, str], ...]]:
+    """Follow processes that appeared after the census listed /proc (#1102).
+
+    One listing cannot see a process born after it: one started in a slot,
+    or a child that inherited a held descriptor from a listed parent that
+    then exited.  So, after reading every listed generation, the census lists
+    /proc again and reads each generation (PID and start time) it has not
+    read yet.  A listing that adds no generation closes the census, as the
+    same-UID census closes; otherwise a listing is proven when none of its new
+    generations uses a target that no earlier generation was already seen
+    using, and two proven listings in a row close it.  Unrelated births on a busy host
+    therefore do not keep it open, and each listing reads only what is new.
+    A mount namespace already examined is not examined again.  The Rust
+    edition's snapshot follows the same rule.
+    """
+
+    read = {(process.pid, process.start_ticks) for process in processes}
+    namespaces = {process.mount_namespace for process in processes}
+    settled = {slot for _pid, slot, _kind, _detail in matches}
+    observed = list(processes)
+    found = list(matches)
+    proven_rounds = 0 if matches else 1
+    unsettling: list[int] = []
+    for _round in range(_CENSUS_LISTING_ROUNDS - 1):
+        budget.remaining_seconds()
+        listed = (
+            _absent_validate_process_snapshot()
+            if include_owner_cgroups
+            else _absent_validate_process_snapshot(include_owner_cgroups=False)
+        )
+        new = tuple(
+            process for process in listed if (process.pid, process.start_ticks) not in read
+        )
+        if not new:
+            # Nothing appeared since the last listing: every later birth
+            # descends from a generation already read.
+            return tuple(observed), tuple(found)
+        read.update((process.pid, process.start_ticks) for process in new)
+        round_matches: tuple[tuple[int, str, str, str], ...] = ()
+        if new:
+            new = _preflight_process_observations(new, budget)
+            fresh_namespaces = tuple(
+                process for process in new if process.mount_namespace not in namespaces
+            )
+            round_matches = (
+                *_absent_validate_find_matches(new, targets, budget),
+                *_absent_validate_maps_matches(new, targets, budget),
+                *_absent_validate_mount_matches(fresh_namespaces, targets, budget),
+            )
+            _recheck_thread_group_observations(new, budget)
+            namespaces.update(process.mount_namespace for process in new)
+            replaced = {process.pid for process in new}
+            observed = [process for process in observed if process.pid not in replaced]
+            observed.extend(new)
+            found.extend(round_matches)
+        newly = {slot for _pid, slot, _kind, _detail in round_matches} - settled
+        if newly:
+            settled |= newly
+            unsettling = sorted(
+                {pid for pid, slot, _kind, _detail in round_matches if slot in newly}
+            )
+            proven_rounds = 0
+            continue
+        proven_rounds += 1
+        if proven_rounds >= 2:
+            return tuple(observed), tuple(found)
+    raise Refusal(
+        "process use is indeterminate because the process census did not close "
+        f"within {_CENSUS_LISTING_ROUNDS} listings of /proc (most recently PIDs "
+        f"{', '.join(str(pid) for pid in unsettling[:16])})"
+    )
+
+
 def _census_churn_for_test() -> None:
     """Test seam: run ``WRKSLOTS_TEST_CENSUS_CHURN`` once the census has listed /proc.
 
@@ -63895,6 +64090,13 @@ def _capture_process_path_census(
                 processes, targets, selected_budget
             )
             _recheck_thread_group_observations(processes, selected_budget)
+            processes, matches = _census_appearing_generations(
+                processes,
+                (*mount_matches, *path_matches),
+                targets,
+                selected_budget,
+                include_owner_cgroups=include_owner_cgroups,
+            )
         except _ProcessEvidenceChanged:
             if attempt < 2:
                 continue
@@ -63903,7 +64105,7 @@ def _capture_process_path_census(
             )
         return _ProcessPathCensus(
             processes,
-            (*mount_matches, *path_matches),
+            matches,
             owner_cgroup_complete=include_owner_cgroups,
         )
     raise Refusal(

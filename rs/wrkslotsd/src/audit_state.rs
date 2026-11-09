@@ -5484,6 +5484,7 @@ fn audit_record(
     validation_paths: &[PathBuf],
     measurement: &CacheMeasurement,
     process_census: &mut Option<std::result::Result<ProcessSnapshot, String>>,
+    census_targets: &[PathBuf],
 ) -> Result<(Value, bool)> {
     let slot = record
         .get("slot")
@@ -5701,7 +5702,10 @@ fn audit_record(
         // One shared census for the whole audit, captured only when
         // a row can use it (single attempt, fail-closed like Python).
         if process_census.is_none() {
-            *process_census = Some(capture_process_snapshot(std::process::id() as i64));
+            *process_census = Some(capture_process_snapshot(
+                std::process::id() as i64,
+                census_targets,
+            ));
         }
         match process_census.as_ref().expect("census captured") {
             Err(error) => {
@@ -6400,6 +6404,19 @@ pub(crate) fn parse_audit(
     };
     let census_measurements = cache_census(&cfg, &census_subjects, &census, &registry_revision)?;
     let mut process_census: Option<std::result::Result<ProcessSnapshot, String>> = None;
+    // Every registered slot directory, as the Python audit passes them
+    // all to its one shared census.
+    let census_targets: Vec<PathBuf> = records
+        .iter()
+        .filter_map(|record| {
+            let slot = record.get("slot").and_then(Value::as_str)?;
+            let slot_type = record
+                .get("slot_type")
+                .and_then(Value::as_str)
+                .unwrap_or("agent");
+            slot_directory(&cfg, slot, slot_type).ok()
+        })
+        .collect();
     let mut rows: Vec<Value> = Vec::new();
     let mut running_agent_count: i64 = 0;
     for (index, record) in records.iter().enumerate() {
@@ -6425,6 +6442,7 @@ pub(crate) fn parse_audit(
             &validation_paths,
             &census_measurements[index],
             &mut process_census,
+            &census_targets,
         )?;
         running_agent_count += i64::from(running);
         if let Some((generation, _path)) = sealed {

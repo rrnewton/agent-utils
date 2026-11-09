@@ -698,3 +698,54 @@ def _ignored_file_still_removes(tmp_path: Path) -> None:
     result = _rust_remove(rust_root)
     assert result.returncode == 0, result.stderr
     assert not (rust_root / "worktrees" / "slot-a").exists()
+
+
+def test_remove_forced_churn_refuses_like_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1102: a process that appears in the slot after the LAST scan listed /proc vetoes removal.
+
+    Both editions, no host load. A first removal of a twin fixture counts the
+    scans (WRKSLOTS_TEST_CENSUS_CHURN calls); the second fires on the last one,
+    after the path fence, where no later scan would meet the appearing process:
+    only the scan's own second listing can.
+    """
+
+    from wrkslots.tests.test_audit_state_rust import (
+        _churn_hook,
+        _seam_calls,
+        _stop_appeared,
+    )
+
+    def remove(edition: str, root: Path) -> str | None:
+        if edition == "python":
+            try:
+                _python_remove(root)
+            except wrkslots_cli.Refusal as exc:
+                return str(exc)
+            return None
+        result = _rust_remove(root)
+        return None if result.returncode == 0 else result.stderr
+
+    with _own_fs(tmp_path) as base:
+        for edition in ("python", "rust"):
+            counting = _fixture(base / f"{edition}-count")
+            hook, _appeared = _churn_hook(
+                base, f"{edition}-count", counting / "worktrees" / "slot-a" / "repo",
+                fire_at=10**6,
+            )
+            monkeypatch.setenv("WRKSLOTS_TEST_CENSUS_CHURN", hook)
+            assert remove(edition, counting) is None, edition
+            scans = _seam_calls(base / f"churn-{edition}-count" / "calls")
+            assert scans >= 1, edition
+            root = _fixture(base / edition)
+            hook, appeared = _churn_hook(
+                base, edition, root / "worktrees" / "slot-a" / "repo", fire_at=scans
+            )
+            monkeypatch.setenv("WRKSLOTS_TEST_CENSUS_CHURN", hook)
+            try:
+                detail = remove(edition, root)
+            finally:
+                pid = _stop_appeared(appeared)
+            assert detail is not None, (edition, "removed a slot in use")
+            assert f"live process {pid} uses slot" in detail, (edition, detail)

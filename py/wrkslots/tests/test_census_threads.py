@@ -551,8 +551,8 @@ def test_a_leader_that_exits_between_the_link_and_maps_readers_discards_the_atte
             census = cli._capture_process_path_census(
                 (slot,), budget=_budget(), include_owner_cgroups=False
             )
-    # The same-UID census ends with its closing inventory, which adds nothing.
-    closing = [(os.getpid(), thread)] if lane == "same-uid" else []
+    # Both censuses end with a closing inventory, which adds nothing (#1102).
+    closing = [(os.getpid(), thread)]
     assert snapshots == [(os.getpid(), child.pid), (os.getpid(), thread), *closing]
     assert len(greps) == 2
     assert {(pid, kind) for pid, _slot, kind, _detail in census.matches} == {(thread, "map")}
@@ -606,7 +606,7 @@ def test_a_thread_that_executes_after_the_snapshot_discards_the_attempt(
             census = cli._capture_process_path_census(
                 (child.slot,), budget=_budget(), include_owner_cgroups=False
             )
-    closing = [(os.getpid(), child.leader)] if lane == "same-uid" else []
+    closing = [(os.getpid(), child.leader)]
     assert snapshots == [
         (os.getpid(), child.thread), (os.getpid(), child.leader), *closing
     ]
