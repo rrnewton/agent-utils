@@ -91,9 +91,8 @@ export {
 } from "../view/dom/index.ts";
 export { SCREEN_TITLES, createActionMenu, createChipsOverComposer, createControlBar, createPromptsTray, createReaderRow, createReplySight, createPageNavigation, createScreens, createScreenShowing, createShellNotices, createUndoOffer, createUndoStamps, modHeld, mountDocumentListeners, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow } from "../view/shell/index.ts";
 export {
-  COMPOSER_FIELDS,
   NEWLINE_KEYS,
-  createComposerGrow,
+  createComposerBoxes,
   createComposerKeys,
   createDictation,
   createOnScreenKeyboard,
@@ -103,7 +102,6 @@ export {
   mountKeyboardListeners,
   mountMessageBox,
   mountQuickReplyListeners,
-  watchBoxInsertions as watchInsertions,
   wireNewlineKey,
 } from "../view/composer/index.ts";
 export { createSerialQueue, sentenceStart } from "../foundation/index.ts";

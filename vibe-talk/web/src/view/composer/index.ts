@@ -3,6 +3,8 @@
 
 export { COMPOSER_GROW_BOXES, COMPOSER_GROW_IDS, createComposerGrow } from "./grow.ts";
 export type { ComposerGrow, ComposerGrowDependencies } from "./grow.ts";
+export { createComposerBoxes } from "./boxes.ts";
+export type { ComposerBox, ComposerBoxes, ComposerBoxesDependencies } from "./boxes.ts";
 export { mountComposerGrowListeners } from "./growlisteners.ts";
 export type { ComposerGrowListeners, ComposerGrowListenersDependencies } from "./growlisteners.ts";
 export { mountMessageBox } from "./boxlisteners.ts";

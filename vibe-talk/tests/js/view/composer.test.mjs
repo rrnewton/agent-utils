@@ -489,3 +489,39 @@ test("`#624 voice-page-modularity`: with no visual viewport the keyboard hears t
     globalThis.document = was;
   }
 });
+
+test("`#624 voice-page-modularity`: the boxes' Enter is said in Settings and on the return key, and the reply box grows in its own list", () => {
+  const { createComposerBoxes } = VIEW_COMPOSER;
+  const els = new Map();
+  const el = (id) => {
+    if (!els.has(id)) els.set(id, { id, hidden: false, checked: false, textContent: "", attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } });
+    return els.get(id);
+  };
+  let sends = false;
+  const boxes = createComposerBoxes({
+    el,
+    leftEl: (id) => el(id),
+    replyScroller: () => el("reply-scroller"),
+    atBottom: () => true,
+    followFoot: () => {},
+    keepBoxInView: () => {},
+    activeElement: () => null,
+    bottomSlack: 24,
+    fieldSizing: false,
+    keepGrow: () => {},
+    storedGrow: () => false,
+    enterSendsCurrent: () => sends,
+    platform: () => "MacIntel",
+    noteInsertion: () => {},
+  });
+  boxes.renderEnterSends();
+  assert.equal(el("enter-sends-hint").textContent, "Cmd+Enter sends. Enter starts a new line.");
+  assert.equal(el("compose-text").attrs.enterkeyhint, "enter");
+  sends = true;
+  boxes.renderEnterSends();
+  assert.match(el("enter-sends-hint").textContent, /^Shift\+Enter starts a new line/);
+  assert.equal(el("compose-text").attrs.enterkeyhint, "send", "the return key did not say send while Enter sends");
+  assert.equal(boxes.growingBoxList({ id: "reply-text" }), el("reply-scroller"), "the reply box did not grow in its own list");
+  assert.equal(boxes.growingBoxList({ id: "side-compose-text" }), el("side-scroll"));
+  assert.equal(boxes.modKeyName(), "Cmd");
+});

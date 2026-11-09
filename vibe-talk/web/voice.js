@@ -2980,85 +2980,8 @@ function keepWrittenBox(area, seen, now) {
 const FIELD_SIZING = Boolean(window.CSS && typeof window.CSS.supports === "function" &&
   window.CSS.supports("field-sizing", "content"));
 
-/**
- * Whether the boxes grow with their text, each box's last height, and every pass that draws or sizes
- * them (web/src/view/composer `createComposerGrow`, `#624 voice-page-modularity`): the boxes and their
- * Grow checkboxes (`COMPOSER_GROW_BOXES`, `COMPOSER_GROW_IDS`) are its. Off unless the reader ticked
- * Grow; see `storedComposerGrow`.
- *
- * @type {import("./src/view/composer/index.ts").ComposerGrow}
- */
-const composerGrowth = createComposerGrow({
-  lookup: (id) => leftEl(id),
-  listOf: (field) => growingBoxList(field),
-  atBottom: (area, slack) => (slack === undefined ? atBottom(area) : atBottom(area, slack)),
-  followFoot: (area) => followFoot(area),
-  keepBoxInView: (box, area) => keepBoxInView(box, area),
-  activeElement: () => document.activeElement,
-  bottomSlack: BOTTOM_SLACK_PX,
-  fieldSizing: FIELD_SIZING,
-  keep: (on) => deviceSettings().keep(DEVICE_SETTINGS.composerGrow, on),
-});
-
-/** What was stored. ABSENT MEANS OFF; a browser that refuses storage reads as nothing stored. */
-function storedComposerGrow() {
-  // A browser refusing storage reads as off (`DEVICE_SETTINGS.composerGrow.refused`).
-  return deviceSettings().get(DEVICE_SETTINGS.composerGrow);
-}
-
-/**
- * Grow ticked or unticked by the reader, on the checkbox `grow`: kept, and drawn (`composerGrowth`). Each
- * list the reader was at the foot of is put back at its foot once the boxes in it are drawn at their new
- * height; the checkbox just ticked, if any of it was on screen, is kept where it was, under the pointer.
- *
- * @param {boolean} on
- * @param {HTMLElement} grow
- */
-function applyComposerGrow(on, grow) {
-  composerGrowth.apply(on, grow);
-}
-
-/** Draw the choice on #screen-main and every Grow checkbox (`composerGrowth`). */
-function renderComposerGrow(on) {
-  composerGrowth.render(on);
-}
-
-/** Whether the composer `field` is in draws its Grow checkbox, which web/voice.css does on a desk (`composerGrowth`). */
-function growShown(field) {
-  return composerGrowth.shown(field);
-}
-
-/**
- * The list `field` is in: the right column's for its box, else the left's; for the reply's, the list it
- * is open in (`#410 inline-reply-editor`).
- */
-const growingBoxList = (field) => field.id === "reply-text"
-  ? replyPane().scroller()
-  : leftEl(field.id === "side-compose-text" ? "side-scroll" : "scroll-area");
-
-/**
- * Where the browser cannot size a box to its text, size it here (`composerGrowth`).
- *
- * @param {HTMLElement} field
- */
-function fitGrowingBox(field) {
-  composerGrowth.fit(field);
-}
-
-/** `fitGrowingBox` for each of the boxes. */
-function fitGrowingBoxes() {
-  composerGrowth.fitAll();
-}
-
-/**
- * A growing box changed size: with the reader typing in it, its whole composer brought into its list
- * (`composerGrowth`).
- *
- * @param {HTMLElement} field
- */
-function keepGrowingBoxInView(field) {
-  composerGrowth.keepInView(field);
-}
+// The boxes' growth is web/src/view/composer's (`createComposerBoxes`, made below with the
+// boxes' keys, `#624 voice-page-modularity`); its Grow owner is `composerGrowth` there.
 
 // --- Enter, in every message box ----------------------------------------------------------------
 //
@@ -3093,51 +3016,8 @@ const enterSends = createEnterSends({
   render: () => renderEnterSends(),
 });
 
-/**
- * The platforms whose keyboards say Cmd where the rest say Ctrl, as `navigator.platform` begins
- * for them ("MacIntel", "iPhone", "iPad", "iPod"). An iPad reporting itself as a Mac lands in
- * the same answer, which is the right one: its keyboard says Cmd either way.
- */
-const CMD_KEY_PLATFORMS = ["Mac", "iPhone", "iPad", "iPod"];
-
-/**
- * The chord modifier, in the word printed on the reader's own keyboard: "Cmd" or "Ctrl".
- *
- * WORDING ONLY. Every chord this page answers takes either key on every platform — `onComposerKey`
- * and `keyDispatch.onPageKey` read `ctrlKey || metaKey` and never this — so a platform guessed wrong costs a
- * hint that names the other key, not a key that stops working. `navigator.platform` rather than the
- * user-agent string, which this page does not read for anything (the suite refuses it, because a
- * layout decided by it rots). `#224 keyboard-shortcuts` names every chord with it.
- */
-function modKeyName() {
-  const platform = String((navigator && navigator.platform) || "");
-  return CMD_KEY_PLATFORMS.some((prefix) => platform.startsWith(prefix)) ? "Cmd" : "Ctrl";
-}
-
-/** The send chord, in the words printed on the reader's own keyboard. See `modKeyName`. */
-function sendChordName() {
-  return `${modKeyName()}+Enter`;
-}
-
-/**
- * Say what Enter does, in the two places it can be said without costing the phone a line.
- *
- *   * The Settings hint, under the switch: with it off, the key that sends instead. That is where
- *     the owner asked for it — "that should be indicated in the settings where the user disables
- *     it" — and the one place a reader who has just turned Enter off is looking.
- *   * Each box's `enterkeyhint`, which is what a phone's keyboard draws on its own return key: a
- *     send arrow while Enter sends, a return arrow while it is a new line. The key itself is the
- *     hint, so no placeholder or extra line under a box has to carry it.
- */
-function renderEnterSends() {
-  el("enter-sends").checked = enterSends.current();
-  el("enter-sends-hint").textContent = enterSends.current()
-    ? "Shift+Enter starts a new line, and on a phone's keyboard so does ↵ in the box's corner."
-    : `${sendChordName()} sends. Enter starts a new line.`;
-  for (const id of COMPOSER_FIELDS) {
-    el(id).setAttribute("enterkeyhint", enterSends.current() ? "send" : "enter");
-  }
-}
+// What Enter does, said in Settings and on each box's return key, is web/src/view/composer's
+// (`createComposerBoxes`, `#624 voice-page-modularity`).
 
 /**
  * What a key does in the message boxes, and when each last took a paste (web/src/view/composer
@@ -3147,6 +3027,31 @@ function renderEnterSends() {
  * @type {import("./src/view/composer/index.ts").ComposerKeys}
  */
 const composerKeys = createComposerKeys({ now: () => Date.now(), enterSends: () => enterSends.current() });
+
+/**
+ * The message boxes' growth and their Enter (`createComposerBoxes`, `#624 voice-page-modularity`):
+ * whether they grow, which list each is in, what Enter does said aloud, and what each last took
+ * as a paste. See web/src/view/composer/boxes.ts.
+ *
+ * @type {import("./src/view/composer/index.ts").ComposerBoxes}
+ */
+const composerBoxes = createComposerBoxes({
+  el: (id) => el(id),
+  leftEl: (id) => leftEl(id),
+  replyScroller: () => replyPane().scroller(),
+  atBottom: (area, slack) => (slack === undefined ? atBottom(area) : atBottom(area, slack)),
+  followFoot: (area) => followFoot(area),
+  keepBoxInView: (box, area) => keepBoxInView(box, area),
+  activeElement: () => document.activeElement,
+  bottomSlack: BOTTOM_SLACK_PX,
+  fieldSizing: FIELD_SIZING,
+  keepGrow: (on) => deviceSettings().keep(DEVICE_SETTINGS.composerGrow, on),
+  storedGrow: () => deviceSettings().get(DEVICE_SETTINGS.composerGrow),
+  enterSendsCurrent: () => enterSends.current(),
+  platform: () => (navigator && navigator.platform) || "",
+  noteInsertion: (box, event) => composerKeys.noteInsertion(box, event),
+});
+const { composerGrowth, storedComposerGrow, applyComposerGrow, renderComposerGrow, growShown, growingBoxList, fitGrowingBox, fitGrowingBoxes, keepGrowingBoxInView, modKeyName, sendChordName, renderEnterSends, noteBoxInsertion, watchBoxInsertions } = composerBoxes;
 
 /**
  * What a keystroke in a message box does: send, or leave the box to handle it.
@@ -3197,20 +3102,6 @@ const composerKeys = createComposerKeys({ now: () => Date.now(), enterSends: () 
 // How long after a paste an Enter is part of it (`PASTE_ENTER_MS`), when each box last took one, each
 // box's new-line key (`NEWLINE_KEYS`) and putting a new line in a box (`insertNewline`) are
 // web/src/view/composer's (`paste-never-sends`, `#575 mobile-keyboard-compose`).
-
-/** A message box's `beforeinput`, `input` or `paste`, noted (`composerKeys`). `paste-never-sends`. */
-function noteBoxInsertion(box, event) {
-  composerKeys.noteInsertion(box, event);
-}
-
-/**
- * Listen to `box` for what `noteBoxInsertion` notes. Each message box, as it is given its Enter.
- *
- * @param {any} box
- */
-function watchBoxInsertions(box) {
-  watchInsertions(box, noteBoxInsertion);
-}
 
 // --- the keyboard -------------------------------------------------------------------------------
 //
