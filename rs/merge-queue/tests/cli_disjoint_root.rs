@@ -1338,3 +1338,160 @@ fn a_stacked_batch_keeps_the_stack_bottom_as_its_base() {
     assert_eq!(status(&fx, 1), "landed");
     assert_eq!(status(&fx, 2), "landed");
 }
+
+/// Root stacking judges the batch the new build depends on (#1127):
+/// with a non-likely stacked flight in the window and a prioritized
+/// root beside it, a new would-be root roots on the base — a likely
+/// root outside the stack never justifies stacking on the stack top.
+#[test]
+fn a_likely_root_outside_the_stack_does_not_make_the_new_root_stack() {
+    let (fx, started, _selects, gates, base_start) = env_setup("root-stack-mismatch", Some(3));
+    let path = config_path(&fx);
+    let mut config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    config["root_stack_min_pass_percent"] = serde_json::json!(70);
+    std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    // Depth 4: a window slot stays free for the new root's decision.
+    let mut daemon = Daemon::start_with_depth(&fx, 4);
+    wait_for("change 1 to validate", &started, |lines| {
+        lines.iter().any(|line| line.starts_with("a_t0_ "))
+    });
+    // A plain stacked flight on change 1: the stack top, not likely
+    // (gated, plain, predicted 0.5 below the 70 threshold). The
+    // --after dependency composes it on change 1's candidate.
+    fx.branch_from("b", "a", &[("tests/b", "ok\n")]);
+    fx.mq_ok(&["submit", "2", "--head", "b", "--after", "1"]);
+    wait_for("change 2 to stack on change 1", &started, |lines| {
+        lines.iter().any(|line| line.starts_with("a_b_t0_ "))
+    });
+    // A prioritized root beside the stack: likely, but outside it.
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    fx.mq_ok(&["submit", "3", "--head", "c", "--prioritized"]);
+    wait_for("the prioritized root to validate", &started, |lines| {
+        lines.iter().any(|line| line.starts_with("c_t0_ "))
+    });
+    let (base, parent, _) = env_of(&started, "c_t0_");
+    assert_eq!(
+        (base.as_str(), parent.as_str()),
+        (base_start.as_str(), base_start.as_str())
+    );
+    // The new would-be root must root on the base too, not stack on
+    // the unjudged stack top.
+    fx.branch("d", &[("tests/d", "ok\n")]);
+    fx.mq_ok(&["submit", "4", "--head", "d"]);
+    wait_for("change 4 to validate", &started, |lines| {
+        lines
+            .iter()
+            .any(|line| line.split(' ').next().is_some_and(|set| set.contains("d_")))
+    });
+    let sets: Vec<String> = started_lines(&started)
+        .iter()
+        .map(|line| line.split(' ').next().unwrap().to_owned())
+        .collect();
+    assert!(
+        sets.iter().any(|set| set == "d_t0_"),
+        "change 4 did not root on the base: {sets:?} in {:?}",
+        started_lines(&started)
+    );
+    let (base, parent, _) = env_of(&started, "d_t0_");
+    assert_eq!(parent, base_start, "started: {:?}", started_lines(&started));
+    assert_eq!(base, base_start, "started: {:?}", started_lines(&started));
+    let events = latest_events(&fx);
+    assert!(
+        events.contains("\"kind\":\"disjoint-root\""),
+        "no disjoint-root event: {events}"
+    );
+    assert!(
+        !events.contains("disjoint-root-stacked"),
+        "change 4 stacked on the unjudged top: {events}"
+    );
+    for set in [
+        "a_t0_",
+        "b_t0_",
+        "c_t0_",
+        "d_t0_",
+        "a_b_t0_",
+        "a_c_t0_",
+        "a_d_t0_",
+        "b_c_t0_",
+        "b_d_t0_",
+        "c_d_t0_",
+        "a_b_c_t0_",
+        "a_b_d_t0_",
+        "a_c_d_t0_",
+        "b_c_d_t0_",
+        "a_b_c_d_t0_",
+        "t0_",
+    ] {
+        open(&gates, set);
+    }
+    assert_eq!(daemon.exit_code(Duration::from_secs(120)), Some(0));
+    for pr in 1..=4 {
+        assert_eq!(status(&fx, pr), "landed", "#{pr}");
+    }
+    let report = latest_report(&fx);
+    let runs = batch_validations(&report, 4);
+    // The build this test judges is the first: a disjoint root on the
+    // base. (It may validate again stacked once the roots ahead of it
+    // have landed and rebuilt; that is ordinary root mechanics.)
+    assert!(!runs.is_empty(), "{report}");
+    assert_eq!(runs[0]["parent"], report["base_start"], "{report}");
+}
+
+/// When the stack top itself is likely, the new batch still stacks
+/// on it (#1127): the likely batch and the parent are the same
+/// batch, and it validates after the top.
+#[test]
+fn a_likely_stack_top_still_stacks() {
+    let (fx, started, _selects, gates, base_start) = env_setup("root-stack-top-likely", Some(3));
+    let path = config_path(&fx);
+    let mut config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    config["root_stack_min_pass_percent"] = serde_json::json!(70);
+    std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let mut daemon = Daemon::start(&fx);
+    wait_for("change 1 to validate", &started, |lines| {
+        lines.iter().any(|line| line.starts_with("a_t0_ "))
+    });
+    let (_, _, head1) = env_of(&started, "a_t0_");
+    // The stack top is prioritized: itself likely.
+    fx.branch_from("b", "a", &[("tests/b", "ok\n")]);
+    fx.mq_ok(&["submit", "2", "--head", "b", "--prioritized"]);
+    wait_for("change 2 to stack on change 1", &started, |lines| {
+        lines.iter().any(|line| line.starts_with("a_b_t0_ "))
+    });
+    // The new batch stacks on that top.
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    fx.mq_ok(&["submit", "3", "--head", "c"]);
+    wait_for("change 3 to stack on the likely top", &started, |lines| {
+        lines.iter().any(|line| line.starts_with("a_b_c_t0_ "))
+    });
+    let (base, parent, _) = env_of(&started, "a_b_c_t0_");
+    assert_eq!(base, base_start, "started: {:?}", started_lines(&started));
+    assert_ne!(parent, head1, "started: {:?}", started_lines(&started));
+    let events = latest_events(&fx);
+    assert!(
+        events.contains("stacks on #2 (likely to land first: #2"),
+        "the event must name the top as both: {events}"
+    );
+    assert!(
+        !started_lines(&started)
+            .iter()
+            .any(|line| line.starts_with("c_t0_ ")),
+        "change 3 rooted instead of stacking: {:?}",
+        started_lines(&started)
+    );
+    for set in ["a_t0_", "a_b_t0_", "a_b_c_t0_", "t0_"] {
+        open(&gates, set);
+    }
+    assert_eq!(daemon.exit_code(Duration::from_secs(120)), Some(0));
+    for pr in 1..=3 {
+        assert_eq!(status(&fx, pr), "landed", "#{pr}");
+    }
+    let report = latest_report(&fx);
+    let runs = batch_validations(&report, 3);
+    assert_eq!(runs.len(), 1, "{report}");
+    assert_ne!(runs[0]["parent"], report["base_start"], "{report}");
+}

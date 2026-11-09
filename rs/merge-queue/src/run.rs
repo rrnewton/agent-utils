@@ -7270,10 +7270,21 @@ impl<'a> Runner<'a> {
                                                     .is_some_and(|item| item.prioritized)
                                         })
                                 };
-                                for flight in flights
-                                    .iter()
-                                    .filter(|f| f.probe_for.is_none() && f.red_work.is_none())
-                                {
+                                // The likely test judges the batch the
+                                // new build would depend on (#1127): the
+                                // stack top alone when one exists, so a
+                                // likely root outside the stack never
+                                // justifies stacking on an unjudged top;
+                                // with no stack top, any likely flight
+                                // may justify it, under the guard below.
+                                let judged: Vec<&Flight> = match stack_top(&flights) {
+                                    Some(top) => vec![top],
+                                    None => flights
+                                        .iter()
+                                        .filter(|f| f.probe_for.is_none() && f.red_work.is_none())
+                                        .collect(),
+                                };
+                                for flight in judged {
                                     // A batch already known not green is
                                     // never likely to land, whatever its
                                     // priority or predicted pass said.
@@ -7301,11 +7312,13 @@ impl<'a> Runner<'a> {
                                         already_green,
                                         self.config.root_stack_min_pass_percent,
                                     ) {
-                                        // Stack on the stack top when one
-                                        // exists; with none, only on a
-                                        // likely root still on the current
-                                        // base (the stale-tip guard), never
-                                        // on a cut-out or stale tip.
+                                        // With a stack top, `flight` is
+                                        // that top: the likely batch and
+                                        // the parent are the same batch.
+                                        // With none, only stack on a likely
+                                        // root still on the current base
+                                        // (the stale-tip guard), never on a
+                                        // cut-out or stale tip.
                                         let (tip, parent_prs) = match stack_top(&flights) {
                                             Some(top) => (
                                                 top.candidate.tip.clone(),
