@@ -51342,11 +51342,32 @@ def test_find_census_drops_the_interrupted_walk_of_a_process_it_reads_again(
         terminate_process(other)
 
 
-def test_find_census_still_refuses_entries_that_keep_vanishing(
+def test_find_census_counts_a_descriptor_that_keeps_vanishing_as_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live process closing a descriptor in every re-read closed it: no refusal (#1102 part 2)."""
+    slot, user, other, observed = _live_census_pair(tmp_path)
+    holder = f"/proc/{user.pid}/cwd\0{slot}\0".encode()
+    reads = _ScriptedPrivilegedReads([(1, holder, _vanished_fd(other.pid)), (1, b"", _vanished_fd(other.pid))])
+    monkeypatch.setattr(wrkslots, "_run_root_owned_command", reads)
+    try:
+        matches = wrkslots._absent_validate_find_matches(
+            tuple(observed.values()), {slot: "slot01"}
+        )
+        assert [pid for pid, *_rest in matches] == [user.pid]
+        assert reads.pids == [{user.pid, other.pid}, *[{other.pid}] * wrkslots._LIVE_ENTRY_REPROBES]
+    finally:
+        terminate_process(user)
+        terminate_process(other)
+
+
+def test_find_census_still_refuses_other_entries_that_keep_vanishing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     slot, user, other, observed = _live_census_pair(tmp_path)
-    reads = _ScriptedPrivilegedReads([(1, b"", _vanished_fd(other.pid))])
+    vanished = f"/usr/bin/find: '/proc/{other.pid}/cwd': No such file or directory\n".encode()
+    # A descriptor beside it does not make the cwd a descriptor.
+    reads = _ScriptedPrivilegedReads([(1, b"", vanished + _vanished_fd(other.pid))])
     monkeypatch.setattr(wrkslots, "_run_root_owned_command", reads)
     try:
         with pytest.raises(wrkslots._ProcessEvidenceChanged, match="privileged find census produced diagnostics"):
@@ -51699,7 +51720,8 @@ def missing_path_census_control(
             return (1, b"", b"")
         if scenario == "once" and calls.count("snapshot") > 1:
             return (0, b"", b"")
-        diagnostic = b"/usr/bin/find: '/proc/123/fd/399': No such file or directory\n"
+        # Not a descriptor: one that keeps vanishing is gone, not a discard (#1102 part 2).
+        diagnostic = b"/usr/bin/find: '/proc/123/cwd': No such file or directory\n"
         if scenario == "unknown":
             diagnostic = diagnostic.replace(b"/123/", b"/124/")
         elif scenario == "malformed":
@@ -51707,7 +51729,7 @@ def missing_path_census_control(
         elif scenario == "permission":
             diagnostic = diagnostic.replace(b"No such file or directory", b"Permission denied")
         elif scenario == "mixed":
-            diagnostic += b"/usr/bin/find: '/proc/124/fd/399': No such file or directory\n"
+            diagnostic += b"/usr/bin/find: '/proc/124/cwd': No such file or directory\n"
         elif scenario == "framing":
             return (0, b"/proc/123/fd/7\0", b"")
         elif scenario == "time":

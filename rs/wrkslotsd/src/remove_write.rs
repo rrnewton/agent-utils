@@ -521,7 +521,23 @@ enum LinkObservation {
 
 struct ProcessLinks {
     pid: i64,
+    /// Set when `pid` is a surviving thread read in place of this
+    /// leader, which exited while its threads still run.
+    leader: Option<i64>,
     links: Vec<(&'static str, LinkObservation)>,
+}
+
+impl ProcessLinks {
+    /// How a refusal names the holder, as the Python census does.
+    fn holder(&self) -> String {
+        match self.leader {
+            None => format!("process {}", self.pid),
+            Some(leader) => format!(
+                "thread {} of process {leader} (whose main thread has exited)",
+                self.pid
+            ),
+        }
+    }
 }
 
 /// One enumeration of `/proc` link targets, captured once and
@@ -588,13 +604,72 @@ fn link_points_into(link: &Path, slot_path: &Path, slot_device: u64) -> Result<b
 /// changing faster than it can read them.
 const SNAPSHOT_LISTING_ROUNDS: usize = 64;
 
-/// A process generation's start time (clock ticks after boot), or
-/// None once it has exited.
-fn process_start_ticks(pid: i64) -> Option<u64> {
-    let raw = std::fs::read(format!("/proc/{pid}/stat")).ok()?;
+/// A process generation's start time (clock ticks after boot) and
+/// scheduler state, read from `base`/stat, or None once it has exited.
+fn process_stat(base: &Path) -> Option<(u64, char)> {
+    let raw = std::fs::read(base.join("stat")).ok()?;
     let text = String::from_utf8_lossy(&raw);
     let closing = text.rfind(") ")?;
-    text[closing + 2..].split_whitespace().nth(19)?.parse().ok()
+    let mut fields = text[closing + 2..].split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let start = fields.nth(18)?.parse().ok()?;
+    Some((start, state))
+}
+
+fn is_terminal_state(state: char) -> bool {
+    matches!(state, 'Z' | 'X')
+}
+
+/// The threads, with their start times, that still run in `pid`'s
+/// thread group after its leader exited (State Z or X) (#1102 part 2).
+/// Such a leader's own entries show nothing and /proc readdir lists
+/// none of its threads, yet the threads keep its working directory,
+/// descriptors and executable: the process is live for slot use, so
+/// each thread is read in its place at /proc/PID/task/TID. A leader
+/// that still runs, or a group that is gone, has none. A thread
+/// listing that cannot be read refuses, as in the Python census.
+fn surviving_threads(pid: i64) -> Result<Vec<(i64, u64)>> {
+    let base = PathBuf::from("/proc").join(pid.to_string());
+    match process_stat(&base) {
+        Some((_start, state)) if is_terminal_state(state) => {}
+        _ => return Ok(Vec::new()),
+    }
+    let task = base.join("task");
+    let entries = match std::fs::read_dir(&task) {
+        Ok(entries) => entries,
+        Err(error) if matches!(error.raw_os_error(), Some(2 | 3)) => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "process use is indeterminate because {} failed: {error}",
+                task.display()
+            ));
+        }
+    };
+    let mut threads = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "process use is indeterminate because {} failed: {error}",
+                task.display()
+            )
+        })?;
+        let Some(tid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        if tid == pid {
+            continue;
+        }
+        if let Some((start, state)) = process_stat(&entry.path()) {
+            if !is_terminal_state(state) {
+                threads.push((tid, start));
+            }
+        }
+    }
+    Ok(threads)
 }
 
 fn list_proc() -> Result<Vec<String>> {
@@ -610,8 +685,11 @@ fn list_proc() -> Result<Vec<String>> {
     Ok(names)
 }
 
-fn read_process_links(pid: i64) -> ProcessLinks {
-    let base = PathBuf::from("/proc").join(pid.to_string());
+fn read_process_links(pid: i64, leader: Option<i64>) -> ProcessLinks {
+    let base = match leader {
+        None => PathBuf::from("/proc").join(pid.to_string()),
+        Some(leader) => PathBuf::from(format!("/proc/{leader}/task/{pid}")),
+    };
     let mut links: Vec<(&'static str, LinkObservation)> = Vec::new();
     for (label, link) in [
         ("working directory", base.join("cwd")),
@@ -624,7 +702,55 @@ fn read_process_links(pid: i64) -> ProcessLinks {
             links.push(("descriptor", observe_link(&fd.path())));
         }
     }
-    ProcessLinks { pid, links }
+    ProcessLinks { pid, leader, links }
+}
+
+/// What one snapshot has read so far, across its listings of /proc.
+struct SnapshotReads<'a> {
+    targets: &'a [PathBuf],
+    devices: Vec<Option<u64>>,
+    settled: Vec<bool>,
+    read: std::collections::HashMap<i64, u64>,
+    processes: Vec<ProcessLinks>,
+    unsettling: Vec<i64>,
+    added: usize,
+}
+
+impl SnapshotReads<'_> {
+    /// Keep `process`, read as generation `start`, settling each target
+    /// it is the first seen to use (or that it may use).
+    fn admit(&mut self, process: ProcessLinks, start: u64) {
+        for (index, target) in self.targets.iter().enumerate() {
+            let Some(device) = self.devices[index] else {
+                continue;
+            };
+            if self.settled[index] {
+                continue;
+            }
+            let uses = process.links.iter().any(|(_label, observation)| {
+                observation_points_into(observation, target, device).unwrap_or(true)
+            });
+            if uses {
+                self.settled[index] = true;
+                self.unsettling.push(process.pid);
+            }
+        }
+        self.processes.retain(|known| known.pid != process.pid);
+        self.read.insert(process.pid, start);
+        self.processes.push(process);
+        self.added += 1;
+    }
+
+    /// Read every surviving thread of `leader` not read yet.
+    fn admit_threads(&mut self, leader: i64) -> Result<()> {
+        for (tid, start) in surviving_threads(leader)? {
+            if self.read.get(&tid) == Some(&start) {
+                continue;
+            }
+            self.admit(read_process_links(tid, Some(leader)), start);
+        }
+        Ok(())
+    }
 }
 
 /// Capture one shared process snapshot for `targets`, excluding this
@@ -640,7 +766,11 @@ fn read_process_links(pid: i64) -> ProcessLinks {
 /// snapshot; otherwise a listing is proven when none of its new
 /// generations uses, or may use, a target no earlier generation was
 /// already seen using, and two proven listings in a row close it. Unrelated births on a busy host therefore do not keep it
-/// open. Exhausting SNAPSHOT_LISTING_ROUNDS refuses.
+/// open. Exhausting SNAPSHOT_LISTING_ROUNDS refuses. A thread-group
+/// leader that exited while its threads still run is live: each
+/// surviving thread is read in its place (`surviving_threads`), both
+/// when a listing finds the leader already exited and when it exits
+/// while it is read (#1102 part 2).
 pub(crate) fn capture_process_snapshot(
     coordinator_pid: i64,
     targets: &[PathBuf],
@@ -657,11 +787,16 @@ pub(crate) fn capture_process_snapshot(
                 .map(|metadata| metadata.dev())
         })
         .collect();
-    let mut settled = vec![false; targets.len()];
-    let mut read: std::collections::HashMap<i64, u64> = std::collections::HashMap::new();
-    let mut processes: Vec<ProcessLinks> = Vec::new();
+    let mut reads = SnapshotReads {
+        targets,
+        devices,
+        settled: vec![false; targets.len()],
+        read: std::collections::HashMap::new(),
+        processes: Vec::new(),
+        unsettling: Vec::new(),
+        added: 0,
+    };
     let mut proven_rounds = 0;
-    let mut unsettling: Vec<i64> = Vec::new();
     for round in 0..SNAPSHOT_LISTING_ROUNDS {
         let names = list_proc()?;
         if round == 0 {
@@ -678,8 +813,8 @@ pub(crate) fn capture_process_snapshot(
                     .status();
             }
         }
-        unsettling.clear();
-        let mut added = 0usize;
+        reads.unsettling.clear();
+        reads.added = 0;
         for name in names {
             let Ok(pid) = name.parse::<i64>() else {
                 continue;
@@ -687,47 +822,44 @@ pub(crate) fn capture_process_snapshot(
             if ignored.contains(&pid) || pid == coordinator_pid {
                 continue;
             }
-            let Some(start) = process_start_ticks(pid) else {
+            let base = PathBuf::from("/proc").join(pid.to_string());
+            let Some((start, state)) = process_stat(&base) else {
                 continue;
             };
-            if read.get(&pid) == Some(&start) {
+            if is_terminal_state(state) {
+                // A leader that exited while its threads still run is
+                // followed through them, however it was read before.
+                reads.admit_threads(pid)?;
                 continue;
             }
-            let process = read_process_links(pid);
-            for (index, target) in targets.iter().enumerate() {
-                let Some(device) = devices[index] else {
-                    continue;
-                };
-                if settled[index] {
-                    continue;
-                }
-                let uses = process.links.iter().any(|(_label, observation)| {
-                    observation_points_into(observation, target, device).unwrap_or(true)
-                });
-                if uses {
-                    settled[index] = true;
-                    unsettling.push(pid);
-                }
+            if reads.read.get(&pid) == Some(&start) {
+                continue;
             }
-            processes.retain(|known| known.pid != pid);
-            processes.push(process);
-            read.insert(pid, start);
-            added += 1;
+            reads.admit(read_process_links(pid, None), start);
+            // A leader that exited while it was read showed nothing; its
+            // threads still hold what it held, so they are read now, in
+            // this listing, not left to one that may never come.
+            reads.admit_threads(pid)?;
         }
-        if round > 0 && added == 0 {
+        if round > 0 && reads.added == 0 {
             // Nothing appeared since the last listing: every later birth
             // descends from a generation already read.
-            return Ok(ProcessSnapshot { processes });
+            return Ok(ProcessSnapshot {
+                processes: reads.processes,
+            });
         }
-        if unsettling.is_empty() {
+        if reads.unsettling.is_empty() {
             proven_rounds += 1;
             if proven_rounds >= 2 {
-                return Ok(ProcessSnapshot { processes });
+                return Ok(ProcessSnapshot {
+                    processes: reads.processes,
+                });
             }
         } else {
             proven_rounds = 0;
         }
     }
+    let mut unsettling = reads.unsettling;
     unsettling.sort_unstable();
     unsettling.dedup();
     Err(format!(
@@ -775,8 +907,8 @@ pub(crate) fn assert_slot_unused_snapshot(
         }
         if let Some(via) = via {
             return Err(format!(
-                "live process {} uses slot {} ({via}); stop it and retry",
-                process.pid,
+                "live {} uses slot {} ({via}); stop it and retry",
+                process.holder(),
                 slot_path.display()
             ));
         }

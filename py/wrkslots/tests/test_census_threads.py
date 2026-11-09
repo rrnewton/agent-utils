@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -432,13 +432,14 @@ def test_the_privileged_census_reports_the_slot_the_thread_holds(
 
 
 @_REAL_CENSUS_COMMANDS
-def test_a_leader_that_exits_under_running_threads_discards_the_attempt(
+def test_a_leader_that_exits_under_running_threads_is_followed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An observed leader is neither live nor released once only its threads run.
 
-    The first attempt holds the leader as it was observed before it exited;
-    the census discards that attempt, and its fresh snapshot finds the thread.
+    Outside a census that lists /proc again, the checks discard the attempt.
+    Inside one (#1102 part 2) they record the leader as followed instead, and
+    the census's next inventory reads the thread in its place.
     """
 
     slot = _slot(tmp_path)
@@ -454,6 +455,15 @@ def test_a_leader_that_exits_under_running_threads_discards_the_attempt(
             cli._preflight_process_observations((observed,), _budget())
         with pytest.raises(cli._ProcessEvidenceChanged, match="threads still run"):
             cli._recheck_thread_group_observations((observed,), _budget())
+        followed: list[int] = []
+        token = cli._FOLLOWED_VANISHED_HOLDERS.set(followed)
+        try:
+            assert not cli._process_observation_is_active(observed)
+            assert cli._preflight_process_observations((observed,), _budget()) == ()
+            cli._recheck_thread_group_observations((observed,), _budget())
+        finally:
+            cli._FOLLOWED_VANISHED_HOLDERS.reset(token)
+        assert followed == [child.pid] * 3
 
         proc_root = _proc_root(tmp_path, child.pid)
         real = cli._same_uid_process_observations
@@ -477,7 +487,7 @@ def test_a_leader_that_exits_under_running_threads_discards_the_attempt(
 
 @_REAL_CENSUS_COMMANDS
 @pytest.mark.parametrize("lane", ("privileged", "same-uid"))
-def test_a_leader_that_exits_between_the_link_and_maps_readers_discards_the_attempt(
+def test_a_leader_that_exits_between_the_link_and_maps_readers_is_followed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str,
 ) -> None:
     """Exiting after find and before grep leaves no diagnostic to catch.
@@ -488,7 +498,8 @@ def test_a_leader_that_exits_between_the_link_and_maps_readers_discards_the_atte
     error.  This test process, listed first and in the same mount namespace,
     is the one whose mount table the mount census reads, so that census never
     reads the leader either.  Only the check after every reader catches the
-    exit, and the retry reports the mapping the thread holds.
+    exit; it follows the leader (#1102 part 2), and the next listing reports
+    the mapping the thread holds.
     """
 
     slot = _slot(tmp_path)
@@ -556,6 +567,87 @@ def test_a_leader_that_exits_between_the_link_and_maps_readers_discards_the_atte
     assert snapshots == [(os.getpid(), child.pid), (os.getpid(), thread), *closing]
     assert len(greps) == 2
     assert {(pid, kind) for pid, _slot, kind, _detail in census.matches} == {(thread, "map")}
+
+
+@_REAL_CENSUS_COMMANDS
+@pytest.mark.parametrize("lane", ("privileged", "same-uid"))
+def test_leaders_that_exit_before_their_readers_are_followed_and_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lane: str,
+) -> None:
+    """A leader calls pthread_exit while its thread holds a cwd in the slot: BLOCKED (#1102 part 2).
+
+    Three children, each the only user of its own slot, through its surviving
+    thread's working directory.  A leader exits each time the census is about
+    to check the generations a listing gave it, before any reader runs, so the
+    first one is never read alive.  Each such exit used to discard the census
+    attempt, and three in one census refused it ("relevant process evidence
+    changed"), as gate shards full of threaded build processes did.  Now every
+    exited leader is followed: a later listing reads its thread at
+    /proc/PID/task/TID, and every slot is BLOCKED.
+
+    The exits come before the readers, not between them: as this user, find
+    is refused a zombie leader's fd directory, which the census refuses
+    outright, and the stand-in for sudo here runs as this user.
+    """
+
+    slots = [tmp_path / f"slot-{index}" for index in range(3)]
+    for slot in slots:
+        slot.mkdir()
+        (slot / "held").write_bytes(b"held by the surviving thread\n")
+    with ExitStack() as stack:
+        children = [stack.enter_context(_started(slot, "cwd")) for slot in slots]
+        threads = [_ready(child)[0] for child in children]
+        proc_root = _proc_root(tmp_path, *(child.pid for child in children))
+        waiting = list(children)
+        real_preflight = cli._preflight_process_observations
+
+        def preflight_after_an_exit(
+            processes: Sequence[cli._AbsentProcessObservation],
+            budget: cli._ReadOnlyCommandBudget,
+            *,
+            replaced_generations_are_gone: bool = False,
+        ) -> tuple[cli._AbsentProcessObservation, ...]:
+            if waiting:
+                _exit_leader(waiting.pop(0))
+            return real_preflight(
+                processes, budget, replaced_generations_are_gone=replaced_generations_are_gone
+            )
+
+        monkeypatch.setattr(cli, "_preflight_process_observations", preflight_after_an_exit)
+        monkeypatch.setattr(cli, "_run_root_owned_command", _root_owned_as_same_uid())
+        if lane == "same-uid":
+            real_observations = cli._same_uid_process_observations
+            monkeypatch.setattr(
+                cli, "_same_uid_process_observations",
+                lambda budget: real_observations(budget, proc_root),
+            )
+            census = cli._capture_same_uid_process_path_census(slots, budget=_budget())
+        else:
+            real_snapshot = cli._absent_validate_process_snapshot
+            monkeypatch.setattr(
+                cli, "_absent_validate_process_snapshot",
+                lambda include_owner_cgroups=True: real_snapshot(
+                    proc_root, include_owner_cgroups=include_owner_cgroups
+                ),
+            )
+            census = cli._capture_process_path_census(
+                slots, budget=_budget(), include_owner_cgroups=False
+            )
+        assert not waiting
+        for slot in slots:
+            with pytest.raises(cli.Refusal, match=rf"uses slot {re.escape(str(slot))}: "):
+                census.assert_slot_unused(slot, None)
+        # The first leader exited before anything read it: only its thread
+        # can have shown the slot.
+        with pytest.raises(
+            cli.Refusal,
+            match=rf"^live thread {threads[0]} of process {children[0].pid} "
+            r"\(whose main thread has exited\) uses slot ",
+        ):
+            census.assert_slot_unused(slots[0], None)
+    matched = {(pid, slot) for pid, slot, _kind, _detail in census.matches}
+    assert {(thread, str(slot)) for thread, slot in zip(threads, slots)} <= matched
+    assert (children[0].pid, str(slots[0])) not in matched
 
 
 @_REAL_CENSUS_COMMANDS

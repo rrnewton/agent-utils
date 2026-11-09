@@ -275,6 +275,18 @@ whose process census failed, or whose cache census found something it could not 
 live lane proven) reads `UNKNOWN` in both, not `BLOCKED`; a slot whose name is also an attention
 slot keeps its own verdict.
 
+The process census tolerates a busy host (#1102). A process that exits while the census reads it
+cannot be using a slot, so it is dropped rather than failing the census. A process that starts
+after the census listed `/proc` is still seen: the census lists `/proc` again and reads every
+process it has not read, until a listing adds nothing that could use a slot. A process whose main
+thread has exited (with `pthread_exit`) while its other threads still run is live: its threads
+keep its working directory, open files and mappings, so the census reads each one at
+`/proc/PID/task/TID` and names it in the reason as `thread TID of process PID (whose main thread
+has exited)`. A file that a running process closes while the census walks its descriptors is gone:
+the census reads that process again, at most twice, and then accepts that the descriptor is gone.
+The census still refuses (the row reads `UNKNOWN`) when its time budget runs out, when it lists
+`/proc` 64 times without closing, or when other evidence changes three times in a row.
+
 Only names a slot can have (`NAME_RE`: a letter or digit, then up to 63 letters, digits, `.`, `_`
 or `-`) are slot candidates (#1113). A directory in a slots root under any other name, such as
 `.pytest_cache`, `_scratch` or a removal's `.<slot>.fenced.*` tree, is never reported as an

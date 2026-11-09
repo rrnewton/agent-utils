@@ -4,7 +4,7 @@ status: open
 priority: 1
 issue_type: bug
 created_at: 2026-11-09T00:17:46.000000000+00:00
-updated_at: 2026-11-09T01:03:25.000000000+00:00
+updated_at: 2026-11-09T09:50:00.000000000+00:00
 assignee: cl-wrkid
 ---
 
@@ -37,6 +37,21 @@ DECISION (the lead's direction, 2026-11-08): both editions adopt one semantics.
 - The wall budget stays a budget for real work, not a casualty of retries: report which phase exhausted it.
 - Rust gains the re-listing step (today it misses appearing PIDs); Python gains vanished-PID tolerance (today it discards the attempt). After this, the two editions return the same answer for the same host history.
 
+Part 2 scope, from the daytime load reproduction (cl-wrkid, 2026-11-09 04:05-04:13 ET, at the stack tip on dab2a70c, after part 1): no census refused, but the near-misses have a clear cause. Method: the Python all-process census over a scratch slot, with every `_ProcessEvidenceChanged` logged, in three load profiles:
+- A: 16 process-churn loops, load ~40: 20/20 ok, 4.5 s typical;
+- B: 64 churn loops plus 160 CPU hogs, load ~240: 15/15 ok, 7-8 s typical;
+- C: 200 churn loops plus 40 CPU hogs, load ~265: 15/15 ok, ~6 s.
+
+"PID exited during mountinfo census" was the most frequent event, about 350, and costs nothing: part 1 already absorbs it. Every slow run, 13.8-15.9 s with one or two of the three attempts discarded, hit one of two whole-attempt discards:
+1. "PID N exited as thread-group leader while its threads still run" (`_assert_leader_released_its_threads`);
+2. "privileged find census produced diagnostics: find: /proc/X/fd/N": an fd that vanished while find read it, for a process still alive (`_LiveEntriesVanished` from `_allow_only_vanished_process_diagnostics`).
+
+Two of those in one census refuse it, which is what gate shards with many threaded rustc and pytest processes hit. Logs: /tmp/cl-wrkid-1102/phase{A,B,C}.log.
+
+Safety points for part 2 (the lead, 2026-11-09):
+1. A thread-group leader that exited while its threads still run is a LIVE process for slot-use purposes. Its threads keep cwd, root, open fds and mappings, and /proc/PID/task/*/ still shows them. "Follow it" means reading the surviving threads' cwd, root, fds and mappings from /proc/PID/task/TID/..., never treating the PID as vanished. Required test: a leader exits via pthread_exit while a thread holds a cwd in the slot; that must BLOCK.
+2. An fd vanishing mid-find: re-read only that PID's fds, with a bound. An fd that is gone counts as gone, not as a failed census.
+
 # Acceptance Criteria
 
 - The forced-churn differential added with #1084 (a vanishing PID and an appearing PID injected deterministically into both editions' census, no host load) passes; it is a strict xfail until this lands, so it flips when fixed.
@@ -59,4 +74,16 @@ Progress (cl-wrkid): the appearing-PID half is in the first #1102 landing, in bo
 Verbatim from the consumer host with 77 slots (Python edition at a0eeb67d), run A, `audit --format json`, DELETABLE 0 of 78, carried by all 21 liveness-dead UNKNOWN slots: `process/path census failed: PID 894871 identity changed after privileged find matched a selected path; the selected path may still be in use`. Run B, minutes later, had no occurrence (intermittent under load), and neither run reproduced the earlier "3.58 s" text. So the identity change in the field is the post-match recheck in the privileged find matcher, not only a /proc listing.
 
 Vanished-PID half, part 1 (cl-wrkid): a matched holder whose generation is gone at its recheck is followed, not refused, in every matcher (privileged and same-UID find, maps, mount, and the same-UID direct census), whenever the census lists /proc again afterwards (the all-process and same-UID censuses; `_FOLLOWED_VANISHED_HOLDERS`). The gone generation's match is dropped; its replacement, or a child it handed a reference to before exiting, is a generation the next listing reads. Callers that do not list again keep the refusal. Test: `test_audit_follows_a_matched_holder_replaced_before_its_recheck` (a seam replaces the holder exactly at the recheck; with the old refusal the row is UNKNOWN, now it is BLOCKED by the replacement), both editions. Remaining, part 2: an attempt is still discarded as a whole on other changed evidence (`_ProcessEvidenceChanged` from a reader), which is what spends the shared budget; keeping verified evidence across attempts waits for the daytime load reproduction to show which refusals dominate.
+
+Vanished-PID half, part 2 (cl-wrkid, 2026-11-09), per the lead's two safety points in the Design:
+1. A thread-group leader that exits while its threads still run is followed, never treated as vanished. Python: inside the censuses that list /proc again (all-process and same-UID), `_assert_leader_released_its_threads` records the leader in `_FOLLOWED_VANISHED_HOLDERS` instead of discarding the attempt; the next listing observes each surviving thread in its place and reads its cwd, root, descriptors and mappings at /proc/PID/task/TID. A round that followed anything cannot close the census, though it does not reopen it either (all-process), and a followed leader is not proven (same-UID), so that listing always comes; a surviving thread's mount namespace is read again, in case the exited leader was its only representative. Callers that do not list again still discard. Rust: `capture_process_snapshot` had no thread handling at all: a zombie leader's links read as no evidence, so a slot held only by a surviving thread was published DELETABLE (fail-open, confirmed by the new differential against the previous source). It now reads each surviving thread (`surviving_threads`), both when a listing finds the leader already exited and when it exits while being read, and names it as `thread TID of process PID (whose main thread has exited)`, as Python does.
+2. A descriptor that keeps vanishing for a live process through the bounded re-reads (`_LIVE_ENTRY_REPROBES = 2`) is gone: `_privileged_census_output` returns instead of discarding the attempt, keeping the last re-read's records. Only descriptor entries (/proc/PID/fd/N); a cwd, root, exe or maps entry that keeps vanishing still discards. Residual, recorded in the docstring: a reference moved by dup2 to a descriptor the last walk had already passed, in the instant before it read the closed one.
+
+Tests: `test_leaders_that_exit_before_their_readers_are_followed_and_block` (three children, each the only user of its own slot through a surviving thread's cwd, a leader exiting before each check; privileged and same-UID lanes; on the previous census both lanes refused "relevant process evidence changed during three liveness attempts", now all three slots BLOCK and the first is named by its thread), `test_audit_follows_a_leader_that_exits_after_the_listing_like_python` (both editions through the churn seam; previous Rust: not BLOCKED), `test_find_census_counts_a_descriptor_that_keeps_vanishing_as_gone`, `test_find_census_still_refuses_other_entries_that_keep_vanishing`; the two zombie-leader "discards_the_attempt" tests are renamed `_is_followed`.
+
+Still open after part 2:
+- the same-UID census's own diagnostics (`_same_uid_indeterminate_processes`) still discard its scan for a vanished descriptor of a live process; it keeps positive matches and allows 3 discards, and the load reproduction never hit it;
+- a surviving thread that executes a new program (taking its leader's PID) still discards the attempt: its new program has a generation the census already read, so re-listing alone would not read it;
+- question for the owner (not probed: the root probe was declined at night): what root's find reports for a zombie leader's /proc/PID/fd. As this user it is "Permission denied", which the privileged census refuses outright, not as churn. A leader exiting between the census's check of it and find's walk would hit that if root sees the same; the tests here drive the exit before the check;
+- acceptance criterion 3 (repeated audits and removals at load above 100 no longer refuse for churn) needs the load reproduction rerun on this code.
 

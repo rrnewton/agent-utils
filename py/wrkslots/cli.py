@@ -1123,11 +1123,16 @@ class _LiveEntriesVanished(_ProcessEvidenceChanged):
     process, still running as the same generation, closed a file or moved: ordinary churn on a
     busy host.  ``pids`` names those processes, so the reader can read just them again instead of
     the census discarding the whole attempt.  Every other caller discards it as before.
+    ``descriptors_only`` says every entry that vanished was a descriptor (/proc/PID/fd/N): a file
+    the process closed, which it no longer holds (#1102 part 2).
     """
 
-    def __init__(self, message: str, pids: Iterable[int]) -> None:
+    def __init__(
+        self, message: str, pids: Iterable[int], *, descriptors_only: bool = False,
+    ) -> None:
         super().__init__(message)
         self.pids = frozenset(pids)
+        self.descriptors_only = descriptors_only
 
 
 class _ValidationRunMayUseRow(Refusal):
@@ -62190,6 +62195,9 @@ _FIND_MISSING_RE = re.compile(
 _GREP_MISSING_RE = re.compile(
     r"^/usr/bin/grep: /proc/(?P<pid>[0-9]+)/maps: No such file or directory$"
 )
+_FIND_MISSING_DESCRIPTOR_RE = re.compile(
+    r"^/usr/bin/find: '/proc/[0-9]+/fd/[0-9]+': No such file or directory$"
+)
 _FIND_PERMISSION_RE = re.compile(
     r"^/usr/bin/find: '/proc/(?P<pid>[0-9]+)(?:/[^']*)?': Permission denied$"
 )
@@ -62296,11 +62304,13 @@ def _process_generation_is_current(process: _AbsentProcessObservation) -> bool:
 def _process_observation_is_active(process: _AbsentProcessObservation) -> bool:
     """Return whether the observed generation still names a non-zombie process.
 
-    Two answers would hide a holder, so they raise _ProcessEvidenceChanged
-    instead and the attempt is discarded: a leader that became a zombie while
-    its other threads still run, and a surviving thread that vanished because
-    it executed a new program under its leader's PID.  A fresh snapshot
-    observes the threads, or the new program, in their place.
+    Two answers would hide a holder.  A surviving thread that vanished because
+    it executed a new program under its leader's PID raises
+    _ProcessEvidenceChanged, and the attempt is discarded; a fresh snapshot
+    observes the new program in its place.  A leader that became a zombie
+    while its other threads still run is followed inside a census that lists
+    /proc again (see `_assert_leader_released_its_threads`) and otherwise
+    discards the attempt the same way.
     """
 
     pid_dir = Path("/proc") / str(process.pid)
@@ -62318,18 +62328,29 @@ def _process_observation_is_active(process: _AbsentProcessObservation) -> bool:
 def _assert_leader_released_its_threads(
     process: _AbsentProcessObservation, pid_dir: Path,
 ) -> None:
-    """Refuse the attempt if the observed zombie ``process`` still has running threads.
+    """Follow, or refuse, an observed zombie ``process`` whose threads still run.
 
     A leader that exits while its other threads run has not released its
     files, but its own entries no longer show them, and /proc readdir never
-    lists the threads.  The attempt that observed the leader is discarded,
-    and a fresh snapshot observes the threads in its place.
+    lists the threads.  Such a process is LIVE for slot use.  Inside a census
+    that lists /proc again after its reads (#1102 part 2) the leader is
+    recorded in `_FOLLOWED_VANISHED_HOLDERS` and followed: that listing
+    observes each surviving thread in the leader's place and reads its cwd,
+    root, descriptors and mappings at /proc/PID/task/TID, and a round that
+    followed a leader cannot close the census, so the listing always comes.  Anywhere else the attempt that observed the leader
+    is discarded, and a fresh snapshot observes the threads in its place.  On
+    a busy host with many threaded build processes the discards alone refused
+    whole censuses.
     """
 
     if not _zombie_leader_has_live_threads(pid_dir):
         return
     current = _read_process_stat(pid_dir)
     if current is not None and current.start_ticks == process.start_ticks:
+        followed = _FOLLOWED_VANISHED_HOLDERS.get()
+        if followed is not None:
+            followed.append(process.pid)
+            return
         raise _ProcessEvidenceChanged(
             f"PID {process.pid} exited as thread-group leader while its threads still run"
         )
@@ -62475,6 +62496,7 @@ def _allow_only_vanished_process_diagnostics(
     pattern = _FIND_MISSING_RE if program == "find" else _GREP_MISSING_RE
     changed_diagnostic: str | None = None
     changed_pids: set[int] = set()
+    descriptors_only = True
     motion: list[_ProcessEvidenceChanged] = []
     for line in lines:
         if program == "find" and _long_path_diagnostic_is_foreign(
@@ -62488,6 +62510,9 @@ def _allow_only_vanished_process_diagnostics(
         if _observation_is_active_deferring_motion(process, motion):
             changed_diagnostic = line
             changed_pids.add(process.pid)
+            descriptors_only = descriptors_only and bool(
+                _FIND_MISSING_DESCRIPTOR_RE.fullmatch(line)
+            )
     # Validate every diagnostic before classifying motion: an earlier vanished
     # FD must not hide a later permission, malformed, or unknown-path refusal.
     # The enclosing bounded retry discards this entire incomplete census.
@@ -62497,6 +62522,7 @@ def _allow_only_vanished_process_diagnostics(
         raise _LiveEntriesVanished(
             f"privileged {program} census produced diagnostics: {changed_diagnostic}",
             changed_pids,
+            descriptors_only=descriptors_only,
         )
 
 
@@ -62589,7 +62615,10 @@ def _same_uid_indeterminate_processes(
 # then recorded here instead of refusing the census: the old generation is
 # gone (it can no longer use the path), and whatever replaced it, or a child
 # it handed a reference to before it exited, is a generation the next listing
-# reads.  Callers that do not list again keep the refusal.
+# reads.  So is a thread-group leader that exited while its threads still run
+# (`_assert_leader_released_its_threads`): the next listing reads the threads.
+# A round that recorded anything here cannot close its census, so the next
+# listing always comes.  Callers that do not list again keep the refusal.
 _FOLLOWED_VANISHED_HOLDERS: contextvars.ContextVar[list[int] | None] = (
     contextvars.ContextVar("wrkslots_followed_vanished_holders", default=None)
 )
@@ -62708,8 +62737,17 @@ def _privileged_census_output(
     while the reader walked it -- just those processes are read again, at most
     ``_LIVE_ENTRY_REPROBES`` times, instead of the census discarding the whole attempt: on a busy
     host one such close in each of three attempts refused the census as "relevant process evidence
-    changed" (#996).  Any other diagnostic, thread-group motion, or entries that still vanish on
-    the last re-read raise as before.
+    changed" (#996).  Any other diagnostic, thread-group motion, or entries other than descriptors
+    that still vanish on the last re-read raise as before.
+
+    Descriptors that still vanish on the last re-read are gone, not a failed census (#1102 part 2,
+    the lead's rule): a process that keeps opening and closing files, as a busy build does, closes
+    some descriptor during nearly every walk of its fd directory, and refusing for that discarded
+    whole attempts under load.  The last re-read's records stand: each names a descriptor read
+    while it was open.  What this cannot see is a reference moved by dup2 to a descriptor the
+    last walk had already passed, in the moment between that walk's listing and its read of the
+    closed one; a census never sees a reference created after it read a process, and this is the
+    same window, three re-reads deep.
 
     The records an interrupted walk printed for the processes read again are dropped, as a
     discarded attempt drops them, and the re-read's records stand in their place; the records of
@@ -62731,6 +62769,8 @@ def _privileged_census_output(
             )
         except _LiveEntriesVanished as exc:
             if attempt == _LIVE_ENTRY_REPROBES:
+                if exc.descriptors_only:
+                    return b"".join(outputs)
                 raise
             selected = {pid: selected[pid] for pid in sorted(exc.pids) if pid in selected}
             if not selected:
@@ -63204,6 +63244,8 @@ def _scan_same_uid_generations(
     """
 
     before_found = set(found)
+    followed = _FOLLOWED_VANISHED_HOLDERS.get()
+    followed_before = 0 if followed is None else len(followed)
     inputs = tuple(processes)
     processes = _preflight_process_observations(
         processes, budget, replaced_generations_are_gone=True
@@ -63230,6 +63272,9 @@ def _scan_same_uid_generations(
     matched_pids = {
         *(pid for pid, *_rest in set(found) - before_found),
         *(pid for pid, *_rest in naming),
+        # A followed holder (#1102), such as a leader whose threads still
+        # run, is not proven: the next inventory reads what replaced it.
+        *(() if followed is None else followed[followed_before:]),
     }
     scanned_set = set(processes)
     relevant: list[_AbsentProcessObservation] = []
@@ -64526,10 +64571,12 @@ def _census_appearing_generations(
     settled = {slot for _pid, slot, _kind, _detail in matches}
     observed = list(processes)
     found = list(matches)
+    followed = _FOLLOWED_VANISHED_HOLDERS.get()
     proven_rounds = 0 if matches else 1
     unsettling: list[int] = []
     for _round in range(_CENSUS_LISTING_ROUNDS - 1):
         budget.remaining_seconds()
+        followed_before = 0 if followed is None else len(followed)
         listed = (
             _absent_validate_process_snapshot()
             if include_owner_cgroups
@@ -64546,8 +64593,14 @@ def _census_appearing_generations(
         round_matches: tuple[tuple[int, str, str, str], ...] = ()
         if new:
             new = _preflight_process_observations(new, budget)
+            # A surviving thread's namespace is read again: its leader, the
+            # namespace's only representative, may have exited before the
+            # mount census read it, which then skipped the namespace.
             fresh_namespaces = tuple(
-                process for process in new if process.mount_namespace not in namespaces
+                process
+                for process in new
+                if process.mount_namespace not in namespaces
+                or process.leader_pid is not None
             )
             round_matches = (
                 *_absent_validate_find_matches(new, targets, budget),
@@ -64567,6 +64620,12 @@ def _census_appearing_generations(
                 {pid for pid, slot, _kind, _detail in round_matches if slot in newly}
             )
             proven_rounds = 0
+            continue
+        if followed is not None and len(followed) > followed_before:
+            # A holder followed in this round is read by the next listing,
+            # so this round cannot close the census.  It does not reopen it
+            # either: on a busy host some unrelated threaded process exits
+            # as leader in many rounds.
             continue
         proven_rounds += 1
         if proven_rounds >= 2:

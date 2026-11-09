@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import cast
@@ -1646,6 +1647,80 @@ def test_audit_forced_churn_matches_python(
         assert row["verdict"] == "BLOCKED", (edition, row)
         assert len(reasons) == 1, (edition, reasons)
         assert reasons[0].startswith(f"live process {pid} uses slot {slot}"), (edition, reasons)
+        rows.append({**row, "reasons": None})
+    assert rows[0] == rows[1]
+
+
+# The leader blocks SIGUSR1 before it starts the thread (which inherits the
+# mask), waits for it, and calls pthread_exit; the thread changes into the
+# slot first and prints its thread ID.
+_PTHREAD_EXIT_CHILD = """
+import ctypes, os, signal, sys, threading, time
+
+signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
+
+def hold():
+    os.chdir(sys.argv[1])
+    print(threading.get_native_id(), flush=True)
+    while True:
+        time.sleep(60)
+
+threading.Thread(target=hold, daemon=True).start()
+signal.sigwait({signal.SIGUSR1})
+ctypes.CDLL(None).pthread_exit(None)
+"""
+
+
+@pytest.mark.real_process_evidence
+def test_audit_follows_a_leader_that_exits_after_the_listing_like_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lead's required case, both editions: pthread_exit under a thread in the slot BLOCKS (#1102).
+
+    The census lists /proc, then the seam makes the listed leader call
+    pthread_exit, so its own entries show nothing while its thread's working
+    directory is inside the slot.  Python used to discard the attempt for it;
+    Rust never looked behind a zombie leader and published the row DELETABLE.
+    Both now read the thread at /proc/PID/task/TID and name it.
+    """
+
+    root = _fixture(tmp_path)
+    slot = root / "worktrees" / "slot-a"
+    rows: list[dict[str, object]] = []
+    for edition in ("python", "rust"):
+        with subprocess.Popen(
+            [sys.executable, "-I", "-c", _PTHREAD_EXIT_CHILD, str(slot / "repo")],
+            stdout=subprocess.PIPE, text=True, cwd="/",
+        ) as child:
+            try:
+                assert child.stdout is not None
+                thread = int(child.stdout.readline())
+                calls = tmp_path / f"exit-calls-{edition}"
+                monkeypatch.setenv(
+                    "WRKSLOTS_TEST_CENSUS_CHURN",
+                    f"n=$(($(cat {calls} 2>/dev/null || echo 0) + 1)); echo $n > {calls}; "
+                    f"[ $n -eq 1 ] || exit 0; kill -USR1 {child.pid}; "
+                    f"n=0; until grep -q '^State:[[:space:]]*Z' /proc/{child.pid}/status "
+                    f"|| [ $n -ge 500 ]; do sleep 0.01; n=$((n+1)); done",
+                )
+                if edition == "python":
+                    payload = _scrub(_python(root, tmp_path))
+                else:
+                    result = _rust(root, census_state=tmp_path / "rust-census.json")
+                    assert result.returncode == 0, result.stderr
+                    payload = _scrub(json.loads(result.stdout))
+                assert calls.read_text().strip() == "1", edition
+            finally:
+                child.kill()
+                child.wait(timeout=10)
+        row = _rows(payload)[0]
+        reasons = [str(reason) for reason in cast(list[object], row["reasons"])]
+        assert row["verdict"] == "BLOCKED", (edition, row)
+        assert len(reasons) == 1, (edition, reasons)
+        assert reasons[0].startswith(
+            f"live thread {thread} of process {child.pid} (whose main thread has exited) "
+            f"uses slot {slot}"
+        ), (edition, reasons)
         rows.append({**row, "reasons": None})
     assert rows[0] == rows[1]
 
