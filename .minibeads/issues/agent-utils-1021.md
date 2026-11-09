@@ -1,10 +1,10 @@
 ---
 title: 'merge-queue-load-sensitive-tests: two load-sensitive tests count wall-clock instead of events'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 created_at: 2026-11-07T19:41:23.000000000+00:00
-updated_at: 2026-11-08T10:36:49.000000000+00:00
+updated_at: 2026-11-09T02:53:16.000000000+00:00
 ---
 
 # Description
@@ -74,3 +74,46 @@ from the starting run and then timing out at 240s. Its fix counts
 only events from the run under test, gates every ordering edge on
 files, and widens depth so intake always has a window slot; see
 #1014's Resolution for the full mechanism and mutation proof.
+
+## Resolution
+
+Landed on main as 3bd08c6ece73c6753d112b561dea4679a086a9bf (gated commit 6e63e234).
+
+All four tests are event-oracled now; no product wait was found
+(the head-stop test's ~121s park matched its own 120s harness wait
+expiring under load: the only 120s bounds in the stop path are
+unrelated donor/sync timeouts). The donor lease test raises
+`lease_secs` to 600 after the ghost's stored 2s grant has expired,
+so `attempts` counts claims rather than whether the live donor
+could finish inside a fresh 2s lease. The stale-cancel recompose
+test holds the slow root on a gate file and returns the third
+root's job only after change 1 has landed, so the claim-time
+sweep deterministically sees the moved base; it releases the slow
+root at once, because the run decides flights in order and
+recomposes only after that root decides (waiting for the
+recomposed job first is a cycle that hung this test). The
+head-stop test holds its slow validation on a gate file and
+asserts the run exits before that validation records its own
+completion (a marker file), instead of asserting a 30s sleep
+beats a 25s wall bound; the marker also distinguishes a detached
+exit from one that merely waited out the gate's self-expiry. The
+intake-window test keeps its status/started-validation oracles
+with 240s liveness bounds (~4x the worst daemon chain observed
+under full-gate contention; ~3s solo). Two harness hardenings
+came out of the sweep: donor job files the tests rewrite are now
+written atomically (tmp+rename, as production writes them) after
+the sweep caught a run stopping on a mid-truncate empty job
+file, and donor thread scopes set their done flag from a drop
+guard so a panic inside a scope cannot deadlock its join.
+
+Acceptance: the contained 30-run sweep under 16 nice-19 CPU
+workers passes 30/30 (15-23s per iteration at load 42-126) after
+a first run failed at iteration 5 on the non-atomic job write
+above. Each test still fails when its guarded behaviour is
+broken, verified in a scratch worktree with the breaks reverted:
+all stale-recompose layers disabled (stale-cancel fails), donor
+report accepting an unleased receipt (dead-donor fails on the
+refusal assertion), mid-run intake disabled (intake-window
+fails), and a stop that does not cancel dropped flights
+(head-stop fails at 125.9s on the completion marker). Gate:
+selected gate on f3deb382 (validate --base HEAD~1, 33 steps) 32 passed / 1 failed with rust.merge-queue.test clean (591 passed / 0 failed, wall 535s) and the one failure a real clippy unused-mut in the head-stop test; after that one-word fix and a patch-identical rebase over the stranded-intake landing, the 4-step amendment rerun on the exact push tree 6e63e234 passed 6/6 (merge-queue 592 / 0 in 502s, clippy, format, client-names, embedded guides, launchers). The landed tree's four test files are byte-identical to the gated tree.
