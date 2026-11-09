@@ -61737,3 +61737,59 @@ def test_agent_remove_refuses_an_adopt_during_its_unlocked_scan(
     assert (checkout(project, "slot01") / "task.txt").is_file()
     assert active_slot_names(project) == ["slot01"]
     assert registry_journals(project) == []
+
+
+def _registered_liveness_records(project: Path) -> list[Mapping[str, object]]:
+    config = wrkslots._load_config(str(project), "testhost")
+    return [
+        cast(Mapping[str, object], cast(Mapping[str, object], item["payload"])["evidence"])
+        for item in wrkslots._load_events(config)
+        if item["kind"] == "active-state-recorded"
+        and cast(Mapping[str, object], item["payload"])["action"]
+        == wrkslots.REGISTERED_LIVENESS_ACTION
+    ]
+
+
+def test_remove_records_the_registered_liveness_line_it_relied_on(tmp_path: Path) -> None:
+    """#994: the authority's dead line is in the history, as written, not parsed."""
+
+    project, _repository, _slots = dead_agent_batch_project(tmp_path, count=1)
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stderr
+    assert _registered_liveness_records(project) == [
+        {
+            "generation": 1,
+            "agent": "codex-1",
+            "registered_liveness": "dead",
+            "detail": "dead agent=codex-1 rc=0",
+            "detail_truncated": False,
+        }
+    ]
+
+
+def test_remove_records_a_long_liveness_line_escaped_and_capped(tmp_path: Path) -> None:
+    """#994: the line is the consumer's text, so it is kept to one escaped line of 1 KiB."""
+
+    project, _repository, _slots = dead_agent_batch_project(tmp_path, count=1)
+    (project / "liveness.py").write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        "print('dead agent=' + sys.argv[1] + ' rc=0 reason=stopped-by-agentctl "
+        "archived=/r/archive/x\\x01 ' + 'y' * 2000)\n"
+        "print('second line is not recorded')\n",
+        encoding="utf-8",
+    )
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stderr
+    [evidence] = _registered_liveness_records(project)
+    detail = str(evidence["detail"])
+    assert detail.startswith(
+        "dead agent=codex-1 rc=0 reason=stopped-by-agentctl archived=/r/archive/x\\x01 yyy"
+    )
+    assert len(detail.encode("utf-8")) == wrkslots._LIVENESS_DETAIL_LIMIT
+    assert "\n" not in detail and "second line" not in detail
+    assert evidence["detail_truncated"] is True

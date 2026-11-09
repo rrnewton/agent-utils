@@ -162,7 +162,11 @@ def test_renamed_then_stopped_agent_is_dead_under_its_old_name(
     registry = tmp_path / ".agentctl"
     write_record(registry / "archive" / "new-bbbb", "new", name_history=history("old"),
                  harness_identity=exited_identity)
-    assert run(tmp_path, "old") == (0, "dead agent=old rc=0 reason=stopped-by-agentctl\n")
+    code, out = run(tmp_path, "old")
+    assert code == 0
+    assert out.startswith(
+        f"dead agent=old rc=0 reason=stopped-by-agentctl archived={registry / 'archive' / 'new-bbbb'} "
+    )
 
 
 def test_incomplete_rename_is_unverifiable(tmp_path: Path) -> None:
@@ -355,3 +359,21 @@ def test_the_queried_agents_nonobject_record_stays_fatal(tmp_path: Path) -> None
     (own / "agent.json").write_text('"not a record"\n', encoding="utf-8")
     code, out = run(tmp_path, "w1")
     assert code == 2 and "reason=error:" in out
+
+
+def test_a_dead_verdict_names_the_newest_archived_record_and_its_time(
+    tmp_path: Path, exited_identity: dict[str, object],
+) -> None:
+    """#994: the archive the verdict rests on, and when it was written, are its evidence."""
+
+    archive = tmp_path / ".agentctl" / "archive"
+    write_record(archive / "w1-old", "w1", custom_process_identity=exited_identity)
+    write_record(archive / "w1-new", "w1", custom_process_identity=exited_identity)
+    os.utime(archive / "w1-old" / "agent.json", (1_700_000_000, 1_700_000_000))
+    os.utime(archive / "w1-new" / "agent.json", (1_800_000_000, 1_800_000_000))
+    assert run(tmp_path, "w1") == (
+        0,
+        f"dead agent=w1 rc=0 reason=stopped-by-agentctl archived={archive / 'w1-new'} "
+        "archived_at=2027-01-15T08:00:00+00:00\n",
+    )
+

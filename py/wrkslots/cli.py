@@ -25806,6 +25806,37 @@ def _owner_consent_was_recorded(
 ATTESTED_STOP_ACTION = "unregistered-agent-stop-attested"
 ATTESTED_STOP_BASIS = "coordinator-attested-unregistered-agent"
 _ATTEST_NOTE_LIMIT = 1024
+# An agent removal whose registered liveness command answered dead records that
+# answer's line, so the history shows what the authority based its verdict on,
+# for example the archived agentctl record and its time (#994).  The line is the
+# consumer's text: it is recorded, never parsed, escaped to one line and capped
+# at _LIVENESS_DETAIL_LIMIT bytes.  Like the attestation, it is an active-state
+# action with the record unchanged, which every client and the wrkslotsd replay
+# accept; a new journal key or event shape would not be.
+REGISTERED_LIVENESS_ACTION = "registered-liveness-recorded"
+_LIVENESS_DETAIL_LIMIT = 1024
+
+
+def _registered_liveness_evidence(record: ActiveRecord, detail: str) -> dict[str, object]:
+    """The evidence of REGISTERED_LIVENESS_ACTION for one dead answer (#994)."""
+
+    escaped = "".join(
+        f"\\x{ord(character):02x}"
+        if ord(character) < 0x20 or ord(character) == 0x7F
+        else character
+        for character in detail
+    )
+    encoded = escaped.encode("utf-8")
+    truncated = len(encoded) > _LIVENESS_DETAIL_LIMIT
+    if truncated:
+        escaped = encoded[:_LIVENESS_DETAIL_LIMIT].decode("utf-8", "ignore")
+    return {
+        "generation": record.generation,
+        "agent": record.agent,
+        "registered_liveness": "dead",
+        "detail": escaped,
+        "detail_truncated": truncated,
+    }
 
 
 def _attested_stop_evidence(
@@ -44135,6 +44166,7 @@ def _cmd_remove_in_scope(
         consent_liveness: tuple[str, str] | None = None
         attested_stop: _AttestedStop | None = None
         attested_never_started: _AttestedStop | None = None
+        dead_liveness_detail: str | None = None
         if live_validate_owner:
             if handoff_writer is None:
                 _assert_caller_process(coordinator, "validate owner")
@@ -44146,6 +44178,8 @@ def _cmd_remove_in_scope(
             consent_liveness = _registered_liveness_state(config, record)
         elif record.slot_type == "agent":
             answer = _registered_liveness_answer(config, record)
+            if answer.state == "dead":
+                dead_liveness_detail = answer.detail
             if answer.state != "dead":
                 # Only the authority's exact "no record of this agent" can be
                 # stood in for, and only for an owner generation proven dead.
@@ -44479,6 +44513,18 @@ def _cmd_remove_in_scope(
                     owner_detail=detail,
                     age=age,
                 ),
+                require_repository=False,
+            )
+        elif dead_liveness_detail is not None:
+            # Inside this same registry-lock hold, before salvage, like the
+            # records above: no extra lock round trip (#994, #1108).
+            state = _replace_record(state, record)
+            _write_active_state(
+                config,
+                state,
+                action=REGISTERED_LIVENESS_ACTION,
+                slot=record.slot,
+                evidence=_registered_liveness_evidence(record, dead_liveness_detail),
                 require_repository=False,
             )
         _write_event_file(

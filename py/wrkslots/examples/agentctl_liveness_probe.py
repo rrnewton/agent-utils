@@ -21,6 +21,9 @@ The check fails closed. It reports dead only when all of these hold:
 - no readable process of this user still carries an archived record's Herdr pane in
   ``HERDR_PANE_ID``.
 
+A dead verdict names its evidence after the reason: ``archived=`` the newest matching archived
+record's directory and ``archived_at=`` when that record was written, in UTC (#994).
+
 An active record whose pinned process or pane is alive is alive. Anything else, including an
 active record with nothing visibly alive behind it, a name agentctl never recorded, or an
 unreadable record, is unverifiable: agentctl has not confirmed that the agent stopped.
@@ -48,6 +51,7 @@ processes using the slot, its time-to-live, and its Git and path checks.
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
@@ -171,6 +175,14 @@ def names_of(record: dict[str, object]) -> set[str]:
 def matching(
     paths: list[Path], agent: str, *, skip_foreign: bool = False
 ) -> list[dict[str, object]]:
+    """The records of `matching_paths`, without their paths."""
+
+    return [record for _path, record in matching_paths(paths, agent, skip_foreign=skip_foreign)]
+
+
+def matching_paths(
+    paths: list[Path], agent: str, *, skip_foreign: bool = False
+) -> list[tuple[Path, dict[str, object]]]:
     """Load every record and keep those that ever carried AGENT; an unreadable one is fatal.
 
     An active directory named AGENT is a claim on the name whatever its content says.
@@ -181,7 +193,7 @@ def matching(
     archive it was read from.
     """
 
-    found: list[dict[str, object]] = []
+    found: list[tuple[Path, dict[str, object]]] = []
     for path in paths:
         try:
             record = load_record(path)
@@ -192,8 +204,25 @@ def matching(
                 continue
             raise
         if agent in names or path.parent.name == agent:
-            found.append(record)
+            found.append((path, record))
     return found
+
+
+def archive_evidence(paths: list[Path]) -> str:
+    """Name the newest archived record a dead verdict rests on, and when it was written (#994).
+
+    agentctl moves a record into the archive only after ``agentctl stop`` retired the runtime it
+    owned, and writes the record before that move, so the record's modification time is when the
+    agent was archived, to within the stop's own duration.
+    """
+
+    try:
+        written = [(path.stat().st_mtime, path) for path in paths]
+    except OSError as exc:
+        raise Unverifiable(f"cannot read an archived record's time: {exc}") from exc
+    seconds, newest = max(written)
+    archived_at = datetime.datetime.fromtimestamp(seconds, datetime.timezone.utc)
+    return f"archived={newest.parent} archived_at={archived_at.isoformat(timespec='seconds')}"
 
 
 def check(agent: str, registry: Path) -> int:
@@ -232,16 +261,17 @@ def check(agent: str, registry: Path) -> int:
             return verdict(agent, 1, "active-record-pane-alive")
     if active:
         return verdict(agent, 2, "active-record-not-stopped")
-    records = matching(sorted((registry / "archive").glob("*/agent.json")), agent)
-    if not records:
+    archived = matching_paths(sorted((registry / "archive").glob("*/agent.json")), agent)
+    if not archived:
         return verdict(agent, 2, "no-agentctl-record")
-    for record in records:
+    for _path, record in archived:
         if identity_alive(record, current_boot):
             return verdict(agent, 1, "archived-record-process-alive")
         pane = record.get("pane_id")
         if isinstance(pane, str) and any(True for _ in processes_with_pane(pane)):
             return verdict(agent, 2, "archived-record-pane-still-occupied")
-    return verdict(agent, 0, "stopped-by-agentctl")
+    evidence = archive_evidence([path for path, _record in archived])
+    return verdict(agent, 0, f"stopped-by-agentctl {evidence}")
 
 
 def main(argv: list[str]) -> int:

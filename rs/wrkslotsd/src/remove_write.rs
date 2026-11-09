@@ -142,6 +142,66 @@ pub(crate) struct Liveness {
     pub(crate) detail: String,
 }
 
+/// The Python edition's liveness detail line: standard error when it is not
+/// empty, else standard output, stripped, and its first line as Python's
+/// `splitlines` splits; "no detail" when nothing is left.
+fn python_first_line(stdout: &str, stderr: &str) -> String {
+    let text = if stderr.is_empty() { stdout } else { stderr };
+    text.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
+        .split(|c: char| {
+            matches!(
+                c,
+                '\n' | '\r'
+                    | '\u{0b}'
+                    | '\u{0c}'
+                    | '\u{1c}'
+                    | '\u{1d}'
+                    | '\u{1e}'
+                    | '\u{85}'
+                    | '\u{2028}'
+                    | '\u{2029}'
+            )
+        })
+        .next()
+        .filter(|line| !line.is_empty())
+        .unwrap_or("no detail")
+        .to_string()
+}
+
+/// The action that records an agent removal's dead liveness line (#994); see
+/// the Python edition's `REGISTERED_LIVENESS_ACTION`.
+const REGISTERED_LIVENESS_ACTION: &str = "registered-liveness-recorded";
+const LIVENESS_DETAIL_LIMIT: usize = 1024;
+
+/// The evidence of [`REGISTERED_LIVENESS_ACTION`]: the line escaped to one
+/// line and capped at [`LIVENESS_DETAIL_LIMIT`] bytes, never parsed.
+fn registered_liveness_evidence(generation: i64, agent: &str, detail: &str) -> Value {
+    let mut escaped = String::new();
+    for character in detail.chars() {
+        let code = character as u32;
+        if code < 0x20 || code == 0x7f {
+            escaped.push_str(&format!("\\x{code:02x}"));
+        } else {
+            escaped.push(character);
+        }
+    }
+    let truncated = escaped.len() > LIVENESS_DETAIL_LIMIT;
+    if truncated {
+        let mut end = LIVENESS_DETAIL_LIMIT;
+        while !escaped.is_char_boundary(end) {
+            end -= 1;
+        }
+        escaped.truncate(end);
+    }
+    json!({
+        "generation": generation,
+        "agent": agent,
+        "registered_liveness": "dead",
+        "detail": escaped,
+        "detail_truncated": truncated,
+    })
+}
+
 pub(crate) fn liveness_answer(cfg: &Cfg, config: &Value, record: &Value) -> Result<Liveness> {
     // The registered-liveness protocol: exit 0 is dead; exit 1 is alive
     // only when the whole output is one line binding agent=<agent> and
@@ -295,7 +355,9 @@ pub(crate) fn liveness_answer(cfg: &Cfg, config: &Value, record: &Value) -> Resu
         Some(combined_lines[0].clone())
     };
     let (state, detail) = match output.status.code() {
-        Some(0) => ("dead", first),
+        // The dead line is recorded in the history (#994), so it is the
+        // line the Python edition records.
+        Some(0) => ("dead", python_first_line(&stdout, &stderr)),
         Some(1) => match bound("rc=1", None) {
             Some(line) => ("alive", line),
             None => (
@@ -1868,6 +1930,34 @@ pub(crate) fn remove_slot(
     // Use check and registry consistency before any event is written.
     assert_slot_unused(&slot_path, coordinator_pid)?;
     ensure_event_log(root, &cfg, &selected)?;
+    // The dead liveness line, recorded inside this registry-lock hold before
+    // salvage, as the Python edition records it (#994).
+    let mut active = active;
+    if release.is_none() && answer.state == "dead" {
+        let previous_revision = active.get("revision").and_then(Value::as_i64).unwrap_or(0);
+        let previous_digest = canonical_sha256(&record).map_err(|error| error.to_string())?;
+        append_event(
+            &cfg,
+            &selected,
+            "active-state-recorded",
+            json!({
+                "action": REGISTERED_LIVENESS_ACTION,
+                "slot": slot,
+                "previous_revision": previous_revision,
+                "revision": previous_revision + 1,
+                "previous_record_sha256": previous_digest,
+                "record": record,
+                "evidence": registered_liveness_evidence(generation, &agent, &answer.detail),
+            }),
+        )?;
+        if let Some(object) = active.as_object_mut() {
+            object.insert("revision".to_string(), json!(previous_revision + 1));
+        }
+        atomic_write_json(
+            &cfg.control.join(format!("ACTIVE.{selected}.json")),
+            &active,
+        )?;
+    }
     let coordinator_obj = json!({
         "pid": coordinator.pid,
         "start_ticks": coordinator.start_ticks,

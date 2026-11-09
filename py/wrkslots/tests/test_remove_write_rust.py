@@ -749,3 +749,34 @@ def test_remove_forced_churn_refuses_like_python(
                 pid = _stop_appeared(appeared)
             assert detail is not None, (edition, "removed a slot in use")
             assert f"live process {pid} uses slot" in detail, (edition, detail)
+
+
+def _liveness_evidence(root: Path) -> list[dict[str, object]]:
+    directory = root / "worktrees" / "EVENTS.node-a"
+    found: list[dict[str, object]] = []
+    for path in sorted(directory.iterdir()):
+        payload = cast(dict[str, object], json.loads(path.read_text())["payload"])
+        if payload.get("action") == "registered-liveness-recorded":
+            found.append(cast(dict[str, object], payload["evidence"]))
+    return found
+
+
+def test_remove_records_the_same_liveness_line_as_python(tmp_path: Path) -> None:
+    """#994: both editions record the dead line escaped, capped and flagged alike."""
+
+    with _own_fs(tmp_path) as base:
+        rust_root, oracle_root = _pair(base)
+        for root in (rust_root, oracle_root):
+            (root / "live.py").write_text(
+                "print('dead agent=agent-slot-a rc=0 reason=stopped-by-agentctl "
+                "archived=/r/archive/x\\x01\\u00e9 ' + 'y' * 2000)\n"
+                "print('second line')\n"
+            )
+        assert _python_remove(oracle_root) == 0
+        result = _rust_remove(rust_root)
+        assert result.returncode == 0, result.stderr
+        expected = _liveness_evidence(oracle_root)
+        assert len(expected) == 1
+        assert expected[0]["detail_truncated"] is True
+        assert "\\x01\u00e9 yyy" in str(expected[0]["detail"])
+        assert _liveness_evidence(rust_root) == expected
