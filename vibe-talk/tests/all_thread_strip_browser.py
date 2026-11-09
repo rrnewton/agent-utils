@@ -512,7 +512,8 @@ def desk_walk(desk: Desk, api: StripApi) -> None:
     root = row_by_id(found, PIVOT)
     x, y = bar_point(root)
     page.mouse.move(x + 4, y)
-    desk.settled()
+    desk.wait_for(f"() => parseFloat(getComputedStyle(document.querySelector(\"#discord-log > li[data-id='{PIVOT}'] > .thread-strip\"), '::before').width) > {number(part(root, 'strip'), 'bar')}",
+                  "a resting mouse did not widen the bar")
     widened = float(page.evaluate(f"() => parseFloat(getComputedStyle(document.querySelector(\"#discord-log > li[data-id='{PIVOT}'] > .thread-strip\"), '::before').width)"))
     desk.check(widened > number(part(root, "strip"), "bar"), f"a resting mouse did not widen the bar: {widened}px")
     page.mouse.move(5, desk.height - 5)

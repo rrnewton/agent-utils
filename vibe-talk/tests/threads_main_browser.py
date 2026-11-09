@@ -158,9 +158,12 @@ def threads_walk(desk: Desk) -> None:
 
     # Main channel: the main channel's messages among the cards, and its box last.
     page.click("#side-main")
-    desk.wait_for("() => document.querySelectorAll('#side-cards > li[data-main-row]').length > 0",
-                  "Main channel put no main-channel message among the cards")
-    desk.settled()
+    desk.wait_for("() => { const kinds = [...document.querySelectorAll('#side-cards > li')]"
+                  ".map((li) => li.hasAttribute('data-card') ? 'card' : li.hasAttribute('data-main-row') ? 'main' : 'row'); "
+                  "const c = document.getElementById('channel-composer'); "
+                  "return kinds.includes('main') && kinds.indexOf('main') < kinds.indexOf('card') "
+                  "&& c.parentNode.id === 'side-list' && document.getElementById('side-list').lastElementChild === c; }",
+                  "the main channel's messages are not among the cards in time order")
     listed = page.evaluate(LIST_JS)
     assert isinstance(listed, dict)
     items = listed.get("items")

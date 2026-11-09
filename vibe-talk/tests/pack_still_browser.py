@@ -391,7 +391,8 @@ def still_walk(desk: Desk, api: StillApi, touch: bool) -> None:
     if room > 70:
         top = num(arrived["scrollTop"])
         page.evaluate("(to) => { document.getElementById('side-scroll').scrollTop = to; }", top - 60)
-        page.wait_for_timeout(200)
+        desk.wait_for(f"() => Math.abs((parseFloat(document.getElementById('side-overextend')?.style.height || '0') || 0) - ({room} - 60)) <= 1",
+                      "scrolling up 60px did not take 60px of room")
         up = still(desk, card)
         desk.check(abs(num(up["room"]) - (room - 60)) <= 1, f"scrolling up 60px left {up['room']}px of {room}px of room")
         # Down to the end again and again, and by the wheel at a desk: never further than the reader was, and
@@ -418,7 +419,8 @@ def still_walk(desk: Desk, api: StillApi, touch: bool) -> None:
         page.evaluate("(by) => { document.getElementById('side-scroll').scrollTop -= by; }", room)
         page.wait_for_timeout(200)
         page.evaluate("() => { const a = document.getElementById('side-scroll'); a.scrollTop = a.scrollHeight; }")
-        page.wait_for_timeout(200)
+        desk.wait_for("() => (parseFloat(document.getElementById('side-overextend')?.style.height || '0') || 0) === 0",
+                      "up past the room it is still open")
         gone = still(desk, card)
         desk.check(num(gone["room"]) == 0, f"up past the room it is still open: {gone}")
         desk.notes.append("the room gave way 60px for 60px up, scrolling down did not re-enter it, and up past it it closed")

@@ -288,3 +288,41 @@ absence and other no-change checks; mid-cycle Unpack and read-mode clicks;
 scroll baselines before moved-by-a-pixel reads.
 
 Solo on 2026-11-09 (Chromium 149.0.7827.55): all five files pass whole.
+
+## Batch 6, 2026-11-09 (mu-settle)
+
+[muse watermelon] `threads_unpack_browser.py`,
+`thread_header_collapse_browser.py`, `all_thread_strip_browser.py`,
+`pack_still_browser.py` and `threads_main_browser.py`
+(61 `settled()` sites reviewed; all batch 1's `Desk`).
+
+Converted, today's checks kept after each:
+
+- threads-unpack: Hide read waits until the unpacked ids themselves exclude
+  the read replies (the mode flip alone did not); a mouse moved onto a row
+  waits until that row is the one selected (`mouse_onto`); the parity walk's
+  arrow keys wait through the new `until_selected` for the row each check
+  then names; the replies-arrive-folded premise, Enter, `;` and `:` wait on
+  the rows' `data-collapsed` (and the status words); Enter on the run line
+  waits for the line to be gone.
+- all-thread-strip: a resting mouse waits until the strip's bar has widened
+  past the width the check then compares against.
+- threads-main: Main channel's wait now pins the whole read that follows —
+  a main row before the first card, in time order, with the channel's box
+  last in the list — replacing a settle after an any-main-row wait.
+- pack-still: two of its room reads wait on the room's own height (60 px
+  shorter after scrolling up 60, and gone after going up past it) instead of
+  fixed 200 ms sleeps. Nothing else converted there: its per-frame sampler
+  is the measurement, and its other timeouts are slide-completion and
+  stillness windows a state wait would end mid-slide.
+- thread-header-collapse: no call-site conversion. Every settle follows
+  `folded_to`'s exact `data-folded` wait (paint before stillness and pixel
+  reads), lands a scroll before its baseline, or gives a fold that must not
+  happen its window; its one 400 ms is the overscroll room finishing opening.
+
+Kept elsewhere: paint-after-exact-wait before seam, bridge, strip and header
+geometry and pixels; scroll baselines (`scrollIntoView`, scroll-to-foot)
+before tap coordinates and moved-by-a-pixel comparisons; the Unpack chips'
+mid-cycle settles; pack-still's timed subjects whole.
+
+Solo on 2026-11-09 (Chromium 149.0.7827.55): all five files pass whole.

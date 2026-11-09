@@ -296,7 +296,11 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
     page.click("#todo-filter")
     desk.wait_for("() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'hide'",
                   "Hide read was not reached")
-    desk.settled()
+    desk.wait_for("() => { const ids = (t) => [...document.querySelectorAll('#side-cards > li[data-unpack-thread=\"' + t + '\"]')]"
+                  ".flatMap((li) => (li.getAttribute('data-ids') || '').split(' ').filter(Boolean)); "
+                  f"const r = ids('{RUNNER}'), p = ids('{REPLICA}'); "
+                  "return r[0] === '202' && !r.includes('204') && !r.includes('206') && !p.includes('210') && !p.includes('212'); }",
+                  "Hide read kept a read reply unpacked")
     desk.check(not set(ids_of(desk, RUNNER)) & {"204", "206"}, "Hide read kept a read reply unpacked")
     desk.check(ids_of(desk, RUNNER)[0] == "202", "Hide read took the summarised root away")
     desk.check(not set(ids_of(desk, REPLICA)) & {"210", "212"}, "Hide read kept a raw read reply")
@@ -360,7 +364,10 @@ def mouse_onto(desk: Desk, selector: str) -> None:
     assert box is not None, f"{selector} has no box"
     page.mouse.move(box["x"] + box["width"] / 2, box["y"] + 12)
     page.mouse.move(box["x"] + box["width"] / 2 + 3, box["y"] + 14)
-    desk.settled()
+    desk.wait_for(f"() => {{ const l = document.querySelector('{selector}'); "
+                  "return l && l.getAttribute('data-selected') === 'true' "
+                  "&& document.querySelectorAll('li[data-selected=\"true\"]').length === 1; }",
+                  f"the mouse did not light {selector}")
 
 
 def selected_key(desk: Desk) -> str:
@@ -368,6 +375,16 @@ def selected_key(desk: Desk) -> str:
     desk.check(len(rows) == 1, f"not one row lit: {rows}")
     row = rows[0]
     return ("card:" if row["card"] else "") + str(row["id"])
+
+
+def until_selected(desk: Desk, want: str) -> None:
+    """Wait until the one lit row is `want` (`#1118`); `selected_key` then judges it."""
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        rows = lit(desk)
+        if len(rows) == 1 and ("card:" if rows[0]["card"] else "") + str(rows[0]["id"]) == want:
+            return
+        desk.page.wait_for_timeout(25)
 
 
 def parity(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int,
@@ -383,7 +400,7 @@ def parity(chromium: BrowserType, args: argparse.Namespace, label: str, width: i
     mouse_onto(desk, f'#side-cards > li[data-card][data-id="{first[5:]}"]')
     desk.check(selected_key(desk) == first, f"the mouse did not light the card: {lit(desk)}")
     page.keyboard.press("ArrowDown")
-    desk.settled()
+    until_selected(desk, second)
     desk.check(selected_key(desk) == second, f"↓ over packed cards went to {lit(desk)}, not {second}")
 
     unpack_all(desk)
@@ -413,20 +430,20 @@ def parity(chromium: BrowserType, args: argparse.Namespace, label: str, width: i
 
     # ↓ and ↑ through the block, in reading order, and across to the next card.
     page.keyboard.press("ArrowDown")
-    desk.settled()
+    until_selected(desk, runner_rows[3])
     desk.check(selected_key(desk) == runner_rows[3], f"↓ from {target} went to {lit(desk)}, not {runner_rows[3]}")
     page.keyboard.press("ArrowUp")
-    desk.settled()
+    until_selected(desk, target)
     desk.check(selected_key(desk) == target, f"↑ did not come back to {target}: {lit(desk)}")
     top_rows = block(first)
     desk.check(len(top_rows) >= 1, f"the first card's thread unpacked nothing: {order}")
     mouse_onto(desk, f'#side-cards > li[data-unpack-thread="{first[5:]}"][data-id="{top_rows[-1]}"]')
     page.keyboard.press("ArrowDown")
-    desk.settled()
+    until_selected(desk, second)
     desk.check(selected_key(desk) == second, f"↓ from a block's last row went to {lit(desk)}, not the next card")
-    page.keyboard.press("ArrowDown")
-    desk.settled()
     after = block(second)[0]
+    page.keyboard.press("ArrowDown")
+    until_selected(desk, after)
     desk.check(selected_key(desk) == after, f"↓ from the card went to {lit(desk)}, not its first row {after}")
     desk.shot("2-keys")
 
@@ -446,6 +463,9 @@ def parity(chromium: BrowserType, args: argparse.Namespace, label: str, width: i
     page.keyboard.press("z")
     desk.wait_for(f"() => document.querySelector('{done_row}[data-archived=\"false\"]') !== null",
                   "z did not put the Done back")
+    desk.wait_for("() => { const f = [...document.querySelectorAll('#side-cards > li[data-unpack-thread][data-collapsed]')]; "
+                  "return f.length >= 6 && f.every((li) => li.getAttribute('data-collapsed') === 'true'); }",
+                  "the unpacked replies do not arrive folded")
     desk.settled()
 
     # Enter on the selected row opens it, and again folds it; : and ; fold and open every unpacked row.
@@ -455,18 +475,26 @@ def parity(chromium: BrowserType, args: argparse.Namespace, label: str, width: i
     fold_target = next(key for key in runner_rows if key in folds)
     mouse_onto(desk, f'#side-cards > li[data-unpack-thread="{RUNNER}"][data-id="{fold_target}"]')
     page.keyboard.press("Enter")
-    desk.settled()
+    desk.wait_for(f"() => document.querySelector(\"#side-cards > li[data-unpack-thread='{RUNNER}'][data-id='{fold_target}']\")?.getAttribute('data-collapsed') === 'false'",
+                  f"Enter did not open unpacked row {fold_target}")
     desk.check(page.evaluate(FOLDS_JS)[fold_target] == "false", f"Enter did not open unpacked row {fold_target}")
     page.keyboard.press("Enter")
-    desk.settled()
+    desk.wait_for(f"() => document.querySelector(\"#side-cards > li[data-unpack-thread='{RUNNER}'][data-id='{fold_target}']\")?.getAttribute('data-collapsed') === 'true'",
+                  f"Enter again did not fold unpacked row {fold_target}")
     desk.check(page.evaluate(FOLDS_JS)[fold_target] == "true", f"Enter again did not fold unpacked row {fold_target}")
     page.keyboard.press(";")
-    desk.settled()
+    desk.wait_for("() => { const f = [...document.querySelectorAll('#side-cards > li[data-unpack-thread][data-collapsed]')]; "
+                  "return f.length > 0 && f.every((li) => li.getAttribute('data-collapsed') === 'false') "
+                  "&& document.getElementById('status').textContent === 'Long messages: all expanded'; }",
+                  "; did not expand every unpacked row")
     desk.check(all(state == "false" for state in page.evaluate(FOLDS_JS).values()), "; did not expand every unpacked row")
     desk.check(page.locator("#status").text_content() == "Long messages: all expanded", "; did not say what it did")
     desk.shot("3-expanded")
     page.keyboard.press(":")
-    desk.settled()
+    desk.wait_for("() => { const f = [...document.querySelectorAll('#side-cards > li[data-unpack-thread][data-collapsed]')]; "
+                  "return f.length > 0 && f.every((li) => li.getAttribute('data-collapsed') === 'true') "
+                  "&& document.getElementById('status').textContent === 'Long messages: all collapsed'; }",
+                  ": did not collapse every unpacked row")
     desk.check(all(state == "true" for state in page.evaluate(FOLDS_JS).values()), ": did not collapse every unpacked row")
     desk.check(page.locator("#status").text_content() == "Long messages: all collapsed", ": did not say what it did")
 
@@ -486,7 +514,7 @@ def parity(chromium: BrowserType, args: argparse.Namespace, label: str, width: i
     desk.check(len(rows) == 1 and rows[0]["run"] == "head", f"the mouse did not light the run line: {rows}")
     desk.shot("4-run-lit")
     page.keyboard.press("Enter")
-    desk.settled()
+    desk.wait_for(f"() => document.querySelector('{head}') === null", "Enter on the run line did not open it")
     desk.check(page.locator(head).count() == 0, "Enter on the run line did not open it")
     overflow = page.evaluate("() => document.documentElement.scrollWidth - window.innerWidth")
     desk.check(overflow <= 0, f"horizontal overflow of {overflow}px")
