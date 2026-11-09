@@ -396,6 +396,13 @@ def main() -> int:
                 check(len(admitted) == 1 and admitted[0]["mention_count"] == 0
                       and admitted[0]["fetched"] is True,
                       f"the linked document was not admitted mention-less and fetched: {listed}")
+                # The back chain (#1082): one Back returns to the guide the
+                # link was followed from; the next reaches the list.
+                page.tap("#doc-back")
+                page.wait_for_function(
+                    "() => (document.getElementById('doc-body')?.textContent || '')"
+                    ".includes('Guide index')",
+                    timeout=20_000)
                 page.tap("#doc-back")
                 page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
 
