@@ -2133,3 +2133,58 @@ test("`#624 voice-page-modularity`: a card says its thread's replies and unread 
   assert.equal(owner.cardLines({ content: "a  b\n\nc" }), "a b\nc", "a card's lines were not folded as its root's are");
   assert.equal(owner.threadIsRead(choice, ""), true);
 });
+
+test("`#624 voice-page-modularity`: a filter change keeps the reader's message where it is, and the reader's own act lets it go", () => {
+  const { createFilterPlace, freshFilterState } = CHANNEL_VIEW;
+  assert.deepStrictEqual(freshFilterState(), { hold: null });
+  const record = freshFilterState();
+  const log = [];
+  const area = { scrollTop: 100 };
+  const row = { parentNode: null, className: "", getAttribute: () => null, hasAttribute: () => false, getBoundingClientRect: () => ({ top: 140 }) };
+  const list = { children: [row] };
+  row.parentNode = list;
+  const owner = createFilterPlace({
+    el: () => area,
+    activeFilter: () => record,
+    activeColumn: () => "main",
+    columnSide: () => false,
+    mainColumn: () => "main", sideColumn: () => "side",
+    inColumn: (_c, act) => act(),
+    eachColumn: (act) => act(),
+    screen: () => "main", view: () => "discord",
+    renderOlderControl: () => {}, dismissStatus: () => {},
+    filterPlace: () => "main",
+    pinsView: () => ({ only: false }),
+    visibleList: () => list,
+    listEmptied: () => false,
+    atBottom: () => false,
+    quickReplyHolds: () => false,
+    endSearchWalks: () => {},
+    scrollToNewest: () => log.push("newest"),
+    renderJumpNewest: () => log.push("jump"),
+    guardQuietly: (fn) => fn,
+    setStatus: (text) => log.push(text),
+    sidePane: () => ({ marks: new Map(), context: () => "main", head: () => 0, foot: () => 0 }),
+    channelPane: () => ({ marks: new Map(), context: () => "main", head: () => 0, foot: () => 0 }),
+    markOf: () => null, markedRow: () => null, rowInView: () => false,
+    takeRow: () => {}, rowOf: (_p, r) => r, paneRows: () => [],
+    releaseRow: () => {}, rowTimeTabStop: () => {}, drawSelection: () => {},
+    hidingRead: () => false, threading: () => true,
+    timelineRows: () => ({ messages: [] }),
+    olderPages: () => ({ moreAbove: false, cursor: null }),
+    loadOlder: () => null, walkCursorOwed: () => false,
+    channelContextKey: () => "ctx",
+    scrollAnchor: () => null,
+    listPlaceTop: () => 100,
+    floatingClearance: () => 0,
+    messageTop: () => 150,
+    rowMessages: () => [],
+    clearEntryLanding: () => log.push("entry-spent"),
+    sideShowing: () => false,
+  });
+  record.hold = { key: JSON.stringify(["main", false]), row, ids: ["m1"], offset: 40, at: 100, origin: { newest: false, row, ids: ["m1"], selected: null, drawn: false, focused: false, time: 1, offset: 40, alternate: null }, mark: null };
+  assert.equal(owner.heldFilterRow(), row, "the held row was not the one the change kept");
+  owner.readerActed();
+  assert.equal(record.hold, null, "the reader's own act did not let the hold go");
+  assert.equal(freshFilterState().hold, null, "a fresh column shared its filter hold");
+});

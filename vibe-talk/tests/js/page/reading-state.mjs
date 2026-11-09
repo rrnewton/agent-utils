@@ -4547,9 +4547,9 @@ test("`#243 filter-keeps-selection`: a message selected among a search's matches
   assert.deepStrictEqual(litIds(page), ["25"], "the message is not lit as the selection once the search went");
   assert.equal(focused(page), page.el("search-field"), "clearing the text took the focus out of the field");
   // THE CONTROL: without the placing, the same offset in the whole list is somewhere else entirely.
-  const unplaced = await run(brokenScript(
-    "        if (!landed || currentFilterHold() !== null) placeFilterAnchor(anchor, wasEmptied);",
-    "        void anchor;"));
+  const unplaced = await run(await brokenModule([{ file: "src/view/channel/filterplace.ts",
+    find: "        if (!landed || currentFilterHold() !== null) placeFilterAnchor(anchor, wasEmptied);",
+    replace: "        void anchor;" }]));
   assert.ok(Math.abs(yOf(unplaced.page, "25") - unplaced.y) > 1, "the test cannot see the message jump");
 });
 
@@ -4734,7 +4734,8 @@ test("`#243 filter-keeps-selection`: Pinned turned on at the newest line before 
   assert.equal(pinnedIds(page).length, 11, "the pins did not land");
   assert.ok(atBottomOf(area), "the pins landed with the reader at the oldest of them");
   // THE CONTROL: without the newest line kept for the pins, they land under a reader at their oldest.
-  const lost = await run(brokenScript("    filterState().hold = anchor\n      ? {", "    filterState().hold = anchor && !anchor.newest\n      ? {"));
+  const lost = await run(await brokenModule([{ file: "src/view/channel/filterplace.ts",
+    find: "      filterState().hold = anchor\n        ? {", replace: "      filterState().hold = anchor && !anchor.newest\n        ? {" }]));
   assert.ok(!atBottomOf(lost.area), "the test cannot see the pins land at their oldest");
 });
 
@@ -4921,8 +4922,9 @@ test("`#243 filter-keeps-selection`: and nothing else moves it afterwards — no
   await reReadChannel(page);
   assert.ok(atBottomOf(area), "a reader on the newest line was not followed once they had scrolled");
   // THE CONTROL: with the hold taken out, the read follows the newest line and the message moves.
-  const followed = await run(await brokenModule([{ file: "src/view/channel/readcore.ts", find: "  if (how.keepPosition && keepFilterHold()) {", replace: "  if (false) {" }],
-    SCRIPT.replace("  return atBottom(area) && heldFilterRow() === null;", "  return atBottom(area);")));
+  const followed = await run(await brokenModule([
+    { file: "src/view/channel/readcore.ts", find: "  if (how.keepPosition && keepFilterHold()) {", replace: "  if (false) {" },
+    { file: "src/view/channel/filterplace.ts", find: "    return deps.atBottom(area) && heldFilterRow() === null;", replace: "    return deps.atBottom(area);" }]));
   const before = yOf(followed, "40");
   followed.messages = [...followed.messages, message({ id: "41", content: longMessage("arrived") })];
   await reReadChannel(followed);
@@ -5011,7 +5013,8 @@ test("`#243 filter-keeps-selection`: after the reader acts in the list — a pre
     assert.ok(atBottomOf(page.el("scroll-area")), `after ${act}, a reader on the newest line was not followed down`);
   }
   // THE CONTROL: with the reader's act not ending the hold, the same tap leaves the new message unfollowed.
-  const page = await kept(brokenScript("function readerActed() {\n  filterState().hold = null;", "function readerActed() {\n  return;"));
+  const page = await kept(await brokenModule([{ file: "src/view/channel/filterplace.ts",
+    find: "  function readerActed(): void {\n    filterState().hold = null;", replace: "  function readerActed(): void {\n    return;" }]));
   await acts["a tap in the list"](page);
   page.messages = [...page.messages, message({ id: String(n), content: longMessage("arrived") })];
   await reReadChannel(page);
@@ -5056,7 +5059,8 @@ test("`#243 filter-keeps-selection`: a pin that is the second part of a combined
   assert.ok(tops[0] < text - 1, "the part above the pin is not above where the pin stood");
   assert.deepStrictEqual(litIds(page), ["29"], "the combined row holding the pin is not lit as the selection");
   // THE CONTROL: placed by the row's top, the pin lands lower by the part above it.
-  const lower = await run(brokenScript("messageTop(placed, row ? id : null)", "messageTop(placed, null)"));
+  const lower = await run(await brokenModule([{ file: "src/view/channel/filterplace.ts",
+    find: "deps.messageTop(placed, row ? id : null)", replace: "deps.messageTop(placed, null)" }]));
   const fell = blockTops(lower.page, placeRow(lower.page, "30")).tops[1];
   assert.ok(fell > lower.text + 1, "the test cannot see the pin land lower by the part above it");
 });
@@ -5098,9 +5102,9 @@ test("`#243 filter-keeps-selection`: a reader who scrolls while the walk back re
   assert.ok(atBottomOf(area(jumped.page)), "the jump did not leave the reader at the newest line");
   assert.equal(walkSaid(jumped.page), false, "the status line still says the walk is loading after the jump");
   // THE CONTROL: without the walk seeing the scroll, the reader is pulled back and the walk reads on.
-  const pulled = await walking(brokenScript(
-    "      if (top && top.parentNode && Math.abs(top.getBoundingClientRect().top - was) > 1) {",
-    "      if (false) {"), scroll);
+  const pulled = await walking(await brokenModule([{ file: "src/view/channel/filterplace.ts",
+    find: "        if (top && top.parentNode && Math.abs(top.getBoundingClientRect().top - was) > 1) {",
+    replace: "        if (false) {" }]), scroll);
   assert.ok(olderReads(pulled.page).length > 1, "the test cannot see the walk read on past the reader's scroll");
   keptAt(pulled.page, "997", pulled.y, "the pin the walk pulled the reader back to");
 });

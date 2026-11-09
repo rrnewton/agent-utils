@@ -106,7 +106,7 @@ test("`#624 voice-page-modularity`: no top-level name of the legacy script or it
       }
     }
   }
-  assert.ok(names.size > 1000 && DOM_GLOBALS.size > 500 && DOM_GLOBALS.has("navigation") && names.has("selectedChannelId"),
+  assert.ok(names.size > 900 && DOM_GLOBALS.size > 500 && DOM_GLOBALS.has("navigation") && names.has("selectedChannelId"),
     "the scan found too few names to mean anything");
   // The call's `stop` now belongs to its owner and no longer hides window.stop.
   const KNOWN = new Set();
@@ -183,7 +183,7 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshScrollTools())")), { held: 0, owed: false });
   // And its filters' hold.
   assert.equal(same("inColumn(columns.side, () => filterState()) === columns.side.filter && filterState() === columns.main.filter"), true);
-  assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshFilterState())")), { hold: null });
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(page.preludeBinding("freshFilterState")())), { hold: null });
   // And what its list has drawn.
   same("inColumn(columns.side, () => { listState().backlog = 3; })");
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.list.backlog, listState().backlog])")), [3, 0]);

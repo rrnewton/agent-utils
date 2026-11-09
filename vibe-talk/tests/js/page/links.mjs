@@ -1614,8 +1614,8 @@ test("a list the filters empty is shown from its head, where it says why, and fi
 
   // THE CONTROLS: each half of `placeForFilter`, and the jump, taken out, and the step above that
   // needs it fails.
-  const unplaced = await run(brokenScript(
-    "  if (listEmptied()) {\n    area.scrollTop = 0;", "  if (listEmptied()) {\n    void 0;"));
+  const unplaced = await run(await brokenModule([{ file: "src/view/channel/filterplace.ts",
+    find: "    if (deps.listEmptied()) {\n      area.scrollTop = 0;", replace: "    if (deps.listEmptied()) {\n      void 0;" }]));
   await tapKind(unplaced, "pr");
   assert.ok(unplaced.el("scroll-area").scrollTop > 0, "the test cannot see a reader left below the sentence");
   const jumping = await run(await brokenModule([{ file: "src/view/channel/folding.ts",
@@ -1624,7 +1624,7 @@ test("a list the filters empty is shown from its head, where it says why, and fi
   await tapKind(jumping, "pr");
   await jumping.el("scroll-area").dispatch("scroll");
   assert.equal(jumping.el("jump-newest").hidden, false, "the test cannot see a jump offered over an emptied list");
-  const unfilled = await run(brokenScript("    if (anchor || wasEmptied) scrollToNewest();", "    if (false) scrollToNewest();"));
+  const unfilled = await run(await brokenModule([{ file: "src/view/channel/filterplace.ts", find: "      if (anchor || wasEmptied) deps.scrollToNewest();", replace: "      if (false) deps.scrollToNewest();" }]));
   await tapKind(unfilled, "pr");
   await tapKind(unfilled, "pr");
   assert.ok(!atBottomOf(unfilled.el("scroll-area")), "the test cannot see links come back above the reader");

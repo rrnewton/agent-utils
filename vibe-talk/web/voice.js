@@ -1589,6 +1589,59 @@ const sideCards = createSideCards({
 });
 const { cardsDrawn, nameSideRegion, sideCardText, cardLines, sideCardRootText, threadIsRead, sideCardUnread, sideCardReplies, cardMessageCount, sideCardParts, placeChildren, redressMainRows, renderSideCards } = sideCards;
 
+/** A filter changed: the reader's message stays where it is (`createFilterPlace`, `#624`). */
+const filterPlaceOwner = createFilterPlace({
+  el: (id) => el(id),
+  activeFilter: () => columnWork.active().filter,
+  activeColumn: () => columnWork.active(),
+  columnSide: () => columnWork.side(),
+  mainColumn: () => columns.main,
+  sideColumn: () => columns.side,
+  inColumn: (column, act) => inColumn(/** @type {any} */ (column), act),
+  eachColumn: (act) => eachColumn(act),
+  screen: () => screens.screen(),
+  view: () => screens.view(),
+  renderOlderControl: () => renderOlderControl(),
+  dismissStatus: () => dismissStatus(),
+  filterPlace: () => filterPlace(),
+  pinsView: () => pinsView(),
+  visibleList: () => visibleList(),
+  listEmptied: () => listEmptied(),
+  atBottom: (area) => atBottom(area),
+  quickReplyHolds: (area) => quickReplyHolds(area),
+  endSearchWalks: () => endSearchWalks(),
+  scrollToNewest: () => scrollToNewest(),
+  renderJumpNewest: () => renderJumpNewest(),
+  guardQuietly: (fn) => guardQuietly(fn),
+  setStatus: (text) => setStatus(text),
+  sidePane: () => /** @type {any} */ (sidePane),
+  channelPane: () => /** @type {any} */ (channelPane),
+  markOf: (pane) => markOf(/** @type {any} */ (pane)),
+  markedRow: (pane, mark) => markedRow(/** @type {any} */ (pane), /** @type {any} */ (mark)),
+  rowInView: (pane, row) => rowInView(/** @type {any} */ (pane), row),
+  takeRow: (pane, row, focus) => takeRow(/** @type {any} */ (pane), row, focus),
+  rowOf: (pane, row) => rowOf(/** @type {any} */ (pane), row),
+  paneRows: (pane) => paneRows(/** @type {any} */ (pane)),
+  releaseRow: (pane, row) => releaseRow(/** @type {any} */ (pane), row),
+  rowTimeTabStop: (row, on) => rowTimeTabStop(row, on),
+  drawSelection: () => drawSelection(),
+  hidingRead: () => hidingRead(),
+  threading: () => providerFacts.threading(),
+  timelineRows: () => timelineRows(),
+  olderPages: () => olderPages(),
+  loadOlder: () => loadOlder(),
+  walkCursorOwed: () => walkCursorOwed(),
+  channelContextKey: () => channelContextKey(),
+  scrollAnchor: (area) => /** @type {any} */ (scrollAnchor(area)),
+  listPlaceTop: (area) => listPlaceTop(area),
+  floatingClearance: (area) => floatingClearance(area),
+  messageTop: (row, id) => messageTop(row, id),
+  rowMessages: (row) => rowMessages(row),
+  clearEntryLanding: () => { entryState().landing = null; entryState().threadOwed = null; entryState().threadAwaitsRead = false; },
+  sideShowing: () => sideShowing(),
+});
+const { filterChanges, filterKey, filterState, endFilterWalk, anchorAt, anchorHolder, anchorRow, nearestShownRow, currentFilterHold, heldFilterRow, readerActed, followsNewest, keepFilterHold, filterAnchor, keepingFilterPlace, placeFilterAnchor, settlePendingFilterPlace } = filterPlaceOwner;
+
 
 const columnRepliesOwner = createColumnReplies({
   el: (id) => el(id),
@@ -2314,8 +2367,8 @@ const folding = createFolding({
   activeName: () => columnWork.active().name,
   side: () => columnWork.side(),
   sideMode: () => columns.side.mode,
-  sidePane: () => sidePane,
-  channelPane: () => channelPane,
+  sidePane: () => /** @type {any} */ (sidePane),
+  channelPane: () => /** @type {any} */ (channelPane),
   fitOverscroll,
   footGap,
   bottomSlackPx: BOTTOM_SLACK_PX,
@@ -2347,7 +2400,7 @@ const folding = createFolding({
   entryState,
   placeFilterAnchor,
   filterHold: () => filterState().hold,
-  setFilterHold: (hold) => { filterState().hold = hold; },
+  setFilterHold: (hold) => { filterState().hold = /** @type {any} */ (hold); },
   listPlaceTop,
   modHeld: (event) => modHeld(event),
 });
@@ -2527,492 +2580,9 @@ const {
 //     change spends. The reader's own act — a press in the list, another message chosen, a key on
 //     the messages, a fold — ends the hold, and is measured from where the reader is.
 
-/**
- * Where the reader was before a filter change, to put them back to after it. See the head of this
- * section.
- *
- * @typedef {object} FilterAnchor
- * @property {boolean} newest The reader was on the newest line, with no selection showing.
- * @property {Element | null} row The row measured: the same element is looked for first.
- * @property {string[]} ids Its messages, the selected one first.
- * @property {string | null} selected The selected message's id when the anchor is the selection.
- * @property {boolean} drawn Whether that selection was drawn, rather than chosen by a tap.
- * @property {boolean} focused Whether the focus was in its row.
- * @property {number} time When its first message was sent, NaN where unknown.
- * @property {number} offset How far its top was below the top of the list's box, in px.
- * @property {FilterAnchor | null} alternate The row last kept in place, when the anchor is the one
- *   that change was asked to keep: tried when that one is not shown.
- */
+// A filter changed: the reader's message stays where it is on the screen, by web/src/view/channel's
+// filter-kept place (`createFilterPlace`, `#624 voice-page-modularity`).
 
-/**
- * The message the last filter change kept in place, while the reader has neither moved nor acted in
- * the list since (`readerActed`): `{ key, row, ids,
- * offset, at, origin, mark }` — the list it is in, the row and its messages, its height in the list's
- * box, the scroll position that put it there, the anchor the change was asked to keep, and the message
- * selected in that list then. `ids` is null when the filters emptied the list, and the anchor waits
- * for something to show. Per column: a column's `filterState().hold`.
- *
- * A column's own record of its filters' hold (`#624 voice-page-modularity`, plan step 15, as
- * `freshOlderPages`).
- *
- * @returns {{hold: any}}
- */
-function freshFilterState() {
-  return { hold: null };
-}
-
-/** The column being worked on's record of its filters' hold (`freshFilterState`). */
-function filterState() {
-  return columnWork.active().filter;
-}
-
-/**
- * Whether a filter change is under way, so a filter turned off inside another is placed once, by the outer;
- * and the walk back to an anchor older than anything loaded, while it is under way, the left column's alone:
- * one owner in web/src/view/channel/filterchanges.ts (`#624 voice-page-modularity`).
- */
-const filterChanges = createFilterChanges();
-
-/** How many older pages a filter change reads, at most, to find the message it is keeping. */
-const FILTER_WALK_PAGES = 10;
-
-/** What the status line says while a walk back is under way: put away with the walk when it ends early. */
-const FILTER_WALK_STATUS = "Loading earlier messages…";
-
-/**
- * End the walk back for a filter change, where it is: another change, a jump, a view or channel, or the
- * reader's own act has taken over. Its line on the status strip goes with it, unless something has
- * said something else there since.
- */
-function endFilterWalk() {
-  if (!filterChanges.endWalk()) return;
-  inColumn(columns.main, renderOlderControl);
-  if (!el("status-line").hidden && el("status").textContent === FILTER_WALK_STATUS) dismissStatus();
-}
-
-/** Which list a filter's place is in: the view on screen, and whether the Pinned list stands in for it. */
-const filterKey = () => JSON.stringify([filterPlace(), pinsView().only]);
-
-/** The anchor `row` makes, the selection's details given in `selection` when it is the selected row. */
-function anchorAt(row, selection = null) {
-  const messages = rowMessages(row);
-  const ids = idsOf(row);
-  const kept = selection ? [selection.id, ...ids.filter((id) => id !== selection.id)] : ids;
-  return {
-    newest: false,
-    row,
-    ids: kept,
-    selected: selection ? selection.id : null,
-    drawn: Boolean(selection && selection.drawn),
-    focused: Boolean(selection && nodeWithin(row, document.activeElement)),
-    time: messages.length ? timeOf(messages[0], "timestamp") : NaN,
-    // Of the message itself, which is the row's top but in a combined row (`messageTop`).
-    // From the list's place, not its top edge, which the search moves (`listPlaceTop`).
-    offset: messageTop(row, kept.length ? kept[0] : null) - listPlaceTop(el("scroll-area")),
-    alternate: null,
-  };
-}
-
-/**
- * The row holding the anchor's message in the list on screen, shown or not: the same element when
- * the list kept it, else the row holding its selected message, else any of its messages.
- */
-function anchorHolder(anchor) {
-  const list = visibleList();
-  if (anchor.row && anchor.row.parentNode === list) return anchor.row;
-  const rows = [...list.children];
-  for (const id of anchor.ids) {
-    const found = rows.find((row) => idsOf(row).includes(id));
-    if (found) return found;
-  }
-  return null;
-}
-
-/** The row on screen standing for the anchor's message, or null when the list does not show it. */
-const anchorRow = (anchor) => standingRow(anchorHolder(anchor));
-
-/**
- * The message shown nearest the anchor's, for an anchor the new filter hides: in the list's own order
- * when the list holds its row — the next one shown first, then the one before, then one further each
- * way — and else by time, the later first when two are as near.
- */
-function nearestShownRow(anchor) {
-  const rows = [...visibleList().children].filter(isMessageRow);
-  const holder = anchorHolder(anchor);
-  const at = holder ? rows.indexOf(holder) : -1;
-  if (at >= 0) {
-    for (let step = 1; step < rows.length; step += 1) {
-      for (const index of [at + step, at - step]) {
-        const shown = index >= 0 && index < rows.length ? standingRow(rows[index]) : null;
-        if (shown) return shown;
-      }
-    }
-    return null;
-  }
-  if (!Number.isFinite(anchor.time)) return null;
-  let best = null;
-  let bestGap = Infinity;
-  let bestLater = false;
-  for (const row of rows) {
-    const shown = standingRow(row);
-    const times = rowMessages(row).map((message) => timeOf(message, "timestamp")).filter(Number.isFinite);
-    if (!shown || times.length === 0) continue;
-    const first = Math.min(...times);
-    const last = Math.max(...times);
-    const gap = anchor.time < first ? first - anchor.time : anchor.time > last ? anchor.time - last : 0;
-    const later = first >= anchor.time;
-    if (gap < bestGap || (gap === bestGap && later && !bestLater)) {
-      best = shown;
-      bestGap = gap;
-      bestLater = later;
-    }
-  }
-  return best;
-}
-
-/**
- * The hold of the last filter change, while it still holds — the same list on the main screen, and
- * the reader not moved: the list where the change left it, or the kept row where the change put it —
- * as `{ hold, row }`, `row` null for a list the filters emptied, or one its message has gone from.
- * Null, and the hold forgotten, once the reader has moved.
- */
-function currentFilterHold() {
-  const hold = filterState().hold;
-  if (hold === null) return null;
-  if (screens.screen() !== "main" || hold.key !== filterKey()) {
-    filterState().hold = null;
-    return null;
-  }
-  if (hold.ids === null) return listEmptied() ? { hold, row: null } : null;
-  const area = el("scroll-area");
-  const row = anchorRow({ row: hold.row, ids: hold.ids });
-  const unmoved = Math.abs(area.scrollTop - hold.at) <= 1 || (row !== null &&
-    Math.abs(row.getBoundingClientRect().top - listPlaceTop(area) - hold.offset) <= 1);
-  if (!unmoved) {
-    filterState().hold = null;
-    return null;
-  }
-  // `row` null: its message has gone from the list — a read of what Hide read leaves — under a reader
-  // who has not moved, and the anchor that change was asked to keep is placed again (`keepFilterHold`).
-  return { hold, row };
-}
-
-/** The row a filter change is holding in place now, or null. What the place-keeping below asks first. */
-function heldFilterRow() {
-  const held = currentFilterHold();
-  return held ? held.row : null;
-}
-
-/**
- * The reader did something in the list of the column being worked on: pressed in it, chose another
- * message, opened or closed one, pressed a key that acts on the messages. The message the last filter
- * change held is let go, and the place-keeping measures from wherever the reader is now — their own act
- * on a message from that message, as it would have been with no filter change before it — and a walk
- * back still under way for that change ends where it is.
- *
- * From review: a hold that lasted until the reader scrolled was still every `preservingScroll`'s
- * anchor after they had moved on, so folding a message just above the kept one, fully on screen, put
- * the first 140px of the message folded above the screen. The reader's own act is the end of what a
- * filter change put in place.
- */
-function readerActed() {
-  filterState().hold = null;
-  if (!columnWork.side()) endFilterWalk();
-}
-
-/**
- * Whether the reader on the list's newest line is following it: not while a filter change holds a
- * message in place, which nothing but the reader moves. Every "follow the newest line" asks this.
- */
-function followsNewest(area) {
-  // `#727 vt-selection-quick-reply`. Never a list held still for a quick reply.
-  if (quickReplyHolds(area)) return false;
-  return atBottom(area) && heldFilterRow() === null;
-}
-
-/**
- * Put the held row back where the filter change put it, after something below or above it changed —
- * or, when its message has gone from the list, put the anchor that change was asked to keep in its
- * place again, as the change would have. False, moving nothing, when nothing is held.
- */
-function keepFilterHold() {
-  const held = currentFilterHold();
-  if (held === null || held.hold.ids === null) return false;
-  if (held.row === null) {
-    placeFilterAnchor(held.hold.origin, false, true);
-    return filterState().hold !== null;
-  }
-  const row = held.row;
-  const area = el("scroll-area");
-  area.scrollTop += row.getBoundingClientRect().top - listPlaceTop(area) - filterState().hold.offset;
-  filterState().hold = { ...filterState().hold, row, ids: idsOf(row).length ? idsOf(row) : filterState().hold.ids, at: area.scrollTop };
-  return true;
-}
-
-/** Measure the anchor of a filter change in the column being worked on, or null with no list on screen. */
-function filterAnchor() {
-  if (screens.screen() !== "main") return null;
-  const area = el("scroll-area");
-  const pane = screens.view() === "discord" ? (columnWork.side() ? sidePane : channelPane) : null;
-  const mark = pane ? markOf(pane) : null;
-  const chosen = pane ? markedRow(pane, mark) : null;
-  const showing = Boolean(pane && mark && chosen && rowInView(pane, chosen));
-  const held = currentFilterHold();
-  // The anchor the last change was asked to keep, while the reader has neither moved nor chosen
-  // another message since: a filter turned on and off again is a round trip. Focused only where the
-  // focus is now.
-  if (held && (!showing || held.hold.mark === (mark ? mark.id : null))) {
-    const origin = held.hold.origin;
-    const asked = { ...origin, focused: Boolean(origin.selected !== null && held.row &&
-      nodeWithin(held.row, document.activeElement)) };
-    return held.row === null ? asked : { ...asked, alternate: anchorAt(held.row) };
-  }
-  if (showing && pane && mark && chosen) return anchorAt(chosen, mark);
-  if (atBottom(area)) {
-    return { newest: true, row: null, ids: [], selected: null, drawn: false, focused: false, time: NaN, offset: 0,
-      alternate: null };
-  }
-  const head = pane ? pane.head() : floatingClearance(area);
-  const foot = pane ? pane.foot() : area.getBoundingClientRect().top + (area.clientHeight || 0);
-  const first = [...visibleList().children].find((row) => {
-    if (!isMessageRow(row) || standingRow(row) !== row) return false;
-    const box = row.getBoundingClientRect();
-    return box.bottom > head && box.top < foot;
-  });
-  return first ? anchorAt(first) : null;
-}
-
-/**
- * Run `change`, a change of what the list shows, keeping the reader's message where it is on the
- * screen in every column showing messages. A `change` that returns a promise — a read — is waited
- * for, and the reader placed when it lands. Returns what `change` returns.
- *
- * @template T
- * @param {() => T} change
- * @returns {T}
- */
-function keepingFilterPlace(change) {
-  if (filterChanges.changing()) return change();
-  /** @type {Array<[ColumnFields, FilterAnchor | null, boolean]>} */
-  const kept = [];
-  eachColumn(() => {
-    kept.push([columnWork.active(), filterAnchor(), listEmptied()]);
-    // A landing a thread's entry made, or still owes, is spent: the reader has acted since. `#221`.
-    entryState().landing = null;
-    entryState().threadOwed = null;
-    entryState().threadAwaitsRead = false;
-  });
-  // A walk back for an earlier change is over: this one decides where the reader goes.
-  endFilterWalk();
-  const result = filterChanges.whileChanging(change);
-  const place = (landed = false) => {
-    for (const [column, anchor, wasEmptied] of kept) {
-      if (column === columns.side && !sideShowing()) continue;
-      inColumn(column, () => {
-        // Once a read has landed, only for a reader still where the change put them.
-        if (!landed || currentFilterHold() !== null) placeFilterAnchor(anchor, wasEmptied);
-      });
-    }
-  };
-  // At once, on the rows on screen; and for a change that reads, again on the rows the read drew.
-  place();
-  if (result && typeof (/** @type {any} */ (result)).then === "function") {
-    return /** @type {any} */ (result).then((/** @type {any} */ value) => {
-      place(true);
-      return value;
-    });
-  }
-  return result;
-}
-
-/**
- * Put the reader back on `anchor` in the column being worked on, after a filter change. `wasEmptied`
- * is whether the filters had emptied the list before it; `walked` that older pages were read for the
- * anchor already, and none is read again.
- *
- * `#212 link-filter`, from review, still holds where nothing is left: an EMPTIED list is taken to its
- * head, where the sentence saying why is. Its rows are gone but the list is not short — the channel's
- * composer stays below every list — and a reader left anywhere else had that sentence under the bar
- * or the kinds of link it names, or above the screen. The anchor is kept for the change that fills it
- * again. A list filled again with no anchor to go back to opens at its newest line, as a list does.
- */
-function placeFilterAnchor(anchor, wasEmptied = false, walked = false) {
-  if (screens.screen() !== "main") return;
-  const area = el("scroll-area");
-  if (listEmptied()) {
-    area.scrollTop = 0;
-    // Kept for what fills the list again — the newest line too: Pinned turned on there before the pins
-    // were read shows "Loading…" until they land, and they land at the newest pin, not the oldest.
-    filterState().hold = anchor
-      ? { key: filterKey(), row: null, ids: null, offset: 0, at: area.scrollTop, origin: anchor, mark: null } : null;
-    renderJumpNewest();
-    return;
-  }
-  if (!anchor || anchor.newest) {
-    filterState().hold = null;
-    if (anchor || wasEmptied) scrollToNewest();
-    else renderJumpNewest();
-    return;
-  }
-  let row = anchorRow(anchor);
-  let offset = anchor.offset;
-  let id = anchor.ids.length ? anchor.ids[0] : null;
-  if (!row && anchor.alternate) {
-    row = anchorRow(anchor.alternate);
-    offset = anchor.alternate.offset;
-    id = anchor.alternate.ids.length ? anchor.alternate.ids[0] : null;
-  }
-  if (!row && !walked && olderThanLoaded(anchor)) {
-    filterState().hold = null;
-    guardQuietly(walkToFilterAnchor)(anchor);
-    return;
-  }
-  const substitute = row ? null : nearestShownRow(anchor);
-  const placed = row || substitute;
-  if (!placed) {
-    filterState().hold = null;
-    renderJumpNewest();
-    return;
-  }
-  // The message's own top where it is part of a combined row (`messageTop`), the row's otherwise.
-  area.scrollTop += messageTop(placed, row ? id : null) - listPlaceTop(area) - offset;
-  carrySelection(anchor, placed, substitute !== null);
-  const pane = screens.view() === "discord" ? (columnWork.side() ? sidePane : channelPane) : null;
-  const mark = pane ? markOf(pane) : null;
-  filterState().hold = {
-    key: filterKey(), row: placed, ids: idsOf(placed), at: area.scrollTop, origin: anchor,
-    offset: placed.getBoundingClientRect().top - listPlaceTop(area), mark: mark ? mark.id : null,
-  };
-  renderJumpNewest();
-  if (substitute && anchor.selected !== null) setStatus(filterHiddenSentence(anchor, walked));
-}
-
-/**
- * The selection goes with the message a filter change kept: the selection of the list now drawn, its
- * ring and its focus as they were (`#239 single-selection`). For a message the filter hides, the
- * selection stays on it, to come back with it, unless the focus was in its row: then the focus and the
- * selection go to the message shown in its place, as `keepSelection` hands them on.
- */
-function carrySelection(anchor, row, substituted) {
-  if (anchor.selected === null || screens.view() !== "discord") return;
-  const pane = columnWork.side() ? sidePane : channelPane;
-  if (rowOf(pane, row) !== row) return;
-  if (substituted) {
-    if (anchor.focused) takeRow(pane, row, true);
-    return;
-  }
-  pane.marks.set(pane.context(), { id: anchor.selected, card: row.hasAttribute("data-card"), drawn: anchor.drawn,
-    index: paneRows(pane).indexOf(row) });
-  if (anchor.drawn) {
-    releaseRow(pane, row);
-    row.setAttribute("tabindex", "0");
-    rowTimeTabStop(row, true);
-    // The focus too, when it was on the row: a change that took the row away dropped it to the page,
-    // as a redraw does (`keepSelection`). A control the reader clicked keeps it, as #239 has it.
-    if (anchor.focused) row.focus({ preventScroll: true });
-  } else {
-    releaseRow(pane);
-  }
-  drawSelection();
-}
-
-/**
- * What the status line says when the selected message is not shown after a filter change, and the
- * nearest message is in its place: why, in words that fit one line of a 360px phone (`setStatus`).
- */
-function filterHiddenSentence(anchor, walked) {
-  if (pinsView().only) return "Not pinned — the nearest pin is here.";
-  if (anchorHolder(anchor)) return "Filtered out — the nearest is here.";
-  if (walked && olderThanLoaded(anchor)) return `Over ${FILTER_WALK_PAGES} pages back — oldest is here.`;
-  // Under Hide read a channel without threads reads only what is left, so a message it hides is in
-  // no list this page holds; with threads it is held, and drawn in none.
-  if (hidingRead() && (!providerFacts.threading() || timelineRows().messages.some((message) => anchor.ids.includes(String(message.id))))) {
-    return "Hide read hides it — nearest is here.";
-  }
-  return "Not in this view — nearest is here.";
-}
-
-/** Whether the anchor's message is older than everything the channel's list has loaded, with more above it. */
-function olderThanLoaded(anchor) {
-  if (columnWork.side() || screens.view() !== "discord" || pinsView().only || olderPages().moreAbove !== true ||
-      !Number.isFinite(anchor.time)) return false;
-  const loaded = providerFacts.threading() ? timelineRows().messages : [...el("discord-log").children].flatMap(rowMessages);
-  const times = loaded.map((message) => timeOf(message, "timestamp")).filter(Number.isFinite);
-  return times.length === 0 || anchor.time < Math.min(...times);
-}
-
-/**
- * Read older pages until the anchor's message is loaded, or the history reaches back past it, and put
- * the reader on it then — at most `FILTER_WALK_PAGES` of them. Meanwhile the reader is at the head of
- * the list, where the step-back line says "Loading earlier messages…". Another filter change, another
- * view or another channel, a jump, the reader's own act in the list (`readerActed`), or the reader
- * scrolling while a page is read, ends the walk where it is: it never pulls them back.
- */
-async function walkToFilterAnchor(anchor) {
-  // `#262 search-load-older`. A walk for the search gives way to this one.
-  endSearchWalks();
-  const walk = filterChanges.startWalk(channelContextKey());
-  const area = el("scroll-area");
-  const current = () => filterChanges.isWalk(walk) && walk.context === channelContextKey() && !pinsView().only &&
-    screens.screen() === "main" && screens.view() === "discord";
-  area.scrollTop = 0;
-  renderOlderControl();
-  renderJumpNewest();
-  setStatus(FILTER_WALK_STATUS);
-  let pages = 0;
-  let scrolled = false;
-  try {
-    while (pages < FILTER_WALK_PAGES && current() && olderThanLoaded(anchor) &&
-        (olderPages().cursor || walkCursorOwed())) {
-      pages += 1;
-      // The row the walk left the reader on, at the head of the list. A step keeps the row the reader
-      // is on where it is (`preservingScroll`), so this one anywhere else afterwards is a reader who
-      // scrolled while the page was read. A list too short to scroll follows its newest line instead,
-      // and has nothing to scroll away in.
-      const top = atBottom(area) ? null : scrollAnchor(area);
-      const was = top ? top.getBoundingClientRect().top : 0;
-      await loadOlder();
-      if (!current()) return;
-      if (top && top.parentNode && Math.abs(top.getBoundingClientRect().top - was) > 1) {
-        scrolled = true;
-        return;
-      }
-      // The step keeps the rows the reader was looking at; the walk keeps the line saying it goes on.
-      area.scrollTop = 0;
-    }
-  } finally {
-    if (filterChanges.isWalk(walk)) {
-      const place = !scrolled && walk.context === channelContextKey() && !pinsView().only;
-      endFilterWalk();
-      if (place) {
-        placeFilterAnchor(anchor, false, true);
-        if (anchorRow(anchor)) {
-          setStatus(anchor.selected !== null ? "Here is the selected message." : "Here is where you were.");
-        }
-      }
-    }
-  }
-}
-
-/**
- * A list the filters emptied has rows again by something other than the reader — the pins landing
- * under a Pinned filter turned on before they had — and the anchor of the change that emptied it is
- * placed now. A filter change it waited through has placed the reader already.
- */
-function settlePendingFilterPlace() {
-  const hold = filterState().hold;
-  if (hold === null || hold.ids !== null || hold.key !== filterKey() || listEmptied() || filterChanges.changing()) return;
-  placeFilterAnchor(hold.origin, true);
-}
-
-/**
- * Open or close the field.
- *
- * Closing CLEARS, rather than leaving a query parked behind a closed control. A filter still in
- * force with nothing on screen saying so is the worst state this feature can be in: the reader
- * concludes the messages are gone. Closing is a change of what the list shows, and keeps the
- * reader's message where it is (`keepingFilterPlace`).
- */
 function setSearchOpen(open) {
   if (!open) {
     keepingFilterPlace(() => showSearchOpen(false));
