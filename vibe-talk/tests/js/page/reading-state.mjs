@@ -5207,8 +5207,7 @@ test("`#300 reply-marks-read`: two messages written at once in a thread nobody h
   assert.deepStrictEqual(page.upstreamReadCalls, [{ message_id: "210", after_reply: true }],
     "the second message, a later one, asked the provider to mark the root again");
   // THE CONTROL: without the outbox counted, the second was taken for the first as well.
-  const control = await run(brokenScript(
-    "    if (entry.channel === String(channel) && (entry.threadId === key || entry.continueIn === key)) return null;\n", ""));
+  const control = await run(await brokenModule([{ file: "src/view/channel/sentread.ts", find: "      if (entry.channel === String(channel) && (entry.threadId === key || entry.continueIn === key)) return null;\n", replace: "" }]));
   assert.equal(control.upstreamReadCalls.length, 2, "with the outbox not counted only one asked, so this test cannot see it");
 });
 
@@ -5270,7 +5269,7 @@ test("`#300 reply-marks-read`: a Reply's mark at the provider follows its Done, 
   assert.deepStrictEqual(plain.dismissCalls, [{ messages: [target] }]);
   assert.deepStrictEqual(plain.upstreamReadCalls, [], "a provider with no marker was asked to move it");
   // THE CONTROL: the provider's word is what keeps the page from asking.
-  const control = await run(false, brokenScript("  if (!channelMarksUpstream(channel)) return none;\n", ""));
+  const control = await run(false, await brokenModule([{ file: "src/view/channel/sentread.ts", find: "    if (!channelMarksUpstream(channel)) return none;\n", replace: "" }]));
   await replyAndSend(control, target, "on it");
   assert.equal(control.upstreamReadCalls.length, 1, "with the check taken out nothing was asked, so this test cannot see it");
 });
@@ -5300,7 +5299,7 @@ test("`#300 reply-marks-read`: a Reply in a channel that is one thread of a larg
   assert.equal(rowOf(page, "302").getAttribute("data-archived"), "true", "the answered row is not drawn read");
 
   // THE CONTROL: without the page's own check it asks, and only the server would stand in the way.
-  const control = await run(brokenScript("  if (channelIsOneThread(channel)) return", "  if (false) return"));
+  const control = await run(await brokenModule([{ file: "src/view/channel/sentread.ts", find: "    if (channelIsOneThread(channel)) return", replace: "    if (false) return" }]));
   await replyAndSend(control, "302", "answering in the conversation");
   assert.deepStrictEqual(control.upstreamReadCalls, [{ message_id: "302", after_reply: true }],
     "with the check taken out nothing was asked, so this test cannot see it");
@@ -5333,7 +5332,7 @@ test("`#300 reply-marks-read`: a reply's mark the server did not ask of the serv
     /^Marked read here, not in Discord: it cannot say whether its read marker covers more than this channel\./);
 
   // THE CONTROL: without the outcome read, the status line claims the service was marked.
-  const control = await run(brokenScript("    const why = serviceMarkNotAsked(outcome);", "    const why = null;"));
+  const control = await run(await brokenModule([{ file: "src/view/channel/sentread.ts", find: "    const why = serviceMarkNotAsked(outcome);", replace: "    const why = null;" }]));
   control.upstreamReadResponse = notAsked("thread_channel");
   await replyAndSend(control, target, "on it");
   assert.match(control.el("status").textContent, /^Marked read here and in Discord\./,

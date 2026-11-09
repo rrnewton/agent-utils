@@ -1562,12 +1562,12 @@ test("`#256 reply-marks-read`: a SENT reply marks the message it answers Done �
 });
 
 test("`#256 reply-marks-read`: the reply's Done is the Done button's own act, called only where a send has succeeded", () => {
-  assert.match(SCRIPT_CODE, /async function markAnsweredDone\([\s\S]*?toggleArchived\(/,
+  assert.match(PAGE_CODE, /async function markAnsweredDone\([\s\S]*?deps\.toggleArchived\(/,
     "the reply's Done does not go through the act the Done button and the swipe use");
   // `#300 reply-marks-read`: through the one act that marks a confirmed send read.
-  assert.match(SCRIPT_CODE, /async function markSentRead\([\s\S]*?await markAnsweredDone\(entry\.channel, id\)/,
+  assert.match(PAGE_CODE, /async function markSentRead\([\s\S]*?await markAnsweredDone\(entry\.channel, id\)/,
     "a confirmed send's read does not begin with the reply's Done");
-  assert.equal(SCRIPT_CODE.split("markAnsweredDone(").length - 1, 2, "the reply's Done is called from more than one place");
+  assert.equal(PAGE_CODE.split("markAnsweredDone(").length - 1, 3, "the reply's Done is called from more than one place");
   // Once, in the send's success, after the posted parts are drawn and before anything can fail it.
   assert.equal(PAGE_CODE.split("deps.markSentRead(entry)").length - 1, 1, "a send's read is marked from more than one place");
   const send = PAGE_CODE.slice(PAGE_CODE.indexOf("async function dispatchOutgoingMessage("));
@@ -1743,7 +1743,7 @@ test("`#245 done-feedback`: a SENT reply's Done draws its moment on the row it a
   assert.equal(sideRow(two, "201").hasAttribute("data-done-flash"), false, "the thread's root was drawn as marked");
 
   // THE CONTROL: the reply's Done handed no row, as it was, marks the message and draws no moment.
-  const control = await run(brokenScript("toggleArchived(ids, found ? found.row : null)", "toggleArchived(ids)"));
+  const control = await run(await brokenModule([{ file: "src/view/channel/sentread.ts", find: "deps.toggleArchived(ids, found ? found.row : null)", replace: "deps.toggleArchived(ids)" }]));
   await replyAndSend(control, target, "answering the open one");
   assert.equal(rowWithId(control, target).getAttribute("data-archived"), "true", "the control made no Done");
   assert.equal(rowWithId(control, target).hasAttribute("data-done-flash"), false,
@@ -2318,7 +2318,7 @@ test("`#306 done-stale-across-views`: a Reply sent from the right column on a me
 // already waited (`doneSaved`, #295); a confirmed send now waits the same way.
 
 /** The line in `markAnsweredDone` that waits for a Done still on its way and looks again, for negative controls. */
-const SENT_WAITS = "    return doneSaved(ids, () => String(selectedChannelId()) === channel && doneHeldHere(ids));\n";
+const SENT_WAITS = "      return deps.doneSaved(ids, () => String(deps.selectedChannelId()) === channel && doneHeldHere(ids));\n";
 
 /**
  * Message 3 of `conversation` marked Done with its Done button, the write held on its way to the server;
@@ -2390,11 +2390,11 @@ test("`#311 sent-read-waits-for-done`: a send confirmed while its message's Done
   // THE CONTROLS. Without the wait the send takes the Done on its way for a saved one: it asks the
   // service at once, so the marker moves for a Done that then fails. Waiting without looking again asks
   // it once that Done has failed.
-  const unwaited = await replyWhileDoneSaving(failing, brokenScript(SENT_WAITS, "    return true;\n"));
+  const unwaited = await replyWhileDoneSaving(failing, await brokenModule([{ file: "src/view/channel/sentread.ts", find: SENT_WAITS, replace: "      return true;\n" }]));
   assert.deepStrictEqual(unwaited.whileSaving, [{ message_id: unwaited.target, after_reply: true }],
     "without the wait the service was not asked before the Done was saved, so this test cannot see it");
   assert.deepStrictEqual(unwaited.asked, [unwaited.target], "without the wait the service's marker did not move, so this test cannot see it");
-  const unlooked = await replyWhileDoneSaving(failing, brokenScript(SENT_WAITS, "    return doneSaved(ids, () => true);\n"));
+  const unlooked = await replyWhileDoneSaving(failing, await brokenModule([{ file: "src/view/channel/sentread.ts", find: SENT_WAITS, replace: "      return deps.doneSaved(ids, () => true);\n" }]));
   assert.deepStrictEqual(unlooked.whileSaving, [], "the control waited no longer");
   assert.deepStrictEqual(unlooked.asked, [unlooked.target],
     "waiting without looking again asked nothing after the failed Done, so this test cannot see it");
@@ -2443,19 +2443,19 @@ test("`#311 sent-read-waits-for-done`: a Done put back while the send waits for 
   // again without asking whether the channel is still the one on screen, the channel left is: the set
   // kept over the change still names the message, its Done having been on its way when the next
   // channel's read landed.
-  const looked = brokenScript(SENT_WAITS, "    return doneSaved(ids, () => true);\n");
+  const looked = await brokenModule([{ file: "src/view/channel/sentread.ts", find: SENT_WAITS, replace: "      return deps.doneSaved(ids, () => true);\n" }]);
   assert.equal((await run(undo, looked)).upstreamReadCalls.length, 1,
     "without looking again the put back message was not asked, so this test cannot see it");
   assert.equal((await run(away, looked)).upstreamReadCalls.length, 1,
     "without looking again the channel left was not asked, so this test cannot see it");
-  const anywhere = brokenScript(SENT_WAITS, "    return doneSaved(ids, () => doneHeldHere(ids));\n");
+  const anywhere = await brokenModule([{ file: "src/view/channel/sentread.ts", find: SENT_WAITS, replace: "      return deps.doneSaved(ids, () => doneHeldHere(ids));\n" }]);
   assert.equal((await run(away, anywhere)).upstreamReadCalls.length, 1,
     "without the channel looked at the channel left was not asked, so this test cannot see it");
   assert.deepStrictEqual((await run(undo, anywhere)).upstreamReadCalls, [], "the channel's check is what keeps a put back unasked");
 });
 
 /** The line in `markAnsweredDone` that asks at once for a message no Done of its own is on its way for, for negative controls. */
-const SENT_SAVED_ALREADY = "    if (!ids.some((one) => doneSaving.has(String(one)))) return true;\n";
+const SENT_SAVED_ALREADY = "      if (!ids.some((one) => deps.doneSavingHas(String(one)))) return true;\n";
 
 /**
  * Found in review of #311 itself. Under Hide read on a channel without threads a message not drawn
@@ -2579,15 +2579,14 @@ test("`#311 sent-read-waits-for-done`: under Hide read without threads a reply t
   // chat service nothing for a Done made elsewhere or before the reload: no set the page keeps names
   // it. And taking a message off the list for Done when looking again — the reading that decides it is
   // Done in the first place — asks for one whose Done here failed, which no read has put back.
-  const lookedAlways = brokenScript(SENT_SAVED_ALREADY, "");
+  const lookedAlways = await brokenModule([{ file: "src/view/channel/sentread.ts", find: SENT_SAVED_ALREADY, replace: "" }]);
   for (const [how, run] of [["Done on another device", elsewhere], ["Done before a reload", reloaded]]) {
     const control = await run(lookedAlways);
     assert.deepStrictEqual(control.page.upstreamReadCalls, [],
       `${how}: looking again for every message Done already still asked the chat service, so this test cannot see it`);
   }
   assert.deepStrictEqual((await heldHere(failing, lookedAlways)).asked, [], "the control changed what a failed Done asks");
-  const offList = brokenScript("  return inColumn(columns.main, () => ids.every((id) => doneState().archived.has(String(id))));\n",
-    "  return inColumn(columns.main, () => readModes.hiding() || ids.every((id) => doneState().archived.has(String(id))));\n");
+  const offList = await brokenModule([{ file: "src/view/channel/sentread.ts", find: "    return deps.inColumn(deps.mainColumn(), () => ids.every((id) => deps.doneArchived().has(String(id))));\n", replace: "    return deps.inColumn(deps.mainColumn(), () => deps.readHiding() || ids.every((id) => deps.doneArchived().has(String(id))));\n" }]);
   const offListFailed = await heldHere(failing, offList);
   assert.deepStrictEqual(offListFailed.whileSaving, [], "the control waited no longer");
   assert.deepStrictEqual(offListFailed.asked, [target],
@@ -3015,8 +3014,8 @@ const THROUGH_WAITS_ON_SCREEN = { file: "src/view/channel/channelrows.ts",
   find: "    const waitingFor = [...new Set([...covered, ...onTheirWay])];\n",
   replace: "    const waitingFor = covered;\n" };
 /** The look of a confirmed send at its message once its own Done is saved, for a negative control. */
-const SENT_LOOKS_AGAIN = ["  return doneSaved(ids, () => String(selectedChannelId()) === channel && doneHeldHere(ids));\n}\n",
-  "  return true;\n}\n"];
+const SENT_LOOKS_AGAIN = ["    return deps.doneSaved(ids, () => String(deps.selectedChannelId()) === channel && doneHeldHere(ids));\n  }\n",
+  "    return true;\n  }\n"];
 /** The rows a refused Done put back under Hide read without threads, for a negative control. */
 const ROWS_PUT_BACK = ["        putBackRowsOff(listed, back);\n", ""];
 
@@ -3258,7 +3257,7 @@ test("`#327 done-races-remaining`: an Undo pressed while a sent reply's own Done
   assert.ok(kept.page.requests.findIndex((one) => one.endsWith("/upstream-read")) > restored,
     "the chat service was asked before the Undo was answered");
   // THE CONTROL: without the look once its own Done is saved, the send asks the service for a message put back.
-  const control = await undoWhileSentDoneSaving(null, brokenScript(...SENT_LOOKS_AGAIN));
+  const control = await undoWhileSentDoneSaving(null, await brokenModule([{ file: "src/view/channel/sentread.ts", find: SENT_LOOKS_AGAIN[0], replace: SENT_LOOKS_AGAIN[1] }]));
   assert.deepStrictEqual(control.asked, [control.target], "without the look the service was not asked, so this test cannot see it");
 });
 

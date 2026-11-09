@@ -136,6 +136,8 @@ export type { ReplyColumnLike, ReplyDraftStoreLike, ReplyMessageLike, ReplySessi
 export { createReplyArrows, freshReplyArrows, REPLY_LANDING_GAP_PX } from "./replyarrows.ts";
 export { createReplyGathering, freshGatherState, freshListState } from "./gathering.ts";
 export { createReadingColumn } from "./readingcolumn.ts";
+export { createSentRead } from "./sentread.ts";
+export type { SentRead, SentReadDependencies, SentReadOutboxEntry, ServiceMark } from "./sentread.ts";
 export type { ReadingColumn, ReadingColumnDependencies } from "./readingcolumn.ts";
 export type { Gathering, GatheringDependencies, GatherMessage, GatherState, GatherThreadChoice, ListState, ReplyLinks } from "./gathering.ts";
 export type { ReplyArrows, ReplyArrowsDependencies, ReplyArrowsState, ReplyArrowRow, ReplyJumpTicket } from "./replyarrows.ts";

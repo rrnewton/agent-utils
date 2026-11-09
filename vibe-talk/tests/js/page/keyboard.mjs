@@ -1387,8 +1387,7 @@ test("Shift+E MARKS THE MESSAGE READ IN THE CHAT SERVICE where the server can mo
   // THE CONTROLS. Where the service has no marker the server can move, nothing is asked (the first
   // test above): without the provider's word checked, it is asked all the same. Without the ask,
   // Shift+E is the branch as it was before #300: Done here only.
-  const { page: unmarked } = await readCollapseOnThree(brokenScript(
-    "  if (!channelMarksUpstream(channel)) return none;\n", ""));
+  const { page: unmarked } = await readCollapseOnThree(await brokenModule([{ file: "src/view/channel/sentread.ts", find: "    if (!channelMarksUpstream(channel)) return none;\n", replace: "" }]));
   assert.deepStrictEqual(unmarked.upstreamReadCalls, [{ message_id: "3", after_reply: true }],
     "with the provider's word unchecked nothing was asked, so the first test's check cannot see it");
   const { page: unasked } = await readCollapseMarked(await brokenModule([{ file: "src/view/shell/readcollapse.ts", find: ASKS_SERVICE,
@@ -1429,8 +1428,7 @@ test("Shift+E ON A MESSAGE ALREADY DONE writes no second Done, and asks the serv
     ": await deps.markReadInService(channel, ids[ids.length - 1] as string);\n" }]));
   assert.deepStrictEqual(skipped.asked, ["3"],
     "with a Done message asking nothing the message e marked was read in the service, so this test cannot see it");
-  const owner = await readCollapseTwice(brokenScript("body: { message_id: String(id), after_reply: true }",
-    "body: { message_id: String(id) }"));
+  const owner = await readCollapseTwice(await brokenModule([{ file: "src/view/channel/sentread.ts", find: "body: { message_id: String(id), after_reply: true }", replace: "body: { message_id: String(id) }" }]));
   assert.deepStrictEqual(owner.again.asked, ["3", "3"],
     "without after_reply the second press did not reach the service, so this fake cannot tell the floor is used");
 });
@@ -1561,7 +1559,7 @@ test("Shift+E on a channel that is one thread of a larger space marks it Done an
   assert.equal(page.el("status").textContent,
     "Marked read here, not in Discord: this channel is one thread of a larger space there, and its read marker covers the whole space.");
   // THE CONTROL: without the page's own check it asks.
-  const control = await run(brokenScript("  if (channelIsOneThread(channel)) return", "  if (false) return"));
+  const control = await run(await brokenModule([{ file: "src/view/channel/sentread.ts", find: "    if (channelIsOneThread(channel)) return", replace: "    if (false) return" }]));
   assert.deepStrictEqual(control.upstreamReadCalls, [{ message_id: "302", after_reply: true }],
     "with the check taken out nothing was asked, so this test cannot see it");
 });

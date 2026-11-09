@@ -1931,3 +1931,48 @@ test("`#624 voice-page-modularity`: a new collapsed-lines count is put on betwee
   owner.stepCollapsedLines(-1);
   assert.equal(log[log.length - 1], "step:-1", "the slider's step did not go through the preference");
 });
+
+test("`#624 voice-page-modularity`: a sent reply marks what it answers Done on the server only for another channel, and the service is not asked where its marker is wider", async () => {
+  const { createSentRead } = CHANNEL_VIEW;
+  const log = [];
+  const owner = createSentRead({
+    el: () => ({ children: [] }),
+    replyColumn: () => "main", mainColumn: () => "main", sideColumn: () => "side",
+    sideShowing: () => false,
+    inColumn: (_c, act) => act(),
+    rowHolding: () => null,
+    threading: () => true,
+    channelCanon: () => ({ channel: "C1", scope: null, dismissed: new Set() }),
+    selectedChannelId: () => "C1",
+    readHiding: () => false,
+    doneArchived: () => new Set(),
+    inboxLedger: () => ({ add: (...args) => { log.push(["add", ...args.slice(0, 3)]); return "kept"; }, settle: (kept) => log.push(["settle", kept]) }),
+    inboxWriteOwner: () => "owner",
+    queueInboxWrite: async (act) => { await act(); },
+    inboxPost: async (path, body) => { log.push(["post", path, body]); },
+    toggleArchived: async () => { log.push(["toggle"]); },
+    bookmarkAnchor: () => null,
+    setStatus: (text) => log.push(["status", text]),
+    doneSavingHas: () => false,
+    doneSaved: async () => true,
+    providerCount: () => 0,
+    providerOfChannel: () => null,
+    upstreamReadMark: () => true,
+    heldUnansweredRoot: () => null,
+    outboxValues: () => [],
+    chatServiceOf: () => "chat",
+    api: async () => ({ outcome: "scope_unknown" }),
+    readableFailure: () => "why",
+    serviceReadWords: () => "words",
+  });
+  assert.equal(await owner.markAnsweredDone("C2", "m9"), true, "the other channel's Done was not kept");
+  assert.deepStrictEqual(log, [["add", "dismiss", "C2", ["m9"]], ["post", "/api/v1/channels/C2/dismiss", { messages: ["m9"] }], ["settle", "kept"]],
+    "the other channel's Done did not go through the inbox write, kept and settled");
+  assert.equal(owner.serviceMarkNotAsked("thread_channel"),
+    "this channel is one thread of a larger space there, and its read marker covers the whole space.");
+  assert.equal(owner.serviceMarkNotAsked("marked"), null);
+  const mark = await owner.markReadInService("C1", "m1");
+  assert.deepStrictEqual(mark, { service: "chat", asked: true, marked: false, already: false,
+    why: "it cannot say whether its read marker covers more than this channel." },
+  "the service was asked where it cannot say what its marker covers");
+});

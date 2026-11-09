@@ -216,6 +216,7 @@ declare const createCardPlaces: LegacyImports["createCardPlaces"];
 declare const createReplyGathering: LegacyImports["createReplyGathering"];
 declare const freshGatherState: LegacyImports["freshGatherState"];
 declare const freshListState: LegacyImports["freshListState"];
+declare const createSentRead: LegacyImports["createSentRead"];
 declare const createReadingColumn: LegacyImports["createReadingColumn"];
 declare const createReplyArrows: LegacyImports["createReplyArrows"];
 declare const freshReplyArrows: LegacyImports["freshReplyArrows"];
