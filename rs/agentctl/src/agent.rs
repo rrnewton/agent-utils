@@ -674,6 +674,11 @@ pub struct DrainOptions {
     /// harness that caps long pastes shows a batch as unreadable. Owner prompts (chat-bridge
     /// requests and console input) are never batched either way; see [`owner_prompt`].
     pub batch_working_backlog: bool,
+    /// For a send: queue the prompt as raw (#1136 raw-message-bridge). Its document is
+    /// marked `raw`, holds the bare text (no deferred-time opening is made of it), is never
+    /// combined into a backlog batch, and keeps its queue place among owner prompts even
+    /// when it opens with `/`. A drain that only types queued prompts ignores this.
+    pub raw_prompt: bool,
 }
 
 /// Bounded backoff between composer-unreadable re-probes within one drain.
@@ -702,6 +707,7 @@ impl Default for DrainOptions {
             max_items: None,
             not_after: None,
             batch_working_backlog: false,
+            raw_prompt: false,
         }
     }
 }
@@ -1700,6 +1706,7 @@ pub fn enqueue(root: &Path, text: &str, message_id: Option<&str>) -> AgentResult
         message_id,
         true,
         None,
+        false,
         &SystemRuntime::default(),
     )
 }
@@ -1712,6 +1719,7 @@ fn enqueue_internal(
     message_id: Option<&str>,
     serialize: bool,
     not_after: Option<u64>,
+    raw: bool,
     runtime: &dyn AgentRuntime,
 ) -> AgentResult<String> {
     if text.is_empty() {
@@ -1730,7 +1738,7 @@ fn enqueue_internal(
         serialize,
         &waiter,
         |identifier| {
-            let mut item = enqueued_item(identifier, text);
+            let mut item = enqueued_item(identifier, text, raw);
             if let Some(not_after) = not_after {
                 item[agent_queue::queue::NOT_AFTER] = json!(not_after);
             }
@@ -1739,8 +1747,15 @@ fn enqueue_internal(
     )?)
 }
 
-/// The document `enqueue` writes for `text`.
-fn enqueued_item(identifier: &str, text: &str) -> Value {
+/// The document `enqueue` writes for `text`. A raw prompt's document is the plain item
+/// marked `raw`, its text exactly as given: no deferred-time opening is made of words that
+/// must reach the composer verbatim (#1136 raw-message-bridge).
+fn enqueued_item(identifier: &str, text: &str, raw: bool) -> Value {
+    if raw {
+        let mut item = agent_queue::queue::plain_item(identifier, text);
+        item["raw"] = json!(true);
+        return item;
+    }
     // A chat request prompt names its message's create time, so the drain can open its first
     // line with the delay as of typing; the stored text stays printable. See `prompt_time`.
     match crate::prompt_time::queue_deferred(text, crate::prompt_time::now_millis()) {
@@ -2136,6 +2151,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
             if options.batch_working_backlog
                 && info.status == "working"
                 && !document.contains_key("stranded_at")
+                && !raw_prompt(&document)
                 && !owner_prompt(&identifier, &document)
                 && priority_only.is_none()
                 && options.max_items.is_none()
@@ -2171,6 +2187,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
                             .map_or(candidate_filename.clone(), str::to_owned);
                         if candidate_attempts >= options.max_attempts
                             || candidate_document.contains_key("stranded_at")
+                            || raw_prompt(&candidate_document)
                             || owner_prompt(&candidate_id, &candidate_document)
                             || set_aside_reason(
                                 &directories,
@@ -2970,6 +2987,7 @@ pub(crate) fn queue_identified_managed(
         message_id,
         message_id.is_some(),
         not_after,
+        false,
         &runtime,
     )?;
     Ok(QueueResult {
@@ -3046,6 +3064,7 @@ fn send_identified_with_runtime_binding<A: AgentApi + ?Sized>(
         message_id,
         message_id.is_some(),
         options.not_after,
+        options.raw_prompt,
         runtime,
     )?;
     let result = drain_with_runtime_binding(
@@ -4495,6 +4514,12 @@ fn typed_text(document: &Map<String, Value>) -> AgentResult<String> {
 /// owner's), or console input, whose sender header names `human@HOST`. The owner's prompts are
 /// typed first and each on its own, never in a batch, so the owner sees their own message in the
 /// pane and the bridge's delivered mark belongs to it.
+/// Whether a queued prompt's document marks it raw (#1136 raw-message-bridge): bare text to
+/// type verbatim, never combined, never reordered behind later owner prompts.
+pub(crate) fn raw_prompt(document: &Map<String, Value>) -> bool {
+    document.get("raw").and_then(Value::as_bool) == Some(true)
+}
+
 pub(crate) fn owner_prompt(identifier: &str, document: &Map<String, Value>) -> bool {
     let request = |id: &str| crate::chat_runtime::request_key_of_message(id).is_some();
     request(identifier)
@@ -4512,13 +4537,17 @@ pub(crate) fn owner_prompt(identifier: &str, document: &Map<String, Value>) -> b
 /// chat-requests-unbatched). A prompt that cannot be read stays with the backlog, where the
 /// drain quarantines it as before. An owner slash command (a chat `/goal`) keeps its place too:
 /// it waits for an idle pane, and at the head it would hold back older backlog that a working
-/// pane can take.
+/// pane can take. A raw prompt is the exception (#1136 raw-message-bridge): marked `raw`, it
+/// stays among the owner prompts in queue order even when it opens with `/`, because its
+/// place among the owner's requests is the order the owner sent them in.
 fn owner_first(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     let (owner, backlog): (Vec<PathBuf>, Vec<PathBuf>) = paths.into_iter().partition(|path| {
         message_id_from_path(path).is_ok_and(|identifier| {
             load_message(path).is_ok_and(|document| {
                 owner_prompt(&identifier, &document)
-                    && message_text(&document).is_ok_and(|text| !text.trim_start().starts_with('/'))
+                    && (raw_prompt(&document)
+                        || message_text(&document)
+                            .is_ok_and(|text| !text.trim_start().starts_with('/')))
             })
         })
     });
@@ -7012,6 +7041,7 @@ mod tests {
             Some(&chat),
             true,
             Some(now_millis() + 3_600_000),
+            false,
             &SystemRuntime::default(),
         )
         .unwrap();
@@ -7045,6 +7075,108 @@ mod tests {
                 "/goal ship it",
                 "older agent note"
             ]
+        );
+    }
+
+    #[test]
+    fn a_raw_prompt_keeps_its_place_among_owner_prompts_and_is_never_batched() {
+        // #1136 raw-message-bridge: a raw queue item holds the bare text and stays where it
+        // was queued among the owner's prompts — even a slash command, which an ordinary
+        // owner slash command does not — and no batch ever absorbs it.
+        let directory = TestDirectory::new("raw-order");
+        let root = directory.path();
+        let first = chat_request_id('a');
+        let raw = chat_request_id('b');
+        let second = chat_request_id('c');
+        enqueue(root, "first owner request", Some(&first)).unwrap();
+        enqueue_internal(
+            root,
+            "/help",
+            Some(&raw),
+            true,
+            None,
+            true,
+            &SystemRuntime::default(),
+        )
+        .unwrap();
+        enqueue(root, "second owner request", Some(&second)).unwrap();
+        let stored = read_json(&root.join(format!("inbox/{raw}.json"))).unwrap();
+        assert_eq!(stored["raw"], true, "{stored}");
+        assert_eq!(stored["text"], "/help", "{stored}");
+        let fake = FakeAgent::new(&["idle"]);
+        let result = drain_with_runtime(
+            &fake,
+            &target(),
+            root,
+            DrainOptions::default(),
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            result.delivered,
+            [first.as_str(), raw.as_str(), second.as_str()],
+            "{result:?}"
+        );
+        assert_eq!(
+            fake.runs(),
+            ["first owner request", "/help", "second owner request"]
+        );
+
+        // With backlog batching on into a working pane, a raw item ends the batch in front
+        // of it and is never a member: the two notes combine, the raw text never joins them.
+        let directory = TestDirectory::new("raw-batch");
+        let (fake, target) =
+            working_claude(crate::submission::fake::FakeScreen::new("claude", true));
+        enqueue(
+            directory.path(),
+            "[from a via agentctl] first note",
+            Some("batch-a"),
+        )
+        .unwrap();
+        enqueue_internal(
+            directory.path(),
+            "bare raw words",
+            Some("batch-raw"),
+            true,
+            None,
+            true,
+            &SystemRuntime::default(),
+        )
+        .unwrap();
+        enqueue(
+            directory.path(),
+            "[from b via agentctl] second note",
+            Some("batch-b"),
+        )
+        .unwrap();
+        let result = drain_with_runtime(
+            &fake,
+            &target,
+            directory.path(),
+            while_working_batched(),
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        let screen = fake.screen.as_ref().unwrap().state();
+        assert!(
+            screen
+                .queued
+                .iter()
+                .chain(screen.steered.iter())
+                .all(|typed| !typed.contains("bare raw words") || typed == "bare raw words"),
+            "queued={:?} steered={:?} delivered={:?}",
+            screen.queued,
+            screen.steered,
+            result.delivered
+        );
+        assert!(
+            !screen
+                .queued
+                .iter()
+                .any(|typed| typed.contains("queued messages:")
+                    && typed.contains("bare raw words")),
+            "the raw text was combined: {:?}",
+            screen.queued
         );
     }
 
@@ -7764,6 +7896,7 @@ mod tests {
             Some("b-second"),
             true,
             Some(now_millis() + 3_600_000),
+            false,
             &SystemRuntime::default(),
         )
         .unwrap();
@@ -7799,6 +7932,7 @@ mod tests {
             Some("hold"),
             true,
             Some(1),
+            false,
             &SystemRuntime::default(),
         )
         .unwrap();
@@ -8715,6 +8849,7 @@ mod tests {
                         Some("stale"),
                         true,
                         None,
+                        false,
                         &runtime,
                     )
                     .map(|_| ())

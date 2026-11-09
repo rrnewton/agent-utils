@@ -38,6 +38,7 @@ pub(crate) mod bang;
 mod grants;
 mod held_replies;
 mod observe;
+mod raw;
 mod rejections;
 mod reply_reminders;
 mod repoint;
@@ -2837,6 +2838,15 @@ struct RequestRecord {
     /// The bound agent's generation token when `target_agent` was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     target_token: Option<String>,
+    /// The bare text a raw request types, verbatim (#1136 raw-message-bridge): cleaned at
+    /// admission (marker line and controls off) and presented instead of a request prompt.
+    /// No reply is expected of it; it retires on delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    raw_text: Option<String>,
+    /// Why a raw mark on this request was ignored, printed as a note line in its ordinary
+    /// prompt (#1136 raw-message-bridge).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    raw_ignored: Option<String>,
     /// Keys a newer agentctl added, kept when this record is written back (#809
     /// chat-bridge-json-forward-compat).
     #[serde(flatten)]
@@ -2959,6 +2969,8 @@ impl RequestRecord {
             settlement: None,
             target_agent: None,
             target_token: None,
+            raw_text: None,
+            raw_ignored: None,
             key,
             message: source,
         })
@@ -2991,6 +3003,28 @@ impl RequestRecord {
             {
                 return Err(ChatRuntimeError::invalid(
                     "saved request was not admitted within its sender grant",
+                ));
+            }
+        }
+        if self.raw_text.is_some() && self.raw_ignored.is_some() {
+            return Err(ChatRuntimeError::invalid(
+                "saved request is both raw and raw-ignored",
+            ));
+        }
+        if let Some(raw_text) = &self.raw_text {
+            let unclean = raw_text.chars().any(|character| {
+                character != '\n' && matches!(character, '\u{0}'..='\u{1f}' | '\u{7f}'..='\u{9f}')
+            });
+            if raw_text.is_empty() || raw_text.chars().count() > raw::RAW_MAX_CHARS || unclean {
+                return Err(ChatRuntimeError::invalid(
+                    "saved raw request text is empty, over its cap, or uncleaned",
+                ));
+            }
+        }
+        if let Some(note) = &self.raw_ignored {
+            if note.is_empty() || note.len() > 512 {
+                return Err(ChatRuntimeError::invalid(
+                    "saved raw-ignored note is empty or oversized",
                 ));
             }
         }
@@ -5813,6 +5847,19 @@ pub(crate) trait CoordinatorDelivery {
         message_id: &str,
         options: DrainOptions,
     ) -> std::result::Result<(), String>;
+    /// [`Self::submit`] for a raw request's bare text (#1136 raw-message-bridge): queued as
+    /// its own raw item — never combined, never reordered — and typed verbatim. The default
+    /// submits with [`DrainOptions::raw_prompt`] set, which is all the queue needs to know.
+    fn submit_raw(
+        &self,
+        agent_name: &str,
+        text: &str,
+        message_id: &str,
+        mut options: DrainOptions,
+    ) -> std::result::Result<(), String> {
+        options.raw_prompt = true;
+        self.submit(agent_name, text, message_id, options)
+    }
     fn drain(&self, agent_name: &str, options: DrainOptions) -> std::result::Result<(), String>;
     /// [`Self::drain`], also saying why it stopped before typing every prompt in the queue's
     /// inbox, if it did. A delivery that cannot say gives `None`.
@@ -8787,6 +8834,14 @@ impl BridgeState {
                         record.target_agent = Some(agent.clone());
                         record.target_token = Some(token.clone());
                     }
+                    // The raw mark, decided once here (#1136 raw-message-bridge): only a
+                    // permanent owner's mark becomes bare text to type; any other mark is
+                    // recorded as a note for the ordinary prompt.
+                    match raw::classify(&record.message, permanent_owner) {
+                        raw::Classification::NotRaw => {}
+                        raw::Classification::Raw(text) => record.raw_text = Some(text),
+                        raw::Classification::Ignored(note) => record.raw_ignored = Some(note),
+                    }
                     record.admitted_at_millis = admitted_at_millis;
                     record.sender_grant = if permanent_owner { None } else { sender_grant };
                     record.admitted_host_batch_sequence = Some(host_batch_sequence);
@@ -10662,6 +10717,9 @@ adding one to the last number in both lines for each later reply.",
         }
         if let Some(help) = self.help_command(executable(), key, &reply_id) {
             footer.push(format!("If you have trouble, run: {help}"));
+        }
+        if let Some(note) = &record.raw_ignored {
+            footer.push(note.clone());
         }
         if command_only {
             let Some(command) = command else {
@@ -16337,6 +16395,7 @@ pub(crate) fn deliver_request_with(
             let detail = "coordinator queue reports a possibly submitted request";
             state.set_delivery_phase(key, RequestPhase::DeliveryUncertain, Some(detail))?;
             reply_to_goal_command(state, delivery, &record, Some(detail));
+            finish_raw_delivery(state, &record);
             return Ok(CoordinatorDeliveryResult::Uncertain(detail.to_owned()));
         }
         // A request set aside untyped (cancelled or expired) is never queued again by itself;
@@ -16344,6 +16403,7 @@ pub(crate) fn deliver_request_with(
         Some(QueueMessageState::Cancelled) => {
             let detail = SET_ASIDE_UNTYPED;
             state.set_delivery_phase(key, RequestPhase::DeliveryUncertain, Some(detail))?;
+            finish_raw_delivery(state, &record);
             return Ok(CoordinatorDeliveryResult::Uncertain(detail.to_owned()));
         }
         // Either one drains the queue, which types the prompts in its inbox, owner requests
@@ -16359,6 +16419,17 @@ pub(crate) fn deliver_request_with(
             },
             Err(error) => Some(error),
         },
+        // A raw request's bare text is typed exactly as the owner wrote it, as its own queue
+        // item, never wrapped in a request prompt (#1136 raw-message-bridge).
+        None if record.raw_text.is_some() => {
+            let text = record.raw_text.clone().unwrap_or_default();
+            match guard_typing(state, delivery, None) {
+                Ok(()) => delivery
+                    .submit_raw(agent_name, &text, message_id, options)
+                    .err(),
+                Err(error) => Some(error),
+            }
+        }
         // A message that is exactly one `/goal` command is typed raw, as the harness's own
         // command, rather than wrapped in a request prompt: see [`BridgeState::goal_command`].
         None if state.goal_command(&record).is_some() => {
@@ -16395,6 +16466,7 @@ pub(crate) fn deliver_request_with(
         state.note_started(delivery, message_id);
         state.set_delivery_phase(key, RequestPhase::Delivered, None)?;
         reply_to_goal_command(state, delivery, &record, None);
+        finish_raw_delivery(state, &record);
         return Ok(CoordinatorDeliveryResult::Delivered);
     }
 
@@ -16403,6 +16475,7 @@ pub(crate) fn deliver_request_with(
             state.note_started(delivery, message_id);
             state.set_delivery_phase(key, RequestPhase::Delivered, None)?;
             reply_to_goal_command(state, delivery, &record, None);
+            finish_raw_delivery(state, &record);
             Ok(CoordinatorDeliveryResult::Delivered)
         }
         Ok(Some(QueueMessageState::Cancelled)) => {
@@ -16412,6 +16485,7 @@ pub(crate) fn deliver_request_with(
                 |error| format!("{SET_ASIDE_UNTYPED}: {error}"),
             );
             state.set_delivery_phase(key, RequestPhase::DeliveryUncertain, Some(&detail))?;
+            finish_raw_delivery(state, &record);
             Ok(CoordinatorDeliveryResult::Uncertain(detail))
         }
         Ok(Some(QueueMessageState::Inflight | QueueMessageState::Failed)) => {
@@ -16420,6 +16494,7 @@ pub(crate) fn deliver_request_with(
             });
             state.set_delivery_phase(key, RequestPhase::DeliveryUncertain, Some(&detail))?;
             reply_to_goal_command(state, delivery, &record, Some(&detail));
+            finish_raw_delivery(state, &record);
             Ok(CoordinatorDeliveryResult::Uncertain(detail))
         }
         Ok(Some(QueueMessageState::Pending) | None) => {
@@ -16496,6 +16571,7 @@ fn resolve_uncertain_delivery(
         state.note_started(delivery, &record.delivery_message_id);
         state.set_delivery_phase(key, RequestPhase::Delivered, None)?;
         reply_to_goal_command(state, delivery, record, None);
+        finish_raw_delivery(state, record);
         return Ok(CoordinatorDeliveryResult::Delivered);
     }
     let agent_name = record.agent_for(&state.config.agent_name);
@@ -16505,6 +16581,7 @@ fn resolve_uncertain_delivery(
             state.note_started(delivery, &record.delivery_message_id);
             state.set_delivery_phase(key, RequestPhase::Delivered, None)?;
             reply_to_goal_command(state, delivery, record, None);
+            finish_raw_delivery(state, record);
             Ok(CoordinatorDeliveryResult::Delivered)
         }
         Ok(Some(QueueMessageState::Pending)) => {
@@ -16517,6 +16594,15 @@ fn resolve_uncertain_delivery(
             Ok(CoordinatorDeliveryResult::Pending(detail))
         }
         Ok(state_of_queue) => {
+            // A raw request is fire-and-forget keystrokes, typed at most once (#1136
+            // raw-message-bridge): past the bound it retires as delivered with no channel
+            // report and no reply to wait for. The queue's own failed entry keeps what
+            // evidence there is, as `chat status` and the failed digest surface it.
+            if record.raw_text.is_some() {
+                state.set_delivery_phase(key, RequestPhase::Delivered, None)?;
+                finish_raw_delivery(state, record);
+                return Ok(CoordinatorDeliveryResult::Delivered);
+            }
             let detail = format!(
                 "delivery has been uncertain for {} ({original}); the coordinator queue now \
                  reports {state_of_queue:?}, so the bridge reported the request in the channel \
@@ -16561,6 +16647,26 @@ fn resolve_uncertain_delivery(
         Err(error) => Ok(CoordinatorDeliveryResult::Uncertain(format!(
             "{original}; the coordinator queue could not be read to resolve it: {error}"
         ))),
+    }
+}
+
+/// Close a raw request's replies once its typing is settled or uncertain (#1136
+/// raw-message-bridge): no reply is expected of bare typed text, so reply capture never
+/// waits on it, and a delivered one retires as soon as its delivery receipt is recorded, as
+/// any request with no replies does. A slash command that starts no turn (a help or picker
+/// dialog) can never confirm by a working transition and stays uncertain until
+/// [`resolve_uncertain_delivery`] retires it without a report; its replies are still closed
+/// here, at once. A failure here cannot change the delivery's outcome, so it is only logged.
+fn finish_raw_delivery(state: &BridgeState, record: &RequestRecord) {
+    if record.raw_text.is_none() {
+        return;
+    }
+    if let Err(error) = state.close_replies(&record.key) {
+        crate::chat_service::service_log(format_args!(
+            "agentctl: raw request {} was delivered, but its replies could not be closed: \
+             {error}",
+            record.key
+        ));
     }
 }
 
@@ -21725,6 +21831,45 @@ pub(crate) mod tests {
             vec![CommittableEvent::message_created(message)],
         )
         .expect("indexed delivery")
+    }
+
+    /// A Slack-shaped delivery whose provider payload marks the message raw when `raw`
+    /// (#1136 raw-message-bridge), from `sender`.
+    fn marked_delivery_at(
+        sequence: u64,
+        index: u64,
+        cursor: &str,
+        text: &str,
+        sender: &str,
+        raw: bool,
+    ) -> DeliveryBatch {
+        let mut payload = Map::from_iter([
+            ("channel_id".to_owned(), Value::from("spaces/example")),
+            ("index".to_owned(), Value::from(index)),
+        ]);
+        if raw {
+            payload.insert("raw".to_owned(), Value::Bool(true));
+        }
+        let message = InboundMessage::new(
+            ChannelId::new("spaces/example").expect("channel"),
+            MessageId::new(format!("spaces/example/messages/{index}")).expect("message"),
+            ThreadId::new(format!("spaces/example/threads/{index}")).expect("thread"),
+            SenderId::new(sender).expect("sender"),
+            text,
+            "2026-09-21T12:00:00Z",
+            false,
+        )
+        .expect("normalized message")
+        .with_provider_payload(
+            ProviderPayload::new("agentctl.slack.message.v1", payload).expect("provider payload"),
+        );
+        DeliveryBatch::new(
+            EventSequence::new(sequence).expect("sequence"),
+            ProviderCursor::new(cursor).expect("cursor"),
+            DeliveryId::new(format!("delivery-{sequence}-{index}")).expect("delivery"),
+            vec![CommittableEvent::message_created(message)],
+        )
+        .expect("marked delivery")
     }
 
     fn boundary_delivery_at(sequence: u64, index: u64, cursor: &str, text: &str) -> DeliveryBatch {
@@ -39851,6 +39996,294 @@ a fence ```sh here, ~~~~ there, and one ``\u{200b}` hidden"
             );
             fs::remove_dir_all(root).expect("cleanup");
         }
+    }
+
+    #[test]
+    fn an_owner_raw_message_is_typed_bare_and_retires_without_a_reply() {
+        // `#1136 raw-message-bridge`: the owner's marked text reaches delivery exactly as
+        // written — no header, no reply markers — and expects no reply: it is closed on
+        // delivery with nothing stored for capture to wait on.
+        for (sent, typed) in [
+            ("/help\n[raw]", "/help"),
+            ("first line\nsecond line\n[raw]", "first line\nsecond line"),
+            // Words that themselves end with the marker line keep theirs.
+            ("look\n[raw]\n[raw]", "look\n[raw]"),
+            // Controls and the tab never reach the composer; newlines do.
+            ("a\tb\u{1b}c\r\nd\n[raw]", "abc\nd"),
+        ] {
+            let root = temporary("raw-owner");
+            let state = BridgeState::initialize(&root, config()).expect("initialize state");
+            let key = state
+                .admit_batch(&marked_delivery_at(
+                    1,
+                    1,
+                    "cursor-1",
+                    sent,
+                    "users/owner",
+                    true,
+                ))
+                .expect("admit request")
+                .new_request_keys[0]
+                .clone();
+            let record = state.read_request(&key).expect("request");
+            assert_eq!(record.raw_text.as_deref(), Some(typed), "{sent:?}");
+            assert_eq!(record.raw_ignored, None);
+            let delivery = FakeDelivery::default();
+            assert_eq!(
+                deliver_request_with(&state, &delivery, &key, DrainOptions::default())
+                    .expect("deliver request"),
+                CoordinatorDeliveryResult::Delivered,
+                "{sent:?}"
+            );
+            assert_eq!(
+                *delivery.submitted_prompts.lock().expect("prompts"),
+                [typed],
+                "{sent:?}: the bare text and nothing else"
+            );
+            let request = state.read_request(&key).expect("request");
+            assert_eq!(request.phase, RequestPhase::Delivered);
+            assert!(request.reply_closed, "{sent:?}");
+            assert_eq!(request.reply_count, 0);
+            assert_eq!(request.next_reply_ordinal, 1, "no reply was stored");
+            let inspection = state.inspect_request(&key).expect("inspect");
+            assert_eq!(
+                inspection["replies"].as_array().expect("replies").len(),
+                0,
+                "{inspection}"
+            );
+            fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn a_raw_message_retires_as_soon_as_its_receipt_is_recorded() {
+        // With no receipt reaction to wait for, delivery alone retires a raw request: its
+        // record is gone and its key is a retired one.
+        let root = temporary("raw-retire");
+        let state =
+            BridgeState::initialize(&root, config_without_reaction()).expect("initialize state");
+        let key = state
+            .admit_batch(&marked_delivery_at(
+                1,
+                1,
+                "cursor-1",
+                "/help\n[raw]",
+                "users/owner",
+                true,
+            ))
+            .expect("admit request")
+            .new_request_keys[0]
+            .clone();
+        // Advance the provider cursor past the raw request's boundary, as the next batch
+        // does in service, so its retirement is authorized.
+        state
+            .admit_batch(&marked_delivery_at(
+                2,
+                2,
+                "cursor-2",
+                "ordinary follow-up",
+                "users/owner",
+                false,
+            ))
+            .expect("advance cursor");
+        let delivery = FakeDelivery::default();
+        deliver_request_with(&state, &delivery, &key, DrainOptions::default())
+            .expect("deliver request");
+        assert!(
+            state.read_request(&key).is_err(),
+            "the delivered raw request retired at once"
+        );
+        assert!(state.retired_key(&key).expect("retired key").is_some());
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_non_owner_or_over_cap_raw_mark_is_ignored_with_a_note_in_the_prompt() {
+        // A granted (not owner) sender's mark, and an owner's over-cap text, are ordinary
+        // requests: wrapped, answered by reply, and told the mark was ignored.
+        let root = temporary("raw-ignored");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        state
+            .grant_senders(
+                &["users/guest".to_owned()],
+                std::time::Duration::from_secs(3_600),
+                None,
+            )
+            .expect("grant guest");
+        let guest_key = state
+            .admit_batch(&marked_delivery_at(
+                1,
+                1,
+                "cursor-1",
+                "/help\n[raw]",
+                "users/guest",
+                true,
+            ))
+            .expect("admit guest request")
+            .new_request_keys[0]
+            .clone();
+        let over = format!("{}\n[raw]", "x".repeat(4_001));
+        let over_key = state
+            .admit_batch(&marked_delivery_at(
+                2,
+                2,
+                "cursor-2",
+                &over,
+                "users/owner",
+                true,
+            ))
+            .expect("admit over-cap request")
+            .new_request_keys[0]
+            .clone();
+        for (key, fragment) in [
+            (&guest_key, "only an owner's raw mark"),
+            (&over_key, "at most 4000 characters"),
+        ] {
+            let record = state.read_request(key).expect("request");
+            assert_eq!(record.raw_text, None);
+            assert!(
+                record
+                    .raw_ignored
+                    .as_deref()
+                    .is_some_and(|note| note.contains(fragment)),
+                "{:?}",
+                record.raw_ignored
+            );
+            let delivery = FakeDelivery::default();
+            deliver_request_with(&state, &delivery, key, DrainOptions::default())
+                .expect("deliver request");
+            let prompts = delivery.submitted_prompts.lock().expect("prompts").clone();
+            assert_eq!(prompts.len(), 1);
+            assert!(prompts[0].contains("<CHAT_REPLY_"), "{prompts:?}");
+            assert!(prompts[0].contains(fragment), "{prompts:?}");
+            assert!(prompts[0].starts_with("[from "), "{prompts:?}");
+            assert!(
+                !state.read_request(key).expect("request").reply_closed,
+                "an ignored mark still expects a reply"
+            );
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_raw_message_keeps_its_place_between_ordinary_requests_unmerged() {
+        let root = temporary("raw-order");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let admit = |sequence: u64, text: &str, raw: bool| {
+            state
+                .admit_batch(&marked_delivery_at(
+                    sequence,
+                    sequence,
+                    &format!("cursor-{sequence}"),
+                    text,
+                    "users/owner",
+                    raw,
+                ))
+                .expect("admit request")
+                .new_request_keys[0]
+                .clone()
+        };
+        let keys = [
+            admit(1, "first ordinary request", false),
+            admit(2, "/help\n[raw]", true),
+            admit(3, "second ordinary request", false),
+        ];
+        let delivery = FakeDelivery::default();
+        for key in &keys {
+            *delivery.queue_state.lock().expect("queue state") = None;
+            deliver_request_with(&state, &delivery, key, DrainOptions::default())
+                .expect("deliver request");
+        }
+        let prompts = delivery.submitted_prompts.lock().expect("prompts").clone();
+        assert_eq!(prompts.len(), 3, "{prompts:?}");
+        assert!(prompts[0].contains("first ordinary request"), "{prompts:?}");
+        assert_eq!(
+            prompts[1], "/help",
+            "the raw item stands alone between them"
+        );
+        assert!(
+            prompts[2].contains("second ordinary request"),
+            "{prompts:?}"
+        );
+        assert!(prompts[0].contains("<CHAT_REPLY_") && prompts[2].contains("<CHAT_REPLY_"));
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn an_uncertain_raw_delivery_closes_at_once_and_retires_without_a_report() {
+        // A slash command that starts no turn can never confirm by a working transition:
+        // its delivery goes uncertain, its replies still close at once (capture never waits
+        // on raw), and past the resolution bound it retires as delivered with no channel
+        // report stored as a reply.
+        let root = temporary("raw-uncertain");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let key = state
+            .admit_batch(&marked_delivery_at(
+                1,
+                1,
+                "cursor-1",
+                "/help\n[raw]",
+                "users/owner",
+                true,
+            ))
+            .expect("admit request")
+            .new_request_keys[0]
+            .clone();
+        let delivery = FakeDelivery::default();
+        *delivery.queue_state.lock().expect("queue state") = Some(QueueMessageState::Failed);
+        assert!(matches!(
+            deliver_request_with(&state, &delivery, &key, DrainOptions::default())
+                .expect("deliver request"),
+            CoordinatorDeliveryResult::Uncertain(_)
+        ));
+        let record = state.read_request(&key).expect("request");
+        assert!(record.reply_closed, "uncertain raw still expects no reply");
+        assert_eq!(record.reply_count, 0);
+        backdate_uncertain(&state, &key);
+        // Closing replies already happened; backdating reopens nothing.
+        assert!(matches!(
+            deliver_request_with(&state, &delivery, &key, DrainOptions::default())
+                .expect("resolve request"),
+            CoordinatorDeliveryResult::Delivered
+        ));
+        let record = state.read_request(&key).expect("request");
+        assert_eq!(record.phase, RequestPhase::Delivered);
+        assert_eq!(record.reply_count, 0, "no uncertain report was stored");
+        let inspection = state.inspect_request(&key).expect("inspect");
+        assert_eq!(
+            inspection["replies"].as_array().expect("replies").len(),
+            0,
+            "{inspection}"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn an_unmarked_slash_message_stays_an_ordinary_request() {
+        // Without the mark nothing changes: a slash text is wrapped like any request (the
+        // sender-header slash rule belongs to `agentctl send`, not to bridge prompts).
+        let root = temporary("raw-unmarked");
+        let state = BridgeState::initialize(&root, config()).expect("initialize state");
+        let key = state
+            .admit_batch(&marked_delivery_at(
+                1,
+                1,
+                "cursor-1",
+                "/help",
+                "users/owner",
+                false,
+            ))
+            .expect("admit request")
+            .new_request_keys[0]
+            .clone();
+        assert_eq!(state.read_request(&key).expect("request").raw_text, None);
+        let delivery = FakeDelivery::default();
+        deliver_request_with(&state, &delivery, &key, DrainOptions::default())
+            .expect("deliver request");
+        let prompts = delivery.submitted_prompts.lock().expect("prompts").clone();
+        assert!(prompts[0].contains("<CHAT_REPLY_"), "{prompts:?}");
+        assert_ne!(prompts[0], "/help");
+        fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

@@ -21,7 +21,9 @@
 //! sent: TIME · reply: ...]`, its `reply` naming the request's reply markers.
 //!
 //! The header is mandatory: no option suppresses it. The chat bridge's request prompts never pass
-//! through `agentctl send` and carry the bridge's own header instead. A one-line harness
+//! through `agentctl send` and carry the bridge's own header instead — except an owner's raw
+//! message (#1136 raw-message-bridge), which the bridge types with no header at all, exactly as
+//! written, as direct terminal input. A one-line harness
 //! slash command (see [`is_slash_command`]) is a command for the harness rather than a message to
 //! the agent, and a header would stop the harness reading it as one, so it is sent as written.
 //!

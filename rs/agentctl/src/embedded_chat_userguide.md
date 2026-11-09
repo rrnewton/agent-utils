@@ -2045,6 +2045,41 @@ already had gets `goal unchanged (already active)`. A command that failed gets
 cancelled and why. The request gets its acknowledgement reaction like any
 other.
 
+### Raw messages: typing exactly what was written
+
+A message the posting client marks raw (the owner ticks the raw box; the post
+then carries `"raw": true` in its Slack metadata and one trailing `[raw]`
+line in its text) is typed into the bridged agent exactly as written: no
+sender header, no reply instructions, no footer. It is direct terminal input,
+so a slash command runs — send a slash command as its own one-line raw
+message. Single-line text is typed and submitted; multi-line text goes as one
+bracketed paste and submits as one prompt.
+
+Raw is owner-only. The bridge honours the mark only from a permanent owner
+(one of `allowed_senders`); anyone else's mark — a granted sender's included —
+is ignored, and the message is delivered as an ordinary request whose prompt
+says so. The text is capped at 4,000 characters; a longer marked text is
+likewise delivered ordinarily with a note, never typed raw. Before typing,
+the bridge takes off exactly the one trailing `[raw]` line the post gained,
+normalizes line endings to line feeds, and strips control characters (tab
+included, since it would open the composer's completion) except the line
+feed.
+
+A raw message is its own queue item between the owner's other requests: it
+keeps its place in per-agent order and is never merged with its neighbours.
+No reply is expected of it — it gets no reply ID and no reply prompt — so on
+delivery the bridge records the usual receipt reaction, closes its replies
+at once, and retires it without waiting for an answer. A slash command that
+starts no turn (a help or picker dialog) cannot be confirmed by the pane
+going to work, so its delivery is uncertain in the usual way — typed at most
+once, never retyped — and past the uncertain bound a raw request retires as
+delivered without the channel report an ordinary uncertain request gets;
+the queue's failed entry keeps the evidence. Whatever the text
+makes the agent do is visible in the channel only if the agent itself writes
+there. For a headless or cloud agent there is no composer to type into, and
+the bare text is queued as a prompt of its own; a slash command needs a
+terminal harness to run as one.
+
 ### A headless coordinator
 
 When the bridge's agent is headless (`agentctl start --mode headless`, run by
