@@ -1838,10 +1838,11 @@ fn restore_promotes_and_transfers_a_slot_lane_whose_bind_is_present() {
     promotable_slotted(&fixture, "slotted", "slotted-slot");
     let host = ScriptedHost::new();
     let root = fixture.root.display().to_string();
+    // Real wrkslots reports a usable mounted image as phase `ready`.
     host.answer(
         "image status",
         0,
-        &format!("work/slotted-slot at {root} (mounted)\n"),
+        &format!("work/slotted-slot at {root} (ready)\n"),
         "",
     );
     host.answer("findmnt", 0, &format!("{root} /dev/loop0\n"), "");

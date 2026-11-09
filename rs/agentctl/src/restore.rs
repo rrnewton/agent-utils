@@ -1608,7 +1608,10 @@ fn verify_slot_bind(
     };
     let location = entry["location"].as_str().unwrap_or_default();
     let phase = entry["phase"].as_str().unwrap_or_default();
-    if phase.contains("not mounted") || !phase.contains("mounted") {
+    // Real `wrkslots image status` reports a mounted, usable image as
+    // phase `ready` (provisioning/discarding are not usable); accept it
+    // alongside an explicit mounted wording, refuse everything else.
+    if phase.contains("not mounted") || !(phase == "ready" || phase.contains("mounted")) {
         return Err(refuse(format!(
             "wrkslots image status reports the slot's bind at {location} as {phase}"
         )));
