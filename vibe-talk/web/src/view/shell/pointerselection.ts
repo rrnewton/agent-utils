@@ -77,9 +77,6 @@ export interface PointerSelectionDependencies<Pane extends PointedPane, Column, 
   /** The selection `pane` keeps, or null, and whether it names `row`. */
   markOf(pane: Pane): Mark | null;
   markNames(mark: Mark | null, row: HTMLElement): boolean;
-  /** Start, or drop, the wait before the other column glides to its counterpart (`#261`). */
-  dwellColumnGlide(pane: Pane, row: HTMLElement): void;
-  driftFromColumnGlide(): void;
   /** An element of the page by id, in the column the code is working in, and in the left column. */
   byId(id: string): HTMLElement;
   leftById(id: string): HTMLElement;
@@ -230,8 +227,8 @@ export function createPointerSelection<Pane extends PointedPane, Column, Mark ex
    * control of the row already holding it); the ring and the tint go with `data-selected`. Not while a
    * ⋯ menu is open: the menu holds the focus and its arrows, and a click outside it closes it first.
    *
-   * The pointer on the selection is also what starts the wait before the other column glides to its
-   * counterpart, and nothing else does (`dwellColumnGlide`, `#261 two-column-connectors`).
+   * Nothing scrolls for it (`#1144 scrollback-typing-jump`): the mouse resting here used to glide
+   * the other column to the selection's counterpart; hover now only selects.
    */
   function pointRow(pane: Pane, row: HTMLElement): void {
     if (deps.rowMenuOpen()) return;
@@ -242,7 +239,6 @@ export function createPointerSelection<Pane extends PointedPane, Column, Mark ex
     if (!(deps.lastPane() === pane && pane.lit === row && (holding || !focusFollowsSelection()))) {
       deps.takeRow(pane, row, !holding && focusFollowsSelection());
     }
-    deps.dwellColumnGlide(pane, row);
   }
 
   /** The scrollers `followPageScroll` listens on: one `scrollend` listener each, added once, for good. */
@@ -298,17 +294,9 @@ export function createPointerSelection<Pane extends PointedPane, Column, Mark ex
     onPointerMove(event) {
       if (!kinds.mouseMoved(event)) return;
       mouseInUse();
-      deps.driftFromColumnGlide();
       // A button held is a drag (text being selected, a scrollbar dragged), not a message being chosen.
       if (event.buttons) return;
       if (deps.screen() !== "main") return;
-      // `#298 thread-card-header`. The card at the top of the right column's thread is what its link joins
-      // to its root, and the mouse resting on it glides Main to that root, as on a card in the list.
-      const header = deps.leftById("side-thread-card");
-      if (nodeWithin(header, event.target)) {
-        deps.dwellColumnGlide(deps.sidePane(), header);
-        return;
-      }
       const pane = deps.keyPanes().find((each) => nodeWithin(each.scroller(), event.target) && each.list() !== null);
       const row = pane ? deps.rowOf(pane, event.target) : null;
       if (pane && row && deps.rowShown(row)) pointRow(pane, row);

@@ -3243,8 +3243,6 @@ const keyboard = createKeyboardComposition({
   replyPane: () => /** @type {any} */ (replyPane()),
   rowMenuOpen: () => Boolean(rowMenus.open()),
   openRowMenu: () => rowMenus.open(),
-  dwellColumnGlide: (pane, row) => dwellColumnGlide(pane, row),
-  driftFromColumnGlide: () => driftFromColumnGlide(),
   toFoot: (area) => toFoot(area),
   endFilterWalk: () => endFilterWalk(),
   closeOverscroll: () => closeOverscroll(),
@@ -8909,10 +8907,6 @@ function toggleLitCard(id, row) {
   const pane = row.parentNode === leftEl("side-cards") ? sidePane : channelPane;
   const before = rowShown(row) ? row.getBoundingClientRect().top : null;
   paintLitCards();
-  // `#280 scroll-stability`. A card highlighted by a click, the mouse resting on it, waits to glide Main
-  // to its root, as the mouse resting on a selection does; Enter on it, as every selection the keys make,
-  // glides nothing.
-  if (litCards.get(channel) === id && inputKinds.kind() === "mouse" && pointerOn(row)) dwellColumnGlide(pane, row);
   if (before === null || !row.parentNode) return;
   // `#338 column-overscroll`. In the room past the right column's foot, the room is fitted to the card as it
   // now is before the card is put back: the last card put out would otherwise be held by the end of the list
@@ -9552,11 +9546,10 @@ function inSideThread(message) {
 
 // --- the links between Main's roots and their cards ------------------------------------------------
 //
-// `#261 two-column-connectors`. The connectors between Main's roots and their cards on the right, and
-// the glide that brings a link's other end on screen when the mouse rests on it, are web/src/view/channel's
-// (`createColumnLinks`, `#624 voice-page-modularity`), with what is drawn, when it glides and what it
-// costs. The page tells it which columns show, the selection and the highlighted card, and where the
-// mouse is; the names below are the page's commands to it.
+// `#261 two-column-connectors`. The connectors between Main's roots and their cards on the right are
+// web/src/view/channel's (`createColumnLinks`, `#624 voice-page-modularity`), with what is drawn and
+// what it costs. The page tells it which columns show, the selection and the highlighted card; the
+// names below are the page's commands to it. Nothing here scrolls for the mouse (`#1144`).
 
 const columnLinks = createColumnLinks({
   lookup: (id) => leftEl(id),
@@ -9569,9 +9562,6 @@ const columnLinks = createColumnLinks({
   litCard: () => litCardOnRight(),
   cardRow: (thread) => cardRowOnRight(thread),
   hue: (thread) => Number(threadHue(thread)),
-  mouse: () => inputKinds.mouseAt(),
-  drawnTop: (row) => drawnTop(row),
-  landingGap: () => REPLY_LANDING_GAP_PX,
 });
 
 /** Whether the links have a place: two columns, the channel on the main screen, and cards or a thread's card. */
@@ -9595,28 +9585,8 @@ function noteLinkedSelection() {
 }
 
 /**
- * A real mouse move over `row` of `pane` (`pointRow`), or a click that has just highlighted the card
- * `row` under the mouse (`toggleLitCard`): the wait before a glide, where `row` is what it follows.
- *
- * @param {KeyPane} pane
- * @param {HTMLElement} row
- */
-function dwellColumnGlide(pane, row) {
-  columnLinks.dwell(pane, row);
-}
-
-/** A real mouse move (`onPointerMove`): one that has left what a glide waits on drops the wait. */
-function driftFromColumnGlide() {
-  columnLinks.drift();
-}
-
-/** The mouse leaving the window, which no move inside it says: the wait before a glide is dropped. */
-function onPointerLeavePage(event) {
-  columnLinks.pointerLeft(event);
-}
-
-/**
- * How a glide moves: "smooth", or "auto" where the stylesheet says so (`--column-glide`).
+ * How a deliberate glide moves (a jump the reader asked for, never the links'): "smooth", or
+ * "auto" where the stylesheet says so (`--column-glide`).
  *
  * @returns {ScrollBehavior}
  */
@@ -11258,15 +11228,13 @@ application.track(mountScreenControls({
   gripKey: (event) => readingWidthControl.gripKey(event),
 }));
 
-// The page's last document-level listeners (`#54 resume-recovery`, `#280 scroll-stability`): the page
-// going away or coming back, a pointer down outside a row's menu, and the mouse leaving the window.
+// The page's last document-level listeners (`#54 resume-recovery`): the page
+// going away or coming back, and a pointer down outside a row's menu.
 // One owner in web/src/view/shell/documentlisteners.ts (`#624 voice-page-modularity`), mounted here,
 // in the page's order; its `unmount` waits for the ordered boot's teardown.
 application.track(mountDocumentListeners({
-  root: () => document.documentElement,
   onVisibility: () => onVisibility(),
   closeRowMenuOutside: (event) => closeRowMenuOutside(event),
-  onPointerLeavePage: (event) => onPointerLeavePage(event),
 }));
 // The keys' and the selection's listeners (`#224 keyboard-shortcuts`, `#344 search-shortcut`, `#296
 // copy-highlighted-message`, `#239 single-selection`): every key heard in one place, the chords that act whatever

@@ -10,7 +10,7 @@
 # tool's lightweight unboxed gate. The root includes `tests.dag.yaml` directly so vibe-talk shares
 # one scheduler and browser cap with the other repository fragments.
 
-.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page web-build pwa-installability enter-to-send-browser pairing-link-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser wit-read-aloud-browser local-read-aloud-browser fallback-chain-browser read-aloud-blocks-browser read-aloud-views-browser read-pause-reply-browser pace-stepper-browser post-confirm-browser approval-card-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser search-chord-browser composer-key-browser command-bar-browser documents-browser two-column-browser desktop-layout-browser bookmark-browser reply-continuity-browser inline-reply-browser threads-main-browser sent-receipts-browser threads-polish-browser pack-still-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test screenshots-self-test container-smoke filter-place-browser search-dates-browser search-unmatched-browser link-url-chip-browser voice-composer-browser composer-grow-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser thread-header-collapse-browser threads-unpack-browser thread-line-browser empty-messages-browser all-thread-strip-browser scroll-stability-browser copy-message-browser open-upstream-link-browser in-app-links-browser message-summaries-browser thread-hue-spread-browser server-thread-hues-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser provider-groups-browser voice-reconnect-browser live-relay-check-self-test live-relay-check channel-search-browser column-overscroll-browser channel-box-browser keyboard-hides-bar-browser
+.PHONY: validate validate-boxed dag-check fmt check scripts-check contract contract-check typecheck test page web-build pwa-installability enter-to-send-browser pairing-link-browser offline-cache-browser reactions-browser system-bots-browser edited-mark-browser rich-headers-browser read-aloud-browser wit-read-aloud-browser local-read-aloud-browser fallback-chain-browser read-aloud-blocks-browser read-aloud-views-browser read-pause-reply-browser pace-stepper-browser post-confirm-browser approval-card-browser voice-call-drops-browser send-order-browser view-switch-browser read-modes-browser keyboard-browser search-chord-browser composer-key-browser command-bar-browser documents-browser two-column-browser desktop-layout-browser bookmark-browser reply-continuity-browser inline-reply-browser threads-main-browser sent-receipts-browser threads-polish-browser pack-still-browser reply-marks-read-browser done-sync-browser voice-read-acceptance-self-test android-speech-self-test screenshots-self-test container-smoke filter-place-browser search-dates-browser search-unmatched-browser link-url-chip-browser voice-composer-browser composer-grow-browser thread-button-browser done-feedback-browser elision-browser clean thread-card-focus-browser thread-card-header-browser thread-header-collapse-browser threads-unpack-browser thread-line-browser empty-messages-browser all-thread-strip-browser scroll-stability-browser copy-message-browser open-upstream-link-browser in-app-links-browser message-summaries-browser thread-hue-spread-browser server-thread-hues-browser fold-steps-browser back-gesture-browser live-pill-browser stale-live-read-browser provider-groups-browser voice-reconnect-browser live-relay-check-self-test live-relay-check channel-search-browser column-overscroll-browser channel-box-browser keyboard-hides-bar-browser typing-scroll-browser
 
 # The whole gate for this tool, cheapest and most likely to fail first.
 #
@@ -533,8 +533,8 @@ live-pill-browser:
 # `#298 thread-card-header` in a real Chromium at 1280x800 with a mouse, in both schemes: a card's replies
 # button opens its thread on the right under its card at the top of the column — the card's words, place,
 # height and colour, by computed colour and pixels, the X on it — joined to the thread's root on Main by
-# one line, clipped at Main's top while the root is above it, that the mouse resting on the card glides
-# Main along and the mouse crossing it does not; a long question's card the same height, and Esc closing
+# one line, clipped at Main's top while the root is above it, and a mouse resting on the card or crossing
+# it scrolling nothing (`#1144 scrollback-typing-jump`); a long question's card the same height, and Esc closing
 # the thread; the card moving up from its
 # place in the list, frame by frame, with nothing under it moving; the same card heading a thread opened
 # from the thread list (real Ctrl+3) across the window, at the desk and on a 412x915 phone by touch;
@@ -606,15 +606,16 @@ stale-live-read-browser:
 # the reader scrolled up in Main stays on the same row, within a pixel, while a message and a reply arrive
 # live, a refresh redraws the list with a message above them grown, a read sent while they were on the
 # newest line lands after they scrolled up (the owner's jump), summaries arrive, and the focus moves, and
-# at the desk while the mouse crosses the cards to the dock or the top bar and rests, and ] is pressed on
-# its own, each sampled every frame for 2.5 s; a reader on the newest line follows a live message to the foot; the list of threads and a thread open at
+# at the desk while the mouse crosses the cards to the dock or the top bar, rests, or crosses back —
+# mouse movement or hover scrolls nothing (`#1144 scrollback-typing-jump`) — and ] is pressed on its
+# own, each sampled every frame for 2.5 s; a reader on the newest line follows a live message to the foot; the list of threads and a thread open at
 # their foot and stay there, older replies coming in under a reader at a thread's head; after a
 # reload the read behind the saved rows leaves the reader where they scrolled; `#281 view-keys`: the view
 # keys show each view where it is read and nothing moves it for 2.5 s after, the thread list opening at its
 # foot from two columns, Main and All, Main coming back from it where the reader left it, a thread
 # opened from it opening at its foot, and a reload in it opening it at its foot with the desk's dock on two
-# rows; and, last, a card highlighted by a click, the mouse going on over another card to the dock, leaves
-# Main still. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a
+# rows; and, last, a card highlighted by a click, the mouse going on over another card to the dock, or
+# resting on the highlighted card, leaves Main still. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir to keep a
 # PNG of each stage.
 scroll-stability-browser:
 	python3 tests/scroll_stability_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
@@ -729,6 +730,13 @@ pack-still-browser:
 # SCREENSHOTS=dir to keep a PNG of each state.
 keyboard-hides-bar-browser:
 	python3 tests/keyboard_hides_bar_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
+
+# `#1144 scrollback-typing-jump` in a real Chromium at 412x915 and 360x800 by touch and 1280x800: typing
+# at the foot follows arrivals, strip resizes and a row grown late with the whole composer on screen;
+# reading scrollback holds across arrivals; unfocused keys navigate; hover between the columns scrolls
+# neither. Pass WEB_ROOT=dir to run it against another copy of the page, and SCREENSHOTS=dir for PNGs.
+typing-scroll-browser:
+	python3 tests/typing_scroll_browser.py $(if $(WEB_ROOT),--web-root $(WEB_ROOT)) $(if $(SCREENSHOTS),--screenshots $(SCREENSHOTS))
 
 # `#300 reply-marks-read` in a real Chromium at 1280x800, in two columns: a Reply docked in either column
 # and the first reply typed in a new thread's box mark what they answer read — Done on the server, the

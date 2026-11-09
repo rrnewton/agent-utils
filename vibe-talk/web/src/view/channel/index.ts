@@ -63,10 +63,7 @@ export type { HeldQuote, QuickReplyDraftStore, QuickReplySend, QuoteRoute, Quote
 export { PULL_ARM_PX, PULL_EDGE_SLACK_PX, PULL_LABELS, PULL_RESULT_MS, PULL_RISE_PX, PULL_WAIT_MS, createPullToRefresh } from "./pull.ts";
 export type { PullFreshness, PullToRefresh, PullToRefreshDependencies, PullTouch } from "./pull.ts";
 export {
-  COLUMN_GLIDE_MS,
-  GLIDE_REST_PX,
   LINK_DOT_PX,
-  LINK_GLIDE_MARGIN_PX,
   LINK_HEAD_PX,
   LINK_LANE_PX,
   createColumnLinks,

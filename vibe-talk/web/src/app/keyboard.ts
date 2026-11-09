@@ -135,8 +135,6 @@ export interface KeyboardCompositionDependencies<
   replyPane(): KeyPane;
   rowMenuOpen(): boolean;
   openRowMenu(): (SteppedMenu & { close(): void }) | null;
-  dwellColumnGlide(pane: KeyPane, row: HTMLElement): void;
-  driftFromColumnGlide(): void;
   // Scrolling.
   toFoot(area: HTMLElement): void;
   endFilterWalk(): void;
@@ -470,8 +468,6 @@ export function createKeyboardComposition<
     rowShown: (row) => deps.rowShown(row),
     markOf: (pane) => markOf(pane),
     markNames: (mark, row) => markNames(mark, row),
-    dwellColumnGlide: (pane, row) => deps.dwellColumnGlide(pane, row),
-    driftFromColumnGlide: () => deps.driftFromColumnGlide(),
     byId: (id) => deps.el(id),
     leftById: (id) => deps.leftEl(id),
     inSide: () => deps.inSide(),

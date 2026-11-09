@@ -1,9 +1,10 @@
-// The links between Main's roots and their cards, and the glide to a link's other end (`#261
+// The links between Main's roots and their cards (`#261
 // two-column-connectors`, `#277 thread-card-focus`, `#280 scroll-stability`, `#298 thread-card-header`;
 // `#624 voice-page-modularity`, moved from the legacy script into view/channel). The one owner of what
-// #column-links last drew, the frame asked for to draw it again, the selection the links follow, and the
-// wait before a glide. Which columns show, the selection and the highlighted card, and where the mouse
-// is, are the page's.
+// #column-links last drew and the frame asked for to draw it again. Which columns show, the selection
+// and the highlighted card are the page's. The links are drawn, never ridden: the mouse resting on a
+// link's end used to glide the other column to it, and that is gone (`#1144 scrollback-typing-jump`:
+// mouse movement or hover never scrolls anything).
 //
 // `#261 two-column-connectors`. The owner, 2026-10-12: "In two column view we get a list of threads on
 // the right. The main channel view on the left contains the root message of ALL those threads, but
@@ -24,47 +25,30 @@
 //     of the other column, where an arrowhead points the way to it. Drawn over the others, heavier.
 //   * A HIGHLIGHTED card (`#277 thread-card-focus`) takes the selection's place while it shows: its
 //     link is the one drawn so, whatever the mouse is over, and every other link is grey.
-//   * And if the mouse RESTS on the selected message or card — on the highlighted card, while one is
-//     highlighted — for COLUMN_GLIDE_MS with the other end off screen, the other column scrolls
-//     smoothly until that end is level with it (`glideToCounterpart`) — unless the pointer leaves it,
-//     the selection or the highlight moves or the reader scrolls that column first. Where the reader's
-//     system asks for reduced motion (the stylesheet's `--column-glide`), it jumps instead.
-//   * ONLY A DWELL GLIDES (`#280 scroll-stability`). The owner: "it jumped me to the bottom of the
-//     screen in the main message view (two column mode)... I don't think I touched anything". The
-//     selection outlives the pointer: a mouse crossing the cards on its way to the dock or the top bar
-//     selects each card it passes over and leaves the last one selected, and when the glide waited on
-//     the selection alone, Main slid 3000px 1.5 s after the pointer had gone. So the wait is armed by a
-//     real mouse move over what the glide follows (`pointRow` -> `dwellColumnGlide`, `glideFollows`),
-//     or by a click highlighting a card under the mouse (`toggleLitCard`), dropped when the mouse moves
-//     on from it or leaves the window (`driftFromColumnGlide`, `onPointerLeavePage`), armed again if it
-//     comes back, and runs only if the mouse is still there (`pointerStays`). A selection drawn whole
-//     that the list then moves out from under a pointer standing still has not been left: the pointer
-//     is resting where it chose it. While a card is highlighted, the mouse over any other card or over
-//     Main arms nothing. A selection or a highlight made any other way — ] or [ handing the keys to a
-//     column, j or k, Tab, Enter on a card, a redraw handing it on — never glides: moving the focus
-//     scrolls no list but the one the focus is in, and that only to show it.
+//   * NOTHING HERE SCROLLS (`#1144 scrollback-typing-jump`). The mouse resting on the selected
+//     message or card used to glide the other column until its end was level (the dwell glide of
+//     `#280 scroll-stability`'s long note). The owner, 2026-11-09: simply moving the mouse from one
+//     column to the other made a column jump, repeatably, touching nothing. The rule now: mouse
+//     movement or hover never scrolls anything; only an explicit keyboard selection move may scroll
+//     its row into view, minimally (the keys' own `bringIntoView`). The link still points the way.
 //   * OVER A THREAD ON THE RIGHT (`#298 thread-card-header`), its card is at the top of the column, and
 //     its one link is drawn, from its first message on Main to that card, always as the selection's:
 //     clipped at Main's edge, pointing the way, while the root is above or below what Main shows; to
 //     the line of the collapsed run the root is in; up from Main's top while the root is older than
 //     every row Main has drawn; and not at all where the root is drawn nowhere else — hidden among
 //     Main's rows by a filter — nor for a thread nobody has answered, which has no colour to draw it
-//     in. The mouse resting on the card glides Main to the root, by the rules above, once each time
-//     the thread is opened.
+//     in.
 //
 // WHAT IT COSTS (`#226 page-energy-profile`). Nothing in one column, on a phone, or while the page is
 // hidden. Otherwise one pass per animation frame at most, asked for by a scroll of either column
 // (passive listeners), a resize, a redraw of either list or a new selection: every rectangle it needs
 // is read before anything is written, and only what changed is written, so a frame in which nothing
 // moved writes nothing. Over a thread on the right that pass measures one link, its root's and its
-// card's. Nothing is measured outside that pass but the one read a glide makes when its wait is up.
+// card's.
 
 import { threadOf, timeOf } from "../../core/channels/index.ts";
-import { drawLinkPath, laneOrder, linkAt, linkedRootThread, pointerOn, rowLinkY } from "./links.ts";
+import { drawLinkPath, laneOrder, linkAt, linkedRootThread, rowLinkY } from "./links.ts";
 import { rowMessages, rowShown, shownRowFor } from "./rows.ts";
-
-/** How long a selection stays with its other end off screen before that column scrolls to it, in ms. */
-const COLUMN_GLIDE_MS = 1500;
 
 /** The most room between two lanes in the gap, in px. */
 const LINK_LANE_PX = 7;
@@ -74,16 +58,6 @@ const LINK_HEAD_PX = 7;
 
 /** The radius of the dot where a link leaves its root, in px. */
 const LINK_DOT_PX = 3;
-
-/** How far inside the other column a glide brings the end it goes to, at least, in px. */
-const LINK_GLIDE_MARGIN_PX = 24;
-
-/**
- * How far the mouse may be from where it last moved on the selection a glide waits on, across or down,
- * and still be resting there, in px: a hand on a mouse, or the selection drawn whole and moving out from
- * under a pointer standing still. `#280 scroll-stability`.
- */
-const GLIDE_REST_PX = 8;
 
 /** A column the keys move through, as far as the links read it (the page's `KeyPane`). */
 export interface LinkPane {
@@ -242,12 +216,6 @@ export interface ColumnLinksDependencies {
   cardRow(thread: string): HTMLElement | null;
   /** The thread's colour (`threadHue`). */
   hue(thread: string): number;
-  /** Where the mouse last moved (`InputKinds.mouseAt`, ./input.ts), or null. */
-  mouse(): Point | null;
-  /** Where `row` is drawn from, its head and the date rule over it included (`drawnTop`). */
-  drawnTop(row: HTMLElement): number;
-  /** The room left above a row brought into view (`REPLY_LANDING_GAP_PX`). */
-  landingGap(): number;
 }
 
 /** The links' commands. */
@@ -260,13 +228,7 @@ export interface ColumnLinks {
   draw(): void;
   /** The selection was drawn again: the links follow it. */
   noteSelection(): void;
-  /** A real mouse move over `row` of `pane`, or a click that has just highlighted the card `row` under the mouse. */
-  dwell(pane: LinkPane, row: HTMLElement): void;
-  /** A real mouse move: one that has left what a glide waits on drops the wait. */
-  drift(): void;
-  /** The mouse leaving the window. */
-  pointerLeft(event: { readonly pointerType?: string } | null | undefined): void;
-  /** How a glide moves: "smooth", or "auto" where the stylesheet says so. */
+  /** How a deliberate glide moves: "smooth", or "auto" where the stylesheet says so. */
   glideBehavior(): ScrollBehavior;
 }
 
@@ -478,187 +440,21 @@ export function createColumnLinks(deps: ColumnLinksDependencies): ColumnLinks {
       ? planColumnLinks(measureColumnLinks(pairs), chosenLinkPair(pairs), deps.litCard(), deps.hue) : []);
   }
 
-  /** The selection the links were last told of, as "pane:id", or "". */
-  let linkedSelection = "";
-
   /**
-   * The wait before a glide, while one is armed: the selection it is for, the column and where that column
-   * was, where the mouse last moved on the selection, and the timer.
-   */
-  let columnGlide: { key: string; other: HTMLElement; at: number; rest: Point | null; timer: ReturnType<typeof setTimeout> } | null = null;
-
-  /**
-   * The selection, as "pane:id", whose glide has had its turn — its wait ran out with the mouse still on
-   * it, whatever it then found — so that the mouse resting on it, or moving about inside it, does not arm
-   * it again: once a selection, as before. "" when the selection moves.
-   */
-  let columnGlideSpent = "";
-
-  /**
-   * The selection was drawn again (`drawSelection`): the links follow it, and a selection that is new
-   * drops the wait for the old one, whose other end is no longer the one to bring on screen.
-   *
-   * `#277 thread-card-focus`. While a card is highlighted, it is what the links follow instead, and what
-   * the glide follows (`glideFollows`): its root is the end brought on screen, and the mouse passing over
-   * other cards neither moves the links nor arms a wait.
-   *
-   * It arms none of its own. `#280 scroll-stability`: only the mouse resting on what the glide follows
-   * does (`dwellColumnGlide`, from `pointRow`, and from `toggleLitCard` for a click highlighting the card
-   * under the mouse). A selection or a highlight made any other way — the keys handed to a column by ] or
-   * [, j or k, Tab, Enter on a card, a redraw handing it on because its message went under Hide read or its
-   * card under Unread only — was not followed by the reader's eye to the other column, and that column
-   * moving 1.5 s later was "something updating underneath".
+   * The selection was drawn again (`drawSelection`): the links follow it, drawing the highlighted
+   * card's link heavy while one shows (`#277 thread-card-focus`). Nothing scrolls for it
+   * (`#1144 scrollback-typing-jump`): the mouse resting here used to glide the other column to
+   * the link's far end, so simply crossing between columns moved one of them.
    */
   function noteLinkedSelection(): void {
-    const header = linkedThreadCard();
-    const card = deps.litCard();
-    const pane = deps.activePane();
-    const lit = pane ? pane.lit : null;
-    const key = header !== null ? `header:${header}` : card !== null ? `card:${card}`
-      : pane && lit ? `${pane.name}:${lit.hasAttribute("data-card") ? "card:" : ""}${lit.getAttribute("data-id")}` : "";
-    if (key !== linkedSelection) {
-      linkedSelection = key;
-      columnGlideSpent = "";
-      dropColumnGlide();
-    }
     scheduleColumnLinks();
   }
 
   /**
-   * The thread whose card stands at the top of the right column beside Main, which its link and the glide
-   * follow there whatever is selected (`#298 thread-card-header`); else null.
-   */
-  function linkedThreadCard(): string | null {
-    if (!columnLinksShown() || deps.sideMode() !== "thread") return null;
-    return deps.lookup("side-thread-card").getAttribute("data-thread");
-  }
-
-  /** Drop the wait before a glide, if one is armed. */
-  function dropColumnGlide(): void {
-    if (columnGlide === null) return;
-    clearTimeout(columnGlide.timer);
-    columnGlide = null;
-  }
-
-  /**
-   * What the glide follows, and its column: the card at the top of the right column's thread beside Main
-   * (`#298 thread-card-header`); else the highlighted card while it shows on the right beside Main (`#277
-   * thread-card-focus`), whatever is selected; else the selection drawn. Null with none of them.
-   */
-  function glideFollows(): { pane: LinkPane; row: HTMLElement } | null {
-    // `#298 thread-card-header`. Over a thread on the right, the card at its top.
-    if (linkedThreadCard() !== null) return { pane: deps.sidePane(), row: deps.lookup("side-thread-card") };
-    const card = deps.litCard();
-    if (card !== null) {
-      const row = deps.cardRow(card);
-      return row ? { pane: deps.sidePane(), row } : null;
-    }
-    const pane = deps.activePane();
-    return pane && pane.lit ? { pane, row: pane.lit } : null;
-  }
-
-  /**
-   * A real mouse move over `row` of `pane` (`pointRow`), the selection having followed it there, or a
-   * click that has just highlighted the card `row` under the mouse (`toggleLitCard`): when `row` is what
-   * the glide follows (`glideFollows`) — a root with a card, or a card; the highlighted card while one is
-   * — and no wait is armed for it and its glide has not had its turn, wait COLUMN_GLIDE_MS, noting where
-   * the other column is, which the reader scrolling it in the meantime changes, and where the mouse is.
-   * The mouse arriving on it, or coming back to it after moving on, starts the wait; moving about inside
-   * it only notes where it is. While a card is highlighted, the mouse on any other card, or on Main, arms
-   * nothing.
-   */
-  function dwellColumnGlide(pane: LinkPane, row: HTMLElement): void {
-    const mouseAt = deps.mouse();
-    const here = mouseAt ? { x: mouseAt.x, y: mouseAt.y } : null;
-    const followed = glideFollows();
-    const on = followed !== null && followed.pane === pane && followed.row === row;
-    if (columnGlide !== null) {
-      if (columnGlide.key === linkedSelection && on) columnGlide.rest = here;
-      return;
-    }
-    if (linkedSelection === "" || columnGlideSpent === linkedSelection) return;
-    if (!on || !columnLinksShown()) return;
-    const linked = pane === deps.sidePane() ? row.hasAttribute("data-card") || row === deps.lookup("side-thread-card")
-      : linkedRootThread(row) !== null;
-    if (!linked) return;
-    const other = deps.lookup(pane === deps.sidePane() ? "scroll-area" : "side-scroll");
-    columnGlide = { key: linkedSelection, other, at: other.scrollTop, rest: here,
-      timer: setTimeout(glideToCounterpart, COLUMN_GLIDE_MS) };
-  }
-
-  /**
-   * Whether the mouse stays on what a glide waits on (`glideFollows`): on it, as the browser says by
-   * `:hover`, or within GLIDE_REST_PX of where it last moved on it — a hand resting on the mouse, or the
-   * selection drawn whole (`#257 summary-truncation`), or a card highlighted and shown whole (`#277
-   * thread-card-focus`), and the list moving it out from under a pointer standing still.
-   */
-  function pointerStays(glide: { rest: Point | null }): boolean {
-    const followed = glideFollows();
-    if (pointerOn(followed ? followed.row : null)) return true;
-    const mouseAt = deps.mouse();
-    return glide.rest !== null && mouseAt !== null &&
-      Math.abs(mouseAt.x - glide.rest.x) <= GLIDE_REST_PX && Math.abs(mouseAt.y - glide.rest.y) <= GLIDE_REST_PX;
-  }
-
-  /**
-   * A real mouse move (`onPointerMove`): one that has taken the pointer off the selection a glide waits
-   * on, and away from where it rested there, drops the wait. `#280 scroll-stability`: the mouse crossing
-   * the cards on its way to the dock or the top bar leaves the last one selected, and glides nothing.
-   */
-  function driftFromColumnGlide(): void {
-    if (columnGlide !== null && !pointerStays(columnGlide)) dropColumnGlide();
-  }
-
-  /** The mouse leaving the window, which no move inside it says: the wait before a glide is dropped. */
-  function onPointerLeavePage(event: { readonly pointerType?: string } | null | undefined): void {
-    if (!event || event.pointerType === "mouse") dropColumnGlide();
-  }
-
-  /**
-   * The wait is up: if the selection is the same — the highlighted card, while one is — and the mouse
-   * still rests on it (`pointerStays`), its end on screen and the other end off it, and the reader has not
-   * scrolled the other column since, scroll that column until the other end is level with the selection —
-   * kept inside it — smoothly, or at once where the reader's system asks for less motion.
-   */
-  function glideToCounterpart(): void {
-    const glide = columnGlide;
-    columnGlide = null;
-    if (!glide || glide.key !== linkedSelection || document.hidden || !columnLinksShown()) return;
-    const pairs = columnLinkPairs();
-    const chosen = chosenLinkPair(pairs);
-    // A root Main has not drawn has no place to be brought to. `#298 thread-card-header`.
-    if (!chosen || !chosen.row) return;
-    // `#280 scroll-stability`. Only a dwell: a mouse that has moved on glides nothing, and coming back to
-    // the selection waits again.
-    if (!pointerStays(glide)) return;
-    columnGlideSpent = glide.key;
-    if (Math.abs(glide.other.scrollTop - glide.at) > 1) return;
-    const measured = measureColumnLinks([chosen]);
-    const end = measured.ends[0] as MeasuredLinks["ends"][number];
-    const onMain = glide.other === deps.lookup("side-scroll");
-    const [own, far, ownSeen, farSeen] = onMain
-      ? [end.from, end.to, end.fromSeen, end.toSeen] : [end.to, end.from, end.toSeen, end.fromSeen];
-    if (!ownSeen || farSeen) return;
-    const span = onMain ? measured.right : measured.left;
-    let level = Math.max(span.top + LINK_GLIDE_MARGIN_PX, Math.min(span.bottom - LINK_GLIDE_MARGIN_PX, own.y));
-    // A root brought to Main is brought whole, its head and the date rule over it included, not only the
-    // point its link leaves from: `#324 live-pill-covers-row` moved Main's top edge down to the floating
-    // line's foot, and a card heading the right column put the root's head above it, cut off.
-    if (!onMain) {
-      const head = deps.drawnTop(chosen.row) + level - far.y;
-      const lowest = span.bottom - LINK_GLIDE_MARGIN_PX;
-      if (head < span.top + deps.landingGap()) level = Math.min(lowest, level + span.top + deps.landingGap() - head);
-    }
-    const top = glide.other.scrollTop + far.y - level;
-    const behavior = glideBehavior();
-    if (typeof glide.other.scrollTo === "function") glide.other.scrollTo({ top, behavior });
-    else glide.other.scrollTop = top;
-  }
-
-  /**
-   * How a glide moves: "smooth", or "auto" — at once — where the stylesheet says so, which it does for a
-   * reader whose system asks for reduced motion (`--column-glide` on #screen-main). The stylesheet's to
-   * say, as everything about the layout is: the script never asks a media query itself.
+   * How a deliberate glide moves (a jump the reader asked for, never the links'): "smooth", or
+   * "auto" — at once — where the stylesheet says so, which it does for a reader whose system asks
+   * for reduced motion (`--column-glide` on #screen-main). The stylesheet's to say, as everything
+   * about the layout is: the script never asks a media query itself.
    */
   function glideBehavior(): ScrollBehavior {
     const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(deps.lookup("screen-main")) : null;
@@ -670,12 +466,9 @@ export function createColumnLinks(deps: ColumnLinksDependencies): ColumnLinks {
     schedule: scheduleColumnLinks,
     draw: drawColumnLinks,
     noteSelection: noteLinkedSelection,
-    dwell: dwellColumnGlide,
-    drift: driftFromColumnGlide,
-    pointerLeft: onPointerLeavePage,
     glideBehavior,
   };
 }
 
 // What the page and the tests use of it.
-export { COLUMN_GLIDE_MS, GLIDE_REST_PX, LINK_DOT_PX, LINK_GLIDE_MARGIN_PX, LINK_HEAD_PX, LINK_LANE_PX, planColumnLinks };
+export { LINK_DOT_PX, LINK_HEAD_PX, LINK_LANE_PX, planColumnLinks };

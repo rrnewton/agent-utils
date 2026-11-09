@@ -3534,8 +3534,6 @@ test("`#281 view-keys` x `#280 scroll-stability`: Ctrl+1 to Ctrl+4 show each vie
     const settled = async () => {
       for (const box of [main, side, ...main.children, ...side.children]) page.resized(box);
       page.expireTimers(0);
-      // The glide's wait, were anything waiting: a view key arms none.
-      page.expireTimers(sourceConstant("COLUMN_GLIDE_MS"));
       await page.settle();
     };
     const key = async (digit) => {

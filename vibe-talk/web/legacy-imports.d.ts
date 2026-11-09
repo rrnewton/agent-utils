@@ -269,7 +269,6 @@ declare const keepsOwnKeys: LegacyImports["keepsOwnKeys"];
 declare const pressedBySpace: LegacyImports["pressedBySpace"];
 declare const scrollsItself: LegacyImports["scrollsItself"];
 declare const quoteBlock: LegacyImports["quoteBlock"];
-declare const pointerOn: LegacyImports["pointerOn"];
 declare const countOf: LegacyImports["countOf"];
 declare const fromGatheredThread: LegacyImports["fromGatheredThread"];
 declare const quoteLabelFits: LegacyImports["quoteLabelFits"];

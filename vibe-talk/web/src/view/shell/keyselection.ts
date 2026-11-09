@@ -382,8 +382,8 @@ export function createKeySelection<Pane extends KeyPane>(deps: KeySelectionDepen
         if (had || (lost && pane === active)) row.focus({ preventScroll: true });
       }
       // The new row of the selected message is lit, the old one having gone with the redraw. A selection
-      // handed on here was nobody's choice, and glides nothing: only the pointer resting on a selection arms
-      // a glide (`dwellColumnGlide`). `#280 scroll-stability`.
+      // handed on here was nobody's choice, and scrolls nothing (`#1144`: only an explicit keyboard
+      // selection move scrolls, minimally, through `bringIntoView`).
       drawSelection();
     },
   };

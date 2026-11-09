@@ -1191,14 +1191,14 @@ steps:
   # it was in and two again when widened, real keys (] Esc j -> [) move between the columns and through
   # the cards, and a phone's width draws neither the button nor the column. `#261 two-column-connectors`:
   # the links from Main's roots to their cards drawn for exactly the pairs on screen, touching their
-  # boxes in their colours, the selected card's link pointing off screen, Main's 1.5 s glide to its
-  # root (smooth, cancelled by the reader's scroll, one step under reduced motion). `#262
-  # search-load-older`: a search reads no older page by itself, and its bounded walk back — Enter in two
-  # columns at 1280x800, a tap on a 412x915 phone — finds older matches under a step back that holds
-  # still. Measured on 2026-10-13: about 22s wall, most of it the glides' waits.
+  # boxes in their colours, the selected card's link pointing off screen, and a mouse resting on it
+  # scrolling nothing (`#1144 scrollback-typing-jump`). `#262 search-load-older`: a search reads no
+  # older page by itself, and its bounded walk back — Enter in two columns at 1280x800, a tap on a
+  # 412x915 phone — finds older matches under a step back that holds still. Measured on 2026-10-13:
+  # about 22s wall.
   - group: check
     job: two-column-browser
-    desc: Main and a thread side by side, cards, selection, independent scrolling, the narrow fallback, the links between roots and cards with their glide, and the search's walk back to older matches, in current Chromium at 1440x900 and 1280x800, and the walk on a 412x915 phone
+    desc: Main and a thread side by side, cards, selection, independent scrolling, the narrow fallback, the links between roots and cards, and the search's walk back to older matches, in current Chromium at 1440x900 and 1280x800, and the walk on a 412x915 phone
     labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/two_column_browser.py
     jobs_flag: ""
@@ -1405,20 +1405,20 @@ steps:
   # edged, ringed and tinted in the thread's colour by computed colour and by pixels; one line, the
   # selection's, from the root's right edge level with its Thread(N) to the card's left edge, in its
   # colour; the card unmoved as the thread scrolls; the root above Main, the line clipped at Main's top;
-  # the mouse crossing the card moving nothing for 2.5 s and resting on it gliding Main to the root; a long
+  # the mouse crossing the card or resting on it moving nothing for 2.5 s (`#1144 scrollback-typing-jump`); a long
   # question's card three lines and the same height, opened over the list with the list unmoved to the
   # pixel, Esc closing it and then the thread. Part 2: the card moving up, watched every frame from
   # before the press — first drawn on its card, then only upward through several places, the thread
   # fading in under it, the line following it and the thread's scroll position fixed; real Ctrl+3 and a
   # card's replies button: the same card heading the thread across the window, fixed while it scrolls,
   # the X, Esc and <- back to the list; nothing moving under reduced motion; and on a 412x915 phone by
-  # touch, two lines and a 44px X. Measured on 2026-10-14: about 30s wall, most of it the glide's waits.
+  # touch, two lines and a 44px X. Measured on 2026-10-14: about 30s wall.
   # `#284 redraw-keeps-pane`: and a redraw of Main, the channel's re-read brought forward on the page's
   # clock, leaving the keys in the right column, after its replies button and with the focus lost to the
   # body, so a real Esc still closes its thread.
   - group: check
     job: thread-card-header-browser
-    desc: a thread under its card at the top — on the right, joined to its root by one line a resting mouse glides Main along, and across the window from the thread list — the card moving up from its place in the list, a redraw of Main leaving the keys on the right, in current Chromium at 1280x800 in both schemes and with reduced motion, and at 412x915 by touch
+    desc: a thread under its card at the top — on the right, joined to its root by one line, a resting mouse scrolling nothing, and across the window from the thread list — the card moving up from its place in the list, a redraw of Main leaving the keys on the right, in current Chromium at 1280x800 in both schemes and with reduced motion, and at 412x915 by touch
     labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/thread_card_header_browser.py
     jobs_flag: ""
@@ -1565,9 +1565,9 @@ steps:
   # within a pixel while a message and a reply arrive live, a refresh redraws the list with a message
   # above grown, a read sent while the reader was on the newest line lands after they scrolled up (the
   # owner's jump to the bottom), summaries arrive, and the focus moves (the mouse, ] [ Tab, a card opening
-  # its thread); at the desk, sampled at every frame for 2.5 s, past the 1.5 s wait before the glide
-  # between the columns, the mouse crossing the cards to the dock and to the top bar with nothing pressed,
-  # and ] on its own, move nothing; a reader on the newest line follows a live message to the foot; the
+  # its thread); at the desk, sampled at every frame for 2.5 s, the mouse crossing the cards to the dock
+  # and to the top bar with nothing pressed, and ] on its own, move nothing — mouse movement or hover
+  # never scrolls (`#1144 scrollback-typing-jump`); a reader on the newest line follows a live message to the foot; the
   # list of threads opens at its foot and stays there under the mouse and a moved thread; a thread with
   # nothing unread, and one whose newest reply alone is unread, open at their foot, and older replies
   # coming in keep the row at the head; after a reload the read behind the saved rows leaves the
@@ -1575,8 +1575,9 @@ steps:
   # nothing moves it for 2.5 s after, the thread list opening at its foot from two columns, Main and All,
   # Main coming back from it where the reader left it, a thread opened from it opening at its foot, and a
   # reload in it opening it at its foot with the desk's dock on two rows; and, last, a card highlighted by
-  # a click with the mouse going on over another card to the dock moves nothing, while the mouse resting
-  # on it glides its root on screen (`#277 thread-card-focus`). Measured on 2026-10-13: about 110s wall,
+  # a click (`#277 thread-card-focus`) with the mouse going on over another card to the dock moves
+  # nothing, and the mouse resting on it scrolls nothing either (`#1144 scrollback-typing-jump`).
+  # Measured on 2026-10-13: about 110s wall,
   # most of it the 2.5 s holds, and about 10s CPU. `#612 view-stability`: then, on fresh pages at 393x852 and
   # 1280x800, the thread list halfway up holds the card being read, at every frame, while replies move the
   # card above the screen, the card half off its top, one mid-screen and one below it to the foot. Measured
@@ -2027,6 +2028,27 @@ steps:
   # the reader at the foot; a reply mid-list stays whole above the keys and its message does not move as
   # they go; Read on leaves one slim Stop that a tap really stops. At 1280x800 with a mouse, a shorter
   # window with the box focused keeps both bars. Measured on 2026-10-22: about 8s wall.
+  # `#1144 scrollback-typing-jump` in the browser engine, at 412x915 and 360x800 by touch (the keyboard
+  # the viewport 336px shorter) and 1280x800: typing at the foot follows an arrival, the strip's resizes
+  # and a row grown 180px late with the whole composer on screen; reading scrollback mid-draft holds its
+  # anchor across arrivals and resizes and typing again lands whole; on the desktop the same without a
+  # keyboard, unfocused keys navigating; and hover crossings and rests between the two columns scroll
+  # neither. Measured on 2026-11-09: about 25s wall.
+  - group: check
+    job: typing-scroll-browser
+    desc: typing at the foot keeps the whole composer in view across arrivals, keyboard resizes and late row growth, reading scrollback holds, and hover scrolls neither column, in current Chromium at 412x915, 360x800 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/typing_scroll_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 25
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   - group: check
     job: keyboard-hides-bar-browser
     desc: both bars away while the on-screen keyboard is up and back as it goes or the box loses the focus, the reader's place kept and a slim Stop while reading, in current Chromium at 393x852 by touch and 1280x800

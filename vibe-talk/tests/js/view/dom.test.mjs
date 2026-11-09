@@ -1598,8 +1598,6 @@ test("`#624 voice-page-modularity`: the mouse and the keys move one selection, t
     rowShown: (row) => !row.hidden,
     markOf: (pane) => state.marks.get(pane) || null,
     markNames: (mark, row) => Boolean(mark) && mark.id === row.id,
-    dwellColumnGlide: (pane, row) => log.push(`dwell ${pane.name} ${row.id}`),
-    driftFromColumnGlide: () => log.push("drift"),
     byId: (id) => ids[id],
     leftById: (id) => ids[id],
     inSide: () => state.side,
@@ -1639,27 +1637,27 @@ test("`#624 voice-page-modularity`: the mouse and the keys move one selection, t
     state.screen = "main";
     globalThis.document.activeElement = channel.scroller();
     // The mouse moving over a row takes it, with the focus; held still, dragging, or over a menu, it takes nothing.
-    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: one })), ["mouse", "drift", "take channel 1 true", "dwell channel 1"]);
+    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: one })), ["mouse", "take channel 1 true"], "hover selected the row and scrolled nothing (#1144)");
     channel.lit = one;
-    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: node("text", one) })), ["mouse", "drift", "take channel 1 true", "dwell channel 1"],
+    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: node("text", one) })), ["mouse", "take channel 1 true"],
       "a move within the lit row did not hand it the focus it was to follow");
     globalThis.document.activeElement = button(true);
-    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: one })), ["mouse", "drift", "dwell channel 1"], "a move within the lit row asked again");
+    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: one })), ["mouse"], "a move within the lit row asked again");
     globalThis.document.activeElement = channel.scroller();
     channel.lit = null;
     state.moved = false;
     assert.deepStrictEqual(run(() => selection.onPointerMove({ target: one })), [], "a list scrolled under a still pointer was taken as a move");
     state.moved = true;
-    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: one, buttons: 1 })), ["mouse", "drift"], "a drag chose a message");
+    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: one, buttons: 1 })), ["mouse"], "a drag chose a message");
     state.menu = true;
-    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: one })), ["mouse", "drift"], "a move took the selection from an open menu, or began a glide under it");
+    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: one })), ["mouse"], "a move took the selection from an open menu");
     state.menu = false;
-    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: node("in-header", header) })), ["mouse", "drift", "dwell side side-thread-card"]);
+    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: node("in-header", header) })), ["mouse"], "resting on the thread card scrolled Main to its root (#1144)");
     two.hidden = true;
-    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: two })), ["mouse", "drift"], "a hidden row was selected");
+    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: two })), ["mouse"], "a hidden row was selected");
     two.hidden = false;
     state.screen = "settings";
-    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: one })), ["mouse", "drift"], "a move off the main screen selected");
+    assert.deepStrictEqual(run(() => selection.onPointerMove({ target: one })), ["mouse"], "a move off the main screen selected");
     state.screen = "main";
     // A press says the pointer's kind, and one in a list or the transcript is the reader acting there.
     assert.deepStrictEqual(run(() => selection.onPointerDown({ pointerType: "mouse", target: sideRow })), ["mouse", "in side", "acted"]);
@@ -2331,13 +2329,12 @@ test("`#624 voice-page-modularity`: the page's last document listeners are mount
   globalThis.document = target("document");
   try {
     const mounted = mountDocumentListeners({
-      root: () => target("root"),
-      onVisibility: act("visibility"), closeRowMenuOutside: act("menu"), onPointerLeavePage: act("leave"),
+      onVisibility: act("visibility"), closeRowMenuOutside: act("menu"),
     });
-    assert.deepStrictEqual(log, ["listen document visibilitychange", "listen document pointerdown", "listen root pointerleave"]);
+    assert.deepStrictEqual(log, ["listen document visibilitychange", "listen document pointerdown"]);
     log.length = 0;
-    fire("document", "visibilitychange"); fire("document", "pointerdown"); fire("root", "pointerleave");
-    assert.deepStrictEqual(log, ["visibility 1", "menu 1", "leave 1"]);
+    fire("document", "visibilitychange"); fire("document", "pointerdown");
+    assert.deepStrictEqual(log, ["visibility 1", "menu 1"]);
     mounted.unmount();
     assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
   } finally {

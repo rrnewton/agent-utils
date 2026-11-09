@@ -27,8 +27,9 @@ which must not move it by more than a pixel:
   -> the focus moved: at the desk the mouse over Main's rows, ] and [ between the columns, Tab and
   Shift+Tab, each held 2.5 s, and a card's replies button clicked, its thread opening on the right (a
   click on the card itself only highlights it, `#277 thread-card-focus`); on the phone Tab and
-  Shift+Tab -> at the desk, sampled at every frame for 2.5 s, longer than the 1.5 s wait before the glide
-  between the columns (`#261 two-column-connectors`), with Main scrolled so the card's root is a screen
+  Shift+Tab -> at the desk, sampled at every frame for 2.5 s with the mouse resting or crossing and
+  nothing pressed (`#1144 scrollback-typing-jump`: mouse movement or hover never scrolls; the links
+  of `#261 two-column-connectors` are drawn, not ridden), with Main scrolled so the card's root is a screen
   off it: THE OWNER'S 19:08, the mouse crossing the cards with nothing pressed on its way to the dock and
   resting there, the last card it passed left selected; the same up to the top bar; and [ then ] on its
   own, handing the keys to the right column onto a card on screen whose root is off Main's screen.
@@ -57,7 +58,7 @@ and then, at each size:
 
 and last, at the desk, sampled at every frame for 2.5 s: a card highlighted by a click, whose root is a
 screen off Main, and the mouse going on over another card to the dock leaves Main still; coming back to
-rest on the highlighted card, the card the glide follows, brings its root on screen.
+rest on the highlighted card itself also leaves Main still, its root still off screen.
 
 and then, `#612 view-stability`, on a fresh page with eight more threads, at 393x852 by touch and at 1280x800: the
 thread list halfway up, and a reply arriving in another thread, moving its card to the foot -- the card just
@@ -123,9 +124,10 @@ FLAT_PAGE = 60
 STILL_PX = 1.0
 # The most the fake server holds a thread's older page for the check (#998); it bounds only a failure.
 HOLD_LIMIT_S = 30.0
-# How long a step that could start the page's glide between the columns (`#261 two-column-connectors`,
-# COLUMN_GLIDE_MS = 1500 in web/src/view/channel/columnlinks.ts) is held before it is judged: longer than that wait, with room.
-GLIDE_HOLD_MS = 2500
+# How long a step is held, the mouse resting or the keys handed over, before it is judged still, in
+# ms: longer than the 1.5 s dwell the page used to wait before scrolling a column for a resting mouse,
+# which `#1144 scrollback-typing-jump` deleted, with room.
+REST_HOLD_MS = 2500
 
 # The first row of a list whose foot is below the top of its scroller: the row the reader is on.
 FIRST_ROW_JS = """(list) => {
@@ -582,7 +584,7 @@ class Reader:
         """Start sampling the first row on screen of `list_id` (Main's by default) and its offset at every frame."""
         self.page.evaluate(WATCH_JS, list_id)
 
-    def held(self, before: tuple[str, float], why: str, hold_ms: int = GLIDE_HOLD_MS,
+    def held(self, before: tuple[str, float], why: str, hold_ms: int = REST_HOLD_MS,
              list_id: str = "discord-log", foot: bool = False) -> None:
         """Wait `hold_ms`, then: at every frame since `watch`, the row the reader was on was the first on
         screen of `list_id`, within a pixel of where it was -- and with `foot`, the list was at its foot.
@@ -653,7 +655,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             open_main(reader)
             main_walk(reader)
             if not touch:
-                glide_walk(reader)
+                crossing_walk(reader)
             follow_walk(reader)
             if not touch:
                 cards_walk(reader)
@@ -804,7 +806,7 @@ def main_walk(reader: Reader) -> None:
     for key in ("]", "[", "Tab", "Shift+Tab"):
         reader.watch()
         page.keyboard.press(key)
-        reader.held(before, f"{key}, held {GLIDE_HOLD_MS}ms")
+        reader.held(before, f"{key}, held {REST_HOLD_MS}ms")
     # The card's own replies button is the way into its thread (`#277 thread-card-focus`): a click on the
     # card itself only highlights it.
     card = page.locator(f"#side-cards > li[data-id='spaces/A/threads/t{SMALL_ROOTS[2]}'] .side-card-open")
@@ -828,8 +830,8 @@ def side_to_foot(reader: Reader) -> None:
 
 def cross_card(reader: Reader, thread_id: str, start: tuple[float, float], end: tuple[float, float], why: str) -> None:
     """The mouse from `start` in Main across the right column to `thread_id`'s card and on to `end`, which is no
-    card; nothing pressed. Main, scrolled with that card's root a screen off it, holds still for the glide's
-    wait and more, though the card stays selected."""
+    card; nothing pressed. Main, scrolled with that card's root a screen off it, holds still for the
+    rest hold and more, though the card stays selected."""
     page = reader.page
     root = root_of(thread_id)
     page.mouse.move(*start)
@@ -844,15 +846,16 @@ def cross_card(reader: Reader, thread_id: str, start: tuple[float, float], end: 
     page.mouse.move(*end, steps=4)
     reader.held(before, why)
     # It proves something only with the card the pointer passed over left selected, its root off Main's
-    # screen: before the fix, the glide brought that root on screen 1.5 s after the pointer had gone.
+    # screen: before, that root was brought on screen 1.5 s after the pointer had gone.
     lit = page.evaluate(LIT_CARD_JS)
     reader.check(lit == thread_id, f"{why}: the card left selected is {lit}, not {thread_id}, so this proves less")
     reader.check(bool(page.evaluate(ROW_AWAY_JS, root)), f"{why}: the card's root came on screen")
 
 
-def glide_walk(reader: Reader) -> None:
+def crossing_walk(reader: Reader) -> None:
     """At the desk: the mouse crossing the cards with nothing pressed, and ] handing the keys to the right column,
-    each held past the 1.5 s glide between the columns (`#261 two-column-connectors`), never move Main."""
+    each held for the rest hold, never move Main (`#1144 scrollback-typing-jump`: mouse movement or
+    hover never scrolls; the links of `#261 two-column-connectors` are drawn, not ridden)."""
     page = reader.page
     reader.wait_for("() => !document.getElementById('side-list').hidden", "the right column is not its cards")
     size = page.viewport_size
@@ -866,7 +869,7 @@ def glide_walk(reader: Reader) -> None:
     side_to_foot(reader)
     cross_card(reader, cards[-1], (300, 300), (width - 180, height - 5),
                "the mouse crossing the cards to the dock, nothing pressed, then resting there")
-    reader.notes.append(f"the mouse crossing the cards to the dock and resting there {GLIDE_HOLD_MS}ms left Main still")
+    reader.notes.append(f"the mouse crossing the cards to the dock and resting there {REST_HOLD_MS}ms left Main still")
 
     # Up across them to the top bar, the last card passed the first, the list scrolled to its head.
     page.evaluate("() => { document.getElementById('side-scroll').scrollTop = 0; }")
@@ -885,32 +888,33 @@ def glide_walk(reader: Reader) -> None:
     page.mouse.move(float(card["x"]), float(card["y"]), steps=2)
     page.mouse.move(5, height - 5)
     reader.check(page.evaluate(LIT_CARD_JS) == cards[-1], "the mouse did not leave the last card selected")
-    reader.quiet(GLIDE_HOLD_MS)
+    reader.quiet(REST_HOLD_MS)
     page.evaluate(ROOT_AWAY_JS, root_of(cards[-1]))
     reader.quiet(250)
     before = reader.first()
     reader.watch()
     page.keyboard.press("[")
-    reader.held(before, f"[ to Main, held {GLIDE_HOLD_MS}ms")
+    reader.held(before, f"[ to Main, held {REST_HOLD_MS}ms")
     side_to_foot(reader)
     before = reader.first()
     reader.watch()
     page.keyboard.press("]")
-    reader.held(before, f"] to the right column on its own, held {GLIDE_HOLD_MS}ms")
+    reader.held(before, f"] to the right column on its own, held {REST_HOLD_MS}ms")
     lit = page.evaluate(LIT_CARD_JS)
     reader.check(lit == cards[-1], f"] lit {lit}, not {cards[-1]}, so this proves less")
     reader.check(bool(page.evaluate(ROW_AWAY_JS, root_of(cards[-1]))), "] brought the card's root on screen")
-    reader.notes.append(f"[ and then ] onto a card whose root is off screen, each held {GLIDE_HOLD_MS}ms, left Main still")
+    reader.notes.append(f"[ and then ] onto a card whose root is off screen, each held {REST_HOLD_MS}ms, left Main still")
     page.keyboard.press("[")
     side_to_foot(reader)
     reader.quiet(300)
 
 
 def highlight_walk(reader: Reader) -> None:
-    """At the desk, last: a card highlighted by a click (`#277 thread-card-focus`) is what the glide follows,
-    and still only while the mouse rests on it. The mouse going on over another card to the dock leaves Main
-    still, and coming back to rest on the highlighted card brings its root on screen. Last, because the
-    clicks leave the focus on a card and Main glided, which the walks before it do not expect."""
+    """At the desk, last: a card highlighted by a click (`#277 thread-card-focus`) is the card the links
+    draw heavy for, and the mouse resting on it scrolls nothing (`#1144 scrollback-typing-jump`). The
+    mouse going on over another card to the dock leaves Main still, and coming back to rest on the
+    highlighted card itself also leaves Main still, its root still off screen. Last, because the
+    clicks leave the focus on a card, which the walks before it do not expect."""
     page = reader.page
     reader.wait_for("() => !document.getElementById('side-list').hidden"
                     " && document.querySelectorAll('#side-cards > li[data-id]').length >= 2",
@@ -945,15 +949,17 @@ def highlight_walk(reader: Reader) -> None:
     reader.held(before, "a card highlighted by a click, the mouse going on over another card to the dock")
     reader.check(bool(page.evaluate(ROW_AWAY_JS, root_of(lit_id))), "the highlighted card's root came on screen")
     reader.notes.append(f"a card highlighted by a click, the mouse going on over another card to the dock, "
-                        f"held {GLIDE_HOLD_MS}ms, left Main still")
-    # THE CONTROL: the mouse resting on the highlighted card glides its root on screen, so the case is one that can.
+                        f"held {REST_HOLD_MS}ms, left Main still")
+    # Resting on the highlighted card itself also moves nothing: its root stays off Main's screen.
     card = page.evaluate(CARD_AT_JS, lit_id)
     assert isinstance(card, dict)
+    before = reader.first()
+    reader.watch()
     page.mouse.move(float(card["x"]), float(card["y"]), steps=4)
-    reader.quiet(GLIDE_HOLD_MS)
-    reader.check(not page.evaluate(ROW_AWAY_JS, root_of(lit_id)), "the mouse resting on the highlighted card did not "
-                 "bring its root on screen, so the step above proves nothing")
-    reader.notes.append("resting on the highlighted card brought its root on screen")
+    reader.held(before, "the mouse resting on the highlighted card")
+    reader.check(bool(page.evaluate(ROW_AWAY_JS, root_of(lit_id))),
+                 "the mouse resting on the highlighted card brought its root on screen")
+    reader.notes.append("resting on the highlighted card also left Main still, its root still off screen")
     # Put out again, the same card pressed.
     page.mouse.down()
     page.mouse.up()
@@ -1108,8 +1114,8 @@ def view_key(reader: Reader, digit: int, view: str, layout: str | None) -> None:
 
 
 def list_at_foot(reader: Reader, why: str) -> None:
-    """The thread list on screen at its foot, where it opens, and held there and still for the glide's wait
-    and more: from when the reads its opening sent have landed and been drawn (`READS_JS`)."""
+    """The thread list on screen at its foot, where it opens, and held there and still for the rest
+    hold: from when the reads its opening sent have landed and been drawn (`READS_JS`)."""
     reader.frames(2)
     reader.wait_for("() => window.__timelineReads === 0", f"{why}: the thread list's read never came back")
     reader.frames(2)
@@ -1121,7 +1127,7 @@ def list_at_foot(reader: Reader, why: str) -> None:
 
 
 def main_held(reader: Reader, why: str) -> None:
-    """Main as the view key left it, and nothing moving it after, for the glide's wait and more."""
+    """Main as the view key left it, and nothing moving it after, for the rest hold."""
     before = reader.first()
     reader.watch()
     reader.held(before, why)
@@ -1159,8 +1165,8 @@ def reload_in_thread_list(reader: Reader) -> None:
 
 def view_keys_walk(reader: Reader) -> None:
     """`#281 view-keys` x `#280 scroll-stability`: the view keys show each view at once where it is to be read
-    -- at its newest, or where the reader left it -- and nothing moves it after, for the glide's wait and
-    more; the thread list opens at its foot. Main left at one width -- one column, and behind the thread
+    -- at its newest, or where the reader left it -- and nothing moves it after, for the rest hold;
+    the thread list opens at its foot. Main left at one width -- one column, and behind the thread
     list, which is one column too -- comes back exactly where it was."""
     page = reader.page
     size = page.viewport_size
@@ -1192,7 +1198,7 @@ def view_keys_walk(reader: Reader) -> None:
     reader.still(kept, f"{key}+1 back from the thread list")
     reader.watch()
     reader.held(kept, f"{key}+1 back from the thread list")
-    reader.notes.append(f"{key}+3 opened the thread list at its foot and held it {GLIDE_HOLD_MS}ms; {key}+1 came "
+    reader.notes.append(f"{key}+3 opened the thread list at its foot and held it {REST_HOLD_MS}ms; {key}+1 came "
                         "back to Main where the reader had left it, and held it")
     view_key(reader, 2, "flat", None)
     main_held(reader, f"{key}+2 from Main")

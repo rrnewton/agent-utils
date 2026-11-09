@@ -5860,10 +5860,6 @@ const TUNING_BANDS = {
     "a second tap a moment late lands in the message box that sprang back up under it and opens the " +
     "phone's keyboard; past two, a box the owner wants to type in stays a single line for no reason"],
   // `#261 two-column-connectors`. The links between Main's roots and their cards.
-  COLUMN_GLIDE_MS: [800, 3000,
-    "how long a selection waits with its link's other end off screen before that column scrolls to " +
-    "it (the owner: 'after say a 1.5 second delay'). Under a second the other column moves under a " +
-    "reader still moving the mouse down the rows; past three the reader has scrolled it themselves"],
   LINK_LANE_PX: [3, 12,
     "the most room between two links' lanes in the gap between the columns. Under three, two lanes " +
     "read as one thick line; past twelve, a few links spread wider than the gap and over the cards"],
@@ -5876,16 +5872,6 @@ const TUNING_BANDS = {
   LINK_ROW_INSET_PX: [8, 40,
     "how far below a root's top its link leaves where the row draws no tag. Under eight it leaves " +
     "along the box's rounded corner; past forty it leaves below a one-line message"],
-  LINK_GLIDE_MARGIN_PX: [8, 80,
-    "how far inside a column a glide brings the end it goes to, at least. Under eight the end lands " +
-    "under the column's edge, as if still off screen; past eighty a selection near the edge has its " +
-    "counterpart brought well away from level with it"],
-  // `#280 scroll-stability`. Only a mouse resting on the selection glides the other column.
-  GLIDE_REST_PX: [4, 24,
-    "how far the mouse may drift from where it last moved on the selection and still be resting there. " +
-    "Under four, a hand on the mouse settling, or a pointer standing still as the card drawn whole moves " +
-    "from under it, drops the glide the reader waits for; past twenty-four, a mouse that crossed a card " +
-    "and stopped in the gap beside it counts as resting on it, and Main moves after the pointer has gone"],
   // `#338 column-overscroll`. The room past the right column's foot.
   OVERSCROLL_REST_MS: [80, 400,
     "how long the wheel rests at the right column's foot before a turn of it goes on past the foot. " +

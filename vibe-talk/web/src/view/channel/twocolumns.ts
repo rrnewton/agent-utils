@@ -983,8 +983,8 @@ export function createTwoColumns(deps: TwoColumnsDependencies): TwoColumns {
     renderSideColumn();
     // `#419 threads-view-main-messages`. The main channel's box at the foot of the cards, or back in its place.
     deps.placeMainCard();
-    // What the links join, and what the glide follows, is the card at the top over a thread and the
-    // cards in the list otherwise: a change of what the column shows is a new selection for both.
+    // What the links join is the card at the top over a thread and the cards in the list otherwise:
+    // a change of what the column shows is a new selection for them.
     deps.noteLinkedSelection();
     // `#304 back-gesture-in-app`. A thread on the right is a level; the cards are not.
     deps.scheduleBackSync();

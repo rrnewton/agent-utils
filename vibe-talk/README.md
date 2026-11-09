@@ -8057,19 +8057,13 @@ scrolled up while it was out was thrown back to the bottom. The rules, in both c
   that message is taller than the screen, when its head shows); one with older unread messages still
   opens on the first of them (`#221 read-modes`). The list of threads opens at its foot and stays there.
 - **Moving the focus never scrolls a list** unless what takes it is off screen, and then the least that
-  shows it. ] and [, j and k, and Tab glide nothing in the other column.
-- **The other column glides to a selection's counterpart (`#261 two-column-connectors`) only when the
-  mouse rests on it.** The selection outlives the pointer: a mouse crossing the cards on its way to the
-  dock or the top bar leaves the last card it passed selected, and Main used to slide thousands of
-  pixels to that card's root 1.5 s after the pointer had gone — the owner's jump in two columns with
-  nothing touched. The wait starts when a real mouse move lands on the selection, ends when the mouse
-  moves on from it or leaves the window, starts again if it comes back, and glides only if the mouse
-  is still there: on it, or within 8px of where it last moved on it, which a card drawn whole moving
-  out from under a still pointer does not count as leaving. A selection a redraw hands on never glides.
-  While a card is highlighted (`#277 thread-card-focus`), the glide follows it instead of the
-  selection: the click that highlighted it, or the mouse coming to rest on it, starts the wait for its
-  root, and the mouse over any other card, or over Main, starts none. Enter highlighting a card glides
-  nothing, as no key does.
+  shows it. ] and [, j and k, and Tab scroll nothing in the other column.
+- **Mouse movement or hover never scrolls anything (`#1144 scrollback-typing-jump`).** The mouse resting
+  on a selected message or card used to glide the other column to its counterpart after 1.5 s (`#261
+  two-column-connectors`), on the highlighted card while one showed (`#277 thread-card-focus`). The
+  selection outlives the pointer, so simply crossing between columns moved one of them with nothing
+  touched. The links are still drawn and still point the way; only an explicit keyboard selection move
+  may scroll its row into view, minimally.
 - **A view key shows the view where it is read, and nothing moves it after** (`#281 view-keys`). Ctrl+3
   (Cmd+3 on a Mac) opens the thread list at its foot, as two columns open their cards; Ctrl+1 back to Main
   finds the reader where they left it, since Main stays laid out behind the list; Esc or Ctrl+2 back to
@@ -10062,12 +10056,8 @@ the card's edge's), out of the root's right edge level with its tag, through a l
 gap between the columns, into the card's left edge, drawn while both ends are on screen. The
 selected message or card draws its link even with the other end off screen, clipped at the columns'
 edge with an arrowhead pointing up or down to it (the highlighted card's, while one is highlighted,
-whatever is selected), and if the mouse rests 1.5 s on the selection — on the highlighted card, while
-one is highlighted, which a click on it starts — the other column glides that end level with it —
-cancelled if the mouse moves on, the selection or the highlight moves or the reader scrolls that column
-first; the mouse crossing other cards, and a selection or a highlight the keys or a redraw made, never
-glide (`#280 scroll-stability`) — and a jump instead of a glide where the reader asks for reduced motion (the stylesheet's
-`--column-glide`; the script asks no media query). The links are one SVG drawn at most once per
+whatever is selected). Mouse movement or hover never scrolls anything (`#1144 scrollback-typing-jump`);
+the link points the way. The links are one SVG drawn at most once per
 animation frame, from passive scroll listeners, resizes and redraws, every rectangle read before
 anything is written and only what changed written; nothing is drawn or measured in one column, on a
 phone, or while the page is hidden (`#226 page-energy-profile`), and over a thread only its one link.
@@ -10075,7 +10065,7 @@ A thread on the right opens under its own card at the top of the column (`#298 t
 the card's words, age, counts and colour, a fixed height outside the scroller so nothing it says moves
 the list, and the X on it; its link goes from
 its root on Main to that card, from a collapsed run's line when the root is in one and up from Main's
-top when the root is older than Main holds, and a mouse resting on the card glides Main to the root.
+top when the root is older than Main holds.
 Opened from its card while that card is on screen, the card moves up from the list to the top — a
 FLIP of a transform alone, 220 ms, the thread fading in under it and the link drawn each frame it
 moves, nothing laid out again so the thread is already at its place — and does not move at all where
@@ -10096,7 +10086,8 @@ its state is the column's own records, reached through the column the code works
 `ColumnFields` and `inColumn` in `web/voice.js`). `tests/two_column_browser.py` checks the layout in Chromium at 1440x900 and 1280x800,
 `tests/thread_card_focus_browser.py` the highlight and the grey, by computed colour and by the
 pixels drawn, at 1280x800 and on a 412x915 phone, and `tests/thread_card_header_browser.py` the card at
-the top of a thread, its move up frame by frame, its line and its glide, at 1280x800 in both schemes and
+the top of a thread, its move up frame by frame and its line — a mouse resting on the card scrolling
+nothing (`#1144 scrollback-typing-jump`) — at 1280x800 in both schemes and
 with reduced motion, and across the window from the thread list at 1280x800 and on a 412x915 phone;
 `tests/thread_header_collapse_browser.py` the card folded to a bar and opened again, at 393x852 by touch
 and 1280x800 with a mouse and the keys, in both schemes.

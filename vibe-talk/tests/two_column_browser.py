@@ -37,11 +37,11 @@ desk size, with a mouse:
   and card both show, each leaving its root's right edge level with its tag, arriving at its card's
   left edge with its arrowhead's point on that edge, its lane in the gap between them, and in the
   colour Chromium draws the card's edge and the tag in -> the mouse on a card whose root is above
-  Main's top: its link drawn, pointing up at the columns' top edge, and after 1.5 s Main glides —
-  through many scroll positions, not one jump — until the root is level with the card and the link
-  whole -> a card whose root is below, and the reader scrolling Main a little before 1.5 s: nothing
-  glides -> with reduced motion emulated, the same glide is one step. No horizontal overflow and no
-  page error at any step.
+  Main's top: its link drawn, pointing up at the columns' top edge, and held resting there for
+  more than 1.5 s neither column moves and the link stays pointing up (`#1144
+  scrollback-typing-jump`: mouse movement or hover never scrolls) -> the mouse likewise held
+  resting on that root's row in Main: neither column moves and its link stays as drawn. No
+  horizontal overflow and no page error at any step.
 
 `#262 search-load-older`, over a second channel whose history really pages — sixty messages, most posted
 to the channel itself, a page of ten at a time, the word in one of them three pages back and two more a
@@ -85,7 +85,7 @@ a finger:
   before <day>" and said nothing.
 
 Pass --screenshots DIR to keep a PNG of each state (the list, a selected thread, the links, the
-selection's link off screen and after its glide, at each size) for review; --web-root DIR to run the
+selection's link off screen, at each size) for review; --web-root DIR to run the
 same walk against another copy of the page.
 """
 
@@ -664,8 +664,10 @@ LINKS_JS = """() => {
 # The root each thread's card should link to.
 ROOTS = {RUNNER: "202", REPLICA: "209", CANARY: "215"}
 
-# How long the page waits on a selection before gliding to its other end (web/src/view/channel/columnlinks.ts `COLUMN_GLIDE_MS`).
-GLIDE_MS = 1500
+# The dwell the page used to wait on a resting mouse before scrolling the other column to a link's
+# far end, in ms, which `#1144 scrollback-typing-jump` deleted: each rest below is held for this
+# long and more, so it would have scrolled either column before.
+MOUSE_REST_MS = 1500
 
 
 def measure_links(desk: Desk) -> Json:
@@ -696,15 +698,6 @@ def links_of(found: Json) -> list[Json]:
 def selected_links(found: Json) -> list[Json]:
     """The selection's link, if it is drawn: one at most."""
     return [link for link in links_of(found) if link["selected"]]
-
-
-def ends_of(found: Json, thread: str) -> Json:
-    """The boxes the link of `thread` should touch."""
-    ends = found["ends"]
-    assert isinstance(ends, dict)
-    end = ends[thread]
-    assert isinstance(end, dict)
-    return end
 
 
 def link_points(found: Json, link: Json) -> tuple[float, float, float, float, float]:
@@ -800,13 +793,30 @@ def hover(desk: Desk, selector: str) -> None:
 
 
 def watch_scrolls(desk: Desk, element_id: str) -> None:
-    """Record each scroll position `element_id` passes through, to tell a glide from a jump."""
-    desk.page.evaluate(f"""() => {{ const node = document.getElementById('{element_id}'); window.__glide = [];
-        node.addEventListener('scroll', () => window.__glide.push(node.scrollTop), {{passive: true}}); }}""")
+    """Record each scroll position `element_id` passes through, so a mouse rest can be judged still:
+    every position it records must be the one it started at."""
+    desk.page.evaluate(f"""() => {{ const node = document.getElementById('{element_id}');
+        window.__scrolls = window.__scrolls || {{}};
+        window.__scrolls['{element_id}'] = [];
+        node.addEventListener('scroll', () => window.__scrolls['{element_id}'].push(node.scrollTop), {{passive: true}}); }}""")
+
+
+def scrolled_positions(desk: Desk, element_id: str) -> list[float]:
+    """The scroll positions `watch_scrolls` recorded for `element_id` since it was last set watching."""
+    return [float(value) for value in desk.page.evaluate(f"() => window.__scrolls['{element_id}']")]
+
+
+def check_still(desk: Desk, element_id: str, before: float, why: str) -> None:
+    """`element_id` exactly where `before` left it, and nowhere else in between."""
+    desk.check(scroll_top(desk.page, element_id) == before,
+               f"{why}: #{element_id} is at {scroll_top(desk.page, element_id)}, not exactly where it was, {before}")
+    passed = scrolled_positions(desk, element_id)
+    desk.check(all(value == before for value in passed), f"{why}: #{element_id} passed through {passed}")
 
 
 def links_walk(desk: Desk) -> None:
-    """`#261 two-column-connectors`: the links over the cards, the selection's off screen, and its glide."""
+    """`#261 two-column-connectors`: the links over the cards, the selection's off screen, and the
+    mouse resting on either end of it moving neither column (`#1144 scrollback-typing-jump`)."""
     page = desk.page
     page.set_viewport_size({"width": desk.width, "height": desk.height})
     desk.wait_for("() => document.getElementById('side-column').getClientRects().length > 0"
@@ -844,58 +854,44 @@ def links_walk(desk: Desk) -> None:
     desk.check(abs(marks[1] + float(corner["top"]) - edge) <= 1,
                f"the arrowhead does not point up at the columns' top edge {edge}: {marks[1]}")
     desk.shot("4-selected-off-screen")
-    # Left selected, Main glides — smoothly, through positions between — until the root is level with it.
+    # Left resting on the card, nothing moves (`#1144 scrollback-typing-jump`): the mouse never
+    # scrolls, however long it rests on one end of a link whose other end is off screen. Both
+    # columns stay exactly where they were, and the link stays clipped, pointing up.
     watch_scrolls(desk, "scroll-area")
-    before = scroll_top(page, "scroll-area")
-    page.wait_for_timeout(GLIDE_MS + 900)
+    watch_scrolls(desk, "side-scroll")
+    main_before, side_before = scroll_top(page, "scroll-area"), scroll_top(page, "side-scroll")
+    page.wait_for_timeout(MOUSE_REST_MS + 900)
     frame(desk)
-    passed = [float(value) for value in page.evaluate("() => window.__glide")]
-    desk.check(scroll_top(page, "scroll-area") < before - 100, "Main did not glide up to the card's root")
-    desk.check(len(set(passed)) >= 3, f"Main jumped rather than glided: {passed}")
-    found = settled_links(desk)
-    selected = selected_links(found)
-    desk.check(len(selected) == 1 and selected[0]["clip"] == "both", f"the link is not whole after the glide: {selected}")
-    check_whole_links(desk, found, "after the glide")
-    end = ends_of(found, RUNNER)
-    badge, card = end["badge"], end["card"]
-    assert isinstance(badge, dict) and isinstance(card, dict)
-    level = abs((float(badge["top"]) + float(badge["bottom"])) / 2 - (float(card["top"]) + float(card["bottom"])) / 2)
-    # Within a few pixels: a smooth scroll ends on a whole pixel, and the tag's middle need not be on one.
-    desk.check(level <= 4, f"the root was not brought level with its card: {level:.1f}px apart")
-    desk.shot("5-after-glide")
-    desk.notes.append(f"the selected card's link pointed up off screen, then Main glided {len(passed)} steps to level")
-
-    # The reader's own scroll of Main while the selection waits — a little, its root still off screen,
-    # and not to the top, which reads older messages — and nothing glides.
-    hover(desk, f"#side-cards > li[data-id='{CANARY}'] .side-card")
+    check_still(desk, "scroll-area", main_before, "the mouse resting on a card whose root is off screen moved Main")
+    check_still(desk, "side-scroll", side_before, "the mouse resting on a card whose root is off screen moved the cards")
     found = measure_links(desk)
     selected = selected_links(found)
-    desk.check(len(selected) == 1 and selected[0]["clip"] == "down", f"the canary's root is on screen, so this proves nothing: {selected}")
-    scroll_to(desk, "scroll-area", str(scroll_top(page, "scroll-area") + 60))
-    put = scroll_top(page, "scroll-area")
-    page.wait_for_timeout(GLIDE_MS + 500)
-    desk.check(abs(scroll_top(page, "scroll-area") - put) < 1, "Main glided after the reader scrolled it")
+    desk.check(len(selected) == 1 and selected[0]["thread"] == RUNNER and selected[0]["clip"] == "up",
+               f"the link did not stay clipped up while the mouse rested on its card: {selected}")
+    desk.shot("5-after-rest")
+    desk.notes.append("the selected card's link pointed up off screen, and the mouse resting on the card "
+                      f"for {(MOUSE_REST_MS + 900) / 1000:.1f}s left both columns exactly still, the link still clipped")
+
+    # The same resting on the link's other end, the root's own row in Main: Main scrolled to its
+    # head so 202 shows, the mouse held on it, and neither column moves, its link as drawn.
+    scroll_to(desk, "scroll-area", "top")
+    hover(desk, "#discord-log > li[data-id='202']")
+    found = measure_links(desk)
+    selected = selected_links(found)
+    desk.check(len(selected) == 1 and selected[0]["thread"] == RUNNER,
+               f"the root under the mouse is not the selection the links follow: {selected}")
+    clip = selected[0]["clip"]
+    watch_scrolls(desk, "scroll-area")
+    watch_scrolls(desk, "side-scroll")
+    main_before, side_before = scroll_top(page, "scroll-area"), scroll_top(page, "side-scroll")
+    page.wait_for_timeout(MOUSE_REST_MS + 900)
+    frame(desk)
+    check_still(desk, "scroll-area", main_before, "the mouse resting on the root moved Main")
+    check_still(desk, "side-scroll", side_before, "the mouse resting on the root moved the cards")
     selected = selected_links(measure_links(desk))
-    desk.check(len(selected) == 1 and selected[0]["clip"] == "down", f"the canary's root came on screen anyway: {selected}")
-
-    # Reduced motion: the same glide, in one step. Main at its foot, the replica's root (209) above it.
-    page.emulate_media(reduced_motion="reduce")
-    scroll_to(desk, "scroll-area", "bottom")
-    hover(desk, f"#side-cards > li[data-id='{REPLICA}'] .side-card")
-    found = measure_links(desk)
-    selected = selected_links(found)
-    desk.check(len(selected) == 1 and selected[0]["clip"] == "up", f"the replica's link does not point up to its root: {selected}")
-    watch_scrolls(desk, "scroll-area")
-    page.wait_for_timeout(GLIDE_MS + 600)
-    frame(desk)
-    passed = [float(value) for value in page.evaluate("() => window.__glide")]
-    desk.check(len(set(passed)) == 1, f"with reduced motion Main did not jump in one step: {passed}")
-    found = settled_links(desk)
-    selected = selected_links(found)
-    desk.check(len(selected) == 1 and selected[0]["clip"] == "both", f"the link is not whole after the jump: {selected}")
-    check_whole_links(desk, found, "after the jump")
-    page.emulate_media(reduced_motion="no-preference")
-    desk.notes.append("a reader's scroll cancelled a glide, and reduced motion jumped in one step")
+    desk.check(len(selected) == 1 and selected[0]["thread"] == RUNNER and selected[0]["clip"] == clip,
+               f"the link did not stay as drawn while the mouse rested on its root: {selected}, was {clip!r}")
+    desk.notes.append("the mouse resting on the root's row likewise left both columns exactly still")
 
 
 # --- searching further back --------------------------------------------------------------------------

@@ -22,8 +22,9 @@ loopback origin, at a 1280x800 desk with a mouse, in the dark scheme and the lig
   the root's right edge level with its Thread(N) and arriving with its arrowhead's point on the card's
   left edge, inside the card, in the card's colour -> the thread scrolled: the card does not move ->
   Main scrolled to its foot, the root above it: the line clipped at Main's top, pointing up -> the mouse
-  crossing the card to the dock: nothing moves for 2.5 s -> the mouse resting on the card: after 1.5 s
-  Main glides, through several scroll positions, until the root is on screen and the line whole -> the X:
+  crossing the card to the dock: nothing moves for 2.5 s -> the mouse resting on the card for 2.5 s:
+  Main still does not move and the line stays clipped, pointing up (`#1144 scrollback-typing-jump`:
+  mouse movement or hover never scrolls) -> the X:
   the cards -> the long question's card's replies button: its text cut to three lines, the card taller
   than the shorter summarised one's by its lines (`#482 thread-card-fit`) -> Esc: the cards. (A press on the card folds it to a bar since
   `#388 thread-header-collapse`, which tests/thread_header_collapse_browser.py walks.)
@@ -110,9 +111,6 @@ SIZES = (
 
 # The root of the summarised thread's card on Main.
 RUNNER_ROOT = "202"
-
-# How long the page waits on the mouse resting on what the glide follows (web/src/view/channel/columnlinks.ts `COLUMN_GLIDE_MS`).
-GLIDE_MS = 1500
 
 # The card at the top of the right column's thread, the line between the columns, and the boxes they
 # should meet, as Chromium lays them out and draws them.
@@ -590,22 +588,26 @@ def desk_walk(desk: Desk) -> None:
     still = main_scroll_samples(desk, 2.5)
     desk.check(max(still) - min(still) < 1, f"the mouse crossing the card moved Main: {min(still)}..{max(still)}")
 
-    # The mouse resting on it: Main glides until the root is on screen, and the line is whole.
+    # The mouse resting on it: Main still does not move, and the line stays clipped, pointing up
+    # (`#1144 scrollback-typing-jump`: the mouse never scrolls, however long it rests).
     page.mouse.move(*middle, steps=3)
     started = time.monotonic()
-    seen = main_scroll_samples(desk, (GLIDE_MS + 1700) / 1000)
-    distinct = sorted({round(value) for value in seen})
-    desk.check(len(distinct) >= 4, f"Main did not glide through several places: {distinct}")
-    desk.wait_for("() => document.querySelector('#column-links path.column-link') !== null"
-                  " && document.querySelector('#column-links path.column-link').getAttribute('data-link') === 'both'",
-                  "the glide did not bring the root on screen with its line whole")
-    glided = measure(desk)
-    desk.check(number(part(glided, "main"), "top") <= number(part(glided, "root"), "top"),
-               "the root is not on screen after the glide")
-    desk.shot("3-glided")
+    seen = main_scroll_samples(desk, 2.5)
+    desk.check(max(seen) - min(seen) < 1, f"the mouse resting on the card moved Main: {min(seen)}..{max(seen)}")
+    rested = measure(desk)
+    desk.check(number(part(rested, "main"), "scrollTop") == number(part(above, "main"), "scrollTop"),
+               f"Main is at {number(part(rested, 'main'), 'scrollTop')} after the mouse rested on the card, "
+               f"not where it was, {number(part(above, 'main'), 'scrollTop')}")
+    links = links_of(rested)
+    desk.check(len(links) == 1 and links[0]["clip"] == "up" and bool(links[0]["selected"]),
+               f"the line did not stay clipped up while the mouse rested on the card: "
+               f"{[(one['thread'], one['clip']) for one in links]}")
+    desk.check(number(part(rested, "root"), "bottom") <= number(part(rested, "main"), "top"),
+               "the root came on screen while the mouse rested on the card")
+    desk.shot("3-rested-still")
     desk.notes.append(f"with the root above Main the line pointed up at its top; the mouse crossing the card moved "
-                      f"nothing for 2.5 s, and resting on it glided Main through {len(distinct)} places in "
-                      f"{time.monotonic() - started:.1f}s until the line was whole")
+                      f"nothing for 2.5 s, and resting on it for {time.monotonic() - started:.1f}s still moved "
+                      "nothing, the line still clipped up")
 
     # The X: the cards. The long question's card: three lines, and taller than the shorter one's
     # card by the lines it has over it (`#482 thread-card-fit`: fitted, no longer one fixed height).
