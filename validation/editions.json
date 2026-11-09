@@ -87,12 +87,13 @@
       "primary": "python",
       "mirror": {
         "edition": "rust",
-        "state": "absent"
+        "state": "paused",
+        "paused_at": "456ed9ce4f2e93b7c6f201ea106d8b0d58aa910e"
       },
       "parity_check": null,
       "rust_entrypoint": "rs/bin/herdr-subagents",
       "python_entrypoint": "py/bin/herdr-subagents",
-      "note": "Headless foreign-harness workers; the Rust edition is an explicit HERDR_SUBAGENTS_ENGINE opt-in whose covered commands run at parity and whose remaining commands refuse by name. The Rust agentctl refuses headless workers with a pointer to this edition."
+      "note": "Headless foreign-harness workers; parity tracking is paused pending the B3-9 differentials (#1125 herdr-subagents-differentials), and the Rust edition is reachable only via the explicit HERDR_SUBAGENTS_ENGINE opt-in; its covered commands run at parity and its remaining commands refuse by name. The Rust agentctl refuses headless workers with a pointer to this edition."
     },
     {
       "name": "parallel-experiment-runner",

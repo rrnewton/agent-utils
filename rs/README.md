@@ -16,7 +16,7 @@ version, license, README, and embedded user guide.
 | `herdr-run` | `herdr-run` | Execute policy-admitted shell commands through Herdr panes. |
 | `agent-queue` | library | Share one durable prompt-queue format and process-identity proof between agent tools. |
 | `agent-harness` | library | Find and read the session transcripts coding-agent harnesses write as they run. |
-| `agentctl` | `agentctl`, `herdr-agent` | Control persistent interactive Herdr agents through one session registry. |
+| `agentctl` | `agentctl`, `herdr-agent`, `herdr-subagents` | Control persistent interactive Herdr agents through one session registry. |
 
 Install one published command with Cargo:
 
@@ -82,3 +82,30 @@ files. Any other unexpected `rs/bin` entry is reported and refused.
 
 Run `make check-rust-packages` from the repository root to build, inspect, and
 smoke the registry archive for each crate independently.
+
+## Registering a new `rs/bin` binary
+
+Adding a `[[bin]]` to a workspace crate is not enough: a tracked source-checkout
+command is registered in several places, and validation fails closed on any of
+them missing. Work through all of these in the same change:
+
+1. Add the `[[bin]]` target to the owning crate's `Cargo.toml`, map the command
+   to its package and sibling tools in `rs/bin/cargo-runner`, and add the tracked
+   `rs/bin/<command>` symlink to `cargo-runner`.
+2. Add the command to `setup_rs` in `setup` — both the `rust_tools` array and
+   the `find` allowlist that refuses unexpected `rs/bin` entries.
+3. Record the tool in `validation/editions.json`: primary edition, mirror
+   state, and both entrypoints as the mirror-state model requires (an `absent`
+   mirror may not name an entrypoint; a `parity` mirror must name a cross job;
+   a `paused` mirror must name `paused_at`). Then regenerate the resolver's
+   copy with the editions checker's `--write-tsv` mode and run that checker by
+   itself.
+4. Bucket the command in the dispatch-wiring test (`RUST_TOOLS` for a bin in a
+   published crate, `NON_PUBLISHED_RUST_BINARIES` for one in a
+   `publish = false` crate); the test scans the Cargo manifests, so the bucket
+   must match the crate's publish flag.
+5. Register the binary in the Rust package checker and run it for the crate
+   (`--crate <name>`); register the launcher in `validation/components.json`
+   too.
+6. Give the binary an embedded user guide in the crate and a rendered guide, so
+   `--userguide` works from the built binary and the registry smoke passes.

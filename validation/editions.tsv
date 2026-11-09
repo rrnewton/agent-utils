@@ -4,7 +4,7 @@ dagrun	rust	parity
 herdr-agent	rust	parity	
 herdr-chat	python	absent	
 herdr-run	rust	parity	
-herdr-subagents	python	absent	
+herdr-subagents	python	paused	456ed9ce4f2e93b7c6f201ea106d8b0d58aa910e
 parallel-experiment-runner	python	absent	
 pr-landing-planner	rust	parity	
 tick-hub	rust	parity	

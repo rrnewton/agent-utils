@@ -63,9 +63,9 @@ case "$TOOL" in
     PACKAGE="wrkviz"
     PACKAGE_TOOLS=(wrkvizd)
     ;;
-  agentctl|herdr-agent)
+  agentctl|herdr-agent|herdr-subagents)
     PACKAGE="agentctl"
-    PACKAGE_TOOLS=(agentctl herdr-agent)
+    PACKAGE_TOOLS=(agentctl herdr-agent herdr-subagents)
     ;;
   cargo-runner)
     echo "cargo-runner: invoke through an rs/bin tool symlink" >&2

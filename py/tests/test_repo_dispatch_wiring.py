@@ -20,12 +20,12 @@ RUST_TOOLS = (
     "herdr-run",
     "agentctl",
     "herdr-agent",
+    "herdr-subagents",
 )
 PYTHON_ONLY_TOOLS = (
     "wrkviz",
     "parallel-experiment-runner",
     "wrkslots",
-    "herdr-subagents",
     "herdr-chat",
     "local-ci-hub",
 )
