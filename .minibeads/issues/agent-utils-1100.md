@@ -1,11 +1,12 @@
 ---
 title: 'stale-root-decisions: ready decisions wait in plan order behind still-running stale roots, and stale roots drop unrelated stacked greens'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-predict
 created_at: 2026-11-08T23:54:22.000000000+00:00
-updated_at: 2026-11-08T23:54:22.000000000+00:00
+updated_at: 2026-11-09T04:13:48.000000000+00:00
+closed_at: 2026-11-09T04:13:48.000000000+00:00
 ---
 
 # Description
@@ -30,3 +31,7 @@ Three linked defects in the landing loop around green disjoint roots whose base 
 # Notes
 
 Reported 2026-11-08 from one live run (20:06 landing, then 20:07 and 20:12 green results with no decision until the stale root arrived at 20:14; a discarded green rebuilt at 20:19). Combines three coordinator items from the same run and code path, after the disjoint-root stacking work landed. A simulate case is welcome if cheap, but the gated run tests are the required evidence.
+
+## Resolution
+
+[watermelon-full-preview] Landed on main as 790c0719eba7660b82b6ef57da7cc244cad1e2ce. The decision loop requeues a stale green disjoint root at any index on its own arrival, selects a later plain green standing on the current base behind stale still-running roots only (dependencies and plan conflicts still block), discards only git/parent-chain descendants of a stale candidate, and records every discard-path drop as a `flight-discarded` event plus item history with its captured verdict. The exact six-flight gated test proves prompt requeue, descendant-only discard with the green recorded, and B landing while the slow root is still gated. Gate note, stated plainly: the nested exclusive cross-differential ticket was stopped (verified PID 4192910) while two main-phase failures were still outstanding, which lapses the clean-main-phase waiver condition; no redo was needed for this merge-queue-only diff after both failures classified clean - agentctl sigterm timing and an ETXTBSY fake-executable race in one validate unit (exact test passes locally; whole-crate rerun clean). Exact refreshed-tree evidence: `rust.merge-queue.test` rerun pass on f0fab399 (593 cases, 1082.345 CPU-s), fmt/clippy -D warnings/client-names exits 0.
