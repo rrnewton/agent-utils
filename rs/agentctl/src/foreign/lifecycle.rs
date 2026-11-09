@@ -8,6 +8,7 @@
 //! [`super::registry`]; process evidence and cleanup in
 //! [`super::ownership`].
 
+use std::collections::HashSet;
 use std::io::Write as _;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt as _;
@@ -758,10 +759,13 @@ fn tmux_target_exists(target: &str) -> bool {
     }
 }
 
-/// Whether the recorded presentation exists (headless backends only here).
+/// Whether the recorded presentation exists.
 pub fn window_exists(record: &AgentRecord) -> bool {
     if record.mode == "tui" {
-        return false;
+        return record
+            .presentation_pane
+            .as_ref()
+            .is_some_and(|pane| herdr_tui_probe_at(Path::new("/proc"), pane).pane_alive);
     }
     if record.backend == "tmux" {
         return tmux_target_exists(&record.tmux_target);
@@ -3025,19 +3029,16 @@ fn herdr_workspace_id(base: &Path, cwd: &str) -> Result<String, ForeignOwnership
     Ok(id)
 }
 
-fn launch_herdr_window(
-    base: &Path,
-    name: &str,
+fn herdr_tab_for_new_agent(
+    workspace_id: &str,
     cwd: &str,
-    wrapper_cmd: &str,
-) -> Result<String, ForeignOwnershipError> {
-    let workspace_id = herdr_workspace_id(base, cwd)?;
+) -> Result<(String, String), ForeignOwnershipError> {
     let created = herdr_call(
         &[
             "tab",
             "create",
             "--workspace",
-            &workspace_id,
+            workspace_id,
             "--cwd",
             cwd,
             "--label",
@@ -3066,6 +3067,18 @@ fn launch_herdr_window(
             message: "Herdr did not return a tab and root pane".to_string(),
         });
     };
+    Ok((tab_id.to_string(), root_pane_id.to_string()))
+}
+
+fn launch_herdr_window(
+    base: &Path,
+    name: &str,
+    cwd: &str,
+    wrapper_cmd: &str,
+) -> Result<String, ForeignOwnershipError> {
+    let workspace_id = herdr_workspace_id(base, cwd)?;
+    let (tab_id, root_pane_id) = herdr_tab_for_new_agent(&workspace_id, cwd)?;
+    let (tab_id, root_pane_id) = (tab_id.as_str(), root_pane_id.as_str());
     let launched = herdr_action(&[
         "pane",
         "run",
@@ -3088,6 +3101,361 @@ fn launch_herdr_window(
         return Err(error);
     }
     Ok(tab_id.to_string())
+}
+
+fn codex_sessions_root() -> PathBuf {
+    let home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".codex"))
+                .unwrap_or_else(|| PathBuf::from(".codex"))
+        });
+    home.join("sessions")
+}
+
+fn find_session_files(dir: &Path, suffix: &str, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            find_session_files(&path, suffix, out);
+        } else if path.to_string_lossy().ends_with(suffix) {
+            out.push(path);
+        }
+    }
+}
+
+/// The model a persisted Codex session last recorded, when it recorded one.
+pub fn session_recorded_model(session_id: &str) -> Option<String> {
+    let mut paths = Vec::new();
+    find_session_files(
+        &codex_sessions_root(),
+        &format!("-{session_id}.jsonl"),
+        &mut paths,
+    );
+    paths.sort();
+    let path = paths.first()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut model: Option<String> = None;
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("turn_context") {
+            continue;
+        }
+        if let Some(found) = value
+            .get("payload")
+            .and_then(|payload| payload.get("model"))
+            .and_then(Value::as_str)
+            .filter(|found| !found.is_empty())
+        {
+            model = Some(found.to_string());
+        }
+    }
+    model
+}
+
+/// The exact visible Codex command shown in a TUI pane.
+pub fn codex_tui_argv(
+    model: Option<&str>,
+    session_id: Option<&str>,
+    bypass_permissions: Option<bool>,
+) -> Result<Vec<String>, ForeignOwnershipError> {
+    let mut argv = vec![super::runner::codex_bin()];
+    if let Some(session_id) = session_id {
+        argv.push("resume".to_string());
+        argv.push(session_id.to_string());
+    }
+    let launch_model = match session_id {
+        Some(session_id) => session_recorded_model(session_id),
+        None => model.map(str::to_owned),
+    };
+    argv.push("--no-alt-screen".to_string());
+    let bypass = bypass_permissions.map_or_else(configured_codex_bypass_permissions, Ok)?;
+    if bypass {
+        argv.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+    }
+    if let Some(model) = launch_model {
+        argv.push("-m".to_string());
+        argv.push(model);
+    }
+    Ok(argv)
+}
+
+/// Launch one visible Codex TUI in its own Herdr tab and prove its pane.
+pub fn launch_herdr_tui_at(
+    base: &Path,
+    proc_root: &Path,
+    name: &str,
+    cwd: &str,
+    model: Option<&str>,
+    session_id: Option<&str>,
+    bypass_permissions: Option<bool>,
+) -> Result<(String, String, TuiProbe), ForeignOwnershipError> {
+    let workspace_id = herdr_workspace_id(base, cwd)?;
+    let (tab_id, root_pane_id) = herdr_tab_for_new_agent(&workspace_id, cwd)?;
+    let attempt = (|| -> Result<(String, String, TuiProbe), ForeignOwnershipError> {
+        let argv = codex_tui_argv(model, session_id, bypass_permissions)?;
+        let command = argv
+            .iter()
+            .map(|item| shlex_quote(item))
+            .collect::<Vec<_>>()
+            .join(" ");
+        herdr_action(&["pane", "run", &root_pane_id, &command])?;
+        herdr_call(&["tab", "rename", &tab_id, name], None)?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut probe = herdr_tui_probe_at(proc_root, &root_pane_id);
+        while !probe.codex_alive && probe.error.is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            probe = herdr_tui_probe_at(proc_root, &root_pane_id);
+        }
+        if !probe.codex_alive {
+            let detail = probe
+                .error
+                .clone()
+                .unwrap_or_else(|| "Codex was not the foreground TUI process".to_string());
+            return Err(ForeignOwnershipError {
+                code: "tui_launch_unconfirmed",
+                message: format!("Herdr TUI pane {root_pane_id} was not live: {detail}"),
+            });
+        }
+        Ok((tab_id.clone(), root_pane_id.clone(), probe))
+    })();
+    match attempt {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            if herdr_call(&["tab", "get", &tab_id], None).is_ok() {
+                if let Err(cleanup) = herdr_call(&["tab", "close", &tab_id], None) {
+                    return Err(ForeignOwnershipError {
+                        code: "herdr_cleanup_failed",
+                        message: format!(
+                            "failed to launch Herdr TUI tab {tab_id} ({}); cleanup also failed: {}",
+                            error.message, cleanup.message
+                        ),
+                    });
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+fn pid_is_descendant(proc_root: &Path, pid: i64, ancestor: i64) -> bool {
+    let mut cur = pid;
+    let mut seen = HashSet::new();
+    while cur > 1 && !seen.contains(&cur) {
+        if cur == ancestor {
+            return true;
+        }
+        seen.insert(cur);
+        let Ok(bytes) = std::fs::read(proc_root.join(cur.to_string()).join("stat")) else {
+            return false;
+        };
+        let Some(parsed) = super::procstat::parse_process_stat(&bytes) else {
+            return false;
+        };
+        if parsed.pid != cur {
+            return false;
+        }
+        cur = parsed.ppid;
+    }
+    false
+}
+
+/// Locate the tmux pane containing the recorded live runner process.
+pub fn find_runner_pane_at(proc_root: &Path, record: &AgentRecord) -> Option<String> {
+    let runner_pid = record.runner_pid?;
+    let output = tmux_run(
+        &["list-panes", "-a", "-F", "#{pane_id}\t#{pane_pid}"],
+        false,
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.split('\t');
+        let (Some(pane_id), Some(raw_pid)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let Ok(pane_pid) = raw_pid.parse::<i64>() else {
+            continue;
+        };
+        if pid_is_descendant(proc_root, runner_pid, pane_pid) {
+            return Some(pane_id.to_string());
+        }
+    }
+    None
+}
+
+/// Recover a displaced tmux runner pane into its own named window.
+pub fn break_runner_pane_to_window_at(
+    proc_root: &Path,
+    record: &AgentRecord,
+) -> Result<Option<String>, ForeignOwnershipError> {
+    let Some(pane_id) = find_runner_pane_at(proc_root, record) else {
+        return Ok(None);
+    };
+    let session = record.tmux_target.split(':').next().unwrap_or_default();
+    exact_tmux_target(&record.tmux_target)?;
+    let output = tmux_run(
+        &[
+            "break-pane",
+            "-d",
+            "-s",
+            &pane_id,
+            "-t",
+            &format!("={session}:"),
+            "-n",
+            &record.name,
+        ],
+        false,
+    )?;
+    if !output.status.success() {
+        return Err(ForeignOwnershipError {
+            code: "presentation_recreate_failed",
+            message: format!(
+                "failed to break pane {pane_id} into window '{}': {}",
+                record.name,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    Ok(Some(pane_id))
+}
+
+/// A recreated presentation: where the live pane now lives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecreateWindowResult {
+    /// Agent name.
+    pub name: String,
+    /// Worker mode.
+    pub mode: String,
+    /// Presentation backend.
+    pub backend: String,
+    /// Recorded presentation target (display id).
+    pub tmux_target: String,
+    /// Live pane id, when one could be located.
+    pub pane_id: Option<String>,
+    /// Whether that pane is in its own window.
+    pub window_alive: bool,
+}
+
+/// Recreate a headless worker's lost presentation as a live tail of its transcript.
+pub fn recreate_window_at(
+    base: &Path,
+    proc_root: &Path,
+    name: &str,
+) -> Result<RecreateWindowResult, ForeignOwnershipError> {
+    let valid_name = super::registry::require_valid_name(name)?.to_string();
+    let Some(record) = super::registry::read_registry_at(base)?
+        .get(&valid_name)
+        .cloned()
+    else {
+        return Err(ForeignOwnershipError {
+            code: "unknown_agent",
+            message: format!("unknown agent '{valid_name}'"),
+        });
+    };
+    if record.mode == "tui" {
+        let pane_id = record.presentation_pane.clone();
+        let alive = pane_id
+            .as_ref()
+            .is_some_and(|pane| herdr_tui_probe_at(proc_root, pane).pane_alive);
+        return Ok(RecreateWindowResult {
+            name: record.name.clone(),
+            mode: record.mode.clone(),
+            backend: record.backend.clone(),
+            tmux_target: record.tmux_target.clone(),
+            pane_id,
+            window_alive: alive,
+        });
+    }
+    if !window_exists(&record) {
+        let broken = if record.backend == "tmux" {
+            break_runner_pane_to_window_at(proc_root, &record)?
+        } else {
+            None
+        };
+        if broken.is_none() {
+            let (session, _window_name) = record
+                .tmux_target
+                .split_once(':')
+                .map(|(s, n)| (s.to_string(), n.to_string()))
+                .unwrap_or_else(|| (tmux_session(), valid_name.clone()));
+            let session = session.to_string();
+            let tail_cmd = format!(
+                "tail -n 200 -F {}",
+                shlex_quote(&transcript_path_at(base, &valid_name)?.display().to_string())
+            );
+            let target = if record.backend == "tmux" {
+                launch_tmux_window(&valid_name, &record.cwd, &tail_cmd, Some(&session))?
+            } else {
+                launch_herdr_window(base, &valid_name, &record.cwd, &tail_cmd)?
+            };
+            with_registry_lock_at(base, |agents| {
+                let Some(current) = agents.get_mut(&valid_name) else {
+                    return Err(ForeignOwnershipError {
+                        code: "unknown_agent",
+                        message: format!("unknown agent '{valid_name}'"),
+                    });
+                };
+                current.tmux_target = target.clone();
+                Ok(())
+            })?;
+        }
+    }
+    let record = super::registry::read_registry_at(base)?
+        .get(&valid_name)
+        .cloned()
+        .ok_or_else(|| ForeignOwnershipError {
+            code: "unknown_agent",
+            message: format!("unknown agent '{valid_name}'"),
+        })?;
+    let pane_id = if record.backend == "tmux" {
+        find_runner_pane_at(proc_root, &record)
+    } else {
+        let tab = herdr_call(&["tab", "get", &record.tmux_target], None)
+            .ok()
+            .and_then(|payload| payload.get("tab").cloned());
+        let workspace_fallback = tab
+            .as_ref()
+            .and_then(|tab| tab.get("workspace_id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let workspace_id = backend_config_value(base, "herdr_workspace_id")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .filter(|value| !value.is_empty())
+            .unwrap_or(workspace_fallback);
+        herdr_call(&["pane", "list", "--workspace", &workspace_id], None)
+            .ok()
+            .and_then(|listed| {
+                listed
+                    .get("panes")?
+                    .as_array()?
+                    .iter()
+                    .find(|pane| {
+                        pane.get("tab_id").and_then(Value::as_str) == Some(&record.tmux_target)
+                    })
+                    .and_then(|pane| pane.get("pane_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+    };
+    let alive = window_exists(&record);
+    Ok(RecreateWindowResult {
+        name: record.name.clone(),
+        mode: record.mode.clone(),
+        backend: record.backend.clone(),
+        tmux_target: record.tmux_target.clone(),
+        pane_id,
+        window_alive: alive,
+    })
 }
 
 /// New worker status, the optional first-turn sequence, and cleanup notes.
@@ -3151,10 +3519,10 @@ pub fn bring_up_agent_at(
             message: "--mode tui requires the herdr backend".to_string(),
         });
     }
-    if mode == "tui" {
+    if mode == "tui" && harness != "codex" {
         return Err(ForeignOwnershipError {
-            code: "tui_not_yet_in_rust",
-            message: "bringing up a TUI worker is not yet in this edition".to_string(),
+            code: "tui_harness_unsupported",
+            message: "TUI mode currently supports Codex only until other interactive harnesses prove reliable coexistence".to_string(),
         });
     }
     if !backend_available(&backend) {
@@ -3240,16 +3608,36 @@ pub fn bring_up_agent_at(
         Ok(())
     })?;
     ensure_agent_dirs_at(base, &valid_name)?;
-    let launched = (|| -> Result<String, ForeignOwnershipError> {
-        let wrapper = runner_wrapper_at(base, &valid_name, None)?;
-        if backend == "tmux" {
-            launch_tmux_window(&valid_name, &root.to_string_lossy(), &wrapper, None)
-        } else {
-            launch_herdr_window(base, &valid_name, &root.to_string_lossy(), &wrapper)
+    let launched = (|| -> Result<(String, Option<(String, TuiProbe)>), ForeignOwnershipError> {
+        if mode == "tui" {
+            let record = super::registry::read_registry_at(base)?
+                .get(&valid_name)
+                .cloned()
+                .ok_or_else(|| ForeignOwnershipError {
+                    code: "unknown_agent",
+                    message: format!("agent '{valid_name}' is not registered"),
+                })?;
+            let (tab, pane, probe) = launch_herdr_tui_at(
+                base,
+                proc_root,
+                &valid_name,
+                &root.to_string_lossy(),
+                model,
+                record.session_id.as_deref(),
+                Some(bypass_permissions),
+            )?;
+            return Ok((tab, Some((pane, probe))));
         }
+        let wrapper = runner_wrapper_at(base, &valid_name, None)?;
+        let target = if backend == "tmux" {
+            launch_tmux_window(&valid_name, &root.to_string_lossy(), &wrapper, None)?
+        } else {
+            launch_herdr_window(base, &valid_name, &root.to_string_lossy(), &wrapper)?
+        };
+        Ok((target, None))
     })();
-    let target = match launched {
-        Ok(target) => target,
+    let (target, tui_launch) = match launched {
+        Ok(pair) => pair,
         Err(error) => {
             let _ = with_registry_lock_at(base, |agents| {
                 agents.remove(&valid_name);
@@ -3271,12 +3659,28 @@ pub fn bring_up_agent_at(
     with_registry_lock_at(base, |agents| {
         if let Some(record) = agents.get_mut(&valid_name) {
             record.tmux_target = target.clone();
+            if let Some((pane, probe)) = &tui_launch {
+                record.presentation_pane = Some(pane.clone());
+                record.runner_pid = probe.pid;
+                record.runner_started_at = match probe.pid {
+                    Some(pid) => pid_start_time_at(proc_root, pid).unwrap_or(None),
+                    None => None,
+                };
+                record.runner_boot_id = Some(super::ownership::current_boot_id_at(proc_root)?);
+                record.status = if probe.status == "working" {
+                    "busy".to_string()
+                } else {
+                    "idle".to_string()
+                };
+            }
         }
         Ok(())
     })?;
     let mut queued_turn: Option<i64> = None;
-    if let Some(brief) = brief {
-        queued_turn = Some(enqueue_message_at(base, &valid_name, brief, None)?);
+    if mode != "tui" {
+        if let Some(brief) = brief {
+            queued_turn = Some(enqueue_message_at(base, &valid_name, brief, None)?);
+        }
     }
     write_event_at(
         base,
