@@ -18,6 +18,7 @@ import contextlib
 import dataclasses
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -2358,20 +2359,41 @@ def _end_run(host: _RealHost, run: _RunProcess) -> None:
     host.tables.clear()
 
 
-def _refused_for_the_run(
-    attempt: Callable[[], tuple[int, str]], expected_returncode: int, needle: str
-) -> str:
-    """Run `attempt` until its refusal names the validation run.
+# An unrelated process the strict real-/proc snapshot met mid-exit (#1120):
+# its mount-namespace link was already gone, but it was not yet proven exited.
+_MOUNT_NAMESPACE_TRANSIENT = re.compile(
+    r"mount namespace is indeterminate for live PID (?P<pid>[0-9]+) after [0-9]+ re-probes"
+)
 
-    The real-host tests judge liveness from the host's real /proc, so an
-    unrelated process caught mid-teardown there (a PID-namespace init of
-    another test's, waiting in zap_pid_ns_processes) can make one attempt
-    refuse as indeterminate instead.  That state is transient; the refusal
-    these tests assert is the run's own, and every refused attempt leaves
-    the slot retained, so asking again is safe.  Only that named transient
-    state is retried: any other refusal text fails at once, so a refusal
-    for the wrong reason is not papered over by a later naming attempt.
-    `#389 gate-flakes`.
+
+def _teardown_transient(text: str, run_pid: int | None) -> bool:
+    """Whether ``text`` refuses only for a named teardown state of an unrelated process.
+
+    The real-host tests judge liveness from the host's real /proc, so another
+    test's process caught mid-teardown there can make one attempt refuse as
+    indeterminate.  Two such states are named, and both pass: a PID-namespace
+    init waiting in zap_pid_ns_processes (#389 gate-flakes), and a process whose
+    mount-namespace link is gone before it is proven exited (#1120
+    batch-seal-remove-retry).  A refusal that names the run's own process
+    (``run_pid``) is never one of them.
+    """
+
+    if "zap_pid_ns_processes" in text:
+        return True
+    named = {int(match["pid"]) for match in _MOUNT_NAMESPACE_TRANSIENT.finditer(text)}
+    return bool(named) and run_pid not in named
+
+
+def _retry_teardown_transients(
+    attempt: Callable[[], tuple[int, str]],
+    accepted: Callable[[int, str], bool],
+    run_pid: int | None,
+) -> str:
+    """Run ``attempt`` until ``accepted``, retrying only the named teardown transients.
+
+    Every refused attempt leaves the slot retained, so asking again is safe.
+    Any other outcome fails at once, so a refusal for the wrong reason is not
+    papered over by a later attempt.
     """
 
     # The deadline scales with measured progress: each attempt is a full
@@ -2385,13 +2407,60 @@ def _refused_for_the_run(
         attempt_started = time.monotonic()
         returncode, text = attempt()
         attempt_seconds = time.monotonic() - attempt_started
-        assert returncode == expected_returncode, text
-        if needle in text:
+        if accepted(returncode, text):
             return text
-        assert "zap_pid_ns_processes" in text, text
+        assert _teardown_transient(text, run_pid), text
         deadline = max(deadline, time.monotonic() + 2 * attempt_seconds)
         assert time.monotonic() < min(deadline, started + 600), text
         time.sleep(0.1)
+
+
+def _refused_for_the_run(
+    attempt: Callable[[], tuple[int, str]],
+    expected_returncode: int,
+    needle: str,
+    run_pid: int,
+) -> str:
+    """Run ``attempt`` until its refusal names the validation run."""
+
+    def names_the_run(returncode: int, text: str) -> bool:
+        assert returncode == expected_returncode, text
+        return needle in text
+
+    return _retry_teardown_transients(attempt, names_the_run, run_pid)
+
+
+def _succeeds_despite_teardown(attempt: Callable[[], tuple[int, str]], run_pid: int) -> str:
+    """Run ``attempt``, expected to succeed once the run ended, past teardown transients."""
+
+    return _retry_teardown_transients(attempt, lambda returncode, _text: returncode == 0, run_pid)
+
+
+def test_only_named_teardown_transients_of_other_processes_are_retried() -> None:
+    """#1120: the retry rule, checked without a host race."""
+
+    mount = (
+        "REFUSED: validation-run authority is unverifiable for slot slot01: validation-run "
+        "evidence is unverifiable: mount namespace is indeterminate for live PID {pid} after "
+        "4 re-probes over 150 ms: its mount-namespace link stayed absent but the process was "
+        "not proven exited in that window"
+    )
+    assert _teardown_transient(mount.format(pid=4242), run_pid=1000)
+    assert _teardown_transient(mount.format(pid=4242), run_pid=None)
+    # The run's own process is never a transient: its refusal is the test's subject.
+    assert not _teardown_transient(mount.format(pid=1000), run_pid=1000)
+    assert _teardown_transient(
+        "wrkslots: PID 77 (sh) is a PID-namespace init being torn down "
+        "(wchan zap_pid_ns_processes; ...)", run_pid=1000,
+    )
+    assert not _teardown_transient(
+        "REFUSED: validation-run authority reports the run may still use slot slot01",
+        run_pid=1000,
+    )
+    attempts = iter([(3, mount.format(pid=4242)), (0, "")])
+    assert _succeeds_despite_teardown(lambda: next(attempts), 1000) == ""
+    with pytest.raises(AssertionError):
+        _succeeds_despite_teardown(lambda: (3, mount.format(pid=1000)), 1000)
 
 
 def _assert_judged_live_run(host: _RealHost, run: _RunProcess, text: str) -> None:
@@ -2423,12 +2492,13 @@ def test_real_host_completed_removal_waits_for_the_run_process(
             remove_once,
             3,
             "validation-run authority reports the run may still use slot slot01",
+            run.child.pid,
         )
         _assert_judged_live_run(host, run, error)
         _assert_retained(host.project, host.tree)
 
         _end_run(host, run)
-        assert _remove_completed(host.project) == 0, capsys.readouterr().err
+        _succeeds_despite_teardown(remove_once, run.child.pid)
         _assert_judged_ended_run(host, run)
 
     assert not host.slot_path.exists()
@@ -2471,13 +2541,14 @@ def test_real_host_batch_seal_waits_for_the_run_process(
             1,
             "RETAINED: slot01 reason=validation-run authority reports the run may "
             "still use slot slot01",
+            run.child.pid,
         )
         _assert_judged_live_run(host, run, output)
         assert not wrkslots._validate_batch_seal_journal_path(config).exists()
         _assert_retained(host.project, host.tree)
 
         _end_run(host, run)
-        assert _remove_batch(host.project) == 0, capsys.readouterr()
+        _succeeds_despite_teardown(remove_once, run.child.pid)
         _assert_judged_ended_run(host, run)
 
     assert not host.slot_path.exists()
@@ -2490,7 +2561,22 @@ def test_real_host_finish_recovery_waits_for_the_run_process(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     host = _prepare_real_host(tmp_path, monkeypatch)
-    interrupt_validate_batch(host.project, monkeypatch, "after-finish-journal", ("slot01",))
+
+    # Interrupt the batch right after it journals its finish.  A batch that
+    # refuses for a teardown transient first (no run exists yet, so nothing
+    # is the run's) retains the slot and is asked again (#1120).
+    def interrupted_batch() -> tuple[int, str]:
+        try:
+            interrupt_validate_batch(
+                host.project, monkeypatch, "after-finish-journal", ("slot01",)
+            )
+        except pytest.fail.Exception:
+            captured = capsys.readouterr()
+            # The batch's own refusal is on stdout, the teardown note on stderr.
+            return 1, captured.out + captured.err
+        return 0, ""
+
+    _retry_teardown_transients(interrupted_batch, lambda returncode, _text: returncode == 0, None)
     config = wrkslots._load_config(str(host.project), "testhost")
     finish_path = wrkslots._journal_path(config)
     assert finish_path.exists()
@@ -2514,13 +2600,14 @@ def test_real_host_finish_recovery_waits_for_the_run_process(
             recover_once,
             3,
             f"has live exact process generation {run.child.pid} for row slot01",
+            run.child.pid,
         )
         _assert_judged_live_run(host, run, error)
         assert finish_path.exists()
         _assert_retained(host.project, host.tree)
 
         _end_run(host, run)
-        assert wrkslots.main(recover) == 0, capsys.readouterr().err
+        _succeeds_despite_teardown(recover_once, run.child.pid)
         _assert_judged_ended_run(host, run)
 
     assert not host.slot_path.exists()
