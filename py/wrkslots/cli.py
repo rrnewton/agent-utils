@@ -933,15 +933,16 @@ _RECLAIMABLE_OUTPUT_WALK_SECONDS = 20.0
 # removal keeps 64 KiB; each further sealed slot adds 64 KiB (512 KiB for
 # eight).
 _VALIDATE_REMOVE_BATCH_CENSUS_STDERR_BYTES = 64 * 1024
-# remove-agent-batch reuses its shared lsof evidence for at most this long.
-# That evidence serves only the use checks an item makes before its path
-# fence, and nothing is deleted before the fence.  Before the fence, a fresh
-# /proc scan covers path, mapping, mount, and cgroup use at the moment of each
-# check and only inode-alias use relies on the shared scan, so this age bounds
-# how long such use could go unseen before an item fences its slot.  On a
-# 4,200-process host at load average 95, with small test slots, one shared
-# scan of three slots took 39 seconds; a batch pays for a new scan roughly
-# once per six items.
+# remove-agent-batch takes a new shared lsof scan before an item whose scan is
+# older than this.  That evidence serves only the early refusals an item makes
+# before its path fence, and nothing is deleted before the fence: the scan after
+# the fence compares every process with the fenced tree by path and by device
+# and inode, so it finds inode-alias use too, and a use refuses there and rolls
+# the fence back (#1108).  An older scan only refuses less early, which is why a
+# single removal whose registry-lock wait outlasts this age goes on rather than
+# refusing (#956).  On a 4,200-process host at load average 95, with small test
+# slots, one shared scan of three slots took 39 seconds; a batch pays for a new
+# scan roughly once per six items.
 _AGENT_REMOVE_BATCH_CENSUS_MAX_AGE_SECONDS = 300.0
 _AGENT_REMOVE_BATCH_LSOF_SECONDS = 600.0
 _AGENT_REMOVE_BATCH_YIELD_SECONDS = 0.25
@@ -44226,19 +44227,8 @@ def _cmd_remove_in_scope(
         if unlocked_refusal is not None:
             raise unlocked_refusal
         if single_item and agent_batch is not None:
-            if (
-                time.monotonic() - agent_batch.captured_at
-                > _AGENT_REMOVE_BATCH_CENSUS_MAX_AGE_SECONDS
-            ):
-                # remove-agent-batch takes a new shared scan before an item
-                # whose scan is older than this; a single removal cannot take
-                # one under the lock, so it stops instead.
-                raise Refusal(
-                    f"the lsof scan of slot {args.slot} is more than "
-                    f"{_AGENT_REMOVE_BATCH_CENSUS_MAX_AGE_SECONDS:.0f} seconds old "
-                    "at its first use check under the registry lock; nothing was "
-                    "salvaged or removed; retry"
-                )
+            # However long the registry-lock wait made this scan, it decides no
+            # deletion: the scan after the fence does (#956, #1108).
             # The batch's checks skip the invoking process, which opens the
             # slot while it removes it.  When lsof ran, before the lock, it had
             # not yet opened it, so a descriptor, mapping or directory lsof

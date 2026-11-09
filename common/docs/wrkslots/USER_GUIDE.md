@@ -1153,8 +1153,10 @@ average about 260, one took 9 to 18 seconds. Default `remove` of one agent slot 
 of one, as described below: its one `lsof +D` runs before the lock is taken, and its work before the
 first deletion has the same per-slot budget as each batch slot (60 seconds, scaled by the slot's
 salvage work as described below), with the same exceptions (listed
-below). A batch of one refuses, without salvaging or removing anything, when its `lsof` scan is more
-than 300 seconds old at its first process-use check under the lock. A slot that the invoking
+below). Its fresh `/proc` scan also runs before the lock (#1108), so no process scan holds the
+registry lock. However long it then waits for the lock, it goes on (#956): those scans only refuse
+early, and the scan after the path fence, which compares every process with the fenced tree by
+path and by device and inode, decides and rolls the fence back on a use. A slot that the invoking
 `wrkslots` process itself holds open, for example through an inherited descriptor, is refused as
 before. `remove --no-lock-budget` runs every check with `lsof +D` under the lock and has no such
 limit; use it only for a slot that default `remove` refused for the limit. Validation slots keep

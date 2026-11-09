@@ -57217,20 +57217,77 @@ def test_remove_refuses_an_agent_slot_whose_lock_budget_runs_out_and_keeps_it(
     assert not checkout(project, "slot01").exists()
 
 
-def test_remove_refuses_when_its_lsof_scan_aged_past_the_batch_bound_waiting_for_the_lock(
+def test_remove_goes_on_after_a_lock_wait_longer_than_the_scan_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A batch of one cannot take a new lsof scan under the lock, so it stops."""
+    """#956: a lock wait that ages the lsof scan no longer stops a batch of one.
+
+    That scan only refuses early; the scan after the fence decides (#1108).
+    """
 
     project, _repository, _slots = dead_agent_batch_project(tmp_path, count=1)
     monkeypatch.setattr(wrkslots, "_AGENT_REMOVE_BATCH_CENSUS_MAX_AGE_SECONDS", -1.0)
 
     returncode, stderr = single_remove(project, "slot01")
 
+    assert returncode == 0, stderr
+    assert not checkout(project, "slot01").exists()
+
+
+def test_remove_finds_a_use_that_began_during_its_lock_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#956: a process that enters while remove waits for the lock is found.
+
+    It starts after the unlocked scan, while the lsof evidence is stale, so no
+    check before the fence looks for it; the scan after the fence names it at
+    the fenced path, and the fence is rolled back.
+    """
+
+    project, _repository, _slots = dead_agent_batch_project(tmp_path, count=1)
+    monkeypatch.setattr(wrkslots, "_AGENT_REMOVE_BATCH_CENSUS_MAX_AGE_SECONDS", -1.0)
+    tree = checkout(project, "slot01")
+    scanned: list[bool] = []
+    entered: list[subprocess.Popen[bytes]] = []
+    real_pass = wrkslots._remove_unlocked_use_pass
+    real_locks = wrkslots._mutation_locks
+
+    def scan(
+        config: wrkslots.Config,
+        slot: str,
+        agent_batch: wrkslots._AgentRemoveBatchContext,
+        live_use_recheck: wrkslots._LiveUseRecheckBudget,
+    ) -> None:
+        real_pass(config, slot, agent_batch, live_use_recheck)
+        scanned.append(True)
+
+    @contextlib.contextmanager
+    def enter_while_waiting(
+        config: wrkslots.Config, wait_seconds: float, *, deadline: float | None = None
+    ) -> Iterator[None]:
+        if scanned and not entered:
+            entered.append(
+                subprocess.Popen(["sleep", "300"], cwd=tree, start_new_session=True)
+            )
+        with real_locks(config, wait_seconds, deadline=deadline):
+            yield
+
+    monkeypatch.setattr(wrkslots, "_remove_unlocked_use_pass", scan)
+    monkeypatch.setattr(wrkslots, "_mutation_locks", enter_while_waiting)
+    try:
+        returncode, stderr = single_remove(project, "slot01")
+    finally:
+        for process in entered:
+            process.kill()
+            process.wait()
+
+    assert len(entered) == 1
     assert returncode != 0
-    assert "seconds old at its first use check under the registry lock" in stderr
-    assert checkout(project, "slot01").is_dir()
+    assert f"live process {entered[0].pid} uses slot" in stderr, stderr
+    assert ".fenced." in stderr, stderr
+    assert (tree / "task.txt").is_file()
     assert fenced_slot_path(project, "slot01") is None
+    assert active_slot_names(project) == ["slot01"]
 
 
 def test_remove_refuses_a_slot_the_invoking_process_holds_open(tmp_path: Path) -> None:
