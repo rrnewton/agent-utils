@@ -63674,6 +63674,25 @@ class _PreparedDeferredFinish:
     journal_path: Path
 
 
+def _census_churn_for_test() -> None:
+    """Test seam: run ``WRKSLOTS_TEST_CENSUS_CHURN`` once the census has listed /proc.
+
+    The forced-churn differential (#1084, #1102 wrkslots-census-churn-tolerant)
+    uses it to make a listed process vanish and a new one appear between the
+    listing and the reads, in both editions, without host load.
+    """
+
+    command = os.environ.get("WRKSLOTS_TEST_CENSUS_CHURN")
+    if command:
+        subprocess.run(
+            ["/bin/sh", "-c", command],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
 def _capture_process_path_census(
     slot_paths: Sequence[Path],
     *,
@@ -63701,6 +63720,7 @@ def _capture_process_path_census(
                     include_owner_cgroups=False
                 )
             )
+            _census_churn_for_test()
             processes = _preflight_process_observations(
                 processes, selected_budget
             )

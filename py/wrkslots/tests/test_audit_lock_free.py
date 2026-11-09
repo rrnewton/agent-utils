@@ -21,6 +21,9 @@ from wrkslots import cli as wrkslots_cli
 
 from wrkslots.tests.test_audit_state_rust import _fixture, _python
 
+# Registry judgment, not process evidence: see the pinned_process_evidence fixture.
+pytestmark = pytest.mark.usefixtures("pinned_process_evidence")
+
 
 def _active(root: Path) -> Path:
     return root / "worktrees" / "ACTIVE.node-a.json"
@@ -66,6 +69,8 @@ def _rows(payload: dict[str, object]) -> dict[str, dict[str, object]]:
     return {str(row["slot"]): row for row in rows}
 
 
+# Unpinned: the real census runs while the writer lock is probed.
+@pytest.mark.real_process_evidence
 def test_audit_measures_outside_the_state_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -141,6 +146,7 @@ def test_audit_unrelated_creation_retains_unchanged_rows(
     assert "slot-b" in cast(list[object], payload["unknown_slots"])
 
 
+@pytest.mark.real_process_evidence
 def test_audit_does_not_retry_a_discarded_census(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -167,6 +173,7 @@ def test_audit_does_not_retry_a_discarded_census(
     assert rows["slot-b"]["verdict"] == "UNKNOWN", rows["slot-b"]
 
 
+@pytest.mark.real_process_evidence
 def test_audit_skips_census_when_no_row_can_use_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

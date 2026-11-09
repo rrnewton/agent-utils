@@ -27,6 +27,9 @@ from wrkslots import cli as wrkslots_cli
 
 from wrkslots.tests.rust_binary import rust_wrkslotsd
 
+# Registry judgment, not process evidence: see the pinned_process_evidence fixture.
+pytestmark = pytest.mark.usefixtures("pinned_process_evidence")
+
 
 AU_ROOT = Path(__file__).resolve().parents[3]
 
@@ -256,6 +259,8 @@ def test_audit_nested_cargo_target_matches_python(tmp_path: Path) -> None:
     assert row["cache_bytes"] == "counted"
 
 
+# Unpinned: the real census path stays exercised in both editions.
+@pytest.mark.real_process_evidence
 def test_audit_deletable_matches_python(tmp_path: Path) -> None:
     root = _fixture(tmp_path)
     actual = _check(root, tmp_path)
@@ -1503,3 +1508,122 @@ def test_audit_legacy_journal_differs_from_evidence_refuses(
     result = _rust(root, census_state=tmp_path / "rust-census.json")
     assert result.returncode != 0
     assert message in result.stderr
+
+
+def _churn_hook(tmp_path: Path, tag: str, slot: Path) -> tuple[str, Path]:
+    """A process to vanish, and a hook that kills it and starts one in ``slot``.
+
+    The census runs the hook once it has listed /proc (WRKSLOTS_TEST_CENSUS_CHURN):
+    the listed process is then gone, reaped by the subreaper, and a new process
+    whose working directory is inside the slot exists that the listing never saw.
+    Returns the hook command and the file the appearing process's PID is written to.
+    """
+
+    work = tmp_path / f"churn-{tag}"
+    work.mkdir()
+    vanishing = subprocess.run(
+        ["/bin/sh", "-c", "setsid sleep 300 </dev/null >/dev/null 2>&1 & echo $!"],
+        capture_output=True, text=True, check=True, cwd=work, timeout=30,
+    ).stdout.strip()
+    appeared = work / "appeared.pid"
+    flag = work / "fired"
+    hook = (
+        f"[ -e {flag} ] && exit 0; : > {flag}; "
+        f"kill -KILL {vanishing}; "
+        f"n=0; while kill -0 {vanishing} 2>/dev/null && [ $n -lt 500 ]; do sleep 0.01; n=$((n+1)); done; "
+        f"cd {slot} || exit 1; setsid sleep 300 </dev/null >/dev/null 2>&1 & echo $! > {appeared}"
+    )
+    return hook, appeared
+
+
+def _stop_appeared(appeared: Path) -> str:
+    """Kill the process the hook started, after checking it is that sleep; return its PID."""
+
+    pid = appeared.read_text().strip()
+    cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    if cmdline[:2] == [b"sleep", b"300"]:
+        os.kill(int(pid), 9)
+    return pid
+
+
+def _churn_row(row: dict[str, object], pid: str) -> dict[str, object]:
+    reasons = [str(reason).replace(pid, "<appeared>") for reason in cast(list[object], row["reasons"])]
+    return {**row, "reasons": reasons}
+
+
+@pytest.mark.real_process_evidence
+@pytest.mark.xfail(
+    strict=True,
+    reason="#1102 wrkslots-census-churn-tolerant: the Python census also misses a "
+    "process that appears after its /proc listing",
+)
+def test_audit_census_sees_appearing_pid_and_tolerates_vanished_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Python: a process that vanished mid-census is no refusal; one that appeared is seen (#1102)."""
+
+    root = _fixture(tmp_path)
+    hook, appeared = _churn_hook(tmp_path, "python", root / "worktrees" / "slot-a" / "repo")
+    monkeypatch.setenv("WRKSLOTS_TEST_CENSUS_CHURN", hook)
+    try:
+        payload = _python(root, tmp_path)
+    finally:
+        pid = _stop_appeared(appeared)
+    row = _rows(payload)[0]
+    reasons = [str(reason) for reason in cast(list[object], row["reasons"])]
+    assert row["verdict"] == "BLOCKED", row
+    assert any(pid in reason for reason in reasons), reasons
+    assert not any("changed during" in reason for reason in reasons), reasons
+
+
+@pytest.mark.real_process_evidence
+@pytest.mark.xfail(
+    strict=True,
+    reason="#1102 wrkslots-census-churn-tolerant: neither edition's census sees a "
+    "process that appears after its /proc listing",
+)
+def test_audit_forced_churn_matches_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both editions, one injected vanishing PID and one appearing PID: the same row (#1102)."""
+
+    rust_root = _fixture(tmp_path / "rust")
+    oracle_root = _fixture(tmp_path / "oracle")
+    hook, appeared = _churn_hook(
+        tmp_path, "python", oracle_root / "worktrees" / "slot-a" / "repo"
+    )
+    monkeypatch.setenv("WRKSLOTS_TEST_CENSUS_CHURN", hook)
+    try:
+        python_payload = _python(oracle_root, tmp_path)
+    finally:
+        python_pid = _stop_appeared(appeared)
+    hook, appeared = _churn_hook(
+        tmp_path, "rust", rust_root / "worktrees" / "slot-a" / "repo"
+    )
+    monkeypatch.setenv("WRKSLOTS_TEST_CENSUS_CHURN", hook)
+    try:
+        result = _rust(rust_root, census_state=tmp_path / "rust-census.json")
+    finally:
+        rust_pid = _stop_appeared(appeared)
+    assert result.returncode == 0, result.stderr
+    rust_row = _churn_row(_rows(_scrub(json.loads(result.stdout)))[0], rust_pid)
+    python_row = _churn_row(_rows(_scrub(python_payload))[0], python_pid)
+    assert rust_row["verdict"] == "BLOCKED", rust_row
+    assert rust_row == python_row
+
+
+def test_pinned_process_evidence_fails_loudly_when_a_process_uses_the_slot(
+    tmp_path: Path,
+) -> None:
+    """The pin never hides real use: a pinned test whose slot is in use fails, naming the process."""
+
+    slot = tmp_path / "slot"
+    slot.mkdir()
+    process = subprocess.Popen(["sleep", "60"], cwd=slot)
+    try:
+        with pytest.raises(pytest.fail.Exception, match="mark it real_process_evidence") as caught:
+            wrkslots_cli._capture_process_path_census([slot])
+        assert f"PID {process.pid} cwd -> {slot}" in str(caught.value)
+    finally:
+        process.kill()
+        process.wait()

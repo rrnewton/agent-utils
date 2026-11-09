@@ -1,10 +1,11 @@
 ---
 title: 'audit-lock-free-row-flake: an unchanged slot is marked UNKNOWN when another slot changes during the audit, under gate load'
-status: open
+status: closed
 priority: 3
 issue_type: bug
 created_at: 2026-11-08T20:50:00.000000000+00:00
-updated_at: 2026-11-08T20:50:00.000000000+00:00
+updated_at: 2026-11-09T00:37:58.000000000+00:00
+closed_at: 2026-11-09T00:37:58.000000000+00:00
 ---
 
 # Description
@@ -28,3 +29,11 @@ So under load, slot-b was judged changed or unverifiable even though only slot-a
 # Notes
 
 Filed by cl-start at the devbig030 coordinator's request. Related: #1084 audit-census-reserve-flake, another wrkslots audit test that fails only under gate load.
+
+## Resolution
+
+slot-b's UNKNOWN reason under load: "process/path census failed: ..." -- the census refusal marks every census-eligible row UNKNOWN, slot-b included, independent of which record changed.
+
+Cause, shared with #1091 audit-lock-free-row-flake / #1084 audit-census-reserve-flake: the Python audit's host-wide process/path census (`_capture_process_path_census`: three attempts, an attempt discarded on any /proc churn, one 60 s budget) refuses on a loaded host (gate load averages 100-235), and every row that consulted it becomes UNKNOWN with "process/path census failed: ...". The Rust audit lists /proc once and ignores vanished entries, so it answers where Python refuses. Confirmed without load: a plugin making the census refuse reproduces the gate failures exactly (all five lock-free tests seen in gate logs, and the differential diffs: Python slot-a UNKNOWN, Rust actionable).
+
+Fixed (cl-wrkid, 2026-11-08) for every audit test in test_audit_state_rust.py and test_audit_lock_free.py: they now use the `pinned_process_evidence` fixture (py/wrkslots/tests/conftest.py), which answers "no process uses these paths" after verifying that with one churn-tolerant /proc pass, and fails the test loudly, naming the process, if it is false. Unpinned (marker `real_process_evidence`): test_audit_deletable_matches_python (real census, both editions), test_audit_measures_outside_the_state_lock (real census), and the two census-behaviour tests that supply their own census. The product fix and the parity decision are #1102 wrkslots-census-churn-tolerant, with strict-xfail forced-churn tests (both editions miss a PID that appears after the listing). Not covered here, tracked under #1102: the remove/reclaim/recover tests that flake on the sibling 30 s /proc-scan bound.

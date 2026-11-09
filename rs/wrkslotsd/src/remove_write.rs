@@ -526,12 +526,27 @@ pub(crate) fn capture_process_snapshot(coordinator_pid: i64) -> Result<ProcessSn
     let ignored = own_ancestry();
     let entries = std::fs::read_dir("/proc")
         .map_err(|error| format!("process use is indeterminate because /proc failed: {error}"))?;
-    let mut processes: Vec<ProcessLinks> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| {
             format!("process use is indeterminate because /proc failed: {error}")
         })?;
-        let name = entry.file_name().to_string_lossy().into_owned();
+        names.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    // Test seam (#1084, #1102 wrkslots-census-churn-tolerant): the
+    // forced-churn differential makes a listed process vanish and a new
+    // one appear between the listing and the reads.
+    if let Some(command) = std::env::var_os("WRKSLOTS_TEST_CENSUS_CHURN") {
+        let _ = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let mut processes: Vec<ProcessLinks> = Vec::new();
+    for name in names {
         let Ok(pid) = name.parse::<i64>() else {
             continue;
         };

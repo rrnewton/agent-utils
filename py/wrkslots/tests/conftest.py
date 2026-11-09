@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 
@@ -57,3 +58,65 @@ def idle_validation_run_host(
     monkeypatch.setattr(cli, "_validation_run_host_evidence", no_validation_runs)
     monkeypatch.setattr(cli, "_retained_unit_cgroup_members", no_retained_cgroup_members)
     monkeypatch.setattr(cli, "_assert_host_process_view", whole_host_process_view)
+
+
+def _pinned_census_users(paths: list[Path]) -> list[str]:
+    """Processes whose cwd, root, executable or descriptors lie under ``paths``.
+
+    One pass over /proc that skips entries vanishing mid-read, the way the Rust
+    edition's audit snapshot reads it, so host churn cannot make it refuse.
+    """
+
+    targets = [str(path) for path in paths]
+    users: list[str] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        links = [entry / "cwd", entry / "root", entry / "exe"]
+        try:
+            links.extend((entry / "fd").iterdir())
+        except OSError:
+            pass
+        for link in links:
+            try:
+                target = os.readlink(link)
+            except OSError:
+                continue
+            if any(target == item or target.startswith(item + "/") for item in targets):
+                users.append(f"PID {entry.name} {link.name} -> {target}")
+    return users
+
+
+@pytest.fixture
+def pinned_process_evidence(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pin the host-wide process/path census for tests of registry judgment (#1084, #1091).
+
+    The real census proves that no process on the whole host uses a slot path:
+    three attempts, each discarded when any process's /proc entries change, in
+    one 60-second budget.  On a loaded host (gate load averages of 100-235) it
+    refuses, fail-closed, and every row that consulted it becomes UNKNOWN, so
+    tests about registry verdicts failed on whatever the host was doing.  Pinned,
+    the census answers "no process uses these paths" after checking that this is
+    true with one churn-tolerant pass, and fails the test loudly if it is not:
+    a test whose fixture really runs something in a slot needs the real census.
+    Tests of process or liveness evidence carry the ``real_process_evidence``
+    marker and keep it.
+    """
+
+    if request.node.get_closest_marker("real_process_evidence") is not None:
+        return
+    from wrkslots import cli
+
+    def census(slot_paths: Sequence[Path], **_options: object) -> cli._ProcessPathCensus:
+        users = _pinned_census_users(list(slot_paths))
+        if users:
+            pytest.fail(
+                "pinned process census: a process uses a slot path, so this test depends on "
+                "real process evidence; mark it real_process_evidence: " + "; ".join(users),
+                pytrace=False,
+            )
+        return cli._ProcessPathCensus((), (), owner_cgroup_complete=True)
+
+    monkeypatch.setattr(cli, "_capture_process_path_census", census)
