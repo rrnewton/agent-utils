@@ -332,8 +332,11 @@ class Walk:
             self.check(bool(self.page.evaluate(condition, arg)), why)
 
     def settled(self) -> None:
+        # Two frames and nothing more (`#1118 browser-fixed-frame-settle`): a paint frame after
+        # an exact wait, before header geometry, or to land a scroll. Never the only wait
+        # before reading what a tap draws: `wait_for` that first. (It also waited a fixed
+        # 150 ms; every site here already follows an exact wait.)
         self.page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
-        self.page.wait_for_timeout(150)
 
     def shot(self, name: str) -> None:
         if self.shots is not None:

@@ -400,3 +400,35 @@ duplicate-burst horizon in continuity's `posted_since`; and the negative
 windows (a reply that must not move, a chip that must not appear).
 
 Solo on 2026-11-09 (Chromium 149.0.7827.55): all three files pass whole.
+
+## Batch 8, 2026-11-09 (mu-settle)
+
+[muse watermelon] `collapsed_lines_browser.py`, `done_sync_browser.py`,
+`message_summaries_browser.py`, `compact_rows_browser.py` and
+`empty_messages_browser.py` (65 `settled()` sites reviewed).
+
+- collapsed-lines and compact-rows: each `Walk.settled` also waited a fixed
+  150 ms; that tail is gone, leaving the two frames batch 1 documents, and
+  the sites that needed more now wait for it as a condition — in
+  collapsed-lines the stepped count and its saving, the slider's saved
+  words, and selection moving at zero. In compact-rows every site already
+  followed an exact `data-collapsed` wait or landed a scroll, so only the
+  helper changed; its remaining timeout is swipe pacing, the gesture
+  itself.
+- empty-messages: its settled was already two frames. Two columns and back
+  now wait until the heading counts the messages drawn and the card counts
+  the unread it then asserts (the card merely existing said neither), and
+  the reload waits for the switch off and the empty rows back.
+- done-sync and message-summaries: no conversion. Done-sync's waits are
+  first-frame watches and held-Done windows — the frames are what could
+  expose a wrong paint, and its 800 ms quiet windows are how long a mark
+  would take to reach the server. Summaries' settles follow its server-side
+  ask drain (`settled_asks`), the failed row's state, or land a scroll; its
+  400 ms and 600 ms windows are where a wrongful ask would fire.
+
+Kept elsewhere: paint-after-exact-wait before row and header geometry;
+scroll baselines; the stepping chords' mid-cycle settles (a change-wait
+would hang at their deliberate bounds: fewer at 0, more past 8, the chord
+in the message box); and the negative windows.
+
+Solo on 2026-11-09 (Chromium 149.0.7827.55): all five files pass whole.

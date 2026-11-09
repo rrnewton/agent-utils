@@ -158,6 +158,9 @@ class Reader:
             self.page.screenshot(path=str(self.args.screenshots / f"{self.label}-{name}.png"))
 
     def settled(self) -> None:
+        # Two frames and nothing more (`#1118 browser-fixed-frame-settle`): a paint frame after
+        # a `wait_for` has pinned the rows, or the window in which a wrongful empty row would
+        # be drawn. Never the only wait before reading what a switch draws: `wait_for` first.
         self.page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
 
     def drawn(self, list_id: str = "discord-log") -> Json:
@@ -289,6 +292,9 @@ def desk_walk(reader: Reader, url: str) -> None:
     check_count(reader, 7, "All")
     page.click("#column-toggle")
     reader.wait_for("() => document.querySelectorAll('#side-cards > li[data-card]').length === 1", "the card is not listed")
+    reader.wait_for("() => /5 messages?/.test(document.getElementById('channel-summary').textContent) "
+                    "&& /1 unread/.test(document.querySelector('#side-cards > li[data-card]').textContent)",
+                    "Main's heading does not count the messages it draws, or the card counts the empty reply unread")
     reader.settled()
     check_count(reader, 5, "Main")
     unread = unread_on_card(reader)
@@ -311,6 +317,8 @@ def desk_walk(reader: Reader, url: str) -> None:
     reader.shot("2-shown")
     page.click("#side-close")
     reader.wait_for("() => document.querySelectorAll('#side-cards > li[data-card]').length === 1", "the X did not go back to the card")
+    reader.wait_for("() => /2 unread/.test(document.querySelector('#side-cards > li[data-card]').textContent)",
+                    "turned off, the card does not count the empty reply unread")
     reader.settled()
     unread_off = unread_on_card(reader)
     reader.check(unread_off == 2, f"turned off, the card counts {unread_off} unread, not the empty reply too")
@@ -318,6 +326,10 @@ def desk_walk(reader: Reader, url: str) -> None:
     page.goto(url, wait_until="load")
     # It reopens as it was left, in two columns: Main on the left, whose newest row is the thread's root.
     reader.wait_for("() => document.querySelector(\"#discord-log > li[data-id='206']\")", "the reload did not reopen the channel")
+    reader.wait_for("() => !document.getElementById('hide-empty-messages').checked "
+                    "&& Boolean(document.querySelector(\"#discord-log > li[data-id='201']\")) "
+                    "&& Boolean(document.querySelector(\"#discord-log > li[data-id='203']\"))",
+                    "a reload forgot the switch was off, or the empty rows did not come back")
     reader.settled()
     reader.check(not page.is_checked("#hide-empty-messages"), "a reload forgot the switch was off")
     reader.check(all(id_ in reader.ids() for id_ in EMPTY), f"after a reload with the switch off the rows are {reader.ids()}")

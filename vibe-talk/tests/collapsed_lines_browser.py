@@ -323,8 +323,12 @@ class Walk:
             self.check(bool(self.page.evaluate(condition, arg)), why)
 
     def settled(self) -> None:
+        # Two frames and nothing more (`#1118 browser-fixed-frame-settle`): a paint frame after
+        # an exact wait, before geometry, between the clicks of a stepping chord (whose bounds a
+        # change-wait would hang on), or to land a scroll. Never the only wait before reading
+        # what a step draws: `wait_for` that first. (It also waited a fixed 150 ms; the waits
+        # each site needed are conditions now.)
         self.page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
-        self.page.wait_for_timeout(150)
 
     def shot(self, name: str) -> None:
         if self.shots is not None:
@@ -450,7 +454,9 @@ def lines_walk(walk: Walk) -> None:
 
     # The way back up: by digit place once (a layout whose Shift+0 types no bracket), then by key.
     chord(walk.cdp, "Control+Shift", "0", "Digit0")
-    walk.settled()
+    walk.wait_for("() => document.documentElement.getAttribute('data-collapsed-lines') === '1' "
+                  "&& localStorage.getItem('vibe-talk.voice.collapsed-lines') === '1'",
+                  "Ctrl+Shift+0 by place did not step the count to 1")
     held = walk.row("604")
     walk.lines_are(1, "Ctrl+Shift+0 by place", held)
     for _ in range(5):
@@ -487,14 +493,16 @@ def lines_walk(walk: Walk) -> None:
     page.click("#fold-collapsed-lines")
     page.locator("#collapsed-lines").focus()
     page.keyboard.press("Home")
-    walk.settled()
+    walk.wait_for("() => document.getElementById('collapsed-lines-state').textContent === 'Saved — collapsed messages show only their header.'",
+                  "the slider at zero did not say it was saved")
     said = str(page.text_content("#collapsed-lines-state"))
     walk.check(said == "Saved — collapsed messages show only their header.",
                f"the slider at zero says {said!r}")
     page.click("#collapsed-lines-larger")
     page.click("#collapsed-lines-larger")
     page.click("#collapsed-lines-larger")
-    walk.settled()
+    walk.wait_for("() => document.getElementById('collapsed-lines-state').textContent === 'Saved — collapsed messages show 3 lines.'",
+                  "the + presses did not say they were saved")
     said = str(page.text_content("#collapsed-lines-state"))
     walk.check(said == "Saved — collapsed messages show 3 lines.", f"the + presses say {said!r}")
     page.click("#close-settings")
@@ -629,7 +637,8 @@ def keeper_and_views_walk(walk: Walk) -> None:
     walk.at_zero_still_works("606", "#discord-log", "the thread at zero")
     # Selection still moves at 0, and Reply still opens its box in the list.
     page.keyboard.press("k")
-    walk.settled()
+    walk.wait_for("() => ['605', '606'].includes((document.querySelector('#discord-log > li[data-selected=\"true\"]') || {}).dataset?.id)",
+                  "at zero k did not move the selection")
     chosen = page.evaluate("() => (document.querySelector('#discord-log > li[data-selected=\"true\"]') || {}).dataset?.id")
     walk.check(chosen in ("605", "606"), f"at zero k left the selection on {chosen!r}")
     page.keyboard.press("r")
