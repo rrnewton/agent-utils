@@ -2684,25 +2684,22 @@ def _require_live_agent(name: str) -> AgentRecord:
     return rec
 
 
-def _read_tui_recent_scrollback(pane_id: str) -> str:
+def _read_tui_recent_scrollback(pane_id: str, lines: int = TUI_READ_LINES) -> str:
     """Return the bounded scrollback used for startup-prompt diagnosis."""
-    payload = _herdr(
+    # `agent read` answers with the scrollback text itself, not a
+    # JSON envelope (herdr 0.9.5 observed live); read it verbatim.
+    return _herdr_stdout(
         "agent",
         "read",
         pane_id,
         "--source",
         "recent",
         "--lines",
-        str(TUI_READ_LINES),
+        str(lines),
         "--format",
         "text",
         timeout_s=HERDR_TUI_PROBE_TIMEOUT_S,
     )
-    raw_read = payload.get("read")
-    text = raw_read.get("text") if isinstance(raw_read, dict) else None
-    if not isinstance(text, str):
-        raise AgentOperationError("herdr_api_invalid", "Herdr did not return TUI scrollback text")
-    return text
 
 
 def _tui_scrollback_tail(text: str, limit: int = 480) -> str:
@@ -3109,24 +3106,7 @@ def read_agent_output(
             raise AgentOperationError("herdr_api_invalid", str(exc)) from exc
         if text:
             return ReadResult(name=valid_name, mode=mode, text=text)
-        fallback = _herdr(
-            "agent",
-            "read",
-            rec.presentation_pane,
-            "--source",
-            "recent",
-            "--lines",
-            str(read_lines),
-            "--format",
-            "text",
-            timeout_s=HERDR_TUI_PROBE_TIMEOUT_S,
-        )
-        fallback_read = fallback.get("read")
-        fallback_text = fallback_read.get("text") if isinstance(fallback_read, dict) else None
-        if not isinstance(fallback_text, str):
-            raise AgentOperationError(
-                "herdr_api_invalid", "Herdr did not return fallback TUI scrollback text"
-            )
+        fallback_text = _read_tui_recent_scrollback(rec.presentation_pane, read_lines)
         write_event("tui_scrollback_fallback", valid_name, preview="recent-unwrapped empty; used recent")
         return ReadResult(name=valid_name, mode=mode, text=fallback_text)
     if rec is None and not transcript_path(valid_name).exists():
@@ -3520,21 +3500,8 @@ def _confirm_resumed_tui(rec: AgentRecord) -> None:
                 "tui_migration_destination_died",
                 "resumed Codex TUI died before it answered the migration health check",
             )
-        payload = _herdr(
-            "agent",
-            "read",
-            rec.presentation_pane,
-            "--source",
-            "recent",
-            "--lines",
-            str(TUI_READ_LINES),
-            "--format",
-            "text",
-            timeout_s=HERDR_TUI_PROBE_TIMEOUT_S,
-        )
-        raw_read = payload.get("read")
-        text = raw_read.get("text") if isinstance(raw_read, dict) else None
-        if isinstance(text, str) and expected in text:
+        text = _read_tui_recent_scrollback(rec.presentation_pane)
+        if expected in text:
             return
         time.sleep(0.2)
     raise AgentOperationError(

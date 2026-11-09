@@ -2601,7 +2601,9 @@ pub fn drain_tui_inbox_at(
 }
 
 fn read_tui_recent_scrollback(pane_id: &str) -> Result<String, ForeignOwnershipError> {
-    let payload = herdr_call(
+    // `agent read` answers with the scrollback text itself, not a
+    // JSON envelope (herdr 0.9.5 observed live); read it verbatim.
+    herdr_stdout(
         &[
             "agent",
             "read",
@@ -2613,17 +2615,8 @@ fn read_tui_recent_scrollback(pane_id: &str) -> Result<String, ForeignOwnershipE
             "--format",
             "text",
         ],
-        Some(herdr_api_timeout()),
-    )?;
-    payload
-        .get("read")
-        .and_then(|read| read.get("text"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or_else(|| ForeignOwnershipError {
-            code: "herdr_api_invalid",
-            message: "Herdr did not return TUI scrollback text".to_string(),
-        })
+        herdr_api_timeout(),
+    )
 }
 
 /// Inspect queued and quarantined message sequence numbers without delivery.
@@ -2917,6 +2910,39 @@ fn launch_tmux_window(
         )?;
     }
     Ok(format!("{session}:{name}"))
+}
+
+/// Run one bounded Herdr request and return successful stdout
+/// verbatim, for the calls whose answer is plain text (pane/agent
+/// reads), not a JSON envelope.
+fn herdr_stdout(args: &[&str], timeout: Duration) -> Result<String, ForeignOwnershipError> {
+    let joined = args.join(" ");
+    let argv: Vec<String> = std::iter::once(herdr_bin())
+        .chain(args.iter().map(|arg| arg.to_string()))
+        .collect();
+    let output = run_bounded(&argv, timeout).ok_or_else(|| ForeignOwnershipError {
+        code: "herdr_unavailable",
+        message: format!(
+            "Herdr probe {joined} failed within {}s",
+            timeout.as_secs_f64()
+        ),
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else if !stdout.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            format!("exit {}", output.status.code().unwrap_or_default())
+        };
+        return Err(ForeignOwnershipError {
+            code: "herdr_api_failed",
+            message: format!("herdr {joined} failed: {detail}"),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn herdr_action(args: &[&str]) -> Result<(), ForeignOwnershipError> {

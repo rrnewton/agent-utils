@@ -260,6 +260,27 @@ def test_herdr_tui_launch_retries_agent_not_found_until_classified(
     assert lib._launch_herdr_tui("worker", "/work", None) == ("wT:t9", "wT:p9", alive)
 
 
+def test_tui_scrollback_read_takes_agent_read_stdout_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `agent read` answers with the scrollback text itself, not a
+    # JSON envelope (herdr 0.9.5 observed live); routing it through
+    # the JSON-demanding _herdr made every TUI read fail.
+    seen: list[tuple[str, ...]] = []
+
+    def fake_stdout(*args: str, timeout_s: float | None = None) -> str:
+        seen.append(args)
+        return "scrollback-body\nsecond line\n"
+
+    def no_json_herdr(*args: str, **kwargs: object) -> dict[str, object]:
+        raise AssertionError(f"scrollback read must not use _herdr: {args}")
+
+    monkeypatch.setattr(lib, "_herdr_stdout", fake_stdout)
+    monkeypatch.setattr(lib, "_herdr", no_json_herdr)
+    assert lib._read_tui_recent_scrollback("wT:p9") == "scrollback-body\nsecond line\n"
+    assert seen and seen[0][:3] == ("agent", "read", "wT:p9")
+
+
 def test_tmux_record_operations_ignore_changed_default_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -706,12 +727,16 @@ def test_tui_readiness_accepts_resumed_session_directory_prompt(
     def herdr(*args: str, timeout_s: float | None = None) -> dict[str, object]:
         del timeout_s
         calls.append(args)
-        if args[:2] == ("agent", "read"):
-            return {"read": {"text": next(reads)}}
         return {}
+
+    def herdr_stdout(*args: str, timeout_s: float | None = None) -> str:
+        del timeout_s
+        calls.append(args)
+        return next(reads)
 
     monkeypatch.setattr(lib, "_herdr", herdr)
     monkeypatch.setattr(lib, "_herdr_action", herdr)
+    monkeypatch.setattr(lib, "_herdr_stdout", herdr_stdout)
 
     lib._wait_for_tui_prompt(record, timeout_s=1, handle_resume_startup=True)
 
@@ -740,12 +765,16 @@ def test_tui_readiness_accepts_resumed_session_model_warning(
     def herdr(*args: str, timeout_s: float | None = None) -> dict[str, object]:
         del timeout_s
         calls.append(args)
-        if args[:2] == ("agent", "read"):
-            return {"read": {"text": lib.TUI_RESUME_MODEL_PROMPT}}
         return {}
+
+    def herdr_stdout(*args: str, timeout_s: float | None = None) -> str:
+        del timeout_s
+        calls.append(args)
+        return lib.TUI_RESUME_MODEL_PROMPT
 
     monkeypatch.setattr(lib, "_herdr", herdr)
     monkeypatch.setattr(lib, "_herdr_action", herdr)
+    monkeypatch.setattr(lib, "_herdr_stdout", herdr_stdout)
 
     lib._wait_for_tui_prompt(record, timeout_s=1, handle_resume_startup=True)
 
@@ -1567,7 +1596,7 @@ def test_tui_migration_health_check_uses_generous_ready_and_working_timeouts(
     monkeypatch.setattr(lib, "secrets", type("Secrets", (), {"token_hex": staticmethod(lambda n: "abc")}))
     monkeypatch.setattr(lib, "_submit_tui_text", submit)
     monkeypatch.setattr(lib, "_herdr_tui_probe", lambda pane: lib.TuiProbe(True, True, "idle", os.getpid()))
-    monkeypatch.setattr(lib, "_herdr", lambda *args, **kwargs: {"read": {"text": expected}})
+    monkeypatch.setattr(lib, "_herdr_stdout", lambda *args, **kwargs: expected)
 
     lib._confirm_resumed_tui(rec)
 
@@ -1588,8 +1617,8 @@ def test_tui_migration_timeout_records_status_and_scrollback(
     monkeypatch.setattr(lib, "_herdr_tui_probe", lambda pane: lib.TuiProbe(True, True, "working", 123))
     monkeypatch.setattr(
         lib,
-        "_herdr",
-        lambda *args, **kwargs: {"read": {"text": "Context compacted; rebuilding session"}},
+        "_herdr_stdout",
+        lambda *args, **kwargs: "Context compacted; rebuilding session",
     )
 
     with pytest.raises(lib.AgentOperationError, match="last Herdr status=working"):
