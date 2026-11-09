@@ -354,3 +354,49 @@ control runs. Live-pill's 300 ms after a thread opens is its landing
 finishing, kept before the settled geometry.
 
 Solo on 2026-11-09 (Chromium 149.0.7827.55): all five files pass whole.
+
+## Batch 4, 2026-11-09 (mu-settle)
+
+[muse watermelon] `reply_continuity_browser.py`, `inline_reply_browser.py`
+and `sent_receipts_browser.py` (72 `settled()` sites reviewed;
+`read_pause_reply_browser.py` is with the read-aloud group, last).
+Continuity's own `Walk.settled` is two frames and 80 ms, now documented;
+inline-reply's shared fixture helpers (`sign_in`, `two_columns`, `place`,
+`press_reply`, `place_row`, used by a dozen walks) are untouched — every
+conversion there is at this file's own call sites.
+
+Converted, today's checks kept after each:
+
+- reply-continuity: the quote cases wait until the box holds the quoted
+  words with the caret under them (by `r`, by tap, by triple-click, and the
+  final open), and for Reply's label to be Reply again after a cancelled
+  quote; the new-thread and Post-to-main destination notes are waited on as
+  words, ticked and unticked; a quick reply waits for its box to take the
+  focus and, put down by a tap outside, for the reply under the message to
+  hold its quoted words; each Draft-chip tap waits until the box it opened
+  holds its draft; a sent Post-to-main reply waits for its new root's reply
+  arrow.
+- inline-reply: a held send waits for its Sending row, and for no row to
+  keep its room once answered; Main's opening waits pin Main's eleven rows
+  and the promoted thread's Thread(1) badge (the picker's own value was set
+  by the picking itself); Grow waits until the box has grown by the measure
+  then asserted; Cancel waits for the thread's box back and the draft
+  marker; a send waits for the reply gathered under its root before the
+  server's record is read, and for the gathered replies and Main's box after
+  it; Escape waits for the gathering gone; a refused send waits for the
+  exact status sentence and its Retry; Ctrl+2's put-down reply waits for its
+  draft marker; a reply kept or reopened across a narrowing waits for its
+  words (and focus) to still be in it.
+
+No conversion in sent-receipts: its settles land a scroll, paint after an
+exact wait, run inside its Unpack cycle, or carry the reload's no-receipts
+negative; its one long timeout waits out the page's own `SENT_RECEIPT_MS`,
+which is the subject.
+
+Kept elsewhere: paint-after-exact-wait before the reply box's under-its-row
+geometry everywhere (the moved-by-a-pixel checks these walks exist for);
+scroll baselines from `place`/`place_row`; the resize windows; the
+duplicate-burst horizon in continuity's `posted_since`; and the negative
+windows (a reply that must not move, a chip that must not appear).
+
+Solo on 2026-11-09 (Chromium 149.0.7827.55): all three files pass whole.

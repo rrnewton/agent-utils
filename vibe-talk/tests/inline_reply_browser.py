@@ -264,7 +264,8 @@ def send_held(desk: Desk, api: ReplyColumnsApi, words: str) -> threading.Event:
     desk.page.click("#reply-send")
     desk.wait_for("() => document.getElementById('column-reply').hidden && document.getElementById('side-reply').hidden",
                   "sending did not put the reply's box away")
-    desk.settled()
+    desk.wait_for("() => { const g = document.querySelector('.outgoing-inplace'); return Boolean(g) && g.textContent.includes('Sending'); }",
+                  "the reply going is not drawn under the row it answers")
     return held
 
 
@@ -283,7 +284,9 @@ def in_place_walk(desk: Desk, api: ReplyColumnsApi) -> None:
     finally:
         held.set()
         api.holding = None
-    desk.wait_for("() => !document.querySelector('.outgoing-inplace')", "the reply's row stayed once the post was answered")
+    desk.wait_for("() => !document.querySelector('.outgoing-inplace') "
+                  "&& ![...document.getElementById('discord-log').children].some((li) => li.hasAttribute('data-outgoing-anchor'))",
+                  "the reply's row stayed once the post was answered")
     desk.settled()
     landed = in_place(desk, "discord-log", target)
     desk.check(number(landed, "anchored") == 0, "a row still keeps room for a reply that went")
@@ -297,8 +300,7 @@ def promotes_walk(desk: Desk, api: ReplyColumnsApi) -> None:
     page = desk.page
     sign_in(desk)
     page.select_option("#thread-select", "main")
-    desk.wait_for("() => document.getElementById('thread-select').value === 'main'", "Main did not open")
-    desk.settled()
+    desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length === 11", "Main did not open")
     target = "205"
     tag = f"#discord-log > li[data-id='{target}'] .thread-badge"
     desk.check(page.eval_on_selector(tag, "(n) => n.getAttribute('data-thread-state')") == "start",
@@ -316,6 +318,8 @@ def promotes_walk(desk: Desk, api: ReplyColumnsApi) -> None:
         page.click(tag)
         desk.wait_for(f"() => document.getElementById('thread-select').value === 'thread:ts-{target}'",
                       "the tag did not open the thread the reply starts")
+        desk.wait_for("() => { const g = document.querySelector('.outgoing-inplace'); return Boolean(g) && g.textContent.includes('Sending'); }",
+                      "the reply going is not drawn in its thread")
         desk.settled()
         check_in_place(desk, in_place(desk, "discord-log", target), "on its way in its thread", "Sending")
         desk.shot("4-promoted-thread")
@@ -326,8 +330,8 @@ def promotes_walk(desk: Desk, api: ReplyColumnsApi) -> None:
                   " && document.querySelectorAll('#discord-log > li[data-id]').length === 2",
                   "the reply was not drawn in its thread once its post was answered")
     page.select_option("#thread-select", "main")
-    desk.wait_for("() => document.getElementById('thread-select').value === 'main'", "Main did not open again")
-    desk.settled()
+    desk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length > 2 "
+                  f"&& document.querySelector(\"{tag}\")?.textContent === 'Thread(1)'", "Main did not open again on the promoted thread")
     after = page.eval_on_selector(tag, "(n) => n.textContent")
     desk.check(after == "Thread(1)", f"sent: the message answered reads {after!r}")
     desk.notes.append(f"on a Slack-like service, a reply to {target} in Main made it Thread(1) at once, its row under "
@@ -532,6 +536,9 @@ def columns_walk(desk: Desk, api: ReplyColumnsApi) -> None:
     for words in ("second line", "third line", "fourth line", "fifth line", "sixth line", "seventh line", "eighth line"):
         page.keyboard.press("Shift+Enter")
         page.keyboard.type(words)
+    desk.wait_for("() => ['column-reply', 'side-reply'].map((one) => document.getElementById(one)).find((one) => !one.hidden)"
+                  f"?.getBoundingClientRect().height > {rect(found, 'mount')['height'] + 10}",
+                  "right 208: Grow did not grow the box")
     desk.settled()
     grown = measure(desk, "side-log", "208")
     desk.check(rect(grown, "mount")["height"] > rect(found, "mount")["height"] + 10,
@@ -549,6 +556,9 @@ def columns_walk(desk: Desk, api: ReplyColumnsApi) -> None:
     if page.is_visible("#reply-discard"):
         page.keyboard.press("Escape")
     desk.wait_for("() => document.getElementById('side-reply').hidden", "Cancel did not put the box away")
+    desk.wait_for("() => document.getElementById('side-compose-text').getClientRects().length > 0 "
+                  "&& !document.querySelector(\"#side-log > li[data-id='208'] .draft-marker\").hidden",
+                  "after Cancel the thread's box is not back, or the words were not kept as the row's draft")
     desk.settled()
     back = measure(desk, "side-log", "208")
     desk.check("side-compose-text" in strings(back, "boxes"), f"after Cancel the thread's box is not back: {strings(back, 'boxes')}")
@@ -576,13 +586,17 @@ def columns_walk(desk: Desk, api: ReplyColumnsApi) -> None:
     page.fill("#reply-text", "into the replica thread, from Main")
     page.click("#reply-send")
     desk.wait_for("() => document.getElementById('column-reply').hidden", "Send did not put the box away")
-    desk.settled()
+    desk.wait_for("() => [...document.querySelectorAll('#discord-log > li[data-stack-under]')].length >= 4",
+                  f"left {root}: the sent reply did not join the replies gathered under the root")
     posted = api.posted()[sent:]
     # Where Reply on Main posts is the route's, as it always was: here a reply by pointer on the main
     # channel, which the gathering then holds under the root with the thread's replies.
     desk.check(len(posted) == 1 and posted[0].get("reply_to") == root, f"left {root}: what was posted was {posted}")
-    desk.wait_for("() => [...document.querySelectorAll('#discord-log > li[data-stack-under]')].length >= 4",
-                  f"left {root}: the sent reply did not join the replies gathered under the root")
+    desk.wait_for("() => { const s = [...document.querySelectorAll('#discord-log > li[data-stack-under]')]"
+                  ".map((li) => li.getAttribute('data-id')); "
+                  "return ['210', '212', '214'].every((id) => s.includes(id)) "
+                  "&& document.getElementById('channel-compose-text').getClientRects().length > 0; }",
+                  f"left {root}: Send put the gathered replies away, or Main's box is not back")
     desk.settled()
     after = measure(desk, "discord-log", root)
     desk.check({"210", "212", "214"} <= set(strings(after, "stack")), f"left {root}: Send put the gathered replies away: {strings(after, 'stack')}")
@@ -608,7 +622,9 @@ def all_walk(desk: Desk, api: ReplyColumnsApi) -> None:
     desk.shot("1-all-root-gathered")
     page.keyboard.press("Escape")
     desk.wait_for("() => document.getElementById('column-reply').hidden", "Escape did not put the box away")
-    desk.settled()
+    desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-stack-under]').length === 0 "
+                  "&& document.getElementById('channel-compose-text').getClientRects().length > 0",
+                  "Escape left the replies gathered, or the channel's box is not back")
     back = measure(desk, "discord-log", root)
     desk.check(strings(back, "stack") == [], f"Escape left the replies gathered: {strings(back, 'stack')}")
     desk.check("channel-compose-text" in strings(back, "boxes"), "after Escape the channel's box is not back")
@@ -631,6 +647,8 @@ def phone_walk(desk: Desk, api: ReplyColumnsApi) -> None:
     assert box is not None
     page.touchscreen.tap(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
     desk.wait_for("() => document.getElementById('column-reply').hidden", "Send did not put the box away")
+    desk.wait_for("() => document.getElementById('channel-compose-text').getClientRects().length > 0",
+                  "phone: after Send the channel's box is not back")
     desk.settled()
     posted = api.posted()[sent:]
     desk.check(len(posted) == 1 and posted[0].get("reply_to") == message_id, f"phone: what was posted was {posted}")
@@ -682,8 +700,8 @@ def refused_walk(desk: Desk, api: ReplyColumnsApi) -> None:
     api.refusing = (422, {"error": "chat_error", "detail": "Google Chat returned HTTP 400"})
     try:
         page.click("#reply-send")
-        desk.wait_for("() => /^Your reply /.test(document.getElementById('status').textContent)"
-                      " && !document.getElementById('status-line').hidden",
+        desk.wait_for("() => document.getElementById('status').textContent === 'Your reply was not sent. Retry is under the message it answers.'"
+                      " && !document.getElementById('status-line').hidden && Boolean(document.querySelector('.outgoing-inplace .outgoing-retry'))",
                       "refused: nothing on screen said the reply did not go")
     finally:
         api.refusing = None
@@ -721,6 +739,9 @@ def view_keys_walk(desk: Desk, api: ReplyColumnsApi) -> None:
                   " && document.getElementById('side-column').getClientRects().length === 0"
                   " && document.getElementById('column-reply').hidden",
                   "view keys: Ctrl+2 in the left column's box did not show All and put the reply down")
+    desk.wait_for("() => { const m = document.querySelector(\"#discord-log > li[data-id='203'] .draft-marker\"); "
+                  "return Boolean(m) && !m.hidden; }",
+                  "view keys: the words of the reply Ctrl+2 put down were not kept as the row's draft")
     desk.settled()
     draft = page.evaluate("() => { const m = document.querySelector(\"#discord-log > li[data-id='203'] .draft-marker\");"
                           " return Boolean(m) && !m.hidden; }")
@@ -742,6 +763,9 @@ def collapse_from_all(desk: Desk, api: ReplyColumnsApi) -> None:
     desk.wait_for("() => document.getElementById('side-column').getClientRects().length === 0",
                   "narrowing to a phone's width did not give one column")
     desk.wait_for("() => !document.getElementById('column-reply').hidden", "the reply did not stay open in the one column")
+    desk.wait_for("() => document.getElementById('reply-text').value === 'kept words' "
+                  "&& document.activeElement && document.activeElement.id === 'reply-text'",
+                  "the words did not stay with the reply, or the reader typing lost the box")
     desk.settled()
     found = measure(desk, "discord-log", "206")
     desk.check(found["text"] == "kept words", f"the words did not stay with the reply: {found['text']!r}")
@@ -771,6 +795,8 @@ def collapse_from_main(desk: Desk, api: ReplyColumnsApi) -> None:
     page.select_option("#thread-select", f"thread:{RUNNER}")
     desk.wait_for("() => !document.getElementById('column-reply').hidden",
                   "the reply did not open again once its message was drawn")
+    desk.wait_for("() => document.getElementById('reply-text').value === 'wait for me'",
+                  "the reply opened again without its words")
     desk.settled()
     found = measure(desk, "discord-log", "206")
     desk.check(found["text"] == "wait for me", f"the reply opened again without its words: {found['text']!r}")

@@ -385,6 +385,10 @@ class Walk:
         return Measured({str(key): value for key, value in found.items()})
 
     def settled(self) -> None:
+        # Two frames and 80 ms (`#1118 browser-fixed-frame-settle`): in this walk only a paint
+        # window after a `wait_for` has pinned the box open or away, before the moved-by-a-pixel
+        # measures, to land a scroll before its baseline, or to carry a no-move window. Never
+        # the only wait before reading what a press draws: `wait_for` that first.
         self.page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
         self.page.wait_for_timeout(80)
 
@@ -683,6 +687,9 @@ def branch_state(walk: Walk) -> Measured:
 def tick_branch(walk: Walk, case: str) -> None:
     walk.press("#reply-branch-row")
     walk.wait_for("() => document.getElementById('reply-branch').checked", f"{case}: a press did not tick the box")
+    walk.wait_for("() => !document.getElementById('reply-destination').hidden "
+                  "&& document.getElementById('reply-destination').textContent === 'Posts in a new thread on this message, as its first reply.'",
+                  f"{case}: ticked, the note does not say where it goes")
     walk.settled()
 
 
@@ -712,6 +719,9 @@ def new_thread_walk(walk: Walk) -> None:
     index = 30
     list_box = walk.measure(index).box("list")
     opened = open_reply(walk, index, list_box["top"] + list_box["height"] * 0.4, "new-thread")
+    walk.wait_for("() => document.getElementById('reply-branch-row').getClientRects().length > 0 "
+                  "&& document.getElementById('reply-destination').textContent === 'Posts in the main channel as a reply to this message.'",
+                  "new-thread: unticked, the note does not say where it goes")
     branch = branch_state(walk)
     row, text, send = branch.box("row"), opened.box("text"), opened.box("send")
     walk.check(branch.found["checked"] is False, "new-thread: the box was ticked before anyone ticked it")
@@ -810,12 +820,16 @@ def quote_case(walk: Walk) -> None:
         # r on the selected message, the selection inside it: the quote, the box focused.
         page.keyboard.press("r")
         walk.wait_for(OPEN, "quote: r did not open the reply")
-        walk.settled()
+        walk.wait_for(f"() => {{ const b = document.getElementById('reply-text'); return b.value === {json.dumps(expected)} "
+                      f"&& document.activeElement === b && b.selectionStart === {len(expected)}; }}",
+                      f"quote: r did not quote {expected!r}")
         keyed = state()
         walk.check(keyed["value"] == expected and keyed["focused"] is True and keyed["caret"] == len(expected),
                    f"quote: r did not quote {expected!r}: {keyed}")
         walk.press("#reply-cancel")
         walk.wait_for(CLOSED, "quote: Cancel did not put the box away")
+        walk.wait_for(f"() => document.querySelector(\"#discord-log > li[data-id='{row_id}'] .reply-button\")?.textContent === 'Reply'",
+                      "quote: Reply stayed Quote reply after its quote was taken")
         walk.settled()
         cancelled = state()
         walk.check(cancelled["draft"] is False, f"quote: an untouched quote was kept as a draft: {cancelled}")
@@ -837,7 +851,9 @@ def quote_case(walk: Walk) -> None:
         # Tapped as Chromium does it, the selection kept through the tap.
         walk.press(f"#discord-log > li[data-id='{row_id}'] .reply-button")
         walk.wait_for(OPEN, "quote: the tap did not open the reply")
-        walk.settled()
+        walk.wait_for(f"() => {{ const b = document.getElementById('reply-text'); return b.value === {json.dumps(expected)} "
+                      f"&& document.activeElement === b && b.selectionStart === {len(expected)}; }}",
+                      f"quote: the tap did not quote {expected!r}")
         tapped = state()
         walk.check(tapped["value"] == expected and tapped["focused"] is True and tapped["caret"] == len(expected),
                    f"quote: the tap did not quote {expected!r}: {tapped}")
@@ -863,6 +879,9 @@ def quote_case(walk: Walk) -> None:
         row_id = two
     walk.press(f"#discord-log > li[data-id='{row_id}'] .reply-button")
     walk.wait_for(OPEN, "quote: Quote reply did not open the reply")
+    walk.wait_for(f"() => {{ const b = document.getElementById('reply-text'); return b.value === {json.dumps(expected)} "
+                  f"&& document.activeElement === b && b.selectionStart === {len(expected)}; }}",
+                  f"quote: the box does not hold {expected!r}")
     walk.settled()
     opened = state()
     walk.check(opened["value"] == expected, f"quote: the box holds {opened['value']!r}, not {expected!r}")
@@ -1021,6 +1040,8 @@ def quick_reply_walk(walk: Walk) -> None:
             walk.shot("quick-chip")
         walk.press("#selection-chip")
         walk.wait_for("() => !document.getElementById('quick-reply').hidden", f"quick {turn}: the chip opened no box")
+        walk.wait_for("() => document.activeElement === document.getElementById('quick-reply-text')",
+                      f"quick {turn}: the box did not take the focus")
         walk.settled()
         opened = state()
         quick = opened["quick"]
@@ -1074,6 +1095,10 @@ def quick_reply_walk(walk: Walk) -> None:
     walk.wait_for("() => document.getElementById('quick-reply').hidden", "quick, put down: a tap outside left the box up")
     walk.wait_for("() => !document.getElementById('column-reply').hidden",
                   "quick, put down: a tap outside hid the draft: no reply open under the message")
+    walk.wait_for(f"() => {{ const t = document.getElementById('reply-text').value; "
+                  f"return t.startsWith('> ') && t.endsWith('\\n\\nhalf a thought') "
+                  f"&& document.getElementById('reply-target-meta').textContent.endsWith('id {row_id}'); }}",
+                  "quick, put down: the reply under the message does not hold the words")
     walk.settled()
     put: object = page.evaluate(PUT_DOWN_JS, row_id)
     assert isinstance(put, dict)
@@ -1180,6 +1205,8 @@ def drafts_walk(walk: Walk) -> None:
         walk.press("#draft-chip")
         walk.wait_for(f"() => document.activeElement && document.activeElement.id === '{box}'",
                       f"drafts, tap {turn + 1}: #{box} did not take the focus: {state()}")
+        walk.wait_for(f"() => document.getElementById('{box}').value.endsWith({json.dumps(words)})",
+                      f"drafts, tap {turn + 1}: #{box} does not hold its draft")
         walk.settled()
         now = state()
         walk.check(str(now["value"]).endswith(words), f"drafts, tap {turn + 1}: #{box} holds {now['value']!r}")
@@ -1249,7 +1276,8 @@ def triple_click_case(walk: Walk, list_box: dict[str, float]) -> None:
     expected = quote_text(str(selected))
     walk.press(f"#discord-log > li[data-id='{row_id}'] .reply-button")
     walk.wait_for(OPEN, "triple-click: Quote reply did not open the reply")
-    walk.settled()
+    walk.wait_for(f"() => document.getElementById('reply-text').value === {json.dumps(expected)}",
+                  f"triple-click: the box does not hold {expected!r}")
     opened: object = page.evaluate(STATE_JS, row_id)
     assert isinstance(opened, dict)
     walk.check(opened["value"] == expected == f"> Message {single}: checked.\n\n",
@@ -1401,6 +1429,8 @@ def post_to_main_walk(walk: Walk) -> None:
     walk.page.evaluate("(selector) => document.querySelector(selector).click()",
                        f"#discord-log > li[data-id='{target}'] .reply-button")
     walk.wait_for(OPEN, "post-to-main: Reply did not open the box in the list")
+    walk.wait_for("() => !document.getElementById('reply-to-main-row').hidden",
+                  "post-to-main: no Post to main choice on a thread reply")
     walk.settled()
     walk.check(page.evaluate("() => !document.getElementById('reply-to-main-row').hidden"),
                "post-to-main: no Post to main choice on a thread reply")
@@ -1436,8 +1466,11 @@ def post_to_main_walk(walk: Walk) -> None:
                f"post-to-main: what left the browser was {posted}")
     walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length > {rows}",
                   "post-to-main: the new root never reached the list")
-    walk.settled()
     new_id = message_id(count)
+    walk.wait_for(f"() => {{ const row = [...document.querySelectorAll('#discord-log > li[data-id]')].find((li) => li.dataset.id === '{new_id}'); "
+                  f"return row && row.dataset.replyTo === '{target}' && Boolean(row.querySelector('.reply-jump')); }}",
+                  "post-to-main: the new root carries no reply arrow to the quoted message")
+    walk.settled()
     arrow: object = page.evaluate("""(id) => {
       const row = [...document.querySelectorAll('#discord-log > li[data-id]')]
         .find((li) => li.dataset.id === id);
@@ -1454,6 +1487,8 @@ def post_to_main_walk(walk: Walk) -> None:
     walk.page.evaluate("(selector) => document.querySelector(selector).click()",
                        f"#discord-log > li[data-id='{target}'] .reply-button")
     walk.wait_for(OPEN, "post-to-main: Reply did not reopen after the ticked send")
+    walk.wait_for("() => !document.getElementById('reply-to-main-row').hidden",
+                  "post-to-main: the choice is not offered again on reopening")
     walk.settled()
     walk.check(page.evaluate("() => !document.getElementById('reply-to-main-row').hidden"),
                "post-to-main: the choice is not offered again on reopening")
