@@ -169,3 +169,52 @@ whose claims overlap a live row, never act under the registry lock
 mid-mutation, and never double-act with a concurrent manual
 `wrkslots recover`. Reversible by moving the file back verbatim.
 Implement only once the lead approves.
+
+## (c) Approved 2026-11-08: conditions recorded before implementation
+
+The lead approves the quarantine in principle, sequenced after #1098
+wrkslots-classify-batch-seals, with four conditions on top of the
+proposal above:
+
+1. Never automatic. `classify-create-journals` stays read-only.
+   Quarantine is an explicit operator command: dry run by default,
+   `--yes` to act, `--coordinator-authorized` (like #1089's
+   release-frozen-incomplete).
+2. Recover first. A `dead-incomplete-create` journal is normally
+   resolved by `wrkslots recover`, which rolls the partial create back.
+   Quarantine is only for a journal recover itself refuses; the command
+   says so and points at recover when recover would work.
+3. Moving the journal must not orphan what it describes. The tombstone
+   (and the dry run) lists every partial artifact the journal names
+   (worktree path, image file, branch, registry claims) and whether each
+   exists, so it can be cleaned with supported commands afterwards.
+4. Visible afterwards: doctor and audit's summary report quarantined
+   journals with age and slot. A `quarantine/` subdirectory is fine.
+
+The proposal's own conditions stand: complete dead-owner proof, stable
+identity, age bound, no overlap with a live row, never under the
+registry lock mid-mutation, never alongside a concurrent recover,
+reversible by moving back verbatim. Both editions, same differential
+pattern.
+
+Lead's answers to the plan's design questions:
+
+1. Target by slot. The dry run prints the exact journal path and its
+   sha256, and `--yes` must be given those same values; refuse if the
+   journal changed in between.
+2. Age bound = max(24 h, the longest legitimate create bound wrkslots
+   knows about), stated in the refusal text when a journal is too young.
+3. No restore command in v1, but "reversible" must stay true. The
+   tombstone carries everything a hand restore needs: original path,
+   the bytes or a pointer to the quarantined file, and the pending
+   entry it closed. The user guide documents the hand-restore steps,
+   and one test follows exactly those steps and shows classify back in
+   its prior state. If that test is awkward to write, that is the
+   signal restore needs a command after all; say so.
+4. Report-only retention in v1, no pruning.
+5. Close the EVENTS-derived pending entry in the same journaled step
+   as the move, so a crash between the two cannot leave classify
+   refusing on "missing while append-only history still names it".
+
+Sequencing: survey note Mon 2026-11-09 noon ET, implementation PUSH
+Tue 2026-11-10 6 PM ET. This issue stays open for (c).
