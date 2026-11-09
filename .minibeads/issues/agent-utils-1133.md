@@ -4,7 +4,7 @@ status: open
 priority: 1
 issue_type: feature
 created_at: 2026-11-09T13:45:55.621866979+00:00
-updated_at: 2026-11-09T13:46:07.267374838+00:00
+updated_at: 2026-11-09T22:21:28.067667242+00:00
 ---
 
 # Description
@@ -34,7 +34,12 @@ Also write the runbook for a live drill without a reboot: the coordinator runs t
 - Certificate variant: when the certificate never appears, the command exits 75 within its bound, names the remedy, and launches nothing that needs the certificate.
 - Refusal variant: with one unrestorable lane, the command exits 74 naming that lane while the others come back.
 - The drill runs green in validation without an exclusive waiver and leaves no process, socket, or directory behind; the live-drill runbook is recorded beside it and names its approval gate and abort condition.
+- Reused pane: the profile lane's revive relaunches in the idle shell the restarted scratch server restored under the same pane id, with the registry launch environment present again afterwards.
+- Bare path: with an image-backed slot unmounted and its mount point occupied, that lane is refused (74) before revive while the other lanes come back.
+- The live-drill runbook confines every step to our registry only, with before/after inventories of the other team (consumer-a) as the closing proof.
 
 # Notes
 
 Proof for the deterministic script and the four scope issues filed alongside it. Reuses the existing fake-server and scratch-slot fixtures where they isolate cleanly; asserts on records, reports, ownership, and queued messages. The live drill is a separate operator act with owner approval; this issue ships its runbook, not its execution.
+
+Gate3 drill as built: py/tests/test_agentctl_restore_drill.py (agentctl component, existing shards, no new DAG step). Real: built restore-teams/restore binary, scratch registry, named scratch server session on its own socket, scratch slot project via the tracked wrkslots launcher by absolute path, report files, exit codes, queued briefs, slot owner via wrkslots status. Stubbed: harness processes only (compiled fake Muse via AGENTCTL_MUSE_BIN; a script cannot be a custom harness). Boot split: no product boot-id override exists, so the drill plants previous-boot record identities under the current kernel boot; scripted-Host injection stays with the Rust suites. Live runbook: ai_docs/transient/2026-11-09-restore-drill-proof/RUNBOOK.md (our registry only; not executed).
