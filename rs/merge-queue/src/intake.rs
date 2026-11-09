@@ -477,11 +477,48 @@ pub fn apply_except(
     Ok(applied)
 }
 
+/// Drop every waiting request for `pr` and return what was dropped, in
+/// recording order. A run calls this for each change it lands (#1103):
+/// requests recorded before the landing are moot, and applying one
+/// afterwards would queue the landed change again. Unreadable entries
+/// stay: they cannot be attributed to a change.
+pub fn drop_pending_for(state: &State, pr: i64) -> Vec<Entry> {
+    let mut dropped = Vec::new();
+    for path in files(&pending_dir(state)).unwrap_or_default() {
+        let Ok(entry) = read(&path) else {
+            continue;
+        };
+        // A mark-exact requirement is not mooted by the landing: it
+        // records that another repository pins this exact head, and
+        // applying it after the landing is how that stays on record.
+        if matches!(entry.request, Request::MarkExact { .. }) {
+            continue;
+        }
+        if entry.request.pr() == pr && std::fs::remove_file(&path).is_ok() {
+            dropped.push(entry);
+        }
+    }
+    dropped
+}
+
 /// Carry out one request.
 fn perform(state: &State, config: &Config, entry: &Entry) -> Result<String, String> {
     let recorded = &entry.recorded_at;
     match &entry.request {
         Request::Submit(submission) => {
+            // A recorded submit is stale intent once its change has
+            // landed (#1103): drop it with a note instead of queueing
+            // the change again. Queueing a landed change on purpose
+            // stays a fresh direct submit, which reads current state.
+            if let Some(item) = state.item(submission.pr)? {
+                if item.status == ItemStatus::Landed {
+                    return Ok(format!(
+                        "dropped #{}: already landed as {}",
+                        item.pr,
+                        short(&item.landed_as)
+                    ));
+                }
+            }
             let mut submission = (**submission).clone();
             submission.recorded_at.clone_from(recorded);
             let item = ops::submit(state, config, submission)?;

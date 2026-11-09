@@ -655,3 +655,37 @@ fn a_late_resubmission_while_one_long_batch_drains_is_taken_in_once_more() {
     assert_eq!(status(&fx, 3), "queued");
     assert_eq!(count_c(&started_lines(&started)), 0);
 }
+
+/// A resubmission recorded while its change is in flight is dropped
+/// when the change lands (#1103), not applied afterwards: the landed
+/// change is neither queued nor validated again, in this run or at
+/// its end.
+#[test]
+fn a_resubmission_recorded_in_flight_is_dropped_when_its_change_lands() {
+    let (fx, started, gates) = setup("intake-landed-resubmit-drop");
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let mut daemon = Daemon::start(&fx);
+    wait_for("change 1 to validate", Duration::from_secs(30), || {
+        started_lines(&started).len() == 1
+    });
+    // The same head submitted again while it validates: recorded, and
+    // still waiting when the batch lands.
+    let out = fx.mq_ok(&["submit", "1", "--head", "a"]);
+    assert!(out.contains("recorded #1"), "{out}");
+    open(&gates, 2);
+    assert_eq!(daemon.exit_code(Duration::from_secs(60)), Some(0));
+    let reports = reports(&fx);
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(landed(&reports[0]), vec![vec![1]], "{}", reports[0]);
+    assert_eq!(status(&fx, 1), "landed");
+    // Validated once: the recorded resubmission never started another.
+    assert_eq!(started_lines(&started), vec!["a t0".to_owned()]);
+    assert!(
+        events(&fx)
+            .iter()
+            .any(|line| line.contains("dropped 1 recorded request")),
+        "events: {:?}",
+        events(&fx)
+    );
+}

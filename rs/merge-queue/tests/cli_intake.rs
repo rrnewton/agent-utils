@@ -519,3 +519,38 @@ fn identical_requests_recorded_one_after_another_are_applied_once() {
     assert_eq!(submitted, 1);
     assert_eq!(status_json(&fx)["intake"]["pending"], 0);
 }
+
+/// A recorded submit applied after its change landed is dropped with
+/// a note (#1103), not queued again: the item stays landed and a
+/// fresh direct submit remains the deliberate way to queue it again.
+#[test]
+fn a_recorded_submit_for_a_landed_change_is_dropped_at_the_next_writer() {
+    let fx = queue("intake-landed-drop");
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    let out = fx.mq(&["run"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(status(&fx, 1), "landed");
+    // The same head submitted again while a writer holds the queue.
+    let lock = hold_writer_lock(&fx);
+    let out = fx.mq_ok(&["submit", "1", "--head", "a"]);
+    assert!(out.contains("recorded #1"), "{out}");
+    assert_eq!(status_json(&fx)["intake"]["pending"], 1);
+    drop(lock);
+    // The next writer drops it instead of queueing the landed change.
+    let out = fx.mq(&["run"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("already landed"), "{stderr}");
+    assert_eq!(status(&fx, 1), "landed");
+    assert_eq!(status_json(&fx)["intake"]["pending"], 0);
+    let submitted = history(&item(&fx, 1))
+        .into_iter()
+        .filter(|(kind, _)| kind == "submitted")
+        .count();
+    assert_eq!(submitted, 1);
+}

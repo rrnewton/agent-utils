@@ -1321,6 +1321,12 @@ pub struct Runner<'a> {
     /// Whether the one extra intake round past the intake window has been
     /// spent in this run (#1087; see [`Self::late_intake_round`]).
     late_intake_taken: Mutex<bool>,
+    /// Flights this run dropped without consuming their results, by id
+    /// with why each was dropped (#1103): a late result for one is
+    /// discarded with its reason instead of logged as unknown. Only
+    /// [`Self::drop_withdrawn_flights`] drops flights that way; the
+    /// discard paths drain their results before returning.
+    dropped_flights: Mutex<BTreeMap<u64, String>>,
     /// The validator donor jobs published now carry: the run's starting validator, replaced
     /// at plan-intake when the config on disk changes (#1050).
     publish_validator: Mutex<crate::state::ValidatorConfig>,
@@ -1497,6 +1503,7 @@ impl<'a> Runner<'a> {
             excluded: Mutex::new(held),
             resubmitted_same_head: Mutex::new(BTreeSet::new()),
             late_intake_taken: Mutex::new(false),
+            dropped_flights: Mutex::new(BTreeMap::new()),
             publish_validator: Mutex::new(publish_validator),
             landed_heads: Mutex::new(Vec::new()),
             carried: Mutex::new(BTreeMap::new()),
@@ -2728,8 +2735,9 @@ impl<'a> Runner<'a> {
     /// `pending` to be rebuilt, and changes that depend on a withdrawn
     /// change are set aside for the rest of the run. Nothing here waits
     /// for a dropped validation to report: a root it releases must not
-    /// wait for the withdrawn batch's validator to return. Later results
-    /// for dropped flights are logged as lost by the run loop.
+    /// wait for the withdrawn batch's validator to return. The dropped
+    /// flights are remembered in `dropped_flights`, so a result that
+    /// arrives for one later is discarded with its reason (#1103).
     fn drop_withdrawn_flights(
         &self,
         flights: &mut VecDeque<Flight>,
@@ -2741,6 +2749,8 @@ impl<'a> Runner<'a> {
         }
         let mut kept: VecDeque<Flight> = VecDeque::new();
         let mut dropped: Vec<Flight> = Vec::new();
+        // Why each dropped flight was dropped, for its late result.
+        let mut reasons: BTreeMap<u64, String> = BTreeMap::new();
         // A stacked batch built on a dropped batch's tree cannot land as
         // built either: it follows the drop, to be rebuilt.
         let mut tree_broken = false;
@@ -2754,6 +2764,14 @@ impl<'a> Runner<'a> {
                 if !flight.rooted {
                     tree_broken = true;
                 }
+                reasons.insert(
+                    flight.id,
+                    if holds_withdrawn {
+                        "its change was withdrawn while it validated".to_owned()
+                    } else {
+                        "it was built on a withdrawn batch".to_owned()
+                    },
+                );
                 dropped.push(flight);
             } else {
                 kept.push_back(flight);
@@ -2765,8 +2783,12 @@ impl<'a> Runner<'a> {
         }
         let kept = follow_dropped_reds(kept, &mut dropped);
         for flight in &dropped {
+            reasons
+                .entry(flight.id)
+                .or_insert_with(|| "it was dropped with a withdrawn batch".to_owned());
             flight.cancel.store(true, Ordering::Relaxed);
         }
+        lock(&self.dropped_flights).extend(reasons);
         let mut withdrawn_prs: Vec<i64> = Vec::new();
         for flight in dropped.into_iter().rev() {
             if flight.probe_for.is_some() {
@@ -7539,6 +7561,16 @@ impl<'a> Runner<'a> {
                     if let Some((id, result)) = arrived {
                         if let Some(flight) = flights.iter_mut().find(|flight| flight.id == id) {
                             flight.result = Some(result);
+                        } else if let Some(reason) = lock(&self.dropped_flights).get(&id).cloned() {
+                            // A flight this run itself dropped (withdrawn):
+                            // its late result is expected and discarded.
+                            self.event(
+                                "result-discarded",
+                                &format!(
+                                    "a validation result arrived for flight {id}, dropped \
+                                     earlier in this run ({reason}); discarded"
+                                ),
+                            );
                         } else {
                             self.event(
                                 "result-lost",
@@ -8570,6 +8602,30 @@ impl<'a> Runner<'a> {
                             ),
                         );
                         self.state.save_item(item)?;
+                    }
+                }
+            }
+            // Requests recorded for a landed change before it landed
+            // are moot (#1103): drop them now, under the writer lock
+            // this run holds, instead of applying one later and
+            // queueing the change again.
+            if self.writer.is_some() {
+                for pr in prs {
+                    let dropped = crate::intake::drop_pending_for(self.state, *pr);
+                    if !dropped.is_empty() {
+                        self.event(
+                            "intake",
+                            &format!(
+                                "#{pr} landed; dropped {} recorded request(s) from before \
+                                 the landing: {}",
+                                dropped.len(),
+                                dropped
+                                    .iter()
+                                    .map(|entry| entry.request.describe())
+                                    .collect::<Vec<_>>()
+                                    .join("; ")
+                            ),
+                        );
                     }
                 }
             }

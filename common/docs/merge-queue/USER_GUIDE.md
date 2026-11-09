@@ -379,9 +379,14 @@ seconds under `run`.
   run reads the recorded withdrawals. If one names a change in the batch, the run does not land
   that batch, stops, and leaves the batch queued. The next cycle applies the withdrawal and
   validates the rest again.
-- A request that cannot be applied when its turn comes (its change landed meanwhile, its head
-  no longer resolves) is moved to `intake/refused/` with the reason, noted in the change's
-  history (`intake-refused`), and shown by `status` for a week.
+- When a change lands, any requests recorded for it before the landing are dropped (the
+  run log names them): they asked about a change that is not in the queue any more. A
+  recorded `submit` that is applied after its change landed some other way is dropped the
+  same way, with a `dropped #N: already landed as <sha>` note; queueing a landed change
+  again takes a fresh direct `submit`. Other requests that cannot be applied when their
+  turn comes (a withdrawal after the landing, a head that no longer resolves) are moved
+  to `intake/refused/` with the reason, noted in the change's history (`intake-refused`),
+  and shown by `status` for a week.
 - A recorded request is not in any item record until it is applied, so `list` and `status` show
   it on its own line, for example `#4885 pending-intake: submit pr-4885 at 1a2b3c4d5e since
   2026-11-04T20:51:03Z` (`list --json`: a row with `"status": "pending-intake"`).
@@ -926,7 +931,16 @@ on which files two changes share.
 A run directory holds `plan.json` (the plan it started from), `events.jsonl` (every step, in
 order), `validations/<NNNN-purpose>/` (one per validation: `run.log`, the runner's results and
 `record.json`), `ejections/<pr>.md` (one report per ejected change), `report.md` and
-`report.json`. The scratch slots are kept between validations and runs: switching a slot to a new
+`report.json`. Three event kinds record validations the run throws away, at most one per
+flight: `flight-discarded` — a flight dropped by the discard paths (a batch cut behind a
+red or decided head, a detached drop at a stop decision, the descendants of a stale root
+being requeued), recorded at the drop with the verdict it held and, for a batch, an item
+history line per change; `result-discarded` — a late result for the one drop that does
+not wait for its validations to report, a change withdrawn while validating (or a batch
+built on one), discarded on arrival with its reason and no verdict taken from it; and
+`result-lost` — a result for a flight the run never knew, which should not happen and is
+worth investigating. The discard paths drain their flights' results before returning, so
+only a withdrawn flight can still report after its drop, and no flight takes two kinds. The scratch slots are kept between validations and runs: switching a slot to a new
 candidate is a forced checkout plus `git clean -ffd`, which keeps ignored build caches, so later
 builds are incremental (`validator.clean_ignored` adds `-x`). There is one slot per possible
 concurrent validation, plus one for selection queries.

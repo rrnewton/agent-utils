@@ -45,7 +45,11 @@ Two leftovers around a landing, both seen in an operator's runs:
   the pending files and returns what they asked for; the landing
   path in run.rs calls it for each landed change under the writer
   lock it already holds. Requests recorded after the landing are
-  untouched. This also closes the #1050 same-head path for landed
+  untouched, and a `mark-exact` requirement is never dropped: it
+  records that another repository pins the landed head, and
+  applying it after the landing is how that stays on record (a
+  peer run that lands the change mid-cycle applies it at its end,
+  as cli_peers pins). This also closes the #1050 same-head path for landed
   changes: there is nothing left for a later intake round in the
   same run to take in again.
 - At apply time (`intake::perform`, Submit arm), a submit whose

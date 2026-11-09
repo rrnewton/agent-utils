@@ -395,3 +395,76 @@ fn a_withdrawn_green_batch_does_not_end_the_run() {
     assert!(files.iter().any(|f| f == "tests/b"), "{files:?}");
     assert!(!files.iter().any(|f| f == "tests/a"), "{files:?}");
 }
+
+/// The event lines of every run, oldest first.
+fn run_events(fx: &Fixture) -> Vec<String> {
+    let runs = fx.queue().join(".git/merge-queue/runs");
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(runs)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.join("events.jsonl").is_file())
+        .collect();
+    dirs.sort();
+    dirs.iter()
+        .flat_map(|dir| {
+            std::fs::read_to_string(dir.join("events.jsonl"))
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// A result for a flight the run itself dropped (here: cancelled by a
+/// withdrawal) is discarded with its reason (#1103), not logged as a
+/// result for an unknown flight, and no verdict is taken from it.
+#[test]
+fn a_late_result_for_a_withdrawn_flight_is_discarded_with_its_reason() {
+    let (fx, started, gates) = gated_setup("withdrawn-late-result");
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    let mut daemon = Daemon::start_once(&fx);
+    wait_for(
+        "the first batch to validate",
+        Duration::from_secs(30),
+        || started_lines(&started).iter().any(|line| line == "a_t0_"),
+    );
+    let out = fx.mq_ok(&["withdraw", "1"]);
+    assert!(out.contains("recorded the withdrawal of #1"), "{out}");
+    // The withdrawn flight is dropped from the window before any gate
+    // opens, so its gated validation can only report afterwards.
+    wait_for(
+        "the withdrawn flight to be dropped",
+        Duration::from_secs(30),
+        || {
+            run_events(&fx)
+                .iter()
+                .any(|line| line.contains("\"kind\":\"withdrawn\""))
+        },
+    );
+    // Now the cancelled validation completes and its late result
+    // arrives; change 2's shapes (stacked, rebuilt, base probe) pass.
+    for set in ["a_t0_", "a_b_t0_", "b_t0_", "t0_"] {
+        open(&gates, set);
+    }
+    assert_eq!(daemon.exit_code(Duration::from_secs(90)), Some(0));
+    assert_eq!(status(&fx, 1), "withdrawn");
+    assert_eq!(status(&fx, 2), "landed");
+    let events = run_events(&fx);
+    assert!(
+        events.iter().any(
+            |line| line.contains("\"kind\":\"result-discarded\"") && line.contains("withdrawn")
+        ),
+        "events: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|line| line.contains("\"kind\":\"result-lost\"")),
+        "events: {events:?}"
+    );
+}
