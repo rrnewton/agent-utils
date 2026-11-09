@@ -1,5 +1,5 @@
 ---
-title: 'worktrees-image-migrate-liveness: migrate's slot-in-use check reads only cwd and ignores holds and registry liveness'
+title: 'worktrees-image-migrate-liveness: migrate''s slot-in-use check reads only cwd and ignores holds and registry liveness'
 status: open
 priority: 2
 issue_type: bug
