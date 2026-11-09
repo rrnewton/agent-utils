@@ -158,6 +158,23 @@ def test_readers_host_file_optin_dispatches_to_soak(tmp_path: Path) -> None:
     assert result.stdout == "SOAK readers=1 args=doctor\n"
 
 
+def test_readers_missing_soak_launcher_falls_through_to_python(
+    tmp_path: Path,
+) -> None:
+    root = _build_sandbox(tmp_path)
+    (root / "common" / "bin" / "wrkslots-soak").unlink()
+    host_file = tmp_path / "wrkslots-rust-readers"
+    host_file.write_text("enabled = true\n")
+    result = _run(
+        root,
+        {"WRKSLOTS_RUST_READERS_FILE": str(host_file)},
+        "status",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"PY-{TOOL}\n"
+    assert "soak launcher missing" in result.stderr
+
+
 def test_readers_zero_and_python_engine_beat_routing(tmp_path: Path) -> None:
     root = _build_sandbox(tmp_path)
     host_file = tmp_path / "wrkslots-rust-readers"

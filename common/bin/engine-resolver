@@ -102,7 +102,13 @@ WRKSLOTS_SOAK=""
 if [[ "$TOOL" == "wrkslots" && -n "${WRKSLOTS_ENGINE:-}" ]]; then
     if [[ "$WRKSLOTS_ENGINE" == "rust-soak" ]]; then
         # Soak mode (#562): dispatch through the soak launcher, which
-        # accepts the exact Python CLI and logs every invocation.
+        # accepts the exact Python CLI and logs every invocation. An
+        # explicit soak request against a checkout without the launcher
+        # refuses by name instead of silently running another edition.
+        if [[ ! -x "$ROOT/common/bin/wrkslots-soak" ]]; then
+            echo "[wrkslots] engine=rust-soak requested but no executable soak launcher exists at common/bin/wrkslots-soak. Refusing to silently fall back to Python." >&2
+            exit 127
+        fi
         exec "$ROOT/common/bin/wrkslots-soak" "$@"
     fi
     ENGINE="$WRKSLOTS_ENGINE"
@@ -133,8 +139,13 @@ if [[ "$TOOL" == "wrkslots" && -z "${WRKSLOTS_ENGINE:-}" && -z "$ENGINE_VAR" ]];
             ;;
     esac
     if [[ -n "$WRKSLOTS_READERS" ]]; then
-        export WRKSLOTS_SOAK_READERS_ONLY=1
-        exec "$ROOT/common/bin/wrkslots-soak" "$@"
+        if [[ -x "$ROOT/common/bin/wrkslots-soak" ]]; then
+            export WRKSLOTS_SOAK_READERS_ONLY=1
+            exec "$ROOT/common/bin/wrkslots-soak" "$@"
+        fi
+        # The host opt-in must never break a partial checkout (or a test
+        # sandbox) that has no soak launcher: stay on the normal path.
+        echo "[wrkslots] rust readers routing requested but soak launcher missing at common/bin/wrkslots-soak; running Python" >&2
     fi
 fi
 

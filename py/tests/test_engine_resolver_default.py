@@ -55,8 +55,21 @@ def _run(
     env = {
         key: value
         for key, value in os.environ.items()
-        if key not in ("DAGRUN_ENGINE", "AGENT_UTILS_ENGINE", "CI_HUB_PYTHON")
+        if key
+        not in (
+            "DAGRUN_ENGINE",
+            "AGENT_UTILS_ENGINE",
+            "WRKSLOTS_ENGINE",
+            "WRKSLOTS_RUST_READERS",
+            "WRKSLOTS_RUST_READERS_FILE",
+            "WRKSLOTS_PYCOMPAT",
+            "WRKSLOTS_SOAK_READERS_ONLY",
+            "CI_HUB_PYTHON",
+        )
     }
+    # Hermetic: a host readers opt-in file must never leak into the
+    # sandbox dispatch decision.
+    env["WRKSLOTS_RUST_READERS_FILE"] = str(root / "no-readers-file")
     env.update(extra_env or {})
     return subprocess.run(
         [str(root / "common" / "bin" / tool)],
