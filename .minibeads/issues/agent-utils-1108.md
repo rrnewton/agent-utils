@@ -1,10 +1,10 @@
 ---
 title: 'remove-lock-hold-starves-validate: a slow wrkslots remove holds the registry locks long enough to refuse validation admission'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 created_at: 2026-11-09T02:30:00.000000000+00:00
-updated_at: 2026-11-09T17:30:00.000000000+00:00
+updated_at: 2026-11-09T18:00:00.000000000+00:00
 assignee: cl-wrkid
 ---
 
@@ -129,4 +129,10 @@ The worktree-slot lock hold is now about 2 s and does not grow with scan time. B
 Image-backed slots, measured separately: their `before_image_fence` check (`observe_image_before_fence`, which runs `_observe_slot_use_once`: lsof +D plus the direct /proc scan) stays under the locks, per the lead. That call, timed alone five times on a one-file scratch directory: 11.64, 11.52, 12.16, 11.54, 11.44 s at load 42-93, about 8 s lsof and 3.5 s direct scan, matching the remove runs' census and scan times. This is a lower bound for a real image slot, whose lsof +D also walks every file of the slot's checkouts. No image slot was created: mounting one needs root, which this lane did not use. So an image-slot removal holds the registry locks for about 2 s plus 11.5 s or more, and that grows with host load as lsof does. It dominates the hold, about 85% at this load.
 
 Proposal (for the lead): the hold is solved for worktree slots, and image slots, the common case on both hosts, still hold the locks for the whole lsof. By the lead's rule ("if it dominates under load, the follow-up must first stop new entrants and only then run an unlocked lsof"), that follow-up is due: under the locks, fence first (stop new entrants by path) and release; then run lsof against the old mount, plus the remount, outside the locks, with the after-fence checks staying decisive. Two ways to track it: (a) close #1108 with this measurement as its Resolution, for worktree slots and the measurements, and file the image follow-up as a new P1 issue; or (b) keep #1108 open for it. Recommendation: (a), since the follow-up is a separate design (it changes the image fence's order and needs its own safety argument); #1108's validation-admission read-lock option can be dropped unless admission still waits once both are in.
+
+## Resolution
+
+Closed by the lead's decision (2026-11-09, relayed by the coordinator), with measurement 2 above as the result. The change (be8b3a8e) moved remove's slot-use scans before the registry locks and keeps a cheap locked re-check under them. A worktree-slot removal now holds the locks for about 2 s (2.03, 1.99, 2.05 s), flat when every scan is 5 s slower; before, it was 8.5 s growing to 18.7 s. The locked whole-record re-check takes under 10 ms.
+
+Not solved here: image-backed slots. Their `before_image_fence` lsof check stays under the locks, by the lead's earlier choice, and dominates their hold: 11.4-12.2 s at load 42-93, a lower bound measured on a scratch directory. The fence-first follow-up is #1142 image-remove-fence-first. The validation-admission shared read lock, the second design option, is dropped for now (the lead).
 
