@@ -1,6 +1,6 @@
 ---
 title: "worktrees-image-host-scope: the worktrees_image section in the shared .wrkslots.yml applies to every host that checks out the project"
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-09T17:55:00.000000000+00:00
@@ -43,3 +43,7 @@ applies on this host, and why.
 
 Reported by the first adopter on 2026-11-09. It blocks that adopter from committing its configuration, so it runs
 right after #1147 worktrees-image-bind-record-race in the worktrees-image set.
+
+## Resolution
+
+Shipped the host-scoped form only (the overlay file can follow if asked): an optional `machines` list inside the `worktrees_image` section names the hosts (the configuration's own machine identity) the whole section applies on. `settings_from_obj` validates it on every host (non-empty, unique, non-empty strings; malformed refuses everywhere) and `_parse_worktrees_image` is the one applies-here decision: an unnamed host gets `worktrees_image = None` exactly as if the section were absent, with the reason kept on the config for diagnostics. Tests prove config load on an unnamed host attempts no mount or bind at all, the create guard does not refuse, `doctor` reports `worktrees-image: skipped: ...` (human and JSON) while reporting a named host's slot row plainly, migrate's refusal names the host scope, and the named host is unchanged (existing tests pass). Documented in the section's configuration comments, `worktrees-image --help`, and the USER_GUIDE ("Host-scoped sections"). Rust parity: mirror the `machines` validation in the Rust settings and config-validation readers and the applies-here decision where Rust builds its config (filed with the landing PUSH).

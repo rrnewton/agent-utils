@@ -54,13 +54,25 @@ class WorktreesImageError(RuntimeError):
 
 @dataclasses.dataclass(frozen=True)
 class WorktreesImageSettings:
-    """Configuration for the project worktrees image."""
+    """Configuration for the project worktrees image.
+
+    ``machines`` scopes the whole section to named hosts: the section
+    usually lives in a tracked configuration file read on every host
+    that checks out the project, while the image exists on one. None
+    means the section applies on every host.
+    """
 
     relative_path: str
     size_bytes: int
     filesystem: str = "btrfs"
     mount: str = "kernel"
     slot_quota_bytes: int | None = None
+    machines: tuple[str, ...] | None = None
+
+    def applies_on(self, machine: str) -> bool:
+        """Whether this section applies on the host named ``machine``."""
+
+        return self.machines is None or machine in self.machines
 
     def image_file(self, root: Path) -> Path:
         """The backing image file for a project rooted at ``root``."""
@@ -88,6 +100,12 @@ WORKTREES_IMAGE_DOCS: dict[str, str] = {
         "Optional per-slot qgroup limit in bytes (referenced, post-compression). "
         "Each new slot becomes a btrfs subvolume inside the image."
     ),
+    "machines": (
+        "Optional list of machine names (the configuration's machine identity) "
+        "the worktrees image applies on. A host not listed behaves exactly as "
+        "if the section were absent, so the section is safe to commit: the "
+        "image exists on the named hosts only. Absent means every host."
+    ),
 }
 
 
@@ -96,7 +114,9 @@ def settings_from_obj(value: object) -> WorktreesImageSettings:
 
     if not isinstance(value, dict):
         raise WorktreesImageError("configuration.worktrees_image must be a mapping")
-    unknown = sorted(set(value) - {"path", "size_bytes", "fs", "mount", "slot_quota_bytes"})
+    unknown = sorted(
+        set(value) - {"path", "size_bytes", "fs", "mount", "slot_quota_bytes", "machines"}
+    )
     if unknown:
         raise WorktreesImageError(
             f"configuration.worktrees_image has unknown keys: {', '.join(unknown)}"
@@ -133,12 +153,27 @@ def settings_from_obj(value: object) -> WorktreesImageSettings:
     quota = value.get("slot_quota_bytes")
     if quota is not None and (not isinstance(quota, int) or isinstance(quota, bool) or quota < 1):
         raise WorktreesImageError("configuration.worktrees_image.slot_quota_bytes must be a positive integer")
+    machines = value.get("machines")
+    if machines is not None:
+        # Validated on every host, named or not: a malformed scope must
+        # never silently read as "applies everywhere" or "nowhere".
+        if (
+            not isinstance(machines, list)
+            or not machines
+            or any(not isinstance(name, str) or not name.strip() for name in machines)
+            or len(set(machines)) != len(machines)
+        ):
+            raise WorktreesImageError(
+                "configuration.worktrees_image.machines must be a non-empty list of "
+                "unique non-empty machine names"
+            )
     return WorktreesImageSettings(
         relative_path=candidate.as_posix(),
         size_bytes=size,
         filesystem=str(filesystem),
         mount=str(mount),
         slot_quota_bytes=quota,
+        machines=tuple(machines) if machines is not None else None,
     )
 
 

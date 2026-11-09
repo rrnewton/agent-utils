@@ -156,6 +156,22 @@ later. From then on, an additive key needs only an `ignorable_keys` entry, and a
 needs a `min_wrkslots_version` raised to the release that introduced it. `init --repair` keeps
 listed keys it does not know as they are.
 
+### Host-scoped sections
+
+Most of the file means the same thing on every host, but a storage choice may not: the
+`worktrees_image` section names an image file that exists on one host, while the file itself is
+usually tracked and read wherever the project is checked out. Its optional `machines` list scopes
+the whole section to the named hosts (the same machine identity the configuration records):
+
+```yaml
+worktrees_image: {path: worktrees.img, size_bytes: 1099511627776, machines: [image-host]}
+```
+
+On a host not listed, every command behaves exactly as if the section were absent: no mount is
+attempted at load, slot creation uses the ordinary representation, and `doctor` says the section
+was skipped and why. On a listed host nothing changes. A malformed `machines` list refuses on
+every host, so a typo cannot silently widen or narrow the scope.
+
 ## Coordinator assignment and creation
 
 An agent name must be one the session tooling can register: a lowercase letter, then lowercase

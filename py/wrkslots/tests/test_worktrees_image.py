@@ -82,7 +82,9 @@ def test_classify_mount_states(tmp_path: Path) -> None:
 
 
 def test_parse_absent_means_disabled(tmp_path: Path) -> None:
-    assert cli._parse_worktrees_image({}, tmp_path, tmp_path / "worktrees" / "slots") is None
+    assert cli._parse_worktrees_image(
+        {}, tmp_path, tmp_path / "worktrees" / "slots", "node-a"
+    ) == (None, None)
 
 
 def test_parse_refuses_image_inside_slots(tmp_path: Path) -> None:
@@ -93,6 +95,40 @@ def test_parse_refuses_image_inside_slots(tmp_path: Path) -> None:
             {"worktrees_image": {"path": "worktrees/slots/inner.img", "size_bytes": 2 * GIB}},
             tmp_path,
             worktrees,
+            "node-a",
+        )
+
+
+def test_machines_scope_named_and_unnamed_hosts(tmp_path: Path) -> None:
+    raw = {
+        "worktrees_image": {
+            "path": "worktrees.img",
+            "size_bytes": 2 * GIB,
+            "machines": ["image-host"],
+        }
+    }
+    worktrees = tmp_path / "worktrees" / "slots"
+    named, skipped = cli._parse_worktrees_image(raw, tmp_path, worktrees, "image-host")
+    assert named is not None and named.machines == ("image-host",) and skipped is None
+    unnamed, reason = cli._parse_worktrees_image(raw, tmp_path, worktrees, "donor-host")
+    assert unnamed is None
+    assert reason is not None and "image-host" in reason and "donor-host" in reason
+    # No machines list: every host, as before.
+    unscoped = {"worktrees_image": {"path": "worktrees.img", "size_bytes": 2 * GIB}}
+    settings, skipped = cli._parse_worktrees_image(
+        unscoped, tmp_path, worktrees, "any-host"
+    )
+    assert settings is not None and settings.machines is None and skipped is None
+
+
+@pytest.mark.parametrize(
+    "machines",
+    [[], "image-host", [""], ["  "], [7], ["a", "a"], ["a", 1]],
+)
+def test_malformed_machines_refused(machines: object) -> None:
+    with pytest.raises(worktreesimage.WorktreesImageError, match="machines"):
+        worktreesimage.settings_from_obj(
+            {"path": "worktrees.img", "size_bytes": 2 * GIB, "machines": machines}
         )
 
 
@@ -663,3 +699,141 @@ def test_ensure_binds_skips_a_record_whose_subvolume_is_gone(
     assert actions == ["bound slot ok from the worktrees image"]
     assert not (slots_dir / "gone").exists()
     assert set(worktreesimage.load_binds(control)) == {"gone", "ok"}
+
+
+def _scoped_project(tmp_path: Path) -> Path:
+    """A loadable project whose worktrees_image names one other host."""
+
+    root = tmp_path / "project"
+    (root / "worktrees" / "slots").mkdir(parents=True)
+    (root / "live.py").write_text("# probe\n", encoding="utf-8")
+    (root / ".wrkslots.yml").write_text(
+        "schema: 2\n"
+        "machine: donor-host\n"
+        "worktrees_dir: worktrees/slots\n"
+        "default_remote: origin\n"
+        "default_landed_ref: refs/remotes/origin/main\n"
+        "heartbeat_ttl_seconds: 60\n"
+        "liveness_command: live.py\n"
+        "layout: flat\n"
+        "worktrees_image:\n"
+        "  path: worktrees.img\n"
+        "  size_bytes: 2147483648\n"
+        "  machines: [image-host]\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+def _forbid_mounts(monkeypatch: pytest.MonkeyPatch) -> None:
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("mount side effect attempted")
+
+    monkeypatch.setattr(worktreesimage, "ensure_image_mounted", forbidden)
+    monkeypatch.setattr(worktreesimage, "ensure_binds", forbidden)
+    monkeypatch.setattr(worktreesimage, "current_state", forbidden)
+
+
+def test_load_on_unnamed_host_has_no_mount_side_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _scoped_project(tmp_path)
+    _forbid_mounts(monkeypatch)
+    config = cli._load_config(str(root), "donor-host")
+    assert config.worktrees_image is None
+    assert config.worktrees_image_state == "disabled"
+    assert config.worktrees_image_skipped is not None
+    assert "image-host" in config.worktrees_image_skipped
+    # Exactly as absent: slot-writing commands are not refused.
+    cli._require_worktrees_image_mounted(config, "create a slot")
+
+
+def test_load_on_named_host_keeps_todays_behaviour(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _scoped_project(tmp_path)
+    calls: list[str] = []
+
+    def fake_mount(*args: object) -> None:
+        calls.append("mount")
+
+    def fake_binds(*args: object) -> list[str]:
+        calls.append("binds")
+        return []
+
+    monkeypatch.setattr(worktreesimage, "ensure_image_mounted", fake_mount)
+    monkeypatch.setattr(worktreesimage, "ensure_binds", fake_binds)
+    monkeypatch.setattr(
+        worktreesimage, "current_state", lambda *a: worktreesimage.MOUNTED
+    )
+    config = cli._load_config(str(root), "image-host")
+    assert config.worktrees_image is not None
+    assert config.worktrees_image_skipped is None
+    assert calls == ["mount", "binds"]
+
+
+def test_doctor_reports_a_named_host_row_plainly_from_an_unnamed_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import argparse
+    import json as json_module
+
+    root = _scoped_project(tmp_path)
+    _forbid_mounts(monkeypatch)
+    config = cli._load_config(str(root), "donor-host")
+    identity = cli.ProcessIdentity(
+        pid=123, start_ticks=456, boot_id="boot", host_id="host", cgroup_path="/"
+    )
+    checkout = cli.Checkout(
+        name="repo",
+        path="worktrees/slots/s1",
+        repository=".",
+        branch="main",
+        start_point="0" * 40,
+        remote="origin",
+        remote_url_sha256="0" * 64,
+        landed_ref="refs/remotes/origin/main",
+        head="0" * 40,
+    )
+    (config.worktrees / "s1").mkdir(parents=True, exist_ok=True)
+    record = cli.ActiveRecord(
+        slot="s1",
+        agent="worker-a",
+        task="t1",
+        purpose="probe",
+        slot_type="agent",
+        machine="donor-host",
+        generation=1,
+        created_at="2026-11-05T00:00:00+00:00",
+        heartbeat_at="2026-11-05T00:00:00+00:00",
+        heartbeat_ttl_seconds=600,
+        owner=None,
+        coordinator_lease=identity,
+        coordinator_recovery_note=None,
+        handoff=None,
+        checkouts=(checkout,),
+        layout="flat",
+    )
+    cli._atomic_write_json(
+        cli._active_path(config),
+        cli._active_to_obj(
+            cli.ActiveState(machine="donor-host", revision=0, slots=(record,))
+        ),
+    )
+    cli._atomic_write_json(
+        cli._archive_path(config),
+        cli._archive_to_obj(cli.ArchiveState(machine="donor-host", revision=0, records=())),
+    )
+    # A bind record left by the named host: read, never acted on here.
+    worktreesimage.save_binds(config.control, {"s1": "s1"})
+    args = argparse.Namespace(
+        project_root=str(root),
+        machine="donor-host",
+        wait_lock=0.0,
+        all_machines=False,
+        format="json",
+    )
+    assert cli._cmd_doctor(args) == 0
+    report = json_module.loads(capsys.readouterr().out)
+    assert report["worktrees_image"].startswith("skipped:")
+    assert [row["slot"] for row in report["active"]] == ["s1"]

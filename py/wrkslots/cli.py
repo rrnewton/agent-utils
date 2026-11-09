@@ -1210,6 +1210,11 @@ class Config:
     #: "mounted" (see worktreesimage.classify_mount).
     worktrees_image: worktreesimage.WorktreesImageSettings | None = None
     worktrees_image_state: str = "disabled"
+    #: Why a configured worktrees_image section does not apply on this
+    #: host (its machines list names other hosts), or None when it
+    #: applies or is absent. Diagnostics only: behaviour keys off
+    #: ``worktrees_image`` being None either way.
+    worktrees_image_skipped: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4339,6 +4344,7 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         disk_values = advisory, provisioning, emergency
     else:
         disk_values = None, None, None
+    wt_settings, wt_skipped = _parse_worktrees_image(raw, root, worktrees, machine)
     config = Config(
         root=root,
         config_path=path,
@@ -4378,7 +4384,8 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         slot_representation=_parse_slot_representation(raw),
         image_settings=_parse_image_settings(raw),
         sandbox_settings=_parse_sandbox_settings(raw),
-        worktrees_image=_parse_worktrees_image(raw, root, worktrees),
+        worktrees_image=wt_settings,
+        worktrees_image_skipped=wt_skipped,
     )
     if config.worktrees_image is not None:
         # Re-establish the image mount and recorded slot binds on every
@@ -4447,11 +4454,18 @@ def _parse_image_settings(raw: Mapping[str, object]) -> slotimage.ImageSettings:
 
 
 def _parse_worktrees_image(
-    raw: Mapping[str, object], root: Path, worktrees: Path
-) -> worktreesimage.WorktreesImageSettings | None:
+    raw: Mapping[str, object], root: Path, worktrees: Path, machine: str
+) -> tuple[worktreesimage.WorktreesImageSettings | None, str | None]:
+    """The section as settings for this host, or why it is skipped here.
+
+    The one host-scope decision: a section whose ``machines`` list does
+    not name this host returns (None, reason), and every consumer keys
+    off the None exactly as if the section were absent.
+    """
+
     value = raw.get("worktrees_image")
     if value is None:
-        return None
+        return None, None
     try:
         settings = worktreesimage.settings_from_obj(_as_mapping(value, "configuration.worktrees_image"))
     except worktreesimage.WorktreesImageError as exc:
@@ -4465,7 +4479,13 @@ def _parse_worktrees_image(
         raise StateError(
             "configuration.worktrees_image.path must live outside the slots directory it mounts"
         )
-    return settings
+    if not settings.applies_on(machine):
+        named = ", ".join(settings.machines or ())
+        return None, (
+            f"configuration.worktrees_image applies on machines [{named}] only; "
+            f"this host is {machine}"
+        )
+    return settings, None
 
 
 def _parse_sandbox_settings(raw: Mapping[str, object]) -> sandbox.SandboxSettings:
@@ -41604,6 +41624,13 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             for record in doctor_records
         ]
     cap = config.max_active_slots
+    wt_scope = (
+        f"skipped: {config.worktrees_image_skipped}"
+        if config.worktrees_image_skipped is not None
+        else f"applies: state={config.worktrees_image_state}"
+        if config.worktrees_image is not None
+        else None
+    )
     if args.format == "json":
         print(
             json.dumps(
@@ -41613,6 +41640,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
                     "worktrees_dir": str(config.worktrees),
                     "control_dir": str(config.control),
                     "layout": config.layout,
+                    **({"worktrees_image": wt_scope} if wt_scope is not None else {}),
                     "machines": [state.machine for state in states],
                     "event_counts": {
                         state.machine: len(_load_events(config, state.machine))
@@ -41633,6 +41661,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             f"active={len(rows)} cap={'none' if cap is None else cap} "
             f"findings={len(findings)}"
         )
+        if wt_scope is not None:
+            print(f"worktrees-image: {wt_scope}")
         counts: dict[str, int] = {}
         for item in findings:
             kind = str(item["kind"])

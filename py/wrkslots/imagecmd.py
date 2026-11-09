@@ -186,7 +186,9 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
         description=(
             "Manage the project worktrees image: one sparse btrfs image mounted at the "
             "slots directory, holding every slot. Configured by the worktrees_image "
-            "section; absent means slots live on the host file system. Kernel mount "
+            "section; absent means slots live on the host file system. The section's "
+            "optional machines list scopes it to named hosts: elsewhere it behaves "
+            "exactly as if absent, so it is safe to commit. Kernel mount "
             "only (sudo -n mount -o loop): btrfs has no unprivileged FUSE fallback. "
             "Slot-writing commands refuse unless the image is verifiably mounted, so "
             "slots are never written onto the host underneath the mount point."
@@ -705,6 +707,11 @@ def _wt_settings(
 ) -> "tuple[cli.Config, worktreesimage.WorktreesImageSettings]":
     config = _config(args)
     if config.worktrees_image is None:
+        if config.worktrees_image_skipped is not None:
+            raise _refuse(
+                f"worktrees_image does not apply on this host: "
+                f"{config.worktrees_image_skipped}"
+            )
         raise _refuse(
             "no worktrees_image configured; add a worktrees_image section "
             "(path, size_bytes, fs: btrfs, mount: kernel) to enable it"
