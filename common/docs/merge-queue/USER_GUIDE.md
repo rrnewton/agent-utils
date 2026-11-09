@@ -739,7 +739,7 @@ through its route; an operator uses `status`, `host-fault` and `clear-fault`.
 |---|---|
 | `run --queue CMD --clone DIR --name NAME [--jobs N]` | Claim jobs through the route, validate each exact candidate in a worktree of `DIR`, report receipts. Options: `--remote` (default `origin`; fetched for the base), `--poll-secs` (default 5), `--work DIR` (default `merge-queue-donor/` in the clone's Git directory), `--mismatch-backoff-secs` (default 300), `--until-idle`, `--cap-file PATH` (read before every claim: a whole number N caps `--jobs` at N, 0 drains, claiming nothing and never exiting under `--until-idle`, and an absent or malformed file means `--jobs`; running jobs are never touched, and each change is logged). SIGINT/SIGTERM gives running jobs back and exits. |
 | `status [--json]` | Jobs by state, leases (never their tokens), and in `compare` mode how many receipts matched the local verdict. |
-| `claim --donor NAME [--host H] [--jobs N] [--drain]` | Lease the oldest job this donor may take; prints `{"job": ...}` (with the token) or `{"job": null}`. The cap it claims under (0 with `--drain`, which leases nothing) is kept for `donor status`. |
+| `claim --donor NAME [--host H] [--jobs N] [--drain] [--revision COMMIT [--revision-dirty]]` | Lease the oldest job this donor may take; prints `{"job": ...}` (with the token) or `{"job": null}`. The cap it claims under (0 with `--drain`, which leases nothing) is kept for `donor status`. `--revision` declares the donor binary's own merge-queue commit: a mismatch with the queue host is refused without leasing as `{"job": null, "refused": "..."}`; no declaration claims as before. |
 | `renew --job ID` | Token on stdin. Prints `{"renewal": "continue", ...}` or `{"renewal": "stop", "reason": ...}`. |
 | `bundle --job ID` | Token on stdin. Writes the candidate's git bundle to stdout. |
 | `report --job ID` | `{"token", "receipt"}` on stdin. Exits 1 with the reason when the receipt is refused. |
@@ -1561,7 +1561,12 @@ Before it claims anything, `donor run` asks the queue host for its repository's 
 refuses to start. The same repository in another URL form is accepted with a note: `https://`,
 `ssh://`, scp-like `git@host:path`, with or without `.git`, a trailing `/`, a user or a port.
 `donor info` also reports the queue host's merge-queue revision, and a donor whose revision
-differs warns at startup. A validator that checks its checkout's origin itself should compare
+differs warns at startup. The check also runs at claim time: each claim declares the
+donor binary's own revision (`--revision COMMIT [--revision-dirty]`), and a claim whose
+declared revision differs from the queue host's is refused without leasing — the reply is
+`{"job": null, "refused": "..."}` with the mismatch, and the donor backs off instead of
+burning a validation whose receipt the same check would refuse. A claim that declares no
+revision (an older donor binary) claims as before; the receipt check still applies. A validator that checks its checkout's origin itself should compare
 the same way. `merge-queue donor same-repository URL URL` exits `0` when two URLs name one
 repository and prints both normalized forms.
 

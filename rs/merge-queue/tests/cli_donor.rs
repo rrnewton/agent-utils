@@ -2947,3 +2947,95 @@ fn a_validator_change_mid_run_reaches_later_donor_jobs() {
     }
     assert!(events.contains("config-reload"), "{events}");
 }
+
+/// Claim-time revision gate (#1105): a claim declaring a revision the
+/// queue host was not built from is refused without leasing; a
+/// matching declaration, and an old claim with none, lease as today.
+#[test]
+fn a_claim_declaring_a_mismatched_revision_is_refused_without_leasing() {
+    let fx = Fixture::new("donor-claim-revision");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+        "--offload",
+        "decide",
+    ]);
+    two_changes(&fx);
+    let mut run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    // Claims go through `command` (which sets MERGE_QUEUE_ALLOW_DIRTY,
+    // as donor runs do): this test build is dirty, so a matching
+    // declaration must carry --revision-dirty too.
+    let claim = |args: &[&str]| -> Value {
+        let out = command(&fx.queue(), args, &[]).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap()
+    };
+    // An old-style claim with no declaration leases as today; give
+    // the job back so the gated claims below see it queued again.
+    let claimed = claim(&["donor", "claim", "--donor", "d1", "--jobs", "1"]);
+    assert!(!claimed["job"].is_null(), "{claimed}");
+    assert!(claimed.get("refused").is_none(), "{claimed}");
+    let id = claimed["job"]["id"].as_str().unwrap().to_owned();
+    let token = claimed["job"]["lease"]["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (ok, _, err) = donor_call(&fx, "release", &id, &token);
+    assert!(ok, "{err}");
+    assert_eq!(jobs(&fx)[0]["state"], "queued", "{}", jobs(&fx)[0]);
+    let wrong = "1".repeat(40);
+    assert_ne!(wrong, own_revision());
+    let refused = claim(&[
+        "donor",
+        "claim",
+        "--donor",
+        "d1",
+        "--jobs",
+        "1",
+        "--revision",
+        &wrong,
+    ]);
+    assert!(refused["job"].is_null(), "{refused}");
+    assert!(
+        refused["refused"]
+            .as_str()
+            .is_some_and(|why| why.contains("this donor's merge-queue is built from")),
+        "{refused}"
+    );
+    // Nothing was leased: the job is still queued for a matching donor.
+    assert_eq!(jobs(&fx)[0]["state"], "queued", "{}", jobs(&fx)[0]);
+    // A matching declaration leases it. This test build is dirty
+    // (its checkout has the test's own changes in it), which a real
+    // donor binary declares with --revision-dirty.
+    let revision = own_revision();
+    let version_out = Command::new(bin()).arg("--version").output().unwrap();
+    let dirty = String::from_utf8_lossy(&version_out.stdout).contains("(dirty)");
+    let mut matching = vec![
+        "donor",
+        "claim",
+        "--donor",
+        "d1",
+        "--jobs",
+        "1",
+        "--revision",
+        revision.as_str(),
+    ];
+    if dirty {
+        matching.push("--revision-dirty");
+    }
+    let claimed = claim(&matching);
+    assert!(!claimed["job"].is_null(), "{claimed}");
+    assert!(claimed.get("refused").is_none(), "{claimed}");
+    let _ = run.kill();
+    let _ = run.wait();
+}

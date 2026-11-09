@@ -702,6 +702,19 @@ pub fn revision_mismatch(
     })
 }
 
+/// Why a claim declaring `declared` must be refused before leasing
+/// (#1105), or `None` when it may claim: a mismatch (or an unusable
+/// declaration) refuses with [`revision_mismatch`]'s wording, the same
+/// the receipt path uses after the work is done. No declaration (an
+/// older donor) is never a refusal: it claims exactly as before the
+/// gate existed.
+pub fn claim_refusal(
+    queue: Option<&crate::build_info::Revision>,
+    declared: Option<&crate::build_info::Revision>,
+) -> Option<String> {
+    declared.and_then(|donor| revision_mismatch(queue, Some(donor)))
+}
+
 /// Names of the tools whose answers differ from the job's.
 pub fn mismatched_tools(
     wanted: &BTreeMap<String, String>,
@@ -4110,12 +4123,24 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
                     &cap_text,
                 ];
                 args.push("--reports-admission");
+                // Declare this binary's revision so the queue can refuse
+                // the claim up front instead of the receipt (#1105). A
+                // queue too old to know the flags refuses the claim,
+                // which leases nothing, as with --drain above.
+                let own_revision = crate::build_info::revision();
+                if let Some(revision) = &own_revision {
+                    args.push("--revision");
+                    args.push(&revision.commit);
+                    if revision.dirty {
+                        args.push("--revision-dirty");
+                    }
+                }
                 if probe_passed {
                     args.push("--probe-passed");
                 }
                 let answer = route.call(&args, b"", ROUTE_TIMEOUT);
                 match answer.and_then(|out| Route::parse_reply::<Claimed>(&out)) {
-                    Ok(Claimed { job: Some(job) }) => {
+                    Ok(Claimed { job: Some(job), .. }) => {
                         claimed = true;
                         active.fetch_add(1, Ordering::SeqCst);
                         eprintln!(
@@ -4128,7 +4153,22 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
                             active.fetch_sub(1, Ordering::SeqCst);
                         });
                     }
-                    Ok(Claimed { job: None }) => {}
+                    Ok(Claimed {
+                        job: None,
+                        refused: Some(reason),
+                    }) => {
+                        // Refused before leasing (a revision mismatch):
+                        // every claim will be refused until the binaries
+                        // match, so back off like a tool mismatch, and do
+                        // not read it as an empty queue.
+                        claim_failed = true;
+                        worker.back_off(&backoff);
+                        eprintln!(
+                            "merge-queue donor {}: claim refused: {reason}",
+                            options.name
+                        );
+                    }
+                    Ok(Claimed { job: None, .. }) => {}
                     Err(error) => {
                         claim_failed = true;
                         eprintln!("merge-queue donor {}: claim failed: {error}", options.name)
@@ -4215,6 +4255,11 @@ fn preflight_against_queue(
 pub struct Claimed {
     /// The leased job (with its token), or `null` when there is nothing for this donor.
     pub job: Option<Job>,
+    /// Why the claim itself was refused (a declared revision the queue
+    /// host was not built from, #1105), when it was. Absent in replies
+    /// from older queue hosts and on every ordinary claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
 
 /// A job as `donor status` shows it: no lease token.
@@ -5876,6 +5921,30 @@ mod unit {
         assert!(missing.contains("no source revision"), "{missing}");
         // A dirty donor never matches a clean queue host.
         assert!(revision_mismatch(Some(&same), Some(&at('a', true))).is_some());
+    }
+
+    #[test]
+    fn a_claim_is_refused_only_for_a_declared_mismatched_revision() {
+        use crate::build_info::Revision;
+        let at = |commit: char, dirty: bool| Revision {
+            commit: commit.to_string().repeat(40),
+            dirty,
+        };
+        let queue = at('a', false);
+        // An old donor declares nothing: no refusal, whatever the queue has.
+        assert!(claim_refusal(Some(&queue), None).is_none());
+        assert!(claim_refusal(None, None).is_none());
+        // A matching declaration claims as today.
+        assert!(claim_refusal(Some(&queue), Some(&at('a', false))).is_none());
+        // A mismatch refuses with the receipt path's wording.
+        let refused = claim_refusal(Some(&queue), Some(&at('b', false))).unwrap();
+        assert!(
+            refused.contains("this donor's merge-queue is built from"),
+            "{refused}"
+        );
+        // So does a dirty (unusable) declaration.
+        let refused = claim_refusal(Some(&queue), Some(&at('a', true))).unwrap();
+        assert!(refused.contains("uncommitted changes"), "{refused}");
     }
 
     #[test]

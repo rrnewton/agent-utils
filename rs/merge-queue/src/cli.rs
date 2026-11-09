@@ -429,6 +429,15 @@ enum DonorCommand {
         /// the stale sweeps. Donors that do not send it keep the old rule.
         #[arg(long)]
         reports_admission: bool,
+        /// The merge-queue commit this donor's binary was built from:
+        /// a claim declaring a revision the queue host was not built
+        /// from is refused without leasing. Donors that send none
+        /// (older binaries) claim as before.
+        #[arg(long, value_name = "COMMIT")]
+        revision: Option<String>,
+        /// The declared `--revision` build had uncommitted changes.
+        #[arg(long, requires = "revision")]
+        revision_dirty: bool,
     },
     /// Queue host: clear a donor's host fault without leasing anything. With
     /// --probe-passed the donor's probe (MQ_PROBE=1) just passed: an ordinary
@@ -610,7 +619,31 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
             probe_passed,
             drain,
             reports_admission,
+            revision,
+            revision_dirty,
         } => {
+            // A declared revision the queue host was not built from
+            // refuses the claim before anything is noted or leased
+            // (#1105); no declaration claims as before.
+            if let Some(commit) = &revision {
+                let declared = crate::build_info::Revision {
+                    commit: commit.clone(),
+                    dirty: revision_dirty,
+                };
+                let queue_revision = crate::build_info::revision();
+                if let Some(reason) =
+                    crate::donor::claim_refusal(queue_revision.as_ref(), Some(&declared))
+                {
+                    print_json_reply(
+                        &serde_json::to_value(&crate::donor::Claimed {
+                            job: None,
+                            refused: Some(reason),
+                        })
+                        .map_err(|error| error.to_string())?,
+                    )?;
+                    return Ok(0);
+                }
+            }
             if probe_passed {
                 store.note_probe_pass(&donor);
             }
@@ -628,8 +661,11 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
             }
             if drain {
                 print_json_reply(
-                    &serde_json::to_value(&crate::donor::Claimed { job: None })
-                        .map_err(|error| error.to_string())?,
+                    &serde_json::to_value(&crate::donor::Claimed {
+                        job: None,
+                        refused: None,
+                    })
+                    .map_err(|error| error.to_string())?,
                 )?;
                 return Ok(0);
             }
@@ -688,7 +724,7 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
             }
             let job = store.claim_reporting(&donor, &host, jobs, reports_admission)?;
             print_json_reply(
-                &serde_json::to_value(&crate::donor::Claimed { job })
+                &serde_json::to_value(&crate::donor::Claimed { job, refused: None })
                     .map_err(|error| error.to_string())?,
             )?;
             Ok(0)
