@@ -482,6 +482,7 @@ function voiceCall() {
     get keepBoxInView() { return keepBoxInView; },
     get currentScreen() { return screens.screen(); },
     get currentView() { return screens.view(); },
+    get docsReaderOpen() { return screens.view() === "docs" && documentsView.reading(); },
     get CANNED_PROMPTS() { return /** @type {import("./src/view/settings/index.ts").CannedPrompt[]} */ (CANNED_PROMPTS); },
     get token() { return token; },
     get apiDecoded() { return apiDecoded; },
@@ -1034,23 +1035,21 @@ const screens = createScreens();
 // and the `?v=docs` deep link in `reopenSavedView`. No document state lives
 // here; the view owns its list, its reader and its speaking.
 
-/** Speak `text` with the device voice, for the reader's Read. */
-function speakDocumentText(text) {
-  const speech = window.speechSynthesis;
-  if (!speech) {
-    setStatus("This device has no voice to read with.");
-    return;
-  }
-  speech.speak(new SpeechSynthesisUtterance(text));
-}
-
 /** The mounted Documents view. */
 const documentsView = createDocumentsView({
   api: (path, options) => api(path, options),
   byId: (id) => el(id),
-  speak: (text) => speakDocumentText(text),
-  stopSpeaking: () => {
-    if (window.speechSynthesis) window.speechSynthesis.cancel();
+  readDocument: (doc) => readAloudOwner().readDocument(doc),
+  // Page-side kind-and-id awareness (`#1039` stage 3): the reader names only its
+  // own document's key; whether that document's is the read playing (or pending)
+  // is read off the owner's surface here, so no other read is ever stopped.
+  stopSpeaking: (key) => {
+    const owner = readAloudOwner();
+    const id = `doc:${key}`;
+    const playing = owner.nowPlaying;
+    if ((playing && playing.kind === "document" && playing.id === id) || owner.pendingRead === id) {
+      owner.stopReading();
+    }
   },
   onStatus: (text) => setStatus(text),
   onLevelChange: () => shellNavigation.scheduleBackSync(),
@@ -1912,9 +1911,19 @@ function showView(name) {
   // Leaving the channel takes the reading with it: audio that goes on playing over the transcript
   // is audio the reader cannot see the source of, on a list where the next thing it does is
   // archive a message.
+  // `#1039 documents-read-parity`: kind-aware. Entering Documents stops a message read (and
+  // clears its mode) but keeps a document read — that view is its source; entering the channel
+  // or the call stops a document read, whose strip and source are the reader's.
+  const readOwner = readAloudOwner();
+  const nowReading = readOwner.nowPlaying;
+  const documentReading = Boolean(
+    (nowReading && nowReading.kind === "document") ||
+    (!nowReading && typeof readOwner.pendingRead === "string" && readOwner.pendingRead.startsWith("doc:")));
   if (!discord) {
-    readAloudOwner().readingMode = false;
-    readAloudOwner().stopReading();
+    readOwner.readingMode = false;
+    if (name !== "docs" || !documentReading) readOwner.stopReading();
+  } else if (documentReading) {
+    readOwner.stopReading();
   }
   // Read replaces Talk in this view, so the control pane has to be re-decided on every switch.
   voiceCall().renderControls();

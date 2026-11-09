@@ -1095,6 +1095,26 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1039 documents-read-parity` stage 3 against the real server binary: the reader's Read
+  # through the shared owner — strip counts, device utterances a block at a time (a recorded
+  # speechSynthesis), Next/Prev and the media nexttrack, Next-on-last finishing, the bar's
+  # device/cloud toggle picking the next read's voice (cloud: a fake local-TTS sidecar the
+  # real server synthesizes through), and Back stopping a read, at 393x852 and 1280x800.
+  - group: check
+    job: documents-read-browser
+    desc: the Documents reader reading aloud through the shared owner by both voices, against the real server (fake chat upstream, fake local-TTS sidecar) in current Chromium at 393x852 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/documents_read_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 90
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#355 provider-grouped-channels` in the browser engine at 1280x800 and a 375x812 phone: with two chat
   # services the bar's channel picker holds one <optgroup> per service in configuration order, Alt+Down
   # and Alt+Up through CDP step across the groups in the order shown, a reload restores the channel

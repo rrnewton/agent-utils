@@ -51,7 +51,7 @@ export interface ControlBar {
  * and because the fit check below is only as good as this table is complete.
  */
 export const PACK_VIEWS: Record<string, string[]> = {
-  "audio-source": ["discord"],
+  "audio-source": ["discord", "docs"],
   "discord-channel": ["discord"],
   // `gchat-thread-selector`. Main, All, or one thread of the channel picked beside it.
   "thread-select": ["discord"],

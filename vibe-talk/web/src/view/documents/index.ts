@@ -20,8 +20,10 @@ import type { OpenDocument } from "./reader.ts";
 export interface DocumentsViewDependencies {
   api(path: string, options?: { method?: string; body?: unknown }): Promise<unknown>;
   byId(id: string): HTMLElement;
-  speak(text: string): unknown;
-  stopSpeaking?(): unknown;
+  /** Read one document aloud through the page's shared read-aloud owner (`#1039`). */
+  readDocument(doc: { key: string; title?: string; texts: readonly string[] }): unknown;
+  /** Stop the reading of document `key`, where that document's is the one playing; no other. */
+  stopSpeaking?(key: string): unknown;
   onStatus?(text: string): unknown;
   /** The open levels changed (a document opened or closed): sync the history. */
   onLevelChange?(): unknown;
@@ -99,7 +101,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
   const reader = createDocumentsReader({
     api: deps.api,
     byId: deps.byId,
-    speak: deps.speak,
+    readDocument: deps.readDocument,
     stopSpeaking: deps.stopSpeaking,
     onBack: () => {
       // The same pop as the gesture, where the page wired its navigation;

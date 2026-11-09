@@ -37,7 +37,7 @@ import "./page/sending.mjs";
 
 // Raise this with the suite. It is a floor against a suite that stopped COLLECTING, so it has to
 // track the real count; left behind, it would keep passing while half the suite went missing.
-const COLLECTED_FLOOR = 294;
+const COLLECTED_FLOOR = 299;
 process.on("exit", () => {
   if (testsDefined < COLLECTED_FLOOR) {
     console.error(`voice_page: the suite defines only ${testsDefined} tests, so something stopped collecting them`);

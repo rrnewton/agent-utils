@@ -37,6 +37,8 @@ export interface VoiceCallDependencies {
   keepBoxInView: (box: HTMLElement, area: HTMLElement) => void;
   currentScreen: string;
   currentView: string;
+  /** `#1039 documents-read-parity`: the Documents reader (not its list) is the view showing. */
+  docsReaderOpen: boolean;
   CANNED_PROMPTS: { key: string; button: string; field: string; title: string; text: string; said: string; }[];
   token: () => string;
   apiDecoded: <K extends keyof VibeTalk.Contract>(type: K, path: string, options?: { method?: string; body?: unknown; signal?: AbortSignal; }) => Promise<VibeTalk.Contract[K]>;
@@ -4612,11 +4614,14 @@ function renderControls() {
   // is decided by the list in front of you. Talk stays available in the voice view, and a live
   // call keeps it everywhere — hiding the control that ends a conversation you are having, or
   // starting audio playback over it, would both be worse than the swap.
-  const reading = deps.currentView === "discord" && !live;
+  // `#1039 documents-read-parity`: the Documents reader reads through the same owner, so its
+  // Read and pace are the channel's too — inert there while the pane itself stays the channel's.
+  const channel = deps.currentView === "discord" && !live;
+  const reading = channel || (deps.docsReaderOpen && !live);
   deps.el("read-aloud").hidden = !reading;
   deps.el("read-speed").hidden = !reading;
   // The archive filter belongs to the CHANNEL, so it appears with the channel and not with a call.
-  deps.el("todo-filter").hidden = !reading;
+  deps.el("todo-filter").hidden = !channel;
   deps.renderReadModeControl();
   deps.el("read-aloud").setAttribute("aria-pressed", deps.readingMode ? "true" : "false");
   // THE CONTROL SAYS WHICH ACT IT PERFORMS, not which state you are in. "Reading" described the

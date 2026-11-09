@@ -22,8 +22,15 @@ import { documentHeadingId, renderDocumentMarkdown } from "./render.ts";
 export interface DocumentsReaderDependencies {
   api(path: string, options?: { method?: string; body?: unknown }): Promise<unknown>;
   byId(id: string): HTMLElement;
-  speak(text: string): unknown;
-  stopSpeaking?(): unknown;
+  /**
+   * Read one document aloud through the page's shared read-aloud owner
+   * (`#1039 documents-read-parity`): one call for the whole document, its
+   * blocks as `texts`. A second call for the document already playing stops
+   * it — the owner's own semantics, which the Read button relies on.
+   */
+  readDocument(doc: { key: string; title?: string; texts: readonly string[] }): unknown;
+  /** Stop the reading of document `key`, where that document's is the one playing; no other. */
+  stopSpeaking?(key: string): unknown;
   onBack(): unknown;
   onStatus?(text: string): unknown;
   /**
@@ -234,7 +241,6 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
   // document current; survives `close()` (which only stops reading aloud) —
   // whether the reader is on screen is the view's fact to gate on.
   let currentDoc: OpenDocument | null = null;
-  let speaking = false;
   let outlineOpen = false;
   let entries: OutlineEntry[] = [];
   let buttons: HTMLButtonElement[] = [];
@@ -442,26 +448,31 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     if (target !== undefined && typeof target.focus === "function") target.focus();
   }
 
-  /** Speak the current document's plain text, one chunk per blank-line break. */
+  /**
+   * Hand the retained document to the shared read-aloud owner in one call
+   * (`#1039 documents-read-parity`), its plain text a chunk per blank-line
+   * break. The owner says what a second Read means (it stops the read it is
+   * already giving), so this button stays the starter it has always been.
+   */
   function readAloud(): void {
-    if (markdown === null) {
+    if (currentDoc === null) {
       deps.onStatus?.("Nothing to read yet.");
       return;
     }
-    const chunks = plainChunks(markdown);
-    if (chunks.length === 0) {
+    const texts = plainChunks(currentDoc.markdown);
+    if (texts.length === 0) {
       deps.onStatus?.("Nothing to read yet.");
       return;
     }
-    speaking = true;
-    for (const chunk of chunks) deps.speak(chunk);
+    // The owner reports its own failures; nothing here follows the ask.
+    void Promise.resolve(
+      deps.readDocument({ key: currentDoc.key, title: currentDoc.title, texts }),
+    ).catch(() => undefined);
   }
 
-  /** Stop this reader's own reading, and only its own. */
+  /** Stop this reader's own document's reading, and only its own. */
   function stopOwnReading(): void {
-    if (!speaking) return;
-    speaking = false;
-    deps.stopSpeaking?.();
+    if (currentDoc !== null) deps.stopSpeaking?.(currentDoc.key);
   }
 
   /**

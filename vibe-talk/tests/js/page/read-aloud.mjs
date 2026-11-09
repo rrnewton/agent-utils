@@ -5411,3 +5411,171 @@ test("`#1039 documents-read-parity`: a cloud document handed its entry plays it 
   assert.deepEqual(page.dismissCalls, [], "the given entry's read archived something at its end");
   assert.equal(ownerReadState(page), "ready");
 });
+
+// --- `#1039 documents-read-parity` stage 3: the reader reads through the owner ------------------
+//
+// The Documents reader's Read no longer queues raw device speech of its own: it hands the shared
+// read-aloud owner one document ({key, title, texts} from the retained open document), so the
+// strip, the device/cloud toggle, the pace, Next/Prev and the media keys are the messages' own.
+// These drive the real page path a reader takes: Documents list, card, reader, `#doc-read`.
+
+const WIRE_BLOCKS = [
+  "Opening block of the document says hello.",
+  "Middle block of the document says more.",
+  "Closing block of the document says goodbye.",
+];
+
+/** Sign in, switch to Documents and open the one seeded document in the reader. */
+async function openWiredDocument(page) {
+  page.documents = [{
+    key: "field-notes", title: "Field notes",
+    content: WIRE_BLOCKS.join("\n\n") + "\n", outline: [],
+  }];
+  await signIn(page);
+  await page.el("view-switch").click();
+  await page.settle();
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(page.tab(), "docs", "fixture: the switch did not reach Documents");
+  let card;
+  for (let tries = 0; tries < 10 && !card; tries += 1) {
+    await page.settle();
+    card = page.el("documents-list").querySelectorAll(".doc-card")[0];
+  }
+  assert.ok(card, "fixture: no document card was drawn");
+  await card.click();
+  await page.settle();
+  assert.equal(page.el("docs-reader").hidden, false, "fixture: the reader did not open");
+}
+
+test("`#1039 documents-read-parity` stage 3: the reader's Read starts an owner document read on the device voice", async () => {
+  const page = devicePage();
+  await openWiredDocument(page);
+  await page.el("doc-read").click();
+  await page.settle();
+  assert.equal(playingId(page), "doc:field-notes", "Read did not start the owner's document read");
+  assert.equal(playingKind(page), "document");
+  assert.equal(page.el("read-steer-count").text(), "1 of 3", "the strip does not count the document's blocks");
+  assert.equal(page.deviceSpeech.utterances.length, 1, "the device voice said nothing, or queued the document raw");
+  assert.equal(page.deviceSpeech.utterances[0].text, WIRE_BLOCKS[0]);
+  assert.deepEqual(prepareRequests(page), [], "a device document read prepared speech");
+  assert.equal(page.players.length, 0, "a device document read built an audio player");
+  // The pane stays the channel's for now, but its read controls already follow the reader:
+  // Read and pace offered, the channel's archive filter not.
+  assert.equal(page.el("control-pane").hidden, true, "the call pane shows over the reader");
+  assert.equal(page.el("read-aloud").hidden, false, "the pane's Read does not follow the open reader");
+  assert.equal(page.el("read-speed").hidden, false, "the pane's pace does not follow the open reader");
+  assert.equal(page.el("todo-filter").hidden, true, "the channel's archive filter followed into Documents");
+  // A second Read is the owner's own already-playing check: it stops, saying nothing new.
+  await page.el("doc-read").click();
+  await page.settle();
+  assert.equal(playingId(page), null, "a second Read left the document playing");
+  assert.equal(page.deviceSpeech.utterances.length, 1, "a second Read started the document again");
+  assert.equal(page.el("read-steer").hidden, true, "the strip outlived the stopped read");
+  // And a fresh Read heard to its end finishes clean, archiving nothing.
+  await page.el("doc-read").click();
+  await page.settle();
+  await sayAllUtterances(page);
+  assert.equal(playingId(page), null, "the read outlived its last block");
+  assert.deepEqual(page.dismissCalls, [], "a document heard to its end archived something");
+  assert.equal(ownerReadState(page), "ready");
+  assert.equal(page.el("read-steer").hidden, true, "the strip outlived the read");
+});
+
+test("`#1039 documents-read-parity` stage 3: the reader's Read prepares a cloud document only at its own route", async () => {
+  const page = newPage();
+  page.speechBlocks["field-notes"] = DOC_KINDS;
+  await openWiredDocument(page);
+  await page.el("doc-read").click();
+  await page.settle();
+  assert.deepEqual(prepareRequests(page), ["POST /api/v1/documents/field-notes/speech/prepare"],
+    "the reader's read prepared anywhere but the document's route");
+  assert.deepEqual(page.speakCalls, [], "the reader's read fetched channel speech");
+  assert.equal(playingId(page), "doc:field-notes");
+  assert.equal(playingKind(page), "document");
+  assert.equal(page.el("read-steer-count").text(), "1 of 3");
+  await playPlayersToEnd(page, 3);
+  assert.deepEqual(page.dismissCalls, [], "a cloud document heard to its end archived something");
+  assert.equal(playingId(page), null);
+  assert.equal(ownerReadState(page), "ready");
+});
+
+test("`#1039 documents-read-parity` stage 3: the bar's audio toggle is offered in Documents and picks the next read's voice", async () => {
+  const page = devicePage();
+  page.readAloud = { backend: "conversation", label: "Internal voice preview", playback: "audio", local_only: false };
+  page.speechBlocks["field-notes"] = DOC_KINDS;
+  await openWiredDocument(page);
+  const toggle = page.el("audio-source");
+  assert.equal(toggle.hidden, false, "the audio source toggle is not offered over the Documents view");
+  assert.equal(toggle.getAttribute("aria-checked"), "true", "the premise: the agent voice is not picked");
+  await toggle.click();
+  await page.settle();
+  assert.equal(toggle.getAttribute("aria-checked"), "false", "the toggle did not pick the device voice");
+  await page.el("doc-read").click();
+  await page.settle();
+  assert.equal(page.deviceSpeech.utterances.length, 1, "the next read did not take the device voice");
+  assert.equal(page.deviceSpeech.utterances[0].text, WIRE_BLOCKS[0]);
+  assert.deepEqual(prepareRequests(page), [], "the device read prepared speech");
+  await page.el("doc-read").click();
+  await page.settle();
+  assert.equal(playingId(page), null, "the premise: the device read is still playing");
+  await toggle.click();
+  await page.settle();
+  await page.el("doc-read").click();
+  await page.settle();
+  assert.deepEqual(prepareRequests(page), ["POST /api/v1/documents/field-notes/speech/prepare"],
+    "the next read did not take the agent voice at the document's route");
+  assert.ok(page.players.length > 0, "the agent read built no player");
+  assert.equal(page.deviceSpeech.utterances.length, 1, "the agent read also spoke on the device");
+  await playPlayersToEnd(page, 3);
+  assert.deepEqual(page.dismissCalls, []);
+});
+
+test("`#1039 documents-read-parity` stage 3: Back stops the document's read", async () => {
+  const page = devicePage();
+  await openWiredDocument(page);
+  await page.el("doc-read").click();
+  await page.settle();
+  assert.equal(playingId(page), "doc:field-notes", "the premise: no document is being read");
+  await page.el("doc-back").click();
+  await page.settle();
+  assert.equal(playingId(page), null, "Back left the document playing");
+  assert.equal(ownerPending(page), null, "Back left the document pending");
+  assert.equal(page.el("read-steer").hidden, true, "the strip outlived the stopped read");
+  assert.deepEqual(page.dismissCalls, [], "stopping at Back archived something");
+});
+
+test("`#1039 documents-read-parity` stage 3: view switches stop the other kind's read and keep their own", async () => {
+  const page = devicePage();
+  await openWiredDocument(page);
+  await page.el("doc-read").click();
+  await page.settle();
+  assert.equal(playingId(page), "doc:field-notes", "the premise: no document is being read");
+  // Re-entering Documents keeps its document read, unstopped and unrestarted.
+  page.pure("showView('docs')");
+  await page.settle();
+  assert.equal(playingId(page), "doc:field-notes", "entering Documents stopped its own document read");
+  assert.equal(page.deviceSpeech.utterances.length, 1, "entering Documents restarted the document");
+  // Entering the channel stops the document read.
+  page.pure("showView('discord')");
+  await page.settle();
+  assert.equal(playingId(page), null, "entering the channel left the document playing");
+  assert.equal(page.el("read-steer").hidden, true, "the strip outlived the stopped read");
+
+  // Entering Documents stops a message read, and takes the reading mode with it.
+  const messagesPage = devicePage();
+  await signIn(messagesPage);
+  const rows = await inReadingMode(messagesPage, [
+    message({ id: "1000000000000000001", content: "A message read before the switch." }),
+  ]);
+  await rows[0].dispatch("click", {});
+  await messagesPage.settle();
+  assert.equal(playingKind(messagesPage), "message", "the premise: no message is being read");
+  assert.equal(messagesPage.pure("readAloudOwner().readingMode"), true, "the premise: reading mode is off");
+  messagesPage.pure("showView('docs')");
+  await messagesPage.settle();
+  assert.equal(playingId(messagesPage), null, "entering Documents left the message playing");
+  assert.equal(messagesPage.pure("readAloudOwner().readingMode"), false,
+    "entering Documents kept the channel's reading mode");
+  assert.deepEqual(messagesPage.dismissCalls, [], "the stopped message was archived");
+});

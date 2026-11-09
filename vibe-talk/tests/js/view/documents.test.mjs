@@ -561,21 +561,27 @@ async function withReader(options, run) {
     content: options.content ?? "# Demo deployment report\n\nBody text.\n",
     outline: options.outline ?? [],
   });
+  const reads = [];
+  const stops = [];
+  const backs = [];
+  const statuses = [];
   const reader = mod.createDocumentsReader({
     api,
     byId: (id) => {
       assert.ok(id in els, `reader looked up an element the test did not provide: ${id}`);
       return els[id];
     },
-    speak: () => {},
-    onBack: () => {},
+    readDocument: (doc) => { reads.push(doc); },
+    stopSpeaking: (key) => { stops.push(key); },
+    onBack: () => { backs.push("back"); },
+    onStatus: (text) => { statuses.push(text); },
   });
   const savedDocument = globalThis.document;
   globalThis.document = { createElement: (tag) => readerEl(tag) };
   try {
     await reader.open("demo-doc");
     const buttons = els["doc-outline"].children.map((item) => item.children[0]);
-    await run({ reader, els, headings, buttons });
+    await run({ reader, els, headings, buttons, reads, stops, backs, statuses });
   } finally {
     if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
   }
@@ -741,7 +747,7 @@ test("documents reader: current() is null before any open and when content never
   const reader = mod.createDocumentsReader({
     api: async () => ({ document: { title: "Gone" }, content: null, outline: [] }),
     byId: (id) => els[id],
-    speak: () => {},
+    readDocument: () => {},
     onBack: () => {},
   });
   assert.equal(reader.current(), null, "current() before any open is not null");
@@ -967,7 +973,7 @@ async function withLinkedReader(options, run) {
       assert.ok(id in els, `reader looked up an element the test did not provide: ${id}`);
       return els[id];
     },
-    speak: () => {},
+    readDocument: () => {},
     onBack: () => {},
     // Stand in for the view's open path: record, then really open through the
     // reader so current() and the drawn headings move as they would in the page.
@@ -1062,7 +1068,7 @@ test("documents reader: an unindexed key falls through to fetch, other failures 
   els["doc-body"].querySelectorAll = () => [];
   const statuses = [];
   const reader = mod.createDocumentsReader({
-    api: failing, byId: (id) => els[id], speak: () => {}, onBack: () => {},
+    api: failing, byId: (id) => els[id], readDocument: () => {}, onBack: () => {},
     onStatus: (text) => statuses.push(text),
   });
   const savedDocument = globalThis.document;
@@ -1114,13 +1120,18 @@ async function withDocumentsView(options, run) {
     }
     return {};
   };
+  const reads = [];
+  const stops = [];
   const view = mod.createDocumentsView({
-    api, byId, speak: () => {}, ...(options.onBack ? { onBack: options.onBack } : {}),
+    api, byId,
+    readDocument: (doc) => { reads.push(doc); },
+    stopSpeaking: (key) => { stops.push(key); },
+    ...(options.onBack ? { onBack: options.onBack } : {}),
   });
   const savedDocument = globalThis.document;
   globalThis.document = { createElement: (tag) => { const el = readerEl(tag); el.querySelectorAll = () => []; return el; } };
   try {
-    await run({ view, els, byId, opened });
+    await run({ view, els, byId, opened, reads, stops });
   } finally {
     view.unmount();
     if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
@@ -1182,5 +1193,68 @@ test("documents view: the reader's Back button takes the page's pop where wired,
     dispatchClick(byId("doc-back"));
     await flush([]);
     assert.equal(view.current()?.key, "doc-a", "unwired, the Back button did not pop one document step");
+  });
+});
+
+// ---- 7. reading through the owner (`#1039 documents-read-parity` stage 3) ----------------------
+//
+// Read hands the shared read-aloud owner ONE call — key and title from the retained open
+// document, its blocks derived there — and stops name only the open document's own key; which
+// read that stops is the page's kind-aware business, never the reader's.
+
+test("documents reader: Read hands the owner the retained document in one call (#1039 stage 3)", async () => {
+  await withReader(
+    { title: "Field notes", content: "Alpha block here.\n\nBeta **block** here.\n", outline: [] },
+    async ({ els, reads, stops, statuses }) => {
+      dispatchClick(els["doc-read"]);
+      assert.deepEqual(reads, [{
+        key: "demo-doc",
+        title: "Field notes",
+        texts: ["Alpha block here.", "Beta block here."],
+      }], "Read did not hand the owner the whole document at once");
+      assert.deepEqual(stops, [], "starting a read stopped something");
+      assert.deepEqual(statuses, [], "starting a read said there was nothing to read");
+      // A second Read is forwarded as it comes: what it means for the document
+      // already playing is the owner's check, not a flag of the reader's.
+      dispatchClick(els["doc-read"]);
+      assert.equal(reads.length, 2, "a second Read was swallowed by the reader");
+      assert.deepEqual(reads[1], reads[0]);
+    },
+  );
+});
+
+test("documents reader: with nothing open to say, Read says so and hands the owner nothing (#1039 stage 3)", async () => {
+  await withReader({ content: "" }, async ({ els, reads, statuses }) => {
+    dispatchClick(els["doc-read"]);
+    assert.deepEqual(reads, [], "an empty document was handed to the owner");
+    assert.deepEqual(statuses, ["Nothing to read yet."]);
+  });
+});
+
+test("documents reader: close and Back stop only the open document's key (#1039 stage 3)", async () => {
+  await withReader({}, async ({ reader, els, stops, backs }) => {
+    dispatchClick(els["doc-back"]);
+    assert.deepEqual(stops, ["demo-doc"], "Back did not stop the open document's reading");
+    assert.equal(backs.length, 1, "Back did not take its step back");
+    reader.close();
+    assert.deepEqual(stops, ["demo-doc", "demo-doc"], "close did not stop the open document's reading");
+  });
+});
+
+test("documents view: each step back stops the document being left, by its key (#1039 stage 3)", async () => {
+  await withDocumentsView({}, async ({ view, reads, stops, byId }) => {
+    await view.show("doc-a");
+    dispatchClick(byId("doc-read"));
+    assert.deepEqual(reads.map((doc) => doc.key), ["doc-a"], "the view's reader read another document");
+    assert.deepEqual(reads[0].texts, ["Doc A", "Alpha."]);
+    await view.show("doc-b");
+    view.showList();
+    await flush([]);
+    assert.deepEqual(stops, ["doc-b"], "going back stopped a read but the one being left");
+    assert.equal(view.current()?.key, "doc-a");
+    view.showList();
+    await flush([]);
+    assert.deepEqual(stops, ["doc-b", "doc-a"], "reaching the list left the document's read unstopped");
+    assert.equal(view.reading(), false);
   });
 });
