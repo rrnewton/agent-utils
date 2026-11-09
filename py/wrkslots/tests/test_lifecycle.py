@@ -57717,15 +57717,16 @@ def test_recover_checks_a_fenced_slot_without_checkouts_before_deleting(
 
 
 @pytest.mark.ordinary_environment
-def test_remove_checks_an_image_backed_agent_slot_under_the_lock(
+def test_remove_of_an_image_backed_agent_slot_checks_use_outside_the_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An image-backed agent slot keeps the checks remove makes under the lock.
+    """Default remove of an image-backed agent slot is a batch of one (#1142).
 
-    Its fence mounts the image again, possibly from another loop device, so
-    the batch's scan after the fence could not match a process still working
-    in the old mount.  Needs an image backend: passwordless sudo, or fuse2fs
-    with /dev/fuse.
+    Its lsof scan runs before the registry locks are taken, and no lsof check
+    runs under them: the scan after the fence decides, on the fenced mount,
+    and lsof runs only when that scan cannot decide (always with FUSE, whose
+    mappings it does not compare).  Needs an image backend: passwordless
+    sudo, or fuse2fs with /dev/fuse.
     """
 
     try:
@@ -57734,33 +57735,58 @@ def test_remove_checks_an_image_backed_agent_slot_under_the_lock(
         pytest.skip(f"no slot image backend on this host: {exc}")
     monkeypatch.setenv("WRKSLOTS_INIT_REPRESENTATION", "image")
     project = tmp_path / "project"
-    shared_calls: list[tuple[Path, ...]] = []
-    ordinary_calls: list[Path] = []
+    held: list[str] = []
+    shared_calls: list[tuple[tuple[Path, ...], bool]] = []
+    ordinary_calls: list[tuple[Path, bool]] = []
+    fence_checks: list[Path] = []
+    original_locked = wrkslots._locked
     original_shared = wrkslots._capture_agent_remove_batch_census
     original_ordinary = wrkslots._lsof_slot_use
+    original_doubt = slotimage.sole_file_system_doubt
+
+    @contextlib.contextmanager
+    def tracked_locked(
+        subject: Path, *, exclusive: bool, wait_seconds: float
+    ) -> Iterator[None]:
+        with original_locked(subject, exclusive=exclusive, wait_seconds=wait_seconds):
+            if exclusive:
+                held.append(str(subject))
+            try:
+                yield
+            finally:
+                if exclusive:
+                    held.pop()
 
     def count_shared(targets: Sequence[Path]) -> object:
-        shared_calls.append(tuple(targets))
+        shared_calls.append((tuple(targets), bool(held)))
         return original_shared(targets)
 
     def count_ordinary(executable: Path, slot_path: Path) -> object:
-        ordinary_calls.append(slot_path)
+        ordinary_calls.append((slot_path, bool(held)))
         return original_ordinary(executable, slot_path)
+
+    def count_doubt(image_file: Path, mount_point: Path) -> str | None:
+        fence_checks.append(mount_point)
+        return original_doubt(image_file, mount_point)
 
     try:
         made, _repository, slots = dead_agent_batch_project(tmp_path, count=1)
         assert made == project
         control = wrkslots._load_config(str(project), "testhost").control
         assert [image.slot for image in slotimage.all_images(control)] == slots
+        slot_path = checkout(project, "slot01").parent
+        monkeypatch.setattr(wrkslots, "_locked", tracked_locked)
         monkeypatch.setattr(wrkslots, "_capture_agent_remove_batch_census", count_shared)
         monkeypatch.setattr(wrkslots, "_lsof_slot_use", count_ordinary)
+        monkeypatch.setattr(slotimage, "sole_file_system_doubt", count_doubt)
 
         returncode, stderr = single_remove(project, "slot01")
 
         assert returncode == 0, stderr
-        assert shared_calls == []
-        # Two ordinary checks before the fence and one after it.
-        assert len(ordinary_calls) >= 3
+        assert shared_calls == [((slot_path,), False)]
+        assert all(".fenced." in path.name and not locked for path, locked in ordinary_calls)
+        assert len(fence_checks) >= 1
+        assert all(".fenced." in path.name for path in fence_checks)
         assert active_slot_names(project) == []
         assert slotimage.all_images(control) == []
     finally:
@@ -58120,6 +58146,7 @@ def test_agent_batch_context_routes_checks_after_the_fence_to_the_fenced_scan(
         *,
         capture_generation: bool,
         cancel: threading.Event | None = None,
+        whole_device: bool = False,
     ) -> object:
         scans.append((fenced_path, canonical_path))
         return verdicts[0]
@@ -58540,7 +58567,6 @@ def test_remove_agent_batch_removes_disk_image_slots(
         agent_batch: wrkslots._AgentRemoveBatchContext | None = None,
         canonical_path: Path | None = None,
         after_fence: bool = False,
-        before_image_fence: bool = False,
         unlocked: bool = False,
         strict_lsof_warnings: bool = False,
     ) -> wrkslots._LiveUseObservation | None:
@@ -58556,16 +58582,15 @@ def test_remove_agent_batch_removes_disk_image_slots(
                 ignore_current_process=ignore_current_process,
                 capture_generation=capture_generation, agent_batch=agent_batch,
                 canonical_path=canonical_path, after_fence=after_fence,
-                before_image_fence=before_image_fence, unlocked=unlocked,
-                strict_lsof_warnings=strict_lsof_warnings)
+                unlocked=unlocked, strict_lsof_warnings=strict_lsof_warnings)
         return None
 
-    # The fresh /proc scan and the lsof check before the fence each walk
-    # every process on the host; how long they take is the host's load, not
-    # this test's subject, and on a loaded host they spent the items' whole
-    # 60-second budgets before their fences (fresh_process_scan_seconds
-    # 63.5 over four scans and image_lsof_check_seconds 53.9 over two when
-    # this was measured starved).  Answer both unused, as the routing test
+    # The fresh /proc scan and the lsof checks each walk every process on the
+    # host; how long they take is the host's load, not this test's subject,
+    # and on a loaded host they spent the items' whole 60-second budgets
+    # before their fences (fresh_process_scan_seconds 63.5 over four scans and
+    # 53.9 seconds over two lsof checks then made before the fences, when this
+    # was measured starved).  Answer both unused, as the routing test
     # above answers the fresh scan; the shared census, the checks' wrappers
     # and counts, and the fenced scans this test counts stay real, and the
     # ordinary lsof check itself is covered with live holders elsewhere.
@@ -58583,9 +58608,11 @@ def test_remove_agent_batch_removes_disk_image_slots(
         assert batch_slots(payload, "removed") == slots
         assert batch_slots(payload, "refused") == []
         assert payload["fenced_process_scans"] == 2
-        # One lsof check of each image-backed slot just before its fence; see
-        # test_remove_agent_batch_checks_an_image_backed_slot_with_lsof_before_its_fence.
-        assert payload["image_lsof_checks"] == 2
+        # No lsof check of an image-backed slot before its fence (#1142); after
+        # it, a proof that the fenced mount is the image's only file system,
+        # and lsof only where the scan cannot decide (always with FUSE).
+        assert payload["image_fence_checks"] == 2
+        assert payload["image_lsof_checks"] == payload["fenced_lsof_fallbacks"]
         assert payload["recovery_required"] is False
         assert active_slot_names(project) == []
         assert registry_journals(project) == []
@@ -58601,27 +58628,83 @@ def test_remove_agent_batch_removes_disk_image_slots(
                 slotimage.destroy(leftover, allow_content=True)
 
 
-@pytest.mark.ordinary_environment
-def test_remove_agent_batch_checks_an_image_backed_slot_with_lsof_before_its_fence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A late use through a detached alias of an image-backed slot blocks removal.
+def kernel_image_backend_or_skip() -> None:
+    """Skip unless slot images mount through the kernel backend here.
 
-    After the shared scan a process enters a bind alias of the slot in a mount
-    namespace of its own and detaches the alias, so no mount table and no
-    /proc path names the slot.  The fence mounts the image again, possibly
-    from another loop device, which the process's old mount does not follow,
-    so the identity scan after the fence would not find it.  Just before the
-    fence of an image-backed slot the batch runs the ordinary lsof check,
-    which finds it by device and inode.  Needs an image backend
-    (passwordless sudo, or fuse2fs with /dev/fuse) and unprivileged mount
-    namespaces.
+    With FUSE the fence itself refuses while a detached copy keeps the old
+    fuse2fs alive, after waiting minutes for it to exit, so the checks after
+    the fence that these tests are about are never reached.
     """
 
     try:
-        slotimage.resolve_backend("auto")
+        backend = slotimage.resolve_backend("auto")
     except slotimage.ImageError as exc:
         pytest.skip(f"no slot image backend on this host: {exc}")
+    if backend != "kernel":
+        pytest.skip(f"the {backend} image backend refuses at the fence itself")
+
+
+def start_unlinked_file_holder(
+    target: Path, alias: Path, cwd: Path
+) -> subprocess.Popen[str]:
+    """Start a process holding only a deleted file of ``target``, in its own mount namespace.
+
+    It opens a file through a bind alias of ``target``, deletes it, and lazily
+    unmounts the alias, so neither a path nor an inode of the tree leads to it.
+    """
+
+    holder = subprocess.Popen(
+        [
+            "unshare",
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "sh",
+            "-c",
+            'mount --bind "$1" "$2" && exec 3>"$2/held-unlinked" && rm "$2/held-unlinked" '
+            '&& umount -l "$2" && echo ready && exec sleep 60',
+            "sh",
+            str(target),
+            str(alias),
+        ],
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+    )
+    assert holder.stdout is not None
+    assert holder.stdout.readline().strip() == "ready"
+    return holder
+
+
+def destroy_leftover_images(project: Path) -> None:
+    """Unmount and delete any slot image a test left behind, its setup's included."""
+
+    if slotimage.images_root(project / "worktrees").exists():
+        control = wrkslots._load_config(str(project), "testhost").control
+        for leftover in slotimage.all_images(control):
+            slotimage.destroy(leftover, allow_content=True)
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("holding", ["directory", "unlinked-file"])
+def test_remove_agent_batch_refuses_a_detached_holder_of_an_image_slot_after_its_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, holding: str,
+) -> None:
+    """A late use through a detached alias of an image-backed slot blocks removal (#1142).
+
+    After the shared scan a process enters a bind alias of the slot in a mount
+    namespace of its own and detaches the alias, so no mount table and no
+    /proc path names the slot; it holds either its working directory there or
+    only a deleted file.  No check runs under the registry locks.  The fence
+    unmounts the image, and the process keeps its loop device, so the fence
+    mounts that same device (b1b7196e): the process holds the fenced mount's
+    file system.  The check after the fence proves that, then finds the
+    process on that file system, the deleted file by device alone, refuses,
+    and rolls the fence back.  Needs the kernel image backend and
+    unprivileged mount namespaces.
+    """
+
+    kernel_image_backend_or_skip()
     skip_without_mount_namespaces()
     monkeypatch.setenv("WRKSLOTS_INIT_REPRESENTATION", "image")
     project = tmp_path / "project"
@@ -58629,13 +58712,17 @@ def test_remove_agent_batch_checks_an_image_backed_slot_with_lsof_before_its_fen
     alias.mkdir()
     holders: list[subprocess.Popen[str]] = []
     unseen_by_path_scan: list[bool] = []
+    fence_doubts: list[str | None] = []
     original_interrupt = wrkslots._interrupt_for_test
+    original_doubt = slotimage.sole_file_system_doubt
 
     def start_holder_after_shared_scan(point: str) -> None:
         if point == "after-agent-batch-shared-census" and not holders:
             slot_path = checkout(project, "slot01").parent
             holders.append(
                 start_bind_alias_holder(slot_path, alias, tmp_path, detach=True)
+                if holding == "directory"
+                else start_unlinked_file_holder(slot_path, alias, tmp_path)
             )
             unseen_by_path_scan.append(
                 wrkslots._agent_batch_fresh_use(slot_path, None, capture_generation=False)
@@ -58643,11 +58730,17 @@ def test_remove_agent_batch_checks_an_image_backed_slot_with_lsof_before_its_fen
             )
         original_interrupt(point)
 
+    def recorded_doubt(image_file: Path, mount_point: Path) -> str | None:
+        doubt = original_doubt(image_file, mount_point)
+        fence_doubts.append(doubt)
+        return doubt
+
     try:
         made, _repository, slots = dead_agent_batch_project(tmp_path, count=1)
         assert made == project
         control = wrkslots._load_config(str(project), "testhost").control
         monkeypatch.setattr(wrkslots, "_interrupt_for_test", start_holder_after_shared_scan)
+        monkeypatch.setattr(slotimage, "sole_file_system_doubt", recorded_doubt)
         try:
             returncode, payload, stderr = in_process_agent_batch(project, slots)
         finally:
@@ -58659,31 +58752,168 @@ def test_remove_agent_batch_checks_an_image_backed_slot_with_lsof_before_its_fen
         assert returncode == 1, (stderr, payload)
         assert batch_slots(payload, "refused") == ["slot01"]
         reason = str(cast(list[Mapping[str, object]], payload["refused"])[0]["reason"])
-        assert f"live process {holders[0].pid} uses slot" in reason
-        assert payload["image_lsof_checks"] == 1
-        assert payload["fenced_process_scans"] == 0
+        assert f"live process {holders[0].pid} uses slot" in reason, reason
+        assert ".fenced." in reason
+        if holding == "unlinked-file":
+            assert "on the fenced slot's own image file system" in reason, reason
+        assert fence_doubts == [None]
+        assert payload["image_fence_checks"] == 1
+        assert payload["fenced_process_scans"] == 1
         assert checkout(project, "slot01").is_dir()
         assert fenced_slot_path(project, "slot01") is None
         assert active_slot_names(project) == ["slot01"]
         assert registry_journals(project) == []
         assert [image.slot for image in slotimage.all_images(control)] == ["slot01"]
     finally:
-        if slotimage.images_root(project / "worktrees").exists():
-            control = wrkslots._load_config(str(project), "testhost").control
-            for leftover in slotimage.all_images(control):
-                slotimage.destroy(leftover, allow_content=True)
+        destroy_leftover_images(project)
 
 
 @pytest.mark.ordinary_environment
-def test_remove_agent_batch_refuses_before_fencing_when_the_image_check_outlasts_the_budget(
+def test_remove_refuses_an_image_slot_whose_fence_mounted_another_device_while_the_old_one_holds_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A check that ends in its grace after the item budget leaves nothing fenced.
+    """The checks after an image-backed slot's fence prove its one file system (#1142).
 
-    The lsof check before an image-backed slot's fence may finish during its
-    termination and reap grace, after the item budget ran out.  The item is
-    then refused at the path fence, before its slot is renamed.  Needs an
-    image backend: passwordless sudo, or fuse2fs with /dev/fuse.
+    They rely on the root helper never attaching an image to a second loop
+    device (b1b7196e).  Here the evidence after the fence says otherwise: the
+    fenced mount is on one device while another device still holds the image,
+    as if the fence had mounted a second device beside a copy that a process
+    keeps.  Nothing after the fence could see that process, so the removal
+    refuses and rolls the fence back.  Needs an image backend: passwordless
+    sudo, or fuse2fs with /dev/fuse.
+    """
+
+    try:
+        backend = slotimage.resolve_backend("auto")
+    except slotimage.ImageError as exc:
+        pytest.skip(f"no slot image backend on this host: {exc}")
+    monkeypatch.setenv("WRKSLOTS_INIT_REPRESENTATION", "image")
+    project = tmp_path / "project"
+    original_doubt = slotimage.sole_file_system_doubt
+    original_attachments = slotimage.image_attachments
+    original_servers = slotimage._fuse_servers
+    proving: list[Path] = []
+    old_device = os.makedev(7, 1048575)
+
+    def second_device_attachments(
+        image_file: Path, mount_point: Path | None = None, **kwargs: object
+    ) -> slotimage.ImageAttachments:
+        found = original_attachments(image_file, mount_point, **kwargs)  # type: ignore[arg-type]
+        if not proving or not found.devices:
+            return found
+        stale = dataclasses.replace(
+            found.devices[0], device=old_device, name="/dev/loop1048575"
+        )
+        return dataclasses.replace(found, devices=(*found.devices, stale))
+
+    def second_server(image_file: Path) -> list[int]:
+        servers = original_servers(image_file)
+        return [*servers, 1] if proving else servers
+
+    def proving_doubt(image_file: Path, mount_point: Path) -> str | None:
+        proving.append(mount_point)
+        try:
+            return original_doubt(image_file, mount_point)
+        finally:
+            proving.clear()
+
+    try:
+        made, _repository, slots = dead_agent_batch_project(tmp_path, count=1)
+        assert made == project
+        control = wrkslots._load_config(str(project), "testhost").control
+        monkeypatch.setattr(slotimage, "image_attachments", second_device_attachments)
+        monkeypatch.setattr(slotimage, "_fuse_servers", second_server)
+        monkeypatch.setattr(slotimage, "sole_file_system_doubt", proving_doubt)
+
+        returncode, stderr = single_remove(project, "slot01")
+
+        assert returncode != 0, stderr
+        assert "may not hold the only live file system" in stderr, stderr
+        if backend == "kernel":
+            assert "/dev/loop1048575" in stderr, stderr
+        else:
+            assert "2 fuse2fs processes serve the image" in stderr, stderr
+        assert checkout(project, "slot01").is_dir()
+        assert fenced_slot_path(project, "slot01") is None
+        assert active_slot_names(project) == ["slot01"]
+        assert registry_journals(project) == []
+        assert [image.slot for image in slotimage.all_images(control)] == ["slot01"]
+    finally:
+        destroy_leftover_images(project)
+
+
+@pytest.mark.parametrize(
+    ("state", "devices", "unidentified", "servers", "doubt"),
+    [
+        ("kernel", ["mount"], [], [], None),
+        ("kernel", ["mount", "other"], [], [], "/dev/loop-other hold the image"),
+        ("kernel", ["other"], [], [], "/dev/loop-other holds the image"),
+        ("kernel", [], [], [], "no loop device holds the image"),
+        ("kernel", ["mount"], ["other"], [], "cannot be determined"),
+        ("fuse", [], [], [11], None),
+        ("fuse", [], [], [], "0 fuse2fs processes"),
+        ("fuse", [], [], [11, 12], "2 fuse2fs processes"),
+        ("absent", [], [], [], "not mounted there"),
+    ],
+)
+def test_sole_file_system_doubt_names_every_other_live_file_system_of_the_image(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    devices: list[str],
+    unidentified: list[str],
+    servers: list[int],
+    doubt: str | None,
+) -> None:
+    """The fenced mount must be the image's one loop device, or its one fuse2fs (#1142)."""
+
+    mount_point = tmp_path / "fenced"
+    mount_point.mkdir()
+    image_file = tmp_path / "slot.img"
+    numbers = {"mount": mount_point.stat().st_dev, "other": os.makedev(7, 1048575)}
+
+    def evidence(label: str) -> slotimage.LoopEvidence:
+        return slotimage.LoopEvidence(
+            device=numbers[label],
+            name=f"/dev/loop-{label}",
+            backing=str(image_file),
+            deleted=False,
+            file_identity=None,
+            fsid=None,
+            udev_uuid=None,
+        )
+
+    monkeypatch.setattr(slotimage, "mount_state", lambda *_args: (state, "detail"))
+    monkeypatch.setattr(
+        slotimage,
+        "image_attachments",
+        lambda *_args, **_kwargs: slotimage.ImageAttachments(
+            image_file=image_file,
+            mount_point=None,
+            devices=tuple(evidence(label) for label in devices),
+            host_device=None,
+            unidentified=tuple(evidence(label) for label in unidentified),
+        ),
+    )
+    monkeypatch.setattr(slotimage, "_fuse_servers", lambda _image: list(servers))
+
+    found = slotimage.sole_file_system_doubt(image_file, mount_point)
+
+    if doubt is None:
+        assert found is None
+    else:
+        assert found is not None and doubt in found, found
+
+
+@pytest.mark.ordinary_environment
+def test_remove_agent_batch_refuses_before_fencing_an_image_slot_whose_budget_ran_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An item whose budget runs out in the checks before its fence leaves nothing fenced.
+
+    The item is refused at the path fence, before the image is unmounted or
+    its slot renamed.  Needs an image backend: passwordless sudo, or fuse2fs
+    with /dev/fuse.
     """
 
     try:
@@ -58692,7 +58922,7 @@ def test_remove_agent_batch_refuses_before_fencing_when_the_image_check_outlasts
         pytest.skip(f"no slot image backend on this host: {exc}")
     monkeypatch.setenv("WRKSLOTS_INIT_REPRESENTATION", "image")
     project = tmp_path / "project"
-    original_check = wrkslots._AgentRemoveBatchContext.observe_image_before_fence
+    original_preconditions = wrkslots._reclaim_preconditions
     original_rename = wrkslots._rename_slot_path
     renames: list[tuple[Path, Path]] = []
 
@@ -58701,88 +58931,35 @@ def test_remove_agent_batch_refuses_before_fencing_when_the_image_check_outlasts
     ) -> None:
         return None
 
-    original_observe_once = wrkslots._observe_slot_use_once
-
-    def unused_lsof_check(
-        slot_path: Path,
-        record: wrkslots.ActiveRecord | None = None,
+    def preconditions_then_expire(
+        config: wrkslots.Config,
+        record: wrkslots.ActiveRecord,
+        vcs: wrkslots._GitVcs,
+        finish: wrkslots._FinishContext,
         *,
-        use_lsof: bool = True,
-        ignore_invoking_ancestry: bool = False,
-        census: wrkslots._ProcessPathCensus | None = None,
-        fallback_census: wrkslots._ProcessPathCensus | None = None,
-        proc_root: Path = Path("/proc"),
-        ignore_current_process: bool = True,
-        capture_generation: bool = False,
-        agent_batch: wrkslots._AgentRemoveBatchContext | None = None,
-        canonical_path: Path | None = None,
-        after_fence: bool = False,
-        before_image_fence: bool = False,
-        unlocked: bool = False,
-        strict_lsof_warnings: bool = False,
-    ) -> wrkslots._LiveUseObservation | None:
-        # The batch routes its own checks through this entry point, and its
-        # fenced fallback names a fenced (``.fenced.``) path; both stay on
-        # the original check.  Only the ordinary check of the unfenced
-        # image slot (the host-wide lsof and /proc walks) is answered unused.
-        if agent_batch is not None or ".fenced." in slot_path.name:
-            return original_observe_once(
-                slot_path, record, use_lsof=use_lsof,
-                ignore_invoking_ancestry=ignore_invoking_ancestry, census=census,
-                fallback_census=fallback_census, proc_root=proc_root,
-                ignore_current_process=ignore_current_process,
-                capture_generation=capture_generation, agent_batch=agent_batch,
-                canonical_path=canonical_path, after_fence=after_fence,
-                before_image_fence=before_image_fence, unlocked=unlocked,
-                strict_lsof_warnings=strict_lsof_warnings)
-        return None
-
-    # As in test_remove_agent_batch_removes_disk_image_slots: the fresh
-    # /proc scan's and the lsof check's lengths are the host's load; left
-    # real, the scan refused this item past its own 30-second bound before
-    # the image check ran, and the lsof check itself outlasted even a fresh
-    # item budget.  The image check's wrapper, its count and its place
-    # before the fence stay real; only its host-wide scan is answered.
-    monkeypatch.setattr(wrkslots, "_agent_batch_fresh_use", unused_fresh_scan)
-    monkeypatch.setattr(wrkslots, "_observe_slot_use_once", unused_lsof_check)
-
-    def check_then_expire(
-        self: wrkslots._AgentRemoveBatchContext,
-        check_path: Path,
-        record: wrkslots.ActiveRecord | None,
-        *,
-        canonical_path: Path,
-        capture_generation: bool,
-    ) -> object:
-        # Begin the check with its whole budget, whenever the work before it
-        # (host-wide scans whose length is the host's load) has left the item.
-        # Otherwise a loaded host spends the budget first and the item is
-        # refused at an earlier scan instead of at the path fence this test
-        # is about.  `#389 gate-flakes`.
-        deadline = wrkslots._ITEM_DEADLINE.get()
-        assert deadline is not None
-        deadline.started_at = time.monotonic()
-        verdict = original_check(
-            self,
-            check_path,
-            record,
-            canonical_path=canonical_path,
-            capture_generation=capture_generation,
-        )
-        deadline.started_at -= deadline.seconds
-        return verdict
+        check_use: bool = True,
+    ) -> tuple[Path, tuple[wrkslots.Checkout, ...]]:
+        result = original_preconditions(config, record, vcs, finish, check_use=check_use)
+        if check_use:
+            # The checks the path fence repeats are its last work before the
+            # rename; spend the item's budget there.
+            deadline = wrkslots._ITEM_DEADLINE.get()
+            assert deadline is not None
+            deadline.started_at = time.monotonic() - deadline.seconds
+        return result
 
     def counted_rename(config: wrkslots.Config, source: Path, destination: Path) -> None:
         renames.append((source, destination))
         original_rename(config, source, destination)
 
+    # The fresh /proc scan's length is the host's load; left real, it can
+    # refuse this item past its own bound before the fence this test is
+    # about.  `#389 gate-flakes`.
+    monkeypatch.setattr(wrkslots, "_agent_batch_fresh_use", unused_fresh_scan)
     try:
         made, _repository, slots = dead_agent_batch_project(tmp_path, count=1)
         assert made == project
-        control = wrkslots._load_config(str(project), "testhost").control
-        monkeypatch.setattr(
-            wrkslots._AgentRemoveBatchContext, "observe_image_before_fence", check_then_expire
-        )
+        monkeypatch.setattr(wrkslots, "_reclaim_preconditions", preconditions_then_expire)
         monkeypatch.setattr(wrkslots, "_rename_slot_path", counted_rename)
 
         returncode, payload, stderr = in_process_agent_batch(project, slots)
@@ -58791,17 +58968,65 @@ def test_remove_agent_batch_refuses_before_fencing_when_the_image_check_outlasts
         assert batch_slots(payload, "refused") == ["slot01"]
         reason = str(cast(list[Mapping[str, object]], payload["refused"])[0]["reason"])
         assert "budget for work before deletion at the path fence" in reason
-        assert payload["image_lsof_checks"] == 1
+        assert payload["image_fence_checks"] == 0
         assert renames == []
         assert checkout(project, "slot01").is_dir()
         assert fenced_slot_path(project, "slot01") is None
         assert active_slot_names(project) == ["slot01"]
         assert registry_journals(project) == []
     finally:
-        if slotimage.images_root(project / "worktrees").exists():
-            control = wrkslots._load_config(str(project), "testhost").control
-            for leftover in slotimage.all_images(control):
-                slotimage.destroy(leftover, allow_content=True)
+        destroy_leftover_images(project)
+
+
+@pytest.mark.ordinary_environment
+@pytest.mark.parametrize("point", ["after-path-fence-before-journal", "after-path-fence"])
+def test_recover_finishes_an_image_slot_removal_interrupted_at_its_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, point: str,
+) -> None:
+    """A removal of an image-backed slot that stops at its fence is finished by recover.
+
+    No use check runs between the fence and its journal record any more
+    (#1142); a crash on either side of that record leaves the image mounted at
+    the fenced path, and recover runs the checks after the fence and removes
+    the slot and its image.  Needs an image backend: passwordless sudo, or
+    fuse2fs with /dev/fuse.
+    """
+
+    try:
+        slotimage.resolve_backend("auto")
+    except slotimage.ImageError as exc:
+        pytest.skip(f"no slot image backend on this host: {exc}")
+    monkeypatch.setenv("WRKSLOTS_INIT_REPRESENTATION", "image")
+    project = tmp_path / "project"
+    try:
+        made, _repository, _slots = dead_agent_batch_project(tmp_path, count=1)
+        assert made == project
+        control = wrkslots._load_config(str(project), "testhost").control
+
+        interrupted = command(
+            project,
+            "remove",
+            "slot01",
+            "--coordinator-pid",
+            str(os.getpid()),
+            "--expected-generation",
+            "1",
+            env={"WRKSLOTS_TEST_INTERRUPT": point},
+        )
+
+        assert interrupted.returncode == 86, interrupted.stderr
+        assert not checkout(project, "slot01").parent.exists()
+        fenced = fenced_slot_path(project, "slot01")
+        assert fenced is not None
+        assert [image.location for image in slotimage.all_images(control)] == [fenced]
+        recovered = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+        assert recovered.returncode == 0, recovered.stderr
+        assert active_slot_names(project) == []
+        assert fenced_slot_path(project, "slot01") is None
+        assert slotimage.all_images(control) == []
+        assert registry_journals(project) == []
+    finally:
+        destroy_leftover_images(project)
 
 
 def test_remove_agent_batch_falls_back_to_lsof_when_the_fenced_scan_cannot_decide(

@@ -1220,10 +1220,10 @@ path and by device and inode, decides and rolls the fence back on a use. A slot 
 `wrkslots` process itself holds open, for example through an inherited descriptor, is refused as
 before. `remove --no-lock-budget` runs every check with `lsof +D` under the lock and has no such
 limit; use it only for a slot that default `remove` refused for the limit. Validation slots keep
-their existing checks. An image-backed agent slot, and any agent slot on a host without `lsof`, uses
-the checks under the lock, since the fence of an image-backed slot mounts its image again, possibly
-from another device. To remove many reclaimable agent slots, name each exact slot and its current
-generation:
+their existing checks. An image-backed agent slot is a batch of one too (#1142), with the checks
+after the fence described for image-backed slots below; an agent slot on a host without `lsof` uses
+the checks under the lock. To remove many reclaimable agent slots, name each exact slot and its
+current generation:
 
 ```sh
 wrkslots remove-agent-batch --coordinator-pid "$COORDINATOR_PID" \
@@ -1291,14 +1291,20 @@ and the checks that `lsof` decided in `fenced_lsof_fallbacks`, with each reason 
 checks `remove --no-lock-budget` makes after the fence, the scan and `lsof` read the fenced slot as
 it is when they run.
 
-An image-backed slot needs one more check (see "Disk-image slots" below). Its fence mounts the image
-again at the fenced path, and the new mount can have another device number, so a process still
-working in the old mount, for example through a detached bind alias in a mount namespace of its own,
-matches nothing in the fenced tree. Immediately before the fence of an image-backed slot the batch
-therefore runs the ordinary `lsof` check of `remove --no-lock-budget`, held to the slot's time limit
-below, which finds such a process by device and inode while the old mount is still the slot's. The
-JSON report counts those checks in `image_lsof_checks`, with their total time in
-`image_lsof_check_seconds`.
+An image-backed slot (see "Disk-image slots" below) gets no process check under the lock. Its fence
+unmounts the image and mounts it again at the fenced path. A process can keep the old mount past
+that unmount, for example through a detached bind alias in a mount namespace of its own, where no
+path names the slot. The image is never attached to a second loop device: while a device still holds
+it, which such a process forces, the fence mounts that same device, so the process is using the
+fenced mount's own file system; a new device is used only when none holds the image, and then no
+such process exists. The check after the fence therefore first confirms that the fenced mount is the
+image's only live file system: its device is the one loop device that holds the image and no loop
+device holds an image that cannot be identified, or, with FUSE, exactly one `fuse2fs` serves the
+image. If not, the slot is refused and the fence rolled back. The scan then counts any use of that
+file system as use of the slot, whatever the file, so a descriptor of a deleted file is found too.
+The JSON report counts those confirmations in `image_fence_checks`, with their total time in
+`image_fence_check_seconds`, and the image-backed slots whose scan `lsof` decided (always, with
+FUSE) in `image_lsof_checks` and `image_lsof_check_seconds`.
 
 Each slot's work before its first deletion is limited to 60 seconds, counted from when the slot
 takes the registry lock, so that other clients waiting for the lock are not kept waiting past their
@@ -2350,8 +2356,9 @@ A mount point cannot be renamed, so the path fence that removal uses unmounts th
 the empty mount point, and mounts the image again at the fenced path. The unmount refuses while
 something uses that particular mount, which is the same refusal the fence already expects. A process
 working in another mount of the same file system, such as a bind copy in this or another mount
-namespace, does not stop it. Removal therefore checks an image-backed slot with `lsof` before the
-fence, while the old mount is still the slot's mount.
+namespace, does not stop it. Such a process keeps the image's loop device, and the fence then mounts
+that same device, so it is using the fenced mount's file system, where the checks after the fence
+find it (see `remove-agent-batch` above).
 
 ### Mounts copied into other mount namespaces
 

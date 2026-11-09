@@ -1350,6 +1350,41 @@ def still_attached(image_file: Path) -> tuple[LoopEvidence, ...]:
     return image_attachments(image_file).devices
 
 
+def sole_file_system_doubt(image_file: Path, mount_point: Path) -> str | None:
+    """Why the mount at ``mount_point`` may not be ``image_file``'s only live file system, or None.
+
+    A removal's path fence mounts a slot image again at the fenced path and
+    then checks processes against that mount alone. That is sound only while
+    no other file system of the image is alive: the root helper never attaches
+    an image to a second loop device (while one still holds it, it mounts that
+    device), and a FUSE mount is refused while an earlier fuse2fs still serves
+    the image. This proves it for the mount as it is now. With the kernel
+    backend the mount's device must be the one loop device that holds the
+    image, and no bound loop device may hold an image that cannot be
+    determined; with FUSE exactly one fuse2fs must serve the image.
+    """
+
+    _forget_host_table()
+    state, detail = mount_state(image_file, mount_point)
+    if state == "kernel":
+        device = os.stat(mount_point).st_dev
+        attachments = image_attachments(image_file)
+        if sorted(item.device for item in attachments.devices) != [device]:
+            held = ", ".join(item.name for item in attachments.devices) or "no loop device"
+            verb = "hold" if len(attachments.devices) > 1 else "holds"
+            return f"{held} {verb} the image, and {mount_point} is on device {device_text(device)}"
+        if attachments.unidentified:
+            unknown = ", ".join(item.name for item in attachments.unidentified)
+            return f"the image that {unknown} holds cannot be determined"
+        return None
+    if state == "fuse":
+        servers = _fuse_servers(image_file)
+        if len(servers) != 1:
+            return f"{len(servers)} fuse2fs processes serve the image ({', '.join(map(str, servers))})"
+        return None
+    return f"the image is not mounted there: {detail}"
+
+
 def unmount(image_file: Path, mount_point: Path) -> list[str]:
     """Unmount ``image_file`` from ``mount_point`` if it is mounted there.
 

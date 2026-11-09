@@ -1072,6 +1072,10 @@ def test_recover_refuses_a_removed_checkout_git_still_registers(tmp_path: Path) 
 #   it is in use. FAKE_STALE_VIEW names a directory whose files count as being on the stale device
 #   for the census's device checks.
 # - `git worktree remove` of an image root leaves its mount point behind, empty.
+# - A fake mount is a directory on the host's own file system, so no device number of its
+#   content is the fake device's. The proof that a fenced mount is its image's only file system
+#   (slotimage.sole_file_system_doubt) reads the fake kernel instead, and the scan after the
+#   fence matches by device and inode only, never by the whole device (#1142).
 # Every privileged call and release is logged to FAKE_IMAGE_LOG.
 _FAKE_IMAGE_HOST = r'''
 import functools, hashlib, json, os, shutil, sys
@@ -1236,6 +1240,24 @@ def release(point, anchor=None):
         stale_released[0] = True
 
 
+def sole_file_system_doubt(image_file, mount_point):
+    entry = kernel["mounts"].get(str(mount_point))
+    if entry is None or entry[1] != str(image_file):
+        return "the image is not mounted there"
+    devices = attached(image_file)
+    if devices != [entry[0]]:
+        held = ", ".join(f"/dev/loop{device}" for device in devices)
+        return f"{held} hold the image, and {mount_point} is on /dev/loop{entry[0]}"
+    return None
+
+
+real_fenced_use = cli._agent_batch_fenced_use
+
+
+def fenced_use(*args, whole_device=False, **kwargs):
+    return real_fenced_use(*args, **kwargs)
+
+
 real_remove_worktree = cli._GitVcs.remove_worktree
 
 
@@ -1248,6 +1270,8 @@ def remove_worktree(self, repository, checkout, *, force=False):
 
 cli._GitVcs.remove_worktree = remove_worktree
 slotimage.all_images = all_images
+slotimage.sole_file_system_doubt = sole_file_system_doubt
+cli._agent_batch_fenced_use = fenced_use
 slotimage.mount_table = mount_table
 slotimage.loop_evidence = loop_evidence
 slotimage._mounted_fsid = mounted_fsid
