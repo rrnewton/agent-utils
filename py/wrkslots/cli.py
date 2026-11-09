@@ -7321,6 +7321,8 @@ def _event_from_path(
 _EVENT_MEMO_STABLE_NS = 2_000_000_000
 _EVENT_MEMO_ENTRIES_LIMIT = 1 << 17
 _REPLAY_MEMO_ENTRIES_LIMIT = 8
+_PENDING_MEMO_ENTRIES_LIMIT = 8
+_EPISODE_MEMO_ENTRIES_LIMIT = 64
 
 _EventFileIdentity = tuple[int, int, int, int, int]
 
@@ -7345,6 +7347,17 @@ class _EventMemo:
     replays: dict[tuple[Config, str, bool], tuple[int, str, _ReplayFold]] = (
         dataclasses.field(default_factory=dict)
     )
+    pendings: dict[
+        tuple[Config, str], tuple[int, str, dict[Path, Mapping[str, object]]]
+    ] = dataclasses.field(default_factory=dict)
+    episodes: dict[
+        tuple[Config, str, Path, str],
+        tuple[
+            int,
+            str,
+            tuple[Mapping[str, object] | None, Mapping[str, object] | None, bool],
+        ],
+    ] = dataclasses.field(default_factory=dict)
     chains: dict[tuple[str, str], _VerifiedEventChain] = dataclasses.field(
         default_factory=dict
     )
@@ -8075,6 +8088,7 @@ def _write_active_state(
     slot: str,
     evidence: Mapping[str, object] | None = None,
     require_repository: bool = True,
+    event_writer: _EventWriter | None = None,
 ) -> dict[str, object]:
     """Record one slot's active-state change and return the event that records it."""
 
@@ -8104,25 +8118,25 @@ def _write_active_state(
             "active state mutation must affect only its named slot; "
             f"expected {slot!r}, changed {sorted(changed)!r}"
         )
-    event = _write_event_file(
-        config,
-        state.machine,
-        "active-state-recorded",
-        {
-            "action": action,
-            "slot": slot,
-            "previous_revision": previous.revision,
-            "revision": state.revision,
-            "previous_record_sha256": (
-                None
-                if previous_record is None
-                else _event_digest(_record_to_obj(previous_record))
-            ),
-            "record": (
-                None if current_record is None else _record_to_obj(current_record)
-            ),
-            "evidence": dict(evidence or {}),
-        },
+    payload: dict[str, object] = {
+        "action": action,
+        "slot": slot,
+        "previous_revision": previous.revision,
+        "revision": state.revision,
+        "previous_record_sha256": (
+            None
+            if previous_record is None
+            else _event_digest(_record_to_obj(previous_record))
+        ),
+        "record": (
+            None if current_record is None else _record_to_obj(current_record)
+        ),
+        "evidence": dict(evidence or {}),
+    }
+    event = (
+        _write_event_file(config, state.machine, "active-state-recorded", payload)
+        if event_writer is None
+        else event_writer.append("active-state-recorded", payload)
     )
     _atomic_write_json(_active_path(config, state.machine), _active_to_obj(state))
     return event
@@ -8303,11 +8317,59 @@ def _operation_event_journal_path(
     return selected
 
 
+def _resume_pending(
+    config: Config,
+    machine: str,
+    events: Sequence[Mapping[str, object]],
+) -> tuple[int, dict[Path, Mapping[str, object]]]:
+    """Return how many events a remembered pending set covers, and its copy.
+
+    The pending set is a pure fold over the verified chain, like the replay:
+    the prefix is identified by its hash-chain tip, so a remembered set is
+    trusted only for the exact prefix that produced it.  The returned dict
+    is a copy, so a scan that refuses partway through its tail cannot alter
+    the remembered prefix.
+    """
+
+    cached = (
+        _ACTIVE_EVENT_MEMO[-1].pendings.get((config, machine))
+        if _ACTIVE_EVENT_MEMO
+        else None
+    )
+    if cached is None:
+        return 0, {}
+    count, tip, pending = cached
+    if count > len(events) or events[count - 1].get("sha256") != tip:
+        return 0, {}
+    return count, dict(pending)
+
+
+def _remember_pending(
+    config: Config,
+    machine: str,
+    events: Sequence[Mapping[str, object]],
+    pending: dict[Path, Mapping[str, object]],
+) -> None:
+    if not _ACTIVE_EVENT_MEMO or not events:
+        return
+    pendings = _ACTIVE_EVENT_MEMO[-1].pendings
+    key = (config, machine)
+    pendings.pop(key, None)
+    if len(pendings) >= _PENDING_MEMO_ENTRIES_LIMIT:
+        pendings.pop(next(iter(pendings)))
+    pendings[key] = (
+        len(events),
+        _as_str(events[-1]["sha256"], "append-only event.sha256"),
+        dict(pending),
+    )
+
+
 def _pending_operations_from_events(
     config: Config, machine: str
 ) -> Mapping[Path, Mapping[str, object]]:
-    pending: dict[Path, Mapping[str, object]] = {}
-    for event in _load_events(config, machine):
+    events = _load_events(config, machine)
+    start, pending = _resume_pending(config, machine, events)
+    for event in events[start:]:
         kind = _as_str(event["kind"], "append-only event.kind")
         payload = _as_mapping(event["payload"], "append-only event.payload")
         if kind == "operation-progress-recorded":
@@ -8341,6 +8403,7 @@ def _pending_operations_from_events(
                 raise StateError(
                     "append-only completion does not match its pending operation"
                 )
+    _remember_pending(config, machine, events, pending)
     return pending
 
 
@@ -10233,6 +10296,100 @@ def _scoped_operation_identity(
     return value if isinstance(value, str) else None
 
 
+def _scoped_operation_episode(
+    config: Config, path: Path, machine: str, operation: str
+) -> tuple[Mapping[str, object] | None, Mapping[str, object] | None, bool]:
+    """Walk one scoped journal path's episodes over the append-only events.
+
+    Returns the latest episode's latest progress, the progress before it in
+    the same episode (or None), and whether the latest episode completed.
+    The walk is a pure function of the verified chain, so within one command
+    its result is kept at the exact (count, tip) it was walked at and reused
+    while that tip stands -- classification verifies each journal's
+    provenance more than once against the same chain (#1123).  An append
+    moves the tip and the walk runs again.  A refusal is never kept: the
+    next caller walks and refuses for itself, exactly as cold.
+    """
+
+    label = f"scoped {operation} journal"
+    events = _load_events(config, machine)
+    key = (config, machine, path, operation)
+    if _ACTIVE_EVENT_MEMO and events:
+        cached = _ACTIVE_EVENT_MEMO[-1].episodes.get(key)
+        if (
+            cached is not None
+            and cached[0] == len(events)
+            and events[-1].get("sha256") == cached[1]
+        ):
+            return cached[2]
+    recorded: Mapping[str, object] | None = None
+    previous: Mapping[str, object] | None = None
+    completed = False
+    current: str | None = None
+    retired: set[str] = set()
+    for event in events:
+        event_kind = _as_str(event["kind"], "append-only event.kind")
+        if event_kind not in {"operation-progress-recorded", "operation-completed"}:
+            continue
+        payload = _as_mapping(event["payload"], "append-only event.payload")
+        journal = (
+            _as_mapping(payload.get("journal"), "append-only operation journal")
+            if event_kind == "operation-progress-recorded"
+            else None
+        )
+        event_path = _operation_event_journal_path(
+            config, machine, payload, journal=journal
+        )
+        if event_path != path:
+            continue
+        if event_kind == "operation-progress-recorded":
+            assert journal is not None
+            identity = _scoped_operation_identity(journal, operation)
+            if completed and (
+                not _scoped_operation_journal_opens(journal, operation)
+                or identity is None
+            ):
+                raise StateError(
+                    f"{label} path was reused after completion without a new "
+                    "operation"
+                )
+            if identity in retired:
+                raise StateError(
+                    f"{label} path was reopened with the identity of a completed "
+                    "operation"
+                )
+            if recorded is None or completed:
+                current = identity
+                previous = None
+            elif identity != current:
+                raise StateError(
+                    f"{label} progress changed its operation identity"
+                )
+            else:
+                previous = recorded
+            recorded = journal
+            completed = False
+            continue
+        if recorded is None:
+            raise StateError(f"scoped {operation} completion has no preceding progress evidence")
+        if current is not None:
+            retired.add(current)
+        completed = True
+        previous = None
+    episode = (recorded, previous, completed)
+    if _ACTIVE_EVENT_MEMO and events:
+        episodes = _ACTIVE_EVENT_MEMO[-1].episodes
+        episodes.pop(key, None)
+        if len(episodes) >= _EPISODE_MEMO_ENTRIES_LIMIT:
+            episodes.pop(next(iter(episodes)))
+        episodes[key] = (
+            len(events),
+            _as_str(events[-1]["sha256"], "append-only event.sha256"),
+            episode,
+        )
+    return episode
+
+
 def _scoped_operation_journal_completed(
     config: Config,
     path: Path,
@@ -10258,55 +10415,9 @@ def _scoped_operation_journal_completed(
     slot = _validate_name(
         _as_str(raw["slot"], f"{operation} journal.slot"), "slot"
     )
-    recorded: Mapping[str, object] | None = None
-    completed = False
-    current: str | None = None
-    retired: set[str] = set()
-    for event in _load_events(config, machine):
-        event_kind = _as_str(event["kind"], "append-only event.kind")
-        if event_kind not in {"operation-progress-recorded", "operation-completed"}:
-            continue
-        payload = _as_mapping(event["payload"], "append-only event.payload")
-        journal = (
-            _as_mapping(payload.get("journal"), "append-only operation journal")
-            if event_kind == "operation-progress-recorded"
-            else None
-        )
-        event_path = _operation_event_journal_path(
-            config, machine, payload, journal=journal
-        )
-        if event_path != path:
-            continue
-        if event_kind == "operation-progress-recorded":
-            assert journal is not None
-            identity = _scoped_operation_identity(journal, operation)
-            if completed and (
-                not _scoped_operation_journal_opens(journal, operation)
-                or identity is None
-            ):
-                raise StateError(
-                    f"{label} path was reused after completion without a new "
-                    "operation"
-                )
-            if identity in retired:
-                raise StateError(
-                    f"{label} path was reopened with the identity of a completed "
-                    "operation"
-                )
-            if recorded is None or completed:
-                current = identity
-            elif identity != current:
-                raise StateError(
-                    f"{label} progress changed its operation identity"
-                )
-            recorded = journal
-            completed = False
-            continue
-        if recorded is None:
-            raise StateError(f"scoped {operation} completion has no preceding progress evidence")
-        if current is not None:
-            retired.add(current)
-        completed = True
+    recorded, _previous, completed = _scoped_operation_episode(
+        config, path, machine, operation
+    )
     if recorded is None:
         raise StateError(f"{label} has no matching append-only progress evidence")
     if not _json_equal(raw, recorded):
@@ -10322,7 +10433,7 @@ def _scoped_journal_roll_forward_target(
 ) -> Mapping[str, object] | None:
     """Latest progress for a journal exactly one step behind, else ``None``.
 
-    Mirrors the episode walk in :func:`_scoped_operation_journal_completed`,
+    Shares the episode walk in :func:`_scoped_operation_episode`,
     including its refusals for broken event history, but instead of requiring
     the journal bytes to equal the latest progress it reports the one repair
     ``recover`` may make: the on-disk journal equals the progress immediately
@@ -10334,65 +10445,14 @@ def _scoped_journal_roll_forward_target(
 
     label = f"scoped {operation} journal"
     machine = _as_str(raw["machine"], f"{operation} journal.machine")
-    recorded: Mapping[str, object] | None = None
-    completed = False
-    current: str | None = None
-    retired: set[str] = set()
-    episode: list[Mapping[str, object]] = []
-    for event in _load_events(config, machine):
-        event_kind = _as_str(event["kind"], "append-only event.kind")
-        if event_kind not in {"operation-progress-recorded", "operation-completed"}:
-            continue
-        payload = _as_mapping(event["payload"], "append-only event.payload")
-        journal = (
-            _as_mapping(payload.get("journal"), "append-only operation journal")
-            if event_kind == "operation-progress-recorded"
-            else None
-        )
-        event_path = _operation_event_journal_path(
-            config, machine, payload, journal=journal
-        )
-        if event_path != path:
-            continue
-        if event_kind == "operation-progress-recorded":
-            assert journal is not None
-            identity = _scoped_operation_identity(journal, operation)
-            if completed and (
-                not _scoped_operation_journal_opens(journal, operation)
-                or identity is None
-            ):
-                raise StateError(
-                    f"{label} path was reused after completion without a new "
-                    "operation"
-                )
-            if identity in retired:
-                raise StateError(
-                    f"{label} path was reopened with the identity of a completed "
-                    "operation"
-                )
-            if recorded is None or completed:
-                current = identity
-                episode = [journal]
-            elif identity != current:
-                raise StateError(
-                    f"{label} progress changed its operation identity"
-                )
-            else:
-                episode.append(journal)
-            recorded = journal
-            completed = False
-            continue
-        if recorded is None:
-            raise StateError(f"scoped {operation} completion has no preceding progress evidence")
-        if current is not None:
-            retired.add(current)
-        completed = True
-        episode = []
+    recorded, previous, completed = _scoped_operation_episode(
+        config, path, machine, operation
+    )
     if recorded is None:
         raise StateError(f"{label} has no matching append-only progress evidence")
     if completed or _json_equal(raw, recorded):
         return None
-    if len(episode) >= 2 and _json_equal(raw, episode[-2]):
+    if previous is not None and _json_equal(raw, previous):
         return recorded
     return None
 
@@ -28920,6 +28980,7 @@ def _run_post_provision_hooks(
     journal: dict[str, object],
     *,
     start: int = 0,
+    event_writer: _EventWriter | None = None,
 ) -> int:
     slot_type = _as_str(journal.get("slot_type", "agent"), "create journal.slot_type")
     hooks = _post_provision_hooks_for(config, slot_type)
@@ -28938,7 +28999,9 @@ def _run_post_provision_hooks(
             "status": "running",
         }
         journal["hook_failure"] = attempt
-        _write_journal(config, journal, journal_path=journal_path)
+        _write_journal(
+            config, journal, event_writer=event_writer, journal_path=journal_path
+        )
         env = os.environ.copy()
         env.update(
             {
@@ -28966,7 +29029,9 @@ def _run_post_provision_hooks(
             attempt["status"] = "failed-to-start"
             attempt["detail"] = str(exc)
             journal["hook_failure"] = attempt
-            _write_journal(config, journal, journal_path=journal_path)
+            _write_journal(
+                config, journal, event_writer=event_writer, journal_path=journal_path
+            )
             raise Refusal(
                 f"post-provision hook {hook_index + 1} for checkout {checkout.name} "
                 f"could not start: {exc}; slot was left for inspection with journal "
@@ -28976,7 +29041,9 @@ def _run_post_provision_hooks(
             attempt["status"] = "failed"
             attempt["returncode"] = completed.returncode
             journal["hook_failure"] = attempt
-            _write_journal(config, journal, journal_path=journal_path)
+            _write_journal(
+                config, journal, event_writer=event_writer, journal_path=journal_path
+            )
             if completed.stdout:
                 print("post-provision hook stdout:", file=sys.stderr)
                 print(completed.stdout, end="" if completed.stdout.endswith("\n") else "\n", file=sys.stderr)
@@ -28994,7 +29061,9 @@ def _run_post_provision_hooks(
             )
         journal["hook_progress"] = step + 1
         journal["hook_failure"] = None
-        _write_journal(config, journal, journal_path=journal_path)
+        _write_journal(
+            config, journal, event_writer=event_writer, journal_path=journal_path
+        )
     return total
 
 
@@ -29646,6 +29715,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
         operation_id = uuid.uuid4().hex
         journal_path = _create_journal_path(config, args.slot)
         created: list[Checkout] = []
+        # One writer for every event this create appends (#1123): each new
+        # writer would load the whole chain just to learn its tip, inside
+        # the locks.  The shard above has already ensured the log exists,
+        # so no append can bypass this writer through _ensure_event_log.
+        event_writer = _event_writer(config, config.machine)
         _write_journal(
             config,
             _create_journal_payload(
@@ -29661,6 +29735,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 hook_progress=0,
                 operation_id=operation_id,
             ),
+            event_writer=event_writer,
             journal_path=journal_path,
         )
         representation = _requested_representation(config, args)
@@ -29726,6 +29801,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                     hook_progress=0,
                     operation_id=operation_id,
                 ),
+                event_writer=event_writer,
                 journal_path=journal_path,
             )
             _interrupt_for_test("after-create-worktree")
@@ -29743,7 +29819,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             operation_id=operation_id,
         )
         hook_progress = _run_post_provision_hooks(
-            config, created, journal_path, hook_journal
+            config, created, journal_path, hook_journal, event_writer=event_writer
         )
         _apply_slot_git_identity(config, created, journal_path)
         for checkout in created:
@@ -29769,6 +29845,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 hook_progress=hook_progress,
                 operation_id=operation_id,
             ),
+            event_writer=event_writer,
             journal_path=journal_path,
         )
         if task_scope is not None:
@@ -29803,11 +29880,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 "coordinator_authorized": True,
                 "coordinator": _identity_to_obj(coordinator_lease),
             },
+            event_writer=event_writer,
         )
         _interrupt_for_test("after-active-write")
         _clear_journal(
             config,
             _as_mapping(_read_json(journal_path, "create journal"), "create journal"),
+            event_writer=event_writer,
             journal_path=journal_path,
         )
         after_states, after_archives, _paths, _slots = (

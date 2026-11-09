@@ -8,12 +8,13 @@ refusal, is the answer a cold load gives.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 import os
 import shutil
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TypeVar, cast
 
@@ -1037,3 +1038,276 @@ def test_a_verified_chain_is_kept_only_when_every_event_has_settled(
         work.parses = 0
         assert cli._load_events(config) is kept
         assert work.parses == 0
+
+
+class _PendingWork:
+    """Count the journal-path validations each pending scan performs."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.path_calls = 0
+        validate = cli._operation_event_journal_path
+
+        def counted(
+            config: cli.Config,
+            machine: str,
+            payload: Mapping[str, object],
+            *,
+            journal: Mapping[str, object] | None = None,
+        ) -> Path:
+            self.path_calls += 1
+            return validate(config, machine, payload, journal=journal)
+
+        monkeypatch.setattr(cli, "_operation_event_journal_path", counted)
+
+
+def _cloned_progress_payload(config: cli.Config) -> dict[str, object]:
+    for event in cli._load_events(config):
+        if event["kind"] == "operation-progress-recorded":
+            payload = cli._as_mapping(
+                event["payload"], "operation-progress-recorded payload"
+            )
+            return copy.deepcopy(dict(payload))
+    raise AssertionError("fixture has no operation-progress-recorded event")
+
+
+def test_pending_operations_resume_from_the_remembered_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A repeated pending scan folds no prefix event twice (#1123).
+
+    The pending set is a pure fold over the verified chain, like the replay:
+    identified by its (count, tip), a remembered prefix is extended by only
+    the new tail.  Without the memo the second scan below validates every
+    operation event's journal path again.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("memo",))
+    config = cli._load_config(str(project), "testhost")
+    _treat_every_event_as_settled(monkeypatch)
+    progress = _cloned_progress_payload(config)
+    pending_path = cli._operation_event_journal_path(
+        config,
+        config.machine,
+        progress,
+        journal=cli._as_mapping(progress["journal"], "cloned progress journal"),
+    )
+    work = _PendingWork(monkeypatch)
+
+    with cli._event_memo_scope():
+        cli._event_writer(config, config.machine).append(
+            "operation-progress-recorded", progress
+        )
+        work.path_calls = 0
+        first = cli._pending_operations_from_events(config, config.machine)
+        full_scan_calls = work.path_calls
+        assert full_scan_calls > 1
+        assert set(first) == {pending_path}
+        assert first == _cold(
+            lambda: cli._pending_operations_from_events(config, config.machine)
+        )
+
+        work.path_calls = 0
+        assert cli._pending_operations_from_events(config, config.machine) == first
+        assert work.path_calls == 0
+
+        cli._event_writer(config, config.machine).append(
+            "operation-completed",
+            {
+                "slot": progress["slot"],
+                "operation": progress["operation"],
+                "journal_path": progress["journal_path"],
+            },
+        )
+        work.path_calls = 0
+        assert cli._pending_operations_from_events(config, config.machine) == {}
+        assert work.path_calls == 1
+        assert {} == _cold(
+            lambda: cli._pending_operations_from_events(config, config.machine)
+        )
+
+
+def test_pending_operations_resumed_refusal_matches_the_cold_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mismatch in the tail refuses from a resumed prefix exactly as cold.
+
+    The refused scan must not be remembered: a retry resumes from the same
+    prefix and refuses again with the same message.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("memo",))
+    config = cli._load_config(str(project), "testhost")
+    _treat_every_event_as_settled(monkeypatch)
+    journal_path = cli._journal_path(config).name
+    progress = {
+        "slot": "memo",
+        "operation": "finish",
+        "journal_path": journal_path,
+        "journal": {"kind": "finish", "slot": "memo", "machine": config.machine},
+    }
+
+    with cli._event_memo_scope():
+        assert cli._pending_operations_from_events(config, config.machine) == {}
+        writer = cli._event_writer(config, config.machine)
+        writer.append("operation-progress-recorded", progress)
+        assert set(cli._pending_operations_from_events(config, config.machine)) == {
+            cli._journal_path(config)
+        }
+        writer.append(
+            "operation-completed",
+            {"slot": "memo", "operation": "recover", "journal_path": journal_path},
+        )
+        with pytest.raises(cli.StateError) as warm:
+            cli._pending_operations_from_events(config, config.machine)
+        with pytest.raises(cli.StateError) as again:
+            cli._pending_operations_from_events(config, config.machine)
+        with pytest.raises(cli.StateError) as cold:
+            _cold(lambda: cli._pending_operations_from_events(config, config.machine))
+
+    expected = "append-only completion does not match its pending operation"
+    assert str(warm.value) == expected
+    assert str(again.value) == expected
+    assert str(cold.value) == expected
+
+
+def test_create_constructs_one_event_writer_for_all_its_appends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One create learns the chain tip once, however many events it appends (#1123).
+
+    Every `_event_writer` construction loads the whole chain just to learn
+    its length and tip, so the several writers one create used to build --
+    journal, per checkout, publication, journal clear -- each paid a full
+    load inside the registry locks.  The created slot and its events are
+    exactly what separate writers produced.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    monkeypatch.setenv("WRKSLOTS_MACHINE", "testhost")
+    _treat_every_event_as_settled(monkeypatch)
+    writers = 0
+    make_writer = cli._event_writer
+
+    def counted_writer(
+        config: cli.Config, machine: str
+    ) -> cli._EventWriter:
+        nonlocal writers
+        writers += 1
+        return make_writer(config, machine)
+
+    monkeypatch.setattr(cli, "_event_writer", counted_writer)
+    argv = [
+        "--project-root",
+        str(project),
+        "create",
+        "memo-create",
+        "--slot-type",
+        "agent",
+        "--coordinator-authorized",
+        "--agent",
+        "memo-agent",
+        "--task",
+        "task-memo-create",
+        "--purpose",
+        "measure event writers",
+        "--owner-pid",
+        str(os.getpid()),
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--repo",
+        "product=repo",
+        "--branch",
+        "product=memo/create",
+    ]
+
+    assert cli.main(argv) == 0
+
+    assert writers == 1
+    config = cli._load_config(str(project), "testhost")
+    record = next(
+        item for item in cli._load_active(config).slots if item.slot == "memo-create"
+    )
+    assert record.agent == "memo-agent"
+    kinds = [event["kind"] for event in cli._load_events(config)]
+    assert kinds.count("operation-progress-recorded") >= 2
+    assert kinds[-2:] == ["active-state-recorded", "operation-completed"]
+
+
+def test_scoped_journal_provenance_reuses_the_episode_at_the_same_tip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A journal's episode walk is not repeated while the chain tip stands (#1123).
+
+    Classification verifies every outstanding journal's provenance, then
+    verifies it again (create classifies twice; the read-only command then
+    re-checks stability), and each verification used to walk every operation
+    event in the log.  The episode at an exact (count, tip) is the same for
+    each of them; an append moves the tip and the walk runs again, including
+    refusals, which are never remembered.
+    """
+
+    project, _repository, _remote = make_project(tmp_path)
+    prepare_dead_validate_slots(project, ("memo",))
+    config = cli._load_config(str(project), "testhost")
+    _treat_every_event_as_settled(monkeypatch)
+    progress = _cloned_progress_payload(config)
+    journal: dict[str, object] = dict(
+        cli._as_mapping(progress["journal"], "cloned progress journal")
+    )
+    journal["operation_id"] = "f" * 32
+    progress["journal"] = journal
+    path = cli._create_journal_path(config, str(journal["slot"]), config.machine)
+    work = _PendingWork(monkeypatch)
+
+    with cli._event_memo_scope():
+        writer = cli._event_writer(config, config.machine)
+        writer.append("operation-progress-recorded", progress)
+        work.path_calls = 0
+        assert (
+            cli._scoped_operation_journal_completed(config, path, journal, "create")
+            is False
+        )
+        full_walk_calls = work.path_calls
+        assert full_walk_calls > 1
+
+        work.path_calls = 0
+        assert (
+            cli._scoped_operation_journal_completed(config, path, journal, "create")
+            is False
+        )
+        assert work.path_calls == 0
+
+        later = dict(journal)
+        later["hook_progress"] = 1
+        writer.append(
+            "operation-progress-recorded", {**progress, "journal": later}
+        )
+        work.path_calls = 0
+        assert (
+            cli._scoped_operation_journal_completed(config, path, later, "create")
+            is False
+        )
+        assert work.path_calls == full_walk_calls + 1
+
+        stranger = dict(later)
+        stranger["operation_id"] = "e" * 32
+        writer.append(
+            "operation-progress-recorded", {**progress, "journal": stranger}
+        )
+        with pytest.raises(cli.StateError) as warm:
+            cli._scoped_operation_journal_completed(config, path, stranger, "create")
+        with pytest.raises(cli.StateError) as again:
+            cli._scoped_operation_journal_completed(config, path, stranger, "create")
+        with pytest.raises(cli.StateError) as cold:
+            _cold(
+                lambda: cli._scoped_operation_journal_completed(
+                    config, path, stranger, "create"
+                )
+            )
+
+    expected = "scoped create journal progress changed its operation identity"
+    assert str(warm.value) == expected
+    assert str(again.value) == expected
+    assert str(cold.value) == expected
