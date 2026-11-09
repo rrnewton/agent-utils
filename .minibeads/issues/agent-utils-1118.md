@@ -201,3 +201,46 @@ Kept, with the reason in each case:
   only a screenshot follows.
 
 Solo on 2026-11-09 (Chromium 149.0.7827.55): all five files pass whole.
+
+## Batch 3, 2026-11-09 (mu-settle)
+
+[muse watermelon] `search_dates_browser.py`, `search_unmatched_browser.py`,
+`view_switch_browser.py`, `filter_place_browser.py` and
+`search_whose_browser.py` (54 `settled()` sites reviewed). These files were
+already condition-first — each carries its own local `until()` /
+`wait_rows()` bounded poll, and most settles follow one — so this batch mostly
+records that, documents each local two-frame `settled` helper's remaining use
+(a paint frame after its `until`, before geometry, a parked-scroll baseline,
+or the end of a no-move window), and converts the sites where the bounded wait
+pinned less than the check then read:
+
+- search-dates: Mine and back-to-everyone now also wait until the showing rows
+  and the count say the filter has been applied (the button's `data-author`
+  flip alone did not); four settles that gated nothing are gone (one after a
+  synchronous scrolled measurement already read, one superseded by the next
+  park's settle, and two duplicates of the scroll-reset settle that follows).
+- search-unmatched: a new `until_shown` waits for exactly the rows `shown()`
+  will then be held to — the opened run above 209, harbor's card alone, the
+  opened card run, and Main under "bright" (replacing an any-non-empty count
+  wait); the thread list waits until its one shown card is harbor's; the
+  unpacked lantern thread waits for its hit and its seam line, and the opened
+  run for its messages; the server-search scope line is read through
+  `server_settled()` instead of a bare settle.
+- view-switch: one genuine gap — behind its held rows, All's read having been
+  sent did not say its freshness pill had rendered; it is now polled for
+  before the kept-place geometry.
+- search-whose and filter-place: no call-site conversion. In whose, every
+  press is already followed by its exact `until` (chip words, tooltip, fade),
+  and the press helper's settle must stay short: the chip it summons is up for
+  about a second and a half. In filter-place every settle follows an exact
+  `until` (paint before a moved-by-a-pixel read), lands a parked scroll before
+  its baseline, or ends the deliberate 500 ms nothing-moved windows, which are
+  the check and stay.
+
+Kept elsewhere, as in batches 1–2: paint-after-exact-wait before rows, seams
+and bar geometry (waiting on the measured rect would wait for the assertion);
+parked-scroll baselines; mid-cycle press settles whose final state the
+following `until` pins; and pre-press settles where nothing is asserted in
+between.
+
+Solo on 2026-11-09 (Chromium 149.0.7827.55): all five files pass whole.

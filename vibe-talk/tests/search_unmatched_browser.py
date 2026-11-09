@@ -249,7 +249,17 @@ class Walk:
             self.page.screenshot(path=str(self.shots / f"{self.label}-search-unmatched-{name}.png"))
 
     def settled(self) -> None:
+        # Two frames and nothing more (`#1118 browser-fixed-frame-settle`): a paint frame after
+        # an `until` (or `server_settled`) has pinned the count or the hits, before seam
+        # geometry. Never the only wait before reading what a search or a press draws.
         self.page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
+
+    def until_shown(self, expected: list[str], why: str, list_id: str = "discord-log", seconds: float = 10) -> None:
+        """Wait until `shown(list_id)` is exactly `expected`, judging it as `why` (`#1118`)."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and self.shown(list_id) != expected:
+            self.page.wait_for_timeout(25)
+        self.check(self.shown(list_id) == expected, why)
 
     def until(self, script: str, why: str, seconds: float = 10) -> None:
         deadline = time.monotonic() + seconds
@@ -362,6 +372,7 @@ def walk_through(walk: Walk) -> None:
 
     # 2. A real press on the middle line shows its run where it stands; the count is unmoved.
     walk.press("#discord-log > li[data-id='209'] > button.row-seam:not(.row-seam-below)")
+    walk.until_shown(["201", "204", "205", "206", "207", "208", "209", "214"], "the opened run did not show its messages")
     walk.check(walk.shown() == ["201", "204", "205", "206", "207", "208", "209", "214"],
                f"the opened run shows {walk.shown()}")
     walk.check(page.evaluate("() => document.getElementById('search-count').textContent") == "4 of 16 loaded",
@@ -402,6 +413,7 @@ def walk_through(walk: Walk) -> None:
     page.evaluate(PICK_JS, "threads")
     walk.until("() => document.getElementById('side-cards').children.length > 0",
                "the thread list drew no cards")
+    walk.until_shown([HARBOR], "harbor did not keep only its card", "side-cards")
     walk.settled()
     walk.check(walk.shown("side-cards") == [HARBOR], f"harbor keeps {walk.shown('side-cards')}")
     card_seams = walk.seams("side-cards")
@@ -412,6 +424,7 @@ def walk_through(walk: Walk) -> None:
     walk.no_overflow()
     walk.shot("4-cards")
     walk.press("#side-cards > li[data-id='" + HARBOR + "'] > button.row-seam.row-seam-below")
+    walk.until_shown([HARBOR, LANTERN], "the opened card run did not show its cards", "side-cards")
     walk.check(walk.shown("side-cards") == [HARBOR, LANTERN],
                f"the opened card run shows {walk.shown('side-cards')}")
     walk.check(walk.seams("side-cards") == [(HARBOR, "… at least 2 unmatched messages in 1 thread …", None)],
@@ -439,7 +452,7 @@ def walk_server_search(walk: Walk, api: GapApi) -> None:
     page.fill("#search-field", "lantern")
     walk.until("() => document.querySelectorAll('#server-hits > li').length === 1",
                "the server's older hit was not drawn")
-    walk.settled()
+    walk.server_settled()
     scope = str(page.evaluate(SCOPE_JS))
     walk.check(scope.startswith("No upstream search · this page: back to ") and
                " · server: back to " in scope and "(still expanding)" in scope and
@@ -471,8 +484,7 @@ def walk_server_search(walk: Walk, api: GapApi) -> None:
     page.evaluate(PICK_JS, "main")
     walk.settled()
     page.fill("#search-field", "bright")
-    walk.until("() => document.getElementById('search-count').textContent !== ''", "Main did not count the search")
-    walk.settled()
+    walk.until_shown(["201"], "Main under 'bright' did not leave only the lantern root")
     walk.check(walk.shown() == ["201"], f"Main under 'bright' shows {walk.shown()}")
     walk.notes.append("Main keeps the lantern root for its reply's 'bright'")
 
@@ -484,6 +496,10 @@ def walk_server_search(walk: Walk, api: GapApi) -> None:
         walk.press("#side-unpack")
     walk.until("() => document.querySelectorAll('#side-cards > li[data-unpack-thread]').length > 0",
                "the threads did not unpack")
+    walk.until("() => { const v = [...document.getElementById('side-cards').children]"
+               ".filter((li) => li.getClientRects().length).map((li) => li.getAttribute('data-id') || li.getAttribute('data-context-id')); "
+               f"return v[0] === '{LANTERN}' && v.includes('214') && Boolean(document.querySelector(\"#side-cards > li[data-id='{LANTERN}'] > button.row-seam.row-seam-below\")); }}",
+               "the unpacked lantern thread did not show only its hit")
     walk.settled()
     shown = walk.shown("side-cards")
     walk.check(shown[0] == LANTERN and "214" in shown and "204" not in shown and "209" not in shown,
@@ -495,6 +511,9 @@ def walk_server_search(walk: Walk, api: GapApi) -> None:
     walk.no_overflow()
     walk.shot("8-unpacked")
     walk.press("#side-cards > li[data-id='" + LANTERN + "'] > button.row-seam.row-seam-below")
+    walk.until("() => { const v = [...document.getElementById('side-cards').children]"
+               ".filter((li) => li.getClientRects().length).map((li) => li.getAttribute('data-id') || li.getAttribute('data-context-id')); "
+               "return v.includes('204') && v.includes('209'); }", "the opened run did not show its messages")
     opened = walk.shown("side-cards")
     walk.check("204" in opened and "209" in opened, f"the opened run shows {opened}")
     walk.notes.append("Threads unpacked: only the hit, a line for the two before it, opened")

@@ -279,6 +279,10 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 check(rows() == expected, f"{label}: {why}: showing {rows()}")
 
             def settled() -> None:
+                # Two frames and nothing more (`#1118 browser-fixed-frame-settle`): in this walk
+                # only a paint frame after `wait_rows` has pinned the rows, before the kept-place
+                # geometry, or to let a parked scroll land before its baseline. Never the only
+                # wait before reading what a switch draws: `wait_rows` that first.
                 page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
 
             def seen() -> dict[str, int]:
@@ -366,6 +370,9 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             check(rows() == api.ids("main"), f"{label}: All did not draw the rows the page held at once: {rows()}")
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline and len(reads) < 2:
+                page.wait_for_timeout(25)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and "refreshing" not in pill():
                 page.wait_for_timeout(25)
             settled()
             check(reads == ["main", "flat"], f"{label}: All was not read once, behind its rows: {reads}")

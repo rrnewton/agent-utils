@@ -264,6 +264,10 @@ def sequence(page: Page, api: PlaceApi, port: int, args: argparse.Namespace, lab
 
     def settled() -> None:
         # Two frames, so what the page did has been laid out and its observers have answered.
+        # Only that (`#1118 browser-fixed-frame-settle`): in this walk a paint frame after an
+        # `until` has pinned the state, before a moved-by-a-pixel read, to let a parked scroll
+        # land before its baseline, or at the end of a deliberate no-move window. Never the
+        # only wait before reading what a tap or a walk back draws: `until` that first.
         page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
 
     def press(selector: str) -> None:

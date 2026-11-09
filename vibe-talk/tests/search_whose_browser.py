@@ -64,6 +64,9 @@ CHIP_JS = """() => {
 
 
 def settled(page: Page) -> None:
+    """Two frames and nothing more (`#1118 browser-fixed-frame-settle`): a paint frame after
+    `until` has pinned the state, before the chip's geometry is read. Never the only wait
+    before reading what a press draws: `until` that first."""
     page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
 
 

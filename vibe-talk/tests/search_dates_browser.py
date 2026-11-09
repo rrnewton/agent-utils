@@ -274,6 +274,9 @@ class Walk:
 
     def settled(self) -> None:
         # Two frames, so what the page did has been laid out and its observers have answered.
+        # Only that (`#1118 browser-fixed-frame-settle`): a paint frame after an `until` has
+        # pinned the filter or the marks, before rows geometry, or to let a parked scroll land
+        # before its baseline. Never the only wait before reading what a search draws.
         self.page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
 
     def until(self, script: str, why: str, seconds: float = 10) -> None:
@@ -426,7 +429,6 @@ def bar_geometry(walk: Walk) -> None:
         walk.check(first is None or number(first, "top") >= number(author, "bottom") - 0.5,
                    "the author filter hangs over the first row")
         found = walk.page.evaluate(SCROLLED_JS)
-        walk.settled()
         scrolled: Json = {str(name): value for name, value in found.items()} if isinstance(found, dict) else {}
         hanging = scrolled.get("author")
         walk.check(number(scrolled, "scrolled") > 0, "the list did not scroll, so the scrolled case was not looked at")
@@ -439,7 +441,6 @@ def bar_geometry(walk: Walk) -> None:
                    number(row, "left") < number(hanging, "right") - 0.5 and number(row, "right") > number(hanging, "left") + 0.5]
         walk.check(not covered, f"scrolled, the author filter covers part of {covered}")
         walk.page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 0; }")
-        walk.settled()
     else:
         walk.check(abs(number(author, "right") - number(measured.get("links"), "left")) <= 0.5 and
                    number(author, "top") >= number(bar, "top") - 0.5 and number(author, "bottom") <= number(bar, "bottom") + 0.5,
@@ -482,7 +483,6 @@ def walk_through(walk: Walk) -> None:
     # The hits are marked once the typing pauses.
     walk.until("() => document.querySelectorAll('#discord-log mark.search-hit').length >= 3",
                "the hits were not marked once the typing paused")
-    walk.settled()
     page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 0; }")
     walk.settled()
     rows = walk.rows()
@@ -508,7 +508,6 @@ def walk_through(walk: Walk) -> None:
     page.fill("#search-field", "")
     walk.until(f"() => document.querySelectorAll('#discord-log > li[data-id]:not(.search-hidden)').length === {len(SCRIPT)}",
                "clearing the text did not bring the week back")
-    walk.settled()
     page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 0; }")
     walk.settled()
     bar_geometry(walk)
@@ -517,12 +516,15 @@ def walk_through(walk: Walk) -> None:
     walk.settled()
     walk.press_row(chosen)
     before = walk.top(chosen)
+    mine = sum(1 for _, _, _, who, _ in SCRIPT if who == "owner")
     walk.press("#author-filter")
     walk.until("() => document.getElementById('author-filter').dataset.author === 'mine'",
                "a press on the author filter did not show only the owner's messages")
+    walk.until(f"() => document.querySelectorAll('#discord-log > li[data-id]:not(.search-hidden)').length === {mine} "
+               f"&& document.getElementById('search-count').textContent === '{mine} of {len(SCRIPT)} loaded'",
+               "Mine did not leave exactly the owner's prompts showing")
     walk.settled()
     rows = walk.rows()
-    mine = sum(1 for _, _, _, who, _ in SCRIPT if who == "owner")
     walk.check(len(rows) == mine and all(row["who"] == "me" for row in rows),
                f"Mine does not show exactly the owner's {mine} prompts")
     count_text = str(page.evaluate("() => document.getElementById('search-count').textContent"))
@@ -535,6 +537,8 @@ def walk_through(walk: Walk) -> None:
         walk.press("#author-filter")
     walk.until("() => document.getElementById('author-filter').dataset.author === 'everyone'",
                "two more presses did not come back to everyone's messages")
+    walk.until(f"() => document.querySelectorAll('#discord-log > li[data-id]:not(.search-hidden)').length === {len(SCRIPT)}",
+               "coming back to everyone did not show the week again")
     walk.settled()
     back = walk.top(chosen)
     walk.check(abs(back - before) <= TOLERANCE_PX, f"back to everyone's, the prompt stands at {back:.1f}px, not {before:.1f}px")
