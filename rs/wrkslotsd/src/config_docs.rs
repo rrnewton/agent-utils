@@ -17,7 +17,10 @@ pub(crate) const TOP_DOCS: &[(&str, &str)] = &[
     ("max_active_slots", "Cap on active slots. Absent means uncapped."),
     ("cache_globs", "Slot-relative globs of regenerable caches that `clean-caches` may delete."),
     ("repo_cache_globs", "Per-repository cache globs: repository name to a list of globs."),
-    ("post_provision_hooks", "Shell commands run, in order, in every new checkout."),
+    (
+        "post_provision_hooks",
+        "Shell commands run, in order, in every new checkout; an entry {command, slot_types} runs only in slots of those types.",
+    ),
     ("identity", "Git author identity ({name, email}) that create sets privately in each new slot: `git config --worktree` in the slot's own checkout, plain `git config` in each populated submodule. Absent means create leaves the identity alone."),
     ("retire_freeze", "When set, every retirement and removal on this host refuses with code retire-freeze and this reason. Managed by `wrkslots freeze`; absent means unfrozen."),
     ("salvage_push_remotes", "Remote URLs that removal may push salvage commits to. Absent or empty allows none: uncommitted work on any other remote is kept in a verified local bundle instead."),

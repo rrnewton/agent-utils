@@ -1243,6 +1243,7 @@ fn create_slot_inner(
                 )
                 .env("WRKSLOTS_CHECKOUT", path.to_string_lossy().into_owned())
                 .env("WRKSLOTS_CHECKOUT_NAME", &checkout_name)
+                .env("WRKSLOTS_SLOT_TYPE", slot_type)
                 .output();
             let failed = match &output {
                 Ok(output) if output.status.success() => None,

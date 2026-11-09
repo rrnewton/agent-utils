@@ -472,3 +472,43 @@ def test_create_identity_refusal_matches_python(tmp_path: Path) -> None:
     for root in (rust_root, oracle_root):
         assert not (root / "worktrees" / "slot-b").exists()
         assert not list((root / "worktrees").glob("CREATE.*.journal"))
+
+
+def test_create_hooks_see_the_slot_type_in_both_editions(tmp_path: Path) -> None:
+    """#1122: every post-provision hook sees WRKSLOTS_SLOT_TYPE."""
+
+    roots = {edition: _empty_fixture(tmp_path / edition) for edition in ("rust", "python")}
+    for root in roots.values():
+        config = root / ".wrkslots.yml"
+        config.write_text(
+            config.read_text()
+            + "post_provision_hooks:\n  - 'printf %s \"$WRKSLOTS_SLOT_TYPE\" > slot-type'\n"
+        )
+    assert _python_create(roots["python"]) == 0
+    result = _rust_create(roots["rust"])
+    assert result.returncode == 0, result.stderr
+    for root in roots.values():
+        assert (root / "worktrees" / "slot-b" / "repo" / "slot-type").read_text() == "agent"
+
+
+def test_rust_refuses_a_hook_slot_types_entry_until_it_is_ported(tmp_path: Path) -> None:
+    """#1122's recorded parity gap: the Rust edition does not run {command, slot_types} yet.
+
+    It refuses such a configuration outright, never running the hook in the
+    wrong slot type or skipping it silently; the Python edition creates the slot.
+    """
+
+    roots = {edition: _empty_fixture(tmp_path / edition) for edition in ("rust", "python")}
+    for root in roots.values():
+        config = root / ".wrkslots.yml"
+        config.write_text(
+            config.read_text()
+            + "post_provision_hooks:\n"
+            + "  - {command: 'printf ran > agent-hook', slot_types: [agent]}\n"
+        )
+    assert _python_create(roots["python"]) == 0
+    assert (roots["python"] / "worktrees" / "slot-b" / "repo" / "agent-hook").read_text() == "ran"
+    result = _rust_create(roots["rust"])
+    assert result.returncode != 0
+    assert "post_provision_hooks" in result.stderr
+    assert not (roots["rust"] / "worktrees" / "slot-b").exists()

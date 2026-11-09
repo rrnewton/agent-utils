@@ -29093,7 +29093,7 @@ def test_repair_updates_the_pre_packaging_control_symlink(tmp_path: Path) -> Non
         check=False,
     )
     assert old_command.returncode == 0, old_command.stderr
-    assert old_command.stdout.strip() == "wrkslots 0.7.0"
+    assert old_command.stdout.strip() == "wrkslots 0.8.0"
 
     repaired = _repair(project)
 
@@ -30649,6 +30649,95 @@ def test_post_provision_hooks_run_in_order_before_registration(
     row = active_slots(project)[0]
     assert isinstance(row, dict)
     assert len(row["checkouts"]) == 2
+
+
+def _set_post_provision_hooks(project: Path, hooks: list[object]) -> None:
+    config_path = project / ".wrkslots.yml"
+    document = dict(wrkslots._read_config(config_path))
+    document["post_provision_hooks"] = hooks
+    wrkslots._write_config(config_path, document)
+
+
+def test_post_provision_hooks_select_slot_types_and_see_the_type(tmp_path: Path) -> None:
+    """#1122: a {command, slot_types} hook runs only in those slot types; every hook sees the type."""
+
+    project, _repository, _remote = make_project(tmp_path)
+    everywhere = python_hook(
+        "import os; from pathlib import Path; "
+        "Path('everywhere').write_text(os.environ['WRKSLOTS_SLOT_TYPE'])"
+    )
+    agent_only = python_hook("from pathlib import Path; Path('agent-only').write_text('ran')")
+    _set_post_provision_hooks(
+        project, [everywhere, {"command": agent_only, "slot_types": ["agent"]}]
+    )
+
+    agent = create(project)
+    validate = create(project, slot="slot02", slot_type="validate", branch=None)
+
+    assert agent.returncode == 0, agent.stderr
+    assert validate.returncode == 0, validate.stderr
+    agent_tree = checkout(project)
+    validate_tree = checkout(project, slot="slot02", slot_type="validate")
+    assert (agent_tree / "everywhere").read_text(encoding="utf-8") == "agent"
+    assert (agent_tree / "agent-only").read_text(encoding="utf-8") == "ran"
+    assert (validate_tree / "everywhere").read_text(encoding="utf-8") == "validate"
+    assert not (validate_tree / "agent-only").exists()
+
+
+def test_an_interrupted_create_journal_records_its_slot_types_hooks(tmp_path: Path) -> None:
+    """#1122: the create journal lists the hooks of its slot's type, and readers accept it."""
+
+    project, _repository, _remote = make_project(tmp_path)
+    validate_only = python_hook("raise SystemExit(3)")
+    _set_post_provision_hooks(
+        project,
+        ["true", {"command": validate_only, "slot_types": ["validate"]}],
+    )
+    assert create(project).returncode == 0
+    failed = create(project, slot="slot02", slot_type="validate", branch=None)
+    assert failed.returncode != 0
+    (journal_path,) = control_directory(project).glob("CREATE.*.journal")
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert journal["post_provision_hooks"] == ["true", validate_only]
+    # The agent slot's hooks were only the plain one.
+    events = wrkslots._load_events(wrkslots._load_config(str(project), "testhost"), "testhost")
+    agent_hooks: list[object] = []
+    for event in events:
+        if event["kind"] != "operation-progress-recorded":
+            continue
+        payload = wrkslots._as_mapping(event["payload"], "event payload")
+        logged = wrkslots._as_mapping(payload["journal"], "event journal")
+        if logged.get("kind") == "create" and logged.get("slot") == "slot01":
+            agent_hooks.append(logged["post_provision_hooks"])
+    assert agent_hooks and all(hooks == ["true"] for hooks in agent_hooks)
+    # A reader comparing the journal with the configuration accepts it: it
+    # reports the failed hook, not "differ from configuration".
+    classified = command(
+        project, "classify-create-journals", "slot03", "--agent", "codex-3",
+        "--slot-type", "agent",
+    )
+    assert "differ from configuration" not in classified.stderr, classified.stderr
+
+
+@pytest.mark.parametrize(
+    ("entry", "message"),
+    (
+        ({"command": "true", "slot_types": ["agnet"]}, "unknown slot type 'agnet'"),
+        ({"command": "true", "slot_types": []}, "must name at least one slot type"),
+        ({"command": "true", "slot_types": ["agent", "agent"]}, "repeats 'agent'"),
+        ({"command": "true", "when": ["agent"]}, "when"),
+        ({"slot_types": ["agent"]}, "command"),
+    ),
+)
+def test_post_provision_hook_slot_types_refuse_at_config_load(
+    tmp_path: Path, entry: dict[str, object], message: str,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    _set_post_provision_hooks(project, [entry])
+    refused = command(project, "status")
+    assert refused.returncode != 0
+    assert "post_provision_hooks[0]" in refused.stderr
+    assert message in refused.stderr
 
 
 def test_create_json_keeps_hook_progress_off_machine_readable_stdout(

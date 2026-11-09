@@ -626,7 +626,10 @@ CONFIG_KEY_DOCS: dict[str, str] = {
     "max_active_slots": "Cap on active slots. Absent means uncapped.",
     "cache_globs": "Slot-relative globs of regenerable caches that `clean-caches` may delete.",
     "repo_cache_globs": "Per-repository cache globs: repository name to a list of globs.",
-    "post_provision_hooks": "Shell commands run, in order, in every new checkout.",
+    "post_provision_hooks": (
+        "Shell commands run, in order, in every new checkout; an entry {command, slot_types} "
+        "runs only in slots of those types."
+    ),
     "identity": (
         "Git author identity ({name, email}) that create sets privately in each new slot: "
         "`git config --worktree` in the slot's own checkout, plain `git config` in each "
@@ -1172,6 +1175,9 @@ class Config:
     cache_globs: tuple[str, ...] = ()
     repo_cache_globs: tuple[tuple[str, tuple[str, ...]], ...] = ()
     post_provision_hooks: tuple[str, ...] = ()
+    #: Per hook, parallel to ``post_provision_hooks``: the slot types it runs
+    #: in, or None for every type (#1122).
+    post_provision_hook_slot_types: tuple[tuple[str, ...] | None, ...] = ()
     #: Git author identity set slot-privately in every new checkout (#1096);
     #: None, the meaning when the key is absent, leaves identity alone.
     identity: SlotIdentity | None = None
@@ -2171,6 +2177,61 @@ def _validate_hook(value: str) -> str:
     if not value.strip() or "\x00" in value:
         raise Refusal("post-provision hooks must be non-empty shell commands")
     return value
+
+
+def _post_provision_hook_entries(
+    value: object, label: str,
+) -> tuple[tuple[str, ...], tuple[tuple[str, ...] | None, ...]]:
+    """Parse ``post_provision_hooks``: each entry a command, or {command, slot_types} (#1122).
+
+    Returns the commands and, in parallel, each one's slot types (None for a
+    plain command or a mapping without ``slot_types``: every slot type).  An
+    unknown or repeated slot type, or an empty list, refuses.
+    """
+
+    commands: list[str] = []
+    slot_types: list[tuple[str, ...] | None] = []
+    for index, item in enumerate(_as_list(value, label)):
+        item_label = f"{label}[{index}]"
+        if isinstance(item, str):
+            commands.append(_validate_hook(item))
+            slot_types.append(None)
+            continue
+        entry = _as_mapping(item, item_label)
+        _exact_keys(entry, {"command"}, {"slot_types"}, item_label)
+        commands.append(_validate_hook(_as_str(entry["command"], f"{item_label}.command")))
+        if "slot_types" not in entry:
+            slot_types.append(None)
+            continue
+        types = _as_list(entry["slot_types"], f"{item_label}.slot_types")
+        selected: list[str] = []
+        for type_index, raw_type in enumerate(types):
+            slot_type = _as_str(raw_type, f"{item_label}.slot_types[{type_index}]")
+            if slot_type not in SLOT_TYPES:
+                raise StateError(
+                    f"{item_label}.slot_types names unknown slot type {slot_type!r}; "
+                    f"expected {' or '.join(SLOT_TYPES)}"
+                )
+            if slot_type in selected:
+                raise StateError(f"{item_label}.slot_types repeats {slot_type!r}")
+            selected.append(slot_type)
+        if not selected:
+            raise StateError(f"{item_label}.slot_types must name at least one slot type")
+        slot_types.append(tuple(selected))
+    return tuple(commands), tuple(slot_types)
+
+
+def _post_provision_hooks_for(config: Config, slot_type: str) -> tuple[str, ...]:
+    """The configured hooks that run in a new slot of ``slot_type``, in order (#1122)."""
+
+    selections = config.post_provision_hook_slot_types or (None,) * len(
+        config.post_provision_hooks
+    )
+    return tuple(
+        command
+        for command, types in zip(config.post_provision_hooks, selections)
+        if types is None or slot_type in types
+    )
 
 
 # One address, as Git writes it between angle brackets: no spaces, no
@@ -4203,14 +4264,11 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
             raw["repo_cache_globs"], "configuration.repo_cache_globs"
         )
     )
-    post_provision_hooks = (
-        ()
+    post_provision_hooks, post_provision_hook_slot_types = (
+        ((), ())
         if "post_provision_hooks" not in raw
-        else _string_tuple(
-            raw["post_provision_hooks"],
-            "configuration.post_provision_hooks",
-            _validate_hook,
-            unique=False,
+        else _post_provision_hook_entries(
+            raw["post_provision_hooks"], "configuration.post_provision_hooks"
         )
     )
     identity = (
@@ -4286,6 +4344,7 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         cache_globs=cache_globs,
         repo_cache_globs=repo_cache_globs,
         post_provision_hooks=post_provision_hooks,
+        post_provision_hook_slot_types=post_provision_hook_slot_types,
         identity=identity,
         salvage_push_remotes=salvage_push_remotes,
         reclaimable_ignored_paths=reclaimable_ignored_paths,
@@ -10092,7 +10151,8 @@ def _completed_create_record(
         _validate_hook,
         unique=False,
     )
-    if hooks != config.post_provision_hooks:
+    # The journal records the hooks of its slot's type (#1122).
+    if hooks != _post_provision_hooks_for(config, slot_type):
         raise StateError("create journal post-provision hooks differ from configuration")
     if (
         _as_int(raw.get("hook_progress", 0), "create journal.hook_progress")
@@ -10532,7 +10592,8 @@ def _create_journal_items(
         _validate_hook,
         unique=False,
     )
-    if hooks != config.post_provision_hooks:
+    # The journal records the hooks of its slot's type (#1122).
+    if hooks != _post_provision_hooks_for(config, slot_type):
         raise StateError("create journal post-provision hooks differ from configuration")
     if raw.get("failure_policy") != "leave-for-inspection":
         raise StateError("create journal has an unsupported hook failure policy")
@@ -28745,7 +28806,7 @@ def _create_journal_payload(
         "coordinator_lease": _identity_to_obj(coordinator_lease),
         "planned": [_planned_to_obj(item) for item in plan],
         "created": [_checkout_to_obj(item) for item in created],
-        "post_provision_hooks": list(config.post_provision_hooks),
+        "post_provision_hooks": list(_post_provision_hooks_for(config, args.slot_type)),
         "hook_progress": hook_progress,
         "hook_failure": None,
         "failure_policy": "leave-for-inspection",
@@ -28860,7 +28921,8 @@ def _run_post_provision_hooks(
     *,
     start: int = 0,
 ) -> int:
-    hooks = config.post_provision_hooks
+    slot_type = _as_str(journal.get("slot_type", "agent"), "create journal.slot_type")
+    hooks = _post_provision_hooks_for(config, slot_type)
     total = len(created) * len(hooks)
     if start < 0 or start > total:
         raise StateError("create journal hook progress is out of range")
@@ -28884,6 +28946,7 @@ def _run_post_provision_hooks(
                 "WRKSLOTS_SLOT": path.parent.name if config.layout == "nested" else path.name,
                 "WRKSLOTS_CHECKOUT": str(path),
                 "WRKSLOTS_CHECKOUT_NAME": checkout.name,
+                "WRKSLOTS_SLOT_TYPE": slot_type,
             }
         )
         print(
@@ -48988,7 +49051,7 @@ def _recover_create(
             unique=False,
         )
     )
-    if journal_hooks != config.post_provision_hooks:
+    if journal_hooks != _post_provision_hooks_for(config, slot_type):
         raise StateError("create journal post-provision hooks differ from configuration")
     hook_progress = _as_int(raw.get("hook_progress", 0), "create journal.hook_progress")
     total_hook_steps = len(plan) * len(journal_hooks)
@@ -69485,7 +69548,11 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--post-provision-hook",
         action="append",
         metavar="SHELL-COMMAND",
-        help="ordered shell command run in every new checkout (repeatable)",
+        help=(
+            "ordered shell command run in every new checkout (repeatable); to limit a "
+            "hook to some slot types, write it in the configuration as "
+            "{command: ..., slot_types: [agent]}"
+        ),
     )
     init.add_argument(
         "--salvage-push-remote",

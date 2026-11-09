@@ -502,6 +502,37 @@ the shared repository configuration, a global value the checkout falls through t
 created before the key existed. It is advisory: doctor never rewrites Git configuration, and it
 reports nothing when no `identity` is configured. Submodules are not checked.
 
+## Post-provision hooks
+
+`post_provision_hooks` lists shell commands that `create` runs, in order, in every new checkout,
+before it registers the slot. Each runs with the checkout as its working directory and sees these
+environment variables:
+
+- `WRKSLOTS_PROJECT_ROOT`: the project root;
+- `WRKSLOTS_SLOT`: the slot name;
+- `WRKSLOTS_CHECKOUT`: the checkout's absolute path;
+- `WRKSLOTS_CHECKOUT_NAME`: the checkout's name;
+- `WRKSLOTS_SLOT_TYPE`: the slot type, `agent` or `validate`.
+
+A hook that fails leaves the slot for inspection with its create journal; fix the cause and run
+`wrkslots recover`, which resumes from the failed hook.
+
+An entry can also be a mapping, so that it runs only in slots of the listed types (#1122):
+
+```yaml
+post_provision_hooks:
+  - make deps
+  - command: ./scripts/generate-dependencies
+    slot_types: [agent]
+min_wrkslots_version: 0.8.0
+```
+
+`slot_types` lists one or more of `agent` and `validate`; an unknown or repeated type, or an empty
+list, is refused when the configuration is read. A mapping without `slot_types`, like a plain
+string, runs in every slot type. The create journal records the hooks for its slot's type.
+wrkslots before 0.8.0 refuses a mapping entry as not a string, so set `min_wrkslots_version: 0.8.0`
+when you use one: an older reader then names the version it needs instead.
+
 ## Git hook installers in new submodules
 
 A repository can ship its own Git hook installer as an executable `scripts/setup-hooks.sh`, which
