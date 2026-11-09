@@ -554,3 +554,51 @@ fn a_recorded_submit_for_a_landed_change_is_dropped_at_the_next_writer() {
         .count();
     assert_eq!(submitted, 1);
 }
+
+/// Priority changes without resubmission (#1104): direct with the
+/// lock free, recorded while a writer holds it and applied at the
+/// next writer, and refused once the change has landed.
+#[test]
+fn prioritize_changes_priority_in_place_and_when_recorded() {
+    let fx = queue("intake-prioritize");
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    // Direct: the numeric priority changes in place, no resubmission.
+    let out = fx.mq_ok(&["prioritize", "2", "--priority", "1"]);
+    assert!(out.contains("#2 priority is now 1"), "{out}");
+    assert_eq!(item(&fx, 2)["priority"], 1);
+    // Not prioritized: the field is omitted when false.
+    assert!(item(&fx, 2)["prioritized"] != true);
+    let submitted = history(&item(&fx, 2))
+        .into_iter()
+        .filter(|(kind, _)| kind == "submitted")
+        .count();
+    assert_eq!(submitted, 1);
+    // Recorded while a writer holds the queue: applied by the next one.
+    let lock = hold_writer_lock(&fx);
+    let out = fx.mq_ok(&["prioritize", "1"]);
+    assert!(out.contains("recorded the prioritization of #1"), "{out}");
+    assert!(item(&fx, 1)["prioritized"] != true);
+    assert_eq!(status_json(&fx)["intake"]["pending"], 1);
+    drop(lock);
+    let out = fx.mq(&["run"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("applied prioritize #1 recorded at"),
+        "{stderr}"
+    );
+    assert_eq!(item(&fx, 1)["prioritized"], true);
+    assert_eq!(status(&fx, 1), "landed");
+    assert_eq!(status(&fx, 2), "landed");
+    // A landed change has no priority left to change.
+    let out = fx.mq(&["prioritize", "1"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("already landed"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

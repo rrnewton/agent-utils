@@ -695,6 +695,68 @@ pub fn retry_recorded(state: &State, pr: i64, recorded_at: &str) -> Result<Item,
     Ok(item)
 }
 
+/// How an item's ordering reads: its numeric priority, with `!` for a
+/// prioritized change (as `list` shows it).
+pub fn priority_text(priority: i64, prioritized: bool) -> String {
+    if prioritized {
+        format!("{priority}!")
+    } else {
+        priority.to_string()
+    }
+}
+
+/// Change a queued change's priority in place (#1104), without
+/// resubmitting it: `priority`/`prioritized` left `None` keep their
+/// current values. `recorded_at` names a request recorded while
+/// another writer held the queue, for the history. A prioritized
+/// change is planned ahead of all other work and validated alone,
+/// as at submit; the caller who wants a landed change queued again
+/// submits it afresh.
+pub fn prioritize_recorded(
+    state: &State,
+    pr: i64,
+    priority: Option<i64>,
+    prioritized: Option<bool>,
+    recorded_at: &str,
+) -> Result<Item, String> {
+    let mut item = state
+        .item(pr)?
+        .ok_or_else(|| format!("#{pr} is not in the queue"))?;
+    if item.status == ItemStatus::Landed {
+        return Err(format!(
+            "#{pr} already landed as {}; submit it again to queue it",
+            crate::plan::short(&item.landed_as)
+        ));
+    }
+    if item.status != ItemStatus::Queued {
+        return Err(format!(
+            "#{pr} is {}, not queued; resubmit it with the priority wanted",
+            item.status.as_str()
+        ));
+    }
+    let was = priority_text(item.priority, item.prioritized);
+    if let Some(priority) = priority {
+        item.priority = priority;
+    }
+    if let Some(prioritized) = prioritized {
+        item.prioritized = prioritized;
+    }
+    let recorded = if recorded_at.is_empty() {
+        String::new()
+    } else {
+        format!("; recorded at {recorded_at} while another writer held the queue")
+    };
+    item.log(
+        "priority",
+        format!(
+            "priority is now {} (was {was}){recorded}",
+            priority_text(item.priority, item.prioritized)
+        ),
+    );
+    state.save_item(&item)?;
+    Ok(item)
+}
+
 /// The held batch `prs` names, checked for `merge-queue accept-flaky`: every change is queued
 /// and held for a GREEN_FLAKY ruling with the candidate it was validated in recorded, they were
 /// all validated together, and `prs` is that whole batch, each still at the head validated.

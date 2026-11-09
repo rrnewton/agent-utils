@@ -445,7 +445,9 @@ enum DonorCommand {
     },
     /// Queue host: record a donor's host fault (its probe failed right after
     /// a could-not-run refusal). Used by `donor run`; operators clear with
-    /// `donor clear-fault`.
+    /// `donor clear-fault`. With `--operator` it is an operator hold
+    /// instead: no probe pass or admitted validation clears it, only
+    /// `donor clear-fault` without `--probe-passed`.
     HostFault {
         /// Donor name.
         #[arg(long)]
@@ -453,6 +455,10 @@ enum DonorCommand {
         /// Why the host cannot validate.
         #[arg(long, default_value = "host probe failed")]
         reason: String,
+        /// Record an operator hold: the donor is leased nothing until
+        /// `donor clear-fault` lifts it, however its probes go.
+        #[arg(long)]
+        operator: bool,
     },
     /// Queue host: print a donor's host fault as JSON (`{"fault": ...}` or
     /// `{"fault": null}`), for a donor re-probing a fault it holds no local
@@ -692,6 +698,20 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
             probe_passed,
         } => {
             if probe_passed {
+                // An operator hold survives a probe pass (#1104): say so
+                // instead of reporting a clear that did not happen. The
+                // probe outcome is still recorded on the entry.
+                if store
+                    .host_fault_details()
+                    .iter()
+                    .any(|(name, .., operator)| *name == donor && *operator)
+                {
+                    store.record_probe_result(&donor, true);
+                    print_json_reply(
+                        &serde_json::json!({"held_by_operator": donor, "leased": null}),
+                    )?;
+                    return Ok(0);
+                }
                 store.record_probe_result(&donor, true);
             } else {
                 store.clear_host_fault(&donor);
@@ -699,8 +719,16 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
             print_json_reply(&serde_json::json!({"cleared": donor, "leased": null}))?;
             Ok(0)
         }
-        DonorCommand::HostFault { donor, reason } => {
-            store.record_host_fault(&donor, &reason);
+        DonorCommand::HostFault {
+            donor,
+            reason,
+            operator,
+        } => {
+            if operator {
+                store.record_operator_fault(&donor, &reason);
+            } else {
+                store.record_host_fault(&donor, &reason);
+            }
             print_json_reply(&serde_json::json!({"faulted": donor}))?;
             Ok(0)
         }
@@ -709,12 +737,13 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
                 .host_fault_details()
                 .into_iter()
                 .find(|(name, ..)| *name == donor)
-                .map(|(_, reason, since, last_probe_at, last_probe)| {
+                .map(|(_, reason, since, last_probe_at, last_probe, operator)| {
                     serde_json::json!({
                         "reason": reason,
                         "since": since,
                         "last_probe_at": last_probe_at,
                         "last_probe": last_probe,
+                        "operator": operator,
                     })
                 });
             print_json_reply(&serde_json::json!({"fault": fault}))?;
@@ -839,22 +868,42 @@ fn donor_command(state: &State, action: DonorCommand) -> Result<i32, String> {
             for alert in store.give_back_alerts(config.donors.give_back_alert())? {
                 println!("{alert}");
             }
-            for (donor, reason, since, last_probe_at, last_probe) in store.host_fault_details() {
-                println!(
-                    "ERROR: donor {donor} faulted since {since}: {reason}; last probe {} {}; \
-                     it is leased nothing until an admitted validation or a passing probe \
-                     (clear with `merge-queue donor clear-fault --donor {donor} --probe-passed`)",
-                    if last_probe_at.is_empty() {
-                        "never"
-                    } else {
-                        &last_probe_at
-                    },
-                    if last_probe.is_empty() {
-                        ""
-                    } else {
-                        &last_probe
-                    },
-                );
+            for (donor, reason, since, last_probe_at, last_probe, operator) in
+                store.host_fault_details()
+            {
+                if operator {
+                    println!(
+                        "ERROR: donor {donor} held by operator: {reason} (since {since}); \
+                         last probe {} {}; it is leased nothing until \
+                         `merge-queue donor clear-fault --donor {donor}` lifts the hold",
+                        if last_probe_at.is_empty() {
+                            "never"
+                        } else {
+                            &last_probe_at
+                        },
+                        if last_probe.is_empty() {
+                            ""
+                        } else {
+                            &last_probe
+                        },
+                    );
+                } else {
+                    println!(
+                        "ERROR: donor {donor} faulted since {since}: {reason}; last probe {} {}; \
+                         it is leased nothing until an admitted validation or a passing probe \
+                         (clear with `merge-queue donor clear-fault --donor {donor} --probe-passed`)",
+                        if last_probe_at.is_empty() {
+                            "never"
+                        } else {
+                            &last_probe_at
+                        },
+                        if last_probe.is_empty() {
+                            ""
+                        } else {
+                            &last_probe
+                        },
+                    );
+                }
             }
             for alert in store.host_fault_escalations() {
                 println!("{alert}");
@@ -1423,6 +1472,26 @@ enum Command {
         /// Change numbers.
         #[arg(required = true)]
         prs: Vec<i64>,
+    },
+    /// Change a queued change's priority without resubmitting it: with no flag, mark it
+    /// prioritized (planned ahead of all other work, validated in a batch of its own, as
+    /// `--prioritized` at submit); `--priority N` sets the numeric priority instead (lower
+    /// lands first); `--clear` restores both defaults. While a run holds the writer lock
+    /// the change is recorded and applied at the run's next intake point, even while the
+    /// change's batch is in flight: the batch is undisturbed and the next plan orders by
+    /// the new priority.
+    Prioritize {
+        /// Change number.
+        pr: i64,
+        /// Numeric priority to set (lower lands first).
+        #[arg(long)]
+        priority: Option<i64>,
+        /// Mark the change prioritized as well: planned ahead of all other work.
+        #[arg(long)]
+        prioritized: bool,
+        /// Restore the defaults instead: not prioritized, the default priority.
+        #[arg(long, conflicts_with_all = ["priority", "prioritized"])]
+        clear: bool,
     },
     /// Set (or, with --clear, remove) the shepherd of a change: the agent
     /// driving it to landing, named in every event-hook payload for it.
@@ -2572,6 +2641,69 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                 ops::retry(&state, pr)?;
                 println!("#{pr} is back in the queue");
             }
+            Ok(0)
+        }
+        Command::Prioritize {
+            pr,
+            priority,
+            prioritized,
+            clear,
+        } => {
+            let config = state.config()?;
+            // Bare `prioritize PR` marks it prioritized; a knob not
+            // named keeps its current value (see ops::prioritize_recorded).
+            let (priority, prioritized) = if clear {
+                (Some(DEFAULT_PRIORITY), Some(false))
+            } else if prioritized {
+                (priority, Some(true))
+            } else if priority.is_some() {
+                (priority, None)
+            } else {
+                (None, Some(true))
+            };
+            let lock = match state.lock() {
+                Ok(lock) => lock,
+                Err(busy) => {
+                    let item = state
+                        .item(pr)?
+                        .ok_or_else(|| format!("#{pr} is not in the queue"))?;
+                    if item.status != ItemStatus::Queued {
+                        return Err(format!("#{pr} is {}, not queued", item.status.as_str()));
+                    }
+                    let (entry, new) = intake::record(
+                        &state,
+                        intake::Request::Prioritize {
+                            pr,
+                            priority,
+                            prioritized,
+                        },
+                        &busy,
+                        "",
+                    )?;
+                    if new {
+                        println!(
+                            "recorded the prioritization of #{pr}: {busy}; the running \
+                             queue applies it at its next intake point"
+                        );
+                    } else {
+                        println!(
+                            "already recorded the prioritization of #{pr} at {}, not \
+                             recorded again: {busy}",
+                            entry.recorded_at
+                        );
+                    }
+                    return Ok(0);
+                }
+            };
+            intake::report(
+                "merge-queue prioritize",
+                intake::apply(&state, &config, &lock),
+            );
+            let item = ops::prioritize_recorded(&state, pr, priority, prioritized, "")?;
+            println!(
+                "#{pr} priority is now {}",
+                ops::priority_text(item.priority, item.prioritized)
+            );
             Ok(0)
         }
         Command::Shepherd { pr, name, clear } => {

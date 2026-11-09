@@ -689,3 +689,88 @@ fn a_resubmission_recorded_in_flight_is_dropped_when_its_change_lands() {
         events(&fx)
     );
 }
+
+/// Prioritizing a change whose batch is in flight (#1104) applies at
+/// the run's next intake point without disturbing the batch, and the
+/// next plan in the same run orders by the new priority: a pending
+/// change prioritized mid-run is validated ahead of an earlier one.
+#[test]
+fn prioritizing_in_flight_applies_at_the_next_intake_point_and_reorders_the_plan() {
+    let (fx, started, gates) = setup("intake-prioritize-in-flight");
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    fx.mq_ok(&["submit", "2", "--head", "b"]);
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    fx.mq_ok(&["submit", "3", "--head", "c"]);
+    // Two files of its own, so change 4's candidates have gate counts
+    // of their own wherever they are planned.
+    fx.branch("d", &[("tests/d", "ok\n"), ("tests/d2", "ok\n")]);
+    fx.mq_ok(&["submit", "4", "--head", "d"]);
+    let mut daemon = Daemon::start(&fx);
+    wait_for("two batches to validate", Duration::from_secs(30), || {
+        started_lines(&started).len() == 2
+    });
+    let prioritized = |pr: i64| {
+        let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+        items
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["pr"] == pr && item["status"] != "pending-intake")
+            .is_some_and(|item| item["prioritized"] == true)
+    };
+    // Change 2 is in flight: its prioritization is recorded, then
+    // applied in this run while its batch keeps validating.
+    let out = fx.mq_ok(&["prioritize", "2"]);
+    assert!(out.contains("recorded the prioritization of #2"), "{out}");
+    wait_for(
+        "change 2 to show prioritized while in flight",
+        Duration::from_secs(30),
+        || prioritized(2),
+    );
+    // The batches in flight are undisturbed: nothing restarted.
+    assert_eq!(started_lines(&started).len(), 2);
+    // Change 4 jumps the pending queue ahead of change 3.
+    let out = fx.mq_ok(&["prioritize", "4"]);
+    assert!(out.contains("recorded the prioritization of #4"), "{out}");
+    wait_for(
+        "change 4 to show prioritized",
+        Duration::from_secs(30),
+        || prioritized(4),
+    );
+    assert_eq!(started_lines(&started).len(), 2);
+    // Change 1 lands; the freed slot takes the next planned batch,
+    // which is now change 4's, not change 3's.
+    open(&gates, 2);
+    wait_for(
+        "a third validation to start",
+        Duration::from_secs(60),
+        || started_lines(&started).len() == 3,
+    );
+    let third = started_lines(&started)[2].clone();
+    assert!(
+        third.split(' ').any(|f| f == "d") && !third.split(' ').any(|f| f == "c"),
+        "the prioritized change did not go first: {third:?} in {:?}",
+        started_lines(&started)
+    );
+    for files in 1..=6 {
+        open(&gates, files);
+    }
+    assert_eq!(daemon.exit_code(Duration::from_secs(90)), Some(0));
+    for pr in 1..=4 {
+        assert_eq!(status(&fx, pr), "landed", "#{pr}");
+    }
+    let reports = reports(&fx);
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    let intake = reports[0]["intake"].as_array().unwrap();
+    for pr in [2, 4] {
+        assert!(
+            intake.iter().any(|line| line
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("applied prioritize #{pr}"))),
+            "{intake:?}"
+        );
+    }
+}

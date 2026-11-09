@@ -5,7 +5,7 @@ changes as ready to land. The queue orders them, splits them into batches, valid
 exact combined tree, and lands only trees that passed. It runs where your clone is. There is no
 hosted service, no webhook and no inbound connection.
 
-Commands: `init`, `submit`, `withdraw`, `retry`, `list` and `plan` decide what can land; `run` builds,
+Commands: `init`, `submit`, `withdraw`, `retry`, `prioritize`, `list` and `plan` decide what can land; `run` builds,
 validates and lands it; `serve` runs that loop forever so nobody has to drive it by hand, and
 `status` reports whether the daemon is alive; `widen` and `obligations` track focused landings
 until the complete suite has run; `bench` measures the landing rate against a serial lander on
@@ -265,6 +265,19 @@ that ends a hold (see "Held for a ruling"): the change is validated again. While
 writer lock, the retry is recorded and applied when the lock frees (see "Intake while a run holds
 the queue").
 
+### `merge-queue prioritize PR [--priority N | --prioritized | --clear]`
+
+This command changes a queued change's priority in place, without resubmitting it. With no flag
+it marks the change prioritized (planned ahead of all other work and validated in a batch of
+its own, as `submit --prioritized`); `--priority N` sets the numeric priority (lower lands
+first, as at submit) and leaves the flag as it was; the two combine; `--clear` restores both
+defaults. The change keeps its head, its history gains a `priority` entry, and nothing is
+revalidated for the edit itself. While a run holds the writer lock the change is recorded
+and applied at the run's next intake point — even while the change's own batch is in
+flight, which is not disturbed: the next plan in the same run orders by the new priority.
+A landed change is refused (submit it again to queue it); one that lands while its
+prioritization waits drops the request with a note.
+
 ### `merge-queue accept-flaky PR... --by WHO --reason WHY`
 
 This command is the ruling that accepts the GREEN_FLAKY passes of a held batch (see "Held for a
@@ -354,6 +367,8 @@ seconds under `run`.
   more, planned on top of that batch, and then no further requests in that run (the run
   log says `past the intake window with one batch left in flight; taking recorded
   requests in once more`). The run report lists what the run applied under `intake`.
+- A `prioritize` request applies at the next intake point even for a change in flight: it
+  disturbs no validation, and the plan the run makes next orders by the new priority.
 - Two more requests apply at the next intake point even though the run set their change
   aside. A `withdraw` of a change with no running validation (held for a ruling, say)
   applies at once and the run goes on without it. And a `submit` at a *new* head for a
@@ -718,7 +733,7 @@ validations keep the validator the run started with until the next run.
 
 Donor validators (see "Donor validators"). `donor run` is the donor daemon, run on any host with
 a clone of the queue's repository. The other verbs are what a donor calls on the queue host
-through its route; an operator uses only `status`.
+through its route; an operator uses `status`, `host-fault` and `clear-fault`.
 
 | Verb | What it does |
 |---|---|
@@ -729,6 +744,9 @@ through its route; an operator uses only `status`.
 | `bundle --job ID` | Token on stdin. Writes the candidate's git bundle to stdout. |
 | `report --job ID` | `{"token", "receipt"}` on stdin. Exits 1 with the reason when the receipt is refused. |
 | `release --job ID [--reason R] [--decline]` | Token on stdin. Gives the job back; `--decline` means this donor does not get it again unless the job is re-stamped. |
+| `host-fault --donor NAME [--reason R] [--operator]` | Record a donor host fault (`donor run`, after a failed probe). With `--operator`, an operator hold: no probe pass or admitted validation clears it, only `clear-fault`. |
+| `clear-fault --donor NAME [--probe-passed]` | Clear a host fault without leasing. `--probe-passed` clears an ordinary fault (an escalated one arms one trial claim); on an operator hold it reports `held_by_operator` and changes nothing. Without the flag it always clears. |
+| `fault --donor NAME` | Print the donor's host fault as JSON (`reason`, `since`, `last_probe_at`, `last_probe`, `operator`), or `{"fault": null}`. |
 
 ### `merge-queue widen`
 
@@ -1145,6 +1163,13 @@ cycles instead of resetting, and only an admitted validation resets it. After `h
 cycles (5 by default) the fault escalates: `donor status` and the serve heartbeat raise an
 `ERROR:` for it, and the donor stays paused until an admitted validation clears it — a
 probe pass then only arms one trial claim, it no longer clears the fault.
+
+**An operator can hold a donor out directly.** `merge-queue donor host-fault --donor
+<name> --operator --reason WHY` records a hold no probe pass and no admitted validation
+clears: status and the heartbeat show `donor <name> held by operator: WHY`, and only
+`merge-queue donor clear-fault --donor <name>` (without `--probe-passed`, which reports
+the hold and leaves it) lifts it. Use it for holds the probe cannot see: a host draining,
+a suspect toolchain, an investigation.
 - `compare_only`: donor names that only ever compare in `decide` mode. Each published job
   gets a duplicate only they may claim; its receipt is recorded as a comparison (`comparison`
   on both jobs, counted by `donor status`) and never decides the batch. Deciding donors never

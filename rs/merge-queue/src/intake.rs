@@ -1,4 +1,4 @@
-//! Intake that never waits for a run. `submit`, `withdraw`, `retry` and `accept-flaky` change
+//! Intake that never waits for a run. `submit`, `withdraw`, `retry`, `prioritize` and `accept-flaky` change
 //! item records, which needs the writer lock, and a run holds that lock for its whole length.
 //! When the lock is busy they record the request under `<state>/intake/pending/` instead, one
 //! file each, and the next holder of the lock applies the requests in the order they were
@@ -60,6 +60,18 @@ pub enum Request {
         /// Change number.
         pr: i64,
     },
+    /// `merge-queue prioritize` of one change (#1104): a knob left
+    /// `None` keeps its current value.
+    Prioritize {
+        /// Change number.
+        pr: i64,
+        /// Numeric priority (lower lands first) to set.
+        #[serde(default)]
+        priority: Option<i64>,
+        /// Prioritized flag to set (planned ahead of all other work).
+        #[serde(default)]
+        prioritized: Option<bool>,
+    },
     /// Another queue's `submit --requires PEER#PR` asked for this change's
     /// exact head while this queue's writer lock was busy: mark it exact
     /// when applied, refusing if its head moved meanwhile.
@@ -85,18 +97,23 @@ impl Request {
     pub fn pr(&self) -> i64 {
         match self {
             Self::Submit(submission) => submission.pr,
-            Self::Withdraw { pr, .. } | Self::Retry { pr } | Self::MarkExact { pr, .. } => *pr,
+            Self::Withdraw { pr, .. }
+            | Self::Retry { pr }
+            | Self::Prioritize { pr, .. }
+            | Self::MarkExact { pr, .. } => *pr,
             Self::AcceptFlaky { prs, .. } => prs.first().copied().unwrap_or_default(),
         }
     }
 
-    /// `submit #N`, `withdraw #N`, `retry #N` or `accept-flaky #N, #M`.
+    /// `submit #N`, `withdraw #N`, `retry #N`, `prioritize #N` or
+    /// `accept-flaky #N, #M`.
     pub fn describe(&self) -> String {
         let verb = match self {
             Self::Submit(_) => "submit",
             Self::MarkExact { .. } => "mark-exact",
             Self::Withdraw { .. } => "withdraw",
             Self::Retry { .. } => "retry",
+            Self::Prioritize { .. } => "prioritize",
             Self::AcceptFlaky { prs, .. } => {
                 return format!(
                     "accept-flaky {}",
@@ -381,6 +398,19 @@ pub fn pending_withdrawals(state: &State) -> BTreeSet<i64> {
         .collect()
 }
 
+/// Changes a waiting request prioritizes. A run applies such a request at
+/// its next intake point even for a change in flight: the edit disturbs
+/// no validation, and the next plan orders by it (see `run`).
+pub fn pending_priorities(state: &State) -> BTreeSet<i64> {
+    pending_entries(state)
+        .into_iter()
+        .filter_map(|entry| match entry.request {
+            Request::Prioritize { pr, .. } => Some(pr),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Changes a waiting request retries. A run lets such a request through for a change it holds
 /// (escalated, or held for a ruling) instead of keeping it for the run's end (see `run`).
 pub fn pending_retries(state: &State) -> BTreeSet<i64> {
@@ -501,6 +531,43 @@ pub fn drop_pending_for(state: &State, pr: i64) -> Vec<Entry> {
     dropped
 }
 
+/// Apply only the waiting `prioritize` requests, in recording order,
+/// whatever else is busy: a run calls this at an intake point so a
+/// priority edit for a change in flight lands without also applying
+/// that change's other waiting requests early (#1104). Other
+/// requests, and records that cannot be read, stay waiting for
+/// [`apply_except`]. A prioritize ahead of an earlier-recorded
+/// request for the same change simply goes first: the other request
+/// still applies in its turn (a resubmission there carries its own
+/// priority, as at submit).
+pub fn apply_priorities(state: &State, config: &Config, _lock: &Lock) -> Vec<Applied> {
+    let mut applied = Vec::new();
+    for path in files(&pending_dir(state)).unwrap_or_default() {
+        let Ok(entry) = read(&path) else {
+            continue;
+        };
+        if !matches!(entry.request, Request::Prioritize { .. }) {
+            continue;
+        }
+        let outcome = perform(state, config, &entry);
+        if let Err(error) = &outcome {
+            if refuse(state, config, &entry, error).is_err() {
+                continue;
+            }
+        }
+        if std::fs::remove_file(&path).is_err() {
+            continue;
+        }
+        applied.push(Applied {
+            pr: entry.request.pr(),
+            request: entry.request.describe(),
+            recorded_at: entry.recorded_at.clone(),
+            outcome,
+        });
+    }
+    applied
+}
+
 /// Carry out one request.
 fn perform(state: &State, config: &Config, entry: &Entry) -> Result<String, String> {
     let recorded = &entry.recorded_at;
@@ -544,6 +611,27 @@ fn perform(state: &State, config: &Config, entry: &Entry) -> Result<String, Stri
         Request::Retry { pr } => {
             ops::retry_recorded(state, *pr, recorded)?;
             Ok(format!("#{pr} is back in the queue"))
+        }
+        Request::Prioritize {
+            pr,
+            priority,
+            prioritized,
+        } => {
+            // As for a recorded submit (#1103): a change that landed
+            // meanwhile drops the request with a note, not a refusal.
+            if let Some(item) = state.item(*pr)? {
+                if item.status == ItemStatus::Landed {
+                    return Ok(format!(
+                        "dropped #{pr}: already landed as {}",
+                        short(&item.landed_as)
+                    ));
+                }
+            }
+            let item = ops::prioritize_recorded(state, *pr, *priority, *prioritized, recorded)?;
+            Ok(format!(
+                "#{pr} priority is now {}",
+                ops::priority_text(item.priority, item.prioritized)
+            ))
         }
         Request::MarkExact { pr, head } => {
             let mut item = state
@@ -676,6 +764,7 @@ pub fn pending(state: &State) -> Vec<Pending> {
             ),
             Request::Withdraw { .. } => ("withdraw", String::new(), String::new()),
             Request::Retry { .. } => ("retry", String::new(), String::new()),
+            Request::Prioritize { .. } => ("prioritize", String::new(), String::new()),
             Request::AcceptFlaky { .. } => ("accept-flaky", String::new(), String::new()),
             Request::MarkExact { head, .. } => ("mark-exact", String::new(), head.clone()),
         };

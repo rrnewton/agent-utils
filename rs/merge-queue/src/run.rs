@@ -4760,11 +4760,18 @@ impl<'a> Runner<'a> {
                             .store
                             .host_fault_details()
                             .into_iter()
-                            .map(|(donor, reason, since, at, result)| {
-                                format!(
-                                    "donor {donor} faulted since {since}: {reason}; \
-                                     last probe {at} {result}"
-                                )
+                            .map(|(donor, reason, since, at, result, operator)| {
+                                if operator {
+                                    format!(
+                                        "donor {donor} held by operator: {reason} \
+                                         (since {since}); last probe {at} {result}"
+                                    )
+                                } else {
+                                    format!(
+                                        "donor {donor} faulted since {since}: {reason}; \
+                                         last probe {at} {result}"
+                                    )
+                                }
                             })
                             .collect::<Vec<_>>()
                             .join("; ");
@@ -5991,13 +5998,21 @@ impl<'a> Runner<'a> {
                 resubmitted_same.insert(pr);
             }
         }
-        let applied = match crate::intake::apply_except(self.state, &self.config, writer, &busy) {
-            Ok(applied) => applied,
+        // Priority edits apply first, even for a change in flight
+        // (#1104): they disturb no validation, and the plan below is
+        // the next decision that orders by them. Only the prioritize
+        // requests go early; anything else waiting for a busy change
+        // keeps waiting for `apply_except` and the run's end.
+        let mut applied = crate::intake::apply_priorities(self.state, &self.config, writer);
+        match crate::intake::apply_except(self.state, &self.config, writer, &busy) {
+            Ok(mut rest) => applied.append(&mut rest),
             Err(error) => {
                 self.event("intake", &format!("recorded requests not applied: {error}"));
-                return Ok(());
+                if applied.is_empty() {
+                    return Ok(());
+                }
             }
-        };
+        }
         // A change held only until its owner's retry goes back into this run's plan once the
         // retry has applied; one whose retry was refused stays held.
         for pr in retried {
@@ -6074,10 +6089,17 @@ impl<'a> Runner<'a> {
     }
 
     /// Whether a waiting request would apply at once even though its change
-    /// is in `busy`: a withdrawal of a change with no running validation, or
-    /// a submit at a new head for a set-aside change that is not in flight
-    /// (see [`Self::take_intake`]).
+    /// is in `busy`: a withdrawal of a change with no running validation, a
+    /// submit at a new head for a set-aside change that is not in flight,
+    /// or a prioritize for any busy change, in flight included (see
+    /// [`Self::take_intake`]).
     fn intake_unblocks(&self, busy: &BTreeSet<i64>, in_flight: &BTreeSet<i64>) -> bool {
+        if crate::intake::pending_priorities(self.state)
+            .iter()
+            .any(|pr| busy.contains(pr))
+        {
+            return true;
+        }
         if crate::intake::pending_withdrawals(self.state)
             .iter()
             .any(|pr| busy.contains(pr) && !in_flight.contains(pr))
@@ -6800,11 +6822,15 @@ impl<'a> Runner<'a> {
                     // change can fill the free slot and a prioritized one goes before batches
                     // not started yet. Past the intake window the same round runs
                     // once more when exactly one batch is left in flight (#1087).
+                    // A waiting prioritization also opens the round with a full
+                    // window (#1104): it starts no batch, it only reorders the
+                    // pending plan, like the value-ordering planners above.
                     if full_loaded
                         && want_more
                         && (occupied(&flights) < window
                             || self.config.value_ordering
-                            || self.config.ev_planner)
+                            || self.config.ev_planner
+                            || !crate::intake::pending_priorities(self.state).is_empty())
                         && (!flights.is_empty() || !pending.is_empty())
                         && (self.takes_intake() || self.late_intake_round(flights.len()))
                     {

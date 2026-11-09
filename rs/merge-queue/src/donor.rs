@@ -2008,7 +2008,11 @@ impl Store {
             job.comparison = Some(compare(local, &receipt.verdict()));
         }
         self.note_receipt(&receipt.donor.name.clone());
-        self.clear_host_fault(&receipt.donor.name.clone());
+        // An admitted validation clears a host fault, but never an
+        // operator hold (#1104): only `clear-fault` lifts that.
+        if !self.operator_held(&receipt.donor.name) {
+            self.clear_host_fault(&receipt.donor.name.clone());
+        }
         job.receipt = Some(receipt);
         self.write(&job)
     }
@@ -2322,16 +2326,18 @@ impl Store {
     pub fn host_fault_list(&self) -> Vec<(String, String, String)> {
         self.host_fault_details()
             .into_iter()
-            .map(|(donor, reason, since, _, _)| (donor, reason, since))
+            .map(|(donor, reason, since, _, _, _)| (donor, reason, since))
             .collect()
     }
 
     /// Host faults with their last probe, by donor name:
-    /// `(donor, reason, since, last_probe_at, last_probe_result)`, where the
-    /// result is `passed`, `failed`, or empty when never probed. Status and
-    /// the serve heartbeat render this as "donor X faulted since T: reason;
-    /// last probe T result", so a fault sitting at zero probes is visible.
-    pub fn host_fault_details(&self) -> Vec<(String, String, String, String, String)> {
+    /// `(donor, reason, since, last_probe_at, last_probe_result, operator)`,
+    /// where the result is `passed`, `failed`, or empty when never probed,
+    /// and `operator` marks a hold only `clear-fault` lifts (#1104).
+    /// Status and the serve heartbeat render this as "donor X faulted
+    /// since T: reason; last probe T result", so a fault sitting at zero
+    /// probes is visible.
+    pub fn host_fault_details(&self) -> Vec<(String, String, String, String, String, bool)> {
         self.host_faults()
             .into_iter()
             .map(|(donor, fault)| {
@@ -2344,9 +2350,33 @@ impl Store {
                         .unwrap_or_default()
                         .to_owned(),
                     fault["last_probe"].as_str().unwrap_or_default().to_owned(),
+                    fault["operator"].as_bool() == Some(true),
                 )
             })
             .collect()
+    }
+
+    /// Whether `donor`'s recorded fault is an operator hold (#1104).
+    fn operator_held(&self, donor: &str) -> bool {
+        self.host_faults()
+            .get(donor)
+            .is_some_and(|fault| fault["operator"].as_bool() == Some(true))
+    }
+
+    /// Record (or refresh) an operator hold on `donor` (#1104): a host
+    /// fault no probe pass or admitted validation clears, only an
+    /// explicit `clear-fault`. Not a probe failure: it counts no probe
+    /// and no flap cycle. An existing entry keeps its `since` and probe
+    /// history; any armed trial is dropped.
+    pub fn record_operator_fault(&self, donor: &str, reason: &str) {
+        let mut faults = self.host_faults();
+        let entry = faults.entry(donor.to_owned()).or_insert_with(|| {
+            serde_json::json!({"reason": reason, "since": now(), "probes": 0, "last_probe": "", "last_probe_at": ""})
+        });
+        entry["reason"] = serde_json::json!(reason);
+        entry["operator"] = serde_json::json!(true);
+        entry.as_object_mut().map(|object| object.remove("trial"));
+        let _ = self.save_host_faults(&faults);
     }
 
     /// Record a host fault for `donor` because its probe (MQ_PROBE=1), run
@@ -2468,8 +2498,12 @@ impl Store {
     /// probe-pass/launch-refuse cycle instead of resetting the cycle count.
     /// An escalated fault is not cleared: it stays recorded (and shown), and
     /// one trial claim is armed so the donor can produce the admitted
-    /// validation that alone clears it.
+    /// validation that alone clears it. An operator hold (#1104) is left
+    /// entirely alone: no clear, no trial, no flap mark.
     pub fn note_probe_pass(&self, donor: &str) {
+        if self.operator_held(donor) {
+            return;
+        }
         let mut flap = self.host_flap();
         flap.entry(donor.to_owned())
             .or_insert_with(|| serde_json::json!({"cycles": 0, "probe_passed": false}))
@@ -4828,6 +4862,35 @@ mod unit {
         )
         .unwrap();
         assert_eq!(faults["d1"]["probes"], 2, "{faults}");
+    }
+
+    #[test]
+    fn an_operator_fault_survives_probe_passes_until_it_is_cleared() {
+        let store = Store::new(&temp("operator-fault"));
+        publish(&store, "c1");
+        store.record_operator_fault("d1", "host draining for maintenance");
+        let details = store.host_fault_details();
+        assert_eq!(details.len(), 1, "{details:?}");
+        assert_eq!(details[0].1, "host draining for maintenance");
+        assert!(details[0].5, "not marked operator: {details:?}");
+        assert!(store.claim("d1", "h1", 1).unwrap().is_none());
+        // Neither kind of probe pass clears it or arms a trial, and the
+        // last probe is still recorded on the entry.
+        store.note_probe_pass("d1");
+        assert_eq!(store.host_fault_list().len(), 1);
+        store.record_probe_result("d1", true);
+        let details = store.host_fault_details();
+        assert_eq!(details.len(), 1, "{details:?}");
+        assert_eq!(details[0].4, "passed", "{details:?}");
+        assert!(store.claim("d1", "h1", 1).unwrap().is_none());
+        // An ordinary fault on another donor still clears as today.
+        store.record_host_fault("d2", "wedged");
+        store.note_probe_pass("d2");
+        assert_eq!(store.host_fault_list().len(), 1);
+        // Only an explicit clear lifts the operator hold.
+        store.clear_host_fault("d1");
+        assert!(store.host_fault_list().is_empty());
+        assert!(store.claim("d1", "h1", 1).unwrap().is_some());
     }
 
     #[test]

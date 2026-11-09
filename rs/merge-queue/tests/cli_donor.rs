@@ -1782,6 +1782,71 @@ fn a_restarted_donor_resumes_probing_and_clears_its_host_fault() {
     );
 }
 
+/// An operator host hold (#1104): `host-fault --operator` survives
+/// probe-passed claims and clear-faults, shows as held by operator,
+/// and only plain `clear-fault` lifts it.
+#[test]
+fn an_operator_host_fault_is_held_until_clear_fault_lifts_it() {
+    let fx = Fixture::new("donor-operator-hold");
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        "exit 0",
+        "--offload",
+        "decide",
+    ]);
+    let out = fx.mq_ok(&[
+        "donor",
+        "host-fault",
+        "--donor",
+        "d1",
+        "--reason",
+        "host draining for maintenance",
+        "--operator",
+    ]);
+    let faulted: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(faulted["faulted"], "d1", "{faulted}");
+    assert_eq!(
+        host_faults(&fx)["d1"]["operator"],
+        true,
+        "{}",
+        host_faults(&fx)
+    );
+    let status = fx.mq_ok(&["donor", "status"]);
+    assert!(
+        status.contains("held by operator: host draining for maintenance"),
+        "{status}"
+    );
+    let fault: Value =
+        serde_json::from_str(&fx.mq_ok(&["donor", "fault", "--donor", "d1"])).unwrap();
+    assert_eq!(fault["fault"]["operator"], true, "{fault}");
+    // A probe-passed clear-fault and a probe-passed claim both leave it.
+    let out = fx.mq_ok(&["donor", "clear-fault", "--donor", "d1", "--probe-passed"]);
+    assert!(out.contains("held_by_operator"), "{out}");
+    assert!(host_faults(&fx).get("d1").is_some(), "{}", host_faults(&fx));
+    let claimed: Value = serde_json::from_str(&fx.mq_ok(&[
+        "donor",
+        "claim",
+        "--donor",
+        "d1",
+        "--jobs",
+        "1",
+        "--probe-passed",
+    ]))
+    .unwrap();
+    assert!(claimed["job"].is_null(), "{claimed}");
+    assert!(host_faults(&fx).get("d1").is_some(), "{}", host_faults(&fx));
+    // Plain clear-fault lifts it.
+    fx.mq_ok(&["donor", "clear-fault", "--donor", "d1"]);
+    assert!(host_faults(&fx).get("d1").is_none(), "{}", host_faults(&fx));
+    assert!(
+        !fx.mq_ok(&["donor", "status"]).contains("held by operator"),
+        "status still shows the lifted hold"
+    );
+}
+
 /// #1059: a stale-base refusal is the job's fault, not the host's. The
 /// donor must not probe (its probe here would fail), must not pause or
 /// record a host fault, and the queue must record the refusal cause —

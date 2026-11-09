@@ -1007,17 +1007,30 @@ fn run_cycle(
                     .give_back_alerts(config.donors.give_back_alert())
                     .unwrap_or_default();
                 alerts.extend(store.host_fault_details().into_iter().map(
-                    |(donor, reason, since, last_probe_at, last_probe)| {
-                        format!(
-                            "ERROR: donor {donor} faulted since {since}: {reason}; \
+                    |(donor, reason, since, last_probe_at, last_probe, operator)| {
+                        if operator {
+                            format!(
+                                "ERROR: donor {donor} held by operator: {reason} \
+                                 (since {since}); last probe {} {}",
+                                if last_probe_at.is_empty() {
+                                    "never"
+                                } else {
+                                    &last_probe_at
+                                },
+                                last_probe
+                            )
+                        } else {
+                            format!(
+                                "ERROR: donor {donor} faulted since {since}: {reason}; \
                                  last probe {} {}",
-                            if last_probe_at.is_empty() {
-                                "never"
-                            } else {
-                                &last_probe_at
-                            },
-                            last_probe
-                        )
+                                if last_probe_at.is_empty() {
+                                    "never"
+                                } else {
+                                    &last_probe_at
+                                },
+                                last_probe
+                            )
+                        }
                     },
                 ));
                 alerts.extend(store.host_fault_escalations());
