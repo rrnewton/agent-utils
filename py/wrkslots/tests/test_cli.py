@@ -55,7 +55,7 @@ def test_pre_packaging_repository_command_still_runs() -> None:
     )
 
     assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "wrkslots 0.8.0"
+    assert completed.stdout.strip() == "wrkslots 0.9.0"
 
 
 def test_every_command_help_explains_effect_and_inputs() -> None:

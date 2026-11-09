@@ -26,6 +26,7 @@ use crate::active_state::{
 use crate::config_validate::validate_name;
 use crate::ensure_states::{refuse_partial_state, require_fixture};
 use crate::hold_write::{acquire_mutation_locks, active_document, validate_global};
+use crate::journal_state::{journal_forward_compatible, JOURNAL_EXTENSION_KEYS};
 use crate::status_state::read_process_identity;
 
 type Result<T> = std::result::Result<T, String>;
@@ -195,6 +196,7 @@ fn journal_resume(
         ));
     }
     // Full journal validation, mirroring _ownerless_clone_journal_inputs.
+    journal_forward_compatible(raw, "ownerless clone journal")?;
     exact_keys(
         raw,
         &[
@@ -208,7 +210,7 @@ fn journal_resume(
             "rescue",
             "record",
         ],
-        &[],
+        &JOURNAL_EXTENSION_KEYS,
         "ownerless clone journal",
     )?;
     if as_int(raw.get("schema").unwrap_or(&Value::Null), "schema", 0)? != 2

@@ -19,13 +19,56 @@ use crate::active_state::{
     as_int, as_list, as_mapping, as_str, checkout_from_obj, exact_keys, identity_from_obj,
     is_digest, is_sha, parse_timestamp, record_from_obj, scope_from_obj, validate_ref, Cfg,
 };
+use crate::canonical::canonical_json;
 use crate::config_validate::{
     refuse_symlink, validate_full_ref, validate_hook, validate_name, validate_remote,
+    version_tuple, WRKSLOTS_VERSION,
 };
 
 type Result<T> = std::result::Result<T, String>;
 
 const SCHEMA: i64 = 2;
+
+// The journal extension slot (#1124): a field under ``x`` may only carry
+// information an older reader can safely ignore. Anything safety-relevant
+// must also bump ``x.min_wrkslots_version``, so old readers refuse loudly
+// instead of misclassifying. Contents are never stripped: provenance
+// compares the journal file with its hash-chained embedded copy by exact
+// JSON equality, so a reader that dropped the slot would manufacture a
+// mismatch. The cap keeps an extension from being replayed and re-hashed
+// at unbounded size through the append-only event log.
+pub(crate) const JOURNAL_EXTENSION_LIMIT_BYTES: usize = 16 * 1024;
+pub(crate) const JOURNAL_EXTENSION_KEYS: [&str; 1] = ["x"];
+
+/// Apply the journal extension slot's checks before exact keys (#1124).
+///
+/// `x.min_wrkslots_version` is checked first, so a reader older than the
+/// journal requires refuses naming both versions, whatever keys the
+/// journal has -- the journal analogue of #1109's config order.
+pub(crate) fn journal_forward_compatible(raw: &Map<String, Value>, label: &str) -> Result<()> {
+    let Some(value) = raw.get("x") else {
+        return Ok(());
+    };
+    let extension = as_mapping(value, &format!("{label}.x"))?;
+    if let Some(required_value) = extension.get("min_wrkslots_version") {
+        let required = as_str(required_value, &format!("{label}.x.min_wrkslots_version"))?;
+        if version_tuple(required, &format!("{label}.x.min_wrkslots_version"))?
+            > version_tuple(WRKSLOTS_VERSION, "wrkslots version")?
+        {
+            return Err(format!(
+                "{label} requires wrkslots {required} or later (x.min_wrkslots_version); this is wrkslots {WRKSLOTS_VERSION}. Run a newer wrkslots for this project"
+            ));
+        }
+    }
+    let encoded =
+        canonical_json(&Value::Object(extension.clone())).map_err(|error| error.to_string())?;
+    if encoded.len() > JOURNAL_EXTENSION_LIMIT_BYTES {
+        return Err(format!(
+            "{label} extension exceeds the {JOURNAL_EXTENSION_LIMIT_BYTES}-byte limit"
+        ));
+    }
+    Ok(())
+}
 
 pub(crate) fn planned_from_obj(value: &Value, label: &str) -> Result<()> {
     let raw = as_mapping(value, label)?;
@@ -73,6 +116,7 @@ pub(crate) fn planned_from_obj(value: &Value, label: &str) -> Result<()> {
 }
 
 fn create_shape(raw: &Map<String, Value>) -> Result<()> {
+    journal_forward_compatible(raw, "create journal")?;
     exact_keys(
         raw,
         &[
@@ -92,6 +136,7 @@ fn create_shape(raw: &Map<String, Value>) -> Result<()> {
             "created",
         ],
         &[
+            "x",
             "slot_type",
             "task_scope",
             "post_provision_hooks",
@@ -421,6 +466,7 @@ fn finish_shape(
     slot: &str,
     is_finish_path: bool,
 ) -> Result<()> {
+    journal_forward_compatible(raw, "finish journal")?;
     exact_keys(
         raw,
         &[
@@ -438,6 +484,7 @@ fn finish_shape(
             "record",
         ],
         &[
+            "x",
             "salvage",
             "validate_complete",
             "original_mode",
@@ -1035,6 +1082,7 @@ fn repository_resolved(cfg: &Cfg, raw: &str) -> Result<PathBuf> {
 }
 
 fn ownerless_agent_shape(cfg: &Cfg, raw: &Map<String, Value>, journal_machine: &str) -> Result<()> {
+    journal_forward_compatible(raw, "ownerless agent journal")?;
     exact_keys(
         raw,
         &[
@@ -1047,7 +1095,7 @@ fn ownerless_agent_shape(cfg: &Cfg, raw: &Map<String, Value>, journal_machine: &
             "authorization",
             "salvage",
         ],
-        &[],
+        &JOURNAL_EXTENSION_KEYS,
         "ownerless agent journal",
     )?;
     if as_int(&raw["schema"], "ownerless agent journal.schema", 0)? != SCHEMA
@@ -1188,6 +1236,7 @@ fn ownerless_clone_authorization(value: &Value) -> Result<(String, (i64, i64, i6
 }
 
 fn ownerless_clone_shape(cfg: &Cfg, raw: &Map<String, Value>, journal_machine: &str) -> Result<()> {
+    journal_forward_compatible(raw, "ownerless clone journal")?;
     exact_keys(
         raw,
         &[
@@ -1201,7 +1250,7 @@ fn ownerless_clone_shape(cfg: &Cfg, raw: &Map<String, Value>, journal_machine: &
             "rescue",
             "record",
         ],
-        &[],
+        &JOURNAL_EXTENSION_KEYS,
         "ownerless clone journal",
     )?;
     if as_int(&raw["schema"], "ownerless clone journal.schema", 0)? != SCHEMA
@@ -1316,6 +1365,7 @@ fn host_id() -> Result<String> {
 }
 
 fn ownerless_cache_shape(cfg: &Cfg, raw: &Map<String, Value>, journal_machine: &str) -> Result<()> {
+    journal_forward_compatible(raw, "ownerless agent cache journal")?;
     exact_keys(
         raw,
         &[
@@ -1331,7 +1381,7 @@ fn ownerless_cache_shape(cfg: &Cfg, raw: &Map<String, Value>, journal_machine: &
             "identity",
             "actor",
         ],
-        &[],
+        &JOURNAL_EXTENSION_KEYS,
         "ownerless agent cache journal",
     )?;
     if as_int(&raw["schema"], "ownerless agent cache journal.schema", 0)? != SCHEMA
@@ -2040,6 +2090,7 @@ fn submodule_salvage(raw: &Map<String, Value>, checkout_names: &[String]) -> Res
 }
 
 fn absent_agent_shape(raw: &Map<String, Value>, journal_machine: &str) -> Result<()> {
+    journal_forward_compatible(raw, "absent-agent-row journal")?;
     exact_keys(
         raw,
         &[
@@ -2057,6 +2108,7 @@ fn absent_agent_shape(raw: &Map<String, Value>, journal_machine: &str) -> Result
             "archive_entry",
         ],
         &[
+            "x",
             "branch_witnesses",
             "remote_containment",
             "submodule_salvage",
@@ -2307,6 +2359,7 @@ fn absent_agent_shape(raw: &Map<String, Value>, journal_machine: &str) -> Result
 
 fn absent_validate_shape(raw: &Map<String, Value>, journal_machine: &str) -> Result<()> {
     const LABEL: &str = "absent-validation-row journal";
+    journal_forward_compatible(raw, LABEL)?;
     exact_keys(
         raw,
         &[
@@ -2320,7 +2373,7 @@ fn absent_validate_shape(raw: &Map<String, Value>, journal_machine: &str) -> Res
             "actor",
             "items",
         ],
-        &[],
+        &JOURNAL_EXTENSION_KEYS,
         LABEL,
     )?;
     if as_int(&raw["schema"], &format!("{LABEL}.schema"), 0)? != SCHEMA
@@ -2460,6 +2513,7 @@ fn ownerless_validate_shape(
     raw: &Map<String, Value>,
     journal_machine: &str,
 ) -> Result<()> {
+    journal_forward_compatible(raw, "ownerless validation journal")?;
     exact_keys(
         raw,
         &[
@@ -2471,7 +2525,7 @@ fn ownerless_validate_shape(
             "fenced",
             "authorization",
         ],
-        &["exclusion"],
+        &["exclusion", "x"],
         "ownerless validation journal",
     )?;
     let phase = as_str(&raw["phase"], "ownerless validation journal.phase")?;
@@ -2571,6 +2625,22 @@ pub(crate) fn validate_journal_shape(
         )?,
         "slot",
     )?;
+    journal_forward_compatible(
+        raw,
+        match kind.as_str() {
+            "create" => "create journal",
+            "import-existing" => "import journal",
+            "finish" => "finish journal",
+            "legacy-validate-remove" => "legacy validate removal journal",
+            "ownerless-validate-remove" => "ownerless validation journal",
+            "ownerless-agent-remove" => "ownerless agent journal",
+            "ownerless-clone-remove" => "ownerless clone journal",
+            "ownerless-agent-cache-relocate" => "ownerless agent cache journal",
+            "recover-absent-validate-rows" => "absent-validation-row journal",
+            "recover-absent-agent-row" => "absent-agent-row journal",
+            _ => "recovery journal",
+        },
+    )?;
     let mut expected = vec![format!("ACTIVE.{machine}.journal")];
     if kind == "create" {
         expected.push(format!(
@@ -2601,7 +2671,7 @@ pub(crate) fn validate_journal_shape(
             exact_keys(
                 raw,
                 &["schema", "kind", "machine", "slot", "record"],
-                &[],
+                &JOURNAL_EXTENSION_KEYS,
                 "import journal",
             )?;
             let record = record_from_obj(&raw["record"], "import journal.record")?;
@@ -2632,7 +2702,7 @@ pub(crate) fn validate_journal_shape(
                     "actor",
                     "coordinator_authorized",
                 ],
-                &[],
+                &JOURNAL_EXTENSION_KEYS,
                 "legacy validate removal journal",
             )?;
             for field in [
@@ -2718,7 +2788,6 @@ pub(crate) fn parse_journal(
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::active_state::identity_to_obj;
-use crate::canonical::canonical_json;
 use crate::handoff_state::{read_regular_file_identity, strict_json_object};
 
 /// One outstanding recovery journal, validated against its

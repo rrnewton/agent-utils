@@ -116,7 +116,13 @@ def _python(root: Path) -> int:
     return wrkslots_cli._cmd_recover_ownerless_agent_clone(args)
 
 
-def _journal(root: Path, clone: Path, *, minimal: bool = False) -> None:
+def _journal(
+    root: Path,
+    clone: Path,
+    *,
+    minimal: bool = False,
+    extension: dict[str, object] | None = None,
+) -> None:
     if minimal:
         journal: dict[str, object] = {
             "kind": "ownerless-clone-remove",
@@ -147,6 +153,8 @@ def _journal(root: Path, clone: Path, *, minimal: bool = False) -> None:
             "rescue": [],
             "record": None,
         }
+    if extension is not None:
+        journal["x"] = extension
     (root / "worktrees" / f"ACTIVE.{MACHINE}.journal").write_text(json.dumps(journal))
 
 
@@ -166,6 +174,46 @@ def test_ownerless_clone_journal_resume_matches_python(
     assert outcome["detail"] == "resume"
     assert outcome["phase"] == "prepared"
     assert expected.endswith("outcome=planned detail=resume phase=prepared")
+
+
+def test_ownerless_clone_journal_with_extension_resumes_in_both_editions(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An interrupted clone journal carrying ``x`` still resumes (#1124)."""
+
+    rust_root, rust_clone = _fixture(tmp_path / "rust")
+    oracle_root, oracle_clone = _fixture(tmp_path / "oracle")
+    extension: dict[str, object] = {"future_field": {"nested": [1, 2]}}
+    _journal(rust_root, rust_clone, extension=extension)
+    _journal(oracle_root, oracle_clone, extension=extension)
+    assert _python(oracle_root) == 0
+    expected = capsys.readouterr().out.strip()
+    result = _rust(rust_root)
+    assert result.returncode == 0, result.stderr
+    outcome = json.loads(result.stdout)
+    assert outcome["outcome"] == "planned"
+    assert outcome["detail"] == "resume"
+    assert expected.endswith("outcome=planned detail=resume phase=prepared")
+
+
+def test_ownerless_clone_journal_future_min_version_refuses_as_version(
+    tmp_path: Path,
+) -> None:
+    """A newer x minimum gives the version refusal, not unknown-field."""
+
+    rust_root, rust_clone = _fixture(tmp_path / "rust")
+    oracle_root, oracle_clone = _fixture(tmp_path / "oracle")
+    extension: dict[str, object] = {"min_wrkslots_version": "99.0.0"}
+    _journal(rust_root, rust_clone, extension=extension)
+    _journal(oracle_root, oracle_clone, extension=extension)
+    with pytest.raises(Exception) as caught:
+        _python(oracle_root)
+    expected = str(caught.value)
+    assert "requires wrkslots 99.0.0 or later (x.min_wrkslots_version)" in expected
+    result = _rust(rust_root)
+    assert result.returncode == 1
+    assert expected in result.stderr
+    assert "has invalid fields" not in result.stderr
 
 
 def test_ownerless_clone_minimal_journal_refuses(tmp_path: Path) -> None:

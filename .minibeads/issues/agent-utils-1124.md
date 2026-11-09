@@ -1,6 +1,6 @@
 ---
 title: 'journal-reader-extension-slot: journal readers accept only exact keys, so every new journal field is a flag day for older pins'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 assignee: mu-createlock
@@ -104,3 +104,25 @@ Follow-up to #1121, requested by the lead coordinator 2026-11-09. Filed by the
 devbig030 coordinator.
 
 Raised to P2 on 2026-11-09 by the lead coordinator: #1123's approved design puts its CREATE-journal creator identity in this extension slot, so #1124 lands first (no second flag day). Owner: mu-createlock, both editions in one landing; mu-rswrk2 reviews the Rust half before landing.
+
+## Resolution
+
+Delivered by mu-createlock in both editions: every top-level journal
+validator — the shape functions, the duplicate recovery/input
+re-validations, and the validate-batch-seal validators — now accepts a
+top-level `x` object before its exact-key check. `x` is capped at 16384
+canonical bytes and is never stripped on rewrite, so provenance equality
+with the event-embedded copy holds. The reserved subkey
+`x.min_wrkslots_version` refuses naming both versions ahead of any key
+error, mirroring #1109's config order; unknown top-level keys still
+refuse, and nested objects stay closed. No writer emits `x` yet.
+wrkslots 0.9.0 in both editions is the one flag day; the user guide's
+upgrade notes carry the rule that a field under `x` may only hold
+information an older reader can safely ignore, and anything
+safety-relevant must raise the minimum version instead. mu-rswrk2
+reviewed the Rust half and caught the duplicate ownerless-clone
+validator in recover_clone_write.rs, which gained the same pre-check.
+Required differential tests: an unknown key inside `x` is accepted by
+both editions (the recover-clone resume path included), `x` not an
+object and over the cap refuse identically, and a newer minimum gives
+the version refusal before key checks.

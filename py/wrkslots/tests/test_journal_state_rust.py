@@ -660,3 +660,80 @@ def test_parse_journal_refusals_name_the_same_problem(
     result = _rust(root, name)
     assert result.returncode == 1
     assert fragment in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("name", "payload"),
+    [
+        ("CREATE.6.node-a.6.slot-a.journal", _create_journal()),
+        ("ACTIVE.node-a.journal", _import_journal()),
+        ("ACTIVE.node-a.journal", _finish_journal()),
+        ("ACTIVE.node-a.journal", _legacy_journal()),
+    ],
+)
+def test_parse_journal_extension_slot_is_ignored_by_both_editions(
+    tmp_path: Path, name: str, payload: dict[str, object]
+) -> None:
+    """An unknown field inside ``x`` parses in both editions (#1124).
+
+    This reader knows no ``creator`` field: it is the reader from before the
+    field existed, and the journal is not a flag day for it. The stored
+    journal, extension included, is echoed unchanged -- the slot is never
+    stripped, so provenance equality with the event-embedded copy holds.
+    """
+
+    root = _root(tmp_path)
+    extended = {
+        **payload,
+        "x": {"creator": _identity(999), "future_field": {"nested": [1, 2]}},
+    }
+    path = _write(root, name, extended)
+    result = _rust(root, name)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == _expected(root, path) == extended
+
+
+@pytest.mark.parametrize(
+    ("extension", "fragment"),
+    [
+        ("not-an-object", "create journal.x must be a JSON object"),
+        ({"pad": "a" * 17_000}, "create journal extension exceeds the 16384-byte limit"),
+        (
+            {"min_wrkslots_version": "1.x"},
+            "create journal.x.min_wrkslots_version must be a version",
+        ),
+    ],
+)
+def test_parse_journal_extension_slot_refusals(
+    tmp_path: Path, extension: object, fragment: str
+) -> None:
+    root = _root(tmp_path)
+    name = "CREATE.6.node-a.6.slot-a.journal"
+    path = _write(root, name, {**_create_journal(), "x": extension})
+    with pytest.raises(Exception) as caught:
+        _expected(root, path)
+    assert fragment in str(caught.value)
+    result = _rust(root, name)
+    assert result.returncode == 1
+    assert fragment in result.stderr
+
+
+def test_parse_journal_min_version_refuses_before_key_checks(tmp_path: Path) -> None:
+    """A newer minimum refuses naming versions, ahead of unknown-key errors."""
+
+    root = _root(tmp_path)
+    name = "CREATE.6.node-a.6.slot-a.journal"
+    payload = {
+        **_create_journal(),
+        "unknown_top_level": True,
+        "x": {"min_wrkslots_version": "99.0.0"},
+    }
+    path = _write(root, name, payload)
+    with pytest.raises(Exception) as caught:
+        _expected(root, path)
+    expected = str(caught.value)
+    assert "requires wrkslots 99.0.0 or later (x.min_wrkslots_version)" in expected
+    assert "unknown_top_level" not in expected
+    result = _rust(root, name)
+    assert result.returncode == 1
+    assert expected in result.stderr
