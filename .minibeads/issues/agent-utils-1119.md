@@ -1,10 +1,10 @@
 ---
 title: 'merge-queue-stackgate-infra: infrastructure reds count in the stack gate window, so stacking stays off on a healthy change stream'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-09T10:44:05.000000000+00:00
-updated_at: 2026-11-09T10:44:05.000000000+00:00
+updated_at: 2026-11-09T14:46:50.000000000+00:00
 ---
 
 # Description
@@ -130,3 +130,44 @@ tests, decisions.rs window tests, and a run-level case if the
 harness fits (decided at implementation).
 
 ## Resolution
+
+Landed on main as 72820b7a80abcb1a6beda6a4da7fea81940ff32d (gated commit d9f1e056).
+
+The dagrun validator now reads the journal's `step_end` reason
+beside the verdict: when a red validation counted no selected
+test (every one skipped or missing after `require`) and every
+failed step ended on infrastructure — `TIMEOUT`, `CPU-TIMEOUT`,
+`OOM-KILLED`/`MEMORY CAP EXHAUSTED`, a budget abort, or a
+supervisor failure, never a plain exit code, so a build the
+change broke still ejects — the run is a could-not-run refusal
+on the existing bounded path, with `cannot_execute` naming the
+step and its reason and a job-scope `MQ_COULD_NOT_RUN_SCOPE`
+line appended to the log so a donor receipt classifies
+identically on the queue host. It applies whatever
+`validator.empty_red` says (this shape is not an empty red: the
+setup failure was an attributed `Fail`). Decision records
+therefore say `refused`, and `recent_red_rate` — which already
+skipped non-decided outcomes before truncating to 20 — needed
+no change; the guide now says the stack/batch gates count only
+decided (green/red) validations and that the window reaches
+back 20 decided change batches past refusals.
+
+Guard, as coordb required: a refused validation can never
+land (deferral path only, results cleared), and repeated
+could-not-runs escalate at `max_deferrals` with the last reason
+on the item, held as `escalated` in plan with the ALARM in the
+heartbeat (no new rendering needed; the escalation line carries
+count + reason).
+
+Tests: journal classification units in validate.rs (timeout
+refused; plain setup exit stays red; a counted plain failure or
+a counted pass beside the timeout stays red), the 80%-window
+case in decisions.rs (16 green + 2 red + 8 refused interleaved
+over older reds → red rate 0.2), and cli_stackgate end to end
+(one refusal records `refused` in decisions; three in a row
+escalate with the TIMEOUT reason, validate nothing more, and
+the batch never lands). Gate: full gate on d9f1e056 (restarted
+after a host reboot), shared phase 239/239, exclusive cross
+differentials stopped under the merge-queue-only waiver
+(ledger `failed_steps` empty); the landed tree differs only by
+intervening main changes outside the four files touched.
