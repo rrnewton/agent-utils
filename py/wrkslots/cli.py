@@ -39924,6 +39924,7 @@ def _slot_findings(
                         f"{release.sequence}) no longer applies: {void_reason}",
                     )
 
+    findings.extend(_identity_drift_findings(config, states))
     findings.extend(_image_attachment_findings(config))
 
     for path in _outstanding_journals(config):
@@ -39955,6 +39956,106 @@ def _slot_findings(
             f"{len(mine)} active slot(s) against max_active_slots={cap} "
             f"(excess {len(mine) - cap})",
         )
+    return findings
+
+
+#: Bound on each `git config` read doctor makes for identity drift (#1097).
+_IDENTITY_DRIFT_GIT_SECONDS = 10.0
+
+
+def _effective_git_setting(path: Path, key: str) -> tuple[str, str] | str | None:
+    """The value of ``key`` in the checkout at ``path``, as Git resolves it for a user.
+
+    Every scope applies, including the user's global configuration, so this
+    runs Git with the caller's environment except GIT_* variables, unlike the
+    isolated commands wrkslots runs for itself.  Returns (origin, value), None
+    when no scope sets the key, or a string saying why it could not be read.
+    """
+
+    env = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    env["LC_ALL"] = "C"
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(path), "config", "--show-origin", "--get", key],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=_IDENTITY_DRIFT_GIT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return f"git config did not answer within {_IDENTITY_DRIFT_GIT_SECONDS:g} seconds"
+    except OSError as exc:
+        return f"cannot run git config: {exc}"
+    if completed.returncode == 1 and not completed.stdout:
+        return None
+    if completed.returncode != 0:
+        lines = completed.stderr.strip().splitlines()
+        return f"git config exited {completed.returncode}" + (f": {lines[0]}" if lines else "")
+    origin, _tab, value = completed.stdout.rstrip("\n").partition("\t")
+    return origin, value
+
+
+def _identity_drift_findings(
+    config: Config, states: Sequence[ActiveState]
+) -> list[dict[str, object]]:
+    """Checkouts whose effective Git identity differs from configuration.identity (#1097).
+
+    One finding per checkout of this machine's slots, naming each differing
+    key's effective value and the origin Git reports for it.  An agent can
+    override the identity, and slots created before the setting existed lack
+    it.  Advisory only: doctor never rewrites Git configuration.  Nothing is
+    reported when no identity is configured.
+    """
+
+    identity = config.identity
+    if identity is None:
+        return []
+    findings: list[dict[str, object]] = []
+    for state in states:
+        if state.machine != config.machine:
+            continue
+        for record in state.slots:
+            for checkout in record.checkouts:
+                try:
+                    path = _stored_path(config, checkout.path, "identity checkout path")
+                except Refusal:
+                    continue
+                if not path.is_dir() or path.is_symlink():
+                    continue
+                drift: list[str] = []
+                for key, expected in (
+                    ("user.name", identity.name),
+                    ("user.email", identity.email),
+                ):
+                    effective = _effective_git_setting(path, key)
+                    if effective is None:
+                        drift.append(f"{key} is unset, configured {expected!r}")
+                    elif isinstance(effective, str):
+                        drift.append(f"{key} cannot be read ({effective}), configured {expected!r}")
+                    elif effective[1] != expected:
+                        drift.append(
+                            f"{key} is {effective[1]!r} from {effective[0]}, "
+                            f"configured {expected!r}"
+                        )
+                if drift:
+                    findings.append(
+                        {
+                            "kind": "identity-drift",
+                            "scope": "row",
+                            "slot": record.slot,
+                            "slot_type": record.slot_type,
+                            "machine": record.machine,
+                            "checkout": checkout.name,
+                            "detail": f"checkout {checkout.name}: " + "; ".join(drift),
+                            "remedy": (
+                                "advisory: doctor never rewrites Git configuration; set "
+                                "user.name and user.email in this checkout's worktree "
+                                "configuration (git config --worktree), or keep an "
+                                "intended override"
+                            ),
+                        }
+                    )
     return findings
 
 

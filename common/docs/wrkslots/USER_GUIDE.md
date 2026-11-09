@@ -473,6 +473,15 @@ writing anything. Git's remedy is to move the setting into the primary worktree'
 
 Slots created before the key was set keep the identity they had; `create` does not revisit them.
 
+`wrkslots doctor` reports the drift (#1097). For each checkout of this machine's slots whose
+effective `user.name` or `user.email` differs from `identity`, as Git resolves them across every
+scope (the user's global configuration included), it prints one `identity-drift` finding naming the
+slot, the checkout, each differing value and the origin `git config --show-origin` gives for it, or
+saying the key is unset. That covers an agent's override in the worktree configuration, a write to
+the shared repository configuration, a global value the checkout falls through to, and slots
+created before the key existed. It is advisory: doctor never rewrites Git configuration, and it
+reports nothing when no `identity` is configured. Submodules are not checked.
+
 ## Git hook installers in new submodules
 
 A repository can ship its own Git hook installer as an executable `scripts/setup-hooks.sh`, which

@@ -234,3 +234,114 @@ def test_audit_human_and_gate_match_python(tmp_path: Path) -> None:
         return lines
 
     assert scrub(rust_result.stdout) == scrub(python_result.stdout)
+
+
+# #1097 wrkslots-doctor-identity: effective Git identity against configuration.identity.
+
+_IDENTITY = "identity: {name: Slot Bot, email: slot-bot@example.invalid}\n"
+
+
+def _identity_project(tmp_path: Path, *, identity: bool = True) -> tuple[Path, Path, Path]:
+    from wrkslots.tests.test_remove_write_rust import _fixture as checkout_fixture
+
+    root = checkout_fixture(tmp_path)
+    if identity:
+        config = root / ".wrkslots.yml"
+        config.write_text(config.read_text() + _IDENTITY)
+    home = tmp_path / "home"
+    home.mkdir()
+    return root, root / "worktrees" / "slot-a" / "repo", home
+
+
+def _identity_git(cwd: Path, *args: str) -> None:
+    from wrkslots.tests.test_remove_write_rust import _git
+
+    _git(cwd, *args)
+
+
+def _identity_findings(root: Path, home: Path) -> list[dict[str, object]]:
+    """Both editions' identity-drift findings, which must agree."""
+
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update({"HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config")})
+    python_env = dict(env, PYTHONPATH=str(AU_ROOT / "py"))
+    python_result = subprocess.run(
+        ["python3", "-m", "wrkslots", "--project-root", str(root), "doctor", "--format", "json"],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=python_env,
+    )
+    rust_result = subprocess.run(
+        [str(rust_wrkslotsd()), "doctor-text", "--root", str(root), "--format", "json"],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env,
+    )
+    assert python_result.returncode == 0, python_result.stderr
+    assert rust_result.returncode == 0, rust_result.stderr
+
+    def drift(text: str) -> list[dict[str, object]]:
+        findings = cast(list[dict[str, object]], json.loads(text)["findings"])
+        return [item for item in findings if item["kind"] == "identity-drift"]
+
+    python_drift = drift(python_result.stdout)
+    assert drift(rust_result.stdout) == python_drift
+    return python_drift
+
+
+def test_doctor_is_silent_for_a_checkout_with_the_configured_identity(tmp_path: Path) -> None:
+    root, checkout, home = _identity_project(tmp_path)
+    _identity_git(tmp_path / "upstream-repo", "config", "extensions.worktreeConfig", "true")
+    _identity_git(checkout, "config", "--worktree", "user.name", "Slot Bot")
+    _identity_git(checkout, "config", "--worktree", "user.email", "slot-bot@example.invalid")
+    assert _identity_findings(root, home) == []
+
+
+def test_doctor_is_silent_without_a_configured_identity(tmp_path: Path) -> None:
+    root, _checkout, home = _identity_project(tmp_path, identity=False)
+    assert _identity_findings(root, home) == []
+
+
+def test_doctor_names_a_worktree_override_and_its_origin(tmp_path: Path) -> None:
+    root, checkout, home = _identity_project(tmp_path)
+    _identity_git(tmp_path / "upstream-repo", "config", "extensions.worktreeConfig", "true")
+    _identity_git(checkout, "config", "--worktree", "user.name", "Slot Bot")
+    _identity_git(checkout, "config", "--worktree", "user.email", "agent@example.invalid")
+    findings = _identity_findings(root, home)
+    assert len(findings) == 1
+    finding = findings[0]
+    assert (finding["slot"], finding["checkout"], finding["scope"]) == ("slot-a", "repo", "row")
+    detail = str(finding["detail"])
+    assert detail.startswith("checkout repo: user.email is 'agent@example.invalid' from file:")
+    assert "config.worktree" in detail
+    assert detail.endswith(", configured 'slot-bot@example.invalid'")
+    assert "user.name" not in detail
+
+
+def test_doctor_names_a_global_fall_through(tmp_path: Path) -> None:
+    root, _checkout, home = _identity_project(tmp_path)
+    (home / ".gitconfig").write_text(
+        "[user]\n\tname = Slot Bot\n\temail = person@example.invalid\n"
+    )
+    findings = _identity_findings(root, home)
+    assert len(findings) == 1
+    assert str(findings[0]["detail"]) == (
+        f"checkout repo: user.email is 'person@example.invalid' from file:{home / '.gitconfig'}, "
+        "configured 'slot-bot@example.invalid'"
+    )
+
+
+def test_doctor_names_a_shared_config_write(tmp_path: Path) -> None:
+    root, checkout, home = _identity_project(tmp_path)
+    _identity_git(checkout, "config", "user.name", "Slot Bot")
+    _identity_git(checkout, "config", "user.email", "shared@example.invalid")
+    findings = _identity_findings(root, home)
+    assert len(findings) == 1
+    detail = str(findings[0]["detail"])
+    assert "user.email is 'shared@example.invalid' from file:" in detail
+    assert "upstream-repo/.git/config," in detail
+
+
+def test_doctor_names_an_unset_identity(tmp_path: Path) -> None:
+    root, _checkout, home = _identity_project(tmp_path)
+    findings = _identity_findings(root, home)
+    assert [str(item["detail"]) for item in findings] == [
+        "checkout repo: user.name is unset, configured 'Slot Bot'; "
+        "user.email is unset, configured 'slot-bot@example.invalid'"
+    ]

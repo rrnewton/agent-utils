@@ -377,6 +377,7 @@ pub(crate) fn doctor_cli(
             }
         }
     }
+    findings.extend(identity_drift_findings(root, &cfg, &config, &selected)?);
     findings.extend(crate::storage_state::image_findings(&cfg, &selected));
     let journals = parse_journals(root)?;
     if let Some(names) = journals.get("journals").and_then(Value::as_array) {
@@ -503,4 +504,174 @@ pub(crate) fn doctor_cli(
         ));
     }
     Ok(out)
+}
+
+/// Bound on each `git config` read doctor makes for identity drift (#1097).
+const IDENTITY_DRIFT_GIT_SECONDS: u64 = 10;
+
+/// What Git reports for one setting in a checkout, as a user sees it.
+enum EffectiveSetting {
+    Set { origin: String, value: String },
+    Unset,
+    Unreadable(String),
+}
+
+/// The value of `key` in the checkout at `path`, every scope applying; see
+/// the Python edition's `_effective_git_setting`.
+fn effective_git_setting(path: &Path, key: &str) -> EffectiveSetting {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(path)
+        .args(["config", "--show-origin", "--get", key])
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, _value) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(name);
+        }
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return EffectiveSetting::Unreadable(format!("cannot run git config: {error}"))
+        }
+    };
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(IDENTITY_DRIFT_GIT_SECONDS);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return EffectiveSetting::Unreadable(format!(
+                    "git config did not answer within {IDENTITY_DRIFT_GIT_SECONDS} seconds"
+                ));
+            }
+            Err(error) => {
+                return EffectiveSetting::Unreadable(format!("cannot run git config: {error}"))
+            }
+        }
+    };
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    let code = status.code().unwrap_or(-1);
+    if code == 1 && stdout.is_empty() {
+        return EffectiveSetting::Unset;
+    }
+    if code != 0 {
+        let first = stderr.trim().lines().next().map(str::to_owned);
+        return EffectiveSetting::Unreadable(match first {
+            Some(line) => format!("git config exited {code}: {line}"),
+            None => format!("git config exited {code}"),
+        });
+    }
+    let line = stdout.strip_suffix('\n').unwrap_or(&stdout);
+    let (origin, value) = line.split_once('\t').unwrap_or((line, ""));
+    EffectiveSetting::Set {
+        origin: origin.to_string(),
+        value: value.to_string(),
+    }
+}
+
+/// Checkouts of this machine's slots whose effective Git identity differs
+/// from `configuration.identity` (#1097); see the Python edition's
+/// `_identity_drift_findings`.  Advisory only.
+fn identity_drift_findings(
+    root: Option<&Path>,
+    cfg: &crate::active_state::Cfg,
+    config: &Value,
+    selected: &str,
+) -> Result<Vec<Value>> {
+    let Some(identity) = config.get("identity").filter(|value| !value.is_null()) else {
+        return Ok(Vec::new());
+    };
+    let expected = |key: &str| {
+        identity
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let settings = [
+        ("user.name", expected("name")),
+        ("user.email", expected("email")),
+    ];
+    let active = crate::hold_write::active_document(root, cfg, selected)?;
+    let mut findings = Vec::new();
+    for record in active
+        .get("slots")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        for checkout in record
+            .get("checkouts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(raw) = checkout.get("path").and_then(Value::as_str) else {
+                continue;
+            };
+            let Ok((_relative, path)) =
+                crate::config_validate::relative_inside(&cfg.root, raw, "identity checkout path")
+            else {
+                continue;
+            };
+            if !path.is_dir() || path.is_symlink() {
+                continue;
+            }
+            let mut drift = Vec::new();
+            for (key, expected) in &settings {
+                let wanted = crate::storage_state::py_repr(expected);
+                match effective_git_setting(&path, key) {
+                    EffectiveSetting::Unset => {
+                        drift.push(format!("{key} is unset, configured {wanted}"))
+                    }
+                    EffectiveSetting::Unreadable(why) => {
+                        drift.push(format!("{key} cannot be read ({why}), configured {wanted}"));
+                    }
+                    EffectiveSetting::Set { origin, value } if &value != expected => {
+                        drift.push(format!(
+                            "{key} is {} from {origin}, configured {wanted}",
+                            crate::storage_state::py_repr(&value)
+                        ))
+                    }
+                    EffectiveSetting::Set { .. } => {}
+                }
+            }
+            if !drift.is_empty() {
+                let name = checkout
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                findings.push(json!({
+                    "kind": "identity-drift",
+                    "scope": "row",
+                    "slot": record.get("slot").cloned().unwrap_or(Value::Null),
+                    "slot_type": record.get("slot_type").cloned().unwrap_or(Value::Null),
+                    "machine": record.get("machine").cloned().unwrap_or(Value::Null),
+                    "checkout": name,
+                    "detail": format!("checkout {name}: {}", drift.join("; ")),
+                    "remedy": "advisory: doctor never rewrites Git configuration; set user.name and user.email in this checkout's worktree configuration (git config --worktree), or keep an intended override",
+                }));
+            }
+        }
+    }
+    Ok(findings)
 }
