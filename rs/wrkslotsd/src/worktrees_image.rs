@@ -490,6 +490,466 @@ pub(crate) fn bind_plan(source: &Path, target: &Path) -> Vec<CommandSpec> {
     ]))]
 }
 
+// ---------------------------------------------------------- handlers (#1141)
+//
+// Dispatch-shaped worktrees-image handlers. Each returns the
+// shared HandlerOutcome byte-identical to the Python edition on
+// post-load inputs; privileged effects go through the
+// PrivilegedRunner seam and bind/mount facts are injected.
+
+use crate::imagecmd::HandlerOutcome;
+
+/// Inputs the dispatch glue supplies for this family.
+pub(crate) struct WtCtx<'a> {
+    pub(crate) root: &'a Path,
+    pub(crate) control: &'a Path,
+    pub(crate) worktrees: &'a Path,
+    pub(crate) entries: &'a [MountEntry],
+}
+
+fn wt_refusal(message: &str) -> HandlerOutcome {
+    HandlerOutcome {
+        exit: 3,
+        stdout: String::new(),
+        stderr: format!(
+            "REFUSED: {message}\nREMEDY: run 'wrkslots worktrees-image --help', correct the named condition, then rerun 'wrkslots worktrees-image' with the required arguments\n"
+        ),
+    }
+}
+
+fn wt_settings(
+    settings: Option<WorktreesImageSettings>,
+) -> Result<WorktreesImageSettings, HandlerOutcome> {
+    settings.ok_or_else(|| {
+        wt_refusal(
+            "no worktrees_image configured; add a worktrees_image section (path, size_bytes, fs: btrfs, mount: kernel) to enable it",
+        )
+    })
+}
+
+fn run_one(
+    runner: &dyn crate::image_ops::PrivilegedRunner,
+    spec: &CommandSpec,
+) -> Result<crate::image_ops::RunOutcome, HandlerOutcome> {
+    match runner.run(spec) {
+        Ok(outcome) if outcome.returncode == 0 => Ok(outcome),
+        Ok(outcome) => {
+            let detail = if outcome.stderr.trim().is_empty() {
+                outcome.stdout.trim()
+            } else {
+                outcome.stderr.trim()
+            };
+            Err(wt_refusal(&format!(
+                "{} failed: {detail}",
+                spec.argv.join(" ")
+            )))
+        }
+        Err(message) => Err(wt_refusal(&message)),
+    }
+}
+
+fn dir_facts(path: &Path) -> (bool, bool) {
+    let exists = path.is_dir();
+    let empty = if exists {
+        std::fs::read_dir(path)
+            .map(|mut it| it.next().is_none())
+            .unwrap_or(false)
+    } else {
+        true
+    };
+    (exists, empty)
+}
+
+/// The status report value, mirroring Python `status_report`.
+pub(crate) fn status_report(
+    ctx: &WtCtx<'_>,
+    settings: &WorktreesImageSettings,
+) -> serde_json::Value {
+    use std::os::unix::fs::MetadataExt as _;
+    let image_file = settings.image_file(ctx.root);
+    let mount_dir = image_mount_dir(ctx.control);
+    let (exists, empty) = dir_facts(&mount_dir);
+    let state = classify_mount(&mount_dir, ctx.entries, exists, empty);
+    let mut report = serde_json::Map::new();
+    report.insert("image_file".into(), json!(image_file.to_string_lossy()));
+    report.insert("mount_point".into(), json!(mount_dir.to_string_lossy()));
+    report.insert("configured_size_bytes".into(), json!(settings.size_bytes));
+    report.insert("state".into(), json!(state));
+    let is_file = image_file.is_file();
+    report.insert("image_exists".into(), json!(is_file));
+    let binds: serde_json::Map<String, Value> = load_bind_records(ctx.control)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(slot, record)| (slot, json!(record.subvolume)))
+        .collect();
+    report.insert("binds".into(), Value::Object(binds));
+    if is_file {
+        if let Ok(meta) = std::fs::metadata(&image_file) {
+            report.insert("apparent_bytes".into(), json!(meta.len()));
+            report.insert("allocated_bytes".into(), json!(meta.blocks() * 512));
+        }
+    }
+    Value::Object(report)
+}
+
+fn py_str(text: &str) -> String {
+    // Python json.dumps default escaping (ensure_ascii=True).
+    let mut out = String::from("\"");
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch if (ch as u32) < 0x7f => out.push(ch),
+            ch => {
+                let mut buf = [0_u16; 2];
+                for unit in ch.encode_utf16(&mut buf) {
+                    out.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// `wrkslots worktrees-image status [--format human|json]`.
+pub(crate) fn wt_status(
+    ctx: &WtCtx<'_>,
+    settings: Option<WorktreesImageSettings>,
+    format: &str,
+) -> HandlerOutcome {
+    let settings = match wt_settings(settings) {
+        Ok(settings) => settings,
+        Err(outcome) => return outcome,
+    };
+    let report = status_report(ctx, &settings);
+    if format == "json" {
+        return HandlerOutcome {
+            exit: 0,
+            stdout: format!("{}\n", render_report_json(&report)),
+            stderr: String::new(),
+        };
+    }
+    let mut out = format!(
+        "image: {} (exists={})\n",
+        report["image_file"].as_str().unwrap_or_default(),
+        if report["image_exists"].as_bool().unwrap_or(false) {
+            "True"
+        } else {
+            "False"
+        }
+    );
+    out.push_str(&format!(
+        "mount point: {} state={}\n",
+        report["mount_point"].as_str().unwrap_or_default(),
+        report["state"].as_str().unwrap_or_default()
+    ));
+    if report["image_exists"].as_bool().unwrap_or(false) {
+        out.push_str(&format!(
+            "apparent={} allocated={}\n",
+            report["apparent_bytes"], report["allocated_bytes"]
+        ));
+    }
+    if report["state"].as_str() != Some(MOUNTED) {
+        out.push_str("remedy: wrkslots worktrees-image mount\n");
+    }
+    HandlerOutcome {
+        exit: 0,
+        stdout: out,
+        stderr: String::new(),
+    }
+}
+
+fn render_report_json(report: &Value) -> String {
+    let keys = [
+        "image_file",
+        "mount_point",
+        "configured_size_bytes",
+        "state",
+        "image_exists",
+        "binds",
+        "apparent_bytes",
+        "allocated_bytes",
+    ];
+    let parts: Vec<String> = keys
+        .iter()
+        .filter_map(|key| {
+            report.get(key).map(|value| {
+                let rendered = match value {
+                    Value::Object(map) => {
+                        if map.is_empty() {
+                            return "{}".to_string();
+                        }
+                        let inner: Vec<String> = map
+                            .iter()
+                            .map(|(k, v)| {
+                                format!(
+                                    "    {}: {}",
+                                    py_str(k),
+                                    py_str(v.as_str().unwrap_or_default())
+                                )
+                            })
+                            .collect();
+                        format!("{{\n{}\n  }}", inner.join(",\n"))
+                    }
+                    Value::String(text) => py_str(text),
+                    other => other.to_string(),
+                };
+                format!("  {}: {}", py_str(key), rendered)
+            })
+        })
+        .collect();
+    format!("{{\n{}\n}}", parts.join(",\n"))
+}
+
+/// `wrkslots worktrees-image create`: zero-byte file, NOCOW, then
+/// truncate, then mkfs — the oracle's load-bearing order. Any
+/// failure deletes the partial file, as `create_image` does.
+pub(crate) fn wt_create(
+    ctx: &WtCtx<'_>,
+    settings: Option<WorktreesImageSettings>,
+    runner: &dyn crate::image_ops::PrivilegedRunner,
+) -> HandlerOutcome {
+    let settings = match wt_settings(settings) {
+        Ok(settings) => settings,
+        Err(outcome) => return outcome,
+    };
+    let image_file = settings.image_file(ctx.root);
+    if image_file.exists() {
+        return wt_refusal(&format!(
+            "worktrees image already exists: {}",
+            image_file.display()
+        ));
+    }
+    if let Some(parent) = image_file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&image_file);
+    if let Err(error) = created {
+        return HandlerOutcome {
+            exit: 1,
+            stdout: String::new(),
+            stderr: format!("{error}\n"),
+        };
+    }
+    let plan = create_format_plan(&image_file);
+    // chattr first, then truncate, then mkfs.
+    let result = run_one(runner, &plan[0]).and_then(|_| {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&image_file)
+            .map_err(|error| HandlerOutcome {
+                exit: 1,
+                stdout: String::new(),
+                stderr: format!("{error}\n"),
+            })?;
+        file.set_len(settings.size_bytes as u64)
+            .map_err(|error| HandlerOutcome {
+                exit: 1,
+                stdout: String::new(),
+                stderr: format!("{error}\n"),
+            })?;
+        run_one(runner, &plan[1])
+    });
+    if let Err(outcome) = result {
+        let _ = std::fs::remove_file(&image_file);
+        return outcome;
+    }
+    HandlerOutcome {
+        exit: 0,
+        stdout: format!(
+            "created {} ({} bytes, sparse btrfs)\n",
+            image_file.display(),
+            settings.size_bytes
+        ),
+        stderr: String::new(),
+    }
+}
+
+/// `wrkslots worktrees-image mount`: mount (idempotent) and
+/// re-establish recorded binds whose targets are not mounted.
+/// `mount_id` records the bind's live mount id for the record.
+pub(crate) fn wt_mount(
+    ctx: &WtCtx<'_>,
+    settings: Option<WorktreesImageSettings>,
+    mount_id: &dyn Fn(&Path) -> Option<i64>,
+    runner: &dyn crate::image_ops::PrivilegedRunner,
+) -> HandlerOutcome {
+    let settings = match wt_settings(settings) {
+        Ok(settings) => settings,
+        Err(outcome) => return outcome,
+    };
+    let mount_dir = image_mount_dir(ctx.control);
+    let _ = std::fs::create_dir_all(&mount_dir);
+    let (exists, empty) = dir_facts(&mount_dir);
+    let state = classify_mount(&mount_dir, ctx.entries, exists, empty);
+    if let Some(message) = mount_refusal(state, &mount_dir) {
+        return wt_refusal(&message);
+    }
+    if state != MOUNTED {
+        if !settings.image_file(ctx.root).is_file() {
+            return wt_refusal(&format!(
+                "worktrees image file is missing: {}",
+                settings.image_file(ctx.root).display()
+            ));
+        }
+        for spec in mount_plan(&settings.image_file(ctx.root), &mount_dir) {
+            if let Err(outcome) = run_one(runner, &spec) {
+                return outcome;
+            }
+        }
+    }
+    // ensure_binds at plan level: bind each recorded slot whose
+    // target is not in the injected mount table.
+    if let Ok(mut records) = load_bind_records(ctx.control) {
+        let mounted_points: Vec<PathBuf> = ctx
+            .entries
+            .iter()
+            .map(|e| crate::image_mounts::normalize_absolute(&e.mount_point))
+            .collect();
+        let mut changed = false;
+        for (slot, record) in records.clone() {
+            let target = record
+                .target
+                .clone()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| ctx.worktrees.join(&slot));
+            if mounted_points.contains(&crate::image_mounts::normalize_absolute(&target)) {
+                continue;
+            }
+            let source = mount_dir.join(&record.subvolume);
+            if !source.is_dir() {
+                return wt_refusal(&format!("slot subvolume is missing: {}", source.display()));
+            }
+            let _ = std::fs::create_dir_all(&target);
+            for spec in bind_plan(&source, &target) {
+                if let Err(outcome) = run_one(runner, &spec) {
+                    return outcome;
+                }
+            }
+            records.insert(
+                slot.clone(),
+                BindRecord {
+                    subvolume: record.subvolume,
+                    mount_id: mount_id(&target),
+                    target: Some(target.to_string_lossy().into_owned()),
+                },
+            );
+            changed = true;
+        }
+        if changed {
+            let _ = save_bind_records(ctx.control, &records);
+        }
+    }
+    HandlerOutcome {
+        exit: 0,
+        stdout: format!(
+            "mounted {} at {} (binds re-established)\n",
+            settings.image_file(ctx.root).display(),
+            mount_dir.display()
+        ),
+        stderr: String::new(),
+    }
+}
+
+/// `wrkslots worktrees-image unmount`.
+pub(crate) fn wt_unmount(
+    ctx: &WtCtx<'_>,
+    settings: Option<WorktreesImageSettings>,
+    runner: &dyn crate::image_ops::PrivilegedRunner,
+) -> HandlerOutcome {
+    let settings = match wt_settings(settings) {
+        Ok(settings) => settings,
+        Err(outcome) => return outcome,
+    };
+    let _ = &settings;
+    let mount_dir = image_mount_dir(ctx.control);
+    for spec in unmount_plan(&mount_dir) {
+        if let Err(outcome) = run_one(runner, &spec) {
+            return outcome;
+        }
+    }
+    HandlerOutcome {
+        exit: 0,
+        stdout: format!("unmounted {}\n", mount_dir.display()),
+        stderr: String::new(),
+    }
+}
+
+/// `wrkslots worktrees-image grow --to-size-bytes N`: truncate,
+/// refresh each holder's loop capacity, resize to max.
+pub(crate) fn wt_grow(
+    ctx: &WtCtx<'_>,
+    settings: Option<WorktreesImageSettings>,
+    to_size_bytes: i64,
+    runner: &dyn crate::image_ops::PrivilegedRunner,
+) -> HandlerOutcome {
+    let settings = match wt_settings(settings) {
+        Ok(settings) => settings,
+        Err(outcome) => return outcome,
+    };
+    let image_file = settings.image_file(ctx.root);
+    let current = std::fs::metadata(&image_file).map(|m| m.len()).unwrap_or(0);
+    if let Some(message) = grow_refusal(current, to_size_bytes as u64) {
+        return wt_refusal(&message);
+    }
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&image_file) {
+        let _ = file.set_len(to_size_bytes as u64);
+    }
+    // losetup -j through the runner, then the refresh plan.
+    let list_spec = spec(sudo_argv(&[
+        "losetup".to_string(),
+        "-j".to_string(),
+        image_file.to_string_lossy().into_owned(),
+    ]));
+    let devices = match run_one(runner, &list_spec) {
+        Ok(outcome) => losetup_devices(&outcome.stdout),
+        Err(outcome) => return outcome,
+    };
+    for spec_item in grow_plan(&devices, &image_mount_dir(ctx.control)) {
+        if let Err(outcome) = run_one(runner, &spec_item) {
+            return outcome;
+        }
+    }
+    HandlerOutcome {
+        exit: 0,
+        stdout: format!("grew {} to {} bytes\n", image_file.display(), to_size_bytes),
+        stderr: String::new(),
+    }
+}
+
+/// `wrkslots worktrees-image trim`: fstrim output or "trimmed".
+pub(crate) fn wt_trim(
+    ctx: &WtCtx<'_>,
+    settings: Option<WorktreesImageSettings>,
+    runner: &dyn crate::image_ops::PrivilegedRunner,
+) -> HandlerOutcome {
+    let settings = match wt_settings(settings) {
+        Ok(settings) => settings,
+        Err(outcome) => return outcome,
+    };
+    let _ = &settings;
+    let plan = trim_plan(&image_mount_dir(ctx.control));
+    match run_one(runner, &plan[0]) {
+        Ok(outcome) => {
+            let text = outcome.stdout.trim();
+            HandlerOutcome {
+                exit: 0,
+                stdout: format!("{}\n", if text.is_empty() { "trimmed" } else { text }),
+                stderr: String::new(),
+            }
+        }
+        Err(outcome) => outcome,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -617,5 +1077,107 @@ mod tests {
         };
         let error = run_sequence(&failing, &mount).expect_err("failure string");
         assert!(error.contains("failed: boom"), "{error}");
+    }
+
+    #[test]
+    fn handlers_match_python_outputs() {
+        use crate::image_ops::RunOutcome;
+        use std::cell::RefCell;
+        struct Fake {
+            calls: RefCell<Vec<Vec<String>>>,
+        }
+        impl crate::image_ops::PrivilegedRunner for Fake {
+            fn run(&self, spec: &CommandSpec) -> Result<RunOutcome, String> {
+                self.calls.borrow_mut().push(spec.argv.clone());
+                let stdout = if spec.argv.iter().any(|a| a == "-j") {
+                    "/dev/loop3: [0806]:1 (/x)\n".to_string()
+                } else {
+                    String::new()
+                };
+                Ok(RunOutcome {
+                    returncode: 0,
+                    stdout,
+                    stderr: String::new(),
+                })
+            }
+        }
+        let root = temp_root("handlers");
+        let control = root.join("control");
+        let worktrees = root.join("worktrees");
+        std::fs::create_dir_all(&control).expect("control");
+        std::fs::create_dir_all(&worktrees).expect("worktrees");
+        let settings = WorktreesImageSettings {
+            relative_path: "wt.img".to_string(),
+            size_bytes: 2 * 1_073_741_824,
+            filesystem: "btrfs".to_string(),
+            mount: "kernel".to_string(),
+            slot_quota_bytes: None,
+        };
+        let ctx = WtCtx {
+            root: &root,
+            control: &control,
+            worktrees: &worktrees,
+            entries: &[],
+        };
+
+        // Unconfigured refuses for every handler entry point.
+        assert_eq!(wt_status(&ctx, None, "human").exit, 3);
+
+        // Status on a sparse temp image, unmounted (empty mount dir).
+        std::fs::create_dir_all(image_mount_dir(&control)).expect("mount dir");
+        std::fs::File::create(settings.image_file(&root))
+            .expect("img")
+            .set_len(2 * 1_073_741_824)
+            .expect("size");
+        let human = wt_status(&ctx, Some(settings.clone()), "human");
+        assert!(
+            human.stdout.contains("state=not-mounted"),
+            "{}",
+            human.stdout
+        );
+        assert!(
+            human
+                .stdout
+                .contains("remedy: wrkslots worktrees-image mount"),
+            "{}",
+            human.stdout
+        );
+        let json_out = wt_status(&ctx, Some(settings.clone()), "json");
+        assert!(
+            json_out.stdout.contains("\"state\": \"not-mounted\""),
+            "{}",
+            json_out.stdout
+        );
+
+        let fake = Fake {
+            calls: RefCell::new(Vec::new()),
+        };
+        let created = wt_create(&ctx, Some(settings.clone()), &fake);
+        assert_eq!(created.exit, 3); // already exists from the status fixture
+        std::fs::remove_file(settings.image_file(&root)).expect("remove");
+        let created = wt_create(&ctx, Some(settings.clone()), &fake);
+        assert_eq!(created.exit, 0, "{}", created.stderr);
+        assert!(created.stdout.starts_with("created "));
+
+        let fake = Fake {
+            calls: RefCell::new(Vec::new()),
+        };
+        let mounted = wt_mount(&ctx, Some(settings.clone()), &|_| Some(42), &fake);
+        assert_eq!(mounted.exit, 0, "{}", mounted.stderr);
+        let fake = Fake {
+            calls: RefCell::new(Vec::new()),
+        };
+        let grown = wt_grow(&ctx, Some(settings.clone()), 4 * 1_073_741_824, &fake);
+        assert_eq!(grown.exit, 0, "{}", grown.stderr);
+        assert!(
+            grown.stdout.contains("to 4294967296 bytes"),
+            "{}",
+            grown.stdout
+        );
+        let trimmed = wt_trim(&ctx, Some(settings.clone()), &fake);
+        assert_eq!(trimmed.stdout, "trimmed\n");
+        let unmounted = wt_unmount(&ctx, Some(settings), &fake);
+        assert_eq!(unmounted.exit, 0);
+        std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }
