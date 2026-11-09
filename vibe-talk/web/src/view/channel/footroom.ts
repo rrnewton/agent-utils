@@ -47,6 +47,13 @@ export interface FootRoomsDependencies {
   paddingBottom(area: Scroller): number;
   /** What a page key moves `area` by (`pageStep`). */
   pageStep(area: Scroller): number;
+  /**
+   * The room in `area`'s height that is the on-screen keyboard's, not the rows' (`#1144
+   * scrollback-typing-jump`): the inset a composer at the list's foot keeps under itself while the
+   * keyboard is up, which `scrollHeight` counts but no message stands in. 0 where no keyboard is up
+   * over a composer in `area`.
+   */
+  keyboardRoom?(area: Scroller): number;
 }
 
 /** The rooms' commands and questions. */
@@ -122,16 +129,26 @@ export function createFootRooms(deps: FootRoomsDependencies): FootRooms {
     return overscroll.px;
   }
 
+  /**
+   * Every room past the rows' foot that `scrollHeight` counts (`#1144 scrollback-typing-jump`):
+   * the right column's two, and the keyboard's room under a composer at the foot. The foot every
+   * measure below is of is the rows', so a reader resting on the composer with the keyboard up is
+   * at it, and one scrolled up from it is that far from it, whatever the keyboard does.
+   */
+  function roomsPastFoot(area: Scroller): number {
+    return overscrollRoom(area) + overextendRoom(area) + (deps.keyboardRoom ? deps.keyboardRoom(area) || 0 : 0);
+  }
+
   function footGap(area: Scroller): number {
     // The room first: asking for it can close it (`overscrollRoom`), which takes its height out of
     // the list and clamps where the reader stands — heights read before it would count the room
     // twice, and a reader in it would measure a room's height short of the foot they are past.
-    const room = overscrollRoom(area) + overextendRoom(area);
+    const room = roomsPastFoot(area);
     return area.scrollHeight - room - area.scrollTop - (area.clientHeight || 0);
   }
 
   function footTop(area: Scroller): number {
-    const room = overscrollRoom(area) + overextendRoom(area);
+    const room = roomsPastFoot(area);
     return Math.max(0, area.scrollHeight - room - (area.clientHeight || 0));
   }
 

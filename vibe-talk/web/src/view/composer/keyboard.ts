@@ -69,6 +69,20 @@ export interface OnScreenKeyboard {
   noteKeyboardReader(): void;
   /** A scroll the browser made in the jump's moment: the jump is made again. */
   settleOnScroll(): void;
+  /**
+   * Text was put in the fitted box while its reader rests at the foot (`#1144
+   * scrollback-typing-jump`): once the browser has had its own say (it reveals the caret, which
+   * shows the caret's line and no more), the jump is made whole again, so the whole composer
+   * stands on the keyboard's top. The caller has judged the reader at the foot; a reader up the
+   * list is the typing guard's, never this one's.
+   */
+  noteComposerInput(field: Element): void;
+  /**
+   * The room, in px, the keyboard keeps under its fitted composer in `area` (`#1144
+   * scrollback-typing-jump`): counted in the list's height but no part of its rows, so the foot
+   * the page measures can leave it out. 0 for any other list, and while no box is fitted.
+   */
+  roomIn(area: HTMLElement): number;
   /** Draw the readout where `on`, keep it redrawn while it is, and set its switch. */
   showKeyboardDebug(on: boolean): void;
   /** Draw the readout, where it is on. */
@@ -91,14 +105,18 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
    * (Safari pans after its resize), in which it is made again as the viewport moves, and `generation`,
    * counting jumps, so a moment's end is only its own; `readerMoved`, a touch, a press or a wheel since
    * the jump, which ends that moment at once. `inset`, the room a composer keeps under itself for the
-   * keyboard (`renderKeyboardInset`); `lastFit`, what the last jump measured, for the readout.
+   * keyboard (`renderKeyboardInset`); `lastFit`, what the last jump measured, for the readout;
+   * `fittedArea`, the list the fitted composer stands in, whose height that room is part of
+   * (`roomIn`); `inputDue`, a whole-composer completion already waiting for its task.
    */
   const onScreenKeyboard: {
     up: boolean; shown: boolean; tallest: Map<number, number>; width: number; turnedAt: number | null;
     fitted: Element | null; fittedHeight: number; settling: boolean; generation: number; readerMoved: boolean;
     inset: number; lastFit: { target: number; moved: number; field: string } | null;
+    fittedArea: HTMLElement | null; inputDue: boolean;
   } = { up: false, shown: false, tallest: new Map(), width: -1, turnedAt: null, fitted: null,
-    fittedHeight: 0, settling: false, generation: 0, readerMoved: false, inset: 0, lastFit: null };
+    fittedHeight: 0, settling: false, generation: 0, readerMoved: false, inset: 0, lastFit: null,
+    fittedArea: null, inputDue: false };
 
   /** Whether the readout is drawn; see `showKeyboardDebug`. */
   let keyboardDebug = false;
@@ -147,7 +165,10 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
       onScreenKeyboard.fitted = fit;
       onScreenKeyboard.settling = false;
       if (fit) startKeyboardFit(fit, height);
-      else renderKeyboardInset(0);
+      else {
+        onScreenKeyboard.fittedArea = null;
+        renderKeyboardInset(0);
+      }
     } else if (fit && Math.abs(height - onScreenKeyboard.fittedHeight) >= 1) {
       // The room follows the keyboard's size whatever the reader is doing: without it the box could sit
       // under a grown keyboard with no scroll left to reach it.
@@ -243,6 +264,7 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
     const where = composerFit(field);
     if (!where) return;
     const { area, foot } = where;
+    onScreenKeyboard.fittedArea = area;
     const viewport = deps.viewport();
     const keysTop = viewport ? (Number(viewport.offsetTop) || 0) + (Number(viewport.height) || 0) : deps.innerHeight() || 0;
     const target = Math.min(area.getBoundingClientRect().bottom, keysTop);
@@ -331,6 +353,18 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
     noteKeyboardReader,
     settleOnScroll() {
       if (onScreenKeyboard.settling && onScreenKeyboard.fitted) settleKeyboardFit(onScreenKeyboard.fitted);
+    },
+    noteComposerInput(field) {
+      if (onScreenKeyboard.fitted !== field || onScreenKeyboard.inputDue) return;
+      onScreenKeyboard.inputDue = true;
+      deps.clock.setTimeout(() => {
+        onScreenKeyboard.inputDue = false;
+        if (onScreenKeyboard.fitted === field) settleKeyboardFit(field);
+      }, 0);
+    },
+    roomIn(area) {
+      return onScreenKeyboard.fitted !== null && area === onScreenKeyboard.fittedArea
+        ? onScreenKeyboard.inset : 0;
     },
     showKeyboardDebug,
     renderKeyboardDebug,

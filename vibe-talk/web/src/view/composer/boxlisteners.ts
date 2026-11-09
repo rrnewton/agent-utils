@@ -13,6 +13,11 @@ export interface MessageBoxDependencies {
   sendButton?: HTMLElement;
   send?(): unknown;
   remember?(): unknown;
+  /**
+   * Text went into the box (`input`), where the box has it (`#1144 scrollback-typing-jump`):
+   * at the foot, the keyboard's jump is made whole after the browser reveals the caret.
+   */
+  typed?(): unknown;
   /** A key in the box: one rule for every message box (`onComposerKey`), with this box's send. */
   onKey(event: KeyboardEvent): unknown;
   /** `paste-never-sends`. A paste only ever puts text in. */
@@ -30,6 +35,8 @@ export function mountMessageBox(deps: MessageBoxDependencies): MessageBox {
   const { listen, unmount } = createListening();
   const remember = deps.remember;
   if (remember) listen<Event>(deps.box, "input", () => remember());
+  const typed = deps.typed;
+  if (typed) listen<Event>(deps.box, "input", () => typed());
   const send = deps.send;
   if (deps.sendButton && send) listen<Event>(deps.sendButton, "click", () => send());
   listen<KeyboardEvent>(deps.box, "keydown", (event) => deps.onKey(event));

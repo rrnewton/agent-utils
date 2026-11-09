@@ -437,6 +437,20 @@ test("`#624 voice-page-modularity`: the rooms past the right column's foot open 
   rooms.toFoot(area);
   assert.equal(rooms.overextendRoom(area), 0);
   assert.equal(area.scrollTop, rows, "to the foot");
+  // `#1144 scrollback-typing-jump`: the keyboard's room under a composer at the foot is no part of
+  // the rows' foot: resting on the keys is at it, and up from it is measured without the room.
+  const mainArea = { clientHeight: 400, clientTop: 0, scrollTop: 880, scrollHeight: 1400, getBoundingClientRect: () => ({ top: 0 }) };
+  const mainRooms = createFootRooms({
+    clock: { setTimeout: () => 0, clearTimeout: () => {} },
+    side: () => area, overscrollBox: () => overscrollBox, overextendBox: () => overextendBox,
+    context: () => context, offered: () => true, sideUp: () => true, lastCard: () => card,
+    paddingBottom: () => 0, pageStep: () => 360,
+    keyboardRoom: (one) => (one === mainArea ? 120 : 0),
+  });
+  assert.equal(mainRooms.footTop(mainArea), 880, "the rows' foot leaves the keyboard's room out");
+  assert.equal(mainRooms.footGap(mainArea), 0, "resting on the composer over the keys is at the rows' foot");
+  mainArea.scrollTop = 800;
+  assert.equal(mainRooms.footGap(mainArea), 80, "scrolled up is measured from the rows' foot, room or none");
 });
 
 test("`#624 voice-page-modularity`: a packed card's gap holds and closes by sliding what is below it on the screen, and ends at once", () => {
@@ -1014,7 +1028,7 @@ test("`#624 voice-page-modularity`: the keepers hold a reader on the newest line
   const box = (id, extra = {}) => ({ id, clientHeight: 500, clientWidth: 400, scrollTop: 100, scrollHeight: 2000, children: [], listeners: [],
     addEventListener(type, listener, options) { this.listeners.push({ type, listener, options }); },
     removeEventListener(type, listener) { this.listeners = this.listeners.filter((one) => one.type !== type || one.listener !== listener); }, ...extra });
-  const main = box("scroll-area");
+  const main = box("scroll-area", { children: [box("pane-discord")] });
   const sideLog = box("side-log");
   const overscroll = box("side-overscroll");
   const overextend = box("side-overextend");
@@ -1025,7 +1039,7 @@ test("`#624 voice-page-modularity`: the keepers hold a reader on the newest line
   const watchers = [];
   const timers = [];
   const state = { sizes: true, screen: "main", view: "discord", dock: 50, bottom: new Set(), quick: false, landing: false, filter: false,
-    writing: false, written: false, sideUp: true, showing: true, mode: "thread", opening: false, columns: true, walk: false, held: null };
+    writing: false, written: false, writingIn: false, sideUp: true, showing: true, mode: "thread", opening: false, columns: true, walk: false, held: null };
   const columns = { main: { name: "main", mode: "main" }, side: { name: "side", get mode() { return state.mode; } } };
   const was = globalThis.setTimeout;
   globalThis.setTimeout = (act) => { timers.push(act); return timers.length; };
@@ -1053,6 +1067,7 @@ test("`#624 voice-page-modularity`: the keepers hold a reader on the newest line
       searchWalkAnchored: () => state.walk,
       voiceCall: () => ({ writingToAgent: () => state.writing, keepComposerInView: () => log.push("call box kept") }),
       keepWrittenBox: (area) => { if (state.written) log.push(`box kept ${area.id}`); return state.written; },
+      writingIn: () => state.writingIn,
       atBottom: (area, slack) => { log.push(`at bottom? ${area.id} ${slack}`); return state.bottom.has(area.id); },
       followFoot: (area) => log.push(`follow ${area.id}`),
       sideColumnUp: () => state.sideUp,
@@ -1064,9 +1079,9 @@ test("`#624 voice-page-modularity`: the keepers hold a reader on the newest line
       pinsView: () => ({ only: false }),
       measureReplyArrows: () => log.push("arrows"),
     });
-    assert.deepStrictEqual(watchers.map((one) => one.watched), [["scroll-area"], ["side-scroll"], ["side-log"], ["discord-log"], ["side-log"]],
+    assert.deepStrictEqual(watchers.map((one) => one.watched), [["scroll-area"], ["side-scroll"], ["side-log"], ["pane-discord"], ["discord-log"], ["side-log"]],
       "a list went unwatched, or the right column's own rooms were watched");
-    const [mainDock, sideDock, footKeeper, arrows, sideArrows] = watchers;
+    const [mainDock, sideDock, footKeeper, mainFootKeeper, arrows, sideArrows] = watchers;
     const run = (act) => { log.length = 0; act(); return [...log]; };
     // Main's list: the first report notes; the dock growing under a reader at the foot keeps them on it.
     assert.deepStrictEqual(run(() => mainDock.report()), []);
@@ -1162,6 +1177,34 @@ test("`#624 voice-page-modularity`: the keepers hold a reader on the newest line
     state.bottom = new Set();
     assert.ok(!run(() => footKeeper.report()).includes("follow side-scroll"), "a reader the search's walk holds was taken to the foot");
     state.walk = false;
+    // `#1144 scrollback-typing-jump`. Main's foot keeper: follow is one state, noted from the reader's
+    // own scrolls; while writing at the foot, late growth is followed; a caret reveal never turns it on.
+    const fireMain = (type) => { for (const one of main.listeners.filter((each) => each.type === type)) one.listener(); };
+    main.clientWidth = 400;
+    main.clientHeight = 500;
+    main.scrollTop = 1500;
+    state.bottom = new Set(["scroll-area"]);
+    fireMain("wheel");
+    fireMain("scroll");
+    state.bottom = new Set();
+    state.writingIn = true;
+    assert.ok(run(() => mainFootKeeper.report()).includes("follow scroll-area"),
+      "a writer at Main's foot was left above it as its rows grew");
+    state.writingIn = false;
+    assert.ok(!run(() => mainFootKeeper.report()).includes("follow scroll-area"),
+      "a reader at the foot not writing was followed (that reader is offered the jump)");
+    fireMain("touchstart");
+    fireMain("scroll");
+    state.writingIn = true;
+    assert.ok(!run(() => mainFootKeeper.report()).includes("follow scroll-area"),
+      "follow stayed on after the reader's own scroll up the list");
+    state.bottom = new Set(["scroll-area"]);
+    fireMain("input");
+    fireMain("scroll");
+    state.bottom = new Set();
+    assert.ok(!run(() => mainFootKeeper.report()).includes("follow scroll-area"),
+      "a caret reveal in the instant after typing turned follow on");
+    state.writingIn = false;
     // The arrows: one measure per burst, after the task; the right column's only while it shows, in its column.
     arrows.report();
     arrows.report();

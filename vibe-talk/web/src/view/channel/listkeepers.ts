@@ -52,6 +52,8 @@ export interface ListKeepersDependencies<Column> extends SizeWatching {
   voiceCall(): { writingToAgent(): boolean; keepComposerInView(): void };
   /** Keep a box being written in `area` in view as the keyboard shrinks it; whether it did (`#429`). */
   keepWrittenBox(area: HTMLElement, seen: UnderListNote | null, now: UnderListNote): boolean;
+  /** Whether a box in `area` is being written in (`boxBeingWritten`): its reader focused there. */
+  writingIn(area: HTMLElement): boolean;
   /** Whether `area` is within `slack` px of its foot (the page's slack by default), and taking it to its foot. */
   atBottom(area: HTMLElement, slack?: number): boolean;
   followFoot(area: HTMLElement): void;
@@ -88,7 +90,7 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
   const {
     el, leftEl, screens, underLists, cardsDrawn, columns, layoutShown, heightUnderLists, quickReplyHolds, placeQuickReply,
     entryLandingHolds, entryState, placeEntryLanding, keepFilterHold, heldFilterRow, searchWalkAnchored, voiceCall,
-    keepWrittenBox, atBottom, followFoot, sideColumnUp, sideShowing, fitOverextend, holdOverscrollReader, channelContextKey,
+    keepWrittenBox, writingIn, atBottom, followFoot, sideColumnUp, sideShowing, fitOverextend, holdOverscrollReader, channelContextKey,
     pinsView, measureReplyArrows,
   } = deps;
   const inColumn = <T>(column: Column, act: () => T): T => deps.inColumn(column, act);
@@ -268,6 +270,51 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
     for (const box of area.children) {
       if (box !== leftEl("side-overscroll") && box !== leftEl("side-overextend")) footKeeper.observe(box);
     }
+  }
+  // `#1144 scrollback-typing-jump`. MAIN'S READER AT ITS FOOT, WRITING, STAYS AT IT as what is in
+  // the list changes size under them with nothing scrolled and nothing redrawn: a row at the foot
+  // laid out again taller (an image, an embed, a streamed line settling) took the composer at the
+  // list's foot down with it until the next key, and left its reader above the slack, no longer
+  // following. The right column's keeper above is the shape, with one difference that is the
+  // point: follow is ONE STATE, noted only from the reader's own scrolls (a touch, a press, a
+  // wheel, as the keyboard's are) and from where the list opened — never from a scroll the
+  // browser made revealing the caret in the box, nor from one this page made. Only while a box
+  // in the list is being written in: a reader at the foot not writing is #207's, offered the jump.
+  if (deps.canWatchSizes()) {
+    const area = el("scroll-area");
+    let footing: Footing | null = null;
+    let readerScrolled = false;
+    let typedAt = -Infinity;
+    const contextOf = () => `${screens.screen()}|${screens.view()}|${channelContextKey()}|${pinsView().only}`;
+    const note = (foot: boolean, context: string): void => {
+      footing = { foot, width: area.clientWidth, height: area.clientHeight, context };
+    };
+    note(area.scrollTop > 0 && atBottom(area), contextOf());
+    for (const type of ["touchstart", "pointerdown", "wheel"]) {
+      listen(area, type, () => { readerScrolled = true; }, { capture: true, passive: true });
+    }
+    listen(area, "input", () => { typedAt = Date.now(); }, { passive: true });
+    listen(area, "scroll", () => {
+      // A scroll in the instant after text went in, with no reader's hand in it, is the browser
+      // revealing the caret: it never turns follow on. The reader's own scrolls, and the page's
+      // landings at the foot (a list opening, the Newest chip), note where the reader stands.
+      const reveal = !readerScrolled && Date.now() - typedAt < 150;
+      readerScrolled = false;
+      if (reveal && footing && !footing.foot) return;
+      note(area.scrollTop > 0 && atBottom(area), footing ? footing.context : contextOf());
+    }, { passive: true });
+    const free = () => screens.screen() === "main" && screens.view() === "discord" && writingIn(area)
+      && !entryLandingHolds() && heldFilterRow() === null && !searchWalkAnchored() && !quickReplyHolds(area);
+    const mainFootKeeper = watch(() => {
+      const was = footing;
+      const context = contextOf();
+      if (was && was.foot && was.width === area.clientWidth && was.height === area.clientHeight
+          && was.context === context && !atBottom(area, 1) && free()) {
+        followFoot(area);
+      }
+      if (was) note(was.foot, context);
+    });
+    for (const box of area.children) mainFootKeeper.observe(box);
   }
   // `#214 reply-arrow`. Where an arrow meets the row directly above it is layout, and layout changes
   // without a redraw: the window resized or turned, the reading column dragged, the reader's type

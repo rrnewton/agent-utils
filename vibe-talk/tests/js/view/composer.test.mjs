@@ -131,6 +131,46 @@ test("`#624 voice-page-modularity`: a focused field with the visual viewport a k
   assert.equal(els["keyboard-debug-readout"].hidden, true);
 });
 
+test("`#1144 scrollback-typing-jump`: typed at the foot, the jump is made whole after the caret's reveal, and the room is the fitted list's", () => {
+  const { createOnScreenKeyboard } = VIEW_COMPOSER;
+  const root = { clientWidth: 412, clientHeight: 915, setAttribute: () => {}, getAttribute: () => null, style: { setProperty: () => {} } };
+  const area = { id: "scroll-area", scrollTop: 100, getBoundingClientRect: () => ({ top: 0, bottom: 915 }) };
+  const composer = { id: "channel-composer", parentNode: area };
+  const field = { tagName: "TEXTAREA", id: "channel-compose-text", type: "textarea", isContentEditable: false,
+    getClientRects: () => [{}], getBoundingClientRect: () => ({ top: 793, bottom: 879 + (100 - area.scrollTop) }) };
+  const els = {
+    "read-speed-box": { id: "read-speed-box" }, "speed-popover": { hidden: true }, "keyboard-debug": { checked: false },
+    "keyboard-debug-readout": { hidden: true, style: {} },
+    "channel-composer": composer, "scroll-area": area, "side-scroll": { id: "side-scroll" },
+    "channel-send": { id: "channel-send", getClientRects: () => [] },
+    "channel-compose-state": { id: "channel-compose-state", getClientRects: () => [] },
+    "channel-compose-text": field,
+  };
+  const timers = [];
+  const keyboard = createOnScreenKeyboard({
+    clock: { setTimeout: (run, ms) => { timers.push({ run, ms }); return timers.length; }, clearTimeout: (h) => { timers[h - 1] = null; } },
+    lookup: (id) => els[id] || { id, getClientRects: () => [] },
+    el: (id) => els[id],
+    viewport: () => ({ height: 579, scale: 1, offsetTop: 300 }), innerHeight: () => 915, scrollY: () => 0, root: () => root,
+    activeElement: () => field, virtualKeyboard: () => undefined,
+    computedStyle: (node) => (node === composer ? { getPropertyValue: (name) => (name === "--keyboard-fit" ? "on" : "") } : null),
+    closeSpeedPopover: () => {},
+  });
+  keyboard.noteKeyboard();
+  assert.equal(area.scrollTop, 100, "the fit as the keyboard came up left the foot on the keys");
+  assert.equal(keyboard.roomIn(area), 36, "the list's 36px under the keys' top is the keyboard's room");
+  assert.equal(keyboard.roomIn(els["side-scroll"]), 0, "no room is the keyboard's in another list");
+  // The browser reveals the caret alone (the list left with the box part-shown), then the key is noted.
+  area.scrollTop = 90;
+  keyboard.noteComposerInput(field);
+  const due = timers.filter((one) => one && one.ms === 0);
+  assert.equal(due.length, 1, "one completion is due for the key");
+  due[0].run();
+  assert.equal(area.scrollTop, 100, "the whole foot is back on the keyboard's top");
+  keyboard.noteComposerInput({ id: "side-compose-text" });
+  assert.equal(timers.filter((one) => one && one.ms === 0).length, 1, "another box's key completes nothing here");
+});
+
 test("`#821 voice-page-read-aloud-react`: dictation writes unsure then settled words after what the box held, says it listens, and falls back to the keyboard's microphone", () => {
   const { createDictation, DICTATION_LISTENING, DICTATION_UNAVAILABLE } = VIEW_COMPOSER;
   const box = { value: "Yes,", getAttribute: () => null, setAttribute: () => {}, removeAttribute: () => {} };

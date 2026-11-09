@@ -5,7 +5,7 @@ priority: 0
 issue_type: bug
 assignee: mu-scroll
 created_at: 2026-11-09T16:28:51.510479950+00:00
-updated_at: 2026-11-09T16:32:28.093067880+00:00
+updated_at: 2026-11-09T20:27:02.193484259+00:00
 ---
 
 # Description
@@ -37,3 +37,15 @@ Root-cause first, then the smallest fix at the writer that moves the list.
 - Whole composer: every deliberate snap to the composer leaves the whole composer (box and its action row as drawn) inside the visible viewport, never clipped by the keyboard.
 - The root cause is named in Notes as commit plus function plus mechanism, with browser evidence.
 - Page tests pin each invariant and a browser walk covers new-row arrival plus typing plus a keyboard resize; the full validation gate passes.
+
+# Notes
+
+Root cause (reproduced in Chromium at 412x915, instrumented; probe /tmp/mu-scroll-repro.py): LATENT, not a regression. The same failures reproduce identically on the pre-#1078 page (4564cc0f); no commit in the 2026-11-08/09 deploy range edits this scroll logic (moves verified word-for-word). Two mechanisms, one root - while a composer inside the list is focused, the browser, not the page, owned the list's scroll:
+
+1. Typing at the bottom, the view jumps UP into older messages: a row at the foot laid out again taller after rendering (image/embed/streamed line settling), or the keyboard strip growing, increases the content (or shrinks the window) while the scroll offset stays put. The composer at the list's foot drops below the keyboard (measured: composer bottom 798 vs visible 579 after +180px growth; foot gap 8 -> 228, so the reader also stops counting as at the bottom), older messages fill the screen, and the next keystroke's browser caret-reveal brings back only the caret's line. Main had no content-growth foot keeper (the right column has one, #280; Main was left as #207 decided). No second mover was found: arrivals and re-renders held the anchor in the repro, read-aloud highlight makes no scroll call, and the live pill only relabels.
+
+2. Typing from scrollback yanks to the composer: Chromium reveals the caret on text insertion (proven with zero page scroll writes, keyboard-free desktop geometry included). Per owner replies 266-268 that jump is acceptable with the composer focused, provided the whole composer shows; unfocused keys navigate and never type or yank.
+
+Fix (first change): follow is one explicit state in Main's new foot keeper (listkeepers) - noted only from the reader's own scrolls and landings at the foot, never switched on by a caret reveal in the instant after an input; while a box in Main is being written in and follow is on, late growth is followed so the composer never sinks. After text goes in at the foot, the keyboard jump is made whole (keyboard.noteComposerInput), so any snap shows the whole composer on the keys. The foot every measure uses is the rows' foot: footGap/footTop leave out the keyboard's room under the fitted composer (footroom.keyboardRoom from keyboard.roomIn), so resting on the composer with the keyboard up counts as at the bottom and scrolled-up is measured without keyboard geometry. In scrollback (follow off) arrivals/re-renders keep the anchor as before (preservingScroll/settleAfterRead, verified in the repro focused and unfocused); only the Newest chip changes.
+
+Tests in the first change: unit pins for the keeper's follow state (growth followed while writing, not while merely at the foot, off after the reader's own scroll up, never on from a reveal), for the whole-composer completion and roomIn, and for the rows'-foot measure. Existing page suites (scrolling, composer, keyboard) pass bar one pre-existing environment failure (process.threadCpuUsage missing in this shell's Node, #532 latency harness). Left for the second change: the maintained browser walk (phone + desktop widths, arrivals + typing + keyboard resize + late growth), desktop-width typing cases beyond the keyboard-free repro scenario, and the reply box. Slot scroll, branch mu-scroll/scroll-jump.

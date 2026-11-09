@@ -2055,6 +2055,10 @@ function atBottom(area, slack = BOTTOM_SLACK_PX) {
  * wheel's and scroll's part in them: one owner in web/src/view/channel/footroom.ts (`#624
  * voice-page-modularity`). What the column shows, whether it is up, and its last card are here.
  */
+// The keyboard's room in a list, for the foot's measures (`#1144 scrollback-typing-jump`): the
+// keyboard owner is made at the boot below, long after the rooms, so its answer is held here once
+// made and read as no room until then.
+var screenKeyboardRoom = null;
 const footRooms = createFootRooms({
   clock: clockOnUse(),
   side: () => leftEl("side-scroll"),
@@ -2067,6 +2071,7 @@ const footRooms = createFootRooms({
   paddingBottom: (area) => (typeof window.getComputedStyle === "function"
     ? parseFloat(window.getComputedStyle(area).paddingBottom) || 0 : 0),
   pageStep: (area) => pageStep(area),
+  keyboardRoom: (area) => (screenKeyboardRoom ? screenKeyboardRoom.roomIn(area) : 0),
 });
 const {
   overscrollRoom, overextendRoom, footGap, footTop, closeOverscroll, waitOverscrollIdle, openOverscroll, fitOverscroll,
@@ -13785,6 +13790,12 @@ application.track(mountMenuOpeners({
 // with Enter to send off an Enter is a new line. `paste-never-sends`: every message box, a paste only ever puts text in.
 application.track(mountMessageBox({
   box: el("compose-text"),
+  // `#1144 scrollback-typing-jump`: typed at the foot, the keyboard's jump is made whole after the
+  // browser reveals the caret, so the whole composer stands on the keys.
+  typed: () => {
+    const box = el("compose-text");
+    if (atBottom(growingBoxList(box))) screenKeyboard.noteComposerInput(box);
+  },
   onKey: (event) => onComposerKey(event, guardQuietly(voiceCall().sendTyped), el("compose-text")),
   watchBoxInsertions: (box) => watchBoxInsertions(box),
 }));
@@ -13874,6 +13885,11 @@ application.track(mountChannelViewControls({
 application.track(mountMessageBox({
   box: el("channel-compose-text"),
   remember: () => rememberChannelDraft(),
+  // `#1144 scrollback-typing-jump`, as the call's box above.
+  typed: () => {
+    const box = el("channel-compose-text");
+    if (atBottom(growingBoxList(box))) screenKeyboard.noteComposerInput(box);
+  },
   sendButton: el("channel-send"),
   send: guardQuietly(sendChannelMessage),
   onKey: (event) => onComposerKey(event, guardQuietly(sendChannelMessage), el("channel-compose-text")),
@@ -13914,6 +13930,10 @@ inColumn(columns.side, () => {
   mountMessageBox({
     box: sideBox,
     remember: inThisColumn(rememberChannelDraft),
+    // `#1144 scrollback-typing-jump`, as the left column's box, in this column.
+    typed: inThisColumn(() => {
+      if (atBottom(growingBoxList(sideBox))) screenKeyboard.noteComposerInput(sideBox);
+    }),
     sendButton: el("channel-send"),
     send: inThisColumn(guardQuietly(sendChannelMessage)),
     onKey: inThisColumn((event) => onComposerKey(event, guardQuietly(sendChannelMessage), sideBox)),
@@ -14009,6 +14029,7 @@ const screenKeyboard = createOnScreenKeyboard({
   closeSpeedPopover: () => closeSpeedPopover(),
 });
 const { noteKeyboard, noteKeyboardReader, settleOnScroll, showKeyboardDebug, renderKeyboardDebug } = screenKeyboard;
+screenKeyboardRoom = screenKeyboard;
 
 
 // --- the keyboard's numbers, on screen -----------------------------------------------------------------
@@ -14472,6 +14493,7 @@ application.track(mountListKeepers({
   },
   voiceCall: () => voiceCall(),
   keepWrittenBox: (area, seen, now) => keepWrittenBox(area, seen, now),
+  writingIn: (area) => boxBeingWritten(area) !== null,
   atBottom: (...args) => atBottom(...args),
   followFoot: (area) => followFoot(area),
   sideColumnUp: () => sideColumnUp(),
