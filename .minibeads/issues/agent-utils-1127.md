@@ -1,10 +1,10 @@
 ---
 title: 'merge-queue-root-stack-mismatch: root stacking judges one batch but builds on another'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-09T13:23:24.000000000+00:00
-updated_at: 2026-11-09T13:23:24.000000000+00:00
+updated_at: 2026-11-09T17:44:53.000000000+00:00
 ---
 
 # Description
@@ -120,3 +120,35 @@ text, donor job parent) are generalized here; run
 cli_disjoint_root, beside the #1071 cases.
 
 ## Resolution
+
+Landed on main as af3062c2e4a7bbd3be7a54ef57c1baddf3aae21a (gated commit 78c37719, files byte-identical after replay).
+
+The root-stacking loop now judges only what the new build
+depends on: when a stack top exists, `likely_landing_reason`
+runs on the stack top alone (its own green state, priority and
+predicted pass, known-not-green still skipped), so with a stack
+top the event's `likely_prs` and `parent_prs` are the same
+batch by construction; when no stack top exists, the previous
+any-flight rule stands under the existing current-base guard
+(a likely root's tip is used only while its parent is the
+current base). A likely root outside the stack can no longer
+make a new root stack on an unjudged top, and the stacked
+flights below the top are deliberately not judged — the
+candidate contains the top's tree either way. Parent choice
+for dependency composition, stale-green stacking and the
+root-near-landing deferral is unchanged, and both shapes keep
+#1111's base recording (disjoint root: parent == base at once;
+stacked: the stack's bottom inherited).
+
+Tests in cli_disjoint_root, both shapes with their
+`MQ_BASE`/`MQ_PARENT` readings: a non-likely stacked flight
+(dep-composed, gated, plain) beside a prioritized root no
+longer makes a new would-be root stack — it roots on the base
+(failing on the old code, which built `a_b_d` on the top's
+candidate justified by the root), and a prioritized stack top
+still stacks with the event naming the top as both batches.
+The #1071 cases pass unchanged. Gate: full gate on 78c37719,
+shared phase 239/239; exclusive cross differentials stopped
+under the merge-queue-only waiver (ledger `failed_steps`
+empty, verdict fail only from that stop); independent review
+of the commit was clean before gating.
