@@ -32893,6 +32893,41 @@ class _CachePlanExhausted(Refusal):
     """Cache-glob planning spent its allowance; the subject's total is unknown."""
 
 
+#: How every cache-census message that only an allowance ran out ends (#1106).
+_CACHE_ALLOWANCE_SHORTFALL = "no cache total can be published within this allowance"
+
+
+def _cache_size_unknown_reason(status: object, error: object) -> str | None:
+    """Why an audit row's cache size is unknown when only an allowance ran out (#1106).
+
+    None when the size is known, or when the cache census FOUND something
+    (nested Git metadata, a symlink crossing, an entry it cannot inspect, a
+    directory that changed): those stay blocking reasons.  A census that only
+    ran out of listings or time is not evidence of use and is no removal
+    safeguard, since every deleting command re-enforces the same refusals, so
+    it leaves the verdict alone and reports the size as unknown, naming the
+    option that gets a complete total.
+    """
+
+    if isinstance(error, str):
+        if not error.endswith(_CACHE_ALLOWANCE_SHORTFALL):
+            return None
+        if "directory listings" in error or "work units" in error:
+            option = "--cache-work-limit"
+        elif "total planning allowance" in error:
+            option = "--cache-plan-total-seconds"
+        else:
+            option = "--cache-wall-seconds"
+        return f"{error}; rerun audit with a larger {option} for a complete total"
+    if status == "partial":
+        return (
+            "the bounded cache census is partial; rerun audit, which resumes it from its "
+            "--cache-census-state, or raise --cache-work-limit and --cache-wall-seconds, "
+            "for a complete total"
+        )
+    return None
+
+
 @dataclasses.dataclass
 class _CachePlanBudget:
     """One audit subject's share of cache-glob expansion.
@@ -38523,15 +38558,16 @@ def _audit_record(
         cache_error = None
         cache_status = "complete"
         reasons.append(_absent_slot_recovery_reason(record, slot_path, record_sha256))
-    if cache_error is not None:
+    # A census that only ran out of its allowance (a partial one included)
+    # leaves the size unknown and decides nothing (#1106): audit's DELETABLE
+    # is advisory, and remove, retirement and clean-caches each refuse a
+    # nested repository, a crossing or a mount point themselves before they
+    # delete a cache.  What the census found still blocks.
+    if (
+        cache_error is not None
+        and _cache_size_unknown_reason(cache_status, cache_error) is None
+    ):
         reasons.append(f"cache inspection failed: {cache_error}")
-    elif cache_status == "partial":
-        # A bounded census may not yet have reached a nested path that the
-        # complete historical traversal would have refused.  Its null byte
-        # count is therefore informationally honest but is not deletion
-        # evidence.  Keep the row out of DELETABLE until the same resumable
-        # census reaches and verifies every entry.
-        reasons.append("cache inspection incomplete: bounded census is partial")
     return (
         {
             "slot": record.slot,
@@ -39456,6 +39492,13 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         )
         kept_slots.add(journal_name)
     worktree_count = len(current_on_disk)
+    for row in rows:
+        # A null cache_bytes is unknown, never zero; a ranker must not read it
+        # as an empty cache (#1106).
+        row["size_known"] = row["cache_bytes"] is not None
+        row["size_unknown_reason"] = _cache_size_unknown_reason(
+            row["cache_status"], row["cache_error"]
+        )
     sorted_rows = sorted(rows, key=lambda row: str(row["slot"]))
     attention = [
         row
@@ -39489,6 +39532,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                 row["verdict"] == "BLOCKED"
                 and row.get("heartbeat_expired") is True
                 and row["cache_error"] is not None
+                and row["size_unknown_reason"] is None
                 and row["liveness_state"] != "alive"
                 and row["owner_state"] != "live"
         )
@@ -39501,6 +39545,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                 row["verdict"] == "BLOCKED"
                 and row.get("heartbeat_expired") is True
                 and row.get("cache_status") == "partial"
+                and row["size_unknown_reason"] is None
                 and row["liveness_state"] != "alive"
                 and row["owner_state"] != "live"
         )
@@ -39593,13 +39638,16 @@ def _cmd_audit(args: argparse.Namespace) -> int:
             reasons = row["reasons"]
             assert isinstance(reasons, list)
             detail = "; ".join(str(reason) for reason in reasons) or "all removal proofs pass"
-            if row["cache_error"] is not None:
+            label = str(row["verdict"])
+            if row["size_unknown_reason"] is not None:
+                label += f" (size unknown: {row['size_unknown_reason']})"
+            elif row["cache_error"] is not None:
                 detail += f"; cache inspection: {row['cache_error']}"
             release_value = row.get("owner_release")
             if release_value is not None:
                 release_obj = _as_mapping(release_value, "audit owner_release")
                 detail += f"; {release_obj['summary']}"
-            print(f"{row['verdict']}: {row['slot']}: {detail}")
+            print(f"{label}: {row['slot']}: {detail}")
         _print_foreign_shard_notes(foreign_notes)
         if args.gate:
             print(f"state={gate_state}")

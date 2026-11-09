@@ -555,7 +555,13 @@ def test_registered_record_planning_uses_its_share(tmp_path: Path) -> None:
     )
     assert row["cache_error"] == exhausted
     assert row["verdict"] == "BLOCKED"
-    assert f"cache inspection failed: {exhausted}" in row["reasons"]
+    # #1106: a planning shortfall leaves the size unknown and is no reason;
+    # the live lane's own evidence keeps the row BLOCKED.
+    assert not [r for r in row["reasons"] if r.startswith("cache inspection")]
+    assert row["size_known"] is False
+    assert row["size_unknown_reason"] == (
+        f"{exhausted}; rerun audit with a larger --cache-work-limit for a complete total"
+    )
     assert complete.returncode == 0, complete.stderr
     row = {row["slot"]: row for row in json.loads(complete.stdout)["slots"]}["slot01"]
     assert row["cache_status"] == "complete"

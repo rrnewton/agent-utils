@@ -340,7 +340,8 @@ Root binding and traversal run in isolated workers with the remaining deadline
 enforced even if a filesystem operation blocks. Expiry starts no further work and cancels
 the worker, with at most one additional second allowed for reaping it.
 Until the census has visited and reverified every directory and entry, JSON reports
-`cache_bytes: null` and `cache_status: "partial"`, keeping the row out of `DELETABLE`.
+`cache_bytes: null` and `cache_status: "partial"`; the size is unknown (see "When only an
+allowance ran out" below).
 An authenticated subject cursor gives lifecycle subjects fair turns, including subjects
 with multiple cache roots. Each turn includes binding and deadline-checked structural
 validation, so an expensive peer cannot consume every call before a cheap subject runs.
@@ -365,7 +366,31 @@ other entry and, once the root's final sweep has passed, judges each nested repo
 completed validation removal does (see "Nested Git repositories in a completed validation's
 caches"), in the order that removal reaches them. The row is `DELETABLE` only if every one is
 disposable; otherwise `cache_error` is the removal's own refusal for the first that is not, and a
-judgment cut short by the wall allowance leaves the row partial rather than giving a verdict.
+judgment cut short by the wall allowance leaves the size unknown rather than giving a verdict.
+
+**When only an allowance ran out (#1106).** A cache census that ran out of directory listings,
+work units or wall time, or is still partial, has found nothing; it only could not finish. It
+does not decide the row's verdict: a slot that passes every other check stays `DELETABLE`. Its
+size is reported as unknown:
+
+- JSON: `cache_bytes: null`, `size_known: false`, and `size_unknown_reason`, the allowance
+  message followed by the option that gets a complete total (`--cache-work-limit`,
+  `--cache-wall-seconds` or `--cache-plan-total-seconds`; for a partial census, rerun audit,
+  which resumes from its `--cache-census-state`). `cache_error` and `cache_status` keep their
+  values.
+- Text: the verdict reads `DELETABLE (size unknown: <reason>)`.
+
+`cache_bytes: null` is unknown, not zero: anything that ranks or sums rows by size must treat it
+as unknown. Every row carries `size_known` (true exactly when `cache_bytes` is a number) and
+`size_unknown_reason` (null unless only an allowance ran out).
+
+This is safe because audit's `DELETABLE` is advisory: every command that deletes a cache
+(`remove`, retirement, `clean-caches`) refuses nested Git metadata it has not judged disposable,
+a crossing onto another filesystem and a crossing of a mount point itself, and `remove` judges
+every nested repository under its path fence. What the census FOUND still blocks the row as
+`cache inspection failed: ...`: nested Git metadata in an agent row's cache, a symlink crossing, an
+entry it cannot inspect, a directory that changed between resumed runs, or a nested repository a
+completed validation's removal would refuse.
 
 The state is keyed by active-registry revision and cache-root identity. Persisted progress
 is authenticated by a sibling 0600 key; missing, malformed, too deeply nested, obsolete, or

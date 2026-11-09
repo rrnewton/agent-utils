@@ -440,6 +440,10 @@ def test_audit_planning_work_exhaustion_matches_python(
     row = _rows(python_payload)[0]
     assert row["cache_status"] == "error"
     assert "share of 5 directory listings" in str(row["cache_error"])
+    assert row["verdict"] == "DELETABLE"
+    assert str(row["size_unknown_reason"]).endswith(
+        "; rerun audit with a larger --cache-work-limit for a complete total"
+    )
 
 
 def test_audit_planning_fair_share_matches_python(tmp_path: Path) -> None:
@@ -531,8 +535,13 @@ def test_audit_census_partial_then_complete_matches_python(tmp_path: Path) -> No
     )
     assert rust_first.returncode == 0, rust_first.stderr
     assert _scrub(json.loads(rust_first.stdout)) == _scrub(python_first)
-    assert _rows(python_first)[0]["cache_status"] == "partial"
-    assert _rows(python_first)[0]["verdict"] == "BLOCKED"
+    first = _rows(python_first)[0]
+    assert first["cache_status"] == "partial"
+    # #1106: an allowance shortfall leaves the size unknown, not the verdict.
+    assert first["verdict"] == "DELETABLE"
+    assert first["reasons"] == []
+    assert first["size_known"] is False
+    assert str(first["size_unknown_reason"]).startswith("the bounded cache census is partial")
 
     python_second = _python(root, tmp_path)
     rust_second = _rust(root, census_state=tmp_path / "rust-census.json")
@@ -540,6 +549,8 @@ def test_audit_census_partial_then_complete_matches_python(tmp_path: Path) -> No
     assert _scrub(json.loads(rust_second.stdout)) == _scrub(python_second)
     assert _rows(python_second)[0]["cache_status"] == "complete"
     assert _rows(python_second)[0]["verdict"] == "DELETABLE"
+    assert _rows(python_second)[0]["size_known"] is True
+    assert _rows(python_second)[0]["size_unknown_reason"] is None
     rust_bytes = _rows(json.loads(rust_second.stdout))[0]["cache_bytes"]
     python_bytes = _rows(python_second)[0]["cache_bytes"]
     assert isinstance(rust_bytes, int) and isinstance(python_bytes, int)
@@ -706,6 +717,13 @@ def test_audit_census_wall_timeout_matches_python(tmp_path: Path) -> None:
     row = _rows(python_payload)[0]
     assert row["cache_status"] == "error"
     assert "fixed wall allowance" in str(row["cache_error"])
+    # #1106: the wall allowance, the one that depends on host load, no longer
+    # decides the verdict.
+    assert row["verdict"] == "DELETABLE"
+    assert row["size_known"] is False
+    assert str(row["size_unknown_reason"]).endswith(
+        "; rerun audit with a larger --cache-wall-seconds for a complete total"
+    )
 
 
 def test_audit_planning_total_matches_python(tmp_path: Path) -> None:
@@ -733,6 +751,10 @@ def test_audit_planning_total_matches_python(tmp_path: Path) -> None:
     assert row["cache_status"] == "error"
     assert "total planning allowance of 1e-06 seconds before this subject's fixed wall " \
         "allowance of 60 seconds" in str(row["cache_error"])
+    assert row["verdict"] == "DELETABLE"
+    assert str(row["size_unknown_reason"]).endswith(
+        "; rerun audit with a larger --cache-plan-total-seconds for a complete total"
+    )
 
 
 def test_audit_census_flat_cache_small_limit_matches_python(tmp_path: Path) -> None:
@@ -777,6 +799,9 @@ def test_audit_census_nested_git_matches_python(tmp_path: Path) -> None:
     assert row["cache_status"] == "error"
     assert row["verdict"] == "BLOCKED"
     assert "nested Git metadata" in str(row["cache_error"])
+    # #1106: what the census found still decides; it is no size shortfall.
+    assert row["size_known"] is False
+    assert row["size_unknown_reason"] is None
 
 
 def _validate_cache_fixture(base: Path) -> tuple[Path, Path]:
@@ -1808,3 +1833,37 @@ def test_audit_follows_a_matched_holder_replaced_before_its_recheck(
             edition, reasons,
         )
 
+
+def test_audit_size_unknown_text_matches_python(tmp_path: Path) -> None:
+    """#1106: both editions print 'DELETABLE (size unknown: ...)' for an allowance shortfall."""
+
+    root = _cache_fixture(tmp_path)
+    args = argparse.Namespace(
+        project_root=str(root), machine=None, format="human", gate=False,
+        cache_census_state=str(tmp_path / "python-census.json"),
+        cache_work_limit=1, cache_wall_seconds=60.0, cache_plan_total_seconds=30.0,
+        wait_lock=0.0,
+    )
+    stream = io.StringIO()
+    with contextlib.redirect_stdout(stream):
+        assert wrkslots_cli._cmd_audit(args) == 0
+    rust = subprocess.run(
+        [
+            str(rust_wrkslotsd()), "audit-text", "--root", str(root),
+            "--cache-census-state", str(tmp_path / "rust-census.json"),
+            "--cache-work-limit", "1", "--cache-wall-seconds", "60",
+        ],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
+    )
+    assert rust.returncode == 0, rust.stderr
+
+    def slot_lines(text: str) -> list[str]:
+        return [line for line in text.splitlines() if ": slot-a: " in line]
+
+    expected = (
+        "DELETABLE (size unknown: the bounded cache census is partial; rerun audit, which "
+        "resumes it from its --cache-census-state, or raise --cache-work-limit and "
+        "--cache-wall-seconds, for a complete total): slot-a: all removal proofs pass"
+    )
+    assert slot_lines(stream.getvalue()) == [expected]
+    assert slot_lines(rust.stdout) == [expected]

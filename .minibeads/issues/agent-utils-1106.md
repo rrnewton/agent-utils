@@ -1,10 +1,11 @@
 ---
 title: 'audit-cache-allowance-load: cache-census allowances leave slots UNKNOWN or BLOCKED on a loaded host'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 created_at: 2026-11-09T02:10:00.000000000+00:00
-updated_at: 2026-11-09T02:39:22.000000000+00:00
+updated_at: 2026-11-09T05:00:00.000000000+00:00
+closed_at: 2026-11-09T05:00:00.000000000+00:00
 assignee: cl-wrkid
 ---
 
@@ -41,4 +42,26 @@ What the audit's cache inspection protects (cl-wrkid, 2026-11-08, written before
 - So it is accounting plus a prediction of a refusal that the deleting command makes itself. A missing total means the size is unknown AND audit cannot yet say whether remove will refuse on a nested repository; it is not evidence the slot is in use, and it is not a removal safeguard. (Audit's DELETABLE is already advisory, #1102.)
 
 Consequence for the design (proposal, for the lead): a cache-census shortfall must stop deciding the row's verdict only where the shortfall is about the walk's allowance (listings or wall time), never where the walk FOUND something (nested Git, a symlink crossing, an unreadable entry, a changed directory): those stay blocking reasons. An allowance shortfall would publish the row with the size unknown and a reason that says remove still judges nested repositories itself, and how to get a complete total (the --cache-work-limit / --cache-wall-seconds flags, or a resumed run with --cache-census-state). Whether such a row is DELETABLE or gets a distinct label is the lead's call; both editions alike.
+
+Decision (the lead, 2026-11-08): keep the verdict DELETABLE when only a cache allowance ran out. JSON: `cache_bytes: null`, plus `size_known: false` and the allowance reason. Human output: `DELETABLE (size unknown: <reason naming the --cache-* knob>)`. Rankers must treat null as unknown, not 0. Document it in the audit output reference. Findings (nested Git, crossings, an unreadable entry, a changed directory) still decide the verdict. Both editions.
+
+## Resolution
+
+Delivered by cl-wrkid, 2026-11-08 ET, in both editions (py/wrkslots/cli.py `_cache_size_unknown_reason`; rs/wrkslotsd/src/audit_state.rs `cache_size_unknown_reason`).
+
+- What counts as an allowance shortfall:
+  - a partial census;
+  - a cache error whose text ends with the shared `no cache total can be published within this allowance`: subject planning listings, subject planning wall, audit-wide planning total, root binding wall, traversal wall (which includes a nested-Git judgment the wall cut short), finalization work, finalization wall.
+  Neither adds a reason any more, so the row keeps the verdict its other evidence gives. Every other cache error still blocks as `cache inspection failed: ...`: nested Git, a symlink crossing, an unreadable entry, a changed directory, a judged nested repository, and unavailable or unpersistable census state.
+- Every audit row now carries `size_known` (true exactly when `cache_bytes` is a number) and `size_unknown_reason`. The reason is null unless only an allowance ran out; then it is the allowance message plus the option for a complete total (`--cache-work-limit`, `--cache-wall-seconds` or `--cache-plan-total-seconds`; for a partial census, rerun audit, which resumes from `--cache-census-state`). `cache_error` and `cache_status` keep their values.
+- Text output: `DELETABLE (size unknown: <reason>): <slot>: ...`. The `; cache inspection: ...` suffix is printed only for a finding.
+- The gate's `unknown_slots` no longer counts a BLOCKED row whose only cache problem is an allowance shortfall. Its other evidence classifies it.
+- Rankers: nothing in this repository ranks or sums audit rows by `cache_bytes`. The user guide ("When only an allowance ran out") states that null is unknown, never zero.
+- Tests:
+  - py/wrkslots/tests/test_audit_state_rust.py, Python/Rust differential:
+    - a 30-directory cache under `--cache-work-limit 1` is DELETABLE with the size unknown, then sized on the resumed run;
+    - planning listings at 5, the planning total at 1 µs, and the census wall allowance at 1 µs (standing in for a listing slower than the allowance, which is what load does to the 5-second default) are each DELETABLE, with the reason naming the matching option;
+    - nested Git in the cache still blocks, with no size reason;
+    - the text line is identical in both editions.
+  - py/wrkslots/tests/test_lifecycle.py: `test_audit_partial_cache_census_leaves_only_the_size_unknown` (formerly `..._cannot_upgrade_deletion_eligibility`) covers the JSON, the gate (attention, not unknown) and the text line.
 

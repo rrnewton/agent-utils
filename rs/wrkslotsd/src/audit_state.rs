@@ -5739,13 +5739,13 @@ fn audit_record(
             slot_path.display()
         ));
     }
+    // A census that only ran out of its allowance (a partial one included)
+    // leaves the size unknown and decides nothing (#1106); what it found
+    // still blocks.
     if let Some(error) = &cache_error {
-        if !slot_absent {
+        if !slot_absent && cache_size_unknown_reason(Some(cache_status), Some(error)).is_none() {
             reasons.push(format!("cache inspection failed: {error}"));
         }
-    }
-    if cache_status == "partial" && !slot_absent {
-        reasons.push("cache inspection incomplete: bounded census is partial".to_string());
     }
     let verdict = if process_census_unknown {
         "UNKNOWN"
@@ -5771,6 +5771,35 @@ fn audit_record(
         sealed_generation,
     );
     Ok((row, agent_running))
+}
+
+/// How every cache-census message that only an allowance ran out ends (#1106).
+const CACHE_ALLOWANCE_SHORTFALL: &str = "no cache total can be published within this allowance";
+
+/// Why an audit row's cache size is unknown when only an allowance ran out
+/// (#1106), or None; see the Python edition's `_cache_size_unknown_reason`.
+fn cache_size_unknown_reason(status: Option<&str>, error: Option<&str>) -> Option<String> {
+    if let Some(error) = error {
+        if !error.ends_with(CACHE_ALLOWANCE_SHORTFALL) {
+            return None;
+        }
+        let option = if error.contains("directory listings") || error.contains("work units") {
+            "--cache-work-limit"
+        } else if error.contains("total planning allowance") {
+            "--cache-plan-total-seconds"
+        } else {
+            "--cache-wall-seconds"
+        };
+        return Some(format!(
+            "{error}; rerun audit with a larger {option} for a complete total"
+        ));
+    }
+    (status == Some("partial")).then(|| {
+        "the bounded cache census is partial; rerun audit, which resumes it from its \
+         --cache-census-state, or raise --cache-work-limit and --cache-wall-seconds, \
+         for a complete total"
+            .to_string()
+    })
 }
 
 type SealTargets = Vec<(String, i64, PathBuf)>;
@@ -7043,6 +7072,18 @@ pub(crate) fn parse_audit(
         }));
         kept_slots.insert(journal_name.clone());
     }
+    for row in &mut rows {
+        // A null cache_bytes is unknown, never zero (#1106).
+        let size_known = row.get("cache_bytes").is_some_and(|value| !value.is_null());
+        let reason = cache_size_unknown_reason(
+            row.get("cache_status").and_then(Value::as_str),
+            row.get("cache_error").and_then(Value::as_str),
+        );
+        if let Some(object) = row.as_object_mut() {
+            object.insert("size_known".to_string(), json!(size_known));
+            object.insert("size_unknown_reason".to_string(), json!(reason));
+        }
+    }
     rows.sort_by(|a, b| {
         a.get("slot")
             .and_then(Value::as_str)
@@ -7101,12 +7142,18 @@ pub(crate) fn parse_audit(
                             // indeterminacy; with a live lane proven it
                             // is only a sizing gap and stays BLOCKED.
                             || (!row.get("cache_error").is_some_and(|value| value.is_null())
+                                && row
+                                    .get("size_unknown_reason")
+                                    .is_some_and(Value::is_null)
                                 && row.get("liveness_state").and_then(Value::as_str)
                                     != Some("alive")
                                 && row.get("owner_state").and_then(Value::as_str)
                                     != Some("live"))
                             || (row.get("cache_status").and_then(Value::as_str)
                                 == Some("partial")
+                                && row
+                                    .get("size_unknown_reason")
+                                    .is_some_and(Value::is_null)
                                 && row.get("liveness_state").and_then(Value::as_str)
                                     != Some("alive")
                                 && row.get("owner_state").and_then(Value::as_str)
@@ -7269,7 +7316,10 @@ pub(crate) fn audit_cli(
             } else {
                 reasons.join("; ")
             };
-            if let Some(error) = row.get("cache_error").and_then(Value::as_str) {
+            let mut label = field("verdict").to_string();
+            if let Some(reason) = row.get("size_unknown_reason").and_then(Value::as_str) {
+                label.push_str(&format!(" (size unknown: {reason})"));
+            } else if let Some(error) = row.get("cache_error").and_then(Value::as_str) {
                 detail.push_str(&format!("; cache inspection: {error}"));
             }
             if let Some(release) = row.get("owner_release").filter(|value| !value.is_null()) {
@@ -7281,12 +7331,7 @@ pub(crate) fn audit_cli(
                         .unwrap_or_default()
                 ));
             }
-            out.push_str(&format!(
-                "{}: {}: {}\n",
-                field("verdict"),
-                field("slot"),
-                detail
-            ));
+            out.push_str(&format!("{label}: {}: {}\n", field("slot"), detail));
         }
     }
     if let Some(notes) = payload.get("foreign_shards").and_then(Value::as_array) {

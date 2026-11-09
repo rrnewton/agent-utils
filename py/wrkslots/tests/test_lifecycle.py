@@ -35051,11 +35051,13 @@ def test_audit_reports_deletable_blocked_held_and_the_leak_invariant(
     )
 
 
-def test_audit_partial_cache_census_cannot_upgrade_deletion_eligibility(
+def test_audit_partial_cache_census_leaves_only_the_size_unknown(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    """#1106: a census its allowance cut short decides no verdict; the size is unknown."""
+
     project, repository, _remote = make_project(tmp_path, cache_globs=("target",))
     made = create(project, slot="bounded", agent="codex-bounded", branch="codex/bounded")
     assert made.returncode == 0, made.stderr
@@ -35096,10 +35098,14 @@ def test_audit_partial_cache_census_cannot_upgrade_deletion_eligibility(
     partial = json.loads(capsys.readouterr().out)["slots"][0]
     assert partial["cache_bytes"] is None
     assert partial["cache_status"] == "partial"
-    assert partial["verdict"] == "BLOCKED"
-    assert partial["reasons"] == [
-        "cache inspection incomplete: bounded census is partial"
-    ]
+    assert partial["verdict"] == "DELETABLE"
+    assert partial["reasons"] == []
+    assert partial["size_known"] is False
+    assert partial["size_unknown_reason"] == (
+        "the bounded cache census is partial; rerun audit, which resumes it from its "
+        "--cache-census-state, or raise --cache-work-limit and --cache-wall-seconds, "
+        "for a complete total"
+    )
 
     assert (
         wrkslots.main(
@@ -35116,11 +35122,31 @@ def test_audit_partial_cache_census_cannot_upgrade_deletion_eligibility(
                 "1",
             ]
         )
-        == 2
+        == 1
     )
     gated_partial = json.loads(capsys.readouterr().out)
-    assert gated_partial["state"] == "unknown"
-    assert gated_partial["unknown_slots"] == ["bounded"]
+    assert gated_partial["state"] == "actionable"
+    assert gated_partial["attention_slots"] == ["bounded"]
+    assert gated_partial["unknown_slots"] == []
+
+    assert (
+        wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "audit",
+                "--cache-census-state",
+                str(state_path),
+                "--cache-work-limit",
+                "1",
+            ]
+        )
+        == 0
+    )
+    assert (
+        "DELETABLE (size unknown: the bounded cache census is partial; "
+        in capsys.readouterr().out
+    )
 
     assert (
         wrkslots.main(
@@ -35143,6 +35169,8 @@ def test_audit_partial_cache_census_cannot_upgrade_deletion_eligibility(
     assert type(complete["cache_bytes"]) is int
     assert complete["verdict"] == "DELETABLE"
     assert complete["reasons"] == []
+    assert complete["size_known"] is True
+    assert complete["size_unknown_reason"] is None
 
 
 @pytest.mark.parametrize("failure", ("file-component", "no-space"))
