@@ -156,6 +156,15 @@ later. From then on, an additive key needs only an `ignorable_keys` entry, and a
 needs a `min_wrkslots_version` raised to the release that introduced it. `init --repair` keeps
 listed keys it does not know as they are.
 
+### The machine name
+
+State files are sharded by machine (`ACTIVE.<machine>.json`). `init` writes the short host name
+as `machine:`, but a project that tracks `.wrkslots.yml` shares that one name with every host.
+Drop the key, or set `machine: auto`, and each host resolves its own short host name at load
+instead. Precedence is unchanged: `--machine`, then `WRKSLOTS_MACHINE`, then the configured
+value (absent or `auto` meaning the host name). When the name came from the host, `doctor` says
+so (`machine: <name> (host name; ...)`). An explicit value behaves exactly as before.
+
 ### Host-scoped sections
 
 Most of the file means the same thing on every host, but a storage choice may not: the

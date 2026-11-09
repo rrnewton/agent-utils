@@ -542,6 +542,7 @@ CONFIG_NAME = ".wrkslots.yml"
 # be materialised: no `max_active_slots` key means allocation is uncapped.
 OPTIONAL_CONFIG_KEYS = frozenset(
     {
+        "machine",
         "liveness_batch_command",
         "max_active_slots",
         "layout",
@@ -578,7 +579,6 @@ REQUIRED_CONFIG_KEYS = frozenset(
     {
         "schema",
         "worktrees_dir",
-        "machine",
         "default_remote",
         "default_landed_ref",
         "heartbeat_ttl_seconds",
@@ -602,7 +602,9 @@ CONFIG_KEY_DOCS: dict[str, str] = {
     ),
     "machine": (
         "Machine shard name: state files are ACTIVE.<machine>.json and EVENTS.<machine>. "
-        "Defaults to the short host name at init; WRKSLOTS_MACHINE or --machine overrides it."
+        "Init writes the short host name. Absent, or the literal auto, resolves to the short "
+        "host name at load, so a tracked file can be shared by every host; WRKSLOTS_MACHINE "
+        "or --machine still overrides any of these."
     ),
     "worktrees_dir": (
         "Where slot directories live, relative to the project root. It says where live state "
@@ -1213,8 +1215,19 @@ class Config:
     #: Why a configured worktrees_image section does not apply on this
     #: host (its machines list names other hosts), or None when it
     #: applies or is absent. Diagnostics only: behaviour keys off
-    #: ``worktrees_image`` being None either way.
-    worktrees_image_skipped: str | None = None
+    #: ``worktrees_image`` being None either way, and the mutation
+    #: coherence reload must not see a difference here.
+    worktrees_image_skipped: str | None = dataclasses.field(
+        default=None, compare=False
+    )
+    #: Where ``machine`` came from: "--machine", "WRKSLOTS_MACHINE",
+    #: "configuration.machine", or a host-name form when the key was
+    #: absent or ``auto``. Diagnostics only; excluded from equality
+    #: because the mutation coherence reload passes the resolved
+    #: machine back in as an override, which would otherwise differ.
+    machine_source: str = dataclasses.field(
+        default="configuration.machine", compare=False
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4211,9 +4224,22 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
             f"`wrkslots init --repair` (it refuses to change any field that "
             f"already has a conflicting value)."
         )
-    machine = machine_override or os.environ.get("WRKSLOTS_MACHINE")
-    if machine is None:
-        machine = _as_str(raw["machine"], "configuration.machine")
+    # Precedence: --machine, then WRKSLOTS_MACHINE, then the configured
+    # value, where an absent key or the literal "auto" means this host's
+    # short name, so one tracked file can serve every host.
+    if machine_override:
+        machine, machine_source = machine_override, "--machine"
+    elif os.environ.get("WRKSLOTS_MACHINE"):
+        machine = os.environ["WRKSLOTS_MACHINE"]
+        machine_source = "WRKSLOTS_MACHINE"
+    elif raw.get("machine") is None:
+        machine, machine_source = _short_hostname(), "host name (machine absent)"
+    else:
+        configured_machine = _as_str(raw["machine"], "configuration.machine")
+        if configured_machine == "auto":
+            machine, machine_source = _short_hostname(), "host name (machine: auto)"
+        else:
+            machine, machine_source = configured_machine, "configuration.machine"
     _validate_name(machine, "machine")
     relative, worktrees = _relative_inside(
         root, _as_str(raw["worktrees_dir"], "configuration.worktrees_dir"), "worktrees_dir"
@@ -4386,6 +4412,7 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         sandbox_settings=_parse_sandbox_settings(raw),
         worktrees_image=wt_settings,
         worktrees_image_skipped=wt_skipped,
+        machine_source=machine_source,
     )
     if config.worktrees_image is not None:
         # Re-establish the image mount and recorded slot binds on every
@@ -41631,6 +41658,11 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         if config.worktrees_image is not None
         else None
     )
+    machine_note = (
+        f"{config.machine} ({config.machine_source})"
+        if config.machine_source.startswith("host name")
+        else None
+    )
     if args.format == "json":
         print(
             json.dumps(
@@ -41641,6 +41673,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
                     "control_dir": str(config.control),
                     "layout": config.layout,
                     **({"worktrees_image": wt_scope} if wt_scope is not None else {}),
+                    **({"machine": machine_note} if machine_note is not None else {}),
                     "machines": [state.machine for state in states],
                     "event_counts": {
                         state.machine: len(_load_events(config, state.machine))
@@ -41663,6 +41696,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         )
         if wt_scope is not None:
             print(f"worktrees-image: {wt_scope}")
+        if machine_note is not None:
+            print(f"machine: {machine_note}")
         counts: dict[str, int] = {}
         for item in findings:
             kind = str(item["kind"])
@@ -70243,9 +70278,10 @@ usage or audit gate unknown, 3 fail-closed refusal.
     parser.add_argument(
         "--machine",
         help=(
-            "override the configured machine shard (or set WRKSLOTS_MACHINE); create, "
-            "register, and import-existing --apply refuse an implicit configured shard "
-            "that differs from the current host"
+            "override the machine shard (or set WRKSLOTS_MACHINE); without either, the "
+            "configured machine applies, where an absent key or the value auto means "
+            "the short host name. create, register, and import-existing --apply refuse "
+            "an implicit configured shard that differs from the current host"
         ),
     )
     parser.add_argument(

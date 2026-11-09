@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import socket
 import subprocess
 from pathlib import Path
 
@@ -837,3 +838,99 @@ def test_doctor_reports_a_named_host_row_plainly_from_an_unnamed_host(
     report = json_module.loads(capsys.readouterr().out)
     assert report["worktrees_image"].startswith("skipped:")
     assert [row["slot"] for row in report["active"]] == ["s1"]
+
+
+def _machine_project(tmp_path: Path, machine_line: str) -> Path:
+    root = tmp_path / "project"
+    (root / "worktrees" / "slots").mkdir(parents=True)
+    (root / "live.py").write_text("# probe\n", encoding="utf-8")
+    (root / ".wrkslots.yml").write_text(
+        "schema: 2\n"
+        f"{machine_line}"
+        "worktrees_dir: worktrees/slots\n"
+        "default_remote: origin\n"
+        "default_landed_ref: refs/remotes/origin/main\n"
+        "heartbeat_ttl_seconds: 60\n"
+        "liveness_command: live.py\n"
+        "layout: flat\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+def test_machine_absent_and_auto_resolve_to_the_short_host_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(socket, "gethostname", lambda: "testhost.example.com")
+    monkeypatch.delenv("WRKSLOTS_MACHINE", raising=False)
+    absent = cli._load_config(str(_machine_project(tmp_path / "a", "")), None)
+    assert absent.machine == "testhost"
+    assert absent.machine_source == "host name (machine absent)"
+    auto = cli._load_config(str(_machine_project(tmp_path / "b", "machine: auto\n")), None)
+    assert auto.machine == "testhost"
+    assert auto.machine_source == "host name (machine: auto)"
+
+
+def test_machine_explicit_and_overrides_still_win(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(socket, "gethostname", lambda: "testhost")
+    monkeypatch.delenv("WRKSLOTS_MACHINE", raising=False)
+    explicit = cli._load_config(
+        str(_machine_project(tmp_path / "a", "machine: node-a\n")), None
+    )
+    assert explicit.machine == "node-a"
+    assert explicit.machine_source == "configuration.machine"
+    monkeypatch.setenv("WRKSLOTS_MACHINE", "node-b")
+    env = cli._load_config(str(_machine_project(tmp_path / "b", "machine: auto\n")), None)
+    assert env.machine == "node-b"
+    assert env.machine_source == "WRKSLOTS_MACHINE"
+    override = cli._load_config(
+        str(_machine_project(tmp_path / "c", "machine: node-a\n")), "node-c"
+    )
+    assert override.machine == "node-c"
+    assert override.machine_source == "--machine"
+    # An override also beats an absent key, with no host-name lookup needed.
+    absent_override = cli._load_config(str(_machine_project(tmp_path / "d", "")), "node-d")
+    assert absent_override.machine == "node-d"
+
+
+def test_machine_source_never_breaks_the_mutation_coherence_reload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # _mutation_locks reloads the configuration passing the resolved
+    # machine back as an override and compares for equality; the
+    # diagnostics-only source must not read as "configuration changed".
+    monkeypatch.setattr(socket, "gethostname", lambda: "testhost")
+    monkeypatch.delenv("WRKSLOTS_MACHINE", raising=False)
+    for label, line in (("absent", ""), ("auto", "machine: auto\n"), ("explicit", "machine: testhost\n")):
+        config = cli._load_config(str(_machine_project(tmp_path / label, line)), None)
+        with cli._mutation_locks(config, 0.0):
+            pass
+
+
+def test_doctor_shows_the_host_name_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import argparse
+    import json as json_module
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "testhost")
+    monkeypatch.delenv("WRKSLOTS_MACHINE", raising=False)
+    root = _machine_project(tmp_path, "machine: auto\n")
+    config = cli._load_config(str(root), None)
+    cli._atomic_write_json(
+        cli._active_path(config),
+        cli._active_to_obj(cli.ActiveState(machine="testhost", revision=0, slots=())),
+    )
+    cli._atomic_write_json(
+        cli._archive_path(config),
+        cli._archive_to_obj(cli.ArchiveState(machine="testhost", revision=0, records=())),
+    )
+    args = argparse.Namespace(
+        project_root=str(root), machine=None, wait_lock=0.0,
+        all_machines=False, format="json",
+    )
+    assert cli._cmd_doctor(args) == 0
+    report = json_module.loads(capsys.readouterr().out)
+    assert report["machine"] == "testhost (host name (machine: auto))"

@@ -6,7 +6,7 @@ pub(crate) const TOP_DOCS: &[(&str, &str)] = &[
     ("schema", "Configuration schema version (2). Written by init; do not edit."),
     ("min_wrkslots_version", "Oldest wrkslots version (MAJOR.MINOR.PATCH) that may read this file. Raise it only when a key this file relies on for correctness is newer than some reader; an older reader then refuses, naming the version. Absent means any version that knows every key."),
     ("ignorable_keys", "Optional keys a wrkslots that does not know them may ignore, with a warning, instead of refusing the file. List a new key here when it only adds behaviour; a key that is not listed (a typo, for example) still refuses."),
-    ("machine", "Machine shard name: state files are ACTIVE.<machine>.json and EVENTS.<machine>. Defaults to the short host name at init; WRKSLOTS_MACHINE or --machine overrides it."),
+    ("machine", "Machine shard name: state files are ACTIVE.<machine>.json and EVENTS.<machine>. Init writes the short host name. Absent, or the literal auto, resolves to the short host name at load, so a tracked file can be shared by every host; WRKSLOTS_MACHINE or --machine still overrides any of these."),
     ("worktrees_dir", "Where slot directories live, relative to the project root. It says where live state is: never change it while slots exist."),
     ("layout", "nested (default when absent): <worktrees_dir>/<slot>/<repo>/. flat: each slot directory is its single checkout."),
     ("default_remote", "Remote whose landed ref decides whether published work is safe; `create --remote` overrides it per checkout."),
