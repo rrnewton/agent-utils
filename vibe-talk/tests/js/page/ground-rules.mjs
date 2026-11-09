@@ -38,7 +38,7 @@ test("`#624 voice-page-modularity`: every page here runs the scripts the shell l
   assert.throws(() => shellScripts("<script>inline();</script>"), /names no local file/);
   assert.throws(() => shellScripts('<script src="//elsewhere.example/a.js"></script>'), /names no local file/);
   // A needle that occurs twice is refused unless the control says it means the first of two.
-  assert.throws(() => brokenScript("  if (chosen) uiState.remember(chosen);", ""), /different number of times/);
+  assert.throws(() => brokenScript("if (typeof window.ResizeObserver === \"function\") {", ""), /different number of times/);
 });
 
 test("every number this page is tuned by stays inside a band that says what would be wrong", () => {

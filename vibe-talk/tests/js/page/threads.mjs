@@ -2237,7 +2237,7 @@ test("`#281 view-keys` x `#277 reply-in-column`: Ctrl+1 to Ctrl+3 in a reply ope
   assert.ok(page.el("side-column").getClientRects().length > 0, "the thread list is not on screen after Cancel");
 
   // THE CONTROL: the view keys leaving the reply to two columns' going, which hands it to the reply screen.
-  const { page: control } = await replyColumnsPage(brokenScript('  if (replyState.docked && which !== "columns") closeReply();\n', ""));
+  const { page: control } = await replyColumnsPage(await brokenModule([{ file: "src/view/channel/twocolumns.ts", find: "    if (deps.replyState().docked && which !== \"columns\") deps.closeReply();\n", replace: "" }]));
   await replyButton(rowWithId(control, "200")).click();
   await control.el("reply-text").setValue("left words");
   await press(control, control.el("reply-text"), "2", { ctrlKey: true });

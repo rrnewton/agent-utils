@@ -2018,3 +2018,62 @@ test("`#624 voice-page-modularity`: entering a thread lands on its first unread 
   rows.push(read);
   assert.equal(entry.landOnFirstUnread(), false, "a thread with nothing unread was landed somewhere");
 });
+
+test("`#624 voice-page-modularity`: the layout button says back to the thread list out of two columns chosen from it, and a narrow window is told so", () => {
+  const { createTwoColumns } = CHANNEL_VIEW;
+  const log = [];
+  const button = { hidden: false, title: "", attrs: {}, setAttribute(k, v) { this.attrs[k] = v; }, getClientRects: () => [{}] };
+  const shown = { columns: false, threadList: false, layout: () => "one", noteFit: () => false, takeListCards: () => null, takeLeftColumn: () => null, sideUp: () => false, setColumns() {}, setThreadList() {}, askOneColumn() {}, takeOneColumn: () => null, whileRestoring() {}, holdListCards() {}, holdLeftColumn() {}, holdListPlace() {} };
+  const choice = { picked: "two", chosen: () => choice.picked, beforeColumns: () => "list", choose: (l) => { choice.picked = l; log.push(`choose:${l}`); }, noteListBefore() {}, listBefore: () => ({ layout: "one" }), restoreBeforeColumns() {} };
+  const owner = createTwoColumns({
+    el: () => button, leftEl: () => button,
+    layoutChoice: choice, layoutShown: shown,
+    mainColumn: () => ({ name: "main" }), sideColumn: () => ({ name: "side", mode: "list" }),
+    activeColumn: () => ({ name: "main" }), columnSide: () => false,
+    useColumn: () => {}, inColumn: (_c, act) => act(),
+    screen: () => "main", view: () => "discord", threading: () => true,
+    selectedChannelId: () => "C1",
+    selection: () => ({ view: "main", threadId: null, thread: null, origin: null }),
+    channelCanon: () => ({ channel: "C1", scope: null, threads: [] }),
+    settleFocus: () => log.push("focus"), setStatus: (t) => log.push(t),
+    noteDeepLinkReaderMove: () => {}, guardQuietly: (fn) => fn,
+    renderThreadSelect: () => {}, scheduleColumnLinks: () => {}, scheduleBackSync: () => {},
+    cardAnchor: () => null, renderSideCards: () => {},
+    readerPlace: () => ({ pinned: true, seen: [] }), keepReaderPlace: () => true,
+    changeChannelView: () => {}, viewOnScreen: () => null,
+    rememberView: () => {}, settleUiState: () => {}, saveUiState: () => {},
+    configApplied: () => true, hydrateChannelScope: () => {}, restoreChannelComposer: () => {},
+    selectSideThread: () => {}, showSideList: () => log.push("cards"),
+    renderSearchInAll: () => {}, refreshSearchCount: () => {},
+    closeReply: () => {}, replyState: () => ({ docked: false, target: null, pending: null, focusTaken: false }),
+    nodeWithin: () => false, focusLost: () => false,
+    endSearchWalk: () => {}, endRepliesWalk: () => {},
+    dropReplyArrowTap: () => {}, putRepliesBack: () => {},
+    rememberChannelDraft: () => {}, rememberChannelContext: () => {},
+    reopenPendingReply: () => {}, renderMainToggle: () => {}, renderOrderToggle: () => {},
+    placeMainCard: () => {}, renderUnpackToggle: () => {}, renderRepliesSearch: () => {},
+    noteLinkedSelection: () => {}, closeOverscroll: () => {}, renderSideFreshness: () => {},
+    setTextIfChanged: () => {}, nameSideRegion: () => {},
+    paintThreadCard: () => {}, replyTally: () => null,
+    knownThreadChoice: () => null, openThreadChoice: () => null,
+    threadName: () => "thread", threadStillKnown: () => false,
+    defaultChannelView: () => "main",
+    openingChannelView: () => ({ view: "main", thread: null, summary: null, origin: null }),
+    followIfPinned: () => {}, scrollToNewest: () => {},
+    pinsView: () => ({ only: false }),
+    leaveThreadList: () => {},
+    catchUpHeldView: () => false, readFilterKeeps: () => () => true,
+    settleAfterRead: () => {}, timelineRows: () => ({ messages: [] }),
+    hiddenEmpty: () => false, hidingRead: () => false,
+    channelReadPosition: () => ({}), syncUnreadReplies: () => {},
+    placeCardAnchor: () => true, cardsPlacedUnderLists: () => {},
+    sameCardPlace: () => false, liveFollowersMain: () => false,
+    transcriptPlacePostCard: () => {}, transcriptCardShown: () => false,
+    reopenedViewsIncludes: () => false, channelOnScreen: () => true,
+  });
+  owner.renderColumnToggle();
+  assert.equal(button.attrs["aria-pressed"], "true", "two columns chosen from the list was not pressed on the button");
+  assert.equal(button.title, "Back to the thread list");
+  assert.equal(owner.columnsOffered(), true);
+  assert.equal(owner.COLUMNS_TOO_NARROW, "Two columns need a wider window; they come back when it is wider.");
+});

@@ -4944,9 +4944,9 @@ test("`#314 reply-focus-flake`: a window narrowed under a reply open in a column
 
   // THE CONTROLS: the hand-off deciding from where the focus is alone, as it did; and the browser's taking
   // never forgotten. The walk above sees each.
-  const { page: control } = await replyColumnsPage(brokenScript(
-    "(nodeWithin(el(\"reply-compose\"), document.activeElement) || (replyState.focusTaken && focusLost()))",
-    "nodeWithin(el(\"reply-compose\"), document.activeElement)"));
+  const { page: control } = await replyColumnsPage(await brokenModule([{ file: "src/view/channel/twocolumns.ts",
+    find: "(deps.nodeWithin(deps.el(\"reply-compose\"), document.activeElement) || (deps.replyState().focusTaken && deps.focusLost()))",
+    replace: "deps.nodeWithin(deps.el(\"reply-compose\"), document.activeElement)" }]));
   await replyTypedInColumn(control, "right", REPLY_COLUMNS_ROWS[1][1]);
   await narrowedUnderSlowFrame(control, "right");
   assert.ok(replyInStream(control));

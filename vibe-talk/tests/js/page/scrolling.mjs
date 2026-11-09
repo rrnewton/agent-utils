@@ -3597,10 +3597,9 @@ test("`#281 view-keys` x `#280 scroll-stability`: Ctrl+1 to Ctrl+4 show each vie
   // column's dock-growth keeper takes it the rest of the way (the next test), so what the placement after
   // the picker spares is the list drawn off its foot and then moved. (From All the left column goes to Main
   // behind the list first, which draws the picker before the cards are placed.)
-  const placedEarly = await run(brokenScript(
-    "  } else {\n    // Where the card the list's place was on has gone since, the place two columns had.\n" +
-    "    placeCardAnchor(place, true);\n  }\n",
-    "  }\n"));
+  const placedEarly = await run(await brokenModule([{ file: "src/view/channel/twocolumns.ts",
+    find: "    } else {\n      // Where the card the list's place was on has gone since, the place two columns had.\n      deps.placeCardAnchor(place, true);\n    }\n",
+    replace: "    }\n" }]));
   assert.deepStrictEqual(placedEarly, { ...real, listFoot: false });
   // The right column's reader kept on its foot in two columns only: a card growing under a reader at the
   // foot of the thread list leaves them above it.
