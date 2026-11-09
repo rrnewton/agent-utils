@@ -2265,6 +2265,51 @@ pub fn bring_down_agent_at(
     })
 }
 
+/// Queued and quarantined message sequence numbers for one worker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TuiInboxResult {
+    /// Agent name.
+    pub name: String,
+    /// Pending sequence numbers in order.
+    pub pending: Vec<i64>,
+    /// Quarantined sequence numbers in order.
+    pub quarantined: Vec<i64>,
+    /// Failed-messages directory (display string).
+    pub failed_dir: String,
+}
+
+fn message_seqs(dir: &Path) -> Result<Vec<i64>, ForeignOwnershipError> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(io_error("list messages", dir, &error)),
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    paths.sort();
+    paths
+        .iter()
+        .map(|path| Message::from_path(path).map(|message| message.seq))
+        .collect()
+}
+
+/// Inspect queued and quarantined message sequence numbers without delivery.
+pub fn tui_inbox_snapshot_at(
+    base: &Path,
+    name: &str,
+) -> Result<TuiInboxResult, ForeignOwnershipError> {
+    let name = super::registry::require_valid_name(name)?;
+    Ok(TuiInboxResult {
+        name: name.to_string(),
+        pending: message_seqs(&inbox_dir_at(base, name)?)?,
+        quarantined: message_seqs(&failed_dir_at(base, name)?)?,
+        failed_dir: failed_dir_at(base, name)?.display().to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -123,3 +123,65 @@ options:
 /// Usage line(s) of `herdr-subagents down --help`.
 pub const DOWN_USAGE: &str =
     r##"usage: herdr-subagents down [-h] [--grace GRACE] [--all-dead] [--force] [name]"##;
+
+/// Verbatim `herdr-subagents turn --help` help.
+pub const TURN_HELP: &str = r##"usage: herdr-subagents turn [-h] [--message-file MESSAGE_FILE] [--cwd CWD]
+                            [--model MODEL] [--fresh] [--effort EFFORT]
+                            [--harness {codex,agy,muse}]
+                            [--backend {tmux,herdr}] [--mode MODE]
+                            [--timeout TIMEOUT] [--tail TAIL] [--quiet]
+                            name [message]
+
+Run one subagent turn to completion
+
+positional arguments:
+  name
+  message
+
+options:
+  -h, --help            show this help message and exit
+  --message-file MESSAGE_FILE
+  --cwd CWD             required only when creating the agent
+  --model MODEL
+  --fresh               clear the agent's session first: a NEW TASK gets clean
+                        context. Costs nothing (every turn re-invokes codex
+                        anyway) and avoids carrying an unrelated task's
+                        context into this one.
+  --effort EFFORT       per-turn reasoning effort; omitted uses
+                        SUBAGENT_EFFORT or the harness default
+  --harness {codex,agy,muse}
+  --backend {tmux,herdr}
+  --mode MODE           headless (default for this path) or tui
+  --timeout TIMEOUT
+  --tail TAIL           lines replayed when --quiet
+  --quiet               suppress live streaming; replay a tail at the end
+"##;
+
+/// Usage line(s) of `herdr-subagents turn --help`.
+pub const TURN_USAGE: &str = r##"usage: herdr-subagents turn [-h] [--message-file MESSAGE_FILE] [--cwd CWD]
+                            [--model MODEL] [--fresh] [--effort EFFORT]
+                            [--harness {codex,agy,muse}]
+                            [--backend {tmux,herdr}] [--mode MODE]
+                            [--timeout TIMEOUT] [--tail TAIL] [--quiet]
+                            name [message]"##;
+
+/// Verbatim `herdr-subagents inbox --help` help.
+pub const INBOX_HELP: &str = r##"usage: herdr-subagents inbox [-h] [--inspect | --drain] [--clear-composer]
+                             name
+
+Inspect or drain a TUI subagent inbox.
+
+positional arguments:
+  name
+
+options:
+  -h, --help        show this help message and exit
+  --inspect         show pending and quarantined sequence numbers
+  --drain           retry pending messages and skip poison entries
+  --clear-composer  discard the visible TUI draft before draining; use only
+                    for known stuck delivery
+"##;
+
+/// Usage line(s) of `herdr-subagents inbox --help`.
+pub const INBOX_USAGE: &str = r##"usage: herdr-subagents inbox [-h] [--inspect | --drain] [--clear-composer]
+                             name"##;

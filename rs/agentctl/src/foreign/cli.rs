@@ -6,7 +6,7 @@
 //! something else.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::daemon::run_runner_default;
 use super::help_texts::*;
@@ -19,7 +19,7 @@ const COMMANDS: [&str; 12] = [
     "keeper", "mcp",
 ];
 
-const NOT_PORTED: [&str; 5] = ["up", "inbox", "migrate", "turn", "keeper"];
+const NOT_PORTED: [&str; 3] = ["up", "migrate", "keeper"];
 
 fn argparse_error(usage: &str, prog: &str, message: &str) -> i32 {
     eprintln!("{usage}\n{prog}: error: {message}");
@@ -545,6 +545,333 @@ fn down_command(args: &[String]) -> i32 {
     }
 }
 
+fn wait_for_sentinel(
+    transcript: &Path,
+    seq: i64,
+    timeout: std::time::Duration,
+    stream: bool,
+    start_offset: u64,
+) -> Option<String> {
+    use std::io::Seek as _;
+    let needle = format!("===TURN-DONE {seq} rc=");
+    let deadline = std::time::Instant::now() + timeout;
+    let mut offset = start_offset;
+    let mut pending = String::new();
+    while std::time::Instant::now() < deadline {
+        if transcript.exists() {
+            if let Ok(mut file) = std::fs::File::open(transcript) {
+                if file.seek(std::io::SeekFrom::Start(offset)).is_ok() {
+                    let mut chunk = String::new();
+                    if std::io::Read::read_to_string(&mut file, &mut chunk).unwrap_or(0) > 0 {
+                        offset += chunk.len() as u64;
+                        if stream {
+                            print!("{chunk}");
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                        }
+                        pending.push_str(&chunk);
+                        if let Some(index) = pending.find(&needle) {
+                            let rest = &pending[index + needle.len()..];
+                            let rc: String = rest
+                                .chars()
+                                .take_while(|ch| !ch.is_whitespace() && *ch != '=')
+                                .collect();
+                            if !rc.is_empty() {
+                                return Some(rc);
+                            }
+                        }
+                        if pending.len() > 65536 {
+                            pending = tail_chars(&pending, 4096);
+                        }
+                    }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    None
+}
+
+fn tail_chars(text: &str, limit: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= limit {
+        return text.to_string();
+    }
+    chars[chars.len() - limit..].iter().collect()
+}
+
+fn inbox_command(args: &[String]) -> i32 {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print!("{INBOX_HELP}");
+        return 0;
+    }
+    let parsed = match parse(
+        args,
+        &[],
+        &["--inspect", "--drain", "--clear-composer"],
+        INBOX_USAGE,
+        "herdr-subagents inbox",
+    ) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
+    if parsed.has("--inspect") && parsed.has("--drain") {
+        return argparse_error(
+            INBOX_USAGE,
+            "herdr-subagents inbox",
+            "argument --drain: not allowed with argument --inspect",
+        );
+    }
+    if parsed.has("--clear-composer") && !parsed.has("--drain") {
+        return argparse_error(
+            INBOX_USAGE,
+            "herdr-subagents inbox",
+            "--clear-composer requires --drain",
+        );
+    }
+    if parsed.positionals.len() != 1 {
+        return argparse_error(
+            INBOX_USAGE,
+            "herdr-subagents inbox",
+            "the following arguments are required: name",
+        );
+    }
+    if parsed.has("--drain") {
+        eprintln!("herdr-subagents: the Rust edition has not ported 'inbox --drain' yet");
+        return 2;
+    }
+    match super::lifecycle::tui_inbox_snapshot_at(&foreign_base(), &parsed.positionals[0]) {
+        Ok(result) => {
+            let show = |seqs: &[i64]| {
+                if seqs.is_empty() {
+                    "none".to_string()
+                } else {
+                    format!(
+                        "[{}]",
+                        seqs.iter()
+                            .map(i64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            };
+            println!("agent: {}", result.name);
+            println!("pending: {}", show(&result.pending));
+            println!("quarantined: {}", show(&result.quarantined));
+            println!("failed messages: {}", result.failed_dir);
+            0
+        }
+        Err(error) => operation_die(&error),
+    }
+}
+
+fn turn_command(args: &[String]) -> i32 {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print!("{TURN_HELP}");
+        return 0;
+    }
+    let parsed = match parse(
+        args,
+        &[
+            "--message-file",
+            "--cwd",
+            "--model",
+            "--effort",
+            "--harness",
+            "--backend",
+            "--mode",
+            "--timeout",
+            "--tail",
+        ],
+        &["--fresh", "--quiet"],
+        TURN_USAGE,
+        "herdr-subagents turn",
+    ) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
+    if parsed.positionals.is_empty() || parsed.positionals.len() > 2 {
+        return argparse_error(
+            TURN_USAGE,
+            "herdr-subagents turn",
+            "the following arguments are required: name",
+        );
+    }
+    for (name, choices) in [
+        ("--harness", &["codex", "agy", "muse"][..]),
+        ("--backend", &["tmux", "herdr"][..]),
+    ] {
+        if let Some(value) = parsed.get(name) {
+            if !choices.contains(&value) {
+                return argparse_error(
+                    TURN_USAGE,
+                    "herdr-subagents turn",
+                    &format!(
+                        "argument {name}: invalid choice: '{value}' (choose from {})",
+                        choices
+                            .iter()
+                            .map(|choice| format!("'{choice}'"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+            }
+        }
+    }
+    let timeout: f64 = match parsed.get("--timeout") {
+        None => 3600.0,
+        Some(raw) => match raw.parse() {
+            Ok(value) => value,
+            Err(_) => {
+                return argparse_error(
+                    TURN_USAGE,
+                    "herdr-subagents turn",
+                    &format!("argument --timeout: invalid float value: '{raw}'"),
+                )
+            }
+        },
+    };
+    let tail: i64 = match parsed.get("--tail") {
+        None => 80,
+        Some(raw) => match raw.parse() {
+            Ok(value) => value,
+            Err(_) => {
+                return argparse_error(
+                    TURN_USAGE,
+                    "herdr-subagents turn",
+                    &format!("argument --tail: invalid int value: '{raw}'"),
+                )
+            }
+        },
+    };
+    let name = parsed.positionals[0].clone();
+    let message = if let Some(file) = parsed.get("--message-file") {
+        match std::fs::read_to_string(file) {
+            Ok(text) => text,
+            Err(_) => {
+                eprintln!("error: --message-file not found: {file}");
+                return 1;
+            }
+        }
+    } else if let Some(text) = parsed.positionals.get(1) {
+        text.clone()
+    } else {
+        let mut data = String::new();
+        let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut data);
+        if data.trim().is_empty() {
+            eprintln!("no message: pass text, --message-file, or stdin");
+            return 1;
+        }
+        data
+    };
+    let base = foreign_base();
+    let proc_root = Path::new("/proc");
+    let record_for = |base: &Path, name: &str| {
+        super::registry::read_registry_at(base)
+            .ok()
+            .and_then(|agents| agents.get(name).cloned())
+    };
+    let pre = record_for(&base, &name);
+    let mut start_offset = 0_u64;
+    if pre.is_some() {
+        if let Ok(path) = super::lifecycle::transcript_path_at(&base, &name) {
+            start_offset = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        }
+    }
+    if parsed.has("--fresh") && record_for(&base, &name).is_some() {
+        match super::lifecycle::reset_agent_context_at(&base, &name) {
+            Ok(res) => {
+                let prior = if res.previous_session_id.is_some() {
+                    "cleared"
+                } else {
+                    "already empty"
+                };
+                println!("[agent_turn] fresh context for {name} ({prior})");
+            }
+            Err(error) => {
+                println!(
+                    "[agent_turn] WARNING: could not reset {name} ({}); fresh-context turn was not submitted",
+                    error.message
+                );
+                return 4;
+            }
+        }
+    }
+    if let Some(effort) = parsed.get("--effort") {
+        std::env::set_var("SUBAGENT_EFFORT", effort);
+    }
+    if record_for(&base, &name).is_none() {
+        if parsed.get("--cwd").is_none() {
+            eprintln!("agent '{name}' does not exist; pass --cwd to create it");
+            return 1;
+        }
+        println!(
+            "[agent_turn] FAILED to prepare {name}: creating an agent is not yet in this edition"
+        );
+        return 4;
+    }
+    // Heal the view best-effort: a gone window degrades the view, never the turn.
+    if let Ok(snapshot) = super::lifecycle::status_snapshot_at(&base, proc_root, Some(&name), true)
+    {
+        if snapshot.agents.iter().any(|agent| !agent.window_alive) {
+            println!("[agent_turn] window for {name} is gone — recreating tab/tailer");
+            println!(
+                "[agent_turn] WARNING: could not recreate window: presentation recreation is not yet in this edition"
+            );
+        }
+    }
+    let sent = match super::lifecycle::send_message_to_agent_at(
+        &base,
+        proc_root,
+        &name,
+        &message,
+        parsed.get("--model"),
+    ) {
+        Ok(sent) => sent,
+        Err(error) => {
+            println!("[agent_turn] FAILED to send to {name}: {}", error.message);
+            return 4;
+        }
+    };
+    if !sent.quarantined.is_empty() {
+        println!(
+            "[agent_turn] WARNING: {} earlier message(s) quarantined",
+            sent.quarantined.len()
+        );
+    }
+    let transcript = PathBuf::from(&sent.transcript);
+    println!(
+        "[agent_turn] {name} seq={} transcript={}",
+        sent.seq, sent.transcript
+    );
+    let rc = wait_for_sentinel(
+        &transcript,
+        sent.seq,
+        std::time::Duration::try_from_secs_f64(timeout.max(0.0)).unwrap_or_default(),
+        !parsed.has("--quiet"),
+        start_offset,
+    );
+    let Some(rc) = rc else {
+        println!(
+            "[agent_turn] TIMEOUT after {timeout}s waiting for TURN-DONE {}",
+            sent.seq
+        );
+        return 3;
+    };
+    println!("[agent_turn] TURN-DONE seq={} rc={rc}", sent.seq);
+    if parsed.has("--quiet") && tail > 0 {
+        if let Ok(text) = std::fs::read_to_string(&transcript) {
+            let lines: Vec<&str> = text.lines().collect();
+            let selected = &lines[lines.len().saturating_sub(tail as usize)..];
+            println!("{}", selected.join("\n"));
+        }
+    }
+    if rc == "0" {
+        0
+    } else {
+        2
+    }
+}
+
 fn reset_command(args: &[String]) -> i32 {
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         print!("{RESET_HELP}");
@@ -622,6 +949,8 @@ pub fn main(arguments: &[String]) -> i32 {
         "reset" => reset_command(rest),
         "status" => status_command(rest),
         "down" => down_command(rest),
+        "turn" => turn_command(rest),
+        "inbox" => inbox_command(rest),
         "mcp" => {
             eprintln!("herdr-subagents: the Rust edition has not ported 'mcp' yet");
             2
