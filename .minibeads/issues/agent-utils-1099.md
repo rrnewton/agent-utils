@@ -1,10 +1,10 @@
 ---
 title: 'claude-stranded-false-lost: a stranded paste Claude Code took is reported lost and set aside as possibly submitted'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 created_at: 2026-11-08T23:40:00.000000000+00:00
-updated_at: 2026-11-08T23:40:00.000000000+00:00
+updated_at: 2026-11-09T00:30:00.000000000+00:00
 ---
 
 # Description
@@ -30,3 +30,14 @@ Before declaring a stranded paste lost on a Claude Code pane, look for the promp
 # Notes
 
 Filed by cl-staged for the devbig030 coordinator.
+
+## Resolution
+
+The example's transcript (read for structure only) shows what happened. The prompt was queued at 20:37:28Z, typed by the drain, and stranded at 20:40:43Z, its paste not seen within the 10 s in-lock window. Claude Code wrote `queue-operation` `enqueue` with the prompt's exact text at 20:41:45Z, about a minute after the paste. Half a second later it wrote `remove` with reason `absorbed_mid_turn`, and attached the prompt to the running turn as a `queued_command`. It never drew the prompt as a user turn, so no screen check could see it. The paste was declared lost at 20:45:22Z and quarantined at 20:46:23Z. The session had begun in another slot, so its transcript sat in a different project directory from the agent's current working directory.
+
+Fix: on a stranded retry for a Claude Code record, before the screen checks, `claude_transcript_took` reads the pinned session's transcript. It is found by the record's conversation id, in any project directory (`harness::claude` `transcript_path`), and read at most 8 MB from its end. `transcript_took_prompt` looks for a `queue-operation` `enqueue`, a `queued_command` attachment, or a `user` entry whose text, whitespace collapsed, is the prompt, written no earlier than 60 s before `stranded_at`. A match is recorded as delivered (queued) with no key and no retyping. Otherwise the screen checks and the lost-paste window decide as before.
+
+Tests:
+- Each entry shape proves the prompt was taken. An older identical entry, a prefix, a tool result, a bare `remove`, or an assistant echo does not.
+- End to end through the drain, a stranded prompt is recorded delivered and never typed again once the pinned transcript shows it.
+- The same text in another session's transcript, in the same project directory, does not count, nor does an entry of this session from before the strand. Such a prompt stays stranded.

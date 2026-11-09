@@ -2963,6 +2963,50 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
         }
     }
 
+    /// How the pinned Claude Code session's transcript shows that it took `text`, a prompt an
+    /// earlier pass pasted and left stranded, or `None` (#1099 claude-stranded-false-lost).
+    ///
+    /// Only entries written since the strand began, less [`CLAUDE_STRANDED_SLACK`] for the paste
+    /// that preceded it, count. The transcript is found by the record's conversation id, in any
+    /// project directory, since the session may have begun in another working directory.
+    fn claude_transcript_took(
+        &self,
+        text: &str,
+        runtime: &dyn agent::AgentRuntime,
+    ) -> Option<&'static str> {
+        let since = runtime.stranded_since()? - CLAUDE_STRANDED_SLACK.as_secs_f64();
+        let session = self
+            .record
+            .effective_native_session()
+            .map(|native| native.value)
+            .or_else(|| self.record.session_value.clone())?;
+        #[cfg(test)]
+        let test_home = TEST_HARNESS_HOME.with(|home| home.borrow().clone());
+        #[cfg(not(test))]
+        let test_home: Option<PathBuf> = None;
+        // The harness process's environment may name its own config directory; a test's home
+        // stands alone.
+        let proc: Option<&dyn crate::work_state::ProcView> = if test_home.is_some() {
+            None
+        } else {
+            Some(&crate::work_state::LinuxProc)
+        };
+        let home = test_home.or_else(crate::harness::home);
+        let cwd = Path::new(&self.record.cwd);
+        let hints = crate::harness::transcript::Hints {
+            session: Some(&session),
+            cwd: Some(cwd),
+            home: home.as_deref(),
+            pid: self
+                .record
+                .harness_anchor()
+                .and_then(|anchor| u32::try_from(anchor.pid).ok()),
+            proc,
+        };
+        let path = crate::harness::adapter("claude")?.transcript_path(&hints)?;
+        crate::harness::claude::transcript_took_prompt(&path, text, since)
+    }
+
     /// After a paste that never showed as the whole Muse editor, and before any Enter, take what
     /// it left in the editor back out, so the prompt is not stranded there unsubmitted (#505
     /// agentctl-muse-followup). The editor was proved empty right before the paste, so whatever
@@ -3830,6 +3874,10 @@ const DRAFT_SUBMIT_TIMEOUT: Duration = Duration::from_secs(15);
 const MUSE_STEER_SETTLE: Duration = Duration::from_secs(3);
 /// Most presses of Enter for a prompt typed into an idle Muse that stays the whole editor.
 const MUSE_IDLE_PRESSES: u32 = 4;
+/// How long before a prompt was stranded its paste may have been typed and taken: the in-lock
+/// stage window, with room for clock skew between agentctl and the harness's transcript (#1099
+/// claude-stranded-false-lost).
+const CLAUDE_STRANDED_SLACK: Duration = Duration::from_secs(60);
 
 /// The refusal that strands a prompt whose paste a pinned Muse pane has not drawn (#1085
 /// muse-send-staged-unsubmitted), or `None` when `screen` shows the whole paste, other text, or
@@ -3856,6 +3904,13 @@ fn muse_input_stalled(pane_id: &str, screen: &str, text: &str, waited: &str) -> 
         crate::unknown_harness::STRANDED_PROMPT_KIND,
         crate::submission::INPUT_STALLED_KIND,
     ))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's home directory for finding a harness transcript, in place of the account's.
+    pub(crate) static TEST_HARNESS_HOME: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -5098,6 +5153,24 @@ impl<A: ManagedApi + ?Sized> WorkspaceClient<'_, A> {
             && !text.trim_start().starts_with('/')
         {
             return self.muse_stranded_retry(pane_id, text, runtime);
+        }
+        // A prompt an earlier pass pasted into a Claude Code pane and stranded may have been
+        // taken without ever showing on the screen: queued and absorbed into the running turn,
+        // or submitted and scrolled away. Claude Code's transcript says so, and that is
+        // delivery; otherwise the screen checks below decide as before (#1099
+        // claude-stranded-false-lost).
+        if runtime.stranded_retry() && self.record.harness == "claude" {
+            if let Some(evidence) = self.claude_transcript_took(text, runtime) {
+                return Ok(Submission::Verified(crate::submission::SubmissionReceipt {
+                    key: "Enter",
+                    key_presses: 0,
+                    elapsed: Duration::ZERO,
+                    evidence: format!("stranded prompt: {evidence}"),
+                    printed: true,
+                    settled: true,
+                    queued: true,
+                }));
+            }
         }
         // A queue drain that found the pane working passes a follow-up key; a Muse pane then
         // takes an ordinary prompt by steering its running turn (#505 agentctl-muse-followup).
@@ -15419,6 +15492,7 @@ pub(crate) mod tests {
                     fail_ready_once: AtomicBool::new(false),
                     fail_start_once: AtomicBool::new(false),
                     receipt: Mutex::new(None),
+                    stranded_refusal: Mutex::new(None),
                 },
                 root,
                 registry_name: "registry",
@@ -15925,6 +15999,9 @@ pub(crate) mod tests {
         /// The receipt a verified submission returns, as the composer path proves one; `None`
         /// leaves submissions unconfirmed.
         pub(crate) receipt: Mutex<Option<crate::submission::SubmissionReceipt>>,
+        /// When set, a guarded prompt is typed and then refused with this detail, as a paste the
+        /// composer never drew is stranded (#1099 claude-stranded-false-lost).
+        pub(crate) stranded_refusal: Mutex<Option<String>>,
     }
     /// How a read that [`Fake::hold_reads`] holds ends.
     #[derive(Clone)]
@@ -16415,6 +16492,9 @@ pub(crate) mod tests {
             _runtime: &dyn agent::AgentRuntime,
         ) -> crate::error::Result<Submission> {
             terminal.native_prompt(pane, text)?;
+            if let Some(detail) = self.stranded_refusal.lock().unwrap().clone() {
+                return Ok(Submission::NotStaged(detail));
+            }
             Ok(match self.receipt.lock().unwrap().clone() {
                 Some(receipt) => Submission::Verified(receipt),
                 None => Submission::Unconfirmed,
@@ -22429,6 +22509,8 @@ fi
         assert!(fixture.client.closed.lock().unwrap().is_empty());
     }
 
+    /// A stranded Claude Code prompt proved taken by its pinned session's transcript (#1099).
+    mod claude_stranded;
     /// The coordinator designation, created_by and managed_by edges, manage and the tree.
     mod control;
     /// Offline retirement of an exact adopted generation with no runtime mutation.

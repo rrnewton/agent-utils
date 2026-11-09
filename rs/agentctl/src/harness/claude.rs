@@ -555,6 +555,90 @@ pub fn project_transcripts(
     found
 }
 
+/// The most transcript bytes, from its end, that [`transcript_took_prompt`] reads: a stranded
+/// prompt is looked for minutes after it was typed, and a busy turn writes far less than this.
+const TOOK_PROMPT_TAIL: u64 = 8 * 1024 * 1024;
+
+/// How Claude Code's transcript at `path` shows that it took `prompt` at or after `since` (Unix
+/// seconds), or `None` when it does not (#1099 claude-stranded-false-lost).
+///
+/// A prompt pasted while a turn runs is queued (`queue-operation` `enqueue`) and then absorbed
+/// into the running turn as a `queued_command` attachment, never drawn as a user turn on the
+/// screen; one taken at an idle composer is a `user` entry with its text. Any of these, with the
+/// prompt's text (runs of whitespace collapsed), is the proof. Earlier entries do not count: an
+/// identical older prompt is not this one.
+pub(crate) fn transcript_took_prompt(
+    path: &std::path::Path,
+    prompt: &str,
+    since: f64,
+) -> Option<&'static str> {
+    use serde_json::Value;
+    use std::io::{Read, Seek, SeekFrom};
+    let collapse = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let wanted = collapse(prompt);
+    if wanted.is_empty() {
+        return None;
+    }
+    let mut file = std::fs::File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    let start = length.saturating_sub(TOOK_PROMPT_TAIL);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+    // A tail that starts mid-file starts mid-line: its first line is not a whole entry.
+    let lines = tail
+        .split(|byte| *byte == b'\n')
+        .skip(usize::from(start > 0));
+    let text_of = |value: &Value| -> Option<String> {
+        match value {
+            Value::String(text) => Some(text.clone()),
+            Value::Array(blocks) => {
+                let texts: Vec<&str> = blocks
+                    .iter()
+                    .filter(|block| block["type"] == "text")
+                    .filter_map(|block| block["text"].as_str())
+                    .collect();
+                (!texts.is_empty()).then(|| texts.join("\n"))
+            }
+            _ => None,
+        }
+    };
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        let at = entry["timestamp"]
+            .as_str()
+            .and_then(super::transcript::parse_utc);
+        if at.is_none_or(|at| at < since) {
+            continue;
+        }
+        let (shown, how) = match entry["type"].as_str() {
+            Some("queue-operation") if entry["operation"] == "enqueue" => (
+                text_of(&entry["content"]),
+                "Claude Code's transcript records the prompt queued (queue-operation enqueue)",
+            ),
+            Some("attachment") if entry["attachment"]["type"] == "queued_command" => (
+                text_of(&entry["attachment"]["prompt"]),
+                "Claude Code's transcript records the prompt absorbed into the running turn \
+                 (queued_command)",
+            ),
+            Some("user") => (
+                text_of(&entry["message"]["content"]),
+                "Claude Code's transcript records the prompt as a user turn",
+            ),
+            _ => continue,
+        };
+        if shown.is_some_and(|shown| collapse(&shown) == wanted) {
+            return Some(how);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::transcript::{Activity, Hints, ToolLimit};
@@ -569,6 +653,83 @@ mod tests {
         let mut activity = Activity::default();
         read_transcript(&all[..lines.min(all.len())], &mut activity);
         activity
+    }
+
+    #[test]
+    fn a_transcript_proves_a_prompt_taken_only_by_its_text_after_the_strand() {
+        // #1099 claude-stranded-false-lost; the entry shapes are those Claude Code wrote for a
+        // prompt pasted mid-turn: enqueued, removed as absorbed_mid_turn, and attached to the
+        // running turn as a queued_command.
+        let prompt = "[from lead via agentctl · reply: agentctl send lead]\nPlan and ETA first.";
+        let directory = std::env::temp_dir().join(format!(
+            "agentctl-claude-took-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("session.jsonl");
+        let write = |entries: &[serde_json::Value]| {
+            let lines: Vec<String> = entries.iter().map(|entry| entry.to_string()).collect();
+            std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        };
+        let at = "2026-11-08T20:41:45.972Z";
+        let since = super::super::transcript::parse_utc("2026-11-08T20:40:00Z").unwrap();
+        for (entry, how) in [
+            (
+                serde_json::json!({"type": "queue-operation", "operation": "enqueue",
+                                   "timestamp": at, "content": prompt}),
+                "queued",
+            ),
+            (
+                serde_json::json!({"type": "attachment", "timestamp": at,
+                                   "attachment": {"type": "queued_command", "prompt": prompt}}),
+                "absorbed",
+            ),
+            (
+                serde_json::json!({"type": "user", "timestamp": at,
+                                   "message": {"role": "user", "content": prompt.replace('\n', "\n\n  ")}}),
+                "user turn",
+            ),
+            (
+                serde_json::json!({"type": "user", "timestamp": at,
+                                   "message": {"role": "user", "content": [{"type": "text", "text": prompt}]}}),
+                "user turn",
+            ),
+        ] {
+            write(&[entry]);
+            let found = transcript_took_prompt(&path, prompt, since);
+            assert!(
+                found.is_some_and(|text| text.contains(how)),
+                "{how}: {found:?}"
+            );
+        }
+        for entry in [
+            // Before the strand: an identical older prompt is not this one.
+            serde_json::json!({"type": "queue-operation", "operation": "enqueue",
+                               "timestamp": "2026-11-08T20:39:59Z", "content": prompt}),
+            // Another prompt, a prefix of this one, or a tool result.
+            serde_json::json!({"type": "queue-operation", "operation": "enqueue",
+                               "timestamp": at, "content": "[from lead via agentctl · reply: agentctl send lead]"}),
+            serde_json::json!({"type": "user", "timestamp": at,
+                               "message": {"role": "user", "content": [{"type": "tool_result", "content": prompt}]}}),
+            // A removal alone, or an assistant echo, is not taking it.
+            serde_json::json!({"type": "queue-operation", "operation": "remove",
+                               "timestamp": at, "content": prompt}),
+            serde_json::json!({"type": "assistant", "timestamp": at,
+                               "message": {"role": "assistant", "content": [{"type": "text", "text": prompt}]}}),
+        ] {
+            write(std::slice::from_ref(&entry));
+            assert_eq!(
+                transcript_took_prompt(&path, prompt, since),
+                None,
+                "{entry}"
+            );
+        }
+        assert_eq!(
+            transcript_took_prompt(&directory.join("missing.jsonl"), prompt, since),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
