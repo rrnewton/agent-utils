@@ -2400,3 +2400,41 @@ test("`#624 voice-page-modularity`: showing a screen hides the others first, sho
     "renderColumns", "placePostCard", "renderJumpNewest", "scheduleBackSync"],
     "the screen already up: no focus settled again, nothing noted or put back");
 });
+
+test("`#624 voice-page-modularity`: the control bar shows each pack member only on its view, and the bar itself only while a member shows", () => {
+  const { createControlBar, PACK_VIEWS } = VIEW_SHELL;
+  assert.deepStrictEqual(PACK_VIEWS["discord-channel"], ["discord"]);
+  const els = new Map();
+  const el = (id) => {
+    if (!els.has(id)) els.set(id, { id, hidden: false, children: [] });
+    return els.get(id);
+  };
+  for (const id of ["view-switch", "action-menu-open", "reader-toggle", "autoplay-toggle", "open-settings", "search-toggle", "search-field", "search-count", "pinned-filter", "links-filter", "author-filter", "control-bar", "topbar", "close-settings", "topbar-title", "bar-pack", "prompts-open"]) el(id);
+  el("bar-pack").children = [el("discord-channel"), el("prompts-open")];
+  let view = "discord";
+  const log = [];
+  const bar = createControlBar({
+    el,
+    screen: () => "main",
+    view: () => view,
+    actionMenuOpen: () => false,
+    renderActionMenu: () => {},
+    screenHasTitle: () => false,
+    readAloudAgent: () => ({}),
+    columnsOffered: () => true,
+    promptsOpen: () => false,
+    setPromptsOpen: (open) => log.push(`prompts:${open}`),
+    setActionMenuOpen: (open) => log.push(`menu:${open}`),
+    searchOpen: () => false,
+    renderLinkKinds: () => {},
+    barWhere: () => "bottom",
+  });
+  bar.renderControlBar();
+  assert.equal(el("discord-channel").hidden, false, "a channel member was hidden on the channel view");
+  assert.equal(el("prompts-open").hidden, true, "a call member showed on the channel view");
+  assert.equal(el("control-bar").hidden, false, "the bar hid while a member showed");
+  view = "voice";
+  bar.renderControlBar();
+  assert.equal(el("discord-channel").hidden, true, "a channel member showed on the call view");
+  assert.equal(el("prompts-open").hidden, false, "a call member was hidden on the call view");
+});

@@ -1063,7 +1063,7 @@ test("EVERY MEMBER OF THE BAR SAYS WHICH VIEWS IT BELONGS ON, AND NONE IS LEFT T
   // The rule is a TABLE and this is what makes that claim true rather than a description of one
   // hardcoded comparison: a member added to the pack with no line in `PACK_VIEWS` is hidden
   // everywhere, and it fails here by name rather than quietly appearing on a view nobody chose.
-  const table = /const PACK_VIEWS = \{([\s\S]*?)\n\};/.exec(SCRIPT_CODE);
+  const table = /const PACK_VIEWS(?::[^=]+)? = \{([\s\S]*?)\n\};/.exec(PAGE_CODE);
   assert.ok(table, "web/voice.js no longer states which views the bar's members belong on");
   const listed = new Set([...table[1].matchAll(/"([\w-]+)":/g)].map((m) => m[1]));
   // The canned buttons are DERIVED from `CANNED_PROMPTS` rather than named here — that is the

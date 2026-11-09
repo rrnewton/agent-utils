@@ -19,6 +19,7 @@ declare const createWebPorts: LegacyImports["createWebPorts"];
 declare const createApplication: LegacyImports["createApplication"];
 declare const createKeyboardComposition: LegacyImports["createKeyboardComposition"];
 declare const SCREEN_TITLES: LegacyImports["SCREEN_TITLES"];
+declare const createControlBar: LegacyImports["createControlBar"];
 declare const createScreenShowing: LegacyImports["createScreenShowing"];
 declare const createPageNavigation: LegacyImports["createPageNavigation"];
 declare const childByClass: LegacyImports["childByClass"];
