@@ -709,6 +709,15 @@ pub struct Speculation {
 
 type JobResult = Result<(usize, Ran), String>;
 
+/// One flight a discard dropped, for the no-silent-drop record: its changes,
+/// the result it held when the wait for it finished (none when detached or
+/// the channel closed), and whether it was a culprit-search probe.
+struct DroppedFlight {
+    prs: Vec<i64>,
+    result: Option<JobResult>,
+    probe: bool,
+}
+
 /// A would-be root diverted to the stack (#1071): build on `tip` (the
 /// `parent_prs` batch) because `likely_prs` is likely to land first for
 /// `reason` at predicted pass `p_pass`.
@@ -2442,7 +2451,7 @@ impl<'a> Runner<'a> {
                         list(&prs)
                     ),
                 );
-                discard(flights, rx, pending);
+                self.discard(flights, rx, pending, "an accepted ruling lands first");
             }
             let note = format!(
                 "{} passes ({}) accepted by {}: {}; validated in run {} as v{}",
@@ -4833,10 +4842,12 @@ impl<'a> Runner<'a> {
         while !waiting.is_empty() {
             match rx.recv() {
                 Ok((id, result)) => {
-                    if !waiting.remove(&id) {
-                        if let Some(flight) = kept.iter_mut().find(|flight| flight.id == id) {
+                    if waiting.remove(&id) {
+                        if let Some(flight) = cancelled.iter_mut().find(|flight| flight.id == id) {
                             flight.result = Some(result);
                         }
+                    } else if let Some(flight) = kept.iter_mut().find(|flight| flight.id == id) {
+                        flight.result = Some(result);
                     }
                 }
                 Err(_) => break,
@@ -5058,6 +5069,218 @@ impl<'a> Runner<'a> {
                 ),
             );
         }
+    }
+
+    /// Record every flight a discard dropped: one event per flight and,
+    /// for a batch flight, one item history line per change, each naming
+    /// the discarded result. No validation is thrown away silently.
+    fn log_discarded(&self, dropped: &[DroppedFlight], why: &str) {
+        for flight in dropped {
+            let verdict = discarded_verdict(flight.result.as_ref());
+            self.event(
+                "flight-discarded",
+                &format!(
+                    "{} discarded ({why}); its {verdict} is thrown away",
+                    list(&flight.prs)
+                ),
+            );
+            if flight.probe {
+                continue;
+            }
+            let mut items = lock(&self.items);
+            for pr in &flight.prs {
+                if let Some(item) = items.get_mut(pr) {
+                    item.log(
+                        "flight-discarded",
+                        format!("discarded ({why}); its {verdict} is thrown away; requeued to be rebuilt"),
+                    );
+                    let _ = self.state.save_item(item);
+                }
+            }
+        }
+    }
+
+    /// [`discard`] with its drops recorded (see [`Self::log_discarded`]).
+    fn discard(
+        &self,
+        flights: &mut VecDeque<Flight>,
+        rx: &mpsc::Receiver<(u64, JobResult)>,
+        pending: &mut VecDeque<Vec<i64>>,
+        why: &str,
+    ) {
+        let dropped = discard(flights, rx, pending);
+        self.log_discarded(&dropped, why);
+    }
+
+    /// [`discard_detached`] with its drops recorded.
+    fn discard_detached(
+        &self,
+        flights: &mut VecDeque<Flight>,
+        pending: &mut VecDeque<Vec<i64>>,
+        why: &str,
+    ) {
+        let dropped = discard_detached(flights, pending);
+        self.log_discarded(&dropped, why);
+    }
+
+    /// [`cut_after`] with its drops recorded.
+    fn cut_after(
+        &self,
+        flights: &mut VecDeque<Flight>,
+        index: usize,
+        rx: &mpsc::Receiver<(u64, JobResult)>,
+        pending: &mut VecDeque<Vec<i64>>,
+        why: &str,
+    ) {
+        let dropped = cut_after(flights, index, rx, pending);
+        self.log_discarded(&dropped, why);
+    }
+
+    /// [`discard_descendants`] with its drops recorded.
+    fn discard_descendants(
+        &self,
+        flights: &mut VecDeque<Flight>,
+        rx: &mpsc::Receiver<(u64, JobResult)>,
+        pending: &mut VecDeque<Vec<i64>>,
+        ancestor: &Candidate,
+        why: &str,
+    ) {
+        let dropped = discard_descendants(flights, rx, pending, ancestor, &self.git);
+        self.log_discarded(&dropped, why);
+    }
+
+    /// Requeue the stale green rooted flight at `index` for a rebuild on
+    /// the current base, at once: disjoint by construction, its decision
+    /// waits on no other root. Only batches built on its candidate are
+    /// discarded with it.
+    fn requeue_stale_green_root(
+        &self,
+        flights: &mut VecDeque<Flight>,
+        rx: &mpsc::Receiver<(u64, JobResult)>,
+        pending: &mut VecDeque<Vec<i64>>,
+        index: usize,
+    ) {
+        let stale = flights.remove(index).expect("stale root flight");
+        let parent = stale.candidate.parent.clone();
+        {
+            let mut items = lock(&self.items);
+            for pr in &stale.candidate.prs {
+                if let Some(item) = items.get_mut(pr) {
+                    item.log(
+                        "green-stale-root",
+                        format!(
+                            "green at {} (the base it was built on); \
+                             requeued at the front to be rebuilt",
+                            short(&parent)
+                        ),
+                    );
+                    let _ = self.state.save_item(item);
+                }
+            }
+        }
+        self.event(
+            "stale-root-green",
+            &format!(
+                "{} was green at {} after the base moved; \
+                 requeued at the front to be rebuilt",
+                list(&stale.candidate.prs),
+                short(&parent)
+            ),
+        );
+        self.record_stale_green(&stale.candidate);
+        self.discard_descendants(
+            flights,
+            rx,
+            pending,
+            &stale.candidate,
+            "built on a stale green root",
+        );
+        pending.push_front(stale.candidate.prs.clone());
+    }
+
+    /// The next flight that may be decided now, preserving plan order
+    /// except across stale still-running disjoint roots (they cannot land
+    /// as built, so they block nothing disjoint from them). The front
+    /// flight keeps every existing decision path; a later flight is
+    /// eligible only as a plain green standing on the current base, with
+    /// no dependency still in flight or pending and no plan conflict
+    /// with the stale roots it skips.
+    fn next_decidable_index(
+        &self,
+        flights: &VecDeque<Flight>,
+        pending: &VecDeque<Vec<i64>>,
+    ) -> Option<usize> {
+        let base = lock(&self.base).clone();
+        for (index, flight) in flights.iter().enumerate() {
+            if flight.probe_for.is_some() {
+                if index == 0 {
+                    return flight.result.is_some().then_some(0);
+                }
+                continue;
+            }
+            if flight.red_work.is_some() {
+                return (index == 0 && flight.result.is_some()).then_some(0);
+            }
+            if flight.result.is_none() {
+                if flight.rooted && flight.candidate.parent != base {
+                    continue;
+                }
+                return None;
+            }
+            if index == 0 {
+                return Some(0);
+            }
+            let Some(Ok((_, ran))) = &flight.result else {
+                return None;
+            };
+            if !ran.green() || !ran.flaky_passes.is_empty() || !ran.infra_blocked.is_empty() {
+                return None;
+            }
+            if flight.candidate.parent != base {
+                return None;
+            }
+            let wanted: BTreeSet<i64> = {
+                let deps = lock(&self.deps).clone();
+                let mut wanted: BTreeSet<i64> = BTreeSet::new();
+                let mut queue: Vec<i64> = flight.candidate.prs.clone();
+                while let Some(pr) = queue.pop() {
+                    if let Some(beneath) = deps.get(&pr) {
+                        for dep in beneath {
+                            if wanted.insert(*dep) {
+                                queue.push(*dep);
+                            }
+                        }
+                    }
+                }
+                wanted
+            };
+            let own: BTreeSet<i64> = flight.candidate.prs.iter().copied().collect();
+            let dep_in_flight = flights.iter().enumerate().any(|(other_index, other)| {
+                other_index != index
+                    && other
+                        .candidate
+                        .prs
+                        .iter()
+                        .any(|pr| wanted.contains(pr) && !own.contains(pr))
+            });
+            let dep_pending = pending
+                .iter()
+                .flatten()
+                .any(|pr| wanted.contains(pr) && !own.contains(pr));
+            if dep_in_flight || dep_pending {
+                return None;
+            }
+            let ahead: Vec<i64> = flights
+                .iter()
+                .take(index)
+                .flat_map(|other| other.candidate.prs.iter().copied())
+                .collect();
+            if !ahead.is_empty() && !self.batch_disjoint(&flight.candidate.prs, &ahead) {
+                return None;
+            }
+            return Some(index);
+        }
+        None
     }
 
     /// Whether every change in `prs` is peripheral in the current plan.
@@ -7354,7 +7577,13 @@ impl<'a> Runner<'a> {
                                     .flat_map(|flight| flight.candidate.prs.iter().copied())
                                     .collect();
                                 flights[index].stacked = false;
-                                cut_after(&mut flights, index, &rx, pending);
+                                self.cut_after(
+                                    &mut flights,
+                                    index,
+                                    &rx,
+                                    pending,
+                                    "built on a red batch behind the head",
+                                );
                                 self.event(
                                     "red-behind-head",
                                     &format!(
@@ -7466,11 +7695,29 @@ impl<'a> Runner<'a> {
                             }
                         }
                     }
-                    // Land (or search) heads that have finished, in order.
-                    while flights
-                        .front()
-                        .is_some_and(|flight| flight.result.is_some())
-                    {
+                    // Land (or search) finished flights in order, except
+                    // across stale still-running disjoint roots: a stale
+                    // green root requeues on its own arrival, and a plain
+                    // green standing on the current base lands behind one
+                    // (see `next_decidable_index`).
+                    loop {
+                        if self.config.keep_stale_roots {
+                            let base = lock(&self.base).clone();
+                            if let Some(index) = flights.iter().position(|flight| {
+                                flight.rooted
+                                    && flight.candidate.parent != base
+                                    && flight.result.as_ref().is_some_and(|result| {
+                                        result.as_ref().is_ok_and(|(_, ran)| ran.green())
+                                    })
+                            }) {
+                                self.requeue_stale_green_root(&mut flights, &rx, pending, index);
+                                continue;
+                            }
+                        }
+                        let Some(selected_index) = self.next_decidable_index(&flights, pending)
+                        else {
+                            break;
+                        };
                         // A red head whose culprit-search probes are still out
                         // keeps its place and waits: the run goes on around it.
                         // When the last probe is back, the search resumes and
@@ -7527,68 +7774,31 @@ impl<'a> Runner<'a> {
                                 }
                             }
                         }
-                        if flights.front().is_some_and(|flight| {
-                            flight.rooted && !rooted_decidable(flight, &flights)
-                        }) {
+                        if selected_index == 0
+                            && flights.front().is_some_and(|flight| {
+                                flight.rooted && !rooted_decidable(flight, &flights)
+                            })
+                        {
                             break;
                         }
-                        if flights.front().is_some_and(|flight| flight.rooted) {
+                        if flights[selected_index].rooted {
                             // A rooted batch never lands on a base other
                             // than its parent.
                             let base = lock(&self.base).clone();
-                            if flights
-                                .front()
-                                .is_some_and(|flight| flight.candidate.parent != base)
-                            {
+                            if flights[selected_index].candidate.parent != base {
                                 if self.config.keep_stale_roots
-                                    && flights.front().is_some_and(|flight| {
-                                        flight.result.as_ref().is_some_and(|result| {
-                                            result.as_ref().is_ok_and(|(_, ran)| ran.green())
-                                        })
-                                    })
+                                    && flights[selected_index].result.as_ref().is_some_and(
+                                        |result| result.as_ref().is_ok_and(|(_, ran)| ran.green()),
+                                    )
                                 {
-                                    // A stale root that came back green
-                                    // cannot land as built: its changes go
-                                    // back to the FRONT of pending (ahead of
-                                    // never-validated ones) to be rebuilt
-                                    // on the current base, with the green
-                                    // result in their history. A red stale
-                                    // root falls through and is decided as
-                                    // usual (a red single change ejects).
-                                    let stale = flights.pop_front().expect("front flight");
-                                    let parent = stale.candidate.parent.clone();
-                                    {
-                                        let mut items = lock(&self.items);
-                                        for pr in &stale.candidate.prs {
-                                            if let Some(item) = items.get_mut(pr) {
-                                                item.log(
-                                                    "green-stale-root",
-                                                    format!(
-                                                        "green at {} (the base it was built on); \
-                                                         requeued at the front to be rebuilt",
-                                                        short(&parent)
-                                                    ),
-                                                );
-                                                let _ = self.state.save_item(item);
-                                            }
-                                        }
-                                    }
-                                    self.event(
-                                        "stale-root-green",
-                                        &format!(
-                                            "{} was green at {} after the base moved; \
-                                             requeued at the front to be rebuilt",
-                                            list(&stale.candidate.prs),
-                                            short(&parent)
-                                        ),
+                                    // A red stale root falls through and
+                                    // is decided as usual below.
+                                    self.requeue_stale_green_root(
+                                        &mut flights,
+                                        &rx,
+                                        pending,
+                                        selected_index,
                                     );
-                                    self.record_stale_green(&stale.candidate);
-                                    // Batches built on the stale candidate
-                                    // (a dependent stacked on it, say) cannot
-                                    // decide on it either: discard them back
-                                    // to pending, as for a discarded head.
-                                    discard(&mut flights, &rx, pending);
-                                    pending.push_front(stale.candidate.prs.clone());
                                     continue;
                                 }
                                 if !self.config.keep_stale_roots {
@@ -7603,15 +7813,17 @@ impl<'a> Runner<'a> {
                             }
                         }
                         let base_before = lock(&self.base).clone();
-                        let Some(mut head) = flights.pop_front() else {
+                        let Some(mut head) = flights.remove(selected_index) else {
                             break;
                         };
                         let head_prs = head.candidate.prs.clone();
                         // A refusal from behind the head, or one stored while later batches were
                         // cut (see `cut_after`), gets its retries here.
-                        if let Some((job, delay)) = self.refused_again(&mut head, true) {
+                        if let Some((job, delay)) =
+                            self.refused_again(&mut head, selected_index == 0)
+                        {
                             self.start_again(scope, &tx, &head, job, delay);
-                            flights.push_front(head);
+                            flights.insert(selected_index, head);
                             break;
                         }
                         // A batch whose donor job was cancelled as stale
@@ -7639,7 +7851,12 @@ impl<'a> Runner<'a> {
                         };
                         if stale_cancelled {
                             if head.stacked {
-                                discard(&mut flights, &rx, pending);
+                                self.discard(
+                                    &mut flights,
+                                    &rx,
+                                    pending,
+                                    "the head was cancelled as stale",
+                                );
                             }
                             self.event(
                                 "stale-cancelled",
@@ -7658,7 +7875,7 @@ impl<'a> Runner<'a> {
                         // and the run goes on.
                         if let Some(pr) = self.withdrawn_pr(&head.candidate.prs) {
                             if head.stacked {
-                                discard(&mut flights, &rx, pending);
+                                self.discard(&mut flights, &rx, pending, "the head was withdrawn");
                             }
                             let withdrawn_now = crate::intake::pending_withdrawals(self.state);
                             let rest: Vec<i64> = head
@@ -7737,7 +7954,7 @@ impl<'a> Runner<'a> {
                             outcome
                         } else if ran.refused() {
                             let detail = refusal_detail(&ran);
-                            discard(&mut flights, &rx, pending);
+                            self.discard(&mut flights, &rx, pending, "the head was refused");
                             let (retry_after, _) =
                                 self.defer_refusal(&head.candidate.prs, &detail)?;
                             deferred_this_run.extend(head.candidate.prs.iter().copied());
@@ -7758,7 +7975,7 @@ impl<'a> Runner<'a> {
                                 }
                                 None => crate::validate::NO_RECORDED_RESULT.to_owned(),
                             };
-                            discard(&mut flights, &rx, pending);
+                            self.discard(&mut flights, &rx, pending, "the head recorded no result");
                             let (retry_after, _) =
                                 self.defer_refusal(&head.candidate.prs, &detail)?;
                             deferred_this_run.extend(head.candidate.prs.iter().copied());
@@ -7771,7 +7988,12 @@ impl<'a> Runner<'a> {
                             // run and its rerun (INFRA-BLOCKED): no result, so neither
                             // land nor eject; hold for a ruling. Batches behind it were
                             // built on its tree.
-                            discard(&mut flights, &rx, pending);
+                            self.discard(
+                                &mut flights,
+                                &rx,
+                                pending,
+                                "the head is held INFRA-BLOCKED",
+                            );
                             let until = self.hold_for_ruling(
                                 &head.candidate,
                                 Hold::InfraBlocked,
@@ -7873,7 +8095,12 @@ impl<'a> Runner<'a> {
                             // never land on the plain pass. Batches behind it were
                             // built on its tree. The hold records the candidate, so
                             // an accepted ruling lands it without validating again.
-                            discard(&mut flights, &rx, pending);
+                            self.discard(
+                                &mut flights,
+                                &rx,
+                                pending,
+                                "the head is held GREEN_FLAKY",
+                            );
                             let claim = ValidationClaim::new(
                                 head.chosen.selection.clone(),
                                 head.chosen.policy.clone(),
@@ -7913,7 +8140,12 @@ impl<'a> Runner<'a> {
                             // in the batch failed its precheck: that explains the red. Those
                             // changes are ejected and the rest go back as one batch.
                             if head.stacked {
-                                discard(&mut flights, &rx, pending);
+                                self.discard(
+                                    &mut flights,
+                                    &rx,
+                                    pending,
+                                    "the head's red is explained by precheck culprits",
+                                );
                             }
                             self.eject_precheck_culprits(
                                 &head.candidate,
@@ -7936,7 +8168,7 @@ impl<'a> Runner<'a> {
                             // validation (confirmed before an ejection when confirmation is on).
                             // The window is not halved, so they validate side by side.
                             if head.stacked {
-                                discard(&mut flights, &rx, pending);
+                                self.discard(&mut flights, &rx, pending, "the red head is split");
                             }
                             self.split_red(&head.candidate, &ran, vid, pending);
                             BatchOutcome::Done
@@ -7946,7 +8178,12 @@ impl<'a> Runner<'a> {
                             // commit beside the run, which goes on. The window is not halved:
                             // nothing is known against the changes behind it.
                             if head.stacked {
-                                discard(&mut flights, &rx, pending);
+                                self.discard(
+                                    &mut flights,
+                                    &rx,
+                                    pending,
+                                    "the head is held as a suspect flake",
+                                );
                             }
                             self.hold_suspect(&head.candidate, &head.chosen, vid, &tests)?;
                             BatchOutcome::Done
@@ -7954,7 +8191,7 @@ impl<'a> Runner<'a> {
                             // Everything behind a red batch was built on its tree, unless it
                             // was cut out of the stack when its result came (see `cut_after`).
                             if head.stacked {
-                                discard(&mut flights, &rx, pending);
+                                self.discard(&mut flights, &rx, pending, "the head is red");
                             }
                             // Only a red whose every failure is a timeout or reached no verdict
                             // says the host may be overloaded, so only it halves the window. Any
@@ -8001,7 +8238,7 @@ impl<'a> Runner<'a> {
                                     "base-moved",
                                     &format!("rebuilding {} on the new base", list(&prs)),
                                 );
-                                discard(&mut flights, &rx, pending);
+                                self.discard(&mut flights, &rx, pending, "the head's base moved");
                                 pending.push_front(prs);
                             }
                             BatchOutcome::Stop(reason, prs) => {
@@ -8012,7 +8249,7 @@ impl<'a> Runner<'a> {
                                     .map(|flight| flight.candidate.prs.clone())
                                     .collect();
                                 self.log_stopped(&reason, &waiting);
-                                discard_detached(&mut flights, pending);
+                                self.discard_detached(&mut flights, pending, "the run stops");
                                 if !prs.is_empty() {
                                     pending.push_front(prs);
                                 }
@@ -8027,7 +8264,12 @@ impl<'a> Runner<'a> {
                                     self.drop_dependents(*pr, pending);
                                 }
                                 if head.stacked {
-                                    discard(&mut flights, &rx, pending);
+                                    self.discard(
+                                        &mut flights,
+                                        &rx,
+                                        pending,
+                                        "the head was ejected at landing",
+                                    );
                                 }
                             }
                             BatchOutcome::Deferred(reason, prs) => {
@@ -8075,7 +8317,12 @@ impl<'a> Runner<'a> {
                                 // rebuilt on the base.
                                 self.event("withdrawn", &reason);
                                 if head.stacked {
-                                    discard(&mut flights, &rx, pending);
+                                    self.discard(
+                                        &mut flights,
+                                        &rx,
+                                        pending,
+                                        "the head was withdrawn",
+                                    );
                                 }
                             }
                         }
@@ -8101,7 +8348,7 @@ impl<'a> Runner<'a> {
             })();
             if let Err(error) = &result {
                 self.log_stopped(error, &[]);
-                discard_detached(&mut flights, pending);
+                self.discard_detached(&mut flights, pending, "the run stops");
             }
             result
         })
@@ -9588,6 +9835,31 @@ fn kept_in_discard(flight: &Flight) -> bool {
     flight.rooted || flight.probe_for.is_some() || flight.red_work.is_some()
 }
 
+/// How a dropped flight's held result reads in the no-silent-drop record,
+/// in `validate_one`'s verdict precedence.
+fn discarded_verdict(result: Option<&JobResult>) -> String {
+    match result {
+        None => "no result yet".to_owned(),
+        Some(Err(error)) => format!("error result ({error})"),
+        Some(Ok((vid, ran))) => {
+            let verdict = if let Some(why) = &ran.interrupted {
+                format!("interrupted result ({why})")
+            } else if ran.cancelled {
+                "cancelled result".to_owned()
+            } else if ran.refused() {
+                "refused result".to_owned()
+            } else if !ran.infra_blocked.is_empty() {
+                "INFRA-BLOCKED result".to_owned()
+            } else if ran.green() {
+                "green result".to_owned()
+            } else {
+                "red result".to_owned()
+            };
+            format!("{verdict} (v{vid})")
+        }
+    }
+}
+
 /// Whether `result` is a red verdict: a validation that ran to its end and is not green, not
 /// refused, not held as INFRA-BLOCKED and not cancelled.
 fn plainly_red(result: Option<&JobResult>) -> bool {
@@ -9632,7 +9904,7 @@ fn cut_after(
     index: usize,
     rx: &mpsc::Receiver<(u64, JobResult)>,
     pending: &mut VecDeque<Vec<i64>>,
-) {
+) -> Vec<DroppedFlight> {
     let drained: Vec<Flight> = flights.drain(index + 1..).collect();
     // Disjoint roots among the drained are not built on the red batch: they stay.
     let mut cut: Vec<Flight> = Vec::new();
@@ -9656,25 +9928,36 @@ fn cut_after(
     while !waiting.is_empty() {
         match rx.recv() {
             Ok((id, result)) => {
-                if !waiting.remove(&id) {
-                    if let Some(kept) = flights
-                        .iter_mut()
-                        .chain(roots.iter_mut())
-                        .find(|flight| flight.id == id)
-                    {
-                        kept.result = Some(result);
+                if waiting.remove(&id) {
+                    if let Some(dropped) = cut.iter_mut().find(|flight| flight.id == id) {
+                        dropped.result = Some(result);
                     }
+                } else if let Some(kept) = flights
+                    .iter_mut()
+                    .chain(roots.iter_mut())
+                    .find(|flight| flight.id == id)
+                {
+                    kept.result = Some(result);
                 }
             }
             Err(_) => break,
         }
     }
+    let dropped: Vec<DroppedFlight> = cut
+        .iter_mut()
+        .map(|flight| DroppedFlight {
+            prs: flight.candidate.prs.clone(),
+            result: flight.result.take(),
+            probe: flight.probe_for.is_some(),
+        })
+        .collect();
     for flight in cut.into_iter().rev() {
         if flight.probe_for.is_none() {
             pending.push_front(flight.candidate.prs);
         }
     }
     flights.extend(roots);
+    dropped
 }
 
 /// Detached form of [`discard`] for a stop decision: cancel the dropped
@@ -9683,7 +9966,10 @@ fn cut_after(
 /// `validate_one`), so a green that finishes later is still kept; the
 /// pipeline's thread scope joins the threads, whose runners answer their
 /// cancel flags promptly. Rooted flights are kept as in [`discard`].
-fn discard_detached(flights: &mut VecDeque<Flight>, pending: &mut VecDeque<Vec<i64>>) {
+fn discard_detached(
+    flights: &mut VecDeque<Flight>,
+    pending: &mut VecDeque<Vec<i64>>,
+) -> Vec<DroppedFlight> {
     let mut kept: VecDeque<Flight> = VecDeque::new();
     let mut dropped: Vec<Flight> = Vec::new();
     while let Some(flight) = flights.pop_front() {
@@ -9702,19 +9988,28 @@ fn discard_detached(flights: &mut VecDeque<Flight>, pending: &mut VecDeque<Vec<i
     for flight in &dropped {
         flight.cancel.store(true, Ordering::Relaxed);
     }
+    let dropped_records: Vec<DroppedFlight> = dropped
+        .iter_mut()
+        .map(|flight| DroppedFlight {
+            prs: flight.candidate.prs.clone(),
+            result: flight.result.take(),
+            probe: flight.probe_for.is_some(),
+        })
+        .collect();
     for flight in dropped.into_iter().rev() {
         if flight.probe_for.is_none() {
             pending.push_front(flight.candidate.prs);
         }
     }
     flights.append(&mut kept);
+    dropped_records
 }
 
 fn discard(
     flights: &mut VecDeque<Flight>,
     rx: &mpsc::Receiver<(u64, JobResult)>,
     pending: &mut VecDeque<Vec<i64>>,
-) {
+) -> Vec<DroppedFlight> {
     // A disjoint root is built on the base, not on anything being discarded: it
     // keeps its slot and its validation.
     let mut kept: VecDeque<Flight> = VecDeque::new();
@@ -9738,21 +10033,120 @@ fn discard(
     while !waiting.is_empty() {
         match rx.recv() {
             Ok((id, result)) => {
-                if !waiting.remove(&id) {
-                    if let Some(flight) = kept.iter_mut().find(|flight| flight.id == id) {
+                if waiting.remove(&id) {
+                    if let Some(flight) = dropped.iter_mut().find(|flight| flight.id == id) {
                         flight.result = Some(result);
                     }
+                } else if let Some(flight) = kept.iter_mut().find(|flight| flight.id == id) {
+                    flight.result = Some(result);
                 }
             }
             Err(_) => break,
         }
     }
+    let dropped_records: Vec<DroppedFlight> = dropped
+        .iter_mut()
+        .map(|flight| DroppedFlight {
+            prs: flight.candidate.prs.clone(),
+            result: flight.result.take(),
+            probe: flight.probe_for.is_some(),
+        })
+        .collect();
     for flight in dropped.into_iter().rev() {
         if flight.probe_for.is_none() {
             pending.push_front(flight.candidate.prs);
         }
     }
     flights.append(&mut kept);
+    dropped_records
+}
+
+/// Discard only flights whose candidate descends from `ancestor` (their
+/// parent chain reaches its tip, directly or transitively in git),
+/// regardless of whether general discard would keep them. Probes of a
+/// dropped red batch follow it. Every other flight keeps its place and
+/// validation.
+fn discard_descendants(
+    flights: &mut VecDeque<Flight>,
+    rx: &mpsc::Receiver<(u64, JobResult)>,
+    pending: &mut VecDeque<Vec<i64>>,
+    ancestor: &Candidate,
+    git: &crate::git::Git,
+) -> Vec<DroppedFlight> {
+    let mut doomed_tips: BTreeSet<String> = ancestor.prefixes.iter().cloned().collect();
+    doomed_tips.insert(ancestor.tip.clone());
+    let mut doomed_ids: BTreeSet<u64> = flights
+        .iter()
+        .filter(|flight| {
+            !flight.candidate.parent.is_empty()
+                && git
+                    .is_ancestor(&ancestor.tip, &flight.candidate.parent)
+                    .unwrap_or(false)
+        })
+        .map(|flight| flight.id)
+        .collect();
+    loop {
+        let mut grew = false;
+        for flight in flights.iter() {
+            if !doomed_ids.contains(&flight.id) && doomed_tips.contains(&flight.candidate.parent) {
+                doomed_ids.insert(flight.id);
+                grew = true;
+            }
+            if doomed_ids.contains(&flight.id) {
+                doomed_tips.insert(flight.candidate.tip.clone());
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    let mut kept: VecDeque<Flight> = VecDeque::new();
+    let mut dropped: Vec<Flight> = Vec::new();
+    while let Some(flight) = flights.pop_front() {
+        if doomed_ids.contains(&flight.id) {
+            dropped.push(flight);
+        } else {
+            kept.push_back(flight);
+        }
+    }
+    let mut kept = follow_dropped_reds(kept, &mut dropped);
+    for flight in &dropped {
+        flight.cancel.store(true, Ordering::Relaxed);
+    }
+    let mut waiting: BTreeSet<u64> = dropped
+        .iter()
+        .filter(|flight| flight.result.is_none())
+        .map(|flight| flight.id)
+        .collect();
+    while !waiting.is_empty() {
+        match rx.recv() {
+            Ok((id, result)) => {
+                if waiting.remove(&id) {
+                    if let Some(flight) = dropped.iter_mut().find(|flight| flight.id == id) {
+                        flight.result = Some(result);
+                    }
+                } else if let Some(flight) = kept.iter_mut().find(|flight| flight.id == id) {
+                    flight.result = Some(result);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let dropped_records: Vec<DroppedFlight> = dropped
+        .iter_mut()
+        .map(|flight| DroppedFlight {
+            prs: flight.candidate.prs.clone(),
+            result: flight.result.take(),
+            probe: flight.probe_for.is_some(),
+        })
+        .collect();
+    for flight in dropped.into_iter().rev() {
+        if flight.probe_for.is_none() {
+            pending.push_front(flight.candidate.prs);
+        }
+    }
+    flights.append(&mut kept);
+    dropped_records
 }
 
 /// A log file's text, with any bytes that are not UTF-8 replaced; `None` when unreadable.

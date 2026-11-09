@@ -239,6 +239,11 @@ struct Daemon(Child);
 
 impl Daemon {
     fn start(fx: &Fixture) -> Self {
+        Self::start_with_depth(fx, 3)
+    }
+
+    fn start_with_depth(fx: &Fixture, depth: usize) -> Self {
+        let depth = depth.to_string();
         let mut command = Command::new(env!("CARGO_BIN_EXE_merge-queue"));
         command
             .args([
@@ -249,7 +254,7 @@ impl Daemon {
                 "--base-poll-secs",
                 "1",
             ])
-            .args(["--depth", "3", "--max-batch", "1"])
+            .args(["--depth", &depth, "--max-batch", "1"])
             .current_dir(fx.queue())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -971,5 +976,200 @@ fn an_after_change_is_composed_on_its_dependency_not_the_stack() {
     assert!(
         landed.iter().position(|pr| *pr == 2) < landed.iter().position(|pr| *pr == 3),
         "change 3 lands after change 2: {landed:?}"
+    );
+}
+
+fn latest_events(fx: &Fixture) -> String {
+    let runs_dir = fx.queue().join(".git/merge-queue/runs");
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(runs_dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.join("events.jsonl").is_file())
+        .collect();
+    dirs.sort();
+    std::fs::read_to_string(dirs.pop().unwrap().join("events.jsonl")).unwrap()
+}
+
+fn wait_for_status(fx: &Fixture, pr: i64, wanted: &str) {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(30) {
+        if status(fx, pr) == wanted {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "timed out waiting for #{pr} to be {wanted}; it is {}",
+        status(fx, pr)
+    );
+}
+
+/// The exact stale-root shape from #1100: a slow earlier root, a stale
+/// root A with dependent D stacked on it, and B stacked on fresh root C.
+/// A requeues and drops only D on its own green arrival; C and B land
+/// without waiting for the slow root; D's dropped green is recorded.
+#[test]
+fn a_stale_root_requeues_at_once_and_drops_only_its_descendants() {
+    let (fx, started, gates) = gated_setup("stale-root-prompt-decisions");
+    let path = config_path(&fx);
+    let mut config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    config["roots"] = serde_json::json!(3);
+    config["keep_stale_roots"] = serde_json::json!(true);
+    std::fs::write(&path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+    fx.branch("l", &[("tests/l", "ok\n")]);
+    fx.branch("c", &[("tests/c", "ok\n")]);
+    fx.branch("s", &[("tests/s", "ok\n")]);
+    fx.branch("b", &[("tests/b", "ok\n")]);
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.branch("d", &[("tests/d", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "l"]);
+    fx.mq_ok(&["submit", "2", "--head", "c", "--after", "1"]);
+    fx.mq_ok(&["submit", "3", "--head", "s"]);
+    fx.mq_ok(&["submit", "4", "--head", "a"]);
+    fx.mq_ok(&["submit", "5", "--head", "d", "--after", "4"]);
+    fx.mq_ok(&["submit", "6", "--head", "b", "--after", "2"]);
+    let mut daemon = Daemon::start_with_depth(&fx, 6);
+    // B waits in pending: its transitive dependencies are in two flights
+    // (L and C) until L lands, then it stacks on C.
+    wait_for("the first five batches to validate", &started, |lines| {
+        ["l_t0_", "c_l_t0_", "s_t0_", "a_t0_", "a_d_t0_"]
+            .iter()
+            .all(|want| lines.iter().any(|line| line == want))
+    });
+    open(&gates, "l_t0_");
+    wait_for_status(&fx, 1, "landed");
+    wait_for("B to stack on C after L lands", &started, |lines| {
+        lines.iter().any(|line| line == "b_c_l_t0_")
+    });
+    open(&gates, "c_l_t0_");
+    wait_for_status(&fx, 2, "landed");
+    open(&gates, "a_d_t0_");
+    let start = Instant::now();
+    while latest_events(&fx)
+        .lines()
+        .filter(|line| line.contains("\"kind\":\"result\""))
+        .count()
+        < 3
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "results did not arrive"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // A now returns stale green while slow root #3 is still gated and B
+    // is still validating on C: A requeues at once and drops only D.
+    open(&gates, "a_t0_");
+    wait_for("the stale root to rebuild", &started, |lines| {
+        lines
+            .iter()
+            .any(|line| line.starts_with("a_") && line != "a_t0_" && line != "a_d_t0_")
+    });
+    assert_eq!(status(&fx, 3), "queued", "the slow root is still in flight");
+    assert_eq!(status(&fx, 6), "queued", "B is still validating on C");
+    open(&gates, "b_c_l_t0_");
+    wait_for_status(&fx, 6, "landed");
+    assert_eq!(status(&fx, 3), "queued", "B landed behind the slow root");
+    open(&gates, "s_t0_");
+    // Stale rebuilds can take several shapes as later batches land; open
+    // every candidate that actually starts until the daemon finishes.
+    let start = Instant::now();
+    loop {
+        for set in started_lines(&started) {
+            open(&gates, &set);
+        }
+        if [1, 2, 3, 4, 5, 6]
+            .iter()
+            .all(|pr| status(&fx, *pr) == "landed")
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(90),
+            "rebuilds did not land; started: {:?}",
+            started_lines(&started)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(daemon.exit_code(Duration::from_secs(120)), Some(0));
+    for pr in [1, 2, 3, 4, 5, 6] {
+        assert_eq!(status(&fx, pr), "landed");
+    }
+    assert_eq!(
+        started_lines(&started)
+            .iter()
+            .filter(|line| *line == "b_c_l_t0_")
+            .count(),
+        1,
+        "B validated once"
+    );
+    let report = latest_report(&fx);
+    let b_runs = batch_validations(&report, 6);
+    assert_eq!(b_runs.len(), 1, "{report}");
+    assert_eq!(
+        b_runs[0]["parent"],
+        batch_validations(&report, 2)[0]["commit"],
+        "{report}"
+    );
+    let d_runs = batch_validations(&report, 5);
+    assert!(d_runs.len() >= 2, "{report}");
+    assert_eq!(
+        d_runs[0]["parent"],
+        batch_validations(&report, 4)[0]["commit"],
+        "{report}"
+    );
+    let events = latest_events(&fx);
+    let event_values: Vec<Value> = events
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        event_values.iter().any(|event| {
+            event["kind"] == "stale-root-green" && event["detail"].as_str().unwrap().contains("#4")
+        }),
+        "{events}"
+    );
+    assert!(
+        event_values.iter().any(|event| {
+            event["kind"] == "flight-discarded"
+                && event["detail"].as_str().unwrap().contains("#5")
+                && event["detail"].as_str().unwrap().contains("green result")
+        }),
+        "{events}"
+    );
+    for pr in [2, 6] {
+        assert!(
+            event_values.iter().all(|event| {
+                event["kind"] != "flight-discarded"
+                    || !event["detail"]
+                        .as_str()
+                        .unwrap()
+                        .contains(&format!("#{pr} discarded"))
+            }),
+            "{events}"
+        );
+    }
+    let items: Value = serde_json::from_str(&fx.mq_ok(&["list", "--all", "--json"])).unwrap();
+    let history = |pr: i64| -> Vec<Value> {
+        items
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["pr"] == pr)
+            .and_then(|item| item["history"].as_array().cloned())
+            .unwrap_or_default()
+    };
+    assert!(
+        history(5)
+            .iter()
+            .any(|event| event["kind"] == "flight-discarded"),
+        "item #5 must record its discarded green"
+    );
+    assert!(
+        history(6)
+            .iter()
+            .all(|event| event["kind"] != "flight-discarded"),
+        "item #6 was never discarded"
     );
 }
