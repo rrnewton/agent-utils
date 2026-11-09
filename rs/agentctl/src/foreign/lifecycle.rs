@@ -246,9 +246,25 @@ fn flock(file: &std::fs::File, exclusive: bool) -> std::io::Result<()> {
     }
 }
 
-/// One held per-worker harness lock (spawn and termination serialize here).
+/// One held per-worker lock file (harness and intake locks share the shape).
 pub struct HarnessLock {
     _file: std::fs::File,
+}
+
+/// The turn-intake lock file (one consumer claims turns at a time).
+pub fn intake_lock_at(base: &Path, name: &str) -> Result<HarnessLock, ForeignOwnershipError> {
+    let path = agent_dir_at(base, name)?.join(".headless-turn.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|error| io_error("open intake lock", &path, &error))?;
+    flock(&file, true).map_err(|error| io_error("lock intake", &path, &error))?;
+    Ok(HarnessLock { _file: file })
 }
 
 /// The per-worker harness lock file (`BASE/.harness-<name>.lock`).
