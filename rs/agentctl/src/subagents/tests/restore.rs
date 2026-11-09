@@ -1738,6 +1738,197 @@ fn restore_derived_exclude_wins_over_a_running_record() {
     assert_eq!(fixture.manager().load("lane").unwrap().token, old.token);
 }
 
+/// A boxed lane whose launch timed out while its harness came up: restore
+/// promotes it, which needs no slot relaunch (#1130, as the boxed test).
+fn promotable_slotted(fixture: &Fixture, name: &str, slot: &str) -> AgentRecord {
+    fixture
+        .client
+        .fresh_presentations
+        .store(true, Ordering::Relaxed);
+    fixture
+        .manager()
+        .start(
+            name,
+            &fixture.root,
+            StartOptions {
+                harness: "codex".to_owned(),
+                resume: Some(format!("{name}-conversation")),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let mut record = fixture.manager().load(name).unwrap();
+    record.lifecycle = "launch_failed".to_owned();
+    record.harness_identity = None;
+    record.anchor_rule = None;
+    record.terminal_id = None;
+    record.session_agent = None;
+    record.session_value = None;
+    record.slot = Some(slot.to_owned());
+    record.slot_project = Some(fixture.root.display().to_string());
+    record.slot_isolation = Some("userns".to_owned());
+    record.launch_spec = None;
+    fixture.manager().save(&record).unwrap();
+    record
+}
+
+fn script_slot_transfer(host: &ScriptedHost, slot: &str, agent: &str) {
+    let status = json!({"active": [{
+        "slot": slot, "agent": agent, "generation": 3,
+        "hold_reason": format!("reboot: agent {agent} waits for agentctl restore"),
+    }]})
+    .to_string();
+    host.answer(
+        &format!("status --slot {slot} --format json"),
+        0,
+        &status,
+        "",
+    );
+}
+
+#[test]
+fn restore_refuses_a_slot_lane_whose_bind_is_missing_and_revives_the_rest() {
+    // #1130 D3: an image-backed slot whose bind mount is gone after the
+    // reboot must not revive into the bare mount-point directory; the
+    // non-slot coordinator and lanes still come back.
+    let fixture = Fixture::new();
+    dead_named(&fixture, "lead");
+    dead_agent(&fixture);
+    let slotted = promotable_slotted(&fixture, "slotted", "slotted-slot");
+    let host = ScriptedHost::new();
+    let root = fixture.root.display().to_string();
+    host.answer(
+        "image status",
+        0,
+        &format!("work/slotted-slot at {root} (mounted)\n"),
+        "",
+    );
+    host.answer("findmnt", 1, "", "");
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, Some("lead")),
+        &options(Some("/opt/wrkslots")),
+    )
+    .unwrap();
+    assert_eq!(report["coordinator"]["action"], "revived", "{report}");
+    assert_eq!(agent_row(&report, "lane")["action"], "revived", "{report}");
+    let row = agent_row(&report, "slotted");
+    assert_eq!(row["action"], "refused", "{report}");
+    let reason = row["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("bind") && reason.contains("slotted-slot"),
+        "{row}"
+    );
+    assert_eq!(
+        fixture.manager().load("slotted").unwrap().token,
+        slotted.token
+    );
+    assert_eq!(report["refused"], 1, "{report}");
+    assert_eq!(restore_exit_code(&report, false), 74, "{report}");
+}
+
+#[test]
+fn restore_promotes_and_transfers_a_slot_lane_whose_bind_is_present() {
+    // #1130: with the bind verified, the lane revives and the slot owner
+    // moves to the revived harness in the same run.
+    let fixture = Fixture::new();
+    promotable_slotted(&fixture, "slotted", "slotted-slot");
+    let host = ScriptedHost::new();
+    let root = fixture.root.display().to_string();
+    host.answer(
+        "image status",
+        0,
+        &format!("work/slotted-slot at {root} (mounted)\n"),
+        "",
+    );
+    host.answer("findmnt", 0, &format!("{root} /dev/loop0\n"), "");
+    script_slot_transfer(&host, "slotted-slot", "slotted");
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, None),
+        &options(Some("/opt/wrkslots")),
+    )
+    .unwrap();
+    let row = agent_row(&report, "slotted");
+    assert_eq!(row["action"], "promoted", "{report}");
+    assert_eq!(row["slot_bind"]["action"], "verified", "{report}");
+    assert_eq!(row["slot_owner"]["action"], "transferred", "{report}");
+    let commands = host.commands();
+    let findmnt = commands.iter().position(|c| c.contains("findmnt")).unwrap();
+    let transfer = commands
+        .iter()
+        .position(|c| c.contains("transfer-owner"))
+        .unwrap();
+    assert!(
+        findmnt < transfer,
+        "bind verified before transfer: {commands:?}"
+    );
+    assert_eq!(report["refused"], 0, "{report}");
+}
+
+#[test]
+fn restore_transfers_a_slotted_coordinators_slot() {
+    // #1130: the coordinator's own slot moves to its revived harness too.
+    let fixture = Fixture::new();
+    promotable_slotted(&fixture, "lead", "lead-slot");
+    let host = ScriptedHost::new();
+    script_slot_transfer(&host, "lead-slot", "lead");
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, Some("lead")),
+        &options(Some("/opt/wrkslots")),
+    )
+    .unwrap();
+    assert_eq!(report["coordinator"]["action"], "promoted", "{report}");
+    assert_eq!(
+        report["coordinator"]["slot_owner"]["action"], "transferred",
+        "{report}"
+    );
+}
+
+#[test]
+fn restore_counts_a_refused_slot_transfer_toward_74_with_its_remedy() {
+    // #1130: a refused transfer never un-revives the lane, but it is a
+    // named refusal for the exit class, never silent.
+    let fixture = Fixture::new();
+    promotable_slotted(&fixture, "slotted", "slotted-slot");
+    let host = ScriptedHost::new();
+    script_slot_transfer(&host, "slotted-slot", "slotted");
+    host.answer("transfer-owner", 1, "", "recorded owner is still alive\n");
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, None),
+        &options(Some("/opt/wrkslots")),
+    )
+    .unwrap();
+    let row = agent_row(&report, "slotted");
+    assert_eq!(row["action"], "promoted", "{report}");
+    assert_eq!(row["slot_owner"]["action"], "refused", "{report}");
+    assert!(
+        row["slot_owner"]["remedy"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("agentctl rebind-slot slotted"),
+        "{row}"
+    );
+    assert_eq!(report["complete"], true, "{report}");
+    assert_eq!(report["refused"], 1, "{report}");
+    assert_eq!(report["refused_lanes"], json!(["slotted"]), "{report}");
+    assert_eq!(restore_exit_code(&report, false), 74, "{report}");
+}
+
 #[test]
 fn restore_derived_refuses_a_record_whose_liveness_cannot_be_decided() {
     // #1129: a corrupt record that would otherwise derive is refused

@@ -711,10 +711,13 @@ fn remount_slot_images(host: &dyn Host, wrkslots: Option<&Path>, project: &Path)
         .map(str::to_owned)
         .collect::<Vec<_>>();
     // A failed mount is only a warning with exit status 0, so read the warning itself.
+    // Both wordings count (#1130 D3): a per-slot image and the shared worktrees image.
     let warnings = outcome
         .stderr
         .lines()
-        .filter(|line| line.contains("slot image not mounted"))
+        .filter(|line| {
+            line.contains("slot image not mounted") || line.contains("worktrees image not mounted")
+        })
         .map(str::to_owned)
         .collect::<Vec<_>>();
     let image_backed = if outcome.status == Some(0) {
@@ -728,10 +731,32 @@ fn remount_slot_images(host: &dyn Host, wrkslots: Option<&Path>, project: &Path)
         "project": project,
         "status": outcome.status,
         "image_backed": image_backed,
+        "slots": if outcome.status == Some(0) { image_slot_entries(&outcome.stdout) } else { Vec::new() },
         "mounted": mounted,
         "warnings": warnings,
         "detail": if outcome.status == Some(0) { Value::Null } else { json!(outcome.stderr.trim()) },
     })
+}
+
+/// Each image-backed slot `wrkslots image status` listed, with its mounted location
+/// and phase, for the pre-revive bind check (#1130 D3).
+fn image_slot_entries(stdout: &str) -> Vec<Value> {
+    stdout
+        .lines()
+        .filter(|line| !line.starts_with(char::is_whitespace))
+        .filter_map(|line| {
+            let (slot, rest) = line.split_once(" at ")?;
+            if !slot.contains('/') || !line.trim_end().ends_with(')') {
+                return None;
+            }
+            let (location, phase) = rest.rsplit_once(" (")?;
+            Some(json!({
+                "slot": slot,
+                "location": location,
+                "phase": phase.trim_end_matches(')'),
+            }))
+        })
+        .collect()
 }
 
 /// How many image-backed slots `wrkslots image status` listed, when its output says.
@@ -805,6 +830,7 @@ fn describe_slot_images(images: &Value) -> String {
                 .filter_map(Value::as_str)
                 .map(|line| {
                     line.split_once("slot image not mounted:")
+                        .or_else(|| line.split_once("worktrees image not mounted:"))
                         .map_or(line, |(_, rest)| rest)
                         .trim()
                 })
@@ -1199,6 +1225,9 @@ struct SlotAgent {
     name: String,
     slot: String,
     project: PathBuf,
+    /// The recorded working directory, checked against the slot's mounted
+    /// location before a revive (#1130 D3), never used to resolve the slot.
+    cwd: Option<PathBuf>,
     /// A running record whose harness may have died; a failed launch is not held.
     running: bool,
 }
@@ -1231,6 +1260,7 @@ fn slot_agents(registry: &Path, names: &[String], config: &RestoreConfig) -> Vec
                 name: name.clone(),
                 slot: record["slot"].as_str()?.to_owned(),
                 project,
+                cwd: record["cwd"].as_str().map(PathBuf::from),
                 running: lifecycle == "running",
             })
         })
@@ -1402,12 +1432,163 @@ fn transfer_slot<A: ManagedApi + ?Sized>(
             );
             unheld = released.status == Some(0);
         }
-        Ok(json!({"action": "transferred", "owner_pid": pid, "unheld": unheld}))
+        Ok(json!({
+            "action": "transferred",
+            "slot": agent.slot,
+            "owner_pid": pid,
+            "unheld": unheld,
+        }))
     })();
     match result {
         Ok(value) => value,
-        Err(error) => json!({"action": "refused", "reason": error.to_string()}),
+        // #1130: a refused transfer is named with the exact remedy an
+        // operator (or the lane itself) runs to rebind from outside the box.
+        Err(error) => json!({
+            "action": "refused",
+            "slot": agent.slot,
+            "reason": error.to_string(),
+            "remedy": format!("agentctl rebind-slot {}", agent.name),
+        }),
     }
+}
+
+/// Whether row `action` means the lane's harness came back in this restore.
+fn lane_revived(row: &Value) -> bool {
+    matches!(
+        row["action"].as_str(),
+        Some("revived" | "revived-fresh" | "promoted")
+    )
+}
+
+/// Record the slot-owner outcome on a revived lane's row (#1130): transfer
+/// through the configured slot manager only, and say so when none is
+/// configured instead of staying silent.
+fn record_slot_owner<A: ManagedApi + ?Sized>(
+    row: &mut Value,
+    manager: &ManagedAgents<'_, A>,
+    host: &dyn Host,
+    wrkslots: Option<&Path>,
+    boxed: &[SlotAgent],
+) {
+    if !lane_revived(row) {
+        return;
+    }
+    let Some(name) = row["name"].as_str() else {
+        return;
+    };
+    let Some(agent) = boxed.iter().find(|agent| agent.name == name) else {
+        return;
+    };
+    row["slot_owner"] = match wrkslots {
+        Some(wrkslots) => transfer_slot(manager, host, wrkslots, agent),
+        None => json!({
+            "action": "skipped",
+            "slot": agent.slot,
+            "reason": "no wrkslots configured; the slot owner was not transferred",
+            "remedy": format!("agentctl rebind-slot {}", agent.name),
+        }),
+    };
+}
+
+/// Verify, before a revive, that an image-backed slot's bind is actually
+/// mounted at the location the lane will start in (#1130 D3).
+///
+/// The evidence is the `wrkslots image status` run already in the report
+/// plus one `findmnt` on the mounted location. A slot the image status does
+/// not list is not image-backed, so there is no bind to verify. The slot is
+/// resolved from its recorded name and project (see `slot_agents`), never
+/// from the stored working directory; the directory is only checked to be
+/// the mounted slot itself, not a bare mount point or a stale original.
+fn verify_slot_bind(
+    host: &dyn Host,
+    agent: &SlotAgent,
+    images: &Value,
+) -> std::result::Result<Value, String> {
+    let refuse = |detail: String| {
+        format!(
+            "slot bind not verified for {} (slot {}): {detail}",
+            agent.name, agent.slot
+        )
+    };
+    let warnings = images["warnings"]
+        .as_array()
+        .map(|rows| rows.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if let Some(line) = warnings
+        .iter()
+        .find(|line| line.contains("worktrees image not mounted"))
+    {
+        return Err(refuse(format!(
+            "the worktrees image is not mounted, so no slot bind exists: {line}"
+        )));
+    }
+    if let Some(line) = warnings
+        .iter()
+        .find(|line| line.contains("slot image not mounted") && line.contains(agent.slot.as_str()))
+    {
+        return Err(refuse(format!("the slot image is not mounted: {line}")));
+    }
+    let entry = images["slots"].as_array().and_then(|rows| {
+        rows.iter().find(|row| {
+            let listed = row["slot"].as_str().unwrap_or_default();
+            listed == agent.slot
+                || listed.rsplit('/').next() == Some(agent.slot.as_str())
+                || row["location"]
+                    .as_str()
+                    .and_then(|location| Path::new(location).file_name())
+                    .and_then(|name| name.to_str())
+                    == Some(agent.slot.as_str())
+        })
+    });
+    let Some(entry) = entry else {
+        return Ok(json!({
+            "action": "verified",
+            "slot": agent.slot,
+            "detail": "the slot is not image-backed in wrkslots image status; no bind to verify",
+        }));
+    };
+    let location = entry["location"].as_str().unwrap_or_default();
+    let phase = entry["phase"].as_str().unwrap_or_default();
+    if phase.contains("not mounted") || !phase.contains("mounted") {
+        return Err(refuse(format!(
+            "wrkslots image status reports the slot's bind at {location} as {phase}"
+        )));
+    }
+    if let Some(cwd) = agent.cwd.as_deref() {
+        if !cwd.starts_with(Path::new(location)) {
+            return Err(refuse(format!(
+                "the recorded working directory {} is not the mounted slot at {location}",
+                cwd.display()
+            )));
+        }
+    }
+    let outcome = host.run(
+        &strings(&["findmnt", "-n", "-o", "TARGET,SOURCE", location]),
+        None,
+        Duration::from_secs(30),
+    );
+    let mounted = outcome.status == Some(0)
+        && outcome
+            .stdout
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().next())
+            == Some(location);
+    if !mounted {
+        return Err(refuse(format!(
+            "no bind mount is present at {location} (findmnt: {})",
+            match outcome.status {
+                Some(status) => format!("exit {status}"),
+                None => outcome.stderr.trim().to_owned(),
+            }
+        )));
+    }
+    Ok(json!({
+        "action": "verified",
+        "slot": agent.slot,
+        "location": location,
+        "phase": phase,
+    }))
 }
 
 fn systemctl(host: &dyn Host, verb: &str, unit: &str) -> CommandOutcome {
@@ -1560,6 +1741,28 @@ fn notice_text(report: &Value, boot_time: Option<u64>, path: &Path) -> String {
             list("died-after-launch", &reason)
         ),
         format!("Refused: {}.", list("refused", &reason)),
+        format!(
+            "Slot owner transfer refused (the lane is up; run its remedy): {}.",
+            {
+                let items = agents
+                    .iter()
+                    .filter(|row| row["slot_owner"]["action"] == "refused")
+                    .map(|row| {
+                        format!(
+                            "{} ({}; {})",
+                            row["name"].as_str().unwrap_or("?"),
+                            row["slot_owner"]["reason"].as_str().unwrap_or("?"),
+                            row["slot_owner"]["remedy"].as_str().unwrap_or("?")
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if items.is_empty() {
+                    "none".to_owned()
+                } else {
+                    items.join("; ")
+                }
+            }
+        ),
         format!(
             "Left as they were: {}.",
             list("skipped", &|_| String::new())
@@ -1903,11 +2106,31 @@ pub fn restore<A: ManagedApi + ?Sized>(
     let mut coordinator_ok = config.coordinator.is_none();
     if herdr_ready {
         if let Some(name) = config.coordinator.as_deref() {
-            let row = if names.iter().any(|known| known == name) {
-                recover_agent(&manager, name, options)
-            } else {
-                json!({"name": name, "action": "refused", "reason": "the coordinator is not registered"})
+            // #1130 D3: a slotted coordinator gets the same bind check and
+            // slot-owner transfer as every other lane.
+            let bind = match boxed.iter().find(|agent| agent.name == name) {
+                Some(agent) if options.wrkslots.is_some() && !options.dry_run => {
+                    Some(verify_slot_bind(host, agent, &report["slot_images"]))
+                }
+                _ => None,
             };
+            let mut row = if !names.iter().any(|known| known == name) {
+                json!({"name": name, "action": "refused", "reason": "the coordinator is not registered"})
+            } else if let Some(Err(reason)) = &bind {
+                json!({"name": name, "action": "refused", "reason": reason, "slot_bind": {"action": "refused"}})
+            } else {
+                recover_agent(&manager, name, options)
+            };
+            if let Some(Ok(verified)) = &bind {
+                row["slot_bind"] = verified.clone();
+            }
+            record_slot_owner(
+                &mut row,
+                &manager,
+                host,
+                options.wrkslots.as_deref(),
+                &boxed,
+            );
             coordinator_ok = matches!(
                 row["action"].as_str(),
                 Some("revived" | "promoted" | "skipped" | "revive" | "promote")
@@ -1975,16 +2198,36 @@ pub fn restore<A: ManagedApi + ?Sized>(
                     Ok(_) => {}
                 }
             }
+            // #1130 D3: never revive a slot lane into a slot whose bind
+            // mount is missing; refuse that lane and carry on with the rest.
+            let bind = match boxed.iter().find(|agent| agent.name == *name) {
+                Some(agent) if options.wrkslots.is_some() && !options.dry_run => {
+                    Some(verify_slot_bind(host, agent, &report["slot_images"]))
+                }
+                _ => None,
+            };
+            if let Some(Err(reason)) = &bind {
+                agents.push(json!({
+                    "name": name,
+                    "action": "refused",
+                    "reason": reason,
+                    "slot_bind": {"action": "refused"},
+                }));
+                continue;
+            }
             eprintln!("agentctl restore: restoring {name}");
             let mut row = recover_agent(&manager, name, options);
-            let launched = matches!(row["action"].as_str(), Some("revived"));
-            if let (Some(wrkslots), Some(agent), true) = (
-                options.wrkslots.as_deref(),
-                boxed.iter().find(|agent| agent.name == *name),
-                matches!(row["action"].as_str(), Some("revived" | "promoted")),
-            ) {
-                row["slot_owner"] = transfer_slot(&manager, host, wrkslots, agent);
+            if let Some(Ok(verified)) = &bind {
+                row["slot_bind"] = verified.clone();
             }
+            let launched = matches!(row["action"].as_str(), Some("revived"));
+            record_slot_owner(
+                &mut row,
+                &manager,
+                host,
+                options.wrkslots.as_deref(),
+                &boxed,
+            );
             agents.push(row);
             if launched && config.startup_delay_seconds > 0 {
                 host.sleep(Duration::from_secs(config.startup_delay_seconds));
@@ -2146,15 +2389,27 @@ pub fn restore<A: ManagedApi + ?Sized>(
         }));
     }
     report["units"] = json!(units);
-    let refused_lanes: Vec<Value> = report["agents"]
-        .as_array()
-        .map(|rows| {
-            rows.iter()
-                .filter(|row| row["action"] == "refused")
-                .filter_map(|row| row["name"].as_str().map(|name| json!(name)))
-                .collect()
-        })
-        .unwrap_or_default();
+    // #1130: a refused slot-owner transfer counts as a named refusal too,
+    // the coordinator's included, even though the lane itself revived.
+    let transfer_refused =
+        |row: &Value| row["action"] == "refused" || row["slot_owner"]["action"] == "refused";
+    let mut refused_lanes: Vec<Value> = Vec::new();
+    if transfer_refused(&report["coordinator"]) && report["coordinator"]["action"] != "refused" {
+        if let Some(name) = report["coordinator"]["name"].as_str() {
+            refused_lanes.push(json!(name));
+        }
+    }
+    refused_lanes.extend(
+        report["agents"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|row| transfer_refused(row))
+                    .filter_map(|row| row["name"].as_str().map(|name| json!(name)))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+    );
     let refused = refused_lanes.len();
     report["refused"] = json!(refused);
     // The summary names every refused lane, so a boot log shows at a

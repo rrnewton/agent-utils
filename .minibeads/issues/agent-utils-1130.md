@@ -4,7 +4,7 @@ status: open
 priority: 1
 issue_type: bug
 created_at: 2026-11-09T13:45:36.698017487+00:00
-updated_at: 2026-11-09T13:45:45.700592515+00:00
+updated_at: 2026-11-09T20:41:24.484350571+00:00
 ---
 
 # Description
@@ -34,3 +34,5 @@ Resolve the slot from the recorded slot name against the harness worktrees root,
 # Notes
 
 Scope gap (b) from the 2026-11-09 reboot restore. The stale on-PATH wording in help text belongs to the restore-core lane; this issue is the behavioural guarantee and its report field. Touches revive and restore slot handling in both agentctl editions; coordinate function-level overlaps with the restore-core lane before editing.
+
+D3 (bind verification before revive): before reviving or promoting each slot agent, restore verifies from the wrkslots image status record plus a findmnt check that the slot's bind mount is present at the mounted location and that the recorded working directory is that mounted slot, not a bare mount-point directory or a stale original. The slot is resolved from the recorded slot name and slot_project, never from the stored working directory. A worktrees-image-not-mounted warning (and a per-slot slot-image-not-mounted warning naming the slot) is fatal for that slot agent the same way. An unverified slot lane is refused with the missing bind or mount named and counts toward exit 74; non-slot agents and a non-slot coordinator still revive. Implemented in restore (verify_slot_bind) with report field slot_bind; standalone revive transfer remains the coordinator-owned revive.rs edit named in the gate report.

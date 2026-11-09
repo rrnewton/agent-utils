@@ -1054,11 +1054,18 @@ In order, it:
    they manage at every depth of the control tree, waiting
    `startup_delay_seconds` (default 20) after each launch, promotes each live
    `launch_failed` record, and records every refusal with its reason; a live
-   harness is left alone, which is what makes reruns safe. For each revived or
-   promoted agent boxed to a slot it runs `wrkslots transfer-owner` with the new
-   harness's process ID (accepted because that harness runs inside the slot's
-   box) and then releases its own reboot hold; a slot whose agent stays down
-   keeps the hold. A Claude Code agent (the coordinator included) whose
+   harness is left alone, which is what makes reruns safe. Before a slot
+   agent (the coordinator included) is revived, its slot bind is verified:
+   the `wrkslots image status` record plus `findmnt` must show the bind
+   mounted at the slot's location, with the recorded working directory
+   inside it; a lane whose bind is missing is refused (it would otherwise
+   start in the bare mount-point directory), while non-slot agents still
+   revive. For each revived, revived-fresh, or promoted agent boxed to a
+   slot it runs `wrkslots transfer-owner` with the new harness's process ID
+   (accepted because that harness runs inside the slot's box) and then
+   releases its own reboot hold; a refused transfer leaves the lane up, is
+   recorded with the remedy (`agentctl rebind-slot NAME`), and counts
+   toward exit 74; a slot whose agent stays down keeps the hold. A Claude Code agent (the coordinator included) whose
    conversation cannot be resumed, because its transcript is in none of the
    configuration directories that exist (`$CLAUDE_CONFIG_DIR`, `~/.claude`),
    does not block the restore: it is revived fresh, as `revive --fresh` does.
