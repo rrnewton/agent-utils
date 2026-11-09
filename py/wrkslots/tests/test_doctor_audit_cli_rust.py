@@ -345,3 +345,33 @@ def test_doctor_names_an_unset_identity(tmp_path: Path) -> None:
         "checkout repo: user.name is unset, configured 'Slot Bot'; "
         "user.email is unset, configured 'slot-bot@example.invalid'"
     ]
+
+def test_both_editions_find_the_harness_root_from_a_slot_through_symlinks(
+    tmp_path: Path,
+) -> None:
+    """#984: called through symlinks from a slot, each edition finds the harness root.
+
+    The executables are reached through a harness's own symlinks, and the
+    working directory through a symlinked path; both editions search from the
+    working directory upward, never from the executable's location.
+    """
+
+    from wrkslots.tests.test_remove_write_rust import _fixture as checkout_fixture
+
+    root = checkout_fixture(tmp_path / "real")
+    via = tmp_path / "via"
+    via.symlink_to(root, target_is_directory=True)
+    slot = via / "worktrees" / "slot-a" / "repo"
+    links = tmp_path / "harness-bin"
+    links.mkdir()
+    (links / "wrkslots").symlink_to(AU_ROOT / "py" / "bin" / "wrkslots")
+    (links / "wrkslotsd").symlink_to(rust_wrkslotsd())
+    for command in (
+        [str(links / "wrkslots"), "doctor", "--format", "json"],
+        [str(links / "wrkslotsd"), "doctor-text", "--format", "json"],
+    ):
+        result = subprocess.run(
+            command, cwd=slot, capture_output=True, text=True, check=False, timeout=900,
+        )
+        assert result.returncode == 0, (command[0], result.stderr)
+        assert json.loads(result.stdout)["project_root"] == str(root.resolve()), command[0]

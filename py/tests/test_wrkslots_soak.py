@@ -318,3 +318,66 @@ def test_readers_only_writer_stays_python(tmp_path: Path) -> None:
     )
     assert result.stdout.startswith("PY wrkslots heartbeat")
     assert "cmd=heartbeat edition=python" in log.read_text()
+
+
+def test_every_route_keeps_the_callers_directory_through_a_symlinked_launcher(
+    tmp_path: Path,
+) -> None:
+    """#984: no launcher layer resolves the project root from its own location.
+
+    A harness calls wrkslots through its own `bin/wrkslots` symlink from a
+    slot directory.  Every route (the Python primary, the WRKSLOTS_ENGINE=rust
+    opt-in, the soak and the per-process readers soak) must hand the edition
+    the caller's working directory and add no --root, so each edition finds
+    the root from the caller's directory upward, as `--root`-less discovery
+    is specified.
+    """
+
+    root, log = _sandbox(tmp_path)
+    (root / "py" / "bin" / "wrkslots").write_text(
+        "import os, sys\nprint('PY cwd=' + os.getcwd() + ' args=' + ' '.join(sys.argv[1:]))\n"
+    )
+    (root / "rs" / "bin" / "wrkslotsd").write_text(
+        "#!/bin/sh\n"
+        "if [ \"$2\" = \"--help\" ]; then echo \"Usage: --root --machine --all-machines "
+        "--format\"; exit 0; fi\n"
+        "echo \"RS cwd=$(pwd -P) args=$*\"\n"
+    )
+    harness = tmp_path / "harness"
+    slot = harness / "worktrees" / "slot-a" / "repo"
+    slot.mkdir(parents=True)
+    (harness / "bin").mkdir()
+    launcher = harness / "bin" / "wrkslots"
+    launcher.symlink_to(root / "common" / "bin" / "wrkslots")
+    base = {
+        key: value
+        for key, value in os.environ.items()
+        if key
+        not in (
+            "DAGRUN_ENGINE",
+            "AGENT_UTILS_ENGINE",
+            "WRKSLOTS_ENGINE",
+            "WRKSLOTS_RUST_READERS",
+            "WRKSLOTS_SOAK_READERS_ONLY",
+            "CI_HUB_PYTHON",
+        )
+    }
+    base["WRKSLOTS_RUST_READERS_FILE"] = str(tmp_path / "no-readers-file")
+    base["WRKSLOTS_SOAK_LOG"] = str(log)
+    routes = {
+        "python": {},
+        "rust": {"WRKSLOTS_ENGINE": "rust"},
+        "rust-soak": {"WRKSLOTS_ENGINE": "rust-soak"},
+        "readers": {"WRKSLOTS_RUST_READERS": "1"},
+    }
+    for route, extra in routes.items():
+        result = subprocess.run(
+            [str(launcher), "doctor", "--format", "json"],
+            cwd=slot, capture_output=True, text=True, check=False, timeout=30,
+            env={**base, **extra},
+        )
+        assert result.returncode == 0, (route, result.stderr)
+        lines = [line for line in result.stdout.splitlines() if " cwd=" in line]
+        assert len(lines) == 1, (route, result.stdout)
+        assert f" cwd={slot.resolve()} " in lines[0], (route, lines[0])
+        assert "--root" not in lines[0], (route, lines[0])
