@@ -642,6 +642,40 @@ impl ChatClient for Recorder {
         self.note("post_in_thread_keyed");
         Ok(self.message.clone())
     }
+    async fn post_message_keyed_marked(
+        &self,
+        _channel: &ChannelId,
+        _content: &str,
+        _reply_to: Option<&MessageId>,
+        _key: Option<&str>,
+        _raw: bool,
+    ) -> Result<Message, ChatError> {
+        self.note("post_message_keyed_marked");
+        Ok(self.message.clone())
+    }
+    async fn post_message_top_level_keyed_marked(
+        &self,
+        _channel: &ChannelId,
+        _content: &str,
+        _reply_to: Option<&MessageId>,
+        _key: Option<&str>,
+        _raw: bool,
+    ) -> Result<Message, ChatError> {
+        self.note("post_message_top_level_keyed_marked");
+        Ok(self.message.clone())
+    }
+    async fn post_in_thread_keyed_marked(
+        &self,
+        _channel: &ChannelId,
+        _thread_id: &str,
+        _content: &str,
+        _reply_to: Option<&MessageId>,
+        _key: Option<&str>,
+        _raw: bool,
+    ) -> Result<Message, ChatError> {
+        self.note("post_in_thread_keyed_marked");
+        Ok(self.message.clone())
+    }
     fn post_limit(&self, _channel: &ChannelId) -> PostLimit {
         self.note("post_limit");
         PostLimit::bytes(4321)
@@ -956,6 +990,21 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
         .await
         .expect("keyed thread post");
     ran("post_in_thread_keyed");
+    client
+        .post_message_keyed_marked(&channel, "hi\n[raw]", None, Some("k"), true)
+        .await
+        .expect("marked keyed post");
+    ran("post_message_keyed_marked");
+    client
+        .post_message_top_level_keyed_marked(&channel, "hi\n[raw]", None, Some("k"), true)
+        .await
+        .expect("marked keyed top-level post");
+    ran("post_message_top_level_keyed_marked");
+    client
+        .post_in_thread_keyed_marked(&channel, "t", "hi\n[raw]", None, Some("k"), true)
+        .await
+        .expect("marked keyed thread post");
+    ran("post_in_thread_keyed_marked");
     assert_eq!(client.post_limit(&channel), PostLimit::bytes(4321));
     ran("post_limit");
     assert!(client.defuses_mentions(&channel));
