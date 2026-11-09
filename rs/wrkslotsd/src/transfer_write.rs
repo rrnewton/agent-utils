@@ -19,10 +19,13 @@ use serde_json::{json, Value};
 use crate::active_state::load_cfg;
 use crate::adopt_write::validate_agent_name;
 use crate::canonical::canonical_sha256;
-use crate::config_validate::validate_name;
+use crate::config_validate::{load_config, validate_name};
 use crate::ensure_states::{
     append_event, atomic_write_json, ensure_event_log, refuse_partial_state, require_fixture,
     utc_now,
+};
+use crate::finish_write::{
+    cache_globs_for, stored_path, stored_repository_path, verify_existing_worktree,
 };
 use crate::global_state::load_event_chain;
 use crate::heartbeat_write::{assert_caller, release_in_effect};
@@ -85,6 +88,99 @@ fn cgroup_in_slot_box(cgroup_path: &str, slot_type: &str, slot: &str) -> bool {
         .any(|component| component == own || component.ends_with(&format!("-{own}")))
 }
 
+fn git_text(repo: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|error| format!("cannot execute Git: {error}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "Git refused in {}: git {}{}",
+            repo.display(),
+            args.join(" "),
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail}")
+            }
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Refuse a rename while any present checkout carries uncommitted work.
+fn assert_checkouts_clean_for_rebind(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    cfg: &crate::active_state::Cfg,
+    record: &Value,
+) -> Result<()> {
+    let config = load_config(root, machine_override)?;
+    for checkout in record
+        .get("checkouts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let name = checkout
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let raw_path = checkout
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let path = stored_path(cfg, raw_path, "checkout path")?;
+        if !path.exists() {
+            continue;
+        }
+        let raw_repository = checkout
+            .get("repository")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let (_relative, repository) = stored_repository_path(cfg, raw_repository)?;
+        verify_existing_worktree(&repository, &path)?;
+        let branch = git_text(&path, &["symbolic-ref", "--quiet", "--short", "HEAD"])?
+            .trim()
+            .to_string();
+        let expected_branch = checkout
+            .get("branch")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if branch != expected_branch {
+            return Err(format!(
+                "checkout {name} branch changed: expected {expected_branch}, found {branch}"
+            ));
+        }
+        let globs = cache_globs_for(&config, &name);
+        let mut status_args: Vec<String> = vec![
+            "status".to_string(),
+            "--porcelain=v2".to_string(),
+            "--untracked-files=all".to_string(),
+            "--ignored=matching".to_string(),
+            "--".to_string(),
+            ".".to_string(),
+        ];
+        for pattern in &globs {
+            status_args.push(format!(":(exclude,glob){pattern}"));
+            status_args.push(format!(":(exclude,glob){pattern}/**"));
+        }
+        let status_refs: Vec<&str> = status_args.iter().map(String::as_str).collect();
+        let status = git_text(&path, &status_refs)?;
+        if !status.is_empty() {
+            let first = status.lines().next().unwrap_or_default();
+            return Err(format!(
+                "checkout {name} is dirty or has untracked/ignored files ({first}); a slot changes agent only with a clean tree: finish or discard the changes first"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Transfer the named slot to a live successor owner.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn transfer_owner(
@@ -92,6 +188,7 @@ pub(crate) fn transfer_owner(
     machine_override: Option<&str>,
     slot: &str,
     agent: &str,
+    to_agent: Option<&str>,
     owner_pid: i64,
     expected_generation: i64,
     reopen: bool,
@@ -125,6 +222,10 @@ pub(crate) fn transfer_owner(
     validate_name(slot, "slot")?;
     validate_name(agent, "agent")?;
     validate_agent_name(agent)?;
+    if let Some(target) = to_agent {
+        validate_name(target, "agent")?;
+        validate_agent_name(target)?;
+    }
     let successor = read_process_identity(owner_pid)?;
     let _locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
     refuse_partial_state(&cfg.control)?;
@@ -164,13 +265,15 @@ pub(crate) fn transfer_owner(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    if !reopen && record_agent != agent {
+    let rename = to_agent.is_some_and(|target| target != record_agent.as_str());
+    let target_agent = to_agent.unwrap_or(agent);
+    if record_agent != agent && (to_agent.is_some() || !reopen) {
         return Err(format!(
             "ownership mismatch for slot {slot}: expected {record_agent}, got {agent}"
         ));
     }
     let existing = record_identity(&record);
-    if !reopen {
+    if !reopen && !rename {
         if let Some(owner) = &existing {
             if *owner == successor {
                 return Ok(json!({
@@ -194,6 +297,11 @@ pub(crate) fn transfer_owner(
             ));
         }
     } else {
+        if rename && (existing.is_none() || previous_state != "dead") {
+            return Err(format!(
+                "slot {slot} owner is {previous_state}: {detail}; transfer-owner only replaces an owner that is provably dead"
+            ));
+        }
         if existing.is_some() && previous_state != "dead" {
             return Err(format!(
                 "slot {slot} owner is {previous_state}: {detail}; transfer-owner only replaces an owner that is provably dead"
@@ -227,15 +335,22 @@ pub(crate) fn transfer_owner(
     if confirmed != successor {
         return Err("owner process generation changed during transfer-owner".to_string());
     }
+    if rename {
+        assert_checkouts_clean_for_rebind(root, machine_override, &cfg, &record)?;
+    }
     ensure_event_log(root, &cfg, &selected)?;
     let previous_revision = active.get("revision").and_then(Value::as_i64).unwrap_or(0);
-    let new_generation = if reopen { generation + 1 } else { generation };
+    let new_generation = if reopen || rename {
+        generation + 1
+    } else {
+        generation
+    };
     let mut transferred = record.clone();
     if let Some(object) = transferred.as_object_mut() {
         object.insert("owner".to_string(), identity_value(&successor));
         object.insert("heartbeat_at".to_string(), json!(utc_now()));
-        if reopen {
-            object.insert("agent".to_string(), json!(agent));
+        if reopen || rename {
+            object.insert("agent".to_string(), json!(target_agent));
             object.insert("generation".to_string(), json!(new_generation));
         }
     }
@@ -276,6 +391,11 @@ pub(crate) fn transfer_owner(
             object.insert("reason".to_string(), json!(reason_text));
             object.insert("release_sequence".to_string(), release_sequence);
         }
+    } else if rename {
+        if let Some(object) = evidence.as_object_mut() {
+            object.insert("previous_agent".to_string(), json!(record_agent));
+            object.insert("previous_generation".to_string(), json!(generation));
+        }
     }
     if !nested.is_empty() {
         if let Some(object) = evidence.as_object_mut() {
@@ -312,7 +432,7 @@ pub(crate) fn transfer_owner(
     Ok(json!({
         "machine": selected,
         "slot": slot,
-        "agent": agent,
+        "agent": target_agent,
         "generation": new_generation,
         "owner_pid": successor.pid,
         "basis": basis,

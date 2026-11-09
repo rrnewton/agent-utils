@@ -546,9 +546,12 @@ pub(crate) enum Recovery {
     TransferOwner {
         /// Active slot whose owner died
         slot: String,
-        /// Agent name already recorded on the slot (with --reopen: live agent to record)
+        /// Agent name already recorded on the slot (with --reopen and no --to-agent: live agent to record)
         #[arg(long, value_name = "NAME")]
         agent: String,
+        /// New agent name to record instead of --agent (starts a new generation, requires a clean tree)
+        #[arg(long, value_name = "NAME")]
+        to_agent: Option<String>,
         /// Live successor PID to bind
         #[arg(long, value_name = "PID")]
         owner_pid: i64,
@@ -2422,6 +2425,7 @@ pub fn run() -> u8 {
             Recovery::TransferOwner {
                 slot,
                 agent,
+                to_agent,
                 owner_pid,
                 expected_generation,
                 reopen,
@@ -2436,6 +2440,7 @@ pub fn run() -> u8 {
                     machine.as_deref(),
                     &slot,
                     &agent,
+                    to_agent.as_deref(),
                     owner_pid,
                     expected_generation,
                     reopen,

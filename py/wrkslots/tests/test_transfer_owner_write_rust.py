@@ -158,25 +158,33 @@ def _pair(tmp_path: Path, owner: dict[str, object] | None) -> tuple[Path, Path]:
 def _rust(
     root: Path, owner_pid: int, *, fixture: bool = True,
     extra: tuple[str, ...] = (), generation: str = "1",
+    agent: str = "agent-slot-a", to_agent: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     if fixture:
         env["WRKSLOTSD_FIXTURE_WRITER"] = "1"
     else:
         env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
+    argv = [
+        str(rust_wrkslotsd()), "transfer-owner", "slot-a",
+        "--agent", agent, "--owner-pid", str(owner_pid),
+        "--expected-generation", generation, "--root", str(root), *extra,
+    ]
+    if to_agent is not None:
+        argv.extend(("--to-agent", to_agent))
     return subprocess.run(
-        [
-            str(rust_wrkslotsd()), "transfer-owner", "slot-a",
-            "--agent", "agent-slot-a", "--owner-pid", str(owner_pid),
-            "--expected-generation", generation, "--root", str(root), *extra,
-        ],
+        argv,
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env,
     )
 
 
-def _python(root: Path, owner_pid: int) -> int:
+def _python(
+    root: Path, owner_pid: int, *,
+    agent: str = "agent-slot-a", to_agent: str | None = None,
+) -> int:
     args = argparse.Namespace(
-        project_root=str(root), machine=None, slot="slot-a", agent="agent-slot-a",
+        project_root=str(root), machine=None, slot="slot-a", agent=agent,
+        to_agent=to_agent,
         owner_pid=owner_pid, expected_generation=1, wait_lock=0.0,
     )
     return wrkslots_cli._cmd_transfer_owner(args)
@@ -433,4 +441,57 @@ def test_transfer_refuses_without_fixture_attestation(tmp_path: Path) -> None:
     result = _rust(rust_root, os.getpid(), fixture=False)
     assert result.returncode == 1
     assert "fixture-only" in result.stderr
+    assert _active(rust_root)["revision"] == 7
+
+
+def test_rebind_dead_owner_to_new_agent_matches_python(tmp_path: Path) -> None:
+    rust_root, oracle_root = _pair(tmp_path, _dead_identity())
+    assert _python(oracle_root, os.getpid(), to_agent="agent-successor") == 0
+    result = _rust(rust_root, os.getpid(), to_agent="agent-successor")
+    assert result.returncode == 0, result.stderr
+    outcome = json.loads(result.stdout)
+    assert outcome["agent"] == "agent-successor"
+    assert outcome["generation"] == 2
+    assert outcome["already_transferred"] is False
+    assert _active(rust_root) == _active(oracle_root)
+    assert _events(rust_root) == _events(oracle_root)
+    record = cast(list[dict[str, object]], _active(rust_root)["slots"])[0]
+    assert record["agent"] == "agent-successor" and record["generation"] == 2
+
+
+def test_rebind_live_owner_refuses(tmp_path: Path) -> None:
+    rust_root, oracle_root = _pair(tmp_path, _live_identity(os.getpid()))
+    with pytest.raises(Exception) as caught:
+        _python(oracle_root, os.getppid(), to_agent="agent-successor")
+    assert "only replaces an owner that is provably dead" in str(caught.value)
+    result = _rust(rust_root, os.getppid(), to_agent="agent-successor")
+    assert result.returncode == 1
+    assert "only replaces an owner that is provably dead" in result.stderr
+    assert _active(rust_root)["revision"] == 7
+
+
+def test_rebind_wrong_old_agent_refuses(tmp_path: Path) -> None:
+    rust_root, oracle_root = _pair(tmp_path, _dead_identity())
+    with pytest.raises(Exception) as caught:
+        _python(
+            oracle_root, os.getpid(), agent="agent-other", to_agent="agent-successor"
+        )
+    assert "ownership mismatch for slot slot-a" in str(caught.value)
+    result = _rust(
+        rust_root, os.getpid(), agent="agent-other", to_agent="agent-successor"
+    )
+    assert result.returncode == 1
+    assert "ownership mismatch for slot slot-a" in result.stderr
+
+
+def test_rebind_dirty_tree_refuses(tmp_path: Path) -> None:
+    rust_root, oracle_root = _pair(tmp_path, _dead_identity())
+    for root in (rust_root, oracle_root):
+        (root / "worktrees" / "slot-a" / "repo" / "file.txt").write_text("dirty\n")
+    with pytest.raises(Exception) as caught:
+        _python(oracle_root, os.getpid(), to_agent="agent-successor")
+    assert "a slot changes agent only with a clean tree" in str(caught.value)
+    result = _rust(rust_root, os.getpid(), to_agent="agent-successor")
+    assert result.returncode == 1
+    assert "a slot changes agent only with a clean tree" in result.stderr
     assert _active(rust_root)["revision"] == 7

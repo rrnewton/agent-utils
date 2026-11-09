@@ -30990,6 +30990,38 @@ def _cgroup_in_slot_box(cgroup_path: str, slot_type: str, slot: str) -> bool:
     )
 
 
+def _assert_clean_tree_for_rebind(config: Config, record: ActiveRecord) -> None:
+    """Refuse a rename while any present checkout carries uncommitted work.
+
+    Work in a checkout was authored under the recorded agent's name;
+    renaming over it would silently reattribute that work. Cleanliness
+    is the working tree only (outside configured caches): the branch
+    and its commits keep their history either way.
+    """
+
+    vcs = _GitVcs()
+    for checkout in record.checkouts:
+        path = _stored_path(config, checkout.path, "checkout path")
+        if not path.exists():
+            continue
+        _relative, repository = _stored_repository_path(config, checkout.repository)
+        vcs.verify_existing_worktree(repository, path)
+        branch = vcs.branch(path)
+        if branch != checkout.branch:
+            raise Refusal(
+                f"checkout {checkout.name} branch changed: "
+                f"expected {checkout.branch}, found {branch}"
+            )
+        status = vcs.status(path, _cache_globs_for(config, checkout.name))
+        if status:
+            first = status.splitlines()[0]
+            raise Refusal(
+                f"checkout {checkout.name} is dirty or has untracked/ignored "
+                f"files ({first}); a slot changes agent only with a clean "
+                "tree: finish or discard the changes first"
+            )
+
+
 def _cmd_transfer_owner(args: argparse.Namespace) -> int:
     """Hand a slot whose recorded owner is provably dead to its live successor.
 
@@ -31007,6 +31039,8 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
     reopen = bool(getattr(args, "reopen", False))
     coordinator = None
     reason = str(getattr(args, "reason", "") or "")
+    to_agent_value = getattr(args, "to_agent", None)
+    to_agent = str(to_agent_value) if to_agent_value is not None else None
     if reopen:
         _require_coordinator_authorized(args, "released generation reopen")
         if getattr(args, "coordinator_pid", None) is None:
@@ -31018,6 +31052,9 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
     _validate_name(args.slot, "slot")
     _validate_name(args.agent, "agent")
     _validate_agent_name(args.agent)
+    if to_agent is not None:
+        _validate_name(to_agent, "agent")
+        _validate_agent_name(to_agent)
     successor = _read_process_identity(args.owner_pid)
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
@@ -31031,11 +31068,12 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
         state = _load_active(config)
         record = _find_record(state, args.slot)
         _expected_generation(record, args.expected_generation)
-        if not reopen and record.agent != args.agent:
+        rename = to_agent is not None and to_agent != record.agent
+        if record.agent != args.agent and (to_agent is not None or not reopen):
             raise Refusal(
                 f"ownership mismatch for slot {args.slot}: expected {record.agent}, got {args.agent}"
             )
-        if not reopen and record.owner == successor:
+        if not reopen and not rename and record.owner == successor:
             print(
                 f"already owned slot={record.slot} agent={record.agent} "
                 f"generation={record.generation} owner_pid={successor.pid}"
@@ -31054,6 +31092,11 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
                     "--reopen for a dead-owner transfer"
                 )
         else:
+            if rename and (record.owner is None or previous_state != "dead"):
+                raise Refusal(
+                    f"slot {record.slot} owner is {previous_state}: {detail}; transfer-owner "
+                    "only replaces an owner that is provably dead"
+                )
             if record.owner is not None and previous_state != "dead":
                 raise Refusal(
                     f"slot {record.slot} owner is {previous_state}: {detail}; transfer-owner "
@@ -31080,11 +31123,13 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
             basis = "slot-box"
         if _read_process_identity(successor.pid) != successor:
             raise Refusal("owner process generation changed during transfer-owner")
+        if rename:
+            _assert_clean_tree_for_rebind(config, record)
         if reopen:
             assert coordinator is not None and released is not None
             transferred = dataclasses.replace(
                 record,
-                agent=args.agent,
+                agent=to_agent or args.agent,
                 owner=successor,
                 generation=record.generation + 1,
                 heartbeat_at=_utc_now(),
@@ -31102,6 +31147,24 @@ def _cmd_transfer_owner(args: argparse.Namespace) -> int:
                 "release_sequence": released.sequence,
             }
             action = "owner-reopened"
+        elif rename:
+            assert to_agent is not None
+            transferred = dataclasses.replace(
+                record,
+                agent=to_agent,
+                owner=successor,
+                generation=record.generation + 1,
+                heartbeat_at=_utc_now(),
+            )
+            evidence = {
+                "owner": _identity_to_obj(successor),
+                "previous_owner": None if record.owner is None else _identity_to_obj(record.owner),
+                "previous_owner_state": previous_state,
+                "basis": basis,
+                "previous_agent": record.agent,
+                "previous_generation": record.generation,
+            }
+            action = "owner-transferred"
         else:
             transferred = dataclasses.replace(record, owner=successor, heartbeat_at=_utc_now())
             evidence = {
@@ -70302,7 +70365,14 @@ usage or audit gate unknown, 3 fail-closed refusal.
     transfer.add_argument("slot", help="active slot whose owner died")
     transfer.add_argument(
         "--agent", required=True, metavar="AGENT",
-        help="agent name already recorded on the slot (with --reopen: live agent to record)",
+        help="agent name already recorded on the slot (with --reopen and no --to-agent: "
+        "live agent to record)",
+    )
+    transfer.add_argument(
+        "--to-agent", metavar="AGENT",
+        help="new agent name to record instead of --agent (rebind a slot whose owner is "
+        "provably dead to a differently named successor; starts a new generation and "
+        "requires a clean tree; default: keep --agent)",
     )
     transfer.add_argument(
         "--owner-pid", type=int, required=True, metavar="PID", help="live successor PID to bind"
