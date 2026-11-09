@@ -1,10 +1,10 @@
 ---
 title: 'merge-queue-root-base: a root planned after main moved mid-run is validated with the run start base as MQ_BASE'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-09T03:08:35.000000000+00:00
-updated_at: 2026-11-09T03:08:35.000000000+00:00
+updated_at: 2026-11-09T06:35:09.000000000+00:00
 ---
 
 # Description
@@ -126,3 +126,33 @@ local validator env) plus cli_donor (job record), decided by
 harness fit at implementation.
 
 ## Resolution
+
+Landed on main as 43ba0f3e533b1fe91c9b53778db54a2a2d6fe65a (gated commit 7d97ff89, files byte-identical after replay).
+
+Fix 1 as designed: `Candidate` and the internal `Job` record
+the batch's own base at planning — combining sets it to the
+parent, the fill loop replaces it with the recorded base of the
+flight a stacked batch stands on, probes and the post-eject
+remainder keep their batch's base, and widen's is the base
+itself. `validate_one` hands the validator that base as
+`MQ_BASE` and `publish` records it on the donor job, so the
+local validator, the donor validator and donor-side selection
+all measure against the same commit; `job_base()` (the
+run-start answer) is deleted. Queue-side selection already used
+the candidate's parent and is unchanged, as is the donor job
+schema — jobs published by an older queue keep their stamped
+base. The user guide now states the planned-on meaning of
+`MQ_BASE` for mid-run roots and stacked batches.
+
+Tests, both failing on the old code with the run-start base on
+the mid-run root and its donor job: a mid-run root after a
+landing sees MQ_BASE == MQ_PARENT == the moved base locally
+and in selection, a stacked batch keeps the stack bottom
+(cli_disjoint_root, combined with #1100's six-flight shape),
+and the donor job for a mid-run root records base == parent
+with the donor validator handed that base (cli_donor), after
+an undeclared old-style claim leases as before. Gate: full
+gate on 7d97ff89 — shared phase 239 passed / 0 failed; the
+exclusive cross differentials were stopped under the
+merge-queue-only waiver (ledger failed_steps empty, verdict
+fail only from that stop).
