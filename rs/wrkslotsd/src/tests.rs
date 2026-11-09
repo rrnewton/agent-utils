@@ -5075,6 +5075,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "parse-doctor",
             "parse-state",
             "plan",
+            "quarantine-journal",
             "read-handoff",
             "recover",
             "rebuild",

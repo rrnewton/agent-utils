@@ -2793,6 +2793,57 @@ receipts, and remaining work. If the mutable journal view is missing, `recover` 
 pending operation from the append-only history. Recovery rechecks every destructive precondition;
 it does not trust the earlier participant's conclusion.
 
+## Quarantine a stranded create journal
+
+Classification reads every outstanding journal, so one stranded create journal that
+`recover` itself refuses (for example, its slot name was already archived, or its
+bytes no longer match their append-only progress evidence) refuses unrelated work
+across the host. `quarantine-journal` sets exactly that journal aside without
+deleting anything it describes. It is never automatic: the default is a dry run,
+and acting requires `--coordinator-authorized`, a `--reason`, and `--yes` echoing
+the exact journal path and sha256 the dry run printed.
+
+```sh
+# see what would be set aside, and why recover refuses it
+wrkslots quarantine-journal SLOT --coordinator-authorized \
+  --coordinator-pid "$COORDINATOR_PID" --reason "why it cannot be recovered"
+# then set it aside, echoing the dry run's path and digest
+wrkslots quarantine-journal SLOT --coordinator-authorized \
+  --coordinator-pid "$COORDINATOR_PID" --reason "..." --yes \
+  --journal <path from the dry run> --journal-sha256 <digest from the dry run>
+```
+
+Eligibility is fail-closed: both recorded owners proven dead, journal age at least
+max(24h, its heartbeat time-to-live), stable bytes across two reads, no overlap
+with another live slot, and a named classification refusal that recover shares.
+A journal recover would resolve refuses here and points at `recover` instead.
+Acting appends an `operation-quarantined` tombstone event — original and
+quarantine paths, journal sha256, the recover refusal, the coordinator, the
+reason, and every partial artifact (worktree paths, branches, image file,
+registry claims) with whether each exists — and then moves the journal into
+`<control>/quarantine/` in the same journaled step, so a crash cannot strand a
+missing file. `doctor` and `audit` list quarantined journals with age and slot;
+retention is report-only in v1 (nothing prunes them).
+
+Clean the named artifacts afterwards with supported commands (`remove`,
+`reap-stray-worktrees`, Git itself) once their contents are salvaged or known
+worthless; quarantine never deletes them.
+
+To hand-restore a quarantined journal (there is no restore command in v1):
+
+1. Find the quarantined file and its recorded digest: run `wrkslots doctor` and
+   note the `quarantined-journal` finding's path, then read the
+   `operation-quarantined` event for that slot in the machine's `EVENTS.*`
+   directory; its payload carries `original_path`, `quarantine_path`, and
+   `journal_sha256`. Do not edit anything under `EVENTS.*`.
+2. Verify the quarantined file still matches the tombstone:
+   `sha256sum <quarantine_path>` must print `journal_sha256`.
+3. Move the file back to exactly `original_path` (same directory, same filename):
+   `mv <quarantine_path> <original_path>`. Change nothing else.
+4. Classification now reports the journal exactly as before quarantine:
+   `wrkslots classify-create-journals <slot> --slot-type <type> --agent <agent>`
+   refuses again naming the journal, and `wrkslots recover` can be retried.
+
 ## Test scenarios
 
 The source package includes deterministic and stress tests for concurrent creation, owner and

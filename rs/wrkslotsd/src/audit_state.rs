@@ -7265,6 +7265,7 @@ pub(crate) fn parse_audit(
                 })
             })
             .collect::<Vec<_>>(),
+        "quarantined_journals": crate::quarantine_write::quarantined_rows(&cfg),
         "foreign_shards": foreign_notes,
     }))
 }
@@ -7436,6 +7437,28 @@ pub(crate) fn audit_cli(
                     .get("name")
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
+            ));
+        }
+    }
+    if let Some(quarantined_rows) = payload
+        .get("quarantined_journals")
+        .and_then(Value::as_array)
+    {
+        for quarantined in quarantined_rows {
+            let age = match quarantined.get("age_seconds").and_then(Value::as_u64) {
+                Some(seconds) => format!("{seconds}s"),
+                None => "unknown".to_string(),
+            };
+            out.push_str(&format!(
+                "quarantined: {}: age={age} journal={}\n",
+                quarantined
+                    .get("slot")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-"),
+                quarantined
+                    .get("journal")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
             ));
         }
     }

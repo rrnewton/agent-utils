@@ -115,7 +115,7 @@ fn pending_journals(control: &Path, machine: &str, events: &[Value]) -> Result<V
             } else {
                 pending.push((name, journal_value));
             }
-        } else if kind == "operation-completed" {
+        } else if kind == "operation-completed" || kind == "operation-quarantined" {
             let name = journal_path_name(control, machine, payload, None)?;
             if let Some(index) = pending.iter().position(|(n, _)| *n == name) {
                 let current = &pending[index].1;

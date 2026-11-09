@@ -197,6 +197,21 @@ pub(crate) fn parse_doctor(
             }
         }
     }
+    for row in crate::quarantine_write::quarantined_rows(&cfg) {
+        let age = match row.get("age_seconds").and_then(Value::as_u64) {
+            Some(seconds) => format!("{seconds}s"),
+            None => "unknown".to_string(),
+        };
+        findings.push(note(
+            "quarantined-journal",
+            row.get("slot").and_then(Value::as_str),
+            row.get("machine").and_then(Value::as_str),
+            format!(
+                "quarantined journal {} retained for inspection (age {age}); report-only in v1, hand restore is in the user guide",
+                row.get("journal").and_then(Value::as_str).unwrap_or_default()
+            ),
+        ));
+    }
     for name in partial_leftovers(&cfg.control)? {
         findings.push(note(
             "partial-atomic-update",
@@ -391,6 +406,21 @@ pub(crate) fn doctor_cli(
                 ));
             }
         }
+    }
+    for row in crate::quarantine_write::quarantined_rows(&cfg) {
+        let age = match row.get("age_seconds").and_then(Value::as_u64) {
+            Some(seconds) => format!("{seconds}s"),
+            None => "unknown".to_string(),
+        };
+        findings.push(note(
+            "quarantined-journal",
+            row.get("slot").and_then(Value::as_str),
+            row.get("machine").and_then(Value::as_str),
+            format!(
+                "quarantined journal {} retained for inspection (age {age}); report-only in v1, hand restore is in the user guide",
+                row.get("journal").and_then(Value::as_str).unwrap_or_default()
+            ),
+        ));
     }
     for name in partial_leftovers(&cfg.control)? {
         findings.push(note(

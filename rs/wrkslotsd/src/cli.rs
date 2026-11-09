@@ -510,6 +510,38 @@ pub(crate) enum Recovery {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Set aside one stranded create journal that recover itself refuses (writer; fixture registries only until cutover)
+    QuarantineJournal {
+        /// Slot whose create journal is stranded
+        slot: String,
+        /// Live coordinator PID recorded as the quarantine actor
+        #[arg(long, value_name = "PID")]
+        coordinator_pid: i64,
+        /// The coordinator authorized setting this journal aside
+        #[arg(long)]
+        coordinator_authorized: bool,
+        /// Why this journal must be set aside instead of recovered
+        #[arg(long, value_name = "TEXT")]
+        reason: String,
+        /// Append the tombstone event and move the journal; without it nothing is changed
+        #[arg(long)]
+        yes: bool,
+        /// Required with --yes: the exact journal path the dry run printed
+        #[arg(long, value_name = "PATH")]
+        journal: Option<String>,
+        /// Required with --yes: the journal digest the dry run printed
+        #[arg(long, value_name = "SHA256")]
+        journal_sha256: Option<String>,
+        /// Output format: human prints the plan lines; json prints the payload
+        #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
+        format: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Hand a slot with a provably dead owner to its live successor (writer; fixture registries only until cutover)
     TransferOwner {
         /// Active slot whose owner died
@@ -1473,6 +1505,7 @@ const PY_IDENTITY: &[&str] = &[
     "freeze",
     "heartbeat",
     "hold",
+    "quarantine-journal",
     "quickstart",
     "read-handoff",
     "reap-stray-worktrees",
@@ -2344,6 +2377,40 @@ pub fn run() -> u8 {
                             "{}",
                             serde_json::to_string_pretty(&value).unwrap_or_default()
                         );
+                        return 0;
+                    }
+                    Err(error) => {
+                        eprintln!("wrkslotsd: {error}");
+                        return 1;
+                    }
+                }
+            }
+            Recovery::QuarantineJournal {
+                slot,
+                coordinator_pid,
+                coordinator_authorized,
+                reason,
+                yes,
+                journal,
+                journal_sha256,
+                format,
+                root,
+                machine,
+            } => {
+                match crate::quarantine_write::quarantine_journal(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    &slot,
+                    coordinator_pid,
+                    coordinator_authorized,
+                    &reason,
+                    yes,
+                    journal.as_deref(),
+                    journal_sha256.as_deref(),
+                    format == "json",
+                ) {
+                    Ok(text) => {
+                        print!("{text}");
                         return 0;
                     }
                     Err(error) => {

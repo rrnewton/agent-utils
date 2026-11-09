@@ -2842,7 +2842,7 @@ fn pending_operations(
                 }
             }
             pending.insert(path, journal.clone());
-        } else if kind == "operation-completed" {
+        } else if kind == "operation-completed" || kind == "operation-quarantined" {
             let path = operation_event_journal_path(cfg, machine, payload, None)?;
             if let Some(current) = pending.get(&path) {
                 if payload.get("slot") == current.get("slot")

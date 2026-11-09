@@ -31,6 +31,7 @@ const NON_STATE_EVENT_KINDS: &[&str] = &[
     "handoff-write-intended",
     "handoff-written",
     "legacy-validate-checkout-removed",
+    "operation-quarantined",
     "owner-released",
     "ownerless-agent-cache-relocated",
     "ownerless-agent-clone-abandoned",

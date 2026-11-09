@@ -46,9 +46,9 @@ fn within(candidate: &Path, parent: &Path) -> bool {
     candidate == parent || candidate.starts_with(parent)
 }
 
-type FileIdentity = (u64, u64, u64, String);
+pub(crate) type FileIdentity = (u64, u64, u64, String);
 
-fn read_identity(path: &Path) -> Result<(Vec<u8>, FileIdentity)> {
+pub(crate) fn read_identity(path: &Path) -> Result<(Vec<u8>, FileIdentity)> {
     use std::os::unix::fs::MetadataExt as _;
     let meta = std::fs::metadata(path)
         .map_err(|e| format!("cannot read recovery journal {}: {e}", path.display()))?;
@@ -64,7 +64,7 @@ fn read_identity(path: &Path) -> Result<(Vec<u8>, FileIdentity)> {
     Ok((bytes, (meta.dev(), meta.ino(), meta.len(), digest)))
 }
 
-fn strict_obj(bytes: &[u8]) -> Result<Map<String, Value>> {
+pub(crate) fn strict_obj(bytes: &[u8]) -> Result<Map<String, Value>> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| "recovery journal is not valid UTF-8".to_string())?;
     let value: Value = serde_json::from_str(text)
@@ -96,7 +96,7 @@ fn pending_ops(control: &Path, machine: &str) -> Result<Vec<(String, Value)>> {
             } else {
                 pending.push((name, journal));
             }
-        } else if kind == "operation-completed" {
+        } else if kind == "operation-completed" || kind == "operation-quarantined" {
             let name = payload
                 .get("journal_path")
                 .and_then(Value::as_str)
@@ -147,7 +147,7 @@ fn outstanding(control: &Path, machines: Option<&BTreeSet<String>>) -> Result<Ve
     Ok(paths.into_iter().collect())
 }
 
-fn create_journal_path(cfg: &Cfg, slot: &str, machine: &str) -> PathBuf {
+pub(crate) fn create_journal_path(cfg: &Cfg, slot: &str, machine: &str) -> PathBuf {
     let machine_part = format!("{}.{}", machine.chars().count(), machine);
     let slot_part = format!("{}.{}", slot.chars().count(), slot);
     cfg.control
@@ -479,7 +479,7 @@ impl std::fmt::Display for ClassifyError {
     }
 }
 
-fn absolute_path(path: &Path) -> PathBuf {
+pub(crate) fn absolute_path(path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -490,7 +490,7 @@ fn absolute_path(path: &Path) -> PathBuf {
 }
 
 /// Whole seconds since the journal file last changed, if readable.
-fn journal_age_seconds(path: &Path) -> Option<u64> {
+pub(crate) fn journal_age_seconds(path: &Path) -> Option<u64> {
     let modified = std::fs::metadata(path)
         .and_then(|meta| meta.modified())
         .ok()?;
@@ -956,6 +956,22 @@ fn standalone_mismatch(
         }
     }
     Some(StandaloneMismatch::Refuse)
+}
+
+/// Classification state of one journal for the quarantine plan
+/// (#1086c): `Ok(Some(state))` when it classifies, `Ok(None)` when it is
+/// skipped as unrelated, and the refusal text otherwise.
+pub(crate) fn create_journal_state(
+    cfg: &Cfg,
+    config: &Value,
+    path: &Path,
+    states: &[(String, Vec<Value>)],
+    archives: &[Vec<Value>],
+    slot: &str,
+    slot_type: &str,
+) -> Result<Option<String>> {
+    classify_one(cfg, config, path, states, archives, slot, slot_type)
+        .map(|row| row.map(|row| row.state))
 }
 
 fn classify_one(

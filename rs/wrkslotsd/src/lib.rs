@@ -84,6 +84,7 @@ mod journals_state;
 mod pair_state;
 mod plan;
 mod policy;
+mod quarantine_write;
 mod read_handoff_write;
 mod reap_strays;
 mod reclaim_state;

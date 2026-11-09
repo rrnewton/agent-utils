@@ -8266,7 +8266,7 @@ def _pending_operations_from_events(
                         "multiple journal paths"
                     )
             pending[path] = journal_value
-        elif kind == "operation-completed":
+        elif kind in {"operation-completed", "operation-quarantined"}:
             path = _operation_event_journal_path(config, machine, payload)
             current = pending.get(path)
             if current is None:
@@ -11215,6 +11215,538 @@ def _cmd_classify_all_journals(
                 f"journal={row['journal']}"
             )
         _print_foreign_shard_notes(foreign_notes)
+    return 0
+
+
+_QUARANTINE_MIN_AGE_SECONDS = 24 * 60 * 60
+_QUARANTINE_REASON_LIMIT = 500
+
+
+def _quarantine_directory(config: Config) -> Path:
+    return config.control / "quarantine"
+
+
+def _quarantined_journal_rows(config: Config) -> list[dict[str, object]]:
+    """Best-effort census rows for journals an operator quarantined."""
+    directory = _quarantine_directory(config)
+    rows: list[dict[str, object]] = []
+    if not directory.is_dir() or directory.is_symlink():
+        return rows
+    for path in sorted(directory.glob("*.journal")):
+        try:
+            parsed: object = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            parsed = None
+        raw: Mapping[str, object] = parsed if isinstance(parsed, dict) else {}
+
+        def text(key: str) -> str | None:
+            value = raw.get(key)
+            return value if isinstance(value, str) else None
+
+        rows.append(
+            {
+                "age_seconds": _journal_age_seconds(path),
+                "agent": text("agent"),
+                "journal": str(path.absolute()),
+                "kind": text("kind") or "unknown",
+                "machine": text("machine"),
+                "slot": text("slot"),
+            }
+        )
+    return rows
+
+
+def _quarantine_event_for(
+    config: Config, path: Path, sha256: str
+) -> dict[str, object] | None:
+    """The tombstone event that already closed this journal, if any."""
+    for event in _load_events(config, config.machine):
+        if event.get("kind") != "operation-quarantined":
+            continue
+        payload = event.get("payload")
+        if not isinstance(payload, Mapping):
+            continue
+        if (
+            payload.get("journal_path") == path.name
+            and payload.get("journal_sha256") == sha256
+        ):
+            return event
+    return None
+
+
+@dataclasses.dataclass(frozen=True)
+class _QuarantinePlan:
+    """Everything a quarantine dry run proves before anything moves."""
+
+    path: Path
+    identity: _RegularFileIdentity
+    slot: str
+    agent: str
+    slot_type: str
+    owner_pid: int | None
+    owner_state: str
+    coordinator_pid: int
+    coordinator_state: str
+    age_seconds: int
+    bound_seconds: int
+    recover_refusal: str
+    artifacts: tuple[dict[str, object], ...]
+    already_journaled_sequence: int | None
+    already_quarantine_path: str | None
+
+
+def _quarantine_artifacts(
+    config: Config,
+    raw: Mapping[str, object],
+    slot: str,
+    slot_type: str,
+    states: Sequence[ActiveState],
+    archives: Sequence[ArchiveState],
+) -> tuple[dict[str, object], ...]:
+    """Every partial artifact the journal names, with existence (#1086c)."""
+    artifacts: list[dict[str, object]] = []
+    slot_path = _slot_directory(config, slot, slot_type)
+    artifacts.append(
+        {
+            "kind": "slot-directory",
+            "path": str(slot_path),
+            "exists": slot_path.exists(),
+        }
+    )
+    vcs = _GitVcs()
+    for index, item in enumerate(
+        _as_list(raw["planned"], "create journal.planned")
+    ):
+        planned = _planned_from_obj(item, f"create journal.planned[{index}]")
+        destination = _stored_path(
+            config, planned.destination, "checkout destination"
+        )
+        _relative, repository = _stored_repository_path(
+            config, planned.repository
+        )
+        try:
+            branch_exists: bool | None = vcs.branch_exists(
+                repository, planned.branch
+            )
+        except (Refusal, StateError, OSError):
+            branch_exists = None
+        artifacts.append(
+            {
+                "kind": "worktree",
+                "name": planned.name,
+                "path": str(destination),
+                "exists": destination.exists(),
+                "branch": planned.branch,
+                "branch_exists": branch_exists,
+                "repository": planned.repository,
+            }
+        )
+    try:
+        image = slotimage.load(config.control, slot_type, slot)
+    except slotimage.ImageError:
+        image = None
+    if image is not None:
+        artifacts.append(
+            {
+                "kind": "image",
+                "path": str(image.slot_image),
+                "exists": image.slot_image.exists(),
+            }
+        )
+    active = next(
+        (
+            record
+            for state in states
+            for record in state.slots
+            if record.slot == slot and state.machine == config.machine
+        ),
+        None,
+    )
+    artifacts.append(
+        {
+            "kind": "active-row",
+            "slot": slot,
+            "exists": active is not None,
+            "generation": active.generation if active is not None else None,
+        }
+    )
+    archived = next(
+        (
+            record
+            for archive in archives
+            if archive.machine == config.machine
+            for record in archive.records
+            if record.get("slot") == slot
+        ),
+        None,
+    )
+    artifacts.append(
+        {
+            "kind": "archive-record",
+            "slot": slot,
+            "exists": archived is not None,
+            "archive_id": (
+                archived.get("archive_id") if archived is not None else None
+            ),
+        }
+    )
+    return tuple(artifacts)
+
+
+def _quarantine_plan(config: Config, slot: str) -> _QuarantinePlan:
+    """Prove one stranded create journal may be quarantined, read-only.
+
+    Eligible exactly when classification refuses the journal for a
+    recover-shared reason while both recorded owners are proven dead:
+    recover resolves every classifiable dead orphan, so those point at
+    recover instead. Provenance and shape must still parse, or the
+    owners and artifacts cannot be named safely.
+    """
+    path = _create_journal_path(config, slot, config.machine)
+    if not path.exists() and not path.is_symlink():
+        standalone = _journal_path(config, config.machine)
+        if standalone.exists():
+            try:
+                legacy = _as_mapping(
+                    _read_json(standalone, "recovery journal"),
+                    "recovery journal",
+                )
+            except (Refusal, StateError):
+                legacy = {}
+            if legacy.get("kind") == "create" and legacy.get("slot") == slot:
+                raise Refusal(
+                    f"slot {slot!r} has a legacy standalone create journal in "
+                    f"{standalone}; quarantine-journal covers scoped create "
+                    "journals only; run 'wrkslots recover' for this journal"
+                )
+        raise Refusal(f"no scoped create journal is recorded for slot {slot!r}")
+    contents, identity = _read_regular_file_identity(
+        path, "recovery journal", 1024 * 1024
+    )
+    try:
+        raw = _strict_json_object(contents, "recovery journal")
+    except StateError as error:
+        raise Refusal(
+            f"quarantine cannot prove the contents of {path}: {error}"
+        ) from error
+    contents_again, identity_again = _read_regular_file_identity(
+        path, "recovery journal", 1024 * 1024
+    )
+    if identity_again != identity or contents_again != contents:
+        raise Refusal(
+            f"create journal changed while it was read: {path}; rerun "
+            "quarantine-journal"
+        )
+    if raw.get("kind") != "create" or raw.get("slot") != slot:
+        raise Refusal(
+            f"journal {path} does not record a create for slot {slot!r}"
+        )
+    try:
+        _validate_journal_shape(config, path, raw)
+    except StateError as error:
+        raise Refusal(
+            f"quarantine cannot prove the owners or artifacts of {path}: "
+            f"{error}"
+        ) from error
+    owner = _identity_from_obj(raw["owner"], "create journal.owner")
+    coordinator = _identity_from_obj(
+        raw["coordinator_lease"], "create journal.coordinator_lease"
+    )
+    assert coordinator is not None
+    coordinator_state, coordinator_detail = _process_state(coordinator)
+    owner_state, owner_detail = _create_journal_owner_state(
+        owner, coordinator_state
+    )
+    if owner_state != "dead" or coordinator_state != "dead":
+        raise Refusal(
+            f"create journal for slot {slot!r} owners are not both proven "
+            f"dead: owner={owner_state} ({owner_detail}); "
+            f"coordinator={coordinator_state} ({coordinator_detail})"
+        )
+    age = _journal_age_seconds(path)
+    assert age is not None
+    ttl = _as_int(
+        raw["heartbeat_ttl_seconds"], "create journal.heartbeat_ttl_seconds"
+    )
+    bound = max(_QUARANTINE_MIN_AGE_SECONDS, ttl)
+    if age < bound:
+        raise Refusal(
+            f"create journal for slot {slot!r} is too young to quarantine: "
+            f"age {age}s is below the bound {bound}s "
+            f"(max(24h, heartbeat_ttl_seconds={ttl}))"
+        )
+    states, archives = _validate_global_state(config)
+    try:
+        row = _classify_create_journal(config, path, states, archives)
+    except _JournalBusy as error:
+        raise Refusal(
+            f"create journal for slot {slot!r} is busy, not stranded: {error}"
+        ) from error
+    except Refusal as error:
+        if "changed while" in str(error):
+            raise Refusal(
+                f"create journal for slot {slot!r} changed while it was "
+                "classified; rerun quarantine-journal"
+            ) from error
+        recover_refusal = str(error)
+    else:
+        assert row is not None
+        if row.state == "completed-create":
+            raise Refusal(
+                f"create journal for slot {slot!r} already completed; it is "
+                "not stranded; run 'wrkslots recover' to clear it"
+            )
+        raise Refusal(
+            f"create journal for slot {slot!r} classifies as {row.state}, "
+            "which recover resolves; run 'wrkslots recover "
+            f"--slot {slot} --coordinator-pid <pid>' (add --abort-create to "
+            "roll it back) instead of quarantining it"
+        )
+    slot_type = _as_str(raw.get("slot_type", "agent"), "create journal.slot_type")
+    slot_path = _slot_directory(config, slot, slot_type)
+    planned_paths = [slot_path]
+    for index, item in enumerate(
+        _as_list(raw["planned"], "create journal.planned")
+    ):
+        planned_paths.append(
+            _stored_path(
+                config,
+                _planned_from_obj(
+                    item, f"create journal.planned[{index}]"
+                ).destination,
+                "checkout destination",
+            )
+        )
+    for state in states:
+        for record in state.slots:
+            if record.slot == slot and state.machine == config.machine:
+                continue
+            other = _slot_directory(config, record.slot, record.slot_type)
+            if any(
+                _path_is_within(candidate, other)
+                or _path_is_within(other, candidate)
+                for candidate in planned_paths
+            ):
+                raise Refusal(
+                    f"create journal for slot {slot!r} overlaps the live "
+                    f"slot {record.slot!r} on {state.machine}; quarantine "
+                    "would strand a claim on a live row"
+                )
+    agent = _validate_name(
+        _as_str(raw["agent"], "create journal.agent"), "agent"
+    )
+    journaled = _quarantine_event_for(config, path, identity.sha256)
+    sequence = (
+        _as_int(journaled["sequence"], "quarantine event.sequence")
+        if journaled is not None
+        else None
+    )
+    already_path: str | None = None
+    if journaled is not None:
+        recorded = journaled.get("payload")
+        if isinstance(recorded, Mapping):
+            candidate = recorded.get("quarantine_path")
+            if isinstance(candidate, str):
+                already_path = candidate
+    return _QuarantinePlan(
+        path=path,
+        identity=identity,
+        slot=slot,
+        agent=agent,
+        slot_type=slot_type,
+        owner_pid=owner.pid if owner is not None else None,
+        owner_state=owner_state,
+        coordinator_pid=coordinator.pid,
+        coordinator_state=coordinator_state,
+        age_seconds=age,
+        bound_seconds=bound,
+        recover_refusal=recover_refusal,
+        artifacts=_quarantine_artifacts(
+            config, raw, slot, slot_type, states, archives
+        ),
+        already_journaled_sequence=sequence,
+        already_quarantine_path=already_path,
+    )
+
+
+def _quarantine_reason(raw: object) -> str:
+    """Require the operator's explanation before anything is read."""
+    reason = raw.strip() if isinstance(raw, str) else ""
+    if not reason:
+        raise Refusal(
+            "quarantine-journal requires --reason saying why this journal "
+            "must be set aside instead of recovered; nothing was changed"
+        )
+    if len(reason) > _QUARANTINE_REASON_LIMIT or "\x00" in reason:
+        raise Refusal(
+            f"--reason must be at most {_QUARANTINE_REASON_LIMIT} characters "
+            "without NUL bytes"
+        )
+    return reason
+
+
+def _quarantine_payload(
+    plan: _QuarantinePlan,
+    *,
+    action: str,
+    reason: str,
+    quarantine_path: Path | None = None,
+    event_sequence: int | None = None,
+) -> dict[str, object]:
+    return {
+        "action": action,
+        "age_seconds": plan.age_seconds,
+        "bound_seconds": plan.bound_seconds,
+        "already_journaled_sequence": plan.already_journaled_sequence,
+        "artifacts": list(plan.artifacts),
+        "event_sequence": event_sequence,
+        "journal": str(plan.path.absolute()),
+        "journal_sha256": plan.identity.sha256,
+        "quarantine_path": (
+            str(quarantine_path.absolute()) if quarantine_path is not None else None
+        ),
+        "reason": reason,
+        "recover_refusal": plan.recover_refusal,
+        "slot": plan.slot,
+        "agent": plan.agent,
+        "slot_type": plan.slot_type,
+        "owner_pid": plan.owner_pid,
+        "owner_state": plan.owner_state,
+        "coordinator_pid": plan.coordinator_pid,
+        "coordinator_state": plan.coordinator_state,
+    }
+
+
+def _print_quarantine_payload(payload: dict[str, object], *, dry_run: bool) -> None:
+    journal = payload["journal"]
+    sha256 = payload["journal_sha256"]
+    if dry_run:
+        print(f"DRY RUN: would quarantine {journal}")
+    else:
+        print(f"quarantined {journal} -> {payload['quarantine_path']}")
+    print(
+        f"  slot={payload['slot']} agent={payload['agent']} "
+        f"sha256={sha256} age={payload['age_seconds']}s "
+        f"bound={payload['bound_seconds']}s"
+    )
+    print(f"  recover refuses: {payload['recover_refusal']}")
+    if payload["already_journaled_sequence"] is not None:
+        print(
+            "  quarantine already journaled at event "
+            f"{payload['already_journaled_sequence']}; the move did not complete"
+        )
+    artifacts = payload["artifacts"]
+    assert isinstance(artifacts, list)
+    for artifact in artifacts:
+        assert isinstance(artifact, dict)
+        exists = artifact.get("exists")
+        state = "exists" if exists else "absent" if exists is False else "unknown"
+        print(
+            f"  {artifact.get('kind')}: "
+            f"{artifact.get('path') or artifact.get('slot') or '-'}: {state}"
+        )
+    if dry_run:
+        print(
+            "nothing changed; rerun with --yes "
+            f"--journal {journal} --journal-sha256 {sha256} to quarantine"
+        )
+
+
+def _cmd_quarantine_journal(args: argparse.Namespace) -> int:
+    """Set aside one stranded create journal recover itself refuses."""
+    reason = _quarantine_reason(args.reason)
+    _require_coordinator_authorized(args, "journal quarantine")
+    config = _load_config(args.project_root, args.machine)
+    coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
+    slot = _validate_name(args.slot, "slot")
+    plan = _quarantine_plan(config, slot)
+    if not args.yes:
+        payload = _quarantine_payload(plan, action="dry-run", reason=reason)
+        if args.format == "json":
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            _print_quarantine_payload(payload, dry_run=True)
+        return 0
+    if args.journal is None or args.journal_sha256 is None:
+        raise Refusal(
+            "quarantine-journal --yes requires --journal and --journal-sha256 "
+            "with the exact values the dry run printed"
+        )
+    if (
+        args.journal != str(plan.path.absolute())
+        or args.journal_sha256 != plan.identity.sha256
+    ):
+        raise Refusal(
+            "the journal changed since the dry run: --journal/--journal-sha256 "
+            f"do not match {plan.path.absolute()} sha256={plan.identity.sha256}; "
+            "rerun the dry run"
+        )
+    with _mutation_locks(config, args.wait_lock):
+        _assert_caller_process(coordinator, "coordinator")
+        _refuse_partial_state(config)
+        plan = _quarantine_plan(config, slot)
+        if plan.identity.sha256 != args.journal_sha256:
+            raise Refusal(
+                "the journal changed since the dry run: "
+                f"sha256 is now {plan.identity.sha256}; rerun the dry run"
+            )
+        directory = _quarantine_directory(config)
+        if plan.already_quarantine_path is not None:
+            destination = Path(plan.already_quarantine_path)
+            if destination.parent != directory.absolute() and (
+                destination.parent != directory
+            ):
+                raise Refusal(
+                    "the journaled quarantine destination is outside the "
+                    f"quarantine directory: {destination}"
+                )
+        else:
+            timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            destination = directory / f"{timestamp}-{plan.path.name}"
+        if destination.exists() or destination.is_symlink():
+            raise Refusal(
+                f"quarantine destination already exists: {destination}"
+            )
+        created = not directory.exists()
+        directory.mkdir(mode=0o755, parents=True, exist_ok=True)
+        if created:
+            _fsync_directory(directory.parent)
+        sequence = plan.already_journaled_sequence
+        if sequence is None:
+            _ensure_event_log(config)
+            writer = _event_writer(config, config.machine)
+            event = writer.append(
+                "operation-quarantined",
+                {
+                    "slot": plan.slot,
+                    "operation": "create",
+                    "journal_path": plan.path.name,
+                    "original_path": str(plan.path.absolute()),
+                    "quarantine_path": str(destination.absolute()),
+                    "journal_sha256": plan.identity.sha256,
+                    "reason": reason,
+                    "actor": _identity_to_obj(coordinator),
+                    "coordinator_authorized": True,
+                    "recover_refusal": plan.recover_refusal,
+                    "artifacts": list(plan.artifacts),
+                },
+            )
+            sequence = _as_int(event["sequence"], "quarantine event.sequence")
+            _interrupt_for_test("after-operation-quarantined")
+        plan.path.rename(destination)
+        _fsync_directory(config.control)
+        _fsync_directory(directory)
+    payload = _quarantine_payload(
+        plan,
+        action="quarantined",
+        reason=reason,
+        quarantine_path=destination,
+        event_sequence=sequence,
+    )
+    if args.format == "json":
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        _print_quarantine_payload(payload, dry_run=False)
     return 0
 
 
@@ -39692,6 +40224,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     else:
         gate_state = "ok"
         summary = "no worktree slot currently needs coordinator attention"
+    quarantined_rows = _quarantined_journal_rows(config)
     payload = {
         "schema": SCHEMA,
         "worktree_count": worktree_count,
@@ -39715,6 +40248,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
             }
             for slot_type, path in non_slot_entries
         ],
+        "quarantined_journals": quarantined_rows,
         "foreign_shards": foreign_notes,
         "metrics": metrics.to_obj(),
     }
@@ -39753,6 +40287,13 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                     f"  {entry['slot_type']} {entry['name']}: "
                     f"{'size unknown' if size is None else f'{size} bytes'}"
                 )
+        for quarantined in quarantined_rows:
+            age_seconds = quarantined["age_seconds"]
+            age = f"{age_seconds}s" if isinstance(age_seconds, int) else "unknown"
+            print(
+                f"quarantined: {quarantined['slot'] or '-'}: "
+                f"age={age} journal={quarantined['journal']}"
+            )
         _print_foreign_shard_notes(foreign_notes)
         if args.gate:
             print(f"state={gate_state}")
@@ -39965,6 +40506,19 @@ def _slot_findings(
 
     for path in _outstanding_journals(config):
         note("unfinished-journal", None, None, f"recovery required: {path.name}")
+
+    for row in _quarantined_journal_rows(config):
+        age_seconds = row["age_seconds"]
+        age = f"{age_seconds}s" if isinstance(age_seconds, int) else "unknown"
+        slot_value = row["slot"]
+        machine_value = row["machine"]
+        note(
+            "quarantined-journal",
+            slot_value if isinstance(slot_value, str) else None,
+            machine_value if isinstance(machine_value, str) else None,
+            f"quarantined journal {row['journal']} retained for inspection "
+            f"(age {age}); report-only in v1, hand restore is in the user guide",
+        )
 
     # `status` refuses outright on a partial atomic update. Diagnosis reports
     # it instead, because an operator looking at a wedged registry needs to see
@@ -69150,6 +69704,77 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--format", choices=("human", "json"), default="human"
     )
     classify_create.set_defaults(handler=_cmd_classify_create_journals)
+
+    quarantine_journal = subparsers.add_parser(
+        "quarantine-journal",
+        help="set aside one stranded create journal that recover itself refuses",
+        description=(
+            "Move one slot's stranded scoped create journal into "
+            "<control>/quarantine/ so unrelated work is no longer refused "
+            "host-wide, without deleting anything it describes. Eligible only "
+            "when both recorded owners are proven dead, the journal is older "
+            "than max(24h, heartbeat_ttl_seconds), and classification refuses "
+            "it for a recover-shared reason; a journal recover would resolve "
+            "refuses here and points at recover. The default is a dry run "
+            "printing the exact journal path and sha256, the recover refusal, "
+            "and every partial artifact; --yes must echo that path and sha256 "
+            "and appends an operation-quarantined tombstone event in the same "
+            "journaled step as the move. Hand restore is moving the file back; "
+            "see the user guide (#1086)."
+        ),
+        epilog=(
+            "examples:\n"
+            "  wrkslots quarantine-journal slot01 --coordinator-authorized \\\n"
+            "    --coordinator-pid \"$COORDINATOR_PID\" \\\n"
+            "    --reason \"archived slot name reused; worktrees preserved\"\n"
+            "  wrkslots quarantine-journal slot01 ... --yes \\\n"
+            "    --journal /abs/CREATE.6.machine.6.slot01.journal \\\n"
+            "    --journal-sha256 <digest from the dry run>"
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    quarantine_journal.add_argument("slot", help="slot whose create journal is stranded")
+    quarantine_journal.add_argument(
+        "--coordinator-pid",
+        type=int,
+        required=True,
+        metavar="PID",
+        help="live coordinator PID recorded as the quarantine actor",
+    )
+    quarantine_journal.add_argument(
+        "--coordinator-authorized",
+        action="store_true",
+        help="required: the coordinator authorized setting this journal aside",
+    )
+    quarantine_journal.add_argument(
+        "--reason",
+        required=True,
+        metavar="TEXT",
+        help=(
+            "why this journal must be set aside instead of recovered "
+            f"(required, non-blank, at most {_QUARANTINE_REASON_LIMIT} "
+            "characters); recorded in the tombstone event"
+        ),
+    )
+    quarantine_journal.add_argument(
+        "--yes",
+        action="store_true",
+        help="append the tombstone event and move the journal; without it nothing is changed",
+    )
+    quarantine_journal.add_argument(
+        "--journal",
+        metavar="PATH",
+        help="required with --yes: the exact journal path the dry run printed",
+    )
+    quarantine_journal.add_argument(
+        "--journal-sha256",
+        metavar="SHA256",
+        help="required with --yes: the journal digest the dry run printed",
+    )
+    quarantine_journal.add_argument(
+        "--format", choices=("human", "json"), default="human"
+    )
+    quarantine_journal.set_defaults(handler=_cmd_quarantine_journal)
 
     register = subparsers.add_parser(
         "register",
