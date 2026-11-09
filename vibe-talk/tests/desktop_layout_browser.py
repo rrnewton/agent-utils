@@ -275,6 +275,12 @@ class Desk:
             self.page.screenshot(path=str(self.screenshots / f"{name}-{self.label}.png"))
 
     def settled(self) -> None:
+        """Two animation frames and nothing more (`#1118 browser-fixed-frame-settle`).
+
+        Only for a frame to paint after a `wait_for` has pinned the state, before a geometry or
+        screenshot read, where nothing is asserted on the next render, or where frames passing is
+        itself the point. Never the only wait before reading what a render draws: `wait_for` that
+        thing instead."""
         self.page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
 
     def wait_for(self, condition: str, why: str, seconds: float = 10) -> None:
@@ -334,6 +340,12 @@ def settings_walk(desk: Desk) -> None:
     page = desk.page
     page.click("#open-settings")
     desk.wait_for("() => document.getElementById('screen-settings').checkVisibility()", "Settings did not open")
+    desk.wait_for("() => { const h = document.getElementById('settings-server-host'); "
+                  "return h && h.textContent !== '' && h.getBoundingClientRect().width > 0 "
+                  "&& document.getElementById('fold-settings-all').getBoundingClientRect().width > 0 "
+                  "&& document.getElementById('open-help').getBoundingClientRect().width > 0 "
+                  "&& document.getElementById('settings-panes').getBoundingClientRect().width > 0; }",
+                  "the Settings head did not lay out")
     desk.settled()
     head = page.evaluate(HEAD_JS)
     host, expand, helps, panes = head["host"], head["expand"], head["help"], head["panes"]
@@ -427,7 +439,11 @@ def columns_walk(desk: Desk) -> None:
         page.click("#action-menu-open")
         page.click("#expand-all")
     page.evaluate("() => { const s = document.getElementById('scroll-area'); s.scrollTop = s.scrollHeight; }")
-    page.wait_for_timeout(200)
+    desk.wait_for("() => { const rows = [...document.querySelectorAll('#discord-log > li.discord-message')]"
+                  ".filter((row) => row.getClientRects().length > 0); "
+                  "return rows.length >= 3 && rows.some((row) => row.getAttribute('data-who') === 'coder') "
+                  "&& rows.some((row) => row.getAttribute('data-who') === 'me'); }",
+                  "too few of Main's rows are on screen to measure")
     desk.settled()
     found = page.evaluate(COLUMNS_JS)
     left, right = found["left"], found["right"]
@@ -479,6 +495,8 @@ def columns_walk(desk: Desk) -> None:
     page.click("#column-toggle")
     desk.wait_for("() => document.getElementById('side-column').getClientRects().length === 0",
                   "the layout button did not go back to one column")
+    desk.wait_for("() => getComputedStyle(document.getElementById('pane-discord')).maxWidth !== 'none'",
+                  "one column did not regain its reading-width cap")
     desk.settled()
     one = page.evaluate(COLUMNS_JS)
     desk.check(one["paneCap"] != "none" and one["pane"]["width"] <= one["readingWidth"] + 1,
@@ -498,6 +516,10 @@ def thread_walk(desk: Desk) -> None:
     page.click(f"#side-cards > li[data-id='{RUNNER}'] .side-card-open")
     desk.wait_for("() => document.querySelectorAll('#side-log > li.discord-message').length >= 3",
                   "the thread did not open on the right")
+    desk.wait_for("() => [...document.querySelectorAll('#side-log > li.discord-message')]"
+                  ".filter((row) => row.getClientRects().length > 0).length >= 3 "
+                  "&& document.getElementById('side-column').getBoundingClientRect().width > 0",
+                  "the thread's rows are not drawn on the right")
     desk.settled()
     found = page.evaluate(COLUMNS_JS)
     right = found["right"]

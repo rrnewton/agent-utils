@@ -300,6 +300,10 @@ def compose_walk(desk: Desk) -> None:
                   "Main channel did not put the main channel's box at the foot of the cards")
     page.focus("#side-cards > li[data-card] .side-card")
     chord(desk, "s")
+    desk.wait_for("() => document.activeElement && document.activeElement.id === 'channel-compose-text' "
+                  "&& document.getElementById('screen-main').getAttribute('data-columns') === 'list' "
+                  "&& document.getElementById('thread-select').value === 'threads'",
+                  "Cmd+S did not focus the box at the foot")
     found = state(desk)
     desk.check(found["layout"] == "list" and found["view"] == "threads", f"Cmd+S left the Threads view: {found}")
     desk.check(found["focus"] == "channel-compose-text", f"Cmd+S did not focus the box at the foot: {found}")
@@ -310,6 +314,9 @@ def compose_walk(desk: Desk) -> None:
     desk.wait_for("() => !document.getElementById('side-reply').hidden", "Reply on a main-channel message did not open the reply")
     page.focus("#side-scroll")
     chord(desk, "s")
+    desk.wait_for("() => document.activeElement && document.activeElement.id === 'reply-text' "
+                  "&& document.getElementById('screen-main').getAttribute('data-columns') === 'list'",
+                  "Cmd+S with a reply open did not focus the reply")
     found = state(desk)
     desk.check(found["layout"] == "list" and found["focus"] == "reply-text", f"Cmd+S with a reply open: {found}")
     desk.shot("2-cmd-s-reply")
@@ -322,6 +329,10 @@ def compose_walk(desk: Desk) -> None:
     set_chip(desk, "side-main", False)
     page.focus("#side-scroll")
     chord(desk, "s")
+    desk.wait_for("() => document.activeElement && document.activeElement.id === 'channel-compose-text' "
+                  "&& document.getElementById('screen-main').getAttribute('data-columns') !== 'list' "
+                  "&& document.getElementById('thread-select').value === 'flat'",
+                  "Cmd+S with Main channel off did not go back to All and its box")
     found = state(desk)
     desk.check(found["layout"] != "list" and found["view"] == "flat" and found["focus"] == "channel-compose-text",
                f"Cmd+S with Main channel off did not go back to All and its box: {found}")
@@ -345,7 +356,9 @@ def center_walk(desk: Desk) -> None:
     page = desk.page
     page.select_option("#thread-select", "flat")
     desk.wait_for("() => document.getElementById('thread-select').value === 'flat'", "the picker did not show All")
-    desk.settled()
+    desk.wait_for("() => ['220', '203'].every((id) => [...document.getElementById('discord-log').children]"
+                  ".some((li) => li.getAttribute('data-id') === id && li.getClientRects().length > 0))",
+                  "All did not draw 220 and 203")
     own_all, agent_all = row(desk, "discord-log", "220"), row(desk, "discord-log", "203")
     desk.check(own_all["who"] == "me" and agent_all["who"] == "coder", f"the premise: 220 the owner's, 203 the agent's: {own_all} {agent_all}")
     to_threads(desk)
@@ -396,6 +409,16 @@ def where(desk: Desk) -> str:
     return "threads" if found["layout"] == "list" else str(found["view"])
 
 
+def wait_where(desk: Desk, want: str) -> None:
+    """Wait until `where` would name `want`, by the same fields it reads (`#1118`)."""
+    desk.wait_for("() => { const screen = document.getElementById('frame-body').getAttribute('data-screen'); "
+                  "const layout = document.getElementById('screen-main').getAttribute('data-columns'); "
+                  "const place = screen !== 'main' ? screen : layout === 'two' "
+                  "? (document.getElementById('side-pane').hidden ? 'two' : 'two+thread') "
+                  ": layout === 'list' ? 'threads' : document.getElementById('thread-select').value; "
+                  f"return place === '{want}'; }}", f"the walk did not reach {want}")
+
+
 def back_walk(desk: Desk) -> None:
     page = desk.page
     to_threads(desk)
@@ -425,6 +448,7 @@ def back_walk(desk: Desk) -> None:
     walked = [where(desk)]
     for at in range(len(visits) - 2, -1, -1):
         chord(desk, "BracketLeft")
+        wait_where(desk, visits[at])
         now = where(desk)
         walked.append(now)
         desk.check(now == visits[at], f"Cmd+[ from {visits[at + 1]} went to {now}, not {visits[at]}")
@@ -436,9 +460,12 @@ def back_walk(desk: Desk) -> None:
     desk.check(where(desk) == "main", f"the bare ] moved: {where(desk)}")
     for at in range(1, len(visits)):
         chord(desk, "BracketRight")
+        wait_where(desk, visits[at])
         now = where(desk)
         desk.check(now == visits[at], f"Cmd+] from {visits[at - 1]} went to {now}, not {visits[at]}")
     chord(desk, "BracketRight")
+    desk.wait_for("() => document.getElementById('status').textContent === 'Nothing to go forward to.'",
+                  "Forward at the end did not say so")
     desk.check(where(desk) == "settings", "Forward past the last place moved")
     status = str(page.evaluate("() => document.getElementById('status').textContent"))
     desk.check(status == "Nothing to go forward to.", f"Forward at the end said {status!r}")
@@ -487,6 +514,9 @@ def order_walk(desk: Desk, touch: bool) -> None:
     page.focus("#side-scroll")
     page.keyboard.press("d")
     desk.wait_for("() => document.getElementById('side-order').getAttribute('aria-pressed') === 'true'", "d did not change the order")
+    desk.wait_for(f"() => [...document.querySelectorAll('#side-cards > li[data-card]')].map((li) => li.getAttribute('data-id')).join(',') === '{','.join(created)}' "
+                  "&& document.getElementById('side-order').getAttribute('aria-label') === 'Order: Thread created'",
+                  "the cards are not by creation")
     desk.settled()
     found = chip_state()
     desk.check(page.evaluate(CARD_ORDER_JS) == created, f"the cards are not by creation: {page.evaluate(CARD_ORDER_JS)}")
@@ -499,10 +529,13 @@ def order_walk(desk: Desk, touch: bool) -> None:
     desk.shot("5-order-created")
     page.reload(wait_until="load")
     desk.wait_for("() => document.querySelectorAll('#side-cards > li[data-card]').length === 3", "the reload did not show the cards")
-    desk.settled()
+    desk.wait_for(f"() => [...document.querySelectorAll('#side-cards > li[data-card]')].map((li) => li.getAttribute('data-id')).join(',') === '{','.join(created)}'",
+                  "a reload forgot the order")
     desk.check(page.evaluate(CARD_ORDER_JS) == created, "a reload forgot the order")
     page.click("#side-order")
     desk.wait_for("() => document.getElementById('side-order').getAttribute('aria-pressed') === 'false'", "a press did not go back to latest update")
+    desk.wait_for(f"() => [...document.querySelectorAll('#side-cards > li[data-card]')].map((li) => li.getAttribute('data-id')).join(',') === '{','.join(updated)}'",
+                  "a press did not put the cards back by latest update")
     desk.check(page.evaluate(CARD_ORDER_JS) == updated, "a press did not put the cards back by latest update")
     desk.notes.append(f"cards by latest update {updated}, d by creation {created} with the highlighted card on screen, kept "
                       f"across a reload; the chips before the glass")
@@ -543,6 +576,14 @@ READ_MODE_JS = """() => ({label: document.getElementById('todo-filter-label').in
     cards: [...document.querySelectorAll('#side-cards > li[data-card]')].filter((li) => li.getClientRects().length > 0
         && !li.hasAttribute('data-read-run')).map((li) => li.getAttribute('data-id'))})"""
 
+# The cards and run lines `READ_MODE_JS` reports, as expressions a wait can hold the page to (`#1118`).
+READ_CARDS_JOIN_JS = ("[...document.querySelectorAll('#side-cards > li[data-card]')]"
+                      ".filter((li) => li.getClientRects().length > 0 && !li.hasAttribute('data-read-run'))"
+                      ".map((li) => li.getAttribute('data-id')).join(',')")
+READ_LINES_JS = ("[...document.querySelectorAll('#discord-log > li[data-read-run=head], #side-cards > li[data-read-run=head]')]"
+                 ".filter((li) => li.getClientRects().length > 0)"
+                 ".map((li) => (li.querySelector('.read-run')?.innerText || '').replace(/\\s+/g, ' ').trim()).filter(Boolean)")
+
 
 def read_mode(desk: Desk) -> dict[str, object]:
     found = desk.page.evaluate(READ_MODE_JS)
@@ -578,7 +619,14 @@ def read_mode_walk(desk: Desk, api: PolishApi) -> None:
         desk.settled()
     page.focus("#scroll-area")
     page.keyboard.press("h")
-    desk.settled()
+    # `#1118 browser-fixed-frame-settle`: two frames could pass before the fold's render drew the run
+    # lines, so wait on the lines themselves (the same expression `read_mode` reads), not on frames.
+    desk.wait_for(f"() => {{ const lines = {READ_LINES_JS}; "
+                  "return document.getElementById('todo-filter').getAttribute('data-read-mode') === 'fold' "
+                  "&& document.getElementById('todo-filter-label').innerText.replace(/\\s+/g, ' ').trim() === 'Fold read' "
+                  "&& document.getElementById('status').textContent.startsWith('Fold read:') "
+                  "&& lines.length > 0 && lines.every((line) => line.includes('read message')); }",
+                  "Fold read by h drew no run line in All", seconds=30)
     found = read_mode(desk)
     desk.check(found["mode"] == "fold" and found["label"] == "Fold read", f"h did not move the button to Fold read: {found}")
     desk.check(str(found["status"]).startswith("Fold read:"), f"h did not say Fold read: {found['status']!r}")
@@ -592,17 +640,20 @@ def read_mode_walk(desk: Desk, api: PolishApi) -> None:
     desk.check(found["cards"] == [RUNNER], f"the unread runner's card is not the one card drawn whole: {found}")
     desk.shot("7-fold-read-threads")
     page.click(f"#side-cards > li[data-id='{REPLICA}'] .read-run")
-    desk.settled()
+    desk.wait_for(f"() => {READ_LINES_JS}.length === 0 && {READ_CARDS_JOIN_JS} === '{REPLICA},{CANARY},{RUNNER}'",
+                  "a tap on the line did not open it")
     found = read_mode(desk)
     desk.check(found["lines"] == [] and found["cards"] == [REPLICA, CANARY, RUNNER], f"a tap on the line did not open it: {found}")
     page.focus("#side-scroll")
     page.keyboard.press("h")
-    desk.settled()
+    desk.wait_for(f"() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'hide' "
+                  f"&& {READ_CARDS_JOIN_JS} === '{RUNNER}'", "Hide read left a read thread's card")
     found = read_mode(desk)
     desk.check(found["mode"] == "hide" and found["cards"] == [RUNNER], f"Hide read left a read thread's card: {found}")
     desk.shot("7-hide-read-threads")
     page.keyboard.press("h")
-    desk.settled()
+    desk.wait_for(f"() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'show' "
+                  f"&& {READ_CARDS_JOIN_JS} === '{REPLICA},{CANARY},{RUNNER}'", "Show read did not bring every card back")
     found = read_mode(desk)
     desk.check(found["mode"] == "show" and found["cards"] == [REPLICA, CANARY, RUNNER], f"Show read did not bring every card back: {found}")
     state(desk)
@@ -669,6 +720,9 @@ def pack_walk(desk: Desk) -> None:
     unpack_to(desk, "mixed")
     desk.wait_for(f"() => document.querySelectorAll(\"#side-cards > li[data-unpack-thread='{RUNNER}']\").length > 0",
                   "Unpack unread did not unpack the unread runner")
+    desk.wait_for("() => document.getElementById('side-cards').getAttribute('data-unpack') === 'unread' "
+                  "&& document.getElementById('side-unpack').innerText.trim() === 'Unpack unread'",
+                  "the chip is not Unpack unread")
     desk.settled()
     found = packs(desk)
     runner, replica, canary = found["runner"], found["replica"], found["canary"]
@@ -728,7 +782,9 @@ def pack_walk(desk: Desk) -> None:
     if page.evaluate("() => matchMedia('(hover: hover) and (pointer: fine)').matches"):
         tri_sel = f"#side-cards > li[data-unpack-thread='{REPLICA}'] .unpack-pack"
         page.locator(tri_sel).hover()
-        desk.settled()
+        desk.wait_for("() => { const b = document.querySelector('#side-cards .unpack-pack:hover'); "
+                      "return b && !['rgba(0, 0, 0, 0)', 'transparent'].includes(getComputedStyle(b).backgroundColor); }",
+                      "a resting mouse lights no wash on the triangle")
         hovered = page.evaluate(
             "() => { const b = document.querySelector('#side-cards .unpack-pack:hover');"
             " return b ? getComputedStyle(b).backgroundColor : null; }")
@@ -736,7 +792,10 @@ def pack_walk(desk: Desk) -> None:
                    f"a resting mouse lights no wash on the triangle: {hovered}")
         page.keyboard.press("Tab")
         page.locator(tri_sel).focus()
-        desk.settled()
+        desk.wait_for(f"() => document.activeElement === document.querySelector(\"{tri_sel}\") "
+                      f"&& getComputedStyle(document.querySelector(\"{tri_sel}\")).outlineStyle !== 'none' "
+                      f"&& getComputedStyle(document.querySelector(\"{tri_sel}\")).outlineColor === '" + str(drawn["edge"]) + "'",
+                      "the triangle's keyboard ring is not in its edge's colour")
         ring = page.evaluate(
             f"() => {{ const s = getComputedStyle(document.querySelector(\"{tri_sel}\"));"
             " return {style: s.outlineStyle, color: s.outlineColor}; }")

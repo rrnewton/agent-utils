@@ -312,6 +312,12 @@ class Desk:
             self.page.screenshot(path=str(self.screenshots / f"{self.label}-{name}.png"))
 
     def settled(self) -> None:
+        """Two animation frames and nothing more (`#1118 browser-fixed-frame-settle`).
+
+        Only for a frame to paint after a `wait_for` has pinned the state, before a geometry or
+        screenshot read, where nothing is asserted on the next render, or where frames passing is
+        itself the point (a no-change check, a scroll's redraw). Never the only wait before reading
+        what a render draws: `wait_for` that thing instead."""
         self.page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
 
     def rows(self, list_id: str) -> list[str]:
@@ -493,6 +499,9 @@ def columns_walk(desk: Desk) -> None:
     page.mouse.click(replica_box["x"] + replica_box["width"] / 2, replica_box["y"] + 12)
     desk.wait_for(f"() => document.querySelector(\"#side-cards > li[data-id='{REPLICA}']\")"
                   ".getAttribute('data-highlighted') === 'true'", "a click on the card did not highlight it")
+    desk.wait_for(f"() => {{ const t = document.querySelector(\"#side-cards > li[data-id='{REPLICA}'] .side-card-text\"); "
+                  "return t && Math.round(t.clientHeight / parseFloat(getComputedStyle(t).lineHeight)) === 5; }",
+                  "the card highlighted does not open to K lines")
     desk.settled()
     desk.check(page.is_visible("#side-list") and not page.is_visible("#side-pane"), "a click on a card entered its thread")
     lit = {str(card["id"]): card for card in desk.cards()}
@@ -530,7 +539,9 @@ def columns_walk(desk: Desk) -> None:
     # Each column scrolls on its own, under the wheel over it.
     page.evaluate("() => { document.getElementById('scroll-area').scrollTop = document.getElementById('scroll-area').scrollHeight; }")
     page.evaluate("() => { document.getElementById('side-scroll').scrollTop = document.getElementById('side-scroll').scrollHeight; }")
-    desk.settled()
+    desk.wait_for("() => ['scroll-area', 'side-scroll'].every((id) => { const n = document.getElementById(id); "
+                  "return n.scrollTop + n.clientHeight >= n.scrollHeight - 1; })",
+                  "a column did not scroll to its foot")
     left_before, right_before = scroll_top(page, "scroll-area"), scroll_top(page, "side-scroll")
     desk.check(right_before > 0 and left_before > 0, "a column is too short to scroll, so this proves nothing")
     right_box = desk.layout().box("scroller")
@@ -1115,10 +1126,14 @@ def older_walk(desk: Desk, api: OlderApi, touch: bool) -> None:
     api.older_gate.set()
     desk.wait_for("() => document.getElementById('load-older').textContent.startsWith('Search before ')",
                   "the walk did not end", seconds=20)
-    desk.settled()
-    page.wait_for_timeout(200)
-    found = measured_older(page)
     hits = [str(200 + index) for index in OLDER_HITS]
+    desk.wait_for(f"() => [...document.querySelectorAll('#discord-log > li[data-id]')]"
+                  ".filter((li) => li.getClientRects().length && !li.classList.contains('search-hidden'))"
+                  f".map((li) => li.getAttribute('data-id')).join(',') === '{','.join(hits)}' "
+                  "&& document.getElementById('search-older-note').textContent.startsWith('Found 3 more matches')",
+                  "the walk did not find the three matches", seconds=20)
+    desk.settled()
+    found = measured_older(page)
     desk.check(found["shown"] == hits, f"the walk did not find the three matches: {found['shown']}")
     # It holds still but for the sentence above it, that nothing matched, going once something does:
     # at the head of the list there is no room to keep it where it stood.
@@ -1319,8 +1334,12 @@ def replies_walk(desk: Desk, api: RepliesApi, touch: bool) -> None:
     # 1. The search: nothing Main holds matches, and no card does; the cards offer to search further back.
     page.click("#search-toggle")
     page.fill("#search-field", REPLIES_TERM)
-    page.wait_for_timeout(400)
+    desk.wait_for("() => document.getElementById('side-list-state').textContent === 'No threads match that search.' "
+                  "&& (document.getElementById('side-search-replies')?.textContent || '').startsWith('Search replies before ')",
+                  "the cards do not say no threads match, offering to search replies")
     desk.settled()
+    # Kept as the no-read-by-itself window for the `reads == 0` check below, not as a render wait.
+    page.wait_for_timeout(400)
     found = measured_replies(page)
     desk.check(not found["cards"], f"a card was found before any older reply was read: {found['cards']}")
     desk.check(found["state"] == "No threads match that search.", f"the cards say {found['state']!r}")
@@ -1351,8 +1370,11 @@ def replies_walk(desk: Desk, api: RepliesApi, touch: bool) -> None:
     api.older_gate.set()
     desk.wait_for("() => document.getElementById('side-search-replies').textContent.startsWith('Search replies before ')",
                   "the cards' walk did not end", seconds=20)
+    desk.wait_for("() => [...document.querySelectorAll('#side-cards > li[data-id]')]"
+                  ".filter((li) => li.getClientRects().length && !li.classList.contains('search-hidden')).length === 3 "
+                  "&& document.getElementById('side-replies-note').textContent.startsWith('Found 3 threads')",
+                  "the cards' walk did not find the three threads", seconds=20)
     desk.settled()
-    page.wait_for_timeout(200)
 
     # 3. What it found: the three threads, each "in replies", under a note saying so between it and them.
     found = measured_replies(page)
@@ -1426,7 +1448,9 @@ def replies_place(desk: Desk) -> None:
                   "the cards did not come up, one per thread")
     page.click("#search-toggle")
     page.fill("#search-field", REPLIES_TERM)
-    page.wait_for_timeout(400)
+    desk.wait_for(f"() => [...document.querySelectorAll('#side-cards > li[data-id]')]"
+                  f".filter((li) => li.getClientRects().length && !li.classList.contains('search-hidden')).length === {len(PLACE_ROOTS)}",
+                  "the search did not show the root cards")
     desk.settled()
     found = measured_replies(page)
     roots = sorted(f"spaces/A/threads/r{t}" for t in PLACE_ROOTS)
@@ -1445,8 +1469,10 @@ def replies_place(desk: Desk) -> None:
         const card = document.querySelector("#side-cards > li[data-id='{anchor}']");
         area.scrollTop += card.getBoundingClientRect().top - area.getBoundingClientRect().top - 200;
     }}""")
+    desk.wait_for(f"() => Math.abs(document.querySelector(\"#side-cards > li[data-id='{anchor}']\").getBoundingClientRect().top "
+                  "- document.getElementById('side-scroll').getBoundingClientRect().top - 200) < 1",
+                  "the cards did not scroll to the reader's place")
     desk.settled()
-    page.wait_for_timeout(200)
     script = PLACE_JS.replace("ID", anchor)
     before = page.evaluate(script)
     desk.check(float(before["right"]) > 0, "the cards were not scrolled")
@@ -1597,8 +1623,9 @@ def advance_walk(desk: Desk, api: AdvanceApi, touch: bool) -> None:
     page.fill("#search-field", ADVANCE_TERM)
     desk.wait_for("() => document.getElementById('load-older').textContent.startsWith('Search before ')",
                   "the step back does not offer to search further back")
-    desk.settled()
-    page.wait_for_timeout(300)
+    desk.wait_for("() => !document.getElementById('search-empty').hidden "
+                  "&& document.getElementById('search-empty').textContent.startsWith('Searched 10 messages')",
+                  "the sentence where the rows were does not say what it searched")
     labels: list[str] = []
     found = advance_measure(desk)
     labels.append(str(found["label"]))
@@ -1619,8 +1646,10 @@ def advance_walk(desk: Desk, api: AdvanceApi, touch: bool) -> None:
         desk.wait_for("() => document.getElementById('load-older').textContent.startsWith('Search before ') && "
                       "!document.getElementById('search-older-note').hidden",
                       f"press {press}: the walk did not end with a note", seconds=20)
+        desk.wait_for(f"() => document.getElementById('search-empty').textContent.startsWith('Searched {10 + 50 * press} messages') "
+                      "&& document.getElementById('search-older-note').textContent.startsWith('None of the 50 older messages')",
+                      f"press {press}: the sentence did not advance", seconds=20)
         desk.settled()
-        page.wait_for_timeout(200)
         found = advance_measure(desk)
         label = str(found["label"])
         desk.check(label not in labels, f"press {press}: the control still says {label!r}, as before the press")
