@@ -32,6 +32,7 @@ Sequence after #1102 wrkslots-census-churn-tolerant's vanished-PID half, which r
 - A test (or forced-slow-census fixture) shows validation admission proceeding while a remove does its slow evidence gathering, with lock-wait time under a stated bound.
 - Remove still refuses when the slot changes between the unlocked evidence pass and the locked re-check (test).
 - Both editions, or the parity gap recorded.
+- Required tests (the lead): a process that enters the slot between the unlocked evidence pass and the fence makes the remove refuse (and the slot is restored); a concurrent `adopt` (or create binding the slot) during the unlocked pass makes the remove refuse under the lock.
 
 # Notes
 
@@ -72,4 +73,17 @@ The locked pre-fence scans added nothing to cases 1-4. They only made a refusal 
 What the locks must still protect is the registry record, not process use: that no adopt, transfer, heartbeat renewal, release, hold or handoff changed the slot between the evidence pass and the fence. Those re-checks are cheap (record digest and generation, heartbeat stamp, hold and handoff identity, journals and seals) and stay under the locks immediately before the fence. A revived owner is a process using the slot (case 1 or 3), or it renews the heartbeat, which changes the record that is re-checked. So "one cheap re-check" means these registry re-checks; no /proc scan is needed under the locks.
 
 One exception stays locked: an image-backed slot. Its fence remounts the image, and a process still inside the old mount is invisible to the after-fence identity scan, so case 1 does not hold there. The lsof-only check right before that rename (`before_image_fence`) stays under the locks, as today.
+
+Decision (the lead, 2026-11-08): keep the cheap registry-state checks under the lock, and move EVERY /proc scan out of it. What each guard protects against:
+
+| Guard | Where | Protects against |
+|---|---|---|
+| Registry re-check: the record's generation and owner unchanged since the unlocked pass, and no new claim (no adopt, transfer, create, hold, release, heartbeat renewal or handoff since then) | under the registry locks, immediately before the fence | a registry change that binds the slot again or changes who owns it, between the evidence pass and the fence; the lock makes the re-check and the fence one atomic step for every other wrkslots command |
+| Unlocked use scans (today's precondition scans, moved out of the lock) | before the locks | nothing the later guards miss; they keep an early refusal with today's messages, before any fence |
+| Path fence (rename to a random name under a private parent) | under the locks | a process reaching the tree by name after the fence: the canonical path is gone and the fenced name cannot be learned |
+| After-fence use scan with #1102 re-listing | unlocked, after the fence, before deletion; a refusal renames the fence back | any process that holds a reference into the tree (it held it before the fence, inherited it from a holder, or appeared during the scan), found by the fenced path and by device and inode |
+
+Process safety therefore rests on the fence plus the after-fence scan; registry safety rests on the locked re-check plus the fence. The registry locks never protected process use.
+
+Open point for the lead: image-backed slots. Their fence remounts the image, and a process still inside the OLD mount is invisible to the after-fence identity scan, so the table's last row does not cover them. Today a lsof check (`before_image_fence`) runs right before that rename, under the locks. Moving it out of the lock reopens that window for image slots only. Proposal: keep it under the lock for image-backed slots and measure its cost there; or, if every scan must leave the lock, re-run it after the fence against the old mount's device before deletion. Needs the lead's choice.
 
