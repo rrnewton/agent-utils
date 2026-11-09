@@ -197,6 +197,9 @@ SCROLL_GAP_UNDER_ROW_JS = """() => {
 
 
 def settled(page: Page) -> None:
+    """Two frames and nothing more (`#1118 browser-fixed-frame-settle`): a paint frame after an
+    `until` has pinned the state, before link geometry, or to land a scroll. Never the only
+    wait before reading what a press draws: `until` that first."""
     page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
 
 
@@ -239,6 +242,10 @@ def open_links(page: Page, label: str, touch: bool) -> None:
         press(page, "#links-filter", touch)
     until(page, "() => !document.getElementById('link-kinds').hidden",
           f"{label}: Links came on without its row of chips")
+    until(page, "() => document.querySelectorAll('#link-kinds button').length === 7 "
+                "&& [...document.querySelectorAll('#discord-log > li:not(.search-hidden) .row-link')]"
+                ".filter((a) => a.getClientRects().length).length > 0",
+          f"{label}: the chips and links are not drawn")
     settled(page)
 
 
@@ -298,6 +305,10 @@ def walk(page: Page, label: str, touch: bool, shots: Path | None, width: int) ->
     press(page, "#link-raw", touch)
     until(page, "() => document.getElementById('link-raw').getAttribute('aria-pressed') === 'true'",
           f"{label}: pressing URL did not turn it on")
+    until(page, "() => { const ls = [...document.querySelectorAll('#discord-log > li:not(.search-hidden) .row-link')]"
+                ".filter((a) => a.getClientRects().length); "
+                "return ls.length > 0 && ls.every((a) => a.textContent === a.getAttribute('href')); }",
+          f"{label}: URL on did not write every link as its address")
     state = page.evaluate(STATE_JS)
     links_written(state, label, True, "addresses")
     check(state["stored"] == "on", f"{label}: URL on was not kept: {state['stored']!r}")
@@ -325,6 +336,10 @@ def walk(page: Page, label: str, touch: bool, shots: Path | None, width: int) ->
     press(page, "#link-raw", touch)
     until(page, "() => document.getElementById('link-raw').getAttribute('aria-pressed') === 'false'",
           f"{label}: pressing URL again did not turn it off")
+    until(page, "() => { const ls = [...document.querySelectorAll('#discord-log > li:not(.search-hidden) .row-link')]"
+                ".filter((a) => a.getClientRects().length); "
+                "return ls.length === 1 && ls[0].textContent !== ls[0].getAttribute('href'); }",
+          f"{label}: URL off did not write the link as its label again")
     state = page.evaluate(STATE_JS)
     check([link["text"] for link in state["links"]] == [LINKS[2][1]],
           f"{label}: URL off under the search shows {[link['text'] for link in state['links']]}")

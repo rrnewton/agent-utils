@@ -251,6 +251,15 @@ class Reader:
             self.page.wait_for_timeout(25)
         return self.clipboard()
 
+    def clipboard_changed(self) -> str:
+        """The clipboard once it changes from the sentinel already there, or after a second (`#1118`)."""
+        for _ in range(40):
+            now = self.clipboard()
+            if now != SENTINEL:
+                return now
+            self.page.wait_for_timeout(25)
+        return self.clipboard()
+
     def check(self, condition: bool, why: str) -> None:
         self.desk.check(condition, why)
 
@@ -289,7 +298,8 @@ class Reader:
         menu_button = f"#discord-log > li[data-id='{QUESTION_ID}'] .row-more-button"
         page.locator(menu_button).scroll_into_view_if_needed()
         page.locator(menu_button).click()
-        self.desk.settled()
+        self.desk.wait_for(f"() => !document.querySelector('#discord-log > li[data-id=\"{QUESTION_ID}\"] .row-more-menu').hidden",
+                           "the ⋯ menu did not open")
         opened = self.menu(QUESTION_ID)
         items = opened["items"]
         assert isinstance(items, list)
@@ -322,7 +332,7 @@ class Reader:
         assert link_box is not None
         page.mouse.move(link_box["x"] + link_box["width"] / 2, link_box["y"] + link_box["height"] / 2)
         page.mouse.down(button="right")
-        page.wait_for_timeout(300)
+        self.desk.wait_for("() => window.__probeCm.length > 0", "a right-click on the link reached no contextmenu")
         probed = page.evaluate(f"() => ({{cm: window.__probeCm,"
                                f" open: !document.querySelector('#discord-log > li[data-id=\"{QUESTION_ID}\"] .row-more-menu').hidden}})")
         page.mouse.up(button="right")
@@ -334,8 +344,9 @@ class Reader:
         # The Copy item: the clipboard holds the address, as l leaves it.
         page.evaluate("(text) => navigator.clipboard.writeText(text)", SENTINEL)
         page.locator(f"#discord-log > li[data-id='{QUESTION_ID}'] .row-copy-link-button").click()
-        self.desk.settled()
-        self.check(self.clipboard() == ADDRESS, "the Copy item did not copy the address")
+        self.check(self.clipboard_changed() == ADDRESS, "the Copy item did not copy the address")
+        self.desk.wait_for(f"() => document.querySelector('#discord-log > li[data-id=\"{QUESTION_ID}\"] .row-more-menu').hidden",
+                           "the ⋯ menu stayed open after the Copy item")
         self.check(not self.menu(QUESTION_ID)["open"], "the ⋯ menu stayed open after the Copy item")
         page.locator(menu_button).click()
         self.desk.settled()
@@ -344,8 +355,7 @@ class Reader:
         # `#462`: this app's own link for the same message, from the reopened menu.
         page.evaluate("(text) => navigator.clipboard.writeText(text)", SENTINEL)
         page.locator(f"#discord-log > li[data-id='{QUESTION_ID}'] .row-copy-deep-link-button").click()
-        self.desk.settled()
-        deep = self.clipboard()
+        deep = self.clipboard_changed()
         self.check(deep.startswith(self.origin + "/?") and "v=main" in deep and "%3A209" in deep
                    and "migration" not in deep,
                    f"Copy vibe-talk link copied no durable link: {deep}")
@@ -375,7 +385,8 @@ class Reader:
         plain_button = f"#discord-log > li[data-id='{PLAIN_ID}'] .row-more-button"
         page.locator(plain_button).scroll_into_view_if_needed()
         page.locator(plain_button).click()
-        self.desk.settled()
+        self.desk.wait_for(f"() => !document.querySelector('#discord-log > li[data-id=\"{PLAIN_ID}\"] .row-more-menu').hidden",
+                           "the plain message's ⋯ menu did not open")
         plain = self.menu(PLAIN_ID)
         plain_items = plain["items"]
         assert isinstance(plain_items, list)

@@ -459,6 +459,9 @@ class Walk:
         self.check(bool(self.page.evaluate(condition, arg)), why)
 
     def settled(self) -> None:
+        # Two frames and 120 ms (`#1118 browser-fixed-frame-settle`): a landing-and-paint window
+        # after an exact wait, before the line's geometry is measured, and to land a scroll
+        # (`scroll`). Never the only wait before reading what a press draws: `wait_for` first.
         self.page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
         self.page.wait_for_timeout(120)
 
@@ -577,6 +580,14 @@ def bookmark_walk(walk: Walk) -> None:
             page.focus("#scroll-area")
             page.keyboard.press("b")
         walk.wait_for("() => document.getElementById('jump-bookmark').hidden", f"{why}: the chip stayed up")
+        walk.wait_for("() => { const area = document.getElementById('scroll-area'); "
+                      "let floating = area.getBoundingClientRect().top; "
+                      "for (const id of ['channel-freshness', 'search-float']) { const n = document.getElementById(id); "
+                      "if (!n.hidden) { const r = n.getBoundingClientRect(); if (r.height > 0) floating = Math.max(floating, r.bottom); } } "
+                      "const line = document.querySelector('#discord-log > li[data-bookmark] > .bookmark-line'); "
+                      "if (!line || !line.getClientRects().length) return false; "
+                      "const top = line.getBoundingClientRect().top; return top >= floating - 2 && top <= floating + 48; }",
+                      f"{why}: the line is not at the top of the list under the pill")
         walk.settled()
         found = walk.measure(marked)
         line_now = found.box("line")
@@ -684,6 +695,9 @@ def clear_walk(walk: Walk, lined: str) -> None:
         page.wait_for_timeout(25)
     walk.check(walk.api.anchor_id() is None, f"the server still holds {walk.api.anchor_id()}")
     walk.check(walk.api.bookmark_writes[-1]["anchor"] is None, f"the last write was not a removal: {walk.api.bookmark_writes[-1]}")
+    if not walk.touch:
+        walk.wait_for(f"() => document.activeElement?.dataset?.id === '{lined}'",
+                      "the X left the focus anywhere but the message it was above")
     walk.settled()
     m = walk.measure(lined)
     after = m.found["anchor"]
@@ -724,6 +738,8 @@ def clear_walk(walk: Walk, lined: str) -> None:
         page.wait_for_timeout(25)
     walk.check(walk.api.anchor_id() == lined, f"the server holds {walk.api.anchor_id()} after Undo")
     walk.check(isinstance(walk.api.bookmark_writes[-1].get("if_revision"), int), "Undo was not conditional")
+    walk.wait_for("() => !document.querySelector('#scroll-tools > #undo-bookmark')?.getClientRects().length",
+                  "Undo stayed up after it was used")
     walk.settled()
     m = walk.measure(lined)
     after = m.found["anchor"]

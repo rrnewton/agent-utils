@@ -471,3 +471,45 @@ either alone), the read-aloud files, and the remaining small files
 (`reply_marks_read` has no `settled()` of its own to convert).
 
 Solo on 2026-11-09 (Chromium 149.0.7827.55): all five files pass whole.
+
+## Batch 7, 2026-11-09 (mu-settle)
+
+[muse watermelon] `back_gesture_browser.py`,
+`open_upstream_link_browser.py`, `bookmark_browser.py`,
+`thread_button_browser.py`, `in_app_links_browser.py` and
+`link_url_chip_browser.py` (65 `settled()` sites reviewed).
+
+Converted, today's checks kept after each:
+
+- back-gesture: a Back with the ⋯ menu open waited on a disjunction (menu
+  gone *or* thread gone); it now also waits for the conjunct the checks
+  then assert — menu gone and thread still open on the phone, menu gone
+  on the desk — and the first Back after a reload waits for the thread
+  list's layout it then reads.
+- open-upstream-link: the ⋯ menus are waited open, a right-click's hold
+  waits for the contextmenu it then reads back instead of 300 ms, and the
+  Copy items are read through a clipboard poll (`clipboard_changed`, the
+  `copied_after` pattern) and a menu-shut wait.
+- bookmark: a jump waits until the line stands in the band under the pill
+  its check then measures; the X waits for the focus it asserts, and Undo
+  for its chip to be gone. Its own `settled` keeps its 120 ms, documented
+  as the landing-and-paint window before line geometry.
+- thread-button: Main's opening waits for the two new rows whose tags are
+  then read (the picker's value is set by the picking), and a grey Thread
+  waits for the empty thread's one row and its box's focus, in one column
+  and on the right.
+- in-app-links: the mouse crossing to another message waits until that
+  message is the selected one, the positive half of the mark check.
+- link-url-chip: opening waits for its seven chips and a drawn link, and
+  URL on and off wait until every shown link is written as its address,
+  then as its label again (the aria flip alone did not say the words had
+  been rewritten).
+
+Kept: scroll baselines and double settles before place and pixel reads
+(the links and tags paint in the page's own frame); the menu snapshots
+whose history depth is deliberately judged only after the Back; Back at
+the top leaving the app (already a bounded URL wait); the parked-menu and
+no-address negative windows; and the generic key/press helpers' internal
+settles, whose callers each wait for their own effect.
+
+Solo on 2026-11-09 (Chromium 149.0.7827.55): all six files pass whole.

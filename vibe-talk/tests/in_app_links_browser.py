@@ -374,7 +374,8 @@ class Reader:
             self.desk.check(other is not None, "no other message on screen to cross with the mouse")
             assert other is not None
             self.page.mouse.move(number_of(other["x"]), number_of(other["y"]), steps=4)
-            self.desk.settled()
+            self.desk.wait_for(f"() => document.querySelector('#discord-log > li[data-selected=\"true\"]')?.getAttribute('data-id') === '{other['id']}'",
+                               f"the mouse did not select {other['id']}")
             after: Json | None = self.page.evaluate(MARK_JS, message_id)
             assert after is not None
             self.desk.check(after["selected"] == other["id"], f"the mouse did not select {other['id']}: {after['selected']}")

@@ -328,6 +328,9 @@ class Walk:
         self.check(bool(self.page.evaluate(condition, arg)), why)
 
     def settled(self) -> None:
+        # Two frames and nothing more (`#1118 browser-fixed-frame-settle`): a paint frame after
+        # an exact wait, before tag colours and pixels are read. Never the only wait before
+        # reading what a press draws: `wait_for` that first.
         self.page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
         self.page.wait_for_timeout(120)
 
@@ -405,8 +408,8 @@ def thread_button_walk(walk: Walk) -> None:
     walk.wait_for(f"() => !!document.querySelector('#discord-log > li[data-id=\"{OTHER}\"] .thread-badge')",
                   "the channel did not open")
     page.select_option("#thread-select", "main")
-    walk.wait_for("() => document.getElementById('thread-select').value === 'main'", "Main did not open")
-    walk.settled()
+    walk.wait_for(f"() => Boolean(document.querySelector('#discord-log > li[data-id=\\\"{FRESH}\\\"]')) "
+                  f"&& Boolean(document.querySelector('#discord-log > li[data-id=\\\"{OTHER}\\\"]'))", "Main did not open")
 
     # Main, in both schemes: the new messages' tags grey, the answered roots' coloured.
     for scheme in ("dark", "light"):
@@ -428,7 +431,9 @@ def thread_button_walk(walk: Walk) -> None:
     # The grey tag pressed: the empty thread, the focus in its box.
     walk.press(f"#discord-log > li[data-id='{FRESH}'] .thread-badge")
     walk.wait_for("() => !document.getElementById('thread-heading').hidden", "the grey Thread opened no thread")
-    walk.settled()
+    walk.wait_for(f"() => [...document.querySelectorAll('#discord-log > li[data-id]')].map((li) => li.dataset.id).join() === '{FRESH}' "
+                  "&& document.activeElement && document.activeElement.id === 'channel-compose-text'",
+                  "the empty thread is not the message alone with its box focused")
     state = walk.state()
     walk.check(state["rows"] == [FRESH], f"the empty thread is not the message alone: {state['rows']}")
     walk.check(state["focus"] == "channel-compose-text", f"the focus is on #{state['focus']}, not the thread's box")
@@ -472,7 +477,8 @@ def thread_button_walk(walk: Walk) -> None:
     walk.press(f"#discord-log > li[data-id='{OTHER}'] .thread-badge")
     walk.wait_for(f"() => [...document.querySelectorAll('#side-log > li[data-id]')].map((li) => li.dataset.id)"
                   f".join(' ') === '{OTHER}'", "the empty thread was not selected on the right")
-    walk.settled()
+    walk.wait_for("() => document.activeElement && document.activeElement.id === 'side-compose-text'",
+                  "the empty thread on the right did not take that column's box")
     state = walk.state()
     walk.check(state["focus"] == "side-compose-text", f"the focus is on #{state['focus']}, not the right column's box")
     walk.check(OTHER in str(state["rows"]), "the left column left Main")

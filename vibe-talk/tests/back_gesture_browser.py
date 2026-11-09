@@ -416,6 +416,8 @@ def gesture_walk(desk: Desk) -> None:
     page.go_back()
     desk.wait_for(f"() => document.querySelector('{menu}').hidden || document.getElementById('thread-heading').hidden",
                   "the browser's Back with the ⋯ menu open changed nothing")
+    desk.wait_for(f"() => document.querySelector('{menu}').hidden && !document.getElementById('thread-heading').hidden",
+                  "the browser's Back did not close the ⋯ menu alone")
     desk.settled()
     desk.check(not page.url.startswith("data:") and state(page)["thread"] is True,
                "the browser's Back with the ⋯ menu open closed the thread under it")
@@ -504,6 +506,8 @@ def back_through_reopened(desk: Desk, reopened: Json) -> None:
     page = desk.page
     page.go_back()
     desk.wait_for("() => document.getElementById('thread-heading').hidden", "the first Back after the reload did not close the thread")
+    desk.wait_for("() => document.getElementById('screen-main').getAttribute('data-columns') === 'list'",
+                  "the first Back after the reload closed more than the thread")
     desk.settled()
     layout = page.evaluate("() => document.getElementById('screen-main').getAttribute('data-columns')")
     desk.check(layout == "list", f"the first Back after the reload closed more than the thread: the layout is {layout!r}, "
@@ -609,6 +613,7 @@ def desk_walk(desk: Desk) -> None:
     page.go_back()
     desk.wait_for(f"() => document.querySelector(\"{menu}\").hidden || document.getElementById('side-list').hidden === false",
                   "the browser's Back with the ⋯ menu open changed nothing")
+    desk.wait_for(f"() => document.querySelector(\"{menu}\").hidden", "the browser's Back did not close the ⋯ menu")
     desk.settled()
     desk.check(len(desk.rows("side-log")) == THREAD_ROWS[RUNNER] and not page.url.startswith("data:"),
                "the browser's Back with the ⋯ menu open took the thread off the right column")
