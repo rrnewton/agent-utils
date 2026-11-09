@@ -1008,7 +1008,7 @@ An **item record** (`items/<pr>.json`) has these fields:
 | `roots` | `1` | How many base-rooted batches may validate at once, each disjoint from everything in flight. `1` is today's behaviour (one disjoint root in the window's last slot); at least the window (`depth`) means every slot may be a root. Set it with `init --roots`. |
 | `keep_stale_roots` | `false` | Keep a rooted batch whose base moved instead of cancelling it: a green one is requeued at the front to be rebuilt on the new base (its history says `green at <base>`), a red one is decided as usual. Set it with `init --keep-stale-roots`. |
 | `root_stack_min_pass_percent` | `0` | Stack a would-be disjoint root on a batch it jumps over when that batch is likely to land first (prioritized, already green awaiting decision, or predicted to pass at or above this percent from the trained model or historical rates), instead of rooting it on the base that landing would move. `0` (the default) always roots, exactly as before. Set it with `init --root-stack-min-pass-percent`. |
-| `stack_min_pass_percent` | `0` | Build on the stack top only when the recent pass rate (green share of the last 20 decided validations) is at least this percent; below it, build a root on the base when `roots` allows. `0` always stacks. Set it with `init --stack-min-pass-percent`. |
+| `stack_min_pass_percent` | `0` | Build on the stack top only when the recent pass rate (green share of the last 20 decided validations) is at least this percent; below it, build a root on the base when `roots` allows. Decided means green or red: could-not-run refusals and cancellations are skipped, never counted as red, and the window still reaches back 20 decided change batches, so an infrastructure stretch (setup timeouts with no test counted, classified could-not-run) does not close the gate. `0` always stacks. Set it with `init --stack-min-pass-percent`. |
 | `batch_min_pass_percent` | `0` | Build batches wider than one change only when the recent pass rate is at least this percent; below it, batches are one change wide whatever `max_batch` says. `0` always allows width. Set it with `init --batch-min-pass-percent`. |
 | `union_paths` | `[]` | Attribute patterns merged with Git's union driver (see "Union merges"). |
 | `priority` | absent | `{label, ci_paths, exact_label}`: the priority label (absent or empty: `mq-priority`; `-`: off), the CI path patterns for label suggestions, and the exact label (absent, empty or `-`: off). Left out of the file while both are defaults. See "Priority changes". |
@@ -1358,6 +1358,18 @@ Either way, a red that did record results (a named failure, or passes beside it)
 normally under both settings, and a culprit-search probe that is an empty red observes
 nothing: it is inconclusive and can name no culprit, so bisection within a multi-change
 batch is unaffected by it.
+
+**A setup step killed by its budget before any test counted** is could-not-run under
+either setting, for a `dagrun` validation: when no selected test recorded a pass or a
+failure of its own and every failed step in the journal ended on infrastructure (a wall
+or CPU timeout, an OOM or memory-cap kill, a budget abort — the journal's `reason`, never
+a plain exit code), nothing ran that could judge the change, so the validation is refused
+on the bounded path with the step and its reason named, exactly like an admission
+refusal. A setup step that simply exits non-zero (a build the change broke, say) stays a
+red verdict, and so does any run in which a test was counted. A timed-out setup step
+never counts as a pass and a refused batch never lands: it stays queued, and repeated
+could-not-runs escalate to the owner at `validator.max_deferrals` with the last reason
+on the item and in `plan`/`status`, never retrying silently forever.
 
 **A red run is a verdict even when its probe cannot run.** After a red validation the queue
 probes the failed tests on prefixes of the batch, to name the culprit change and to tell a flaky

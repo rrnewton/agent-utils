@@ -1442,6 +1442,9 @@ struct JournalLine {
     wall_elapsed_s: Option<String>,
     #[serde(default)]
     log: Option<String>,
+    /// Why a step ended as it did (a budget breach, say); empty on a pass.
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// Create `dir` readable only by its owner; dagrun writes its journal only into a private,
@@ -1534,6 +1537,78 @@ pub fn parse_step_lines(text: &str) -> TestResults {
         });
     }
     results
+}
+
+/// The failed steps in a dagrun journal with the reason each ended:
+/// `(step, reason)`, reason empty when the journal names none.
+fn journal_failures(text: &str) -> Vec<(TestId, String)> {
+    let mut failures = Vec::new();
+    for line in text.lines() {
+        let Ok(record) = serde_json::from_str::<JournalLine>(line) else {
+            continue;
+        };
+        if record.event != "step_end" || record.ok == Some(true) {
+            continue;
+        }
+        let Ok(id) = TestId::parse(&record.step) else {
+            continue;
+        };
+        failures.push((id, record.reason.unwrap_or_default()));
+    }
+    failures
+}
+
+/// Whether a dagrun step_end reason names an infrastructure budget
+/// breach rather than a verdict on the change: a wall or CPU timeout,
+/// an OOM/memory-cap kill, a run-budget or peer-failure abort, or a
+/// supervisor failure (`step_failure_reason` in dagrun's model). A
+/// plain exit code is explicitly not one: a change can make a setup
+/// step exit non-zero by breaking the build.
+fn infra_reason(reason: &str) -> bool {
+    [
+        "TIMEOUT",
+        "CPU-TIMEOUT",
+        "OOM-KILLED",
+        "MEMORY CAP EXHAUSTED",
+        "ABORTED (",
+        "SUPERVISOR ",
+    ]
+    .iter()
+    .any(|prefix| reason.starts_with(prefix))
+}
+
+/// A could-not-run detail for a red dagrun validation in which no
+/// test was counted and every failed step failed on infrastructure
+/// (#1119): a setup step (or a selected step itself) hit a wall/CPU
+/// budget, an OOM cap or an abort before any selected test ran, so
+/// there is no verdict against the change. `None` when any test was
+/// counted (a pass anywhere, or a failure with a non-infrastructure
+/// reason), or when nothing failed that way.
+fn setup_could_not_run(results: &TestResults, failures: &[(TestId, String)]) -> Option<String> {
+    if failures.is_empty() {
+        return None;
+    }
+    // Counted: a pass anywhere, or a failure whose step's reason is
+    // not infrastructure (a plain exit included).
+    let infra: std::collections::BTreeMap<&TestId, &str> = failures
+        .iter()
+        .filter(|(_, reason)| infra_reason(reason))
+        .map(|(id, reason)| (id, reason.as_str()))
+        .collect();
+    if infra.len() != failures.len() {
+        return None;
+    }
+    let counted = results.results.iter().any(|(id, outcome)| {
+        *outcome == Outcome::Pass || (*outcome == Outcome::Fail && !infra.contains_key(id))
+    });
+    if counted {
+        return None;
+    }
+    let (step, reason) = &failures[0];
+    Some(format!(
+        "step {} failed before any test ran ({reason})",
+        step.step
+    ))
 }
 
 /// Per-step results from a dagrun `journal.jsonl`.
@@ -1706,7 +1781,7 @@ impl Validator for DagrunValidator {
         }
         results.require(whole_steps.as_ref().unwrap_or(selection));
         let log_text = std::fs::read_to_string(&log).unwrap_or_default();
-        let cannot_execute =
+        let mut cannot_execute =
             cannot_execute(&self.0, &argv, &finished, &log_text, reported_failures);
         let mut refused = cannot_execute.is_some()
             || (!cancelled && is_refusal(exit, &log_text, reported_failures));
@@ -1717,6 +1792,22 @@ impl Validator for DagrunValidator {
         {
             refused = true;
             empty_refused = true;
+        }
+        // A setup step killed by its budget before any test counted is
+        // infrastructure, whatever `empty_red` says (#1119): no test
+        // ran, so there is no verdict against the change. The scope
+        // line appended to the log lets a donor receipt carry the
+        // same classification to the queue host.
+        if !refused && !cancelled && red_exit(exit) {
+            if let Some(detail) = setup_could_not_run(&results, &journal_failures(&journal)) {
+                refused = true;
+                empty_refused = true;
+                cannot_execute = Some(format!("could not run: {detail}"));
+                if let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&log) {
+                    use std::io::Write as _;
+                    let _ = writeln!(file, "{COULD_NOT_RUN_SCOPE_MARKER}: job {detail}");
+                }
+            }
         }
         if refused {
             results = TestResults::default();
@@ -2842,5 +2933,105 @@ not json"#;
         assert_eq!(results.durations_ms[&TestId::step("a")], 1500);
         assert_eq!(results.failed(), [TestId::step("b")].into());
         assert_eq!(results.results[&TestId::step("c")], Outcome::Skip);
+    }
+
+    /// Run a fake dagrun that writes `journal` and exits 1, selecting
+    /// `steps`; the Ran the queue would decide on, with its log text
+    /// (the temp dir dies with this call, so the log is read here).
+    fn dagrun_ran(name: &str, journal: &str, steps: &[&str]) -> (Ran, String) {
+        let tmp = TempDir::new(name);
+        let script = tmp.0.join("fake-dagrun");
+        let echoes: Vec<String> = journal
+            .lines()
+            .map(|line| format!("echo '{line}' >> \"$DAGRUN_LOG_DIR/journal.jsonl\""))
+            .collect();
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\n{}\nexit 1\n", echoes.join("\n")),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let cfg = ValidatorConfig {
+            kind: "dagrun".into(),
+            dagrun: script.display().to_string(),
+            dag: "validation.dag.yaml".into(),
+            ..ValidatorConfig::default()
+        };
+        let selection = Selection::of(steps.iter().map(|step| TestId::step(*step)));
+        let ran = from_config(&cfg)
+            .unwrap()
+            .run(
+                &tmp.0,
+                &selection,
+                &tmp.0.join("o"),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+        let log = std::fs::read_to_string(&ran.log).unwrap_or_default();
+        (ran, log)
+    }
+
+    #[test]
+    fn a_setup_timeout_with_no_test_counted_is_could_not_run() {
+        let (ran, log) = dagrun_ran(
+            "validate-setup-timeout",
+            "{\"event\":\"step_end\",\"step\":\"setup.fetch\",\"ok\":false,\"reason\":\"TIMEOUT >60s\"}\n\
+             {\"event\":\"step_skip\",\"step\":\"check.unit\",\"reason\":\"setup.fetch failed\"}",
+            &["check.unit"],
+        );
+        assert!(ran.refused, "{ran:?}");
+        assert!(!ran.green() && !ran.deterministic_red(), "{ran:?}");
+        let why = ran.cannot_execute.clone().unwrap_or_default();
+        assert!(
+            why.contains("setup.fetch") && why.contains("TIMEOUT"),
+            "{why}"
+        );
+        assert!(
+            log.contains("MQ_COULD_NOT_RUN_SCOPE: job"),
+            "scope line missing for donor receipts: {log}"
+        );
+    }
+
+    #[test]
+    fn a_setup_plain_exit_with_no_test_counted_stays_red() {
+        let (ran, _log) = dagrun_ran(
+            "validate-setup-plain-exit",
+            "{\"event\":\"step_end\",\"step\":\"setup.build\",\"ok\":false,\"reason\":\"exit 1\"}\n\
+             {\"event\":\"step_skip\",\"step\":\"check.unit\",\"reason\":\"setup.build failed\"}",
+            &["check.unit"],
+        );
+        assert!(!ran.refused, "{ran:?}");
+        assert_eq!(ran.failed(), [TestId::step("setup.build")].into());
+    }
+
+    #[test]
+    fn a_setup_timeout_beside_a_counted_failure_stays_red() {
+        let (ran, _log) = dagrun_ran(
+            "validate-setup-timeout-counted",
+            "{\"event\":\"step_end\",\"step\":\"setup.fetch\",\"ok\":false,\"reason\":\"CPU-TIMEOUT >60s cpu\"}\n\
+             {\"event\":\"step_end\",\"step\":\"check.unit\",\"ok\":false,\"reason\":\"exit 1\"}",
+            &["check.unit"],
+        );
+        assert!(!ran.refused, "{ran:?}");
+        assert!(
+            ran.failed().contains(&TestId::step("check.unit")),
+            "{ran:?}"
+        );
+    }
+
+    #[test]
+    fn a_setup_timeout_beside_a_counted_pass_stays_red() {
+        let (ran, _log) = dagrun_ran(
+            "validate-setup-timeout-pass",
+            "{\"event\":\"step_end\",\"step\":\"check.unit\",\"ok\":true}\n\
+             {\"event\":\"step_end\",\"step\":\"setup.fetch\",\"ok\":false,\"reason\":\"TIMEOUT >60s\"}",
+            &["check.unit", "check.other"],
+        );
+        assert!(!ran.refused, "{ran:?}");
+        assert!(!ran.green(), "{ran:?}");
     }
 }

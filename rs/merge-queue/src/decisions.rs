@@ -1653,6 +1653,37 @@ mod unit {
         assert_eq!(recent_red_rate(&root, 20), Some(0.5));
         assert_eq!(recent_red_rate(&root, 2), Some(1.0));
         assert_eq!(recent_red_rate(&root, 0), None);
+        // The stack gate's window (#1119): could-not-run refusals are
+        // skipped, and the window still reaches back 20 decided
+        // batches. Newest decided here: 16 green, 2 red, then older
+        // reds, with 8 refusals interleaved on top - a pass rate of
+        // exactly 80% opens an 80 gate, where counting the refusals
+        // as red (or letting them spend window slots) would close it.
+        let mut seq: Vec<(String, &str)> = Vec::new();
+        for i in 0..5 {
+            seq.push((format!("2026-11-01T00:00:{i:02}Z"), "red"));
+        }
+        let mut tick = 0u32;
+        let mut stamp = || {
+            tick += 1;
+            format!("2026-11-02T00:{:02}:{:02}Z", tick / 60, tick % 60)
+        };
+        for i in 0..16 {
+            seq.push((stamp(), "green"));
+            if i % 2 == 0 {
+                seq.push((stamp(), "refused"));
+            }
+        }
+        seq.push((stamp(), "red"));
+        seq.push((stamp(), "red"));
+        let mut records = Vec::new();
+        for (at, outcome) in &seq {
+            let mut record = decision("batch", 1, outcome, 1.0);
+            record.at = at.clone();
+            records.push(serde_json::to_string(&record).unwrap());
+        }
+        std::fs::write(dir.join("2026-11-02.jsonl"), records.join("\n")).unwrap();
+        assert_eq!(recent_red_rate(&root, 20), Some(0.2));
         let empty = root.join("empty");
         assert_eq!(recent_red_rate(&empty, 20), None);
         let _ = std::fs::remove_dir_all(&root);
