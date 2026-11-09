@@ -4,7 +4,7 @@ status: open
 priority: 1
 issue_type: feature
 created_at: 2026-11-09T16:52:51.923846039+00:00
-updated_at: 2026-11-09T16:52:51.927743175+00:00
+updated_at: 2026-11-09T17:11:16.939921001+00:00
 ---
 
 # Description
@@ -15,22 +15,31 @@ The generated names make the gap easy to miss: the repair unit and the notifier 
 
 Impact: a team installed through the default path can run indefinitely with notification but no repair. The failures repair exists to fix then present as unrelated stalls: orphan shells accumulate, queues sit untyped, and a dead server or timer stays dead until a person intervenes.
 
+Rescope (owner replies 256-257, 2026-11-09): repair and notification converge on one daemon with per-duty switches (Phase 1 switches, Phase 2 fold-in with a compatible alias), and the watch settings move from restore.json to REGISTRY/watch.json with a backward-compatible read, since the daemon reads them on every pass rather than once per boot. See Design.
+
 # Design
 
-Make the pair the default. The default install path (the services snapshot flow and the setup skill's unit generation) installs the repair unit next to the notifier for every team, so a fresh team cannot end up with only one. Installing one without the other stays possible only as an explicit opt-out that the install output names.
+Rescoped 2026-11-09 (owner reply 257): there is no good reason for repair and notification to be separate daemons beyond blast radius, so converge on ONE daemon with per-duty switches, in two phases. The slug and number stay; the pairing, detection, naming, and config-file parts of the original issue are kept and folded in below.
 
-Flag the half-installed state where an operator already looks: the repair check-only pass and the host restore command each report a registry that has a notifier unit but no repair unit (and the reverse), naming the missing unit and the install command that adds it. The check reads unit presence only; it installs, enables, and starts nothing.
+Phase 1 (small, first): the repair daemon gains per-duty switches in its config and as flags, each duty independently on or off, defaulting to today's behaviour when unset: notify, status_requests, tab_hygiene, unit_repair, herdr, slot_images, restore_check, queue_drain. A disabled duty is reported as skipped-by-config on every pass (including check-only), never as healthy and never repaired. The motivating case is a team whose bridge is owner-managed: with unit_repair off it can run hygiene and notification without the daemon ever restarting its bridge, while herdr, timers, and restore checks keep their own switches. Flags override config for one run; an unknown duty name in either place is refused at load.
 
-Rename the generated units so the name states the behaviour: for example a repair name and a notify name scoped per team. Existing installed units keep working under their current names; the tool only generates the new names for new installs and prints a migration note (old name, new name, and the operator steps to rename). Live units are renamed by the host operator or coordinators, never by the tool, and the tool never deletes or renames a unit file it did not just write in the same run.
+Phase 2: fold the notifier duties (per-agent notices, blocked-prompt alerts, idle and stall classification, status-request pages) into the same daemon, so a host runs one unit per registry. The existing notifier command stays as a compatible alias or mode for installed units until they are migrated; its flags keep their meanings. The generated combined unit takes a name that states the single-daemon behaviour (for example an agent-scoped name per team). Service discovery (including the turnover flow, coordinated with its owner lane) must recognise all three unit kinds: the current repair unit, the current notifier unit, and the new combined unit.
+
+Config file naming (owner reply 256, decided here): the repair daemon reads its hygiene and repair settings on every pass, so keeping them in a file named for boot restore misleads. Decision: watch settings move to a clearly named REGISTRY/watch.json (schema agentctl-watch/v1) holding the duties switches, herdr_unit, timers, bare_shell_grace_seconds, and close_bare_shells. Reads are backward compatible: watch.json wins when present; otherwise the same keys are read from restore.json exactly as today, with a warning naming watch.json as their home. New installs write watch.json and leave restore.json holding only restore keys; no existing file is rewritten automatically. Help text and the user guide state prominently which file each command reads on every pass versus once per boot. A key set in both files is refused with both locations named, never silently merged.
+
+Kept from the original issue: the default install path (services snapshot flow and setup unit generation) installs the full duty set so a fresh team cannot end up with only half; the check-only pass and the host restore command flag a registry running only half the duties (by unit presence in Phase 1, by effective duties once switches exist), naming what is missing and the exact remedy; generated names state the behaviour; the install output carries the migration note (current names, replacement names, operator steps); live units are renamed by the host operator or coordinators, never by the tool, which never deletes or renames a unit file it did not just write.
 
 # Acceptance Criteria
 
-- A default install for a fresh team writes both the repair unit and the notifier unit; omitting either requires an explicit flag whose output names the omission and its consequence.
-- A registry with a notifier unit but no repair unit is flagged by the check-only repair pass and by the host restore command, naming the missing unit and the exact install command; a fully paired registry reports no such finding.
-- New installs generate the clear repair and notify names; the install output includes the migration note mapping each current generated name to its replacement, and no existing unit file is renamed, deleted, enabled, or started by the tool.
-- Setup-generated units and services-generated units agree on the pair and the names (one shared rendering path or a test pinning both).
-- Existing watch and watch-agents behaviour is unchanged for teams already running either unit under its current name.
+- Phase 1: with no duties configured, every pass behaves exactly as today; with unit_repair off (config or flag), a pass tidies tabs and drains queues but never resets, restarts, or starts any configured unit, and its health report lists unit_repair as skipped-by-config on every pass.
+- Phase 1: each named duty can be switched off independently and the others still run; an unknown duty name in config or on the command line is refused before any pass runs, naming the duty.
+- Config naming: a registry with watch settings only in restore.json keeps working unchanged (with the migration warning); the same settings in watch.json take effect identically; a key set in both files is refused naming both paths; new installs write watch.json.
+- A registry running only half the duties is flagged by the check-only pass and by the host restore command, naming the missing duties and the exact remedy; a full-duty registry reports no such finding. A default install writes the full duty set; narrowing it requires an explicit switch whose output names the omission.
+- Phase 2: one combined unit per registry performs repair and notification; an existing notifier unit invoking the alias or mode behaves as today until migrated; service discovery (including turnover) lists old repair, old notifier, and new combined units without double-counting a registry.
+- New installs generate the clear single-daemon name; install output includes the migration note mapping each current generated name to its replacement, and no existing unit file is renamed, deleted, enabled, or started by the tool. Setup-generated and services-generated units agree (one shared rendering path or a test pinning both).
 
 # Notes
 
 Filed on coordinator instruction after owner reply 244, alongside the restore script and scope work; implementation is sequenced after the registry-derived, slot-rebind, and resume-brief batch. Repair covers tab hygiene, queue drain, and health/repair; the notifier covers per-agent notices. Host unit renames and enablement stay with the host operator; this issue ships generation, detection, and the migration note only.
+
+Sequencing: Phase 1 is small enough to implement in a parallel worktree while earlier gates queue, landing immediately after the deterministic-script batch; Phase 2 follows the restore scope batch. Turnover service discovery overlaps the restore-core lane (old repair, old notifier, and new combined units); coordinate through the coordinator before editing shared discovery code.
