@@ -9942,13 +9942,14 @@ const { outgoingInView, renderOutgoingMessages, renderOutgoingEverywhere, withPe
  */
 const channelSend = createChannelSend({
   composerState, composerKeys: /** @type {any} */ (composerKeys), el: /** @type {any} */ (el), selectedChannelId, selectionThreadId: () => selection().threadId,
+  setHiddenIfChanged: (node, hidden) => setHiddenIfChanged(node, hidden),
   knownWritable: (channel) => knownChannel(channel)?.writable !== false,
   rootThisStarts, queueOutgoingMessage,
   channelDrafts: { get: (key) => channelDrafts.get(key), set: (key, text) => channelDrafts.set(key, text), delete: (key) => channelDrafts.delete(key), save: () => channelDrafts.save() },
   storageOkay: () => outbox.storageOkay(), noteDraft, fitBox: (box) => fitGrowingBox(box),
   draftRefusedWords: CHANNEL_DRAFT_REFUSED, scrollToNewest, renderChannelNavigation, renderDraftChip,
 });
-const { sendChannelMessage, rememberChannelDraft, restoreChannelComposer, saveChannelDrafts, channelComposerKey, onComposerKey } = channelSend;
+const { sendChannelMessage, cancelChannelMessage, answerChannelDiscard, rememberChannelDraft, restoreChannelComposer, saveChannelDrafts, channelComposerKey, onComposerKey } = channelSend;
 /**
  * Which drafts are held, and whether one is live (web/src/core/outbox `createDraftQueries`,
  * `#624 voice-page-modularity`). Writing the ledger stays with each writer.
@@ -11318,6 +11319,12 @@ application.track(mountMessageBox({
   },
   sendButton: el("channel-send"),
   send: guardQuietly(sendChannelMessage),
+  // `#1135 raw-message-page`: the row under the box, its Cancel and the question Cancel asks.
+  cancelButton: el("channel-cancel"),
+  discardYes: el("channel-discard-yes"),
+  discardNo: el("channel-discard-no"),
+  cancel: () => cancelChannelMessage(),
+  answerDiscard: (discard) => answerChannelDiscard(discard),
   onKey: (event) => onComposerKey(event, guardQuietly(sendChannelMessage), el("channel-compose-text")),
   watchBoxInsertions: (box) => watchBoxInsertions(box),
 }));
@@ -11362,6 +11369,11 @@ inColumn(columns.side, () => {
     }),
     sendButton: el("channel-send"),
     send: inThisColumn(guardQuietly(sendChannelMessage)),
+    cancelButton: el("channel-cancel"),
+    discardYes: el("channel-discard-yes"),
+    discardNo: el("channel-discard-no"),
+    cancel: inThisColumn(cancelChannelMessage),
+    answerDiscard: inThisColumn(answerChannelDiscard),
     onKey: inThisColumn((event) => onComposerKey(event, guardQuietly(sendChannelMessage), sideBox)),
     watchBoxInsertions: (box) => watchBoxInsertions(box),
   });

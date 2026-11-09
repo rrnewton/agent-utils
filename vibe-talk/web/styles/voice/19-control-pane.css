@@ -387,9 +387,12 @@
          Android does; the keyboard's height where only the visual viewport shrinks, as in Safari), and
          web/voice.js brings that foot to the keyboard's top as it comes up (`fitComposerToKeyboard`, told
          by `--keyboard-fit` that the composer is laid out for it).
-       * SEND GOES WHILE ENTER SENDS. The keyboard's own key is the send then (`enterkeyhint="send"`, which
-         is what the box says while Enter to send is on). With it off, that key is a new line, so Send
-         stays, the last thing above the keyboard.
+       * THE ROW UNDER THE BOX IS SCROLLED TO (`#1135 raw-message-page`, the owner, 2026-11-09). Send
+         used to go while Enter sent, the keyboard's own key being the send then; the owner then asked
+         for Send and Cancel back, below the resting box. So nothing of the row — Send raw message,
+         Cancel, Send — is hidden: the jump rests the BOX on the keys, the row stands under them, and
+         the reader's own scroll further down brings it up over them, which the room above leaves
+         exactly the scroll for. The keyboard's key still sends while Enter to send is on.
        * A NEW-LINE KEY IN THE BOX'S CORNER, while Enter sends. A phone keyboard's Shift is its own: neither
          Gboard nor iOS reports it on the return key, so Shift+Enter cannot reach the page from one. The
          box keeps room on its right for the key, so no word is written under it. */
@@ -398,22 +401,28 @@
      list's keepers leave the reader within its padding of the end, so its box is on the keys already, and
      its padding is left as it is: taken away there, the reader was left far above the foot as the
      keyboard went down (tests/keyboard_hides_bar_browser.py). */
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #side-scroll:has(:is(#channel-compose-text, #side-compose-text):focus) {
+  /* `#1135 raw-message-page`: none of these three rules turns on the box's focus, though all three did.
+     A tap on the row under the box takes the focus off it between the finger down and up; a rule that
+     then changed the composer's height (its room back, its empty state line back) set the foot's keeper
+     scrolling in that same moment, the row moved under the finger, and the tap landed on the composer
+     (measured in tests/keyboard_hides_bar_browser.py: the list scrolled 40px at the blur). The room is
+     the keyboard's while it is up, whichever of the composer's controls holds the focus; only
+     `--keyboard-fit`, which changes no height, still says which box is being written in. */
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #side-scroll {
     padding-bottom: 0;
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) :is(#channel-composer, #side-composer):has(> textarea:focus) {
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) :is(#channel-composer, #side-composer) {
     padding-bottom: var(--keyboard-inset, 0px);
-    --keyboard-fit: on;
   }
 
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) :is(#channel-compose-text, #side-compose-text)[enterkeyhint="send"]:focus ~ :is(#channel-send, #side-send) {
-    display: none;
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) :is(#channel-composer, #side-composer):has(> textarea:focus) {
+    --keyboard-fit: on;
   }
 
   /* The box's state line, with nothing to say, is a row and a gap of nothing under the box. Something to
      say (a send failed, a send waits) still shows, under the box. */
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) :is(#channel-compose-text, #side-compose-text):focus ~ :is(#channel-compose-state, #side-compose-state):empty {
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) :is(#channel-compose-state, #side-compose-state):empty {
     display: none;
   }
 

@@ -648,11 +648,31 @@
                 <!-- `#575 mobile-keyboard-compose`: a phone keyboard's return key sends, and its Shift never reaches the page,
                      so this is its new line. Drawn in the box's corner while the keyboard is up (web/voice.css). -->
                 <button id="channel-newline" class="newline-key" type="button" aria-label="New line" title="New line" tabindex="-1">↵</button>
-                <button id="channel-send" type="button">Send</button>
-                <!-- `#340 composer-grow-box`: see #compose-grow. -->
-                <label class="composer-grow" title="Let the box grow with what you type or paste, up to about 60% of the window">
-                  <input id="channel-compose-grow" type="checkbox" /> Grow
-                </label>
+                <!-- `#1135 raw-message-page`. The row under the box, as the reply's is (`.reply-actions`):
+                     with a phone's keyboard up the box rests on it and the reader scrolls the list
+                     further down to this row. Send raw message posts the words exactly as typed;
+                     it is never ticked as the page is served and unticks itself after each send.
+                     Cancel clears the draft and drops the keyboard (`#846` below). -->
+                <div class="row composer-actions">
+                  <label id="channel-raw-row" class="toggle">
+                    <input id="channel-raw" type="checkbox" />
+                    Send raw message
+                  </label>
+                  <button id="channel-cancel" class="secondary" type="button">Cancel</button>
+                  <button id="channel-send" type="button">Send</button>
+                  <!-- `#340 composer-grow-box`: see #compose-grow. After Send in the markup, so Tab
+                       goes from the box to the row's buttons first; drawn at the row's start. -->
+                  <label class="composer-grow" title="Let the box grow with what you type or paste, up to about 60% of the window">
+                    <input id="channel-compose-grow" type="checkbox" /> Grow
+                  </label>
+                </div>
+                <!-- `#846 draft-chip-honest`, as the reply's Cancel: with words in the box it asks
+                     first, and Yes takes the draft from the page and the device. -->
+                <div id="channel-discard" class="draft-discard" role="group" aria-labelledby="channel-discard-text" hidden>
+                  <p id="channel-discard-text">Discard this draft?</p>
+                  <button id="channel-discard-yes" type="button">Yes</button>
+                  <button id="channel-discard-no" class="secondary" type="button">No</button>
+                </div>
                 <p id="channel-compose-state" class="hint" role="status" aria-live="polite"></p>
               </div>
               <!--
@@ -889,11 +909,24 @@
                   <!-- `#575 mobile-keyboard-compose`: a phone keyboard's return key sends, and its Shift never reaches the page,
                        so this is its new line. Drawn in the box's corner while the keyboard is up (web/voice.css). -->
                   <button id="side-newline" class="newline-key" type="button" aria-label="New line" title="New line" tabindex="-1">↵</button>
-                  <button id="side-send" type="button">Send</button>
-                  <!-- `#340 composer-grow-box`: see #compose-grow. -->
-                  <label class="composer-grow" title="Let the box grow with what you type or paste, up to about 60% of the window">
-                    <input id="side-compose-grow" type="checkbox" /> Grow
-                  </label>
+                  <!-- `#1135 raw-message-page`: the channel box's row, in its right column's twin. -->
+                  <div class="row composer-actions">
+                    <label id="side-raw-row" class="toggle">
+                      <input id="side-raw" type="checkbox" />
+                      Send raw message
+                    </label>
+                    <button id="side-cancel" class="secondary" type="button">Cancel</button>
+                    <button id="side-send" type="button">Send</button>
+                    <!-- `#340 composer-grow-box`: see #compose-grow. -->
+                    <label class="composer-grow" title="Let the box grow with what you type or paste, up to about 60% of the window">
+                      <input id="side-compose-grow" type="checkbox" /> Grow
+                    </label>
+                  </div>
+                  <div id="side-discard" class="draft-discard" role="group" aria-labelledby="side-discard-text" hidden>
+                    <p id="side-discard-text">Discard this draft?</p>
+                    <button id="side-discard-yes" type="button">Yes</button>
+                    <button id="side-discard-no" class="secondary" type="button">No</button>
+                  </div>
                   <p id="side-compose-state" class="hint" role="status" aria-live="polite"></p>
                 </div>
                 <!-- `#410 inline-reply-editor`. The right column's place for a reply opened in it, under its
@@ -2878,6 +2911,17 @@
                 <strong>Yes</strong> throws the words away. Reply on another message moves the
                 box there. <kbd>r</kbd> replies to the selected message, and <kbd>m</kbd> or
                 <kbd>Ctrl</kbd>+<kbd>S</kbd> (<kbd>⌘</kbd>+<kbd>S</kbd> on a Mac) go back to the box.
+              </p>
+              <p class="hint">
+                <strong>Sending as typed.</strong> Under the channel's box is a row holding
+                <strong>Send raw message</strong>, <strong>Cancel</strong> and <strong>Send</strong>.
+                On a phone with the keyboard up the box rests on the keyboard; scroll the list
+                further down to reach the row. <strong>Cancel</strong> clears what you wrote and
+                puts the keyboard away, asking <q>Discard this draft?</q> first when the box holds
+                words. Ticked, <strong>Send raw message</strong> posts your words exactly as
+                typed, with nothing added around them, and unticks itself for the next message. A
+                slash command is sent as its own one-line raw message: raw text of more than one
+                line is delivered as one prompt, so a command goes alone.
               </p>
               <p class="hint">
                 <strong>Quote reply.</strong> Select some of a message's words (drag over them, or

@@ -22,7 +22,7 @@ const KEYBOARD_MIN_SHARE = 0.2;
  */
 const KEYBOARD_SETTLE_MS = 1200;
 
-/** The channel's and the right column's box: each with its composer, its Send and its state line. */
+/** The channel's and the right column's box: each with its composer (its Send and state line kept for the readout's names). */
 const KEYBOARD_FIT_PARTS: Readonly<Record<string, readonly [string, string, string]>> = {
   "channel-compose-text": ["channel-composer", "channel-send", "channel-compose-state"],
   "side-compose-text": ["side-composer", "side-send", "side-compose-state"],
@@ -200,7 +200,7 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
 
   /**
    * `#610 mobile-keyboard-compose`. The jump itself: the room for the keyboard as it now stands, then the box's foot
-   * brought to the keyboard's top, which the room makes the very end of the list.
+   * brought to the keyboard's top. The composer's row stays below it, a scroll away (`#1135 raw-message-page`).
    */
   function settleKeyboardFit(field: Element): void {
     renderKeyboardInset(keyboardInset(field));
@@ -217,8 +217,10 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
    * `#575 mobile-keyboard-compose`, `#610`. The room, in CSS pixels, the composer `field` is written in keeps under
    * itself while the keyboard is up, so its box can be brought to the keyboard's top: as much of the list
    * it is in as the keyboard covers, from the visual viewport's foot to the list's own foot. Not from
-   * `innerHeight`, which a browser may or may not shrink for the keyboard; less Safari's pan, so the box on
-   * the keyboard's top is the very end of the list; measured only at the jump and as the keyboard changes size.
+   * `innerHeight`, which a browser may or may not shrink for the keyboard; less Safari's pan, so at the
+   * list's very end the last thing in the composer stands on the keyboard's top — which is the room the
+   * row under the box is scrolled into (`#1135 raw-message-page`); measured only at the jump and as the
+   * keyboard changes size.
    */
   function keyboardInset(field: Element): number {
     const viewport = deps.viewport();
@@ -238,8 +240,10 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
   /**
    * The composer `field` is written in, the list it is in, and its foot, where the stylesheet lays it out
    * for the keyboard (`--keyboard-fit`, which it sets under a coarse pointer alone); null elsewhere, as on
-   * a desk whose window is made shorter with the box focused. The foot is its box, or its Send where Send is
-   * still drawn, or its state line where that has something to say. The list is the one the composer is in.
+   * a desk whose window is made shorter with the box focused. The foot is the box itself
+   * (`#1135 raw-message-page`): the row under it — Send raw message, Cancel and Send — stays below the
+   * keys at rest, and the reader scrolls the list further down to it, which the room under the composer
+   * (`keyboardInset`) leaves exactly the scroll for. The list is the one the composer is in.
    */
   function composerFit(field: Element | null): { area: HTMLElement; foot: Element } | null {
     const parts = field && KEYBOARD_FIT_PARTS[field.id];
@@ -250,8 +254,7 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
     if (style.getPropertyValue("--keyboard-fit").trim() !== "on") return null;
     const area = ["scroll-area", "side-scroll"].map((id) => deps.lookup(id)).find((list) => nodeWithin(list, composer));
     if (!area) return null;
-    const drawn = (node: Element): boolean => node.getClientRects().length > 0;
-    return { area, foot: [deps.lookup(parts[2]), deps.lookup(parts[1])].find(drawn) || (field as Element) };
+    return { area, foot: field as Element };
   }
 
   /**

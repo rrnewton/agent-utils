@@ -91,9 +91,21 @@
   font-size: max(1rem, 16px);
 }
 
-.reply-actions {
+.reply-actions,
+.composer-actions {
   align-items: center;
   justify-content: flex-end;
+}
+
+/* `#1135 raw-message-page`: the channel boxes' row holds one line at a phone's width — its choice
+   gives up room first, its words wrapping, and Send sizes to its word as the reply's does. */
+.composer-actions > .toggle {
+  min-width: 0;
+}
+
+.composer-actions #channel-send,
+.composer-actions #side-send {
+  min-width: 0;
 }
 
 /* The lines under the box take only the room of what they say: the grid's gap is the space between
@@ -114,7 +126,8 @@
 }
 
 /* Grow at the start of the row, though it follows Send in the markup, as in the composers. */
-.reply-actions > .composer-grow {
+.reply-actions > .composer-grow,
+.composer-actions > .composer-grow {
   order: -1;
   margin-inline-end: auto;
 }

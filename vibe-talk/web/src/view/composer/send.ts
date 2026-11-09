@@ -12,10 +12,12 @@ export interface ChannelSendDependencies {
   selectedChannelId(): string;
   composerState(): { key: string };
   selectionThreadId(): string | null;
+  /** Show or hide `node`, only where that is a change (`setHiddenIfChanged`). */
+  setHiddenIfChanged(node: HTMLElement, hidden: boolean): void;
 
   knownWritable(channel: string): boolean;
   rootThisStarts(channel: string, threadId: string | null): string | null;
-  queueOutgoingMessage(request: { channel: string; threadId: string | null; replyTo: null; text: string; marksRead: string | null }): Promise<unknown>;
+  queueOutgoingMessage(request: { channel: string; threadId: string | null; replyTo: null; text: string; marksRead: string | null; raw?: boolean }): Promise<unknown>;
   channelDrafts: {
     get(key: string): string | undefined;
     set(key: string, text: string): void;
@@ -34,6 +36,10 @@ export interface ChannelSendDependencies {
 /** The box's send commands: the legacy names, unchanged. */
 export interface ChannelSend {
   sendChannelMessage(): Promise<void>;
+  /** Cancel under the box: ask first where it holds words, else drop the keyboard (`#1135 raw-message-page`). */
+  cancelChannelMessage(): void;
+  /** The answer to Cancel's "Discard this draft?" (`#1135 raw-message-page`, `#846 draft-chip-honest`). */
+  answerChannelDiscard(discard: boolean): void;
   rememberChannelDraft(): void;
   restoreChannelComposer(): void;
   saveChannelDrafts(): boolean;
@@ -70,21 +76,74 @@ async function sendChannelMessage() {
   }
   if (!text.trim() || !channel) return;
   rememberChannelDraft();
+  // `#1135 raw-message-page`. Ticked for this send alone, the words go exactly as typed; the choice
+  // is taken here, with the text, and is never kept for the next message.
+  const raw = el("channel-raw").checked === true;
   // `#300 reply-marks-read`. The first reply in a thread nobody has answered marks its root, as Reply
   // on the root would; a later one marks nothing, and the main channel's box never does.
   const completion = queueOutgoingMessage({
     channel, threadId: selection().threadId, replyTo: null, text,
     marksRead: rootThisStarts(channel, selection().threadId),
+    ...(raw ? { raw: true } : {}),
   });
   channelDrafts.delete(key);
   // A failed outbox write leaves the previous durable draft available as a last resort.
   if (outbox.storageOkay()) saveChannelDrafts();
   noteDraft("composer", key, String(channel), false);
   el("channel-compose-text").value = "";
+  el("channel-raw").checked = false;
   fitGrowingBox(el("channel-compose-text"));
   el("channel-compose-state").textContent = "";
   scrollToNewest();
   await completion;
+}
+
+/**
+ * `#1135 raw-message-page`. Cancel under the box, as the reply's Cancel (`#846 draft-chip-honest`):
+ * with words it would keep as a draft, it asks first, "Discard this draft?", under the row
+ * (`answerChannelDiscard`); with none, the keyboard goes down at once.
+ */
+function cancelChannelMessage() {
+  if (el("channel-compose-text").value.trim()) {
+    deps.setHiddenIfChanged(el("channel-discard"), false);
+    // Into view as it takes the focus: under the box, it may open below the list's foot.
+    el("channel-discard-no").focus();
+    return;
+  }
+  discardChannelDraft();
+}
+
+/**
+ * The answer to "Discard this draft?": Yes empties the box, so the draft is gone from the page and
+ * the device, and drops the keyboard; No leaves the box as it was, focused.
+ */
+function answerChannelDiscard(discard: boolean) {
+  deps.setHiddenIfChanged(el("channel-discard"), true);
+  if (!discard) {
+    el("channel-compose-text").focus({ preventScroll: true });
+    return;
+  }
+  discardChannelDraft();
+}
+
+/** Take the box's words away for good and put the keyboard down: Cancel's own act, asked or not. */
+function discardChannelDraft() {
+  const key = composerState().key;
+  deps.setHiddenIfChanged(el("channel-discard"), true);
+  el("channel-compose-text").value = "";
+  channelDrafts.delete(key);
+  // As `rememberChannelDraft`: a save the browser refuses is said where the box is, on failure only —
+  // without it, what the device still holds would come back on a reload as if never discarded.
+  const saved = saveChannelDrafts();
+  noteDraft("composer", key, String(selectedChannelId() || ""), false);
+  fitGrowingBox(el("channel-compose-text"));
+  el("channel-compose-state").textContent = !saved
+    ? CHANNEL_DRAFT_REFUSED
+    : knownChannel(selectedChannelId())?.writable === false
+      ? "This channel is read-only."
+      : "";
+  renderDraftChip();
+  el("channel-compose-text").blur();
 }
 
 
@@ -112,6 +171,8 @@ function restoreChannelComposer() {
     : "";
   el("channel-compose-text").disabled = false;
   el("channel-send").disabled = !channel || readOnly;
+  // A discard question left open on the box that was belongs to its words, not these.
+  deps.setHiddenIfChanged(el("channel-discard"), true);
   renderChannelNavigation();
   // `#340 composer-grow-box`. The draft put back is the box's height too.
   fitGrowingBox(el("channel-compose-text"));
@@ -138,5 +199,5 @@ function onComposerKey(event: KeyboardEvent, send: () => void, box: EventTarget 
 
 /** A message box's `beforeinput`, `input` or `paste`, noted (`composerKeys`). `paste-never-sends`. */
 
-  return { sendChannelMessage, rememberChannelDraft, restoreChannelComposer, saveChannelDrafts, channelComposerKey, onComposerKey };
+  return { sendChannelMessage, cancelChannelMessage, answerChannelDiscard, rememberChannelDraft, restoreChannelComposer, saveChannelDrafts, channelComposerKey, onComposerKey };
 }

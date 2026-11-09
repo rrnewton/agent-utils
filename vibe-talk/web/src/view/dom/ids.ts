@@ -48,6 +48,7 @@ export interface ElementById {
   "card-max-lines-smaller": HTMLButtonElement;
   "card-max-lines-state": HTMLParagraphElement;
   "channel-alias": HTMLInputElement;
+  "channel-cancel": HTMLButtonElement;
   "channel-compose-grow": HTMLInputElement;
   "channel-compose-state": HTMLParagraphElement;
   "channel-compose-text": HTMLTextAreaElement;
@@ -57,6 +58,10 @@ export interface ElementById {
   "channel-directory-retry": HTMLButtonElement;
   "channel-directory-search": HTMLInputElement;
   "channel-directory-state": HTMLParagraphElement;
+  "channel-discard": HTMLDivElement;
+  "channel-discard-no": HTMLButtonElement;
+  "channel-discard-text": HTMLParagraphElement;
+  "channel-discard-yes": HTMLButtonElement;
   "channel-facts": HTMLParagraphElement;
   "channel-freshness": HTMLParagraphElement;
   "channel-freshness-anchor": HTMLDivElement;
@@ -70,6 +75,8 @@ export interface ElementById {
   "channel-loading": HTMLParagraphElement;
   "channel-navigation": HTMLDivElement;
   "channel-newline": HTMLButtonElement;
+  "channel-raw": HTMLInputElement;
+  "channel-raw-row": HTMLLabelElement;
   "channel-send": HTMLButtonElement;
   "channel-settings": HTMLElement;
   "channel-summary": HTMLOListElement;
@@ -525,6 +532,7 @@ export interface ElementById {
   "settings-voice-agent-title": HTMLHeadingElement;
   "settings-wit-audio": HTMLOptionElement;
   "settings-wit-voice": HTMLSelectElement;
+  "side-cancel": HTMLButtonElement;
   "side-cards": HTMLUListElement;
   "side-clear-backlog": HTMLButtonElement;
   "side-close": HTMLButtonElement;
@@ -533,6 +541,10 @@ export interface ElementById {
   "side-compose-state": HTMLParagraphElement;
   "side-compose-text": HTMLTextAreaElement;
   "side-composer": HTMLDivElement;
+  "side-discard": HTMLDivElement;
+  "side-discard-no": HTMLButtonElement;
+  "side-discard-text": HTMLParagraphElement;
+  "side-discard-yes": HTMLButtonElement;
   "side-freshness": HTMLParagraphElement;
   "side-heading": HTMLDivElement;
   "side-inbox-note": HTMLParagraphElement;
@@ -555,6 +567,8 @@ export interface ElementById {
   "side-overscroll": HTMLDivElement;
   "side-pane": HTMLDivElement;
   "side-pinned-log": HTMLOListElement;
+  "side-raw": HTMLInputElement;
+  "side-raw-row": HTMLLabelElement;
   "side-replies-note": HTMLParagraphElement;
   "side-reply": HTMLDivElement;
   "side-scroll": HTMLDivElement;

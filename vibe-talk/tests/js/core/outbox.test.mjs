@@ -165,12 +165,12 @@ test("`#624 voice-page-modularity`: an outbox entry read back from the device, f
     wire: { text: "w", replyTo: "", threadId: "t" }, serverMs: "12", upstreamMs: "soon", sentAt: 9 }, now);
   assert.deepStrictEqual(
     [reply.marksRead, reply.originView, reply.parts, reply.observedParts, reply.wire, reply.serverMs, reply.upstreamMs, reply.sentAt],
-    ["r", "thread", [{ id: "p", content: "a" }], ["p"], { text: "w", replyTo: null, threadId: "t", postToMain: false }, 12, null, 9]);
+    ["r", "thread", [{ id: "p", content: "a" }], ["p"], { text: "w", replyTo: null, threadId: "t", postToMain: false, raw: false }, 12, null, 9]);
   // `#1052 post-to-main`: a saved top-level ask reads back as one; absent is an ordinary post.
   assert.equal(reply.postToMain, false);
   assert.equal(outgoingFromSaved({ ...base, postToMain: true }, now).postToMain, true);
   assert.deepStrictEqual(savedWire({ text: "w", postToMain: true }),
-    { text: "w", replyTo: null, threadId: null, postToMain: true });
+    { text: "w", replyTo: null, threadId: null, postToMain: true, raw: false });
   assert.equal(outgoingFromSaved({ ...base, replyTo: "r", marksRead: null }, now).marksRead, null);
   assert.equal(savedWire({ text: 3 }), null);
 });
@@ -758,6 +758,57 @@ test("`#1052 post-to-main`: dispatch does not place a ticked top-level reply, an
   assert.deepStrictEqual(calls, [{ text: "promoted", reply_to: "m1", post_to_main: true, idempotency_key: entry.id }]);
   assert.equal(entry.postToMain, true);
   assert.equal(entry.wire.postToMain, true);
+});
+
+test("`#1135 raw-message-page`: a raw ask rides the wire once, is pinned there, and reads back from the device", async () => {
+  const { createOutboxDispatch, createOutboxStore, outgoingFromSaved, savedWire } = OUTBOX;
+  const saved = new Map();
+  const storage = {
+    getItem: (key) => saved.get(key) ?? null,
+    setItem: (key, value) => saved.set(key, value),
+    removeItem: (key) => saved.delete(key),
+  };
+  const store = createOutboxStore({ storage, makeRoom: () => {}, keepsOwnPosts: () => false });
+  const calls = [];
+  const dispatch = createOutboxDispatch({
+    store, observations: new Map(), now: () => 100000,
+    clock: { setTimeout: () => ({}), clearTimeout: () => {} },
+    cancellation: { create: () => null }, random: () => 0.5,
+    api: async (_path, options) => {
+      calls.push(options.body);
+      return { parts: [{ id: "p1", content: options.body.text, channel_id: "c", author_id: "me" }] };
+    },
+    token: () => "tok", identity: () => "me", online: () => true,
+    channelWritable: () => true, originView: () => "main", persist: () => store.save(),
+    renderOutgoing: () => {}, renderRows: () => {},
+    placeReplyTarget: async () => "thread",
+    postsOnce: () => true, serviceOf: () => "upstream",
+    readableFailure: (error) => String(error.message || ""), readableCause: (detail) => String(detail || ""),
+    refusalWords: () => "", redact: (text) => text, threadOf: () => null,
+    noteOwnSent: () => {}, armSentReceipt: () => {}, selectedChannel: () => "c", inDiscord: () => false,
+    followsNewest: () => false, noteSelfAuthor: () => {}, noteStartsRead: () => {}, appendPart: () => {},
+    scrollToNewest: () => {}, markSentRead: () => {}, reportColumnReply: () => {},
+    columnReplies: new Map(), quietly: (run) => run(),
+  });
+  // Unticked, the body is what it always was: no marker at all.
+  await dispatch.queue({ channel: "c", threadId: null, replyTo: null, text: "ordinary", marksRead: null });
+  const [plain] = [...store.values()];
+  assert.deepStrictEqual(calls, [{ text: "ordinary", idempotency_key: plain.id }], "an ordinary send changed");
+  assert.equal(plain.wire.raw, false);
+  // Ticked, raw rides, and the first attempt pins it for every later one.
+  await dispatch.queue({ channel: "c", threadId: null, replyTo: null, text: "/compact", marksRead: null, raw: true });
+  const entry = [...store.values()].find((held) => held.text === "/compact");
+  assert.deepStrictEqual(calls.at(-1), { text: "/compact", raw: true, idempotency_key: entry.id });
+  assert.equal(entry.raw, true);
+  assert.equal(entry.wire.raw, true);
+  // Saved and read back, as after a reload: raw survives; absent is an ordinary post.
+  const now = () => 5000;
+  const base = { id: "x", channel: "c", text: "w", state: "failed" };
+  assert.equal(outgoingFromSaved({ ...base, raw: true }, now).raw, true);
+  assert.equal(outgoingFromSaved(base, now).raw, false, "an entry saved before raw posts raw");
+  assert.deepStrictEqual(savedWire({ text: "w", raw: true }),
+    { text: "w", replyTo: null, threadId: null, postToMain: false, raw: true });
+  assert.equal(savedWire({ text: "w" }).raw, false);
 });
 
 test("`#624 voice-page-modularity`: the outbox composition makes the store, the dismissed sends and the Undo together, and the connection coming back resumes retries", () => {

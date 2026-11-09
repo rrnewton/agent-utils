@@ -32,6 +32,8 @@ export interface OutgoingRequest {
   placement?: "unknown";
   /** Land top-level answering `replyTo` by edge only (`#1052 post-to-main`). */
   postToMain?: boolean;
+  /** Post the words exactly as typed, marked raw for what carries them on (`#1135 raw-message-page`). */
+  raw?: boolean;
   inPlace?: string;
   inCards?: boolean;
 }
@@ -42,6 +44,7 @@ export interface DispatchEntry {
   channel: string;
   threadId?: string | null;
   postToMain?: boolean;
+  raw?: boolean;
   placement?: "unknown" | null;
   replyTo?: string | null;
   marksRead?: string | null;
@@ -82,6 +85,7 @@ export interface OutgoingBody {
   reply_to?: string;
   thread_id?: string;
   post_to_main?: boolean;
+  raw?: boolean;
   idempotency_key?: string;
 }
 
@@ -634,6 +638,10 @@ export function createOutboxDispatch(deps: OutboxDispatchDependencies): OutboxDi
       // `#1052 post-to-main`: asked to land top-level, answering by edge only. The rest of a post
       // cut in parts continues in the new root's thread as ever, so this rides only until then.
       let postToMain = entry.postToMain === true && !entry.continueIn;
+      // `#1135 raw-message-page`: asked to go exactly as typed. As post-to-main, the marker rides
+      // only until a post cut in parts continues elsewhere, so a remainder is never delivered raw
+      // on its own.
+      let raw = entry.raw === true && !entry.continueIn;
       // `#448 send-dedupe`. Where these words go is decided by the first attempt that sends them, and
       // every later one says the same, across reloads: the server answers a repeat under the key with
       // the post it made, and a page that has since drawn the reply into the thread it started must
@@ -641,12 +649,14 @@ export function createOutboxDispatch(deps: OutboxDispatchDependencies): OutboxDi
       if (entry.wire && entry.wire.text === entry.remaining) {
         ({ replyTo, threadId } = entry.wire);
         postToMain = entry.wire.postToMain === true && !entry.continueIn;
+        raw = entry.wire.raw === true && !entry.continueIn;
       } else {
-        entry.wire = { text: entry.remaining, replyTo, threadId, postToMain: entry.postToMain === true };
+        entry.wire = { text: entry.remaining, replyTo, threadId, postToMain: entry.postToMain === true, raw: entry.raw === true };
       }
       if (replyTo) body.reply_to = replyTo;
       if (threadId) body.thread_id = threadId;
       if (postToMain) body.post_to_main = true;
+      if (raw) body.raw = true;
       // The entry's id names this post on every attempt, across reloads, so the server can tell a
       // retry from a second message. `#448 send-dedupe`: sent to every provider, since the server
       // itself answers a repeat of a post that landed, or is landing, with that post. Only a provider

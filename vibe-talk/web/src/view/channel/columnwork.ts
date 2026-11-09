@@ -95,6 +95,13 @@ export const COLUMN_IDS = {
   "channel-composer": "side-composer",
   "channel-compose-text": "side-compose-text",
   "channel-send": "side-send",
+  // `#1135 raw-message-page`: the row under the box and Cancel's question, in each column.
+  "channel-raw": "side-raw",
+  "channel-cancel": "side-cancel",
+  "channel-discard": "side-discard",
+  "channel-discard-text": "side-discard-text",
+  "channel-discard-yes": "side-discard-yes",
+  "channel-discard-no": "side-discard-no",
   "channel-compose-state": "side-compose-state",
   "search-empty": "side-search-empty",
   "scroll-tools": "side-tools",

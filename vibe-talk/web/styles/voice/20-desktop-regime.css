@@ -705,14 +705,18 @@
   #screen-main:not([data-draft]) #compose-text,
   #screen-main:not([data-draft]) #channel-compose-text,
   #side-compose-text,
+  /* `#1135 raw-message-page`: the channel boxes' row and its discard question span the desk's row;
+     what the row holds is laid out by the row, as the reply's is. */
+  #screen-main:not([data-draft]) #channel-composer > .composer-actions,
+  #side-composer > .composer-actions,
+  #screen-main:not([data-draft]) #channel-discard,
+  #side-discard,
   #screen-main:not([data-draft]) #channel-compose-state,
   #side-compose-state {
     grid-column: 1 / -1;
   }
 
-  #screen-main:not([data-draft]) #send-text,
-  #screen-main:not([data-draft]) #channel-send,
-  #side-send {
+  #screen-main:not([data-draft]) #send-text {
     grid-column: 2;
   }
 
@@ -729,7 +733,7 @@
   }
 
   #screen-main[data-draft] #voice-composer > .composer-grow,
-  #screen-main[data-draft] #channel-composer > .composer-grow {
+  #screen-main[data-draft] #channel-composer .composer-grow {
     display: none;
   }
 

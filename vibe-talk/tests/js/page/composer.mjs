@@ -696,7 +696,7 @@ test("MOBILE KEYBOARD COMPOSE: Keyboard layout debug draws the page's numbers ov
   assert.match(cssBlock("#keyboard-debug-readout"), /position:\s*absolute/);
 });
 
-test("MOBILE KEYBOARD COMPOSE: with the keyboard up, the box's foot is on it, Send goes only while the keyboard's key sends, and the new-line key comes only then", () => {
+test("MOBILE KEYBOARD COMPOSE: with the keyboard up, the box's foot is on it, the row under it stays drawn to be scrolled to, and the new-line key comes only while Enter sends", () => {
   const { body } = keyboardMedia();
   const P = ':root[data-keyboard="open"]:has(#pane-discord:not([hidden]))';
   const rule = (selector) => {
@@ -704,24 +704,22 @@ test("MOBILE KEYBOARD COMPOSE: with the keyboard up, the box's foot is on it, Se
     assert.ok(at >= 0, `no keyboard rule for ${selector}`);
     return body.slice(body.indexOf("{", at) + 1, body.indexOf("}", at));
   };
-  // The composer of the box being written in keeps no room under itself but what the keyboard covers,
-  // and says so to the script that brings its foot to the keyboard's top.
-  const composer = rule(":is(#channel-composer, #side-composer):has(> textarea:focus)");
-  assert.match(composer, /padding-bottom:\s*var\(--keyboard-inset, 0px\);/);
-  assert.match(composer, /--keyboard-fit:\s*on;/);
-  assert.match(rule("#side-scroll:has(:is(#channel-compose-text, #side-compose-text):focus)"),
-    /padding-bottom:\s*0;/, "the list keeps its own room under the composer at its foot");
-  // Send goes while the keyboard's key sends (`enterkeyhint="send"`), and only for the box with the focus.
-  assert.match(rule(':is(#channel-compose-text, #side-compose-text)[enterkeyhint="send"]:focus ~ :is(#channel-send, #side-send)'),
-    /display:\s*none;/);
-  for (const hidden of body.matchAll(/([^{}]*#(?:channel|side)-send[^{}]*)\{([^{}]*)\}/g)) {
-    if (/display:\s*none/.test(hidden[2])) {
-      assert.match(hidden[1], /\[enterkeyhint="send"\]:focus/, `Send goes with the keyboard's key a return: ${hidden[1].trim()}`);
-    }
+  // The composer keeps no room under itself but what the keyboard covers while it is up — focus or
+  // not, so a tap on the row under the box, which takes the focus off it between down and up, cannot
+  // change its height and move the row under the finger (`#1135 raw-message-page`) — and the box
+  // being written in says so to the script that brings its foot to the keyboard's top.
+  assert.match(rule(":is(#channel-composer, #side-composer)"), /padding-bottom:\s*var\(--keyboard-inset, 0px\);/);
+  assert.match(rule(":is(#channel-composer, #side-composer):has(> textarea:focus)"), /--keyboard-fit:\s*on;/);
+  assert.match(rule("#side-scroll"), /padding-bottom:\s*0;/,
+    "the list keeps its own room under the composer at its foot");
+  // `#1135 raw-message-page` supersedes Send going while Enter sends: nothing of the row under the
+  // box is hidden by the keyboard, in either Enter mode — the resting box stands on the keys and the
+  // reader scrolls the rest of the way to Send raw message, Cancel and Send.
+  for (const hidden of body.matchAll(/([^{}]*#(?:channel|side)-(?:send|cancel|raw)[^{}]*)\{([^{}]*)\}/g)) {
+    assert.doesNotMatch(hidden[2], /display:\s*none/, `the keyboard hides a control of the revealed row: ${hidden[1].trim()}`);
   }
   // An empty state line is no row under the box; one with something to say stays.
-  assert.match(rule(":is(#channel-compose-text, #side-compose-text):focus ~ :is(#channel-compose-state, #side-compose-state):empty"),
-    /display:\s*none;/);
+  assert.match(rule(":is(#channel-compose-state, #side-compose-state):empty"), /display:\s*none;/);
   // The new-line key: none anywhere but here, and here only while Enter sends.
   assert.match(CSS_CODE, /(?:^|\})\s*\.newline-key\s*\{\s*display:\s*none;\s*\}/, "the new-line key is drawn without a keyboard");
   const shown = rule(':is(#channel-compose-text, #side-compose-text, #reply-text)[enterkeyhint="send"]:focus ~ .newline-key');
@@ -788,11 +786,16 @@ const GROWING = [
     state: "side-compose-state" },
 ];
 
-/** The markup of one composer, `<div id="...">` to its closing tag (a composer holds no other div). */
+/** The markup of one composer, `<div id="...">` to its own closing tag, past the boxes nested in it. */
 function composerMarkup(id) {
   const at = HTML_CODE.indexOf(`<div id="${id}">`);
   assert.ok(at >= 0, `web/voice.html has no #${id}`);
-  return HTML_CODE.slice(at, HTML_CODE.indexOf("</div>", at));
+  let depth = 0;
+  for (const tag of HTML_CODE.slice(at).matchAll(/<div\b[^>]*>|<\/div>/g)) {
+    depth += tag[0].startsWith("</") ? -1 : 1;
+    if (depth === 0) return HTML_CODE.slice(at, at + tag.index + tag[0].length);
+  }
+  throw new Error(`#${id} never closes`);
 }
 
 /** The selector the desktop block gives a part of a composer: scoped away from a send card where one can be up. */
@@ -810,13 +813,21 @@ test("`#340 composer-grow-box`: EACH COMPOSER HOLDS A Grow CHECKBOX AFTER Send, 
     // beside it, above the box: whatever is added to a composer must say where it goes.
     // `#575 mobile-keyboard-compose`: the new-line key is drawn under a coarse pointer alone, with a phone's
     // keyboard up, so never in a desk's row (`(pointer: fine)`), and takes the box's own cell where it is.
+    // `#1135 raw-message-page`: what a channel box's row and its discard question hold is laid out by
+    // them, not by the composer's grid, so the row and the question are what must span.
+    const inRow = (id) => /-raw(?:-row)?$|-cancel$|-discard-(?:text|yes|no)$/.test(id);
     const ids = [...markup.matchAll(/\sid="([^"]+)"/g)].map((m) => m[1])
       .filter((id) => id !== composer && !/-newline$/.test(id));
-    for (const id of ids.filter((one) => one !== send && one !== grow)) {
+    for (const id of ids.filter((one) => one !== send && one !== grow && !inRow(one))) {
       assert.match(cssBlockIn(DESKTOP_QUERY, growScoped(composer, `#${id}`)), /grid-column:\s*1 \/ -1/,
         `#${id} does not span both columns of #${composer} on a desk`);
     }
-    assert.match(cssBlockIn(DESKTOP_QUERY, growScoped(composer, `#${send}`)), /grid-column:\s*2\b/);
+    if (composer === "voice-composer") {
+      assert.match(cssBlockIn(DESKTOP_QUERY, growScoped(composer, `#${send}`)), /grid-column:\s*2\b/);
+    } else {
+      assert.match(cssBlockIn(DESKTOP_QUERY, growScoped(composer, `#${composer} > .composer-actions`)),
+        /grid-column:\s*1 \/ -1/, `#${composer}'s row does not span both columns on a desk`);
+    }
     const row = cssBlockIn(DESKTOP_QUERY, growScoped(composer, `#${composer}`));
     assert.match(row, /grid-template-columns:\s*minmax\(0, 1fr\) auto/);
     assert.match(row, /grid-auto-flow:\s*row dense/, `#${composer}: the label cannot come up beside Send`);
@@ -827,11 +838,12 @@ test("`#340 composer-grow-box`: EACH COMPOSER HOLDS A Grow CHECKBOX AFTER Send, 
   assert.match(label, /display:\s*inline-flex/);
   assert.match(label, /grid-column:\s*1\b/);
   assert.match(label, /min-height:\s*24px/, "the Grow checkbox is a smaller target than WCAG 2.2's 24px");
-  // A send card's one-line box wins: no checkbox drawn under it.
-  for (const composer of ["voice-composer", "channel-composer"]) {
-    assert.match(cssBlockIn(DESKTOP_QUERY, `#screen-main[data-draft] #${composer} > .composer-grow`), /display:\s*none/,
-      `#${composer} draws Grow under a send card`);
-  }
+  // A send card's one-line box wins: no checkbox drawn under it. The channel box's Grow is in its
+  // row (`#1135 raw-message-page`), so its rule reaches it there.
+  assert.match(cssBlockIn(DESKTOP_QUERY, "#screen-main[data-draft] #voice-composer > .composer-grow"), /display:\s*none/,
+    "#voice-composer draws Grow under a send card");
+  assert.match(cssBlockIn(DESKTOP_QUERY, "#screen-main[data-draft] #channel-composer .composer-grow"), /display:\s*none/,
+    "#channel-composer draws Grow under a send card");
 });
 
 test("`#340 composer-grow-box`: THE BOX GROWS by the browser's own field-sizing, up to 60% of the window and scrolling beyond, on a desk alone and not under a send card", () => {
@@ -1291,4 +1303,179 @@ test("`#422 composer-key-stay`: in Main, All, a thread and two columns, each wit
   const { page: two } = await twoColumnServer();
   await chordFrom(two, two.el("side-scroll"), { metaKey: true }, "Cmd+S in two columns");
   assert.ok(inTwoColumns(two), "Cmd+S left two columns");
+});
+
+// --- `#1135 raw-message-page`: the row under the box, and sending raw --------------------------------
+//
+// The owner, reply 240 (2026-11-09), on Android: the main channel would not scroll past the message
+// box, so Send and Cancel were unreachable with the keyboard up. The box still rests directly on top
+// of the keyboard, and scrolling further down reveals the row under it: Send raw message, Cancel and
+// Send. This fixture lays nothing out, so it holds the markup, the rules, the jump's target and the
+// sends; tests/keyboard_hides_bar_browser.py measures the resting box and the revealed row in Chromium.
+
+/** One channel composer's parts, in each column: its box, its row and its discard question. */
+const RAW_COMPOSERS = [
+  { composer: "channel-composer", box: "channel-compose-text", raw: "channel-raw", rawRow: "channel-raw-row", cancel: "channel-cancel",
+    send: "channel-send", grow: "channel-compose-grow", discard: "channel-discard", state: "channel-compose-state" },
+  { composer: "side-composer", box: "side-compose-text", raw: "side-raw", rawRow: "side-raw-row", cancel: "side-cancel",
+    send: "side-send", grow: "side-compose-grow", discard: "side-discard", state: "side-compose-state" },
+];
+
+test("`#1135 raw-message-page`: the row under each channel box holds Send raw message, Cancel and Send, in Tab's order", () => {
+  for (const { composer, box, raw, rawRow, cancel, send, grow, discard, state } of RAW_COMPOSERS) {
+    const markup = composerMarkup(composer);
+    // One row under the box, drawn as the reply's actions row is.
+    assert.match(markup, /<div class="row composer-actions">/, `#${composer} has no actions row under its box`);
+    // The checkbox, named by its label exactly, unticked as served.
+    const boxTag = new RegExp(`<label id="${rawRow}" class="toggle">\\s*<input id="${raw}" type="checkbox" \\/>\\s*Send raw message\\s*<\\/label>`);
+    assert.match(markup, boxTag, `#${composer}'s raw checkbox is not labelled "Send raw message"`);
+    assert.doesNotMatch(markup, new RegExp(`<input id="${raw}"[^>]*\\bchecked\\b`), `#${raw} is ticked as served`);
+    assert.match(markup, new RegExp(`<button id="${cancel}" class="secondary" type="button">Cancel</button>`),
+      `#${composer} has no Cancel in its row`);
+    assert.match(markup, new RegExp(`<button id="${send}" type="button">Send</button>`),
+      `#${composer}'s Send is not in its row`);
+    // Cancel with words asks first, under the row, answered Yes or No (`#846 draft-chip-honest`).
+    assert.match(markup, new RegExp(`<div id="${discard}" class="draft-discard" role="group" aria-labelledby="${discard}-text" hidden>`),
+      `#${composer} has no discard question`);
+    assert.match(markup, new RegExp(`<p id="${discard}-text">Discard this draft\\?</p>`));
+    assert.match(markup, new RegExp(`<button id="${discard}-yes" type="button">Yes</button>`));
+    assert.match(markup, new RegExp(`<button id="${discard}-no" class="secondary" type="button">No</button>`));
+    // Tab's order is the markup's: the box, the choice, Cancel, Send, then Grow; the state line last.
+    const order = [box, raw, cancel, send, grow, discard, state].map((id) => markup.indexOf(`id="${id}"`));
+    assert.ok(order.every((at, i) => at >= 0 && (i === 0 || at > order[i - 1])),
+      `#${composer}'s parts are out of Tab's order: ${order}`);
+  }
+  // The keyboard's rules hide none of the row: scrolling is what reveals it, so it stays drawn.
+  const { body } = keyboardMedia();
+  for (const hidden of body.matchAll(/([^{}]*#(?:channel|side)-(?:send|cancel|raw)[^{}]*)\{([^{}]*)\}/g)) {
+    assert.doesNotMatch(hidden[2], /display:\s*none/, `the keyboard takes a control of the revealed row away: ${hidden[1].trim()}`);
+  }
+  // Help says the one-line rule where sending from the channel is told.
+  assert.match(HTML_CODE, /slash command is sent as its own one-line raw message/,
+    "Help does not say a slash command goes as its own one-line raw message");
+});
+
+/**
+ * The channel's box as `phoneComposer` lays it out, with its actions row drawn `ROW_PX` tall under it:
+ * the list scrolls that much further than the box's foot needs, and Send's foot is the row's.
+ */
+const ROW_PX = 44;
+function phoneComposerWithRow(page) {
+  page.sayStyle({ "--keyboard-fit": "on" });
+  const area = page.el("scroll-area");
+  const box = page.el("channel-compose-text");
+  const send = page.el("channel-send");
+  const room = () => Number.parseFloat(page.documentElement.style.getPropertyValue("--keyboard-inset")) || 0;
+  let top = END_TOP;
+  Object.defineProperty(area, "scrollTop", {
+    configurable: true,
+    get: () => top,
+    set: (value) => { top = Math.max(0, Math.min(Number(value) || 0, END_TOP + room() + ROW_PX)); },
+  });
+  area.getBoundingClientRect = () => ({ top: 0, bottom: 852, height: 852, left: 0, right: 393, width: 393 });
+  area.getClientRects = () => [{}];
+  box.getClientRects = () => [{}];
+  box.getBoundingClientRect = () => {
+    const bottom = 852 - (top - END_TOP);
+    return { top: bottom - BOX_PX, bottom, height: BOX_PX, left: 0, right: 393, width: 393 };
+  };
+  send.getClientRects = () => [{}];
+  send.getBoundingClientRect = () => {
+    const bottom = 852 - (top - END_TOP) + ROW_PX;
+    return { top: bottom - ROW_PX, bottom, height: ROW_PX, left: 0, right: 393, width: 393 };
+  };
+  page.el("channel-compose-state").getClientRects = () => [];
+  return { area, box, send, room, furthest: () => END_TOP + room() + ROW_PX,
+    keysTop: () => page.viewport.offsetTop + page.viewport.visual };
+}
+
+test("`#1135 raw-message-page`: the box rests on the keyboard with its row still to scroll to, and the reader's scroll reveals it whole", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1000000000000000001" })]);
+  const phone = phoneComposerWithRow(page);
+  await focusOn(page, phone.box);
+  await page.resizeViewport({ visual: 472 });
+  assert.equal(keyboardSaid(page), "open");
+  // The resting place is the box's foot on the keys, though Send is drawn under it...
+  assert.equal(phone.box.getBoundingClientRect().bottom, phone.keysTop(),
+    "the jump took the row to the keys instead of resting the box on them");
+  // ...with exactly the row's height of scroll left beyond it.
+  assert.equal(phone.furthest() - phone.area.scrollTop, ROW_PX,
+    "the resting place is the list's end, so nothing below the box can be scrolled to");
+  assert.ok(phone.send.getBoundingClientRect().bottom > phone.keysTop(), "the row is not below the keys at rest");
+  // The reader's own scroll the rest of the way: the row's foot on the keys, whole above them.
+  await touch(page);
+  phone.area.scrollTop = 1e9;
+  assert.equal(phone.area.scrollTop, phone.furthest());
+  assert.equal(phone.send.getBoundingClientRect().bottom, phone.keysTop(),
+    "scrolled to the end, the row does not stand on the keyboard's top");
+  assert.ok(phone.send.getBoundingClientRect().top >= 0, "the revealed row is cut off at the top");
+});
+
+test("`#1135 raw-message-page`: ticked, the post carries raw and the box unticks itself; unticked, the post is as it was", async () => {
+  const box = await ENTER_COMPOSERS.channel(true);
+  const { page } = box;
+  const raw = page.el("channel-raw");
+  assert.equal(raw.checked, false, "the raw box starts ticked");
+  // Unticked: no marker on the wire at all.
+  await box.ready("plain words");
+  await page.el("channel-send").click();
+  await page.settle();
+  assert.equal(box.sent(), 1);
+  assert.deepEqual(sentWithoutKey(page.repliesPosted.at(-1).body), { text: "plain words" },
+    "an unticked send changed");
+  assert.equal(raw.checked, false);
+  // Ticked, and sent by the phone keyboard's own return key (`#575 mobile-keyboard-compose`).
+  await raw.setChecked(true);
+  await box.ready("/compact");
+  await page.el(box.field).dispatch("keydown", enterKey({}));
+  await page.settle();
+  assert.equal(box.sent(), 2, "the keyboard's Enter did not send with the box ticked");
+  assert.deepEqual(sentWithoutKey(page.repliesPosted.at(-1).body), { text: "/compact", raw: true },
+    "a ticked send did not carry raw");
+  assert.equal(raw.checked, false, "the raw box stayed ticked after a send");
+  // The next send is an ordinary one again.
+  await box.ready("afterwards");
+  await page.el("channel-send").click();
+  await page.settle();
+  assert.deepEqual(sentWithoutKey(page.repliesPosted.at(-1).body), { text: "afterwards" },
+    "raw rode on a later send");
+});
+
+test("`#1135 raw-message-page`: Cancel drops the keyboard; with words it asks first, and Yes takes the draft from the page and the device", async () => {
+  const store = new Map();
+  const page = newPage(store);
+  await signIn(page);
+  await showDiscord(page, [message({ id: "300", content: "history" })]);
+  const field = page.el("channel-compose-text");
+  // Nothing written: Cancel just puts the keyboard down, no question, nothing sent.
+  field.focus();
+  assert.equal(focused(page), field);
+  await page.el("channel-cancel").click();
+  assert.equal(page.el("channel-discard").hidden, true, "an empty box was asked about discarding");
+  assert.notEqual(focused(page), field, "Cancel on an empty box left the focus, and the keyboard, up");
+  assert.equal(page.repliesPosted.length, 0, "Cancel sent");
+  // Words written: it asks. No keeps them, in the box and on the device, the reader back in the box.
+  await field.setValue("half a thought");
+  assert.match(store.get("vibe-talk.channel-drafts") || "", /half a thought/, "the premise: the draft is kept");
+  field.focus();
+  await page.el("channel-cancel").click();
+  assert.equal(page.el("channel-discard").hidden, false, "Cancel with words did not ask");
+  assert.equal(focused(page), page.el("channel-discard-no"), "the question does not stand on No");
+  await page.el("channel-discard-no").click();
+  assert.equal(page.el("channel-discard").hidden, true);
+  assert.equal(field.value, "half a thought", "No took the words");
+  assert.equal(focused(page), field, "No did not put the reader back in the box");
+  assert.match(store.get("vibe-talk.channel-drafts") || "", /half a thought/, "No took the kept draft");
+  // Yes: the words go, from the box and the device, and the keyboard with them.
+  await page.el("channel-cancel").click();
+  assert.equal(page.el("channel-discard").hidden, false);
+  await page.el("channel-discard-yes").click();
+  assert.equal(page.el("channel-discard").hidden, true);
+  assert.equal(field.value, "", "Yes left the words in the box");
+  assert.notEqual(focused(page), field, "Yes left the focus, and the keyboard, up");
+  assert.doesNotMatch(store.get("vibe-talk.channel-drafts") || "", /half a thought/,
+    "the discarded draft is still kept on the device");
+  assert.equal(page.repliesPosted.length, 0, "discarding sent");
 });

@@ -10,6 +10,8 @@ export interface OutgoingWire {
   readonly threadId: string | null;
   /** Asked to land top-level answering `replyTo` by edge only (`#1052 post-to-main`). */
   readonly postToMain: boolean;
+  /** Asked to go exactly as typed, marked raw (`#1135 raw-message-page`). */
+  readonly raw: boolean;
 }
 
 /** One part of a post the server confirmed. */
@@ -26,6 +28,8 @@ export interface OutgoingEntry {
   threadId: string | null;
   /** Asked to land top-level answering `replyTo` by edge only (`#1052 post-to-main`). */
   postToMain: boolean;
+  /** Asked to go exactly as typed, marked raw (`#1135 raw-message-page`). */
+  raw: boolean;
   placement: "unknown" | null;
   replyTo: string | null;
   marksRead: string | null;
@@ -70,7 +74,7 @@ export function savedWire(wire: unknown): OutgoingWire | null {
   const place = (value: unknown): string | null => (typeof value === "string" && value ? value : null);
   const held = wire as Saved | null | undefined;
   return held && typeof held.text === "string"
-    ? { text: held.text, replyTo: place(held.replyTo), threadId: place(held.threadId), postToMain: held.postToMain === true } : null;
+    ? { text: held.text, replyTo: place(held.replyTo), threadId: place(held.threadId), postToMain: held.postToMain === true, raw: held.raw === true } : null;
 }
 
 /**
@@ -91,6 +95,8 @@ export function outgoingFromSaved(saved: unknown, now: () => number): OutgoingEn
     threadId: typeof held.threadId === "string" ? held.threadId : null,
     // An entry saved before post-to-main existed posts where it always posted.
     postToMain: held.postToMain === true,
+    // An entry saved before raw existed posts as it always posted.
+    raw: held.raw === true,
     // A reply whose destination was still to be found out keeps finding it out on Retry.
     placement: held.placement === "unknown" ? "unknown" : null,
     replyTo: typeof held.replyTo === "string" ? held.replyTo : null,

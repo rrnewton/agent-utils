@@ -189,7 +189,9 @@
   align-items: end;
 }
 
-#screen-main[data-draft] #channel-compose-state {
+#screen-main[data-draft] #channel-compose-state,
+#screen-main[data-draft] #channel-composer > .composer-actions,
+#screen-main[data-draft] #channel-discard {
   grid-column: 1 / -1;
 }
 
@@ -207,7 +209,7 @@
 }
 
 #screen-main[data-draft] #compose-text:placeholder-shown ~ #send-text,
-#screen-main[data-draft] #channel-compose-text:placeholder-shown ~ #channel-send {
+#screen-main[data-draft] #channel-compose-text:placeholder-shown ~ .composer-actions #channel-send {
   display: none;
 }
 

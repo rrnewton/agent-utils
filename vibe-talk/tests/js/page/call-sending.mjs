@@ -364,7 +364,7 @@ test("`#269 approval-card-inline`: while a draft is up the message box is one li
   assert.match(cssBlock("#screen-main[data-draft] #compose-text"), /height:\s*2\.75rem/);
   assert.match(cssBlock("#screen-main[data-draft] #compose-text:placeholder-shown ~ #send-text"),
     /display:\s*none/, "the box's Send stays up beside the card's");
-  assert.match(cssBlock("#screen-main[data-draft] #channel-compose-text:placeholder-shown ~ #channel-send"),
+  assert.match(cssBlock("#screen-main[data-draft] #channel-compose-text:placeholder-shown ~ .composer-actions #channel-send"),
     /display:\s*none/, "the channel box's Send stays up beside the card's");
   assert.match(cssBlock("#screen-main[data-draft] #pane-voice > #post-confirm"), /margin-top:\s*auto/);
   assert.match(cssBlock("#pane-voice > #post-confirm"), /margin-left:\s*15%/,

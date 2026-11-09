@@ -18,6 +18,12 @@ export interface MessageBoxDependencies {
    * at the foot, the keyboard's jump is made whole after the browser reveals the caret.
    */
   typed?(): unknown;
+  /** Its Cancel and the Yes and No of the question Cancel asks, where the box has them (`#1135 raw-message-page`). */
+  cancelButton?: HTMLElement;
+  discardYes?: HTMLElement;
+  discardNo?: HTMLElement;
+  cancel?(): unknown;
+  answerDiscard?(discard: boolean): unknown;
   /** A key in the box: one rule for every message box (`onComposerKey`), with this box's send. */
   onKey(event: KeyboardEvent): unknown;
   /** `paste-never-sends`. A paste only ever puts text in. */
@@ -39,6 +45,11 @@ export function mountMessageBox(deps: MessageBoxDependencies): MessageBox {
   if (typed) listen<Event>(deps.box, "input", () => typed());
   const send = deps.send;
   if (deps.sendButton && send) listen<Event>(deps.sendButton, "click", () => send());
+  const cancel = deps.cancel;
+  if (deps.cancelButton && cancel) listen<Event>(deps.cancelButton, "click", () => cancel());
+  const answerDiscard = deps.answerDiscard;
+  if (deps.discardYes && answerDiscard) listen<Event>(deps.discardYes, "click", () => answerDiscard(true));
+  if (deps.discardNo && answerDiscard) listen<Event>(deps.discardNo, "click", () => answerDiscard(false));
   listen<KeyboardEvent>(deps.box, "keydown", (event) => deps.onKey(event));
   deps.watchBoxInsertions(deps.box);
   return { unmount };
