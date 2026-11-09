@@ -36142,11 +36142,17 @@ def test_agent_remove_builds_and_verifies_a_local_archive_before_the_lock(
         "fsck free",
     ], calls
     assert all(line.endswith(" free") for line in calls), calls
-    # Nothing is left beside the bundle but the bundle and its receipt.
+    # Nothing is left beside the shared bundle but the bundle, its record of
+    # the passed verification and the writers' lock (#1153), and nothing
+    # beside the slot's own receipt.
     assert sorted(entry.name for entry in bundle.parent.iterdir()) == [
-        "receipt.json",
+        ".lock",
+        "bundle.json",
         "repository.bundle",
     ]
+    assert sorted(
+        entry.name for entry in Path(receipt["archive_receipt"]).parent.iterdir()
+    ) == ["receipt.json"]
 
 
 def _git_call_probe(
@@ -36272,12 +36278,10 @@ def test_agent_remove_verifies_an_existing_local_archive_before_the_lock(
     assert receipt["disposition"] == "archived-local"
     assert Path(receipt["archive_bundle"]) == bundle
     calls = log.read_text(encoding="utf-8").splitlines()
-    # The existing bundle is not made again; it is restored and checked once,
-    # before the lock, and under the lock only its bytes are reread.
-    assert [line for line in calls if line.split()[0] in {"bundle", "clone", "fsck"}] == [
-        "clone free",
-        "fsck free",
-    ], calls
+    # The existing bundle is not made again, and not restored either: it is
+    # the shared bundle whose record says it passed the full verification
+    # (#1153), so only its bytes are reread, before the lock and under it.
+    assert [line for line in calls if line.split()[0] in {"bundle", "clone", "fsck"}] == [], calls
 
 
 @pytest.mark.skipif(shutil.which("flock") is None, reason="needs flock(1)")
@@ -61368,8 +61372,9 @@ def test_archive_drifted_checkouts_keeps_a_commit_held_only_by_a_mirror_inside_t
     assert tree.is_dir()
     assert len(active_slots(project)) == 1
     assert not _finish_journal(project).exists()
-    salvage = control_directory(project) / "wrkslots-salvage" / "testhost" / "slot01" / "1"
-    [bundle] = sorted(salvage.glob("product-component-*/repository.bundle"))
+    # A submodule's bundle is the shared one of its commit (#1153).
+    shared = control_directory(project) / "wrkslots-salvage" / "_by-commit"
+    [bundle] = sorted(shared.glob("*/repository.bundle"))
     restored = tmp_path / "inside-restored.git"
     git(tmp_path, "clone", "-q", "--bare", str(bundle), str(restored))
     assert git(restored, "cat-file", "-e", f"{inside_only}^{{commit}}", check=False).returncode == 0
@@ -61552,6 +61557,441 @@ def _collect_lifecycle_cases(module: types.ModuleType) -> None:
 
 
 sys.modules.setdefault("wrkslots.tests.test_lifecycle", sys.modules[__name__])
+# --------------------------------------------------------------------------- #1153 salvage proofs
+
+
+def published_submodule_project(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    """A project whose repository pins submodule ``component``; salvage bundles locally."""
+
+    project, repository, _remote = make_project(tmp_path, allow_salvage_push=False)
+    component_remote = tmp_path / "component.git"
+    component_source = tmp_path / "component-source"
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(component_remote)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "clone", str(component_remote), str(component_source)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(component_source, "config", "user.name", "Wrkslots Test")
+    git(component_source, "config", "user.email", "wrkslots@example.invalid")
+    (component_source / "base.txt").write_text("base\n", encoding="utf-8")
+    git(component_source, "add", "base.txt")
+    git(component_source, "commit", "-m", "component base")
+    git(component_source, "push", "-u", "origin", "main")
+    git(
+        repository,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        str(component_remote),
+        "component",
+    )
+    git(repository, "commit", "-am", "add component")
+    git(repository, "push", "origin", "main")
+    update_configuration(
+        project,
+        post_provision_hooks=[
+            "git -c protocol.file.allow=always submodule update --init --recursive"
+        ],
+    )
+    return project, repository, component_remote, component_source
+
+
+def pin_component_off_every_branch(
+    repository: Path, component_source: Path, *, tag: str | None
+) -> str:
+    """Pin ``component`` at a commit no remote branch holds; ``tag`` keeps it on the remote."""
+
+    git(component_source, "checkout", "-q", "-b", "release")
+    (component_source / "release.txt").write_text("release\n", encoding="utf-8")
+    git(component_source, "add", "release.txt")
+    git(component_source, "commit", "-m", "release")
+    pinned = git(component_source, "rev-parse", "HEAD").stdout.strip()
+    git(component_source, "push", "origin", "release")
+    if tag is not None:
+        git(component_source, "tag", "-a", tag, "-m", tag)
+        git(component_source, "push", "origin", tag)
+    nested = repository / "component"
+    git(nested, "fetch", "origin")
+    git(nested, "checkout", "-q", pinned)
+    git(repository, "commit", "-am", "pin component")
+    git(repository, "push", "origin", "main")
+    # The branch goes; a clone that fetched it keeps a stale
+    # refs/remotes/origin/release that still names the commit.
+    git(component_source, "push", "origin", "--delete", "release")
+    return pinned
+
+
+def finished_dead_slot(project: Path, repository: Path, slot: str, agent: str) -> Path:
+    made = create(project, slot=slot, agent=agent, branch=f"codex/{slot}")
+    assert made.returncode == 0, made.stderr
+    tree = checkout(project, slot)
+    commit_task(repository, tree, f"codex/{slot}")
+    handed_off = finish(project, slot, agent)
+    assert handed_off.returncode == 0, handed_off.stderr
+    mark_owner_dead(project, slot=slot)
+    set_liveness(project, "dead")
+    return tree
+
+
+def salvage_receipts(project: Path, slot: str) -> dict[str, Mapping[str, object]]:
+    archive = json.loads(
+        (project / "worktrees" / "ARCHIVED.testhost.json").read_text(encoding="utf-8")
+    )
+    records = [record for record in archive["records"] if record["slot"] == slot]
+    assert len(records) == 1
+    receipts = {str(receipt["checkout"]): receipt for receipt in records[0]["salvage"]}
+    return {
+        ("component" if name.endswith("/component") else "superproject"): receipt
+        for name, receipt in receipts.items()
+    }
+
+
+def written_bundles(project: Path) -> list[Path]:
+    return sorted((project / "worktrees" / "wrkslots-salvage").rglob("*.bundle"))
+
+
+def test_remove_skips_the_bundle_of_a_superproject_whose_only_change_is_a_published_gitlink(
+    tmp_path: Path,
+) -> None:
+    """Gitlink-only dirt pointing at a published submodule commit is published (#1153)."""
+
+    project, repository, _component_remote, component_source = published_submodule_project(
+        tmp_path
+    )
+    tree = finished_dead_slot(project, repository, "slot01", "codex-1")
+    (component_source / "next.txt").write_text("next\n", encoding="utf-8")
+    git(component_source, "add", "next.txt")
+    git(component_source, "commit", "-m", "next")
+    git(component_source, "push", "origin", "main")
+    published = git(component_source, "rev-parse", "HEAD").stdout.strip()
+    git(tree / "component", "fetch", "origin")
+    git(tree / "component", "checkout", "-q", published)
+    assert git(tree, "status", "--porcelain").stdout.strip() == "M component"
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stderr
+    receipts = salvage_receipts(project, "slot01")
+    superproject = receipts["superproject"]
+    assert superproject["disposition"] == "already-published"
+    assert superproject["publication_proof"] == "published-gitlinks"
+    assert superproject["salvage_commit"] != superproject["source_head"]
+    assert superproject["containing_remote_refs"]
+    assert superproject["gitlinks"] == [
+        {
+            "path": "component",
+            "commit": published,
+            "checkout": str(next(iter(
+                name for name in (r["checkout"] for r in receipts.values())
+                if str(name).endswith("/component")
+            ))),
+            "remote": "origin",
+            "containing_remote_refs": ["refs/remotes/origin/main"],
+            "containing_remote_tags": [],
+        }
+    ]
+    assert receipts["component"]["disposition"] == "already-published"
+    assert written_bundles(project) == []
+
+
+@pytest.mark.parametrize("extra", ["unpublished-gitlink", "gitlink-and-file"])
+def test_remove_still_bundles_a_superproject_whose_changes_are_not_all_published_gitlinks(
+    tmp_path: Path, extra: str,
+) -> None:
+    """A gitlink at an unpublished commit, or any other change, is still salvaged (#1153)."""
+
+    project, repository, _component_remote, component_source = published_submodule_project(
+        tmp_path
+    )
+    tree = finished_dead_slot(project, repository, "slot01", "codex-1")
+    nested = tree / "component"
+    if extra == "unpublished-gitlink":
+        git(nested, "config", "user.name", "Wrkslots Test")
+        git(nested, "config", "user.email", "wrkslots@example.invalid")
+        (nested / "local.txt").write_text("only here\n", encoding="utf-8")
+        git(nested, "add", "local.txt")
+        git(nested, "commit", "-m", "unpublished")
+    else:
+        (component_source / "next.txt").write_text("next\n", encoding="utf-8")
+        git(component_source, "add", "next.txt")
+        git(component_source, "commit", "-m", "next")
+        git(component_source, "push", "origin", "main")
+        git(nested, "fetch", "origin")
+        git(nested, "checkout", "-q", "origin/main")
+        (tree / "notes.txt").write_text("a file beside the gitlink\n", encoding="utf-8")
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stderr
+    receipts = salvage_receipts(project, "slot01")
+    superproject = receipts["superproject"]
+    assert superproject["disposition"] == "archived-local"
+    assert "publication_proof" not in superproject
+    assert Path(str(superproject["archive_bundle"])).is_file()
+    if extra == "unpublished-gitlink":
+        assert receipts["component"]["disposition"] == "archived-local"
+    else:
+        assert receipts["component"]["disposition"] == "already-published"
+
+
+def test_remove_skips_a_pinned_submodule_commit_a_remote_tag_holds(tmp_path: Path) -> None:
+    """A clean pinned commit on no remote branch but on a live remote tag is published (#1153)."""
+
+    project, repository, _component_remote, component_source = published_submodule_project(
+        tmp_path
+    )
+    pinned = pin_component_off_every_branch(repository, component_source, tag="v1")
+    tree = finished_dead_slot(project, repository, "slot01", "codex-1")
+    assert git(tree / "component", "rev-parse", "HEAD").stdout.strip() == pinned
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stderr
+    component = salvage_receipts(project, "slot01")["component"]
+    assert component["disposition"] == "already-published"
+    assert component["publication_proof"] == "remote-tag"
+    assert component["containing_remote_refs"] == []
+    assert component["containing_remote_tags"] == ["refs/tags/v1"]
+    assert written_bundles(project) == []
+
+
+def test_remove_bundles_a_pinned_commit_only_a_deleted_branch_held(tmp_path: Path) -> None:
+    """A stale local remote-tracking branch is no proof: the pinned commit is bundled (#1153)."""
+
+    project, repository, _component_remote, component_source = published_submodule_project(
+        tmp_path
+    )
+    pinned = pin_component_off_every_branch(repository, component_source, tag=None)
+    tree = finished_dead_slot(project, repository, "slot01", "codex-1")
+    nested = tree / "component"
+    git(nested, "update-ref", "refs/remotes/origin/release", pinned)
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stderr
+    component = salvage_receipts(project, "slot01")["component"]
+    assert component["disposition"] == "archived-local"
+    assert component["shared_bundle"] is True
+    assert component["bundle_reused"] is False
+    assert component["salvage_commit"] == pinned
+
+
+def test_remove_reuses_the_shared_bundle_of_a_pin_another_slot_bundled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The second slot with the same pin writes and verifies no bundle (#1153).
+
+    clean-caches afterwards leaves the shared bundle alone.
+    """
+
+    project, repository, _component_remote, component_source = published_submodule_project(
+        tmp_path
+    )
+    pinned = pin_component_off_every_branch(repository, component_source, tag=None)
+    update_configuration(project, cache_globs=["build"])
+    finished_dead_slot(project, repository, "slot01", "codex-1")
+    finished_dead_slot(project, repository, "slot02", "codex-2")
+    clones: list[str] = []
+    original_temporary = tempfile.TemporaryDirectory
+
+    def counted_temporary(
+        suffix: str | None = None, prefix: str | None = None, dir: str | None = None
+    ) -> tempfile.TemporaryDirectory[str]:
+        # A full bundle verification restores the bundle into a fresh clone
+        # in such a directory beside it (_verify_local_salvage_bundle).
+        if prefix == ".wrkslots-archive-verify-" and dir is not None:
+            clones.append(dir)
+        return original_temporary(suffix=suffix, prefix=prefix, dir=dir)
+
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", counted_temporary)
+    first, first_stderr = single_remove(project, "slot01")
+    assert first == 0, first_stderr
+    first_clones = list(clones)
+    second, second_stderr = single_remove(project, "slot02")
+    assert second == 0, second_stderr
+
+    one = salvage_receipts(project, "slot01")["component"]
+    two = salvage_receipts(project, "slot02")["component"]
+    assert one["bundle_reused"] is False and two["bundle_reused"] is True
+    assert one["archive_bundle"] == two["archive_bundle"]
+    assert one["archive_receipt"] != two["archive_receipt"]
+    assert one["salvage_commit"] == two["salvage_commit"] == pinned
+    bundle = Path(str(two["archive_bundle"]))
+    assert bundle.parent.name == pinned and bundle.parent.parent.name == "_by-commit"
+    shared = [path for path in written_bundles(project) if "_by-commit" in path.parts]
+    assert shared == [bundle]
+    # The pin's bundle was verified (cloned) by the first removal only.
+    def verifies_the_pin(destination: str) -> bool:
+        return Path(destination) == bundle.parent
+
+    assert any(verifies_the_pin(item) for item in first_clones)
+    assert not any(verifies_the_pin(item) for item in clones[len(first_clones):])
+    metadata = bundle.parent / "bundle.json"
+    before = (bundle.read_bytes(), metadata.read_bytes())
+    cleaned = raw_command(project, "clean-caches", "--yes")
+    assert cleaned.returncode == 0, cleaned.stderr
+    assert (bundle.read_bytes(), metadata.read_bytes()) == before
+
+
+def test_shared_salvage_bundle_writers_of_one_commit_serialize_and_reuse(
+    tmp_path: Path,
+) -> None:
+    """Two processes bundling one commit at once write one bundle; the second reuses it (#1153)."""
+
+    project, repository, _component_remote, component_source = published_submodule_project(
+        tmp_path
+    )
+    pinned = pin_component_off_every_branch(repository, component_source, tag=None)
+    barrier = tmp_path / "barrier"
+    barrier.mkdir()
+    script = """
+import sys, time
+from pathlib import Path
+from wrkslots import cli
+
+project, source, commit, barrier, name = sys.argv[1:6]
+config = cli._load_config(project, "testhost")
+real_verify = cli._verify_local_salvage_bundle
+
+def slow_verify(*args, **kwargs):
+    time.sleep(1.5)  # hold the lock while the other writer arrives
+    return real_verify(*args, **kwargs)
+
+cli._verify_local_salvage_bundle = slow_verify
+Path(barrier, name).touch()
+while len(list(Path(barrier).iterdir())) < 2:
+    time.sleep(0.01)
+_root, bundle, _ref, reused = cli._ensure_shared_salvage_bundle(
+    config, Path(source), commit, config.control, cli._GitVcs()
+)
+print(f"{reused} {bundle}")
+"""
+    writers = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(project), str(repository / "component"),
+             pinned, str(barrier), name],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=source_environment(None),
+        )
+        for name in ("a", "b")
+    ]
+    results = [writer.communicate(timeout=300) for writer in writers]
+    assert [writer.returncode for writer in writers] == [0, 0], results
+    outputs = sorted(stdout.split() for stdout, _stderr in results)
+    assert [reused for reused, _bundle in outputs] == ["False", "True"]
+    assert outputs[0][1] == outputs[1][1]
+    bundle = Path(outputs[0][1])
+    assert sorted(path.name for path in bundle.parent.iterdir()) == [
+        ".lock", "bundle.json", "repository.bundle"
+    ]
+    metadata = json.loads((bundle.parent / "bundle.json").read_text(encoding="utf-8"))
+    assert metadata["verification"]["result"] == "pass"
+    assert metadata["commit"] == pinned
+
+
+def test_shared_salvage_bundle_reuse_refuses_a_bundle_that_differs_from_its_record(
+    tmp_path: Path,
+) -> None:
+    """A changed shared bundle or a record without a passed verification is never reused (#1153)."""
+
+    project, repository, _component_remote, component_source = published_submodule_project(
+        tmp_path
+    )
+    pinned = pin_component_off_every_branch(repository, component_source, tag=None)
+    config = wrkslots._load_config(str(project), "testhost")
+    vcs = wrkslots._GitVcs()
+    _root, bundle, _ref, reused = wrkslots._ensure_shared_salvage_bundle(
+        config, repository / "component", pinned, config.control, vcs
+    )
+    assert reused is False
+    metadata = bundle.parent / "bundle.json"
+    record = json.loads(metadata.read_text(encoding="utf-8"))
+    record["verification"]["result"] = "fail"
+    metadata.chmod(0o600)
+    metadata.write_text(json.dumps(record), encoding="utf-8")
+    with pytest.raises(wrkslots.Refusal, match="does not match the passed verification"):
+        wrkslots._ensure_shared_salvage_bundle(
+            config, repository / "component", pinned, config.control, vcs
+        )
+    record["verification"]["result"] = "pass"
+    metadata.write_text(json.dumps(record), encoding="utf-8")
+    bundle.chmod(0o600)
+    with bundle.open("ab") as handle:
+        handle.write(b"\0")
+    with pytest.raises(wrkslots.Refusal, match="does not match the passed verification"):
+        wrkslots._ensure_shared_salvage_bundle(
+            config, repository / "component", pinned, config.control, vcs
+        )
+
+
+@pytest.mark.parametrize("lost", ["remote-tag", "shared-bundle"])
+def test_remove_keeps_a_bundle_of_its_own_when_a_proof_is_lost_before_deletion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lost: str,
+) -> None:
+    """A skip or shared bundle that stops holding after salvage ends as a real bundle (#1153).
+
+    After the path fence the remote drops the tag that proved the pinned
+    commit, or the shared bundle stops matching its record.  The check
+    before deletion keeps the commit in a verified bundle of the slot's own
+    and journals that receipt in place of the old one.
+    """
+
+    project, repository, _component_remote, component_source = published_submodule_project(
+        tmp_path
+    )
+    pinned = pin_component_off_every_branch(
+        repository, component_source, tag="v1" if lost == "remote-tag" else None
+    )
+    finished_dead_slot(project, repository, "slot01", "codex-1")
+    original_interrupt = wrkslots._interrupt_for_test
+    broken: list[str] = []
+
+    def break_the_proof(point: str) -> None:
+        if point == "after-path-fence" and not broken:
+            if lost == "remote-tag":
+                git(component_source, "push", "origin", "--delete", "v1")
+                # A removal keeps its remote answers for up to
+                # _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS; age them out,
+                # as a removal that ran that long would find them.
+                memo = wrkslots._REMOTE_CONTAINMENT_MEMO.get()
+                assert memo is not None
+                memo.clear()
+            else:
+                shared = next(
+                    path for path in written_bundles(project) if "_by-commit" in path.parts
+                )
+                shared.chmod(0o600)
+                with shared.open("ab") as handle:
+                    handle.write(b"\0")
+            broken.append(point)
+        original_interrupt(point)
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", break_the_proof)
+    returncode, stderr = single_remove(project, "slot01")
+
+    assert returncode == 0, stderr
+    assert broken == ["after-path-fence"]
+    component = salvage_receipts(project, "slot01")["component"]
+    assert component["disposition"] == "archived-local"
+    assert component["archive_reason"] == "publication-proof-lost"
+    assert "shared_bundle" not in component
+    assert "publication_proof" not in component
+    assert component["salvage_commit"] == pinned
+    bundle = Path(str(component["archive_bundle"]))
+    assert bundle.is_file() and "_by-commit" not in bundle.parts
+    assert git(tmp_path, "bundle", "list-heads", str(bundle)).stdout.split()[0] == pinned
+
+
 from wrkslots.tests import foreign_mount_ns_cases  # noqa: E402
 from wrkslots.tests import orphan_retire_cases  # noqa: E402
 

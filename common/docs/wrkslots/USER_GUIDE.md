@@ -1460,6 +1460,35 @@ before this change name `refs/heads/salvage/...` or `refs/heads/rescue/wrkslots/
 verify against the exact ref they recorded. If the checkout was already clean and published, the existing remote containment
 is recorded instead. A failed or unverifiable push preserves the checkout.
 
+Two more cases count as already published (#1153), and the receipt names the proof in
+`publication_proof`. With `published-gitlinks`, the checkout's HEAD is on a remote branch, and the
+only differences from it are submodule gitlinks pointing at other commits: no file, no added or
+removed submodule, no `.gitmodules` change. Each of those commits must be the HEAD of an
+initialized submodule of the same slot, and that submodule's own remote must hold it in a branch or
+a tag. The receipt's `gitlinks` lists each one with the refs that hold it, so HEAD plus that list
+rebuilds the salvage commit's tree exactly. With `remote-tag`, a submodule's clean HEAD is on no
+remote branch, but a tag that the remote lists at that moment contains it; the receipt lists those
+tags in `containing_remote_tags`. Only what the remote lists counts. A local remote-tracking branch
+or tag never counts, because it can name a branch or tag that the remote has since deleted. Every
+proof is asked of the remote again right before deletion. If it no longer holds, the checkout's
+salvage commit is kept in a verified bundle of the slot's own (`archive_reason`
+`publication-proof-lost`), and that receipt replaces the old one before anything is deleted.
+
+A bundle written during removal of an agent slot is shared: it lives in
+`wrkslots-salvage/_by-commit/<commit>/`, holds the commit's complete history under the ref
+`refs/heads/wrkslots-salvage/_by-commit/<commit>`, and is written and verified once. A
+`bundle.json` beside it records the bundle's SHA-256, its size and the passed verification, and is
+written only after that verification. A later removal that salvages the same commit, in any slot,
+reuses the bundle when its SHA-256 and size still match that record, without verifying it again,
+and its receipt says `"shared_bundle": true` and `"bundle_reused": true`. A lock in that directory
+serializes removals that bundle one commit at the same time; the second waits and reuses the
+first's bundle, and nothing is ever overwritten. Each slot still gets its own `receipt.json` in its
+own directory. If a shared bundle no longer matches its record when it is checked again before
+deletion, the checkout is kept in a bundle of the slot's own instead. Wrkslots never deletes
+anything under `_by-commit/`. One bundle there can serve many receipts in many slots' archive
+records, so before you remove one by hand, make sure that no receipt still names it. Bundles written
+before this change stay where they are and remain valid.
+
 When an allowed remote cannot accept a salvage ref, an operator may explicitly choose durable
 local custody by adding `--salvage-archive-root ABSOLUTE_PATH` to `remove`. The
 directory must already exist, must be owned by the current user, must not be group/world writable,

@@ -73,6 +73,14 @@ _LOCAL_SALVAGE_RECEIPT_BYTES_LIMIT = 256 * 1024
 #: Directory under a salvage archive root (by default the control directory)
 #: that holds local salvage bundles and their receipts.
 _LOCAL_SALVAGE_DIRECTORY = "wrkslots-salvage"
+#: Under that directory, one verified complete-history bundle per commit,
+#: shared by every receipt that names it (#1153).  A machine name begins with
+#: a letter or digit, so this name never meets a machine's directory.
+#: NOTHING DELETES IT: many receipts, in many slots' archive records, refer
+#: to one bundle, so any future pruning of the salvage archive must first
+#: count every receipt that names a bundle here.
+_SHARED_SALVAGE_DIRECTORY = "_by-commit"
+_SHARED_SALVAGE_METADATA_SCHEMA = 1
 # Remote salvage and rescue refs are published outside refs/heads/. A branch
 # namespace would make every reclaim create a visible branch on the recorded
 # remote, which a main-only repository must not accumulate. Custom refs are
@@ -13026,6 +13034,11 @@ _REMOTE_CONTAINMENT_MEMO: contextvars.ContextVar[
 _VERIFIED_SALVAGE_BUNDLES: contextvars.ContextVar[
     set[tuple[str, str, int]] | None
 ] = contextvars.ContextVar("wrkslots_verified_salvage_bundles", default=None)
+# The commits whose shared salvage bundle this removal created, its prefetch
+# included, so a receipt says it reused only a bundle an earlier removal made.
+_CREATED_SHARED_SALVAGE_BUNDLES: contextvars.ContextVar[set[str] | None] = (
+    contextvars.ContextVar("wrkslots_created_shared_salvage_bundles", default=None)
+)
 
 #: Tearing-down PID-namespace inits met by a census (#908): counted, not
 #: narrated per PID, unless verbose diagnostics are on for this command.
@@ -13100,6 +13113,7 @@ def _remote_containment_scope() -> Iterator[None]:
 
     token = _REMOTE_CONTAINMENT_MEMO.set({})
     bundles = _VERIFIED_SALVAGE_BUNDLES.set(set())
+    created = _CREATED_SHARED_SALVAGE_BUNDLES.set(set())
     facts = _SALVAGE_FACTS_MEMO.set({})
     inventories = _SUBMODULE_INVENTORY_MEMO.set({})
     try:
@@ -13107,6 +13121,7 @@ def _remote_containment_scope() -> Iterator[None]:
     finally:
         _SUBMODULE_INVENTORY_MEMO.reset(inventories)
         _SALVAGE_FACTS_MEMO.reset(facts)
+        _CREATED_SHARED_SALVAGE_BUNDLES.reset(created)
         _VERIFIED_SALVAGE_BUNDLES.reset(bundles)
         _REMOTE_CONTAINMENT_MEMO.reset(token)
 
@@ -17839,6 +17854,97 @@ class _GitVcs:
             if memo is not None:
                 memo[key] = _RemoteContainmentEvidence((), time.monotonic(), exc)
             raise
+        if memo is not None:
+            memo[key] = _RemoteContainmentEvidence(refs, time.monotonic())
+        return refs
+
+    def remote_tags_containing(
+        self,
+        checkout: Path,
+        remote: str,
+        head: str,
+        authority: _RemoteAuthority,
+        *,
+        network_authority: _RemoteAuthority | None = None,
+    ) -> tuple[str, ...]:
+        """Return refs/tags/<name> for each tag the remote advertises now that contains ``head``.
+
+        The proof for a pinned submodule commit that no remote branch
+        contains (#1153).  Only what the remote lists at this moment counts:
+        a local refs/remotes/* or tag ref may name a branch or tag the remote
+        has since deleted.  Tag tips are compared as remote_heads_containing
+        compares branch tips, an annotated tag through the commit it names;
+        a tip that is not already a commit in the checkout's store is fetched,
+        commits only, into an empty temporary store.  The answer shares
+        remote_heads_containing's memo, under a key no branch question uses.
+        """
+
+        _validate_remote(remote)
+        if not SHA_RE.fullmatch(head):
+            raise Refusal(f"cannot search the remote for invalid commit {head!r}")
+        self.assert_remote_authority(checkout, remote, authority)
+        target = authority if network_authority is None else network_authority
+        expected_digest = hashlib.sha256(target.url.encode("utf-8")).hexdigest()
+        if target.sha256 != expected_digest:
+            raise StateError("remote authority URL and digest disagree")
+        if target.url.startswith("-"):
+            raise Refusal(
+                f"remote {remote!r} URL cannot begin with '-' for isolated transport"
+            )
+        common = self.common_directory(checkout)
+        objects = common / "objects"
+        memo = _REMOTE_CONTAINMENT_MEMO.get()
+        # A URL holds no NUL, so this key never meets a branch question's.
+        key = (str(objects.resolve()), "tags\0" + target.url, head, False)
+        if memo is not None:
+            cached = memo.get(key)
+            if (
+                cached is not None
+                and time.monotonic() - cached.observed_at
+                <= _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS
+            ):
+                if cached.refusal is not None:
+                    raise cached.refusal
+                return cached.refs
+        tags_prefix = "refs/tags/"
+        try:
+            with self._isolated_repository(objects) as (isolated, object_env):
+                advertised = self._ls_remote_inventory(
+                    isolated,
+                    target.url,
+                    refs=(f"{tags_prefix}*",),
+                    env_overrides=object_env,
+                    timeout_seconds=_REMOTE_CONTAINMENT_LIST_SECONDS,
+                )
+                tags = {
+                    ref: tip for ref, tip in advertised.items() if ref.startswith(tags_prefix)
+                }
+                present = self._present_commits(isolated, set(tags.values()), object_env)
+                containing = self._isolated_refs_containing(
+                    isolated,
+                    {ref: tip for ref, tip in tags.items() if tip in present},
+                    head,
+                    object_env,
+                )
+            if not containing:
+                missing = {ref: tip for ref, tip in tags.items() if tip not in present}
+                if missing:
+                    containing = self._fetched_commits_containing(
+                        common,
+                        self._private_git_directory(checkout),
+                        target,
+                        missing,
+                        head,
+                    )
+        except Refusal as exc:
+            if memo is not None:
+                memo[key] = _RemoteContainmentEvidence((), time.monotonic(), exc)
+            raise
+        refs = tuple(sorted(containing))
+        for ref in refs:
+            if not ref.startswith(tags_prefix):
+                raise Refusal(f"Git listed a non-tag ref as a tag: {ref}")
+            _validate_full_ref(ref, "remote tag")
         if memo is not None:
             memo[key] = _RemoteContainmentEvidence(refs, time.monotonic())
         return refs
@@ -22886,10 +22992,13 @@ def _local_salvage_receipt_payload(
     bundle_size: int,
     *,
     drift: _CheckoutDrift | None = None,
+    shared: bool = False,
 ) -> dict[str, object]:
     extra: dict[str, object] = (
         {} if drift is None else {_CHECKOUT_DRIFT_RECEIPT_KEY: drift.to_obj()}
     )
+    if shared:
+        extra["shared_bundle"] = True
     return {
         **extra,
         "schema": _LOCAL_SALVAGE_RECEIPT_SCHEMA,
@@ -22987,6 +23096,151 @@ def _ensure_local_salvage_bundle(
     return checked_root, bundle, receipt_path, archive_ref
 
 
+def _shared_salvage_paths(archive_root: Path, commit: str) -> tuple[Path, Path, str]:
+    """The shared bundle of ``commit``, its metadata file, and its archive ref (#1153).
+
+    A complete-history bundle of a commit depends on nothing but the commit,
+    whose name covers everything reachable from it, so the commit alone is
+    the key: one bundle serves every slot, checkout and repository that
+    salvages it.
+    """
+
+    if not SHA_RE.fullmatch(commit):
+        raise StateError(f"shared salvage bundle for an invalid commit {commit!r}")
+    directory = archive_root / _LOCAL_SALVAGE_DIRECTORY / _SHARED_SALVAGE_DIRECTORY / commit
+    ref = f"refs/heads/{_LOCAL_SALVAGE_DIRECTORY}/{_SHARED_SALVAGE_DIRECTORY}/{commit}"
+    _validate_full_ref(ref, "shared salvage archive ref")
+    return directory / "repository.bundle", directory / "bundle.json", ref
+
+
+def _shared_salvage_metadata(
+    commit: str, archive_ref: str, bundle_sha256: str, bundle_size: int
+) -> dict[str, object]:
+    return {
+        "schema": _SHARED_SALVAGE_METADATA_SCHEMA,
+        "kind": "wrkslots-shared-salvage-bundle",
+        "commit": commit,
+        "archive_ref": archive_ref,
+        "bundle_sha256": bundle_sha256,
+        "bundle_bytes": bundle_size,
+        "verification": {
+            "fresh_bare_clone": True,
+            "exact_ref": True,
+            "full_fsck": True,
+            "complete_history": True,
+            "result": "pass",
+        },
+    }
+
+
+def _shared_salvage_bundle_verified(
+    bundle: Path, metadata: Path, archive_ref: str, commit: str
+) -> tuple[str, int]:
+    """Return the digest and size of a shared bundle whose metadata records a passed verification.
+
+    The metadata is written only after the bundle passed the full
+    verification (_verify_local_salvage_bundle), so the same bytes need no
+    second one: the bundle's SHA-256 and size must equal the recorded ones,
+    and the record must say the verification passed.  Anything else
+    refuses; the caller then keeps a bundle of its own, and nothing here is
+    ever rewritten.
+    """
+
+    contents = _read_bounded_regular_file(
+        metadata, "shared salvage bundle metadata", _LOCAL_SALVAGE_RECEIPT_BYTES_LIMIT
+    )
+    observed = _strict_json_object(contents, "shared salvage bundle metadata")
+    digest, size = _sha256_regular_file(bundle, "shared salvage bundle")
+    if not _json_equal(observed, _shared_salvage_metadata(commit, archive_ref, digest, size)):
+        raise Refusal(
+            f"shared salvage bundle {bundle} does not match the passed verification "
+            f"its metadata {metadata} records"
+        )
+    verified = _VERIFIED_SALVAGE_BUNDLES.get()
+    if verified is not None:
+        verified.add((f"{archive_ref}\0{commit}", digest, size))
+    return digest, size
+
+
+def _ensure_shared_salvage_bundle(
+    config: Config,
+    path: Path,
+    commit: str,
+    archive_root: Path,
+    vcs: _GitVcs,
+) -> tuple[Path, Path, str, bool]:
+    """Reuse, or create and verify once, the shared bundle of ``commit`` (#1153).
+
+    Returns the checked archive root, the bundle, its archive ref, and
+    whether an existing bundle an earlier removal made was reused (one this
+    removal's prefetch made is not; _CREATED_SHARED_SALVAGE_BUNDLES).  Writers of one commit are
+    serialized by an exclusive lock on a file in its directory: the first
+    creates the bundle beside it, verifies it in full, links it into place
+    and only then writes the metadata; a later one, or one that waited,
+    finds the metadata and reuses the bundle without a second verification.
+    A bundle linked by a writer that stopped before its metadata is verified
+    in full and then recorded.  Nothing is overwritten: a metadata file or
+    bundle that disagrees refuses (_shared_salvage_bundle_verified).
+    """
+
+    checked_root = _local_salvage_archive_root(config, str(archive_root))
+    assert checked_root is not None
+    bundle, metadata, archive_ref = _shared_salvage_paths(checked_root, commit)
+    _prepare_local_salvage_directory(checked_root, bundle.parent)
+    _ensure_no_symlink_components(checked_root, bundle.parent, "shared salvage archive")
+    descriptor = os.open(
+        bundle.parent / ".lock",
+        os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        created = _CREATED_SHARED_SALVAGE_BUNDLES.get()
+        if metadata.exists() or metadata.is_symlink():
+            _shared_salvage_bundle_verified(bundle, metadata, archive_ref, commit)
+            return checked_root, bundle, archive_ref, created is None or commit not in created
+        if not bundle.exists():
+            temp_bundle = (
+                bundle.parent / f".{bundle.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+            )
+            try:
+                with tempfile.TemporaryDirectory(prefix="wrkslots-bundle-stage-") as temporary:
+                    stage = Path(temporary) / "stage.git"
+                    vcs._run(Path(temporary), ["init", "--bare", "--", str(stage)])
+                    object_env = {
+                        "GIT_OBJECT_DIRECTORY": str(vcs.common_directory(path) / "objects")
+                    }
+                    vcs._run(stage, ["update-ref", archive_ref, commit], env_overrides=object_env)
+                    vcs._run(
+                        stage,
+                        ["bundle", "create", str(temp_bundle), archive_ref],
+                        env_overrides=object_env,
+                    )
+                temp_descriptor = os.open(temp_bundle, os.O_RDONLY | os.O_CLOEXEC)
+                try:
+                    os.fsync(temp_descriptor)
+                finally:
+                    os.close(temp_descriptor)
+                os.chmod(temp_bundle, 0o444)
+                os.link(temp_bundle, bundle, follow_symlinks=False)
+                _fsync_directory(bundle.parent)
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    temp_bundle.unlink()
+        digest, size = _sha256_regular_file(bundle, "shared salvage bundle")
+        _verify_local_salvage_bundle(bundle, digest, size, archive_ref, commit, vcs)
+        _interrupt_for_test("after-shared-salvage-bundle-before-metadata")
+        _atomic_write_json(
+            metadata, _shared_salvage_metadata(commit, archive_ref, digest, size)
+        )
+        _shared_salvage_bundle_verified(bundle, metadata, archive_ref, commit)
+        if created is not None:
+            created.add(commit)
+        return checked_root, bundle, archive_ref, False
+    finally:
+        os.close(descriptor)
+
+
 def _archive_salvage_locally(
     config: Config,
     machine: str,
@@ -23001,6 +23255,7 @@ def _archive_salvage_locally(
     *,
     drift: _CheckoutDrift | None = None,
     archive_reason: str | None = None,
+    shared: bool = False,
 ) -> dict[str, object]:
     """Create and read back a self-contained bundle instead of a remote push.
 
@@ -23010,10 +23265,38 @@ def _archive_salvage_locally(
     ``archive_reason`` overrides the recorded reason (recorded-checkout-drift
     for a drifted checkout and its submodules, which are never pushed), and
     ``drift`` is recorded in both receipts (see _CheckoutDrift).
+
+    With ``shared`` the bundle is the one shared bundle of ``facts.commit``
+    (_ensure_shared_salvage_bundle), reused when another removal already
+    made and verified it; the receipt is still this slot's own, and says
+    ``shared_bundle`` and whether the bundle was reused (#1153).
     """
-    checked_root, bundle, receipt_path, archive_ref = _ensure_local_salvage_bundle(
-        config, machine, slot, generation, checkout, path, facts, archive_root, vcs
-    )
+    reused = False
+    if shared:
+        try:
+            checked_root, bundle, archive_ref, reused = _ensure_shared_salvage_bundle(
+                config, path, facts.commit, archive_root, vcs
+            )
+        except Refusal as exc:
+            # A shared bundle that disagrees with its record is never
+            # rewritten; this checkout keeps a bundle of its own instead.
+            print(
+                f"WARNING: {exc}; keeping checkout {checkout.name} in a bundle of its own",
+                file=sys.stderr,
+            )
+            shared = False
+    if shared:
+        _slot_bundle, receipt_path, _slot_ref = _local_salvage_paths(
+            checked_root, machine, slot, generation, checkout, facts.commit
+        )
+        _prepare_local_salvage_directory(checked_root, receipt_path.parent)
+        _ensure_no_symlink_components(
+            checked_root, receipt_path.parent, "local salvage archive"
+        )
+    else:
+        checked_root, bundle, receipt_path, archive_ref = _ensure_local_salvage_bundle(
+            config, machine, slot, generation, checkout, path, facts, archive_root, vcs
+        )
 
     bundle_digest, bundle_size = _sha256_regular_file(bundle, "local salvage bundle")
     _verify_local_salvage_bundle(
@@ -23031,6 +23314,7 @@ def _archive_salvage_locally(
         bundle_digest,
         bundle_size,
         drift=drift,
+        shared=shared,
     )
     if receipt_path.exists() or receipt_path.is_symlink():
         contents = _read_bounded_regular_file(
@@ -23063,6 +23347,8 @@ def _archive_salvage_locally(
         )
     if archive_reason == _FROZEN_RELEASE_ARCHIVE_REASON:
         reason = f"commit {facts.commit} is not on remote {checkout.remote}"
+    elif archive_reason == _PUBLICATION_LOST_ARCHIVE_REASON:
+        reason = "the remote no longer proves its earlier salvage receipt"
     elif archive_reason == _CHECKOUT_DRIFT_ARCHIVE_REASON:
         reason = (
             "the checkout differs from its recorded branch or remote"
@@ -23102,6 +23388,7 @@ def _archive_salvage_locally(
             if drift is None
             else {_CHECKOUT_DRIFT_RECEIPT_KEY: drift.to_obj()}
         ),
+        **({"shared_bundle": True, "bundle_reused": reused} if shared else {}),
     }
 
 
@@ -23123,6 +23410,12 @@ def _assert_local_salvage_receipt(
     bundle, receipt_path, archive_ref = _local_salvage_paths(
         root, machine, slot, generation, checkout, facts.commit
     )
+    shared = salvage.get("shared_bundle") is True
+    if shared:
+        bundle, metadata, archive_ref = _shared_salvage_paths(root, facts.commit)
+        _shared_salvage_bundle_verified(bundle, metadata, archive_ref, facts.commit)
+    elif "shared_bundle" in salvage:
+        raise StateError("salvage receipt.shared_bundle must be true when present")
     if _as_str(
         salvage.get("archive_receipt"), "salvage receipt.archive_receipt"
     ) != str(receipt_path):
@@ -23164,6 +23457,7 @@ def _assert_local_salvage_receipt(
         bundle_digest,
         bundle_size,
         drift=_checkout_drift_from_receipt(salvage),
+        shared=shared,
     )
     observed_receipt = _strict_json_object(
         receipt_contents, "local salvage archive receipt"
@@ -23193,6 +23487,10 @@ class _SalvageCandidate:
     # The shallow file of a submodule repository that was let through
     # (_salvage_candidate's allow_shallow); see _shallow_history_refusal.
     shallow: Path | None = None
+    # For a dirty checkout whose salvage tree differs from HEAD's only in
+    # gitlinks that point at other commits, each such (path, commit); None
+    # when anything else differs (#1153).  See _published_gitlinks_proof.
+    gitlinks: tuple[tuple[str, str], ...] | None = None
 
     @property
     def aliased(self) -> bool:
@@ -24504,6 +24802,7 @@ def _salvage_candidate_facts(
             input_text=message,
             env_overrides=identity,
         ).stdout.strip()
+        gitlinks = _gitlink_only_changes(vcs, path, head_tree, tree)
     if not SHA_RE.fullmatch(commit):
         raise Refusal(f"salvage commit for checkout {checkout.name} is not a full Git object")
     return _SalvageCandidate(
@@ -24513,7 +24812,41 @@ def _salvage_candidate_facts(
         dirty=True,
         remote_authority=remote_authority,
         network_authority=network_authority,
+        gitlinks=gitlinks,
     )
+
+
+def _gitlink_only_changes(
+    vcs: _GitVcs, path: Path, head_tree: str, tree: str
+) -> tuple[tuple[str, str], ...] | None:
+    """Each (path, commit) of a gitlink that ``tree`` points elsewhere than ``head_tree`` does.
+
+    None unless every entry that differs is a gitlink modified in place, with
+    mode 160000 on both sides: a submodule added or removed, a .gitmodules
+    edit, or any regular file, directory or mode change leaves the checkout
+    dirty in the ordinary sense (#1153).
+    """
+
+    raw = vcs._run(
+        path, ["diff-tree", "-r", "-z", "--no-renames", head_tree, tree]
+    ).stdout
+    fields = raw.split("\0")
+    if fields and fields[-1] == "":
+        fields.pop()
+    if not fields or len(fields) % 2:
+        return None
+    changes: list[tuple[str, str]] = []
+    for header, name in zip(fields[0::2], fields[1::2]):
+        parts = header.lstrip(":").split(" ")
+        if len(parts) != 5:
+            return None
+        old_mode, new_mode, _old, new, status = parts
+        if (old_mode, new_mode, status) != ("160000", "160000", "M"):
+            return None
+        if not SHA_RE.fullmatch(new) or not name:
+            return None
+        changes.append((name, new))
+    return tuple(changes)
 
 
 def _submodule_salvage_checkouts(
@@ -25249,6 +25582,9 @@ def _same_repository_remote(left: str, right: str) -> bool:
 
 _CHECKOUT_DRIFT_RECEIPT_KEY = "recorded_checkout_drift"
 _CHECKOUT_DRIFT_ARCHIVE_REASON = "recorded-checkout-drift"
+# A #1153 publication proof or shared bundle that no longer held when checked
+# again before deletion; the checkout was then kept in a bundle of its own.
+_PUBLICATION_LOST_ARCHIVE_REASON = "publication-proof-lost"
 _CHECKOUT_DRIFT_KEYS = frozenset(
     {
         "recorded_branch",
@@ -25403,12 +25739,25 @@ def _salvage_one_checkout(
     prepared: _SalvageCandidate | None = None,
     archive_root: Path | None = None,
     never_push: bool = False,
+    gitlink_sources: Mapping[str, tuple[Checkout, Path, _SalvageCandidate]] | None = None,
+    tag_proof: bool = False,
 ) -> dict[str, object]:
     """Preserve one checkout's unpublished state before its slot is removed.
 
     ``never_push`` (a submodule of a drifted checkout, see _CheckoutDrift)
     keeps anything not already published in a verified local bundle instead
     of pushing it to a salvage remote.
+
+    Two more proofs count a checkout as already published (#1153), each
+    named in the receipt's ``publication_proof`` and checked again before
+    deletion (_recheck_published_receipt).  ``published-gitlinks``: HEAD is
+    on a remote branch and the checkout differs from it only in gitlinks
+    (_SalvageCandidate.gitlinks), each pointing at the HEAD of a submodule
+    in ``gitlink_sources`` (keyed by its path in this checkout) that its own
+    remote holds; HEAD and the receipt's ``gitlinks`` rebuild the salvage
+    tree exactly.  ``remote-tag``, with ``tag_proof`` (a submodule): no
+    remote branch holds the clean HEAD, but a tag the remote advertises now
+    does.  Any doubt in either proof salvages as before.
     """
     path = path_override or _stored_path(config, checkout.path, "checkout path")
     facts = (
@@ -25460,9 +25809,19 @@ def _salvage_one_checkout(
             archive_root,
             exc,
             vcs,
+            shared=True,
         )
     vcs.assert_remote_authority(path, checkout.remote, facts.remote_authority)
-    if not facts.dirty and containing:
+    proof: dict[str, object] = {}
+    if facts.dirty and containing and not never_push and gitlink_sources is not None:
+        gitlinks = _published_gitlinks_proof(facts, gitlink_sources, vcs)
+        if gitlinks is not None:
+            proof = {"publication_proof": "published-gitlinks", "gitlinks": gitlinks}
+    elif not facts.dirty and not containing and tag_proof and facts.shallow is None:
+        tags = _published_tags(vcs, path, checkout, facts)
+        if tags:
+            proof = {"publication_proof": "remote-tag", "containing_remote_tags": list(tags)}
+    if (not facts.dirty and containing) or proof:
         receipt: dict[str, object] = {
             "checkout": checkout.name,
             "source_head": facts.head,
@@ -25471,6 +25830,7 @@ def _salvage_one_checkout(
             "disposition": "already-published",
             "remote_ref": None,
             "containing_remote_refs": list(containing),
+            **proof,
         }
         if _checkout_is_self_sourced(config, checkout, path, vcs):
             # The primary no longer declares this submodule, so publication
@@ -25498,6 +25858,7 @@ def _salvage_one_checkout(
             None,
             vcs,
             archive_reason=_CHECKOUT_DRIFT_ARCHIVE_REASON if never_push else None,
+            shared=True,
         )
     salvage_name = checkout.name.replace("/", "-")
     salvage_ref = (
@@ -25528,6 +25889,7 @@ def _salvage_one_checkout(
             archive_root,
             exc,
             vcs,
+            shared=True,
         )
     return {
         "checkout": checkout.name,
@@ -25539,6 +25901,82 @@ def _salvage_one_checkout(
         "containing_remote_refs": [],
         "destination": f"{checkout.remote}:{salvage_ref}",
     }
+
+
+def _published_tags(
+    vcs: _GitVcs, path: Path, checkout: Checkout, facts: _SalvageCandidate
+) -> tuple[str, ...]:
+    """Tags the checkout's remote advertises now that contain its HEAD; none on any doubt.
+
+    A refused or failed question is no proof, so the checkout is salvaged as
+    it would have been without this one (#1153).
+    """
+
+    try:
+        return vcs.remote_tags_containing(
+            path,
+            checkout.remote,
+            facts.head,
+            facts.remote_authority,
+            network_authority=facts.network_authority,
+        )
+    except Refusal:
+        return ()
+
+
+def _published_gitlinks_proof(
+    facts: _SalvageCandidate,
+    sources: Mapping[str, tuple[Checkout, Path, _SalvageCandidate]],
+    vcs: _GitVcs,
+) -> list[dict[str, object]] | None:
+    """The remote proof of each gitlink a checkout's only changes point at, or None.
+
+    Each changed gitlink must point at the HEAD of an initialized submodule
+    of this removal at that path, and that submodule's own recorded remote
+    must hold the commit now: in a branch, or in a tag it advertises.  Any
+    gap, refusal or failed question is None, and the checkout is salvaged
+    as before (#1153).
+    """
+
+    if not facts.gitlinks:
+        return None
+    proofs: list[dict[str, object]] = []
+    for gitlink_path, commit in facts.gitlinks:
+        source = sources.get(gitlink_path)
+        if source is None:
+            return None
+        submodule, submodule_path, submodule_facts = source
+        if submodule_facts.head != commit:
+            return None
+        try:
+            refs = vcs.remote_heads_containing(
+                submodule_path,
+                submodule.remote,
+                commit,
+                submodule_facts.remote_authority,
+                network_authority=submodule_facts.network_authority,
+                shallow=submodule_facts.shallow is not None,
+            )
+        except Refusal:
+            return None
+        tags = (
+            ()
+            if refs or submodule_facts.shallow is not None
+            else _published_tags(vcs, submodule_path, submodule, submodule_facts)
+        )
+        if not refs and not tags:
+            return None
+        proofs.append(
+            {
+                "path": gitlink_path,
+                "commit": commit,
+                "checkout": submodule.name,
+                "remote": submodule.remote,
+                "containing_remote_refs": list(refs),
+                "containing_remote_tags": list(tags),
+            }
+        )
+    return proofs
 
 
 def _drifted_checkout_refusal(
@@ -25664,6 +26102,13 @@ def _salvage_agent_slot(
         for checkout, path, detached, drift, never_push in candidates
     ]
     receipts: list[dict[str, object]] = []
+    # Every initialized submodule of this removal, for the proof that a
+    # checkout's gitlinks point at published commits (#1153).
+    submodule_sources = [
+        (checkout, path, facts)
+        for checkout, path, detached, drift, _never_push, facts in prepared
+        if detached and drift is None
+    ]
     for checkout, path, detached, drift, never_push, facts in prepared:
         if drift is not None:
             # Recheck right before archiving that the drift is what was seen.
@@ -25705,6 +26150,12 @@ def _salvage_agent_slot(
                 prepared=facts,
                 archive_root=archive_root,
                 never_push=never_push,
+                gitlink_sources={
+                    source_path.relative_to(path).as_posix(): (source, source_path, source_facts)
+                    for source, source_path, source_facts in submodule_sources
+                    if source_path != path and source_path.is_relative_to(path)
+                },
+                tag_proof=detached,
             )
         )
     return tuple(receipts)
@@ -25853,7 +26304,23 @@ def _assert_salvage_still_matches(
     *,
     paths: Mapping[str, Path] | None = None,
     checkouts: Sequence[Checkout] | None = None,
+    defer_lost_proofs: bool = False,
+    fall_back: Callable[[Checkout, Path, _SalvageCandidate, Mapping[str, object]], None]
+    | None = None,
 ) -> None:
+    """Check every salvage receipt against the checkout and the remote again.
+
+    A receipt that skipped a bundle on a #1153 proof (``publication_proof``)
+    or names a shared bundle may stop holding: the remote drops a tag, or
+    the shared bundle no longer matches its record.  Such a receipt must
+    never be what deletion relies on.  ``defer_lost_proofs`` (the check
+    before the path fence) leaves it to the check after the fence, which
+    runs before anything is deleted; there ``fall_back`` keeps the
+    checkout's salvage commit in a verified bundle of this slot's own and
+    journals that receipt in its place.  Without either it refuses, as a
+    lost proof of any other receipt always does.
+    """
+
     by_name = {
         _as_str(value.get("checkout"), "salvage receipt.checkout"): value
         for value in receipts
@@ -25934,6 +26401,20 @@ def _assert_salvage_still_matches(
         )
         for checkout, path, allow_detached, drifted in targets
     ]
+    facts_by_name = {
+        checkout.name: (checkout, path, facts) for checkout, path, _detached, facts in prepared
+    }
+
+    def lost(checkout: Checkout, path: Path, facts: _SalvageCandidate, receipt: Mapping[str, object]) -> bool:
+        """Whether a lost #1153 proof is deferred or replaced rather than refused."""
+
+        if defer_lost_proofs:
+            return True
+        if fall_back is None:
+            return False
+        fall_back(checkout, path, facts, receipt)
+        return True
+
     for checkout, path, _allow_detached, facts in prepared:
         receipt = by_name[checkout.name]
         expected = (
@@ -25967,31 +26448,158 @@ def _assert_salvage_still_matches(
                     "preserve the checkout and restore the remote evidence before deletion"
                 )
         elif disposition == "already-published":
-            if not vcs.remote_heads_containing(
+            if not _published_receipt_holds(
+                vcs, checkout, path, facts, receipt, facts_by_name
+            ):
+                if "publication_proof" in receipt and lost(checkout, path, facts, receipt):
+                    continue
+                raise Refusal(
+                    f"checkout {checkout.name} is no longer present on its recorded remote; "
+                    "preserve it and rerun remove to publish salvage"
+                )
+        elif disposition == "archived-local":
+            try:
+                _assert_local_salvage_receipt(
+                    config,
+                    record.machine,
+                    record.slot,
+                    record.generation,
+                    checkout,
+                    facts,
+                    receipt,
+                    vcs,
+                )
+            except Refusal:
+                if receipt.get("shared_bundle") is True and lost(checkout, path, facts, receipt):
+                    continue
+                raise
+        else:
+            raise StateError(f"unknown salvage disposition {disposition!r}")
+
+
+def _replace_lost_salvage_receipt(
+    config: Config,
+    record: ActiveRecord,
+    journal: dict[str, object],
+    checkout: Checkout,
+    path: Path,
+    facts: _SalvageCandidate,
+    receipt: Mapping[str, object],
+    vcs: _GitVcs,
+    *,
+    journal_path: Path,
+) -> None:
+    """Keep a checkout whose #1153 proof no longer holds in a bundle of this slot's own.
+
+    Runs after the path fence and before anything is deleted.  The salvage
+    commit goes into a verified complete-history bundle in this slot's own
+    archive directory, never a shared one, and that receipt replaces the old
+    one in the finish journal, so the archive record names a real bundle of
+    the commit, never a skip.
+    """
+
+    root_text = receipt.get("archive_root")
+    archive_root = (
+        _local_salvage_archive_root(config, root_text)
+        if isinstance(root_text, str)
+        else None
+    ) or _default_salvage_archive_root(config)
+    if receipt.get("shared_bundle") is True:
+        # This slot's own receipt of the shared bundle sits where the
+        # bundle of its own and its receipt go; it no longer holds, and the
+        # journal entry naming it is replaced below.  A crash in between
+        # leaves that entry failing its check again, which lands here again.
+        _bundle, stale_receipt, _ref = _local_salvage_paths(
+            archive_root, record.machine, record.slot, record.generation, checkout, facts.commit
+        )
+        if str(stale_receipt) == receipt.get("archive_receipt"):
+            with contextlib.suppress(FileNotFoundError):
+                stale_receipt.unlink()
+    replacement = _archive_salvage_locally(
+        config,
+        record.machine,
+        record.slot,
+        record.generation,
+        checkout,
+        path,
+        facts,
+        archive_root,
+        None,
+        vcs,
+        archive_reason=_PUBLICATION_LOST_ARCHIVE_REASON,
+    )
+    entries = [
+        dict(_as_mapping(item, "finish journal.salvage entry"))
+        for item in _as_list(journal.get("salvage", []), "finish journal.salvage")
+    ]
+    names = [entry.get("checkout") for entry in entries]
+    if names.count(checkout.name) != 1:
+        raise StateError(f"finish journal names checkout {checkout.name} other than once")
+    entries[names.index(checkout.name)] = replacement
+    journal["salvage"] = entries
+    _write_journal(config, journal, journal_path=journal_path)
+    _interrupt_for_test("after-lost-proof-salvage-journaled")
+
+
+def _published_receipt_holds(
+    vcs: _GitVcs,
+    checkout: Checkout,
+    path: Path,
+    facts: _SalvageCandidate,
+    receipt: Mapping[str, object],
+    facts_by_name: Mapping[str, tuple[Checkout, Path, _SalvageCandidate]],
+) -> bool:
+    """Whether an already-published receipt's proof holds at the remote now.
+
+    A receipt without ``publication_proof`` needs a remote branch holding
+    HEAD, as always.  ``remote-tag`` accepts a branch or an advertised tag.
+    ``published-gitlinks`` needs HEAD on a branch and, for every recorded
+    gitlink, the named submodule still at that commit with its remote still
+    holding it (#1153).  A failed question is a proof that does not hold.
+    """
+
+    proof = receipt.get("publication_proof")
+    try:
+        on_branch = bool(
+            vcs.remote_heads_containing(
                 path,
                 checkout.remote,
                 facts.head,
                 facts.remote_authority,
                 network_authority=facts.network_authority,
                 shallow=facts.shallow is not None,
-            ):
-                raise Refusal(
-                    f"checkout {checkout.name} is no longer present on its recorded remote; "
-                    "preserve it and rerun remove to publish salvage"
-                )
-        elif disposition == "archived-local":
-            _assert_local_salvage_receipt(
-                config,
-                record.machine,
-                record.slot,
-                record.generation,
-                checkout,
-                facts,
-                receipt,
-                vcs,
             )
-        else:
-            raise StateError(f"unknown salvage disposition {disposition!r}")
+        )
+    except Refusal:
+        if proof is None:
+            raise
+        on_branch = False
+    if proof is None:
+        return on_branch
+    if proof == "remote-tag":
+        return on_branch or bool(_published_tags(vcs, path, checkout, facts))
+    if proof != "published-gitlinks":
+        raise StateError(f"unknown salvage publication proof {proof!r}")
+    if not on_branch:
+        return False
+    sources: dict[str, tuple[Checkout, Path, _SalvageCandidate]] = {}
+    recorded: list[tuple[str, str]] = []
+    for raw in _as_list(receipt.get("gitlinks"), "salvage receipt.gitlinks"):
+        item = _as_mapping(raw, "salvage receipt.gitlinks entry")
+        gitlink_path = _as_str(item.get("path"), "salvage receipt.gitlinks entry.path")
+        name = _as_str(item.get("checkout"), "salvage receipt.gitlinks entry.checkout")
+        recorded.append(
+            (gitlink_path, _as_str(item.get("commit"), "salvage receipt.gitlinks entry.commit"))
+        )
+        source = facts_by_name.get(name)
+        if source is None:
+            return False
+        sources[gitlink_path] = source
+    # The same salvage commit has the same tree, so the same gitlinks; the
+    # receipt must name exactly those.
+    if not recorded or tuple(recorded) != facts.gitlinks:
+        return False
+    return _published_gitlinks_proof(facts, sources, vcs) is not None
 
 
 def _assert_slot_contents(config: Config, record: ActiveRecord) -> Path:
@@ -27760,7 +28368,11 @@ def _reclaim_preconditions(
         if finish.salvage:
             raise StateError("validate slot unexpectedly records salvage evidence")
     elif finish.salvage:
-        _assert_salvage_still_matches(config, record, finish.salvage, vcs)
+        # Deletion never relies on this check: a lost #1153 proof is decided
+        # by the check after the path fence (_finish_remove_paths).
+        _assert_salvage_still_matches(
+            config, record, finish.salvage, vcs, defer_lost_proofs=True
+        )
     elif record.handoff is not None:
         return _remove_preconditions(
             config,
@@ -43390,6 +44002,25 @@ def _finish_remove_paths(
             )
             _assert_handoff_read(config, record, fenced_slot)
             if record.slot_type == "agent" and salvage:
+
+                def fall_back(
+                    checkout: Checkout,
+                    path: Path,
+                    facts: _SalvageCandidate,
+                    receipt: Mapping[str, object],
+                ) -> None:
+                    _replace_lost_salvage_receipt(
+                        config,
+                        record,
+                        journal,
+                        checkout,
+                        path,
+                        facts,
+                        receipt,
+                        vcs,
+                        journal_path=journal_path,
+                    )
+
                 _assert_salvage_still_matches(
                     config,
                     record,
@@ -43397,6 +44028,7 @@ def _finish_remove_paths(
                     vcs,
                     paths=moved_paths,
                     checkouts=remaining,
+                    fall_back=fall_back,
                 )
             if private_fence_identity is None:
                 _assert_slot_unused(
@@ -44428,8 +45060,8 @@ def _prefetch_remote_containment(
         )
         archive_root = salvage_archive_root or _default_salvage_archive_root(config)
         vcs = _GitVcs()
-        # (checkout, path, facts, drifted, never_push)
-        prepared: list[tuple[Checkout, Path, _SalvageCandidate, bool, bool]] = []
+        # (checkout, path, facts, drifted, never_push, detached)
+        prepared: list[tuple[Checkout, Path, _SalvageCandidate, bool, bool, bool]] = []
         for checkout in record.checkouts:
             path = _stored_path(config, checkout.path, "checkout path")
             drifted = (
@@ -44495,11 +45127,19 @@ def _prefetch_remote_containment(
                         ),
                         candidate_drifted,
                         drifted or extra_never_push,
+                        detached,
                     )
                 )
     except Refusal:
         return
-    for candidate, candidate_path, facts, drifted, never_push in prepared:
+    # As under the lock (_salvage_agent_slot): the submodules that may prove
+    # a checkout's gitlinks published (#1153).
+    submodule_sources = [
+        (candidate, candidate_path, facts)
+        for candidate, candidate_path, facts, drifted, _never_push, detached in prepared
+        if detached and not drifted
+    ]
+    for candidate, candidate_path, facts, drifted, never_push, detached in prepared:
         try:
             if drifted:
                 # No remote is asked: a drifted checkout is always archived.
@@ -44531,6 +45171,37 @@ def _prefetch_remote_containment(
             )
             if published and not facts.dirty:
                 continue
+            # The #1153 proofs _salvage_one_checkout accepts skip the bundle
+            # here too; under the lock they are asked again.
+            if (
+                facts.dirty
+                and published
+                and not never_push
+                and _published_gitlinks_proof(
+                    facts,
+                    {
+                        source_path.relative_to(candidate_path).as_posix(): (
+                            source,
+                            source_path,
+                            source_facts,
+                        )
+                        for source, source_path, source_facts in submodule_sources
+                        if source_path != candidate_path
+                        and source_path.is_relative_to(candidate_path)
+                    },
+                    vcs,
+                )
+                is not None
+            ):
+                continue
+            if (
+                not facts.dirty
+                and not published
+                and detached
+                and facts.shallow is None
+                and _published_tags(vcs, candidate_path, candidate, facts)
+            ):
+                continue
             if facts.shallow is not None:
                 # Refused under the lock (_shallow_history_refusal).
                 continue
@@ -44541,23 +45212,10 @@ def _prefetch_remote_containment(
             ):
                 # A push is decided, and made, under the lock as before.
                 continue
-            _checked_root, bundle, _receipt, archive_ref = _ensure_local_salvage_bundle(
-                config,
-                record.machine,
-                record.slot,
-                record.generation,
-                candidate,
-                candidate_path,
-                facts,
-                archive_root,
-                vcs,
-            )
-            # A bundle an earlier, refused removal left is restored and fully
-            # checked here, once; under the lock its bytes are only rehashed
-            # (_VERIFIED_SALVAGE_BUNDLES). One just made was checked already.
-            digest, size = _sha256_regular_file(bundle, "local salvage bundle")
-            _verify_local_salvage_bundle(
-                bundle, digest, size, archive_ref, facts.commit, vcs
+            # The shared bundle the removal under the lock archives into
+            # (#1153); made and verified once, or reused, here.
+            _ensure_shared_salvage_bundle(
+                config, candidate_path, facts.commit, archive_root, vcs
             )
         except Refusal:
             continue
