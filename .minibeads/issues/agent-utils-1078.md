@@ -1,10 +1,11 @@
 ---
 title: 'bottom-bar-switcher: outline in the bottom bar, dock rows flipped, tap-through tabs at the lower right'
-status: open
+status: closed
 priority: 1
 issue_type: task
 created_at: 2026-11-08T17:56:40.954836998+00:00
-updated_at: 2026-11-08T17:56:40.954836998+00:00
+updated_at: 2026-11-09T00:38:57.266806077+00:00
+closed_at: 2026-11-09T00:38:57.266805977+00:00
 ---
 
 # Description

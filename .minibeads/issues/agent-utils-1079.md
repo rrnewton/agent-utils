@@ -1,10 +1,11 @@
 ---
 title: 'documents-chronological: Documents list newest at the bottom with drag-up refresh'
-status: open
+status: closed
 priority: 1
 issue_type: task
 created_at: 2026-11-08T17:56:46.831874072+00:00
-updated_at: 2026-11-08T17:56:46.831874072+00:00
+updated_at: 2026-11-09T00:38:57.267087350+00:00
+closed_at: 2026-11-09T00:38:57.267087270+00:00
 ---
 
 # Description
