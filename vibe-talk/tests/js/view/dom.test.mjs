@@ -1963,6 +1963,9 @@ test("`#624 voice-page-modularity`: the keymap lists every key in a group, hands
   assert.deepStrictEqual([press("]", { metaKey: true }, target, { mod: true }), press("[", { ctrlKey: true }, target, { mod: true })],
     [["placeFromKeyboard did", "placeFromKeyboard 1"], ["placeFromKeyboard did", "placeFromKeyboard -1"]]);
   assert.deepStrictEqual([press("/", {}), press("/", { ctrlKey: true }, target, { mod: true })], [["searchFromKeyboard did", "searchFromKeyboard"], ["searchFromAnywhere did", "searchFromAnywhere"]]);
+  // `#1038 documents-outline-popup`. g toggles the document outline; Mod+g does so from a message box too.
+  assert.deepStrictEqual([press("g", {}), press("g", { ctrlKey: true }, field, { mod: true })],
+    [["outlineFromKeyboard did", "outlineFromKeyboard"], ["outlineFromKeyboard did", "outlineFromKeyboard"]]);
   assert.deepStrictEqual(press("ArrowDown", { repeat: true }), ["stepFromKeyboard did", "stepFromKeyboard [object Object] 1 true"]);
   assert.deepStrictEqual(press("ArrowUp"), ["stepFromKeyboard did", "stepFromKeyboard [object Object] -1"], "↑ was given a third argument");
   assert.deepStrictEqual([press("e"), press("e", { repeat: true, ctrlKey: true }, target, { mod: true }), press("e", { repeat: true }, target, { mod: true })],
@@ -2026,7 +2029,7 @@ test("`#624 voice-page-modularity`: the keymap lists every key in a group, hands
     "columnsFromKeyboard", "composeFromKeyboard", "copyChordFromKeyboard", "copyFromKeyboard", "copyLinkFromKeyboard",
     "deepLinkFromKeyboard", "detailsFromKeyboard", "doneFromKeyboard", "filterFromKeyboard", "foldOneFromKeyboard", "foldStepFromKeyboard", "jumpList",
     "keyContext", "keysFromKeyboard", "listEdge", "mainRowsFromKeyboard", "menuFromKeyboard", "newestFromComposer",
-    "nextUnreadFromKeyboard", "onEscape", "openFromKeyboard", "orderFromKeyboard", "packFromKeyboard", "pickChannel",
+    "nextUnreadFromKeyboard", "onEscape", "openFromKeyboard", "orderFromKeyboard", "outlineFromKeyboard", "packFromKeyboard", "pickChannel",
     "placeFromKeyboard", "pressRowButton", "readCollapseFromKeyboard", "readFromKeyboard", "readModeFromKeyboard",
     "quoteFromKeyboard",
     "replyFromKeyboard", "searchFromAnywhere", "searchFromKeyboard", "settingsFromKeyboard", "stepChannel", "stepFromKeyboard",

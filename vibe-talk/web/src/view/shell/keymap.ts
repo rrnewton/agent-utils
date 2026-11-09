@@ -120,6 +120,8 @@ export interface KeymapActs<Target> {
   orderFromKeyboard(): unknown;
   mainRowsFromKeyboard(): unknown;
   columnsFromKeyboard(): unknown;
+  /** Toggle the open document's outline pop-up (`#1038 documents-outline-popup`); whether it did. */
+  outlineFromKeyboard(): unknown;
   composeFromKeyboard(): unknown;
   writeFromKeyboard(): unknown;
   newestFromComposer(target: Target): unknown;
@@ -140,7 +142,7 @@ export function createKeymap<Target>(acts: KeymapActs<Target>): KeymapBinding<Ta
     copyChordFromKeyboard, copyFromKeyboard, nextUnreadFromKeyboard, doneFromKeyboard, readCollapseFromKeyboard, foldOneFromKeyboard,
     foldStepFromKeyboard, collapsedLinesFromKeyboard, packFromKeyboard, unpackFromKeyboard, bookmarkFromKeyboard,
     bookmarkJumpFromKeyboard, viewFromKeyboard, voiceFromKeyboard, readModeFromKeyboard, filterFromKeyboard,
-    undoFromKeyboard, orderFromKeyboard, mainRowsFromKeyboard, columnsFromKeyboard, composeFromKeyboard,
+    undoFromKeyboard, orderFromKeyboard, mainRowsFromKeyboard, columnsFromKeyboard, outlineFromKeyboard, composeFromKeyboard,
     writeFromKeyboard, newestFromComposer,
   } = acts;
   return [
@@ -216,6 +218,16 @@ export function createKeymap<Target>(acts: KeymapActs<Target>): KeymapBinding<Ta
         "this list until now, searches",
       controls: ["help-link-keyboard"],
       run: () => keysFromKeyboard(),
+    },
+    {
+      // `#1038 documents-outline-popup`. The reader's outline without the button: g toggles wherever the
+      // single keys reach, and the modified chord from anywhere, as for / and ? (a message box included).
+      group: KEYS_PAGE, chords: [{ key: "g" }, { key: "g", mod: true }], everywhere: true,
+      does: () => `In Documents, the document outline: opens the section list (with where you are marked), ` +
+        "and again closes it. Inside it the arrow keys move, Enter jumps to a section, and Esc closes it. " +
+        `${modKeyName()}+g toggles it from anywhere, a message box included`,
+      controls: ["doc-outline-open"],
+      run: () => outlineFromKeyboard(),
     },
     {
       group: KEYS_MOVING, chords: [{ key: "ArrowDown" }, { key: "j" }], repeats: true,

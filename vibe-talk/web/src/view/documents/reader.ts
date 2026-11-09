@@ -42,6 +42,8 @@ export interface DocumentsReaderDependencies {
    * opens the document itself.
    */
   onOpenDocument?(key: string): unknown;
+  /** The outline pop-up opened or closed: the page's back levels changed. */
+  onOutlineChange?(open: boolean): unknown;
 }
 
 /**
@@ -63,6 +65,12 @@ export interface DocumentsReader {
   open(key: string): Promise<void>;
   /** The last successfully opened document, or null where none is open. */
   current(): OpenDocument | null;
+  /** Whether the outline pop-up is open (its back level, `menu:outline`). */
+  outlineOpen(): boolean;
+  /** Open the outline pop-up, or close it where it is already open. */
+  toggleOutline(): void;
+  /** Close the outline pop-up where open; say whether it was. */
+  closeOutline(): boolean;
   /** Stop any reading in progress. */
   close(): void;
   /** Take down every listener the reader added. */
@@ -287,9 +295,11 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
 
   /** Open or close the outline pop-up, the same fact on the panel and its button. */
   function setOutlineOpen(open: boolean): void {
+    const wasOpen = outlineOpen;
     outlineOpen = open === true && entries.length > 0;
     deps.byId("doc-outline-pop").hidden = !outlineOpen;
     deps.byId("doc-outline-open").setAttribute("aria-expanded", outlineOpen ? "true" : "false");
+    if (outlineOpen !== wasOpen) deps.onOutlineChange?.(outlineOpen);
     if (outlineOpen) {
       refreshHere(true);
       const focusOn = buttons[hereIndex >= 0 ? hereIndex : 0];
@@ -649,6 +659,17 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     open,
     current(): OpenDocument | null {
       return currentDoc;
+    },
+    outlineOpen(): boolean {
+      return outlineOpen;
+    },
+    toggleOutline(): void {
+      setOutlineOpen(!outlineOpen);
+    },
+    closeOutline(): boolean {
+      if (!outlineOpen) return false;
+      closeOutline(true);
+      return true;
     },
     close(): void {
       stopOwnReading();

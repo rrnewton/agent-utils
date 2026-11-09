@@ -214,6 +214,13 @@ export interface PageNavigationDependencies<Column, ThreadLike, Pane> {
    * each. Unwired, an open document counts as the one level it always was.
    */
   documentDepth?(): number;
+  /**
+   * Whether the open document's outline pop-up is open, and its close
+   * (`#1038 documents-outline-popup`): its `menu:outline` level. Unwired, the
+   * pop-up element itself is read and its button pressed.
+   */
+  documentOutlineOpen?(): boolean;
+  closeDocumentOutline?(): boolean;
   /** Close the open document one step: the previous one, or its list. */
   closeDocument(): void;
   threadListBack(): void;
@@ -413,6 +420,13 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
     if (deps.actionMenuOpen()) open.push("menu:actions");
     // `#348 settings-dynamic-lists`. The pop-out over Recently dismissed, on Settings.
     if (!el("dismissed-send-popout").hidden) open.push("menu:dismissed");
+    // `#1038 documents-outline-popup`. The outline; unwired, its toggle's expanded word tells it.
+    const outlineToggle = el("doc-outline-open");
+    if (deps.documentOutlineOpen
+      ? deps.documentOutlineOpen()
+      : typeof outlineToggle.getAttribute === "function" && outlineToggle.getAttribute("aria-expanded") === "true") {
+      open.push("menu:outline");
+    }
     return open;
   }
 
@@ -446,6 +460,16 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
       return true;
     }
     if (name === "menu:dismissed" && !el("dismissed-send-popout").hidden) return deps.closeDismissedPopout();
+    if (name === "menu:outline") {
+      if (deps.closeDocumentOutline) return deps.closeDocumentOutline();
+      const toggle = el("doc-outline-open");
+      if (typeof toggle.getAttribute === "function" && toggle.getAttribute("aria-expanded") === "true" &&
+        typeof toggle.click === "function") {
+        toggle.click();
+        if (typeof toggle.focus === "function") toggle.focus({ preventScroll: true });
+        return true;
+      }
+    }
     return false;
   }
 

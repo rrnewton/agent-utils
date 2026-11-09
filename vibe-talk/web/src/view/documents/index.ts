@@ -59,6 +59,12 @@ export interface DocumentsView {
   current(): OpenDocument | null;
   /** The voice notice for the open document, or null where none is open. */
   documentNotice(): string | null;
+  /** Whether the reader's outline pop-up is open (its `menu:outline` back level). */
+  outlineOpen(): boolean;
+  /** Toggle the reader's outline pop-up, as its button does. */
+  toggleOutline(): void;
+  /** Close the outline pop-up where open; say whether it was. */
+  closeOutline(): boolean;
   /** Take down every listener the view added. */
   unmount(): void;
 }
@@ -114,6 +120,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     // goes through this same `openDocument` entry a list tap uses — the one
     // open path `#1082 documents-back-chain` builds its chain on.
     onOpenDocument: (key) => openDocument(key),
+    onOutlineChange: () => deps.onLevelChange?.(),
   });
   const list = createDocumentsList({
     api: deps.api,
@@ -170,6 +177,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
    * `document` level does, so gesture and button walk the same chain.
    */
   function back(): void {
+    if (readingNow && reader.closeOutline()) return;
     if (!readingNow || chain.length <= 1) {
       toList();
       return;
@@ -319,6 +327,11 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
       const doc = readingNow ? reader.current() : null;
       return doc === null ? null : openDocumentNotice(doc);
     },
+    outlineOpen: () => (readingNow ? reader.outlineOpen() : false),
+    toggleOutline(): void {
+      if (readingNow) reader.toggleOutline();
+    },
+    closeOutline: (): boolean => (readingNow ? reader.closeOutline() : false),
     unmount(): void {
       if (liveTimer !== 0) clearTimeout(liveTimer);
       liveTimer = 0;

@@ -255,6 +255,8 @@ export interface KeyboardCompositionDependencies<
   orderFromKeyboard(): unknown;
   mainRowsFromKeyboard(): unknown;
   columnsFromKeyboard(): unknown;
+  /** Toggle the open document's outline pop-up from the keyboard (`#1038`); whether it did. */
+  toggleDocumentOutline?(): unknown;
   // Dispatch, timing and hints.
   childByClass(row: HTMLElement, className: string): HTMLElement | null;
   deviceSettings(): DeviceSettings;
@@ -821,6 +823,7 @@ export function createKeyboardComposition<
     orderFromKeyboard: () => deps.orderFromKeyboard(),
     mainRowsFromKeyboard: () => deps.mainRowsFromKeyboard(),
     columnsFromKeyboard: () => deps.columnsFromKeyboard(),
+    outlineFromKeyboard: () => deps.toggleDocumentOutline?.() ?? false,
     composeFromKeyboard: () => composeFromKeyboard(),
     writeFromKeyboard: () => writeFromKeyboard(),
     newestFromComposer: (target) => newestFromComposer(target),

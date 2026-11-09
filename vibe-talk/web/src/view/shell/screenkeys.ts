@@ -227,6 +227,8 @@ export function createScreenKeys<Pane>(deps: ScreenKeysDependencies<Pane>): Scre
     goBack,
     onEscape(event, target) {
       if (deps.closeRowMenuOnEscape(event)) return true;
+      // `#1038 documents-outline-popup`. The document outline, before the rest.
+      if (deps.closeOpenMenu("menu:outline")) return true;
       // The pace popover and the prompts tray, as the back gesture closes them (`#304 back-gesture-in-app`).
       if (deps.closeOpenMenu("menu:pace") || deps.closeOpenMenu("menu:prompts") || deps.closeOpenMenu("menu:actions")) return true;
       // `#348 settings-dynamic-lists`. The pop-out over Recently dismissed, before Settings itself.

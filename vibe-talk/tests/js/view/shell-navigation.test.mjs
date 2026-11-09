@@ -45,6 +45,8 @@ function makeNavigation(state) {
     documentOpen: () => state.docs.length > 0,
     ...(state.noDocDepth ? {} : { documentDepth: () => state.docs.length }),
     closeDocument: () => { calls.push("closeDocument"); state.docs.pop(); },
+    documentOutlineOpen: () => state.outline === true,
+    closeDocumentOutline: () => { calls.push("closeOutline"); const was = state.outline === true; state.outline = false; return was; },
     openDocument: (key) => { calls.push(["openDocument", key]); state.view = "docs"; state.docs.push(key); },
     leaveThread: () => calls.push("leaveThread"), showScreen: () => {}, showHelp: () => {},
     showView: (name) => { calls.push(["showView", name]); state.view = name; },
@@ -119,6 +121,21 @@ test("`#1082 documents-back-chain`: the chain's depth is its levels, menus on to
   unwired.noDocDepth = true;
   assert.deepStrictEqual(makeNavigation(unwired).nav.backLevels(), ["document"],
     "without the depth wired, an open document is not its one old level");
+});
+
+test("`#1038 documents-outline-popup`: the open outline is a menu level on top, and Back closes it before the document", () => {
+  const state = freshState();
+  state.view = "docs";
+  state.docs = ["doc-a"];
+  state.outline = true;
+  const { nav, calls } = makeNavigation(state);
+  assert.deepStrictEqual(nav.backLevels(), ["document", "menu:outline"],
+    "the open outline is not a level on top of its document");
+  nav.documentBack();
+  assert.deepStrictEqual(calls.filter((call) => call === "closeOutline"), ["closeOutline"],
+    "Back did not close the outline first");
+  assert.deepStrictEqual(state.docs, ["doc-a"], "closing the outline popped a document too");
+  assert.equal(state.outline, false, "the outline stayed open after Back");
 });
 
 test("`#1082 documents-back-chain`: channel -> document is a jump, a second document stacks over it, and Back walks both steps home", async () => {

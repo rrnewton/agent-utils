@@ -797,6 +797,8 @@ const shellNavigation = createPageNavigation({
   closeReply: () => closeReply(),
   documentOpen: () => documentsView.reading(),
   documentDepth: () => documentsView.depth(),
+  documentOutlineOpen: () => documentsView.outlineOpen(),
+  closeDocumentOutline: () => documentsView.closeOutline(),
   closeDocument: () => documentsView.showList(),
   threadListBack: () => threadListBack(),
   leaveThread: () => leaveThread(),
@@ -3361,6 +3363,11 @@ const keyboard = createKeyboardComposition({
   deviceSettings: () => deviceSettings(),
   keyTimingSetting: () => deviceSettings().get(DEVICE_SETTINGS.keyTiming),
   locationSearch: () => window.location.search || "",
+  toggleDocumentOutline: () => {
+    if (screens.view() !== "docs" || !documentsView.reading()) return false;
+    documentsView.toggleOutline();
+    return true;
+  },
 });
 const {
   channelPane, sidePane, KEY_PANES, paneColumn, lastPane, keySelection,
