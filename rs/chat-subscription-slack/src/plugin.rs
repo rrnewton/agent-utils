@@ -174,6 +174,28 @@ use crate::transport::{
 pub const CONFIGURATION_SCHEMA: &str = "agentctl.slack.v1";
 /// Schema of each delivered message's provider payload.
 pub const PAYLOAD_SCHEMA: &str = "agentctl.slack.message.v1";
+/// The `event_type` a posting client files its operation key (and, for a raw post, its raw
+/// marker) under (#1136 raw-message-bridge).
+const OP_KEY_EVENT_TYPE: &str = "vibe_talk_op_key";
+
+/// Whether inbound message `metadata` (compact JSON, or none) marks its message raw: exactly
+/// `event_type` [`OP_KEY_EVENT_TYPE`] with `event_payload.raw` the boolean `true`. Anything
+/// else — absent, unparsable, another type, a non-boolean — is not raw, so a malformed marker
+/// fails closed to ordinary delivery.
+fn raw_marked(metadata: Option<&str>) -> bool {
+    let Some(metadata) = metadata else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(metadata) else {
+        return false;
+    };
+    value.get("event_type").and_then(Value::as_str) == Some(OP_KEY_EVENT_TYPE)
+        && value
+            .get("event_payload")
+            .and_then(|payload| payload.get("raw"))
+            .and_then(Value::as_bool)
+            == Some(true)
+}
 /// Backend name reported in capabilities.
 pub const BACKEND_NAME: &str = "slack";
 const CURSOR_PREFIX: &str = "slack1:";
@@ -1385,6 +1407,9 @@ impl SlackDriver {
         );
         payload.insert("thread_ts".to_owned(), Value::String(root.to_owned()));
         payload.insert("user_id".to_owned(), Value::String(user.to_owned()));
+        if raw_marked(message.metadata.as_deref()) {
+            payload.insert("raw".to_owned(), Value::Bool(true));
+        }
         if let Some(team) = &message.team_id {
             payload.insert("team_id".to_owned(), Value::String(team.clone()));
         }
@@ -2909,6 +2934,32 @@ impl ChatSubscriptionDriver for SlackDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_exact_raw_marker_is_raw() {
+        // `#1136 raw-message-bridge`: the marker rides inside the operation-key payload, and
+        // every near miss fails closed to ordinary delivery.
+        let marked =
+            r#"{"event_type":"vibe_talk_op_key","event_payload":{"op_key":"k.1","raw":true}}"#;
+        assert!(raw_marked(Some(marked)));
+        let marked_bare = r#"{"event_type":"vibe_talk_op_key","event_payload":{"raw":true}}"#;
+        assert!(raw_marked(Some(marked_bare)));
+        for not_raw in [
+            None,
+            Some(""),
+            Some("not json"),
+            Some(r#"{"event_type":"vibe_talk_op_key","event_payload":{"op_key":"k.1"}}"#),
+            Some(r#"{"event_type":"vibe_talk_op_key","event_payload":{"raw":false}}"#),
+            Some(r#"{"event_type":"vibe_talk_op_key","event_payload":{"raw":"true"}}"#),
+            Some(r#"{"event_type":"vibe_talk_op_key","event_payload":{"raw":1}}"#),
+            Some(r#"{"event_type":"other_app","event_payload":{"raw":true}}"#),
+            Some(r#"{"event_payload":{"raw":true}}"#),
+            Some(r#"{"event_type":"vibe_talk_op_key"}"#),
+            Some(r#"[{"event_type":"vibe_talk_op_key","event_payload":{"raw":true}}]"#),
+        ] {
+            assert!(!raw_marked(not_raw), "{not_raw:?}");
+        }
+    }
 
     #[test]
     fn cursors_round_trip() {

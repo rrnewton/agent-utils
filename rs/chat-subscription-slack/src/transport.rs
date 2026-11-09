@@ -54,6 +54,9 @@ pub struct SlackMessage {
     pub subtype: Option<String>,
     /// Message text as Slack stores it (with `&amp;`, `&lt;`, `&gt;` escapes).
     pub text: String,
+    /// Slack message metadata as compact JSON (`{"event_type": …, "event_payload": {…}}`),
+    /// when the event carried it (#1136 raw-message-bridge).
+    pub metadata: Option<String>,
     /// Workspace ID, when reported.
     pub team_id: Option<String>,
     /// IDs of the files attached to the message, in Slack's order.

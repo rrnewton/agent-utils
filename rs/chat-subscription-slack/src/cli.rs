@@ -201,6 +201,19 @@ fn text_field(value: &Value, key: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The most bytes of compact message metadata an inbound event carries through: Slack's own
+/// metadata bound. A larger or non-object value is dropped whole, which fails closed (no raw
+/// marker can be read from it).
+const MAX_INBOUND_METADATA_BYTES: usize = 8 * 1024;
+
+/// A `slack_message`'s `metadata` as compact JSON, when it is an object within bounds
+/// (#1136 raw-message-bridge).
+fn metadata_field(slack: &Value) -> Option<String> {
+    let metadata = slack.get("metadata").filter(|value| value.is_object())?;
+    let compact = metadata.to_string();
+    (compact.len() <= MAX_INBOUND_METADATA_BYTES).then_some(compact)
+}
+
 /// The valid Slack file IDs in a row's `file_ids`, which the client reports either as a list or
 /// as one comma-separated string. At most [`MAX_FILE_IDS`] are kept, in order, without repeats.
 #[must_use]
@@ -290,6 +303,7 @@ pub fn parse_tail_line(line: &str) -> StreamRecord {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_owned(),
+                metadata: metadata_field(slack),
                 team_id: text_field(slack, "team_id"),
                 file_ids: file_ids_field(slack),
             }))
