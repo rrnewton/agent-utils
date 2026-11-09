@@ -62,6 +62,17 @@ fi
 CMD="${ARGS[0]}"
 REST=("${ARGS[@]:1}")
 
+# Readers-only routing (#562 early flip soak): when the resolver sets
+# WRKSLOTS_SOAK_READERS_ONLY=1, only the approved readers run in Rust;
+# every other command (audit included, until its census parity lands)
+# stays Python with the note below.
+if [[ "${WRKSLOTS_SOAK_READERS_ONLY:-}" == "1" ]]; then
+    case "$CMD" in
+        status|doctor|unpushed|shell-command|quickstart) ;;
+        *) run_python "$CMD" "${ORIGINAL[@]}" ;;
+    esac
+fi
+
 # Python command -> wrkslotsd command. Anything unlisted stays Python.
 RUST_CMD=""
 case "$CMD" in
@@ -69,6 +80,7 @@ case "$CMD" in
     doctor) RUST_CMD="doctor-text" ;;
     audit) RUST_CMD="audit-text" ;;
     shell-command) RUST_CMD="shell-command" ;;
+    quickstart) RUST_CMD="quickstart" ;;
     unpushed) RUST_CMD="unpushed-text" ;;
     create) RUST_CMD="create-text" ;;
     recover-absent-agent-rows) RUST_CMD="recover-absent-agent-rows-text" ;;
@@ -98,15 +110,16 @@ for arg in "${REST[@]}"; do
     esac
 done
 
-# Move the globals the Rust commands accept per-command.
-if [[ -n "$PROJECT_ROOT" ]]; then
+# Move the globals the Rust commands accept per-command. quickstart
+# ignores the project globals in Python too, so they are dropped there.
+if [[ -n "$PROJECT_ROOT" && "$CMD" != "quickstart" ]]; then
     if grep -q -- "--root" <<<"$HELP_TEXT"; then
         REST+=("--root" "$PROJECT_ROOT")
     else
         run_python "$CMD" "${ORIGINAL[@]}"
     fi
 fi
-if [[ -n "$MACHINE" ]]; then
+if [[ -n "$MACHINE" && "$CMD" != "quickstart" ]]; then
     if grep -q -- "--machine" <<<"$HELP_TEXT"; then
         REST+=("--machine" "$MACHINE")
     else

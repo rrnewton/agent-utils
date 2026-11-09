@@ -42,23 +42,39 @@ def _build_sandbox(tmp_path: Path) -> Path:
     stub.write_text(f"print('PY-{TOOL}')\n")
     _chmod_x(stub)
     rust_stub = rust_bin / "wrkslotsd"
-    rust_stub.write_text("#!/bin/sh\necho RS-wrkslotsd\n")
+    rust_stub.write_text("#!/bin/sh\necho \"RS-wrkslotsd pycompat=${WRKSLOTS_PYCOMPAT:-}\"\n")
     _chmod_x(rust_stub)
+    soak_stub = common_bin / "wrkslots-soak"
+    soak_stub.write_text(
+        "#!/bin/sh\necho \"SOAK readers=${WRKSLOTS_SOAK_READERS_ONLY:-} args=$@\"\n"
+    )
+    _chmod_x(soak_stub)
     return root
 
 
 def _run(
-    root: Path, extra_env: dict[str, str] | None = None
+    root: Path, extra_env: dict[str, str] | None = None, *args: str
 ) -> subprocess.CompletedProcess[str]:
     env = {
         key: value
         for key, value in os.environ.items()
         if key
-        not in ("DAGRUN_ENGINE", "AGENT_UTILS_ENGINE", "WRKSLOTS_ENGINE", "CI_HUB_PYTHON")
+        not in (
+            "DAGRUN_ENGINE",
+            "AGENT_UTILS_ENGINE",
+            "WRKSLOTS_ENGINE",
+            "WRKSLOTS_RUST_READERS",
+            "WRKSLOTS_RUST_READERS_FILE",
+            "WRKSLOTS_PYCOMPAT",
+            "CI_HUB_PYTHON",
+        )
     }
+    # Hermetic: a host file enabling the soak on this machine must
+    # not leak into sandbox dispatch decisions.
+    env["WRKSLOTS_RUST_READERS_FILE"] = str(root / "no-readers-file")
     env.update(extra_env or {})
     return subprocess.run(
-        [str(root / "common" / "bin" / TOOL)],
+        [str(root / "common" / "bin" / TOOL), *args],
         cwd=root,
         capture_output=True,
         text=True,
@@ -81,7 +97,7 @@ def test_wrkslots_engine_rust_selects_rust_edition(tmp_path: Path) -> None:
     for value in ("rust", "rs"):
         result = _run(root, {"WRKSLOTS_ENGINE": value})
         assert result.returncode == 0, result.stderr
-        assert result.stdout == "RS-wrkslotsd\n"
+        assert result.stdout == "RS-wrkslotsd pycompat=1\n"
         assert "engine=rust" in result.stderr
 
 
@@ -98,7 +114,7 @@ def test_wrkslots_engine_wins_over_generic_overrides(tmp_path: Path) -> None:
         root, {"WRKSLOTS_ENGINE": "rust", "DAGRUN_ENGINE": "python"}
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "RS-wrkslotsd\n"
+    assert result.stdout == "RS-wrkslotsd pycompat=1\n"
     result = _run(
         root, {"WRKSLOTS_ENGINE": "python", "DAGRUN_ENGINE": "rust"}
     )
@@ -120,3 +136,41 @@ def test_wrkslots_engine_invalid_value_refuses(tmp_path: Path) -> None:
     assert result.returncode == 2
     assert result.stdout == ""
     assert "WRKSLOTS_ENGINE" in result.stderr
+
+
+def test_readers_env_optin_dispatches_to_soak(tmp_path: Path) -> None:
+    root = _build_sandbox(tmp_path)
+    result = _run(root, {"WRKSLOTS_RUST_READERS": "1"}, "status")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "SOAK readers=1 args=status\n"
+
+
+def test_readers_host_file_optin_dispatches_to_soak(tmp_path: Path) -> None:
+    root = _build_sandbox(tmp_path)
+    host_file = tmp_path / "wrkslots-rust-readers"
+    host_file.write_text("enabled = true\n")
+    result = _run(
+        root,
+        {"WRKSLOTS_RUST_READERS_FILE": str(host_file)},
+        "doctor",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "SOAK readers=1 args=doctor\n"
+
+
+def test_readers_zero_and_python_engine_beat_routing(tmp_path: Path) -> None:
+    root = _build_sandbox(tmp_path)
+    host_file = tmp_path / "wrkslots-rust-readers"
+    host_file.write_text("enabled = true\n")
+    result = _run(
+        root,
+        {"WRKSLOTS_RUST_READERS": "0", "WRKSLOTS_RUST_READERS_FILE": str(host_file)},
+        "status",
+    )
+    assert result.stdout == f"PY-{TOOL}\n"
+    result = _run(
+        root,
+        {"WRKSLOTS_ENGINE": "python", "WRKSLOTS_RUST_READERS": "1"},
+        "status",
+    )
+    assert result.stdout == f"PY-{TOOL}\n"

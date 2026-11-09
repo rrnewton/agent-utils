@@ -110,6 +110,34 @@ if [[ "$TOOL" == "wrkslots" && -n "${WRKSLOTS_ENGINE:-}" ]]; then
     WRKSLOTS_OPTIN="1"
 fi
 
+# wrkslots Rust readers routing (#562 early flip, soak phase): with no
+# explicit engine override of any kind, dispatch through the soak
+# launcher in readers-only mode when opted in per process
+# (WRKSLOTS_RUST_READERS=1) or per host (an `enabled = true` line in
+# ${WRKSLOTS_RUST_READERS_FILE:-~/.local/etc/agent-utils/wrkslots-rust-readers},
+# a per-host file that is not synced between hosts). Code default is
+# OFF: neither opt-in, nothing changes. WRKSLOTS_ENGINE=python (or
+# WRKSLOTS_RUST_READERS=0) opts back out. Routed calls are logged by
+# the soak launcher (WRKSLOTS_SOAK_LOG, default
+# ~/.local/state/wrkslots-soak/soak.log).
+if [[ "$TOOL" == "wrkslots" && -z "${WRKSLOTS_ENGINE:-}" && -z "$ENGINE_VAR" ]]; then
+    WRKSLOTS_READERS=""
+    case "${WRKSLOTS_RUST_READERS:-}" in
+        1|true) WRKSLOTS_READERS="1" ;;
+        0|false) WRKSLOTS_READERS="" ;;
+        *)
+            READERS_FILE="${WRKSLOTS_RUST_READERS_FILE:-$HOME/.local/etc/agent-utils/wrkslots-rust-readers}"
+            if [[ -f "$READERS_FILE" ]] && grep -Eq '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*true[[:space:]]*$' "$READERS_FILE"; then
+                WRKSLOTS_READERS="1"
+            fi
+            ;;
+    esac
+    if [[ -n "$WRKSLOTS_READERS" ]]; then
+        export WRKSLOTS_SOAK_READERS_ONLY=1
+        exec "$ROOT/common/bin/wrkslots-soak" "$@"
+    fi
+fi
+
 # wrkviz edition-switch opt-in (#706 rust-primary-wrkviz): WRKVIZ_ENGINE is the
 # per-tool trial switch for the Rust edition growing in rs/wrkviz. It wins over
 # the generic overrides for this tool only, and it bypasses the mirror-state

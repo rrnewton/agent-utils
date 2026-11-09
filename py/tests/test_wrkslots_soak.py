@@ -71,6 +71,9 @@ case "$1" in
   classify-ownerless-validate-batch-text)
     if [ "$2" = "--help" ]; then echo "Usage: --root --machine --checkout --frozen-validate-checkout --completed-record --repository --validation-proof-manifest --format"; exit 0; fi
     echo "RS classify-ownerless-validate-batch-text $@" ;;
+  quickstart)
+    if [ "$2" = "--help" ]; then echo "Usage: quickstart"; exit 0; fi
+    echo "RS quickstart $@" ;;
   heartbeat)
     if [ "$2" = "--help" ]; then echo "Usage: --agent --owner-pid --expected-generation --root --machine"; exit 0; fi
     echo "RS heartbeat-run $@" ;;
@@ -103,13 +106,24 @@ def _sandbox(tmp_path: Path) -> tuple[Path, Path]:
     return root, tmp_path / "soak.log"
 
 
-def _run(root: Path, log: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _run(
+    root: Path, log: Path, *args: str, readers_only: bool = False
+) -> subprocess.CompletedProcess[str]:
     env = {
         key: value
         for key, value in os.environ.items()
-        if key not in ("DAGRUN_ENGINE", "AGENT_UTILS_ENGINE", "WRKSLOTS_ENGINE", "CI_HUB_PYTHON")
+        if key
+        not in (
+            "DAGRUN_ENGINE",
+            "AGENT_UTILS_ENGINE",
+            "WRKSLOTS_ENGINE",
+            "WRKSLOTS_SOAK_READERS_ONLY",
+            "CI_HUB_PYTHON",
+        )
     }
     env["WRKSLOTS_ENGINE"] = "rust-soak"
+    if readers_only:
+        env["WRKSLOTS_SOAK_READERS_ONLY"] = "1"
     env["WRKSLOTS_SOAK_LOG"] = str(log)
     return subprocess.run(
         [str(root / "common" / "bin" / "wrkslots"), *args],
@@ -269,3 +283,38 @@ def test_wait_lock_reaches_the_rust_path(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert result.stdout.startswith("RS heartbeat-run")
     assert "cmd=heartbeat edition=rust" in log.read_text()
+
+
+def test_quickstart_runs_in_rust(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    result = _run(root, log, "--project-root", "/p", "quickstart")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("RS quickstart quickstart")
+    assert "--root" not in result.stdout
+    assert "cmd=quickstart edition=rust rc=0" in log.read_text()
+
+
+def test_readers_only_approved_readers_still_run_in_rust(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    result = _run(root, log, "status", readers_only=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("RS status-text status-text")
+    assert "cmd=status edition=rust rc=0" in log.read_text()
+
+
+def test_readers_only_audit_stays_python(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    result = _run(root, log, "audit", "--gate", readers_only=True)
+    assert result.stdout.startswith("PY wrkslots audit")
+    assert "cmd=audit edition=python" in log.read_text()
+
+
+def test_readers_only_writer_stays_python(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    result = _run(
+        root, log, "heartbeat", "slot1",
+        "--agent", "a", "--owner-pid", "1", "--expected-generation", "2",
+        readers_only=True,
+    )
+    assert result.stdout.startswith("PY wrkslots heartbeat")
+    assert "cmd=heartbeat edition=python" in log.read_text()
