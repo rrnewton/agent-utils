@@ -2603,7 +2603,15 @@ pub fn drain_tui_inbox_at(
 fn read_tui_recent_scrollback(pane_id: &str) -> Result<String, ForeignOwnershipError> {
     let payload = herdr_call(
         &[
-            "agent", "read", pane_id, "--source", "recent", "--lines", "500", "--format", "text",
+            "agent",
+            "read",
+            pane_id,
+            "--source",
+            "recent",
+            "--lines",
+            &tui_read_lines(),
+            "--format",
+            "text",
         ],
         Some(herdr_api_timeout()),
     )?;
@@ -3866,6 +3874,34 @@ fn restore_migration_record_at(
     })
 }
 
+fn restore_headless_runner_at(
+    base: &Path,
+    proc_root: &Path,
+    name: &str,
+    old: &AgentRecord,
+) -> Result<ProcessIdentity, ForeignOwnershipError> {
+    if window_exists(old) {
+        kill_window(old);
+    }
+    let wrapper = runner_wrapper_at(base, name, None)?;
+    let target = launch_window_at(base, &old.backend, name, &old.cwd, &wrapper)?;
+    let previous = ProcessIdentity::new(
+        old.runner_pid.unwrap_or(-1),
+        old.runner_started_at.clone(),
+        old.runner_boot_id.clone(),
+    );
+    wait_for_restarted_runner_at(base, proc_root, name, &previous)?.ok_or_else(|| {
+        ForeignOwnershipError {
+            code: "migration_source_restore_unconfirmed",
+            message: format!(
+                "{} presentation {target} was created but its replacement runner did not publish a live identity within {}s",
+                old.backend,
+                migration_ready_timeout().as_secs()
+            ),
+        }
+    })
+}
+
 fn wait_for_restarted_runner_at(
     base: &Path,
     proc_root: &Path,
@@ -4242,10 +4278,8 @@ pub fn migrate_agent_at(
                         .to_string(),
             });
         }
-        return Err(ForeignOwnershipError {
-            code: "tui_not_yet_in_rust",
-            message: "converting a headless worker to a TUI is not yet in this edition".to_string(),
-        });
+        let record = require_live_agent_at(base, proc_root, &valid_name)?;
+        return convert_headless_to_tui_at(base, proc_root, &valid_name, &record);
     }
     if record.backend == to_backend {
         return Err(ForeignOwnershipError {
@@ -4521,6 +4555,643 @@ pub fn migrate_agent_at(
         session_id,
         transcript: transcript_path_at(base, &valid_name)?.display().to_string(),
     })
+}
+
+const TUI_RESUME_DIRECTORY_PROMPT: &str = "Choose working directory to resume this session";
+const TUI_RESUME_MODEL_PROMPT: &str = "This session was recorded with model ";
+
+fn tui_env_seconds(key: &str, default: f64) -> Duration {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .and_then(|seconds| Duration::try_from_secs_f64(seconds.max(0.0)).ok())
+        .unwrap_or_else(|| Duration::from_secs_f64(default))
+}
+
+fn tui_read_lines() -> String {
+    std::env::var("SUBAGENTS_TUI_READ_LINES").unwrap_or_else(|_| "500".to_string())
+}
+
+fn tui_scrollback_tail(text: &str) -> String {
+    let compact = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.is_empty() {
+        return "<empty scrollback>".to_string();
+    }
+    let chars: Vec<char> = compact.chars().collect();
+    chars[chars.len().saturating_sub(480)..].iter().collect()
+}
+
+fn accept_tui_resume_startup_prompt(
+    pane_id: &str,
+    accepted_directory: bool,
+    accepted_model: bool,
+) -> Result<Option<&'static str>, ForeignOwnershipError> {
+    let text = read_tui_recent_scrollback(pane_id)?;
+    if !accepted_directory && text.contains(TUI_RESUME_DIRECTORY_PROMPT) {
+        herdr_action(&["pane", "send-keys", pane_id, "enter"])?;
+        return Ok(Some("directory"));
+    }
+    if !accepted_model && text.contains(TUI_RESUME_MODEL_PROMPT) {
+        herdr_action(&["pane", "send-keys", pane_id, "enter"])?;
+        return Ok(Some("model"));
+    }
+    Ok(None)
+}
+
+/// Wait, in bounded Herdr slices, until the interactive composer is safe to submit.
+pub fn wait_for_tui_prompt_at(
+    base: &Path,
+    proc_root: &Path,
+    record: &AgentRecord,
+    timeout: Duration,
+    handle_resume_startup: bool,
+) -> Result<(), ForeignOwnershipError> {
+    let pane_id = record.presentation_pane.as_deref().unwrap_or_default();
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut next_progress = started;
+    let progress_interval = tui_env_seconds("SUBAGENTS_TUI_MIGRATION_PROGRESS_INTERVAL", 15.0);
+    let mut resume_directory_accepted = false;
+    let mut resume_model_accepted = false;
+    loop {
+        let probe = herdr_tui_probe_at(proc_root, pane_id);
+        if let Some(error) = &probe.error {
+            return Err(ForeignOwnershipError {
+                code: "tui_probe_failed",
+                message: error.clone(),
+            });
+        }
+        if !probe.codex_alive {
+            return Err(ForeignOwnershipError {
+                code: "dead_tui",
+                message: format!(
+                    "TUI agent '{}' no longer has a live Codex process",
+                    record.name
+                ),
+            });
+        }
+        let startup_prompt = if handle_resume_startup {
+            accept_tui_resume_startup_prompt(
+                pane_id,
+                resume_directory_accepted,
+                resume_model_accepted,
+            )?
+        } else {
+            None
+        };
+        if let Some(kind) = startup_prompt {
+            if kind == "directory" {
+                resume_directory_accepted = true;
+                write_event_at(
+                    base,
+                    "tui_resume_directory_accepted",
+                    &record.name,
+                    None,
+                    None,
+                    None,
+                )?;
+            } else {
+                resume_model_accepted = true;
+                write_event_at(
+                    base,
+                    "tui_resume_model_warning_accepted",
+                    &record.name,
+                    None,
+                    None,
+                    None,
+                )?;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        let now = Instant::now();
+        if handle_resume_startup && now >= next_progress {
+            let tail = read_tui_recent_scrollback(pane_id)
+                .map(|text| tui_scrollback_tail(&text))
+                .unwrap_or_else(|error| format!("<scrollback unavailable: {}>", error.message));
+            write_event_at(
+                base,
+                "tui_resume_wait_progress",
+                &record.name,
+                None,
+                None,
+                Some(&format!(
+                    "elapsed={:.1}s status={}; scrollback={tail}",
+                    (now - started).as_secs_f64(),
+                    probe.status
+                )),
+            )?;
+            next_progress = now + progress_interval;
+        }
+        if matches!(probe.status.as_str(), "idle" | "done") {
+            return Ok(());
+        }
+        if probe.status == "blocked" {
+            let tail = read_tui_recent_scrollback(pane_id)
+                .map(|text| tui_scrollback_tail(&text))
+                .unwrap_or_else(|error| format!("<scrollback unavailable: {}>", error.message));
+            let hint = crate::harness_tui::harness_tui(Some("codex"))
+                .map(|adapter| crate::harness_tui::blocked_hint(&adapter.classify(&tail)))
+                .unwrap_or_default();
+            return Err(ForeignOwnershipError {
+                code: "tui_blocked",
+                message: format!(
+                    "TUI agent '{}' is blocked; resolve its visible prompt before coordinator delivery; {hint} scrollback tail: {tail}",
+                    record.name
+                ),
+            });
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        if remaining.is_zero() {
+            let tail = read_tui_recent_scrollback(pane_id)
+                .map(|text| tui_scrollback_tail(&text))
+                .unwrap_or_else(|error| format!("<scrollback unavailable: {}>", error.message));
+            write_event_at(
+                base,
+                "tui_resume_readiness_timeout",
+                &record.name,
+                None,
+                None,
+                Some(&format!(
+                    "elapsed={:.1}s status={}; scrollback={tail}",
+                    (now - started).as_secs_f64(),
+                    probe.status
+                )),
+            )?;
+            return Err(ForeignOwnershipError {
+                code: "tui_not_idle",
+                message: format!(
+                    "TUI agent '{}' did not become idle within {}s; the message remains queued for this bounded delivery attempt; last Herdr status={}; scrollback tail: {tail}",
+                    record.name,
+                    timeout.as_secs(),
+                    probe.status
+                ),
+            });
+        }
+        let wait_ms = remaining.as_millis().min(1000) as u64;
+        let _ = herdr_call(
+            &[
+                "agent",
+                "wait",
+                pane_id,
+                "--until",
+                "idle",
+                "--timeout",
+                &wait_ms.to_string(),
+            ],
+            Some(Duration::from_millis(wait_ms) + herdr_api_timeout().min(Duration::from_secs(1))),
+        );
+    }
+}
+
+fn submit_tui_text_at(
+    base: &Path,
+    proc_root: &Path,
+    record: &AgentRecord,
+    text: &str,
+    ready_timeout: Duration,
+    working_timeout_ms: u64,
+    handle_resume_startup: bool,
+) -> Result<(), ForeignOwnershipError> {
+    if handle_resume_startup {
+        wait_for_tui_prompt_at(base, proc_root, record, ready_timeout, true)?;
+    }
+    let client = shared_tui_client()?;
+    let root = agent_dir_at(base, &record.name)?;
+    crate::agent::send(
+        &client,
+        &shared_tui_target(record),
+        &root,
+        text,
+        crate::agent::DrainOptions {
+            ready_timeout,
+            working_timeout: Duration::from_millis(working_timeout_ms),
+            max_attempts: env_u64("SUBAGENTS_TUI_DELIVERY_MAX_ATTEMPTS", 2),
+            ..crate::agent::DrainOptions::default()
+        },
+    )
+    .map_err(|error| ForeignOwnershipError {
+        code: "tui_delivery_failed",
+        message: error.to_string(),
+    })?;
+    Ok(())
+}
+
+fn confirm_resumed_tui_at(
+    base: &Path,
+    proc_root: &Path,
+    record: &AgentRecord,
+) -> Result<(), ForeignOwnershipError> {
+    let token = random_token_hex()[..24].to_string();
+    let expected: String = token.chars().rev().collect();
+    let prompt =
+        format!("Migration health check. Reply with only the reverse of this token: {token}");
+    let ready = tui_env_seconds("SUBAGENTS_TUI_MIGRATION_READY_TIMEOUT", 300.0);
+    submit_tui_text_at(
+        base,
+        proc_root,
+        record,
+        &prompt,
+        ready,
+        (ready.as_secs_f64() * 1000.0) as u64,
+        true,
+    )?;
+    let pane_id = record.presentation_pane.as_deref().unwrap_or_default();
+    let deadline =
+        Instant::now() + tui_env_seconds("SUBAGENTS_TUI_MIGRATION_CONFIRM_TIMEOUT", 300.0);
+    while Instant::now() < deadline {
+        let probe = herdr_tui_probe_at(proc_root, pane_id);
+        if let Some(error) = &probe.error {
+            return Err(ForeignOwnershipError {
+                code: "tui_migration_probe_failed",
+                message: error.clone(),
+            });
+        }
+        if !probe.codex_alive {
+            return Err(ForeignOwnershipError {
+                code: "tui_migration_destination_died",
+                message: "resumed Codex TUI died before it answered the migration health check"
+                    .to_string(),
+            });
+        }
+        if read_tui_recent_scrollback(pane_id).is_ok_and(|text| text.contains(&expected)) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Err(ForeignOwnershipError {
+        code: "tui_migration_response_unconfirmed",
+        message: format!(
+            "resumed Codex TUI stayed live but did not answer its health check within {}s",
+            tui_env_seconds("SUBAGENTS_TUI_MIGRATION_CONFIRM_TIMEOUT", 300.0).as_secs()
+        ),
+    })
+}
+
+fn tui_conversion_result(old: &AgentRecord, current: &AgentRecord, base: &Path) -> MigrationResult {
+    MigrationResult {
+        name: current.name.clone(),
+        from_backend: old.backend.clone(),
+        to_backend: current.backend.clone(),
+        from_mode: old.mode.clone(),
+        to_mode: current.mode.clone(),
+        tmux_target: current.tmux_target.clone(),
+        session_id: current.session_id.clone(),
+        transcript: transcript_path_at(base, &current.name)
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    }
+}
+
+fn commit_headless_to_tui_at(
+    base: &Path,
+    name: &str,
+    old: &AgentRecord,
+    destination: &AgentRecord,
+) -> Result<AgentRecord, ForeignOwnershipError> {
+    with_registry_lock_at(base, |agents| {
+        let Some(current) = agents.get(name).cloned() else {
+            return Err(ForeignOwnershipError {
+                code: "unknown_agent",
+                message: format!("agent '{name}' disappeared during TUI conversion"),
+            });
+        };
+        if pending_count_at(base, name)? > 0 {
+            return Err(ForeignOwnershipError {
+                code: "migration_message_queued",
+                message:
+                    "a message was queued during TUI conversion; destination was not committed"
+                        .to_string(),
+            });
+        }
+        if current.backend != old.backend
+            || current.mode != "headless"
+            || current.tmux_target != old.tmux_target
+            || current.runner_pid != old.runner_pid
+            || current.runner_started_at != old.runner_started_at
+        {
+            return Err(ForeignOwnershipError {
+                code: "migration_source_changed",
+                message: "source registry changed before TUI conversion could be committed"
+                    .to_string(),
+            });
+        }
+        agents.insert(name.to_string(), destination.clone());
+        Ok(destination.clone())
+    })
+}
+
+fn convert_headless_to_tui_at(
+    base: &Path,
+    proc_root: &Path,
+    name: &str,
+    old: &AgentRecord,
+) -> Result<MigrationResult, ForeignOwnershipError> {
+    if old.harness != "codex" {
+        return Err(ForeignOwnershipError {
+            code: "tui_harness_unsupported",
+            message: "headless-to-TUI conversion currently supports codex only".to_string(),
+        });
+    }
+    let Some(session_id) = old.session_id.clone() else {
+        return Err(ForeignOwnershipError {
+            code: "tui_session_unavailable",
+            message: "cannot convert a headless agent before it has recorded a Codex session id"
+                .to_string(),
+        });
+    };
+    let old_identity = ProcessIdentity::new(
+        old.runner_pid.expect("live runner checked by caller"),
+        old.runner_started_at.clone(),
+        old.runner_boot_id.clone(),
+    );
+    with_registry_lock_at(base, |agents| {
+        let Some(current) = agents.get(name).cloned() else {
+            return Err(ForeignOwnershipError {
+                code: "dead_runner",
+                message: format!("agent '{name}' runner stopped before conversion"),
+            });
+        };
+        if !runner_identity_alive_at(proc_root, &current)? {
+            return Err(ForeignOwnershipError {
+                code: "dead_runner",
+                message: format!("agent '{name}' runner stopped before conversion"),
+            });
+        }
+        if current.status != "idle" || pending_count_at(base, name)? > 0 {
+            return Err(ForeignOwnershipError {
+                code: "agent_busy",
+                message: format!("agent '{name}' is busy or has queued work"),
+            });
+        }
+        write_migration_pause_at(base, name, &old_identity)
+    })?;
+    if !wait_for_pause_ack_at(base, proc_root, name, &old_identity)? {
+        if old.backend == "tmux" {
+            return convert_legacy_tmux_headless_to_tui_at(base, proc_root, name, old);
+        }
+        clear_migration_markers_at(base, name, "")?;
+        return Err(ForeignOwnershipError {
+            code: "migration_pause_unconfirmed",
+            message: format!(
+                "could not confirm that source {} runner pid {} paused intake; no TUI destination was started and the registry remains unchanged",
+                old.backend, old_identity.pid
+            ),
+        });
+    }
+    let mut destination: Option<AgentRecord> = None;
+    let mut source_retired = false;
+    let attempt = (|| -> Result<AgentRecord, ForeignOwnershipError> {
+        let (target, pane_id, probe) = launch_herdr_tui_at(
+            base,
+            proc_root,
+            name,
+            &old.cwd,
+            old.model.as_deref(),
+            Some(&session_id),
+            Some(old.codex_bypass_permissions),
+        )?;
+        let dest = AgentRecord {
+            backend: "herdr".to_string(),
+            tmux_target: target,
+            mode: "tui".to_string(),
+            presentation_pane: Some(pane_id),
+            runner_pid: probe.pid,
+            runner_started_at: match probe.pid {
+                Some(pid) => pid_start_time_at(proc_root, pid).unwrap_or(None),
+                None => None,
+            },
+            runner_boot_id: None,
+            status: "idle".to_string(),
+            ..old.clone()
+        };
+        destination = Some(dest.clone());
+        confirm_resumed_tui_at(base, proc_root, &dest)?;
+        if !terminate_runner_at(base, proc_root, old, Duration::from_secs(10))? {
+            return Err(ForeignOwnershipError {
+                code: "migration_source_cleanup_failed",
+                message: format!(
+                    "resumed TUI was confirmed, but source runner pid {} did not stop",
+                    old_identity.pid
+                ),
+            });
+        }
+        source_retired = true;
+        commit_headless_to_tui_at(base, name, old, &dest)
+    })();
+    let committed = match attempt {
+        Ok(committed) => committed,
+        Err(error) => {
+            let mut rollback_errors: Vec<String> = Vec::new();
+            if let Some(dest) = &destination {
+                kill_window(dest);
+            }
+            let (code, detail) = if source_retired {
+                match restore_headless_runner_at(base, proc_root, name, old) {
+                    Ok(restored) => {
+                        rollback_errors
+                            .push(format!("headless source restored as pid {}", restored.pid));
+                        let resumed_record = super::registry::read_registry_at(base)
+                            .ok()
+                            .and_then(|agents| agents.get(name).cloned())
+                            .unwrap_or_else(|| old.clone());
+                        match resume_source_intake_at(base, proc_root, name, &resumed_record) {
+                            Ok(()) => rollback_errors.push(format!(
+                                "source intake resumed for pid {}",
+                                resumed_record.runner_pid.unwrap_or_default()
+                            )),
+                            Err(resume_error) => rollback_errors.push(format!(
+                                "intake resume proof failed: {}",
+                                resume_error.message
+                            )),
+                        }
+                        (
+                            "tui_conversion_rollback",
+                            format!("TUI destination was not committed ({})", error.message),
+                        )
+                    }
+                    Err(restore_error) => {
+                        rollback_errors.push(format!(
+                            "headless source restoration failed: {}",
+                            restore_error.message
+                        ));
+                        (
+                            "tui_conversion_rollback",
+                            format!("TUI destination was not committed ({})", error.message),
+                        )
+                    }
+                }
+            } else {
+                match resume_source_intake_at(base, proc_root, name, old) {
+                    Ok(()) => rollback_errors.push(format!(
+                        "source intake resumed for pid {}",
+                        old_identity.pid
+                    )),
+                    Err(resume_error) => rollback_errors.push(format!(
+                        "intake resume proof failed: {}",
+                        resume_error.message
+                    )),
+                }
+                (
+                    "tui_conversion_failed_before_retiring_source",
+                    format!(
+                        "TUI destination was not committed ({}); source {} runner pid {} has its pause marker removed and registry unchanged",
+                        error.message, old.backend, old_identity.pid
+                    ),
+                )
+            };
+            let suffix = if rollback_errors.is_empty() {
+                String::new()
+            } else {
+                format!("; {}", rollback_errors.join("; "))
+            };
+            return Err(ForeignOwnershipError {
+                code,
+                message: format!("{detail}{suffix}"),
+            });
+        }
+    };
+    if old.backend == "tmux" {
+        kill_window(old);
+        create_legacy_tmux_guard_at(base, name, &old.cwd, Some(&old.tmux_target))?;
+    }
+    clear_migration_markers_at(base, name, "")?;
+    write_event_at(
+        base,
+        "agent_converted_to_tui",
+        name,
+        None,
+        None,
+        Some(&last_message_preview_at(base, name, 240)?),
+    )?;
+    Ok(tui_conversion_result(old, &committed, base))
+}
+
+fn convert_legacy_tmux_headless_to_tui_at(
+    base: &Path,
+    proc_root: &Path,
+    name: &str,
+    old: &AgentRecord,
+) -> Result<MigrationResult, ForeignOwnershipError> {
+    with_registry_lock_at(base, |agents| {
+        let Some(current) = agents.get(name).cloned() else {
+            return Err(ForeignOwnershipError {
+                code: "dead_runner",
+                message: format!("legacy source runner for '{name}' is no longer alive"),
+            });
+        };
+        if !runner_identity_alive_at(proc_root, &current)? {
+            return Err(ForeignOwnershipError {
+                code: "dead_runner",
+                message: format!("legacy source runner for '{name}' is no longer alive"),
+            });
+        }
+        if current.status != "idle" || pending_count_at(base, name)? > 0 {
+            return Err(ForeignOwnershipError {
+                code: "agent_busy",
+                message: format!("legacy source '{name}' is no longer idle with an empty inbox"),
+            });
+        }
+        Ok(())
+    })?;
+    if !terminate_runner_at(base, proc_root, old, Duration::from_secs(10))? {
+        return Err(ForeignOwnershipError {
+            code: "legacy_source_stop_failed",
+            message: format!(
+                "legacy source tmux runner pid {} did not stop; no TUI destination was started",
+                old.runner_pid.unwrap_or_default()
+            ),
+        });
+    }
+    let mut destination: Option<AgentRecord> = None;
+    let attempt = (|| -> Result<AgentRecord, ForeignOwnershipError> {
+        let (target, pane_id, probe) = launch_herdr_tui_at(
+            base,
+            proc_root,
+            name,
+            &old.cwd,
+            old.model.as_deref(),
+            old.session_id.as_deref(),
+            Some(old.codex_bypass_permissions),
+        )?;
+        let dest = AgentRecord {
+            backend: "herdr".to_string(),
+            tmux_target: target,
+            mode: "tui".to_string(),
+            presentation_pane: Some(pane_id),
+            runner_pid: probe.pid,
+            runner_started_at: match probe.pid {
+                Some(pid) => pid_start_time_at(proc_root, pid).unwrap_or(None),
+                None => None,
+            },
+            runner_boot_id: None,
+            status: "idle".to_string(),
+            ..old.clone()
+        };
+        destination = Some(dest.clone());
+        confirm_resumed_tui_at(base, proc_root, &dest)?;
+        commit_headless_to_tui_at(base, name, old, &dest)
+    })();
+    let committed = match attempt {
+        Ok(committed) => committed,
+        Err(error) => {
+            let mut cleanup_errors: Vec<String> = Vec::new();
+            if let Some(dest) = &destination {
+                kill_window(dest);
+            }
+            let resume_source = match restore_headless_runner_at(base, proc_root, name, old) {
+                Ok(restored) => {
+                    cleanup_errors.push(format!("tmux source restored as pid {}", restored.pid));
+                    super::registry::read_registry_at(base)
+                        .ok()
+                        .and_then(|agents| agents.get(name).cloned())
+                        .unwrap_or_else(|| old.clone())
+                }
+                Err(restore_error) => {
+                    cleanup_errors.push(format!(
+                        "tmux source restoration failed: {}",
+                        restore_error.message
+                    ));
+                    old.clone()
+                }
+            };
+            match resume_source_intake_at(base, proc_root, name, &resume_source) {
+                Ok(()) => cleanup_errors.push(format!(
+                    "source intake resumed for pid {}",
+                    resume_source.runner_pid.unwrap_or_default()
+                )),
+                Err(resume_error) => cleanup_errors.push(format!(
+                    "intake resume proof failed: {}",
+                    resume_error.message
+                )),
+            }
+            return Err(ForeignOwnershipError {
+                code: "legacy_tui_conversion_rolled_back",
+                message: format!(
+                    "legacy source was stopped and TUI destination was not committed ({}); {}",
+                    error.message,
+                    cleanup_errors.join("; ")
+                ),
+            });
+        }
+    };
+    kill_window(old);
+    create_legacy_tmux_guard_at(base, name, &old.cwd, Some(&old.tmux_target))?;
+    clear_migration_markers_at(base, name, "")?;
+    write_event_at(
+        base,
+        "agent_converted_to_tui",
+        name,
+        None,
+        None,
+        Some(&last_message_preview_at(base, name, 240)?),
+    )?;
+    Ok(tui_conversion_result(old, &committed, base))
 }
 
 #[cfg(test)]

@@ -1024,9 +1024,12 @@ fn turn_command(args: &[String]) -> i32 {
     {
         if snapshot.agents.iter().any(|agent| !agent.window_alive) {
             println!("[agent_turn] window for {name} is gone — recreating tab/tailer");
-            println!(
-                "[agent_turn] WARNING: could not recreate window: presentation recreation is not yet in this edition"
-            );
+            if let Err(error) = super::lifecycle::recreate_window_at(&base, proc_root, &name) {
+                println!(
+                    "[agent_turn] WARNING: could not recreate window: {}",
+                    error.message
+                );
+            }
         }
     }
     let sent = match super::lifecycle::send_message_to_agent_at(

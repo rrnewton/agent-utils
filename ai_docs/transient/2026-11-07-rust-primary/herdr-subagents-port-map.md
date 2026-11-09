@@ -189,3 +189,11 @@ Adds `migrate_agent_at` (backend swap with pause-ack staging, activation commit 
 ## 19. B3-7c scope, fourth slice (bring-up, headless)
 
 Adds `up` for headless workers: policy-mode resolution, Antigravity preflight, orphan presentation refusal (tmux window / Herdr tab label in the configured workspace), registry row creation, tmux session/window and Herdr workspace/tab launch running the runner wrapper (`herdr-subagents __runner`, stderr capture, keep-alive shell), launch-failure row rollback, first-brief enqueue, and the `agent_up` event. TUI mode bring-up still refuses by name (`tui_not_yet_in_rust`) until the visible-Codex launch slice; dynamic consumer policy modules refuse instead of being silently skipped. Remaining: `migrate`, `keeper`, TUI launch/delivery/read, and window recreation.
+
+## 22. B3-7c scope, seventh slice (TUI launch and window recreation)
+
+Adds `launch_herdr_tui_at` (visible Codex TUI launch in a Herdr workspace/tab, startup-prompt handling, readiness wait) and `recreate_window_at` (tab/tailer recreation for a live agent whose window is gone). TUI reads honour `SUBAGENTS_TUI_READ_LINES` (default 500) via `tui_read_lines`.
+
+## 23. B3-7c scope, eighth slice (migrate TUI conversion)
+
+Completes the destination-TUI branch of `migrate_agent_at`: `convert_headless_to_tui_at` and `convert_legacy_tmux_headless_to_tui_at` stop the recorded runner by pinned identity, launch the TUI (`launch_herdr_tui_at`), wait for the prompt (`wait_for_tui_prompt_at`), submit the staged text (`submit_tui_text_at`), and confirm the resumed session (`confirm_resumed_tui_at`); failure restores the headless runner (`restore_headless_runner_at`) and resumes intake. `turn` now calls `recreate_window_at` in its heal path, warning with the underlying error instead of the not-yet-ported refusal. Remaining B3-7c: `keeper` only (`mcp` is B3-8). Conversion paths are compile- and suite-verified; live-Herdr exercise is still pending.
