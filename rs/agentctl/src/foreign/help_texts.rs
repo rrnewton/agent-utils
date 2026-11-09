@@ -218,3 +218,26 @@ pub const UP_USAGE: &str = r##"usage: herdr-subagents up [-h] --cwd CWD [--model
                           [--backend {tmux,herdr}] [--mode {headless,tui}]
                           [--brief BRIEF] [--brief-file BRIEF_FILE]
                           name"##;
+
+/// Verbatim `herdr-subagents migrate --help` help.
+pub const MIGRATE_HELP: &str = r##"usage: herdr-subagents migrate [-h] [--to {tmux,herdr}]
+                               [--mode {headless,tui}]
+                               name
+
+Migrate an idle subagent presentation backend.
+
+positional arguments:
+  name
+
+options:
+  -h, --help            show this help message and exit
+  --to {tmux,herdr}
+  --mode {headless,tui}
+                        destination mode for supported non-Codex runners;
+                        Codex is TUI-only
+"##;
+
+/// Usage line(s) of `herdr-subagents migrate --help`.
+pub const MIGRATE_USAGE: &str = r##"usage: herdr-subagents migrate [-h] [--to {tmux,herdr}]
+                               [--mode {headless,tui}]
+                               name"##;

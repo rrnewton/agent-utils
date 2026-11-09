@@ -182,6 +182,10 @@ Adds `turn` for existing agents (fresh-context reset with the return-4 refusal, 
 
 Wires TUI workers to the shared Rust transport (`crate::agent::drain` on a direct Herdr client bound by pane, session, harness, workspace, and cwd): send enqueues then delivers (model-override messages quarantined first with attempt records), `inbox --drain` runs the same delivery and reports the resulting snapshot, TUI reads serve bounded recent scrollback (`all`, and `tail` with the 500-line default), and `require_live_agent` now probes TUI panes with the exact missing-pane/probe-failed/dead refusals. The composer clear still refuses, as upstream: Herdr has no draft-state API, so `--clear-composer` can never prove clearing is safe. Remaining B3-7c: `up` TUI launch (visible Codex startup-prompt handling), `migrate` (+ window recreation), and `keeper`.
 
+## 21. B3-7c scope, sixth slice (migrate, headless)
+
+Adds `migrate_agent_at` (backend swap with pause-ack staging, activation commit under the registry lock, source cleanup only after destination commit, full rollback with record restoration and intake resume, plus the legacy pre-handshake tmux path with restart-on-failure) and the `migrate` CLI command. Destination TUI conversion and `recreate_window` remain with the TUI launch slice; `keeper` is the last B3-7c command.
+
 ## 19. B3-7c scope, fourth slice (bring-up, headless)
 
 Adds `up` for headless workers: policy-mode resolution, Antigravity preflight, orphan presentation refusal (tmux window / Herdr tab label in the configured workspace), registry row creation, tmux session/window and Herdr workspace/tab launch running the runner wrapper (`herdr-subagents __runner`, stderr capture, keep-alive shell), launch-failure row rollback, first-brief enqueue, and the `agent_up` event. TUI mode bring-up still refuses by name (`tui_not_yet_in_rust`) until the visible-Codex launch slice; dynamic consumer policy modules refuse instead of being silently skipped. Remaining: `migrate`, `keeper`, TUI launch/delivery/read, and window recreation.

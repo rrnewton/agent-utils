@@ -3300,6 +3300,825 @@ pub fn bring_up_agent_at(
     })
 }
 
+/// The outcome of moving one worker between backends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MigrationResult {
+    /// Agent name.
+    pub name: String,
+    /// Source backend.
+    pub from_backend: String,
+    /// Destination backend.
+    pub to_backend: String,
+    /// Source mode.
+    pub from_mode: String,
+    /// Destination mode.
+    pub to_mode: String,
+    /// Recorded presentation target after migration.
+    pub tmux_target: String,
+    /// Preserved harness session id.
+    pub session_id: Option<String>,
+    /// Transcript location (display string).
+    pub transcript: String,
+}
+
+fn random_token_hex() -> String {
+    let mut bytes = [0_u8; 16];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut bytes))
+        .is_err()
+    {
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = ((ns >> ((index % 8) * 8)) & 0xff) as u8;
+        }
+    }
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn launch_window_at(
+    base: &Path,
+    backend: &str,
+    name: &str,
+    cwd: &str,
+    wrapper_cmd: &str,
+) -> Result<String, ForeignOwnershipError> {
+    if backend == "tmux" {
+        launch_tmux_window(name, cwd, wrapper_cmd, None)
+    } else {
+        launch_herdr_window(base, name, cwd, wrapper_cmd)
+    }
+}
+
+fn rollback_step(
+    errors: &mut Vec<String>,
+    label: &str,
+    step: Result<(), ForeignOwnershipError>,
+) -> bool {
+    match step {
+        Ok(()) => true,
+        Err(error) => {
+            errors.push(format!("{label} failed: {}", error.message));
+            false
+        }
+    }
+}
+
+fn runner_state_at(proc_root: &Path, record: &AgentRecord) -> String {
+    match runner_identity_alive_at(proc_root, record) {
+        Ok(true) => "alive".to_string(),
+        Ok(false) => "not alive".to_string(),
+        Err(error) => format!("of unknown state ({})", error.message),
+    }
+}
+
+fn stop_staged_runner_at(
+    base: &Path,
+    proc_root: &Path,
+    name: &str,
+    identity: &ProcessIdentity,
+) -> Result<bool, ForeignOwnershipError> {
+    let _lock = harness_lock_at(base, name)?;
+    let mut stopped = false;
+    if let Some(record) = read_active_harness_at(base, name)? {
+        if !record.legacy()
+            && (record.runner.pid, &record.runner.started_at)
+                == (identity.pid, &identity.started_at)
+        {
+            let report = super::ownership::kill_harness_tree_at(
+                proc_root, &record, None, false, false, None,
+            )?;
+            if !report.complete() {
+                return Err(ForeignOwnershipError {
+                    code: "harness_cleanup_incomplete",
+                    message: format!(
+                        "staged runner pid {}'s harness: {}",
+                        identity.pid,
+                        report.describe()
+                    ),
+                });
+            }
+            super::registry::remove_active_harness_at(base, name, &record)?;
+            stopped = report.killed > 0;
+        }
+    }
+    Ok(
+        terminate_runner_identity_at(proc_root, identity, Duration::from_millis(0), Some(name))?
+            || stopped,
+    )
+}
+
+fn restore_migration_record_at(
+    base: &Path,
+    name: &str,
+    old: &AgentRecord,
+    destination: Option<&ProcessIdentity>,
+    backend: &str,
+    target: Option<&str>,
+) -> Result<bool, ForeignOwnershipError> {
+    with_registry_lock_at(base, |agents| {
+        let Some(current) = agents.get_mut(name) else {
+            return Err(ForeignOwnershipError {
+                code: "migration_source_changed",
+                message: "worker disappeared during migration rollback".to_string(),
+            });
+        };
+        let actual = (
+            current.backend.clone(),
+            current.tmux_target.clone(),
+            current.runner_pid,
+            current.runner_started_at.clone(),
+        );
+        let source = (
+            old.backend.clone(),
+            old.tmux_target.clone(),
+            old.runner_pid,
+            old.runner_started_at.clone(),
+        );
+        if actual == source {
+            return Ok(false);
+        }
+        let expected = destination.map(|dest| {
+            (
+                backend.to_string(),
+                target.unwrap_or_default().to_string(),
+                Some(dest.pid),
+                dest.started_at.clone(),
+            )
+        });
+        if Some(actual) != expected {
+            return Err(ForeignOwnershipError {
+                code: "migration_source_changed",
+                message: "registry identity changed during migration rollback".to_string(),
+            });
+        }
+        current.backend.clone_from(&old.backend);
+        current.tmux_target.clone_from(&old.tmux_target);
+        current.runner_pid = old.runner_pid;
+        current.runner_started_at.clone_from(&old.runner_started_at);
+        current.runner_boot_id.clone_from(&old.runner_boot_id);
+        Ok(true)
+    })
+}
+
+fn wait_for_restarted_runner_at(
+    base: &Path,
+    proc_root: &Path,
+    name: &str,
+    previous: &ProcessIdentity,
+) -> Result<Option<ProcessIdentity>, ForeignOwnershipError> {
+    let replaced = |base: &Path| -> Result<Option<ProcessIdentity>, ForeignOwnershipError> {
+        let Some(record) = super::registry::read_registry_at(base)?.get(name).cloned() else {
+            return Ok(None);
+        };
+        let Some(identity) = record.runner_identity() else {
+            return Ok(None);
+        };
+        if (identity.pid, &identity.started_at) == (previous.pid, &previous.started_at) {
+            return Ok(None);
+        }
+        Ok(runner_identity_alive_at(proc_root, &record)?.then_some(identity))
+    };
+    let deadline = Instant::now() + migration_ready_timeout();
+    loop {
+        if let Some(identity) = replaced(base)? {
+            return Ok(Some(identity));
+        }
+        if Instant::now() >= deadline {
+            return replaced(base);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn restore_legacy_tmux_runner_at(
+    base: &Path,
+    proc_root: &Path,
+    name: &str,
+    old: &AgentRecord,
+) -> Result<ProcessIdentity, ForeignOwnershipError> {
+    if old.backend != "tmux" {
+        return Err(ForeignOwnershipError {
+            code: "legacy_restore_unsupported",
+            message: format!(
+                "legacy rollback only supports tmux sources, not {}",
+                old.backend
+            ),
+        });
+    }
+    if window_exists(old) {
+        kill_window(old);
+    }
+    let wrapper = runner_wrapper_at(base, name, None)?;
+    let target = launch_tmux_window(name, &old.cwd, &wrapper, None)?;
+    let previous = ProcessIdentity::new(
+        old.runner_pid.unwrap_or(-1),
+        old.runner_started_at.clone(),
+        old.runner_boot_id.clone(),
+    );
+    wait_for_restarted_runner_at(base, proc_root, name, &previous)?.ok_or_else(|| {
+        ForeignOwnershipError {
+            code: "legacy_restore_unconfirmed",
+            message: format!(
+                "tmux presentation {target} was created but its replacement runner did not publish a live identity within {}s",
+                migration_ready_timeout().as_secs_f64()
+            ),
+        }
+    })
+}
+
+/// Create the tmux guard window that reserves a migrating worker name.
+pub fn create_legacy_tmux_guard_at(
+    base: &Path,
+    name: &str,
+    cwd: &str,
+    target: Option<&str>,
+) -> Result<(), ForeignOwnershipError> {
+    let target = target
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{}:{name}", tmux_session()));
+    exact_tmux_target(&target)?;
+    if !tmux_target_exists(&target) {
+        let (session, window) = target.split_once(':').expect("validated target");
+        launch_tmux_window(window, cwd, "exec sleep infinity", Some(session))?;
+    }
+    let marker = agent_dir_at(base, name)?.join("legacy-tmux-guard");
+    std::fs::write(&marker, format!("{target}\n"))
+        .map_err(|error| io_error("write tmux guard marker", &marker, &error))
+}
+
+#[allow(dead_code)]
+fn resume_source_intake_at(
+    base: &Path,
+    proc_root: &Path,
+    name: &str,
+    old: &AgentRecord,
+) -> Result<(), ForeignOwnershipError> {
+    clear_migration_markers_at(base, name, "")?;
+    let markers = [
+        migration_pause_path_at(base, name)?,
+        migration_pause_ack_path_at(base, name)?,
+    ];
+    let remaining: Vec<String> = markers
+        .iter()
+        .filter(|path| path.exists())
+        .map(|path| path.display().to_string())
+        .collect();
+    if !remaining.is_empty() {
+        return Err(ForeignOwnershipError {
+            code: "migration_intake_resume_failed",
+            message: format!(
+                "source {} runner intake could not be resumed; pause marker(s) remain: {}",
+                old.backend,
+                remaining.join(", ")
+            ),
+        });
+    }
+    if !runner_identity_alive_at(proc_root, old)? {
+        return Err(ForeignOwnershipError {
+            code: "migration_intake_resume_failed",
+            message: format!(
+                "source {} runner pid {} is not live after rollback; cannot prove intake resumed",
+                old.backend,
+                old.runner_pid.unwrap_or_default()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn migrate_legacy_tmux_source_at(
+    base: &Path,
+    proc_root: &Path,
+    name: &str,
+    old: &AgentRecord,
+    to_backend: &str,
+) -> Result<MigrationResult, ForeignOwnershipError> {
+    let old_identity = ProcessIdentity::new(
+        old.runner_pid
+            .expect("live legacy runner checked by caller"),
+        old.runner_started_at.clone(),
+        old.runner_boot_id.clone(),
+    );
+    with_registry_lock_at(base, |agents| {
+        let Some(current) = agents.get(name).cloned() else {
+            return Err(ForeignOwnershipError {
+                code: "dead_runner",
+                message: format!("legacy source runner for '{name}' is no longer alive"),
+            });
+        };
+        if !runner_identity_alive_at(proc_root, &current)? {
+            return Err(ForeignOwnershipError {
+                code: "dead_runner",
+                message: format!("legacy source runner for '{name}' is no longer alive"),
+            });
+        }
+        if current.status != "idle" || pending_count_at(base, name)? > 0 {
+            return Err(ForeignOwnershipError {
+                code: "agent_busy",
+                message: format!(
+                    "legacy source '{name}' is no longer idle with an empty inbox; refusing to stop it"
+                ),
+            });
+        }
+        if current.backend != old.backend
+            || current.tmux_target != old.tmux_target
+            || current.runner_pid != Some(old_identity.pid)
+            || current.runner_started_at != old_identity.started_at
+        {
+            return Err(ForeignOwnershipError {
+                code: "migration_source_changed",
+                message: format!("legacy source '{name}' changed before it could be stopped"),
+            });
+        }
+        Ok(())
+    })?;
+    if !terminate_runner_at(base, proc_root, old, Duration::from_secs(10))? {
+        return Err(ForeignOwnershipError {
+            code: "legacy_source_stop_failed",
+            message: format!(
+                "legacy source tmux runner pid {} did not stop; no destination was started",
+                old_identity.pid
+            ),
+        });
+    }
+    let token = random_token_hex();
+    let mut new_target: Option<String> = None;
+    let mut staged_identity: Option<ProcessIdentity> = None;
+    let mut session_id: Option<String> = None;
+    let attempt = (|| -> Result<(), ForeignOwnershipError> {
+        let wrapper = runner_wrapper_at(base, name, Some(&token))?;
+        new_target = Some(launch_window_at(
+            base, to_backend, name, &old.cwd, &wrapper,
+        )?);
+        staged_identity = wait_for_staged_runner_at(base, proc_root, name, &token)?;
+        let Some(staged) = &staged_identity else {
+            return Err(ForeignOwnershipError {
+                code: "migration_destination_unconfirmed",
+                message: format!(
+                    "{to_backend} presentation {} was created, but no live staged runner identity was recorded within {}s",
+                    new_target.as_deref().unwrap_or_default(),
+                    migration_ready_timeout().as_secs_f64()
+                ),
+            });
+        };
+        with_registry_lock_at(base, |agents| {
+            let Some(current) = agents.get_mut(name) else {
+                return Err(ForeignOwnershipError {
+                    code: "unknown_agent",
+                    message: format!("agent '{name}' disappeared during migration"),
+                });
+            };
+            if pending_count_at(base, name)? > 0 {
+                return Err(ForeignOwnershipError {
+                    code: "migration_message_queued",
+                    message: "a message was queued after the legacy source stopped; destination was not committed".to_string(),
+                });
+            }
+            if current.backend != old.backend
+                || current.tmux_target != old.tmux_target
+                || current.runner_pid != Some(old_identity.pid)
+                || current.runner_started_at != old_identity.started_at
+            {
+                return Err(ForeignOwnershipError {
+                    code: "migration_source_changed",
+                    message: "legacy source registry changed before destination commit; refusing the migration".to_string(),
+                });
+            }
+            current.backend = to_backend.to_string();
+            current.tmux_target = new_target.clone().unwrap_or_default();
+            current.runner_pid = Some(staged.pid);
+            current.runner_started_at = staged.started_at.clone();
+            current.runner_boot_id = staged.boot_id.clone();
+            session_id = current.session_id.clone();
+            let activate = staged_runner_activate_path_at(base, name, &token)?;
+            std::fs::write(&activate, format!("{}\n", now_iso()))
+                .map_err(|error| io_error("write activation marker", &activate, &error))?;
+            Ok(())
+        })?;
+        if !wait_for_staged_runner_activation_at(base, name, &token)? {
+            return Err(ForeignOwnershipError {
+                code: "migration_activation_unconfirmed",
+                message: "staged destination did not acknowledge activation before marker cleanup"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    })();
+    if let Err(error) = attempt {
+        let mut cleanup_errors: Vec<String> = Vec::new();
+        if let Some(staged) = &staged_identity {
+            let step = stop_staged_runner_at(base, proc_root, name, staged).map(|_| ());
+            rollback_step(
+                &mut cleanup_errors,
+                &format!("stopping staged runner pid {}", staged.pid),
+                step,
+            );
+        }
+        if let Some(target) = &new_target {
+            let dest = AgentRecord {
+                backend: to_backend.to_string(),
+                tmux_target: target.clone(),
+                ..old.clone()
+            };
+            kill_window(&dest);
+        }
+        if let Err(restore_error) = restore_migration_record_at(
+            base,
+            name,
+            old,
+            staged_identity.as_ref(),
+            to_backend,
+            new_target.as_deref(),
+        ) {
+            return Err(ForeignOwnershipError {
+                code: "legacy_migration_rollback_failed",
+                message: format!(
+                    "destination failed ({}); source registry restoration failed: {}; markers were kept and the tmux runner was not restarted{}",
+                    error.message,
+                    restore_error.message,
+                    cleanup_errors
+                        .iter()
+                        .map(|item| format!("; {item}"))
+                        .collect::<String>()
+                ),
+            });
+        }
+        rollback_step(
+            &mut cleanup_errors,
+            "clearing migration markers",
+            clear_migration_markers_at(base, name, &token),
+        );
+        let restored = restore_legacy_tmux_runner_at(base, proc_root, name, old);
+        if let Err(restore_error) = &restored {
+            cleanup_errors.push(format!(
+                "tmux restoration failed: {}",
+                restore_error.message
+            ));
+        }
+        if !cleanup_errors.is_empty() {
+            return Err(ForeignOwnershipError {
+                code: "legacy_migration_rollback_failed",
+                message: format!(
+                    "legacy source was stopped and destination failed ({}); {}",
+                    error.message,
+                    cleanup_errors.join("; ")
+                ),
+            });
+        }
+        let restored = restored.expect("restoration checked");
+        return Err(ForeignOwnershipError {
+            code: "legacy_migration_destination_failed",
+            message: format!(
+                "legacy source was stopped, destination was rolled back ({}), and tmux runner pid {} was restored",
+                error.message, restored.pid
+            ),
+        });
+    }
+    kill_window(old);
+    if to_backend == "herdr" {
+        create_legacy_tmux_guard_at(base, name, &old.cwd, Some(&old.tmux_target))?;
+    }
+    clear_migration_markers_at(base, name, &token)?;
+    write_event_at(
+        base,
+        "agent_migrated",
+        name,
+        None,
+        None,
+        Some(&last_message_preview_at(base, name, 240)?),
+    )?;
+    Ok(MigrationResult {
+        name: name.to_string(),
+        from_backend: old.backend.clone(),
+        to_backend: to_backend.to_string(),
+        from_mode: old.mode.clone(),
+        to_mode: old.mode.clone(),
+        tmux_target: new_target.unwrap_or_default(),
+        session_id,
+        transcript: transcript_path_at(base, name)?.display().to_string(),
+    })
+}
+
+/// Atomically move one idle headless runner between backends without losing
+/// its durable session. Destination TUI conversion is a later slice.
+pub fn migrate_agent_at(
+    base: &Path,
+    proc_root: &Path,
+    name: &str,
+    to_backend: &str,
+    to_mode: Option<&str>,
+) -> Result<MigrationResult, ForeignOwnershipError> {
+    let valid_name = super::registry::require_valid_name(name)?.to_string();
+    let to_backend = super::registry::require_supported_backend(to_backend)?.to_string();
+    let record = require_live_agent_at(base, proc_root, &valid_name)?;
+    let destination_mode = match to_mode {
+        Some(mode) => super::registry::require_supported_mode(mode)?.to_string(),
+        None => record.mode.clone(),
+    };
+    if record.mode == "tui" {
+        return Err(ForeignOwnershipError {
+            code: "tui_migration_unsupported",
+            message: "interactive TUI sessions cannot be migrated yet; keep their Herdr tab open or start a new TUI".to_string(),
+        });
+    }
+    if destination_mode == "tui" {
+        if to_backend != "herdr" {
+            return Err(ForeignOwnershipError {
+                code: "tui_requires_herdr",
+                message: "--mode tui requires --to herdr".to_string(),
+            });
+        }
+        if !backend_available("herdr") {
+            return Err(ForeignOwnershipError {
+                code: "herdr_missing",
+                message:
+                    "herdr is selected but is not available; check its binary and running server"
+                        .to_string(),
+            });
+        }
+        return Err(ForeignOwnershipError {
+            code: "tui_not_yet_in_rust",
+            message: "converting a headless worker to a TUI is not yet in this edition".to_string(),
+        });
+    }
+    if record.backend == to_backend {
+        return Err(ForeignOwnershipError {
+            code: "already_on_backend",
+            message: format!("agent '{valid_name}' already uses the {to_backend} backend"),
+        });
+    }
+    if record.status != "idle" || pending_count_at(base, &valid_name)? > 0 {
+        return Err(ForeignOwnershipError {
+            code: "agent_busy",
+            message: format!(
+                "agent '{valid_name}' is busy or has queued work; migrate only at an idle boundary"
+            ),
+        });
+    }
+    if !backend_available(&to_backend) {
+        return Err(ForeignOwnershipError {
+            code: if to_backend == "tmux" {
+                "tmux_missing"
+            } else {
+                "herdr_missing"
+            },
+            message: format!(
+                "{to_backend} is selected but is not available; check its binary and running server"
+            ),
+        });
+    }
+    let old = record;
+    let old_identity = ProcessIdentity::new(
+        old.runner_pid.expect("live runner checked"),
+        old.runner_started_at.clone(),
+        old.runner_boot_id.clone(),
+    );
+    let token = random_token_hex();
+    with_registry_lock_at(base, |agents| {
+        let Some(current) = agents.get(&valid_name).cloned() else {
+            return Err(ForeignOwnershipError {
+                code: "dead_runner",
+                message: format!(
+                    "agent '{valid_name}' runner stopped before migration could begin"
+                ),
+            });
+        };
+        if !runner_identity_alive_at(proc_root, &current)? {
+            return Err(ForeignOwnershipError {
+                code: "dead_runner",
+                message: format!(
+                    "agent '{valid_name}' runner stopped before migration could begin"
+                ),
+            });
+        }
+        if current.status != "idle" || pending_count_at(base, &valid_name)? > 0 {
+            return Err(ForeignOwnershipError {
+                code: "agent_busy",
+                message: format!(
+                    "agent '{valid_name}' became busy before migration could pause intake"
+                ),
+            });
+        }
+        write_migration_pause_at(base, &valid_name, &old_identity)
+    })?;
+    if !wait_for_pause_ack_at(base, proc_root, &valid_name, &old_identity)? {
+        if old.backend == "tmux" {
+            return migrate_legacy_tmux_source_at(base, proc_root, &valid_name, &old, &to_backend);
+        }
+        clear_migration_markers_at(base, &valid_name, &token)?;
+        return Err(ForeignOwnershipError {
+            code: "migration_pause_unconfirmed",
+            message: format!(
+                "could not confirm that source {} runner pid {} paused intake; no destination was started and the registry remains unchanged",
+                old.backend, old_identity.pid
+            ),
+        });
+    }
+    let mut new_target: Option<String> = None;
+    let mut staged_identity: Option<ProcessIdentity> = None;
+    let mut session_id: Option<String> = None;
+    let attempt = (|| -> Result<(), ForeignOwnershipError> {
+        let wrapper = runner_wrapper_at(base, &valid_name, Some(&token))?;
+        new_target = Some(launch_window_at(
+            base,
+            &to_backend,
+            &valid_name,
+            &old.cwd,
+            &wrapper,
+        )?);
+        staged_identity = wait_for_staged_runner_at(base, proc_root, &valid_name, &token)?;
+        let Some(staged) = &staged_identity else {
+            return Err(ForeignOwnershipError {
+                code: "migration_destination_unconfirmed",
+                message: format!(
+                    "{to_backend} presentation {} was created, but no live staged runner identity was recorded within {}s",
+                    new_target.as_deref().unwrap_or_default(),
+                    migration_ready_timeout().as_secs_f64()
+                ),
+            });
+        };
+        if staged.pid == old_identity.pid {
+            return Err(ForeignOwnershipError {
+                code: "migration_destination_unconfirmed",
+                message: format!(
+                    "destination runner reused source pid {}; refusing to replace the source",
+                    old_identity.pid
+                ),
+            });
+        }
+        with_registry_lock_at(base, |agents| {
+            let Some(current) = agents.get_mut(&valid_name) else {
+                return Err(ForeignOwnershipError {
+                    code: "migration_source_lost",
+                    message: "source runner stopped before the destination could be committed"
+                        .to_string(),
+                });
+            };
+            if !runner_identity_alive_at(proc_root, current)? {
+                return Err(ForeignOwnershipError {
+                    code: "migration_source_lost",
+                    message: "source runner stopped before the destination could be committed"
+                        .to_string(),
+                });
+            }
+            if current.backend != old.backend
+                || current.tmux_target != old.tmux_target
+                || current.runner_pid != Some(old_identity.pid)
+                || current.runner_started_at != old_identity.started_at
+            {
+                return Err(ForeignOwnershipError {
+                    code: "migration_source_changed",
+                    message: "source registry identity changed before destination commit; refusing the migration".to_string(),
+                });
+            }
+            if pending_count_at(base, &valid_name)? > 0 {
+                return Err(ForeignOwnershipError {
+                    code: "migration_message_queued",
+                    message: "a message was queued during migration; destination was not committed and source remains paused".to_string(),
+                });
+            }
+            current.backend = to_backend.clone();
+            current.tmux_target = new_target.clone().unwrap_or_default();
+            current.runner_pid = Some(staged.pid);
+            current.runner_started_at = staged.started_at.clone();
+            current.runner_boot_id = staged.boot_id.clone();
+            session_id = current.session_id.clone();
+            let activate = staged_runner_activate_path_at(base, &valid_name, &token)?;
+            std::fs::write(&activate, format!("{}\n", now_iso()))
+                .map_err(|error| io_error("write activation marker", &activate, &error))?;
+            Ok(())
+        })?;
+        if !wait_for_staged_runner_activation_at(base, &valid_name, &token)? {
+            return Err(ForeignOwnershipError {
+                code: "migration_activation_unconfirmed",
+                message: "staged destination did not acknowledge activation before marker cleanup"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    })();
+    if let Err(error) = attempt {
+        let mut rollback_errors: Vec<String> = Vec::new();
+        if let Some(staged) = &staged_identity {
+            let step = stop_staged_runner_at(base, proc_root, &valid_name, staged).map(|_| ());
+            rollback_step(
+                &mut rollback_errors,
+                &format!("stopping staged runner pid {}", staged.pid),
+                step,
+            );
+        }
+        if let Some(target) = &new_target {
+            kill_window(&AgentRecord {
+                backend: to_backend.clone(),
+                tmux_target: target.clone(),
+                ..old.clone()
+            });
+        }
+        let restored = match restore_migration_record_at(
+            base,
+            &valid_name,
+            &old,
+            staged_identity.as_ref(),
+            &to_backend,
+            new_target.as_deref(),
+        ) {
+            Ok(restored) => restored,
+            Err(restore_error) => {
+                return Err(ForeignOwnershipError {
+                code: "migration_rollback_failed",
+                message: format!(
+                    "destination failed ({}); source registry restoration failed: {}; intake remains paused{}",
+                    error.message,
+                    restore_error.message,
+                    rollback_errors
+                        .iter()
+                        .map(|item| format!("; {item}"))
+                        .collect::<String>()
+                ),
+            });
+            }
+        };
+        rollback_step(
+            &mut rollback_errors,
+            "clearing migration markers",
+            clear_migration_markers_at(base, &valid_name, &token),
+        );
+        let source_state = runner_state_at(proc_root, &old);
+        if !rollback_errors.is_empty() {
+            return Err(ForeignOwnershipError {
+                code: "migration_rollback_failed",
+                message: format!(
+                    "destination failed ({}); source registry restored; {} runner is {source_state}; {}",
+                    error.message,
+                    old.backend,
+                    rollback_errors.join("; ")
+                ),
+            });
+        }
+        return Err(ForeignOwnershipError {
+            code: if restored {
+                "migration_activation_rolled_back"
+            } else {
+                "migration_failed_before_commit"
+            },
+            message: format!(
+                "destination failed: {}; source {} runner pid {} is {source_state}, its window is retained and its registry identity is restored",
+                error.message, old.backend, old_identity.pid
+            ),
+        });
+    }
+    let source_stopped = terminate_runner_at(base, proc_root, &old, Duration::from_secs(10));
+    match source_stopped {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(ForeignOwnershipError {
+                code: "migration_source_cleanup_failed",
+                message: format!(
+                    "destination runner pid {} was committed, but source runner pid {} did not stop; intake remains paused on the source",
+                    staged_identity.as_ref().map(|s| s.pid).unwrap_or_default(),
+                    old_identity.pid
+                ),
+            });
+        }
+        Err(error) => {
+            return Err(ForeignOwnershipError {
+                code: "migration_source_cleanup_failed",
+                message: format!(
+                    "destination runner pid {} was committed, but source runner pid {} could not be stopped ({}); intake remains paused on the source",
+                    staged_identity.as_ref().map(|s| s.pid).unwrap_or_default(),
+                    old_identity.pid,
+                    error.message
+                ),
+            });
+        }
+    }
+    kill_window(&old);
+    if to_backend == "herdr" {
+        create_legacy_tmux_guard_at(base, &valid_name, &old.cwd, Some(&old.tmux_target))?;
+    }
+    clear_migration_markers_at(base, &valid_name, &token)?;
+    write_event_at(
+        base,
+        "agent_migrated",
+        &valid_name,
+        None,
+        None,
+        Some(&last_message_preview_at(base, &valid_name, 240)?),
+    )?;
+    Ok(MigrationResult {
+        name: valid_name.clone(),
+        from_backend: old.backend.clone(),
+        to_backend: to_backend.clone(),
+        from_mode: old.mode.clone(),
+        to_mode: old.mode.clone(),
+        tmux_target: new_target.unwrap_or_default(),
+        session_id,
+        transcript: transcript_path_at(base, &valid_name)?.display().to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

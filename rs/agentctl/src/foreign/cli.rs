@@ -19,7 +19,7 @@ const COMMANDS: [&str; 12] = [
     "keeper", "mcp",
 ];
 
-const NOT_PORTED: [&str; 2] = ["migrate", "keeper"];
+const NOT_PORTED: [&str; 1] = ["keeper"];
 
 fn argparse_error(usage: &str, prog: &str, message: &str) -> i32 {
     eprintln!("{usage}\n{prog}: error: {message}");
@@ -455,6 +455,83 @@ fn up_command(args: &[String]) -> i32 {
                 agent.tmux_target
             );
             println!("  transcript: {}", agent.transcript);
+            0
+        }
+        Err(error) => operation_die(&error),
+    }
+}
+
+fn migrate_command(args: &[String]) -> i32 {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print!("{MIGRATE_HELP}");
+        return 0;
+    }
+    let parsed = match parse(
+        args,
+        &["--to", "--mode"],
+        &[],
+        MIGRATE_USAGE,
+        "herdr-subagents migrate",
+    ) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
+    if parsed.positionals.len() != 1 {
+        return argparse_error(
+            MIGRATE_USAGE,
+            "herdr-subagents migrate",
+            "the following arguments are required: name",
+        );
+    }
+    for (name, choices) in [
+        ("--to", &["tmux", "herdr"][..]),
+        ("--mode", &["headless", "tui"][..]),
+    ] {
+        if let Some(value) = parsed.get(name) {
+            if !choices.contains(&value) {
+                return argparse_error(
+                    MIGRATE_USAGE,
+                    "herdr-subagents migrate",
+                    &format!(
+                        "argument {name}: invalid choice: '{value}' (choose from {})",
+                        choices
+                            .iter()
+                            .map(|choice| format!("'{choice}'"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+            }
+        }
+    }
+    match super::lifecycle::migrate_agent_at(
+        &foreign_base(),
+        Path::new("/proc"),
+        &parsed.positionals[0],
+        parsed.get("--to").unwrap_or("herdr"),
+        parsed.get("--mode"),
+    ) {
+        Ok(result) => {
+            println!(
+                "agent '{}' migrated {}/{} -> {}/{}; presentation {}; session {}",
+                result.name,
+                result.from_backend,
+                result.from_mode,
+                result.to_backend,
+                result.to_mode,
+                result.tmux_target,
+                if result.session_id.is_some() {
+                    "preserved"
+                } else {
+                    "not yet created"
+                }
+            );
+            println!("  transcript: {}", result.transcript);
+            if result.to_backend == "herdr" {
+                println!(
+                    "WARNING: restart any pre-Herdr MCP server before using its subagent tools on this worker; a temporary tmux guard prevents its old garbage collector from archiving the Herdr runner."
+                );
+            }
             0
         }
         Err(error) => operation_die(&error),
@@ -1084,6 +1161,7 @@ pub fn main(arguments: &[String]) -> i32 {
         "down" => down_command(rest),
         "turn" => turn_command(rest),
         "up" => up_command(rest),
+        "migrate" => migrate_command(rest),
         "inbox" => inbox_command(rest),
         "mcp" => {
             eprintln!("herdr-subagents: the Rust edition has not ported 'mcp' yet");
