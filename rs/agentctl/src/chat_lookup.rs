@@ -218,22 +218,66 @@ fn index_entries_in(directory: &Path) -> Vec<(PathBuf, IndexEntry)> {
     entries
 }
 
+/// The environment variable naming the registry when `--registry` is not given. It outranks
+/// ancestor discovery but never an explicit `--registry`; the wrkslots liveness probe already
+/// reads the same variable, so one setting steers every reader of a registry.
+pub const REGISTRY_VARIABLE: &str = "AGENTCTL_REGISTRY";
+
 /// The registry a `chat` command uses: `given` when it exists; otherwise, when it is the relative
 /// default `.agentctl`, the nearest `.agentctl` directory in the working directory's ancestors,
 /// as `git` finds `.git`; otherwise `given`.
 #[must_use]
 pub fn find_registry(given: &Path) -> PathBuf {
-    if given.exists() || given != Path::new(".agentctl") {
-        return given.to_path_buf();
-    }
     let Ok(start) = std::env::current_dir() else {
         return given.to_path_buf();
     };
+    find_registry_from(&start, given)
+}
+
+/// [`find_registry`] from an explicit start directory, so tests need not move the process.
+/// The walk is lexical — `ancestors` never consults mounts or the Git worktree a directory
+/// belongs to — so it crosses the bind mount and worktree boundaries of a wrkslots slot and
+/// reaches the harness registry above it (#1169 slot-registry-discovery). A Git-root lookup
+/// could not: a slot is its own worktree, so its toplevel is the slot itself.
+#[must_use]
+pub fn find_registry_from(start: &Path, given: &Path) -> PathBuf {
+    if given != Path::new(".agentctl") {
+        return given.to_path_buf();
+    }
     start
         .ancestors()
         .map(|directory| directory.join(".agentctl"))
         .find(|candidate| candidate.is_dir())
         .unwrap_or_else(|| given.to_path_buf())
+}
+
+/// The registry every command uses, with one precedence: an explicit `--registry` wins; then
+/// `AGENTCTL_REGISTRY` when set and nonempty; then, for the unset default `.agentctl`, the
+/// nearest `.agentctl` in the working directory's ancestors ([`find_registry_from`]); with no
+/// registry in any ancestor the default stands, exactly as before discovery existed.
+#[must_use]
+pub fn resolve_registry(
+    given: &Path,
+    environment: &dyn Fn(&str) -> Option<String>,
+) -> PathBuf {
+    let Ok(start) = std::env::current_dir() else {
+        return given.to_path_buf();
+    };
+    resolve_registry_from(&start, given, environment(REGISTRY_VARIABLE).as_deref())
+}
+
+/// [`resolve_registry`] from an explicit start directory and environment value.
+#[must_use]
+pub fn resolve_registry_from(start: &Path, given: &Path, environment: Option<&str>) -> PathBuf {
+    if given != Path::new(".agentctl") {
+        return given.to_path_buf();
+    }
+    if let Some(value) = environment {
+        if !value.is_empty() {
+            return PathBuf::from(value);
+        }
+    }
+    find_registry_from(start, given)
 }
 
 /// A bridge that a lookup considered: its state directory, the registry it serves, where it was
@@ -869,6 +913,46 @@ mod tests {
         fs::remove_dir_all(&gone).expect("remove a state");
         register_in(&index, &state, &root.join("registry")).expect("register once more");
         assert_eq!(index_entries_in(&index).len(), 1);
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn registry_discovery_walks_from_a_slot_to_the_harness_registry() {
+        // #1169 slot-registry-discovery: a slot is a nested Git worktree (its own `.git`
+        // file) bind-mounted under the harness root. The walk is lexical, so neither
+        // boundary stops it; a Git-toplevel lookup would stop at the slot itself.
+        let root =
+            std::env::temp_dir().join(format!("agentctl-discovery-1169-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let harness = root.join("harness/.agentctl");
+        let slot = root.join("harness/worktrees/slots/slot1");
+        fs::create_dir_all(&harness).expect("harness registry");
+        fs::create_dir_all(&slot).expect("slot");
+        fs::write(slot.join(".git"), "gitdir: ../elsewhere\n").expect("worktree marker");
+        let deep = slot.join("rs/agentctl/src");
+        fs::create_dir_all(&deep).expect("deep directory");
+        let default = Path::new(".agentctl");
+        assert_eq!(resolve_registry_from(&slot, default, None), harness);
+        assert_eq!(resolve_registry_from(&deep, default, None), harness);
+        // The environment outranks discovery, and an explicit registry outranks both.
+        let env_registry = root.join("elsewhere/.agentctl");
+        assert_eq!(
+            resolve_registry_from(&slot, default, Some(env_registry.to_str().unwrap())),
+            env_registry
+        );
+        assert_eq!(
+            resolve_registry_from(&slot, &env_registry, Some("/ignored")),
+            env_registry
+        );
+        // An empty environment value is unset, so discovery still applies.
+        assert_eq!(resolve_registry_from(&slot, default, Some("")), harness);
+        // No registry in any ancestor keeps the historical default.
+        let bare = root.join("bare/sub");
+        fs::create_dir_all(&bare).expect("bare directory");
+        assert_eq!(
+            resolve_registry_from(&bare, default, None),
+            PathBuf::from(".agentctl")
+        );
         fs::remove_dir_all(&root).expect("cleanup");
     }
 

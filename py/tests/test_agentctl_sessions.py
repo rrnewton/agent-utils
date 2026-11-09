@@ -1575,3 +1575,32 @@ def test_profile_resume_cli_rejects_invalid_conversations_before_allocation(
     captured = capsys.readouterr()
     assert "native session id must be nonempty and contain no NUL" in captured.err
     assert not sessions.registry.exists() and fake.environments == [] and fake.launched == []
+
+
+def test_registry_discovery_walks_from_a_slot_to_the_harness_registry(tmp_path: Path) -> None:
+    """#1169 slot-registry-discovery: from a nested Git worktree under a harness (a
+    wrkslots slot: its own ``.git`` file, bind-mounted), the default registry resolves
+    to the enclosing harness registry. The walk is lexical, so neither the worktree
+    nor a mount boundary stops it; a Git-toplevel lookup would stop at the slot."""
+    harness = tmp_path / "harness"
+    registry = harness / ".agentctl"
+    slot = harness / "worktrees" / "slots" / "slot1"
+    deep = slot / "rs" / "agentctl" / "src"
+    registry.mkdir(parents=True)
+    deep.mkdir(parents=True)
+    (slot / ".git").write_text("gitdir: ../elsewhere\n", encoding="utf-8")
+    assert cli.resolve_registry(".agentctl", cwd=slot, environ={}) == str(registry)
+    assert cli.resolve_registry(".agentctl", cwd=deep, environ={}) == str(registry)
+    # The environment outranks discovery, and an explicit registry outranks both.
+    elsewhere = str(tmp_path / "elsewhere" / ".agentctl")
+    assert cli.resolve_registry(
+        ".agentctl", cwd=slot, environ={"AGENTCTL_REGISTRY": elsewhere}) == elsewhere
+    assert cli.resolve_registry(
+        elsewhere, cwd=slot, environ={"AGENTCTL_REGISTRY": "/ignored"}) == elsewhere
+    # An empty environment value is unset, so discovery still applies.
+    assert cli.resolve_registry(
+        ".agentctl", cwd=slot, environ={"AGENTCTL_REGISTRY": ""}) == str(registry)
+    # No registry in any ancestor keeps the historical default.
+    bare = tmp_path / "bare" / "sub"
+    bare.mkdir(parents=True)
+    assert cli.resolve_registry(".agentctl", cwd=bare, environ={}) == ".agentctl"

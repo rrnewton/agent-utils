@@ -40,7 +40,10 @@ fn parse_term_backend(raw: &str) -> std::result::Result<String, String> {
     after_help = "Examples:\n  agentctl quickstart\n  agentctl start reviewer --cwd .\n  agentctl adopt reviewer --pane w1:p2 --workspace project --cwd /work/project --harness codex\n  agentctl send reviewer 'Review the current changes'\n  agentctl chat status --bridge-state ~/.local/state/agentctl/chat\n  agentctl pause reviewer\n  agentctl attach reviewer\n  agentctl resume reviewer\n  agentctl stop reviewer"
 )]
 struct Cli {
-    /// Registry directory containing agent records and durable queues
+    /// Registry directory containing agent records and durable queues. Default: $AGENTCTL_REGISTRY
+    /// when set and nonempty, else the nearest .agentctl in the working directory's ancestors,
+    /// else .agentctl — so a command run inside a wrkslots slot finds the harness registry above
+    /// it without spelling --registry
     #[arg(
         long,
         visible_alias = "state",
@@ -2781,7 +2784,7 @@ pub(crate) fn main_with_environment<I: IntoIterator<Item = OsString>>(
         );
         return 2;
     }
-    let args = match Cli::try_parse_from(arguments.iter().cloned()) {
+    let mut args = match Cli::try_parse_from(arguments.iter().cloned()) {
         Ok(args) => args,
         Err(error) => {
             let code = error.exit_code();
@@ -2794,6 +2797,17 @@ pub(crate) fn main_with_environment<I: IntoIterator<Item = OsString>>(
             return code;
         }
     };
+    // One registry resolution for every command (#1169 slot-registry-discovery): explicit
+    // --registry, then AGENTCTL_REGISTRY, then the nearest ancestor .agentctl. Three commands
+    // keep the raw value: skill install and codex-goal refuse --registry outright (their guard
+    // compares against the default), and restore-teams deliberately has no discovery — a bare
+    // .agentctl there must stay "no filter", never the enclosing team's registry.
+    if !matches!(
+        args.command,
+        Some(Commands::Skill(_) | Commands::CodexGoal(_) | Commands::RestoreTeams(_))
+    ) {
+        args.registry = crate::chat_lookup::resolve_registry(&args.registry, environment);
+    }
     let stop_context = matches!(&args.command, Some(Commands::Stop(_)))
         .then(|| StopContext::new(&args.registry, &args.herdr_bin));
     let service_log = args.writes_service_log();

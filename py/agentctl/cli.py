@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from importlib.resources import files
 from pathlib import Path
 
@@ -33,10 +34,39 @@ def guide(document: str) -> int:
     return 0
 
 
+def resolve_registry(
+    registry: str, *, cwd: Path | None = None, environ: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve the registry every command uses (#1169 slot-registry-discovery).
+
+    One precedence: an explicit ``--registry`` wins; then ``AGENTCTL_REGISTRY``
+    when set and nonempty; then, for the unset default ``.agentctl``, the nearest
+    ``.agentctl`` in the working directory's ancestors; with no registry in any
+    ancestor the default stands, exactly as before discovery existed. The walk
+    is lexical — it never consults mounts or the Git worktree a directory
+    belongs to — so it crosses a wrkslots slot's bind mount and worktree
+    boundaries and reaches the harness registry above it. A Git-root lookup
+    could not: a slot is its own worktree, so its toplevel is the slot itself.
+    """
+    if registry != ".agentctl":
+        return registry
+    override = (os.environ if environ is None else environ).get("AGENTCTL_REGISTRY")
+    if override:
+        return override
+    start = Path.cwd() if cwd is None else cwd
+    for directory in (start, *start.parents):
+        candidate = directory / ".agentctl"
+        if candidate.is_dir():
+            return str(candidate)
+    return registry
+
+
 def _common(parser: argparse.ArgumentParser, *, inherited: bool = False) -> None:
     default: object = argparse.SUPPRESS if inherited else ".agentctl"
     parser.add_argument("--registry", "--state", default=default, metavar="DIR",
-        help="private session registry (default: .agentctl); use an existing registry to retain its sessions")
+        help="private session registry; default: $AGENTCTL_REGISTRY when set and nonempty, else the nearest "
+             ".agentctl in the working directory's ancestors, else .agentctl (so a command run inside a "
+             "wrkslots slot finds the harness registry above it)")
     parser.add_argument("--herdr-bin", default=argparse.SUPPRESS if inherited else "herdr", metavar="PATH",
         help="Herdr executable for interactive control (default: installed herdr)")
 
@@ -445,7 +475,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if prefix.herdr_bin != "herdr":
             settings.error("--herdr-bin applies to session commands; Chat uses its configured target adapter")
         from agentctl.chat import run_cli as chat_main
-        return chat_main(arguments[command_index + 1:], default_state=Path(prefix.registry) / ".chat")
+        return chat_main(arguments[command_index + 1:],
+                         default_state=Path(resolve_registry(prefix.registry)) / ".chat")
     if (command_index < len(arguments) and arguments[command_index] in _RUST_ONLY
             and not {"-h", "--help"} & set(arguments[command_index + 1:])):
         print(f"agentctl: {arguments[command_index]} is implemented only by the Rust edition of agentctl; "
@@ -453,6 +484,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     root = parser()
     args = root.parse_args(arguments)
+    # One registry resolution for every command (#1169 slot-registry-discovery).
+    # Skill install keeps the raw value: it refuses --registry outright, and its
+    # guard compares against the default.
+    if getattr(args, "command", None) != "skill" and hasattr(args, "registry"):
+        args.registry = resolve_registry(args.registry)
     if args.userguide or args.command == "userguide":
         return guide("USER_GUIDE.md")
     if args.command == "quickstart":
