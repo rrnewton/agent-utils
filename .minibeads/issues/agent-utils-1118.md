@@ -326,3 +326,31 @@ before tap coordinates and moved-by-a-pixel comparisons; the Unpack chips'
 mid-cycle settles; pack-still's timed subjects whole.
 
 Solo on 2026-11-09 (Chromium 149.0.7827.55): all five files pass whole.
+
+## Batch 9, 2026-11-09 (mu-settle)
+
+[muse watermelon] `live_pill_browser.py`, `bridge_gutter_browser.py`,
+`copy_message_browser.py`, `bridge_even_browser.py` and
+`thread_line_browser.py` (36 `settled()` sites reviewed; all batch 1's
+`Desk`; read-aloud's files are not in this batch). The small files were
+already exact-wait first; three conversions:
+
+- bridge-even: the keyboard ring's rectangle and the triangle under the
+  mouse are waited on as computed styles (`washBg`, the mark's opacity —
+  the very fields `ROWS_JS` then reads), instead of a settle after focusing
+  or hovering the pack triangle.
+- copy-message: ↓ in the thread list waits until the one selected row is a
+  card; the clipboard itself was already waited on properly here (`copied`
+  polls until it changes, a second if it does not), and every other key's
+  highlight is walked to by the self-correcting `highlight` loop.
+- thread-line: with the root above Main, the line clipped `up` is waited on
+  before its lane is measured, as in the header walk.
+
+No conversion in live-pill or bridge-gutter: their settles land a scroll
+before the pill-line and gutter geometry is read at each place, follow an
+exact wait (the pill's live words, the unpack counts, the bridge tap's own
+landing wait), or let an injected stylesheet restyle before its negative
+control runs. Live-pill's 300 ms after a thread opens is its landing
+finishing, kept before the settled geometry.
+
+Solo on 2026-11-09 (Chromium 149.0.7827.55): all five files pass whole.

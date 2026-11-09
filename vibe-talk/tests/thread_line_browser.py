@@ -271,6 +271,8 @@ def desk_walk(desk: Desk) -> None:
 
     # Main at its foot, the root above it: the line clipped at Main's top, down the same lane.
     page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
+    desk.wait_for("() => document.querySelector('#column-links path.column-link')?.getAttribute('data-link') === 'up'",
+                  "with the root above Main the line is not clipped pointing up")
     desk.settled()
     desk.settled()
     found = measure(desk, "side-log")

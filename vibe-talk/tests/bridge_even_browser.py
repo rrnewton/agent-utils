@@ -287,6 +287,12 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 # The ring is the one a still screenshot can hold.
                 page.evaluate(f"() => document.querySelector(\"#side-cards > li[data-unpack-thread='{RUNNER}'] "
                               f".unpack-pack\").focus({{focusVisible: true}})")
+                desk.wait_for(f"() => {{ const b = document.querySelector(\"#side-cards > li[data-unpack-thread='{RUNNER}'] .unpack-pack\"); "
+                              "const w = getComputedStyle(b, '::before'); "
+                              "const own = w.content !== 'none' && w.content !== 'normal' && w.content !== ''; "
+                              "const bg = own ? w.backgroundColor : getComputedStyle(b).backgroundColor; "
+                              "return !['rgba(0, 0, 0, 0)', 'transparent'].includes(bg); }",
+                              "the keyboard's ring draws no rectangle behind the triangle")
                 desk.settled()
                 ringed = page.evaluate(ROWS_JS, RUNNER)
                 assert isinstance(ringed, dict)
@@ -298,6 +304,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 page.evaluate("() => document.activeElement && document.activeElement.blur()")
             if not touch:
                 page.mouse.move(button["left"] + button["width"] / 2, button["top"] + button["height"] / 2)
+                desk.wait_for(f"() => parseFloat(getComputedStyle(document.querySelector(\"#side-cards > li[data-unpack-thread='{RUNNER}'] .unpack-pack-mark\")).opacity) >= 0.99",
+                              "the triangle under the mouse did not come to full strength")
                 desk.settled()
                 hovered = page.evaluate(ROWS_JS, RUNNER)
                 assert isinstance(hovered, dict)

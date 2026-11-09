@@ -380,6 +380,9 @@ def desk_walk(reader: Reader) -> None:
                          "Ctrl+3 did not show the thread list")
     reader.desk.settled()
     reader.key("ArrowDown")
+    reader.desk.wait_for("() => { const l = [...document.querySelectorAll('[data-selected=\"true\"]')]; "
+                         "return l.length === 1 && l[0].parentNode && l[0].parentNode.id === 'side-cards'; }",
+                         "↓ in the thread list did not highlight a card")
     lit = reader.lit()
     reader.check(len(lit) == 1 and lit[0][0] == "side-cards", f"↓ in the thread list did not highlight a card: {lit}")
     card = lit[0][1]
