@@ -5432,8 +5432,7 @@ test("`#315 removed-reply-target`: a reply sent before its message was removed, 
 
   // THE CONTROL, as #308 left it: placed from the store's bare copy, the reply goes to the main channel
   // with no read first, and the note after it follows.
-  const control = await run(brokenScript("  refuseRemoved();\n  const held = current() ? heldMessage(id) : null;",
-    "  const held = current() ? heldMessage(id) : null;"));
+  const control = await run(await brokenModule([{ file: "src/view/channel/readcore.ts", find: "    refuseRemoved();\n    const held = current() ? deps.heldMessage(id) : null;", replace: "    const held = current() ? deps.heldMessage(id) : null;" }]));
   assert.deepStrictEqual(control.posted[0], { text: "an answer sent as the message was taken back", reply_to: "300" },
     "without the check the reply still did not go to the main channel, so this test cannot see it");
   assert.deepStrictEqual(replyPlacingReads(control.page, control.from), []);

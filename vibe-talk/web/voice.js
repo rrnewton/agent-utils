@@ -1384,22 +1384,27 @@ function outgoingFromSaved(held) {
 // was queued under, one pass at a time over the outbox, every automatic retry's hold and timer, and
 // the running number in new sends' ids are the send service's own (web/src/core/outbox
 // `createOutboxDispatch`, made below with the outbox's other owners, `#624 voice-page-modularity`).
-/**
- * `#277 reply-in-column`. Replies sent from a column, by outbox id, and the column each was sent from:
- * every attempt at one that settles is told (`reportColumnReply`) until it is sent or leaves the
- * outbox. For this page only: a reload shows the outbox as it is, with nothing to tell.
- *
- * @type {Map<string, ColumnFields>}
- */
-const columnReplies = new Map();
-/**
- * `#277 reply-in-column`. By column, the outbox id of a reply sent from it that did not go, while the
- * reader has not been down to the foot of that column, where its row is, since they were told: what
- * the column's Newest chip says (`unseenColumnReply`).
- *
- * @type {{main: string | null, side: string | null}}
- */
-const unseenColumnReplies = { main: null, side: null };
+/** The column a reply that did not go was sent from, and the one in it not yet been down to,
+ * are web/src/view/channel's now (`createColumnReplies`, `#624 voice-page-modularity`). */
+const columnRepliesOwner = createColumnReplies({
+  el: (id) => el(id),
+  outbox,
+  retryOf: (id) => outboxDispatch.retryOf(id),
+  retryPending: (id) => outboxDispatch.retryPending(id),
+  inPlaceDrawn: (column) => outgoingInPlaceDrawn.get(column),
+  layoutColumns: () => layoutShown.columns(),
+  isSide: (column) => column === columns.side,
+  isMain: (column) => column === columns.main,
+  sideShowing: () => sideShowing(),
+  inColumn: (column, act) => inColumn(column, act),
+  columnKey: (column) => column.name,
+  activeColumn: () => columnWork.active(),
+  setStatus: (text) => setStatus(text),
+  renderJumpNewest: () => renderJumpNewest(),
+});
+const { columnReplies, unseenReplies: unseenColumnReplies, reportColumnReply, unseenColumnReply } = columnRepliesOwner;
+
+
 
 // `#193 compose-draft-loss`. A send dismissed from the outbox, kept for Undo and then for a while
 // longer. See "taking a send back"; how many are kept, for how long and where are web/src/core/outbox's
@@ -7282,51 +7287,7 @@ function pendingThreadTimes() {
 
 
 
-/**
- * Settle where a reply to an unplaced message goes, before anything is posted, and answer the
- * thread it belongs in or null for the main channel. `#185 reply-new-thread`.
- *
- * From the store when a read has placed the message since Reply was opened; otherwise from one
- * read of All, which carries every message with the thread record its live copy lacked. A message
- * that read does not carry cannot be placed and the reply is not posted at all: guessing the main
- * channel is exactly what turned the answer of 2026-10-04 into a thread of its own.
- *
- * NOR ONE REMOVED UPSTREAM (`noteRemoved`), before the read or while it was out: the reply is not
- * posted, and no read is made for it. `#315 removed-reply-target`. Its bare copy, held until the read
- * behind the removal lands, is not a message placed on the main channel.
- */
-async function placeReplyTarget(entry) {
-  const id = String(entry.replyTo);
-  const current = () => String(selectedChannelId()) === entry.channel;
-  const refuseRemoved = () => {
-    if (!current() || !removedUpstream(id)) return;
-    const error = /** @type {Error & {removed?: boolean}} */ (new Error("the message you answered was removed from the channel"));
-    error.removed = true;
-    throw error;
-  };
-  refuseRemoved();
-  const held = current() ? heldMessage(id) : null;
-  if (held && !channelStore.current().unplaced.has(id)) return answeredThread(held);
-  const payload = await timelineReader.readTimeline(
-    `/api/v1/channels/${encodeURIComponent(entry.channel)}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}` +
-      "&reason=reply-place"
-  );
-  const messages = payload.messages || [];
-  if (current()) {
-    // What the read says about every message the stream left unplaced, not only this one. The
-    // page itself is not folded: the view on screen is the next read's to redraw. Each copy it gives
-    // stands where the read was sent (`copyOrder`), so no read sent before it undoes it.
-    const number = sentNumberOf(payload);
-    for (const message of messages) {
-      if (channelStore.current().unplaced.has(String(message.id))) foldLiveMessage(message, false, false, number);
-    }
-    saveChannelScope();
-  }
-  refuseRemoved();
-  const found = messages.find((message) => String(message.id) === id);
-  if (!found) throw new Error("it is not among the channel's newest messages");
-  return answeredThread(found);
-}
+
 
 // --- placing what the stream left unplaced -------------------------------------------------------
 //
@@ -12174,79 +12135,11 @@ const {
 
 /** The keys' list of `column`: the left column's, or the right one's. */
 
-/**
- * An attempt at a reply sent from a column has settled (`dispatchOutgoingMessage`). Sent: nothing to
- * say, the row it answers turning Done says it. Not sent: the status line says so, and where the row
- * with Retry is, and the column's Newest chip says "Reply not sent" until the reader gets there. Held
- * for a retry the page makes itself, offline or after a provider's blip: the status line says it will
- * go again, and the chip waits for how that ends. `#277 reply-in-column`.
- *
- * @param {any} entry
- */
-function reportColumnReply(entry) {
-  const column = columnReplies.get(entry.id);
-  // Those dismissed, or taken back into a box by Edit, since: nothing more to tell of them.
-  for (const id of [...columnReplies.keys()]) if (!outbox.has(id)) columnReplies.delete(id);
-  if (!column || entry.state === "sending") return;
-  if (entry.state === "sent") {
-    columnReplies.delete(entry.id);
-    return;
-  }
-  const waiting = outboxDispatch.retryOf(entry.id);
-  if (waiting) {
-    setStatus(waiting.offline
-      ? "Your reply is not sent yet: this device is offline. It goes when the connection is back."
-      : "Your reply is not sent yet. The page tries again in a moment.");
-    return;
-  }
-  // `#467 inline-send-in-place`. Drawn where it was written, under the message it answers: said so, and
-  // no way down to a row the reader is already at.
-  const placed = (outgoingInPlaceDrawn.get(column) || { groups: [] }).groups
-    .some((group) => [...group.children].some((row) => /** @type {any} */ (row).outgoingEntry === entry));
-  if (placed) {
-    setStatus(entry.state === "failed"
-      ? entry.postedCount > 0
-        ? "Only part of your reply was sent. Retry the rest under the message it answers."
-        : "Your reply was not sent. Retry is under the message it answers."
-      : "Your reply may not have been posted. Check it under the message it answers.");
-    return;
-  }
-  // Where the row is: in the column it was sent from while that column shows where it went.
-  const named = layoutShown.columns() ? (column === columns.side ? "the right column" : "the left column") : "the list";
-  const drawn = (column === columns.main || sideShowing()) && inColumn(column, () => outboxRow(entry.id) !== null);
-  const where = drawn ? `at the foot of ${named}` : "with it where it was sent";
-  // A refusal after some parts went (`#444 send-refusal-reason`) is failed too, and part of it is in.
-  setStatus(entry.state === "failed"
-    ? entry.postedCount > 0
-      ? `Only part of your reply was sent. Retry the rest ${where}.`
-      : `Your reply was not sent. Retry is ${where}.`
-    : `Your reply may not have been posted. Check it ${where}.`);
-  unseenColumnReplies[column.name] = entry.id;
-  if (drawn) inColumn(column, renderJumpNewest);
-}
 
-/** The outbox row of entry `id` in the column being worked on, while it is drawn there; else null. */
-function outboxRow(id) {
-  const host = el("outgoing-log");
-  if (host.hidden) return null;
-  return /** @type {HTMLElement | undefined} */ ([...host.children].find((row) => row.getAttribute("data-outgoing-id") === id)) || null;
-}
 
-/**
- * The reply sent from the column being worked on that did not go, while its outbox row is drawn in
- * this column and the reader has not been down to it since they were told: the entry, or null. One
- * sent since, Retried, or dismissed is let go.
- */
-function unseenColumnReply() {
-  const id = unseenColumnReplies[columnWork.active().name];
-  if (id === null) return null;
-  const entry = outbox.get(id);
-  if (!entry || (entry.state !== "failed" && entry.state !== "unconfirmed") || outboxDispatch.retryPending(id)) {
-    unseenColumnReplies[columnWork.active().name] = null;
-    return null;
-  }
-  return outboxRow(id) ? entry : null;
-}
+
+
+
 
 // --- a reply that is sent marks what it answers Done ---------------------------------------------
 //
@@ -15404,7 +15297,7 @@ const timelineView = createTimelineView({
   reader: timelineReader, timelineDeltaPages: TIMELINE_DELTA_PAGES, isCursorRefusal,
   abandonedReads, channelReads, queueDiscordLoad: (options) => queueDiscordLoad(options), finishDiscordLoad: (column) => finishDiscordLoad(column),
   replayLedger, columnReadsSent, landAbandonedTimelineRead: (payload, read) => landAbandonedTimelineRead(payload, /** @type {any} */ (read)),
-  queuePlaceUnplaced, prepareSpeech: () => readAloudOwner().prepareSpeech(), guardQuietly: (fn) => guardQuietly(fn),
+  queuePlaceUnplaced, heldMessage: (id) => liveStream.heldMessage(id), removedUpstream: (id) => removedUpstream(id), prepareSpeech: () => readAloudOwner().prepareSpeech(), guardQuietly: (fn) => guardQuietly(fn),
   settleReplays: (read, answer) => settleReplays(read, answer), setStatus,
   liveSeen: (channel) => liveEvents.seen(channel), liveNews: (channel) => liveEvents.news(channel),
   readsAsked: () => readOrder.asked(), readOrderNow: () => readOrder.now(), sentNumberOf, refreshFailed, within,
@@ -16018,7 +15911,7 @@ const outboxDispatch = createOutboxDispatch({
   channelWritable: (channel) => knownChannel(channel)?.writable !== false,
   originView: () => selection().view, persist: () => persistOutgoingMessages(),
   renderOutgoing: () => renderOutgoingEverywhere(), renderRows: () => eachColumn(renderChannelRows),
-  placeReplyTarget,
+  placeReplyTarget: timelineView.placeReplyTarget,
   // Per channel, by its own provider where several are described (`#195 send-resilience`): one
   // owner in web/src/core/channels/providerfacts.ts (`channelPostsOnce`, `#624 voice-page-modularity`).
   postsOnce: (channel) => channelPostsOnce(channel, providerOfChannel, channelDirectory.providers().size, channelDirectory.capabilities()),

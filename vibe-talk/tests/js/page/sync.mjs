@@ -4995,7 +4995,7 @@ test("`#316 late-counts-resurrect`: a read of All for Main's counts does not und
 
   // THE CONTROL, as the page was: the reply's read of All gave the reply the stream's kind of copy, as
   // posted, and the read for the counts takes its own over it, which the polls after never correct.
-  const control = await run(brokenScript("foldLiveMessage(message, false, false, number)", "foldLiveMessage(message)"));
+  const control = await run(await brokenModule([{ file: "src/view/channel/readcore.ts", find: "foldLiveMessage(message, false, false, number)", replace: "foldLiveMessage(message)" }]));
   assert.equal(control.landed, pushedText, "the finished answer survived anyway, so this test cannot see it");
   assert.deepStrictEqual(control.polls, Array(3).fill(pushedText));
   assert.ok(control.row.includes(pushedText));
@@ -5717,11 +5717,11 @@ for (const when of ["held", "never held"]) {
 
     // THE CONTROL, as the page was: asking only whether a newer newest page of Main has landed, the read for
     // the counts puts the reply into its thread and the saved store, and the polls after keep it there.
-    // In the module, `answeredThread` and `newerPage` are the legacy script's own functions, found at run
-    // time in the page's global scope as every top-level function of a classic script is.
+    // In the module, the thread a reply answers and whether a newer page of Main has landed are the
+    // placement module's own helpers, which this file and that one both take from the canon.
     const control = await run(await brokenModule([{ file: "src/core/channels/fold.ts",
       find: "      return !deps.newerPageSpeaksFor(canon, message, number);\n",
-      replace: "      return answeredThread(message) !== null || !newerPage(canon, \"main\", number);\n" }]));
+      replace: "      return (threadOf(message) !== null && message.thread?.is_root !== true) || !newerPage(canon, \"main\", number);\n" }]));
     assert.deepStrictEqual(control.landed, { shown: true, saved: true }, "the reply stayed out anyway, so this test cannot see it");
     assert.ok(control.polls.every((state) => state.shown && state.saved));
   });
@@ -5772,7 +5772,7 @@ test("`#316 late-counts-resurrect`: a placing read that is not folded does not p
   // read puts the reply back into its thread and the saved store, and the polls after keep it there.
   const control = await run(await brokenModule([{ file: "src/core/channels/placement.ts",
     find: "    : [...carried.values()].filter((copy) => !newerPageSpeaksFor(canon, copy, number));\n",
-    replace: "    : [...carried.values()].filter((copy) => answeredThread(copy) !== null || !newerPage(canon, \"main\", number));\n" }]));
+    replace: "    : [...carried.values()].filter((copy) => (threadOf(copy) !== null && copy.thread?.is_root !== true) || !newerPage(canon, \"main\", number));\n" }]));
   assert.deepStrictEqual(control.landed, { shown: true, saved: true }, "the reply stayed out anyway, so this test cannot see it");
   assert.ok(control.polls.every((state) => state.shown && state.saved));
 });

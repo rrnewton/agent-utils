@@ -133,6 +133,8 @@ export { mountReadingJumps } from "./readingjumps.ts";
 export type { ReadingJumps, ReadingJumpsDependencies } from "./readingjumps.ts";
 export { createReplySession } from "./replysession.ts";
 export type { ReplyColumnLike, ReplyDraftStoreLike, ReplyMessageLike, ReplySession, ReplySessionDependencies } from "./replysession.ts";
+export { createColumnReplies } from "./columnreplies.ts";
+export type { ColumnReplies, ColumnRepliesDependencies, ColumnReplyEntry } from "./columnreplies.ts";
 export { mountReplyBox } from "./replybox.ts";
 export type { ReplyBox, ReplyBoxDependencies } from "./replybox.ts";
 export { mountKeptSends } from "./keptsends.ts";

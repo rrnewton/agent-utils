@@ -1770,3 +1770,30 @@ test("`#624 voice-page-modularity`: the reply session routes, words the destinat
   assert.deepStrictEqual(queued, [{ channel: "C1", threadId: null, postToMain: true, replyTo: "m1",
     text: "promoted", marksRead: null }], "the ticked send did not go top-level with its answer kept");
 });
+
+test("`#624 voice-page-modularity`: a reply that did not go is reported in the column it was sent from, and the unseen one is let go when it goes", () => {
+  const { createColumnReplies } = CHANNEL_VIEW;
+  const log = [];
+  const entries = new Map();
+  const main = { name: "main" };
+  const side = { name: "side" };
+  const owner = createColumnReplies({
+    el: () => ({ hidden: false, children: [{ getAttribute: () => "e1" }] }),
+    outbox: { has: (id) => entries.has(id), get: (id) => entries.get(id) },
+    retryOf: () => null, retryPending: () => false,
+    inPlaceDrawn: () => undefined, layoutColumns: () => true,
+    isSide: (c) => c === side, isMain: (c) => c === main, sideShowing: () => true,
+    inColumn: (_c, act) => act(), columnKey: (c) => c.name,
+    activeColumn: () => side, setStatus: (t) => log.push(t), renderJumpNewest: () => log.push("jump"),
+  });
+  const failed = { id: "e1", state: "failed", postedCount: 0 };
+  entries.set("e1", failed);
+  owner.columnReplies.set("e1", side);
+  owner.reportColumnReply(failed);
+  assert.deepStrictEqual(log, ["Your reply was not sent. Retry is at the foot of the right column.", "jump"]);
+  assert.equal(owner.unseenColumnReply(), failed, "the unseen reply in the active column was not the failed one");
+  owner.reportColumnReply({ id: "e1", state: "sent", postedCount: 1 });
+  entries.delete("e1");
+  assert.equal(owner.columnReplies.has("e1"), false, "a sent reply kept its column");
+  assert.equal(owner.unseenColumnReply(), null);
+});

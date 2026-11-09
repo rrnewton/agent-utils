@@ -47,6 +47,7 @@ import { isMessageRow, rowShown, shownRowFor } from "./rows.ts";
 import { cardRunIds, threadCardId } from "./cards.ts";
 import { childByClass } from "../dom/index.ts";
 import { neighbourStayed, rowNeighbours } from "./cardplace.ts";
+import { answeredThread } from "../../core/channels/index.ts";
 import { isNoise, joinsGroup, readRunText } from "../../present/rows/index.ts";
 import type { CancelSignal, ClockPort } from "../../ports/index.ts";
 
@@ -172,6 +173,8 @@ export interface TimelineViewDependencies {
   columnReadsSent: Map<TimelineColumn, { context: string; read: unknown; full: boolean }>;
   landAbandonedTimelineRead(payload: TimelineResponse, read: TimelineFoldRead): void;
   queuePlaceUnplaced(): void;
+  heldMessage(id: string): Message | null;
+  removedUpstream(id: string): boolean;
   setStatus(text: string): void;
   prepareSpeech(): void;
   guardQuietly(fn: (...args: never[]) => unknown): (...args: never[]) => unknown;
@@ -331,6 +334,7 @@ export interface TimelineView {
   loadOlderTimeline(signal?: CancelSignal): Promise<void>;
   foldLiveMessage(message: Message, live?: boolean, replayed?: boolean, read?: unknown): Message;
   loadDiscord(options?: TimelineReadOptions): Promise<void>;
+  placeReplyTarget(entry: { replyTo?: unknown; channel?: string }): Promise<string | null>;
   loadTodo(options?: TimelineReadOptions): Promise<void>;
   loadOlder(signal?: CancelSignal): Promise<void> | null;
   maybeLoadOlder(): void;
@@ -2538,7 +2542,52 @@ function readRunsSuspended() {
  * its own (`loadTodo`), and stays in force.
  */
 
+
+  /**
+   * Settle where a reply to an unplaced message goes, before anything is posted, and answer the
+   * thread it belongs in or null for the main channel. `#185 reply-new-thread`.
+   *
+   * From the store when a read has placed the message since Reply was opened; otherwise from one
+   * read of All, which carries every message with the thread record its live copy lacked. A message
+   * that read does not carry cannot be placed and the reply is not posted at all: guessing the main
+   * channel is exactly what turned the answer of 2026-10-04 into a thread of its own.
+   *
+   * NOR ONE REMOVED UPSTREAM (`noteRemoved`), before the read or while it was out: the reply is not
+   * posted, and no read is made for it. `#315 removed-reply-target`. Its bare copy, held until the read
+   * behind the removal lands, is not a message placed on the main channel.
+   */
+  async function placeReplyTarget(entry: { replyTo?: unknown; channel?: string }): Promise<string | null> {
+    const id = String(entry.replyTo);
+    const current = (): boolean => String(deps.selectedChannelId()) === String(entry.channel);
+    const refuseRemoved = (): void => {
+      if (!current() || !deps.removedUpstream(id)) return;
+      const error = new Error("the message you answered was removed from the channel") as Error & { removed?: boolean };
+      error.removed = true;
+      throw error;
+    };
+    refuseRemoved();
+    const held = current() ? deps.heldMessage(id) : null;
+    if (held && !deps.channelStore.current().unplaced.has(id)) return answeredThread(held);
+    const payload = await timelineReader.readTimeline(
+      `/api/v1/channels/${encodeURIComponent(String(entry.channel))}/timeline?view=flat&limit=${DISCORD_PAGE_LIMIT}` +
+        "&reason=reply-place"
+    );
+    const messages = payload.messages || [];
+    if (current()) {
+      const number = deps.sentNumberOf(payload);
+      for (const message of messages) {
+        if (deps.channelStore.current().unplaced.has(String(message.id))) foldLiveMessage(message, false, false, number);
+      }
+      deps.saveChannelScope();
+    }
+    refuseRemoved();
+    const found = messages.find((message) => String(message.id) === id);
+    if (!found) throw new Error("it is not among the channel's newest messages");
+    return answeredThread(found);
+  }
+
   return {
+    placeReplyTarget,
     loadCanon, drawProjection, walkCursorOwed, heldViewRows, drawHeldRows,
     queueReadAllForCounts, readAllForCounts, rowsAsDrawn, applyTimelinePage,
     renderCachedTimeline, mutationAwaitsRead, loadTimeline, foldLateTimelinePage,
