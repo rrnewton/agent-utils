@@ -88,3 +88,38 @@ options:
 
 /// Usage line(s) of `herdr-subagents reset --help`.
 pub const RESET_USAGE: &str = r##"usage: herdr-subagents reset [-h] name"##;
+
+/// Verbatim `herdr-subagents status --help` help.
+pub const STATUS_HELP: &str = r##"usage: herdr-subagents status [-h] [name]
+
+Status of live subagents.
+
+positional arguments:
+  name
+
+options:
+  -h, --help  show this help message and exit
+"##;
+
+/// Usage line(s) of `herdr-subagents status --help`.
+pub const STATUS_USAGE: &str = r##"usage: herdr-subagents status [-h] [name]"##;
+
+/// Verbatim `herdr-subagents down --help` help.
+pub const DOWN_HELP: &str = r##"usage: herdr-subagents down [-h] [--grace GRACE] [--all-dead] [--force] [name]
+
+Stop a subagent or reap dead ones.
+
+positional arguments:
+  name
+
+options:
+  -h, --help     show this help message and exit
+  --grace GRACE  seconds to let a turn finish
+  --all-dead     gc every dead agent and exit
+  --force        retire NAME without probing or closing its presentation
+                 backend; archives state loudly
+"##;
+
+/// Usage line(s) of `herdr-subagents down --help`.
+pub const DOWN_USAGE: &str =
+    r##"usage: herdr-subagents down [-h] [--grace GRACE] [--all-dead] [--force] [name]"##;

@@ -1103,6 +1103,1168 @@ pub fn read_agent_output_at(
     })
 }
 
+fn herdr_bin() -> String {
+    std::env::var("HERDR_BIN").unwrap_or_else(|_| "herdr".to_string())
+}
+
+fn herdr_api_timeout() -> Duration {
+    std::env::var("SUBAGENTS_HERDR_TIMEOUT")
+        .ok()
+        .and_then(|value| value.parse::<f64>().ok())
+        .and_then(|seconds| Duration::try_from_secs_f64(seconds.max(0.0)).ok())
+        .unwrap_or(Duration::from_secs(2))
+}
+
+fn run_bounded(argv: &[String], timeout: Duration) -> Option<std::process::Output> {
+    let mut child = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
+/// One bounded Herdr request, returning its `result` object (or wait-event envelope).
+pub fn herdr_call(
+    args: &[&str],
+    timeout: Option<Duration>,
+) -> Result<Value, ForeignOwnershipError> {
+    let timeout = timeout.unwrap_or_else(herdr_api_timeout);
+    let mut argv = vec![herdr_bin()];
+    argv.extend(args.iter().map(|arg| arg.to_string()));
+    let joined = args.join(" ");
+    let output = run_bounded(&argv, timeout).ok_or_else(|| ForeignOwnershipError {
+        code: "herdr_unavailable",
+        message: format!(
+            "Herdr probe {joined} failed within {}s",
+            timeout.as_secs_f64()
+        ),
+    })?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else if !stdout.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            format!("exit {}", output.status.code().unwrap_or_default())
+        };
+        return Err(ForeignOwnershipError {
+            code: "herdr_api_failed",
+            message: format!("herdr {joined} failed: {detail}"),
+        });
+    }
+    let raw: Value = serde_json::from_str(&stdout).map_err(|_| ForeignOwnershipError {
+        code: "herdr_api_invalid",
+        message: format!(
+            "herdr {joined} returned invalid API JSON: {}",
+            stdout.trim()
+        ),
+    })?;
+    let Some(obj) = raw.as_object() else {
+        return Err(ForeignOwnershipError {
+            code: "herdr_api_invalid",
+            message: format!(
+                "herdr {joined} returned invalid API JSON: {}",
+                stdout.trim()
+            ),
+        });
+    };
+    if let Some(payload) = obj.get("result") {
+        if payload.is_object() {
+            return Ok(payload.clone());
+        }
+        return Err(ForeignOwnershipError {
+            code: "herdr_api_invalid",
+            message: format!("herdr {joined} returned no object"),
+        });
+    }
+    if obj.get("event").is_some_and(Value::is_string)
+        && obj.get("data").is_some_and(Value::is_object)
+    {
+        return Ok(raw);
+    }
+    Err(ForeignOwnershipError {
+        code: "herdr_api_invalid",
+        message: format!(
+            "herdr {joined} returned invalid API JSON: {}",
+            stdout.trim()
+        ),
+    })
+}
+
+fn herdr_not_found(error: &ForeignOwnershipError) -> bool {
+    let message = error.message.to_lowercase();
+    message.contains("not_found") || message.contains("not found")
+}
+
+/// Bounded health/state snapshot for one interactive Herdr-hosted TUI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TuiProbe {
+    /// Whether the pane has foreground processes.
+    pub pane_alive: bool,
+    /// Whether the Codex process is alive in the pane.
+    pub codex_alive: bool,
+    /// Herdr agent status string.
+    pub status: String,
+    /// Codex pid when found.
+    pub pid: Option<i64>,
+    /// Probe error, when the probe itself failed.
+    pub error: Option<String>,
+}
+
+/// Inspect a TUI pane without allowing status/gc to block indefinitely.
+pub fn herdr_tui_probe_at(proc_root: &Path, pane_id: &str) -> TuiProbe {
+    let timeout = Some(herdr_api_timeout().min(Duration::from_secs(1)));
+    let outcome = (|| -> Result<TuiProbe, ForeignOwnershipError> {
+        let info = herdr_call(&["pane", "process-info", "--pane", pane_id], timeout)?;
+        let process_info = info.get("process_info").cloned().unwrap_or(Value::Null);
+        let Some(process_info) = process_info.as_object() else {
+            return Err(ForeignOwnershipError {
+                code: "herdr_api_invalid",
+                message: "Herdr did not return pane process information".to_string(),
+            });
+        };
+        let processes: Vec<&serde_json::Map<String, Value>> = process_info
+            .get("foreground_processes")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(Value::as_object).collect())
+            .filter(|items: &Vec<_>| {
+                process_info
+                    .get("foreground_processes")
+                    .and_then(Value::as_array)
+                    .is_some_and(|all| all.len() == items.len())
+            })
+            .unwrap_or_default();
+        let pane_alive = !processes.is_empty();
+        let codex_name = Path::new(&super::runner::codex_bin())
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "codex".to_string());
+        let codex_process = processes.iter().find(|process| {
+            process.get("name").and_then(Value::as_str) == Some(codex_name.as_str())
+                || process
+                    .get("argv")
+                    .and_then(Value::as_array)
+                    .and_then(|argv| argv.first())
+                    .and_then(Value::as_str)
+                    == Some(super::runner::codex_bin().as_str())
+        });
+        let pid = codex_process
+            .and_then(|process| process.get("pid"))
+            .and_then(Value::as_i64);
+        let agent = herdr_call(&["agent", "get", pane_id], timeout)?;
+        let status = agent
+            .get("agent")
+            .and_then(|agent| agent.get("agent_status"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        Ok(TuiProbe {
+            pane_alive,
+            codex_alive: pid.is_some_and(|pid| pid_alive_at(proc_root, Some(pid))),
+            status,
+            pid,
+            error: None,
+        })
+    })();
+    outcome.unwrap_or_else(|error| TuiProbe {
+        pane_alive: false,
+        codex_alive: false,
+        status: "probe_error".to_string(),
+        pid: None,
+        error: Some(error.message),
+    })
+}
+
+/// Move the agent's state dir under `state/_archive/` (transcripts kept).
+pub fn archive_state_at(base: &Path, name: &str) -> Result<Option<PathBuf>, ForeignOwnershipError> {
+    let src = agent_dir_at(base, name)?;
+    if !src.exists() {
+        return Ok(None);
+    }
+    let archive = state_dir(base).join("_archive");
+    std::fs::create_dir_all(&archive).map_err(|e| io_error("create archive", &archive, &e))?;
+    let stamp = chrono::Local::now().format("%Y%m%dT%H%M%S").to_string();
+    let mut dest = archive.join(format!("{name}-{stamp}"));
+    let mut n = 1;
+    while dest.exists() {
+        dest = archive.join(format!("{name}-{stamp}-{n}"));
+        n += 1;
+    }
+    std::fs::rename(&src, &dest).map_err(|e| io_error("archive state", &src, &e))?;
+    Ok(Some(dest))
+}
+
+fn recorded_identity_at(path: &Path) -> Result<ProcessIdentity, ForeignOwnershipError> {
+    let unknown = |message: String| ForeignOwnershipError {
+        code: "runner_identity_unknown",
+        message,
+    };
+    let bytes = std::fs::read(path).map_err(|e| {
+        unknown(format!(
+            "{} is unreadable or malformed: {e}",
+            path.display()
+        ))
+    })?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|e| {
+        unknown(format!(
+            "{} is unreadable or malformed: {e}",
+            path.display()
+        ))
+    })?;
+    let Some(obj) = value.as_object() else {
+        return Err(unknown(format!("{} is not an object", path.display())));
+    };
+    let pid = obj.get("pid").and_then(Value::as_i64);
+    if !matches!(pid, Some(pid) if (2..=(1_i64 << 31) - 1).contains(&pid)) {
+        return Err(unknown(format!("{} has no valid pid", path.display())));
+    }
+    let started_at = obj.get("started_at");
+    if started_at.is_some_and(|value| !value.is_null() && !value.is_string()) {
+        return Err(unknown(format!(
+            "{} has an invalid started_at",
+            path.display()
+        )));
+    }
+    let boot_id = obj.get("boot_id");
+    if boot_id.is_some_and(|value| {
+        !value.is_null() && !value.as_str().is_some_and(super::ownership::valid_boot_id)
+    }) {
+        return Err(unknown(format!(
+            "{} has an invalid boot_id",
+            path.display()
+        )));
+    }
+    Ok(ProcessIdentity::new(
+        pid.unwrap_or_default(),
+        started_at.and_then(Value::as_str).map(str::to_owned),
+        boot_id.and_then(Value::as_str).map(str::to_owned),
+    ))
+}
+
+/// Whether every process recorded for one worker is provably gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Liveness {
+    /// Every recorded process has exited or its pid was reused.
+    Dead,
+    /// At least one recorded process may still run.
+    Alive,
+    /// Evidence cannot prove death.
+    Inconclusive,
+}
+
+/// Whether every process recorded for one worker is provably gone.
+///
+/// Records are checked in order: the registry row's runner (bound to its
+/// boot by the sidecar), a different pid in runner.pid, the recorded
+/// harness leader and its tree, and staged replacement runners.
+pub fn recorded_liveness_at(
+    base: &Path,
+    proc_root: &Path,
+    name: &str,
+    starting_grace: bool,
+) -> (Liveness, String) {
+    let inconclusive = |detail: String| (Liveness::Inconclusive, detail);
+    let registry_path = super::registry::registry_path(base);
+    let state = state_dir(base).join(name);
+    let rows: Value = if registry_path.exists() {
+        match std::fs::read(&registry_path)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|e| e.to_string()))
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                return inconclusive(format!("the runtime records are malformed: {error}"));
+            }
+        }
+    } else {
+        Value::Array(Vec::new())
+    };
+    let Some(rows) = rows.as_array() else {
+        return inconclusive(format!(
+            "{} is not a JSON array of objects",
+            registry_path.display()
+        ));
+    };
+    if !rows.iter().all(Value::is_object) {
+        return inconclusive(format!(
+            "{} is not a JSON array of objects",
+            registry_path.display()
+        ));
+    }
+    let matching: Vec<&serde_json::Map<String, Value>> = rows
+        .iter()
+        .filter_map(Value::as_object)
+        .filter(|row| row.get("name").and_then(Value::as_str) == Some(name))
+        .collect();
+    if matching.len() > 1 {
+        return inconclusive(format!(
+            "{} has more than one row for '{name}'",
+            registry_path.display()
+        ));
+    }
+    let row = matching.first().copied();
+    let mut processes: Vec<(&str, ProcessIdentity)> = Vec::new();
+    let mut row_pid: Option<i64> = None;
+    if let Some(row) = row {
+        match row.get("mode").and_then(Value::as_str) {
+            Some("tui") => {
+                return inconclusive(
+                    "the row is an interactive TUI, whose liveness this proof does not cover"
+                        .to_string(),
+                );
+            }
+            None if super::registry::presentation_identity_path_at(base, name)
+                .is_ok_and(|path| path.exists()) =>
+            {
+                return inconclusive(
+                    "the row has no mode and a presentation sidecar marks it as a possible TUI"
+                        .to_string(),
+                );
+            }
+            Some(mode) if mode != "headless" => {
+                return inconclusive(format!("the row has an unsupported mode '{mode}'"));
+            }
+            _ => {}
+        }
+        let raw_started = row.get("runner_started_at");
+        if raw_started.is_some_and(|value| !value.is_null() && !value.is_string()) {
+            return inconclusive("the row has an invalid runner_started_at".to_string());
+        }
+        if let Some(raw_pid) = row.get("runner_pid").filter(|value| !value.is_null()) {
+            let Some(pid) = raw_pid
+                .as_i64()
+                .filter(|pid| (1..=(1_i64 << 31) - 1).contains(pid))
+            else {
+                return inconclusive("the row has an invalid runner_pid".to_string());
+            };
+            row_pid = Some(pid);
+            // Join the boot sidecar directly (never the registry reader:
+            // gc calls this under the registry lock, and flock is per
+            // open-file-description, so re-entering it would self-deadlock).
+            let boot_id = super::registry::runner_identity_path_at(base, name)
+                .ok()
+                .and_then(|path| std::fs::read(path).ok())
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .filter(|sidecar| {
+                    sidecar.get("schema").and_then(Value::as_str)
+                        == Some(super::ownership::RUNNER_SCHEMA)
+                        && sidecar.get("name").and_then(Value::as_str) == Some(name)
+                        && sidecar.get("runner_pid").and_then(Value::as_i64) == Some(pid)
+                })
+                .and_then(|sidecar| {
+                    sidecar
+                        .get("runner_boot_id")
+                        .and_then(Value::as_str)
+                        .filter(|boot| super::ownership::valid_boot_id(boot))
+                        .map(str::to_owned)
+                });
+            processes.push((
+                "its runner",
+                ProcessIdentity::new(
+                    pid,
+                    raw_started.and_then(Value::as_str).map(str::to_owned),
+                    boot_id,
+                ),
+            ));
+        }
+    }
+    if let Ok(pid_path) = runner_pid_path_at(base, name) {
+        if pid_path.exists() {
+            let text = std::fs::read_to_string(&pid_path)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let parsed = text
+                .parse::<i64>()
+                .ok()
+                .filter(|pid| (1..=(1_i64 << 31) - 1).contains(pid));
+            let Some(pid) = parsed.filter(|_| text.bytes().all(|b| b.is_ascii_digit())) else {
+                return inconclusive(format!("{} is malformed", pid_path.display()));
+            };
+            if Some(pid) != row_pid {
+                processes.push((
+                    "the runner named in runner.pid",
+                    ProcessIdentity::new(pid, None, None),
+                ));
+            }
+        }
+    }
+    let mut harness = None;
+    let harness_path = state.join("active-harness.json");
+    if harness_path.exists() {
+        match recorded_identity_at(&harness_path) {
+            Ok(identity) => processes.push(("its harness", identity)),
+            Err(error) => return inconclusive(error.message),
+        }
+        match read_active_harness_at(base, name) {
+            Ok(record) => harness = record,
+            Err(error) => return inconclusive(error.message),
+        }
+    }
+    if state.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&state) {
+            let mut staged: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|file| file.to_str())
+                        .is_some_and(|file| {
+                            file.starts_with("MIGRATION_STAGED_") && file.ends_with(".json")
+                        })
+                })
+                .collect();
+            staged.sort();
+            for path in staged {
+                match recorded_identity_at(&path) {
+                    Ok(identity) => processes.push(("a staged replacement runner", identity)),
+                    Err(error) => return inconclusive(error.message),
+                }
+            }
+        }
+    }
+    let mut gone: Vec<String> = Vec::new();
+    for (label, identity) in &processes {
+        match super::ownership::recorded_process_alive_at(proc_root, label, identity) {
+            Ok(Some(alive)) => return (Liveness::Alive, alive),
+            Ok(None) => {}
+            Err(error) => return inconclusive(error.message),
+        }
+        gone.push(format!("{label} (pid {})", identity.pid));
+        if *label == "its harness" {
+            if let Some(harness) = &harness {
+                match super::ownership::tree_alive_at(proc_root, harness) {
+                    Ok(Some(member)) => return (Liveness::Alive, member),
+                    Ok(None) => {}
+                    Err(error) => return inconclusive(error.message),
+                }
+            }
+        }
+    }
+    if starting_grace {
+        if let Some(row) = row {
+            if row_pid.is_none() {
+                let created = row
+                    .get("created_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let Ok(instant) = chrono::DateTime::parse_from_rfc3339(created) else {
+                    return inconclusive(format!(
+                        "the row records no runner process and its created_at '{created}' cannot be read"
+                    ));
+                };
+                let age =
+                    chrono::Utc::now().signed_duration_since(instant.with_timezone(&chrono::Utc));
+                if age.num_seconds() < 20 {
+                    return inconclusive(
+                        "the row records no runner process yet; its runner may still be starting"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    let detail = if gone.is_empty() {
+        "no recorded process".to_string()
+    } else {
+        format!(
+            "every recorded process has exited or its PID now names a newer process: {}",
+            gone.join(", ")
+        )
+    };
+    (Liveness::Dead, detail)
+}
+
+fn stop_recorded_staged_runners_at(
+    base: &Path,
+    proc_root: &Path,
+    name: &str,
+) -> Result<(), ForeignOwnershipError> {
+    let state = state_dir(base).join(name);
+    if !state.is_dir() {
+        return Ok(());
+    }
+    let mut staged: Vec<PathBuf> = std::fs::read_dir(&state)
+        .map_err(|e| io_error("list staged runners", &state, &e))?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|file| file.to_str())
+                .is_some_and(|file| {
+                    file.starts_with("MIGRATION_STAGED_") && file.ends_with(".json")
+                })
+        })
+        .collect();
+    staged.sort();
+    for path in staged {
+        let identity = recorded_identity_at(&path)?;
+        if super::ownership::recorded_process_alive_at(
+            proc_root,
+            "a staged replacement runner",
+            &identity,
+        )?
+        .is_some()
+        {
+            terminate_runner_identity_at(proc_root, &identity, Duration::from_secs(2), Some(name))?;
+        }
+    }
+    Ok(())
+}
+
+/// The exact tmux target for a recorded `session:name` window.
+pub fn exact_tmux_target(target: &str) -> Result<String, ForeignOwnershipError> {
+    let Some((session, name)) = target.split_once(':') else {
+        return Err(ForeignOwnershipError {
+            code: "invalid_tmux_target",
+            message: format!("invalid recorded tmux window target '{target}'"),
+        });
+    };
+    if session.is_empty() || name.is_empty() {
+        return Err(ForeignOwnershipError {
+            code: "invalid_tmux_target",
+            message: format!("invalid recorded tmux window target '{target}'"),
+        });
+    }
+    Ok(format!("={session}:={name}"))
+}
+
+/// The tmux session subagents live in (`$SUBAGENTS_TMUX_SESSION`).
+pub fn tmux_session() -> String {
+    std::env::var("SUBAGENTS_TMUX_SESSION").unwrap_or_else(|_| "subagents".to_string())
+}
+
+/// Whether a named tmux window exists in the subagents session.
+pub fn tmux_window_exists(name: &str) -> bool {
+    tmux_target_exists(&format!("{}:{name}", tmux_session()))
+}
+
+/// Close the presentation belonging to this record without closing its workspace.
+pub fn kill_window(record: &AgentRecord) {
+    if record.backend == "tmux" {
+        if let Ok(target) = exact_tmux_target(&record.tmux_target) {
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-window", "-t", &target])
+                .output();
+        }
+    } else if let Some(tab) = record
+        .tmux_target
+        .split(':')
+        .nth(1)
+        .filter(|tab| !tab.is_empty())
+    {
+        // Herdr: close just the agent's tab.
+        let _ = herdr_call(&["tab", "close", &record.tmux_target], None)
+            .or_else(|_| herdr_call(&["tab", "close", tab], None));
+    }
+}
+
+fn herdr_workspace_from_tab(tab_id: &str) -> Option<String> {
+    let (workspace_id, separator, _tab) = match tab_id.split_once(':') {
+        Some((a, b)) => (a, ":", b),
+        None => return None,
+    };
+    let _ = separator;
+    if workspace_id.is_empty() {
+        None
+    } else {
+        Some(workspace_id.to_string())
+    }
+}
+
+/// False only for a confirmed missing workspace; unknown preserves state.
+fn herdr_workspace_exists(workspace_id: &str) -> Option<bool> {
+    match herdr_call(
+        &["workspace", "get", workspace_id],
+        Some(herdr_api_timeout().min(Duration::from_secs(1))),
+    ) {
+        Ok(_) => Some(true),
+        Err(error) if herdr_not_found(&error) => Some(false),
+        Err(_) => None,
+    }
+}
+
+fn write_workspace_loss_snapshot_at(
+    base: &Path,
+    record: &AgentRecord,
+    workspace_id: &str,
+) -> Result<PathBuf, ForeignOwnershipError> {
+    ensure_agent_dirs_at(base, &record.name)?;
+    let path = agent_dir_at(base, &record.name)?.join("WORKSPACE_LOST.json");
+    let payload = serde_json::json!({
+        "detected_at": now_iso(),
+        "workspace_id": workspace_id,
+        "agent": record.to_dict(),
+        "recovery": "The Herdr workspace disappeared. Read transcript.log and this saved registry row before starting a replacement agent. A TUI's visible-only scrollback may be unavailable after a hard workspace death.",
+    });
+    write_durable_json(&path, &payload)
+        .map_err(|e| io_error("write workspace loss snapshot", &path, &e))?;
+    Ok(path)
+}
+
+fn reap_workspace_loss_at(
+    base: &Path,
+    proc_root: &Path,
+    record: &AgentRecord,
+    workspace_id: &str,
+) -> Result<String, ForeignOwnershipError> {
+    let snapshot = write_workspace_loss_snapshot_at(base, record, workspace_id)?;
+    if record.mode == "headless" {
+        terminate_active_harness_at(base, proc_root, record)?;
+    }
+    let dest = archive_state_at(base, &record.name)?;
+    let saved_snapshot = match &dest {
+        Some(dest) => dest.join("WORKSPACE_LOST.json"),
+        None => snapshot,
+    };
+    let tail = dest
+        .as_ref()
+        .map(|dest| format!("; state archived to {}", dest.display()))
+        .unwrap_or_default();
+    write_event_at(
+        base,
+        "herdr_workspace_lost",
+        &record.name,
+        None,
+        None,
+        Some(&last_message_preview_at(base, &record.name, 240)?),
+    )?;
+    Ok(format!(
+        "reaped {} (Herdr workspace {workspace_id} is gone; hard workspace death may have interrupted a turn; recovery snapshot {}{tail})",
+        record.name,
+        saved_snapshot.display()
+    ))
+}
+
+/// Reap registry entries whose runner process is truly gone.
+///
+/// Returns human-readable notes (one per reaped agent) so callers can print
+/// a visible record — silent reaping would hide lost work.
+pub fn gc_at(base: &Path, proc_root: &Path) -> Result<Vec<String>, ForeignOwnershipError> {
+    let mut notes: Vec<String> = Vec::new();
+    let mut workspace_state: std::collections::HashMap<String, Option<bool>> = Default::default();
+    with_registry_lock_at(base, |agents| {
+        for name in agents.keys().cloned().collect::<Vec<_>>() {
+            let rec = agents[&name].clone();
+            if within_startup_grace(&rec) {
+                continue;
+            }
+            if rec.backend == "herdr" {
+                if let Some(workspace_id) = herdr_workspace_from_tab(&rec.tmux_target) {
+                    let exists = *workspace_state
+                        .entry(workspace_id.clone())
+                        .or_insert_with(|| herdr_workspace_exists(&workspace_id));
+                    match exists {
+                        None => {
+                            notes.push(format!(
+                                "{name} Herdr workspace {workspace_id} probe failed; preserving state instead of assuming a workspace death"
+                            ));
+                            continue;
+                        }
+                        Some(false) => {
+                            let process_alive = rec.mode == "headless"
+                                && runner_identity_alive_at(proc_root, &rec)?;
+                            if process_alive {
+                                notes.push(format!(
+                                    "{name} degraded: Herdr workspace {workspace_id} is gone but runner pid {} remains alive; recover its presentation before sending work",
+                                    rec.runner_pid.unwrap_or_default()
+                                ));
+                                write_event_at(
+                                    base,
+                                    "herdr_workspace_lost",
+                                    &name,
+                                    None,
+                                    None,
+                                    Some(&last_message_preview_at(base, &name, 240)?),
+                                )?;
+                                continue;
+                            }
+                            match reap_workspace_loss_at(base, proc_root, &rec, &workspace_id) {
+                                Ok(note) => notes.push(note),
+                                Err(error) => {
+                                    notes.push(format!(
+                                        "{name} degraded: Herdr workspace {workspace_id} is gone but its harness could not be cleaned ({}); preserving state",
+                                        error.message
+                                    ));
+                                    continue;
+                                }
+                            }
+                            agents.remove(&name);
+                            continue;
+                        }
+                        Some(true) => {}
+                    }
+                }
+            }
+            if rec.mode == "tui" {
+                let Some(pane) = rec.presentation_pane.clone() else {
+                    notes.push(format!(
+                        "{name} degraded: TUI registry row has no pane id; preserving state"
+                    ));
+                    continue;
+                };
+                let probe = herdr_tui_probe_at(proc_root, &pane);
+                if let Some(error) = &probe.error {
+                    notes.push(format!(
+                        "{name} TUI probe failed; preserving state: {error}"
+                    ));
+                    continue;
+                }
+                if probe.pane_alive {
+                    if !probe.codex_alive {
+                        notes.push(format!(
+                            "{name} degraded: Herdr TUI pane {pane} is alive but Codex is not its foreground process; preserving it for inspection"
+                        ));
+                    }
+                    continue;
+                }
+                if herdr_tab_exists(&rec.tmux_target) {
+                    notes.push(format!(
+                        "{name} degraded: Herdr tab {} remains but its TUI pane is gone; preserving state for inspection",
+                        rec.tmux_target
+                    ));
+                    continue;
+                }
+                let dest = archive_state_at(base, &name)?;
+                agents.remove(&name);
+                let tail = dest
+                    .as_ref()
+                    .map(|dest| format!("; state archived to {}", dest.display()))
+                    .unwrap_or_default();
+                notes.push(format!("reaped {name} (Herdr TUI pane is gone){tail}"));
+                continue;
+            }
+            let win = window_exists(&rec);
+            let runner_alive = runner_identity_alive_at(proc_root, &rec)?;
+            if runner_alive {
+                if !win {
+                    notes.push(format!(
+                        "{name} degraded: runner pid {} is alive but {} presentation {} is missing; recreate presentation",
+                        rec.runner_pid.unwrap_or_default(),
+                        rec.backend,
+                        if rec.tmux_target.is_empty() { &rec.name } else { &rec.tmux_target }
+                    ));
+                }
+                continue;
+            }
+            let reason = match rec.runner_pid {
+                None => "runner pid missing after startup grace".to_string(),
+                Some(pid) => format!("runner pid {pid} not alive or reused"),
+            };
+            if let Err(error) = terminate_active_harness_at(base, proc_root, &rec) {
+                notes.push(format!(
+                    "{name} degraded: {reason}, but its harness could not be cleaned ({}); preserving state",
+                    error.message
+                ));
+                continue;
+            }
+            let (verdict, detail) = recorded_liveness_at(base, proc_root, &name, true);
+            if verdict != Liveness::Dead {
+                let verdict_name = match verdict {
+                    Liveness::Alive => "alive",
+                    Liveness::Inconclusive => "inconclusive",
+                    Liveness::Dead => "dead",
+                };
+                notes.push(format!(
+                    "{name} degraded: {reason}, but a recorded process is {verdict_name} ({detail}); preserving state"
+                ));
+                continue;
+            }
+            if win {
+                kill_window(&rec);
+            }
+            let dest = archive_state_at(base, &name)?;
+            agents.remove(&name);
+            let tail = dest
+                .as_ref()
+                .map(|dest| format!("; state archived to {}", dest.display()))
+                .unwrap_or_default();
+            notes.push(format!("reaped {name} ({reason}){tail}"));
+        }
+        Ok(())
+    })?;
+    Ok(notes)
+}
+
+fn herdr_tab_exists(tab_id: &str) -> bool {
+    match herdr_call(&["tab", "get", tab_id], None) {
+        Ok(_) => true,
+        Err(error) if herdr_not_found(&error) => false,
+        Err(error) => !herdr_not_found(&error),
+    }
+}
+
+/// A worker snapshot combining registry identity, process health, and queue counts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentStatus {
+    /// Agent name.
+    pub name: String,
+    /// Harness identifier.
+    pub harness: String,
+    /// Presentation backend.
+    pub backend: String,
+    /// Tmux target or Herdr tab id.
+    pub tmux_target: String,
+    /// Working directory.
+    pub cwd: String,
+    /// Model override.
+    pub model: Option<String>,
+    /// Harness session id.
+    pub session_id: Option<String>,
+    /// Display status.
+    pub status: String,
+    /// Runner pid.
+    pub runner_pid: Option<i64>,
+    /// Runner kernel start ticks.
+    pub runner_started_at: Option<String>,
+    /// Next message sequence number.
+    pub next_seq: i64,
+    /// Creation timestamp.
+    pub created_at: String,
+    /// Last turn timestamp.
+    pub last_turn_at: Option<String>,
+    /// Whether the presentation window/tab is alive.
+    pub window_alive: bool,
+    /// Whether the runner process is alive.
+    pub runner_alive: bool,
+    /// Whether a live runner has lost its presentation.
+    pub presentation_degraded: bool,
+    /// Pending message count.
+    pub pending: usize,
+    /// Transcript path (display string).
+    pub transcript: String,
+    /// Bounded preview of the latest answer.
+    pub last_message_preview: String,
+    /// Worker mode.
+    pub mode: String,
+    /// Herdr pane owning an interactive TUI.
+    pub presentation_pane: Option<String>,
+    /// Whether automation is paused for this worker.
+    pub automation_paused: bool,
+}
+
+/// Worker status snapshots plus garbage-collection notes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatusResult {
+    /// Snapshots by sorted agent name.
+    pub agents: Vec<AgentStatus>,
+    /// Garbage-collection notes from the pre-pass.
+    pub gc_notes: Vec<String>,
+}
+
+fn agent_status_at(
+    base: &Path,
+    proc_root: &Path,
+    record: &AgentRecord,
+) -> Result<AgentStatus, ForeignOwnershipError> {
+    if record.mode == "tui" {
+        let probe = match &record.presentation_pane {
+            None => TuiProbe {
+                pane_alive: false,
+                codex_alive: false,
+                status: "probe_error".to_string(),
+                pid: None,
+                error: Some("registry row has no TUI pane id".to_string()),
+            },
+            Some(pane) => herdr_tui_probe_at(proc_root, pane),
+        };
+        let status = if let Some(error) = &probe.error {
+            format!("probe_error: {error}")
+        } else {
+            match probe.status.as_str() {
+                "working" => "busy".to_string(),
+                "idle" | "done" => "idle".to_string(),
+                "blocked" => "blocked".to_string(),
+                _ => "unknown".to_string(),
+            }
+        };
+        return Ok(AgentStatus {
+            name: record.name.clone(),
+            harness: record.harness.clone(),
+            backend: record.backend.clone(),
+            tmux_target: record.tmux_target.clone(),
+            cwd: record.cwd.clone(),
+            model: record.model.clone(),
+            session_id: record.session_id.clone(),
+            status,
+            runner_pid: probe.pid,
+            runner_started_at: match probe.pid {
+                Some(pid) => pid_start_time_at(proc_root, pid).unwrap_or(None),
+                None => None,
+            },
+            next_seq: record.next_seq,
+            created_at: record.created_at.clone(),
+            last_turn_at: record.last_turn_at.clone(),
+            window_alive: probe.pane_alive,
+            runner_alive: probe.codex_alive,
+            presentation_degraded: probe.pane_alive && !probe.codex_alive,
+            pending: pending_count_at(base, &record.name)?,
+            transcript: format!(
+                "herdr pane {}",
+                record.presentation_pane.as_deref().unwrap_or("<missing>")
+            ),
+            last_message_preview: String::new(),
+            mode: record.mode.clone(),
+            presentation_pane: record.presentation_pane.clone(),
+            automation_paused: agent_dir_at(base, &record.name)
+                .is_ok_and(|dir| dir.join("automation-paused").exists()),
+        });
+    }
+    let runner_alive = runner_identity_alive_at(proc_root, record)?;
+    let win = window_exists(record);
+    Ok(AgentStatus {
+        name: record.name.clone(),
+        harness: record.harness.clone(),
+        backend: record.backend.clone(),
+        tmux_target: record.tmux_target.clone(),
+        cwd: record.cwd.clone(),
+        model: record.model.clone(),
+        session_id: record.session_id.clone(),
+        status: record.status.clone(),
+        runner_pid: record.runner_pid,
+        runner_started_at: record.runner_started_at.clone(),
+        next_seq: record.next_seq,
+        created_at: record.created_at.clone(),
+        last_turn_at: record.last_turn_at.clone(),
+        window_alive: win,
+        runner_alive,
+        presentation_degraded: runner_alive && !win,
+        pending: pending_count_at(base, &record.name)?,
+        transcript: transcript_path_at(base, &record.name)?
+            .display()
+            .to_string(),
+        last_message_preview: last_message_preview_at(base, &record.name, 240)?,
+        mode: record.mode.clone(),
+        presentation_pane: record.presentation_pane.clone(),
+        automation_paused: agent_dir_at(base, &record.name)
+            .is_ok_and(|dir| dir.join("automation-paused").exists()),
+    })
+}
+
+/// One or all worker statuses, optionally collecting confirmed dead workers first.
+pub fn status_snapshot_at(
+    base: &Path,
+    proc_root: &Path,
+    name: Option<&str>,
+    run_gc: bool,
+) -> Result<StatusResult, ForeignOwnershipError> {
+    let notes = if run_gc {
+        gc_at(base, proc_root)?
+    } else {
+        Vec::new()
+    };
+    let registry = super::registry::read_registry_at(base)?;
+    let records: Vec<AgentRecord> = match name {
+        Some(name) => {
+            let name = super::registry::require_valid_name(name)?;
+            let Some(record) = registry.get(name) else {
+                return Err(ForeignOwnershipError {
+                    code: "unknown_agent",
+                    message: format!("unknown agent '{name}'"),
+                });
+            };
+            vec![record.clone()]
+        }
+        None => registry.values().cloned().collect(),
+    };
+    let mut agents = Vec::new();
+    for record in &records {
+        agents.push(agent_status_at(base, proc_root, record)?);
+    }
+    Ok(StatusResult {
+        agents,
+        gc_notes: notes,
+    })
+}
+
+/// Worker retirement outcome, including presentation cleanup and archive location.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DownResult {
+    /// Agent name.
+    pub name: String,
+    /// Whether the presentation window/tab was killed.
+    pub killed_window: bool,
+    /// Archive destination (display string), when state was archived.
+    pub archived_to: Option<String>,
+    /// Kept state path when not archiving.
+    pub state_path: Option<String>,
+    /// Whether a registry row existed.
+    pub was_registered: bool,
+    /// Whether retirement was forced without backend probing.
+    pub forced: bool,
+    /// Presentation that force mode did not verify.
+    pub unverified_presentation: Option<String>,
+}
+
+/// Remove a headless worker's tmux guard window, when it keeps one.
+fn remove_legacy_tmux_guard(record: &AgentRecord) {
+    if record.backend != "herdr" {
+        return;
+    }
+    // The guard is a plain tmux window named after the worker in the
+    // subagents session; closing it cannot touch the Herdr presentation.
+    if tmux_window_exists(&record.name) {
+        let target = format!("{}:{}", tmux_session(), record.name);
+        if let Ok(exact) = exact_tmux_target(&target) {
+            let _ = std::process::Command::new("tmux")
+                .args(["kill-window", "-t", &exact])
+                .output();
+        }
+    }
+}
+
+/// Retire an agent: stop its runner, close its presentation, archive state.
+///
+/// Force mode remains narrow: it can stop a local headless runner, but
+/// never contacts or claims to close the presentation backend.
+pub fn bring_down_agent_at(
+    base: &Path,
+    proc_root: &Path,
+    name: &str,
+    grace: Duration,
+    archive: bool,
+    force: bool,
+) -> Result<DownResult, ForeignOwnershipError> {
+    let valid_name = super::registry::require_valid_name(name)?.to_string();
+    let record = super::registry::read_registry_at(base)?
+        .get(&valid_name)
+        .cloned();
+    let was_registered = record.is_some();
+    if let Some(record) = &record {
+        if record.mode == "headless" {
+            let stop = stop_path_at(base, &valid_name)?;
+            std::fs::write(&stop, format!("{}\n", now_iso()))
+                .map_err(|error| io_error("write stop marker", &stop, &error))?;
+            let deadline = Instant::now() + grace;
+            while Instant::now() < deadline {
+                let current = super::registry::read_registry_at(base)?
+                    .get(&valid_name)
+                    .cloned();
+                match current {
+                    None => break,
+                    Some(current) if !runner_identity_alive_at(proc_root, &current)? => break,
+                    _ => std::thread::sleep(Duration::from_millis(200)),
+                }
+            }
+            if let Some(current) = super::registry::read_registry_at(base)?
+                .get(&valid_name)
+                .cloned()
+            {
+                terminate_runner_at(base, proc_root, &current, grace)?;
+            }
+            stop_recorded_staged_runners_at(base, proc_root, &valid_name)?;
+            let (verdict, detail) = recorded_liveness_at(base, proc_root, &valid_name, false);
+            if verdict == Liveness::Alive || (verdict == Liveness::Inconclusive && !force) {
+                let verdict_name = match verdict {
+                    Liveness::Alive => "alive",
+                    Liveness::Inconclusive => "inconclusive",
+                    Liveness::Dead => "dead",
+                };
+                return Err(ForeignOwnershipError {
+                    code: "worker_processes_remain",
+                    message: format!(
+                        "refusing to retire '{valid_name}': a recorded process is {verdict_name} ({detail}); its state and registry row are unchanged"
+                    ),
+                });
+            }
+        }
+    }
+    let mut unverified_presentation: Option<String> = None;
+    let mut killed_window = false;
+    if force {
+        if let Some(record) = &record {
+            let presentation = if record.mode == "tui" {
+                record
+                    .presentation_pane
+                    .clone()
+                    .unwrap_or_else(|| record.name.clone())
+            } else {
+                record.tmux_target.clone()
+            };
+            unverified_presentation =
+                Some(format!("{} presentation {presentation}", record.backend));
+        }
+    } else if let Some(record) = &record {
+        killed_window = if record.mode == "tui" {
+            herdr_tab_exists(&record.tmux_target)
+        } else {
+            window_exists(record)
+        };
+        if killed_window {
+            if record.mode == "tui" {
+                // Closing the Herdr tab closes the presentation.
+                kill_window(record);
+            } else {
+                kill_window(record);
+            }
+        }
+    }
+    if let Some(record) = &record {
+        if record.backend == "herdr"
+            && (record.mode == "headless"
+                || agent_dir_at(base, &record.name)
+                    .is_ok_and(|dir| dir.join("legacy-tmux-guard").exists()))
+        {
+            remove_legacy_tmux_guard(record);
+        }
+    }
+    let preview = last_message_preview_at(base, &valid_name, 240)?;
+    let (mut archived_to, mut state_path) = (None::<String>, None::<String>);
+    if archive {
+        archived_to = archive_state_at(base, &valid_name)?.map(|path| path.display().to_string());
+    } else {
+        let dir = agent_dir_at(base, &valid_name)?;
+        if dir.exists() {
+            state_path = Some(dir.display().to_string());
+        }
+    }
+    with_registry_lock_at(base, |agents| {
+        agents.remove(&valid_name);
+        Ok(())
+    })?;
+    if was_registered || killed_window || archived_to.is_some() || state_path.is_some() {
+        write_event_at(
+            base,
+            if force {
+                "agent_down_forced"
+            } else {
+                "agent_down"
+            },
+            &valid_name,
+            None,
+            None,
+            Some(&preview),
+        )?;
+    }
+    Ok(DownResult {
+        name: valid_name,
+        killed_window,
+        archived_to,
+        state_path,
+        was_registered,
+        forced: force,
+        unverified_presentation,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1195,6 +2357,67 @@ mod tests {
         assert!(wait_for_staged_runner_activation_at(&base, "worker-1", "tok1").unwrap());
         clear_migration_markers_at(&base, "worker-1", "tok1").unwrap();
         assert!(!migration_pause_path_at(&base, "worker-1").unwrap().exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn gc_reaps_a_dead_headless_worker_and_status_lists_live_ones() {
+        let base = fake_base("gc-status");
+        with_registry_lock_at(&base, |agents| {
+            for (name, pid) in [("dead-1", Some(2_147_483_646)), ("live-1", None)] {
+                agents.insert(
+                    name.to_string(),
+                    AgentRecord {
+                        name: name.to_string(),
+                        harness: "codex".to_string(),
+                        backend: "tmux".to_string(),
+                        tmux_target: "subagents:gone".to_string(),
+                        status: "idle".to_string(),
+                        runner_pid: pid,
+                        created_at: "2026-11-01T00:00:00Z".to_string(),
+                        ..AgentRecord::default()
+                    },
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+        ensure_agent_dirs_at(&base, "dead-1").unwrap();
+        // live-1 has no runner pid but is far past startup grace; gc would
+        // reap it too, so give it this process as its live runner.
+        with_registry_lock_at(&base, |agents| {
+            let record = agents.get_mut("live-1").unwrap();
+            record.runner_pid = Some(std::process::id() as i64);
+            record.runner_started_at =
+                pid_start_time_at(Path::new("/proc"), std::process::id() as i64).unwrap();
+            record.runner_boot_id = Some(current_boot_id_at(Path::new("/proc")).unwrap());
+            Ok(())
+        })
+        .unwrap();
+        let notes = gc_at(&base, Path::new("/proc")).unwrap();
+        assert!(
+            notes.iter().any(|note| note.starts_with("reaped dead-1")),
+            "{notes:?}"
+        );
+        let registry = read_registry_at(&base).unwrap();
+        assert!(!registry.contains_key("dead-1"));
+        assert!(registry.contains_key("live-1"));
+        let status = status_snapshot_at(&base, Path::new("/proc"), Some("live-1"), false).unwrap();
+        assert_eq!(status.agents.len(), 1);
+        assert!(status.agents[0].runner_alive);
+        // Down on the live stand-in refuses while its runner (this test
+        // process) is alive and not the recorded daemon: terminate_runner
+        // would signal it, so only check the unknown-agent path here.
+        let gone = bring_down_agent_at(
+            &base,
+            Path::new("/proc"),
+            "never-registered",
+            Duration::ZERO,
+            true,
+            false,
+        )
+        .unwrap();
+        assert!(!gone.was_registered);
         let _ = std::fs::remove_dir_all(&base);
     }
 

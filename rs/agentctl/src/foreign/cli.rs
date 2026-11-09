@@ -19,7 +19,7 @@ const COMMANDS: [&str; 12] = [
     "keeper", "mcp",
 ];
 
-const NOT_PORTED: [&str; 7] = ["up", "status", "down", "inbox", "migrate", "turn", "keeper"];
+const NOT_PORTED: [&str; 5] = ["up", "inbox", "migrate", "turn", "keeper"];
 
 fn argparse_error(usage: &str, prog: &str, message: &str) -> i32 {
     eprintln!("{usage}\n{prog}: error: {message}");
@@ -347,6 +347,204 @@ fn read_command(args: &[String]) -> i32 {
     }
 }
 
+fn short_session(sid: Option<&str>) -> String {
+    match sid {
+        None => "-".to_string(),
+        Some(sid) => sid.chars().take(8).collect(),
+    }
+}
+
+fn status_command(args: &[String]) -> i32 {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print!("{STATUS_HELP}");
+        return 0;
+    }
+    let parsed = match parse(args, &[], &[], STATUS_USAGE, "herdr-subagents status") {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
+    if parsed.positionals.len() > 1 {
+        return argparse_error(
+            STATUS_USAGE,
+            "herdr-subagents status",
+            &format!(
+                "unrecognized arguments: {}",
+                parsed.positionals[1..].join(" ")
+            ),
+        );
+    }
+    let base = foreign_base();
+    let status = match super::lifecycle::status_snapshot_at(
+        &base,
+        Path::new("/proc"),
+        parsed.positionals.first().map(String::as_str),
+        true,
+    ) {
+        Ok(status) => status,
+        Err(error) => return operation_die(&error),
+    };
+    for note in &status.gc_notes {
+        println!("[gc] {note}");
+    }
+    if status.agents.is_empty() {
+        println!("no live subagents");
+        return 0;
+    }
+    let header = format!(
+        "{:<16} {:<7} {:<9} {:<8} {:<14} {:<4} {:<16} {:<5} {:<10} {:<20} CWD",
+        "NAME",
+        "BACKEND",
+        "MODE",
+        "HARNESS",
+        "MODEL",
+        "WIN",
+        "STATUS",
+        "PEND",
+        "SESSION",
+        "LAST_TURN"
+    );
+    println!("{header}");
+    println!("{}", "-".repeat(header.len()));
+    for rec in &status.agents {
+        let win = if rec.window_alive {
+            "yes"
+        } else if rec.presentation_degraded {
+            "DEG"
+        } else {
+            "NO"
+        };
+        println!(
+            "{:<16} {:<7} {:<9} {:<8} {:<14} {:<4} {:<16} {:<5} {:<10} {:<20} {}",
+            rec.name,
+            rec.backend,
+            rec.mode,
+            rec.harness,
+            rec.model.as_deref().unwrap_or("<default>"),
+            win,
+            rec.status,
+            rec.pending,
+            short_session(rec.session_id.as_deref()),
+            rec.last_turn_at.as_deref().unwrap_or("-"),
+            rec.cwd
+        );
+    }
+    println!();
+    for rec in &status.agents {
+        if rec.mode == "tui" {
+            println!("  {}: Herdr scrollback {}", rec.name, rec.transcript);
+        } else {
+            println!("  {}: transcript {}", rec.name, rec.transcript);
+        }
+        if rec.presentation_degraded {
+            println!(
+                "  {}: runner alive but {} presentation missing; use MCP subagent_recreate_window to restore presentation",
+                rec.name, rec.backend
+            );
+        }
+    }
+    0
+}
+
+fn down_command(args: &[String]) -> i32 {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print!("{DOWN_HELP}");
+        return 0;
+    }
+    let parsed = match parse(
+        args,
+        &["--grace"],
+        &["--all-dead", "--force"],
+        DOWN_USAGE,
+        "herdr-subagents down",
+    ) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
+    if parsed.positionals.len() > 1 {
+        return argparse_error(
+            DOWN_USAGE,
+            "herdr-subagents down",
+            &format!(
+                "unrecognized arguments: {}",
+                parsed.positionals[1..].join(" ")
+            ),
+        );
+    }
+    let grace_seconds: f64 = match parsed.get("--grace") {
+        None => 10.0,
+        Some(raw) => match raw.parse() {
+            Ok(value) => value,
+            Err(_) => {
+                return argparse_error(
+                    DOWN_USAGE,
+                    "herdr-subagents down",
+                    &format!("argument --grace: invalid float value: '{raw}'"),
+                )
+            }
+        },
+    };
+    let grace = std::time::Duration::try_from_secs_f64(grace_seconds.max(0.0)).unwrap_or_default();
+    let base = foreign_base();
+    if parsed.has("--all-dead") {
+        if parsed.has("--force") {
+            return die("--force requires an agent NAME; --all-dead remains conservative");
+        }
+        return match super::lifecycle::gc_at(&base, Path::new("/proc")) {
+            Ok(notes) => {
+                if notes.is_empty() {
+                    println!("no dead agents to reap");
+                } else {
+                    for note in notes {
+                        println!("[gc] {note}");
+                    }
+                }
+                0
+            }
+            Err(error) => operation_die(&error),
+        };
+    }
+    let Some(name) = parsed.positionals.first() else {
+        return die("give an agent NAME, or use --all-dead");
+    };
+    if let Err(error) = super::registry::require_valid_name(name) {
+        return operation_die(&error);
+    }
+    match super::lifecycle::bring_down_agent_at(
+        &base,
+        Path::new("/proc"),
+        name,
+        grace,
+        true,
+        parsed.has("--force"),
+    ) {
+        Ok(res) => {
+            if !res.was_registered {
+                println!(
+                    "agent '{}' was not in the registry; killed_window={}; archived {}",
+                    res.name,
+                    res.killed_window,
+                    res.archived_to.as_deref().unwrap_or("None")
+                );
+            } else if res.forced {
+                println!(
+                    "WARNING: forced retirement of '{}'; {} was not probed or closed. State archived to {}; registry entry removed.",
+                    res.name,
+                    res.unverified_presentation.as_deref().unwrap_or_default(),
+                    res.archived_to.as_deref().unwrap_or("None")
+                );
+            } else {
+                println!(
+                    "agent '{}' down; window killed; state archived to {}",
+                    res.name,
+                    res.archived_to.as_deref().unwrap_or("None")
+                );
+            }
+            0
+        }
+        Err(error) => operation_die(&error),
+    }
+}
+
 fn reset_command(args: &[String]) -> i32 {
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         print!("{RESET_HELP}");
@@ -422,6 +620,8 @@ pub fn main(arguments: &[String]) -> i32 {
         "send" => send_command(rest),
         "read" => read_command(rest),
         "reset" => reset_command(rest),
+        "status" => status_command(rest),
+        "down" => down_command(rest),
         "mcp" => {
             eprintln!("herdr-subagents: the Rust edition has not ported 'mcp' yet");
             2
