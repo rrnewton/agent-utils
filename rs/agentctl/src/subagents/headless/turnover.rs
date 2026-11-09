@@ -329,6 +329,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                     "now",
                     None,
                     false,
+                    None,
                 )?;
             }
             journal.insert("prompt_id".to_owned(), json!(id));
@@ -418,6 +419,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 &handoff_request(&record.name, &path, &nonce),
                 None,
                 options.interrupt,
+                None,
                 None,
                 Duration::ZERO,
             )?;

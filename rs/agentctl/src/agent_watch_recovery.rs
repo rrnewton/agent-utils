@@ -94,7 +94,17 @@ pub(super) fn recover_due(
                 receipt.attempts
             );
             let target = options.coordinator.as_str();
-            if let Err(error) = notifier.notify(target, &notice, &notice_id) {
+            let supersede_key = format!(
+                "recovery-{agent}-{:x}",
+                super::stable_hash(&receipt.episode)
+            );
+            if let Err(error) = notifier.notify_expiring(
+                target,
+                &notice,
+                &notice_id,
+                Some(super::NOTICE_TTL),
+                Some(&supersede_key),
+            ) {
                 super::log(format_args!("recovery notice failed: {error}"));
             }
             super::log(format_args!(

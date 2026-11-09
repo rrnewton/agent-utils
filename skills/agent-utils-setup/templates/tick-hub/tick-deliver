@@ -32,7 +32,10 @@ grep -q '^ACTION:' "$out" || exit 0
     echo "tick-hub (from $(basename "$H")-tick-hub.timer):"
     cat "$out"
 } > "$msg"
-"$AU/agentctl" send "$AGENT" --file "$msg" --ready-timeout 0
+# TTL = the timer period (15 min) and one supersede key for the tick blob, so a
+# coordinator that was blocked or busy is typed only the newest tick, never a
+# backlog of stale ones (#1157 automated-notice-ttl).
+"$AU/agentctl" send "$AGENT" --file "$msg" --ready-timeout 0 --ttl 900 --supersede-key "tick-hub:$(basename "$H")"
 rc=$?
 [ "$rc" -eq 75 ] && exit 0      # queued; the next run's drain delivers it
 exit "$rc"

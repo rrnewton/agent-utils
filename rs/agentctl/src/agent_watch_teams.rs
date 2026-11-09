@@ -84,7 +84,13 @@ pub(super) fn report_team_declarations(
     );
     let recipient = team_recipient(probe, options);
     let message_id = format!("agent-watch-team-declarations-{}", now as u64);
-    let outcome = match notifier.notify(&recipient, &text, &message_id) {
+    let outcome = match notifier.notify_expiring(
+        &recipient,
+        &text,
+        &message_id,
+        Some(super::NOTICE_TTL),
+        Some("team-declarations"),
+    ) {
         Ok(outcome) => {
             state.team_flags_reported = fingerprint;
             json!({"reported": true, "recipient": recipient, "outcome": outcome})
@@ -168,7 +174,13 @@ pub(super) fn report_team_notices(
         );
         let recipient = team_recipient(probe, options);
         told = notifier
-            .notify(&recipient, &text, &message_id)
+            .notify_expiring(
+                &recipient,
+                &text,
+                &message_id,
+                Some(super::NOTICE_TTL),
+                Some("team-undeliverable"),
+            )
             .map(|outcome| json!({"recipient": recipient, "outcome": outcome}))
             .map_err(|error| error.to_string());
     }

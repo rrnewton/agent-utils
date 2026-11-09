@@ -88,6 +88,8 @@ class QueueResult:
     pending: tuple[str, ...]
     blocked: str | None = None
     outcome: str = "delivered"
+    #: Pending prompts this send's supersede key set aside untyped (#1156).
+    superseded: tuple[str, ...] = ()
 
 
 class _PossiblySubmitted(AgentDeliveryError):
@@ -1216,6 +1218,7 @@ def enqueue(
 
 def queue_only(
     root: str, target: Target, text: str, *, message_id: str | None = None,
+    supersede_key: str | None = None,
     max_artifact_bytes: int | None = None, atomic_policy: AtomicWritePolicy | None = None,
 ) -> QueueResult:
     """Queue one prompt and return at once, without draining it (#746 restore-im-back).
@@ -1229,14 +1232,95 @@ def queue_only(
             root, target, max_artifact_bytes=max_artifact_bytes,
             allow_legacy_workspace_binding=True,
         )
-        identifier = _enqueue(
-            root, text, message_id=message_id, serialize=message_id is not None,
+        identifier, superseded = _enqueue_outcome(
+            root, text, message_id=message_id,
+            serialize=message_id is not None or supersede_key is not None,
+            supersede_key=supersede_key,
             max_artifact_bytes=max_artifact_bytes,
         )
         return QueueResult(
             message_id=identifier, delivered=(), quarantined=(),
             pending=(identifier,), blocked=None, outcome="pending",
+            superseded=tuple(superseded),
         )
+
+
+def validate_supersede_key(key: str) -> None:
+    """Require a valid supersede key: 1-255 bytes, no control characters (#1156)."""
+    encoded = key.encode("utf-8")
+    if not encoded or len(encoded) > 255 or any(byte < 0x20 or byte == 0x7F for byte in encoded):
+        raise AgentDeliveryError(
+            "supersede key must be 1-255 bytes with no control characters"
+        )
+
+
+def _supersede_pending(
+    root: str, inbox: str, *, key: str, new_id: str, max_artifact_bytes: int | None,
+) -> list[str]:
+    """Set aside every still-pending inbox prompt carrying ``key`` (#1156).
+
+    The caller holds the delivery lock, so no drain moves items meanwhile.
+    Replaced prompts move to ``cancelled/`` stamped ``superseded`` with
+    ``superseded_by`` naming the new prompt, exactly as the Rust edition
+    records them; delivered history and composer-stranded prompts
+    (``stranded_at`` / ``paste_started_at``) are never touched. Returns the
+    replaced identifiers, oldest first.
+    """
+    matches: list[tuple[float, str, dict[str, object]]] = []
+    try:
+        names = sorted(os.listdir(inbox))
+    except OSError:
+        return []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(inbox, name)
+        try:
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                continue
+            with open(path, encoding="utf-8") as handle:
+                document = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(document, dict) or document.get("supersede_key") != key:
+            continue
+        if document.get("id") == new_id:
+            continue
+        if document.get("stranded_at") is not None or document.get("paste_started_at") is not None:
+            continue
+        queued_at = document.get("queued_at")
+        matches.append((
+            float(queued_at) if isinstance(queued_at, (int, float)) else float("inf"),
+            path,
+            document,
+        ))
+    if not matches:
+        return []
+    matches.sort(key=lambda item: item[0])
+    cancelled = os.path.join(root, "cancelled")
+    os.makedirs(cancelled, mode=0o700, exist_ok=True)
+    _validate_private_directory(cancelled, "queue state directory", tighten=True)
+    superseded: list[str] = []
+    for _queued_at, path, document in matches:
+        identifier = document.get("id")
+        if not isinstance(identifier, str):
+            identifier = os.path.basename(path)[:-5]
+        document = dict(document)
+        for field in ("possibly_submitted", "inflight_at", "paste_tracking",
+                      "inflight_from", "paste_started_at"):
+            document.pop(field, None)
+        document["delivery_state"] = "cancelled"
+        document["cancel_reason"] = "superseded"
+        document["cancel_detail"] = f"superseded by {new_id}"
+        document["cancelled_at"] = time.time()
+        document["superseded_by"] = new_id
+        _atomic_json(path, document, max_artifact_bytes=max_artifact_bytes)
+        _transition(
+            path, os.path.join(cancelled, os.path.basename(path)),
+            max_artifact_bytes=max_artifact_bytes,
+        )
+        superseded.append(identifier)
+    return superseded
 
 
 def _enqueue(
@@ -1247,9 +1331,29 @@ def _enqueue(
     serialize: bool,
     max_artifact_bytes: int | None = None,
 ) -> str:
+    identifier, _superseded = _enqueue_outcome(
+        root, text, message_id=message_id, serialize=serialize,
+        max_artifact_bytes=max_artifact_bytes,
+    )
+    return identifier
+
+
+def _enqueue_outcome(
+    root: str,
+    text: str,
+    *,
+    message_id: str | None,
+    serialize: bool,
+    supersede_key: str | None = None,
+    max_artifact_bytes: int | None = None,
+) -> tuple[str, list[str]]:
     max_artifact_bytes = _effective_artifact_limit(max_artifact_bytes)
     if not text:
         raise AgentDeliveryError("message must not be empty")
+    if supersede_key is not None:
+        validate_supersede_key(supersede_key)
+        if not serialize:
+            raise AgentDeliveryError("supersede key requires a serialized enqueue")
     _refuse_queue_lanes(root)
     inbox, inflight, processed, failed = _prepare(root)
     identifier = f"{time.time_ns():020d}-{os.getpid()}" if message_id is None else message_id
@@ -1274,23 +1378,35 @@ def _enqueue(
         if any(os.path.lexists(os.path.join(directory, filename))
                for directory in (inbox, inflight, processed, failed, *lanes)):
             raise AgentDeliveryError(f"message id already exists: {identifier}")
+        document: dict[str, object] = {
+            "id": identifier,
+            "text": text,
+            "queued_at": time.time(),
+            "delivery_attempts": 0,
+        }
+        if supersede_key is not None:
+            document["supersede_key"] = supersede_key
         try:
             _atomic_json_create(
                 path,
-                {
-                    "id": identifier,
-                    "text": text,
-                    "queued_at": time.time(),
-                    "delivery_attempts": 0,
-                },
+                document,
                 max_artifact_bytes=max_artifact_bytes,
             )
         except FileExistsError as exc:
             raise AgentDeliveryError(f"message id already exists: {identifier}") from exc
+        # The new prompt is durable before anything is set aside, so a failure
+        # here can duplicate a notice but never lose one; the delivery lock
+        # (serialize, required above) keeps a drain from typing either copy.
+        superseded: list[str] = []
+        if supersede_key is not None:
+            superseded = _supersede_pending(
+                root, inbox, key=supersede_key, new_id=identifier,
+                max_artifact_bytes=max_artifact_bytes,
+            )
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-    return identifier
+    return identifier, superseded
 
 
 def _binding(target: Target) -> dict[str, object]:
@@ -2375,6 +2491,7 @@ def _drain(
 
 def send(
     client: HerdrClient, target: Target, root: str, text: str, *, message_id: str | None = None,
+    supersede_key: str | None = None,
     **kwargs: object,
 ) -> QueueResult:
     """Durably enqueue one prompt, drain its bound FIFO, and return confirmed delivery."""
@@ -2383,11 +2500,13 @@ def send(
         raise AgentDeliveryError("atomic_policy must be an AtomicWritePolicy or None")
     with atomic_write_policy(atomic_policy):
         return _send(client, target, root, text, message_id=message_id,
+                     supersede_key=supersede_key,
                      atomic_policy=_ACTIVE_ATOMIC_POLICY.get(), **kwargs)
 
 
 def _send(
     client: HerdrClient, target: Target, root: str, text: str, *, message_id: str | None,
+    supersede_key: str | None = None,
     atomic_policy: AtomicWritePolicy | None, **kwargs: object,
 ) -> QueueResult:
 
@@ -2409,14 +2528,23 @@ def _send(
     # and terminal-artifact inspection resolve any cross-sender consumption safely.
     # A caller-selected ID can move out of inbox while another caller is checking
     # it. Serialize that check with delivery, so the same ID cannot be recreated.
-    identifier = _enqueue(
-        root, text, message_id=message_id, serialize=message_id is not None,
+    identifier, superseded = _enqueue_outcome(
+        root, text, message_id=message_id,
+        serialize=message_id is not None or supersede_key is not None,
+        supersede_key=supersede_key,
         max_artifact_bytes=max_artifact_bytes,
     )
     result = drain(client, target, root, max_artifact_bytes=max_artifact_bytes,
                    atomic_policy=atomic_policy,
                    allow_legacy_workspace_binding=allow_legacy_workspace_binding,
                    **kwargs)  # type: ignore[arg-type]
+    if superseded:
+        result = QueueResult(
+            message_id=result.message_id, delivered=result.delivered,
+            quarantined=result.quarantined, pending=result.pending,
+            blocked=result.blocked, outcome=result.outcome,
+            superseded=tuple(superseded),
+        )
     filename = f"{identifier}.json"
     failed_path = os.path.join(root, "failed", filename)
     if identifier in result.quarantined or os.path.lexists(failed_path):
@@ -2470,6 +2598,7 @@ def _send(
             result.pending,
             result.blocked,
             "delivered",
+            superseded=result.superseded,
         )
     raise AgentDeliveryError(
         _bounded_error(f"message {identifier} disappeared without a durable terminal artifact", max_artifact_bytes)

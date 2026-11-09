@@ -442,7 +442,7 @@ fn a_raw_bridge_send_to_a_headless_agent_keeps_its_raw_mark() {
         ..DrainOptions::default()
     };
     manager
-        .send_headless_record(&record, "/help", Some("raw-1"), &options)
+        .send_headless_record(&record, "/help", Some("raw-1"), &options, None)
         .unwrap();
     let queue = manager.queue("lead").unwrap();
     let item = agent_queue::queue::load_message(&queue.join("inbox.v2/raw-1.json")).unwrap();

@@ -6778,6 +6778,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         text: &str,
         options: DrainOptions,
         message_id: Option<&str>,
+        supersede_key: Option<&str>,
         priority: bool,
     ) -> Result<QueueResult> {
         self.auto_repin_resumed(agent_name);
@@ -6805,7 +6806,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             let result = if priority {
                 self.send_record_priority(&record, text, probe_options, message_id)
             } else {
-                self.send_record(&record, text, probe_options, message_id, None)
+                self.send_record(
+                    &record,
+                    text,
+                    probe_options,
+                    message_id,
+                    supersede_key,
+                    None,
+                )
             };
             (result, record.is_headless())
         };
@@ -9620,6 +9628,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         let mut structured_arguments =
             crate::profiles::reasoning_arguments(&options.harness, reasoning_effort)?;
         structured_arguments.extend_from_slice(&options.harness_args);
+        // #1158: a launch that can park on an in-TUI question says so at once,
+        // while someone is still watching the start.
+        if let Some(warning) =
+            crate::profiles::blocking_question_warning(&options.harness, &structured_arguments)
+        {
+            eprintln!("agentctl: warning: {agent_name}: this launch {warning}");
+        }
         // Load the launch environment before the name is taken, so a missing team file or
         // directory refuses the start cleanly.
         let launch_env = self.project_launch_env()?;
@@ -9963,7 +9978,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             // A just-started harness may take longer than READBACK to print its first prompt;
             // it gets as long as it has to start working.
             let readback = Some(options.delivery.working_timeout);
-            self.send_record(&record, &brief, options.delivery, None, readback)?;
+            self.send_record(&record, &brief, options.delivery, None, None, readback)?;
             // Codex writes its conversation's rollout only once it has a first prompt, so a
             // session the launch could not see may be held now (#916).
             if record.native_session.is_none()
@@ -11704,18 +11719,28 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
 
     /// Serialize against stop and durably deliver one prompt.
     pub fn send(&self, agent_name: &str, text: &str, options: DrainOptions) -> Result<QueueResult> {
-        self.send_identified(agent_name, text, options, None)
+        self.send_identified(agent_name, text, options, None, None)
     }
 
     /// Submit a prompt with an optional caller-supplied ID; existing IDs are refused.
+    /// With a `supersede_key`, still-pending prompts in the agent's queue carrying the
+    /// same key are set aside untyped at enqueue, so only this newest copy is typed.
     pub fn send_identified(
         &self,
         agent_name: &str,
         text: &str,
         options: DrainOptions,
         message_id: Option<&str>,
+        supersede_key: Option<&str>,
     ) -> Result<QueueResult> {
-        self.send_holding_no_lock_while_waiting(agent_name, text, options, message_id, false)
+        self.send_holding_no_lock_while_waiting(
+            agent_name,
+            text,
+            options,
+            message_id,
+            supersede_key,
+            false,
+        )
     }
 
     /// An interactive agent's pending prompts as `(id, queued_at millis)`, oldest
@@ -11867,6 +11892,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         agent_name: &str,
         text: &str,
         not_after: Option<u64>,
+        supersede_key: Option<&str>,
         message_id: Option<&str>,
     ) -> Result<QueueResult> {
         let (_lock, _probe) =
@@ -11879,7 +11905,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         record.input_allowed()?;
         let queue = self.queue(&record.name)?;
-        agent::queue_identified_managed(&self.target(&record)?, &queue, text, not_after, message_id)
+        agent::queue_identified_managed(
+            &self.target(&record)?,
+            &queue,
+            text,
+            not_after,
+            supersede_key,
+            message_id,
+        )
     }
 
     /// Submit through an injected runtime that can interrupt bounded readiness waits.
@@ -11922,6 +11955,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             options,
             runtime,
             Some(message_id),
+            None,
         )
     }
 
@@ -11942,6 +11976,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             quarantined: Vec::new(),
             pending: Vec::new(),
             cancelled: Vec::new(),
+            superseded: Vec::new(),
             blocked: None,
             outcome: agent::QueueOutcome::Delivered,
         })
@@ -12014,6 +12049,7 @@ its drain would also type, so it was not queued",
             options,
             &withdrawing,
             Some(message_id),
+            None,
         ) {
             Ok(_) => return Ok(None),
             Err(error) => error,
@@ -12140,6 +12176,7 @@ its drain would also type, so it was not queued",
                 not_after: Some(agent::now_millis().saturating_add(10_000)),
                 ..DrainOptions::default()
             },
+            None,
             None,
             None,
         )?;
@@ -12549,6 +12586,7 @@ its drain would also type, so it was not queued",
                 ..options
             },
             message_id,
+            None,
             true,
         )?;
         let mut value = json!(result);
@@ -12755,10 +12793,11 @@ its drain would also type, so it was not queued",
         text: &str,
         options: DrainOptions,
         message_id: Option<&str>,
+        supersede_key: Option<&str>,
         readback: Option<Duration>,
     ) -> Result<QueueResult> {
         if record.is_headless() {
-            return self.send_headless_record(record, text, message_id, &options);
+            return self.send_headless_record(record, text, message_id, &options, supersede_key);
         }
         if record.is_cloud() {
             // Journaled into the session at once, as `agentctl send` does
@@ -12802,8 +12841,16 @@ its drain would also type, so it was not queued",
                 text,
                 options,
                 identifier,
+                supersede_key,
             ),
-            None => agent::send_managed(&client, &self.target(record)?, &queue, text, options),
+            None => agent::send_managed(
+                &client,
+                &self.target(record)?,
+                &queue,
+                text,
+                options,
+                supersede_key,
+            ),
         }
     }
 
@@ -12817,7 +12864,7 @@ its drain would also type, so it was not queued",
         message_id: Option<&str>,
     ) -> Result<QueueResult> {
         if record.is_headless() {
-            return self.send_headless_record(record, text, message_id, &options);
+            return self.send_headless_record(record, text, message_id, &options, None);
         }
         record.input_allowed()?;
         let queue = self.queue(&record.name)?;
@@ -13028,6 +13075,7 @@ its drain would also type, so it was not queued",
                 quarantined: Vec::new(),
                 pending: Vec::new(),
                 cancelled: Vec::new(),
+                superseded: Vec::new(),
                 blocked: None,
                 outcome: agent::QueueOutcome::Delivered,
             });
@@ -13153,6 +13201,7 @@ its drain would also type, so it was not queued",
                 quarantined: Vec::new(),
                 pending: Vec::new(),
                 cancelled: Vec::new(),
+                superseded: Vec::new(),
                 blocked: None,
                 outcome: agent::QueueOutcome::Delivered,
             });
@@ -13701,6 +13750,7 @@ its drain would also type, so it was not queued",
             &prompt,
             options,
             &identifier,
+            None,
         );
         match outcome {
             Ok(delivered) => {
@@ -22569,10 +22619,22 @@ fi
         );
         manager.pause("worker", false).unwrap();
         manager
-            .send_identified("worker", "task", DrainOptions::default(), Some("request-1"))
+            .send_identified(
+                "worker",
+                "task",
+                DrainOptions::default(),
+                Some("request-1"),
+                None,
+            )
             .unwrap();
         assert!(manager
-            .send_identified("worker", "task", DrainOptions::default(), Some("request-1"))
+            .send_identified(
+                "worker",
+                "task",
+                DrainOptions::default(),
+                Some("request-1"),
+                None
+            )
             .is_err());
         assert_eq!(*fixture.client.runs.lock().unwrap(), ["task"]);
     }

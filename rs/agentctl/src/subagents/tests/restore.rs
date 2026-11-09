@@ -544,7 +544,13 @@ fn watch_types_a_queued_prompt_and_reports_a_stale_one() {
     // A queue-only prompt sits pending until a drain types it (#804).
     fixture
         .manager()
-        .queue_identified("lane", "queued while idle", None, Some("watch-drain-1"))
+        .queue_identified(
+            "lane",
+            "queued while idle",
+            None,
+            None,
+            Some("watch-drain-1"),
+        )
         .unwrap();
     assert_eq!(fixture.manager().pending_prompts("lane").unwrap().len(), 1);
     let host = ScriptedHost::new();
@@ -580,7 +586,7 @@ fn watch_types_a_queued_prompt_and_reports_a_stale_one() {
     // Check-only reports an old prompt as stale, naming the agent, and types nothing.
     fixture
         .manager()
-        .queue_identified("lane", "queued long ago", None, Some("watch-stale-1"))
+        .queue_identified("lane", "queued long ago", None, None, Some("watch-stale-1"))
         .unwrap();
     let findings = watch_once(
         &fixture.client,
@@ -3190,7 +3196,7 @@ fn watch_unit_repair_off_skips_units_but_still_drains_queues() {
         .unwrap();
     fixture
         .manager()
-        .queue_identified("lane", "queued while idle", None, Some("duty-1"))
+        .queue_identified("lane", "queued while idle", None, None, Some("duty-1"))
         .unwrap();
     let host = ScriptedHost::new();
     host.answer("show bridge.service", 0, "ActiveState=inactive\n", "");

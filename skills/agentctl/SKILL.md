@@ -17,6 +17,18 @@ multi-step investigations, or pushes in bulk) goes to a worker.
 Answer the user within minutes, even partially, and come back with results.
 Do not stay in long tool chains.
 
+**Never park your turn on an in-TUI question.** If you coordinate over chat,
+a blocking question tool (AskUserQuestion, `request_user_input`) waits for a
+person at your terminal while every queued message sits unread behind it;
+on unblock they all arrive at once. Ask the owner over chat instead and
+keep working on everything the answer does not block. The same holds for
+lanes you start unattended. Each harness disables its tool in a different
+place (Claude: `permissions.deny`; Muse: `--disable-request-user-input` in
+the profile's argv — `agentctl profiles` and `start` warn when it is
+missing; Codex: `[tools.experimental_request_user_input] enabled = false`
+in `~/.codex/config.toml`); `agentctl userguide` has the table. If you find
+yourself facing such a prompt anyway, decline it and ask over chat.
+
 Use the installed command as the authority:
 
 - `agentctl quickstart`

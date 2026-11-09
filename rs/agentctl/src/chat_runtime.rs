@@ -6119,7 +6119,7 @@ impl<A: ManagedApi + ?Sized> CoordinatorDelivery for ManagedAgents<'_, A> {
         message_id: &str,
         options: DrainOptions,
     ) -> std::result::Result<(), String> {
-        ManagedAgents::send_identified(self, agent_name, prompt, options, Some(message_id))
+        ManagedAgents::send_identified(self, agent_name, prompt, options, Some(message_id), None)
             .map(|_| ())
             .map_err(|error| error.to_string())
     }

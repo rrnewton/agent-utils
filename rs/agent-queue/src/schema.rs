@@ -33,6 +33,8 @@ pub enum CancelReason {
     Cancelled,
     /// Its `not_after` deadline passed.
     Expired,
+    /// A newer queued item with the same `supersede_key` replaced it.
+    Superseded,
 }
 
 /// One recorded delivery misroute.
@@ -132,6 +134,16 @@ pub struct QueueItem {
     /// item; only an `inbox.v2` item may carry one. `null` is none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub not_after: Option<u64>,
+    /// Sender-chosen key naming what this item is the latest word on, within
+    /// its queue: enqueueing an item sets aside every still-pending item
+    /// with the same key (see `superseded_by`). Items without a key are
+    /// never superseded and supersede nothing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersede_key: Option<String>,
+    /// The identifier of the newer item that superseded this one, recorded
+    /// when it was set aside with reason `superseded`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
     /// Why the item was set aside, when it was.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cancel_reason: Option<CancelReason>,
@@ -184,6 +196,8 @@ impl QueueItem {
             draft_recovered_at: None,
             draft_recovered_evidence: None,
             not_after: None,
+            supersede_key: None,
+            superseded_by: None,
             cancel_reason: None,
             cancel_detail: None,
             cancelled_at: None,

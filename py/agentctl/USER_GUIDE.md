@@ -501,6 +501,18 @@ are launch policy and therefore must not contain secrets. Raw Codex
 model or effort because those opaque settings could override the structured
 selection.
 
+A chat-driven coordinator must never park its turn on an in-TUI question
+(#1158 coordinator-never-blocks): while it waits for a person at its own
+terminal, nothing queued to it is read, and on unblock it all arrives at
+once. It should ask the owner over chat and keep working. Each harness's
+blocking question tool is disabled in a different place:
+
+| Harness | Blocking tool | Disable it |
+| --- | --- | --- |
+| Claude Code | AskUserQuestion | `"AskUserQuestion"` in `permissions.deny` (`~/.claude/settings.json` or the project's `.claude/settings.local.json`) |
+| Muse | `request_user_input` | pass `--disable-request-user-input` in the profile's `argv`; Muse has no persistent settings key for it. `agentctl profiles` shows `blocking_question_warning` on a Muse profile missing the flag, and `start` warns the same way |
+| Codex | `request_user_input` (Plan mode) | `[tools.experimental_request_user_input] enabled = false` in `~/.codex/config.toml`; the `features.default_mode_request_user_input` pin alone leaves Plan mode exposed, and a profile with a structured model/effort cannot carry the raw `-c` form |
+
 Interactive profiles support Codex, Claude, and Muse, plus `agentcloud` in the
 Rust distribution (see [Agentcloud sessions](#agentcloud-sessions)). Headless profiles support
 Codex, AGY, and Muse in installations that include the worker extension.
@@ -1445,7 +1457,11 @@ agentctl watch-agents --coordinator coordinator
 `--coordinator` defaults to the registry's designated coordinator, else the
 agent named `coordinator`. Every `--interval` seconds (default 60) it lists the
 registry and reads each running or starting agent except the coordinator —
-lieutenants are watched like any agent — paused, mid-move, and
+lieutenants are watched like any agent. The coordinator's own screen is read
+for one check only: a question or permission prompt it is parked on pages
+the `--notice-fallback` (else the owner alarm) within a pass, never the
+coordinator's own queue, repeating at most once per `--min-notice-interval`;
+the pass report carries it under `coordinator_blocked`. Paused, mid-move, and
 agentcloud agents are skipped, and a `launch_failed` record, which `start`
 already reported, is left alone; a record that cannot be read is watched as
 unreachable rather than skipped. One watcher runs per `--state-dir`; a second
@@ -1516,6 +1532,18 @@ harness, a stall while working, input queued behind a turn, a finish with a
 verdict, and owner requests left undelivered. `list` and `status` show
 `standing: true` for it, and each pass's report lists standing agents under
 `standing`, so the exemption stays visible.
+
+The watcher's own periodic notices expire and replace themselves (#1157
+automated-notice-ttl), so a coordinator that was busy or blocked is typed
+each notice once, in its newest copy, instead of a backlog of stale repeats:
+status-file pages carry `--ttl` = `repage_minutes` and one supersede key per
+request; child-done, delivery-jam, held-queue, agent-teams and recovery
+notices and the failed-prompt digest carry a TTL of about their period
+(default one hour; the digest uses its own cadence) and one key per lane or
+check. Episode batches (idle, stall and the rest) expire after twice
+`--min-notice-interval` (floor one hour) but never supersede: a batch
+carries distinct once-only notices, and a per-recipient key would silently
+discard the other lanes' notices in the batch it replaced.
 
 An agent that was never sent work, or that still has prompts queued, is never
 reported idle or finished. Idle is timed from the last screen change, since herdr can
@@ -2441,17 +2469,19 @@ request ID and artifact path. Preserve that ID and use `drain` for pending
 work. Sending the same task under a new ID creates a second request and can
 duplicate work; it is not a recovery operation.
 
-### Expiring and cancelled prompts (Rust edition)
+### Expiring, cancelled and superseded prompts
 
 A prompt can lose its meaning before an agent that takes input only when idle
-gets to it, such as a "hold" that a later message already lifted. The Rust
-edition adds three more directories, each created only when first used:
+gets to it, such as a "hold" that a later message already lifted, or the
+older copies of a periodic notice. The Rust edition adds three more
+directories, each created only when first used (the Python edition writes
+superseded prompts to the same `cancelled/`, created on first use):
 
 | Directory | Meaning |
 | --- | --- |
 | `inbox.v2/` | Pending prompts that may expire; drained together with `inbox/`, oldest first |
 | `cancel/` | Tombstones: `cancel/ID.json` asks every drain not to type prompt `ID` |
-| `cancelled/` | Prompts set aside untyped, with `cancel_reason` `cancelled` or `expired` |
+| `cancelled/` | Prompts set aside untyped, with `cancel_reason` `cancelled`, `expired` or `superseded` |
 
 ```sh
 agentctl send worker 'Hold the release' --message-id hold-1 --ttl 3600
@@ -2460,7 +2490,22 @@ agentctl drain worker --deadline 40 --lock-timeout 10 --max-items 1
 ```
 
 `send --ttl SECONDS` records `not_after` (a Unix time in milliseconds) and puts
-the prompt in `inbox.v2/`. `cancel NAME ID` writes the tombstone without
+the prompt in `inbox.v2/`. `send --supersede-key KEY` names what the prompt is
+the latest word on, within the target's queue: queueing it sets aside every
+still-pending prompt with the same key untyped (`cancel_reason` `superseded`,
+with `superseded_by` naming the new prompt, also listed in the send output's
+`superseded`), so a periodic notice that piled up behind a busy agent is
+typed once, in its newest copy. The replacement takes its own fresh place at
+the back of the queue; prompts already inflight, processed or failed are
+never touched, and neither are prompts a drain already pasted into a
+composer. A key is 1–255 bytes with no control characters, compared byte for
+byte; one key per request, lane or check (for example
+`status-request:lane:abc123`). It composes with `--ttl` and conflicts with
+`--urgent`. The Python edition honours the key within the classic `inbox/`
+it writes; the Rust edition routes keyed prompts to `inbox.v2/` like `--ttl`,
+and either edition's enqueue supersedes keyed prompts pending in either
+inbox. Agentcloud sends refuse both flags, as they journal at once.
+`cancel NAME ID` writes the tombstone without
 waiting for any lock, so it works while a drain is waiting for a busy agent; it
 reports `outcome` `set_aside` (no drain held the queue, so the prompt was moved
 to `cancelled/` at once), `pending` (a drain holds the queue; it sets the

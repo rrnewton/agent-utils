@@ -47,6 +47,42 @@ def test_send_queue_only_persists_pending_without_typing(tmp_path: Path, monkeyp
     assert manager.queue_only("worker", "second", message_id="queue-only-2").pending == ("queue-only-2",)
 
 
+def test_supersede_key_replaces_the_pending_copy_and_only_the_newest_is_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #1156 queue-supersede-key: a newer queued prompt with the same key sets
+    # aside the older undelivered one, which is never typed but kept in
+    # cancelled/ marked superseded; unkeyed neighbours are untouched.
+    manager, fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), brief="first task")
+    submitted_before = list(fake.submitted)
+    first = manager.queue_only(
+        "worker", "notice v1", message_id="notice-1", supersede_key="notice:worker",
+    )
+    assert first.superseded == ()
+    manager.queue_only("worker", "unrelated", message_id="plain-1")
+    second = manager.queue_only(
+        "worker", "notice v2", message_id="notice-2", supersede_key="notice:worker",
+    )
+    assert second.superseded == ("notice-1",)
+    queue = Path(manager._queue("worker"))
+    assert not (queue / "inbox" / "notice-1.json").exists()
+    replaced = json.loads((queue / "cancelled" / "notice-1.json").read_text(encoding="utf-8"))
+    assert replaced["cancel_reason"] == "superseded"
+    assert replaced["superseded_by"] == "notice-2"
+    assert replaced["delivery_state"] == "cancelled"
+    drained = manager.drain("worker", ready_timeout=0, deliver_while_working=True)
+    assert drained.outcome == "delivered"
+    assert set(drained.delivered) == {"notice-2", "plain-1"}
+    assert fake.submitted[len(submitted_before):] != []
+    typed = "\n".join(fake.submitted[len(submitted_before):])
+    assert "notice v2" in typed
+    assert "notice v1" not in typed
+    # A malformed key is refused before anything is queued.
+    with pytest.raises(AgentDeliveryError):
+        manager.queue_only("worker", "bad", supersede_key="with\nnewline")
+
+
 def test_start_holds_its_generation_lock_through_brief_and_returned_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manager, fake = setup(tmp_path, monkeypatch)
     original_info = fake.pane_info

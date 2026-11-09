@@ -56,6 +56,30 @@ pub(crate) const ROLES: [&str; 4] = ["coordinator", "liaison", "coordinator-hand
 /// hands them to other agents (#897).
 pub(crate) const PROTOCOLS: [&str; 2] = ["self-tooling", "hands-delegating"];
 
+/// Why a launch with these arguments can still park its turn on a blocking
+/// question tool, when agentctl can tell from the arguments alone (#1158
+/// coordinator-never-blocks). Only Muse is detectable here: its
+/// `request_user_input` is withheld per run by `--disable-request-user-input`
+/// and Muse has no persistent settings key for it. Claude Code's
+/// AskUserQuestion is denied in its own settings files and Codex's
+/// request_user_input in its host config (`tools.experimental_request_user_input`),
+/// neither of which a profile's arguments show; the userguide names both.
+pub(crate) fn blocking_question_warning(harness: &str, argv: &[String]) -> Option<&'static str> {
+    if harness == "muse"
+        && !argv
+            .iter()
+            .any(|argument| argument == "--disable-request-user-input")
+    {
+        return Some(
+            "does not pass --disable-request-user-input: a Muse launched this way can park \
+             its turn on request_user_input at the terminal, unread, until a person answers; \
+             a chat-driven coordinator (or any unattended lane) must pass it and ask over \
+             chat instead",
+        );
+    }
+    None
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct PublicProfile {
     name: String,
@@ -72,6 +96,9 @@ pub(crate) struct PublicProfile {
     /// Agentcloud profiles are launchable only by this edition; the other edition lists them too.
     #[serde(skip_serializing_if = "Option::is_none")]
     requires_edition: Option<&'static str>,
+    /// The profile can park on a blocking question tool (#1158), when detectable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocking_question_warning: Option<&'static str>,
 }
 
 impl LaunchProfile {
@@ -91,6 +118,7 @@ impl LaunchProfile {
                 .collect(),
             agentcloud: self.cloud.clone(),
             requires_edition: self.cloud.as_ref().map(|_| "rust"),
+            blocking_question_warning: blocking_question_warning(&self.harness, &self.argv),
         }
     }
 }
@@ -1804,6 +1832,24 @@ mod tests {
             );
         }
         fs::remove_dir_all(&registry).unwrap();
+    }
+
+    #[test]
+    fn a_muse_launch_without_the_question_kill_flag_warns() {
+        // #1158: only Muse is detectable from launch arguments alone.
+        let bare = vec!["--trust-workspace".to_owned()];
+        let warning = blocking_question_warning("muse", &bare).expect("warns");
+        assert!(
+            warning.contains("--disable-request-user-input"),
+            "{warning}"
+        );
+        let guarded = vec![
+            "--trust-workspace".to_owned(),
+            "--disable-request-user-input".to_owned(),
+        ];
+        assert_eq!(blocking_question_warning("muse", &guarded), None);
+        assert_eq!(blocking_question_warning("claude", &bare), None);
+        assert_eq!(blocking_question_warning("codex", &bare), None);
     }
 
     #[test]

@@ -2022,6 +2022,65 @@ def _queue_lanes(harness: Harness, report: Report) -> None:
         "the Rust drain did not type the expiring prompt once, or the cancelled one left cancelled/")
 
 
+def _queue_supersede(harness: Harness, report: Report) -> None:
+    """#1156 queue-supersede-key: only the newest pending copy per key is typed.
+
+    Run once per edition (the same edition in both projects, as _queue_lanes):
+    two sends under one key while the pane cannot take them, then a drain.
+    The editions agree on the outcome and on the cancelled/ record; they
+    differ only in lane placement - Rust writes keyed prompts to inbox.v2/,
+    Python to the classic inbox it can also supersede within.
+    """
+    for edition, command, lane in (
+        ("rust", harness.rust, "inbox.v2"),
+        ("python", harness.python, "inbox"),
+    ):
+        case = harness.case(f"primary-queue-supersede-{edition}")
+        if not _start(harness, report, case, f"primary/supersede-{edition}/start"):
+            continue
+        roots = (case.python_root, case.rust_root)
+
+        def both(label: str, arguments: Sequence[str], expected: int) -> tuple[Outcome, Outcome]:
+            first = harness._invoke_one(command, case.python_root, arguments)
+            second = harness._invoke_one(command, case.rust_root, arguments)
+            report.require(label, first.returncode == second.returncode == expected,
+                           f"expected rc {expected}; first={first!r} second={second!r}")
+            return first, second
+
+        _change(case, {"status": "working", "screen": "unrecognized terminal layout\n"})
+        both(f"primary/supersede-{edition}/send-first",
+             ("send", "worker", "notice v1", "--supersede-key", "notice:worker",
+              "--message-id", "sup-1", "--queue-only", *_COMMON), 0)
+        outcomes = both(f"primary/supersede-{edition}/send-second",
+                        ("send", "worker", "notice v2", "--supersede-key", "notice:worker",
+                         "--message-id", "sup-2", "--queue-only", *_COMMON), 0)
+        report.require(f"primary/supersede-{edition}/reported", all(
+            isinstance(record := _json(outcome), dict)
+            and record.get("superseded") == ["sup-1"] for outcome in outcomes),
+            f"the replacing send did not name what it superseded: {outcomes!r}")
+
+        def replaced_ok(root: Path) -> bool:
+            path = root / "registry/agents/worker/queue/cancelled/sup-1.json"
+            if not path.is_file():
+                return False
+            document = json.loads(path.read_text(encoding="utf-8"))
+            return (document.get("cancel_reason") == "superseded"
+                    and document.get("superseded_by") == "sup-2"
+                    and document.get("supersede_key") == "notice:worker")
+
+        report.require(f"primary/supersede-{edition}/set-aside", all(
+            replaced_ok(root)
+            and (root / f"registry/agents/worker/queue/{lane}/sup-2.json").is_file()
+            and not (root / f"registry/agents/worker/queue/{lane}/sup-1.json").exists()
+            for root in roots),
+            "the older copy was not set aside as superseded, or the newest is not pending")
+        _change(case, {"status": "idle", "screen": ""})
+        both(f"primary/supersede-{edition}/drain", ("drain", "worker", *_COMMON), 0)
+        report.require(f"primary/supersede-{edition}/typed-newest-only", all(
+            _submitted(root) == ["notice v2"] for root in roots),
+            "the drain did not type only the newest copy")
+
+
 def _registry_and_interop(harness: Harness, report: Report) -> None:
     defaults = harness.case("primary-default-registry")
     _pair(harness, report, defaults, "primary/default-registry/start", ("start", "worker", "--herdr-bin", "<HERDR>"))
@@ -3807,6 +3866,7 @@ def _groups() -> list[tuple[str, object]]:
         ("herdr-093", _herdr_093_compatibility), ("muse-adoption", _muse_adoption),
         ("muse14-status", _muse14_status), ("muse-busy", _muse_busy_followup),
         ("handoff", _handoff_and_pending), ("queue-lanes", _queue_lanes),
+        ("queue-supersede", _queue_supersede),
         ("registry-interop", _registry_and_interop),
         ("legacy-registry", _legacy_adopted_registry_and_queue),
         ("registry-migration", _registry_layout_migration),

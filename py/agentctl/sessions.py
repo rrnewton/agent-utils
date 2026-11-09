@@ -233,6 +233,7 @@ class Sessions(ManagedAgents):
         return result
 
     def send_session(self, name: str, text: str, *, message_id: str | None = None,
+                     supersede_key: str | None = None,
                      model: str | None = None, **options: object) -> dict[str, object]:
         """Submit to the selected adapter without reusing another generation's name."""
         record = self._load(name)
@@ -244,10 +245,12 @@ class Sessions(ManagedAgents):
             if warning is not None:
                 print(f"agentctl send: {warning}", file=sys.stderr)
             if options.pop("queue_only", False):
-                return asdict(super().queue_only(name, text, message_id=message_id, expected_token=record.token))
-            return asdict(super().send(name, text, message_id=message_id, expected_token=record.token, **options))
+                return asdict(super().queue_only(name, text, message_id=message_id, supersede_key=supersede_key, expected_token=record.token))
+            return asdict(super().send(name, text, message_id=message_id, supersede_key=supersede_key, expected_token=record.token, **options))
         if message_id is not None:
             raise AgentDeliveryError("headless requests use monotonically numbered turns; message-id is interactive-only")
+        if supersede_key is not None:
+            raise AgentDeliveryError("supersede-key applies to interactive agents in this edition")
         with self._lock(name):
             current = self._load(name)
             if current.token != record.token:

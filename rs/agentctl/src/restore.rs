@@ -1470,6 +1470,7 @@ fn revive_fresh<A: ManagedApi + ?Sized>(
             "restore-fresh-{}",
             &session[..8.min(session.len())]
         )),
+        None,
     );
     if let Ok(status) = manager.status(name) {
         let token = status["token"].as_str().unwrap_or_default().to_owned();
@@ -2876,6 +2877,7 @@ pub fn restore<A: ManagedApi + ?Sized>(
                 &text,
                 options,
                 Some(&message_id),
+                None,
             ) {
                 Ok(result) => {
                     json!({"message_id": message_id, "outcome": json!(result)["outcome"]})
@@ -3792,6 +3794,7 @@ fn alert<A: ManagedApi + ?Sized>(
                 ..DrainOptions::default()
             },
             Some(&message_id),
+            None,
         )
     });
     for row in &due {

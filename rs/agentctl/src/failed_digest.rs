@@ -587,10 +587,16 @@ fn queue_digest_locked(root: &Path, now: f64) -> Result<Option<String>, String> 
         agent_queue::queue::generated_message_id()
     );
     let summarised = !backlog_entries(root, now).is_empty();
-    let identifier = agent_queue::queue::enqueue(
+    // #1157: a digest is a periodic automated notice - it expires by the next
+    // one (its own cadence) and replaces any still-pending digest, so an
+    // agent that was unreachable for hours is not flooded with stale digests.
+    let not_after =
+        agent_queue::queue::now_millis().saturating_add((min_interval_seconds() * 1000.0) as u64);
+    let identifier = agent_queue::queue::enqueue_into_outcome(
         root,
+        agent_queue::queue::Lane::InboxV2,
         Some(&digest_id),
-        false,
+        true,
         &agent_queue::fsio::Blocking,
         |id| {
             json!({
@@ -600,10 +606,13 @@ fn queue_digest_locked(root: &Path, now: f64) -> Result<Option<String>, String> 
                 "failed_ids": named,
                 "queued_at": now,
                 "delivery_attempts": 0,
+                agent_queue::queue::NOT_AFTER: not_after,
+                agent_queue::queue::SUPERSEDE_KEY: "failed-digest",
             })
         },
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.to_string())?
+    .id;
     record_shown(root, &named)?;
     let mut state = read_state(root);
     state["last_digest_at"] = json!(now);
@@ -873,9 +882,12 @@ mod tests {
         enable_since(&root, 1);
         let first = queue_digest_at(&root, 1_000.0).unwrap().expect("queued");
         assert!(first.starts_with(DIGEST_ID_PREFIX), "{first}");
-        assert!(root.join("inbox").join(format!("{first}.json")).is_file());
+        assert!(root
+            .join("inbox.v2")
+            .join(format!("{first}.json"))
+            .is_file());
         let queued: Value = serde_json::from_str(
-            &fs::read_to_string(root.join("inbox").join(format!("{first}.json"))).unwrap(),
+            &fs::read_to_string(root.join("inbox.v2").join(format!("{first}.json"))).unwrap(),
         )
         .unwrap();
         assert!(
@@ -884,12 +896,16 @@ mod tests {
                 .is_some_and(|text| text.starts_with("[agentctl failed-digest]\n")),
             "{queued}"
         );
+        // #1157: the digest expires by its own cadence and supersedes a
+        // still-pending earlier digest.
+        assert_eq!(queued["supersede_key"], "failed-digest", "{queued}");
+        assert!(queued["not_after"].as_u64().is_some(), "{queued}");
         assert!(
             queue_digest_at(&root, 1_000.0).unwrap().is_none(),
             "once per entry"
         );
         // Even if the digest item itself lands in failed/, it is excluded.
-        let item = fs::read_to_string(root.join("inbox").join(format!("{first}.json"))).unwrap();
+        let item = fs::read_to_string(root.join("inbox.v2").join(format!("{first}.json"))).unwrap();
         fs::create_dir_all(root.join("failed")).unwrap();
         fs::write(root.join("failed").join(format!("{first}.json")), item).unwrap();
         assert_eq!(failed_entries(&root).len(), 1, "only the real entry");
@@ -998,8 +1014,8 @@ mod tests {
         });
         let queued: Vec<_> = [a, b].into_iter().filter_map(|r| r.unwrap()).collect();
         assert_eq!(queued.len(), 1, "exactly one drainer queues a digest");
-        let inbox_count = fs::read_dir(root.join("inbox")).unwrap().count();
-        assert_eq!(inbox_count, 1, "one digest item in the inbox");
+        let inbox_count = fs::read_dir(root.join("inbox.v2")).unwrap().count();
+        assert_eq!(inbox_count, 1, "one digest item in the second inbox");
         assert_eq!(
             shown_ids(&root).len(),
             1,
@@ -1063,7 +1079,7 @@ mod tests {
         enable_since(&root, 1);
         write_failed(&root, "msg-1", "real one", "cancelled", 900);
         let id = queue_digest_at(&root, 1_000.0).unwrap().expect("digest");
-        let path = root.join("inbox").join(format!("{id}.json"));
+        let path = root.join("inbox.v2").join(format!("{id}.json"));
         let mut item: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         item["stranded_at"] = json!(1_000.0);
         fs::write(&path, item.to_string()).unwrap();

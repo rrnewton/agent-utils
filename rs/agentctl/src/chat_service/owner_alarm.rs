@@ -30,14 +30,19 @@
 //! The repeats coalesce in place (#981 chat-bridge-alarm-coalesce): an episode has at most one
 //! visible warning. The first warning is posted at the top level and its message is saved with
 //! the episode; each repeat rewrites that message with the current count, age, reason and fix,
-//! and when delivery resumes the same message is rewritten to a short resolved line naming the
-//! ET time. Rewriting is an edit where the transport supports it (Slack `chat.update`, through
-//! the outbound helper's `update` action); where it cannot edit but can delete, the old warning
-//! is deleted and the replacement posted; a transport that can do neither keeps the #830
-//! behaviour of replies in the first warning's thread, and one without threads posts at the top
-//! level. The resolved line is kept rather than deleted so the channel keeps a one-line record
-//! that the episode happened and when it ended; deleting it would also race a reader who is
-//! looking at, or replying to, the warning. The other `[chat-bridge WARNING]` posters were
+//! and when delivery resumes the same message keeps its warning text with a resolved line
+//! appended under it, naming the ET resolution time, when the hold began and how long it
+//! lasted (#1160 owner-alarm-says-why: the old rewrite replaced the warning with the resolved
+//! line alone, and an edit does not re-notify, so the owner saw only that all was well).
+//! Where the reason says the pane sits at a question or permission prompt, the warning also
+//! says so in plain terms and how to answer it. Rewriting is an edit where the transport
+//! supports it (Slack `chat.update`, through the outbound helper's `update` action); where it
+//! cannot edit but can delete, the old warning is deleted and the replacement posted; a
+//! transport that can do neither keeps the #830 behaviour of replies in the first warning's
+//! thread, and one without threads posts at the top level. The resolved message is kept rather
+//! than deleted so the channel keeps the record that the episode happened and when it ended;
+//! deleting it would also race a reader who is looking at, or replying to, the warning. The
+//! other `[chat-bridge WARNING]` posters were
 //! checked for the same stacking: the capture-miss warnings in `reply_source` and the
 //! stale-composer notice each post once per event, and the watcher's notices already replace
 //! their unread predecessor, so this episode warning is the only repeating one.
@@ -120,6 +125,15 @@ pub(crate) struct Episode {
     /// When the next warning is due, unless silenced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) next_post_millis: Option<u64>,
+    /// When the first warning was posted (#1160): the resolved line says how
+    /// long delivery was held, from here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) first_post_millis: Option<u64>,
+    /// The latest warning's full text (#1160): resolution rewrites the one
+    /// visible message, so the warning is kept and the resolution appended
+    /// under it instead of erasing what happened.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) last_warning: Option<String>,
     #[serde(flatten)]
     pub(crate) unknown: KeptKeys,
 }
@@ -180,6 +194,10 @@ pub(crate) struct OwnerAlarm {
 pub(crate) fn reason_kind(reason: &str, disagreement: bool) -> &'static str {
     if disagreement {
         "status-disagreement"
+    } else if reason.contains("is blocked") {
+        // The pane is parked at a question or permission prompt (#1160):
+        // delivery typed nothing because the form owns the screen.
+        "blocked-prompt"
     } else if crate::submission::is_input_stalled(reason) {
         "input-stalled"
     } else if reason.contains("did not type") || reason.contains("last status=staged") {
@@ -235,9 +253,16 @@ fn cut(text: &str, limit: usize) -> String {
 /// What the owner can do about requests held for `reason`, as a sentence ending in a space, or
 /// nothing.
 fn hint(agent: &str, reason: &str) -> String {
-    // An idle Muse whose editor holds a draft reads `staged`; agentctl submits a draft it typed
-    // itself before it gives up, so one still there is not its own.
-    if reason.contains("did not type") || reason.contains("last status=staged") {
+    if reason.contains("is blocked") {
+        // #1160: say it in plain terms first - the quoted reason alone read as
+        // plumbing, and the owner could not tell a person was being waited on.
+        format!(
+            "In plain terms: {agent} is waiting at a question or permission prompt in \
+             its TUI and cannot read messages until it is answered. Answer it with \
+             `agentctl prompts {agent}` and `agentctl answer {agent} --option N`, or \
+             type the answer in its terminal; delivery resumes at once. "
+        )
+    } else if reason.contains("did not type") || reason.contains("last status=staged") {
         format!(
             "Text that agentctl did not type is in {agent}'s input box, so it is left alone; \
              submit or clear it there, and delivery resumes. "
@@ -349,6 +374,7 @@ impl OwnerAlarm {
         if held.is_empty() {
             if let Some(episode) = self.episode.take() {
                 if episode.posts > 0 {
+                    let replacing = episode.root_message_id.is_some();
                     let place = match (episode.root_message_id, episode.thread_id) {
                         (Some(message_id), thread_id) => Place::Replace {
                             message_id,
@@ -357,14 +383,33 @@ impl OwnerAlarm {
                         (None, Some(thread)) => Place::Thread(thread),
                         (None, None) => Place::TopLevel,
                     };
-                    notices.push(Notice {
-                        text: format!(
-                            "[chat-bridge] Resolved {}: your messages to {agent} are being \
-                             delivered again.",
-                            crate::chat_trace::et_clock((now_millis / 1_000) as f64)
-                        ),
-                        place,
-                    });
+                    // #1160: keep the evidence. The resolved rewrite used to
+                    // replace the warning outright, so the only trace left in
+                    // the channel said everything was fine. Now the warning
+                    // stays and the resolution is appended under it, with
+                    // when the hold began and how long it lasted.
+                    let first = episode
+                        .first_post_millis
+                        .unwrap_or(episode.started_at_millis);
+                    let resolved = format!(
+                        "[chat-bridge] Resolved {}: your messages to {agent} are being \
+                         delivered again. {} held for {} min (first warning {}, \
+                         {} warning update(s)).",
+                        crate::chat_trace::et_clock((now_millis / 1_000) as f64),
+                        if episode.held == 1 {
+                            "1 message was".to_owned()
+                        } else {
+                            format!("{} messages were", episode.held)
+                        },
+                        minutes(now_millis.saturating_sub(first)),
+                        crate::chat_trace::et_clock((first / 1_000) as f64),
+                        episode.posts,
+                    );
+                    let text = match (replacing, episode.last_warning) {
+                        (true, Some(warning)) => format!("{warning}\n{resolved}"),
+                        _ => resolved,
+                    };
+                    notices.push(Notice { text, place });
                 }
             }
             return notices;
@@ -399,6 +444,9 @@ impl OwnerAlarm {
         }
         episode.step += 1;
         episode.posts += 1;
+        if episode.first_post_millis.is_none() {
+            episode.first_post_millis = Some(now_millis);
+        }
         episode.last_post_millis = Some(now_millis);
         let wait = backoff(after, episode.step);
         episode.next_post_millis = Some(now_millis.saturating_add(wait));
@@ -433,19 +481,21 @@ impl OwnerAlarm {
             .map(|entry| entry.admitted_at_millis)
             .min()
             .unwrap_or(now_millis);
+        let warning = format!(
+            "{WARNING}{count} to {agent} {verb} not reached it, the oldest sent {} min \
+             ago ({}, \"{}\"). Why: {}. {}This notice is updated in place in {} min unless \
+             they are delivered; `agentctl chat alarm ack` silences it until the held messages \
+             or the reason change.",
+            minutes(oldest),
+            crate::chat_trace::et_clock((oldest_admitted / 1_000) as f64),
+            held[0].excerpt,
+            cut(reason, REASON_CHARS),
+            hint(agent, reason),
+            minutes(wait).max(1)
+        );
+        episode.last_warning = Some(warning.clone());
         notices.push(Notice {
-            text: format!(
-                "{WARNING}{count} to {agent} {verb} not reached it, the oldest sent {} min \
-                 ago ({}, \"{}\"). Why: {}. {}This notice is updated in place in {} min unless \
-                 they are delivered; `agentctl chat alarm ack` silences it until the held messages \
-                 or the reason change.",
-                minutes(oldest),
-                crate::chat_trace::et_clock((oldest_admitted / 1_000) as f64),
-                held[0].excerpt,
-                cut(reason, REASON_CHARS),
-                hint(agent, reason),
-                minutes(wait).max(1)
-            ),
+            text: warning,
             place,
         });
         notices
@@ -563,12 +613,25 @@ mod tests {
         );
         entries[0].phase = RequestPhase::Delivered;
         let resumed = due(&mut alarm, &entries, minute(111));
-        assert_eq!(
-            texts(&resumed),
-            [
+        // #1160: the warning text is kept and the resolution appended under it,
+        // so the channel still shows what happened and for how long.
+        assert_eq!(resumed.len(), 1);
+        assert!(
+            resumed[0].text.starts_with(
+                "[chat-bridge WARNING] 1 of your messages to coord5 has not reached it, the \
+                 oldest sent 10 min ago (20:40 ET"
+            ),
+            "{}",
+            resumed[0].text
+        );
+        assert!(
+            resumed[0].text.ends_with(
                 "[chat-bridge] Resolved 20:51 ET: your messages to coord5 are being delivered \
-              again."
-            ]
+                 again. 1 message was held for 6 min (first warning 20:45 ET, 2 warning \
+                 update(s))."
+            ),
+            "{}",
+            resumed[0].text
         );
         assert_eq!(
             resumed[0].place,
@@ -579,6 +642,32 @@ mod tests {
         );
         assert!(due(&mut alarm, &entries, minute(130)).is_empty());
         assert!(alarm.episode().is_none());
+    }
+
+    #[test]
+    fn a_blocked_prompt_warning_says_a_person_is_being_waited_on() {
+        // #1160: the delivery reason for a pane parked at its harness's
+        // question form, as the 2026-11-09 lockup produced it.
+        const BLOCKED: &str = "request remains pending: pane wJ:pMX is blocked; Question text \
+                               is not recognizable on this screen. Use agentctl prompts NAME \
+                               to inspect";
+        assert_eq!(reason_kind(BLOCKED, false), "blocked-prompt");
+        let mut alarm = OwnerAlarm::new(DEFAULT_AFTER);
+        let entries = [entry("a", RequestPhase::Pending, 100, BLOCKED)];
+        let notices = due(&mut alarm, &entries, minute(105));
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0]
+                .text
+                .contains("waiting at a question or permission prompt in its TUI"),
+            "{}",
+            notices[0].text
+        );
+        assert!(
+            notices[0].text.contains("agentctl answer coord5"),
+            "{}",
+            notices[0].text
+        );
     }
 
     /// #830 chat-bridge-warning-backoff: four hours stuck give a handful of warnings, one of them

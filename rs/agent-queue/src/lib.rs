@@ -113,7 +113,12 @@
 //! ([`queue::set_aside_reason`]); an item that fails either check goes to `cancelled/` untyped,
 //! with `delivery_state: cancelled`, `cancel_reason` (`cancelled` or `expired`), `cancel_detail`
 //! and `cancelled_at` ([`queue::set_aside`]). Because the check follows the move, a tombstone
-//! written while the item was still pending is always seen.
+//! written while the item was still pending is always seen. An item may also carry
+//! `supersede_key`: enqueueing it (serialized, under the delivery lock) sets aside every
+//! still-pending item in either inbox with the same key, with `cancel_reason: superseded`
+//! and `superseded_by` naming the new item, so only the newest copy of a periodic notice
+//! is typed; settled history and composer-stranded items are never superseded, and the
+//! replacement keeps its own fresh queue position.
 //!
 //! **Timestamps** in items and sidecars are Unix seconds as JSON numbers, except `not_after`.
 

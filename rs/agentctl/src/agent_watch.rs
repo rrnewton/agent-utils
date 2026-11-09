@@ -66,6 +66,11 @@ const QUOTED_LINE_CHARS: usize = 160;
 const FINISHED_MEMORY_SECONDS: f64 = 3600.0;
 /// Seconds the coordinator is given to accept a notice before it simply stays queued.
 const NOTICE_READY_SECONDS: u64 = 10;
+/// How long an automated notice may wait untyped before the queue sets it aside
+/// (#1157 automated-notice-ttl): a notice older than this describes state a later
+/// pass has already superseded, and typing it into an unblocked coordinator is
+/// the flood this prevents. Senders with their own period use that instead.
+const NOTICE_TTL: Duration = Duration::from_secs(3600);
 
 type Result<T> = std::result::Result<T, AgentError>;
 
@@ -438,6 +443,39 @@ pub(crate) fn blocked_finding(screen: &str) -> Option<(EpisodeKind, String)> {
         return Some((EpisodeKind::Stuck(cause), cause.as_str().to_owned()));
     }
     approval_prompt_line(screen).map(|line| (EpisodeKind::ApprovalPrompt, line))
+}
+
+/// [`blocked_finding`], plus one harness's own question and picker forms
+/// ([`crate::harness_tui::HarnessTui::classify`]): a multiple-choice question
+/// whose text carries no approval phrase (Claude's AskUserQuestion, Muse's
+/// request_user_input, Codex approval) still parks the turn until a person
+/// answers at the terminal (#1158 coordinator-never-blocks). Used for the
+/// designated coordinator, whose notice can never wait in its own queue.
+pub(crate) fn blocked_finding_for(
+    screen: &str,
+    harness: Option<&str>,
+) -> Option<(EpisodeKind, String)> {
+    if let Some(finding) = blocked_finding(screen).filter(|(kind, _)| kind.is_blocked()) {
+        return Some(finding);
+    }
+    let view = crate::harness_tui::harness_tui(harness)?.classify(screen);
+    match view.state {
+        crate::harness_tui::State::BlockingQuestion => Some((
+            EpisodeKind::ApprovalPrompt,
+            view.question
+                .as_ref()
+                .filter(|question| !question.text.trim().is_empty())
+                .map_or_else(
+                    || crate::harness_tui::blocked_hint(&view),
+                    |question| question.text.trim().to_owned(),
+                ),
+        )),
+        crate::harness_tui::State::MenuOrPicker => Some((
+            EpisodeKind::ApprovalPrompt,
+            "a menu or picker prompt is showing".to_owned(),
+        )),
+        _ => None,
+    }
 }
 
 /// The prompt line at the bottom of `screen`, trimmed and bounded, when one is showing.
@@ -944,6 +982,14 @@ struct WatchState {
     /// heading hash; a record goes once its request is answered or edited.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     status_pages: BTreeMap<String, status_requests::PageRecord>,
+    /// When the designated coordinator was first seen waiting at a prompt in its own
+    /// TUI this episode (#1158 coordinator-never-blocks); cleared when a pass finds
+    /// its screen unblocked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    coordinator_blocked_since: Option<f64>,
+    /// When the fallback or owner was last told about the blocked coordinator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    coordinator_blocked_noticed_at: Option<f64>,
 }
 
 /// One agent's recovery-ladder episode: when blockage was first seen,
@@ -1300,6 +1346,13 @@ pub trait Probe {
     ) -> std::result::Result<Option<StatusRequests>, String> {
         Ok(None)
     }
+    /// The designated coordinator's own latest screen as `(agent, harness, screen)`
+    /// (#1158 coordinator-never-blocks): the coordinator is exempt from ordinary
+    /// episodes, but its screen is still read so a prompt it is parked on can page
+    /// the owner instead of queueing behind itself. The default reads none.
+    fn coordinator_screen(&mut self) -> Option<(String, Option<String>, String)> {
+        None
+    }
     /// Sleep for `duration` on `clock`, ending early, with `true`, when a status file changes.
     /// The default watches nothing and sleeps it all.
     fn wait_for_status_change(&mut self, clock: &dyn Clock, duration: Duration) -> bool {
@@ -1326,6 +1379,35 @@ pub trait Notifier {
     /// as a priority sender. The default sends it as any other.
     fn notify_urgent(&mut self, coordinator: &str, text: &str, message_id: &str) -> Result<String> {
         self.notify(coordinator, text, message_id)
+    }
+    /// [`Self::notify`] for a periodic automated notice (#1157 automated-notice-ttl):
+    /// `ttl` (about the notice's own period) bounds how long it may wait untyped before
+    /// the queue sets it aside, and `supersede_key` (one per request, lane or check)
+    /// makes this copy replace any still-pending copy with the same key, so a blocked
+    /// coordinator is not flooded with stale repeats on unblock. The default ignores
+    /// both and notifies plainly.
+    fn notify_expiring(
+        &mut self,
+        coordinator: &str,
+        text: &str,
+        message_id: &str,
+        ttl: Option<Duration>,
+        supersede_key: Option<&str>,
+    ) -> Result<String> {
+        let _ = (ttl, supersede_key);
+        self.notify(coordinator, text, message_id)
+    }
+    /// [`Self::notify_expiring`] as a priority sender, like [`Self::notify_urgent`].
+    fn notify_urgent_expiring(
+        &mut self,
+        coordinator: &str,
+        text: &str,
+        message_id: &str,
+        ttl: Option<Duration>,
+        supersede_key: Option<&str>,
+    ) -> Result<String> {
+        let _ = (ttl, supersede_key);
+        self.notify_urgent(coordinator, text, message_id)
     }
     /// Raise one alarm in the owner's chat for a notice no agent can be told (#844
     /// watch-notice-route), under `alarm_id`, and return where it was posted. The default has no
@@ -2880,7 +2962,11 @@ fn send_batch(
         lines.join("\n")
     );
     let recipient = batch.recipient.as_deref().unwrap_or(&options.coordinator);
-    match notifier.notify(recipient, &text, &batch.message_id) {
+    // A batch carries distinct once-only episode notices, so it expires but never
+    // supersedes: a per-recipient key would silently discard the other lanes'
+    // notices in the batch it replaced (#1157).
+    let batch_ttl = (options.min_notice_interval * 2).max(NOTICE_TTL);
+    match notifier.notify_expiring(recipient, &text, &batch.message_id, Some(batch_ttl), None) {
         Ok(outcome) => {
             for notice in &notices {
                 mark_notified(state, notice, now);
@@ -2994,7 +3080,14 @@ fn flush_child_done(
             "\nRead its reply with `agentctl read {}`, then give it its next task or stop it.",
             notice.agent
         ));
-        let mut sent = notifier.notify(notice_target(options, &notice), &text, &message_id);
+        let supersede_key = format!("child-done:{key}");
+        let mut sent = notifier.notify_expiring(
+            notice_target(options, &notice),
+            &text,
+            &message_id,
+            Some(NOTICE_TTL),
+            Some(&supersede_key),
+        );
         // A manager that cannot take the finish (stopped, renamed, paused since) passes it to
         // the coordinator, now and from then on.
         if sent.is_err() && notice.recipient.is_some() {
@@ -3006,7 +3099,13 @@ fn flush_child_done(
                 pending.recipient = None;
                 pending.redirected = true;
             }
-            sent = notifier.notify(&options.coordinator, &text, &message_id);
+            sent = notifier.notify_expiring(
+                &options.coordinator,
+                &text,
+                &message_id,
+                Some(NOTICE_TTL),
+                Some(&supersede_key),
+            );
         }
         match sent {
             Ok(outcome) => {
@@ -3188,9 +3287,18 @@ fn report_status_requests(
             stable_hash(&format!("{}\n{sent}", request.key()))
         );
         let text = status_requests::page_text(&request, reason, &found.config);
+        // A re-page replaces its still-pending predecessor and expires by the next
+        // one: at most one copy per request ever waits in the queue (#1157).
+        let supersede_key = format!("status-request:{}", request.key());
         let outcome = match route_from(&coordinator, &request.agent, &jammed, options) {
             Some(recipient) => notifier
-                .notify(recipient, &text, &message_id)
+                .notify_expiring(
+                    recipient,
+                    &text,
+                    &message_id,
+                    Some(Duration::from_secs_f64(repage)),
+                    Some(&supersede_key),
+                )
                 .map(|outcome| json!({"to": recipient, "outcome": outcome})),
             None => match alarm_owner(notifier, &text, &message_id) {
                 (true, alarm) => Ok(alarm),
@@ -3258,15 +3366,119 @@ fn tell_about(
     message_id: &str,
     options: &WatchAgentsOptions,
 ) -> Result<Value> {
+    tell_about_expiring(
+        notifier, subject, jammed, text, message_id, options, None, None,
+    )
+}
+
+/// [`tell_about`] for a periodic automated notice, with its TTL and supersede key (#1157).
+#[allow(clippy::too_many_arguments)]
+fn tell_about_expiring(
+    notifier: &mut dyn Notifier,
+    subject: &str,
+    jammed: &BTreeSet<String>,
+    text: &str,
+    message_id: &str,
+    options: &WatchAgentsOptions,
+    ttl: Option<Duration>,
+    supersede_key: Option<&str>,
+) -> Result<Value> {
     match notice_route(subject, jammed, options) {
         Some(recipient) => notifier
-            .notify_urgent(recipient, text, message_id)
+            .notify_urgent_expiring(recipient, text, message_id, ttl, supersede_key)
             .map(|outcome| json!({"to": recipient, "outcome": outcome})),
         None => match alarm_owner(notifier, text, message_id) {
             (true, row) => Ok(row),
             (false, row) => Err(fail(row["error"].as_str().unwrap_or("owner alarm failed"))),
         },
     }
+}
+
+/// Tell the fallback (or, with none reachable, the owner) that the designated
+/// coordinator itself is parked at a prompt in its TUI (#1158
+/// coordinator-never-blocks): the coordinator is exempt from ordinary episodes,
+/// so without this its blockage is invisible until its queue flushes hours
+/// later. The notice is routed by [`notice_route`] with the coordinator as
+/// subject, so it never waits in the blocked coordinator's own queue; with no
+/// agent route it raises the owner alarm. Repeats at most once per
+/// `--min-notice-interval` (floored at a minute) while blocked. Returns the
+/// report row, or `None` when no screen was read or nothing changed.
+fn report_coordinator_blocked(
+    probe: &mut dyn Probe,
+    notifier: &mut dyn Notifier,
+    state: &mut WatchState,
+    now: f64,
+    options: &WatchAgentsOptions,
+) -> Option<Value> {
+    let (coordinator, harness, screen) = probe.coordinator_screen()?;
+    let Some((kind, detail)) = blocked_finding_for(&screen, harness.as_deref()) else {
+        if state.coordinator_blocked_since.take().is_some() {
+            state.coordinator_blocked_noticed_at = None;
+            return Some(json!({"agent": coordinator, "blocked": false, "cleared": true}));
+        }
+        return None;
+    };
+    let since = *state.coordinator_blocked_since.get_or_insert(now);
+    let window = options.min_notice_interval.as_secs_f64().max(60.0);
+    let due = state
+        .coordinator_blocked_noticed_at
+        .is_none_or(|at| now - at >= window);
+    let mut row = json!({
+        "agent": coordinator,
+        "blocked": true,
+        "kind": kind.as_str(),
+        "detail": detail,
+        "since": since,
+        "blocked_for_seconds": (now - since).max(0.0),
+    });
+    if !due {
+        row["reported"] = json!(true);
+        return Some(row);
+    }
+    if options.check_only {
+        row["due"] = json!(true);
+        return Some(row);
+    }
+    let text = format!(
+        "[agentctl watch-agents] {coordinator} is waiting at a question or permission \
+         prompt in its TUI (blocked {}): {detail}. The designated coordinator cannot \
+         read its queue while blocked, so this notice bypasses it. Answer the prompt \
+         at its pane (agentctl prompts {coordinator}; agentctl answer {coordinator} \
+         --option N), or tell it over chat to ask there instead.",
+        ago(now, since)
+    );
+    let message_id = format!(
+        "agent-watch-coordinator-blocked-{coordinator}-{}",
+        since as u64
+    );
+    let jammed = BTreeSet::from([coordinator.clone()]);
+    let key = format!("coordinator-blocked:{coordinator}");
+    match tell_about_expiring(
+        notifier,
+        &coordinator,
+        &jammed,
+        &text,
+        &message_id,
+        options,
+        Some(Duration::from_secs_f64(window)),
+        Some(&key),
+    ) {
+        Ok(outcome) => {
+            state.coordinator_blocked_noticed_at = Some(now);
+            row["reported"] = json!(true);
+            row["outcome"] = outcome;
+            log(format_args!(
+                "coordinator {coordinator} is blocked at a TUI prompt ({detail}); told past it"
+            ));
+        }
+        Err(error) => {
+            row["error"] = json!(error.to_string());
+            log(format_args!(
+                "coordinator {coordinator} blocked at a TUI prompt but nobody could be told: {error}"
+            ));
+        }
+    }
+    Some(row)
 }
 
 /// Who is told about a notice: the agent's nearest reachable manager, as the pass decided it,
@@ -3448,6 +3660,13 @@ fn watch_agents_once(
     // First, as a priority sender: the other notices wait for the coordinator's lock like any
     // ordinary sender, so behind a jam on the coordinator they would hold this one up.
     let delivery_waits = report_delivery_jams(probe, notifier, state, now, options);
+    // The coordinator's own blocked prompt, told past it at once (#1158): it is
+    // exempt from episodes, so this dedicated check is its only alert.
+    let coordinator_blocked = if probe_error.is_null() {
+        report_coordinator_blocked(probe, notifier, state, now, options)
+    } else {
+        None
+    };
     // Queued prompts are typed here, not parked (#804): this pass drains every
     // interactive agent's queue, and a remainder past the stale threshold keeps
     // the pass not-ok with the agent and the oldest prompt's age named.
@@ -3539,7 +3758,10 @@ fn watch_agents_once(
                 // A finished child is news for its coordinator, not a fault in the team.
                 row["kind"] == EpisodeKind::ChildDone.as_str()
                     || (row["reported"] != true && row["due"] != true)
-            }),
+            })
+            && coordinator_blocked
+                .as_ref()
+                .is_none_or(|row| row["blocked"] != true),
         "probe_error": probe_error,
         "agents": seen.len(),
         "episodes": episodes,
@@ -3554,6 +3776,7 @@ fn watch_agents_once(
         "child_done": child_done,
         "waiting": state.pending.len(),
         "delivery_waits": delivery_waits,
+        "coordinator_blocked": coordinator_blocked,
         "queue_drains": queue_drains,
         "held": held,
         "owner_waits": owner_waits,
@@ -3676,12 +3899,16 @@ fn check_blocked(
         })
         .collect();
     let draft_sweeps = sweep_editor_drafts(probe, notifier, state, editor_screens, now, options);
+    // The coordinator has no episode memory here either: its dedicated check
+    // runs on the quick cadence too, so its prompt pages within minutes (#1158).
+    let coordinator_blocked = report_coordinator_blocked(probe, notifier, state, now, options);
     let retry_due = state.batches.iter().any(|batch| !batch.retry.waiting(now));
-    if found.is_empty() && draft_sweeps.is_empty() && !retry_due {
+    if found.is_empty() && draft_sweeps.is_empty() && !retry_due && coordinator_blocked.is_none() {
         return None;
     }
     let notice = flush_notices(state, notifier, now, options);
     Some(json!({"checked_at": now, "found": found, "notice": notice,
+                "coordinator_blocked": coordinator_blocked,
                 "draft_sweeps": draft_sweeps}))
 }
 
@@ -3735,7 +3962,17 @@ fn report_delivery_jams(
                      chat requests are caught in it."
                 );
                 let message_id = format!("agent-watch-jam-{agent}-{}", now as u64);
-                match tell_about(notifier, agent, &jammed, &text, &message_id, options) {
+                let supersede_key = format!("jam:{agent}");
+                match tell_about_expiring(
+                    notifier,
+                    agent,
+                    &jammed,
+                    &text,
+                    &message_id,
+                    options,
+                    Some(NOTICE_TTL),
+                    Some(&supersede_key),
+                ) {
                     Ok(outcome) => {
                         still_jammed.insert(agent.clone(), now);
                         row["reported"] = json!(true);
@@ -4194,9 +4431,19 @@ fn report_held_queues(
         }
         let mut told = Vec::new();
         let mut errors = Vec::new();
+        // A held-queue notice expires well past the stale threshold that raised it,
+        // and replaces any still-pending copy about the same hold (#1157).
+        let held_ttl = (options.queue_stale * 3).max(NOTICE_TTL);
+        let held_key = format!("held:{agent}:{kind}");
         for (recipient, text) in &recipients {
             let message_id = format!("agent-watch-held-{agent}-{recipient}-{}", now as u64);
-            match notifier.notify_urgent(recipient, text, &message_id) {
+            match notifier.notify_urgent_expiring(
+                recipient,
+                text,
+                &message_id,
+                Some(held_ttl),
+                Some(&held_key),
+            ) {
                 Ok(_) => told.push(recipient.clone()),
                 Err(error) => errors.push(json!({"to": recipient, "error": error.to_string()})),
             }
@@ -4922,11 +5169,16 @@ struct Checked {
     kept: Option<KeptScreen>,
     /// The screen came from the last pass, not from Herdr.
     reused: bool,
+    /// For the designated coordinator only: its harness and recent screen, read
+    /// for the blocked-prompt check (#1158); it gets no ordinary observation.
+    coordinator_screen: Option<(Option<String>, String)>,
 }
 
 /// The production probe: one registry, read through Herdr. The coordinator itself,
 /// paused agents, cloud sessions viewed through a terminal, and records that are not
 /// running are not watched; a `launch_failed` record was already reported by `start`.
+/// The coordinator's screen is still read, for the blocked-prompt check alone
+/// (#1158 coordinator-never-blocks): it gets no episodes and no other judgement.
 ///
 /// A pass checks only records that are running or starting and not paused (#571
 /// watch-agents-scale): the rest are judged from the record alone. Up to [`PASS_WORKERS`]
@@ -4952,10 +5204,14 @@ pub struct ManagedProbe<'a, A: ManagedApi + ?Sized> {
     teams_state: PathBuf,
     /// The watch on the status files' directory, once a configuration names one that exists.
     status_watch: Option<status_requests::DirectoryWatch>,
+    /// The coordinator's latest read screen (agent, harness, screen) for
+    /// [`Probe::coordinator_screen`]; refreshed by each pass and quick check.
+    coordinator_latest: Option<(String, Option<String>, String)>,
 }
 
 impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
-    /// Watch `registry` through `client`, exempting `coordinator`.
+    /// Watch `registry` through `client`, exempting `coordinator` from episodes
+    /// (its screen is still read for the blocked-prompt check, #1158).
     pub fn new(client: &'a A, registry: &Path, coordinator: &str) -> Self {
         Self {
             client,
@@ -4969,6 +5225,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
             screened: Vec::new(),
             teams_state: crate::subagents::agent_teams_state_dir(),
             status_watch: None,
+            coordinator_latest: None,
         }
     }
 
@@ -5020,8 +5277,8 @@ impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
         }
         let name = row["name"].as_str().unwrap_or_default().to_owned();
         let row = manager.watch_status(&name, &mut crate::subagents::FleetCache::new());
-        let watched = name != self.coordinator
-            && row["paused"] != true
+        let is_coordinator = name == self.coordinator;
+        let live = row["paused"] != true
             && row["move_pending"] != true
             && (row["record_error"] == true
                 || (matches!(row["lifecycle"].as_str(), Some("running" | "starting"))
@@ -5033,12 +5290,29 @@ impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
                     && row["agent_status"] != "turning-over"
                     && (row["agent_status"] != "taken-over"
                         || row["takeover_needs_handback"] == true)));
+        let watched = !is_coordinator && live;
         if !watched {
+            // The coordinator gets no episodes, but its screen is still read for
+            // the one check that is about it (#1158): a prompt it is parked on.
+            // A headless coordinator has no TUI screen to park on.
+            let (coordinator_screen, kept, reused) = if is_coordinator
+                && live
+                && row["adapter"].as_str() != Some(crate::headless::ADAPTER)
+                && !(row["agent_status"] == "unknown" && !row["probe_error"].is_null())
+            {
+                let status = row["agent_status"].as_str().unwrap_or("unknown");
+                let harness = row["harness"].as_str().map(str::to_owned);
+                let (screen, kept, reused) = self.screen(manager, &name, status);
+                (screen.map(|screen| (harness, screen)), kept, reused)
+            } else {
+                (None, None, false)
+            };
             return (!expired()).then_some(Checked {
                 row,
                 observation: None,
-                kept: None,
-                reused: false,
+                kept,
+                reused,
+                coordinator_screen,
             });
         }
         let headless = row["adapter"].as_str() == Some(crate::headless::ADAPTER);
@@ -5059,6 +5333,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedProbe<'a, A> {
             observation: Some(observation),
             kept,
             reused,
+            coordinator_screen: None,
         })
     }
 
@@ -5451,6 +5726,10 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
             .flatten()
     }
 
+    fn coordinator_screen(&mut self) -> Option<(String, Option<String>, String)> {
+        self.coordinator_latest.clone()
+    }
+
     fn status_requests(
         &mut self,
         skip: &BTreeSet<String>,
@@ -5582,17 +5861,34 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
         };
         let manager = manager.with_project_workspace_resolved();
         let client = self.client;
-        let screens = bounded_map(&self.screened, PASS_WORKERS, |name| {
-            // A view scrolled back shows old rows, perhaps an old prompt: it is no evidence.
-            manager
-                .watch_visible(name, SCREEN_LINES)
+        let mut screens: Vec<(String, String)> =
+            bounded_map(&self.screened, PASS_WORKERS, |name| {
+                // A view scrolled back shows old rows, perhaps an old prompt: it is no evidence.
+                manager
+                    .watch_visible(name, SCREEN_LINES)
+                    .ok()
+                    .filter(|(pane, _)| client.pane_at_bottom(pane))
+                    .map(|(_, text)| (name.clone(), text))
+            })
+            .into_iter()
+            .flatten()
+            .collect();
+        // The coordinator is never among the screened (it has no observation),
+        // but the quick check reads its visible rows too (#1158).
+        if !screens.iter().any(|(name, _)| name == &self.coordinator) {
+            if let Some((_, text)) = manager
+                .watch_visible(&self.coordinator, SCREEN_LINES)
                 .ok()
                 .filter(|(pane, _)| client.pane_at_bottom(pane))
-                .map(|(_, text)| (name.clone(), text))
-        })
-        .into_iter()
-        .flatten()
-        .collect();
+            {
+                self.coordinator_latest = Some((
+                    self.coordinator.clone(),
+                    self.agent_harness(&self.coordinator),
+                    text.clone(),
+                ));
+                screens.push((self.coordinator.clone(), text));
+            }
+        }
         // Start the next check further along, so a slow server that cuts every check short at
         // its deadline does not leave the same agents unread each time.
         let turn = PASS_WORKERS.min(self.screened.len());
@@ -5688,6 +5984,18 @@ impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
             match checked {
                 Some(checked) => {
                     reused += usize::from(checked.reused);
+                    // The coordinator's screen was read this pass: it is the
+                    // freshest word on its blockage, replacing any stale read.
+                    // Its kept screen is kept too, so an unchanged idle
+                    // coordinator costs no recent read next pass.
+                    if rows[index]["name"].as_str() == Some(self.coordinator.as_str()) {
+                        if let Some(kept) = checked.kept.clone() {
+                            screens.insert(self.coordinator.clone(), kept);
+                        }
+                        self.coordinator_latest = checked
+                            .coordinator_screen
+                            .map(|(harness, screen)| (self.coordinator.clone(), harness, screen));
+                    }
                     if let Some(observation) = checked.observation {
                         if let Some(kept) = checked.kept {
                             screens.insert(observation.name.clone(), kept);
@@ -5856,6 +6164,8 @@ impl<A: ManagedApi + ?Sized> Notifier for ManagedNotifier<'_, A> {
             coordinator,
             text,
             message_id,
+            None,
+            None,
         )
     }
 
@@ -5865,6 +6175,44 @@ impl<A: ManagedApi + ?Sized> Notifier for ManagedNotifier<'_, A> {
             coordinator,
             text,
             message_id,
+            None,
+            None,
+        )
+    }
+
+    fn notify_expiring(
+        &mut self,
+        coordinator: &str,
+        text: &str,
+        message_id: &str,
+        ttl: Option<Duration>,
+        supersede_key: Option<&str>,
+    ) -> Result<String> {
+        self.queue_notice(
+            ManagedAgents::new(self.client, &self.registry)?,
+            coordinator,
+            text,
+            message_id,
+            ttl,
+            supersede_key,
+        )
+    }
+
+    fn notify_urgent_expiring(
+        &mut self,
+        coordinator: &str,
+        text: &str,
+        message_id: &str,
+        ttl: Option<Duration>,
+        supersede_key: Option<&str>,
+    ) -> Result<String> {
+        self.queue_notice(
+            ManagedAgents::new(self.client, &self.registry)?.with_lock_priority(),
+            coordinator,
+            text,
+            message_id,
+            ttl,
+            supersede_key,
         )
     }
 
@@ -5985,7 +6333,15 @@ impl<A: ManagedApi + ?Sized> ManagedNotifier<'_, A> {
         coordinator: &str,
         text: &str,
         message_id: &str,
+        ttl: Option<Duration>,
+        supersede_key: Option<&str>,
     ) -> Result<String> {
+        // One deadline for every attempt in this call: a requeue after a failed
+        // copy keeps the original expiry instead of extending it.
+        let not_after = ttl.map(|ttl| {
+            crate::agent::now_millis()
+                .saturating_add(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX))
+        });
         for attempt in 0..=NOTICE_REQUEUE_ATTEMPTS {
             let attempt_id = attempt_message_id(message_id, attempt);
             // A previous attempt may have queued this batch just before the watcher
@@ -6015,9 +6371,11 @@ impl<A: ManagedApi + ?Sized> ManagedNotifier<'_, A> {
                         DrainOptions {
                             ready_timeout: Duration::from_secs(NOTICE_READY_SECONDS),
                             deliver_while_working: true,
+                            not_after,
                             ..DrainOptions::default()
                         },
                         Some(&attempt_id),
+                        supersede_key,
                     )?;
                     return Ok(if attempt == 0 {
                         result.outcome.as_str().to_owned()
@@ -7339,6 +7697,8 @@ mod tests {
         alarms: Vec<(String, String)>,
         /// Whether raising an owner alarm fails, as with no route configured (#844).
         alarm_fails: bool,
+        /// Expiring notices, as (message ID, ttl, supersede key) (#1157).
+        expiring: Vec<(String, Option<Duration>, Option<String>)>,
         /// Ladder steps attempted, as (step, agent).
         ladder_steps: Vec<(String, String)>,
         /// Whether ladder sweep/redraw fail (restart succeeds).
@@ -7430,6 +7790,32 @@ mod tests {
             self.notify(coordinator, text, message_id)
         }
 
+        fn notify_expiring(
+            &mut self,
+            coordinator: &str,
+            text: &str,
+            message_id: &str,
+            ttl: Option<Duration>,
+            supersede_key: Option<&str>,
+        ) -> Result<String> {
+            self.expiring
+                .push((message_id.to_owned(), ttl, supersede_key.map(str::to_owned)));
+            self.notify(coordinator, text, message_id)
+        }
+
+        fn notify_urgent_expiring(
+            &mut self,
+            coordinator: &str,
+            text: &str,
+            message_id: &str,
+            ttl: Option<Duration>,
+            supersede_key: Option<&str>,
+        ) -> Result<String> {
+            self.expiring
+                .push((message_id.to_owned(), ttl, supersede_key.map(str::to_owned)));
+            self.notify_urgent(coordinator, text, message_id)
+        }
+
         fn notify(&mut self, coordinator: &str, text: &str, message_id: &str) -> Result<String> {
             self.attempts.push(message_id.to_owned());
             if self
@@ -7462,6 +7848,110 @@ mod tests {
         options: &WatchAgentsOptions,
     ) -> Value {
         watch_agents_once(probe, notifier, state, now, options)
+    }
+
+    /// A probe whose only read is the coordinator's own screen (#1158).
+    struct CoordScreenProbe(Vec<Option<String>>);
+
+    impl Probe for CoordScreenProbe {
+        fn observe(&mut self) -> Result<Vec<Observation>> {
+            Ok(Vec::new())
+        }
+        fn coordinator_screen(&mut self) -> Option<(String, Option<String>, String)> {
+            let screen = if self.0.is_empty() {
+                None
+            } else {
+                self.0.remove(0)
+            };
+            screen.map(|screen| ("coordinator".to_owned(), Some("claude".to_owned()), screen))
+        }
+    }
+
+    const QUESTION_SCREEN: &str = "──────\nMay I delete the inactive swap file?\n❯ 1. Delete it\n  2. Keep it\nEnter to select · ↑/↓ to navigate · Esc to cancel\n";
+
+    #[test]
+    fn a_question_dialog_is_a_blocked_finding_for_its_harness() {
+        let (kind, detail) = blocked_finding_for(QUESTION_SCREEN, Some("claude"))
+            .expect("a Claude question form blocks");
+        assert_eq!(kind, EpisodeKind::ApprovalPrompt);
+        assert!(detail.contains("swap file"), "{detail}");
+        assert!(
+            blocked_finding_for("❯ \n  esc to interrupt", Some("claude")).is_none(),
+            "a working composer is not blocked"
+        );
+        // The approval table still reads without a harness form.
+        assert!(blocked_finding_for("Do you want to proceed?\n", None)
+            .is_some_and(|(kind, _)| kind.is_blocked()));
+    }
+
+    #[test]
+    fn a_blocked_coordinator_pages_the_fallback_never_itself() {
+        let mut probe = CoordScreenProbe(vec![
+            Some(QUESTION_SCREEN.to_owned()),
+            Some(QUESTION_SCREEN.to_owned()),
+            Some("❯ ".to_owned()),
+        ]);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let mut options = options();
+        options.notice_fallback = vec!["liaison".to_owned()];
+        options.min_notice_interval = Duration::from_secs(600);
+
+        let row =
+            report_coordinator_blocked(&mut probe, &mut notifier, &mut state, 1000.0, &options)
+                .expect("a blocked row");
+        assert_eq!(row["blocked"], true);
+        assert_eq!(notifier.sent.len(), 1, "{:?}", notifier.sent);
+        assert_eq!(
+            notifier.sent[0].0, "liaison",
+            "never the blocked coordinator"
+        );
+        assert!(
+            notifier.sent[0]
+                .1
+                .contains("waiting at a question or permission prompt"),
+            "{}",
+            notifier.sent[0].1
+        );
+        assert!(
+            notifier.sent[0].1.contains("swap file"),
+            "{}",
+            notifier.sent[0].1
+        );
+        assert!(notifier.alarms.is_empty());
+
+        // Still blocked inside the window: no second page.
+        let row =
+            report_coordinator_blocked(&mut probe, &mut notifier, &mut state, 1100.0, &options)
+                .expect("still blocked");
+        assert_eq!(row["blocked"], true);
+        assert_eq!(notifier.sent.len(), 1);
+
+        // Unblocked: the episode clears and is not repeated.
+        let row =
+            report_coordinator_blocked(&mut probe, &mut notifier, &mut state, 1200.0, &options)
+                .expect("a cleared row");
+        assert_eq!(row["blocked"], false);
+        assert!(state.coordinator_blocked_since.is_none());
+    }
+
+    #[test]
+    fn a_blocked_coordinator_with_no_fallback_raises_the_owner_alarm() {
+        let mut probe = CoordScreenProbe(vec![Some(QUESTION_SCREEN.to_owned())]);
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let options = options();
+        let row =
+            report_coordinator_blocked(&mut probe, &mut notifier, &mut state, 1000.0, &options)
+                .expect("a blocked row");
+        assert_eq!(row["blocked"], true);
+        assert!(notifier.sent.is_empty(), "nothing queued to any agent");
+        assert_eq!(notifier.alarms.len(), 1);
+        assert!(
+            notifier.alarms[0].1.contains("swap file"),
+            "{}",
+            notifier.alarms[0].1
+        );
     }
 
     /// #731 agentctl-paste-tail-flush sweep fixture: one agent whose editor
@@ -11063,6 +11553,18 @@ mod tests {
         assert_eq!(
             report["status_requests"]["pages"][0]["reason"], "new",
             "{report}"
+        );
+        // #1157: the page carries the repage interval as its TTL and one
+        // supersede key per request, so a re-page replaces the pending copy.
+        assert_eq!(notifier.expiring.len(), 1, "{:?}", notifier.expiring);
+        assert_eq!(notifier.expiring[0].1, Some(Duration::from_secs(1800)));
+        assert!(
+            notifier.expiring[0]
+                .2
+                .as_deref()
+                .is_some_and(|key| key.starts_with("status-request:lane ")),
+            "{:?}",
+            notifier.expiring
         );
         // The coordinator's own status file is never read for requests.
         assert!(probe.skipped[0].contains("coordinator"));

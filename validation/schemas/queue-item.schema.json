@@ -12,6 +12,11 @@
           "const": "expired",
           "description": "Its `not_after` deadline passed.",
           "type": "string"
+        },
+        {
+          "const": "superseded",
+          "description": "A newer queued item with the same `supersede_key` replaced it.",
+          "type": "string"
         }
       ]
     },
@@ -265,6 +270,20 @@
       "minimum": 0,
       "type": [
         "integer",
+        "null"
+      ]
+    },
+    "supersede_key": {
+      "description": "Sender-chosen key naming what this item is the latest word on, within\nits queue: enqueueing an item sets aside every still-pending item\nwith the same key (see `superseded_by`). Items without a key are\nnever superseded and supersede nothing.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "superseded_by": {
+      "description": "The identifier of the newer item that superseded this one, recorded\nwhen it was set aside with reason `superseded`.",
+      "type": [
+        "string",
         "null"
       ]
     },

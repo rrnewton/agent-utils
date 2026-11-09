@@ -115,6 +115,20 @@ def test_lane_and_cancelled_items_validate() -> None:
     }
     assert validate(cancelled, schema, schema) == []
     assert validate({"text": "x", "misroutes": [{"at": 1.0}]}, schema, schema)
+    # #1156 queue-supersede-key: keyed and superseded items, as both editions write them.
+    keyed = {"text": "x", "supersede_key": "status-request:lane:abc"}
+    assert validate(keyed, schema, schema) == []
+    superseded = {
+        "text": "x",
+        "supersede_key": "status-request:lane:abc",
+        "delivery_state": "cancelled",
+        "cancel_reason": "superseded",
+        "cancel_detail": "superseded by m2",
+        "cancelled_at": 3.0,
+        "superseded_by": "m2",
+    }
+    assert validate(superseded, schema, schema) == []
+    assert validate({"text": "x", "supersede_key": 7}, schema, schema)
 
 
 def test_tombstone_and_sidecar_validate() -> None:

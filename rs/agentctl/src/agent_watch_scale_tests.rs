@@ -353,12 +353,14 @@ fn a_pass_over_sixty_records_and_a_hundred_panes_takes_seconds_and_asks_each_thi
     // Every pane the listing names is answered from it; only the gone agent's pane is asked
     // about, and found missing.
     assert_eq!(count("pane get"), 1, "{calls:#?}");
+    // 18 reachable watched agents plus the coordinator, whose screen is read
+    // for its blocked-prompt check alone (#1158).
     assert_eq!(
         calls
             .iter()
             .filter(|call| call.contains("--source recent"))
             .count(),
-        18,
+        19,
         "one recent read per reachable agent: {calls:#?}"
     );
     let mut distinct = calls.clone();
@@ -400,7 +402,8 @@ fn an_idle_agents_screen_is_read_again_only_when_its_visible_rows_change() {
             .collect()
     };
     let first = probe.observe().unwrap();
-    assert_eq!(recent_reads(&team).len(), 3);
+    // The three watched agents plus the coordinator's blocked-prompt read (#1158).
+    assert_eq!(recent_reads(&team).len(), 4);
     team.clear_calls();
 
     let second = probe.observe().unwrap();

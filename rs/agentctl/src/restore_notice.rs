@@ -58,7 +58,7 @@ pub fn after_restore<A: ManagedApi + ?Sized>(
             let id = message_id("imback", boot_id, &other.name);
             let result = (|| -> crate::subagents::Result<crate::agent::QueueResult> {
                 let manager = ManagedAgents::new(client, &other.registry)?;
-                manager.queue_identified(&other.name, summary, None, Some(&id))
+                manager.queue_identified(&other.name, summary, None, None, Some(&id))
             })();
             bridges.push(queued(&other.name, &id, result));
         }
@@ -86,7 +86,7 @@ pub fn after_restore<A: ManagedApi + ?Sized>(
                 catch_up.push(queued(
                     name,
                     &id,
-                    manager.queue_identified(name, &text, None, Some(&id)),
+                    manager.queue_identified(name, &text, None, None, Some(&id)),
                 ));
             }
         }
@@ -133,7 +133,7 @@ pub fn resume_briefs<A: ManagedApi + ?Sized>(
         };
         let id = message_id("brief", boot_id, name);
         let text = render_resume_brief(template, config, report, row);
-        let row_outcome = match manager.queue_identified(name, &text, None, Some(&id)) {
+        let row_outcome = match manager.queue_identified(name, &text, None, None, Some(&id)) {
             Ok(result) => json!({
                 "name": name,
                 "action": "queued",

@@ -22,11 +22,15 @@ enqueues, a status reader) share one on-disk format:
 An item moves to `inflight/` before it is typed, so a crash can never cause a
 second paste: an item found there afterwards is quarantined, not replayed.
 
-Prompts can also expire or be cancelled. An item in the second pending
-directory, `inbox.v2/`, may carry `not_after`; a tombstone in `cancel/`, written
-without any lock, asks every drainer not to type an item. A drainer checks both
-after it moves an item to `inflight/` and before it types, and sets such an item
-aside in `cancelled/` untyped. These directories exist only once something used
+Prompts can also expire, be cancelled, or supersede an older copy. An item in
+the second pending directory, `inbox.v2/`, may carry `not_after`; a tombstone
+in `cancel/`, written without any lock, asks every drainer not to type an
+item. An item with a `supersede_key` replaces every still-pending item with
+the same key when it is enqueued (under the delivery lock), so only the
+newest copy of a periodic notice is typed. A drainer checks expiry and
+tombstones after it moves an item to `inflight/` and before it types, and
+sets such an item aside in `cancelled/` untyped; superseded items land there
+too, marked `superseded`. These directories exist only once something used
 them, so a drainer that knows only the first four can tell a queue it must not
 touch.
 

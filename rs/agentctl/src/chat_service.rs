@@ -6378,6 +6378,7 @@ fn send_parent_notices<A: ManagedApi + ?Sized>(
             &body,
             DrainOptions::default(),
             Some(&binding.parent_notice_id),
+            None,
         ) {
             Ok(_) => {
                 let _ = state.mark_parent_notified(&binding.thread_id);
@@ -17280,11 +17281,15 @@ esac
         );
         let (resumed_thread, resumed_text) = roots.threaded.last().expect("resumed");
         assert_eq!(resumed_thread, thread);
+        // #1160: the warning is kept with the resolution appended (this
+        // episode had a root message, so its restart restored Replace),
+        // and the resolved line says how long the hold lasted.
         assert!(
-            resumed_text.starts_with("[chat-bridge] Resolved ")
+            resumed_text.starts_with("[chat-bridge WARNING]")
+                && resumed_text.contains("\n[chat-bridge] Resolved ")
                 && resumed_text.contains(" ET: ")
-                && resumed_text
-                    .ends_with("your messages to coordinator are being delivered again."),
+                && resumed_text.contains("your messages to coordinator are being delivered again.")
+                && resumed_text.contains("was held for "),
             "{resumed_text}"
         );
         assert_eq!(alarm_status(&root)["episode"], Value::Null);
@@ -17297,7 +17302,7 @@ esac
 
     /// #981 chat-bridge-alarm-coalesce: on a transport that can edit, an episode's repeats
     /// rewrite its one visible warning in place, across a restart, and delivery resuming
-    /// rewrites that same message to the resolved line. Nothing else is ever posted.
+    /// appends the resolved line under the kept warning (#1160). Nothing else is ever posted.
     #[test]
     fn the_owner_alarm_rewrites_its_one_warning_in_place_across_a_restart() {
         let (state, key, root) = state_with_request();
@@ -17364,8 +17369,10 @@ esac
         assert_eq!(roots.posts.len(), 1, "{:?}", roots.posts);
         assert_eq!(roots.updates.len(), 2, "{:?}", roots.updates);
         assert_eq!(roots.updates[1].0, "spaces/example/messages/post-1");
+        // #1160: the warning text survives; the resolution is appended under it.
         assert!(
-            roots.updates[1].1.starts_with("[chat-bridge] Resolved ")
+            roots.updates[1].1.starts_with("[chat-bridge WARNING]")
+                && roots.updates[1].1.contains("\n[chat-bridge] Resolved ")
                 && roots.updates[1].1.contains(" ET: "),
             "{}",
             roots.updates[1].1
@@ -17500,8 +17507,10 @@ esac
             Some(&mut roots),
             false,
         );
+        // #1160: the reposted message carries the warning plus its resolution.
         assert!(
-            roots.posts[1].1.starts_with("[chat-bridge] Resolved ")
+            roots.posts[1].1.starts_with("[chat-bridge WARNING]")
+                && roots.posts[1].1.contains("\n[chat-bridge] Resolved ")
                 && roots.posts[1].1.contains(" ET: "),
             "{}",
             roots.posts[1].1

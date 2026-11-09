@@ -43,6 +43,12 @@ pub const BINDING_LOCK: &str = ".binding.lock";
 pub const TARGET_BINDING: &str = "target.json";
 /// Item field: Unix time in milliseconds after which no drainer types the item.
 pub const NOT_AFTER: &str = "not_after";
+/// Item field: sender-chosen key naming what the item is the latest word on.
+pub const SUPERSEDE_KEY: &str = "supersede_key";
+/// Item field: identifier of the newer item that superseded this one.
+pub const SUPERSEDED_BY: &str = "superseded_by";
+/// Longest supersede key, in bytes.
+pub const SUPERSEDE_KEY_MAX: usize = 255;
 
 /// Exact durable location of one caller-selected queue message identifier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -300,6 +306,21 @@ pub fn validate_message_id(identifier: &str) -> Result<()> {
     Ok(())
 }
 
+/// Require `key` to be a valid supersede key: 1-255 bytes with no control characters.
+/// Keys name a subject within one queue (`status-request:lane:hash`), so punctuation such as
+/// colons is fine; they are compared byte for byte.
+pub fn validate_supersede_key(key: &str) -> Result<()> {
+    if key.is_empty()
+        || key.len() > SUPERSEDE_KEY_MAX
+        || key.bytes().any(|byte| byte < 0x20 || byte == 0x7f)
+    {
+        return Err(Error::invalid(
+            "supersede key must be 1-255 bytes with no control characters",
+        ));
+    }
+    Ok(())
+}
+
 /// A fresh message identifier: the wall-clock time in nanoseconds, twenty digits, then the
 /// process identifier.
 #[must_use]
@@ -339,6 +360,16 @@ pub fn enqueue(
     enqueue_into(root, Lane::Inbox, message_id, serialize, waiter, document)
 }
 
+/// What one enqueue did: the new item's identifier, and the identifiers of the
+/// still-pending items its `supersede_key` set aside (empty without a key).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Enqueued {
+    /// The new item's identifier.
+    pub id: String,
+    /// Identifiers set aside as superseded by this enqueue, oldest first.
+    pub superseded: Vec<String>,
+}
+
 /// [`enqueue`] into `lane`. An item for [`Lane::InboxV2`] may also carry `not_after`, a Unix time
 /// in milliseconds after which no drainer types it; that lane is created when first used.
 pub fn enqueue_into(
@@ -349,6 +380,29 @@ pub fn enqueue_into(
     waiter: &dyn Waiter,
     document: impl FnOnce(&str) -> Value,
 ) -> Result<String> {
+    Ok(enqueue_into_outcome(root, lane, message_id, serialize, waiter, document)?.id)
+}
+
+/// [`enqueue_into`], also reporting which pending items were superseded.
+///
+/// When the new item carries a `supersede_key`, every still-pending item in the queue (`inbox/`
+/// or `inbox.v2/`) with the same key is set aside untyped into `cancelled/` with
+/// `cancel_reason: superseded` and `superseded_by` naming the new item, so at most one pending
+/// item per key survives. Delivered history is never touched: items in `inflight/`,
+/// `processed/`, `failed/` or `cancelled/` keep their state, items without a key are never
+/// superseded, and an item already stranded in a composer (`stranded_at` or `paste_started_at`
+/// recorded) is left for the drain paths that own composers. The new item keeps its own fresh
+/// `queued_at`: it takes its place at the back of the queue, it does not inherit the replaced
+/// item's position. A key requires `serialize`: the scan, the set-asides and the write must be
+/// exact against a drain moving items between phases.
+pub fn enqueue_into_outcome(
+    root: &Path,
+    lane: Lane,
+    message_id: Option<&str>,
+    serialize: bool,
+    waiter: &dyn Waiter,
+    document: impl FnOnce(&str) -> Value,
+) -> Result<Enqueued> {
     let directories = prepare(root)?;
     let identifier = message_id.map_or_else(generated_message_id, str::to_owned);
     validate_message_id(&identifier)?;
@@ -385,6 +439,24 @@ pub fn enqueue_into(
             "queued message {identifier}: not_after must be a Unix time in milliseconds, and only an inbox.v2 item may carry one"
         )));
     }
+    let supersede_key = match document.get(SUPERSEDE_KEY) {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let Some(key) = value.as_str() else {
+                return Err(Error::invalid(format!(
+                    "queued message {identifier}: supersede_key must be a string"
+                )));
+            };
+            validate_supersede_key(key)
+                .map_err(|error| Error::invalid(format!("queued message {identifier}: {error}")))?;
+            if !serialize {
+                return Err(Error::invalid(format!(
+                    "queued message {identifier}: supersede_key requires a serialized enqueue"
+                )));
+            }
+            Some(key.to_owned())
+        }
+    };
     if document
         .get("text")
         .and_then(Value::as_str)
@@ -404,7 +476,61 @@ pub fn enqueue_into(
             io_error("persist queued message", &path, error)
         }
     })?;
-    Ok(identifier)
+    // The new item is durable before anything is set aside, so a failure here can duplicate a
+    // notice but never lose one; the delivery lock (required above) keeps a drain from typing
+    // either copy in between.
+    let mut superseded = Vec::new();
+    if let Some(key) = supersede_key {
+        let mut matches: Vec<(Option<f64>, PathBuf, Map<String, Value>)> = Vec::new();
+        for inbox in [&directories.inbox, &directories.inbox_v2] {
+            if fs::symlink_metadata(inbox).is_err() {
+                continue;
+            }
+            for candidate in json_paths(inbox)? {
+                if candidate == path {
+                    continue;
+                }
+                let Ok(raw) = read_json(&candidate) else {
+                    continue;
+                };
+                if raw.get(SUPERSEDE_KEY).and_then(Value::as_str) != Some(key.as_str()) {
+                    continue;
+                }
+                // An item a drain already pasted into a composer stays with the stale-draft
+                // paths; setting it aside here would misattribute that draft.
+                if raw.get("stranded_at").is_some_and(|v| !v.is_null())
+                    || raw.get("paste_started_at").is_some_and(|v| !v.is_null())
+                {
+                    continue;
+                }
+                let Ok(mut old) = load_message(&candidate) else {
+                    continue;
+                };
+                let queued_at = old.get("queued_at").and_then(Value::as_f64);
+                old.insert(SUPERSEDED_BY.to_owned(), json!(identifier));
+                matches.push((queued_at, candidate, old));
+            }
+        }
+        matches.sort_by(|(a, _, _), (b, _, _)| match (a, b) {
+            (Some(x), Some(y)) => x.total_cmp(y),
+            _ => a.is_some().cmp(&b.is_some()),
+        });
+        for (_, candidate, old) in matches {
+            let detail = format!("superseded by {identifier}");
+            superseded.push(set_aside(
+                root,
+                &directories,
+                &candidate,
+                old,
+                "superseded",
+                &detail,
+            )?);
+        }
+    }
+    Ok(Enqueued {
+        id: identifier,
+        superseded,
+    })
 }
 
 fn duplicate(identifier: &str) -> Error {
@@ -1427,6 +1553,133 @@ mod tests {
         .unwrap();
         assert_eq!(cancel(root, "done", "x").unwrap(), CancelOutcome::TooLate);
         assert!(!directories.cancel.join("done.json").exists());
+    }
+
+    #[test]
+    fn a_supersede_key_replaces_only_pending_items_with_the_same_key() {
+        let queue = TestQueue::new();
+        let root = &queue.0;
+        let directories = prepare(root).unwrap();
+        let keyed = |id: &str, queued_at: f64, extra: Value| {
+            let mut document = json!({
+                "id": id, "text": "t", "queued_at": queued_at, "delivery_attempts": 0,
+                "supersede_key": "notice:lane-a",
+            });
+            document
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().cloned().unwrap_or_default());
+            enqueue_into_outcome(root, Lane::InboxV2, Some(id), true, &Blocking, move |_| {
+                document
+            })
+            .unwrap()
+        };
+        // Settled history and a composer-owned copy with the same key, one plain pending
+        // copy, and an unkeyed neighbour. Setup enqueues go settled-first: each keyed
+        // enqueue supersedes plain pending copies, so order builds the intended set.
+        keyed("inflight-keyed", 101.0, json!({}));
+        transition(
+            &directories.inbox_v2.join("inflight-keyed.json"),
+            &directories.inflight.join("inflight-keyed.json"),
+        )
+        .unwrap();
+        keyed("done-keyed", 102.0, json!({}));
+        transition(
+            &directories.inbox_v2.join("done-keyed.json"),
+            &directories.processed.join("done-keyed.json"),
+        )
+        .unwrap();
+        keyed("stranded-keyed", 103.0, json!({"stranded_at": 103.5}));
+        enqueue_into(
+            root,
+            Lane::Inbox,
+            Some("unkeyed"),
+            true,
+            &Blocking,
+            |id| json!({"id": id, "text": "t", "queued_at": 150.0, "delivery_attempts": 0}),
+        )
+        .unwrap();
+        keyed("first", 100.0, json!({}));
+
+        let outcome = keyed("newest", 200.0, json!({}));
+        assert_eq!(outcome.id, "newest");
+        assert_eq!(
+            outcome.superseded,
+            vec!["first"],
+            "only the plain pending copy"
+        );
+        assert_eq!(
+            message_state(root, "first").unwrap(),
+            Some(MessageState::Cancelled)
+        );
+        let replaced = load_message(&directories.cancelled.join("first.json")).unwrap();
+        assert_eq!(replaced["cancel_reason"], "superseded");
+        assert_eq!(replaced["superseded_by"], "newest");
+        assert_eq!(replaced["cancel_detail"], "superseded by newest");
+        // Delivered history and composer-owned items are never touched.
+        assert_eq!(
+            message_state(root, "done-keyed").unwrap(),
+            Some(MessageState::Processed)
+        );
+        assert_eq!(
+            message_state(root, "inflight-keyed").unwrap(),
+            Some(MessageState::Inflight)
+        );
+        assert_eq!(
+            message_state(root, "stranded-keyed").unwrap(),
+            Some(MessageState::Pending)
+        );
+        assert_eq!(
+            message_state(root, "unkeyed").unwrap(),
+            Some(MessageState::Pending)
+        );
+        // The replacement keeps its own fresh position: last by queued_at.
+        let order: Vec<String> = pending_in_queue_order(&directories)
+            .unwrap()
+            .iter()
+            .map(|path| message_id_from_path(path).unwrap())
+            .collect();
+        assert_eq!(
+            order.last().map(String::as_str),
+            Some("newest"),
+            "{order:?}"
+        );
+        assert!(!order.contains(&"first".to_owned()), "{order:?}");
+
+        // A key without the serializing lock, or of the wrong shape, writes nothing.
+        let error = enqueue_into_outcome(
+            root,
+            Lane::InboxV2,
+            Some("loose"),
+            false,
+            &Blocking,
+            |id| json!({"id": id, "text": "t", "supersede_key": "notice:lane-a"}),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("serialized"), "{error}");
+        assert_eq!(message_state(root, "loose").unwrap(), None);
+        let error = enqueue_into_outcome(
+            root,
+            Lane::InboxV2,
+            Some("bad-key"),
+            true,
+            &Blocking,
+            |id| json!({"id": id, "text": "t", "supersede_key": "with\nnewline"}),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("supersede key"), "{error}");
+        assert_eq!(message_state(root, "bad-key").unwrap(), None);
+        // An entry whose key field is not a string never matches and is left alone.
+        enqueue_into(
+            root,
+            Lane::Inbox,
+            Some("odd"),
+            true,
+            &Blocking,
+            |id| json!({"id": id, "text": "t", "supersede_key": 7}),
+        )
+        .unwrap_err();
+        assert_eq!(message_state(root, "odd").unwrap(), None);
     }
 
     #[test]

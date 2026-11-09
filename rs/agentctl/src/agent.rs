@@ -101,6 +101,10 @@ pub struct QueueResult {
     /// `not_after` passed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub cancelled: Vec<String>,
+    /// Prompt identifiers this send's `supersede_key` set aside untyped at enqueue: older
+    /// pending copies of the same notice, retained in `cancelled/` as superseded.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub superseded: Vec<String>,
     /// Readiness or identity failure that stopped FIFO progress.
     pub blocked: Option<String>,
     /// Machine-readable aggregate state.
@@ -1700,19 +1704,22 @@ pub fn prompt_size_check(text: &str) -> Result<Option<String>, String> {
 
 /// Persist one prompt before any readiness or transport operation.
 pub fn enqueue(root: &Path, text: &str, message_id: Option<&str>) -> AgentResult<String> {
-    enqueue_internal(
+    Ok(enqueue_internal(
         root,
         text,
         message_id,
         true,
         None,
         false,
+        None,
         &SystemRuntime::default(),
-    )
+    )?
+    .id)
 }
 
-/// Persist one prompt; one with a `not_after` goes to `inbox.v2/`, which drainers that do not
-/// honour expiry never read.
+/// Persist one prompt; one with a `not_after` or a `supersede_key` goes to `inbox.v2/`, which
+/// drainers that do not honour expiry never read. A supersede key forces the serializing lock:
+/// the scan-and-set-aside must be exact against a concurrent drain.
 fn enqueue_internal(
     root: &Path,
     text: &str,
@@ -1720,27 +1727,34 @@ fn enqueue_internal(
     serialize: bool,
     not_after: Option<u64>,
     raw: bool,
+    supersede_key: Option<&str>,
     runtime: &dyn AgentRuntime,
-) -> AgentResult<String> {
+) -> AgentResult<agent_queue::queue::Enqueued> {
     if text.is_empty() {
         return Err(AgentError::delivery("message must not be empty"));
     }
+    if let Some(key) = supersede_key {
+        agent_queue::queue::validate_supersede_key(key)?;
+    }
     let waiter = RuntimeWaiter(runtime);
-    let lane = if not_after.is_some() {
+    let lane = if not_after.is_some() || supersede_key.is_some() {
         Lane::InboxV2
     } else {
         Lane::Inbox
     };
-    Ok(agent_queue::queue::enqueue_into(
+    Ok(agent_queue::queue::enqueue_into_outcome(
         root,
         lane,
         message_id,
-        serialize,
+        serialize || supersede_key.is_some(),
         &waiter,
         |identifier| {
             let mut item = enqueued_item(identifier, text, raw);
             if let Some(not_after) = not_after {
                 item[agent_queue::queue::NOT_AFTER] = json!(not_after);
+            }
+            if let Some(key) = supersede_key {
+                item[agent_queue::queue::SUPERSEDE_KEY] = json!(key);
             }
             item
         },
@@ -2826,6 +2840,7 @@ fn drain_with_runtime_binding<A: AgentApi + ?Sized>(
         quarantined,
         pending,
         cancelled,
+        superseded: Vec::new(),
         blocked,
         outcome,
     })
@@ -2897,6 +2912,7 @@ pub(crate) fn send_identified_with_runtime<A: AgentApi + ?Sized>(
         text,
         options,
         message_id,
+        None,
         (runtime, false),
         false,
     )
@@ -2908,6 +2924,7 @@ pub(crate) fn send_managed<A: AgentApi + ?Sized>(
     root: &Path,
     text: &str,
     options: DrainOptions,
+    supersede_key: Option<&str>,
 ) -> AgentResult<QueueResult> {
     send_identified_with_runtime_binding(
         client,
@@ -2916,6 +2933,7 @@ pub(crate) fn send_managed<A: AgentApi + ?Sized>(
         text,
         options,
         None,
+        supersede_key,
         (&SystemRuntime::default(), true),
         false,
     )
@@ -2938,6 +2956,7 @@ pub(crate) fn send_priority_managed<A: AgentApi + ?Sized>(
         text,
         options,
         message_id,
+        None,
         (&SystemRuntime::default(), true),
         true,
     )
@@ -2977,25 +2996,28 @@ pub(crate) fn queue_identified_managed(
     root: &Path,
     text: &str,
     not_after: Option<u64>,
+    supersede_key: Option<&str>,
     message_id: Option<&str>,
 ) -> AgentResult<QueueResult> {
     let runtime = SystemRuntime::default();
     bind_queue_with_runtime(root, target, &runtime, true)?;
-    let identifier = enqueue_internal(
+    let enqueued = enqueue_internal(
         root,
         text,
         message_id,
         message_id.is_some(),
         not_after,
         false,
+        supersede_key,
         &runtime,
     )?;
     Ok(QueueResult {
-        message_id: identifier.clone(),
+        message_id: enqueued.id.clone(),
         delivered: Vec::new(),
         quarantined: Vec::new(),
-        pending: vec![identifier],
+        pending: vec![enqueued.id],
         cancelled: Vec::new(),
+        superseded: enqueued.superseded,
         blocked: None,
         outcome: QueueOutcome::Pending,
     })
@@ -3008,6 +3030,7 @@ pub(crate) fn send_identified_managed<A: AgentApi + ?Sized>(
     text: &str,
     options: DrainOptions,
     message_id: &str,
+    supersede_key: Option<&str>,
 ) -> AgentResult<QueueResult> {
     send_identified_with_runtime_binding(
         client,
@@ -3016,6 +3039,7 @@ pub(crate) fn send_identified_managed<A: AgentApi + ?Sized>(
         text,
         options,
         Some(message_id),
+        supersede_key,
         (&SystemRuntime::default(), true),
         false,
     )
@@ -3029,6 +3053,7 @@ pub(crate) fn send_identified_managed_with_runtime<A: AgentApi + ?Sized>(
     options: DrainOptions,
     runtime: &dyn AgentRuntime,
     message_id: Option<&str>,
+    supersede_key: Option<&str>,
 ) -> AgentResult<QueueResult> {
     send_identified_with_runtime_binding(
         client,
@@ -3037,6 +3062,7 @@ pub(crate) fn send_identified_managed_with_runtime<A: AgentApi + ?Sized>(
         text,
         options,
         message_id,
+        supersede_key,
         (runtime, true),
         false,
     )
@@ -3050,6 +3076,7 @@ fn send_identified_with_runtime_binding<A: AgentApi + ?Sized>(
     text: &str,
     options: DrainOptions,
     message_id: Option<&str>,
+    supersede_key: Option<&str>,
     runtime_and_binding_mode: (&dyn AgentRuntime, bool),
     priority: bool,
 ) -> AgentResult<QueueResult> {
@@ -3058,16 +3085,18 @@ fn send_identified_with_runtime_binding<A: AgentApi + ?Sized>(
     // Explicit IDs serialize their cross-directory check against delivery transitions. Generated
     // identifiers plus no-replace creation need not wait behind a long-running drain. The drain and terminal-artifact inspection below resolve any message
     // consumed by another sender between these phases.
-    let identifier = enqueue_internal(
+    let enqueued = enqueue_internal(
         root,
         text,
         message_id,
         message_id.is_some(),
         options.not_after,
         options.raw_prompt,
+        supersede_key,
         runtime,
     )?;
-    let result = drain_with_runtime_binding(
+    let identifier = enqueued.id;
+    let mut result = drain_with_runtime_binding(
         client,
         target,
         root,
@@ -3076,6 +3105,7 @@ fn send_identified_with_runtime_binding<A: AgentApi + ?Sized>(
         allow_legacy_workspace_binding,
         priority.then(|| identifier.clone()),
     )?;
+    result.superseded = enqueued.superseded;
     send_outcome(root, identifier, result)
 }
 
@@ -3221,6 +3251,7 @@ fn send_outcome(root: &Path, identifier: String, result: QueueResult) -> AgentRe
         quarantined: result.quarantined,
         pending: result.pending,
         cancelled: result.cancelled,
+        superseded: result.superseded,
         blocked: result.blocked,
         outcome: QueueOutcome::Delivered,
     })
@@ -5239,6 +5270,7 @@ mod tests {
             directory.path(),
             "queued for later",
             None,
+            None,
             Some("queue-only-1"),
         )
         .expect("queue");
@@ -5255,6 +5287,7 @@ mod tests {
             directory.path(),
             "queued for later",
             None,
+            None,
             Some("queue-only-1"),
         )
         .is_err());
@@ -5269,6 +5302,7 @@ mod tests {
             &target,
             directory.path(),
             "queued while working",
+            None,
             None,
             Some("queue-only-boundary-1"),
         )
@@ -7042,6 +7076,7 @@ mod tests {
             true,
             Some(now_millis() + 3_600_000),
             false,
+            None,
             &SystemRuntime::default(),
         )
         .unwrap();
@@ -7096,6 +7131,7 @@ mod tests {
             true,
             None,
             true,
+            None,
             &SystemRuntime::default(),
         )
         .unwrap();
@@ -7140,6 +7176,7 @@ mod tests {
             true,
             None,
             true,
+            None,
             &SystemRuntime::default(),
         )
         .unwrap();
@@ -7897,6 +7934,7 @@ mod tests {
             true,
             Some(now_millis() + 3_600_000),
             false,
+            None,
             &SystemRuntime::default(),
         )
         .unwrap();
@@ -7933,6 +7971,7 @@ mod tests {
             true,
             Some(1),
             false,
+            None,
             &SystemRuntime::default(),
         )
         .unwrap();
@@ -7986,6 +8025,53 @@ mod tests {
             "{error}"
         );
         assert_eq!(fake.runs(), ["still wanted"]);
+    }
+
+    #[test]
+    fn a_superseding_send_types_only_the_newest_copy() {
+        // #1156 queue-supersede-key at the send/drain level: two queued copies
+        // under one key, one unkeyed neighbour; the older copy is set aside
+        // at enqueue and never typed.
+        let directory = TestDirectory::new("lanes-supersede");
+        let root = directory.path();
+        let first = queue_identified_managed(
+            &target(),
+            root,
+            "notice v1",
+            None,
+            Some("notice:worker"),
+            Some("notice-1"),
+        )
+        .expect("queue first");
+        assert!(first.superseded.is_empty());
+        enqueue(root, "unrelated", Some("plain-1")).unwrap();
+        let second = queue_identified_managed(
+            &target(),
+            root,
+            "notice v2",
+            None,
+            Some("notice:worker"),
+            Some("notice-2"),
+        )
+        .expect("queue second");
+        assert_eq!(second.superseded, ["notice-1"]);
+        assert!(root.join("inbox.v2/notice-2.json").exists());
+        let replaced = read_json(&root.join("cancelled/notice-1.json")).unwrap();
+        assert_eq!(replaced["cancel_reason"], "superseded");
+        assert_eq!(replaced["superseded_by"], "notice-2");
+
+        let fake = FakeAgent::new(&["idle"]);
+        let result = drain_with_runtime(
+            &fake,
+            &target(),
+            root,
+            DrainOptions::default(),
+            &FakeRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(result.outcome, QueueOutcome::Delivered);
+        assert_eq!(fake.runs(), ["unrelated", "notice v2"]);
+        assert!(!result.delivered.contains(&"notice-1".to_owned()));
     }
 
     #[test]
@@ -8850,6 +8936,7 @@ mod tests {
                         true,
                         None,
                         false,
+                        None,
                         &runtime,
                     )
                     .map(|_| ())

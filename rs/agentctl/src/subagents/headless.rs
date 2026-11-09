@@ -191,7 +191,12 @@ fn settle(queue_root: &Path, ids: &[String], wait: Duration) -> Settled {
     }
 }
 
-fn queue_result(message_id: String, settled: Settled, blocked: Option<String>) -> QueueResult {
+fn queue_result(
+    message_id: String,
+    settled: Settled,
+    blocked: Option<String>,
+    superseded: Vec<String>,
+) -> QueueResult {
     let outcome = if !settled.quarantined.is_empty() {
         agent::QueueOutcome::PossiblySubmitted
     } else if !settled.pending.is_empty() {
@@ -210,6 +215,7 @@ fn queue_result(message_id: String, settled: Settled, blocked: Option<String>) -
         quarantined: settled.quarantined,
         pending: settled.pending,
         cancelled: settled.cancelled,
+        superseded,
         blocked,
         outcome,
     }
@@ -341,15 +347,19 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let queue_root = self.queue(agent_name)?;
         agent_queue::queue::prepare(&queue_root)?;
         let brief_id = match options.brief.as_deref().filter(|text| !text.is_empty()) {
-            Some(text) => Some(self.enqueue_headless(
-                &queue_root,
-                text,
-                None,
-                "normal",
-                "turn-boundary",
-                None,
-                false,
-            )?),
+            Some(text) => Some(
+                self.enqueue_headless(
+                    &queue_root,
+                    text,
+                    None,
+                    "normal",
+                    "turn-boundary",
+                    None,
+                    false,
+                    None,
+                )?
+                .id,
+            ),
             None => None,
         };
         drop(lock);
@@ -556,12 +566,16 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         deliver: &str,
         not_after: Option<u64>,
         raw: bool,
-    ) -> Result<String> {
+        supersede_key: Option<&str>,
+    ) -> Result<agent_queue::queue::Enqueued> {
         let from = std::env::var("AGENTCTL_AGENT")
             .ok()
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "agentctl".to_owned());
-        Ok(agent_queue::queue::enqueue_into(
+        if let Some(key) = supersede_key {
+            agent_queue::queue::validate_supersede_key(key)?;
+        }
+        Ok(agent_queue::queue::enqueue_into_outcome(
             queue_root,
             agent_queue::queue::Lane::InboxV2,
             message_id,
@@ -577,6 +591,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                     item["priority"] = json!(priority);
                     item["deliver"] = json!(deliver);
                     item["not_after"] = json!(not_after);
+                    if let Some(key) = supersede_key {
+                        item[agent_queue::queue::SUPERSEDE_KEY] = json!(key);
+                    }
                     return item;
                 }
                 // A chat request prompt names its message's create time, as for a pane queue:
@@ -591,6 +608,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                     "deliver": deliver,
                     "not_after": not_after,
                 });
+                if let Some(key) = supersede_key {
+                    item[agent_queue::queue::SUPERSEDE_KEY] = json!(key);
+                }
                 if let Some(queued) =
                     crate::prompt_time::queue_deferred(text, crate::prompt_time::now_millis())
                 {
@@ -765,13 +785,15 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         message_id: Option<&str>,
         urgent: bool,
         not_after: Option<u64>,
+        supersede_key: Option<&str>,
         wait: Duration,
     ) -> Result<QueueResult> {
-        let (queue_root, id) = {
+        let (queue_root, enqueued) = {
             let _lock = self.lock(agent_name)?;
             let record = self.load(agent_name)?;
-            self.enqueue_for(&record, text, message_id, urgent, not_after, false)?
+            self.enqueue_for(&record, text, message_id, urgent, not_after, false, supersede_key)?
         };
+        let id = enqueued.id;
         let blocked = self.wake(agent_name);
         let wait = if blocked.is_some() {
             Duration::ZERO
@@ -782,6 +804,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             id.clone(),
             settle(&queue_root, &[id], wait),
             blocked,
+            enqueued.superseded,
         ))
     }
 
@@ -794,15 +817,18 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         text: &str,
         message_id: Option<&str>,
         options: &DrainOptions,
+        supersede_key: Option<&str>,
     ) -> Result<QueueResult> {
-        let (queue_root, id) = self.enqueue_for(
+        let (queue_root, enqueued) = self.enqueue_for(
             record,
             text,
             message_id,
             options.deliver_while_working,
             options.not_after,
             options.raw_prompt,
+            supersede_key,
         )?;
+        let id = enqueued.id;
         let blocked = self.wake(&record.name);
         // The caller holds the lifecycle lock that `stop` needs: never wait long under it.
         let wait = if blocked.is_some() {
@@ -814,6 +840,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             id.clone(),
             settle(&queue_root, &[id], wait),
             blocked,
+            enqueued.superseded,
         ))
     }
 
@@ -833,20 +860,23 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         message_id: &str,
         options: &DrainOptions,
     ) -> Result<QueueResult> {
-        let (queue_root, id) = self.enqueue_for(
+        let (queue_root, enqueued) = self.enqueue_for(
             record,
             text,
             Some(message_id),
             options.deliver_while_working,
             options.not_after,
             options.raw_prompt,
+            None,
         )?;
+        let id = enqueued.id;
         drop(lock);
         let blocked = self.wake_within(&record.name, CHAT_WAKE_TIMEOUT);
         let result = queue_result(
             id.clone(),
             settle(&queue_root, std::slice::from_ref(&id), Duration::ZERO),
             blocked,
+            enqueued.superseded,
         );
         let undelivered = |state: &str| agent::UndeliveredMessage {
             message: format!(
@@ -899,6 +929,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             String::new(),
             settle(&queue_root, &ids, Duration::ZERO),
             blocked,
+            Vec::new(),
         ))
     }
 
@@ -932,7 +963,8 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         urgent: bool,
         not_after: Option<u64>,
         raw: bool,
-    ) -> Result<(PathBuf, String)> {
+        supersede_key: Option<&str>,
+    ) -> Result<(PathBuf, agent_queue::queue::Enqueued)> {
         if !record.is_headless() || record.lifecycle != "running" {
             return Err(fail(format!(
                 "agent {:?} is not a running headless agent",
@@ -948,7 +980,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             ("normal", "turn-boundary")
         };
         let queue_root = self.queue(&record.name)?;
-        let id = self.enqueue_headless(
+        let enqueued = self.enqueue_headless(
             &queue_root,
             text,
             message_id,
@@ -956,8 +988,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             deliver,
             not_after,
             raw,
+            supersede_key,
         )?;
-        Ok((queue_root, id))
+        Ok((queue_root, enqueued))
     }
 
     /// Wake a headless agent's wrapper and wait for the inputs pending now to settle.
@@ -984,6 +1017,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             String::new(),
             settle(&queue_root, &ids, wait),
             blocked,
+            Vec::new(),
         ))
     }
 
@@ -996,15 +1030,18 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         if !self.load(agent_name)?.is_headless() {
             return Err(fail(format!("agent {agent_name:?} is not headless")));
         }
-        let id = self.enqueue_headless(
-            &queue_root,
-            "/compact",
-            None,
-            "normal",
-            "turn-boundary",
-            None,
-            false,
-        )?;
+        let id = self
+            .enqueue_headless(
+                &queue_root,
+                "/compact",
+                None,
+                "normal",
+                "turn-boundary",
+                None,
+                false,
+                None,
+            )?
+            .id;
         drop(lock);
         let blocked = self.wake(agent_name);
         Ok(

@@ -250,6 +250,8 @@ def parser() -> argparse.ArgumentParser:
     _message(send)
     _delivery(send)
     send.add_argument("--message-id", metavar="ID", help="caller-selected interactive request ID; duplicate IDs are rejected")
+    send.add_argument("--supersede-key", metavar="KEY",
+        help="interactive only: key naming what this prompt is the latest word on, within the target's queue; queueing sets aside every still-pending prompt with the same key untyped (kept in cancelled/ as superseded, named in the output's superseded list), so only the newest copy of a periodic notice is typed (default: no key)")
     send.add_argument("--model", metavar="MODEL", help="model override for this headless turn only")
     send.add_argument("--queue-only", action="store_true",
         help="interactive only: queue the prompt and return at once with outcome pending, without waiting for the agent's pane; the running agentctl watch types it on its next pass (at once when idle, at the next tool boundary for a working Muse or Claude Code agent), as does any later send or drain (default: off)")
@@ -638,7 +640,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                        sender_header.ROUTE)
             if getattr(args, "queue_only", False):
                 options["queue_only"] = True
-            result = sessions.send_session(name, text, message_id=args.message_id, model=args.model, **options)
+            result = sessions.send_session(name, text, message_id=args.message_id, supersede_key=args.supersede_key, model=args.model, **options)
         elif args.command == "prompts":
             result = sessions.prompts(name)
         elif args.command == "answer":

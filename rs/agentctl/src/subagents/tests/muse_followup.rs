@@ -89,7 +89,13 @@ fn a_watchers_drain_types_a_queued_prompt_into_a_busy_muse() {
     let fixture = Fixture::new();
     let manager = start_busy_muse(&fixture, false);
     manager
-        .queue_identified("worker", "queued while busy", None, Some("watch-queued"))
+        .queue_identified(
+            "worker",
+            "queued while busy",
+            None,
+            None,
+            Some("watch-queued"),
+        )
         .unwrap();
     let rows = manager.drain_pending(
         std::time::Duration::from_secs(600),

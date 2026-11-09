@@ -1642,6 +1642,9 @@ struct Send {
     /// Seconds after which no drain types the prompt; an expired prompt is set aside in the queue's cancelled/ untyped. The prompt goes to the queue's inbox.v2/, which older agentctl binaries and the other edition never type (default: no expiry; interactive agents only)
     #[arg(long, value_name = "SECONDS", value_parser = positive_seconds, conflicts_with = "urgent")]
     ttl: Option<f64>,
+    /// Key naming what this prompt is the latest word on, within the target's queue: queueing it sets aside every still-pending prompt with the same key untyped (kept in cancelled/ as superseded, named in the output's superseded list), so only the newest copy of a periodic notice is typed. The prompt goes to inbox.v2/ like --ttl (default: no key; interactive and headless agents only)
+    #[arg(long, value_name = "KEY", conflicts_with = "urgent")]
+    supersede_key: Option<String>,
     /// Deliver now: type the prompt even while the agent works, wait up to --boundary-wait for its harness to take it at a tool boundary, and if it is still queued, interrupt the turn (Escape) and submit the queued input (Enter), so nobody drives those keys by hand. Codex holds follow-ups until its turn ends, Claude Code until a tool boundary, and Muse steers the running turn at once. The JSON gains an `urgent` object saying whether a turn was interrupted (default: off; interactive agents only)
     #[arg(long)]
     urgent: bool,
@@ -5043,12 +5046,19 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     value.message_id.as_deref(),
                     value.urgent,
                     not_after,
+                    value.supersede_key.as_deref(),
                     value.delivery.options().ready_timeout,
                 )?)
             } else if manager.is_cloud(&value.agent.name)? {
                 if value.ttl.is_some() {
                     return Err(Failure::Usage(
                         "--ttl applies to interactive agents; agentcloud journals the prompt at once"
+                            .to_owned(),
+                    ));
+                }
+                if value.supersede_key.is_some() {
+                    return Err(Failure::Usage(
+                        "--supersede-key applies to interactive and headless agents; agentcloud journals the prompt at once"
                             .to_owned(),
                     ));
                 }
@@ -5069,6 +5079,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     &value.agent.name,
                     &text,
                     not_after,
+                    value.supersede_key.as_deref(),
                     value.message_id.as_deref(),
                 )?)
             } else if value.urgent {
@@ -5095,6 +5106,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         ..value.delivery.options()
                     },
                     value.message_id.as_deref(),
+                    value.supersede_key.as_deref(),
                 )?;
                 let mut document = json!(result);
                 // A prompt typed into a busy harness can land in its queue, which counts as
@@ -6583,6 +6595,32 @@ mod tests {
         );
         assert!(Cli::try_parse_from([
             "agentctl", "send", "lane-a", "now", "--urgent", "--ttl", "5"
+        ])
+        .is_err());
+        // #1156: --supersede-key parses beside --ttl and conflicts with --urgent.
+        let cli = Cli::try_parse_from([
+            "agentctl",
+            "send",
+            "lane-a",
+            "notice",
+            "--ttl",
+            "900",
+            "--supersede-key",
+            "tick-hub:harness",
+        ])
+        .unwrap();
+        let Some(Commands::Send(send)) = cli.command else {
+            panic!("send");
+        };
+        assert_eq!(send.supersede_key.as_deref(), Some("tick-hub:harness"));
+        assert!(Cli::try_parse_from([
+            "agentctl",
+            "send",
+            "lane-a",
+            "now",
+            "--urgent",
+            "--supersede-key",
+            "k"
         ])
         .is_err());
         let cli = Cli::try_parse_from([

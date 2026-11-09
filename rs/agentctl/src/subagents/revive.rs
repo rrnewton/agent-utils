@@ -2984,7 +2984,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 };
                 let new_id = format!("restart-{id}");
                 if self
-                    .queue_identified(agent_name, text, None, Some(&new_id))
+                    .queue_identified(agent_name, text, None, None, Some(&new_id))
                     .is_ok()
                 {
                     replayed.push(json!({"old_id": id, "new_id": new_id, "lane": lane}));
@@ -3082,6 +3082,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                     ..DrainOptions::default()
                 },
                 Some(&format!("restart-{}", &session[..8.min(session.len())])),
+                None,
             )
             .map(|_| true)
             .unwrap_or(false);

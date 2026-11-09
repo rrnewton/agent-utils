@@ -131,6 +131,7 @@ fn a_send_gives_up_at_its_deadline_while_the_agent_stays_locked_and_queues_nothi
                 ..DrainOptions::default()
             },
             Some("hard-deadline-lock"),
+            None,
         )
         .unwrap_err();
     let elapsed = started.elapsed();
@@ -173,6 +174,7 @@ fn a_send_whose_pane_never_becomes_ready_gives_up_at_its_deadline_and_releases_e
                 ..DrainOptions::default()
             },
             Some("hard-deadline-ready"),
+            None,
         )
         .unwrap_err();
     let elapsed = started.elapsed();
@@ -252,6 +254,7 @@ fn a_send_waiting_for_readiness_holds_no_lock_and_types_once_the_pane_is_idle() 
                     ..DrainOptions::default()
                 },
                 Some("lock-free-wait"),
+                None,
             )
         });
         // Wait until the prompt is queued and the first probe has found the pane busy.
