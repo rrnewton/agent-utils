@@ -1827,7 +1827,12 @@ def test_audit_heavy_churn_many_slots_matches_python(
             pid = _stop_appeared(appeared)
         rows = {str(row["slot"]): row for row in _rows(payload)}
         assert len(rows) == 77, edition
-        assert payload["unknown_slots"] == [], (edition, payload["unknown_slots"])
+        unknown = cast(list[object], payload["unknown_slots"])
+        # A refusal names its cause in the row reasons; show one, so a gate
+        # log says why the census refused, not only that it did (#1102).
+        assert unknown == [], (
+            edition, unknown, rows[str(unknown[0])]["reasons"] if unknown else None
+        )
         blocked = rows.pop("slot-40")
         assert blocked["verdict"] == "BLOCKED", (edition, blocked)
         reasons = cast(list[object], blocked["reasons"])

@@ -1,10 +1,10 @@
 ---
 title: 'wrkslots-census-churn-tolerant: one process-use census semantics for both editions, tolerant of vanished PIDs, never blind to appearing ones'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-09T00:17:46.000000000+00:00
-updated_at: 2026-11-09T11:30:00.000000000+00:00
+updated_at: 2026-11-09T15:00:00.000000000+00:00
 assignee: cl-wrkid
 ---
 
@@ -92,4 +92,18 @@ Part 3 (cl-wrkid, 2026-11-09), the two small items:
 - A surviving thread that executes a new program is followed inside the re-listing censuses: `_assert_thread_kept_its_identity` records the leader's PID (so the round cannot close) and the leader's exact generation in `_REREAD_GENERATIONS`, which the census forgets having read, so the next listing reads the new program even if that generation was read before the leader exited. Rust did not need the forgetting: its read of the leader while it still ran showed what the group then shared. It did have a narrower gap: a thread listed under a zombie leader and then read after its execve showed nothing, and the revived leader was read only by a next listing that a closing round could skip. `admit_threads` now reads a leader that runs again in the same listing. Tests: `test_threads_that_execute_before_their_readers_are_followed_and_block` (three children, both Python lanes; on the previous census both refused "changed during three liveness attempts"); `test_a_thread_that_executes_after_the_snapshot_is_followed` (renamed). The Rust race needs an execve between the task listing and the thread read, which no seam reaches; it is covered by reading, not by a test.
 
 Remaining: acceptance criterion 3 (the load rerun, when the gate queue is empty), and the owner question about root's view of a zombie leader's fd directory.
+
+## Resolution
+
+Delivered in both editions (cl-wrkid, 2026-11-08/09):
+- appearing-PID half: 89b240dc (re-listing closure in the shared census, the agent-batch scans and the direct scan; Rust `capture_process_snapshot`);
+- vanished-PID half, part 1: 8948e67e (a matched holder gone at its recheck is followed, not refused);
+- part 2: f0728d34 (a thread-group leader that exits under running threads is followed through /proc/PID/task/TID in both editions; the Rust snapshot had no thread handling at all, a fail-open; a descriptor still gone after the bounded re-reads counts as gone);
+- part 3: 30a28e0b (the same-UID census gets the same bounded re-read; a surviving thread's execve is followed).
+
+Load rerun after parts 2 and 3 (2026-11-09 09:43-09:54 ET, gate queue empty, other lanes holding): the morning's profile B (64 churn loops plus 160 CPU hogs) over the host's own load, measured 268-291. The all-process census ran 15/15 ok in 8.0-10.7 s, with zero thread-group-leader discards and one vanished descriptor absorbed by the re-read. In the morning, at load ~240 and before part 2, runs were 7-8 s with 13.8-15.9 s outliers, each from discarded attempts. `test_audit_heavy_churn_many_slots_matches_python` passed 8/8 under that load and 20/20 across the day on part-3 code (load 45-291). Logs: /tmp/cl-wrkid-1102r/ on devbig030.
+
+Unverified:
+- Acceptance criterion 3 was measured for audit, not for remove under load.
+- The heavy-churn differential failed twice that day with every Python row UNKNOWN (the audit's one census refused): once on a tree with only part 2, once in another lane's gate on a367e847 (part 2 in its final form). Both were before part 3, and the refusal reason was never captured; part 3 does not obviously address such a refusal, so its cause is unexplained rather than known fixed. The test's assertion message now carries the first UNKNOWN row's reasons, so a recurrence names its cause in the gate log.
 
