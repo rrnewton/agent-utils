@@ -1925,7 +1925,13 @@ def _launch_herdr_tui(
         _herdr("tab", "rename", tab_id, name)
         deadline = time.monotonic() + 5.0
         probe = _herdr_tui_probe(pane_id)
-        while not probe.codex_alive and probe.error is None and time.monotonic() < deadline:
+        while not probe.codex_alive and time.monotonic() < deadline:
+            # agent_not_found is the normal transient state until Herdr
+            # classifies the just-launched pane (measured ~0.5 s); only
+            # it (or no error) may retry to the deadline. Any other
+            # probe error is terminal.
+            if probe.error is not None and "agent_not_found" not in probe.error and "not found" not in probe.error.lower():
+                break
             time.sleep(0.05)
             probe = _herdr_tui_probe(pane_id)
         if not probe.codex_alive:

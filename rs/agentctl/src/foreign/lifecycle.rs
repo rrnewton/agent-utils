@@ -3443,7 +3443,18 @@ pub fn launch_herdr_tui_at(
         herdr_call(&["tab", "rename", &tab_id, name], None)?;
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut probe = herdr_tui_probe_at(proc_root, &root_pane_id);
-        while !probe.codex_alive && probe.error.is_none() && Instant::now() < deadline {
+        while !probe.codex_alive && Instant::now() < deadline {
+            // agent_not_found is the normal transient state until
+            // Herdr classifies the just-launched pane (measured
+            // ~0.5 s); only it (or no error) may retry to the
+            // deadline. Any other probe error is terminal.
+            let retryable = probe.error.as_deref().is_none_or(|error| {
+                let error = error.to_lowercase();
+                error.contains("agent_not_found") || error.contains("not found")
+            });
+            if !retryable {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(50));
             probe = herdr_tui_probe_at(proc_root, &root_pane_id);
         }

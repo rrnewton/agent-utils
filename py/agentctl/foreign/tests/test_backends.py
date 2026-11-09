@@ -238,6 +238,28 @@ def test_herdr_tui_launch_preserves_live_resume_prompt_for_readiness_barrier(
     assert argv[-2:] == ["-m", "model-a"]
 
 
+def test_herdr_tui_launch_retries_agent_not_found_until_classified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Herdr answers agent_not_found until it classifies the
+    # just-launched pane (~0.5 s live); the launch loop must retry
+    # that transient instead of treating the first probe error as
+    # terminal before its own deadline.
+    not_found = lib.TuiProbe(
+        False, False, "probe_error", None,
+        'herdr agent get wT:p9 failed: {"error":{"code":"agent_not_found","message":"agent target wT:p9 not found"}}',
+    )
+    alive = lib.TuiProbe(True, True, "idle", os.getpid())
+    states = iter([not_found, not_found, alive])
+    monkeypatch.setattr(lib, "CODEX_BIN", "codex")
+    monkeypatch.setattr(lib, "_herdr_action", lambda *args: None)
+    monkeypatch.setattr(lib, "_herdr_workspace_id", lambda cwd: "wT")
+    monkeypatch.setattr(lib, "_herdr_tab_for_new_agent", lambda workspace, cwd: ("wT:t9", "wT:p9"))
+    monkeypatch.setattr(lib, "_herdr", lambda *args: {})
+    monkeypatch.setattr(lib, "_herdr_tui_probe", lambda pane: next(states))
+    assert lib._launch_herdr_tui("worker", "/work", None) == ("wT:t9", "wT:p9", alive)
+
+
 def test_tmux_record_operations_ignore_changed_default_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
