@@ -1,10 +1,10 @@
 ---
 title: 'merge-queue-sync-exact: label-driven sync cannot mark an item exact'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-11-08T10:36:49.000000000+00:00
-updated_at: 2026-11-08T10:36:49.000000000+00:00
+updated_at: 2026-11-09T01:14:42.000000000+00:00
 ---
 
 # Description
@@ -64,3 +64,20 @@ into the rebase-aware conflict probe issue, which lands first.
 The CLI path (`submit --exact --prioritized`) already covers
 automation that submits explicitly; this issue is only about the
 label-driven daemon path.
+
+## Resolution
+
+Landed on main as 22b65f014cb49413916e85581e3f6f2ef1e4426d (gated commit 3b79d2ca, in the same push as #1094's 3592b245).
+
+`sync` can now submit a change exact: `init --exact-label LABEL`
+names a label (compared without regard to case; empty or `-` is
+off, stored as `priority.exact_label`) that hosting sync honours
+like the priority label, and a ready-file line can use the bare
+word `exact`. Reconcile resubmits when a change's exactness
+differs from its entry's. Label-driven catch-up merges can now
+land by fast-forward automatically instead of by hand with
+`submit --exact`. With #1094 the label is followed both ways:
+removing it clears exact on the next reconcile, unless a peer
+requirement pins that head. Covered by cli_sync tests (ready-file
+word, configured label sets exact and resubmits on change, label
+removal clears). Gate: full shared phase on the gated stack (dagrun 238 passed / 1 failed; rust.merge-queue.test clean at 585 passed / 0 failed across 51 binaries, wall 534.312s at user 519.555 + sys 776.082 CPU-s). The one failure was untouched timeline.browser.functional, refused in 1s because another lane's server held its health port, and it passed solo in an exclusive rerun (38 passed in 49s). The gate-exclusive cross differentials were stopped under the coordinator waiver for this merge-queue-only diff. Main had moved one overlapping merge-queue change set (plan-intake naming, run.rs/USER_GUIDE/cli/state context) since the gated base; the replay is patch-identical, and the combined tree passed the whole merge-queue crate (591 / 0) with fmt, clippy -D warnings and the client-names check clean; its merge-queue paths are byte-identical to the landed tree.

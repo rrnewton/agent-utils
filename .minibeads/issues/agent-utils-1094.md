@@ -1,10 +1,10 @@
 ---
 title: 'merge-queue-exact-clear: submit --exact is sticky with no way off, and an inherited exact is invisible'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-08T23:00:04.000000000+00:00
-updated_at: 2026-11-08T23:00:04.000000000+00:00
+updated_at: 2026-11-09T01:14:42.000000000+00:00
 ---
 
 # Description
@@ -85,3 +85,25 @@ repository convention. Gate as a product change under the
 merge-queue rules (full shared gate phase; exclusive phase waived
 for a merge-queue-only diff), landing with #1054 as a second
 commit in the same push.
+
+## Resolution
+
+Landed on main as 3592b245d1ea61eca5343e38cabf06946058e418 (gated commit b84fc925, stacked on #1054's 3b79d2ca in one gated push).
+
+`submit --no-exact` clears a recorded exact (history: `exact
+cleared`); a plain resubmission keeps inheriting it, since
+resubmission is also the head-move path and an omitted flag must
+not silently change landing semantics. Every submission's output
+and record now name the effective exact and its source while it
+is set (`submitted --exact`, `inherited from an earlier
+submission; --no-exact clears it`, `sync label`, `sync ready
+file`, peer-held), and say nothing when it is not. A peer
+requirement records the head it pins (`exact_peer_head`, set by
+`--requires` resolution and the busy-lock mark-exact intake;
+pre-existing history marks count too) and holds exact against a
+clear while that is the item's head, saying so in the receipt; a
+new head is not pinned. `sync` follows its exact marking both
+ways under the same exception, and a peer-held item counts as
+settled in reconcile. Covered by cli_peers tests (inherit, clear
+then replay onto a moved base, peer hold until the head moves)
+and the cli_sync label-removal test. Gate: full shared phase on the gated stack (dagrun 238 passed / 1 failed; rust.merge-queue.test clean at 585 passed / 0 failed across 51 binaries, wall 534.312s at user 519.555 + sys 776.082 CPU-s). The one failure was untouched timeline.browser.functional, refused in 1s because another lane's server held its health port, and it passed solo in an exclusive rerun (38 passed in 49s). The gate-exclusive cross differentials were stopped under the coordinator waiver for this merge-queue-only diff. Main had moved one overlapping merge-queue change set (plan-intake naming, run.rs/USER_GUIDE/cli/state context) since the gated base; the replay is patch-identical, and the combined tree passed the whole merge-queue crate (591 / 0) with fmt, clippy -D warnings and the client-names check clean; its merge-queue paths are byte-identical to the landed tree.
