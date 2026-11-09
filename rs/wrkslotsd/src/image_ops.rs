@@ -170,7 +170,7 @@ pub(crate) fn trim_plan(
 /// stderr text otherwise. A nonzero helper exit is reported, not
 /// raised, exactly as the oracle does.
 pub(crate) fn run_trim(
-    runner: &impl PrivilegedRunner,
+    runner: &dyn PrivilegedRunner,
     plan: &[(String, CommandSpec)],
 ) -> Result<Vec<String>, String> {
     let mut done = Vec::new();
@@ -314,6 +314,43 @@ pub(crate) fn canonical_listing(rows: &[String]) -> Vec<String> {
 /// `_convert_to_image`'s `pre-image-original` sibling.
 pub(crate) fn pre_image_original_name() -> &'static str {
     "pre-image-original"
+}
+
+/// The FUSE mount probe, mirroring Python `_fuse_mount`'s
+/// systemd-run form: a transient user service running
+/// `fuse2fs -f`, nested in the caller's images slice. `unit` is
+/// the full transient unit name the caller composed
+/// (`wrkslots-fuse-<digest>-<pid>-<epoch>`).
+pub(crate) fn fuse_mount_spec(
+    systemd_run: &str,
+    image_file: &Path,
+    mount_point: &Path,
+    unit: &str,
+    images_slice: &str,
+) -> CommandSpec {
+    CommandSpec::new(
+        vec![
+            systemd_run.to_string(),
+            "--user".to_string(),
+            "--quiet".to_string(),
+            "--collect".to_string(),
+            format!("--unit={unit}"),
+            format!("--slice={images_slice}"),
+            format!(
+                "--working-directory={}",
+                image_file
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            ),
+            "--".to_string(),
+            "fuse2fs".to_string(),
+            "-f".to_string(),
+            image_file.to_string_lossy().into_owned(),
+            mount_point.to_string_lossy().into_owned(),
+        ],
+        Duration::from_secs(30),
+    )
 }
 
 #[cfg(test)]

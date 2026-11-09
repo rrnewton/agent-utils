@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::image_mounts::MountEntry;
-use crate::image_ops::PrivilegedRunner;
+use crate::image_ops::{PrivilegedRunner, RunOutcome};
 use crate::image_record::{all_images, ImageRecord};
 use crate::image_status::{usage_report, VfsFacts};
 
@@ -222,6 +222,586 @@ pub(crate) fn image_status(
     HandlerOutcome {
         exit: 0,
         stdout: crate::image_status::render_status_human(new_slot_representation, &reports),
+        stderr: String::new(),
+    }
+}
+
+/// Load one slot's image record for the mount family, mirroring
+/// Python `_load_image`: a bad record or a non-image slot refuses.
+fn load_image(
+    control: &Path,
+    slot_path: &dyn Fn(&str, &str) -> PathBuf,
+    slot_type: &str,
+    slot: &str,
+) -> Result<ImageRecord, HandlerOutcome> {
+    let expected = slot_path(slot_type, slot);
+    match crate::image_record::load_slot_image(control, slot_type, slot, &expected) {
+        Ok(Some(record)) => Ok(record),
+        Ok(None) => Err(refusal(
+            &format!("{slot_type} slot '{slot}' is not image-backed"),
+            "image",
+        )),
+        Err(message) => Err(refusal(&message, "image")),
+    }
+}
+
+/// `wrkslots image set-default {worktree|image}` (#1116): the pure
+/// config decision. Returns the outcome and the updated raw config
+/// object for the caller's locked config writer (which preserves
+/// the file's format and backup, as Python `_write_config` does).
+pub(crate) fn image_set_default(
+    representation: &str,
+    raw: &Value,
+) -> (HandlerOutcome, Option<Value>) {
+    let Some(mut updated) = raw.as_object().cloned() else {
+        return (refusal("configuration must be an object", "image"), None);
+    };
+    if representation == "worktree" {
+        updated.remove("slot_representation");
+    } else {
+        updated.insert(
+            "slot_representation".to_string(),
+            Value::String(representation.to_string()),
+        );
+    }
+    (
+        HandlerOutcome {
+            exit: 0,
+            stdout: format!(
+                "new slots will use the {representation} representation; existing slots are unchanged (see `wrkslots image convert`)\n"
+            ),
+            stderr: String::new(),
+        },
+        Some(Value::Object(updated)),
+    )
+}
+
+/// Shared handler inputs for the mount family.
+pub(crate) struct MountCtx<'a> {
+    pub(crate) control: &'a Path,
+    pub(crate) slot_path: &'a dyn Fn(&str, &str) -> PathBuf,
+    pub(crate) tools: &'a crate::image_ops::ToolPaths,
+}
+
+/// `wrkslots image trim` (#1116): one line per mounted image,
+/// mirroring `_cmd_image_trim`. Facts resolve the mounted backend
+/// per image file and mount point.
+pub(crate) fn image_trim(
+    ctx: &MountCtx<'_>,
+    slot_type: &str,
+    slot: &str,
+    facts: &MountFactsFn<'_>,
+    runner: &dyn PrivilegedRunner,
+) -> HandlerOutcome {
+    let (control, slot_path, tools) = (ctx.control, ctx.slot_path, ctx.tools);
+    let record = match load_image(control, slot_path, slot_type, slot) {
+        Ok(record) => record,
+        Err(outcome) => return outcome,
+    };
+    let slot_backend = facts(&record.image_file(), &record.location).0;
+    let state_backend = facts(&record.state_image(), &record.state_mount()).0;
+    let plan = match crate::image_ops::trim_plan(
+        tools,
+        &record,
+        slot_backend.as_deref(),
+        state_backend.as_deref(),
+        crate::image_ops::BoxKind::None,
+    ) {
+        Ok(plan) => plan,
+        Err(message) => return refusal(&message, "image"),
+    };
+    match crate::image_ops::run_trim(runner, &plan) {
+        Ok(lines) => HandlerOutcome {
+            exit: 0,
+            stdout: lines.iter().map(|line| format!("{line}\n")).collect(),
+            stderr: String::new(),
+        },
+        Err(message) => refusal(&message, "image"),
+    }
+}
+
+/// `wrkslots image grow --ceiling-gib N` (#1116), mirroring
+/// `_cmd_image_grow` and `slotimage.grow`'s step order: shrink
+/// refuses; a kernel image grows online (truncate, helper grow);
+/// otherwise offline (truncate, e2fsck, resize2fs); the record is
+/// rewritten with the new ceiling. Mount steps that Python's
+/// ensure-mounted performs around the resize are the runner's
+/// recorded commands in the plan built by the caller at dispatch.
+pub(crate) fn image_grow(
+    ctx: &MountCtx<'_>,
+    slot_type: &str,
+    slot: &str,
+    ceiling_gib: i64,
+    facts: &MountFactsFn<'_>,
+    runner: &dyn PrivilegedRunner,
+) -> HandlerOutcome {
+    let (control, slot_path, tools) = (ctx.control, ctx.slot_path, ctx.tools);
+    let record = match load_image(control, slot_path, slot_type, slot) {
+        Ok(record) => record,
+        Err(outcome) => return outcome,
+    };
+    let image_file = record.image_file();
+    let current = match std::fs::metadata(&image_file) {
+        Ok(meta) => meta.len(),
+        Err(error) => {
+            return HandlerOutcome {
+                exit: 1,
+                stdout: String::new(),
+                stderr: format!("{error}\n"),
+            };
+        }
+    };
+    let new_ceiling = (ceiling_gib * 1_073_741_824) as u64;
+    if let Some(message) = crate::image_ops::grow_refusal(current, new_ceiling) {
+        return refusal(&message, "image");
+    }
+    let slot_backend = facts(&image_file, &record.location).0;
+    let mode = if record.backend == "kernel" || slot_backend.as_deref() == Some("kernel") {
+        crate::image_ops::GrowMode::OnlineKernel
+    } else {
+        crate::image_ops::GrowMode::Offline
+    };
+    // Python truncates before the resize steps in both modes.
+    let file = match std::fs::OpenOptions::new().write(true).open(&image_file) {
+        Ok(file) => file,
+        Err(error) => {
+            return HandlerOutcome {
+                exit: 1,
+                stdout: String::new(),
+                stderr: format!("{error}\n"),
+            };
+        }
+    };
+    if let Err(error) = file.set_len(new_ceiling) {
+        return HandlerOutcome {
+            exit: 1,
+            stdout: String::new(),
+            stderr: format!("{error}\n"),
+        };
+    }
+    drop(file);
+    let plan =
+        match crate::image_ops::grow_plan(tools, &record, mode, crate::image_ops::BoxKind::None) {
+            Ok(plan) => plan,
+            Err(message) => return refusal(&message, "image"),
+        };
+    for item in &plan {
+        match runner.run(item) {
+            Ok(outcome) if outcome.returncode == 0 => {}
+            Ok(outcome) => {
+                let detail = if outcome.stderr.trim().is_empty() {
+                    outcome.stdout.trim()
+                } else {
+                    outcome.stderr.trim()
+                };
+                return refusal(
+                    &format!("{} failed: {detail}", item.argv.join(" ")),
+                    "image",
+                );
+            }
+            Err(message) => return refusal(&message, "image"),
+        }
+    }
+    let mut grown = record.clone();
+    grown.ceiling_bytes = new_ceiling as i64;
+    if let Err(message) = crate::image_record::write_record(&grown) {
+        return refusal(&message, "image");
+    }
+    HandlerOutcome {
+        exit: 0,
+        stdout: format!(
+            "{slot_type}/{slot} ceiling is now {} GiB\n",
+            new_ceiling / 1_073_741_824
+        ),
+        stderr: String::new(),
+    }
+}
+
+/// Mount-state facts for one image file and mount point:
+/// `(state, detail, backend)` as `image_mounts::classify_mount`
+/// and Python `mount_state` report them.
+pub(crate) type MountStateFn<'a> = dyn Fn(&Path, &Path) -> (String, String, Option<String>) + 'a;
+
+/// Why a discarding image is not mounted, mirroring Python
+/// `discard_hold_message`.
+fn discard_hold_message(record: &ImageRecord, held: &[String]) -> String {
+    format!(
+        "slot image {} was unmounted while a stale copy of it was being discarded{}; it is not mounted again: a mount would reuse a loop device that may hold the stale file system, and a stale copy released after the host's own file system may have written its old metadata into the image. remedy: stop the processes whose mount table holds that device; once no loop device holds the image, check the image file (e2fsck -fn) and run 'wrkslots image mount --coordinator-authorized', which mounts it from the file only",
+        record.image_file().display(),
+        if held.is_empty() {
+            String::new()
+        } else {
+            format!(", and {} still holds it", held.join(", "))
+        },
+    )
+}
+
+fn run_or_refusal(
+    runner: &dyn PrivilegedRunner,
+    spec: &crate::image_ops::CommandSpec,
+) -> Result<RunOutcome, HandlerOutcome> {
+    match runner.run(spec) {
+        Ok(outcome) if outcome.returncode == 0 => Ok(outcome),
+        Ok(outcome) => {
+            let detail = if outcome.stderr.trim().is_empty() {
+                outcome.stdout.trim()
+            } else {
+                outcome.stderr.trim()
+            };
+            Err(refusal(
+                &format!("{} failed: {detail}", spec.argv.join(" ")),
+                "image",
+            ))
+        }
+        Err(message) => Err(refusal(&message, "image")),
+    }
+}
+
+/// `wrkslots image mount [--coordinator-authorized]` (#1116):
+/// mount every unmounted image, collecting per-slot failures the
+/// way `ensure_all_mounted` does (one failure does not stop the
+/// others; any failure refuses after the rest were mounted).
+/// `held` names loop devices still holding an image; `backend_for`
+/// resolves a record's backend preference the way Python
+/// `resolve_backend` does on this host.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn image_mount(
+    ctx: &MountCtx<'_>,
+    remount_discarded: bool,
+    state: &MountStateFn<'_>,
+    held: &dyn Fn(&Path) -> Vec<String>,
+    backend_for: &dyn Fn(&ImageRecord) -> Result<String, String>,
+    fuse_unit: &dyn Fn(&Path) -> (String, String),
+    runner: &dyn PrivilegedRunner,
+) -> HandlerOutcome {
+    let images = match all_images(ctx.control, ctx.slot_path) {
+        Ok(images) => images,
+        Err(message) => return refusal(&message, "image"),
+    };
+    let mut actions: Vec<String> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for record in &images {
+        match ensure_image(
+            ctx,
+            record,
+            remount_discarded,
+            state,
+            held,
+            backend_for,
+            fuse_unit,
+            runner,
+        ) {
+            Ok(done) => actions.extend(done),
+            Err(message) => {
+                failures.push(format!("{}/{}: {message}", record.slot_type, record.slot))
+            }
+        }
+    }
+    if !failures.is_empty() {
+        return refusal(
+            &format!(
+                "{} image-backed slot(s) could not be mounted; every other slot was: {}",
+                failures.len(),
+                failures.join("; ")
+            ),
+            "image",
+        );
+    }
+    HandlerOutcome {
+        exit: 0,
+        stdout: format!(
+            "{}\n",
+            if actions.is_empty() {
+                "no image-backed slot needed mounting".to_string()
+            } else {
+                actions.join("\n")
+            }
+        ),
+        stderr: String::new(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ensure_image(
+    ctx: &MountCtx<'_>,
+    record: &ImageRecord,
+    remount_discarded: bool,
+    state: &MountStateFn<'_>,
+    held: &dyn Fn(&Path) -> Vec<String>,
+    backend_for: &dyn Fn(&ImageRecord) -> Result<String, String>,
+    fuse_unit: &dyn Fn(&Path) -> (String, String),
+    runner: &dyn PrivilegedRunner,
+) -> Result<Vec<String>, String> {
+    let pairs = [
+        (record.image_file(), record.location.clone()),
+        (record.state_image(), record.state_mount()),
+    ];
+    if record.phase == crate::image_record::DISCARD_PHASE {
+        let pending: Vec<&(PathBuf, PathBuf)> = pairs
+            .iter()
+            .filter(|(file, mount)| state(file, mount).2.is_none())
+            .collect();
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        let held_labels: Vec<String> = pending.iter().flat_map(|(file, _)| held(file)).collect();
+        if !held_labels.is_empty() || !remount_discarded {
+            return Err(discard_hold_message(record, &held_labels));
+        }
+        let mut actions = Vec::new();
+        for (file, mount) in pending {
+            if !file.exists() {
+                return Err(format!("slot image file is missing: {}", file.display()));
+            }
+            mount_one(
+                ctx,
+                record,
+                file,
+                mount,
+                true,
+                state,
+                backend_for,
+                fuse_unit,
+                runner,
+            )?;
+            actions.push(format!(
+                "mounted {} at {} from the image file, which a stale-copy discard had left unmounted; a stale copy released since may have written its old metadata into it, so check its content before relying on it",
+                file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                mount.display()
+            ));
+        }
+        let mut ready = record.clone();
+        ready.phase = "ready".to_string();
+        crate::image_record::write_record(&ready)?;
+        return Ok(actions);
+    }
+    if record.phase != "ready" {
+        return Ok(Vec::new());
+    }
+    let mut actions = Vec::new();
+    for (file, mount) in &pairs {
+        if state(file, mount).2.is_some() {
+            continue;
+        }
+        if !file.exists() {
+            return Err(format!("slot image file is missing: {}", file.display()));
+        }
+        let reused = mount_one(
+            ctx,
+            record,
+            file,
+            mount,
+            false,
+            state,
+            backend_for,
+            fuse_unit,
+            runner,
+        )?;
+        actions.push(
+            format!(
+                "mounted {} at {}",
+                file.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                mount.display()
+            ) + &reused
+                .map(|dev| {
+                    format!(" (reusing {dev}, which a copy in another mount namespace still holds)")
+                })
+                .unwrap_or_default(),
+        );
+    }
+    Ok(actions)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mount_one(
+    ctx: &MountCtx<'_>,
+    record: &ImageRecord,
+    image_file: &Path,
+    mount_point: &Path,
+    fresh: bool,
+    state: &MountStateFn<'_>,
+    backend_for: &dyn Fn(&ImageRecord) -> Result<String, String>,
+    fuse_unit: &dyn Fn(&Path) -> (String, String),
+    runner: &dyn PrivilegedRunner,
+) -> Result<Option<String>, String> {
+    let (mount_state, detail, _backend) = state(image_file, mount_point);
+    if mount_state != "absent" {
+        return Err(format!(
+            "{} already has a different file system mounted on it: {detail}",
+            mount_point.display()
+        ));
+    }
+    if mount_point.is_symlink() || !mount_point.is_dir() {
+        return Err(format!(
+            "image mount point is not a real directory: {}",
+            mount_point.display()
+        ));
+    }
+    let mut content: Vec<String> = std::fs::read_dir(mount_point)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    content.sort();
+    if !content.is_empty() {
+        return Err(format!(
+            "image mount point is not empty: {} holds {}",
+            mount_point.display(),
+            content[..content.len().min(5)].join(", ")
+        ));
+    }
+    let backend = backend_for(record)?;
+    if backend == "kernel" {
+        let mut args = vec![
+            image_file.to_string_lossy().into_owned(),
+            mount_point.to_string_lossy().into_owned(),
+        ];
+        if fresh {
+            args.push("--fresh".to_string());
+        }
+        let outcome = run_or_refusal(
+            runner,
+            &crate::image_ops::CommandSpec::new(
+                ctx.tools.helper_argv("mount", &args),
+                std::time::Duration::from_secs(120),
+            ),
+        )
+        .map_err(|outcome| {
+            outcome
+                .stderr
+                .trim()
+                .trim_start_matches("REFUSED: ")
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        })?;
+        let reused = outcome
+            .stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("reused "))
+            .map(|dev| dev.trim().to_string());
+        return Ok(reused);
+    }
+    let (unit, slice) = fuse_unit(image_file);
+    let systemd_run = ctx
+        .tools
+        .systemd_run
+        .clone()
+        .unwrap_or_else(|| "systemd-run".to_string());
+    run_or_refusal(
+        runner,
+        &crate::image_ops::fuse_mount_spec(&systemd_run, image_file, mount_point, &unit, &slice),
+    )
+    .map_err(|outcome| {
+        outcome
+            .stderr
+            .trim()
+            .trim_start_matches("REFUSED: ")
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    })?;
+    Ok(None)
+}
+
+/// `wrkslots image unmount` (#1116): unmount state then slot, and
+/// refuse while a copy in another namespace still holds the image
+/// (the residual labels the caller's facts report after unmount).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn image_unmount(
+    ctx: &MountCtx<'_>,
+    slot_type: &str,
+    slot: &str,
+    discard_stale: bool,
+    state: &MountStateFn<'_>,
+    held_after: &dyn Fn(&Path) -> Vec<String>,
+    runner: &dyn PrivilegedRunner,
+) -> HandlerOutcome {
+    let record = match load_image(ctx.control, ctx.slot_path, slot_type, slot) {
+        Ok(record) => record,
+        Err(outcome) => return outcome,
+    };
+    let mut residual: Vec<String> = Vec::new();
+    for (image_file, mount_point) in [
+        (record.state_image(), record.state_mount()),
+        (record.image_file(), record.location.clone()),
+    ] {
+        let (mount_state, detail, backend) = state(&image_file, &mount_point);
+        if mount_state == "absent" {
+            continue;
+        }
+        let Some(backend) = backend else {
+            return refusal(
+                &format!(
+                    "{} has {detail}; refusing to treat {} as unmounted there",
+                    mount_point.display(),
+                    image_file.display()
+                ),
+                "image",
+            );
+        };
+        if backend == "kernel" {
+            let mut args = vec![
+                image_file.to_string_lossy().into_owned(),
+                mount_point.to_string_lossy().into_owned(),
+            ];
+            if discard_stale {
+                args.push("--discard-stale-copies".to_string());
+            }
+            if let Err(outcome) = run_or_refusal(
+                runner,
+                &crate::image_ops::CommandSpec::new(
+                    ctx.tools.helper_argv("umount", &args),
+                    std::time::Duration::from_secs(120),
+                ),
+            ) {
+                return outcome;
+            }
+            residual.extend(held_after(&image_file));
+        } else {
+            // FUSE: fstrim first (its result is reported, not fatal
+            // in the oracle), then fusermount -u through the host.
+            let _ = runner.run(&crate::image_ops::CommandSpec::new(
+                vec![
+                    "fstrim".to_string(),
+                    mount_point.to_string_lossy().into_owned(),
+                ],
+                std::time::Duration::from_secs(120),
+            ));
+            if let Err(outcome) = run_or_refusal(
+                runner,
+                &crate::image_ops::CommandSpec::new(
+                    vec![
+                        ctx.tools.fusermount.clone(),
+                        "-u".to_string(),
+                        mount_point.to_string_lossy().into_owned(),
+                    ],
+                    std::time::Duration::from_secs(120),
+                ),
+            ) {
+                return outcome;
+            }
+        }
+    }
+    if !residual.is_empty() {
+        return refusal(
+            &format!(
+                "unmounted {slot_type}/{slot} on this host, but {} still holds its image (a mount in another mount namespace that is still in use). Do not copy or change the image file until that is released; the next wrkslots command remounts the slot through the same device",
+                residual.join(", ")
+            ),
+            "image",
+        );
+    }
+    HandlerOutcome {
+        exit: 0,
+        stdout: format!("unmounted {slot_type}/{slot}; the next wrkslots command remounts it\n"),
         stderr: String::new(),
     }
 }
@@ -537,6 +1117,244 @@ sys.stdout.write(f"{rc}\n{out.getvalue()}---STDERR---\n{err.getvalue()}")
                 "case {case} format {fmt}"
             );
         }
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn set_default_trim_grow_handlers() {
+        use crate::image_ops::{CommandSpec, ToolPaths};
+        use serde_json::json;
+        use std::cell::RefCell;
+
+        struct Fake {
+            calls: RefCell<Vec<Vec<String>>>,
+        }
+        impl PrivilegedRunner for Fake {
+            fn run(&self, spec: &CommandSpec) -> Result<RunOutcome, String> {
+                self.calls.borrow_mut().push(spec.argv.clone());
+                Ok(RunOutcome {
+                    returncode: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let tools = ToolPaths {
+            sudo: "sudo".to_string(),
+            python: "/usr/bin/python3".to_string(),
+            helper: PathBuf::from("/opt/imagehelper.py"),
+            systemd_run: None,
+            fusermount: "fusermount".to_string(),
+        };
+
+        // set-default: worktree removes the key, image sets it.
+        let (outcome, updated) = image_set_default(
+            "worktree",
+            &json!({"slot_representation": "image", "machine": "n"}),
+        );
+        assert_eq!(outcome.exit, 0);
+        assert!(outcome
+            .stdout
+            .starts_with("new slots will use the worktree representation;"));
+        assert!(updated
+            .expect("updated")
+            .get("slot_representation")
+            .is_none());
+        let (_o, updated) = image_set_default("image", &json!({"machine": "n"}));
+        assert_eq!(updated.expect("updated")["slot_representation"], "image");
+
+        // Fixture image for trim/grow.
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("wrkslotsd-mount-family-{}-{n}", std::process::id()));
+        let control = root.join("control");
+        let record = ImageRecord {
+            directory: image_directory(&control, "agent", "slot-a"),
+            slot: "slot-a".to_string(),
+            slot_type: "agent".to_string(),
+            location: root.join("slots").join("slot-a"),
+            ceiling_bytes: 2 * 1_073_741_824,
+            state_ceiling_bytes: 1_073_741_824,
+            backend: "kernel".to_string(),
+            created_at: "2026-11-07T00:00:00+00:00".to_string(),
+            phase: "ready".to_string(),
+        };
+        std::fs::create_dir_all(&record.directory).expect("dir");
+        write_record(&record).expect("record");
+        std::fs::File::create(record.image_file())
+            .expect("img")
+            .set_len(2 * 1_073_741_824)
+            .expect("size");
+        std::fs::File::create(record.state_image())
+            .expect("state")
+            .set_len(1_073_741_824)
+            .expect("size");
+        let slot_path = |_t: &str, slot: &str| root.join("slots").join(slot);
+        let no_facts = |_: &Path, _: &Path| (None, None);
+
+        // trim with nothing mounted prints nothing and runs nothing.
+        let fake = Fake {
+            calls: RefCell::new(Vec::new()),
+        };
+        let ctx = MountCtx {
+            control: &control,
+            slot_path: &slot_path,
+            tools: &tools,
+        };
+        let outcome = image_trim(&ctx, "agent", "slot-a", &no_facts, &fake);
+        assert_eq!(
+            outcome,
+            HandlerOutcome {
+                exit: 0,
+                stdout: String::new(),
+                stderr: String::new()
+            }
+        );
+        // not image-backed refuses.
+        let outcome = image_trim(&ctx, "agent", "nope", &no_facts, &fake);
+        assert_eq!(outcome.exit, 3);
+        assert!(
+            outcome.stderr.contains("is not image-backed"),
+            "{}",
+            outcome.stderr
+        );
+
+        // grow: shrink refuses; grow online runs helper and rewrites the record.
+        let outcome = image_grow(&ctx, "agent", "slot-a", 1, &no_facts, &fake);
+        assert_eq!(outcome.exit, 3);
+        let fake = Fake {
+            calls: RefCell::new(Vec::new()),
+        };
+        let outcome = image_grow(&ctx, "agent", "slot-a", 4, &no_facts, &fake);
+        assert_eq!(outcome.exit, 0, "{}", outcome.stderr);
+        assert_eq!(outcome.stdout, "agent/slot-a ceiling is now 4 GiB\n");
+        assert_eq!(
+            std::fs::metadata(record.image_file()).expect("meta").len(),
+            4 * 1_073_741_824
+        );
+        let loaded =
+            crate::image_record::load_slot_image(&control, "agent", "slot-a", &record.location)
+                .expect("load")
+                .expect("some");
+        assert_eq!(loaded.ceiling_bytes, 4 * 1_073_741_824);
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn mount_unmount_handlers() {
+        use crate::image_ops::{CommandSpec, ToolPaths};
+        use std::cell::RefCell;
+
+        struct Fake {
+            calls: RefCell<Vec<Vec<String>>>,
+        }
+        impl PrivilegedRunner for Fake {
+            fn run(&self, spec: &CommandSpec) -> Result<RunOutcome, String> {
+                self.calls.borrow_mut().push(spec.argv.clone());
+                Ok(RunOutcome {
+                    returncode: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let tools = ToolPaths {
+            sudo: "sudo".to_string(),
+            python: "/usr/bin/python3".to_string(),
+            helper: PathBuf::from("/opt/imagehelper.py"),
+            systemd_run: Some("/usr/bin/systemd-run".to_string()),
+            fusermount: "fusermount".to_string(),
+        };
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "wrkslotsd-mount-unmount-{}-{n}",
+            std::process::id()
+        ));
+        let control = root.join("control");
+        let record = ImageRecord {
+            directory: image_directory(&control, "agent", "slot-a"),
+            slot: "slot-a".to_string(),
+            slot_type: "agent".to_string(),
+            location: root.join("slots").join("slot-a"),
+            ceiling_bytes: 2 * 1_073_741_824,
+            state_ceiling_bytes: 1_073_741_824,
+            backend: "kernel".to_string(),
+            created_at: "2026-11-07T00:00:00+00:00".to_string(),
+            phase: "ready".to_string(),
+        };
+        std::fs::create_dir_all(&record.directory).expect("dir");
+        std::fs::create_dir_all(&record.location).expect("mount point");
+        std::fs::create_dir_all(record.state_mount()).expect("state point");
+        write_record(&record).expect("record");
+        std::fs::File::create(record.image_file())
+            .expect("img")
+            .set_len(2 * 1_073_741_824)
+            .expect("size");
+        std::fs::File::create(record.state_image())
+            .expect("state")
+            .set_len(1_073_741_824)
+            .expect("size");
+        let slot_path = |_t: &str, slot: &str| root.join("slots").join(slot);
+        let ctx = MountCtx {
+            control: &control,
+            slot_path: &slot_path,
+            tools: &tools,
+        };
+        let absent = |_: &Path, _: &Path| {
+            (
+                "absent".to_string(),
+                "nothing is mounted there".to_string(),
+                None,
+            )
+        };
+        let no_held = |_: &Path| Vec::new();
+        let kernel = |_: &ImageRecord| Ok("kernel".to_string());
+        let fuse_unit = |_: &Path| {
+            (
+                "wrkslots-fuse-x-1-2".to_string(),
+                "wrkslots-images.slice".to_string(),
+            )
+        };
+
+        // mount: both images unmounted -> two helper mount actions.
+        let fake = Fake {
+            calls: RefCell::new(Vec::new()),
+        };
+        let outcome = image_mount(&ctx, false, &absent, &no_held, &kernel, &fuse_unit, &fake);
+        assert_eq!(outcome.exit, 0, "{}", outcome.stderr);
+        assert!(
+            outcome.stdout.contains("mounted slot.img at"),
+            "{}",
+            outcome.stdout
+        );
+        assert_eq!(fake.calls.borrow().len(), 2);
+
+        // unmount: kernel backend -> helper umount, then the success line.
+        let mounted = |_: &Path, _: &Path| {
+            (
+                "kernel".to_string(),
+                "ext4 /dev/loop3 (7:3, root /)".to_string(),
+                Some("kernel".to_string()),
+            )
+        };
+        let fake = Fake {
+            calls: RefCell::new(Vec::new()),
+        };
+        let outcome = image_unmount(&ctx, "agent", "slot-a", false, &mounted, &no_held, &fake);
+        assert_eq!(outcome.exit, 0, "{}", outcome.stderr);
+        assert_eq!(
+            outcome.stdout,
+            "unmounted agent/slot-a; the next wrkslots command remounts it\n"
+        );
+        // residual holder refuses.
+        let held = |_: &Path| vec!["loop3 (7:3)".to_string()];
+        let outcome = image_unmount(&ctx, "agent", "slot-a", false, &mounted, &held, &fake);
+        assert_eq!(outcome.exit, 3);
+        assert!(
+            outcome.stderr.contains("still holds its image"),
+            "{}",
+            outcome.stderr
+        );
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }
