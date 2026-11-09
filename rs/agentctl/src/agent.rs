@@ -3045,6 +3045,7 @@ pub(crate) fn send_identified_managed<A: AgentApi + ?Sized>(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn send_identified_managed_with_runtime<A: AgentApi + ?Sized>(
     client: &A,
     target: &Target,

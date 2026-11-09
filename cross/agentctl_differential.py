@@ -2063,10 +2063,10 @@ def _queue_supersede(harness: Harness, report: Report) -> None:
             path = root / "registry/agents/worker/queue/cancelled/sup-1.json"
             if not path.is_file():
                 return False
-            document = json.loads(path.read_text(encoding="utf-8"))
-            return (document.get("cancel_reason") == "superseded"
-                    and document.get("superseded_by") == "sup-2"
-                    and document.get("supersede_key") == "notice:worker")
+            document = cast(dict[str, object], json.loads(path.read_text(encoding="utf-8")))
+            return bool(document.get("cancel_reason") == "superseded"
+                        and document.get("superseded_by") == "sup-2"
+                        and document.get("supersede_key") == "notice:worker")
 
         report.require(f"primary/supersede-{edition}/set-aside", all(
             replaced_ok(root)

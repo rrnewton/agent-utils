@@ -778,6 +778,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
 
     /// Queue one input for a headless agent, wake its wrapper, and wait up to `wait` for the
     /// model to start it. `urgent` delivers mid-turn, between tool calls.
+    #[allow(clippy::too_many_arguments)]
     pub fn send_headless(
         &self,
         agent_name: &str,

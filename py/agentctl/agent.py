@@ -2500,10 +2500,12 @@ def _drain(
 
 def send(
     client: HerdrClient, target: Target, root: str, text: str, *, message_id: str | None = None,
-    supersede_key: str | None = None,
     **kwargs: object,
 ) -> QueueResult:
     """Durably enqueue one prompt, drain its bound FIFO, and return confirmed delivery."""
+    supersede_key = kwargs.pop("supersede_key", None)
+    if supersede_key is not None and not isinstance(supersede_key, str):
+        raise AgentDeliveryError("supersede_key must be a string or None")
     atomic_policy = kwargs.pop("atomic_policy", None)
     if atomic_policy is not None and not isinstance(atomic_policy, AtomicWritePolicy):
         raise AgentDeliveryError("atomic_policy must be an AtomicWritePolicy or None")

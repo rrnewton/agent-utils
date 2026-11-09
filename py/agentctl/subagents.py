@@ -4152,7 +4152,7 @@ class ManagedAgents:
         except Exception:
             pass
 
-    def send(self, name: str, text: str, *, message_id: str | None = None, supersede_key: str | None = None, expected_token: str | None = None, **options: object) -> agent.QueueResult:
+    def send(self, name: str, text: str, *, message_id: str | None = None, expected_token: str | None = None, **options: object) -> agent.QueueResult:
         """Serialize against stop, then use the existing durable submission transport."""
         self._auto_repin_resumed(name)
         with self._lock(name):
@@ -4165,7 +4165,7 @@ class ManagedAgents:
             ))
             return agent.send(
                 client, self._target(record), self._queue(name), text,
-                message_id=message_id, supersede_key=supersede_key,
+                message_id=message_id,
                 allow_legacy_workspace_binding=True,
                 **options,
             )
