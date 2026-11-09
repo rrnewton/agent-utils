@@ -197,3 +197,7 @@ Adds `launch_herdr_tui_at` (visible Codex TUI launch in a Herdr workspace/tab, s
 ## 23. B3-7c scope, eighth slice (migrate TUI conversion)
 
 Completes the destination-TUI branch of `migrate_agent_at`: `convert_headless_to_tui_at` and `convert_legacy_tmux_headless_to_tui_at` stop the recorded runner by pinned identity, launch the TUI (`launch_herdr_tui_at`), wait for the prompt (`wait_for_tui_prompt_at`), submit the staged text (`submit_tui_text_at`), and confirm the resumed session (`confirm_resumed_tui_at`); failure restores the headless runner (`restore_headless_runner_at`) and resumes intake. `turn` now calls `recreate_window_at` in its heal path, warning with the underlying error instead of the not-yet-ported refusal. Remaining B3-7c: `keeper` only (`mcp` is B3-8). Conversion paths are compile- and suite-verified; live-Herdr exercise is still pending.
+
+## 24. B3-7c scope, ninth slice (keeper)
+
+Adds `keeper_ensure_at` / `keeper_retire_at` / `keeper_status_line_at` and the `keeper` CLI command: the workspace is resolved by label WITHOUT creating one, the keeper tab is `subagents-status`, ensure starts the `status` self-invocation loop (`|| true`, `--interval` default 300 s) on the created pane, retire refuses while any agent is registered unless `--force`. Help and argparse error wording differentially identical to Python (help, missing action, invalid action, invalid interval). This completes the B3-7c command surface; only `mcp` (B3-8) still refuses by name in the Rust dispatcher. Live-Herdr exercise of ensure/retire is still pending.

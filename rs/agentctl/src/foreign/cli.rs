@@ -1,8 +1,7 @@
 //! Command dispatcher for persistent foreign-harness workers.
 //!
-//! Headless commands (`backend`, `send`, `read`, `reset`, and the hidden
-//! runner entry) run on the Rust lifecycle today; presentation commands
-//! refuse by name until their slice lands, rather than silently doing
+//! Every command but `mcp` (a later slice) runs on the Rust
+//! lifecycle; `mcp` refuses by name rather than silently doing
 //! something else.
 
 use std::collections::HashMap;
@@ -19,7 +18,65 @@ const COMMANDS: [&str; 12] = [
     "keeper", "mcp",
 ];
 
-const NOT_PORTED: [&str; 1] = ["keeper"];
+fn keeper_command(args: &[String]) -> i32 {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print!("{KEEPER_HELP}");
+        return 0;
+    }
+    let parsed = match parse(
+        args,
+        &["--interval"],
+        &["--force"],
+        KEEPER_USAGE,
+        "herdr-subagents keeper",
+    ) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
+    if parsed.positionals.len() != 1 {
+        return argparse_error(
+            KEEPER_USAGE,
+            "herdr-subagents keeper",
+            "the following arguments are required: action",
+        );
+    }
+    let action = parsed.positionals[0].as_str();
+    if !matches!(action, "ensure" | "retire" | "status") {
+        return argparse_error(
+            KEEPER_USAGE,
+            "herdr-subagents keeper",
+            &format!(
+                "argument action: invalid choice: '{action}' (choose from ensure, retire, status)"
+            ),
+        );
+    }
+    let interval = match parsed.get("--interval") {
+        None => super::lifecycle::KEEPER_DEFAULT_INTERVAL_SECONDS,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(value) => value,
+            Err(_) => {
+                return argparse_error(
+                    KEEPER_USAGE,
+                    "herdr-subagents keeper",
+                    &format!("argument --interval: invalid int value: '{raw}'"),
+                )
+            }
+        },
+    };
+    let base = foreign_base();
+    let outcome = match action {
+        "ensure" => keeper_ensure_at(&base, interval),
+        "retire" => keeper_retire_at(&base, parsed.has("--force")),
+        _ => {
+            println!("{}", keeper_status_line_at(&base));
+            return 0;
+        }
+    };
+    for line in &outcome.lines {
+        println!("{line}");
+    }
+    outcome.code
+}
 
 fn argparse_error(usage: &str, prog: &str, message: &str) -> i32 {
     eprintln!("{usage}\n{prog}: error: {message}");
@@ -1166,12 +1223,9 @@ pub fn main(arguments: &[String]) -> i32 {
         "up" => up_command(rest),
         "migrate" => migrate_command(rest),
         "inbox" => inbox_command(rest),
+        "keeper" => keeper_command(rest),
         "mcp" => {
             eprintln!("herdr-subagents: the Rust edition has not ported 'mcp' yet");
-            2
-        }
-        other if NOT_PORTED.contains(&other) => {
-            eprintln!("herdr-subagents: the Rust edition has not ported '{other}' yet");
             2
         }
         _ => unreachable!("command list checked"),

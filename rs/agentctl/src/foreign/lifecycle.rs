@@ -2749,7 +2749,7 @@ pub fn shlex_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-fn child_runner_command(base: &Path, name: &str) -> String {
+fn child_environment_prefix(base: &Path) -> String {
     let mut environment: Vec<(String, String)> = vec![
         (
             "HERDR_SUBAGENTS_HOME".to_string(),
@@ -2795,18 +2795,35 @@ fn child_runner_command(base: &Path, name: &str) -> String {
             environment.push((key.to_string(), value));
         }
     }
-    let prefix = environment
+    environment
         .iter()
         .map(|(key, value)| format!("{key}={}", shlex_quote(value)))
         .collect::<Vec<_>>()
-        .join(" ");
-    let executable = std::env::current_exe()
+        .join(" ")
+}
+
+fn self_executable() -> String {
+    std::env::current_exe()
         .map(|path| path.display().to_string())
-        .unwrap_or_else(|_| "herdr-subagents".to_string());
+        .unwrap_or_else(|_| "herdr-subagents".to_string())
+}
+
+fn child_runner_command(base: &Path, name: &str) -> String {
     format!(
-        "env {prefix} {} __runner {}",
-        shlex_quote(&executable),
+        "env {} {} __runner {}",
+        child_environment_prefix(base),
+        shlex_quote(&self_executable()),
         shlex_quote(name)
+    )
+}
+
+/// Shell command for the keeper's status loop, carrying this runtime's
+/// state and policy into the presentation-server child.
+fn child_status_command(base: &Path) -> String {
+    format!(
+        "env {} {} status",
+        child_environment_prefix(base),
+        shlex_quote(&self_executable())
     )
 }
 
@@ -3035,6 +3052,215 @@ fn herdr_workspace_id(base: &Path, cwd: &str) -> Result<String, ForeignOwnership
         .to_string();
     remember_herdr_workspace(base, &id);
     Ok(id)
+}
+
+/// Label of the keeper tab that keeps the subagents workspace
+/// closeable: Herdr refuses to close the last tab in a workspace.
+pub const KEEPER_LABEL: &str = "subagents-status";
+
+/// Default keeper status-print interval in seconds.
+pub const KEEPER_DEFAULT_INTERVAL_SECONDS: i64 = 300;
+
+/// Find the id of the entry carrying `label` in a Herdr list
+/// response; a non-string id reads as absent, as upstream.
+fn find_labelled_id(listed: &Value, list_key: &str, label: &str, id_key: &str) -> Option<String> {
+    listed
+        .get(list_key)?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("label").and_then(Value::as_str) == Some(label))
+        .and_then(|entry| entry.get(id_key))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Resolve the subagents workspace WITHOUT creating one: if no
+/// workspace exists there is nothing to keep alive.
+fn keeper_workspace_id() -> Option<String> {
+    let listed = herdr_call(&["workspace", "list"], None).ok()?;
+    find_labelled_id(
+        &listed,
+        "workspaces",
+        &herdr_workspace_label(),
+        "workspace_id",
+    )
+}
+
+fn keeper_tab_id(workspace_id: &str) -> Option<String> {
+    let listed = herdr_call(&["tab", "list", "--workspace", workspace_id], None).ok()?;
+    find_labelled_id(&listed, "tabs", KEEPER_LABEL, "tab_id")
+}
+
+fn keeper_agent_count_at(base: &Path) -> usize {
+    super::registry::read_registry_at(base)
+        .map(|agents| agents.len())
+        .unwrap_or(0)
+}
+
+/// Outcome of a keeper operation: an exit code plus the lines the CLI
+/// prints, so partial failures stay loud instead of aborting early.
+pub struct KeeperOutcome {
+    /// Process exit code for the keeper action.
+    pub code: i32,
+    /// Lines for the CLI to print, in order.
+    pub lines: Vec<String>,
+}
+
+/// Create the keeper tab if the workspace exists and lacks one.
+pub fn keeper_ensure_at(base: &Path, interval: i64) -> KeeperOutcome {
+    let Some(workspace_id) = keeper_workspace_id() else {
+        return KeeperOutcome {
+            code: 0,
+            lines: vec!["[keeper] no subagents workspace yet — nothing to keep alive".to_string()],
+        };
+    };
+    if keeper_tab_id(&workspace_id).is_some() {
+        return KeeperOutcome {
+            code: 0,
+            lines: vec!["[keeper] already present".to_string()],
+        };
+    }
+    // `|| true` keeps the loop alive when the status call fails; a
+    // keeper that dies on a transient error is worse than useless.
+    let status_loop = format!(
+        "while true; do {} || true; sleep {interval}; done",
+        child_status_command(base)
+    );
+    let created = herdr_call(
+        &[
+            "tab",
+            "create",
+            "--workspace",
+            &workspace_id,
+            "--label",
+            KEEPER_LABEL,
+            "--no-focus",
+        ],
+        None,
+    );
+    let created = match created {
+        Ok(created) => created,
+        Err(error) => {
+            return KeeperOutcome {
+                code: 1,
+                lines: vec![error.message],
+            };
+        }
+    };
+    let Some(tab_id) = keeper_tab_id(&workspace_id) else {
+        return KeeperOutcome {
+            code: 1,
+            lines: vec![
+                "[keeper] WARNING: created a tab but could not find it by label".to_string(),
+            ],
+        };
+    };
+    // Text goes to a PANE, not a tab. Prefer the pane id the create
+    // call reported; fall back to the tab's first pane (`pane list`
+    // filters by workspace, so select panes of the keeper tab).
+    let mut pane_id = created.get("tab").and_then(|tab| {
+        tab.get("active_pane_id")
+            .or_else(|| tab.get("pane_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    });
+    if pane_id.is_none() {
+        if let Ok(listed) = herdr_call(&["pane", "list", "--workspace", &workspace_id], None) {
+            pane_id = listed
+                .get("panes")
+                .and_then(Value::as_array)
+                .and_then(|panes| {
+                    panes.iter().find_map(|pane| {
+                        if pane.get("tab_id").and_then(Value::as_str) == Some(tab_id.as_str()) {
+                            pane.get("pane_id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        } else {
+                            None
+                        }
+                    })
+                });
+        }
+    }
+    let Some(pane_id) = pane_id else {
+        return KeeperOutcome {
+            code: 1,
+            lines: vec![format!(
+                "[keeper] WARNING: created {tab_id} but found no pane to drive"
+            )],
+        };
+    };
+    // The tab EXISTING is what makes the last-tab refusal
+    // unreachable; the status loop is a convenience, so failing to
+    // start it degrades the view, never the fix.
+    match herdr_call(&["pane", "send-text", &pane_id, &format!("{status_loop}\n")], None) {
+        Ok(_) => KeeperOutcome {
+            code: 0,
+            lines: vec![format!(
+                "[keeper] created {tab_id} pane={pane_id} (status every {interval}s)"
+            )],
+        },
+        Err(error) => KeeperOutcome {
+            code: 0,
+            lines: vec![
+                format!(
+                    "[keeper] created {tab_id} pane={pane_id}, but could NOT start the status loop: {}",
+                    error.message
+                ),
+                "[keeper] the keeper still protects tab-close; the loop is cosmetic".to_string(),
+            ],
+        },
+    }
+}
+
+/// Remove the keeper once no agents remain (unless forced).
+pub fn keeper_retire_at(base: &Path, force: bool) -> KeeperOutcome {
+    let count = keeper_agent_count_at(base);
+    if count > 0 && !force {
+        return KeeperOutcome {
+            code: 0,
+            lines: vec![format!(
+                "[keeper] {count} agent(s) still registered — keeping it"
+            )],
+        };
+    }
+    let Some(workspace_id) = keeper_workspace_id() else {
+        return KeeperOutcome {
+            code: 0,
+            lines: Vec::new(),
+        };
+    };
+    let Some(tab_id) = keeper_tab_id(&workspace_id) else {
+        return KeeperOutcome {
+            code: 0,
+            lines: vec!["[keeper] none present".to_string()],
+        };
+    };
+    match herdr_action(&["tab", "close", &tab_id]) {
+        Ok(()) => KeeperOutcome {
+            code: 0,
+            lines: vec![format!("[keeper] closed {tab_id}")],
+        },
+        Err(error) => KeeperOutcome {
+            code: 1,
+            lines: vec![format!(
+                "[keeper] WARNING: could not close {tab_id}: {}",
+                error.message
+            )],
+        },
+    }
+}
+
+/// One-line keeper status for the CLI.
+pub fn keeper_status_line_at(base: &Path) -> String {
+    let workspace_id = keeper_workspace_id();
+    let tab_id = workspace_id.as_deref().and_then(keeper_tab_id);
+    format!(
+        "workspace={} keeper={} agents={}",
+        workspace_id.as_deref().unwrap_or("-"),
+        tab_id.as_deref().unwrap_or("-"),
+        keeper_agent_count_at(base)
+    )
 }
 
 fn herdr_tab_for_new_agent(
@@ -5379,5 +5605,40 @@ mod tests {
         )
         .unwrap());
         assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
+    }
+
+    #[test]
+    fn keeper_label_lookup_and_retire_guard() {
+        let listed = serde_json::json!({"tabs": [
+            {"label": "worker-1", "tab_id": "t-1"},
+            {"label": KEEPER_LABEL, "tab_id": "t-keep"},
+        ]});
+        assert_eq!(
+            find_labelled_id(&listed, "tabs", KEEPER_LABEL, "tab_id").as_deref(),
+            Some("t-keep")
+        );
+        // The first labelled entry wins; a non-string id reads as absent.
+        let non_string = serde_json::json!({"tabs": [
+            {"label": KEEPER_LABEL, "tab_id": 7},
+            {"label": KEEPER_LABEL, "tab_id": "t-keep"},
+        ]});
+        assert_eq!(
+            find_labelled_id(&non_string, "tabs", KEEPER_LABEL, "tab_id"),
+            None
+        );
+        assert_eq!(
+            find_labelled_id(&listed, "missing", KEEPER_LABEL, "tab_id"),
+            None
+        );
+        // Retire refuses to touch Herdr while an agent is registered.
+        let base = fake_base("keeper");
+        seed_record(&base, "worker-1");
+        let outcome = keeper_retire_at(&base, false);
+        assert_eq!(outcome.code, 0);
+        assert_eq!(
+            outcome.lines,
+            ["[keeper] 1 agent(s) still registered — keeping it"]
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

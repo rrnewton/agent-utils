@@ -241,3 +241,22 @@ options:
 pub const MIGRATE_USAGE: &str = r##"usage: herdr-subagents migrate [-h] [--to {tmux,herdr}]
                                [--mode {headless,tui}]
                                name"##;
+
+/// Verbatim `herdr-subagents keeper --help` output.
+pub const KEEPER_HELP: &str = r##"usage: herdr-subagents keeper [-h] [--interval INTERVAL] [--force]
+                              {ensure,retire,status}
+
+Manage the subagents keeper tab
+
+positional arguments:
+  {ensure,retire,status}
+
+options:
+  -h, --help            show this help message and exit
+  --interval INTERVAL
+  --force               retire even if agents remain
+"##;
+
+/// Usage line(s) of `herdr-subagents keeper --help`.
+pub const KEEPER_USAGE: &str = r##"usage: herdr-subagents keeper [-h] [--interval INTERVAL] [--force]
+                              {ensure,retire,status}"##;
