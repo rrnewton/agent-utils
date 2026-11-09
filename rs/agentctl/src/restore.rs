@@ -189,6 +189,14 @@ pub struct RestoreConfig {
     /// hand-opened shells are included when true).
     #[serde(default = "default_true")]
     pub close_bare_shells: bool,
+    /// Optional per-lane resume brief template (#1131): rendered once per
+    /// revived or promoted lane and queued under a per-boot message ID.
+    /// Variables are double-curly-braced names drawn only from the facts
+    /// restore knows (see the resume-brief variable list); an unknown one
+    /// refuses the configuration at load. Absent or blank means no briefs,
+    /// exactly as before this key existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_brief: Option<String>,
     /// Top-level keys this build does not know, named in a warning and otherwise ignored.
     #[serde(flatten)]
     pub(crate) unknown: UnknownKeys,
@@ -299,6 +307,7 @@ impl RestoreConfig {
             scheduled: Vec::new(),
             bare_shell_grace_seconds: default_bare_shell_grace(),
             close_bare_shells: default_true(),
+            resume_brief: None,
             unknown: UnknownKeys::default(),
         }
     }
@@ -397,8 +406,58 @@ impl RestoreConfig {
         {
             return Err(invalid("report_dir must be absolute"));
         }
+        if let Some(template) = self.resume_brief.as_deref() {
+            resume_brief_variables(template).map_err(|detail| invalid(&detail))?;
+        }
         Ok(())
     }
+}
+
+/// The only variables a `resume_brief` template may name (#1131): the facts
+/// restore itself knows. `report` is the per-boot report's path.
+pub(crate) const RESUME_BRIEF_VARIABLES: [&str; 8] = [
+    "boot_id",
+    "boot_time",
+    "finished_at",
+    "agent",
+    "coordinator",
+    "slot",
+    "slot_outcome",
+    "report",
+];
+
+/// Every double-curly-braced variable in a resume-brief template, in order.
+///
+/// An unclosed opening or a variable outside `RESUME_BRIEF_VARIABLES` is an
+/// error naming the variable, so a bad template is refused at configuration
+/// load instead of being delivered half-rendered.
+pub(crate) fn resume_brief_variables(template: &str) -> std::result::Result<Vec<String>, String> {
+    let mut variables = Vec::new();
+    let mut rest = template;
+    while let Some(open) = rest.find("{{") {
+        let after = &rest[open + 2..];
+        let Some(close) = after.find("}}") else {
+            return Err("resume_brief has an unclosed {{variable}}".to_owned());
+        };
+        let name = after[..close].trim();
+        if !RESUME_BRIEF_VARIABLES.contains(&name) {
+            return Err(format!(
+                "resume_brief names unknown variable {{{{{name}}}}}; the variables are {}",
+                RESUME_BRIEF_VARIABLES.join(", ")
+            ));
+        }
+        variables.push(name.to_owned());
+        rest = &after[close + 2..];
+    }
+    Ok(variables)
+}
+
+/// The resume-brief template in force, when configured and not blank.
+pub(crate) fn resume_brief_template(config: &RestoreConfig) -> Option<&str> {
+    config
+        .resume_brief
+        .as_deref()
+        .filter(|template| !template.trim().is_empty())
 }
 
 fn agent_name(value: &str) -> bool {
@@ -1795,6 +1854,39 @@ fn notice_text(report: &Value, boot_time: Option<u64>, path: &Path) -> String {
                 .to_owned(),
         );
     }
+    // #1131: the notice and the report agree on who got a resume brief.
+    if let Some(briefs) = report["resume_briefs"].as_array() {
+        let briefed = briefs
+            .iter()
+            .filter(|row| matches!(row["action"].as_str(), Some("queued" | "already-queued")))
+            .filter_map(|row| row["name"].as_str())
+            .collect::<Vec<_>>();
+        let coordinator = report["coordinator"]["name"].as_str();
+        let unbriefed = agents
+            .iter()
+            .filter(|row| row["name"].as_str() != coordinator)
+            .filter(|row| {
+                matches!(
+                    row["action"].as_str(),
+                    Some("revived" | "revived-fresh" | "promoted")
+                )
+            })
+            .filter_map(|row| row["name"].as_str())
+            .filter(|name| !briefed.contains(name))
+            .collect::<Vec<_>>();
+        let join_or_none = |names: &[&str]| {
+            if names.is_empty() {
+                "none".to_owned()
+            } else {
+                names.join("; ")
+            }
+        };
+        lines.push(format!(
+            "Resume briefs queued: {}. Not briefed: {}.",
+            join_or_none(&briefed),
+            join_or_none(&unbriefed)
+        ));
+    }
     lines.push(format!("Report: {}", path.display()));
     lines.join("\n")
 }
@@ -2428,6 +2520,15 @@ pub fn restore<A: ManagedApi + ?Sized>(
     report["would_complete"] =
         json!(herdr_ready && coordinator_ok && launched_survived && refused == 0);
     report["notice"] = Value::Null;
+    // Stamped before the briefs render it (#1131 gives each brief a finished_at).
+    report["finished_at"] = json!(host.now());
+    // The standard per-lane resume brief (#1131), queued before the
+    // coordinator's notice so the notice can name the unbriefed lanes.
+    report["resume_briefs"] = if !options.dry_run && herdr_ready {
+        crate::restore_notice::resume_briefs(client, registry, config, &report, &boot_id)
+    } else {
+        Value::Null
+    };
     let summary = config
         .coordinator
         .as_deref()
@@ -2469,7 +2570,6 @@ pub fn restore<A: ManagedApi + ?Sized>(
     } else {
         Value::Null
     };
-    report["finished_at"] = json!(host.now());
     if !options.dry_run {
         write_report(&path, &report)?;
     }

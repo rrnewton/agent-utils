@@ -1929,6 +1929,155 @@ fn restore_counts_a_refused_slot_transfer_toward_74_with_its_remedy() {
     assert_eq!(restore_exit_code(&report, false), 74, "{report}");
 }
 
+const BRIEF_TEMPLATE: &str = "Resume {{agent}}: boot {{boot_id}} at {{boot_time}}, restored {{finished_at}}; slot {{slot}} ({{slot_outcome}}); coordinator {{coordinator}}; report {{report}}.";
+
+fn brief_text(fixture: &Fixture, name: &str, message_id: &str) -> String {
+    let queue = fixture.manager().queue(name).unwrap();
+    let item: Value = serde_json::from_slice(
+        &fs::read(queue.join("inbox").join(format!("{message_id}.json"))).unwrap(),
+    )
+    .unwrap();
+    item["text"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn restore_queues_one_resume_brief_per_revived_lane_and_never_twice() {
+    // #1131 restore-resume-brief: rendered once per revived lane under a
+    // per-boot message ID; a same-boot rerun that revives the lane again
+    // reports already-queued instead of sending a second brief.
+    let fixture = Fixture::new();
+    dead_named(&fixture, "lead");
+    dead_agent(&fixture);
+    let host = ScriptedHost::new();
+    let registry = fixture.root.join("registry");
+    let config = RestoreConfig {
+        resume_brief: Some(BRIEF_TEMPLATE.to_owned()),
+        ..config(&fixture, Some("lead"))
+    };
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    let briefs = report["resume_briefs"].as_array().unwrap();
+    assert_eq!(briefs.len(), 1, "{report}");
+    assert_eq!(briefs[0]["name"], "lane");
+    assert_eq!(briefs[0]["action"], "queued");
+    assert_eq!(briefs[0]["message_id"], "restore-brief-11111111-lane");
+    assert_eq!(briefs[0]["outcome"], "pending");
+    let text = brief_text(&fixture, "lane", "restore-brief-11111111-lane");
+    assert!(text.contains("Resume lane: boot 11111111"), "{text}");
+    assert!(text.contains("coordinator lead"), "{text}");
+    assert!(text.contains("reports/11111111"), "{text}");
+    assert!(!text.contains("{{"), "{text}");
+    // The coordinator's notice agrees about who was briefed.
+    let runs = fixture.client.runs.lock().unwrap().join("\n");
+    assert!(runs.contains("Resume briefs queued: lane"), "{runs}");
+    assert!(runs.contains("Not briefed: none"), "{runs}");
+
+    // The lane dies again in the same boot; a forced rerun revives it but
+    // the brief's message identity is already queued.
+    let record = fixture.manager().load("lane").unwrap();
+    fixture
+        .client
+        .dead_panes
+        .lock()
+        .unwrap()
+        .insert(record.pane_id.clone().unwrap());
+    fixture.client.started.store(false, Ordering::Relaxed);
+    let rerun = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config,
+        &RestoreOptions {
+            force: true,
+            ..options(None)
+        },
+    )
+    .unwrap();
+    assert_eq!(agent_row(&rerun, "lane")["action"], "revived", "{rerun}");
+    let briefs = rerun["resume_briefs"].as_array().unwrap();
+    assert_eq!(briefs.len(), 1, "{rerun}");
+    assert_eq!(briefs[0]["action"], "already-queued", "{rerun}");
+    // No second brief waits for delivery: the rerun's revive archived the
+    // first run's copy out of the inbox, and the duplicate message ID
+    // stopped a new one being added.
+    let queue = fixture.manager().queue("lane").unwrap();
+    let prompts = agent::queued_prompts(&queue).unwrap();
+    assert!(
+        prompts.iter().all(|id| !id.contains("brief")),
+        "{prompts:?}"
+    );
+}
+
+#[test]
+fn restore_brief_names_a_refused_slot_transfer_instead_of_claiming_rebind() {
+    // #1131: slot_outcome carries the refusal and its remedy.
+    let fixture = Fixture::new();
+    promotable_slotted(&fixture, "slotted", "slotted-slot");
+    let host = ScriptedHost::new();
+    script_slot_transfer(&host, "slotted-slot", "slotted");
+    host.answer("transfer-owner", 1, "", "recorded owner is still alive\n");
+    let registry = fixture.root.join("registry");
+    let config = RestoreConfig {
+        resume_brief: Some(BRIEF_TEMPLATE.to_owned()),
+        ..config(&fixture, None)
+    };
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config,
+        &options(Some("/opt/wrkslots")),
+    )
+    .unwrap();
+    assert_eq!(report["resume_briefs"][0]["action"], "queued", "{report}");
+    let text = brief_text(&fixture, "slotted", "restore-brief-11111111-slotted");
+    assert!(text.contains("slot slotted-slot"), "{text}");
+    assert!(text.contains("REFUSED"), "{text}");
+    assert!(text.contains("agentctl rebind-slot slotted"), "{text}");
+}
+
+#[test]
+fn restore_without_a_resume_brief_template_queues_none() {
+    // #1131: no template, no briefs; the catch-up is unchanged.
+    let fixture = Fixture::new();
+    dead_agent(&fixture);
+    let host = ScriptedHost::new();
+    let registry = fixture.root.join("registry");
+    let report = restore(
+        &fixture.client,
+        &registry,
+        &host,
+        &config(&fixture, None),
+        &options(None),
+    )
+    .unwrap();
+    assert_eq!(report["resume_briefs"], Value::Null, "{report}");
+    let queue = fixture.manager().queue("lane").unwrap();
+    assert_eq!(
+        agent::queued_prompts(&queue).unwrap(),
+        ["restore-catchup-11111111-lane"]
+    );
+}
+
+#[test]
+fn restore_resume_brief_with_an_unknown_variable_is_refused_at_load() {
+    // #1131: a template restore cannot render never reaches a lane.
+    let fixture = Fixture::new();
+    let registry = fixture.root.join("registry");
+    fs::create_dir_all(&registry).unwrap();
+    for (template, needle) in [
+        ("Resume {{bogus}} now", "bogus"),
+        ("Resume {{agent now", "resume_brief"),
+    ] {
+        fs::write(
+            registry.join("restore.json"),
+            json!({"schema": "agentctl-restore/v1", "resume_brief": template}).to_string(),
+        )
+        .unwrap();
+        let error = RestoreConfig::load(&registry).expect_err("the template must refuse");
+        assert!(error.to_string().contains(needle), "{error}");
+    }
+}
+
 #[test]
 fn restore_derived_refuses_a_record_whose_liveness_cannot_be_decided() {
     // #1129: a corrupt record that would otherwise derive is refused

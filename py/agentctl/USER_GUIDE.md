@@ -1100,6 +1100,31 @@ choice under `desired_state_source` (`registry-derived` or `pinned-list`).
 a step a correct reboot requires. A dry run never completes; its
 `would_complete` says whether the same run would.
 
+With a `resume_brief` template in `restore.json`, every revived,
+revived-fresh, or promoted lane also gets its rendered copy queued once per
+boot (message ID `restore-brief-BOOT8-NAME`; a rerun reports
+`already-queued`). Skipped, excluded, and refused lanes get none, and the
+coordinator gets the recovery notice instead, which lists the briefed and
+unbriefed lanes; the report records each brief under `resume_briefs`.
+Variables are written with double curly braces around the name (this guide
+cannot print that literally, so they are written `{name}` below; copy the
+exact suggested text from `agentctl restore --help`). The only variables
+are `{boot_id}`, `{boot_time}` and `{finished_at}` (kernel boot and
+restore-finish Unix seconds), `{agent}`, `{coordinator}`, `{slot}`,
+`{slot_outcome}` (rebind done, or its refusal with the remedy), and
+`{report}` (the report path); an unknown variable refuses the configuration
+at load, and an absent or blank template sends no briefs, as before. A
+useful default to copy from the help text and adapt:
+
+```
+[agentctl restore] {agent}: the host rebooted (boot {boot_id}, kernel
+boot at Unix time {boot_time}; restore finished at {finished_at}).
+Slot {slot}: {slot_outcome}. Check wrkslots status and your slot tip
+against your notes, restart only the step the reboot interrupted, and
+leave pre-boot admission tickets to their reaper — never delete them by
+hand. Coordinator: {coordinator}. Report: {report}.
+```
+
 The report is `REPORT_DIR/BOOT_ID.json` (default
 `REGISTRY/restore-reports`). Exit status is 0 when the restore completed
 with no refusal, 74 when it completed except for refused lanes (named in
