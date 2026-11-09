@@ -1971,6 +1971,61 @@ impl ChatClient for ProfiledClient {
         .await
     }
 
+    async fn post_message_keyed_marked(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+        raw: bool,
+    ) -> Result<Message, ChatError> {
+        self.timed(
+            "post_message_keyed_marked",
+            Direction::Other,
+            About::channel(channel),
+            self.inner
+                .post_message_keyed_marked(channel, content, reply_to, key, raw),
+        )
+        .await
+    }
+
+    async fn post_message_top_level_keyed_marked(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+        raw: bool,
+    ) -> Result<Message, ChatError> {
+        self.timed(
+            "post_message_top_level_keyed_marked",
+            Direction::Other,
+            About::channel(channel),
+            self.inner
+                .post_message_top_level_keyed_marked(channel, content, reply_to, key, raw),
+        )
+        .await
+    }
+
+    async fn post_in_thread_keyed_marked(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+        raw: bool,
+    ) -> Result<Message, ChatError> {
+        self.timed(
+            "post_in_thread_keyed_marked",
+            Direction::Other,
+            About::thread(channel, thread_id),
+            self.inner
+                .post_in_thread_keyed_marked(channel, thread_id, content, reply_to, key, raw),
+        )
+        .await
+    }
+
     fn post_limit(&self, channel: &ChannelId) -> PostLimit {
         self.inner.post_limit(channel)
     }

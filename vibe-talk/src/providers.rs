@@ -860,6 +860,21 @@ impl ChatClient for ChatRouter {
             .await
     }
 
+    async fn post_in_thread_keyed_marked(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+        raw: bool,
+    ) -> Result<Message, ChatError> {
+        self.route(channel)?
+            .client
+            .post_in_thread_keyed_marked(channel, thread_id, content, reply_to, key, raw)
+            .await
+    }
+
     /// The channel's own provider's limit: a Slack channel and a Google Chat channel in one
     /// server are cut at their own sizes. `#263 post-split-per-provider`. A channel no provider
     /// holds cannot be posted to at all, so the default it falls back to is never spent.
@@ -1258,6 +1273,34 @@ impl ChatClient for ChatRouter {
         self.route(channel)?
             .client
             .post_message_top_level_keyed(channel, content, reply_to, key)
+            .await
+    }
+
+    async fn post_message_keyed_marked(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+        raw: bool,
+    ) -> Result<Message, ChatError> {
+        self.route(channel)?
+            .client
+            .post_message_keyed_marked(channel, content, reply_to, key, raw)
+            .await
+    }
+
+    async fn post_message_top_level_keyed_marked(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+        raw: bool,
+    ) -> Result<Message, ChatError> {
+        self.route(channel)?
+            .client
+            .post_message_top_level_keyed_marked(channel, content, reply_to, key, raw)
             .await
     }
 

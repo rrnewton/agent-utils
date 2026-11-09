@@ -123,6 +123,9 @@ mod noise;
 #[path = "op_key_carrier.rs"]
 mod op_key_carrier;
 
+#[path = "raw_post.rs"]
+mod raw_post;
+
 #[path = "own_read.rs"]
 mod own_read;
 

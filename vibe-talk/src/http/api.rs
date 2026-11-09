@@ -2753,6 +2753,13 @@ pub struct ReplyRequest {
     /// opposite destinations. Absent is the ordinary post.
     #[serde(default)]
     pub post_to_main: bool,
+    /// Mark the post raw (`#1136 raw-message-bridge`): the chat bridge types the text into
+    /// the bridged agent exactly as written, with no sender header or reply instructions, so
+    /// a slash command sent as its own one-line raw message runs. The posted text gains one
+    /// trailing `[raw]` line, the text is capped at 4,000 characters, and only the owner's
+    /// raw mark is honoured by the bridge. Absent is the ordinary post.
+    #[serde(default)]
+    pub raw: bool,
     /// Names this post across attempts, so sending it again cannot post it twice where the
     /// provider honours that. `#195 send-resilience`; see [`ops::reply_scoped`].
     ///
@@ -2921,6 +2928,7 @@ pub async fn reply(
                 request.reply_to.as_deref(),
                 request.thread_id.as_deref(),
                 request.post_to_main,
+                request.raw,
                 key,
             )
             .await?;
@@ -2943,6 +2951,7 @@ pub async fn reply(
         request.reply_to.as_deref(),
         request.thread_id.as_deref(),
         request.post_to_main,
+        request.raw,
         request.idempotency_key.as_deref(),
     )
     .await;
@@ -3049,6 +3058,7 @@ pub async fn reply_outcome(
         request.reply_to.as_deref(),
         request.thread_id.as_deref(),
         request.post_to_main,
+        request.raw,
         key,
         wait,
     )

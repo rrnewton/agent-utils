@@ -1487,6 +1487,55 @@ impl crate::chat::ChatClient for CountingChat {
         .await
     }
 
+    async fn post_message_keyed_marked(
+        &self,
+        channel: &crate::model::ChannelId,
+        content: &str,
+        reply_to: Option<&crate::model::MessageId>,
+        key: Option<&str>,
+        raw: bool,
+    ) -> Result<crate::model::Message, crate::chat::ChatError> {
+        self.counted(
+            call_in("post_message_keyed_marked", channel),
+            self.inner
+                .post_message_keyed_marked(channel, content, reply_to, key, raw),
+        )
+        .await
+    }
+
+    async fn post_message_top_level_keyed_marked(
+        &self,
+        channel: &crate::model::ChannelId,
+        content: &str,
+        reply_to: Option<&crate::model::MessageId>,
+        key: Option<&str>,
+        raw: bool,
+    ) -> Result<crate::model::Message, crate::chat::ChatError> {
+        self.counted(
+            call_in("post_message_top_level_keyed_marked", channel),
+            self.inner
+                .post_message_top_level_keyed_marked(channel, content, reply_to, key, raw),
+        )
+        .await
+    }
+
+    async fn post_in_thread_keyed_marked(
+        &self,
+        channel: &crate::model::ChannelId,
+        thread_id: &str,
+        content: &str,
+        reply_to: Option<&crate::model::MessageId>,
+        key: Option<&str>,
+        raw: bool,
+    ) -> Result<crate::model::Message, crate::chat::ChatError> {
+        self.counted(
+            thread_call("post_in_thread_keyed_marked", channel, thread_id),
+            self.inner
+                .post_in_thread_keyed_marked(channel, thread_id, content, reply_to, key, raw),
+        )
+        .await
+    }
+
     fn post_limit(&self, channel: &crate::model::ChannelId) -> crate::chat::PostLimit {
         self.inner.post_limit(channel)
     }

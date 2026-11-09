@@ -1424,6 +1424,65 @@ pub trait ChatClient: Send + Sync {
             .await
     }
 
+    /// [`ChatClient::post_message_keyed`], marking the post raw where the provider can carry
+    /// the marker invisibly (`#1136 raw-message-bridge`): the chat bridge then types the text
+    /// into the bridged agent exactly as written. `content` already ends with the visible
+    /// `[raw]` marker line the caller appended. The default posts as the keyed method does,
+    /// which is what a provider with no invisible carrier honestly does: the words land, the
+    /// marker does not travel.
+    ///
+    /// # Errors
+    ///
+    /// As [`ChatClient::post_message_keyed`].
+    async fn post_message_keyed_marked(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+        _raw: bool,
+    ) -> Result<Message, ChatError> {
+        self.post_message_keyed(channel, content, reply_to, key)
+            .await
+    }
+
+    /// [`ChatClient::post_message_top_level_keyed`], marking the post raw as
+    /// [`ChatClient::post_message_keyed_marked`] does.
+    ///
+    /// # Errors
+    ///
+    /// As [`ChatClient::post_message_top_level_keyed`].
+    async fn post_message_top_level_keyed_marked(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+        _raw: bool,
+    ) -> Result<Message, ChatError> {
+        self.post_message_top_level_keyed(channel, content, reply_to, key)
+            .await
+    }
+
+    /// [`ChatClient::post_in_thread_keyed`], marking the post raw as
+    /// [`ChatClient::post_message_keyed_marked`] does.
+    ///
+    /// # Errors
+    ///
+    /// As [`ChatClient::post_in_thread_keyed`].
+    async fn post_in_thread_keyed_marked(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+        _raw: bool,
+    ) -> Result<Message, ChatError> {
+        self.post_in_thread_keyed(channel, thread_id, content, reply_to, key)
+            .await
+    }
+
     /// How this provider carries a post's operation key, invisibly to anyone reading the channel.
     /// `#465 replication-c6-op-key-marker`.
     ///

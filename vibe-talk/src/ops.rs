@@ -5184,8 +5184,18 @@ pub async fn reply(
     text: &str,
     reply_to: Option<&str>,
 ) -> Result<(ChannelInfo, Message, Vec<Message>), OpError> {
-    reply_scoped(state, channel_id, text, reply_to, None, false, None).await
+    reply_scoped(state, channel_id, text, reply_to, None, false, false, None).await
 }
+
+/// The most characters one raw post may carry (`#1136 raw-message-bridge`): a raw text is
+/// typed into a terminal whole, so it is bounded like a paste, and the chat bridge refuses a
+/// longer one the same way.
+pub const RAW_POST_MAX_CHARS: usize = 4_000;
+
+/// What a raw post's text gains as its last line, so the channel shows the raw mark beside the
+/// words as typed and the bridge can take exactly this one line back off (`#1136
+/// raw-message-bridge`).
+pub const RAW_MARKER_SUFFIX: &str = "\n[raw]";
 
 /// Post to the channel or to one of its threads, preserving write policy and partial progress.
 ///
@@ -5206,6 +5216,7 @@ pub async fn reply(
 /// [`ChatClient::supports_idempotent_posts`]: crate::chat::ChatClient::supports_idempotent_posts
 /// [`ChatClient::post_limit`]: crate::chat::ChatClient::post_limit
 /// [`ChatClient::continuation_thread`]: crate::chat::ChatClient::continuation_thread
+#[allow(clippy::too_many_arguments)]
 pub async fn reply_scoped(
     state: &AppState,
     channel_id: &str,
@@ -5213,6 +5224,7 @@ pub async fn reply_scoped(
     reply_to: Option<&str>,
     thread_id: Option<&str>,
     post_to_main: bool,
+    raw: bool,
     idempotency_key: Option<&str>,
 ) -> Result<(ChannelInfo, Message, Vec<Message>), OpError> {
     let post = Post {
@@ -5221,6 +5233,7 @@ pub async fn reply_scoped(
         reply_to,
         thread_id,
         post_to_main,
+        raw,
         idempotency_key,
     };
     post_settled(state, post, None).await.0
@@ -5229,6 +5242,7 @@ pub async fn reply_scoped(
 /// Two-phase send, phase one. `#621 send-double-check`: validate, claim the
 /// op key durably in [`crate::post_keys`], then post upstream in a detached
 /// task and answer at once. Phase two is read via [`post_outcome`].
+#[allow(clippy::too_many_arguments)]
 pub async fn reply_accepted(
     state: &AppState,
     channel_id: &str,
@@ -5236,6 +5250,7 @@ pub async fn reply_accepted(
     reply_to: Option<&str>,
     thread_id: Option<&str>,
     post_to_main: bool,
+    raw: bool,
     idempotency_key: &str,
 ) -> Result<(u64, usize), OpError> {
     let started = std::time::Instant::now();
@@ -5245,6 +5260,7 @@ pub async fn reply_accepted(
         reply_to,
         thread_id,
         post_to_main,
+        raw,
         idempotency_key: Some(idempotency_key),
     };
     let (posting, turn) = match ready_to_post(state, post).await {
@@ -5334,6 +5350,7 @@ fn binding_post(binding: &crate::post_gate::Binding) -> Post<'_> {
         reply_to: binding.reply_to.as_deref(),
         thread_id: None,
         post_to_main: false,
+        raw: false,
         idempotency_key: None,
     }
 }
@@ -5371,6 +5388,9 @@ struct Post<'a> {
     /// (`#1052 post-to-main`). Names the opposite destination from `thread_id`; the two together
     /// are refused in [`ready_to_post`].
     post_to_main: bool,
+    /// Mark the post raw (`#1136 raw-message-bridge`): its text gains the `[raw]` line and its
+    /// provider metadata the marker the chat bridge types verbatim from.
+    raw: bool,
     idempotency_key: Option<&'a str>,
 }
 
@@ -5458,6 +5478,7 @@ async fn ready_to_post(state: &AppState, post: Post<'_>) -> Result<Ready, OpErro
         reply_to,
         thread_id,
         post_to_main,
+        raw,
         idempotency_key,
     } = post;
     let info = allowed(state, channel_id).await?;
@@ -5488,11 +5509,36 @@ async fn ready_to_post(state: &AppState, post: Post<'_>) -> Result<Ready, OpErro
     let defuse = state.chat.defuses_mentions(&info.id);
     // The words as the caller sent them, which its key names. `#448 send-dedupe`.
     let asked = text;
+    // `#1136 raw-message-bridge`. A raw text is typed into the bridged agent whole, so it is
+    // capped before anything is cut, and what is posted is those words plus the one visible
+    // marker line. It must still land as one message: cut in parts, no part would be the text
+    // as typed, and the bridge would type fragments.
+    let marked;
+    let text = if raw {
+        let count = text.chars().count();
+        if count > RAW_POST_MAX_CHARS {
+            return Err(OpError::Chat(ChatError::Refused(format!(
+                "raw message is {count} characters, over the {RAW_POST_MAX_CHARS}-character \
+                 cap for a raw post; send it as an ordinary message or shorten it"
+            ))));
+        }
+        marked = format!("{text}{RAW_MARKER_SUFFIX}");
+        marked.as_str()
+    } else {
+        text
+    };
     let (defused, parts) = cut_post(text, &limit, defuse);
     let text: &str = &defused;
     if parts.is_empty() {
         return Err(OpError::Chat(ChatError::Refused(
             "message content is empty".to_owned(),
+        )));
+    }
+    if raw && parts.len() > 1 {
+        return Err(OpError::Chat(ChatError::Refused(
+            "raw message does not fit in one message on this provider; send it as an ordinary \
+             message or shorten it"
+                .to_owned(),
         )));
     }
 
@@ -5514,6 +5560,7 @@ async fn ready_to_post(state: &AppState, post: Post<'_>) -> Result<Ready, OpErro
             } else {
                 fingerprint
             };
+            let fingerprint = if raw { fingerprint.raw() } else { fingerprint };
             match claim_post(state, fingerprint).await? {
                 Ok(pending) => Some(pending),
                 Err(outcome) => return Ok(Ready::Known(outcome)),
@@ -5534,6 +5581,7 @@ async fn ready_to_post(state: &AppState, post: Post<'_>) -> Result<Ready, OpErro
         reply_to,
         thread_id: thread_id.map(str::to_owned),
         post_to_main,
+        raw,
         limit,
         defuse,
         claim,
@@ -5684,6 +5732,7 @@ pub async fn post_outcome(
     reply_to: Option<&str>,
     thread_id: Option<&str>,
     post_to_main: bool,
+    raw: bool,
     idempotency_key: &str,
     wait: std::time::Duration,
 ) -> Result<PostOutcome, OpError> {
@@ -5705,6 +5754,7 @@ pub async fn post_outcome(
     } else {
         fingerprint
     };
+    let fingerprint = if raw { fingerprint.raw() } else { fingerprint };
     let waiting = match state.post_keys.lookup(&fingerprint) {
         crate::post_keys::Lookup::Known(outcome) => {
             return Ok(PostOutcome::Settled(Box::new(remembered_answer(&outcome))))
@@ -5804,6 +5854,8 @@ struct Posting {
     thread_id: Option<String>,
     /// Land top-level, answering `reply_to` by edge only (`#1052 post-to-main`).
     post_to_main: bool,
+    /// Mark the post raw (`#1136 raw-message-bridge`); `parts` is then the one marked text.
+    raw: bool,
     limit: crate::chat::PostLimit,
     /// Whether the post was defused as it was cut; see [`cut_post`].
     defuse: bool,
@@ -5884,6 +5936,7 @@ async fn post_each(
         reply_to,
         thread_id,
         post_to_main,
+        raw,
         limit,
         defuse,
         claim: _,
@@ -5920,7 +5973,7 @@ async fn post_each(
             Some(thread) => {
                 state
                     .chat
-                    .post_in_thread_keyed(&info.id, thread, part, parent, key)
+                    .post_in_thread_keyed_marked(&info.id, thread, part, parent, key, raw)
                     .await
             }
             // `#1052 post-to-main`: only the first part can take this arm with the flag set;
@@ -5928,13 +5981,13 @@ async fn post_each(
             None if post_to_main => {
                 state
                     .chat
-                    .post_message_top_level_keyed(&info.id, part, parent, key)
+                    .post_message_top_level_keyed_marked(&info.id, part, parent, key, raw)
                     .await
             }
             None => {
                 state
                     .chat
-                    .post_message_keyed(&info.id, part, parent, key)
+                    .post_message_keyed_marked(&info.id, part, parent, key, raw)
                     .await
             }
         };

@@ -1412,7 +1412,7 @@ impl ChatClient for HttpSlackClient {
         content: &str,
         reply_to: Option<&MessageId>,
     ) -> Result<Message, ChatError> {
-        self.thread_post(channel, thread_id, content, reply_to, None)
+        self.thread_post(channel, thread_id, content, reply_to, None, false)
             .await
             .map_err(|error| error.with_provider(&self.provider_name))
     }
@@ -1425,7 +1425,21 @@ impl ChatClient for HttpSlackClient {
         reply_to: Option<&MessageId>,
         key: Option<&str>,
     ) -> Result<Message, ChatError> {
-        self.thread_post(channel, thread_id, content, reply_to, key)
+        self.thread_post(channel, thread_id, content, reply_to, key, false)
+            .await
+            .map_err(|error| error.with_provider(&self.provider_name))
+    }
+
+    async fn post_in_thread_keyed_marked(
+        &self,
+        channel: &ChannelId,
+        thread_id: &str,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+        raw: bool,
+    ) -> Result<Message, ChatError> {
+        self.thread_post(channel, thread_id, content, reply_to, key, raw)
             .await
             .map_err(|error| error.with_provider(&self.provider_name))
     }
@@ -1847,7 +1861,7 @@ impl ChatClient for HttpSlackClient {
         content: &str,
         reply_to: Option<&MessageId>,
     ) -> Result<Message, ChatError> {
-        self.post(channel, content, reply_to, None)
+        self.post(channel, content, reply_to, None, false)
             .await
             .map_err(|error| error.with_provider(&self.provider_name))
     }
@@ -1859,7 +1873,20 @@ impl ChatClient for HttpSlackClient {
         reply_to: Option<&MessageId>,
         key: Option<&str>,
     ) -> Result<Message, ChatError> {
-        self.post(channel, content, reply_to, key)
+        self.post(channel, content, reply_to, key, false)
+            .await
+            .map_err(|error| error.with_provider(&self.provider_name))
+    }
+
+    async fn post_message_keyed_marked(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+        raw: bool,
+    ) -> Result<Message, ChatError> {
+        self.post(channel, content, reply_to, key, raw)
             .await
             .map_err(|error| error.with_provider(&self.provider_name))
     }
@@ -1871,7 +1898,20 @@ impl ChatClient for HttpSlackClient {
         reply_to: Option<&MessageId>,
         key: Option<&str>,
     ) -> Result<Message, ChatError> {
-        self.post_top_level(channel, content, reply_to, key)
+        self.post_top_level(channel, content, reply_to, key, false)
+            .await
+            .map_err(|error| error.with_provider(&self.provider_name))
+    }
+
+    async fn post_message_top_level_keyed_marked(
+        &self,
+        channel: &ChannelId,
+        content: &str,
+        reply_to: Option<&MessageId>,
+        key: Option<&str>,
+        raw: bool,
+    ) -> Result<Message, ChatError> {
+        self.post_top_level(channel, content, reply_to, key, raw)
             .await
             .map_err(|error| error.with_provider(&self.provider_name))
     }
@@ -1882,16 +1922,25 @@ impl ChatClient for HttpSlackClient {
 /// under another type is never read as a key.
 pub const OP_KEY_EVENT_TYPE: &str = "vibe_talk_op_key";
 
-/// The `metadata` parameter of a `chat.postMessage` carrying `key` and, for a reply, the message it
-/// answers (`#934 voice-page-reply-parent-arrow`): Slack's documented shape, `{event_type,
-/// event_payload}`. None where there is neither.
-pub(super) fn post_metadata(key: Option<&str>, reply_to: Option<&MessageId>) -> Option<String> {
+/// The `metadata` parameter of a `chat.postMessage` carrying `key`, for a reply the message it
+/// answers (`#934 voice-page-reply-parent-arrow`), and, for a raw post, `"raw": true` beside
+/// them (`#1136 raw-message-bridge`): Slack's documented shape, `{event_type, event_payload}`.
+/// None where there is none of them. Readers of `op_key` and `reply_to` ignore payload keys
+/// they do not know, so the raw marker changes nothing for them.
+pub(super) fn post_metadata(
+    key: Option<&str>,
+    reply_to: Option<&MessageId>,
+    raw: bool,
+) -> Option<String> {
     let mut payload = serde_json::Map::new();
     if let Some(key) = key {
         payload.insert("op_key".to_owned(), Value::String(key.to_owned()));
     }
     if let Some(parent) = reply_to {
         payload.insert("reply_to".to_owned(), Value::String(parent.0.clone()));
+    }
+    if raw {
+        payload.insert("raw".to_owned(), Value::Bool(true));
     }
     if payload.is_empty() {
         return None;
@@ -2056,14 +2105,14 @@ mod tests {
         // metadata gives it back as `reply_to`.
         let parent = MessageId("1700000000000100".to_owned());
         let filed: Value = serde_json::from_str(
-            &post_metadata(Some("k.1"), Some(&parent)).expect("metadata for a keyed reply"),
+            &post_metadata(Some("k.1"), Some(&parent), false).expect("metadata for a keyed reply"),
         )
         .expect("JSON");
         assert_eq!(filed["event_type"], OP_KEY_EVENT_TYPE);
         assert_eq!(filed["event_payload"]["op_key"], "k.1");
         assert_eq!(filed["event_payload"]["reply_to"], parent.0.as_str());
         let unkeyed: Value = serde_json::from_str(
-            &post_metadata(None, Some(&parent)).expect("metadata for a reply"),
+            &post_metadata(None, Some(&parent), false).expect("metadata for a reply"),
         )
         .expect("JSON");
         assert!(unkeyed["event_payload"].get("op_key").is_none());
@@ -2077,7 +2126,7 @@ mod tests {
             assert!(metadata.to_string().len() < 8 * 1024, "{metadata}");
         }
         assert_eq!(
-            post_metadata(None, None),
+            post_metadata(None, None, false),
             None,
             "a plain unkeyed post carried metadata"
         );
@@ -2110,6 +2159,45 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn a_raw_post_marks_its_metadata_beside_key_and_parent_and_readers_ignore_it() {
+        // `#1136 raw-message-bridge`. The marker is one more key inside the same
+        // `event_payload`, under the same `event_type`: no new metadata shape for a bridge in
+        // front of Slack to refuse, and the key and parent readers keep working.
+        let parent = MessageId("1700000000000100".to_owned());
+        let filed: Value = serde_json::from_str(
+            &post_metadata(Some("k.1"), Some(&parent), true).expect("metadata for a raw reply"),
+        )
+        .expect("JSON");
+        assert_eq!(filed["event_type"], OP_KEY_EVENT_TYPE);
+        assert_eq!(filed["event_payload"]["op_key"], "k.1");
+        assert_eq!(filed["event_payload"]["reply_to"], parent.0.as_str());
+        assert_eq!(filed["event_payload"]["raw"], true);
+        let fields = filed.as_object().expect("an object");
+        assert_eq!(fields.len(), 2, "{filed}");
+        assert!(fields["event_type"].is_string(), "{filed}");
+        assert!(fields["event_payload"].is_object(), "{filed}");
+        assert!(filed.to_string().len() < 8 * 1024, "{filed}");
+        // A raw post with neither key nor parent still files metadata, holding only the marker.
+        let bare: Value = serde_json::from_str(
+            &post_metadata(None, None, true).expect("metadata for a bare raw post"),
+        )
+        .expect("JSON");
+        assert_eq!(bare["event_payload"]["raw"], true);
+        assert!(bare["event_payload"].get("op_key").is_none());
+        assert!(bare["event_payload"].get("reply_to").is_none());
+        // Not raw is exactly the metadata of before: no `raw` key at all.
+        let plain: Value = serde_json::from_str(
+            &post_metadata(Some("k.1"), Some(&parent), false).expect("metadata for a reply"),
+        )
+        .expect("JSON");
+        assert!(plain["event_payload"].get("raw").is_none(), "{plain}");
+        // The existing readers see through the extra key unchanged.
+        let read = serde_json::json!({"metadata": filed});
+        assert_eq!(op_key_of(&read).as_deref(), Some("k.1"));
+        assert_eq!(reply_to_of(&read).as_ref(), Some(&parent));
     }
 
     #[test]

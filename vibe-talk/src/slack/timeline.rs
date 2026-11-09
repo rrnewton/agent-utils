@@ -1393,6 +1393,7 @@ impl HttpSlackClient {
         content: &str,
         reply_to: Option<&MessageId>,
         key: Option<&str>,
+        raw: bool,
     ) -> Result<Message, ChatError> {
         let _in_flight = self.write_in_flight();
         ReadReason::Write
@@ -1411,6 +1412,7 @@ impl HttpSlackClient {
                     thread.as_deref(),
                     reply_to,
                     key,
+                    raw,
                 )
                 .await
             })
@@ -1430,6 +1432,7 @@ impl HttpSlackClient {
         content: &str,
         reply_to: Option<&MessageId>,
         key: Option<&str>,
+        raw: bool,
     ) -> Result<Message, ChatError> {
         let _in_flight = self.write_in_flight();
         ReadReason::Write
@@ -1442,6 +1445,7 @@ impl HttpSlackClient {
                     None,
                     reply_to,
                     key,
+                    raw,
                 )
                 .await
             })
@@ -1474,6 +1478,7 @@ impl HttpSlackClient {
         Ok(target.thread_ts().unwrap_or(target.ts))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn post_raw(
         &self,
         channel: &ChannelId,
@@ -1482,6 +1487,7 @@ impl HttpSlackClient {
         thread: Option<&str>,
         reply_to: Option<&MessageId>,
         key: Option<&str>,
+        raw: bool,
     ) -> Result<Message, ChatError> {
         if content.trim().is_empty() {
             return Err(refused("message content is empty"));
@@ -1504,7 +1510,7 @@ impl HttpSlackClient {
         // With it, for a reply, the message it answers, which Slack has no pointer for: kept in
         // Slack itself, so a read anywhere that returns metadata draws it as a reply. `#934
         // voice-page-reply-parent-arrow`.
-        if let Some(metadata) = super::client::post_metadata(key, reply_to) {
+        if let Some(metadata) = super::client::post_metadata(key, reply_to, raw) {
             params.push(("metadata", metadata));
         }
         let value = self.call("chat.postMessage", &params).await?;
@@ -1546,6 +1552,7 @@ impl HttpSlackClient {
         content: &str,
         reply_to: Option<&MessageId>,
         key: Option<&str>,
+        raw: bool,
     ) -> Result<Message, ChatError> {
         let _in_flight = self.write_in_flight();
         ReadReason::Write
@@ -1570,6 +1577,7 @@ impl HttpSlackClient {
                     Some(&thread),
                     reply_to,
                     key,
+                    raw,
                 )
                 .await
             })

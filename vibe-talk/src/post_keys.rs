@@ -71,6 +71,11 @@ pub struct Fingerprint {
     /// from records filed before it existed, which name ordinary posts.
     #[serde(default)]
     top_level: bool,
+    /// The post was asked to be marked raw (`#1136 raw-message-bridge`): the same words under
+    /// the same key unmarked are another post, for the reason `top_level` gives. Absent from
+    /// records filed before it existed, which name unmarked posts.
+    #[serde(default)]
+    raw: bool,
 }
 
 impl Fingerprint {
@@ -90,6 +95,7 @@ impl Fingerprint {
             reply_to: reply_to.map(str::to_owned),
             text: text.to_owned(),
             top_level: false,
+            raw: false,
         }
     }
 
@@ -97,6 +103,13 @@ impl Fingerprint {
     #[must_use]
     pub fn top_level(mut self) -> Self {
         self.top_level = true;
+        self
+    }
+
+    /// This post, asked to be marked raw (`#1136 raw-message-bridge`).
+    #[must_use]
+    pub fn raw(mut self) -> Self {
+        self.raw = true;
         self
     }
 }
