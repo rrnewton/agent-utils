@@ -3556,6 +3556,12 @@ def _restore_team(harness: Harness, report: Report) -> None:
         "restore/already-restored/report",
         rust.returncode == 0 and isinstance(value, dict)
         and value.get("action") == "already-restored"
+        and value.get("replayed") is True
+        and value.get("complete") is True
+        and value.get("refused") == 0
+        and value.get("refused_lanes") == []
+        and value.get("would_complete") is True
+        and value.get("agents") == []
         and value.get("schema") == "agentctl-restore-report/v1"
         and value.get("report") == f"<ROOT>/restore-reports/{value.get('boot_id')}.json",
         f"a second restore for the same boot diverged: {rust!r}",

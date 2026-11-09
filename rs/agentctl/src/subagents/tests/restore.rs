@@ -2,8 +2,8 @@
 
 use super::*;
 use crate::restore::{
-    restore, watch_once, CommandOutcome, Host, RestoreConfig, RestoreOptions, TimerWatch,
-    WatchOptions,
+    restore, restore_exit_code, watch_once, CommandOutcome, Host, RestoreConfig, RestoreOptions,
+    TimerWatch, WatchOptions,
 };
 use std::cell::{Cell, RefCell};
 
@@ -190,6 +190,16 @@ fn restore_remounts_first_revives_then_starts_units_and_is_idempotent() {
 
     let again = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
     assert_eq!(again["action"], "already-restored");
+    // #1132: a clean rerun replays the recorded rows and completion fields,
+    // labelled as a replay, never a bare already-restored stub.
+    assert_eq!(again["replayed"], true, "{again}");
+    assert_eq!(again["complete"], true, "{again}");
+    assert_eq!(again["refused"], 0, "{again}");
+    assert_eq!(again["refused_lanes"], json!([]), "{again}");
+    assert_eq!(again["would_complete"], true, "{again}");
+    assert_eq!(again["agents"], report["agents"], "{again}");
+    assert_eq!(again["coordinator"], report["coordinator"], "{again}");
+    assert_eq!(again["report"], report["report"], "{again}");
     assert_eq!(
         host.commands().len(),
         3,
@@ -323,6 +333,65 @@ fn restore_refuses_an_ambiguous_muse_lane_per_lane_and_carries_on() {
     assert_eq!(other["action"], "revived", "{report}");
     assert_eq!(report["refused"], 1, "{report}");
     assert_eq!(report["refused_lanes"], json!(["lane"]), "{report}");
+    assert_eq!(report["complete"], true, "{report}");
+
+    // #1132: a non-force rerun in the same boot replays the recorded
+    // refusal instead of reading as a fresh success.
+    let again = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(again["action"], "already-restored", "{again}");
+    assert_eq!(again["replayed"], true, "{again}");
+    assert_eq!(again["complete"], true, "{again}");
+    assert_eq!(again["refused"], 1, "{again}");
+    assert_eq!(again["refused_lanes"], json!(["lane"]), "{again}");
+    assert_eq!(again["would_complete"], false, "{again}");
+    assert_eq!(again["agents"], report["agents"], "{again}");
+    assert_eq!(again["coordinator"], report["coordinator"], "{again}");
+    assert_eq!(again["report"], report["report"], "{again}");
+    let again_lane = again["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "lane")
+        .unwrap_or_else(|| panic!("no replayed row for lane: {again}"));
+    assert_eq!(again_lane["action"], "refused", "{again}");
+    assert!(
+        again_lane["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+        "{again_lane}"
+    );
+}
+
+#[test]
+fn restore_exit_code_follows_the_recorded_run() {
+    // #1132: no already-restored shortcut to 0; the class is the recorded
+    // run's (74 for a completed run with refused lanes, #948).
+    for (report, dry_run, expected) in [
+        (json!({"complete": true, "refused": 0}), false, 0),
+        (json!({"complete": true, "refused": 2}), false, 74),
+        (
+            json!({"action": "already-restored", "replayed": true, "complete": true, "refused": 1}),
+            false,
+            74,
+        ),
+        (
+            json!({"action": "already-restored", "replayed": true, "complete": true, "refused": 0}),
+            false,
+            0,
+        ),
+        (json!({"complete": false, "refused": 0}), false, 75),
+        (json!({"complete": false, "refused": 1}), false, 75),
+        (json!({}), false, 75),
+        (json!({"complete": false, "refused": 1}), true, 0),
+        (json!({"complete": true, "refused": 1}), true, 0),
+    ] {
+        assert_eq!(
+            restore_exit_code(&report, dry_run),
+            expected,
+            "{report} dry_run={dry_run}"
+        );
+    }
 }
 
 #[test]

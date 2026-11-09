@@ -5,7 +5,7 @@
 //!
 //! 1. Hold `<registry>/.restore.lock`, so a boot unit and a manual run never overlap: the
 //!    second waits for the first, then finds its completed report.
-//! 2. Stop early, successfully, when this boot's report already says the restore completed.
+//! 2. Replay this boot's recorded report when it already says the restore completed.
 //! 3. Run the project's slot manager once (`wrkslots image status`), which remounts every
 //!    image-backed slot before any agent starts in one.
 //! 4. Wait for the Herdr server to answer.
@@ -1551,6 +1551,22 @@ pub fn spec_write_agents<A: ManagedApi + ?Sized>(
     }))
 }
 
+/// The process exit class for a restore report (#1132): 0 only when the
+/// (recorded, for a replay) run completed with no refusal, or for a dry run;
+/// 74 when it completed except for refused lanes (named in `refused_lanes`,
+/// not a failure a boot unit should retry); 75 otherwise. An
+/// `already-restored` replay has no class of its own: it follows the
+/// recorded run it replayed.
+pub fn restore_exit_code(report: &Value, dry_run: bool) -> i32 {
+    if dry_run || (report["complete"] == true && report["refused"] == 0) {
+        0
+    } else if report["complete"] == true && report["refused"] != 0 {
+        74
+    } else {
+        75
+    }
+}
+
 /// Repair whatever differs from the desired state: revive the coordinator, then the
 /// agents, then start the units, and write the per-boot report.
 pub fn restore<A: ManagedApi + ?Sized>(
@@ -1573,7 +1589,7 @@ pub fn restore<A: ManagedApi + ?Sized>(
         .mode(0o600)
         .open(registry.join(".restore.lock"))
         .map_err(|error| fail(format!("cannot open the restore lock: {error}")))?;
-    // A second restore waits for the first, then finds its completed report and stops.
+    // A second restore waits for the first, then replays its completed report.
     lock.lock_exclusive()
         .map_err(|error| fail(format!("cannot take the restore lock: {error}")))?;
     let boot_id = host.boot_id()?;
@@ -1581,12 +1597,45 @@ pub fn restore<A: ManagedApi + ?Sized>(
     if !options.force && !options.dry_run {
         if let Some(previous) = read_report(&path) {
             if previous["complete"] == true {
-                return Ok(json!({
-                    "schema": REPORT_SCHEMA,
-                    "boot_id": boot_id,
-                    "action": "already-restored",
-                    "report": path,
-                }));
+                // #1132: replay the recorded outcomes (rows, refusals and
+                // completion fields) labelled as a replay, so a rerun can
+                // never read as a fresh success for a boot that refused
+                // lanes. The caller maps this to the recorded exit class.
+                let mut replayed = previous;
+                if let Some(object) = replayed.as_object_mut() {
+                    object.entry("coordinator").or_insert(Value::Null);
+                    object.entry("agents").or_insert_with(|| json!([]));
+                    if !object.contains_key("refused") || !object.contains_key("refused_lanes") {
+                        let lanes: Vec<Value> = object
+                            .get("agents")
+                            .and_then(Value::as_array)
+                            .map(|rows| {
+                                rows.iter()
+                                    .filter(|row| row["action"] == "refused")
+                                    .filter_map(|row| row["name"].as_str().map(|name| json!(name)))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        object
+                            .entry("refused")
+                            .or_insert_with(|| json!(lanes.len()));
+                        object
+                            .entry("refused_lanes")
+                            .or_insert_with(|| json!(lanes));
+                    }
+                    if !object.contains_key("would_complete") {
+                        let clean = object.get("refused") == Some(&json!(0));
+                        object.insert("would_complete".to_owned(), json!(clean));
+                    }
+                    object
+                        .entry("schema")
+                        .or_insert_with(|| json!(REPORT_SCHEMA));
+                    object.insert("boot_id".to_owned(), json!(boot_id));
+                    object.insert("action".to_owned(), json!("already-restored"));
+                    object.insert("replayed".to_owned(), json!(true));
+                    object.insert("report".to_owned(), json!(path));
+                }
+                return Ok(replayed);
             }
         }
     }
