@@ -307,8 +307,7 @@ CONTROLS: tuple[Control, ...] = (
       (LIST_KEEPERS, "      holdOverscrollReader(area);\n      const was = footing;\n", "      const was = footing;\n")),
      ("HIGHLIGHT",)),
     ("the search not what the room was opened over", "voice.js",
-     (("inColumn(columns.side, () => [channelContextKey(), pinsView().only, searchKey()])",
-       "inColumn(columns.side, () => [channelContextKey(), pinsView().only])"),), ("SEARCH",)),
+     ((", searchKey()])", "])"),), ("SEARCH",)),
 )
 
 

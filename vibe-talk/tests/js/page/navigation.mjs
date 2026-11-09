@@ -2505,7 +2505,9 @@ test("a channel reopens in the view chosen in it, one nobody chose a view in ope
     "a channel nobody chose a view in was recorded as choosing one");
 
   // THE CONTROL: with the choice not kept, coming back opens in All, and this fails.
-  const control = await run(await brokenModule([{ file: "src/view/channel/twocolumns.ts", find: "    if (chosen) deps.rememberView(chosen);", replace: "    if (chosen) void chosen;" }], brokenScript("  if (chosen) uiState.remember(chosen);", "  if (chosen) void chosen;")));
+  const control = await run(await brokenModule([
+    { file: "src/view/channel/twocolumns.ts", find: "    if (chosen) deps.rememberView(chosen);", replace: "    if (chosen) void chosen;" },
+    { file: "src/view/channel/channelviews.ts", find: "      if (chosen) deps.rememberView(chosen);", replace: "      if (chosen) void chosen;" }]));
   assert.equal(control.page.el("thread-select").value, "flat", "the test cannot tell a kept choice from none");
 
   // The Threads list is not a view a channel opens in: picked, it leaves the channel to its default.

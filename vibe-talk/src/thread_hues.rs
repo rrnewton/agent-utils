@@ -1,7 +1,7 @@
 //! The colour each thread is drawn in, decided here rather than in the browser. `#427
 //! server-thread-hues`.
 //!
-//! Until this, the page chose thread colours itself (`web/voice.js` `threadHue`): `#396
+//! Until this, the page chose thread colours itself (the page's own thread colour): `#396
 //! thread-color-memory` remembered them per browser in localStorage, so two devices could colour
 //! the same thread differently and there was no one answer to "which colour is that thread". The
 //! owner, 2026-10-22: thread colours should be server side — whatever the policy is, it should be

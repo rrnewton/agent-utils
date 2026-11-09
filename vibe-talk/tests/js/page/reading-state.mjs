@@ -951,9 +951,9 @@ test("...but not a landing made on an earlier visit, when the thread comes back 
     "the first visit's landing opened the row the read drew under message 12, or the thread came back without the Done made in All");
   // Negative control: the landing left standing when the view changes, and the thread's rows come back
   // as they were left, the very row the landing was made on among them.
-  const control = brokenScriptEach(["  entryState().landing = null;\n  if (view === \"thread\")", "  if (view === \"thread\")"],
-    ["if (!caughtUp && (held.readMode !== readModes.mode() || rowsMissDone())) renderCachedTimeline();",
-      "if (!caughtUp && held.readMode !== readModes.mode()) renderCachedTimeline();"]);
+  const control = await brokenModule([
+    { file: "src/view/channel/channelviews.ts", find: "    deps.entryState().landing = null;\n    if (view === \"thread\") deps.readRunsForget(deps.viewKey());", replace: "    if (view === \"thread\") deps.readRunsForget(deps.viewKey());" },
+    { file: "src/view/channel/channelviews.ts", find: "    if (!caughtUp && (held.readMode !== deps.readMode() || deps.rowsMissDone())) deps.renderCachedTimeline();", replace: "    if (!caughtUp && held.readMode !== deps.readMode()) deps.renderCachedTimeline();" }]);
   assert.equal((await run(control)).collapsed, "false", "the first visit's landing did not hold without the reset; the control proves nothing");
 });
 
@@ -1020,8 +1020,9 @@ test("Fold read: a switch from All to Main keeps the reader's message by the lin
   };
   assert.equal(await run(SCRIPT), 0, "Main did not put the run hiding the reader's message where the message was");
   // Negative control: found by the hidden row's own empty box, which stands below the line's row.
-  assert.notEqual(await run(brokenScript("    const row = shownRowFor(rows.find((candidate) => idsOf(candidate).some((id) => seen.ids.includes(id))));",
-    "    const row = rows.find((candidate) => idsOf(candidate).some((id) => seen.ids.includes(id)));")), 0,
+  assert.notEqual(await run(await brokenModule([{ file: "src/view/channel/channelviews.ts",
+    find: "      const row = deps.shownRowFor(rows.find((candidate) => deps.idsOf(candidate).some((id) => seen.ids.includes(id))));",
+    replace: "      const row = rows.find((candidate) => deps.idsOf(candidate).some((id) => seen.ids.includes(id)));" }])), 0,
   "the hidden row's box put the reader in the same place; the control proves nothing");
 });
 

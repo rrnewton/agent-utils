@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 
 import { moduleForTests } from "../../../web/build.mjs";
 
-import { CHANNEL, CSS, GLYPHS, HOLD_MS, HTML_CODE, PRESENT_ROWS, REPO, SCRIPT, SCRIPT_CODE, SETTINGS,
+import { CHANNEL, CSS, GLYPHS, HOLD_MS, HTML_CODE, PRESENT_ROWS, REPO, SCRIPT, PAGE_CODE, SCRIPT_CODE, SETTINGS,
   assertMarkupContains, assistantSays, atBottomOf, backFacts, backlog, brokenModule, brokenScript,
   cssBlock, cssRules, doneButton, inReadingMode, linkPairs, linksOf, longMessage, message, mouseTo, newPage,
   pagedTimeline, passTime, press, reReadChannel, readAloudMessages, reloadWith, reopenedChannel, rowMore,
@@ -1659,8 +1659,8 @@ test("Links over a channel with no link shows the sentence, and off puts the rea
 test("the channel composer says where the message goes in its placeholder, not in a heading line", () => {
   assert.doesNotMatch(HTML_CODE, /id="channel-compose-label"/, "the composer's heading line came back");
   assert.match(HTML_CODE, /id="channel-compose-text"[^>]*placeholder="Message the main channel…"[^>]*aria-label="Message the main channel"/);
-  assert.match(SCRIPT_CODE, /const destination = selection\(\)\.threadId \? "Reply in this thread" : "Message the main channel";/);
-  assert.match(SCRIPT_CODE, /el\("channel-compose-text"\)\.placeholder = `\$\{destination\}…`;/);
+  assert.match(PAGE_CODE, /const destination = deps.selection\(\)\.threadId \? "Reply in this thread" : "Message the main channel";/);
+  assert.match(PAGE_CODE, /\(deps\.el\("channel-compose-text"\) as HTMLTextAreaElement\)\.placeholder = `\$\{destination\}…`;/);
   assert.doesNotMatch(SCRIPT_CODE, /Write a message…|Write a thread reply…/, "the old, less informative hint came back");
 });
 

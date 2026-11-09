@@ -305,7 +305,7 @@ test("`#333 page-live-reads-remainder`: Main shown again draws the words a read 
   assert.deepStrictEqual(shownIds(page), ["200", "201", "203"]);
   assert.equal(rowText(page, "201"), edited, "Main shown again drew the root's old words");
   // THE CONTROL: rows compared by id alone, Main draws the old words until its own next read.
-  const control = await run(brokenScript(...HELD_COMPARES_IDS));
+  const control = await run(await brokenModule([{ file: "src/view/channel/channelviews.ts", find: HELD_COMPARES_IDS[0], replace: HELD_COMPARES_IDS[1] }]));
   assert.equal(rowText(control, "201"), "first thread root", "compared by id alone Main drew the edit, so this test cannot see it");
 });
 
@@ -328,7 +328,7 @@ test("`#333 page-live-reads-remainder`: Main shown again keeps its very rows whe
   assert.ok(page.el("discord-log").children.every((li, at) => li === drawn[at]),
     "Main shown again was drawn afresh for a root that says what it said");
   // THE CONTROL: compared as JSON, the fields' order alone draws Main again.
-  const control = await run(brokenScript(...HELD_COMPARES_JSON));
+  const control = await run(await brokenModule([{ file: "src/view/channel/channelviews.ts", find: HELD_COMPARES_JSON[0], replace: HELD_COMPARES_JSON[1] }]));
   assert.ok(!control.page.el("discord-log").children.every((li, at) => li === control.drawn[at]),
     "compared as JSON Main kept its rows, so this test cannot see a redraw");
 });
@@ -363,7 +363,7 @@ test("`#333 page-live-reads-remainder`: in two columns, a read of the thread on 
   const page = await run();
   assert.equal(rowText(page, "201"), edited, "Main on the left drew the root's old words beside its edit on the right");
   // THE CONTROL: rows compared by id alone, the left column keeps the old words.
-  const control = await run(brokenScript(...HELD_COMPARES_IDS));
+  const control = await run(await brokenModule([{ file: "src/view/channel/channelviews.ts", find: HELD_COMPARES_IDS[0], replace: HELD_COMPARES_IDS[1] }]));
   assert.equal(rowText(control, "201"), "first thread root", "compared by id alone Main drew the edit, so this test cannot see it");
 });
 
@@ -6804,12 +6804,12 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: A READER WHOSE SCRE
 
   // THE CONTROLS. The card not a place: the reader who sees only the card is put wherever the rows above
   // it leave them, or at the foot.
-  const unplaced = await run(brokenScript(
-    '  const card = typeof place.card === "number" ? channelCard() : null;\n', "  const card = null;\n"));
+  const unplaced = await run(await brokenModule([{ file: "src/view/channel/channelviews.ts",
+    find: '    const card = typeof place.card === "number" ? channelCard() : null;\n', replace: "    const card = null;\n" }]));
   assert.deepStrictEqual(unplaced, every(false));
   // The card a place whatever else is on screen: the reader who could see All's reply is held on the card.
-  const always = await run(brokenScript(
-    "  const card = seen.length === 0 ? channelCard() : null;\n", "  const card = channelCard();\n"));
+  const always = await run(await brokenModule([{ file: "src/view/channel/channelviews.ts",
+    find: "    const card = seen.length === 0 ? channelCard() : null;\n", replace: "    const card = channelCard();\n" }]));
   assert.deepStrictEqual(always, { ...real, byRow: false });
 });
 
@@ -7054,8 +7054,8 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: A READER WHO SAW ON
   // over a root Main ends on, so Main is at its foot behind the list and the way back finds the foot without
   // the place; in Chromium Main stood up its list there, and point 18 of tests/approval_card_browser.py takes
   // a reader from All that way.
-  const unplaced = await run(brokenScript(
-    '  if (typeof place.card === "number" && voiceTranscript().postWatch.shown === null) {\n', "  if (false) {\n"));
+  const unplaced = await run(await brokenModule([{ file: "src/view/channel/channelviews.ts",
+    find: '    if (typeof place.card === "number" && deps.transcriptShown() === null) {\n', replace: "    if (false) {\n" }]));
   assert.deepStrictEqual(unplaced, every((view) => view === "All"));
 });
 
@@ -7161,9 +7161,9 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: TWO COLUMNS COMING 
   const unread = await run(await brokenModule([{ file: "src/view/channel/twocolumns.ts", find: READ_BEFORE, replace: "    const left = null;\n" }]));
   assert.deepStrictEqual(unread, { ...real, footMain: false });
   // As the page was before, neither: Main stays where it was left, and All is drawn as far up on the way back.
-  const before = await run(brokenFurther(await brokenModule([{ file: "src/view/channel/twocolumns.ts", find: READ_BEFORE, replace: "    const left = null;\n" }]),
-    "    if (keepPlace && !keepReaderPlace(place) && place.cardSeen) scrollToNewest();\n",
-    "    if (keepPlace) keepReaderPlace(place);\n"));
+  const before = await run(await brokenModule([
+    { file: "src/view/channel/twocolumns.ts", find: READ_BEFORE, replace: "    const left = null;\n" },
+    { file: "src/view/channel/channelviews.ts", find: "    if (keepPlace && !keepReaderPlace(place) && place.cardSeen) deps.scrollToNewest();\n", replace: "    if (keepPlace) keepReaderPlace(place);\n" }]));
   assert.deepStrictEqual(before, { ...real, footMain: false, footAll: false });
   // The place read before, but not put back where the left column's view stays: All's reader is kept by the
   // switch to Main, and Main's is left as the card grows.
@@ -7249,9 +7249,9 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: BACK FROM A CHANGE 
   assert.deepStrictEqual(unheld, { ...real, allBack: false, mainBack: false });
   // A switch that finds none of the reader's rows leaving Main where it was last left, the card in view or
   // not: 200px up its list, Send off screen, by Cmd-4 and by Cmd-1. The way back still finds All as it was.
-  const left = await run(brokenScript(
-    "    if (keepPlace && !keepReaderPlace(place) && place.cardSeen) scrollToNewest();\n",
-    "    if (keepPlace) keepReaderPlace(place);\n"));
+  const left = await run(await brokenModule([{ file: "src/view/channel/channelviews.ts",
+    find: "    if (keepPlace && !keepReaderPlace(place) && place.cardSeen) deps.scrollToNewest();\n",
+    replace: "    if (keepPlace) keepReaderPlace(place);\n" }]));
   assert.deepStrictEqual(left, { ...real, allAway: false, allToMain: false });
 });
 

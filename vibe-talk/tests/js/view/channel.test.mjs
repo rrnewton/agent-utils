@@ -2319,3 +2319,83 @@ test("`#624 voice-page-modularity`: Done's state, saving wait and refused-write 
   const stands = owner.settleInboxWrite(["m3"], true, new Set());
   assert.deepStrictEqual([...stands], ["m3"], "a refused write with a later one on its way took the act back");
 });
+
+test("`#624 voice-page-modularity`: a thread's count comes from its summary before its own record, and Main is inherited from All's cover", () => {
+  const { createChannelViews } = CHANNEL_VIEW;
+  const canon = {
+    channel: "C1",
+    threads: [{ id: "t1", reply_count: 4, reply_count_exact: false, root: { id: "r1" } }],
+    messages: [],
+    views: new Map([["flat", { live: true, at: 10, notice: "note", cursor: "c", newest: "n", fullAt: 1 }]]),
+    dismissed: new Set(),
+  };
+  const owner = createChannelViews({
+    el: () => ({ hidden: false, children: [], setAttribute: () => {}, replaceChildren: () => {} }),
+    leftEl: () => ({ hidden: false }),
+    columnSide: () => false,
+    channelCanon: () => canon,
+    view: () => "discord",
+    threading: () => true,
+    entryState: () => ({ threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null, backGesture: null }),
+    selection: () => ({ view: "main", threadId: null, thread: null, origin: null }),
+    readMode: () => "show",
+    transcriptShown: () => false,
+    selectedChannelId: () => "C1",
+    heldMessage: () => null,
+    providerOfChannel: () => null,
+    providersSize: () => 0,
+    repliesInThreadCapability: () => false,
+    threadOf: (m) => (m && m.thread ? String(m.thread.id) : null),
+    rowMessages: () => [],
+    renderSideColumn: () => {}, renderThreadSelect: () => {}, renderThreadHeading: () => {},
+    followReplyStore: () => {}, markListView: () => {}, paintAllThreadFocus: () => {},
+    pinsView: () => ({ only: false }),
+    renderOutgoingMessages: () => {}, syncCanonDismissed: () => {},
+    timelineRows: () => ({ messages: [], threads: [] }),
+    olderPages: () => ({ moreAbove: false, cursor: null }),
+    captureScroll: () => null,
+    loadState: () => ({ freshAt: 0, freshness: "fresh", generation: 0 }),
+    doneState: () => ({ archived: new Set() }),
+    idsOf: () => [], shownRowFor: () => null, atBottom: () => true,
+    noteDeepLinkReaderMove: () => {}, putDockedReplyAway: () => {},
+    replyDocked: () => false, replyColumn: () => null, activeColumn: () => null,
+    putRepliesBack: () => {}, dropReplyArrowTap: () => {}, rememberChannelDraft: () => {},
+    setPinnedOnly: () => {}, viewOnScreen: () => null, saveUiState: () => {},
+    scheduleBackSync: () => {}, voiceCall: () => ({ renderControls: () => {} }),
+    threadOutrunsStore: () => false, heldViewRows: () => [],
+    drawProjection: () => false, drawHeldRows: () => false,
+    setChannelFreshness: () => {}, saveChannelScope: () => {},
+    walkCursorOwed: () => false, maybeLoadOlder: () => {},
+    allReachesThread: () => false, storeLacksReplies: () => false,
+    projectView: () => null, channelReadPosition: () => ({}),
+    readFilterKeeps: () => () => true, settleAfterRead: () => {},
+    hiddenEmpty: () => false, hidingRead: () => false,
+    renderChannelLoading: () => {}, restoreChannelComposer: () => {},
+    renderOlderControl: () => {}, restoreScroll: () => {},
+    renderCachedTimeline: () => {}, syncUnreadReplies: () => {},
+    renderChannelFreshness: () => {}, payThreadEntry: () => {},
+    rowsMissDone: () => false, scrollToNewest: () => {}, renderJumpNewest: () => {},
+    threadCards: () => [], loadDiscordTimeline: async () => {},
+    api: async () => null,
+    deviceStorage: () => ({ getItem: () => null, setItem: () => {}, removeItem: () => {} }),
+    tokenScope: () => "read",
+    channelRecord: () => null, timeOfRecord: () => 0,
+    threadOfMessage: () => null,
+    layoutShown: () => ({ columns: () => false, threadList: () => false, restoring: () => false }),
+    stopReading: () => {}, setReadingMode: () => {},
+    readRunsForget: () => {},
+    viewKey: (view = "main", threadId = null) => (view === "thread" && threadId ? `thread:${threadId}` : view),
+    rememberView: () => {}, forgetChosenView: () => {}, settleUiState: () => {},
+    payReadCursor: () => {}, readsBusy: () => false, readContext: () => "ctx",
+    channelContexts: () => new Map(), listState: () => ({ newestId: null }),
+  });
+  assert.deepStrictEqual(owner.threadReplies("t1", null), { count: 4, exact: false },
+    "the count did not come from the thread's summary");
+  assert.equal(owner.threadCount(1, true), "1 reply");
+  assert.equal(owner.threadCount(null, false), "Replies");
+  assert.equal(owner.inheritAllCover("main"), true, "Main was not inherited from All's cover");
+  const cover = canon.views.get("main");
+  assert.equal(cover.fromAll, true);
+  assert.equal(cover.notice, "", "All's notice came with Main's cover");
+  assert.equal(cover.cursor, null, "Main kept All's forward cursor");
+});

@@ -1770,8 +1770,8 @@ const DONE_FOLLOWS = ["      deps.followDoneEverywhere(requested, column);\n    
 /** ...the same in `restoreMessages`. */
 const UNDO_FOLLOWS = ["      deps.followDoneEverywhere(restored, column);\n      if (deps.lastDismissal", "      if (deps.lastDismissal"];
 /** The check that draws a held view's rows again as it is shown, where they say otherwise than its copy. */
-const HELD_REDRAWS = ["if (!caughtUp && (held.readMode !== readModes.mode() || rowsMissDone())) renderCachedTimeline();",
-  "if (!caughtUp && held.readMode !== readModes.mode()) renderCachedTimeline();"];
+const HELD_REDRAWS = ["    if (!caughtUp && (held.readMode !== deps.readMode() || deps.rowsMissDone())) deps.renderCachedTimeline();",
+  "    if (!caughtUp && held.readMode !== deps.readMode()) deps.renderCachedTimeline();"];
 
 /**
  * The channel of `threadData` opened in All, then Main read for itself as its poll reads it, so that
@@ -1848,7 +1848,7 @@ test("`#306 done-stale-across-views`: a Done in Main is drawn in All, held from 
   assert.equal(doneDrawn(unfollowed.page, "201"), "false", "without the views held brought into line All showed the Done, so this test cannot see it");
   assert.equal(await laterSave(unfollowed.page), false,
     "the stale copy did not reach the snapshot, so this test's claim about it is untested");
-  const undrawn = await run(brokenScript(...HELD_REDRAWS));
+  const undrawn = await run(await brokenModule([{ file: "src/view/channel/channelviews.ts", find: HELD_REDRAWS[0], replace: HELD_REDRAWS[1] }]));
   assert.equal(doneDrawn(undrawn.page, "201"), "false", "without the redraw as All is shown All showed the Done, so this test cannot see it");
   const unundone = await run(await brokenDoneAct(UNDO_FOLLOWS));
   await unundone.page.el("undo-dismiss").click();
