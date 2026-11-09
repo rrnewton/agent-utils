@@ -558,7 +558,13 @@ fn worktrees_image_settings(raw: &Map<String, Value>) -> Result<Value> {
         .filter(|key| {
             !matches!(
                 *key,
-                "path" | "size_bytes" | "fs" | "mount" | "slot_quota_bytes"
+                "path"
+                    | "size_bytes"
+                    | "fs"
+                    | "mount"
+                    | "slot_quota_bytes"
+                    | "mount_at"
+                    | "quota_mode"
             )
         })
         .collect();
@@ -620,10 +626,30 @@ fn worktrees_image_settings(raw: &Map<String, Value>) -> Result<Value> {
             1
         )?),
     };
+    let mount_at = section
+        .get("mount_at")
+        .and_then(Value::as_str)
+        .unwrap_or("binds");
+    if !matches!(mount_at, "binds" | "worktrees_dir") {
+        return Err(format!(
+            "configuration.worktrees_image.mount_at must be one of binds, worktrees_dir, not {mount_at:?}"
+        ));
+    }
+    let quota_mode = section
+        .get("quota_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("simple");
+    if !matches!(quota_mode, "simple" | "full") {
+        return Err(format!(
+            "configuration.worktrees_image.quota_mode must be one of simple, full, not {quota_mode:?}"
+        ));
+    }
     Ok(json!({
         "fs": filesystem,
         "mount": mount,
+        "mount_at": mount_at,
         "path": path,
+        "quota_mode": quota_mode,
         "size_bytes": size,
         "slot_quota_bytes": quota,
     }))

@@ -8,6 +8,7 @@ refusals, and process-use checks.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import json
 import os
@@ -184,8 +185,10 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
         "worktrees-image",
         help="manage the one btrfs image holding every slot (opt-in worktrees_image)",
         description=(
-            "Manage the project worktrees image: one sparse btrfs image mounted at the "
-            "slots directory, holding every slot. Configured by the worktrees_image "
+            "Manage the project worktrees image: one sparse btrfs image holding "
+            "every slot, mounted beside the control files with a bind per slot "
+            "(mount_at: binds, the default) or at the slots directory itself "
+            "(mount_at: worktrees_dir). Configured by the worktrees_image "
             "section; absent means slots live on the host file system. The section's "
             "optional machines list scopes it to named hosts: elsewhere it behaves "
             "exactly as if absent, so it is safe to commit. Kernel mount "
@@ -200,7 +203,7 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
         "create", help="create the sparse btrfs image file (does not mount it)"
     )
     wt_create.set_defaults(handler=_cmd_wt_image_create)
-    wt_mount = wt_actions.add_parser("mount", help="mount the worktrees image at the slots directory")
+    wt_mount = wt_actions.add_parser("mount", help="mount the worktrees image at its configured mount point")
     wt_mount.set_defaults(handler=_cmd_wt_image_mount)
     wt_unmount = wt_actions.add_parser("unmount", help="unmount the worktrees image")
     wt_unmount.set_defaults(handler=_cmd_wt_image_unmount)
@@ -212,6 +215,37 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
     wt_grow.set_defaults(handler=_cmd_wt_image_grow)
     wt_trim = wt_actions.add_parser("trim", help="return freed guest blocks to the host (fstrim)")
     wt_trim.set_defaults(handler=_cmd_wt_image_trim)
+    wt_migrate_layout = wt_actions.add_parser(
+        "migrate-layout",
+        help="switch the image between per-slot binds and mounting at the slots directory",
+        description=(
+            "Switch the worktrees image layout. --to direct unbinds every slot, "
+            "reclaims any host original left beneath a bind (the verified image "
+            "copy is kept), unmounts beside the control files and mounts the image "
+            "at the slots directory itself, so slot subvolumes become its top-level "
+            "entries. --to binds does the reverse. Refuses while any slot is in use "
+            "(the removal census, a live or unverifiable owner, or a hold), while a "
+            "validation slot exists (finish or remove it first), or while any entry "
+            "in the slots directory is not a recorded slot. The worktrees_image "
+            "mount_at key is rewritten only after the new mount verifiably holds "
+            "every slot; on refusal the previous layout is re-established."
+        ),
+        epilog=(
+            "examples:\n"
+            "  wrkslots worktrees-image migrate-layout --to direct\n"
+            "  wrkslots worktrees-image migrate-layout --to binds"
+        ),
+        formatter_class=formatter,
+    )
+    wt_migrate_layout.add_argument(
+        "--to",
+        choices=("direct", "binds"),
+        required=True,
+        dest="target",
+        help="direct: mount at the slots directory, no binds; binds: mount beside "
+        "the control files with one bind per slot",
+    )
+    wt_migrate_layout.set_defaults(handler=_cmd_wt_migrate_layout)
     wt_image.set_defaults(handler=_cmd_wt_image_help, wt_image_parser=wt_image)
 
     migrate = subparsers.add_parser(
@@ -731,40 +765,72 @@ def _cmd_wt_image_create(args: argparse.Namespace) -> int:
 
 def _cmd_wt_image_mount(args: argparse.Namespace) -> int:
     config, settings = _wt_settings(args)
+    mount_point = settings.mount_point(config.control, config.worktrees)
     try:
-        worktreesimage.ensure_image_mounted(config.root, config.control, settings)
+        worktreesimage.ensure_image_mounted(
+            config.root, config.control, settings, config.worktrees
+        )
         worktreesimage.ensure_binds(
-            config.control, worktreesimage.image_mount_dir(config.control), config.worktrees
+            config.control,
+            worktreesimage.image_mount_dir(config.control),
+            config.worktrees,
+            settings,
         )
     except worktreesimage.WorktreesImageError as exc:
         raise _refuse(str(exc)) from exc
-    print(
-        f"mounted {settings.image_file(config.root)} at "
-        f"{worktreesimage.image_mount_dir(config.control)} (binds re-established)"
-    )
+    suffix = "" if settings.direct else " (binds re-established)"
+    print(f"mounted {settings.image_file(config.root)} at {mount_point}{suffix}")
     return 0
 
 
 def _cmd_wt_image_unmount(args: argparse.Namespace) -> int:
     config, settings = _wt_settings(args)
+    mount_point = settings.mount_point(config.control, config.worktrees)
+    if settings.direct:
+        # Every wrkslots command remounts on config load, and this one is
+        # no exception: the direct slots directory cannot be left
+        # unmounted here (and must never be unmounted from inside a
+        # slot). Say so instead of silently remounting on the next load.
+        raise _refuse(
+            "in mount_at: worktrees_dir layout the image mounts at the slots "
+            "directory and every wrkslots command remounts it; unmount it "
+            "outside wrkslots only when no slot is in use, or switch layout "
+            "with 'wrkslots worktrees-image migrate-layout --to binds' first"
+        )
     try:
-        worktreesimage.unmount_image(worktreesimage.image_mount_dir(config.control))
+        worktreesimage.unmount_image(mount_point)
     except worktreesimage.WorktreesImageError as exc:
         raise _refuse(str(exc)) from exc
-    print(f"unmounted {worktreesimage.image_mount_dir(config.control)}")
+    print(f"unmounted {mount_point}")
     return 0
 
 
 def _cmd_wt_image_status(args: argparse.Namespace) -> int:
+    from wrkslots import cli
+
     config, settings = _wt_settings(args)
     report = worktreesimage.status_report(config.root, config.worktrees, settings)
+    lock_missing: list[str] = []
+    try:
+        lock_missing = cli._image_slots_missing_lock(config, [cli._load_active(config)])
+        report["lock_missing"] = lock_missing
+    except (cli.Refusal, cli.StateError, OSError) as exc:
+        report["lock_missing"] = lock_missing
+        report["lock_check_error"] = str(exc)
     if args.format == "json":
         print(json.dumps(report, indent=2))
         return 0
     print(f"image: {report['image_file']} (exists={report['image_exists']})")
-    print(f"mount point: {report['mount_point']} state={report['state']}")
+    print(
+        f"mount point: {report['mount_point']} state={report['state']} "
+        f"mount_at={report['mount_at']} quota={report['quota_mode']}"
+    )
     if report["image_exists"]:
         print(f"apparent={report['apparent_bytes']} allocated={report['allocated_bytes']}")
+    for entry in lock_missing:
+        print(f"lock missing: {entry}")
+    if "lock_check_error" in report:
+        print(f"lock check unavailable: {report['lock_check_error']}")
     if report["state"] != worktreesimage.MOUNTED:
         print("remedy: wrkslots worktrees-image mount")
     return 0
@@ -773,7 +839,11 @@ def _cmd_wt_image_status(args: argparse.Namespace) -> int:
 def _cmd_wt_image_grow(args: argparse.Namespace) -> int:
     config, settings = _wt_settings(args)
     try:
-        worktreesimage.grow_image(settings.image_file(config.root), worktreesimage.image_mount_dir(config.control), args.to_size_bytes)
+        worktreesimage.grow_image(
+            settings.image_file(config.root),
+            settings.mount_point(config.control, config.worktrees),
+            args.to_size_bytes,
+        )
     except worktreesimage.WorktreesImageError as exc:
         raise _refuse(str(exc)) from exc
     print(f"grew {settings.image_file(config.root)} to {args.to_size_bytes} bytes")
@@ -783,11 +853,41 @@ def _cmd_wt_image_grow(args: argparse.Namespace) -> int:
 def _cmd_wt_image_trim(args: argparse.Namespace) -> int:
     config, settings = _wt_settings(args)
     try:
-        output = worktreesimage.trim_image(worktreesimage.image_mount_dir(config.control))
+        output = worktreesimage.trim_image(
+            settings.mount_point(config.control, config.worktrees)
+        )
     except worktreesimage.WorktreesImageError as exc:
         raise _refuse(str(exc)) from exc
     print(output or "trimmed")
     return 0
+
+
+def _lock_slot_checkouts(config: "cli.Config", slot: str, slot_type: str) -> None:
+    """Take wrkslots' image Git lock on every checkout of one slot row.
+
+    No row (an unregistered directory being migrated by path) means no
+    registration exists to lock. An unreadable registry is left to the
+    doctor lock-missing finding; a foreign lock refuses.
+    """
+
+    from wrkslots import cli
+
+    try:
+        state = cli._load_active(config)
+    except (cli.Refusal, cli.StateError, OSError):
+        return
+    record = next(
+        (item for item in state.slots if item.slot == slot and item.slot_type == slot_type),
+        None,
+    )
+    if record is None:
+        return
+    vcs = cli._GitVcs()
+    for checkout in record.checkouts:
+        _relative, repository = cli._stored_repository_path(config, checkout.repository)
+        vcs.lock_worktree(
+            repository, cli._stored_path_reference(config, checkout.path, "checkout path")
+        )
 
 
 def _cmd_migrate(args: argparse.Namespace) -> int:
@@ -802,7 +902,10 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
     slot_path = cli._slot_directory(config, args.slot, args.slot_type)
     if not slot_path.is_dir():
         raise _refuse(f"slot directory is missing: {slot_path}")
+    if settings.direct:
+        return _cmd_migrate_direct(config, settings, args, slot_path)
     if args.slot in worktreesimage.load_binds(config.control):
+        _lock_slot_checkouts(config, args.slot, args.slot_type)
         print(f"{args.slot} is already bound from the worktrees image")
         return 0
     if worktreesimage.process_inside(slot_path):
@@ -836,8 +939,359 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
         worktreesimage.bind_slot(config.control, mount_dir, args.slot, slot_path)
     except worktreesimage.WorktreesImageError as exc:
         raise _refuse(str(exc)) from exc
+    _lock_slot_checkouts(config, args.slot, args.slot_type)
     print(f"migrated {args.slot} into the worktrees image, bound at {slot_path} (original kept beneath)")
     return 0
+
+
+def _cmd_migrate_direct(
+    config: "cli.Config",
+    settings: worktreesimage.WorktreesImageSettings,
+    args: argparse.Namespace,
+    slot_path: Path,
+) -> int:
+    """Direct-layout `migrate`: turn a plain in-image slot dir into a subvolume.
+
+    The slot already lives inside the mounted image; a staging subvolume
+    is filled, compared file by file, and swapped in by two renames, and
+    the plain original is then deleted (nothing is kept beneath anything
+    in this layout).
+    """
+
+    if worktreesimage.is_subvolume(slot_path):
+        _lock_slot_checkouts(config, args.slot, args.slot_type)
+        print(f"{args.slot} is already a subvolume in the worktrees image")
+        return 0
+    if worktreesimage.process_inside(slot_path):
+        raise _refuse(f"a process is working inside {slot_path}; migrate only a stopped slot")
+    before = worktreesimage.listing_signature(slot_path)
+    staging = slot_path.parent / f".{args.slot}.migrating-{secrets.token_hex(8)}"
+    displaced = slot_path.parent / f".{args.slot}.premigrate-{secrets.token_hex(8)}"
+    try:
+        worktreesimage.create_slot_subvolume(staging, settings.slot_quota_bytes)
+        try:
+            shutil.copytree(
+                slot_path,
+                staging,
+                dirs_exist_ok=True,
+                symlinks=True,
+                ignore=worktreesimage._skip_special,
+            )
+        except BaseException:
+            worktreesimage.delete_slot_subvolume(staging)
+            raise
+        if worktreesimage.listing_signature(staging) != before:
+            worktreesimage.delete_slot_subvolume(staging)
+            raise _refuse("migrated copy does not match the slot file by file; original kept")
+    except worktreesimage.WorktreesImageError as exc:
+        raise _refuse(str(exc)) from exc
+    os.rename(slot_path, displaced)
+    try:
+        os.rename(staging, slot_path)
+    except OSError:
+        os.rename(displaced, slot_path)
+        worktreesimage.delete_slot_subvolume(staging)
+        raise
+    try:
+        shutil.rmtree(displaced)
+    except OSError as exc:
+        raise _refuse(
+            f"migrated {args.slot} into the worktrees image at {slot_path}, but the "
+            f"verified plain original remains at {displaced}: {exc}; delete it once "
+            "inspected"
+        ) from exc
+    _lock_slot_checkouts(config, args.slot, args.slot_type)
+    print(f"migrated {args.slot} into the worktrees image at {slot_path} (original reclaimed)")
+    return 0
+
+
+def _layout_census(
+    config: "cli.Config", state: "cli.ActiveState"
+) -> "list[cli.ActiveRecord]":
+    """Every agent slot, proven idle for a layout switch; refuses otherwise.
+
+    The switch unmounts every slot's storage, so the bar is the removal
+    fence's: the registered liveness authority says the owner is dead,
+    no hold protects the slot, and the process-use census finds nobody
+    in it. Validation slots refuse outright (they are ephemeral: finish
+    or remove them first), as does a per-slot-image slot.
+    """
+
+    from wrkslots import cli
+
+    records = list(state.slots)
+    validate = [record for record in records if record.slot_type == "validate"]
+    if validate:
+        names = ", ".join(sorted(record.slot for record in validate))
+        raise _refuse(
+            f"validation slots exist ({names}); finish or remove them before "
+            "switching the worktrees image layout"
+        )
+    holds = cli._load_record_holds(config, [state])
+    liveness = cli._owner_liveness_states(config, records)
+    for record in records:
+        hold = holds.get((record.machine, record.slot))
+        if hold is None or hold.error is not None or hold.value is not None:
+            detail = hold.error if hold is not None and hold.error else "slot is held"
+            raise _refuse(f"slot {record.slot}: {detail}; unhold it before migrate-layout")
+        owner_state, owner_detail = liveness[
+            (record.machine, record.slot, record.generation)
+        ]
+        if owner_state != "dead":
+            raise _refuse(
+                f"slot {record.slot}: owner is not proven dead ({owner_state}: "
+                f"{owner_detail}); stop its agent before migrate-layout"
+            )
+        slot_path = cli._slot_directory(config, record.slot, record.slot_type)
+        if cli._slot_image_at(config, slot_path) is not None:
+            raise _refuse(
+                f"slot {record.slot} uses a per-slot image; convert or remove it "
+                "before switching the worktrees image layout"
+            )
+        cli._assert_slot_unused(
+            slot_path,
+            cli._record_for_slot_use_check(
+                record, validate_complete=False, allow_live_validate_owner=False
+            ),
+        )
+    return records
+
+
+def _write_mount_at(config: "cli.Config", mount_at: str) -> None:
+    """Rewrite only ``worktrees_image.mount_at``; caller holds mutation locks."""
+
+    from wrkslots import cli
+
+    raw = cli._read_config(config.config_path)
+    section = dict(cli._as_mapping(raw.get("worktrees_image"), "configuration.worktrees_image"))
+    section["mount_at"] = mount_at
+    updated = dict(raw)
+    updated["worktrees_image"] = section
+    cli._write_config(config.config_path, updated)
+
+
+def _layout_unknown_entries(
+    root: Path, allowed: set[str], *, what: str
+) -> None:
+    if not root.is_dir():
+        return
+    unknown = sorted(
+        entry.name for entry in root.iterdir() if entry.name not in allowed
+    )
+    if unknown:
+        raise _refuse(
+            f"{what} holds entries that are not recorded slots ({', '.join(unknown)}); "
+            "inspect and move or register them before switching layout - the switch "
+            "mounts over this directory and would hide them"
+        )
+
+
+def _cmd_wt_migrate_layout(args: argparse.Namespace) -> int:
+    from wrkslots import cli
+
+    config, settings = _wt_settings(args)
+    want_direct = args.target == "direct"
+    if settings.direct == want_direct:
+        print(f"worktrees image already uses mount_at: {settings.mount_at}")
+        return 0
+    if config.worktrees_image_state != worktreesimage.MOUNTED:
+        raise _refuse(
+            f"worktrees image is {config.worktrees_image_state}; run "
+            "'wrkslots worktrees-image mount' and resolve what it reports first"
+        )
+    with cli._mutation_locks(config, args.wait_lock):
+        cli._refuse_partial_state(config)
+        state = cli._load_active(config)
+        agents = _layout_census(config, state)
+        if want_direct:
+            _migrate_layout_to_direct(config, settings, agents)
+        else:
+            _migrate_layout_to_binds(config, settings, agents)
+    fresh = cli._load_config(args.project_root, args.machine)
+    fresh_settings = fresh.worktrees_image
+    if (
+        fresh_settings is None
+        or fresh_settings.direct != want_direct
+        or fresh.worktrees_image_state != worktreesimage.MOUNTED
+    ):
+        raise _refuse(
+            "layout switched and the configuration rewritten, but reloading it "
+            f"reports state={fresh.worktrees_image_state}; inspect "
+            "'wrkslots worktrees-image status' before creating slots"
+        )
+    mode = worktreesimage.quota_mode_at(
+        fresh_settings.mount_point(fresh.control, fresh.worktrees),
+        fresh_settings.image_file(fresh.root),
+    )
+    print(
+        f"worktrees image now mounts at "
+        f"{fresh_settings.mount_point(fresh.control, fresh.worktrees)} "
+        f"(mount_at: {fresh_settings.mount_at}, quota={mode}, {len(agents)} slots)"
+    )
+    return 0
+
+
+def _migrate_layout_to_direct(
+    config: "cli.Config",
+    settings: worktreesimage.WorktreesImageSettings,
+    agents: "list[cli.ActiveRecord]",
+) -> None:
+    from wrkslots import cli
+
+    mount_dir = worktreesimage.image_mount_dir(config.control)
+    records = worktreesimage.load_bind_records(config.control)
+    for record in agents:
+        bind = records.get(record.slot)
+        if bind is None:
+            raise _refuse(
+                f"slot {record.slot} is not in the worktrees image (no bind "
+                "record); run 'wrkslots migrate' for it, or remove it, first"
+            )
+        if record.slot == worktreesimage.VALIDATE_SUBDIR:
+            raise _refuse(
+                "agent slot 'validate' cannot switch to the direct layout: that "
+                "top-level entry holds the validation slots there; remove or "
+                "rename (recreate) the slot first"
+            )
+        if not (mount_dir / bind.subvolume).is_dir():
+            raise _refuse(
+                f"slot {record.slot}: image subvolume is missing: "
+                f"{mount_dir / bind.subvolume}"
+            )
+    stray = sorted(set(records) - {record.slot for record in agents})
+    if stray:
+        raise _refuse(
+            f"binds recorded for slots with no active row ({', '.join(stray)}); "
+            "inspect .worktrees-image.json before switching layout"
+        )
+    _layout_unknown_entries(
+        config.worktrees,
+        {record.slot for record in agents},
+        what=f"slots directory {config.worktrees}",
+    )
+    image_file = settings.image_file(config.root)
+    direct_settings = dataclasses.replace(
+        settings, mount_at=worktreesimage.MOUNT_AT_WORKTREES_DIR
+    )
+    try:
+        for record in agents:
+            worktreesimage.unbind_slot(
+                config.control,
+                record.slot,
+                cli._slot_directory(config, record.slot, record.slot_type),
+            )
+        for record in agents:
+            host_path = cli._slot_directory(config, record.slot, record.slot_type)
+            if host_path.is_dir() and not host_path.is_symlink():
+                # The empty mount point, plus the stale host original a
+                # `migrate` kept beneath the bind (#1149): the subvolume
+                # in the image is the slot; the original is reclaimed.
+                shutil.rmtree(host_path)
+        worktreesimage.unmount_image(mount_dir)
+        worktreesimage.mount_image(image_file, config.worktrees, direct_settings)
+        (config.worktrees / worktreesimage.VALIDATE_SUBDIR).mkdir(exist_ok=True)
+        for record in agents:
+            slot_path = cli._slot_directory(config, record.slot, record.slot_type)
+            if not worktreesimage.is_subvolume(slot_path):
+                raise worktreesimage.WorktreesImageError(
+                    f"slot {record.slot} is not a subvolume at {slot_path} after "
+                    "mounting the image at the slots directory"
+                )
+    except (worktreesimage.WorktreesImageError, OSError) as exc:
+        try:
+            with contextlib.suppress(Exception):
+                worktreesimage.unmount_image(config.worktrees)
+            worktreesimage.save_bind_records(config.control, records)
+            worktreesimage.ensure_image_mounted(
+                config.root, config.control, settings, config.worktrees
+            )
+            worktreesimage.ensure_binds(
+                config.control, mount_dir, config.worktrees, settings
+            )
+        except Exception as rollback_exc:
+            raise _refuse(
+                f"migrate-layout failed ({exc}) and re-establishing the bind "
+                f"layout also failed ({rollback_exc}); the image and its "
+                "subvolumes are intact: inspect the mounts, then run "
+                "'wrkslots worktrees-image mount'"
+            ) from exc
+        raise _refuse(
+            f"migrate-layout failed ({exc}); the bind layout was "
+            "re-established and the configuration is unchanged"
+        ) from exc
+    for record in agents:
+        _lock_slot_checkouts(config, record.slot, record.slot_type)
+    _write_mount_at(config, worktreesimage.MOUNT_AT_WORKTREES_DIR)
+
+
+def _migrate_layout_to_binds(
+    config: "cli.Config",
+    settings: worktreesimage.WorktreesImageSettings,
+    agents: "list[cli.ActiveRecord]",
+) -> None:
+    from wrkslots import cli
+
+    for record in agents:
+        slot_path = cli._slot_directory(config, record.slot, record.slot_type)
+        if not worktreesimage.is_subvolume(slot_path):
+            raise _refuse(
+                f"slot {record.slot} at {slot_path} is a plain directory inside "
+                "the image, not a subvolume; run 'wrkslots migrate' for it first"
+            )
+    _layout_unknown_entries(
+        config.worktrees,
+        {record.slot for record in agents} | {worktreesimage.VALIDATE_SUBDIR},
+        what=f"slots directory {config.worktrees}",
+    )
+    validate_dir = config.worktrees / worktreesimage.VALIDATE_SUBDIR
+    if validate_dir.is_dir() and next(validate_dir.iterdir(), None) is not None:
+        raise _refuse(
+            f"{validate_dir} is not empty; remove its validation slots before "
+            "switching to the bind layout"
+        )
+    image_file = settings.image_file(config.root)
+    binds_settings = dataclasses.replace(
+        settings, mount_at=worktreesimage.MOUNT_AT_BINDS
+    )
+    mount_dir = worktreesimage.image_mount_dir(config.control)
+    bound: list[str] = []
+    try:
+        worktreesimage.unmount_image(config.worktrees)
+        worktreesimage.ensure_image_mounted(
+            config.root, config.control, binds_settings, config.worktrees
+        )
+        for record in agents:
+            worktreesimage.bind_slot(
+                config.control,
+                mount_dir,
+                record.slot,
+                cli._slot_directory(config, record.slot, record.slot_type),
+            )
+            bound.append(record.slot)
+    except (worktreesimage.WorktreesImageError, OSError) as exc:
+        try:
+            for slot in bound:
+                with contextlib.suppress(Exception):
+                    worktreesimage.unbind_slot(
+                        config.control, slot, config.worktrees / slot
+                    )
+            with contextlib.suppress(Exception):
+                worktreesimage.unmount_image(mount_dir)
+            worktreesimage.mount_image(image_file, config.worktrees, settings)
+        except Exception as rollback_exc:
+            raise _refuse(
+                f"migrate-layout failed ({exc}) and re-establishing the direct "
+                f"layout also failed ({rollback_exc}); the image and its "
+                "subvolumes are intact: inspect the mounts, then run "
+                "'wrkslots worktrees-image mount'"
+            ) from exc
+        raise _refuse(
+            f"migrate-layout failed ({exc}); the direct layout was "
+            "re-established and the configuration is unchanged"
+        ) from exc
+    for record in agents:
+        _lock_slot_checkouts(config, record.slot, record.slot_type)
+    _write_mount_at(config, worktreesimage.MOUNT_AT_BINDS)
 
 
 def _cmd_image_help(args: argparse.Namespace) -> int:

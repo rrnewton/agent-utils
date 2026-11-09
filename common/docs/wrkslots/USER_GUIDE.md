@@ -2559,6 +2559,53 @@ Conversion is not journaled: convert only idle slots, and if a conversion is int
 the slot, its image directory, and the kept copy before retrying. Converting to `worktree` discards the sandbox state
 image (the slot's private HOME layer).
 
+## One image for every slot: the worktrees image
+
+Instead of one image per slot, the opt-in `worktrees_image` section puts every slot of the project
+in one sparse btrfs image, one subvolume per slot, so slots can reflink and snapshot between each
+other and a per-slot qgroup limit (`slot_quota_bytes`) bounds each one. Mounting is kernel-only
+(`sudo -n mount -o loop`; btrfs has no unprivileged FUSE fallback). Every command remounts the
+image on load, and slot-writing commands refuse unless it is verifiably mounted, so a slot is never
+written onto the host file system underneath an empty mount point. Scope the section to the hosts
+that have the image with its `machines` list (see "Host-scoped sections").
+
+`mount_at` chooses the layout:
+
+- `binds` (the default): the image mounts at `<control>/.slots-image` and each slot subvolume is
+  bind-mounted at its slot path, recorded in `<control>/.worktrees-image.json`. Validation slots
+  stay at `worktrees/validate/<slot>` and are bound the same way.
+- `worktrees_dir`: the image mounts at the slots directory itself and slot subvolumes are its
+  top-level entries; there are no binds and no bind records. Validation slots live inside the
+  image at `worktrees/slots/validate/<slot>` (for `worktrees_dir: worktrees/slots`), and the agent
+  slot name `validate` is reserved. The image root is owned by the invoking user so slot creates
+  and removal fences (renames of a subvolume) work without privilege beyond the mount itself.
+
+Switch layouts with `wrkslots worktrees-image migrate-layout --to direct|binds` once no slot is
+in use: it refuses on a live or unverifiable owner, a hold, any process found by the removal
+census, an existing validation slot, or an entry in the slots directory that is not a recorded
+slot. Going to `direct` unbinds every slot, deletes the stale host original a `migrate` kept
+beneath each bind (the image copy is the slot), and mounts the image at the slots directory; the
+configuration is rewritten only after every slot verifiably sits in the new mount, and on failure
+the old layout is re-established with the configuration unchanged.
+
+`quota_mode` chooses quota accounting for a new image: `simple` (the default) enables btrfs simple
+quotas where kernel 6.7+ and btrfs-progs support them, falling back to full qgroups; `full` always
+uses full qgroups. Mounting never changes an existing image's mode, and `wrkslots worktrees-image
+status` reports the active mode (`none`, `full`, or `simple`). Convert an existing full-qgroup
+image by hand while no slot is in use: `sudo btrfs quota disable <mount>`, then `sudo btrfs quota
+enable --simple <mount>`, then re-apply each slot's `sudo btrfs qgroup limit <bytes> <slot>`
+(disable drops the limits). Simple quotas only account extents written after they are enabled, so
+existing slot data is under-counted - and a slot can sit over its nominal limit - until it is
+rewritten.
+
+When the image is unmounted (before the boot mount, or after a manual unmount) every slot path
+looks missing, and a `git worktree prune` in a source repository would detach every slot's
+worktree registration. Slots born in the image therefore carry `git worktree lock --reason "in
+worktrees image"`, taken at create and at migrate. Removal drops only that exact lock, after its
+fence and use census; a lock with any other reason still refuses removal. `worktrees-image status`
+and `doctor` report image slots whose lock is missing (`worktrees-image-lock-missing`); take it by
+hand with the same command until the slot is next migrated or recreated.
+
 ## Running commands and agents inside a slot's box
 
 `wrkslots run SLOT -- COMMAND` runs COMMAND boxed to one slot. The box does not depend on how the

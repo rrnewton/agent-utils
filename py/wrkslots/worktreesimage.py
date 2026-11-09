@@ -1,9 +1,13 @@
 """One sparse btrfs image holding a project's whole slots tree.
 
-Opt-in via the ``worktrees_image`` configuration section. When configured,
-the project's slots directory (``worktrees_dir``) is the mount point of one
-sparse btrfs image file that lives outside the mount, on the host file
-system. Every slot lives inside the image, so guest metadata (millions of
+Opt-in via the ``worktrees_image`` configuration section. Two layouts hold
+the slots in one sparse btrfs image file that lives outside the mount, on
+the host file system. In the default bind layout the image mounts beside
+the control directory and every slot subvolume is bind-mounted at its slot
+path. With ``mount_at: worktrees_dir`` the project's slots directory
+(``worktrees_dir``) is itself the mount point and slot subvolumes are the
+image's top-level entries, with no bind mounts or bind records. Every slot
+lives inside the image either way, so guest metadata (millions of
 small build files) stays out of the host file system, slots can reflink
 and snapshot between each other, and per-slot qgroup quotas apply inside
 the guest. The registry and journals stay outside the image, beside the
@@ -40,6 +44,21 @@ MIN_SIZE_BYTES = 1024**3
 FILESYSTEMS = ("btrfs",)
 MOUNTS = ("kernel", "auto")
 
+#: Where the image mounts: beside the control directory with a bind per
+#: slot (``binds``, the default), or at the slots directory itself with
+#: slot subvolumes as its top-level entries (``worktrees_dir``).
+MOUNT_AT_BINDS = "binds"
+MOUNT_AT_WORKTREES_DIR = "worktrees_dir"
+MOUNT_ATS = (MOUNT_AT_BINDS, MOUNT_AT_WORKTREES_DIR)
+
+#: Quota accounting for a new image: btrfs simple quotas (the default where
+#: supported) or full qgroups. See ``apply_quota_mode``.
+QUOTA_MODES = ("simple", "full")
+
+#: Name of the validation-slots directory inside the image when the image
+#: mounts at the slots directory: ``<worktrees_dir>/validate/<slot>``.
+VALIDATE_SUBDIR = "validate"
+
 #: Mount classification states (see ``classify_mount``).
 MOUNTED = "mounted"
 NOT_MOUNTED = "not-mounted"
@@ -68,6 +87,8 @@ class WorktreesImageSettings:
     mount: str = "kernel"
     slot_quota_bytes: int | None = None
     machines: tuple[str, ...] | None = None
+    mount_at: str = MOUNT_AT_BINDS
+    quota_mode: str = "simple"
 
     def applies_on(self, machine: str) -> bool:
         """Whether this section applies on the host named ``machine``."""
@@ -79,13 +100,24 @@ class WorktreesImageSettings:
 
         return root / self.relative_path
 
+    @property
+    def direct(self) -> bool:
+        """Whether the image mounts at the slots directory itself."""
+
+        return self.mount_at == MOUNT_AT_WORKTREES_DIR
+
+    def mount_point(self, control: Path, worktrees: Path) -> Path:
+        """Where this project's image mounts under the configured layout."""
+
+        return worktrees if self.direct else image_mount_dir(control)
+
 
 #: The comment written above each ``worktrees_image`` key in a literate
 #: configuration.
 WORKTREES_IMAGE_DOCS: dict[str, str] = {
     "path": (
-        "Project-relative backing file for the one sparse btrfs image mounted at the "
-        "slots directory. It lives outside the mount, on the host file system."
+        "Project-relative backing file for the one sparse btrfs image holding every slot. "
+        "It lives outside the mount, on the host file system."
     ),
     "size_bytes": (
         "Apparent size of the worktrees image in bytes. The file is sparse: an upper "
@@ -106,6 +138,17 @@ WORKTREES_IMAGE_DOCS: dict[str, str] = {
         "if the section were absent, so the section is safe to commit: the "
         "image exists on the named hosts only. Absent means every host."
     ),
+    "mount_at": (
+        "Where the image mounts: binds (default; mounted beside the control files, "
+        "one bind mount per slot) or worktrees_dir (mounted at the slots directory, "
+        "slot subvolumes as its top-level entries, no binds). Change it only with "
+        "`wrkslots worktrees-image migrate-layout`."
+    ),
+    "quota_mode": (
+        "Quota accounting for a new image: simple (default; btrfs simple quotas "
+        "where the kernel and btrfs-progs support them, else full qgroups) or full. "
+        "Mounting never changes an existing image's mode; status reports the active one."
+    ),
 }
 
 
@@ -115,7 +158,17 @@ def settings_from_obj(value: object) -> WorktreesImageSettings:
     if not isinstance(value, dict):
         raise WorktreesImageError("configuration.worktrees_image must be a mapping")
     unknown = sorted(
-        set(value) - {"path", "size_bytes", "fs", "mount", "slot_quota_bytes", "machines"}
+        set(value)
+        - {
+            "path",
+            "size_bytes",
+            "fs",
+            "mount",
+            "slot_quota_bytes",
+            "machines",
+            "mount_at",
+            "quota_mode",
+        }
     )
     if unknown:
         raise WorktreesImageError(
@@ -167,6 +220,16 @@ def settings_from_obj(value: object) -> WorktreesImageSettings:
                 "configuration.worktrees_image.machines must be a non-empty list of "
                 "unique non-empty machine names"
             )
+    mount_at = value.get("mount_at", MOUNT_AT_BINDS)
+    if mount_at not in MOUNT_ATS:
+        raise WorktreesImageError(
+            f"configuration.worktrees_image.mount_at must be one of {', '.join(MOUNT_ATS)}, not {mount_at!r}"
+        )
+    quota_mode = value.get("quota_mode", "simple")
+    if quota_mode not in QUOTA_MODES:
+        raise WorktreesImageError(
+            f"configuration.worktrees_image.quota_mode must be one of {', '.join(QUOTA_MODES)}, not {quota_mode!r}"
+        )
     return WorktreesImageSettings(
         relative_path=candidate.as_posix(),
         size_bytes=size,
@@ -174,6 +237,8 @@ def settings_from_obj(value: object) -> WorktreesImageSettings:
         mount=str(mount),
         slot_quota_bytes=quota,
         machines=tuple(machines) if machines is not None else None,
+        mount_at=str(mount_at),
+        quota_mode=str(quota_mode),
     )
 
 
@@ -207,13 +272,12 @@ def classify_mount(
 def current_state(root: Path, worktrees: Path, settings: WorktreesImageSettings) -> str:
     """Classify the live image mount (reads the real mount table).
 
-    The image mounts beside the control directory, never at the slots
-    directory itself, so no live slot path is ever renamed or covered.
-    ``root``/``worktrees`` are kept for call-site stability; the mount
-    classified is the image mount directory derived from the project.
+    The mount classified is the configured one: beside the control
+    directory in the bind layout, the slots directory itself when
+    ``settings.direct``. ``root`` is kept for call-site stability.
     """
 
-    mount_dir = worktrees.parent / IMAGE_MOUNT_NAME
+    mount_dir = worktrees if settings.direct else worktrees.parent / IMAGE_MOUNT_NAME
     exists = mount_dir.is_dir()
     empty = True
     if exists:
@@ -226,9 +290,18 @@ def current_state(root: Path, worktrees: Path, settings: WorktreesImageSettings)
     )
 
 
-def ensure_image_mounted(root: Path, control: Path, settings: WorktreesImageSettings) -> None:
-    """Mount the image beside the control directory if it is not mounted."""
+def ensure_image_mounted(
+    root: Path,
+    control: Path,
+    settings: WorktreesImageSettings,
+    slots_dir: Path,
+) -> None:
+    """Mount the image at its configured mount point if it is not mounted."""
 
+    if settings.direct:
+        mount_image(settings.image_file(root), slots_dir, settings)
+        (slots_dir / VALIDATE_SUBDIR).mkdir(exist_ok=True)
+        return
     mount_dir = image_mount_dir(control)
     mount_dir.mkdir(parents=True, exist_ok=True)
     state = classify_mount(
@@ -243,7 +316,7 @@ def ensure_image_mounted(root: Path, control: Path, settings: WorktreesImageSett
         ["mount", "-o", "loop,compress=zstd:3,noatime", str(settings.image_file(root)), str(mount_dir)],
         sudo=True,
     )
-    _run(["btrfs", "quota", "enable", str(mount_dir)], sudo=True)
+    apply_quota_mode(mount_dir, settings.image_file(root), settings.quota_mode)
 
 
 def _run(argv: list[str], *, sudo: bool = False) -> subprocess.CompletedProcess[str]:
@@ -253,6 +326,62 @@ def _run(argv: list[str], *, sudo: bool = False) -> subprocess.CompletedProcess[
         detail = (result.stderr or result.stdout).strip()
         raise WorktreesImageError(f"{' '.join(command)} failed: {detail}")
     return result
+
+
+def _quotas_enabled(mount_point: Path) -> bool:
+    """Whether quota accounting is on for the file system at ``mount_point``."""
+
+    try:
+        _run(["btrfs", "qgroup", "show", str(mount_point)], sudo=True)
+    except WorktreesImageError:
+        return False
+    return True
+
+
+def _simple_quota_flag(image_file: Path) -> bool:
+    """Whether the image superblock carries the simple-quota feature flag.
+
+    The flag is sticky: once ``quota enable --simple`` sets it, ``quota
+    disable`` keeps it, and a later plain ``quota enable`` runs simple
+    accounting again. So flag plus quotas-enabled is the active mode.
+    """
+
+    try:
+        output = _run(["btrfs", "inspect-internal", "dump-super", str(image_file)]).stdout
+    except WorktreesImageError:
+        return False
+    return "SIMPLE_QUOTA" in output
+
+
+def quota_mode_at(mount_point: Path, image_file: Path) -> str:
+    """The active quota mode at a mounted image: ``none``, ``full`` or ``simple``."""
+
+    if not _quotas_enabled(mount_point):
+        return "none"
+    return "simple" if _simple_quota_flag(image_file) else "full"
+
+
+def apply_quota_mode(mount_point: Path, image_file: Path, quota_mode: str) -> None:
+    """Enable quotas after a fresh mount, never flipping an existing mode.
+
+    A file system that already accounts (either mode) only gets the plain
+    idempotent ``quota enable`` every mount uses today; verified on
+    kernel 7.1 that it never turns simple quotas back into full qgroups.
+    A new file system gets ``--simple`` when configured and supported,
+    falling back to a plain enable (full qgroups) when the kernel or
+    btrfs-progs refuse it; ``quota_mode_at`` then reports the truth.
+    """
+
+    if _quotas_enabled(mount_point):
+        _run(["btrfs", "quota", "enable", str(mount_point)], sudo=True)
+        return
+    if quota_mode == "simple":
+        try:
+            _run(["btrfs", "quota", "enable", "--simple", str(mount_point)], sudo=True)
+            return
+        except WorktreesImageError:
+            pass
+    _run(["btrfs", "quota", "enable", str(mount_point)], sudo=True)
 
 
 def create_image(image_file: Path, size_bytes: int) -> None:
@@ -283,9 +412,35 @@ def create_image(image_file: Path, size_bytes: int) -> None:
         raise
 
 
-def mount_image(image_file: Path, mount_point: Path) -> None:
-    """Mount the image at the slots directory (idempotent)."""
+def _ensure_mount_root_owner(mount_point: Path) -> None:
+    """Give the user the image root so slot create and fence renames work.
 
+    A fresh btrfs root is root-owned; slots are renamed and created at
+    the top level in the direct layout, and rename needs write access
+    to the parent. The bind layout never needed this (its mount-point
+    directories live on the host), so it keeps its root-owned root.
+    """
+
+    try:
+        owner = mount_point.stat().st_uid
+    except OSError as exc:
+        raise WorktreesImageError(f"cannot inspect mount root {mount_point}: {exc}") from exc
+    if owner != os.getuid():
+        _run(["chown", f"{os.getuid()}:{os.getgid()}", str(mount_point)], sudo=True)
+
+
+def mount_image(
+    image_file: Path,
+    mount_point: Path,
+    settings: WorktreesImageSettings | None = None,
+) -> None:
+    """Mount the image at ``mount_point`` (idempotent).
+
+    With direct-layout ``settings`` the image root becomes the user's
+    and the configured quota mode is applied after a fresh mount.
+    """
+
+    direct = settings is not None and settings.direct
     state = classify_mount(
         mount_point,
         slotimage.mount_table(),
@@ -293,6 +448,8 @@ def mount_image(image_file: Path, mount_point: Path) -> None:
         slots_dir_empty=(next(mount_point.iterdir(), None) is None if mount_point.is_dir() else True),
     )
     if state == MOUNTED:
+        if direct:
+            _ensure_mount_root_owner(mount_point)
         return
     if state in (WRONG_MOUNT, NOT_EMPTY_UNMOUNTED):
         raise WorktreesImageError(
@@ -306,7 +463,11 @@ def mount_image(image_file: Path, mount_point: Path) -> None:
         ["mount", "-o", "loop,compress=zstd:3,noatime", str(image_file), str(mount_point)],
         sudo=True,
     )
-    _run(["btrfs", "quota", "enable", str(mount_point)], sudo=True)
+    apply_quota_mode(
+        mount_point, image_file, settings.quota_mode if settings is not None else "simple"
+    )
+    if direct:
+        _ensure_mount_root_owner(mount_point)
 
 
 def unmount_image(mount_point: Path) -> None:
@@ -700,15 +861,25 @@ def unbind_slot(control: Path, slot: str, slot_path: Path) -> None:
     _update_bind_records(control, drop)
 
 
-def ensure_binds(control: Path, mount_dir: Path, slots_dir: Path) -> list[str]:
+def ensure_binds(
+    control: Path,
+    mount_dir: Path,
+    slots_dir: Path,
+    settings: WorktreesImageSettings | None = None,
+) -> list[str]:
     """Re-establish the image mount and every recorded bind; return actions.
 
     Each bind goes back at its recorded target. A slot whose canonical path
     has a fenced sibling is mid-removal: its bind lives at (or is headed to)
     the fenced path, and resurrecting the canonical mount would make every
     later recovery refuse that both paths exist, so it is left alone.
+
+    The direct layout has no binds at all: with direct ``settings`` this
+    returns before any record is read or written.
     """
 
+    if settings is not None and settings.direct:
+        return []
     actions: list[str] = []
     if not mount_dir.is_dir() or next(mount_dir.iterdir(), None) is None:
         pass
@@ -738,15 +909,22 @@ def ensure_binds(control: Path, mount_dir: Path, slots_dir: Path) -> list[str]:
 
 
 def status_report(root: Path, worktrees: Path, settings: WorktreesImageSettings) -> dict[str, object]:
-    """Mount state, apparent size, and host-allocated bytes of the image."""
+    """Mount state, quota mode, apparent and host-allocated bytes of the image."""
     image_file = settings.image_file(root)
+    mount_point = worktrees if settings.direct else worktrees.parent / IMAGE_MOUNT_NAME
+    state = current_state(root, worktrees, settings)
     report: dict[str, object] = {
         "image_file": str(image_file),
-        "mount_point": str(worktrees.parent / IMAGE_MOUNT_NAME),
+        "mount_point": str(mount_point),
+        "mount_at": settings.mount_at,
         "configured_size_bytes": settings.size_bytes,
-        "state": current_state(root, worktrees, settings),
+        "state": state,
         "image_exists": image_file.is_file(),
-        "binds": load_binds(worktrees.parent),
+        "quota_mode": (
+            quota_mode_at(mount_point, image_file) if state == MOUNTED else "unknown"
+        ),
+        "configured_quota_mode": settings.quota_mode,
+        "binds": {} if settings.direct else load_binds(worktrees.parent),
     }
     if image_file.is_file():
         stat = image_file.stat()

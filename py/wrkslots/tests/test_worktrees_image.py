@@ -934,3 +934,627 @@ def test_doctor_shows_the_host_name_source(
     assert cli._cmd_doctor(args) == 0
     report = json_module.loads(capsys.readouterr().out)
     assert report["machine"] == "testhost (host name (machine: auto))"
+
+
+# --- #1162 worktrees-image-at-slots-dir: direct layout, quota modes, locks ---
+
+
+def test_settings_mount_at_and_quota_mode() -> None:
+    defaults = worktreesimage.settings_from_obj(
+        {"path": "worktrees.img", "size_bytes": 2 * GIB}
+    )
+    assert defaults.mount_at == "binds" and not defaults.direct
+    assert defaults.quota_mode == "simple"
+    direct = worktreesimage.settings_from_obj(
+        {
+            "path": "worktrees.img",
+            "size_bytes": 2 * GIB,
+            "mount_at": "worktrees_dir",
+            "quota_mode": "full",
+        }
+    )
+    assert direct.direct and direct.quota_mode == "full"
+    assert direct.mount_point(Path("/c"), Path("/c/slots")) == Path("/c/slots")
+    assert defaults.mount_point(Path("/c"), Path("/c/slots")) == Path("/c/.slots-image")
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [{"mount_at": "elsewhere"}, {"mount_at": 3}, {"quota_mode": "none"}, {"quota_mode": ""}],
+)
+def test_settings_refuse_bad_mount_at_and_quota_mode(extra: dict[str, object]) -> None:
+    with pytest.raises(worktreesimage.WorktreesImageError):
+        worktreesimage.settings_from_obj(
+            {"path": "worktrees.img", "size_bytes": 2 * GIB, **extra}
+        )
+
+
+class _FakeQuotaHost:
+    """btrfs quota commands in miniature, with a switchable mode."""
+
+    def __init__(
+        self, *, enabled: bool = False, simple: bool = False, simple_supported: bool = True
+    ) -> None:
+        self.calls: list[list[str]] = []
+        self.enabled = enabled
+        self.simple = simple
+        self.simple_supported = simple_supported
+
+    def run(
+        self, argv: list[str], *, sudo: bool = False
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append(list(argv))
+        if argv[:3] == ["btrfs", "qgroup", "show"]:
+            if not self.enabled:
+                raise worktreesimage.WorktreesImageError("quotas not enabled")
+            return subprocess.CompletedProcess(argv, 0, "0/5 0 0\n", "")
+        if argv[:3] == ["btrfs", "quota", "enable"]:
+            if "--simple" in argv:
+                if not self.simple_supported:
+                    raise worktreesimage.WorktreesImageError("unknown flag --simple")
+                self.simple = True
+            self.enabled = True
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:3] == ["btrfs", "inspect-internal", "dump-super"]:
+            flags = "incompat_flags\t0x1\n\t\t\t  SIMPLE_QUOTA )\n" if self.simple else "incompat_flags\t0x1\n"
+            return subprocess.CompletedProcess(argv, 0, flags, "")
+        raise AssertionError(f"unexpected command: {argv}")
+
+
+def test_quota_mode_apply_and_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mount = tmp_path / "mnt"
+    image = tmp_path / "wt.img"
+
+    fresh = _FakeQuotaHost()
+    monkeypatch.setattr(worktreesimage, "_run", fresh.run)
+    assert worktreesimage.quota_mode_at(mount, image) == "none"
+    worktreesimage.apply_quota_mode(mount, image, "simple")
+    assert ["btrfs", "quota", "enable", "--simple", str(mount)] in fresh.calls
+    assert worktreesimage.quota_mode_at(mount, image) == "simple"
+    # Already accounting: only the plain idempotent enable, never a flip.
+    calls_before = len(fresh.calls)
+    worktreesimage.apply_quota_mode(mount, image, "full")
+    new_enables = [
+        call for call in fresh.calls[calls_before:] if call[:3] == ["btrfs", "quota", "enable"]
+    ]
+    assert new_enables == [["btrfs", "quota", "enable", str(mount)]]
+    assert worktreesimage.quota_mode_at(mount, image) == "simple"
+
+    unsupported = _FakeQuotaHost(simple_supported=False)
+    monkeypatch.setattr(worktreesimage, "_run", unsupported.run)
+    worktreesimage.apply_quota_mode(mount, image, "simple")
+    assert worktreesimage.quota_mode_at(mount, image) == "full"
+
+    full = _FakeQuotaHost(enabled=True)
+    monkeypatch.setattr(worktreesimage, "_run", full.run)
+    assert worktreesimage.quota_mode_at(mount, image) == "full"
+
+
+def _direct_config(tmp_path: Path, state: str) -> cli.Config:
+    config = _config(tmp_path, state)
+    object.__setattr__(
+        config,
+        "worktrees_image",
+        worktreesimage.WorktreesImageSettings(
+            relative_path="worktrees.img",
+            size_bytes=2 * GIB,
+            mount_at="worktrees_dir",
+            slot_quota_bytes=64 * 1024 * 1024,
+        ),
+    )
+    return config
+
+
+def test_direct_ensure_binds_reads_and_writes_no_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    control = tmp_path / "worktrees"
+    control.mkdir(parents=True)
+    worktreesimage.save_binds(control, {"s1": "s1"})
+    before = (control / worktreesimage.RECORD_NAME).read_bytes()
+    fake = _FakeMounts()
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    settings = worktreesimage.WorktreesImageSettings(
+        relative_path="wt.img", size_bytes=2 * GIB, mount_at="worktrees_dir"
+    )
+    actions = worktreesimage.ensure_binds(
+        control, worktreesimage.image_mount_dir(control), tmp_path / "slots", settings
+    )
+    assert actions == []
+    assert fake.calls == []
+    assert (control / worktreesimage.RECORD_NAME).read_bytes() == before
+
+
+def test_direct_state_and_status_classify_the_slots_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _direct_config(tmp_path, worktreesimage.MOUNTED)
+    assert config.worktrees_image is not None
+    config.worktrees.mkdir(parents=True)
+    (config.worktrees / "s1").mkdir()
+    monkeypatch.setattr(
+        slotimage, "mount_table", lambda: [_entry(config.worktrees, "btrfs")]
+    )
+    assert (
+        worktreesimage.current_state(config.root, config.worktrees, config.worktrees_image)
+        == worktreesimage.MOUNTED
+    )
+    fake = _FakeQuotaHost(enabled=True, simple=True)
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    report = worktreesimage.status_report(
+        config.root, config.worktrees, config.worktrees_image
+    )
+    assert report["mount_point"] == str(config.worktrees)
+    assert report["mount_at"] == "worktrees_dir"
+    assert report["quota_mode"] == "simple"
+    assert report["configured_quota_mode"] == "simple"
+    assert report["binds"] == {}
+    assert cli._validate_slots_directory(config) == config.worktrees / "validate"
+    with pytest.raises(cli.Refusal, match="reserved"):
+        cli._slot_directory(config, "validate", "agent")
+    assert cli._slot_directory(config, "v1", "validate") == (
+        config.worktrees / "validate" / "v1"
+    )
+
+
+def test_direct_fence_renames_plainly_and_remove_deletes_the_subvolume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _direct_config(tmp_path, worktreesimage.MOUNTED)
+    slot_path = config.worktrees / "s1"
+    slot_path.mkdir(parents=True)
+    fake = _FakeMounts()
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    monkeypatch.setattr(worktreesimage, "is_subvolume", lambda path: path.is_dir())
+    monkeypatch.setattr(cli, "_DIRECT_WORKTREES_IMAGE_ROOT", None)
+    cli._refresh_worktrees_bind_mounts(config)
+    assert cli._DIRECT_WORKTREES_IMAGE_ROOT == config.worktrees.absolute()
+    assert cli._is_owned_direct_subvolume_root(slot_path)
+    assert cli._worktrees_bind_slot(config, slot_path) is None
+
+    fenced = config.worktrees / (".s1.fenced.1." + "e" * 32)
+    cli._rename_slot_path(config, slot_path, fenced)
+    assert fenced.is_dir() and not slot_path.exists()
+    assert fake.calls == []  # no mount dance: a subvolume renames like a directory
+
+    cli._remove_slot_directory(config, fenced)
+    assert not fenced.exists()
+    assert fake.calls == [["btrfs", "subvolume", "delete", str(fenced)]]
+    assert not (config.control / worktreesimage.RECORD_NAME).exists()
+
+
+def _git_repo_with_worktrees(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "lock-test")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "lock-test@example.invalid")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "lock-test")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "lock-test@example.invalid")
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "--allow-empty", "-m", "init"], cwd=repository, check=True
+    )
+    return repository
+
+
+def test_image_lock_survives_prune_and_only_its_own_reason_unlocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("needs git")
+    repository = _git_repo_with_worktrees(tmp_path, monkeypatch)
+    vcs = cli._GitVcs()
+    locked = tmp_path / "slots" / "locked-one"
+    plain = tmp_path / "slots" / "plain-one"
+    for path, branch in ((locked, "b-locked"), (plain, "b-plain")):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "worktree", "add", str(path), "-b", branch],
+            cwd=repository, check=True, capture_output=True, text=True,
+        )
+    vcs.lock_worktree(repository, locked)
+    assert vcs.worktree_lock_state(repository, locked) == (
+        True,
+        cli.WORKTREES_IMAGE_LOCK_REASON,
+    )
+    assert vcs.worktree_lock_state(repository, plain) == (False, None)
+    # Simulate the unmounted image: both paths vanish, then a prune runs
+    # with immediate expiry (the form that would detach a missing slot).
+    away = tmp_path / "away"
+    away.mkdir()
+    locked.rename(away / "locked-one")
+    plain.rename(away / "plain-one")
+    subprocess.run(
+        ["git", "worktree", "prune", "--expire", "now"], cwd=repository, check=True,
+        capture_output=True, text=True,
+    )
+    listed = vcs.listed_worktrees(repository)
+    assert locked.absolute() in listed  # locked survives
+    assert plain.absolute() not in listed  # unlocked was pruned away
+    # Bring the locked tree back and remove it: the wrapper drops only
+    # wrkslots' own lock, so a plain remove (no force at all) succeeds.
+    (away / "locked-one").rename(locked)
+    vcs.remove_worktree(repository, locked)
+    assert locked.absolute() not in vcs.listed_worktrees(repository)
+
+
+def test_foreign_lock_still_refuses_remove(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("needs git")
+    repository = _git_repo_with_worktrees(tmp_path, monkeypatch)
+    vcs = cli._GitVcs()
+    held = tmp_path / "held"
+    subprocess.run(
+        ["git", "worktree", "add", str(held), "-b", "b-held"],
+        cwd=repository, check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "worktree", "lock", "--reason", "operator hold", str(held)],
+        cwd=repository, check=True, capture_output=True, text=True,
+    )
+    assert vcs.worktree_lock_state(repository, held) == (True, "operator hold")
+    vcs.drop_own_worktree_lock(repository, held)
+    assert vcs.worktree_lock_state(repository, held) == (True, "operator hold")
+    with pytest.raises(cli.Refusal, match="locked"):
+        vcs.remove_worktree(repository, held, force=True)
+    assert held.absolute() in vcs.listed_worktrees(repository)
+    # Taking wrkslots' lock over a foreign one also refuses.
+    with pytest.raises(cli.Refusal, match="already locked"):
+        vcs.lock_worktree(repository, held)
+
+
+def _record(slot: str = "s1", slot_type: str = "agent") -> cli.ActiveRecord:
+    return cli.ActiveRecord(
+        slot=slot,
+        agent="worker-a",
+        task="t1",
+        purpose="probe",
+        slot_type=slot_type,
+        machine="testhost",
+        generation=1,
+        created_at="2026-11-05T00:00:00+00:00",
+        heartbeat_at="2026-11-05T00:00:00+00:00",
+        heartbeat_ttl_seconds=600,
+        owner=None,
+        coordinator_lease=cli.ProcessIdentity(
+            pid=123, start_ticks=456, boot_id="boot", host_id="host", cgroup_path="/"
+        ),
+        coordinator_recovery_note=None,
+        handoff=None,
+        checkouts=(),
+        layout="flat",
+    )
+
+
+def test_layout_census_refuses_a_live_holder_and_validation_slots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wrkslots import imagecmd
+
+    config = _direct_config(tmp_path, worktreesimage.MOUNTED)
+    slot_path = config.worktrees / "s1"
+    slot_path.mkdir(parents=True)
+    record = _record()
+    state = cli.ActiveState(machine="testhost", revision=0, slots=(record,))
+    monkeypatch.setattr(
+        cli,
+        "_load_record_holds",
+        lambda cfg, states: {("testhost", "s1"): cli._HoldResult(None)},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_owner_liveness_states",
+        lambda cfg, records: {
+            (r.machine, r.slot, r.generation): ("dead", "probe") for r in records
+        },
+    )
+    assert imagecmd._layout_census(config, state) == [record]
+
+    holder = subprocess.Popen(["sleep", "60"], cwd=slot_path)
+    try:
+        with pytest.raises(cli.Refusal):
+            imagecmd._layout_census(config, state)
+    finally:
+        holder.terminate()
+        holder.wait(timeout=10)
+
+    validate_state = cli.ActiveState(
+        machine="testhost", revision=0, slots=(record, _record("v1", "validate"))
+    )
+    with pytest.raises(cli.Refusal, match="validation slots exist"):
+        imagecmd._layout_census(config, validate_state)
+
+
+class _FakeLayoutHost:
+    """Mounts in miniature: the image top level moves between mount points."""
+
+    def __init__(self, mount_dir: Path, slots_dir: Path) -> None:
+        self.calls: list[list[str]] = []
+        self.mount_dir = mount_dir
+        self.slots_dir = slots_dir
+
+    def run(
+        self, argv: list[str], *, sudo: bool = False
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append(list(argv))
+        ok = subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[:1] == ["mount"] and "--bind" not in argv:
+            point = Path(argv[-1])
+            if point == self.slots_dir:
+                for entry in list(self.mount_dir.iterdir()):
+                    entry.rename(self.slots_dir / entry.name)
+            return ok
+        if argv[:1] in (["mount"], ["chown"]):
+            return ok
+        if argv[:1] == ["umount"]:
+            point = Path(argv[-1])
+            if point == self.slots_dir and self.slots_dir.is_dir():
+                for entry in list(self.slots_dir.iterdir()):
+                    if entry.name != worktreesimage.VALIDATE_SUBDIR:
+                        entry.rename(self.mount_dir / entry.name)
+            return ok
+        if argv[:3] == ["btrfs", "qgroup", "show"]:
+            return subprocess.CompletedProcess(argv, 0, "0/5 0 0\n", "")
+        if argv[:2] in (["btrfs", "quota"], ["btrfs", "qgroup"]):
+            return ok
+        if argv[:3] == ["btrfs", "inspect-internal", "dump-super"]:
+            return subprocess.CompletedProcess(
+                argv, 0, "incompat_flags\t0x1\n\t\t\t  SIMPLE_QUOTA )\n", ""
+            )
+        if argv[:3] == ["btrfs", "subvolume", "create"]:
+            Path(argv[3]).mkdir(parents=True, exist_ok=False)
+            return ok
+        if argv[:3] == ["btrfs", "subvolume", "delete"]:
+            shutil.rmtree(argv[3])
+            return ok
+        raise AssertionError(f"unexpected command: {argv}")
+
+
+def _layout_project(tmp_path: Path) -> cli.Config:
+    config = _config(tmp_path, worktreesimage.MOUNTED)
+    config.config_path.write_text(
+        "schema: 2\n"
+        "machine: testhost\n"
+        "worktrees_dir: worktrees/slots\n"
+        "default_remote: origin\n"
+        "default_landed_ref: refs/remotes/origin/main\n"
+        "heartbeat_ttl_seconds: 60\n"
+        "liveness_command: live.py\n"
+        "layout: flat\n"
+        "worktrees_image:\n"
+        "  path: worktrees.img\n"
+        "  size_bytes: 2147483648\n",
+        encoding="utf-8",
+    )
+    return config
+
+
+def test_migrate_layout_round_trip_with_fake_mounts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wrkslots import imagecmd
+
+    config = _layout_project(tmp_path)
+    assert config.worktrees_image is not None
+    config.worktrees_image.image_file(config.root).touch()
+    control = config.control
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "s1").mkdir(parents=True)
+    (mount_dir / "s1" / "keep.txt").write_text("image copy\n", encoding="utf-8")
+    slot_path = config.worktrees / "s1"
+    slot_path.mkdir(parents=True)
+    (slot_path / "orig.txt").write_text("stale original\n", encoding="utf-8")
+    worktreesimage.save_bind_records(
+        control,
+        {"s1": worktreesimage.BindRecord(subvolume="s1", target=str(slot_path))},
+    )
+    fake = _FakeLayoutHost(mount_dir, config.worktrees)
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    monkeypatch.setattr(worktreesimage, "mount_id_at", lambda point: 99)
+    monkeypatch.setattr(worktreesimage, "is_subvolume", lambda path: path.is_dir())
+    monkeypatch.setattr(slotimage, "mount_table", lambda: [])
+    locked: list[str] = []
+    monkeypatch.setattr(
+        imagecmd, "_lock_slot_checkouts", lambda cfg, slot, slot_type: locked.append(slot)
+    )
+    record = _record()
+
+    imagecmd._migrate_layout_to_direct(config, config.worktrees_image, [record])
+    assert (slot_path / "keep.txt").read_text(encoding="utf-8") == "image copy\n"
+    assert not (mount_dir / "s1").exists()  # now a top level of the direct mount
+    assert worktreesimage.load_binds(control) == {}
+    assert (config.worktrees / "validate").is_dir()
+    assert "mount_at: worktrees_dir" in config.config_path.read_text(encoding="utf-8")
+    assert locked == ["s1"]
+
+    direct = worktreesimage.settings_from_obj(
+        {"path": "worktrees.img", "size_bytes": 2 * GIB, "mount_at": "worktrees_dir"}
+    )
+    imagecmd._migrate_layout_to_binds(config, direct, [record])
+    assert (mount_dir / "s1" / "keep.txt").read_text(encoding="utf-8") == "image copy\n"
+    assert slot_path.is_dir()
+    assert worktreesimage.load_binds(control) == {"s1": "s1"}
+    assert "mount_at: binds" in config.config_path.read_text(encoding="utf-8")
+    assert locked == ["s1", "s1"]
+
+
+def test_doctor_reports_a_missing_image_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("needs git")
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "lock-test")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "lock-test@example.invalid")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "lock-test")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "lock-test@example.invalid")
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "--allow-empty", "-m", "init"], cwd=tmp_path, check=True
+    )
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=tmp_path, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+    config = _direct_config(tmp_path, worktreesimage.MOUNTED)
+    slot_path = config.worktrees / "s1"
+    slot_path.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "worktree", "add", str(slot_path), "-b", "b-s1"],
+        cwd=tmp_path, check=True, capture_output=True, text=True,
+    )
+    monkeypatch.setattr(worktreesimage, "is_subvolume", lambda path: path == slot_path)
+    checkout = cli.Checkout(
+        name="repo",
+        path="worktrees/slots/s1",
+        repository=".",
+        branch="b-s1",
+        start_point=head,
+        remote="origin",
+        remote_url_sha256="0" * 64,
+        landed_ref="refs/remotes/origin/main",
+        head=head,
+    )
+    import dataclasses as _dc
+
+    record = _dc.replace(_record(), checkouts=(checkout,))
+    states = [cli.ActiveState(machine="testhost", revision=0, slots=(record,))]
+    findings = cli._image_lock_findings(config, states)
+    assert [item["kind"] for item in findings] == ["worktrees-image-lock-missing"]
+    cli._GitVcs().lock_worktree(tmp_path, slot_path)
+    assert cli._image_lock_findings(config, states) == []
+    # Advisory only: the storage-inconsistency channel that targeted
+    # mutations gate on never carries this kind.
+    cli._GitVcs().drop_own_worktree_lock(tmp_path, slot_path)
+    kinds = {
+        item.kind
+        for item in cli._registry_storage_inconsistencies(
+            config, states, tolerate_unavailable_repositories=True
+        )
+    }
+    assert "worktrees-image-lock-missing" not in kinds
+
+
+def _real_btrfs_or_skip() -> None:
+    if shutil.which("sudo") is None or shutil.which("mkfs.btrfs") is None:
+        pytest.skip("needs sudo and mkfs.btrfs")
+    probe = subprocess.run(
+        ["sudo", "-n", "true"], capture_output=True, text=True, check=False
+    )
+    if probe.returncode != 0:
+        pytest.skip("needs passwordless sudo for a loop-mounted btrfs image")
+
+
+def test_real_direct_image_lifecycle(tmp_path: Path) -> None:
+    # Real loop-mounted scratch image (never a live one): create, mount at
+    # the slots directory, simple quotas, a quota-limited subvolume slot,
+    # a fence rename, status, delete, and the unmounted refusal state.
+    _real_btrfs_or_skip()
+    root = tmp_path / "project"
+    control = root / "worktrees"
+    slots = control / "slots"
+    slots.mkdir(parents=True)
+    settings = worktreesimage.WorktreesImageSettings(
+        relative_path="worktrees.img",
+        size_bytes=GIB,
+        mount_at="worktrees_dir",
+        quota_mode="simple",
+        slot_quota_bytes=64 * 1024 * 1024,
+    )
+    image = settings.image_file(root)
+    worktreesimage.create_image(image, settings.size_bytes)
+    try:
+        worktreesimage.ensure_image_mounted(root, control, settings, slots)
+        assert (
+            worktreesimage.current_state(root, slots, settings)
+            == worktreesimage.MOUNTED
+        )
+        assert slots.stat().st_uid == os.getuid()
+        assert (slots / "validate").is_dir()
+        mode = worktreesimage.quota_mode_at(slots, image)
+        if mode != "simple":
+            pytest.skip(f"simple quotas unsupported on this host (mode={mode})")
+        slot = slots / "s1"
+        worktreesimage.create_slot_subvolume(slot, settings.slot_quota_bytes)
+        assert worktreesimage.is_subvolume(slot)
+        (slot / "work.txt").write_text("work\n", encoding="utf-8")
+        fenced = slots / (".s1.fenced.1." + "f" * 32)
+        os.rename(slot, fenced)
+        assert (fenced / "work.txt").read_text(encoding="utf-8") == "work\n"
+        os.rename(fenced, slot)
+        report = worktreesimage.status_report(root, slots, settings)
+        assert report["mount_point"] == str(slots)
+        assert report["quota_mode"] == "simple"
+        assert report["binds"] == {}
+        # A remount never flips the existing mode.
+        worktreesimage.apply_quota_mode(slots, image, "full")
+        assert worktreesimage.quota_mode_at(slots, image) == "simple"
+        worktreesimage.delete_slot_subvolume(slot)
+        assert not slot.exists()
+    finally:
+        subprocess.run(
+            ["sudo", "-n", "umount", str(slots)], capture_output=True, check=False
+        )
+    assert (
+        worktreesimage.current_state(root, slots, settings)
+        == worktreesimage.NOT_MOUNTED
+    )
+
+
+def test_real_migrate_layout_round_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The movers on a real image: binds -> direct -> binds, contents kept,
+    # host original beneath the bind reclaimed on the way to direct.
+    from wrkslots import imagecmd
+
+    _real_btrfs_or_skip()
+    config = _layout_project(tmp_path)
+    assert config.worktrees_image is not None
+    binds = config.worktrees_image
+    control = config.control
+    mount_dir = worktreesimage.image_mount_dir(control)
+    slot_path = config.worktrees / "s1"
+    config.worktrees.mkdir(parents=True, exist_ok=True)
+    locked: list[str] = []
+    monkeypatch.setattr(
+        imagecmd, "_lock_slot_checkouts", lambda cfg, slot, slot_type: locked.append(slot)
+    )
+    record = _record()
+    try:
+        worktreesimage.create_image(binds.image_file(config.root), binds.size_bytes)
+        worktreesimage.ensure_image_mounted(config.root, control, binds, config.worktrees)
+        worktreesimage.create_slot_subvolume(mount_dir / "s1", binds.slot_quota_bytes)
+        slot_path.mkdir(parents=True)
+        (slot_path / "orig.txt").write_text("stale original\n", encoding="utf-8")
+        worktreesimage.bind_slot(control, mount_dir, "s1", slot_path)
+        (slot_path / "keep.txt").write_text("image copy\n", encoding="utf-8")
+
+        imagecmd._migrate_layout_to_direct(config, binds, [record])
+        assert (slot_path / "keep.txt").read_text(encoding="utf-8") == "image copy\n"
+        assert worktreesimage.is_subvolume(slot_path)
+        assert not (slot_path / "orig.txt").exists()
+        assert worktreesimage.load_binds(control) == {}
+
+        direct = worktreesimage.settings_from_obj(
+            {"path": "worktrees.img", "size_bytes": 2 * GIB, "mount_at": "worktrees_dir"}
+        )
+        imagecmd._migrate_layout_to_binds(config, direct, [record])
+        assert (slot_path / "keep.txt").read_text(encoding="utf-8") == "image copy\n"
+        assert worktreesimage.load_binds(control) == {"s1": "s1"}
+        assert locked == ["s1", "s1"]
+    finally:
+        subprocess.run(
+            ["sudo", "-n", "umount", str(slot_path)], capture_output=True, check=False
+        )
+        subprocess.run(
+            ["sudo", "-n", "umount", str(mount_dir)], capture_output=True, check=False
+        )
+        subprocess.run(
+            ["sudo", "-n", "umount", str(config.worktrees)],
+            capture_output=True,
+            check=False,
+        )

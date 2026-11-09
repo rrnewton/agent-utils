@@ -31,7 +31,7 @@ pub(crate) const TOP_DOCS: &[(&str, &str)] = &[
     ("slot_representation", "How NEW slots are stored: image (one sparse ext4 disk image per slot, mounted at the slot directory) or worktree (plain directories; the meaning when absent). Existing slots keep their representation: change this default with `wrkslots image set-default`, and migrate one idle slot in place with `wrkslots image convert SLOT --to image|worktree`."),
     ("image", "Settings for new disk-image slots; absent keys take their defaults."),
     ("sandbox", "Defaults for the slot box (`wrkslots run`, `wrkslots shell-command`, and agent launchers). The box is the same for plain and image slots. `wrkslots sandbox show-config` prints the effective values; `wrkslots sandbox write-defaults` adds missing keys."),
-    ("worktrees_image", "One sparse btrfs image holding every slot, mounted at the slots directory. Absent means slots live directly on the host file system (the default). Manage it with `wrkslots worktrees-image`; kernel mount only (sudo -n), because btrfs has no unprivileged FUSE fallback."),
+    ("worktrees_image", "One sparse btrfs image holding every slot (see its mount_at key for where it mounts). Absent means slots live directly on the host file system (the default). Manage it with `wrkslots worktrees-image`; kernel mount only (sudo -n), because btrfs has no unprivileged FUSE fallback."),
 ];
 
 pub(crate) const SANDBOX_DOCS: &[(&str, &str)] = &[
@@ -74,11 +74,13 @@ pub(crate) const IMAGE_DOCS: &[(&str, &str)] = &[
 ];
 
 pub(crate) const WORKTREES_IMAGE_DOCS: &[(&str, &str)] = &[
-    ("path", "Project-relative backing file for the one sparse btrfs image mounted at the slots directory. It lives outside the mount, on the host file system."),
+    ("path", "Project-relative backing file for the one sparse btrfs image holding every slot. It lives outside the mount, on the host file system."),
     ("size_bytes", "Apparent size of the worktrees image in bytes. The file is sparse: an upper bound, not a reservation. Grow it later with `wrkslots worktrees-image grow`."),
     ("fs", "File system inside the worktrees image. Only btrfs is supported."),
     ("mount", "How the worktrees image is mounted: kernel (sudo -n mount -o loop) or auto (the same; btrfs has no unprivileged FUSE fallback). fuse is refused."),
     ("slot_quota_bytes", "Optional per-slot qgroup limit in bytes (referenced, post-compression). Each new slot becomes a btrfs subvolume inside the image."),
+    ("mount_at", "Where the image mounts: binds (default; mounted beside the control files, one bind mount per slot) or worktrees_dir (mounted at the slots directory, slot subvolumes as its top-level entries, no binds). Change it only with `wrkslots worktrees-image migrate-layout`."),
+    ("quota_mode", "Quota accounting for a new image: simple (default; btrfs simple quotas where the kernel and btrfs-progs support them, else full qgroups) or full. Mounting never changes an existing image's mode; status reports the active one."),
 ];
 
 pub(crate) const OPTIONAL_KEYS: &[&str] = &[

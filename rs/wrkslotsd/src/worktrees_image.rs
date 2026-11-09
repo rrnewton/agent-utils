@@ -34,11 +34,17 @@ pub(crate) struct WorktreesImageSettings {
     pub(crate) filesystem: String,
     pub(crate) mount: String,
     pub(crate) slot_quota_bytes: Option<i64>,
+    pub(crate) mount_at: String,
+    pub(crate) quota_mode: String,
 }
 
 impl WorktreesImageSettings {
     pub(crate) fn image_file(&self, root: &Path) -> PathBuf {
         root.join(&self.relative_path)
+    }
+
+    pub(crate) fn direct(&self) -> bool {
+        self.mount_at == "worktrees_dir"
     }
 }
 
@@ -55,7 +61,15 @@ pub(crate) fn settings_from_obj(value: &Value) -> Result<WorktreesImageSettings,
     let Some(map) = value.as_object() else {
         return Err("configuration.worktrees_image must be a mapping".to_string());
     };
-    let known = ["path", "size_bytes", "fs", "mount", "slot_quota_bytes"];
+    let known = [
+        "path",
+        "size_bytes",
+        "fs",
+        "mount",
+        "slot_quota_bytes",
+        "mount_at",
+        "quota_mode",
+    ];
     let mut unknown: Vec<&String> = map
         .keys()
         .filter(|key| !known.contains(&key.as_str()))
@@ -114,12 +128,34 @@ pub(crate) fn settings_from_obj(value: &Value) -> Result<WorktreesImageSettings,
             );
         }
     }
+    let mount_at = map
+        .get("mount_at")
+        .and_then(Value::as_str)
+        .unwrap_or("binds");
+    if !matches!(mount_at, "binds" | "worktrees_dir") {
+        return Err(format!(
+            "configuration.worktrees_image.mount_at must be one of binds, worktrees_dir, not {}",
+            py_repr(&json!(mount_at))
+        ));
+    }
+    let quota_mode = map
+        .get("quota_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("simple");
+    if !matches!(quota_mode, "simple" | "full") {
+        return Err(format!(
+            "configuration.worktrees_image.quota_mode must be one of simple, full, not {}",
+            py_repr(&json!(quota_mode))
+        ));
+    }
     Ok(WorktreesImageSettings {
         relative_path: raw_path.replace('\\', "/"),
         size_bytes: size.unwrap_or_default(),
         filesystem: filesystem.to_string(),
         mount: mount.to_string(),
         slot_quota_bytes: quota.and_then(Value::as_i64),
+        mount_at: mount_at.to_string(),
+        quota_mode: quota_mode.to_string(),
     })
 }
 
@@ -973,6 +1009,23 @@ mod tests {
             settings_from_obj(&json!({"path": "wt.img", "size_bytes": 1073741824})).expect("ok");
         assert_eq!(ok.filesystem, "btrfs");
         assert_eq!(ok.mount, "kernel");
+        assert_eq!(ok.mount_at, "binds");
+        assert_eq!(ok.quota_mode, "simple");
+        assert!(!ok.direct());
+        let direct = settings_from_obj(
+            &json!({"path": "wt.img", "size_bytes": 1073741824, "mount_at": "worktrees_dir", "quota_mode": "full"}),
+        )
+        .expect("direct ok");
+        assert!(direct.direct());
+        assert_eq!(direct.quota_mode, "full");
+        assert!(settings_from_obj(
+            &json!({"path": "wt.img", "size_bytes": 1073741824, "mount_at": "elsewhere"})
+        )
+        .is_err());
+        assert!(settings_from_obj(
+            &json!({"path": "wt.img", "size_bytes": 1073741824, "quota_mode": "none"})
+        )
+        .is_err());
         assert!(
             settings_from_obj(&json!({"path": "../wt.img", "size_bytes": 1073741824})).is_err()
         );
@@ -1112,6 +1165,8 @@ mod tests {
             filesystem: "btrfs".to_string(),
             mount: "kernel".to_string(),
             slot_quota_bytes: None,
+            mount_at: "binds".to_string(),
+            quota_mode: "simple".to_string(),
         };
         let ctx = WtCtx {
             root: &root,

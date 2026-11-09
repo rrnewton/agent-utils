@@ -683,7 +683,7 @@ CONFIG_KEY_DOCS: dict[str, str] = {
         "missing keys."
     ),
     "worktrees_image": (
-        "One sparse btrfs image holding every slot, mounted at the slots directory. "
+        "One sparse btrfs image holding every slot (see its mount_at key for where it mounts). "
         "Absent means slots live directly on the host file system (the default). "
         "Manage it with `wrkslots worktrees-image`; kernel mount only (sudo -n), "
         "because btrfs has no unprivileged FUSE fallback."
@@ -4421,11 +4421,14 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         # inspects them. Failures leave the classified state in place;
         # slot-writing commands refuse on it below.
         try:
-            worktreesimage.ensure_image_mounted(config.root, config.control, config.worktrees_image)
+            worktreesimage.ensure_image_mounted(
+                config.root, config.control, config.worktrees_image, config.worktrees
+            )
             worktreesimage.ensure_binds(
                 config.control,
                 worktreesimage.image_mount_dir(config.control),
                 config.worktrees,
+                config.worktrees_image,
             )
         except worktreesimage.WorktreesImageError:
             pass
@@ -4540,6 +4543,12 @@ _OWNED_REPRESENTATION_MOUNTS: frozenset[tuple[Path, str]] = frozenset()
 #: for the slot-image mounts above; the recorded mount ID is kept in the
 #: bind record for diagnostics.
 _OWNED_WORKTREES_BIND_MOUNTS: frozenset[tuple[Path, str, str]] = frozenset()
+#: The slots directory itself when the worktrees image mounts there
+#: directly (``mount_at: worktrees_dir``), else None. A slot root directly
+#: under it (or under its validate directory) that is a btrfs subvolume is
+#: the slot's own storage root, judged like a recorded bind root when Git
+#: removes the checkout.
+_DIRECT_WORKTREES_IMAGE_ROOT: Path | None = None
 #: ``(mount point, MAJOR:MINOR, /dev/loopN)`` of every second attachment of a
 #: doubly attached image: an independent, stale file system on the same image
 #: file. The census reports such a line as use, naming it, unless this command
@@ -4672,10 +4681,18 @@ def _refresh_worktrees_bind_mounts(config: Config) -> None:
     counts only when the table shows the recorded subvolume bound there.
     """
 
-    global _OWNED_WORKTREES_BIND_MOUNTS
+    global _OWNED_WORKTREES_BIND_MOUNTS, _DIRECT_WORKTREES_IMAGE_ROOT
     if config.worktrees_image is None:
         _OWNED_WORKTREES_BIND_MOUNTS = frozenset()
+        _DIRECT_WORKTREES_IMAGE_ROOT = None
         return
+    if config.worktrees_image.direct:
+        # No binds exist to own; the image mount at the slots directory is
+        # every slot's parent mount, never a mount inside a slot.
+        _OWNED_WORKTREES_BIND_MOUNTS = frozenset()
+        _DIRECT_WORKTREES_IMAGE_ROOT = Path(os.path.abspath(config.worktrees))
+        return
+    _DIRECT_WORKTREES_IMAGE_ROOT = None
     try:
         records = worktreesimage.load_bind_records(config.control)
         table = slotimage.mount_table()
@@ -4741,7 +4758,7 @@ def _worktrees_bind_slot(config: Config, path: Path) -> str | None:
     the fenced path and unbinds it from there (#898).
     """
 
-    if config.worktrees_image is None:
+    if config.worktrees_image is None or config.worktrees_image.direct:
         return None
     try:
         records = worktreesimage.load_bind_records(config.control)
@@ -4818,6 +4835,22 @@ def _remove_slot_directory(config: Config, path: Path) -> None:
             finally:
                 _refresh_owned_mounts(config)
             path.rmdir()
+            return
+        if (
+            config.worktrees_image is not None
+            and config.worktrees_image.direct
+            and worktreesimage.is_subvolume(path)
+        ):
+            # Direct layout: the emptied slot directory IS the subvolume.
+            # `git worktree remove` may already have rmdir'd it on kernels
+            # that allow that, in which case the caller never reaches here
+            # (the fenced path is simply gone).
+            try:
+                worktreesimage.delete_slot_subvolume(path)
+            except worktreesimage.WorktreesImageError as exc:
+                raise OSError(errno.ENOTEMPTY, str(exc)) from exc
+            finally:
+                _refresh_owned_mounts(config)
             return
         path.rmdir()
         return
@@ -5017,6 +5050,24 @@ def _is_owned_worktrees_bind_root(path: Path) -> bool:
 
     target = Path(os.path.abspath(path))
     return any(point == target for point, _device, _root in _OWNED_WORKTREES_BIND_MOUNTS)
+
+
+def _is_owned_direct_subvolume_root(path: Path) -> bool:
+    """Whether ``path`` is a slot subvolume root in the direct image layout.
+
+    The path may be the canonical slot path or its fenced sibling; both
+    live directly under the slots directory (agent slots) or its
+    validate directory. The inode-256 check keeps a plain directory at
+    the same place from counting as image storage.
+    """
+
+    root = _DIRECT_WORKTREES_IMAGE_ROOT
+    if root is None:
+        return False
+    target = Path(os.path.abspath(path))
+    if target.parent not in (root, root / worktreesimage.VALIDATE_SUBDIR):
+        return False
+    return worktreesimage.is_subvolume(target)
 
 
 def _load_new_slot_config(args: argparse.Namespace, operation: str) -> Config:
@@ -9612,6 +9663,54 @@ def _validate_global_state_for_absent_agent_recovery(
                 f"slot {slot!r} is active on {active_machine} and archived on {archive.machine}"
             )
     return states, archives
+
+
+def _worktrees_image_bind_slots(config: Config) -> frozenset[str]:
+    """Slot names with a recorded worktrees-image bind (bind layout only)."""
+
+    if config.worktrees_image is None or config.worktrees_image.direct:
+        return frozenset()
+    try:
+        return frozenset(worktreesimage.load_bind_records(config.control))
+    except worktreesimage.WorktreesImageError:
+        return frozenset()
+
+
+def _record_in_worktrees_image(
+    config: Config, record: ActiveRecord, slot_path: Path, bind_slots: frozenset[str]
+) -> bool:
+    """Whether the slot's storage is inside the mounted worktrees image."""
+
+    settings = config.worktrees_image
+    if settings is None or config.worktrees_image_state != worktreesimage.MOUNTED:
+        return False
+    if settings.direct:
+        return worktreesimage.is_subvolume(slot_path)
+    return record.slot in bind_slots
+
+
+def _image_slots_missing_lock(
+    config: Config, states: Sequence[ActiveState], vcs: _GitVcs | None = None
+) -> list[str]:
+    """``slot_type/slot/checkout`` in the worktrees image without its Git lock."""
+
+    vcs = _GitVcs() if vcs is None else vcs
+    bind_slots = _worktrees_image_bind_slots(config)
+    missing: list[str] = []
+    for state in states:
+        for record in state.slots:
+            slot_path = _slot_directory(config, record.slot, record.slot_type)
+            if not _record_in_worktrees_image(config, record, slot_path, bind_slots):
+                continue
+            for checkout in record.checkouts:
+                path = _stored_path_reference(config, checkout.path, "checkout path")
+                _relative, repository = _stored_repository_path(
+                    config, checkout.repository
+                )
+                lock = vcs.worktree_lock_state(repository, path)
+                if lock is not None and lock != (True, WORKTREES_IMAGE_LOCK_REASON):
+                    missing.append(f"{record.slot_type}/{record.slot}/{checkout.name}")
+    return missing
 
 
 def _registry_storage_inconsistencies(
@@ -15265,6 +15364,13 @@ def _credential_pacing_deadline(what: str) -> float:
     return deadline
 
 
+#: The exact `git worktree lock` reason wrkslots takes on every checkout
+#: born in the worktrees image, so `git worktree prune` with the image
+#: unmounted can never detach a slot's registration. Removal drops only a
+#: lock with this exact reason; any other lock still refuses.
+WORKTREES_IMAGE_LOCK_REASON = "in worktrees image"
+
+
 class _GitVcs:
     """The small Git boundary used by slot operations."""
 
@@ -18271,9 +18377,78 @@ class _GitVcs:
             )
         return result.returncode == 0
 
+    def worktree_lock_state(
+        self, repository: Path, checkout: Path
+    ) -> tuple[bool, str | None] | None:
+        """``(locked, reason)`` for one registered worktree, or None if unregistered.
+
+        A lock taken without ``--reason`` reads as ``(True, None)``.
+        """
+
+        result = self._run(repository, ["worktree", "list", "--porcelain", "-z"])
+        fields = result.stdout.split("\x00")
+        if fields and fields[-1] == "":
+            fields.pop()
+        target = checkout.absolute()
+        found: dict[str, str | None] | None = None
+        current: dict[str, str | None] | None = None
+        for field in fields:
+            key, separator, value = field.partition(" ")
+            if key == "worktree":
+                if current is not None and Path(str(current.get("worktree"))).absolute() == target:
+                    found = current
+                current = {"worktree": value}
+                continue
+            if current is None:
+                raise Refusal("Git worktree inventory starts without a worktree path")
+            if key in current:
+                raise Refusal(f"Git worktree inventory repeats field {key!r}")
+            current[key] = value if separator else None
+        if current is not None and Path(str(current.get("worktree"))).absolute() == target:
+            found = current
+        if found is None:
+            return None
+        if "locked" not in found:
+            return (False, None)
+        return (True, found["locked"])
+
+    def lock_worktree(self, repository: Path, checkout: Path) -> None:
+        """Take wrkslots' image lock on one worktree (already-own is success)."""
+
+        state = self.worktree_lock_state(repository, checkout)
+        if state is None:
+            raise Refusal(f"Git does not register worktree {checkout}; cannot lock it")
+        locked, reason = state
+        if locked:
+            if reason == WORKTREES_IMAGE_LOCK_REASON:
+                return
+            raise Refusal(
+                f"worktree {checkout} is already locked ({reason or 'no reason given'}); "
+                "wrkslots image slots need its own lock instead"
+            )
+        self._run(
+            repository,
+            ["worktree", "lock", "--reason", WORKTREES_IMAGE_LOCK_REASON, str(checkout)],
+        )
+
+    def drop_own_worktree_lock(self, repository: Path, checkout: Path) -> None:
+        """Unlock one worktree only when the lock is wrkslots' own image lock."""
+
+        try:
+            state = self.worktree_lock_state(repository, checkout)
+        except Refusal:
+            return
+        if state is not None and state == (True, WORKTREES_IMAGE_LOCK_REASON):
+            self._run(repository, ["worktree", "unlock", str(checkout)])
+
     def remove_worktree(
         self, repository: Path, checkout: Path, *, force: bool = False
     ) -> None:
+        # Drop wrkslots' own image lock first: Git refuses to remove a
+        # locked worktree even with one --force, and every removal that
+        # reaches this wrapper has already passed the fence and use
+        # census. A lock with any other reason stays, so Git still refuses.
+        self.drop_own_worktree_lock(repository, checkout)
         # Do not run `git submodule deinit` before removal. Submodule
         # registration lives in the repository's common config, so deinitializing
         # one linked worktree makes populated submodules in every peer appear
@@ -18283,16 +18458,20 @@ class _GitVcs:
         if force:
             args.append("--force")
         args.extend(("--", str(checkout)))
-        bind_root = _is_owned_worktrees_bind_root(checkout)
+        bind_root = _is_owned_worktrees_bind_root(checkout) or _is_owned_direct_subvolume_root(
+            checkout
+        )
         if not bind_root and not _is_owned_image_root(checkout):
             self._run(repository, args)
             return
         # A flat image-backed checkout's root is the image's mount point, which
         # cannot be removed; a flat worktrees-image checkout's root is its
-        # recorded bind mount, the same case. Git deletes the working tree's
-        # contents, fails only on that final rmdir, and still deletes the
-        # administrative directory. Accept exactly that outcome; the image or
-        # subvolume itself is destroyed with the slot directory afterwards.
+        # recorded bind mount, the same case; in the direct layout it is a
+        # btrfs subvolume root, which Git may or may not be able to rmdir.
+        # Git deletes the working tree's contents, fails only on that final
+        # rmdir, and still deletes the administrative directory. Accept
+        # exactly that outcome; the image or subvolume itself is destroyed
+        # with the slot directory afterwards.
         result = self._run(repository, args, check=False)
         if result.returncode == 0:
             return
@@ -19230,6 +19409,11 @@ def _managed_worktrees_root(config: Config) -> Path:
 
 
 def _validate_slots_directory(config: Config) -> Path:
+    if config.worktrees_image is not None and config.worktrees_image.direct:
+        # Direct layout: validation slots live inside the image with the
+        # agent slots, under one plain directory at its top level. The
+        # agent slot name "validate" is refused there (_slot_directory).
+        return config.worktrees / worktreesimage.VALIDATE_SUBDIR
     return _managed_worktrees_root(config) / "validate"
 
 
@@ -19244,6 +19428,17 @@ def _slot_directory(config: Config, slot: str, slot_type: str = "agent") -> Path
     _validate_name(slot, "slot")
     if slot_type not in SLOT_TYPES:
         raise Refusal(f"slot type must be one of {', '.join(SLOT_TYPES)}")
+    if (
+        slot_type == "agent"
+        and slot == worktreesimage.VALIDATE_SUBDIR
+        and config.worktrees_image is not None
+        and config.worktrees_image.direct
+    ):
+        raise Refusal(
+            "agent slot name 'validate' is reserved when the worktrees image "
+            "mounts at the slots directory: that top-level entry holds the "
+            "validation slots; pick another slot name"
+        )
     return _slot_roots(config)[slot_type] / slot
 
 
@@ -30402,21 +30597,30 @@ def _cmd_create(args: argparse.Namespace) -> int:
             journal_path=journal_path,
         )
         representation = _requested_representation(config, args)
-        if (
+        born_in_image = (
             config.worktrees_image is not None
             and representation != "image"
             and config.worktrees_image_state == worktreesimage.MOUNTED
-        ):
+        )
+        if born_in_image:
             # First-class project-image mode: the slot is born as a btrfs
-            # subvolume inside the one project image and bind-mounted at
-            # its original real path, so slots share extents
-            # (reflink/snapshot) while qgroups bound each slot.
+            # subvolume inside the one project image, so slots share
+            # extents (reflink/snapshot) while qgroups bound each slot.
+            # Bind layout: subvolume beside the control files, bound at
+            # the slot's original real path. Direct layout: the slot
+            # path itself, a top-level entry of the mounted image.
+            assert config.worktrees_image is not None
             try:
-                mount_dir = worktreesimage.image_mount_dir(config.control)
-                worktreesimage.create_slot_subvolume(
-                    mount_dir / args.slot, config.worktrees_image.slot_quota_bytes
-                )
-                worktreesimage.bind_slot(config.control, mount_dir, args.slot, slot_path)
+                if config.worktrees_image.direct:
+                    worktreesimage.create_slot_subvolume(
+                        slot_path, config.worktrees_image.slot_quota_bytes
+                    )
+                else:
+                    mount_dir = worktreesimage.image_mount_dir(config.control)
+                    worktreesimage.create_slot_subvolume(
+                        mount_dir / args.slot, config.worktrees_image.slot_quota_bytes
+                    )
+                    worktreesimage.bind_slot(config.control, mount_dir, args.slot, slot_path)
             except worktreesimage.WorktreesImageError as exc:
                 raise Refusal(str(exc)) from exc
             _fsync_directory(slot_path.parent)
@@ -30467,6 +30671,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 event_writer=event_writer,
                 journal_path=journal_path,
             )
+            if born_in_image:
+                # An unmounted image makes every slot path look missing;
+                # the lock keeps `git worktree prune` from detaching the
+                # registration in that window. Removal drops only this
+                # exact lock (WORKTREES_IMAGE_LOCK_REASON).
+                vcs.lock_worktree(repository, destination)
             _interrupt_for_test("after-create-worktree")
         hook_journal = _create_journal_payload(
             config,
@@ -34291,6 +34501,7 @@ def _cmd_reap_stray_worktrees(args: argparse.Namespace) -> int:
                     retained.append({**row, "outcome": "retained-rescue-failed", "reason": "rescue ref did not read back"})
                     continue
             if path.exists():
+                vcs.drop_own_worktree_lock(repository, path)
                 removed = vcs._run(
                     repository, ["worktree", "remove", "--force", str(path)], check=False
                 )
@@ -41374,6 +41585,7 @@ def _slot_findings(
 
     findings.extend(_identity_drift_findings(config, states))
     findings.extend(_image_attachment_findings(config))
+    findings.extend(_image_lock_findings(config, states))
 
     for path in _outstanding_journals(config):
         note("unfinished-journal", None, None, f"recovery required: {path.name}")
@@ -41517,6 +41729,65 @@ def _identity_drift_findings(
                             ),
                         }
                     )
+    return findings
+
+
+def _image_lock_findings(
+    config: Config, states: Sequence[ActiveState]
+) -> list[dict[str, object]]:
+    """Doctor findings for image slots missing wrkslots' Git worktree lock.
+
+    Advisory only, doctor-side: a missing lock must never refuse the
+    slot's own lifecycle commands (removal works fine without one), so
+    this deliberately does not go through the storage-inconsistency
+    channel that targeted mutations gate on.
+    """
+
+    findings: list[dict[str, object]] = []
+    if config.worktrees_image is None:
+        return findings
+    vcs = _GitVcs()
+    bind_slots = _worktrees_image_bind_slots(config)
+    for state in states:
+        for record in state.slots:
+            try:
+                slot_path = _slot_directory(config, record.slot, record.slot_type)
+            except Refusal:
+                continue
+            if not _record_in_worktrees_image(config, record, slot_path, bind_slots):
+                continue
+            for checkout in record.checkouts:
+                try:
+                    path = _stored_path_reference(config, checkout.path, "checkout path")
+                    _relative, repository = _stored_repository_path(
+                        config, checkout.repository
+                    )
+                    lock = vcs.worktree_lock_state(repository, path)
+                except Refusal:
+                    continue
+                if lock is None or lock == (True, WORKTREES_IMAGE_LOCK_REASON):
+                    continue
+                findings.append(
+                    {
+                        "kind": "worktrees-image-lock-missing",
+                        "scope": "operational",
+                        "slot": record.slot,
+                        "slot_type": record.slot_type,
+                        "machine": record.machine,
+                        "checkout": checkout.name,
+                        "detail": (
+                            f"checkout {path} lives in the worktrees image but "
+                            f"does not carry wrkslots' Git lock "
+                            f"({WORKTREES_IMAGE_LOCK_REASON!r}); with the image "
+                            "unmounted its path looks missing and 'git worktree "
+                            "prune' would detach the registration"
+                        ),
+                        "remedy": (
+                            "take the lock: git worktree lock --reason "
+                            f"'{WORKTREES_IMAGE_LOCK_REASON}' {path}"
+                        ),
+                    }
+                )
     return findings
 
 
@@ -43557,6 +43828,40 @@ def _git_removal_finished_at_bind_root(
     return not _git_registers_checkout(config, checkout, path, vcs)
 
 
+def _git_removal_finished_at_direct_root(
+    config: Config,
+    checkout: Checkout,
+    path: Path,
+    vcs: _GitVcs,
+) -> bool:
+    """Whether Git already removed ``checkout`` whose root is a direct subvolume.
+
+    The direct-layout twin of the bind-root case: a flat checkout at a
+    slot subvolume root loses its contents and registration to `git
+    worktree remove`, which then may fail only on rmdir of the subvolume
+    root, and the interrupted removal never journaled the removal. That
+    is recognised only while the image verifiably mounts at the slots
+    directory, ``path`` is a subvolume root there, it is completely
+    empty, and Git lists the checkout at neither its fenced nor its
+    canonical path.
+    """
+
+    if (
+        config.worktrees_image is None
+        or not config.worktrees_image.direct
+        or config.worktrees_image_state != worktreesimage.MOUNTED
+    ):
+        return False
+    if path.is_symlink() or not path.is_dir() or not _is_owned_direct_subvolume_root(path):
+        return False
+    try:
+        if next(path.iterdir(), None) is not None:
+            return False
+    except OSError as exc:
+        raise Refusal(f"cannot inspect direct-image checkout root {path}: {exc}") from exc
+    return not _git_registers_checkout(config, checkout, path, vcs)
+
+
 def _drop_rebound_canonical_bind(
     config: Config, slot: str, original: Path, fenced: Path
 ) -> bool:
@@ -43688,6 +43993,8 @@ def _begin_or_resume_path_fence(
         if _git_removal_finished_at_image_root(config, record, checkout, path, vcs):
             continue
         if _git_removal_finished_at_bind_root(config, record.slot, checkout, path, vcs):
+            continue
+        if _git_removal_finished_at_direct_root(config, checkout, path, vcs):
             continue
         if record.slot_type == "validate" and _checkout_registration_gone(
             vcs, _stored_repository_path(config, checkout.repository)[1], path
@@ -43958,6 +44265,7 @@ def _finish_remove_paths(
             and not _git_removal_finished_at_bind_root(
                 config, record.slot, checkout, path, vcs
             )
+            and not _git_removal_finished_at_direct_root(config, checkout, path, vcs)
         ):
             present.append(checkout)
             continue
@@ -50237,6 +50545,16 @@ def _recover_create(
     )
     if record.task_scope is not None:
         _verify_task_scope_before_publication(record.task_scope, _CREATE_SCOPE_REMEDY)
+    if _record_in_worktrees_image(
+        config, record, slot_path, _worktrees_image_bind_slots(config)
+    ):
+        # A create interrupted between `git worktree add` and taking the
+        # image lock finishes here; take it before publishing the row.
+        for checkout in created:
+            _relative, repository = _stored_repository_path(config, checkout.repository)
+            vcs.lock_worktree(
+                repository, _stored_path(config, checkout.path, "checkout path")
+            )
     _verify_created_checkouts(config, record, vcs)
     _write_active_state(
         config,

@@ -78,7 +78,9 @@ def _expected(root: Path) -> dict[str, object]:
             else {
                 "fs": config.worktrees_image.filesystem,
                 "mount": config.worktrees_image.mount,
+                "mount_at": config.worktrees_image.mount_at,
                 "path": config.worktrees_image.relative_path,
+                "quota_mode": config.worktrees_image.quota_mode,
                 "size_bytes": config.worktrees_image.size_bytes,
                 "slot_quota_bytes": config.worktrees_image.slot_quota_bytes,
             }
@@ -110,6 +112,31 @@ def test_validate_config_with_sections_matches_python(tmp_path: Path) -> None:
         "identity: {name: Slot Bot, email: slot-bot@example.invalid}\n"
         "image: {backend: kernel, ceiling_bytes: 2147483648}\n"
         "sandbox: {isolation: cgroup, limits: {memory_max: 32G, tasks_max: 10}}\n",
+    )
+    result = _rust(root)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == _expected(root)
+
+
+def test_validate_config_worktrees_image_matches_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The first exercise of the non-null worktrees_image shape: the Rust
+    # reader must accept mount_at and quota_mode (#1162) and print the
+    # same resolved settings Python does. Python's loader would try to
+    # mount the (missing) image on load; neutralise that side effect the
+    # way the worktrees-image tests do.
+    from wrkslots import worktreesimage
+
+    monkeypatch.setattr(worktreesimage, "ensure_image_mounted", lambda *a: None)
+    monkeypatch.setattr(worktreesimage, "ensure_binds", lambda *a: [])
+    monkeypatch.setattr(
+        worktreesimage, "current_state", lambda *a: worktreesimage.NOT_MOUNTED
+    )
+    root = _root(
+        tmp_path,
+        "worktrees_image: {path: wt.img, size_bytes: 2147483648, "
+        "slot_quota_bytes: 67108864, mount_at: worktrees_dir, quota_mode: full}\n",
     )
     result = _rust(root)
     assert result.returncode == 0, result.stderr
