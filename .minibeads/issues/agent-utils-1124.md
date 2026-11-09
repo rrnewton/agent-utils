@@ -1,10 +1,11 @@
 ---
 title: 'journal-reader-extension-slot: journal readers accept only exact keys, so every new journal field is a flag day for older pins'
 status: open
-priority: 3
+priority: 2
 issue_type: feature
+assignee: mu-createlock
 created_at: 2026-11-09T11:10:12.000000000+00:00
-updated_at: 2026-11-09T11:10:12.000000000+00:00
+updated_at: 2026-11-09T13:28:11.000000000+00:00
 ---
 
 # Description
@@ -41,3 +42,5 @@ the config file only (ignorable_keys plus min_wrkslots_version).
 
 Follow-up to #1121, requested by the lead coordinator 2026-11-09. Filed by the
 devbig030 coordinator.
+
+Raised to P2 on 2026-11-09 by the lead coordinator: #1123's approved design puts its CREATE-journal creator identity in this extension slot, so #1124 lands first (no second flag day). Owner: mu-createlock, both editions in one landing; mu-rswrk2 reviews the Rust half before landing.
