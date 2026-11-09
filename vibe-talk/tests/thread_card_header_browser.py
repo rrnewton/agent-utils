@@ -652,7 +652,7 @@ def list_card(desk: Desk, thread_id: str) -> tuple[dict[str, float], str]:
 
     The cards are drawn first from the channel's roots, saying each root's
     own words; the threads read then folds in the summaries and repaints a
-    summarised card with its name and summary (`sideCardText`).  Read the
+    summarised card with its name and summary.  Read the
     card only once that read has landed for this thread, or on a loaded
     machine the words read here are the root's while the heading card,
     painted after the fold, says the summary.  `#389 gate-flakes`.

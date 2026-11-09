@@ -294,7 +294,7 @@ pub fn card_max_lines(value: Option<&str>) -> usize {
 /// How many card lines `text` takes by the proxy: each line of it that is not blank, wrapped
 /// word by word at [`CARD_LINE_CHARS`] characters as a card wraps it — a word that does not fit
 /// on the line begins the next, and a word longer than a whole line is broken across lines. The
-/// lines are the page's card lines (`cardLines` in web/voice.js), which drops blank lines and
+/// lines are the page's card lines (web/src/view/channel's, since #624), which drops blank lines and
 /// closes up white space the same way, and the page wraps them by this same rule
 /// (`wrapCardLine`) to find where K lines end. Word by word, not one line per so many
 /// characters: a browser breaks only between words, and a count that ignored that would say

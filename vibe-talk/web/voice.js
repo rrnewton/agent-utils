@@ -1518,6 +1518,78 @@ const twoColumns = createTwoColumns({
 });
 const { sideColumnUp, threadListOnScreen, sideThreads, sideShowing, COLUMNS_TOO_NARROW, inThisColumn, columnSteps, eachColumn, inOtherColumn, followInOtherColumn, threadListOffered, columnsOffered, renderColumnToggle, sideHasBox, toggleHasBox, renderColumns, moveLayout, leftColumnPlace, keepLeftColumnPlace, sameLeftPlace, setLayout, noteListBefore, oneColumnBeforeList, columnsFromKeyboard, toggleColumns, chooseView, chooseOneColumn, showOneColumnView, recordViewChoice, leftColumnToMain, enterColumns, leaveColumns, showOneColumnLeft, enterThreadList, renderSideMode, renderSideColumn, sideThreadChoice } = twoColumns;
 
+/** The right column's cards are web/src/view/channel's now (`createSideCards`, `#624`). */
+const sideCards = createSideCards({
+  leftEl: (id) => leftEl(id),
+  cardView: (choice) => cardView(/** @type {any} */ (choice)),
+  messageText: (message) => messageText(message),
+  stillToDo: (root, dismissed) => stillToDo(root, dismissed),
+  channelCanon: () => channelStore.current(),
+  sideColumn: () => columns.side,
+  inColumn: (column, act) => inColumn(/** @type {any} */ (column), act),
+  unseenReplies: (id, root, tally, summary) => unseenReplies(id, /** @type {any} */ (root), /** @type {any} */ (tally), /** @type {any} */ (summary)),
+  repliesPartlyHeld: (id, root, held, tally) => repliesPartlyHeld(id, /** @type {any} */ (root), held, /** @type {any} */ (tally)),
+  exactReplyCount: (id, root, tally, summary) => exactReplyCount(id, /** @type {any} */ (root), /** @type {any} */ (tally), /** @type {any} */ (summary)),
+  pendingInto: (id) => pendingInto(id),
+  threadCount: (count, exact) => threadCount(count, /** @type {any} */ (exact)),
+  unpackHeldMessages: (canon, choice, same) => unpackHeldMessages(/** @type {any} */ (canon), /** @type {any} */ (choice), same),
+  unpackSignature: (choice, held) => unpackSignature(/** @type {any} */ (choice), held),
+  unpackReadSignature: (held, dismissed, filter) => unpackReadSignature(held, dismissed, /** @type {any} */ (filter)),
+  unpackFilter: () => unpackFilter,
+  foldedOneIds: (key) => foldedOneIds(key),
+  viewKey: (view, id) => viewKey(view, id),
+  threadChoices: () => threadChoices(),
+  inThreadOrder: (choices, order) => inThreadOrder(/** @type {any} */ (choices), order),
+  cardOrderOnScreen: () => cardOrderOnScreen(),
+  watchPendingSummaries: (choices, listId) => watchPendingSummaries(/** @type {any} */ (choices), listId),
+  cardIsSummarized: (choice) => cardIsSummarized(/** @type {any} */ (choice)),
+  briefAge: (at) => briefAge(at),
+  threadName: (choice, limit) => threadName(/** @type {any} */ (choice), limit),
+  unpackWatch: () => unpackWatch,
+  dressChannelRow: (row, pass) => dressChannelRow(row, /** @type {any} */ (pass)),
+  answeredBy: (rows, viewing) => answeredBy(rows, viewing),
+  replyTally: () => replyTally(),
+  readMode: () => readModes.mode(),
+  readRunsSuspended: () => readRunsSuspended(),
+  cardPackingMode: () => cardPacking.mode(),
+  combineOn: () => combineSwitch.on(),
+  nowPlaying: () => readAloudOwner().nowPlaying,
+  pendingRead: () => readAloudOwner().pendingRead,
+  markReadingCard: (card) => readAloudOwner().markReadingCard(card),
+  mainRowsOnScreen: () => mainRowsOnScreen(),
+  mainRowMessages: (except) => mainRowMessages(except),
+  messageLook: (message) => messageLook(message),
+  readLook: (message, dismissed, filter) => readLook(message, dismissed, /** @type {any} */ (filter)),
+  olderThreadsToRead: () => olderThreadsToRead(),
+  keepingCardPlace: (act) => keepingCardPlace(act),
+  sideCard: (card) => sideCard(/** @type {any} */ (card)),
+  countSideCard: (card, input) => countSideCard(card, /** @type {any} */ (input)),
+  paintLitCard: (card, id) => paintLitCard(card, id),
+  unpackBlock: (choice, tally) => unpackBlock(/** @type {any} */ (choice), /** @type {any} */ (tally)),
+  redrawUnpackBlock: (choice, rows, tally) => redrawUnpackBlock(/** @type {any} */ (choice), rows, /** @type {any} */ (tally)),
+  doneArchived: () => doneState().archived,
+  setDoneArchived: (archived) => { doneState().archived = archived; },
+  caughtUpDone: (archived, shown) => caughtUpDone(archived, /** @type {any} */ (shown)),
+  mainRunsAmong: (main, times) => mainRunsAmong(main, /** @type {any} */ (times)),
+  mainRows: (run, tally) => mainRows(/** @type {any} */ (run), /** @type {any} */ (tally)),
+  foldCardRuns: (list) => foldCardRuns(list),
+  filterSideCards: () => filterSideCards(),
+  cardsCycle: () => cardsCycle(),
+  sideCardsShown: () => sideCardsShown(),
+  outboxValues: () => outbox.values(),
+  eachColumn: (act) => eachColumn(act),
+  renderOutgoingMessages: () => renderOutgoingMessages(),
+  replyState: () => replyState,
+  placeInlineReply: () => placeInlineReply(),
+  reopenPendingReply: () => reopenPendingReply(),
+  setTextIfChanged: (el, text) => setTextIfChanged(el, text),
+  threadPagesLoading: () => threadList.threadPagesLoading(),
+  selectedChannelId: () => selectedChannelId(),
+  cardState: (choice, read) => cardState(/** @type {any} */ (choice), read),
+});
+const { cardsDrawn, nameSideRegion, sideCardText, cardLines, sideCardRootText, threadIsRead, sideCardUnread, sideCardReplies, cardMessageCount, sideCardParts, placeChildren, redressMainRows, renderSideCards } = sideCards;
+
+
 const columnRepliesOwner = createColumnReplies({
   el: (id) => el(id),
   outbox,
@@ -10737,343 +10809,8 @@ function leaveThreadList(next = "one") {
   refreshSearchCount();
 }
 
-function nameSideRegion(name) {
-  const region = leftEl("side-scroll");
-  if (region.getAttribute("aria-label") !== name) region.setAttribute("aria-label", name);
-}
-
-/**
- * What a card says of its thread: "display_name: summary" when the summariser has named it and summed
- * it up, else the text of its first message, else its name. Whitespace is folded, so a raw card's
- * clamped lines show lines of words rather than a paragraph break; a summarised card's words are
- * drawn whole besides (`#428 summary-cards-full`).
- */
-function sideCardText(choice) {
-  // `#522 thread-card-max-lines`, `#528 thread-card-markdown-and-cap`: a root longer than the card
-  // shows, its first lines and "…" (`cardView`).
-  return cardView(choice).text;
-}
-
-/**
- * `#489 card-root-lines`. A message's words as a card shows them in place of a summary: line by line
- * as its body is drawn (a line end at each line break and each block's edge, `messageText`), each
- * line's white space closed up and blank lines dropped. The owner, 2026-10-22: a card showing his
- * "header / ----- / body" as one squashed line should "render properly"; the stylesheet keeps these
- * line ends (`white-space: pre-line` on the card's text).
- */
-function cardLines(message) {
-  return messageText(message).split("\n").map((line) => line.replace(/\s+/g, " ").trim()).filter(Boolean).join("\n");
-}
-
-/**
- * The words of a thread's first message, for the search over its card, when the card says something
- * else — the summariser's name and summary — or "". `#262 search-load-older`: a summed-up thread is
- * found by what its first message says too, not only by the summary of it.
- */
-function sideCardRootText(choice) {
-  const first = choice.root ? cardLines(choice.root) : "";
-  return first && first !== sideCardText(choice) ? first : "";
-}
-
-/**
- * Whether thread `choice` is read, as the read modes see a thread (`#432 read-mode-unify`): no unread
- * reply held or reported (`unread`, `sideCardUnread`'s words) and its root read too. One unread message,
- * the root or any reply, makes the whole thread unread, packed under its card or unpacked.
- */
-function threadIsRead(choice, unread) {
-  return unread === "" && !(choice.root && stillToDo(choice.root, channelStore.current().dismissed));
-}
-
-/** What a card says of its thread's unread replies, as a root on Main says it ("3 unread", "1 new"), or "". */
-function sideCardUnread(choice, tally) {
-  const entry = tally.threads.get(choice.id);
-  const unread = entry ? entry.unread : 0;
-  const unseen = unseenReplies(choice.id, choice.root, tally, choice.summary);
-  if (unread > 0) return `${unread}${repliesPartlyHeld(choice.id, choice.root, entry.held, tally) ? "+" : ""} unread`;
-  return unseen > 0 ? `${unseen} new` : "";
-}
-
-/**
- * What a card says of its thread's replies, "3 replies" or "about 3 replies", or "" with none.
- *
- * `#231 two-column-polish`. By the rule of the thread's tag on a root in Main (`drawThreadChips`):
- * the count reported, never fewer than the replies the store holds nor than an exact count the
- * store's copy of the root gives. A reply that comes in on the stream is counted on its thread's
- * summary and root as it is folded in (`foldLiveMessage`), so the card counts it with its unread
- * chip, not up to a minute later at the thread list's next read.
- */
-function sideCardReplies(choice, tally) {
-  const entry = tally.threads.get(choice.id);
-  const reported = typeof choice.count === "number" ? choice.count : 0;
-  // `#466 reply-promotes-thread`: with the sends in the outbox going into it, as its root's tag counts.
-  const count = Math.max(reported, entry ? entry.held : 0, exactReplyCount(choice.id, choice.root, tally) || 0) +
-    pendingInto(choice.id);
-  return count > 0 ? threadCount(count, choice.summary ? choice.summary.reply_count_exact : true) : "";
-}
-
-/**
- * How many messages thread `choice` holds, the root counted, and whether the page knows exactly.
- * `#439 search-unmatched-separators`: what a gap among the cards counts for a whole thread. Never
- * more than is known: an inexact reported count is left out rather than rounded into a claim, and
- * the count is then the replies this page holds and no more — which the line says as "at least".
- * By the same rule as `sideCardReplies`, so a gap and the card it stands for never disagree where
- * the count is exact.
- *
- * @returns {{messages: number, exact: boolean}}
- */
-function cardMessageCount(choice, tally) {
-  const entry = tally.threads.get(choice.id);
-  const held = entry ? entry.held : 0;
-  const exactHeld = exactReplyCount(choice.id, choice.root, tally, choice.summary);
-  const reported = typeof choice.count === "number" ? choice.count : null;
-  // The count's own source decides its exactness, as `exactCount` decides it: the summary's flag
-  // where the count is the summary's, and the root record's where it is the record's — a
-  // summary-less thread can still carry a count its record says is not exact.
-  const reportedExact = reported !== null && (choice.summary
-    ? choice.summary.reply_count_exact !== false
-    : !(choice.root && choice.root.thread && choice.root.thread.reply_count_exact === false));
-  const known = Math.max(exactHeld === null ? -1 : exactHeld, reportedExact && reported !== null ? reported : -1);
-  // Exact only where an exact source accounts for every reply held: one gone stale below what
-  // this page holds says the thread has grown since, and how far is not known.
-  return { messages: Math.max(held, known) + 1, exact: known >= held && known >= 0 };
-}
-
-/**
- * One thread as the cards draw it, in parts (`renderSideCards`, `#532 shift-o-latency`): `card`, what its
- * card says; `counts`, what it counts (its age, replies, unread and whether it is read, which a card
- * already drawn takes in place, `countSideCard`); `block`, what its unpacked block draws
- * (`unpackSignature`); `read`, which of the block's messages are still to do (`unpackReadSignature`); and
- * `fold`, which of them the reader folded away one by one (`#480 fold-one-message-key`). Each of the
- * last three is "" for a thread not unpacked.
- *
- * @typedef {{card: string, counts: string, block: string, read: string, fold: string}} CardParts
- */
-
-/**
- * `#532 shift-o-latency`. What the last pass over the cards drew: the whole list's signature, each
- * thread's parts (`CardParts`) with its card's element and its block's rows, and each run of Main's
- * messages (by its messages) with its rows. The next pass under the same whole keeps every element it
- * can: a card or a block whose part is the same stays, and a block whose messages only changed their
- * read state or what was folded away is dressed again and its runs placed again, in place. So a Done or
- * a fold in one thread costs that thread's card, not every thread unpacked.
- *
- * What the cards were last drawn from, so a pass that changes nothing draws nothing, what that pass drew,
- * what the last count found, and whether the cards are being opened: one owner in
- * web/src/view/channel/cardsdrawn.ts (`#624 voice-page-modularity`).
- *
- * @type {import("./src/view/channel/index.ts").CardsDrawn<{parts: CardParts, card: HTMLElement, rows: HTMLElement[]}, HTMLElement[]>}
- */
-const cardsDrawn = createCardsDrawn();
-
-/**
- * One thread's parts as a pass over the cards finds them (`CardParts`).
- *
- * @param {{choice: any, view: any, text: string, summarized: boolean, root: string, age: string, replies: string, unread: string, read: boolean, state: string, size: {messages: number, exact: boolean}}} card
- * @returns {CardParts}
- */
-function sideCardParts({ choice, view, text, summarized, root, age, replies, unread, read, state, size }) {
-  // Everything `sideCard` draws from but its counts: the name the search finds it by, where its root is
-  // cut, and the root's body the card draws. The highlight is painted on a kept card in place.
-  const parts = { card: JSON.stringify([choice.id, view.mode, text, summarized, root, state, threadName(choice, Infinity),
-    view.cut ? [view.cut.head, view.cut.whole] : null, choice.root ? renderedHtmlOf(choice.root) || rawTextOf(choice.root) : ""]),
-    counts: JSON.stringify([age, replies, unread, read, size.messages, size.exact]), block: "", read: "", fold: "" };
-  if (state !== "unpacked") return parts;
-  const held = unpackHeldMessages(channelStore.current(), choice, channelStore.current().channel === String(selectedChannelId()));
-  return { ...parts, block: unpackSignature(choice, held), read: unpackReadSignature(held, channelStore.current().dismissed, unpackFilter),
-    fold: [...foldedOneIds(viewKey("thread", choice.id))].sort().join(",") };
-}
-
-/**
- * Put `wanted` in `list` as its children, in that order, moving only what is out of place: an element
- * left where it was keeps its box, so the browser lays out only what changed (`#532 shift-o-latency`).
- * What is not wanted goes, and an unpacked block's loading line going is no longer watched.
- *
- * @param {HTMLElement} list
- * @param {HTMLElement[]} wanted
- */
-function placeChildren(list, wanted) {
-  const keep = new Set(wanted);
-  for (const child of [...list.children]) {
-    if (keep.has(/** @type {HTMLElement} */ (child))) continue;
-    unpackWatch.unwatch(child);
-    list.removeChild(child);
-  }
-  let at = list.firstElementChild;
-  for (const node of wanted) {
-    if (at === node) {
-      at = at.nextElementSibling;
-      continue;
-    }
-    list.insertBefore(node, at);
-  }
-}
-
-/**
- * Main's message rows kept from the last pass (`renderSideCards`), dressed again from what the page holds
- * now (`dressChannelRow`), as a new row would be: a pin, a flash or a reply since they were drawn.
- *
- * @param {HTMLElement[]} rows
- * @param {ReplyTally} tally
- */
-function redressMainRows(rows, tally) {
-  const viewing = String(selectedChannelId());
-  const pass = { tally, answered: answeredBy(rows, viewing), viewing, inMain: false, inAll: false };
-  for (const row of rows) dressChannelRow(row, pass);
-}
-
-/**
- * One card per thread the channel's store knows, each a fixed three lines of what the thread is about,
- * then how long since it moved, and the button into it saying how many replies it has and how many of
- * them are unread. A press on a card highlights it (`#277 thread-card-focus`); its button goes into the
- * thread — selected on the right in two columns, and from the thread list across the window
- * (`enterCard`). Redrawn only when what it would draw has changed, so a refresh with nothing new draws
- * nothing here either. `#281 view-keys`: the one rendering of the channel's threads, in two columns and
- * in the thread list alike.
- *
- * `#261 two-column-connectors`. NEWEST ACTIVITY AT THE FOOT, as the channel's own lists have their
- * newest message: the owner, "We have the main chat views in forward-chronological mode with newest at
- * bottom. But now it's flipped with newest at top on threads list. I want the newest thread on the
- * bottom and us default scrolled to the bottom of the list." So a thread that moves goes to the foot,
- * a reader there follows it, and a reader up the list keeps the card they were on where it was
- * (`keepingCardPlace`). The way to older threads is at the head, above the oldest card.
- */
-function renderSideCards() {
-  const list = leftEl("side-cards");
-  const tally = replyTally();
-  // `#426 threads-sort-toggle`. In the order chosen over the Threads view's cards, else the default.
-  const order = cardOrderOnScreen();
-  const choices = inThreadOrder(threadChoices(), order);
-  // `#528 thread-card-markdown-and-cap`. A card waiting for its summary reads the Threads list again soon.
-  watchPendingSummaries(choices, leftEl("side-cards").id);
-  const cards = choices.map((choice) => ({
-    choice,
-    view: cardView(choice),
-    text: sideCardText(choice),
-    // `#428 summary-cards-full`. With the text, so a summary arriving with the same words as the
-    // root's still redraws the card unclamped (below, and in the signature).
-    summarized: cardIsSummarized(choice),
-    root: sideCardRootText(choice),
-    age: briefAge(Number.isFinite(choice.at) ? choice.at : choice.started),
-    replies: sideCardReplies(choice, tally),
-    unread: sideCardUnread(choice, tally),
-    size: cardMessageCount(choice, tally),
-  })).map((card) => ({ ...card, read: threadIsRead(card.choice, card.unread) }))
-    // `#440 thread-card-pack-toggle`. Each thread's card, collapsed, whole or unpacked (`cardState`).
-    .map((card) => ({ ...card, state: cardState(card.choice, card.read) }));
-  const unpacked = cards.some((card) => card.state === "unpacked");
-  // `#419 threads-view-main-messages`. And the main channel's messages that are not threads, among them.
-  const main = mainRowsOnScreen() ? mainRowMessages(new Set(cards.map(({ choice }) => choice.id))) : [];
-  // `#532 shift-o-latency`. What the whole list is drawn under, then each thread's card and block, then
-  // Main's messages: a pass that changes one thread draws that thread again and keeps every other one.
-  const whole = JSON.stringify([order, readModes.mode(), readRunsSuspended(), cardPacking.mode(),
-    main.length ? [readModes.mode(), combineSwitch.on(), readAloudOwner().nowPlaying ? readAloudOwner().nowPlaying.id : "", readAloudOwner().pendingRead] : ""]);
-  const parts = cards.map(sideCardParts);
-  const signature = JSON.stringify([whole, parts, main.map((message) => [messageLook(message), readLook(message, channelStore.current().dismissed, unpackFilter)])]);
-  const more = olderThreadsToRead();
-  if (cardsDrawn.changed(signature)) {
-    // Kept only from a pass under the same whole, and never where the cards were asked to be drawn anew
-    // (`cardsDrawn.forget`: something the signatures do not say has changed).
-    const keep = cardsDrawn.redraw(signature, whole);
-    keepingCardPlace(() => {
-      if (!keep) unpackWatch.stop();
-      const kept = cards.map((card) => (keep ? cardsDrawn.kept().threads.get(card.choice.id) : undefined));
-      // A card that says the same is kept, its counts brought up to date where they changed: putting a new
-      // element in the list costs its every row laid out again, a count changed in place does not.
-      const cardRows = cards.map((card, at) => {
-        const was = kept[at];
-        if (!was || was.parts.card !== parts[at].card) return sideCard(card);
-        if (was.parts.counts !== parts[at].counts) countSideCard(was.card, card);
-        else /** @type {any} */ (was.card).cardChoice = card.choice;
-        // Highlighted or put out in place (`toggleLitCard`), and by the view since: as a card drawn now.
-        paintLitCard(was.card, card.choice.id);
-        readAloudOwner().markReadingCard(was.card);
-        return was.card;
-      });
-      // `#407 unpack-row-parity`. Unpacked rows are built in the right column, the column of the cards
-      // the keys and the mouse move them in (`sidePane`), its read state brought into line with the
-      // store's for every message drawn, as each thread's own would be: a key acting on a row asks it.
-      const blocks = unpacked ? inColumn(columns.side, () => {
-        const shown = cards.filter((card) => card.state === "unpacked")
-          .flatMap((card) => unpackHeldMessages(channelStore.current(), card.choice, channelStore.current().channel === String(selectedChannelId())).map((message) => String(message.id)));
-        doneState().archived = caughtUpDone(doneState().archived, shown);
-        return cards.map((card, at) => {
-          const was = kept[at];
-          const now = parts[at];
-          if (card.state !== "unpacked") return [];
-          if (!was || was.parts.block === "" || was.parts.block !== now.block) return unpackBlock(card.choice, tally);
-          // The same block, but for its messages' read state or what was folded away one by one: its rows
-          // dressed again and their runs placed again where they are, in the frame of the act.
-          if (was.parts.read !== now.read || was.parts.fold !== now.fold) {
-            redrawUnpackBlock(card.choice, was.rows, tally);
-            // Placing the runs can remember a run opened as it grew (`readRunPlan`), which the block's
-            // signature says: read again, so the next pass finds it the same.
-            now.block = unpackSignature(card.choice, unpackHeldMessages(channelStore.current(), card.choice, channelStore.current().channel === String(selectedChannelId())));
-          }
-          return was.rows;
-        });
-      }) : [];
-      /** @type {ReturnType<typeof cardsDrawn.kept>["threads"]} */
-      const threads = new Map(cards.map((card, at) =>
-        [card.choice.id, { parts: parts[at], card: cardRows[at], rows: unpacked ? blocks[at] : [] }]));
-      const drawn = cards.map((card, at) => [cardRows[at], ...(unpacked ? blocks[at] : [])]);
-      // `#419 threads-view-main-messages`. Main's messages in the list's order: each run of them between
-      // two cards, by when it was posted against when each card's thread last moved. Only they are drawn
-      // as the right column's rows; the cards are drawn as before. A run drawn the same is kept, dressed
-      // again from what the page holds now.
-      const runs = mainRunsAmong(main, cards.map((card) => THREAD_ORDERS[order].time(card.choice)));
-      /** @type {Map<string, HTMLElement[]>} */
-      const mainKept = new Map();
-      const between = main.length ? inColumn(columns.side, () => {
-        doneState().archived = caughtUpDone(doneState().archived, main.map((message) => String(message.id)));
-        return runs.map((run) => {
-          if (run.length === 0) return [];
-          // By its messages as drawn: a Done or a put back is in how a row is dressed, done again below.
-          const key = JSON.stringify(run.map(messageLook));
-          const was = keep ? cardsDrawn.kept().main.get(key) : undefined;
-          const rows = was || mainRows(run, tally);
-          if (was) redressMainRows(rows, tally);
-          mainKept.set(key, rows);
-          return rows;
-        });
-      }) : runs.map(() => []);
-      const wanted = [...drawn.flatMap((rows, at) => [...between[at], ...rows]), ...between[drawn.length]];
-      if (keep) placeChildren(list, wanted);
-      else list.replaceChildren(...wanted);
-      cardsDrawn.keep({ whole, threads, main: mainKept });
-      // `#432 read-mode-unify`. Under Fold read, the runs of read threads and Main's read messages.
-      foldCardRuns(list);
-      filterSideCards();
-    });
-  } else {
-    filterSideCards();
-  }
-  // `#440 thread-card-pack-toggle`. Unpack's state over the Threads view's cards, where the stylesheet greys
-  // a read card under Unpack unread; nothing over two columns' cards.
-  const mode = cardsCycle() ? cardPacking.mode() : "";
-  if ((list.getAttribute("data-unpack") || "") !== mode) list.setAttribute("data-unpack", mode);
-  // Above the cards, so the reader's place is kept as it comes or goes.
-  const button = /** @type {HTMLButtonElement} */ (leftEl("side-more-threads"));
-  if (button.hidden === more) {
-    keepingCardPlace(() => {
-      button.hidden = !more;
-    });
-  }
-  // `#281 view-keys`. It reads where it stands now, and says so while it does.
-  const loading = threadList.threadPagesLoading();
-  setTextIfChanged(button, loading ? "Loading older threads…" : "Older threads…");
-  if (button.disabled !== loading) button.disabled = loading;
-  // `#491 threads-view-sent-receipt`. A sent reply these cards now draw takes its receipt away: the
-  // outbox was drawn before them on a pass over the rows, and an unpack read draws them on its own.
-  // `#500 sent-receipts-pile-up`: and a reply's row drawn under the row it answers here is placed
-  // again under that row as now drawn.
-  if (sideCardsShown() && [...outbox.values()].some((entry) => entry.state === "sent" || entry.inPlace)) {
-    eachColumn(renderOutgoingMessages);
-  }
-  // `#410 inline-reply-editor`. A reply open under a row unpacked here, under it as the rows now stand;
-  // one waiting for its message, opened again once the message is drawn here.
-  if (replyState.docked) placeInlineReply();
-  else if (replyState.pending) reopenPendingReply();
-}
+// The right column's cards are web/src/view/channel's now (`createSideCards`, `#624
+// voice-page-modularity`).
 
 // --- the card the reader was held by, moved -----------------------------------------------------------
 //

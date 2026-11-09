@@ -2077,3 +2077,59 @@ test("`#624 voice-page-modularity`: the layout button says back to the thread li
   assert.equal(owner.columnsOffered(), true);
   assert.equal(owner.COLUMNS_TOO_NARROW, "Two columns need a wider window; they come back when it is wider.");
 });
+
+test("`#624 voice-page-modularity`: a card says its thread's replies and unread by the tally it is handed, and a fresh pass draws nothing twice", () => {
+  const { createSideCards } = CHANNEL_VIEW;
+  const owner = createSideCards({
+    leftEl: () => ({ children: [], getAttribute: () => null, setAttribute: () => {} }),
+    cardView: (choice) => ({ text: `words of ${choice.id}`, mode: "card", cut: null }),
+    messageText: (m) => m.content,
+    stillToDo: () => false,
+    channelCanon: () => ({ channel: "C1", dismissed: new Set() }),
+    sideColumn: () => ({}),
+    inColumn: (_c, act) => act(),
+    unseenReplies: () => 0,
+    repliesPartlyHeld: () => false,
+    exactReplyCount: () => 2,
+    pendingInto: () => 0,
+    threadCount: (count, exact) => exact === false ? `about ${count} replies` : `${count} replies`,
+    unpackHeldMessages: () => [],
+    unpackSignature: () => "", unpackReadSignature: () => "", unpackFilter: () => null,
+    foldedOneIds: () => [],
+    viewKey: () => "thread:t1",
+    threadChoices: () => [],
+    inThreadOrder: (choices) => [...choices],
+    cardOrderOnScreen: () => "latest",
+    watchPendingSummaries: () => {},
+    cardIsSummarized: () => false,
+    briefAge: () => "1h",
+    threadName: (choice) => `name ${choice.id}`,
+    unpackWatch: () => ({ unwatch: () => {}, stop: () => {} }),
+    dressChannelRow: () => {}, answeredBy: () => null,
+    replyTally: () => ({ threads: new Map() }),
+    readMode: () => "show", readRunsSuspended: () => false,
+    cardPackingMode: () => "", combineOn: () => false,
+    nowPlaying: () => null, pendingRead: () => null, markReadingCard: () => {},
+    mainRowsOnScreen: () => false, mainRowMessages: () => [],
+    messageLook: () => "", readLook: () => "",
+    olderThreadsToRead: () => false, keepingCardPlace: (act) => act(),
+    sideCard: () => ({}), countSideCard: () => {}, paintLitCard: () => {},
+    unpackBlock: () => [], redrawUnpackBlock: () => {},
+    doneArchived: () => new Set(), setDoneArchived: () => {}, caughtUpDone: (held) => held,
+    mainRunsAmong: () => [], mainRows: () => [],
+    foldCardRuns: () => {}, filterSideCards: () => {},
+    cardsCycle: () => false, sideCardsShown: () => false,
+    outboxValues: () => [], eachColumn: () => {}, renderOutgoingMessages: () => {},
+    replyState: () => ({ docked: false, pending: null }),
+    placeInlineReply: () => {}, reopenPendingReply: () => {},
+    setTextIfChanged: () => {}, threadPagesLoading: () => false,
+    selectedChannelId: () => "C1", cardState: () => "whole",
+  });
+  const tally = { threads: new Map([["t1", { unread: 3, held: 2 }]]) };
+  const choice = { id: "t1", count: 5, root: { id: "r1", content: "first line\nsecond line" } };
+  assert.equal(owner.sideCardUnread(choice, tally), "3 unread");
+  assert.equal(owner.sideCardReplies(choice, tally), "5 replies", "the card did not say the count it was handed");
+  assert.deepStrictEqual(owner.cardMessageCount(choice, tally), { messages: 6, exact: true });
+  assert.equal(owner.cardLines({ content: "a  b\n\nc" }), "a b\nc", "a card's lines were not folded as its root's are");
+  assert.equal(owner.threadIsRead(choice, ""), true);
+});
