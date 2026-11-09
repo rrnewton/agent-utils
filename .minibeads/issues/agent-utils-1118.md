@@ -1,10 +1,11 @@
 ---
 title: 'browser-fixed-frame-settle: browser checks assert after a fixed two-frame wait that loses to paint timing under load'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 created_at: 2026-11-09T09:34:09.000000000+00:00
-updated_at: 2026-11-09T09:34:09.000000000+00:00
+updated_at: 2026-11-09T23:31:50.000000000+00:00
+closed_at: 2026-11-09T23:31:50.000000000+00:00
 ---
 
 # Description
@@ -565,3 +566,11 @@ has no fixed-frame wait of its own.
 
 Solo on 2026-11-09 (Chromium 149.0.7827.55): scroll_stability and the
 column-overscroll step that shares it pass whole.
+
+Closed 2026-11-09 (mu-settle): the sweep is complete and every batch
+landed. One observation outlives it, not fixed here because it is a page
+performance matter, not a wait: on 84adb684 `fold_latency`'s Shift+O
+median main-thread work measured 31 ms solo against its 28 ms budget
+(load x1.07) before passing in its exclusive gate rerun — the same step
+failed on shape under load in batches 2, 8 and 10b's gates and passed
+every exclusive rerun.
