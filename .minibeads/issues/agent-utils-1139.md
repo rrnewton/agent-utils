@@ -1,10 +1,11 @@
 ---
 title: 'revive-reused-pane-env: revive into a reused pane silently drops the profile environment values'
-status: open
+status: closed
 priority: 1
 issue_type: bug
-created_at: 2026-11-09T13:53:37.000000000+00:00
-updated_at: 2026-11-09T13:53:37.000000000+00:00
+created_at: 2026-11-09T13:53:37+00:00
+updated_at: 2026-11-09T14:45:51.991004551+00:00
+closed_at: 2026-11-09T14:45:51.991004411+00:00
 ---
 
 # Description
@@ -58,3 +59,20 @@ Remediation for lanes already running downgraded: restart does not help
 new tab with --env. One observed lane had also lost its recorded
 environment_names entirely, which needs --refresh-profile or a fresh start
 regardless of this fix.
+
+## Resolution
+
+[watermelon-full-preview] Delivered with this closing commit. Pane reuse
+in preflight_revive now requires an empty recorded environment: an
+env-carrying revive takes a fresh tab, which receives --env through the
+existing delivery path, instead of relaunching in the reused shell that
+would silently drop the values. Confirmed for the report: plain revive
+already re-supplied the values from the profile (and --refresh-profile
+would not have changed the outcome) - the loss was delivery-side only.
+New regression test
+revive_with_profile_environment_never_reuses_the_pane_and_delivers_the_values
+asserts the fresh pane and the delivered KEY=VALUE; the no-environment
+reuse test still reuses in place. Rust-only: the Python edition has no
+pane-reuse path. Unverified limit: restart into the same live shell is
+unchanged (that shell was launched with the environment); a lane already
+downgraded still needs the close-tab-then-revive remediation above.

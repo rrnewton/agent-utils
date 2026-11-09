@@ -2306,9 +2306,15 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         // already closed and replaced by revive cleanup. A pane that still reports
         // a session is excluded from the census and relaunched elsewhere instead:
         // a candidate on that pane could not be told apart from the stale report.
+        // A launch carrying profile environment never reuses (#1139): the reused
+        // shell inherits its own environment and the tab's --env died with the
+        // original shell, so reuse would silently drop the values; a fresh tab
+        // receives them. Typing exports into the shell would put them in
+        // scrollback instead.
         let reuse_pane = (proof.kind == "idle_shell"
             && proof.reported_agent.is_none()
             && proof.reported_session_value.is_none()
+            && record.environment_names.is_empty()
             && matches!(record.adapter.as_str(), "herdr-pane" | "herdr-relay"))
         .then(|| proof.pane_id.clone());
         let plan = self.revive_launch_plan(record, timeout, reuse_pane)?;

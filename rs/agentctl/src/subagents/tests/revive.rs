@@ -1170,6 +1170,64 @@ fn revive_reuses_a_proved_idle_shell_pane_and_records_the_reanchor() {
 }
 
 #[test]
+fn revive_with_profile_environment_never_reuses_the_pane_and_delivers_the_values() {
+    // #1139: the reused shell inherits its own environment, so an
+    // env-carrying launch relaunched there silently loses the profile
+    // values. It must take a fresh tab that receives --env instead.
+    let fixture = Fixture::new();
+    fixture
+        .client
+        .fresh_presentations
+        .store(true, Ordering::Relaxed);
+    fixture.client.report_session.store(true, Ordering::Relaxed);
+    let output = std::process::Command::new("/usr/bin/git")
+        .args(["init", "--quiet"])
+        .current_dir(&fixture.root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    fs::write(fixture.root.join(".gitignore"), ".agentctl/\n").unwrap();
+    let directory = fixture.root.join(".agentctl");
+    agent::create_private_directory(&directory, "test profile config", false, false).unwrap();
+    agent::atomic_json(
+        &directory.join("profiles.json"),
+        &json!({"schema":"agentctl-profiles/v1","profiles":{
+            "muse-env": {"harness":"muse","mode":"interactive", "env":{"RECOVERY_MODE":"on"}}
+        }}),
+    )
+    .unwrap();
+    fixture
+        .manager()
+        .start(
+            "worker",
+            &fixture.root,
+            StartOptions {
+                harness: "muse".to_owned(),
+                profile: Some("muse-env".to_owned()),
+                environment: vec!["RECOVERY_MODE=on".to_owned()],
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let old = fixture.manager().load("worker").unwrap();
+    assert_eq!(old.environment_names, ["RECOVERY_MODE"]);
+    kill_owned(&fixture, &old);
+    let result = fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .unwrap();
+    assert_eq!(result["revived"], true, "{result}");
+    let resumed = fixture.manager().load("worker").unwrap();
+    assert_ne!(
+        resumed.pane_id, old.pane_id,
+        "an env-carrying revive must not reuse the old pane"
+    );
+    let environments = fixture.client.environments.lock().unwrap();
+    assert_eq!(environments.len(), 2);
+    assert_eq!(environments[1], ["RECOVERY_MODE=on"]);
+}
+
+#[test]
 fn revive_reuse_recovers_after_an_interruption_without_a_new_tab() {
     let (fixture, old) = recoverable("muse", true);
     super::super::revive::fail_once("launched");
