@@ -294,6 +294,10 @@ class Walk:
             self.check(bool(self.page.evaluate(condition, arg)), why)
 
     def settled(self) -> None:
+        # Two frames and 150 ms (`#1118 browser-fixed-frame-settle`): in this walk only a
+        # paint-and-restyle window after a `wait_for` has pinned the cards, before card
+        # geometry and computed styles are read, and between the clicks of a cycling chip.
+        # Never the only wait before reading what a click draws: `wait_for` that first.
         self.page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
         self.page.wait_for_timeout(150)
 
@@ -390,6 +394,9 @@ def card_fit_walk(walk: Walk) -> None:
                    f"unread card {ident} recedes: {card}")
     # Back at full strength under the reader's focus, as a read row is.
     page.locator(f"#side-cards > li[data-id='{READ_ONE}'] .side-card").focus()
+    walk.wait_for(f"() => {{ const s = getComputedStyle(document.querySelector('#side-cards > li[data-id=\"{READ_ONE}\"]')); "
+                  "return s.opacity === '1' && s.filter === 'none'; }",
+                  "the focused read card stays dimmed")
     walk.settled()
     focused = walk.card(READ_ONE)
     walk.check(focused["opacity"] == "1" and focused["filter"] == "none",
@@ -421,6 +428,8 @@ def card_fit_walk(walk: Walk) -> None:
 
     # Unpack all: the long card whole, at its words' own height (the negative control's other half).
     page.click("#side-unpack")
+    walk.wait_for(f"() => !!document.querySelector('#side-cards li[data-unpack-thread=\"{READ_ONE}\"]')",
+                  "Unpack all did not unpack the read thread")
     walk.settled()
     whole = walk.card(LONG_THREAD)
     # Whole, up to K: the long message is one paragraph longer than a card shows, so unpacked its card
@@ -448,18 +457,26 @@ def card_fit_walk(walk: Walk) -> None:
         page.click("#todo-filter")
         walk.settled()
     walk.check(mode() == "fold", f"the read mode is {mode()}, not fold")
+    walk.wait_for(f"() => document.querySelector('#side-cards > li[data-id=\"{READ_ONE}\"]')?.getAttribute('data-read-run') === 'head'",
+                  "Fold read drew no run line over the read cards")
     head, member = walk.card(READ_ONE), walk.card(READ_TWO)
     walk.check(head["run"] == "head" and head["opacity"] == "1",
                f"the folded run's line recedes or is drawn on the wrong card: {head}")
     walk.check(member["hidden"], f"the run's second read card still shows under Fold read: {member}")
     walk.shot("5-fold-read")
     page.click("#todo-filter")
+    walk.wait_for(f"() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'hide' "
+                  f"&& !document.querySelector('#side-cards > li[data-id=\"{READ_ONE}\"]')?.getClientRects().length",
+                  "Hide read did not leave the read cards out")
     walk.settled()
     walk.check(mode() == "hide", f"the read mode is {mode()}, not hide")
     walk.check(walk.card(READ_ONE)["hidden"] and walk.card(READ_TWO)["hidden"],
                "a read card still shows under Hide read")
     walk.check(not walk.card(LONG_THREAD)["hidden"], "an unread card went with the read ones")
     page.click("#todo-filter")
+    walk.wait_for(f"() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'show' "
+                  f"&& Boolean(document.querySelector('#side-cards > li[data-id=\"{READ_ONE}\"]')?.getClientRects().length)",
+                  "Show read did not bring the read cards back")
     walk.settled()
     walk.check(mode() == "show" and not walk.card(READ_ONE)["hidden"],
                "Show read did not bring the read cards back")

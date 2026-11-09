@@ -244,3 +244,47 @@ following `until` pins; and pre-press settles where nothing is asserted in
 between.
 
 Solo on 2026-11-09 (Chromium 149.0.7827.55): all five files pass whole.
+
+## Batch 5, 2026-11-09 (mu-settle)
+
+[muse watermelon] `thread_card_focus_browser.py`,
+`thread_card_header_browser.py`, `thread_card_fit_browser.py`,
+`thread_card_max_lines_browser.py` and `thread_card_markdown_browser.py`
+(70 `settled()` sites reviewed). Four use batch 1's `Desk`; fit has its own
+`Walk.settled` (two frames and 150 ms), now documented as a
+paint-and-restyle window to use only after a `wait_for`. Like batch 3, most
+sites already follow an exact wait (a card state, a highlighted attribute,
+row counts) and the settle paints before card geometry, computed colours and
+screenshot pixels; those stay, including the double settles before pixel
+sampling and `whole_links`' scroll scan (the links redraw in the page's own
+frame, and the scan's wanted count varies by caller).
+
+Converted, today's checks kept after each:
+
+- focus: a highlighted or tapped-whole card now also waits until its text
+  measures unclamped past three lines (the `STATE_JS` lines expression), and
+  a tapped card on the phone until it says what its thread is about — an
+  attribute flip alone did not say the whole text had been drawn.
+- header: Main at its foot waits for the line clipped `up` and selected;
+  the focus-lost redraw case waits for the focus to be the body's and for the
+  selected row to have actually been redrawn; three settles that gated
+  nothing (before `watch`/`open_card`, which carry their own waits, and a
+  duplicate in the thread list) are gone.
+- fit: a focused read card waits for its computed opacity and filter to come
+  back; Unpack all waits for the read thread's rows; Fold read waits for its
+  run line, Hide and Show read for the read cards to go and come back.
+- max-lines: the packed premise waits for the card collapsed and split
+  (`sign_in` and `to_threads` pinned neither); at K = 2 it waits for the
+  continuation the next check reads, and a link landing waits for the
+  continuation under the landed card.
+- markdown: no call-site conversion — its settles follow exact waits (the
+  summary's arrival, the build chip) or land a scroll before a moved-by
+  baseline; its frame-count and load-timing windows are the measurements.
+
+Kept: the flight and glide timings in header (the 1.5 s hover glide, the
+2.5 s mouse-crossing stillness samples, the per-frame flight recorder) and
+markdown's frame/load windows — durations that are the subject; highlight
+absence and other no-change checks; mid-cycle Unpack and read-mode clicks;
+scroll baselines before moved-by-a-pixel reads.
+
+Solo on 2026-11-09 (Chromium 149.0.7827.55): all five files pass whole.

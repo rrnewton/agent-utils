@@ -440,6 +440,10 @@ def desk_walk(desk: Desk) -> None:
     page.mouse.click(*card_point(desk, "side-cards", REPLICA, ".side-card-text"))
     desk.wait_for(f"() => document.querySelector(\"#side-cards > li[data-id='{REPLICA}']\").getAttribute('data-highlighted') === 'true'",
                   "a click on the card did not highlight it")
+    desk.wait_for(f"() => {{ const t = document.querySelector(\"#side-cards > li[data-id='{REPLICA}'] .side-card-text\"); "
+                  "return t && !(t.scrollHeight > t.clientHeight + 2) "
+                  "&& Math.round(t.clientHeight / parseFloat(getComputedStyle(t).lineHeight)) > 3; }",
+                  "the highlighted card does not show its whole text")
     desk.settled()
     desk.settled()
     desk.check(page.is_visible("#side-list") and not page.is_visible("#side-pane"), "a click on the card entered its thread")
@@ -536,6 +540,8 @@ def phone_walk(desk: Desk) -> None:
     page.touchscreen.tap(*card_point(desk, "thread-list", CANARY, ".thread-open strong"))
     desk.wait_for(f"() => document.querySelector(\"#thread-list > li[data-context-id='{CANARY}']\").getAttribute('data-highlighted') === 'true'",
                   "a tap on the card did not highlight it")
+    desk.wait_for(f"() => document.querySelector(\"#thread-list > li[data-context-id='{CANARY}'] .thread-card-text\")?.textContent.startsWith('Message 215. Thread starts here.')",
+                  "the highlighted card does not say what its thread is about")
     desk.settled()
     desk.settled()
     desk.check(page.is_visible("#thread-list") and not page.is_visible("#thread-heading"), "a tap on the card entered its thread")
@@ -615,6 +621,10 @@ def phone_list_walk(desk: Desk) -> None:
     page.touchscreen.tap(*card_point(desk, "side-cards", REPLICA, ".side-card-text"))
     desk.wait_for(f"() => document.querySelector(\"#side-cards > li[data-id='{REPLICA}']\").getAttribute('data-card-state') === 'expanded'",
                   "a tap on a card of the thread list did not show it whole")
+    desk.wait_for(f"() => {{ const t = document.querySelector(\"#side-cards > li[data-id='{REPLICA}'] .side-card-text\"); "
+                  "return t && !(t.scrollHeight > t.clientHeight + 2) "
+                  "&& Math.round(t.clientHeight / parseFloat(getComputedStyle(t).lineHeight)) > 3; }",
+                  "the card tapped is not shown whole")
     desk.settled()
     desk.settled()
     desk.check(page.evaluate("() => document.getElementById('screen-main').getAttribute('data-columns')") == "list"

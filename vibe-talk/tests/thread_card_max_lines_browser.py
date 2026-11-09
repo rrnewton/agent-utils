@@ -179,6 +179,9 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             to_threads(desk)
 
             # Packed: the collapsed clamp, as before, over words that already stop at K lines.
+            desk.wait_for(f"() => {{ const c = document.querySelector(\"#side-cards > li[data-card][data-id='{REPLICA}']\"); "
+                          "return c && c.getAttribute('data-card-state') === 'collapsed' && c.hasAttribute('data-split-card'); }",
+                          "the premise: the replica's card did not come up packed and split")
             packed = card(desk)
             desk.check(packed["state"] == "collapsed" and bool(packed["split"]),
                        f"the premise: the replica's card packed and split, found {packed['state']}, split {packed['split']}")
@@ -250,6 +253,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                           ".hasAttribute('data-split-card')", "the card did not split again without its summary")
             page.evaluate("() => { const input = document.getElementById('card-max-lines'); input.value = '2';"
                           " input.dispatchEvent(new Event('input', {bubbles: true})); }")
+            desk.wait_for(f"() => document.querySelector(\"#side-cards > li[data-unpack-thread='{REPLICA}'][data-root-continuation]\") !== null",
+                          "at K = 2 the continuation is gone")
             desk.settled()
             two = card(desk)
             desk.check(number(two, "lines") <= 2, f"at K = 2 the unpacked card shows {two['lines']} lines")
@@ -285,6 +290,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             page.goto(f"http://127.0.0.1:{server.server_port}{link}", wait_until="load")
             desk.wait_for("() => /linked message's card/.test(document.getElementById('status').textContent)",
                           "the link did not land on a card", seconds=20)
+            desk.wait_for(f"() => document.querySelector(\"#side-cards > li[data-unpack-thread='{REPLICA}'][data-root-continuation]\") !== null",
+                          "the continuation is not under the landed card", seconds=20)
             desk.settled()
             landed = card(desk)
             gap = number(landed, "card", "top") - number(landed, "scroller", "top")

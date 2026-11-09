@@ -569,6 +569,9 @@ def desk_walk(desk: Desk) -> None:
 
     # Main at its foot, the root above it: the line clipped at Main's top, pointing up.
     page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
+    desk.wait_for("() => { const p = document.querySelector('#column-links path.column-link'); "
+                  "return p && p.getAttribute('data-link') === 'up' && p.hasAttribute('data-selected'); }",
+                  "with the root above Main the line is not clipped pointing up")
     desk.settled()
     desk.settled()
     above = measure(desk)
@@ -743,7 +746,6 @@ def list_walk(desk: Desk) -> None:
                   "Ctrl+3 did not show the thread list")
     page.mouse.move(5, desk.height - 5)
     desk.settled()
-    desk.settled()
     card, said = list_card(desk, RUNNER)
     desk.shot("6-thread-list")
 
@@ -808,7 +810,8 @@ def redraw_walk(desk: Desk, api: ColumnsApi) -> None:
         if lose:
             # A press on the card folds it to a bar (`#388 thread-header-collapse`) and takes no focus.
             page.click("#side-thread-card-age")
-            desk.settled()
+            desk.wait_for("() => !document.activeElement || document.activeElement === document.body",
+                          f"{where}: a click on the card's age did not lose the focus to the body")
             desk.check(page.evaluate(FOCUS_JS) == "body",
                        f"{where}: a click on the card's age left the focus on {page.evaluate(FOCUS_JS)}, not the body")
         before = str(page.evaluate(FOCUS_JS))
@@ -816,7 +819,8 @@ def redraw_walk(desk: Desk, api: ColumnsApi) -> None:
         with api.lock:
             api.messages.append(said(24 + index, f"Message {224 + index}, new in the channel. {FILLER}", "human"))
         page.clock.fast_forward(POLL_PAST_MS)
-        desk.wait_for(f"() => Boolean(document.querySelector(\"#discord-log > li[data-id='{224 + index}']\"))",
+        desk.wait_for(f"() => Boolean(document.querySelector(\"#discord-log > li[data-id='{224 + index}']\"))"
+                      f" && document.querySelector(\"{row}\")?.dataset.beforeRedraw !== 'yes'",
                       f"{where}: the channel's re-read did not draw the new message in Main")
         desk.settled()
         desk.check(bool(page.evaluate(f'() => document.querySelector("{row}").dataset.beforeRedraw !== "yes"')),
@@ -837,7 +841,6 @@ def reduced_walk(desk: Desk) -> None:
     page = desk.page
     open_two_columns(desk)
     page.mouse.move(5, desk.height - 5)
-    desk.settled()
     watch(desk, "side-thread-card", "side-scroll", "side-log", "side-pane")
     found = open_card(desk, RUNNER)
     check_still(desk, watched(desk), number(part(found, "box"), "top"), "two columns")
@@ -848,7 +851,6 @@ def reduced_walk(desk: Desk) -> None:
     desk.wait_for("() => document.getElementById('screen-main').getAttribute('data-columns') === 'list'"
                   " && document.querySelectorAll('#side-cards > li[data-card]').length === 3",
                   "Ctrl+3 did not show the thread list")
-    desk.settled()
     watch(desk, "thread-card", "scroll-area", "discord-log", "pane-discord")
     into_list_thread(desk, RUNNER)
     at_rest(desk, "thread-card", "pane-discord")
