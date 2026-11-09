@@ -394,12 +394,12 @@ def main() -> int:
 
             with sync_playwright() as pw:
                 browser = pw.chromium.launch(args=CHROMIUM_AUDIO_ARGS)
-                for viewport, touch, (doc_name, doc_blocks) in (
-                    ({"width": 393, "height": 852}, True, DOCS[0]),
-                    ({"width": 1280, "height": 800}, False, DOCS[1]),
+                for width, height, touch, (doc_name, doc_blocks) in (
+                    (393, 852, True, DOCS[0]),
+                    (1280, 800, False, DOCS[1]),
                 ):
                     ctx = browser.new_context(
-                        viewport=viewport, has_touch=touch, is_mobile=touch)
+                        viewport={"width": width, "height": height}, has_touch=touch, is_mobile=touch)
                     page = ctx.new_page()
                     page.add_init_script(
                         f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
