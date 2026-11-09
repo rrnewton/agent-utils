@@ -42,13 +42,16 @@ def _norm(text: str, root: Path) -> str:
     return HEX40.sub("HEAD", text)
 
 
-def _interrupted(root: Path) -> None:
+def _interrupted(
+    root: Path,
+    *,
+    hooks: str = "  - 'echo hook-broken >&2; exit 3'\n",
+    slot_type: str = "agent",
+) -> None:
     config = root / ".wrkslots.yml"
-    config.write_text(
-        config.read_text() + "post_provision_hooks:\n  - 'echo hook-broken >&2; exit 3'\n"
-    )
+    config.write_text(config.read_text() + "post_provision_hooks:\n" + hooks)
     args = argparse.Namespace(
-        project_root=str(root), machine="node-a", slot="slot-b", slot_type="agent",
+        project_root=str(root), machine="node-a", slot="slot-b", slot_type=slot_type,
         coordinator_authorized=True, agent="agent-new", task="task-1",
         purpose="testing", owner_pid=os.getpid(), coordinator_pid=os.getpid(),
         task_scope_unit=None, task_scope_invocation_id=None,
@@ -111,6 +114,31 @@ def test_classify_journals_json_matches_python(tmp_path: Path) -> None:
     def scrub(text: str) -> str:
         return re.sub(r'"journal_identity": \{[^}]*\}', '"journal_identity": {}', text)
     assert scrub(_norm(result.stdout, rust_root)) == scrub(_norm(out, oracle_root))
+
+
+def test_classify_typed_hook_journal_matches_python(tmp_path: Path) -> None:
+    """#1122: classification filters hooks by the journal's own slot type.
+
+    The interrupted validate journal records only its effective hooks; a
+    reader comparing it with every configured hook would misreport it as
+    differing from configuration.
+    """
+
+    rust_root = _fixture(tmp_path / "rust")
+    oracle_root = _fixture(tmp_path / "oracle")
+    hooks = (
+        "  - 'true'\n"
+        "  - {command: 'echo hook-broken >&2; exit 3', slot_types: [validate]}\n"
+        "  - {command: 'true', slot_types: [agent]}\n"
+    )
+    _interrupted(rust_root, hooks=hooks, slot_type="validate")
+    _interrupted(oracle_root, hooks=hooks, slot_type="validate")
+    rc, out = _python_classify(oracle_root, fmt="human")
+    assert rc == 0
+    assert "differ from configuration" not in out
+    result = _rust_classify(rust_root, fmt="human")
+    assert result.returncode == 0, result.stderr
+    assert _norm(result.stdout, rust_root) == _norm(out, oracle_root)
 
 
 def _write_import_journal(root: Path, owner: dict[str, object]) -> Path:

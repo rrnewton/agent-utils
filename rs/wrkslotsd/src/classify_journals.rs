@@ -1117,16 +1117,7 @@ fn classify_one(
             );
         }
     }
-    let hooks: Vec<String> = config
-        .get("post_provision_hooks")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
+    let hooks: Vec<String> = crate::config_validate::post_provision_hooks_for(config, &slot_type);
     let journal_hooks: Vec<String> = raw
         .get("post_provision_hooks")
         .and_then(Value::as_array)

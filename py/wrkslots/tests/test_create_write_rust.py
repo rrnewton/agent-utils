@@ -220,6 +220,7 @@ def _rust_create(
     fixture: bool = True,
     authorized: bool = True,
     representation: str = "config",
+    slot_type: str = "agent",
 ) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     if fixture:
@@ -227,7 +228,7 @@ def _rust_create(
     else:
         env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
     args = [
-        str(rust_wrkslotsd()), "create", slot, "--slot-type", "agent",
+        str(rust_wrkslotsd()), "create", slot, "--slot-type", slot_type,
         "--agent", agent, "--task", "task-1", "--purpose", "testing",
         "--owner-pid", str(os.getpid()), "--coordinator-pid", str(os.getpid()),
         "--repo", "repo=../upstream-repo", "--branch", f"repo={branch}",
@@ -242,10 +243,15 @@ def _rust_create(
 
 
 def _python_create(
-    root: Path, *, slot: str = "slot-b", branch: str = "suite/new", agent: str = "agent-new"
+    root: Path,
+    *,
+    slot: str = "slot-b",
+    branch: str = "suite/new",
+    agent: str = "agent-new",
+    slot_type: str = "agent",
 ) -> int:
     args = argparse.Namespace(
-        project_root=str(root), machine="node-a", slot=slot, slot_type="agent",
+        project_root=str(root), machine="node-a", slot=slot, slot_type=slot_type,
         coordinator_authorized=True, agent=agent, task="task-1",
         purpose="testing", owner_pid=os.getpid(), coordinator_pid=os.getpid(),
         task_scope_unit=None, task_scope_invocation_id=None,
@@ -491,12 +497,8 @@ def test_create_hooks_see_the_slot_type_in_both_editions(tmp_path: Path) -> None
         assert (root / "worktrees" / "slot-b" / "repo" / "slot-type").read_text() == "agent"
 
 
-def test_rust_refuses_a_hook_slot_types_entry_until_it_is_ported(tmp_path: Path) -> None:
-    """#1122's recorded parity gap: the Rust edition does not run {command, slot_types} yet.
-
-    It refuses such a configuration outright, never running the hook in the
-    wrong slot type or skipping it silently; the Python edition creates the slot.
-    """
+def test_create_hook_slot_types_entry_matches_python(tmp_path: Path) -> None:
+    """#1122 parity: both editions run an agent-scoped mapping hook for an agent slot."""
 
     roots = {edition: _empty_fixture(tmp_path / edition) for edition in ("rust", "python")}
     for root in roots.values():
@@ -507,8 +509,45 @@ def test_rust_refuses_a_hook_slot_types_entry_until_it_is_ported(tmp_path: Path)
             + "  - {command: 'printf ran > agent-hook', slot_types: [agent]}\n"
         )
     assert _python_create(roots["python"]) == 0
-    assert (roots["python"] / "worktrees" / "slot-b" / "repo" / "agent-hook").read_text() == "ran"
     result = _rust_create(roots["rust"])
-    assert result.returncode != 0
-    assert "post_provision_hooks" in result.stderr
-    assert not (roots["rust"] / "worktrees" / "slot-b").exists()
+    assert result.returncode == 0, result.stderr
+    for root in roots.values():
+        assert (root / "worktrees" / "slot-b" / "repo" / "agent-hook").read_text() == "ran"
+    assert _active_doc(roots["rust"]) == _active_doc(roots["python"])
+    assert _kinds(roots["rust"]) == _kinds(roots["python"])
+
+
+def test_create_hook_slot_types_select_by_type_in_both_editions(tmp_path: Path) -> None:
+    """#1122 parity: scoped hooks run in only their slot types in both editions."""
+
+    roots = {edition: _empty_fixture(tmp_path / edition) for edition in ("rust", "python")}
+    hook_lines = (
+        "post_provision_hooks:\n"
+        "  - 'printf x >> everywhere-hooks'\n"
+        "  - {command: 'printf ran > agent-only', slot_types: [agent]}\n"
+        "  - {command: 'printf ran > validate-only', slot_types: [validate]}\n"
+    )
+    for root in roots.values():
+        config = root / ".wrkslots.yml"
+        config.write_text(config.read_text() + hook_lines)
+    for edition, root in roots.items():
+        for slot, branch, agent, slot_type in (
+            ("slot-b", "suite/new", "agent-new", "agent"),
+            ("slot-c", "suite/new-validate", "agent-validate", "validate"),
+        ):
+            if edition == "python":
+                assert _python_create(root, slot=slot, branch=branch, agent=agent, slot_type=slot_type) == 0
+            else:
+                result = _rust_create(root, slot=slot, branch=branch, agent=agent, slot_type=slot_type)
+                assert result.returncode == 0, result.stderr
+    assert _active_doc(roots["rust"]) == _active_doc(roots["python"])
+    assert _kinds(roots["rust"]) == _kinds(roots["python"])
+    for root in roots.values():
+        agent_checkout = root / "worktrees" / "slot-b" / "repo"
+        validate_checkout = root / "worktrees" / "validate" / "slot-c" / "repo"
+        assert (agent_checkout / "agent-only").read_text() == "ran"
+        assert not (agent_checkout / "validate-only").exists()
+        assert (agent_checkout / "everywhere-hooks").read_text() == "x"
+        assert (validate_checkout / "validate-only").read_text() == "ran"
+        assert not (validate_checkout / "agent-only").exists()
+        assert (validate_checkout / "everywhere-hooks").read_text() == "x"

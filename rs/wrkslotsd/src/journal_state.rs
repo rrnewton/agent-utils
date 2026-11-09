@@ -3118,16 +3118,8 @@ fn completed_create_expected(config: &Value, raw: &Map<String, Value>) -> Result
         validate_hook(hook)?;
         hooks.push(hook.to_owned());
     }
-    let config_hooks: Vec<String> = config
-        .get("post_provision_hooks")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
+    let config_hooks: Vec<String> =
+        crate::config_validate::post_provision_hooks_for(config, slot_type);
     if hooks != config_hooks {
         return Err("create journal post-provision hooks differ from configuration".to_owned());
     }

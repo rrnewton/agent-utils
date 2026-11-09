@@ -246,6 +246,46 @@ def test_config_convert_json_to_yaml_matches_python(tmp_path: Path) -> None:
     ).read_bytes()
 
 
+def test_config_convert_hook_slot_types_matches_python(tmp_path: Path) -> None:
+    """#1122: conversion renders the raw document in both directions."""
+
+    rust_root, oracle_root = _pair(tmp_path)
+    payload = {
+        "schema": 2,
+        "machine": "node-a",
+        "worktrees_dir": "worktrees",
+        "default_remote": "origin",
+        "default_landed_ref": "refs/remotes/origin/main",
+        "heartbeat_ttl_seconds": 60,
+        "liveness_command": "live.py",
+        "post_provision_hooks": [
+            "true",
+            {"command": "true", "slot_types": ["validate", "agent"]},
+            {"command": "true"},
+        ],
+    }
+    for root in (rust_root, oracle_root):
+        (root / ".wrkslots.yml").write_text(json.dumps(payload, indent=2) + "\n")
+    code, expected = _run(
+        wrkslots_cli._cmd_config_convert,
+        argparse.Namespace(
+            project_root=str(oracle_root), machine="node-a", target="yaml", wait_lock=0.0
+        ),
+    )
+    assert code == 0
+    result = _rust(rust_root, "config", "convert", "--to", "yaml")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.replace(str(rust_root), "ROOT") == expected.replace(
+        str(oracle_root), "ROOT"
+    )
+    assert (rust_root / ".wrkslots.yml").read_bytes() == (
+        oracle_root / ".wrkslots.yml"
+    ).read_bytes()
+    assert (rust_root / ".wrkslots.yml.bak").read_bytes() == (
+        oracle_root / ".wrkslots.yml.bak"
+    ).read_bytes()
+
+
 def test_config_convert_refuses_without_fixture_attestation(tmp_path: Path) -> None:
     rust_root = _fixture(tmp_path / "plain")
     before = (rust_root / ".wrkslots.yml").read_bytes()

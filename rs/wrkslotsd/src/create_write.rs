@@ -1092,16 +1092,7 @@ fn create_slot_inner(
         .get("heartbeat_ttl_seconds")
         .and_then(Value::as_i64)
         .unwrap_or(60);
-    let hooks: Vec<String> = config
-        .get("post_provision_hooks")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let hooks: Vec<String> = crate::config_validate::post_provision_hooks_for(&config, slot_type);
     let journal_path = cfg.control.join(format!(
         "CREATE.{}.{}.{}.{}.journal",
         selected.chars().count(),
@@ -1278,6 +1269,10 @@ fn create_slot_inner(
                 ));
             }
             progress += 1;
+            write_journal(
+                &cfg,
+                &make_journal(&created, &heartbeat_at, progress, &Value::Null),
+            )?;
             let _ = checkout_index;
         }
     }

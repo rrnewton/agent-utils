@@ -64,6 +64,10 @@ def _expected(root: Path) -> dict[str, object]:
         "machine": config.machine,
         "max_active_slots": config.max_active_slots,
         "post_provision_hooks": list(config.post_provision_hooks),
+        "post_provision_hook_slot_types": [
+            None if types is None else list(types)
+            for types in config.post_provision_hook_slot_types
+        ],
         "reclaimable_ignored_paths": list(config.reclaimable_ignored_paths),
         "repo_cache_globs": [[name, list(globs)] for name, globs in config.repo_cache_globs],
         "retire_freeze": config.retire_freeze,
@@ -111,7 +115,8 @@ def test_validate_config_with_sections_matches_python(tmp_path: Path) -> None:
         tmp_path,
         "identity: {name: Slot Bot, email: slot-bot@example.invalid}\n"
         "image: {backend: kernel, ceiling_bytes: 2147483648}\n"
-        "sandbox: {isolation: cgroup, limits: {memory_max: 32G, tasks_max: 10}}\n",
+        "sandbox: {isolation: cgroup, limits: {memory_max: 32G, tasks_max: 10}}\n"
+        "post_provision_hooks: ['true', {command: 'true', slot_types: [validate, agent]}, {command: 'true'}]\n",
     )
     result = _rust(root)
     assert result.returncode == 0, result.stderr
@@ -160,6 +165,43 @@ def test_validate_config_worktrees_image_matches_python(
         ("identity: {name: Bot, email: 'a@b@c'}\n", "configuration.identity.email must be"),
         ("identity: {name: Bot, email: 'a b@c'}\n", "configuration.identity.email must be"),
         ("identity: {name: Bot, email: 7}\n", "configuration.identity.email must be a string"),
+        (
+            "post_provision_hooks: [{command: 'true', slot_types: [agnet]}]\n",
+            "unknown slot type 'agnet'",
+        ),
+        (
+            "post_provision_hooks: [{command: 'true', slot_types: []}]\n",
+            "must name at least one slot type",
+        ),
+        (
+            "post_provision_hooks: [{command: 'true', slot_types: [agent, agent]}]\n",
+            "repeats 'agent'",
+        ),
+        (
+            "post_provision_hooks: [{command: 'true', when: [agent]}]\n",
+            "configuration.post_provision_hooks[0] has invalid fields: unknown when",
+        ),
+        (
+            "post_provision_hooks: [{slot_types: [agent]}]\n",
+            "configuration.post_provision_hooks[0] has invalid fields: missing command",
+        ),
+        (
+            "post_provision_hooks: [7]\n",
+            "configuration.post_provision_hooks[0] must be a JSON object",
+        ),
+        (
+            "post_provision_hooks: [{command: 'true', slot_types: agent}]\n",
+            "configuration.post_provision_hooks[0].slot_types must be a JSON array",
+        ),
+        (
+            "post_provision_hooks: [{command: 'true', slot_types: [7]}]\n",
+            "configuration.post_provision_hooks[0].slot_types[0] must be a string",
+        ),
+        (
+            "post_provision_hooks: [{command: 'true', slot_types: null}]\n",
+            "configuration.post_provision_hooks[0].slot_types must be a JSON array",
+        ),
+        ("post_provision_hooks: 'true'\n", "configuration.post_provision_hooks must be a JSON array"),
     ],
 )
 def test_validate_config_refusals_name_the_same_problem(tmp_path: Path, extra: str, fragment: str) -> None:

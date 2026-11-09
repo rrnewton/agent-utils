@@ -422,6 +422,122 @@ pub(crate) fn validate_hook(value: &str) -> Result<String> {
     Ok(value.to_owned())
 }
 
+type HookEntries = (Vec<String>, Vec<Option<Vec<String>>>);
+
+/// Parse `post_provision_hooks`: each entry a command, or
+/// `{command, slot_types}` (#1122), mirroring the Python oracle.
+/// Returns the commands and, in parallel, each one's slot types
+/// (`None` for a plain command or a mapping without `slot_types`).
+fn post_provision_hook_entries(value: &Value, label: &str) -> Result<HookEntries> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| format!("{label} must be a JSON array"))?;
+    let mut commands: Vec<String> = Vec::new();
+    let mut selections: Vec<Option<Vec<String>>> = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let item_label = format!("{label}[{index}]");
+        if let Some(text) = item.as_str() {
+            commands.push(validate_hook(text)?);
+            selections.push(None);
+            continue;
+        }
+        let Some(entry) = item.as_object() else {
+            return Err(format!("{item_label} must be a JSON object"));
+        };
+        let mut details: Vec<String> = Vec::new();
+        if !entry.contains_key("command") {
+            details.push("missing command".to_owned());
+        }
+        let mut unknown: Vec<&str> = entry
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !matches!(*key, "command" | "slot_types"))
+            .collect();
+        unknown.sort_unstable();
+        if !unknown.is_empty() {
+            details.push(format!("unknown {}", unknown.join(", ")));
+        }
+        if !details.is_empty() {
+            return Err(format!(
+                "{item_label} has invalid fields: {}",
+                details.join("; ")
+            ));
+        }
+        commands.push(validate_hook(as_str(
+            entry.get("command").unwrap_or(&Value::Null),
+            &format!("{item_label}.command"),
+        )?)?);
+        let Some(raw_types) = entry.get("slot_types") else {
+            selections.push(None);
+            continue;
+        };
+        let Some(types) = raw_types.as_array() else {
+            return Err(format!("{item_label}.slot_types must be a JSON array"));
+        };
+        let mut selected: Vec<String> = Vec::new();
+        for (type_index, raw_type) in types.iter().enumerate() {
+            let slot_type = as_str(raw_type, &format!("{item_label}.slot_types[{type_index}]"))?;
+            if !matches!(slot_type, "agent" | "validate") {
+                return Err(format!(
+                    "{item_label}.slot_types names unknown slot type {}; expected agent or validate",
+                    crate::storage_state::py_repr(slot_type)
+                ));
+            }
+            if selected.iter().any(|chosen| chosen == slot_type) {
+                return Err(format!(
+                    "{item_label}.slot_types repeats {}",
+                    crate::storage_state::py_repr(slot_type)
+                ));
+            }
+            selected.push(slot_type.to_owned());
+        }
+        if selected.is_empty() {
+            return Err(format!(
+                "{item_label}.slot_types must name at least one slot type"
+            ));
+        }
+        selections.push(Some(selected));
+    }
+    Ok((commands, selections))
+}
+
+/// The configured hooks that run in a new slot of `slot_type`, in order.
+pub(crate) fn post_provision_hooks_for(config: &Value, slot_type: &str) -> Vec<String> {
+    let hooks: Vec<String> = config
+        .get("post_provision_hooks")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let selections: Vec<Value> = config
+        .get("post_provision_hook_slot_types")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if selections.is_empty() {
+        return hooks;
+    }
+    hooks
+        .into_iter()
+        .zip(selections)
+        .filter_map(|(command, types)| match &types {
+            Value::Null => Some(command),
+            Value::Array(selected)
+                if selected
+                    .iter()
+                    .any(|value| value.as_str() == Some(slot_type)) =>
+            {
+                Some(command)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 const IDENTITY_MAX_CHARS: usize = 256;
 
 fn identity_control(character: char) -> bool {
@@ -1268,14 +1384,9 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
         None => Vec::new(),
         Some(value) => cache_glob_groups(value, "configuration.repo_cache_globs")?,
     };
-    let hooks = match raw.get("post_provision_hooks") {
-        None => Vec::new(),
-        Some(value) => string_tuple(
-            value,
-            "configuration.post_provision_hooks",
-            validate_hook,
-            false,
-        )?,
+    let (hooks, hook_slot_types) = match raw.get("post_provision_hooks") {
+        None => (Vec::new(), Vec::new()),
+        Some(value) => post_provision_hook_entries(value, "configuration.post_provision_hooks")?,
     };
     let identity = identity_settings(raw)?;
     let salvage = match raw.get("salvage_push_remotes") {
@@ -1358,6 +1469,7 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
         "machine": machine,
         "max_active_slots": cap,
         "post_provision_hooks": hooks,
+        "post_provision_hook_slot_types": hook_slot_types,
         "reclaimable_ignored_paths": reclaimable,
         "repo_cache_globs": repo_cache_globs.iter().map(|(name, globs)| json!([name, globs])).collect::<Vec<_>>(),
         "retire_freeze": raw.get("retire_freeze").cloned().unwrap_or(Value::Null),
@@ -1379,5 +1491,43 @@ mod tests {
         assert_eq!(validate_cache_glob("target/**").expect("glob"), "target/**");
         assert!(validate_cache_glob("*/x").is_err());
         assert!(validate_cache_glob(".git/x").is_err());
+    }
+
+    #[test]
+    fn hook_entries_and_selection_mirror_python() {
+        let value = json!([
+            "everywhere",
+            {"command": "agent-only", "slot_types": ["agent"]},
+            {"command": "both", "slot_types": ["validate", "agent"]},
+            {"command": "plain-mapping"},
+        ]);
+        let (commands, selections) =
+            post_provision_hook_entries(&value, "configuration.post_provision_hooks")
+                .expect("entries");
+        assert_eq!(
+            commands,
+            ["everywhere", "agent-only", "both", "plain-mapping"]
+        );
+        assert_eq!(
+            selections,
+            [
+                None,
+                Some(vec!["agent".to_owned()]),
+                Some(vec!["validate".to_owned(), "agent".to_owned()]),
+                None,
+            ]
+        );
+        let config = json!({
+            "post_provision_hooks": commands,
+            "post_provision_hook_slot_types": selections,
+        });
+        assert_eq!(
+            post_provision_hooks_for(&config, "validate"),
+            ["everywhere", "both", "plain-mapping"]
+        );
+        let invalid = json!([{"command": "true", "slot_types": ["agnet"]}]);
+        let error = post_provision_hook_entries(&invalid, "configuration.post_provision_hooks")
+            .expect_err("unknown type");
+        assert!(error.contains("unknown slot type 'agnet'"), "{error}");
     }
 }
