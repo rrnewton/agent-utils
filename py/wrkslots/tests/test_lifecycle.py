@@ -50543,18 +50543,15 @@ def test_process_census_preflight_keeps_vanished_identity_in_every_observer(
         return wrkslots._capture_same_uid_process_path_census((target,), budget=budget)
 
     if evidence.startswith("stale"):
-        with pytest.raises(
-            wrkslots.Refusal,
-            match="identity changed after .* matched a selected path",
-        ) as refused:
-            capture()
-        assert not isinstance(refused.value, wrkslots._ProcessEvidenceChanged)
-        expected = ["snapshot", "find"]
-        if evidence in {"stale-map", "stale-mount"}:
-            expected.append("maps")
-        if evidence == "stale-mount":
-            expected.append("mount:123")
-        assert calls == expected
+        # #1102: the matched holder's PID names another process by the time it
+        # is rechecked.  The old generation is gone, so its match is dropped,
+        # not refused; the census then lists /proc again, where whatever took
+        # the PID (or a child the holder handed a reference to) is read.
+        census = capture()
+        assert all(pid != 123 for pid, *_rest in census.matches), census.matches
+        assert calls[:2] == ["snapshot", "find"]
+        assert calls[-1] == "snapshot"
+        assert calls.count("snapshot") >= 2
     elif evidence == "mixed":
         with pytest.raises(wrkslots.Refusal, match="Permission denied") as refused:
             capture()

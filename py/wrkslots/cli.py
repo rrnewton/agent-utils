@@ -61120,10 +61120,7 @@ def _absent_validate_mount_matches(
                     is not None
                     for observed, _detail in candidate_references
                 ):
-                    raise Refusal(
-                        f"PID {process.pid} identity changed after mount matched a selected path; "
-                        "the selected path may still be in use"
-                    )
+                    _matched_holder_vanished(process.pid, "mount")
                 continue
             selected = process
             references = candidate_references
@@ -62089,6 +62086,28 @@ def _same_uid_indeterminate_processes(
     return tuple(indeterminate.values())
 
 
+# Set, to a list, while a census that lists /proc again after its reads is
+# running (#1102 wrkslots-census-churn-tolerant).  A process that matched a
+# selected path and then exited, or whose PID now names another process, is
+# then recorded here instead of refusing the census: the old generation is
+# gone (it can no longer use the path), and whatever replaced it, or a child
+# it handed a reference to before it exited, is a generation the next listing
+# reads.  Callers that do not list again keep the refusal.
+_FOLLOWED_VANISHED_HOLDERS: contextvars.ContextVar[list[int] | None] = (
+    contextvars.ContextVar("wrkslots_followed_vanished_holders", default=None)
+)
+
+
+def _matched_holder_vanished(pid: int, matcher: str) -> None:
+    followed = _FOLLOWED_VANISHED_HOLDERS.get()
+    if followed is None:
+        raise Refusal(
+            f"PID {pid} identity changed after {matcher} matched a selected path; "
+            "the selected path may still be in use"
+        )
+    followed.append(pid)
+
+
 def _parse_find_path_matches(
     output: bytes,
     processes: Mapping[int, _AbsentProcessObservation],
@@ -62114,11 +62133,10 @@ def _parse_find_path_matches(
         matched = _matching_absent_validate_target(observed, targets, match_cache)
         if matched is None:
             continue
+        _census_match_churn_for_test()
         if not _process_generation_is_current(process):
-            raise Refusal(
-                f"PID {pid} identity changed after {census} find matched a selected path; "
-                "the selected path may still be in use"
-            )
+            _matched_holder_vanished(pid, f"{census} find")
+            continue
         _target, slot = matched
         matches.append((pid, slot, "link", raw_target))
     return tuple(matches)
@@ -62156,10 +62174,8 @@ def _parse_maps_path_matches(
         if process is None:
             raise Refusal(f"{census} grep census returned an unexpected PID: {pid}")
         if not _process_generation_is_current(process):
-            raise Refusal(
-                f"PID {pid} identity changed after {census} maps matched a selected path; "
-                "the selected path may still be in use"
-            )
+            _matched_holder_vanished(pid, f"{census} maps")
+            continue
         _target, slot = matched
         matches.append((pid, slot, "map", str(observed)))
     return tuple(matches)
@@ -62733,7 +62749,7 @@ def _scan_same_uid_generations(
     return processes, tuple(relevant)
 
 
-def _capture_same_uid_process_path_census(
+def _capture_same_uid_process_path_census_following(
     slot_paths: Sequence[Path],
     *,
     budget: _ReadOnlyCommandBudget,
@@ -62848,6 +62864,45 @@ def _capture_same_uid_process_path_census(
                 f"{sample}); retry when fewer processes are starting"
             )
 
+
+
+def _capture_process_path_census(
+    slot_paths: Sequence[Path],
+    *,
+    budget: _ReadOnlyCommandBudget | None = None,
+    include_owner_cgroups: bool = True,
+) -> _ProcessPathCensus:
+    """The all-process census; see _capture_process_path_census_following.
+
+    A matched holder that vanishes is followed, not refused (#1102): the
+    census lists /proc again after its reads (_census_appearing_generations).
+    """
+
+    token = _FOLLOWED_VANISHED_HOLDERS.set([])
+    try:
+        return _capture_process_path_census_following(
+            slot_paths, budget=budget, include_owner_cgroups=include_owner_cgroups
+        )
+    finally:
+        _FOLLOWED_VANISHED_HOLDERS.reset(token)
+
+
+def _capture_same_uid_process_path_census(
+    slot_paths: Sequence[Path],
+    *,
+    budget: _ReadOnlyCommandBudget,
+) -> _ProcessPathCensus:
+    """The same-UID census; see _capture_same_uid_process_path_census_following.
+
+    A matched holder that vanishes is followed, not refused (#1102): its
+    generation is no longer current, so the next inventory follows it.
+    """
+
+    token = _FOLLOWED_VANISHED_HOLDERS.set([])
+    try:
+        return _capture_same_uid_process_path_census_following(slot_paths, budget=budget)
+    finally:
+        _FOLLOWED_VANISHED_HOLDERS.reset(token)
 
 @dataclasses.dataclass(frozen=True)
 class _ProcessPathCensus:
@@ -63152,11 +63207,7 @@ def _direct_process_identity_matches(
             if process_link_matches or process_inode_matches:
                 # A child forked before the exit, outside the snapshot, can
                 # still hold what this process was seen holding.
-                raise Refusal(
-                    f"PID {process.pid} identity changed after direct census "
-                    "matched a selected path; the selected path may still be "
-                    "in use"
-                )
+                _matched_holder_vanished(process.pid, "direct census")
             # A socket inode alone names no path. A still-live socket bound
             # inside a target then has no holder in the namespace table that
             # lists it, which the Unix association hard-refuses. Recording
@@ -64030,6 +64081,24 @@ def _census_appearing_generations(
     )
 
 
+def _census_match_churn_for_test() -> None:
+    """Test seam: run ``WRKSLOTS_TEST_CENSUS_MATCH_CHURN`` when find matched a selected path.
+
+    It runs before the matched process's identity is rechecked, so the forced-churn
+    test (#1102) can replace the holder exactly there.
+    """
+
+    command = os.environ.get("WRKSLOTS_TEST_CENSUS_MATCH_CHURN")
+    if command:
+        subprocess.run(
+            ["/bin/sh", "-c", command],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
 def _census_churn_for_test() -> None:
     """Test seam: run ``WRKSLOTS_TEST_CENSUS_CHURN`` once the census has listed /proc.
 
@@ -64049,7 +64118,7 @@ def _census_churn_for_test() -> None:
         )
 
 
-def _capture_process_path_census(
+def _capture_process_path_census_following(
     slot_paths: Sequence[Path],
     *,
     budget: _ReadOnlyCommandBudget | None = None,

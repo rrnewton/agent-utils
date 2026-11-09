@@ -1729,3 +1729,82 @@ def test_audit_heavy_churn_many_slots_matches_python(
         assert {str(row["verdict"]) for row in rows.values()} == {"DELETABLE"}, edition
         verdicts.append({slot: row["verdict"] for slot, row in rows.items()})
     assert verdicts[0] == verdicts[1]
+
+
+def _holder_replacement_hook(base: Path, tag: str, slot: Path) -> tuple[str, Path, Path]:
+    """A process working in ``slot`` now, and a hook that replaces it there once.
+
+    The holder is detached, so the subreaper reaps it once killed (a child of
+    this test would stay a zombie with its generation intact).  The hook kills
+    it, waits until it is gone, and starts a new process in the slot, whose PID
+    it writes to the returned file.  Returns the hook, that file, and the file
+    naming the holder.
+    """
+
+    work = base / f"holder-{tag}"
+    work.mkdir()
+    holder_file = work / "holder.pid"
+    holder_file.write_text(
+        subprocess.run(
+            ["/bin/sh", "-c", "setsid sleep 300 </dev/null >/dev/null 2>&1 & echo $!"],
+            capture_output=True, text=True, check=True, cwd=slot, timeout=30,
+        ).stdout.strip()
+    )
+    holder = holder_file.read_text()
+    appeared = work / "appeared.pid"
+    hook = (
+        f"[ -e {work}/fired ] && exit 0; : > {work}/fired; "
+        f"kill -KILL {holder}; "
+        f"n=0; while [ -e /proc/{holder}/stat ] && [ $n -lt 500 ]; do sleep 0.01; n=$((n+1)); done; "
+        f"cd {slot} || exit 1; setsid sleep 300 </dev/null >/dev/null 2>&1 & echo $! > {appeared}"
+    )
+    return hook, appeared, holder_file
+
+
+@pytest.mark.real_process_evidence
+def test_audit_follows_a_matched_holder_replaced_before_its_recheck(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1102: the holder find matched is gone at its identity recheck, and a new one works there.
+
+    Before, the census refused ("PID ... identity changed after privileged find
+    matched a selected path; the selected path may still be in use") and every
+    candidate row became UNKNOWN.  Now the gone generation is dropped and the
+    next listing reads its replacement, so the row is BLOCKED by the new process.
+    The Rust edition has no separate matcher step; its seam replaces the holder
+    between its listing and its reads, the same history at its own boundary.
+    """
+
+    root = _fixture(tmp_path)
+    slot = root / "worktrees" / "slot-a"
+    for edition, variable in (
+        ("python", "WRKSLOTS_TEST_CENSUS_MATCH_CHURN"),
+        ("rust", "WRKSLOTS_TEST_CENSUS_CHURN"),
+    ):
+        hook, appeared, holder_file = _holder_replacement_hook(tmp_path, edition, slot / "repo")
+        monkeypatch.setenv(variable, hook)
+        try:
+            if edition == "python":
+                payload = _python(root, tmp_path)
+            else:
+                result = _rust(root, census_state=tmp_path / "rust-census.json")
+                assert result.returncode == 0, result.stderr
+                payload = json.loads(result.stdout)
+        finally:
+            monkeypatch.delenv(variable)
+            holder = int(holder_file.read_text())
+            with contextlib.suppress(OSError):
+                if Path(f"/proc/{holder}/cmdline").read_bytes().split(b"\0")[:2] == [
+                    b"sleep", b"300",
+                ]:
+                    os.kill(holder, 9)
+            pid = _stop_appeared(appeared)
+        row = _rows(payload)[0]
+        reasons = [str(reason) for reason in cast(list[object], row["reasons"])]
+        assert row["verdict"] == "BLOCKED", (edition, row)
+        assert payload["unknown_slots"] == [], (edition, reasons)
+        assert not any("identity changed" in reason for reason in reasons), (edition, reasons)
+        assert any(reason.startswith(f"live process {pid} uses slot {slot}") for reason in reasons), (
+            edition, reasons,
+        )
+
