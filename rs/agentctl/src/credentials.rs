@@ -210,6 +210,37 @@ pub(crate) fn inspect<'a>(
     files
 }
 
+/// Whether the certificate at one explicit path can be used right now, for
+/// callers that name the file directly instead of through an environment
+/// variable (restore's `certificate_file`, #1137). Only the first PEM
+/// certificate's notAfter is read, as everywhere in this module.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CertificateState {
+    /// No file at the path.
+    Missing,
+    /// A file is there but cannot serve as a certificate now; the detail
+    /// says why in operator words and never quotes file contents.
+    Unusable(&'static str),
+    /// A parseable certificate whose notAfter is still ahead.
+    Valid,
+}
+
+pub(crate) fn certificate_state(path: &Path, now_millis: i64) -> CertificateState {
+    match read_bounded(path) {
+        FileRead::Missing => CertificateState::Missing,
+        FileRead::NotAFile => CertificateState::Unusable("not a regular file"),
+        FileRead::Unreadable => CertificateState::Unusable("unreadable"),
+        FileRead::Inaccessible => CertificateState::Unusable("inaccessible"),
+        FileRead::Contents(contents) => match first_certificate_not_after_millis(&contents) {
+            None => CertificateState::Unusable("no parseable certificate"),
+            Some(not_after) if not_after <= now_millis => {
+                CertificateState::Unusable("certificate expired")
+            }
+            Some(_) => CertificateState::Valid,
+        },
+    }
+}
+
 /// The process environment, as [`inspect`] reads it in production.
 pub(crate) fn process_environment(name: &str) -> Option<OsString> {
     #[cfg(test)]

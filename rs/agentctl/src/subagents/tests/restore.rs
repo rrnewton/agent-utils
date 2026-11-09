@@ -1471,6 +1471,159 @@ fn restore_without_the_certificate_revives_nothing_and_names_the_fetch() {
         .is_none_or(|rows| rows.is_empty()));
 }
 
+/// A host that writes the certificate file on its second sleep, as a
+/// renewal landing moments after the boot unit starts would.
+struct CertHost {
+    inner: ScriptedHost,
+    certificate: PathBuf,
+    sleeps: Cell<u32>,
+}
+
+impl Host for CertHost {
+    fn boot_id(&self) -> crate::subagents::Result<String> {
+        self.inner.boot_id()
+    }
+    fn boot_time(&self) -> Option<u64> {
+        self.inner.boot_time()
+    }
+    fn now(&self) -> f64 {
+        self.inner.now()
+    }
+    fn sleep(&self, duration: Duration) {
+        self.sleeps.set(self.sleeps.get() + 1);
+        if self.sleeps.get() == 2 {
+            fs::write(
+                &self.certificate,
+                crate::credentials::fixtures::GENERALIZED_TIME_CERTIFICATE,
+            )
+            .unwrap();
+        }
+        self.inner.sleep(duration);
+    }
+    fn run(&self, argv: &[String], cwd: Option<&Path>, timeout: Duration) -> CommandOutcome {
+        self.inner.run(argv, cwd, timeout)
+    }
+}
+
+#[test]
+fn restore_waits_for_the_certificate_and_then_revives() {
+    // #1137: the certificate renewed moments after boot must not burn the
+    // boot's one attempt; restore waits bounded, then revives.
+    let fixture = Fixture::new();
+    let _old = dead_agent(&fixture);
+    let certificate = fixture.root.join("user-cert.pem");
+    let host = CertHost {
+        inner: ScriptedHost::new(),
+        certificate: certificate.clone(),
+        sleeps: Cell::new(0),
+    };
+    let registry = fixture.root.join("registry");
+    let config = RestoreConfig {
+        certificate_file: Some(certificate),
+        certificate_fetch: Some("fetch-cert --user".to_owned()),
+        certificate_wait_seconds: Some(30),
+        ..config(&fixture, None)
+    };
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(report["certificate"]["present"], true, "{report}");
+    assert_eq!(report["certificate"]["valid"], true, "{report}");
+    assert_eq!(report["certificate"]["waited_seconds"], 4.0, "{report}");
+    assert_eq!(report["agents"][0]["action"], "revived", "{report}");
+    assert_eq!(report["complete"], true, "{report}");
+}
+
+#[test]
+fn restore_refuses_an_expired_certificate_and_revives_nothing() {
+    // #1137: existence is not enough; an expired certificate revives
+    // nothing and the report says why. The fixture certificate expired in
+    // 2026, well before the scripted host's 2033 clock.
+    let fixture = Fixture::new();
+    let _old = dead_agent(&fixture);
+    let host = ScriptedHost::new();
+    let certificate = fixture.root.join("expired-cert.pem");
+    fs::write(
+        &certificate,
+        crate::credentials::fixtures::UTC_TIME_CERTIFICATE,
+    )
+    .unwrap();
+    let registry = fixture.root.join("registry");
+    let config = RestoreConfig {
+        certificate_file: Some(certificate),
+        certificate_wait_seconds: Some(0),
+        ..config(&fixture, None)
+    };
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(report["certificate"]["present"], true, "{report}");
+    assert_eq!(report["certificate"]["valid"], false, "{report}");
+    assert_eq!(
+        report["certificate"]["detail"], "certificate expired",
+        "{report}"
+    );
+    assert_eq!(report["complete"], false, "{report}");
+    assert!(report["agents"]
+        .as_array()
+        .is_none_or(|rows| rows.is_empty()));
+}
+
+/// A host that closes every pane on its first sleep (the post-launch
+/// startup delay), as a harness dying on first use would present.
+struct KillOnSleepHost<'a> {
+    inner: ScriptedHost,
+    client: &'a Fake,
+}
+
+impl Host for KillOnSleepHost<'_> {
+    fn boot_id(&self) -> crate::subagents::Result<String> {
+        self.inner.boot_id()
+    }
+    fn boot_time(&self) -> Option<u64> {
+        self.inner.boot_time()
+    }
+    fn now(&self) -> f64 {
+        self.inner.now()
+    }
+    fn sleep(&self, duration: Duration) {
+        let panes: Vec<String> = self
+            .client
+            .panes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|pane| pane.pane_id.clone())
+            .collect();
+        self.client.herdr_closed.lock().unwrap().extend(panes);
+        self.inner.sleep(duration);
+    }
+    fn run(&self, argv: &[String], cwd: Option<&Path>, timeout: Duration) -> CommandOutcome {
+        self.inner.run(argv, cwd, timeout)
+    }
+}
+
+#[test]
+fn restore_reports_a_lane_that_died_right_after_launch_and_stays_incomplete() {
+    // #1137: started is judged again before the boot is called restored;
+    // a lane whose runtime is already gone must not read as revived.
+    let fixture = Fixture::new();
+    let _old = dead_agent(&fixture);
+    let host = KillOnSleepHost {
+        inner: ScriptedHost::new(),
+        client: &fixture.client,
+    };
+    let registry = fixture.root.join("registry");
+    let config = config(&fixture, None);
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(
+        report["agents"][0]["action"], "died-after-launch",
+        "{report}"
+    );
+    assert_eq!(report["agents"][0]["disposition"], "failed", "{report}");
+    assert_eq!(report["complete"], false, "{report}");
+    // The boot did not complete, so a rerun is a fresh attempt, never
+    // already-restored. Its own outcome depends on the (closed) panes.
+    let again = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_ne!(again["action"], "already-restored", "{again}");
+}
+
 #[test]
 fn restore_with_a_desired_agents_list_leaves_unlisted_records_retired() {
     let fixture = Fixture::new();

@@ -151,6 +151,11 @@ pub struct RestoreConfig {
     /// Command that fetches the user certificate, printed verbatim when it is missing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certificate_fetch: Option<String>,
+    /// Seconds to wait for a usable user certificate before reviving nothing
+    /// (#1137; default: `herdr_wait_seconds`). At boot the certificate is
+    /// often renewed moments after the restore unit starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_wait_seconds: Option<u64>,
     /// Expected Herdr version (#742): restore reports a mismatch against the version
     /// the configured Herdr binary prints, so an in-place update cannot lie silently.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -282,6 +287,7 @@ impl RestoreConfig {
             agents: None,
             certificate_file: None,
             certificate_fetch: None,
+            certificate_wait_seconds: None,
             herdr_version: None,
             startup_delay_seconds: default_startup_delay(),
             herdr_wait_seconds: default_herdr_wait(),
@@ -372,9 +378,14 @@ impl RestoreConfig {
                 ));
             }
         }
-        if self.startup_delay_seconds > 600 || self.herdr_wait_seconds > 3600 {
+        if self.startup_delay_seconds > 600
+            || self.herdr_wait_seconds > 3600
+            || self
+                .certificate_wait_seconds
+                .is_some_and(|wait| wait > 3600)
+        {
             return Err(invalid(
-                "startup_delay_seconds is at most 600 and herdr_wait_seconds at most 3600",
+                "startup_delay_seconds is at most 600, herdr_wait_seconds and certificate_wait_seconds at most 3600",
             ));
         }
         if self
@@ -865,6 +876,69 @@ fn wait_for_herdr<A: ManagedApi + ?Sized>(client: &A, host: &dyn Host, wait: Dur
                         "waited_seconds": (host.now() - started).round(),
                         "detail": error.to_string(),
                     });
+                }
+                host.sleep(Duration::from_secs(2));
+            }
+        }
+    }
+}
+
+/// Wait, bounded, for the configured user certificate to be usable (#1137):
+/// at boot it is often renewed moments after the restore unit starts, and
+/// launching before it exists burns every lane on a certificate it cannot
+/// use. Returns whether agents may start and the report row. Unconfigured
+/// means no gate, as before; a dry run samples once and never waits.
+fn wait_for_certificate(host: &dyn Host, config: &RestoreConfig, dry_run: bool) -> (bool, Value) {
+    let Some(path) = config.certificate_file.as_ref() else {
+        return (true, json!({"present": null, "detail": "not configured"}));
+    };
+    let wait = if dry_run {
+        0
+    } else {
+        config
+            .certificate_wait_seconds
+            .unwrap_or(config.herdr_wait_seconds)
+    };
+    let started = host.now();
+    loop {
+        let now_millis = (host.now() * 1000.0) as i64;
+        match crate::credentials::certificate_state(path, now_millis) {
+            crate::credentials::CertificateState::Valid => {
+                return (
+                    true,
+                    json!({
+                        "present": true,
+                        "valid": true,
+                        "path": path,
+                        "waited_seconds": (host.now() - started).round(),
+                    }),
+                );
+            }
+            state => {
+                if host.now() - started >= wait as f64 {
+                    let (present, detail) = match state {
+                        crate::credentials::CertificateState::Missing => (false, "missing"),
+                        crate::credentials::CertificateState::Unusable(detail) => (true, detail),
+                        crate::credentials::CertificateState::Valid => unreachable!(),
+                    };
+                    let remedy = config.certificate_fetch.clone().unwrap_or_else(|| {
+                        format!("fetch the user certificate to {}", path.display())
+                    });
+                    eprintln!(
+                        "agentctl restore: user certificate unusable at {} ({detail}); run: {remedy}",
+                        path.display()
+                    );
+                    return (
+                        false,
+                        json!({
+                            "present": present,
+                            "valid": false,
+                            "path": path,
+                            "detail": detail,
+                            "remedy": remedy,
+                            "waited_seconds": (host.now() - started).round(),
+                        }),
+                    );
                 }
                 host.sleep(Duration::from_secs(2));
             }
@@ -1444,6 +1518,10 @@ fn notice_text(report: &Value, boot_time: Option<u64>, path: &Path) -> String {
             list("revived-fresh", &reason)
         ),
         format!("Promoted: {}.", list("promoted", &pane)),
+        format!(
+            "Died right after launch (this boot stays incomplete; a retry will attempt them again): {}.",
+            list("died-after-launch", &reason)
+        ),
         format!("Refused: {}.", list("refused", &reason)),
         format!(
             "Left as they were: {}.",
@@ -1733,31 +1811,11 @@ pub fn restore<A: ManagedApi + ?Sized>(
             .collect::<Vec<_>>()),
         _ => json!([]),
     };
-    // The certificate comes first (#742): without it every harness refuses to start,
-    // so name the exact fetch command and revive nothing.
-    let certificate_ok = match config.certificate_file.as_ref() {
-        Some(path) if !path.is_file() => {
-            report["certificate"] = json!({
-                "present": false,
-                "path": path,
-                "remedy": config.certificate_fetch.clone().unwrap_or_else(|| format!("fetch the user certificate to {}", path.display())),
-            });
-            eprintln!(
-                "agentctl restore: user certificate missing at {}; run: {}",
-                path.display(),
-                report["certificate"]["remedy"].as_str().unwrap_or_default()
-            );
-            false
-        }
-        Some(path) => {
-            report["certificate"] = json!({"present": true, "path": path});
-            true
-        }
-        None => {
-            report["certificate"] = json!({"present": null, "detail": "not configured"});
-            true
-        }
-    };
+    // The certificate comes first (#742, #1137): without a usable one every
+    // harness refuses to start, so wait bounded for it, then name the exact
+    // fetch command and revive nothing.
+    let (certificate_ok, certificate) = wait_for_certificate(host, config, options.dry_run);
+    report["certificate"] = certificate;
     // Version pin (#742): name a Herdr update instead of restoring against it silently.
     if let Some(expected) = config.herdr_version.as_deref() {
         if !options.herdr_bin.as_os_str().is_empty() {
@@ -1867,6 +1925,46 @@ pub fn restore<A: ManagedApi + ?Sized>(
             }
         }
         report["agents"] = json!(agents);
+    }
+    // Survival re-check (#1137): a launch is counted started at first
+    // detection, but a harness can still die seconds later (an unusable
+    // certificate is the boot case). Re-resolve every lane this run
+    // launched before the boot is called restored; one whose runtime is
+    // already gone is died-after-launch and keeps the boot incomplete, so
+    // the bounded unit retry attempts it again instead of a later run
+    // reading already-restored.
+    let mut launched_survived = true;
+    if !options.dry_run && herdr_ready {
+        fn launched(row: &Value) -> bool {
+            matches!(
+                row["action"].as_str(),
+                Some("revived" | "promoted" | "revived-fresh")
+            )
+        }
+        let mut recheck = |row: &mut Value| {
+            if !launched(row) {
+                return;
+            }
+            let Some(name) = row["name"].as_str().map(str::to_owned) else {
+                return;
+            };
+            if let Err(error) = manager.pane_info(&name) {
+                row["action"] = json!("died-after-launch");
+                row["reason"] = json!(format!("launched but its runtime did not survive: {error}"));
+                launched_survived = false;
+            }
+        };
+        if report["coordinator"].is_object() {
+            recheck(&mut report["coordinator"]);
+            if report["coordinator"]["action"] == "died-after-launch" {
+                coordinator_ok = false;
+            }
+        }
+        if let Some(rows) = report["agents"].as_array_mut() {
+            for row in rows.iter_mut() {
+                recheck(row);
+            }
+        }
     }
     // Per-lane disposition in the owner's words, plus tab hygiene on the
     // Herdr auto-restored shells (item 5 restore-in-place): a lane that came
@@ -2003,9 +2101,11 @@ pub fn restore<A: ManagedApi + ?Sized>(
         .map(|row| row["warning"].clone())
         .collect();
     report["fresh_starts"] = json!(fresh_starts);
-    report["complete"] = json!(herdr_ready && coordinator_ok && !options.dry_run);
+    report["complete"] =
+        json!(herdr_ready && coordinator_ok && launched_survived && !options.dry_run);
     // A dry run never completes; this says whether the same run for real would.
-    report["would_complete"] = json!(herdr_ready && coordinator_ok && refused == 0);
+    report["would_complete"] =
+        json!(herdr_ready && coordinator_ok && launched_survived && refused == 0);
     report["notice"] = Value::Null;
     let summary = config
         .coordinator

@@ -1,10 +1,11 @@
 ---
 title: 'restore-waits-for-certificate: restore burns its one boot attempt launching agents before the user certificate exists'
-status: open
+status: closed
 priority: 1
 issue_type: bug
-created_at: 2026-11-09T13:53:37.000000000+00:00
-updated_at: 2026-11-09T13:53:37.000000000+00:00
+created_at: 2026-11-09T13:53:37+00:00
+updated_at: 2026-11-09T14:20:37.655879925+00:00
+closed_at: 2026-11-09T14:20:37.655879784+00:00
 ---
 
 # Description
@@ -63,3 +64,22 @@ restore.json now name their certificate_file, so the next boot refuses
 (and the unit retries) instead of burning launches. This issue is the code
 half: wait/validity plus not counting instant deaths as started. Related:
 #742 restore-team-spec (the gate), #975 boot-restore-retry (the retry).
+
+## Resolution
+
+[watermelon-full-preview] Delivered with this closing commit. Restore now
+waits bounded for a usable certificate (wait_for_certificate in restore.rs:
+polls every 2 s under certificate_wait_seconds, defaulting to
+herdr_wait_seconds; usable means a parseable, unexpired PEM certificate via
+credentials::certificate_state) and still revives nothing with the fetch
+remedy at the deadline; a dry run samples once. Before the boot is called
+restored, every lane this run launched (coordinator included) is resolved
+again through pane_info; a runtime already gone becomes died-after-launch
+with disposition failed, keeps complete false, and is named in the
+recovery notice, so the boot unit retry attempts it instead of a rerun
+reading already-restored. Tests: certificate appearing during the wait
+revives (waited_seconds recorded), an expired certificate refuses with its
+detail, and a lane killed during its startup delay reports
+died-after-launch with the boot incomplete. Unverified limit: no live boot
+has yet raced a real renewal through the wait; the survival probe is one
+resolution at report time, not a continuous watch (the watch owns that).

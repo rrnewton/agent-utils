@@ -1036,15 +1036,21 @@ In order, it:
    detected restart it also runs `wrkslots hold SLOT --reason "reboot: agent NAME
    waits for agentctl restore"` for the slot of every running agent, so no
    cleanup can retire it while the agent is down;
-4. waits for the Herdr server (`herdr_wait_seconds`, default 300);
-5. revives the coordinator (`coordinator` in `restore.json`, else the registry's
+4. when `certificate_file` is configured, waits bounded for a usable user
+   certificate there (`certificate_wait_seconds`, default
+   `herdr_wait_seconds`): a parseable, unexpired PEM certificate. Still
+   unusable at the deadline, it revives nothing, names `certificate_fetch`
+   as the remedy, and the boot stays incomplete so the unit retry can
+   succeed once the certificate lands;
+5. waits for the Herdr server (`herdr_wait_seconds`, default 300);
+6. revives the coordinator (`coordinator` in `restore.json`, else the registry's
    designated coordinator; when the two disagree, or the designation cannot be
    read, it keeps `restore.json`'s and records `designation_problem` in the
    report) from its launch spec, then makes every registry in
    `also_registered` name its new pane: the same pane has its anchors replaced,
    and an adopted record left on the old pane is retired (bound to its exact
    token and bytes) and the live pane adopted under the same name;
-6. revives every other dead agent one at a time, managers before the agents
+7. revives every other dead agent one at a time, managers before the agents
    they manage at every depth of the control tree, waiting
    `startup_delay_seconds` (default 20) after each launch, promotes each live
    `launch_failed` record, and records every refusal with its reason; a live
@@ -1062,9 +1068,13 @@ In order, it:
    names these agents under "STARTED FRESH", and the agent's first prompt warns
    it that it remembers nothing. The lineage records `fresh-after-restore` with
    the reason. When agentctl cannot tell (no configuration directory, or a
-   launch profile that sets `CLAUDE_CONFIG_DIR`), it resumes as before;
-7. runs `systemctl --user reset-failed` and `start` for each of `units`;
-8. queues one recovery notice for the coordinator (message ID
+   launch profile that sets `CLAUDE_CONFIG_DIR`), it resumes as before.
+   Before the boot is called restored, every lane this run launched is
+   resolved again: a harness already gone is reported `died-after-launch`
+   and the boot stays incomplete, so a retry attempts it again instead of
+   a rerun reading already-restored;
+8. runs `systemctl --user reset-failed` and `start` for each of `units`;
+9. queues one recovery notice for the coordinator (message ID
    `restore-` and the first 8 characters of the boot ID, so it is sent once per
    boot): what was revived and where, what started fresh and why, what was
    promoted or refused and why, the units, the slot images, and the report path.
@@ -1094,6 +1104,9 @@ a newer `agentctl` does not stop an older one:
   "exclude": ["stale-record"],
   "startup_delay_seconds": 20,
   "herdr_wait_seconds": 300,
+  "certificate_file": "/path/to/user-certificate.pem",
+  "certificate_fetch": "fetch-cert --user",
+  "certificate_wait_seconds": 300,
   "report_dir": "/home/me/.local/state/agentctl/restore",
   "herdr_unit": "herdr-server.service",
   "timers": [{"unit": "health-tick.timer", "max_age_seconds": 5400}],
