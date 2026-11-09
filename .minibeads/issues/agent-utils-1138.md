@@ -1,10 +1,11 @@
 ---
 title: 'revive-candidate-auto-relaunch: a candidate whose harness exits immediately strands in no-pinned-runtime limbo'
-status: open
+status: closed
 priority: 1
 issue_type: bug
-created_at: 2026-11-09T13:53:37.000000000+00:00
-updated_at: 2026-11-09T13:53:37.000000000+00:00
+created_at: 2026-11-09T13:53:37+00:00
+updated_at: 2026-11-09T14:41:08.420774806+00:00
+closed_at: 2026-11-09T14:41:08.420774675+00:00
 ---
 
 # Description
@@ -62,6 +63,26 @@ both gain it with no API change:
 
 Manual recovery (tab close, retire-stale-registration, revive --archived)
 stays available and unchanged; this issue only removes the cases that
-forced it. Related: #899/#920 candidate abandon paths, #1137
+forced it. Related: #899/#920 candidate abandon paths, #1140
 restore-waits-for-certificate (its died-after-launch rows feed the same
 relaunch-on-rerun expectation).
+
+## Resolution
+
+[watermelon-full-preview] Delivered with this closing commit (Rust edition;
+the Python edition has no candidate-abandon machinery to extend). Two
+changes in rs/agentctl/src/subagents/revive.rs: failed_candidate_pane now
+accepts a `starting` candidate as well as `launch_failed`, so a revive
+killed mid-launch gets the #920 own-pane close-and-relaunch; and
+check_candidate gains CandidateCheck::NotOurs - an unanchored candidate
+(no terminal, no harness identity) whose pane provably reports a
+different harness kind or native conversation is abandoned and relaunched
+like a dead candidate, closing the pane first only when this revive
+opened it and never touching a foreign pane. The existing
+revive_rejects_a_different_reported_conversation_before_retirement test
+now expects the bounded relaunch (still refusing before retirement, old
+bytes untouched); new tests cover the starting own-pane relaunch and the
+foreign-pane abandon without close. Full revive suite: 100 passed.
+Unverified limit: the reused-old-pane unproven case still refuses by
+design (that pane is the old generation's); manual recovery remains for
+it.

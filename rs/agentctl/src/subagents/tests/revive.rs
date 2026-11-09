@@ -1400,7 +1400,108 @@ fn revive_rejects_a_different_reported_conversation_before_retirement() {
         .manager()
         .revive("worker", false, None, TIMEOUT)
         .is_err());
-    assert_eq!(fixture.client.environments.lock().unwrap().len(), 2);
+    // #1138: the rerun abandons the unanchored candidate — closing the
+    // pane this revive opened, whose harness reports a different
+    // conversation — and launches once more (bounded at one relaunch). The
+    // pane still reports a different conversation, so the rerun still
+    // refuses before anything is retired.
+    assert_eq!(fixture.client.environments.lock().unwrap().len(), 3);
+    assert_eq!(
+        fs::read(fixture.root.join("registry/agents/worker/agent.json")).unwrap(),
+        old_bytes
+    );
+    assert!(journal_path(&fixture, &old).exists());
+    let (_, kept) = abandoned_attempt(&fixture, &old);
+    assert!(
+        kept["evidence"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("different native conversation"),
+        "{kept}"
+    );
+}
+
+#[test]
+fn a_starting_candidate_whose_harness_never_came_up_is_abandoned_and_relaunched() {
+    // #1138: a revive killed mid-launch (a boot is exactly that) leaves the
+    // candidate `starting`, never stamped `launch_failed`. The #920 own-pane
+    // close-and-relaunch must still apply without --abandon-candidate.
+    let (fixture, old) = recoverable("codex", true);
+    fixture
+        .client
+        .fail_start_once
+        .store(true, Ordering::Relaxed);
+    assert!(fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .is_err());
+    let path = stage_path(&fixture, &old).join("agent.json");
+    let mut candidate = agent::read_private_json(&path).unwrap();
+    assert_eq!(candidate["lifecycle"], "launch_failed");
+    candidate["lifecycle"] = json!("starting");
+    agent::atomic_json(&path, &candidate).unwrap();
+    let (_, staged, _) =
+        super::super::revive::read_record_at(&stage_path(&fixture, &old), "worker").unwrap();
+    let pane = staged.pane_id.clone().expect("the candidate's pane");
+    fixture
+        .client
+        .custom_at_idle_shell
+        .store(false, Ordering::Relaxed);
+    let result = fixture
+        .manager()
+        .revive("worker", false, Some(&old.token), TIMEOUT)
+        .unwrap();
+    assert_eq!(result["revived"], true, "{result}");
+    assert!(
+        result["abandoned_candidate"]["evidence"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("never came up"),
+        "{result}"
+    );
+    assert!(fixture.client.closed.lock().unwrap().contains(&pane));
+}
+
+#[test]
+fn an_unanchored_candidate_in_a_foreign_pane_is_abandoned_without_closing_it() {
+    // #1138: the candidate pinned no runtime and its pane reports a
+    // different conversation, but the pane is not one this revive opened
+    // (the recorded tab is not the pane's), so the attempt is abandoned
+    // and relaunched while the foreign pane keeps running.
+    let (fixture, old) = recoverable("claude", true);
+    *fixture.client.session_override.lock().unwrap() =
+        Some((Some("claude".to_owned()), Some("different".to_owned())));
+    assert!(fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .is_err());
+    let path = stage_path(&fixture, &old).join("agent.json");
+    let mut candidate = agent::read_private_json(&path).unwrap();
+    let pane = candidate["pane_id"].as_str().unwrap().to_owned();
+    candidate["tab_id"] = json!("foreign-tab");
+    agent::atomic_json(&path, &candidate).unwrap();
+    // The pane keeps reporting the different conversation, so the bounded
+    // relaunch after the abandon fails the same way; what matters is that
+    // the first attempt was abandoned on that evidence, one new launch was
+    // made, and the foreign pane was never closed.
+    assert!(fixture
+        .manager()
+        .revive("worker", false, Some(&old.token), TIMEOUT)
+        .is_err());
+    assert_eq!(fixture.client.environments.lock().unwrap().len(), 3);
+    assert!(
+        !fixture.client.closed.lock().unwrap().contains(&pane),
+        "the foreign pane must never be closed"
+    );
+    let (_, kept) = abandoned_attempt(&fixture, &old);
+    assert_eq!(kept["explicit"], false);
+    assert!(
+        kept["evidence"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("different native conversation"),
+        "{kept}"
+    );
 }
 
 #[test]

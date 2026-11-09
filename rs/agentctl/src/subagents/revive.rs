@@ -895,6 +895,65 @@ enum CandidateCheck {
     Live(String),
     /// Neither can be proved.
     Unproven(String),
+    /// The candidate pinned no runtime (no terminal, no harness process),
+    /// and its pane provably holds a different harness or conversation
+    /// (#1138): nothing of the candidate's runs there, so the attempt is
+    /// abandoned like a dead one. A pane this revive opened itself is
+    /// closed first; a foreign pane is never touched.
+    NotOurs(String),
+}
+
+/// Whether `candidate` pinned no runtime a later revive could verify: no
+/// usable terminal and no harness process identity — the failing half of
+/// `verify_candidate`'s "no independently pinned runtime" gate.
+fn candidate_unanchored(candidate: &AgentRecord) -> bool {
+    let identity_missing = if candidate.anchors_with_harness_identity() {
+        candidate.harness_anchor().is_none()
+    } else {
+        candidate.custom_process_identity.is_none()
+    };
+    candidate
+        .terminal_id
+        .as_deref()
+        .is_none_or(|terminal| !valid_metadata_text(terminal))
+        && identity_missing
+}
+
+/// Positive evidence that the harness Herdr reports in `pane` is not
+/// `candidate`'s: a different harness kind (native adapters only, where
+/// that vocabulary is the harness name), or a different native
+/// conversation. Anything short of proof is `None` and stays Live.
+fn foreign_pane_evidence(
+    candidate: &AgentRecord,
+    info: &AgentPaneInfo,
+    pane: &str,
+) -> Option<String> {
+    if candidate.anchors_with_harness_identity() {
+        if let Some(kind) = info.agent.as_deref() {
+            if kind != candidate.harness {
+                return Some(format!(
+                    "Herdr reports {kind} running in its pane {pane}, not the candidate's \
+                     {} harness, and the candidate pinned no runtime there",
+                    candidate.harness
+                ));
+            }
+        }
+    }
+    if let (Some(native), Some(agent), Some(value)) = (
+        candidate.native_session.as_ref(),
+        info.session_agent.as_ref(),
+        info.session_value.as_ref(),
+    ) {
+        if native.agent != *agent || native.value != *value {
+            return Some(format!(
+                "its pane {pane} reports a different native conversation ({agent} session \
+                 {value}) than the candidate's ({} session {}), and the candidate pinned no \
+                 runtime there",
+                native.agent, native.value
+            ));
+        }
+    }
+    None
 }
 
 fn operation_directory(registry: &Path, journal: &Journal) -> PathBuf {
@@ -3129,6 +3188,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 if let Some(check) = self.abandonable(&journal)? {
                     let mut plan = match (check, abandon_candidate) {
                         (CandidateCheck::Dead(evidence), _)
+                        | (CandidateCheck::NotOurs(evidence), _)
                         | (CandidateCheck::Unproven(evidence), true) => self.revive_plan_document(
                             &old,
                             "revive",
@@ -3229,6 +3289,21 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             let pane = self.pane_lock(&journal.proof.pane_id)?;
             let abandoned = match self.abandonable(&journal)? {
                 Some(CandidateCheck::Dead(evidence)) => {
+                    Some(self.abandon_revive(&journal, &evidence, abandon_candidate)?)
+                }
+                // The pane holds a different harness or conversation than
+                // the candidate's. A pane this revive opened itself is
+                // closed first (the wrong runtime there is this attempt's
+                // own launch); any other pane is foreign and never
+                // touched (#1138).
+                Some(CandidateCheck::NotOurs(evidence)) => {
+                    let evidence = match self.failed_candidate_pane(&journal)? {
+                        Some(pane) => {
+                            self.client.close_pane(&pane)?;
+                            format!("{evidence}; pane {pane}, which this revive opened, was closed")
+                        }
+                        None => evidence,
+                    };
                     Some(self.abandon_revive(&journal, &evidence, abandon_candidate)?)
                 }
                 Some(CandidateCheck::Unproven(evidence)) if abandon_candidate => {
@@ -3594,10 +3669,21 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         if !self.client.panes()?.iter().any(|row| row.pane_id == pane) {
             return Ok(CandidateCheck::Dead(format!("its pane {pane} is gone")));
         }
-        if let Some(kind) = self.client.pane_info(pane).ok().and_then(|info| info.agent) {
-            return Ok(CandidateCheck::Live(format!(
-                "Herdr reports {kind} running in its pane {pane}"
-            )));
+        if let Ok(info) = self.client.pane_info(pane) {
+            if let Some(kind) = info.agent.clone() {
+                // An unanchored candidate can never be verified against
+                // whatever runs here; when that runtime is provably a
+                // different harness or conversation it is not the
+                // candidate's at all (#1138).
+                if candidate_unanchored(candidate) {
+                    if let Some(evidence) = foreign_pane_evidence(candidate, &info, pane) {
+                        return Ok(CandidateCheck::NotOurs(evidence));
+                    }
+                }
+                return Ok(CandidateCheck::Live(format!(
+                    "Herdr reports {kind} running in its pane {pane}"
+                )));
+            }
         }
         if self.client.pane_is_idle_shell(pane)? {
             return Ok(CandidateCheck::Dead(format!(
@@ -3635,7 +3721,11 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let Some(pane) = candidate.pane_id.as_deref() else {
             return Ok(None);
         };
-        if candidate.lifecycle != "launch_failed" || pane == journal.proof.pane_id {
+        // `starting` counts too (#1138): a revive killed mid-launch (a boot
+        // is exactly that) never lived to stamp `launch_failed`.
+        if !matches!(candidate.lifecycle.as_str(), "launch_failed" | "starting")
+            || pane == journal.proof.pane_id
+        {
             return Ok(None);
         }
         let opened_here = self.client.panes()?.iter().any(|row| {
