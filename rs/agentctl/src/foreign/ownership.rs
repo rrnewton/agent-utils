@@ -830,7 +830,7 @@ pub fn pin_at(
 /// in uninterruptible sleep outlives this bound and is reported, not
 /// forgotten. (`$SUBAGENTS_HARNESS_KILL_WAIT`, default 10 seconds, as in
 /// the `KILL_WAIT_S` default; read per call rather than at import.)
-fn default_kill_wait() -> Duration {
+pub(crate) fn default_kill_wait() -> Duration {
     std::env::var("SUBAGENTS_HARNESS_KILL_WAIT")
         .ok()
         .and_then(|value| value.parse::<f64>().ok())

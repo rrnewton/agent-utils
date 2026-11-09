@@ -50,6 +50,7 @@ dependencies = [
  "agent-queue",
  "chat-subscription",
  "chat-subscription-plugin",
+ "chrono",
  "clap",
  "fs2",
  "libc",
