@@ -185,3 +185,36 @@ options:
 /// Usage line(s) of `herdr-subagents inbox --help`.
 pub const INBOX_USAGE: &str = r##"usage: herdr-subagents inbox [-h] [--inspect | --drain] [--clear-composer]
                              name"##;
+
+/// Verbatim `herdr-subagents up --help` help.
+pub const UP_HELP: &str = r##"usage: herdr-subagents up [-h] --cwd CWD [--model MODEL]
+                          [--harness {codex,agy,muse}]
+                          [--backend {tmux,herdr}] [--mode {headless,tui}]
+                          [--brief BRIEF] [--brief-file BRIEF_FILE]
+                          name
+
+Bring up a subagent.
+
+positional arguments:
+  name
+
+options:
+  -h, --help            show this help message and exit
+  --cwd CWD             working root for the agent
+  --model MODEL         default model (omit = harness default)
+  --harness {codex,agy,muse}
+  --backend {tmux,herdr}
+  --mode {headless,tui}
+                        per-agent mode override (otherwise environment/project
+                        default)
+  --brief BRIEF         first-turn brief text
+  --brief-file BRIEF_FILE
+                        file holding the first-turn brief
+"##;
+
+/// Usage line(s) of `herdr-subagents up --help`.
+pub const UP_USAGE: &str = r##"usage: herdr-subagents up [-h] --cwd CWD [--model MODEL]
+                          [--harness {codex,agy,muse}]
+                          [--backend {tmux,herdr}] [--mode {headless,tui}]
+                          [--brief BRIEF] [--brief-file BRIEF_FILE]
+                          name"##;

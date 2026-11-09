@@ -19,7 +19,7 @@ const COMMANDS: [&str; 12] = [
     "keeper", "mcp",
 ];
 
-const NOT_PORTED: [&str; 3] = ["up", "migrate", "keeper"];
+const NOT_PORTED: [&str; 2] = ["migrate", "keeper"];
 
 fn argparse_error(usage: &str, prog: &str, message: &str) -> i32 {
     eprintln!("{usage}\n{prog}: error: {message}");
@@ -351,6 +351,113 @@ fn short_session(sid: Option<&str>) -> String {
     match sid {
         None => "-".to_string(),
         Some(sid) => sid.chars().take(8).collect(),
+    }
+}
+
+fn up_command(args: &[String]) -> i32 {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print!("{UP_HELP}");
+        return 0;
+    }
+    let mut args: Vec<String> = args.to_vec();
+    let mut harness_args: Vec<String> = Vec::new();
+    if let Some(split) = args.iter().position(|arg| arg == "--") {
+        harness_args = args.drain(split + 1..).collect();
+        args.truncate(split);
+    }
+    let parsed = match parse(
+        &args,
+        &[
+            "--cwd",
+            "--model",
+            "--harness",
+            "--backend",
+            "--mode",
+            "--brief",
+            "--brief-file",
+        ],
+        &[],
+        UP_USAGE,
+        "herdr-subagents up",
+    ) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
+    if parsed.positionals.len() != 1 {
+        return argparse_error(
+            UP_USAGE,
+            "herdr-subagents up",
+            "the following arguments are required: name",
+        );
+    }
+    let Some(cwd) = parsed.get("--cwd") else {
+        return argparse_error(
+            UP_USAGE,
+            "herdr-subagents up",
+            "the following arguments are required: --cwd",
+        );
+    };
+    for (name, choices) in [
+        ("--harness", &["codex", "agy", "muse"][..]),
+        ("--backend", &["tmux", "herdr"][..]),
+        ("--mode", &["headless", "tui"][..]),
+    ] {
+        if let Some(value) = parsed.get(name) {
+            if !choices.contains(&value) {
+                return argparse_error(
+                    UP_USAGE,
+                    "herdr-subagents up",
+                    &format!(
+                        "argument {name}: invalid choice: '{value}' (choose from {})",
+                        choices
+                            .iter()
+                            .map(|choice| format!("'{choice}'"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+            }
+        }
+    }
+    let brief = if let Some(file) = parsed.get("--brief-file") {
+        match std::fs::read_to_string(file) {
+            Ok(text) => Some(text),
+            Err(_) => return die(&format!("--brief-file not found: {file}")),
+        }
+    } else {
+        parsed.get("--brief").map(str::to_owned)
+    };
+    match super::lifecycle::bring_up_agent_at(
+        &foreign_base(),
+        Path::new("/proc"),
+        &parsed.positionals[0],
+        cwd,
+        brief.as_deref(),
+        parsed.get("--model"),
+        parsed.get("--harness").unwrap_or("codex"),
+        parsed.get("--backend"),
+        parsed.get("--mode"),
+        &harness_args,
+    ) {
+        Ok(result) => {
+            for note in &result.gc_notes {
+                println!("[gc] {note}");
+            }
+            let agent = &result.agent;
+            println!(
+                "agent '{}' up ({} / {} / {}, model {}, session {}, target {})",
+                agent.name,
+                agent.backend,
+                agent.mode,
+                agent.harness,
+                agent.model.as_deref().unwrap_or("<default>"),
+                short_session(agent.session_id.as_deref()),
+                agent.tmux_target
+            );
+            println!("  transcript: {}", agent.transcript);
+            0
+        }
+        Err(error) => operation_die(&error),
     }
 }
 
@@ -950,6 +1057,7 @@ pub fn main(arguments: &[String]) -> i32 {
         "status" => status_command(rest),
         "down" => down_command(rest),
         "turn" => turn_command(rest),
+        "up" => up_command(rest),
         "inbox" => inbox_command(rest),
         "mcp" => {
             eprintln!("herdr-subagents: the Rust edition has not ported 'mcp' yet");

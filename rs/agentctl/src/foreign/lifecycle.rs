@@ -2310,6 +2310,678 @@ pub fn tui_inbox_snapshot_at(
     })
 }
 
+/// Whether tmux is installed and can report its version.
+pub fn tmux_available() -> bool {
+    std::process::Command::new("tmux")
+        .arg("-V")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Probe the selected presentation backend for startup availability.
+pub fn backend_available(backend: &str) -> bool {
+    if backend == "tmux" {
+        tmux_available()
+    } else {
+        super::registry::herdr_available()
+    }
+}
+
+fn configured_codex_bypass_permissions() -> Result<bool, ForeignOwnershipError> {
+    match std::env::var("SUBAGENTS_CODEX_BYPASS_PERMISSIONS").as_deref() {
+        Err(_) | Ok("0") => Ok(false),
+        Ok("1") => Ok(true),
+        Ok(_) => Err(ForeignOwnershipError {
+            code: "invalid_permission_policy",
+            message: "SUBAGENTS_CODEX_BYPASS_PERMISSIONS must be exactly 0 (native permissions) or 1 (bypass approvals and sandbox)".to_string(),
+        }),
+    }
+}
+
+fn require_antigravity_preflight(cwd: &Path) -> Result<(), ForeignOwnershipError> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let settings_path = home.join(".gemini/antigravity-cli/settings.json");
+    let instruction = format!(
+        "Fix: edit {} so toolPermission is exactly \"always-proceed\" and trustedWorkspaces contains \"{}\". Do not use --dangerously-skip-permissions for agy subagent turns.",
+        settings_path.display(),
+        cwd.display()
+    );
+    let fail = |message: String| ForeignOwnershipError {
+        code: "agy_preflight_failed",
+        message,
+    };
+    if !settings_path.is_file() {
+        return Err(fail(format!(
+            "Antigravity settings file not found at {}. {instruction}",
+            settings_path.display()
+        )));
+    }
+    let raw: Value = std::fs::read(&settings_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or_else(|| {
+            fail(format!(
+                "Antigravity settings file is not valid JSON. {instruction}"
+            ))
+        })?;
+    let Some(raw) = raw.as_object() else {
+        return Err(fail(format!(
+            "Antigravity settings file must contain a JSON object. {instruction}"
+        )));
+    };
+    if raw.get("toolPermission").and_then(Value::as_str) != Some("always-proceed") {
+        return Err(fail(format!(
+            "Antigravity toolPermission is not \"always-proceed\". {instruction}"
+        )));
+    }
+    let workspaces: Vec<String> = match raw.get("trustedWorkspaces").and_then(Value::as_array) {
+        Some(items) if items.iter().all(Value::is_string) => items
+            .iter()
+            .map(|item| {
+                let item = item.as_str().unwrap_or_default();
+                let expanded = if let Some(rest) = item.strip_prefix("~/") {
+                    home.join(rest)
+                } else {
+                    PathBuf::from(item)
+                };
+                expanded
+                    .canonicalize()
+                    .unwrap_or(expanded)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect(),
+        _ => {
+            return Err(fail(format!(
+                "Antigravity trustedWorkspaces must be a list of strings. {instruction}"
+            )));
+        }
+    };
+    if !workspaces.iter().any(|item| item == &cwd.to_string_lossy()) {
+        return Err(fail(format!(
+            "Antigravity cwd is not trusted. {instruction}"
+        )));
+    }
+    Ok(())
+}
+
+/// Shell-quote one value the way POSIX shlex does.
+pub fn shlex_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"@%_+=:,./-".contains(&byte))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn child_runner_command(base: &Path, name: &str) -> String {
+    let mut environment: Vec<(String, String)> = vec![
+        (
+            "HERDR_SUBAGENTS_HOME".to_string(),
+            base.display().to_string(),
+        ),
+        (
+            "HERDR_SUBAGENTS_PROJECT_DEFAULTS".to_string(),
+            super::registry::project_defaults_path(base)
+                .display()
+                .to_string(),
+        ),
+        (
+            "SUBAGENTS_CODEX_BYPASS_PERMISSIONS".to_string(),
+            if configured_codex_bypass_permissions().unwrap_or(false) {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            },
+        ),
+    ];
+    if let Ok(policy) = std::env::var("HERDR_SUBAGENTS_POLICY") {
+        if !policy.is_empty() {
+            let resolved = PathBuf::from(&policy);
+            let resolved = resolved.canonicalize().unwrap_or(resolved);
+            environment.push((
+                "HERDR_SUBAGENTS_POLICY".to_string(),
+                resolved.display().to_string(),
+            ));
+        }
+    }
+    for key in [
+        "CODEX_BIN",
+        "AGY_BIN",
+        "MUSE_BIN",
+        "HERDR_BIN",
+        "CODEX_HOME",
+        "SUBAGENT_EFFORT",
+        "SUBAGENTS_TMUX_SESSION",
+        "SUBAGENTS_HERDR_WORKSPACE",
+        "SUBAGENTS_TURN_TIMEOUT",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            environment.push((key.to_string(), value));
+        }
+    }
+    let prefix = environment
+        .iter()
+        .map(|(key, value)| format!("{key}={}", shlex_quote(value)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let executable = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "herdr-subagents".to_string());
+    format!(
+        "env {prefix} {} __runner {}",
+        shlex_quote(&executable),
+        shlex_quote(name)
+    )
+}
+
+/// Shell command used by every backend to host a runner visibly.
+pub fn runner_wrapper_at(
+    base: &Path,
+    name: &str,
+    stage_token: Option<&str>,
+) -> Result<String, ForeignOwnershipError> {
+    let mut inner = child_runner_command(base, name);
+    if let Some(token) = stage_token {
+        inner = format!("SUBAGENTS_MIGRATION_STAGE={} {inner}", shlex_quote(token));
+    }
+    let stderr = shlex_quote(&runner_stderr_path_at(base, name)?.display().to_string());
+    Ok(format!(
+        "{inner} 2>>{stderr}; ec=$?; echo '[subagents] runner exited rc='$ec >>{stderr}; echo; \
+         echo '[subagents] runner for {name} exited rc='$ec' - presentation kept for \
+         inspection; run agent_down.py {name} to reap'; exec sleep infinity"
+    ))
+}
+
+fn tmux_run(args: &[&str], check: bool) -> Result<std::process::Output, ForeignOwnershipError> {
+    let output = std::process::Command::new("tmux").args(args).output();
+    match output {
+        Ok(output) => {
+            if check && !output.status.success() {
+                return Err(ForeignOwnershipError {
+                    code: "tmux_failed",
+                    message: format!(
+                        "tmux {} failed: {}",
+                        args.join(" "),
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ),
+                });
+            }
+            Ok(output)
+        }
+        Err(_error) if !check => Ok(std::process::Output {
+            status: std::process::ExitStatus::default(),
+            stdout: Vec::new(),
+            stderr: b"tmux: not found".to_vec(),
+        }),
+        Err(error) => Err(ForeignOwnershipError {
+            code: "tmux_failed",
+            message: format!("cannot run tmux {}: {error}", args.join(" ")),
+        }),
+    }
+}
+
+fn launch_tmux_window(
+    name: &str,
+    cwd: &str,
+    wrapper_cmd: &str,
+    session: Option<&str>,
+) -> Result<String, ForeignOwnershipError> {
+    let session = session.map(str::to_owned).unwrap_or_else(tmux_session);
+    let exists = tmux_run(&["has-session", "-t", &format!("={session}")], false)
+        .is_ok_and(|output| output.status.success());
+    if !exists {
+        tmux_run(
+            &[
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                "-n",
+                name,
+                "-c",
+                cwd,
+                "bash",
+                "-lc",
+                wrapper_cmd,
+            ],
+            true,
+        )?;
+    } else {
+        tmux_run(
+            &[
+                "new-window",
+                "-t",
+                &format!("={session}:"),
+                "-n",
+                name,
+                "-c",
+                cwd,
+                "bash",
+                "-lc",
+                wrapper_cmd,
+            ],
+            true,
+        )?;
+    }
+    Ok(format!("{session}:{name}"))
+}
+
+fn herdr_action(args: &[&str]) -> Result<(), ForeignOwnershipError> {
+    let argv: Vec<String> = std::iter::once(herdr_bin())
+        .chain(args.iter().map(|arg| arg.to_string()))
+        .collect();
+    match run_bounded(&argv, herdr_api_timeout()) {
+        Some(output) if output.status.success() => Ok(()),
+        Some(output) => Err(ForeignOwnershipError {
+            code: "herdr_api_failed",
+            message: format!(
+                "herdr {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        }),
+        None => Err(ForeignOwnershipError {
+            code: "herdr_unavailable",
+            message: format!("Herdr probe {} failed", args.join(" ")),
+        }),
+    }
+}
+
+fn herdr_orphan_window_exists(base: &Path, name: &str) -> Result<bool, ForeignOwnershipError> {
+    let Some(workspace_id) = backend_config_value(base, "herdr_workspace_id")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(false);
+    };
+    match herdr_call(&["tab", "list", "--workspace", &workspace_id], None) {
+        Ok(listed) => {
+            let tabs = listed
+                .get("tabs")
+                .and_then(Value::as_array)
+                .ok_or_else(|| ForeignOwnershipError {
+                    code: "herdr_api_invalid",
+                    message: "herdr response lacks a tabs list".to_string(),
+                })?;
+            Ok(tabs
+                .iter()
+                .any(|tab| tab.get("label").and_then(Value::as_str) == Some(name)))
+        }
+        Err(error) if herdr_not_found(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn herdr_workspace_label() -> String {
+    std::env::var("SUBAGENTS_HERDR_WORKSPACE").unwrap_or_else(|_| "subagents".to_string())
+}
+
+fn backend_config_value(base: &Path, key: &str) -> Option<Value> {
+    let bytes = std::fs::read(super::registry::backend_config_path(base)).ok()?;
+    serde_json::from_slice::<Value>(&bytes)
+        .ok()?
+        .get(key)
+        .cloned()
+}
+
+fn remember_herdr_workspace(base: &Path, workspace_id: &str) {
+    let path = super::registry::backend_config_path(base);
+    let mut config = std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    config.insert(
+        "herdr_workspace_id".into(),
+        Value::String(workspace_id.to_string()),
+    );
+    let _ = std::fs::create_dir_all(base);
+    let _ = write_durable_json(&path, &Value::Object(config));
+}
+
+fn herdr_workspace_id(base: &Path, cwd: &str) -> Result<String, ForeignOwnershipError> {
+    let label = herdr_workspace_label();
+    if let Some(configured) = backend_config_value(base, "herdr_workspace_id")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .filter(|value| !value.is_empty())
+    {
+        match herdr_call(&["workspace", "get", &configured], None) {
+            Ok(found)
+                if found
+                    .get("workspace")
+                    .and_then(|w| w.get("label"))
+                    .and_then(Value::as_str)
+                    == Some(label.as_str()) =>
+            {
+                return Ok(configured);
+            }
+            Ok(_) => {}
+            Err(error) if !herdr_not_found(&error) => return Err(error),
+            Err(_) => {}
+        }
+    }
+    let listed = herdr_call(&["workspace", "list"], None)?;
+    let workspaces = listed
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .ok_or_else(|| ForeignOwnershipError {
+            code: "herdr_api_invalid",
+            message: "herdr response lacks a workspaces list".to_string(),
+        })?;
+    for workspace in workspaces {
+        if workspace.get("label").and_then(Value::as_str) == Some(label.as_str()) {
+            if let Some(id) = workspace.get("workspace_id").and_then(Value::as_str) {
+                remember_herdr_workspace(base, id);
+                return Ok(id.to_string());
+            }
+        }
+    }
+    let created = herdr_call(
+        &[
+            "workspace",
+            "create",
+            "--cwd",
+            cwd,
+            "--label",
+            &label,
+            "--no-focus",
+        ],
+        None,
+    )?;
+    let id = created
+        .get("workspace")
+        .and_then(|w| w.get("workspace_id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| ForeignOwnershipError {
+            code: "herdr_api_invalid",
+            message: "Herdr did not return its new workspace id".to_string(),
+        })?
+        .to_string();
+    remember_herdr_workspace(base, &id);
+    Ok(id)
+}
+
+fn launch_herdr_window(
+    base: &Path,
+    name: &str,
+    cwd: &str,
+    wrapper_cmd: &str,
+) -> Result<String, ForeignOwnershipError> {
+    let workspace_id = herdr_workspace_id(base, cwd)?;
+    let created = herdr_call(
+        &[
+            "tab",
+            "create",
+            "--workspace",
+            &workspace_id,
+            "--cwd",
+            cwd,
+            "--label",
+            "subagent",
+            "--no-focus",
+        ],
+        None,
+    )?;
+    let tab = created.get("tab");
+    let root = created.get("root_pane");
+    let (Some(tab), Some(root)) = (
+        tab.and_then(Value::as_object),
+        root.and_then(Value::as_object),
+    ) else {
+        return Err(ForeignOwnershipError {
+            code: "herdr_api_invalid",
+            message: "Herdr did not return a tab and root pane".to_string(),
+        });
+    };
+    let (Some(tab_id), Some(root_pane_id)) = (
+        tab.get("tab_id").and_then(Value::as_str),
+        root.get("pane_id").and_then(Value::as_str),
+    ) else {
+        return Err(ForeignOwnershipError {
+            code: "herdr_api_invalid",
+            message: "Herdr did not return a tab and root pane".to_string(),
+        });
+    };
+    let launched = herdr_action(&[
+        "pane",
+        "run",
+        root_pane_id,
+        &format!("/bin/bash -lc {}", shlex_quote(wrapper_cmd)),
+    ])
+    .and_then(|()| herdr_call(&["tab", "rename", tab_id, name], None).map(|_| ()));
+    if let Err(error) = launched {
+        if herdr_call(&["tab", "get", tab_id], None).is_ok() {
+            if let Err(cleanup) = herdr_call(&["tab", "close", tab_id], None) {
+                return Err(ForeignOwnershipError {
+                    code: "herdr_cleanup_failed",
+                    message: format!(
+                        "failed to launch Herdr tab {tab_id} ({}); cleanup also failed: {}",
+                        error.message, cleanup.message
+                    ),
+                });
+            }
+        }
+        return Err(error);
+    }
+    Ok(tab_id.to_string())
+}
+
+/// New worker status, the optional first-turn sequence, and cleanup notes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpResult {
+    /// The new worker's status snapshot.
+    pub agent: AgentStatus,
+    /// First queued turn sequence, when a brief was given.
+    pub queued_turn: Option<i64>,
+    /// Garbage-collection notes from the pre-launch pass.
+    pub gc_notes: Vec<String>,
+}
+
+/// Validate policy and launch a named headless worker, optionally enqueueing its first task.
+#[allow(clippy::too_many_arguments)]
+pub fn bring_up_agent_at(
+    base: &Path,
+    proc_root: &Path,
+    name: &str,
+    cwd: &str,
+    brief: Option<&str>,
+    model: Option<&str>,
+    harness: &str,
+    backend: Option<&str>,
+    mode: Option<&str>,
+    harness_args: &[String],
+) -> Result<UpResult, ForeignOwnershipError> {
+    let harness = super::registry::require_supported_harness(harness)?;
+    if harness_args
+        .iter()
+        .any(|item| item.is_empty() || item.contains('\0'))
+    {
+        return Err(ForeignOwnershipError {
+            code: "invalid_harness_arguments",
+            message: "harness arguments must be nonempty NUL-free strings".to_string(),
+        });
+    }
+    if harness != "muse" && !harness_args.is_empty() {
+        return Err(ForeignOwnershipError {
+            code: "unsupported_harness_arguments",
+            message: "headless harness arguments currently apply only to Muse".to_string(),
+        });
+    }
+    // Consumer policy modules remain a dynamic-language hook this edition
+    // refuses rather than silently skipping a launch check.
+    if std::env::var("HERDR_SUBAGENTS_POLICY").is_ok_and(|value| !value.is_empty()) {
+        return Err(ForeignOwnershipError {
+            code: "policy_invalid",
+            message: "cannot load subagent policy: dynamic policy modules are not supported by this edition".to_string(),
+        });
+    }
+    let bypass_permissions = configured_codex_bypass_permissions()?;
+    let backend = super::registry::selected_backend_at(base, backend)?;
+    let (mode, warning) = super::registry::selected_mode_at(base, harness, mode, Some(&backend))?;
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
+    if mode == "tui" && backend != "herdr" {
+        return Err(ForeignOwnershipError {
+            code: "tui_requires_herdr",
+            message: "--mode tui requires the herdr backend".to_string(),
+        });
+    }
+    if mode == "tui" {
+        return Err(ForeignOwnershipError {
+            code: "tui_not_yet_in_rust",
+            message: "bringing up a TUI worker is not yet in this edition".to_string(),
+        });
+    }
+    if !backend_available(&backend) {
+        return Err(ForeignOwnershipError {
+            code: if backend == "tmux" {
+                "tmux_missing"
+            } else {
+                "herdr_missing"
+            },
+            message: format!(
+                "{backend} is selected but is not available; check its binary and running server"
+            ),
+        });
+    }
+    let valid_name = super::registry::require_valid_name(name)?.to_string();
+    let root = {
+        let path = PathBuf::from(cwd);
+        let expanded = if let Some(rest) = cwd.strip_prefix("~/") {
+            std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(rest))
+                .unwrap_or(path)
+        } else {
+            path
+        };
+        expanded.canonicalize().unwrap_or(expanded)
+    };
+    if !root.is_dir() {
+        return Err(ForeignOwnershipError {
+            code: "bad_cwd",
+            message: format!("cwd is not a directory: {}", root.display()),
+        });
+    }
+    if harness == "agy" {
+        require_antigravity_preflight(&root)?;
+    }
+    let notes = gc_at(base, proc_root)?;
+    with_registry_lock_at(base, |agents| {
+        if agents.contains_key(&valid_name) {
+            return Err(ForeignOwnershipError {
+                code: "agent_exists",
+                message: format!("agent '{valid_name}' already active; subagent_down it first"),
+            });
+        }
+        let orphan = if backend == "tmux" {
+            tmux_window_exists(&valid_name)
+        } else {
+            herdr_orphan_window_exists(base, &valid_name)?
+        };
+        if orphan {
+            return Err(ForeignOwnershipError {
+                code: "orphan_window",
+                message: format!(
+                    "{backend} presentation for '{valid_name}' already exists with no registry row"
+                ),
+            });
+        }
+        agents.insert(
+            valid_name.clone(),
+            AgentRecord {
+                name: valid_name.clone(),
+                harness: harness.to_string(),
+                backend: backend.clone(),
+                tmux_target: format!("{}:{}", tmux_session(), valid_name),
+                cwd: root.to_string_lossy().into_owned(),
+                model: model.map(str::to_owned),
+                session_id: if harness == "muse" {
+                    Some(new_uuid4())
+                } else {
+                    None
+                },
+                status: "starting".to_string(),
+                runner_pid: None,
+                runner_started_at: None,
+                next_seq: 0,
+                created_at: now_iso(),
+                last_turn_at: None,
+                mode: mode.clone(),
+                codex_bypass_permissions: bypass_permissions,
+                harness_args: harness_args.to_vec(),
+                ..AgentRecord::default()
+            },
+        );
+        Ok(())
+    })?;
+    ensure_agent_dirs_at(base, &valid_name)?;
+    let launched = (|| -> Result<String, ForeignOwnershipError> {
+        let wrapper = runner_wrapper_at(base, &valid_name, None)?;
+        if backend == "tmux" {
+            launch_tmux_window(&valid_name, &root.to_string_lossy(), &wrapper, None)
+        } else {
+            launch_herdr_window(base, &valid_name, &root.to_string_lossy(), &wrapper)
+        }
+    })();
+    let target = match launched {
+        Ok(target) => target,
+        Err(error) => {
+            let _ = with_registry_lock_at(base, |agents| {
+                agents.remove(&valid_name);
+                Ok(())
+            });
+            return Err(ForeignOwnershipError {
+                code: if backend == "tmux" {
+                    "tmux_launch_failed"
+                } else {
+                    "herdr_launch_failed"
+                },
+                message: format!(
+                    "failed to launch {backend} presentation for '{valid_name}': {}",
+                    error.message
+                ),
+            });
+        }
+    };
+    with_registry_lock_at(base, |agents| {
+        if let Some(record) = agents.get_mut(&valid_name) {
+            record.tmux_target = target.clone();
+        }
+        Ok(())
+    })?;
+    let mut queued_turn: Option<i64> = None;
+    if let Some(brief) = brief {
+        queued_turn = Some(enqueue_message_at(base, &valid_name, brief, None)?);
+    }
+    write_event_at(
+        base,
+        "agent_up",
+        &valid_name,
+        None,
+        None,
+        Some(&last_message_preview_at(base, &valid_name, 240)?),
+    )?;
+    let record = super::registry::read_registry_at(base)?
+        .get(&valid_name)
+        .cloned()
+        .ok_or_else(|| ForeignOwnershipError {
+            code: "unknown_agent",
+            message: format!("unknown agent '{valid_name}'"),
+        })?;
+    Ok(UpResult {
+        agent: agent_status_at(base, proc_root, &record)?,
+        queued_turn,
+        gc_notes: notes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

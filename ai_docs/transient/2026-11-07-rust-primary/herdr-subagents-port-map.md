@@ -177,3 +177,7 @@ Adds `status` and `down` (including `--all-dead` gc and `--force`) to the dispat
 ## 18. B3-7c scope, third slice (turn + inbox snapshot)
 
 Adds `turn` for existing agents (fresh-context reset with the return-4 refusal, effort env, send, sentinel streaming wait with pre-dispatch transcript offset, exit codes 0/2/3/4; creation and window recreation still refuse/warn until bring-up lands) and `inbox --inspect` (`tui_inbox_snapshot_at`); `inbox --drain` still refuses by name pending TUI delivery. Also `status`/`down`/`gc` from the second slice are covered there. Remaining B3-7c: `up` (presentation launch: tmux/Herdr windows, runner wrapper, TUI launch), `migrate`, `keeper`, and TUI delivery/read paths.
+
+## 19. B3-7c scope, fourth slice (bring-up, headless)
+
+Adds `up` for headless workers: policy-mode resolution, Antigravity preflight, orphan presentation refusal (tmux window / Herdr tab label in the configured workspace), registry row creation, tmux session/window and Herdr workspace/tab launch running the runner wrapper (`herdr-subagents __runner`, stderr capture, keep-alive shell), launch-failure row rollback, first-brief enqueue, and the `agent_up` event. TUI mode bring-up still refuses by name (`tui_not_yet_in_rust`) until the visible-Codex launch slice; dynamic consumer policy modules refuse instead of being silently skipped. Remaining: `migrate`, `keeper`, TUI launch/delivery/read, and window recreation.
