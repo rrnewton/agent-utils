@@ -731,7 +731,7 @@ for (const [mode, read, tail, held] of [
     assert.deepStrictEqual(await enter(SCRIPT, true, live), covered,
       "the read behind the held rows, overtaken by a live message, did not end as the covered thread does");
     // Negative control: the answer kept where it landed, as before. The root is above the screen.
-    const control = await enter(brokenScript("  const head = entryHeadRow(first);\n", "  const head = first;\n"), true);
+    const control = await enter(await brokenModule([{ file: "src/view/channel/threadentry.ts", find: "    const head = entryHeadRow(first);\n", replace: "    const head = first;\n" }]), true);
     assert.equal(control.rootAtHead, false, "the control still put the root at the head; it proves nothing");
     assert.ok(control.root < covered.root, "the control did not leave the root above the screen");
   });
@@ -768,8 +768,7 @@ test("...and keeps the landed message open when the read joins an older message 
   await reReadChannel(page);
   assert.equal(rowWithId(page, runId(500)).getAttribute("data-collapsed"), "true", "a read opened the row the reader folded");
   // Negative control: without opening the row again, it is drawn folded under message 12.
-  const control = await run(brokenScript("    fold.click();\n  }\n  const head = entryHeadRow(first);",
-    "  }\n  const head = entryHeadRow(first);"));
+  const control = await run(await brokenModule([{ file: "src/view/channel/threadentry.ts", find: "      fold.click();\n    }\n    const head = entryHeadRow(first);", replace: "    }\n    const head = entryHeadRow(first);" }]));
   assert.equal(control.open, "true", "the row stayed open without being opened; the control proves nothing");
 });
 
@@ -874,7 +873,7 @@ test("...and a root the landing put at the head stays there when the reader open
   }
   // Negative control: the landing made again on the first unread whenever the root no longer fits,
   // whatever the landing had at the head. The reader goes down past the run, and the root off screen.
-  const control = brokenScript("  if (head !== first && head !== kept) {", "  if (head !== first || kept !== first) {");
+  const control = await brokenModule([{ file: "src/view/channel/threadentry.ts", find: "    if (head !== first && head !== kept) {", replace: "    if (head !== first || kept !== first) {" }]);
   for (const fromHeldRows of [false, true]) {
     const { moved, rootShown } = await run(control, fromHeldRows);
     assert.equal(rootShown, false, `the control left the root on screen (moved ${moved}px); it proves nothing`);
@@ -1433,10 +1432,9 @@ test("...and lands the first unread's day rule under the floating line with it, 
     `the day rule landed at ${real.rule}px, not just under the floating line at ${real.line}px`);
   assert.ok(real.tile > real.rule, "the tile is not under its rule");
   // THE CONTROL: the landing measured from the tile, as it was.
-  const control = await land(brokenScript(
-    "  area.scrollTop += drawnTop(row) - floatingClearance(area) - REPLY_LANDING_GAP_PX;\n  entryState().landing =",
-    "  area.scrollTop += row.getBoundingClientRect().top - floatingClearance(area) - REPLY_LANDING_GAP_PX;\n" +
-      "  entryState().landing ="));
+  const control = await land(await brokenModule([{ file: "src/view/channel/threadentry.ts",
+    find: "    area.scrollTop += deps.drawnTop(row) - deps.floatingClearance(area) - REPLY_LANDING_GAP_PX;\n    entryState().landing =",
+    replace: "    area.scrollTop += row.getBoundingClientRect().top - deps.floatingClearance(area) - REPLY_LANDING_GAP_PX;\n    entryState().landing =" }]));
   assert.ok(control.rule < control.line,
     "the control left the day rule clear of the floating line too, so the check above proves nothing");
   assert.ok(Math.abs(control.tile - real.rule) <= 1, "the control did not land the tile where the rule now lands");

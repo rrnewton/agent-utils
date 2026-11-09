@@ -215,6 +215,8 @@ declare const freshGatherState: LegacyImports["freshGatherState"];
 declare const freshListState: LegacyImports["freshListState"];
 declare const createSentRead: LegacyImports["createSentRead"];
 declare const createReadingColumn: LegacyImports["createReadingColumn"];
+declare const createThreadEntry: LegacyImports["createThreadEntry"];
+declare const freshEntryState: LegacyImports["freshEntryState"];
 declare const createReplyArrows: LegacyImports["createReplyArrows"];
 declare const freshReplyArrows: LegacyImports["freshReplyArrows"];
 declare const REPLY_LANDING_GAP_PX: LegacyImports["REPLY_LANDING_GAP_PX"];

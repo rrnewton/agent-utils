@@ -171,7 +171,7 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
     { freshness: "fresh", freshAt: 0, refreshing: false, lineTimer: null, generation: 0 });
   // And entering a view.
   assert.equal(same("inColumn(columns.side, () => entryState()) === columns.side.entry && entryState() === columns.main.entry"), true);
-  assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshEntryState())")),
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(page.preludeBinding("freshEntryState")())),
     { threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null, backGesture: null });
   // And its Pinned filter.
   same("inColumn(columns.side, () => { pinsView().only = true; })");

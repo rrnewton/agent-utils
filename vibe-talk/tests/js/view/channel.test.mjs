@@ -1976,3 +1976,45 @@ test("`#624 voice-page-modularity`: a sent reply marks what it answers Done on t
     why: "it cannot say whether its read marker covers more than this channel." },
   "the service was asked where it cannot say what its marker covers");
 });
+
+test("`#624 voice-page-modularity`: entering a thread lands on its first unread message, opened, and a thread with nothing unread is left where it was", () => {
+  const { createThreadEntry, freshEntryState } = CHANNEL_VIEW;
+  assert.deepStrictEqual(freshEntryState(), { threadOwed: null, threadAwaitsRead: false, readOwed: null, landing: null, backGesture: null });
+  const record = freshEntryState();
+  const log = [];
+  const rows = [];
+  const list = { children: rows };
+  const area = { scrollTop: 0, clientHeight: 100, getBoundingClientRect: () => ({ top: 0, bottom: 100 }) };
+  const entry = createThreadEntry({
+    el: (id) => (id === "discord-log" ? list : id === "scroll-area" ? area : { hidden: true, getBoundingClientRect: () => ({ height: 0, top: 0, bottom: 0 }) }),
+    activeEntry: () => record,
+    channelContextKey: () => "ctx",
+    selection: () => ({ view: "thread", threadId: "t1" }),
+    channelViewsHas: () => true,
+    viewKey: () => "thread:t1",
+    applyReadRuns: () => log.push("runs"),
+    atBottom: () => false,
+    renderScrollTools: () => log.push("tools"),
+    requestVisibleSummaries: () => log.push("summaries"),
+    floatingClearance: () => 0,
+    drawnTop: (row) => row.top,
+    openThreadRootId: () => null,
+    isOpenThreadRoot: () => false,
+    rowIsRead: (row) => row.read === true,
+    toFoot: () => log.push("foot"),
+    setJumpNewest: (wanted) => log.push(`jump:${wanted}`),
+    screen: () => "main",
+    view: () => "discord",
+    pinsView: () => ({ only: false }),
+  });
+  const read = { read: true, top: 40, hidden: false, className: "", parentNode: list, getAttribute: () => null, hasAttribute: () => false, getBoundingClientRect: () => ({ top: 40, height: 20, bottom: 60 }) };
+  const unread = { read: false, top: 80, hidden: false, className: "", parentNode: list, getAttribute: (k) => (k === "data-collapsed" ? "true" : null), hasAttribute: () => false, getBoundingClientRect: () => ({ top: 80, height: 20, bottom: 100 }) };
+  const after = { read: true, top: 120, hidden: false, className: "", parentNode: list, getAttribute: () => null, hasAttribute: () => false, getBoundingClientRect: () => ({ top: 120, height: 20, bottom: 140 }) };
+  rows.push(read, unread, after);
+  assert.equal(entry.landOnFirstUnread(), true, "the entry did not land on the first unread message");
+  assert.deepStrictEqual(log, ["tools", "summaries"], "the landing was not drawn after");
+  assert.equal(record.landing.first, unread, "the landing did not keep the first unread row");
+  rows.length = 0;
+  rows.push(read);
+  assert.equal(entry.landOnFirstUnread(), false, "a thread with nothing unread was landed somewhere");
+});
