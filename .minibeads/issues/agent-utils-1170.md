@@ -1,6 +1,6 @@
 ---
 title: "gate-soak-host-optin-isolation: a per-host Rust readers opt-in leaks into gate test sandboxes"
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-09T22:37:10.000000000+00:00
@@ -47,3 +47,13 @@ environment; the child must observe the forced opt-out values.
 
 Approved by the lead coordinator on 2026-11-09 after the first reader-soak
 pause. Build the test helpers' existing pins remain as defence in depth.
+
+## Resolution
+
+[watermelon-full-preview] `scripts/gate.py` now has a single
+`_child_environment` helper used by both `run_preflight()` and
+`run_admitted()`. It preserves the parent environment while forcing
+`WRKSLOTS_RUST_READERS=0` and pointing `WRKSLOTS_RUST_READERS_FILE` at a
+nonexistent path under the gate admission directory. A gate admission test
+sets an enabled host file and parent `WRKSLOTS_RUST_READERS=1`, then proves the
+admitted child observes the opt-out values and keeps its admission run ID.

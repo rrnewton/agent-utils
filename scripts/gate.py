@@ -38,8 +38,9 @@ nested gate can stop its own group first), then SIGKILLs whatever is left,
 releases the slot and records the run as `aborted` in the ledger, so a
 stopped gate never leaves dagrun and its steps running outside admission.
 
-An admitted run's children see $GATE_ADMISSION_RUN_ID. A gate invoked from
-inside an admitted run (validate.py's gate-exclusive phase) releases the
+An admitted run's children see $GATE_ADMISSION_RUN_ID, and never inherit the
+host's wrkslots Rust-readers routing opt-in (see `_child_environment`). A
+gate invoked from inside an admitted run (validate.py's gate-exclusive phase) releases the
 parent's slot before queueing: the parent is blocked on that call, so holding
 its slot would deadlock, and the nested call must still wait for — and block —
 every other gate as a fresh exclusive ticket.
@@ -156,6 +157,24 @@ _VERDICT = re.compile(r"validate: (OK|PARTIAL|FAILED)")
 
 def state_dir() -> Path:
     return Path(os.environ.get("GATE_ADMISSION_DIR") or DEFAULT_DIR)
+
+
+def _child_environment(**overrides: str) -> dict[str, str]:
+    """Environment for the preflight and the admitted command (#1170).
+
+    A per-host Rust-readers opt-in is for interactive calls on that host,
+    not for validation children: a sandbox that lacks the soak launcher
+    must never inherit it. Force the explicit opt-out, which the engine
+    resolver ranks above the host file, and point the file variable at a
+    name that does not exist under the gate scratch directory.
+    """
+
+    return {
+        **os.environ,
+        "WRKSLOTS_RUST_READERS": "0",
+        "WRKSLOTS_RUST_READERS_FILE": str(state_dir() / "no-wrkslots-rust-readers"),
+        **overrides,
+    }
 
 
 #: Exit status for a start refused by a blackout window (#907).
@@ -635,7 +654,8 @@ def run_preflight() -> tuple[bool, float, list[str], list[str]]:
 
     started = time.time()
     try:
-        proc = subprocess.run(preflight_command(), cwd=_repo_root(), stdout=subprocess.PIPE,
+        proc = subprocess.run(preflight_command(), cwd=_repo_root(), env=_child_environment(),
+                              stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True, errors="replace")
         returncode, lines = proc.returncode, proc.stdout.splitlines()
     except OSError as exc:
@@ -766,7 +786,7 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
             signal.signal(sig, _raise_aborted)
         proc = subprocess.Popen(
             command,
-            env={**os.environ, "GATE_ADMISSION_RUN_ID": run_id},
+            env=_child_environment(GATE_ADMISSION_RUN_ID=run_id),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

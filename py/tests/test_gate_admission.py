@@ -85,6 +85,42 @@ def test_finished_runs_append_to_the_durable_ledger(tmp_path: Path) -> None:
     assert "queue wait over 3 run(s): median" in stats.stdout
 
 
+def test_gate_children_do_not_inherit_the_host_readers_optin(tmp_path: Path) -> None:
+    """#1170: gate children force the wrkslots readers opt-out.
+
+    A parent may have opted the whole host into the readers soak by env and
+    file; neither the preflight nor the admitted command may receive it.
+    """
+
+    preflight_env = tmp_path / "preflight.env"
+    readers_file = tmp_path / "wrkslots-rust-readers"
+    readers_file.write_text("enabled = true\n")
+    env = {
+        **_env(tmp_path),
+        "WRKSLOTS_RUST_READERS": "1",
+        "WRKSLOTS_RUST_READERS_FILE": str(readers_file),
+        "GATE_PREFLIGHT_COMMAND": f"env > {preflight_env}",
+    }
+    child = (
+        "import os; "
+        "print('readers=' + os.environ.get('WRKSLOTS_RUST_READERS', '')); "
+        "print('readers_file=' + os.environ.get('WRKSLOTS_RUST_READERS_FILE', '')); "
+        "print('run_id=' + ('yes' if os.environ.get('GATE_ADMISSION_RUN_ID') else 'no'))"
+    )
+    result = subprocess.run(
+        [PY, str(GATE), "--", PY, "-c", child],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    expected_file = str(tmp_path / "admission" / "no-wrkslots-rust-readers")
+    assert result.returncode == 0, result.stdout
+    assert "readers=0" in result.stdout.splitlines()
+    assert f"readers_file={expected_file}" in result.stdout.splitlines()
+    assert "run_id=yes" in result.stdout.splitlines()
+    preflight_lines = preflight_env.read_text().splitlines()
+    assert "WRKSLOTS_RUST_READERS=0" in preflight_lines
+    assert f"WRKSLOTS_RUST_READERS_FILE={expected_file}" in preflight_lines
+
+
 def test_shared_gates_run_up_to_the_cap_and_queue_the_rest(tmp_path: Path) -> None:
     sleepers = [_start(tmp_path, "--slots", "3", "--", PY, "-c", "import time; time.sleep(4)") for _ in range(3)]
     _wait_for_runs(tmp_path, 3)
