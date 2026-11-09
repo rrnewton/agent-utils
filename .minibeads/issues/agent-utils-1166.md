@@ -1,57 +1,49 @@
 ---
-title: 'switcher-frame-panel: frame the view switcher tab row so the selected cell cannot bleed into Talk'
+title: "gate-soak-host-optin-isolation: a per-host Rust readers opt-in leaks into gate test sandboxes"
 status: open
 priority: 1
-issue_type: task
-created_at: 2026-11-09T22:31:16.847801059+00:00
-updated_at: 2026-11-09T22:31:16.847801059+00:00
+issue_type: bug
+created_at: 2026-11-09T22:37:10.000000000+00:00
+updated_at: 2026-11-09T22:37:10.000000000+00:00
 ---
 
 # Description
 
-Owner reply 278 (2026-11-09), from the voice view on Android: "That
-little selector thing when I'm tapping the voice channel documents
-three-way selector needs to have some kind of background frame
-around it. Do you see in the screenshot how the blue of the voice
-button that's selected just bleeds in to a talk button underneath
-it."
-
-The transient tab row from #1078 (Voice, Channel, Documents) floats
-directly over the control pane's big Talk button. The selected Voice
-cell is the same accent blue as Talk, the unselected cells are dark
-with thin borders, and nothing frames the row, so the selected cell
-and the button underneath read as one blue shape.
+The Rust readers soak can be opted in per process with
+`WRKSLOTS_RUST_READERS=1` or per host with an `enabled = true` line in
+`~/.local/etc/agent-utils/wrkslots-rust-readers`. `scripts/gate.py` passes the
+calling process environment to the admitted validation command and preflight,
+and resolver tests inherit the real `$HOME`, so enabling the soak on one host
+changes default dispatch inside gate test sandboxes. A sandbox tree without
+`common/bin/wrkslots-soak` paged the 2026-11-09 soak at 11:09 PM ET when
+`test_python_only_tool_defaults_to_python` exited 127 on the missing launcher.
 
 # Design
 
-Give the tab row its own framed panel: an opaque background, a
-border and shadow, a little padding inside the frame, and a small
-gap between the row and what is under it. The selected cell keeps
-its highlight but in a colour or with an outline that stays
-distinct from Talk's blue, in dark and light schemes alike. Nothing
-else about the row changes: same cells, same rotation, same settle
-after the last press, same direct choice, same pointer behaviour
-while a call can be hung up.
-
-Files are expected to be the Documents stylesheet's row rules and
-the page test that already covers the row; any shared shell or
-script file will be cleared with the coordinator before editing.
+Make `scripts/gate.py` the isolation boundary. It builds one child
+environment for both the preflight and the admitted command: preserve the
+caller's environment, add `GATE_ADMISSION_RUN_ID`, and force
+`WRKSLOTS_RUST_READERS=0`. It also points `WRKSLOTS_RUST_READERS_FILE` at a
+nonexistent path under the gate scratch directory. `engine-resolver` already
+gives `WRKSLOTS_RUST_READERS=0` precedence over the file, and tests that
+deliberately exercise routing replace those environment values afterwards.
+Real interactive calls outside `gate.py` continue to honour the host file.
+Keep the existing test-helper pins as a second layer. Also add a gate test in
+which an enabled host file is present while a child echoes its routing
+environment; the child must observe the forced opt-out values.
 
 # Acceptance Criteria
 
-- Over the voice view's Talk button, the channel composer and the
-  Documents view, at phone and desktop widths in dark and light,
-  the row reads as one framed panel and the selected cell is
-  unmistakable against what is under it.
-- The row's behaviour is unchanged: stepping, wrapping, settling,
-  dismissal and direct choice as #1078 delivered.
-- A page test or browser screenshot check covers the framed row
-  and the distinct selected cell.
+- A gate child sees `WRKSLOTS_RUST_READERS=0` even when the parent process has
+  the variable set to `1`.
+- A gate child sees `WRKSLOTS_RUST_READERS_FILE` pointing to a path that does
+  not exist, even when the parent process points it elsewhere.
+- The admitted command still receives `GATE_ADMISSION_RUN_ID`.
+- A sandbox resolver call with a real enabled host file stays on Python under
+  the gate environment, and the dedicated resolver tests still cover explicit
+  opt-in routing outside that isolated child environment.
 
 # Notes
 
-Owner reply 278, 2026-11-09 5:23 PM ET; follow-up to #1078
-bottom-bar-switcher. Screenshot supplied with the request. To be
-gated together with #1167 jump-to-unread-chip and #1168
-read-toggle-two-way under one full gate after the coordinator's
-all-clear.
+Approved by the lead coordinator on 2026-11-09 after the first reader-soak
+pause. Build the test helpers' existing pins remain as defence in depth.
