@@ -22542,6 +22542,9 @@ fi
     mod recovery_metadata;
     /// `agentctl restore` and `agentctl watch` against the fake Herdr and a scripted host.
     mod restore;
+    /// `agentctl restore-teams` over two fake-Herdr registries: aggregation,
+    /// certificate gating, refused lanes, replay, and single-registry filters.
+    mod restore_teams;
     mod retire_registration;
     /// Resume recovery, immutable planning, exact publication and crash reconciliation.
     mod revive;

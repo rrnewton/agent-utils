@@ -145,9 +145,14 @@ enum Commands {
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl restore --dry-run\n  agentctl --registry ~/project/.agentctl restore --boot\n\nConfiguration is REGISTRY/restore.json (schema agentctl-restore/v1): coordinator (default: the\nregistry's designated coordinator; when both are set and disagree, restore.json wins and the report\nsays so under designation_problem), also_registered\n([{registry, name}]), units, exclude (names to leave alone), startup_delay_seconds (default 20), herdr_wait_seconds (default 300),\nreport_dir (default $XDG_STATE_HOME/agentctl/restore), herdr_unit, timers (used by watch), and scheduled ([{name, on_calendar, command}], rendered as persistent timer units by install-units --scheduled).\nThe slot manager is AGENTCTL_WRKSLOTS_BIN, then profiles.json \"wrkslots\", then PATH; restore runs\n`wrkslots image status` once, before any agent starts, so image-backed slots are mounted.\nA completed restore for this boot makes a rerun replay the recorded report (action\nalready-restored, replayed true) and exit by that recorded class, unless --force. Exit 0 when\nthe restore completed with no refusal; 74 when it completed except for refused lanes (named in\nthe report's refused_lanes; not a failure a boot unit should retry); 75 otherwise. Every step\nand refusal is in the report."
     )]
     Restore(Restore),
-    /// Write the user units that restore the team at boot: a persistent herdr-server.service, the agent-restore.service boot hook, agent-watch.service, and a drop-in that orders the chat bridge after Herdr and restarts it on failure (start limits stay with the bridge's own policy). With --bridge NAME, write only that bridge's persistent unit (agentctl-bridge-NAME.service) instead of a transient. With --scheduled, write only the persistent timer/service pairs the team spec names. Never enables, starts, or reloads anything
+    /// Restore every team named by a teams file and/or repeated --registry filters, in order, in one deterministic host command: bounded wait for each registry's configured user certificate, then that registry's own `restore`, then one aggregated JSON report and one per-agent table. With no --config and no --registry it is a usage error: there is no host-wide discovery
     #[command(
-        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl --herdr-bin ~/bin/herdr install-units --dest ~/.config/systemd/user --bridge-unit chat-bridge.service --dry-run\n  agentctl --registry ~/project/.agentctl install-units --dest ~/.config/systemd/user --bridge coordinator\n  agentctl --registry ~/project/.agentctl install-units --dest ~/.config/systemd/user --scheduled\n\nWith --scheduled, every `scheduled` entry in REGISTRY/restore.json ({name, on_calendar,\ncommand}, command an argv whose first element is an absolute path) renders as\nagentctl-scheduled-NAME.service plus agentctl-scheduled-NAME.timer under --dest, each with\nConditionHost set to this host and the timer Persistent=true, so the pair replaces a\nsystemd-run transient and survives reboots. Paths are rendered absolute: --agentctl\n(default: this executable), --herdr-bin (looked up on PATH when it is a bare name), and\n--registry. A file that exists with different contents is refused unless --force. The\noutput lists the files and the systemctl commands an operator runs next."
+        after_help = "Examples:\n  agentctl restore-teams --config ~/.config/agentctl/teams.json\n  agentctl restore-teams --registry ~/project/.agentctl\n  agentctl restore-teams --config ~/.config/agentctl/teams.json --registry ~/project/.agentctl --dry-run\n\nThe last example limits the run to one registry: its records, panes and reports only. With\n--config, each --registry only limits the config's list (one the config does not name is an\nerror); without --config, the repeated --registry values are the list, in the order given.\nSpell a registry in the current directory ./.agentctl: a bare .agentctl is the unset\nglobal default and selects nothing.\n\nThe teams file is JSON {\"schema\": \"agentctl-restore-teams/v1\", \"registries\": [ENTRY, ...]}\nwhere ENTRY is an absolute registry path, or {\"registry\": PATH, \"herdr_bin\": PATH} with\nabsolute paths (herdr_bin optional). Nothing about a team, host, certificate or fetch command\nis built in: each registry's restore.json names its own. For each registry in order, a\nconfigured certificate_file is waited for up to --cert-wait-seconds; on timeout that\nregistry launches nothing, is counted 75 with its remedy, and registries without a\ncertificate requirement still run. The terminal server is never started here: each\nregistry's restore waits for Herdr and starts its configured herdr_unit itself, as it does\nstandalone, and nothing beyond that registry's own restore effects (its agents and its\nconfigured units) is touched.\n\nPrints schema agentctl-restore-teams-report/v1 as JSON on stdout (per-registry reports,\nrows, refused_lanes, aggregate complete/refused/exit_code) and the human per-agent table on\nstderr, one `agentctl restore-teams:` line per agent; rows re-read from this boot's recorded\nreport on a rerun end with `(replayed)` and keep their recorded class. Exit 0 when every\nregistry completed with no refusal; 74 when every registry finished but some lanes were\nrefused (named in refused_lanes; a boot unit must not retry it); 75 when any registry is\nincomplete or certificate-gated; a dry run exits 0. `install-units --teams-config PATH`\nwrites the boot unit that runs this command with --config PATH --boot."
+    )]
+    RestoreTeams(RestoreTeams),
+    /// Write the user units that restore the team at boot: a persistent herdr-server.service, the agent-restore.service boot hook, agent-watch.service, and a drop-in that orders the chat bridge after Herdr and restarts it on failure (start limits stay with the bridge's own policy). With --bridge NAME, write only that bridge's persistent unit (agentctl-bridge-NAME.service) instead of a transient. With --scheduled, write only the persistent timer/service pairs the team spec names. With --teams-config PATH, write only agent-restore-teams.service, the boot unit that restores every team that teams file names. Never enables, starts, or reloads anything
+    #[command(
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl --herdr-bin ~/bin/herdr install-units --dest ~/.config/systemd/user --bridge-unit chat-bridge.service --dry-run\n  agentctl --registry ~/project/.agentctl install-units --dest ~/.config/systemd/user --bridge coordinator\n  agentctl --registry ~/project/.agentctl install-units --dest ~/.config/systemd/user --scheduled\n  agentctl install-units --dest ~/.config/systemd/user --teams-config ~/.config/agentctl/teams.json\n\nWith --teams-config PATH, only agent-restore-teams.service is written: a oneshot after\nherdr-server.service that runs `restore-teams --config PATH --boot`, treats exit 74 as\nsuccess, and retries only temporary failures, bounded. With --scheduled, every `scheduled` entry in REGISTRY/restore.json ({name, on_calendar,\ncommand}, command an argv whose first element is an absolute path) renders as\nagentctl-scheduled-NAME.service plus agentctl-scheduled-NAME.timer under --dest, each with\nConditionHost set to this host and the timer Persistent=true, so the pair replaces a\nsystemd-run transient and survives reboots. Paths are rendered absolute: --agentctl\n(default: this executable), --herdr-bin (looked up on PATH when it is a bare name), and\n--registry. A file that exists with different contents is refused unless --force. The\noutput lists the files and the systemctl commands an operator runs next."
     )]
     InstallUnits(InstallUnits),
     /// Build compiled snapshots of agentctl and move this registry's long-running services (chat bridges, the agent watcher, headless wrappers run as systemd user units) onto them: list, build, refresh
@@ -479,6 +484,31 @@ struct Restore {
 }
 
 #[derive(Args)]
+struct RestoreTeams {
+    /// Teams file (JSON schema agentctl-restore-teams/v1: {"registries": [DIR or {"registry": DIR, "herdr_bin": PATH}, ...]}, absolute paths) naming the registries to restore, in order. At least one of --config and --registry is required
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// A registry to restore; repeat for several, in the order given. With --config, each value only limits the config's list, so one value confines the run to that registry alone. Relative paths resolve against the current directory
+    #[arg(long = "registry", value_name = "DIR")]
+    registry: Vec<PathBuf>,
+    /// Mark each per-registry report as the boot hook's run (agent-restore-teams.service passes it)
+    #[arg(long)]
+    boot: bool,
+    /// Run each registry even when this boot's report already says its restore completed
+    #[arg(long)]
+    force: bool,
+    /// Report what each registry would do without reviving, promoting, registering, starting units, notifying, or writing reports, and without waiting for certificates
+    #[arg(long)]
+    dry_run: bool,
+    /// Startup-readiness deadline for each revived harness in seconds, greater than 0 and at most 300 (default: 30)
+    #[arg(long, default_value = "30", value_parser = startup_seconds, value_name = "SECONDS")]
+    startup_timeout: f64,
+    /// Seconds to wait for each registry's configured user certificate file before that registry is left unlaunched and counted as retry-later (75), from 0 (check once) to 3600 (default: 600)
+    #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(0..=3600), value_name = "SECONDS")]
+    cert_wait_seconds: u64,
+}
+
+#[derive(Args)]
 struct Services {
     /// Directory holding snapshots (ROOT/snapshots/COMMIT12/) and refresh records
     /// (ROOT/refreshes/STAMP-COMMIT12/) (default: $XDG_STATE_HOME/agentctl/services, else
@@ -614,6 +644,12 @@ struct InstallUnits {
     /// ConditionHost set to this host), instead of the restore units
     #[arg(long, conflicts_with_all = ["bridge_unit", "bridge", "headless"])]
     scheduled: bool,
+    /// Write only agent-restore-teams.service, the boot unit that runs
+    /// `restore-teams --config PATH --boot` for every team the teams file
+    /// at PATH names (schema agentctl-restore-teams/v1), instead of the
+    /// restore units. Example: agentctl install-units --dest ~/.config/systemd/user --teams-config ~/.config/agentctl/teams.json
+    #[arg(long, value_name = "PATH", conflicts_with_all = ["bridge_unit", "bridge", "headless", "scheduled"])]
+    teams_config: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -3235,6 +3271,25 @@ impl crate::blank_working::CoordinatorAlert for CoordinatorNotifier<'_> {
     }
 }
 
+/// The `--registry` filters of a `restore-teams` invocation, absolute.
+/// The subcommand's repeatable `--registry` shares the global `--registry`
+/// argument's identity (Clap requires unique long options per command), so
+/// when no `--registry` is given anywhere the global default propagates in
+/// as the sole value `.agentctl`. That propagated default is not a team
+/// filter: dropping it keeps a filterless invocation a usage error instead
+/// of an implicit restore of the current directory's registry. An operator
+/// who means that registry spells it `./.agentctl` or absolute.
+fn restore_teams_filters(raw: &[PathBuf]) -> Result<Vec<PathBuf>, Failure> {
+    if raw == [Path::new(".agentctl")] {
+        return Ok(Vec::new());
+    }
+    raw.iter()
+        .map(|registry| {
+            std::path::absolute(registry).map_err(|error| Failure::Usage(error.to_string()))
+        })
+        .collect()
+}
+
 fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, Failure> {
     if args.userguide {
         print!("{}", crate::USER_GUIDE);
@@ -3253,6 +3308,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         Commands::Chat(_)
             | Commands::Inbox(_)
             | Commands::Restore(_)
+            | Commands::RestoreTeams(_)
             | Commands::Watch(_)
             | Commands::WatchAgents(_)
             | Commands::Health(_)
@@ -3408,6 +3464,81 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             // #1132: a replay exits by the recorded run's class, never by
             // its already-restored action alone (#948 for the 74 class).
             return Ok(crate::restore::restore_exit_code(&report, value.dry_run));
+        }
+        Commands::RestoreTeams(value) => {
+            let teams_config = match &value.config {
+                Some(path) => Some(
+                    crate::restore_teams::TeamsConfig::load(path)
+                        .map_err(|error| Failure::Usage(error.to_string()))?,
+                ),
+                None => None,
+            };
+            let filters = restore_teams_filters(&value.registry)?;
+            let entries = crate::restore_teams::resolve_entries(teams_config.as_ref(), &filters)
+                .map_err(|error| Failure::Usage(error.to_string()))?;
+            if !value.dry_run {
+                // Only the selected registries are touched: new writes use
+                // layout 2, so each selected registry's idle layout-1
+                // agents move first, exactly as a single restore's would.
+                for entry in &entries {
+                    if let Some(notice) =
+                        crate::registry_layout::auto_migrate(&entry.registry, environment)
+                    {
+                        eprintln!("{notice}");
+                    }
+                }
+            }
+            let boot = value.boot;
+            let outcome = crate::restore_teams::restore_teams(
+                &crate::restore::SystemHost,
+                &entries,
+                &crate::restore_teams::RestoreTeamsOptions {
+                    boot,
+                    force: value.force,
+                    dry_run: value.dry_run,
+                    startup_timeout: Duration::from_secs_f64(value.startup_timeout),
+                    cert_wait: Duration::from_secs(value.cert_wait_seconds),
+                    herdr_bin: args.herdr_bin.clone(),
+                },
+                |entry, config, restore_options| {
+                    let herdr_bin = resolve_herdr_bin(&entry.registry, &restore_options.herdr_bin);
+                    let client = HerdrClient::with_executable("direct", &herdr_bin)
+                        .map_err(AgentError::from)?;
+                    let resolved = crate::restore::RestoreOptions {
+                        herdr_bin,
+                        ..restore_options.clone()
+                    };
+                    crate::restore_teams::restore_one_with_client(
+                        &client,
+                        &crate::restore::SystemHost,
+                        &entry.registry,
+                        config,
+                        &resolved,
+                        boot,
+                    )
+                },
+            )?;
+            write_json(&outcome.report).map_err(Failure::Output)?;
+            for line in &outcome.table {
+                eprintln!("{line}");
+            }
+            for registry in outcome.report["registries"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                for warning in registry["report"]["fresh_starts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                {
+                    eprintln!(
+                        "agentctl restore-teams: {}",
+                        warning.as_str().unwrap_or_default()
+                    );
+                }
+            }
+            return Ok(outcome.exit_code);
         }
         Commands::Watch(value) => {
             let client = HerdrClient::with_executable("direct", &args.herdr_bin)
@@ -3719,6 +3850,22 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     },
                     &name,
                     &unit,
+                )?)
+                .map_err(Failure::Output)?;
+                return Ok(0);
+            }
+            if let Some(teams_config) = value.teams_config {
+                write_json(&crate::units::install_restore_teams(
+                    &crate::units::InstallOptions {
+                        dest: value.dest,
+                        agentctl,
+                        herdr,
+                        registry: absolute(&args.registry)?,
+                        bridge_unit: None,
+                        dry_run: value.dry_run,
+                        force: value.force,
+                    },
+                    &absolute(&teams_config)?,
                 )?)
                 .map_err(Failure::Output)?;
                 return Ok(0);
@@ -4712,6 +4859,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         | Commands::Skill(_)
         | Commands::CodexGoal(_)
         | Commands::Restore(_)
+        | Commands::RestoreTeams(_)
         | Commands::InstallUnits(_)
         | Commands::Services(_)
         | Commands::Watch(_)
@@ -6331,6 +6479,80 @@ mod tests {
             "--startup-timeout",
         ] {
             assert!(help.contains(option));
+        }
+    }
+
+    #[test]
+    fn restore_teams_registries_are_repeatable_and_never_defaulted() {
+        let parsed = Cli::try_parse_from([
+            "agentctl",
+            "restore-teams",
+            "--registry",
+            "/home/owner/one/.agentctl",
+            "--registry",
+            "/home/owner/two/.agentctl",
+            "--cert-wait-seconds",
+            "0",
+            "--dry-run",
+        ])
+        .unwrap();
+        let Some(Commands::RestoreTeams(value)) = parsed.command else {
+            panic!("restore-teams command");
+        };
+        assert_eq!(
+            value.registry,
+            [
+                PathBuf::from("/home/owner/one/.agentctl"),
+                PathBuf::from("/home/owner/two/.agentctl")
+            ]
+        );
+        assert_eq!(value.cert_wait_seconds, 0);
+        assert!(value.dry_run);
+        assert_eq!(value.config, None);
+        // No filter at all: the global --registry default must not leak
+        // in as an implicit team selection (that is a usage error in
+        // resolve_entries, never host-wide discovery).
+        let bare = Cli::try_parse_from(["agentctl", "restore-teams"]).unwrap();
+        let Some(Commands::RestoreTeams(value)) = bare.command else {
+            panic!("restore-teams command");
+        };
+        // Clap propagates the global default in as the sole value; the
+        // filter helper must drop exactly that, so the run stays a
+        // usage error (resolve_entries), never an implicit local restore.
+        assert_eq!(value.registry, [PathBuf::from(".agentctl")]);
+        assert!(restore_teams_filters(&value.registry)
+            .unwrap_or_else(|_| panic!("filters"))
+            .is_empty());
+        assert_eq!(value.cert_wait_seconds, 600);
+        // An explicit global --registry before the subcommand is an
+        // explicit selection of exactly that registry.
+        let global = Cli::try_parse_from([
+            "agentctl",
+            "--registry",
+            "/home/owner/one/.agentctl",
+            "restore-teams",
+        ])
+        .unwrap();
+        let Some(Commands::RestoreTeams(value)) = global.command else {
+            panic!("restore-teams command");
+        };
+        assert_eq!(
+            restore_teams_filters(&value.registry).unwrap_or_else(|_| panic!("filters")),
+            [PathBuf::from("/home/owner/one/.agentctl")]
+        );
+        let help = Cli::try_parse_from(["agentctl", "restore-teams", "--help"])
+            .err()
+            .unwrap()
+            .to_string();
+        for option in [
+            "--config",
+            "--registry",
+            "--cert-wait-seconds",
+            "--startup-timeout",
+            "agentctl-restore-teams/v1",
+            "limits the run to one registry",
+        ] {
+            assert!(help.contains(option), "{option} missing from help");
         }
     }
 

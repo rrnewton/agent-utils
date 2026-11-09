@@ -21,6 +21,7 @@ const HEADLESS: &str = include_str!("systemd/agentctl-headless.service");
 const BRIDGE: &str = include_str!("systemd/agentctl-bridge.service");
 const SCHEDULED_SERVICE: &str = include_str!("systemd/agentctl-scheduled.service");
 const SCHEDULED_TIMER: &str = include_str!("systemd/agentctl-scheduled.timer");
+const AGENT_RESTORE_TEAMS: &str = include_str!("systemd/agent-restore-teams.service");
 
 type Result<T> = std::result::Result<T, AgentError>;
 
@@ -341,6 +342,44 @@ pub fn install_scheduled(options: &InstallOptions) -> Result<Value> {
             "review the files",
             "systemctl --user daemon-reload",
             format!("systemctl --user enable --now {}", timers.join(" ")),
+        ],
+    }))
+}
+
+/// The boot unit that restores every team the teams file at
+/// `teams_config` names (#1128), rendered, as `(file name, contents)`.
+/// It runs the same `restore-teams --config PATH --boot` an operator
+/// runs by hand; the Herdr executable each registry uses resolves
+/// per registry at restore time, so the unit names none.
+pub fn rendered_restore_teams(
+    options: &InstallOptions,
+    teams_config: &Path,
+) -> Result<(PathBuf, String)> {
+    let agentctl = unit_path("agentctl", &options.agentctl)?;
+    let teams_config = unit_path("teams config", teams_config)?;
+    Ok((
+        PathBuf::from("agent-restore-teams.service"),
+        AGENT_RESTORE_TEAMS
+            .replace("@AGENTCTL@", &agentctl)
+            .replace("@TEAMS_CONFIG@", &teams_config),
+    ))
+}
+
+/// Write only `agent-restore-teams.service`; refuse to replace a
+/// different existing file without `force`. Enables and starts nothing.
+pub fn install_restore_teams(options: &InstallOptions, teams_config: &Path) -> Result<Value> {
+    let file = rendered_restore_teams(options, teams_config)?;
+    let unit = file.0.display().to_string();
+    let (written, unchanged) = write_files(options, &[file])?;
+    Ok(json!({
+        "dry_run": options.dry_run,
+        "written": written,
+        "unchanged": unchanged,
+        "next_steps": [
+            "review the file",
+            "systemctl --user daemon-reload",
+            format!("systemctl --user enable {unit}"),
+            "loginctl enable-linger \"$USER\"   # once, so the units start at boot without a login",
         ],
     }))
 }
@@ -733,5 +772,56 @@ mod tests {
             .unwrap()
             .starts_with("systemctl --user enable"));
         fs::remove_dir_all(&dest).unwrap();
+    }
+
+    #[test]
+    fn restore_teams_unit_runs_the_host_command_and_is_written_alone() {
+        let dest = scratch("restore-teams");
+        let config = PathBuf::from("/home/owner/.config/agentctl/teams.json");
+        let (name, contents) = rendered_restore_teams(&options(&dest), &config).unwrap();
+        assert_eq!(name, PathBuf::from("agent-restore-teams.service"));
+        assert!(
+            contents.contains(
+                "ExecStart=/opt/agentctl/bin/agentctl restore-teams --config \
+                 /home/owner/.config/agentctl/teams.json --boot\n"
+            ),
+            "{contents}"
+        );
+        assert!(
+            contents.contains("Requires=herdr-server.service"),
+            "{contents}"
+        );
+        assert!(
+            contents.contains("After=herdr-server.service"),
+            "{contents}"
+        );
+        assert!(contents.contains("Type=oneshot"), "{contents}");
+        assert!(contents.contains("Restart=on-failure"), "{contents}");
+        assert!(contents.contains("RestartSec=60"), "{contents}");
+        assert!(contents.contains("StartLimitBurst=5"), "{contents}");
+        assert!(
+            contents.contains("StartLimitIntervalSec=1800"),
+            "{contents}"
+        );
+        assert!(contents.contains("TimeoutStartSec=1800"), "{contents}");
+        // A run that finished with refused lanes is a success systemd
+        // must not retry; only 75 (retry later) restarts.
+        assert!(contents.contains("SuccessExitStatus=74"), "{contents}");
+        assert!(contents.contains("StandardOutput=journal"), "{contents}");
+        assert!(contents.contains("StandardError=journal"), "{contents}");
+        assert!(!contents.contains('@'), "{contents}");
+        assert!(rendered_restore_teams(&options(&dest), Path::new("relative.json")).is_err());
+        let report = install_restore_teams(&options(&dest), &config).unwrap();
+        assert_eq!(report["written"].as_array().unwrap().len(), 1);
+        assert!(dest.join("agent-restore-teams.service").is_file());
+        assert!(!dest.join("agent-restore.service").exists());
+        assert!(!dest.join("agent-watch.service").exists());
+        assert!(report["next_steps"][2]
+            .as_str()
+            .unwrap()
+            .contains("enable agent-restore-teams.service"));
+        let again = install_restore_teams(&options(&dest), &config).unwrap();
+        assert_eq!(again["unchanged"].as_array().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(&dest);
     }
 }

@@ -1,0 +1,31 @@
+# Installed by `agentctl install-units --teams-config PATH`. Restores every
+# team the teams file names, once per boot, in one deterministic command.
+#
+# `agentctl restore-teams` is idempotent: each registry's restore exits at
+# once when this boot's report already says it completed, and revives only
+# dead agents. Exit 74 means every registry finished but some lanes were
+# refused (named in the journal output); `SuccessExitStatus=74` keeps that
+# from being retried as a failure. Exit 75 means retry later (for example
+# the user certificate is not there yet), so `Restart=on-failure` retries
+# it, bounded by the start limit below.
+[Unit]
+Description=Restore every configured agentctl team after boot
+Requires=herdr-server.service
+After=herdr-server.service
+StartLimitIntervalSec=1800
+StartLimitBurst=5
+
+[Service]
+Type=oneshot
+ExecStart=@AGENTCTL@ restore-teams --config @TEAMS_CONFIG@ --boot
+# Each registry waits for Herdr, the user certificate, and every lane's
+# startup deadline in turn.
+TimeoutStartSec=1800
+Restart=on-failure
+RestartSec=60
+SuccessExitStatus=74
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

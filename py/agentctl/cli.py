@@ -293,6 +293,9 @@ def parser() -> argparse.ArgumentParser:
     for rust_only, purpose, example in (
         ("restore", "Bring the coordinator team back after the host restarts (Rust edition only; this edition refuses).",
          "agentctl --registry ~/project/.agentctl restore --dry-run"),
+        ("restore-teams", "Restore every team a teams file or repeated --registry filters name, in one host "
+         "command (Rust edition only; this edition refuses).",
+         "agentctl restore-teams --registry ~/project/.agentctl"),
         ("install-units", "Write the user units that restore the team at boot (Rust edition only; this edition refuses).",
          "agentctl install-units --dest ~/.config/systemd/user --dry-run"),
         ("watch", "Check and repair Herdr, configured units and timers, and slot images (Rust edition only; this "
@@ -397,7 +400,7 @@ def _goal_command(args: argparse.Namespace) -> list[str] | None:
 
 
 #: Commands only the Rust edition implements; this edition refuses them with exit status 2.
-_RUST_ONLY = ("restore", "install-units", "watch", "watch-agents", "hold", "coordinator", "manage", "set",
+_RUST_ONLY = ("restore", "restore-teams", "install-units", "watch", "watch-agents", "hold", "coordinator", "manage", "set",
               "tree", "progress", "services")
 
 

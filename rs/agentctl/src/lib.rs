@@ -44,6 +44,7 @@ pub mod recovery_ladder;
 pub mod registry_layout;
 pub mod restore;
 pub mod restore_notice;
+pub mod restore_teams;
 pub mod screen_heuristics;
 pub mod sender_header;
 pub mod services;

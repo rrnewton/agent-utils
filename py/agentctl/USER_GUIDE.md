@@ -1135,6 +1135,62 @@ reloads anything; its output lists the `systemctl --user` commands to run after
 review. Keep `resume_agents_on_restore = false` in Herdr's configuration: Herdr
 knows each agent's kind and session, never its flags.
 
+`agentctl restore-teams` restores every team on the host in one idempotent
+command, sequencing the per-registry restores above:
+
+```sh
+agentctl restore-teams --config ~/.config/agentctl/teams.json
+agentctl restore-teams --registry ~/project/.agentctl
+agentctl restore-teams --config ~/.config/agentctl/teams.json --registry ~/project/.agentctl --dry-run
+```
+
+The registries are always named explicitly; there is no host-wide discovery,
+and with neither `--config` nor `--registry` the command is a usage error.
+With `--config`, each repeated `--registry` only limits the config's list, so
+one value confines a live run to that registry alone — its records, panes and
+reports; nothing beyond that registry's own restore effects (its agents and
+its configured units) is touched. Spell a registry in the current directory
+`./.agentctl`: a bare `.agentctl` is the unset global default and selects
+nothing. The teams file names no team, host, certificate or fetch command of
+its own — each registry's `restore.json` still names its own:
+
+```json
+{
+  "schema": "agentctl-restore-teams/v1",
+  "registries": [
+    "/home/me/project/.agentctl",
+    {"registry": "/home/me/other/.agentctl", "herdr_bin": "/home/me/bin/herdr"}
+  ]
+}
+```
+
+For each registry in order, a configured `certificate_file` is waited for up
+to `--cert-wait-seconds` (default 600, and 0 checks once); on timeout that
+registry launches nothing, is recorded `certificate-timeout` with its remedy
+(the registry's `certificate_fetch`), and registries without a certificate
+requirement still run. `restore-teams` never starts the terminal server
+itself: each registry's restore waits for Herdr and starts its configured
+`herdr_unit` itself, exactly as it does standalone. The aggregated report
+(schema `agentctl-restore-teams-report/v1`) is printed as JSON on stdout,
+with the per-registry reports, one row per agent, `refused_lanes` and the
+aggregate `complete`/`refused`/`exit_code`; the same rows are printed as a
+human table on stderr, one `agentctl restore-teams:` line per agent. Recorded
+reports are read from each registry's own `restore-reports/` subdirectory
+first, then its configured `report_dir`, then the shared default. An
+immediate rerun in the same boot replays the recorded per-agent outcomes —
+labelled `(replayed)` in the table and `replayed: true` in the rows — at the
+recorded exit class, never as a fresh empty success. Exit status is 0 when
+every registry completed with no refusal, 74 when every registry finished but
+some lanes were refused (named in `refused_lanes`; a boot unit must not retry
+it), and 75 when any registry is incomplete or certificate-gated; `--dry-run`
+exits 0 and waits for no certificate. `agentctl install-units --teams-config
+PATH` writes only `agent-restore-teams.service`, a oneshot after
+`herdr-server.service` that runs `restore-teams --config PATH --boot` with
+`SuccessExitStatus=74` and bounded `Restart=on-failure` retries for 75. The
+certificate fetch itself stays a host step before this command: a thin host
+shim may refresh the certificate and then run `restore-teams`, but holds no
+restore logic of its own.
+
 `agentctl watch` runs as a service and, every `--interval` seconds (default 60),
 checks and repairs:
 
