@@ -20,9 +20,11 @@ PY = sys.executable
 
 
 def _env(tmp_path: Path) -> dict[str, str]:
-    return {**os.environ, "GATE_ADMISSION_DIR": str(tmp_path / "admission"),
+    base = {key: value for key, value in os.environ.items() if key != "GATE_PHASE_PRIORITY"}
+    return {**base, "GATE_ADMISSION_DIR": str(tmp_path / "admission"),
             "GATE_LEDGER": str(tmp_path / "ledger.jsonl"), "GATE_PRUNE_TARGETS": "off",
             "GATE_SLOTS_CONFIG": str(tmp_path / "gate-slots.toml"),
+            "GATE_PHASE_PRIORITY_CONFIG": str(tmp_path / "gate-phase-priority.toml"),
             # A lane may run the suite under GATE_SLOTS=1; the tests assume the default.
             "GATE_SLOTS": "2",
             # The real preflight runs validation steps; these tests give it a stand-in.
@@ -295,6 +297,32 @@ def test_malformed_blackout_config_refuses_with_a_clear_error(tmp_path: Path) ->
         assert "gate blackout config" in result.stdout
 
 
+def test_a_marked_phase_keeps_nested_blackout_behaviour(tmp_path: Path) -> None:
+    """#1146 audit: the phase mark is not a rerun. A marked nested phase
+    inside a blackout follows its parent admission's rule (it queues and
+    waits the window out, even with --no-wait-blackout), while a top-level
+    --rerun with --no-wait-blackout is refused. Its five selected steps go
+    through the nested path, never the rerun step check."""
+    env = _blackout_env(tmp_path, _BLACKOUT, _INSIDE)
+    env["GATE_PHASE_PRIORITY"] = "1"
+    runs = tmp_path / "admission" / "runs"
+    runs.mkdir(parents=True)
+    (runs / "parent-live.json").write_text(json.dumps(
+        {"id": "parent-live", "pid": os.getpid(), "class": "shared", "queued_at": 0}))
+    nested = subprocess.run(
+        [PY, str(GATE), "--exclusive", "--no-wait-blackout", "--wait-timeout", "2",
+         "--", PY, "-c", "pass", "--selected", "a.step,b.step,c.step,d.step,e.step"],
+        env={**env, "GATE_ADMISSION_RUN_ID": "parent-live"},
+        capture_output=True, text=True, timeout=30)
+    assert nested.returncode == 75, nested.stdout  # waited out, not refused
+    assert "waits out blackout" in nested.stdout
+    rerun = subprocess.run(
+        [PY, str(GATE), "--rerun", "--no-wait-blackout", "--", PY, "-c", "pass",
+         "--selected", "a.step"],
+        env=env, capture_output=True, text=True, timeout=30)
+    assert rerun.returncode == 78, rerun.stdout
+
+
 def test_blackout_help_documents_config_and_flag(tmp_path: Path) -> None:
     result = subprocess.run(
         [PY, str(GATE), "--help"], env=_env(tmp_path), capture_output=True, text=True, timeout=30
@@ -346,6 +374,264 @@ def test_a_rerun_must_name_a_few_selected_steps(tmp_path: Path) -> None:
                            "--selected", "a,b,c,d,e"],
                           env=_env(tmp_path), capture_output=True, text=True, timeout=30)
     assert many.returncode == 2 and "at most 4" in many.stdout
+
+
+def _start_env(tmp_path: Path, env: dict[str, str], *args: str) -> subprocess.Popen[str]:
+    del tmp_path
+    return subprocess.Popen(
+        [PY, str(GATE), *args], env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+
+def _phase_scenario(tmp_path: Path, env: dict[str, str]) -> tuple[list[str], dict[str, object]]:
+    """A shared holder runs; an admitted shared gate starts its nested
+    exclusive phase, which queues behind the holder; then an ordinary shared
+    gate and a later rerun queue behind it. Returns the run order and the
+    phase ticket."""
+    order = tmp_path / "order.txt"
+    release = tmp_path / "release"
+    holder = _start_env(
+        tmp_path, env, "--", PY, "-c",
+        f"import os, time\nwhile not os.path.exists({str(release)!r}): time.sleep(0.05)")
+    _wait_for_runs(tmp_path, 1)
+    nested_script = (
+        "import subprocess, sys\n"
+        f"done = subprocess.run([sys.executable, {str(GATE)!r}, '--exclusive', '--', "
+        f"sys.executable, '-c', \"open({str(order)!r}, 'a').write('phase\\\\n')\", "
+        "'--selected', 'cross.a,cross.b,cross.c,cross.d,cross.e'])\n"
+        "sys.exit(done.returncode)\n"
+    )
+    outer = _start_env(tmp_path, env, "--", PY, "-c", nested_script)
+    queue = tmp_path / "admission" / "queue"
+    deadline = time.time() + 20
+    ticket: dict[str, object] = {}
+    while not ticket and time.time() < deadline:
+        for path in queue.glob("*.json"):
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, ValueError):
+                continue
+            if data.get("class") == "exclusive":
+                ticket = data
+        time.sleep(0.05)
+    assert ticket, "the nested phase did not queue"
+
+    def note(tag: str) -> str:
+        return f"open({str(order)!r}, 'a').write({tag!r} + '\\n')"
+
+    ordinary = _start_env(tmp_path, env, "--", PY, "-c", note("ordinary"))
+    _wait_for_queue(tmp_path, 2)
+    rerun = _start_env(tmp_path, env, "--rerun", "--", PY, "-c", note("rerun"),
+                       "--selected", "a.step")
+    _wait_for_queue(tmp_path, 3)
+    release.write_text("")
+    for proc in (holder, outer, ordinary, rerun):
+        out, _ = proc.communicate(timeout=60)
+        assert proc.returncode == 0, out
+    return order.read_text().split(), ticket
+
+
+def test_a_marked_nested_phase_is_not_overtaken_by_a_later_rerun(tmp_path: Path) -> None:
+    """#1146: with the phase mark on (env hook), a nested exclusive phase
+    keeps the rerun tier it queued in: a later rerun cannot pass it, but
+    still passes an ordinary shared gate. The phase's five `--selected`
+    steps are not refused as an over-long rerun, its preflight record stays
+    'nested gate', and the ledger keeps kind 'exclusive-rerun' while naming
+    the phase and the switch source."""
+    env = {**_env(tmp_path), "GATE_PHASE_PRIORITY": "1"}
+    order, ticket = _phase_scenario(tmp_path, env)
+    assert order == ["phase", "rerun", "ordinary"]
+    assert ticket["rerun"] is True and ticket["nested_phase"] is True
+    assert str(ticket["phase_priority"]).startswith("env")
+    [row] = [row for row in _ledger_rows(tmp_path) if row.get("nested_phase") is True]
+    assert row["kind"] == "exclusive-rerun" and row["rerun"] is False
+    assert row["preflight"] == "skipped: nested gate"
+    assert str(row["phase_priority"]).startswith("env")
+    history = [json.loads(line) for line in
+               (tmp_path / "admission" / "history.jsonl").read_text().splitlines()]
+    [hrow] = [row for row in history if row.get("nested_phase") is True]
+    assert hrow["rerun"] is False and str(hrow["phase_priority"]).startswith("env")
+
+
+def test_a_nested_phase_is_unmarked_by_default(tmp_path: Path) -> None:
+    """Switch off is today's behaviour: the later rerun jumps the phase."""
+    order, ticket = _phase_scenario(tmp_path, _env(tmp_path))
+    assert order == ["rerun", "phase", "ordinary"]
+    assert ticket["rerun"] is False and ticket["nested_phase"] is True
+    assert ticket["phase_priority"] is None
+
+
+def test_a_marked_nested_phase_from_the_host_file(tmp_path: Path) -> None:
+    (tmp_path / "gate-phase-priority.toml").write_text("phase_priority = true\n")
+    order, ticket = _phase_scenario(tmp_path, _env(tmp_path))
+    assert order == ["phase", "rerun", "ordinary"]
+    assert str(ticket["phase_priority"]).startswith("host file")
+    [row] = [row for row in _ledger_rows(tmp_path) if row.get("nested_phase") is True]
+    assert str(row["phase_priority"]).startswith("host file")
+
+
+def test_phase_priority_switch_sources(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = _gate_module()
+    config = tmp_path / "gate-phase-priority.toml"
+    monkeypatch.setenv("GATE_PHASE_PRIORITY_CONFIG", str(config))
+    monkeypatch.delenv("GATE_PHASE_PRIORITY", raising=False)
+    enabled, source = gate.phase_priority()
+    assert enabled is False and "default off" in source
+    config.write_text("phase_priority = true\n")
+    enabled, source = gate.phase_priority()
+    assert enabled is True and source.startswith("host file")
+    config.write_text("phase_priority = 'yes'\n")
+    enabled, source = gate.phase_priority()
+    assert enabled is False and "off" in source
+    monkeypatch.setenv("GATE_PHASE_PRIORITY", "0")
+    enabled, source = gate.phase_priority()
+    assert enabled is False and source.startswith("env")
+    config.write_text("phase_priority = true\n")
+    monkeypatch.setenv("GATE_PHASE_PRIORITY", "1")
+    enabled, source = gate.phase_priority()
+    assert enabled is True and source.startswith("env")
+
+
+def test_marked_tickets_keep_the_legacy_sort_for_old_clients(tmp_path: Path) -> None:
+    """An old client reads only `rerun`, class and filename order: the new
+    fields must not change the order it computes, and it makes no max-steps
+    or blackout judgement of another lane's ticket."""
+    gate = _gate_module()
+    adm = gate.Admission(tmp_path / "admission", 2)
+    queue = tmp_path / "admission" / "queue"
+    rows = [
+        ("050-shared", "shared", False, {}),
+        ("100-phase", "exclusive", True,
+         {"nested_phase": True, "phase_priority": "env GATE_PHASE_PRIORITY=1"}),
+        ("150-ordinary", "exclusive", False, {}),
+        ("200-rerun", "exclusive", True, {}),
+    ]
+    for run_id, cls, rerun, extra in rows:
+        (queue / f"{run_id}.json").write_text(json.dumps(
+            {"id": run_id, "pid": os.getpid(), "class": cls, "queued_at": 0,
+             "command": [], "rerun": rerun, **extra}))
+    assert [str(data["id"]) for _, data in adm.tickets()] == [
+        "100-phase", "200-rerun", "050-shared", "150-ordinary"]
+
+
+def test_the_phase_mark_requires_a_live_parent(tmp_path: Path) -> None:
+    """A stale parent runs/ file left behind (dead pid) plus the leaked env
+    var is not a nested phase: no mark, even with the switch on."""
+    env = {**_env(tmp_path), "GATE_PHASE_PRIORITY": "1"}
+    holder = _start_env(tmp_path, env, "--exclusive", "--", PY, "-c",
+                        "import time; time.sleep(6)")
+    _wait_for_runs(tmp_path, 1)
+    runs = tmp_path / "admission" / "runs"
+    (runs / "stale-parent.json").write_text(json.dumps(
+        {"id": "stale-parent", "pid": 99999999, "class": "shared", "queued_at": 0}))
+    stale = _start_env(tmp_path, {**env, "GATE_ADMISSION_RUN_ID": "stale-parent"},
+                       "--exclusive", "--", PY, "-c", "pass")
+    _wait_for_queue(tmp_path, 1)
+    [ticket_path] = list((tmp_path / "admission" / "queue").glob("*.json"))
+    ticket = json.loads(ticket_path.read_text())
+    assert ticket["rerun"] is False and ticket["nested_phase"] is False
+    assert ticket["phase_priority"] is None
+    out, _ = stale.communicate(timeout=30)
+    assert stale.returncode == 0, out
+    holder.communicate(timeout=30)
+
+
+def test_a_leaked_run_id_alone_gives_no_phase_mark(tmp_path: Path) -> None:
+    """GATE_ADMISSION_RUN_ID leaked into an unrelated child, with no runs/
+    file behind it at all, is not a nested phase: no mark, switch on."""
+    env = {**_env(tmp_path), "GATE_PHASE_PRIORITY": "1"}
+    holder = _start_env(tmp_path, env, "--exclusive", "--", PY, "-c",
+                        "import time; time.sleep(6)")
+    _wait_for_runs(tmp_path, 1)
+    leaked = _start_env(tmp_path, {**env, "GATE_ADMISSION_RUN_ID": "no-such-run"},
+                        "--exclusive", "--", PY, "-c", "pass")
+    _wait_for_queue(tmp_path, 1)
+    [ticket_path] = list((tmp_path / "admission" / "queue").glob("*.json"))
+    ticket = json.loads(ticket_path.read_text())
+    assert ticket["rerun"] is False and ticket["nested_phase"] is False
+    out, _ = leaked.communicate(timeout=30)
+    assert leaked.returncode == 0, out
+    assert "rerun tier" not in out
+    holder.communicate(timeout=30)
+
+
+def test_a_malformed_switch_file_is_off_and_never_blocks(tmp_path: Path) -> None:
+    """A malformed host file means off plus a warning; the phase still runs."""
+    (tmp_path / "gate-phase-priority.toml").write_text("phase_priority = [\n")
+    env = _env(tmp_path)
+    runs = tmp_path / "admission" / "runs"
+    runs.mkdir(parents=True)
+    (runs / "parent-live.json").write_text(json.dumps(
+        {"id": "parent-live", "pid": os.getpid(), "class": "shared", "queued_at": 0}))
+    result = subprocess.run(
+        [PY, str(GATE), "--exclusive", "--", PY, "-c", "pass"],
+        env={**env, "GATE_ADMISSION_RUN_ID": "parent-live"},
+        capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout
+    assert "gate: warning: phase priority off" in result.stdout
+    assert "is not TOML" in result.stdout
+    [row] = _ledger_rows(tmp_path)
+    assert row["nested_phase"] is True and row["phase_priority"] is None
+    explained = subprocess.run([PY, str(GATE), "queue", "--explain"], env=env,
+                               capture_output=True, text=True, timeout=30)
+    assert explained.returncode == 0 and "phase priority off" in explained.stdout
+    assert "is not TOML" in explained.stdout
+
+
+def _write_ticket(root: Path, folder: str, run_id: str, data: dict[str, object]) -> None:
+    folder_path = root / folder
+    folder_path.mkdir(parents=True, exist_ok=True)
+    (folder_path / f"{run_id}.json").write_text(json.dumps(data))
+
+
+def test_queue_explain_names_runs_and_tickets_ahead(tmp_path: Path) -> None:
+    """#1146: a legacy (unmarked) phase ticket's starvation is visible: the
+    running run it waits for and the later rerun queued ahead of it."""
+    now = time.time()
+    root = tmp_path / "admission"
+    _write_ticket(root, "runs", "000-run", {
+        "id": "000-run", "pid": os.getpid(), "class": "shared",
+        "queued_at": now - 600, "started_at": now - 540,
+        "command": [PY, "scripts/validate.py", "--all"]})
+    _write_ticket(root, "queue", "100-phase", {
+        "id": "100-phase", "pid": os.getpid(), "class": "exclusive",
+        "queued_at": now - 3600, "rerun": False,
+        "command": [PY, "common/bin/dagrun", "run", "--max-steps", "1",
+                    "--selected", "cross.a,cross.b"]})
+    _write_ticket(root, "queue", "200-rerun", {
+        "id": "200-rerun", "pid": os.getpid(), "class": "exclusive",
+        "queued_at": now - 60, "rerun": True,
+        "command": [PY, "-c", "pass", "--selected", "a.step"]})
+    # A ticket from before the rerun field existed.
+    _write_ticket(root, "queue", "300-shared", {
+        "id": "300-shared", "pid": os.getpid(), "class": "shared",
+        "queued_at": now - 30, "command": [PY, "scripts/validate.py", "--all"]})
+    plain = subprocess.run([PY, str(GATE), "queue"], env=_env(tmp_path),
+                           capture_output=True, text=True, timeout=30)
+    assert plain.returncode == 0, plain.stdout
+    positions = [plain.stdout.index(run_id) for run_id in ("200-rerun", "100-phase", "300-shared")]
+    assert positions == sorted(positions), plain.stdout
+    explained = subprocess.run([PY, str(GATE), "queue", "--explain"], env=_env(tmp_path),
+                               capture_output=True, text=True, timeout=30)
+    assert explained.returncode == 0, explained.stdout
+    assert "phase priority off" in explained.stdout
+    assert "running 000-run" in explained.stdout
+    assert "inferred gate-exclusive phase" in explained.stdout
+    assert "blocked by running 000-run" in explained.stdout
+    assert "blocked by ticket 200-rerun ahead (rerun tier)" in explained.stdout
+    assert "starvation: 1 rerun ticket(s) queued after this ticket are ahead of it" in explained.stdout
+    assert "blocked by ticket 100-phase ahead (FIFO)" in explained.stdout
+
+
+def test_queue_explain_says_admissible_when_nothing_blocks(tmp_path: Path) -> None:
+    root = tmp_path / "admission"
+    _write_ticket(root, "queue", "100-shared", {
+        "id": "100-shared", "pid": os.getpid(), "class": "shared",
+        "queued_at": time.time(), "rerun": False, "command": [PY, "-c", "pass"]})
+    explained = subprocess.run([PY, str(GATE), "queue", "--explain"], env=_env(tmp_path),
+                               capture_output=True, text=True, timeout=30)
+    assert explained.returncode == 0, explained.stdout
+    assert "admissible now" in explained.stdout
 
 
 FAILING_PREFLIGHT = (

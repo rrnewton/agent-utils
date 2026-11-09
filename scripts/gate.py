@@ -71,6 +71,39 @@ gates to finish, so a two-minute rerun no longer waits behind every gate queued
 after the one it repeats. $GATE_BLACKOUT_NOW (ISO 8601) overrides the clock
 for tests.
 
+Exclusive-phase priority (#1146 gate-exclusive-phase-starvation): that same
+unbounded rerun priority starved a full gate's nested exclusive phase, which
+queues as a fresh ordinary exclusive ticket. When the phase-priority switch
+is on, a genuine nested exclusive gate — $GATE_ADMISSION_RUN_ID naming a
+parent whose runs/ ticket is present and whose holder is still alive, the
+liveness `_reap` applies before every grant — enqueues with the rerun
+ordering mark (the ticket's `rerun` field, which every client generation
+already sorts by) plus `nested_phase` and `phase_priority` fields naming the
+phase and the switch source. No ordering rule changes: tickets queued later
+cannot pass it, and the only reruns that can precede it are those already
+waiting when it enqueues. The mark is only the ordering field. Every other
+reader of `rerun` keys off the caller's own --rerun flag or the run's class,
+never another ticket: the RERUN_MAX_STEPS check and the preflight skip run
+only for an explicit --rerun (a phase's five steps keep the nested
+preflight wording), blackout handling follows the parent admission, the
+ledger kind still derives from the class, and an older client reading a
+marked ticket does no max-steps or blackout judgement of it — it only sorts
+it, exactly as it sorts a rerun. The switch defaults off: $GATE_PHASE_PRIORITY
+(1/0) is the test and override hook and wins; otherwise a per-host file
+(default ~/.local/etc/agent-utils/gate-phase-priority.toml, override with
+$GATE_PHASE_PRIORITY_CONFIG) holding only `phase_priority = true` turns it
+on; a malformed file means off and says why, never refusing a gate. It is
+read once at enqueue, so flipping it never rewrites a queued ticket.
+Rollout is the coordinators': land with the switch off, watch
+`gate.py queue --explain` for a day, enable the first host in a quiet
+window, then the second after a clean day.
+
+`gate.py queue [--explain]` lists running runs and queued tickets in grant
+order; --explain says for each ticket why it waits: the running runs and the
+tickets ahead of it (and why each is ahead), a full shared box, or an active
+blackout — including a starvation line when rerun tickets queued after an
+unmarked exclusive-phase ticket stand ahead of it.
+
 Preflight: before a top-level run takes a ticket, it runs the repository's
 deterministic content checks on this checkout (PREFLIGHT_STEPS: the
 client-name guard and the package contract, whose standalone-docs rules and
@@ -177,6 +210,53 @@ def host_slot_cap(path: Path | None = None) -> tuple[int | None, str | None]:
     if set(raw) != {"slots"} or isinstance(value, bool) or not isinstance(value, int) or value < 1:
         return 1, f"gate slots config {path} must hold only `slots = N` with N >= 1; capping at 1"
     return value, None
+
+
+#: The phase-priority switch (#1146) lives in its own per-host file for the
+#: same reason as the slot cap: an older gate.py refuses a gate.toml holding
+#: anything but [[blackout]] tables and caps at 1 on extra slots-file keys.
+DEFAULT_PHASE_PRIORITY_CONFIG = Path("~/.local/etc/agent-utils/gate-phase-priority.toml")
+
+
+def phase_priority_config_path() -> Path:
+    return Path(
+        os.environ.get("GATE_PHASE_PRIORITY_CONFIG") or DEFAULT_PHASE_PRIORITY_CONFIG
+    ).expanduser()
+
+
+def phase_priority() -> tuple[bool, str]:
+    """Whether nested exclusive phases get the rerun ordering mark, and what
+    decided it: (enabled, source). $GATE_PHASE_PRIORITY (1/0) is the test and
+    override hook and wins; otherwise the per-host file decides; no file and
+    no env means off. A malformed file means off and names itself in the
+    source, so `queue --explain` can show it; it never refuses a gate. Every
+    source that ends in "; off" is a problem the enqueue warns about."""
+
+    raw = os.environ.get("GATE_PHASE_PRIORITY")
+    if raw is not None:
+        value = raw.strip().lower()
+        if value in ("1", "true", "yes", "on"):
+            return True, f"env GATE_PHASE_PRIORITY={raw}"
+        if value in ("0", "false", "no", "off", ""):
+            return False, f"env GATE_PHASE_PRIORITY={raw} (override off)"
+        return False, f"env GATE_PHASE_PRIORITY={raw!r} is not 1/0; off"
+    path = phase_priority_config_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False, f"default off: no host file {path}"
+    except OSError as exc:
+        return False, f"host file {path} is unreadable ({exc}); off"
+    try:
+        parsed = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        return False, f"host file {path} is not TOML ({exc}); off"
+    value = parsed.get("phase_priority")
+    if set(parsed) != {"phase_priority"} or not isinstance(value, bool):
+        return False, f"host file {path} must hold only `phase_priority = true/false`; off"
+    if value:
+        return True, f"host file {path}"
+    return False, f"host file {path} says phase_priority = false"
 
 
 def blackout_config_path(explicit: str | None = None) -> Path:
@@ -385,11 +465,27 @@ class Admission:
                 out.append(data)
         return out
 
-    def enqueue(self, cls: str, command: list[str], rerun: bool = False) -> tuple[str, Path]:
+    def parent_is_live(self, run_id: str) -> bool:
+        """Whether `run_id` names a parent run whose holder still lives: the
+        runs/ ticket is present and its pid passes the same `_alive` check
+        `_reap` applies before a grant. A stale file left behind, or the env
+        var alone, is not a parent (#1146)."""
+        data = self._read(self.root / "runs" / f"{run_id}.json")
+        return data is not None and _alive(data.get("pid"))
+
+    def enqueue(
+        self,
+        cls: str,
+        command: list[str],
+        rerun: bool = False,
+        nested_phase: bool = False,
+        phase_priority_source: str | None = None,
+    ) -> tuple[str, Path]:
         run_id = f"{time.time_ns()}-{uuid.uuid4().hex[:8]}"
         ticket: dict[str, object] = {
             "id": run_id, "pid": os.getpid(), "class": cls,
             "queued_at": time.time(), "command": command, "rerun": rerun,
+            "nested_phase": nested_phase, "phase_priority": phase_priority_source,
         }
         self._locked()
         try:
@@ -400,6 +496,33 @@ class Admission:
             self._unlocked()
         return run_id, path
 
+    def grant_blockers(
+        self,
+        run_id: str,
+        cls: str,
+        tickets: list[tuple[Path, dict[str, object]]],
+        runs: list[dict[str, object]],
+    ) -> list[tuple[str, dict[str, object], str]]:
+        """What blocks `run_id` from a grant: (kind, ticket-or-run, reason)
+        rows implementing exactly the class rules `try_grant` applies, so
+        `queue --explain` can name the same blockers a grant would see."""
+        ids = [str(data["id"]) for _, data in tickets]
+        if run_id not in ids:
+            return []
+        ahead = tickets[: ids.index(run_id)]
+        if cls == "exclusive":
+            return (
+                [("ticket", data, "ahead") for _, data in ahead]
+                + [("run", run, "running") for run in runs]
+            )
+        blockers: list[tuple[str, dict[str, object], str]] = [
+            ("ticket", data, "ahead") for _, data in ahead if data.get("class") == "exclusive"
+        ]
+        blockers += [("run", run, "running") for run in runs if run.get("class") == "exclusive"]
+        if not blockers and len(runs) >= self.effective_slots():
+            blockers += [("run", run, "slots-full") for run in runs]
+        return blockers
+
     def try_grant(self, run_id: str, cls: str) -> bool:
         """Grant admission if FIFO order and the class rules allow it."""
         self._locked()
@@ -409,18 +532,8 @@ class Admission:
             ids = [str(data["id"]) for _, data in tickets]
             if run_id not in ids:
                 return False
-            ahead = tickets[: ids.index(run_id)]
-            runs = self.runs()
-            if cls == "exclusive":
-                if ahead or runs:
-                    return False
-            else:
-                if any(data.get("class") == "exclusive" for _, data in ahead):
-                    return False
-                if any(run.get("class") == "exclusive" for run in runs):
-                    return False
-                if len(runs) >= self.effective_slots():
-                    return False
+            if self.grant_blockers(run_id, cls, tickets, self.runs()):
+                return False
             for path, data in tickets:
                 if str(data["id"]) == run_id:
                     data["started_at"] = time.time()
@@ -479,16 +592,20 @@ def _refuse_blackout(window: BlackoutWindow, instant: dt.datetime) -> int:
     return BLACKOUT_EXIT
 
 
-def _rerun_problem(command: list[str]) -> str | None:
-    """Why `command` is not a short rerun of named steps, or None if it is."""
-
+def _selected_steps(command: list[str]) -> list[str]:
     selected: list[str] = []
     for index, word in enumerate(command):
         if word == "--selected" and index + 1 < len(command):
             selected.extend(command[index + 1].split(","))
         elif word.startswith("--selected="):
             selected.extend(word.split("=", 1)[1].split(","))
-    selected = [step for step in selected if step]
+    return [step for step in selected if step]
+
+
+def _rerun_problem(command: list[str]) -> str | None:
+    """Why `command` is not a short rerun of named steps, or None if it is."""
+
+    selected = _selected_steps(command)
     if not selected:
         return "a rerun names its steps with --selected A,B"
     if len(selected) > RERUN_MAX_STEPS:
@@ -577,6 +694,20 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
         print(f"gate: preflight passed in {seconds:.0f}s ({', '.join(PREFLIGHT_STEPS)})", flush=True)
         preflight = "passed"
     adm = Admission(state_dir(), args.slots)
+    # #1146: the rerun ordering mark needs a live parent, checked with the
+    # same liveness as a grant, before the parent slot is released below. An
+    # explicit --rerun is never a phase, however it was invoked. The mark is
+    # only the ticket's ordering field; `rerun` above stays the caller's own
+    # flag for the step check, the preflight wording and blackout handling.
+    nested_live = bool(parent_run and adm.parent_is_live(parent_run))
+    nested_phase = nested_live and args.cls == "exclusive" and not rerun
+    phase_enabled, phase_source = phase_priority() if nested_phase else (False, None)
+    phase_marked = nested_phase and phase_enabled
+    phase_mark_source = phase_source if phase_marked else None
+    if phase_marked:
+        print(f"gate: nested exclusive phase queues in the rerun tier ({phase_source})", flush=True)
+    elif phase_source is not None and phase_source.endswith("; off"):
+        print(f"gate: warning: phase priority off: {phase_source}", flush=True)
     # A gate invoked from inside an admitted gate (validate.py running its
     # gate-exclusive steps) must not queue behind its own parent: the parent
     # process is blocked waiting for this call and will never finish. Release
@@ -585,7 +716,10 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     # blocks new ones, with no deadlock.
     if parent_run:
         adm.finish(parent_run)
-    run_id, _ = adm.enqueue(args.cls, command, rerun)
+    run_id, _ = adm.enqueue(
+        args.cls, command, rerun or phase_marked,
+        nested_phase=nested_phase, phase_priority_source=phase_mark_source,
+    )
     queued_at = time.time()
     last_pos = -1
     blackout_noted: BlackoutWindow | None = None
@@ -670,7 +804,9 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
         adm.record({"id": run_id, "class": args.cls, "command": command,
                     "queued_at": queued_at, "started_at": started,
                     "finished_at": finished, "wait_s": round(waited, 2),
-                    "run_s": round(finished - started, 2), "exit_code": rc})
+                    "run_s": round(finished - started, 2), "exit_code": rc,
+                    "rerun": rerun, "nested_phase": nested_phase,
+                    "phase_priority": phase_mark_source})
         # After the slot is released, so no other gate waits on it (#940). A
         # nested gate leaves it to its parent, which is still building.
         pruned = None if nested or getattr(args, "no_prune", False) else _prune_after_gate()
@@ -680,7 +816,8 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
             sys.stdout.flush()
         _record_ledger(args, command, started, finished, rc,
                        passed_steps, failed_steps, verdict_word, pruned, queued_at,
-                       preflight=preflight, aborted=aborted)
+                       preflight=preflight, aborted=aborted, rerun_flag=rerun,
+                       nested_phase=nested_phase, phase_priority_source=phase_mark_source)
     return rc
 
 
@@ -755,6 +892,9 @@ def _record_ledger(
     kind: str | None = None,
     preflight: str | None = None,
     aborted: str | None = None,
+    rerun_flag: bool = False,
+    nested_phase: bool = False,
+    phase_priority_source: str | None = None,
 ) -> None:
     """Append one durable ledger line for the finished run (#827). Best effort:
     a ledger failure must never change the gate's own result. `queued_utc` and
@@ -790,6 +930,9 @@ def _record_ledger(
             "blackout_ignored": bool(getattr(args, "ignore_blackout", False)),
             "preflight": preflight,
             "aborted": aborted,
+            "rerun": rerun_flag,
+            "nested_phase": nested_phase,
+            "phase_priority": phase_priority_source,
             "log_path": None,
             "target_bytes_before": (pruned or {}).get("target_bytes_before"),
             "target_bytes_after": (pruned or {}).get("target_bytes_after"),
@@ -828,6 +971,147 @@ def show_status(args: argparse.Namespace) -> int:
           f"({len(recent) / 24.0:.1f}/hour), "
           f"median wait {(waits[len(waits) // 2] if waits else 0):.0f}s, "
           f"max wait {(waits[-1] if waits else 0):.0f}s")
+    return 0
+
+
+def _float_or(value: object, default: float = 0.0) -> float:
+    try:
+        return float(str(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _age_text(seconds: float) -> str:
+    seconds = max(seconds, 0.0)
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+def _command_list(data: dict[str, object]) -> list[str]:
+    command = data.get("command")
+    return [str(word) for word in command] if isinstance(command, list) else []
+
+
+def _command_summary(data: dict[str, object]) -> str:
+    command = _command_list(data)
+    selected = _selected_steps(command)
+    if selected:
+        summary = "--selected " + ",".join(selected)
+    elif command:
+        summary = shlex.join(command)
+    else:
+        summary = "(no command recorded)"
+    return summary if len(summary) <= 160 else summary[:157] + "..."
+
+
+def _is_inferred_phase(data: dict[str, object]) -> bool:
+    """A ticket from before phase marks that validate.py's exclusive phase
+    would have written: an exclusive dagrun at --max-steps 1 over the
+    cross.* gate-exclusive steps."""
+    if data.get("class") != "exclusive" or data.get("nested_phase"):
+        return False
+    command = _command_list(data)
+    selected = _selected_steps(command)
+    max_one = any(
+        command[i] == "--max-steps" and i + 1 < len(command) and command[i + 1] == "1"
+        for i in range(len(command))
+    )
+    return bool(max_one and selected and all(step.startswith("cross.") for step in selected))
+
+
+def _ticket_label(data: dict[str, object]) -> str:
+    if data.get("nested_phase"):
+        if data.get("rerun"):
+            return f"nested exclusive phase (rerun-tier mark on, {data.get('phase_priority')})"
+        return "nested exclusive phase (unmarked)"
+    if data.get("rerun"):
+        return "--rerun ticket"
+    if _is_inferred_phase(data):
+        return "inferred gate-exclusive phase (ticket predates phase marks)"
+    return f"{data.get('class')} ticket"
+
+
+def _why_ahead(ahead: dict[str, object], ticket: dict[str, object]) -> str:
+    if ahead.get("rerun") and not ticket.get("rerun"):
+        return "rerun tier"
+    if ahead.get("rerun"):
+        return "FIFO within rerun tier"
+    return "FIFO"
+
+
+def show_queue(args: argparse.Namespace) -> int:
+    try:
+        windows = load_blackout_windows(getattr(args, "blackout_config", None))
+        now = blackout_now()
+    except BlackoutConfigError as exc:
+        print(f"gate: {exc}", flush=True)
+        return 2
+    adm = Admission(state_dir(), args.slots)
+    adm._locked()
+    try:
+        adm._reap()
+        tickets = adm.tickets()
+        runs = adm.runs()
+    finally:
+        adm._unlocked()
+    enabled, source = phase_priority()
+    print(f"gate queue: {len(runs)} running, {len(tickets)} queued (grant order)")
+    print(f"gate queue: phase priority {'on' if enabled else 'off'} ({source})")
+    cap, problem = host_slot_cap()
+    print(f"gate queue: shared slots {adm.effective_slots()}"
+          + (f" (host cap {cap} from {slots_config_path()})" if cap is not None else
+             f" (no host cap; {slots_config_path()} absent)")
+          + (f"; {problem}" if problem else ""))
+    blackout = active_blackout(windows, now)
+    if blackout is not None:
+        nxt = blackout.next_start_after(now).astimezone(blackout.tz)
+        print(f"gate queue: blackout {blackout.describe()}: no gate may start; "
+              f"starts resume {nxt:%Y-%m-%d %H:%M %Z}")
+    now_s = time.time()
+    for run in runs:
+        print(f"gate queue: running {run.get('id')} class={run.get('class')} "
+              f"for {_age_text(now_s - _float_or(run.get('started_at'), now_s))}: "
+              f"{_command_summary(run)}")
+    for index, (_, data) in enumerate(tickets):
+        run_id = str(data.get("id"))
+        print(f"gate queue: #{index + 1} {run_id} class={data.get('class')} "
+              f"{_ticket_label(data)}, queued "
+              f"{_age_text(now_s - _float_or(data.get('queued_at'), now_s))} ago: "
+              f"{_command_summary(data)}")
+        if not getattr(args, "explain", False):
+            continue
+        if blackout is not None:
+            print("gate queue:   blocked by blackout (see above)")
+        else:
+            blockers = adm.grant_blockers(run_id, str(data.get("class")), tickets, runs)
+            if not blockers:
+                print("gate queue:   admissible now; waiting only for its own poll")
+            for kind, blocker, reason in blockers:
+                blocker_id = str(blocker.get("id"))
+                if kind == "ticket":
+                    print(f"gate queue:   blocked by ticket {blocker_id} ahead "
+                          f"({_why_ahead(blocker, data)})")
+                elif reason == "slots-full":
+                    print(f"gate queue:   blocked by a full shared box "
+                          f"({len(runs)}/{adm.effective_slots()} slots in use): "
+                          f"running {blocker_id}")
+                else:
+                    print(f"gate queue:   blocked by running {blocker_id} "
+                          f"(class={blocker.get('class')}, running "
+                          f"{_age_text(now_s - _float_or(blocker.get('started_at'), now_s))})")
+        if data.get("nested_phase") or _is_inferred_phase(data):
+            ahead = tickets[:index]
+            starved = sum(
+                1 for _, other in ahead
+                if other.get("rerun")
+                and _float_or(other.get("queued_at")) > _float_or(data.get("queued_at"))
+            )
+            if starved:
+                print(f"gate queue:   starvation: {starved} rerun ticket(s) queued after "
+                      "this ticket are ahead of it")
     return 0
 
 
@@ -1356,6 +1640,9 @@ def main(argv: list[str] | None = None) -> int:
         prog="gate",
         description="Gate admission: counting slots plus an exclusive class.",
         epilog=(
+            "Subcommands: gate status, gate stats, gate queue [--explain] (why each "
+            "queued ticket waits, and the phase-priority switch state), gate prune. "
+            "Run each as `gate <name> --help`.\n\n"
             "Blackout windows (#907): no gate starts inside a window from the per-host "
             "config (default ~/.local/etc/agent-utils/gate.toml, override with "
             "$GATE_BLACKOUT_CONFIG or --blackout-config). Format, one or more tables:\n"
@@ -1404,6 +1691,38 @@ def main(argv: list[str] | None = None) -> int:
                              "see `gate prune --help`)")
     if argv[:1] == ["status"]:
         return show_status(parser.parse_args([]))
+    if argv[:1] == ["queue"]:
+        queue_parser = argparse.ArgumentParser(
+            prog="gate queue",
+            description=(
+                "List running runs and queued tickets in grant order. The header "
+                "shows the phase-priority switch (#1146): on/off and what decided "
+                "it ($GATE_PHASE_PRIORITY=1/0, else `phase_priority = true` in the "
+                "per-host file $GATE_PHASE_PRIORITY_CONFIG or "
+                "~/.local/etc/agent-utils/gate-phase-priority.toml; default off). "
+                "An older gate.py reads the same tickets: it sorts by the same "
+                "`rerun` field and ignores the phase fields."),
+            epilog=(
+                "Examples:\n"
+                "  scripts/gate.py queue             # grant order, marks and ages\n"
+                "  scripts/gate.py queue --explain   # why each ticket waits"),
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+        queue_parser.add_argument("--explain", action="store_true",
+                                  help="for each queued ticket, name what blocks it: the running "
+                                       "runs it waits for, the tickets ahead of it and why each is "
+                                       "ahead (rerun tier or FIFO), a full shared box, or an active "
+                                       "blackout; an unmarked exclusive-phase ticket also gets a "
+                                       "starvation line counting reruns queued after it that stand "
+                                       "ahead of it")
+        queue_parser.add_argument("--slots", type=int,
+                                  default=int(os.environ.get("GATE_SLOTS", "2")),
+                                  help="concurrent shared gates for the full-box check "
+                                       "(default 2, or $GATE_SLOTS); a host cap lowers it")
+        queue_parser.add_argument("--blackout-config", default=None,
+                                  help="blackout config path (default $GATE_BLACKOUT_CONFIG or "
+                                       "~/.local/etc/agent-utils/gate.toml)")
+        return show_queue(queue_parser.parse_args(argv[1:]))
     if argv[:1] == ["prune"]:
         return run_prune(argv[1:])
     if argv[:1] == ["stats"]:
