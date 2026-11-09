@@ -154,7 +154,8 @@ def walk(desk: Desk, api: VoicesApi, voice: str) -> None:
         desk.wait_for("() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
                       "the audio switch did not choose the device voice")
     tap(page, "#read-aloud")
-    desk.settled()
+    desk.wait_for("() => document.getElementById('read-aloud').getAttribute('data-active') === 'true'",
+                  f"{voice}: Read did not turn on")
     row = f"#{LIST} > li[data-id='{MESSAGE}']"
     page.evaluate("(selector) => document.querySelector(selector).scrollIntoView({block: 'center'})", row)
     desk.settled()
@@ -174,7 +175,8 @@ def walk(desk: Desk, api: VoicesApi, voice: str) -> None:
         page.wait_for_timeout(100)
     desk.check(label(page) == "Pause", f"{voice}: Read says {label(page)!r} while the read plays")
     tap(page, "#read-aloud")
-    desk.settled()
+    desk.wait_for("() => document.getElementById('read-aloud-label').textContent === 'Resume'",
+                  f"{voice}: Pause did not hold the read")
     if voice == "agent":
         # Held in its second block, so the third is still to come after Resume.
         count = page.evaluate("() => document.getElementById('read-steer-count').textContent")
@@ -284,7 +286,8 @@ def quote_walk(desk: Desk, api: VoicesApi, touch: bool) -> None:
     page = desk.page
     sign_in(desk)
     press(page, "#read-aloud", touch)
-    desk.settled()
+    desk.wait_for("() => document.getElementById('read-aloud').getAttribute('data-active') === 'true'",
+                  "quote: Read did not turn on")
     row = f"#{LIST} > li[data-id='{MESSAGE}']"
     page.evaluate("(selector) => document.querySelector(selector).scrollIntoView({block: 'center'})", row)
     desk.settled()
@@ -305,7 +308,9 @@ def quote_walk(desk: Desk, api: VoicesApi, touch: bool) -> None:
                "quote: the strip offered Quote reply while the read played")
     page.evaluate("() => getSelection().removeAllRanges()")
     press(page, "#read-aloud", touch)
-    desk.settled()
+    desk.wait_for("() => document.getElementById('read-aloud-label').textContent === 'Resume' "
+                  "&& document.documentElement.getAttribute('data-read-strip') === 'paused'",
+                  "quote: Pause did not hold the read")
     desk.check(label(page) == "Resume", f"quote: Pause left Read saying {label(page)!r}")
     desk.check(page.evaluate("() => document.documentElement.getAttribute('data-read-strip')") == "paused",
                "quote: the strip does not say the read is paused")
@@ -567,7 +572,8 @@ def react_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool, recognition:
         desk.wait_for("() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
                       "react: the audio switch did not choose the device voice")
     press(page, "#read-aloud", touch)
-    desk.settled()
+    desk.wait_for("() => document.getElementById('read-aloud').getAttribute('data-active') === 'true'",
+                  "react: Read did not turn on")
     row = f"#{LIST} > li[data-id='{MESSAGE}']"
     page.evaluate("(selector) => document.querySelector(selector).scrollIntoView({block: 'center'})", row)
     desk.settled()
@@ -592,7 +598,8 @@ def react_walk(desk: Desk, api: VoicesApi, voice: str, touch: bool, recognition:
         check_nav_row(desk, "react, playing", touch)
         check_jump_to_reading(desk, "jump, playing", touch, row, step=True)
     press(page, "#read-aloud", touch)
-    desk.settled()
+    desk.wait_for("() => document.getElementById('read-aloud-label').textContent === 'Resume'",
+                  "react: Pause did not hold the read")
     desk.check(label(page) == "Resume", f"react: Pause left Read saying {label(page)!r}")
     held = page.evaluate(LIT_JS) if voice == "agent" else None
     page.wait_for_timeout(1000)

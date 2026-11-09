@@ -513,3 +513,28 @@ no-address negative windows; and the generic key/press helpers' internal
 settles, whose callers each wait for their own effect.
 
 Solo on 2026-11-09 (Chromium 149.0.7827.55): all six files pass whole.
+
+## Read-aloud pair, 2026-11-09 (mu-settle)
+
+[muse watermelon] `read_pause_reply_browser.py` and
+`read_aloud_views_browser.py` (22 `settled()` sites reviewed). Eight
+conversions, all the same two shapes: turning Read on waits for the
+button's own `data-active` (in `walk`, `quote_walk` and `react_walk`, in
+`Walk.view`'s re-arm, and at the views walk's start), and Pause waits for
+the label to say Resume (and, in the quote walk, the strip to say paused)
+before the held position is captured. Only the label is waited on there:
+the paused-at count and the held sentence are snapshots of where the read
+stopped, and waiting for a value would capture a later position if the
+pause had failed.
+
+Everything else is kept, and most of it is the subject rather than a wait:
+the dwells that put the pause mid-sentence and mid-block, the agent
+resume's fixed 300 ms clock-rate window (the views file's poll-until-moved
+twin from #998 measures a different thing — that the read resumed at
+all), the chip's zero-drops observation window, React's held-for-a-second
+light, and the views controls' 500 ms for a wrongful continuation to
+betray itself. The rest is scroll baselines and paint after exact waits.
+#998's conversions in views (30 s state bounds, the audio-clock poll, the
+card-kinds poll) are as they were.
+
+Solo on 2026-11-09 (Chromium 149.0.7827.55): both files pass whole.

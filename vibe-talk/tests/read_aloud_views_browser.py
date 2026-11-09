@@ -382,7 +382,8 @@ class Walk:
         self.desk.settled()
         if self.page.evaluate("() => document.getElementById('read-aloud').getAttribute('data-active') !== 'true'"):
             self.page.click("#read-aloud")
-            self.desk.settled()
+            self.wait_for("Read did not turn back on",
+                          "() => document.getElementById('read-aloud').getAttribute('data-active') === 'true'")
 
 
 def walk(walk_: Walk) -> None:
@@ -394,7 +395,8 @@ def walk(walk_: Walk) -> None:
         desk.wait_for("() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
                       "the audio switch did not choose the device voice")
     page.click("#read-aloud")
-    desk.settled()
+    walk_.wait_for("Read did not turn on",
+                   "() => document.getElementById('read-aloud').getAttribute('data-active') === 'true'")
     blocks = walk_.voice == "agent"
 
     # All: a reply in the runner's thread.
