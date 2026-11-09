@@ -75,7 +75,10 @@ def value(walk: Walk, element_id: str) -> str:
 def chord(walk: Walk, where: str, box: str, keys: str = "Control+s") -> Json:
     """Press the chord and check the focus went to `box` with the Save page refused."""
     before = focus(walk)
+    heard = walk.page.evaluate("() => window.__keys.length")
     kb.press(walk.cdp, keys)
+    walk.wait_for(f"() => document.activeElement && document.activeElement.id === '{box}' && window.__keys.length > {heard}",
+                  f"{keys} {where} did not go to #{box}")
     state = walk.settled()
     last = walk.last_key()
     check(last["prevented"] is True, f"{keys} {where} was left to the browser, whose Save page it opens: {last}")
@@ -88,6 +91,9 @@ def chord(walk: Walk, where: str, box: str, keys: str = "Control+s") -> Json:
 def select_row(walk: Walk, selector: str) -> str:
     """Click a message to select it, as the reader would; return the focus it left."""
     walk.page.click(f"{selector} >> nth=-1", position={"x": 300, "y": 10})
+    walk.wait_for("() => document.activeElement && document.activeElement.tagName === 'LI' "
+                  "&& Boolean(document.activeElement.dataset && document.activeElement.dataset.id)",
+                  f"a click on {selector} selected nothing")
     walk.settled()
     held = focus(walk)
     check(held.startswith("li#"), f"fixture: a click on {selector} selected nothing, the focus on {held!r}")

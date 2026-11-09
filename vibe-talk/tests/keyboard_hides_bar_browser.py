@@ -329,7 +329,10 @@ def phone_walk(desk: Desk) -> None:
     # Up again, then the box losing the focus: the bars back at once, the keyboard not yet gone.
     keyboard(desk, True)
     page.evaluate("() => document.activeElement.blur()")
-    desk.settled()
+    desk.wait_for("() => document.documentElement.getAttribute('data-keyboard') === 'closed' "
+                  "&& ['control-bar', 'dock'].every((id) => { const n = document.getElementById(id); "
+                  "return Boolean(n) && !n.hidden && n.getClientRects().length > 0; })",
+                  "blurred: the page still says the keyboard is up, or the bars are not back")
     found = state(desk)
     desk.check(found["said"] == "closed", f"blurred: the page still says the keyboard is up: {found}")
     bars_up(desk, found, "blurred with the keyboard still up")
@@ -504,7 +507,10 @@ def compose_walk(desk: Desk, api: ReplyColumnsApi) -> None:
 
     page.keyboard.type("first line")
     page.tap("#channel-newline")
-    desk.settled()
+    desk.wait_for("() => { const b = document.getElementById('channel-compose-text'); "
+                  "return b.value === 'first line\\n' && document.activeElement === b "
+                  "&& document.documentElement.getAttribute('data-keyboard') === 'open'; }",
+                  "the new-line key did not write a new line at the caret")
     found = state(desk)
     value = page.evaluate("() => document.getElementById('channel-compose-text').value")
     desk.check(value == "first line\n", f"the new-line key did not write a new line at the caret: {value!r}")
@@ -546,7 +552,8 @@ def compose_walk(desk: Desk, api: ReplyColumnsApi) -> None:
     page.keyboard.type("one")
     page.keyboard.press("Enter")
     page.keyboard.type("two")
-    desk.settled()
+    desk.wait_for("() => document.getElementById('channel-compose-text').value === 'one\\ntwo'",
+                  "Enter to send off: Enter did not write a new line")
     value = page.evaluate("() => document.getElementById('channel-compose-text').value")
     desk.check(value == "one\ntwo" and len(posted(api)) == sent,
                f"Enter to send off: Enter did not write a new line, or sent: {value!r} {posted(api)[sent:]}")
@@ -588,6 +595,15 @@ def ios_flush(desk: Desk, found: Json, when: str, *, above: float = 0) -> None:
     desk.check(number(found, "boxTop") >= number(found, "top"), f"{when}: the box's top is above the screen: {found}")
 
 
+def wait_ios_flush(desk: Desk, why: str, *, above: float = 0) -> None:
+    """Wait until the box stands where `ios_flush` will hold it (`#1118`), by the same measurements."""
+    desk.wait_for("() => { const v = window.visualViewport; "
+                  "const b = document.getElementById('channel-compose-text').getBoundingClientRect(); "
+                  f"const gap = v.offsetTop + v.height - b.bottom; "
+                  f"return document.documentElement.getAttribute('data-keyboard') === 'open' && gap >= -1 && gap <= {above + 1} && b.top >= v.offsetTop; }}",
+                  why)
+
+
 def wheel(desk: Desk, dy: float) -> None:
     """The reader's own scroll of the list, by a wheel over it (Chromium has no touch scroll to drive)."""
     desk.page.mouse.move(desk.width / 2, 120)
@@ -610,7 +626,9 @@ def ios_walk(desk: Desk, api: ReplyColumnsApi) -> None:
 
     # The keyboard up, `innerHeight` left at the layout's height: the box on the keys.
     page.evaluate(f"() => window.__iosKeyboard({IOS_VISUAL_PX})")
-    desk.settled()
+    wait_ios_flush(desk, "keyboard up: the box's foot is not on the keyboard's top")
+    desk.wait_for("() => document.getElementById('control-bar').getClientRects().length === 0",
+                  "keyboard up: the control bar is still drawn")
     found = ios_place(desk)
     ios_flush(desk, found, "keyboard up")
     desk.check(found["bar"] is False, f"keyboard up: the control bar is still drawn: {found}")
@@ -619,7 +637,7 @@ def ios_walk(desk: Desk, api: ReplyColumnsApi) -> None:
     desk.shot("1-ios-keyboard-up")
     # Safari's pan over the field, straight after: the box follows to the new top.
     page.evaluate(f"() => window.__iosPan({IOS_PAN_PX})")
-    desk.settled()
+    wait_ios_flush(desk, "panned: the box's foot is not on the keyboard's top")
     found = ios_place(desk)
     ios_flush(desk, found, "panned")
     flush_scroll = number(found, "scroll")
@@ -644,7 +662,7 @@ def ios_walk(desk: Desk, api: ReplyColumnsApi) -> None:
     desk.check(number(down, "scroll") >= number(down, "furthest") - 1, f"the reader's wheel did not reach the end: {down}")
     ios_flush(desk, down, "scrolled back to the end", above=END_PADDING_PX)
     page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop -= 400; a.scrollTop = a.scrollHeight; }")
-    desk.settled()
+    wait_ios_flush(desk, "sent to the foot by the page: the box's foot is not on the keyboard's top", above=END_PADDING_PX)
     ios_flush(desk, ios_place(desk), "sent to the foot by the page", above=END_PADDING_PX)
     desk.shot("3-ios-back-at-the-end")
     # A message sent with the keyboard's own key: the page goes to the newest, and the box stays on the keys.
@@ -656,13 +674,13 @@ def ios_walk(desk: Desk, api: ReplyColumnsApi) -> None:
             break
         page.wait_for_timeout(100)
     desk.check(posted(api)[before:] == ["from the phone"], f"the keyboard's Enter did not send: {posted(api)[before:]}")
-    page.wait_for_timeout(500)
-    desk.settled()
+    wait_ios_flush(desk, "after a send: the box's foot is not on the keyboard's top", above=END_PADDING_PX)
     ios_flush(desk, ios_place(desk), "after a send", above=END_PADDING_PX)
     desk.shot("4-ios-after-send")
     page.evaluate("() => window.__iosClose()")
     page.evaluate("() => document.activeElement && document.activeElement.blur()")
-    desk.settled()
+    desk.wait_for("() => document.documentElement.getAttribute('data-keyboard') === 'closed'",
+                  "the keyboard closed and the page still lays itself out for it")
     desk.check(ios_place(desk)["said"] == "closed", "the keyboard closed and the page still lays itself out for it")
 
     # `innerHeight` already leaving out the keyboard, as WebKit reports it for this page's
@@ -671,7 +689,7 @@ def ios_walk(desk: Desk, api: ReplyColumnsApi) -> None:
     page.tap("#channel-compose-text")
     desk.settled()
     page.evaluate(f"() => window.__iosKeyboard({IOS_VISUAL_PX}, 0, {IOS_VISUAL_PX})")
-    desk.settled()
+    wait_ios_flush(desk, "innerHeight without the keyboard: the box's foot is not on the keyboard's top")
     found = ios_place(desk)
     ios_flush(desk, found, "innerHeight without the keyboard")
     desk.shot("5-ios-short-innerheight")

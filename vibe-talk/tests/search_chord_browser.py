@@ -125,6 +125,10 @@ def press_raw(cdp: CDPSession, key: str, code: str, vk: int, modifiers: int, tex
 
 def searched(walk: Walk, where: str, refused: bool = True) -> Json:
     """The state after a chord that must have opened the search with its field focused, its default refused."""
+    walk.wait_for("() => !document.getElementById('search-field').hidden "
+                  "&& document.activeElement && document.activeElement.id === 'search-field' "
+                  "&& !document.getElementById('screen-main').hidden",
+                  f"{where}: the chord did not open the search")
     state = walk.settled()
     check(state["screen"] == "main", f"{where}: the chord left the reader on {state['screen']!r}")
     check(state["search"] is True, f"{where}: the chord did not open the search: {state}")
@@ -137,7 +141,8 @@ def searched(walk: Walk, where: str, refused: bool = True) -> Json:
 
 def close_search(walk: Walk) -> None:
     walk.page.focus("#search-field")
-    closed = walk.key("Escape")
+    closed = walk.key_until("Escape", "() => document.getElementById('search-field').hidden",
+                            "Escape did not close the search")
     check(closed["search"] is False, f"Escape did not close the search: {closed}")
 
 
@@ -173,6 +178,8 @@ def from_the_box(walk: Walk) -> None:
     page.evaluate("() => { const box = document.getElementById('channel-compose-text');"
                   " box.setSelectionRange(box.value.length, box.value.length); }")
     kb.press(walk.cdp, "/")
+    walk.wait_for("() => document.getElementById('channel-compose-text').value === 'draft words/'",
+                  'a bare "/" in the message box typed no slash')
     state = walk.settled()
     check(state["search"] is False, f'a bare "/" in the message box opened the search: {state}')
     check(value(page, "channel-compose-text") == "draft words/",
@@ -204,7 +211,8 @@ def from_a_menu(walk: Walk) -> None:
     page.focus("#scroll-area")
     kb.press(walk.cdp, "Home")
     kb.press(walk.cdp, ".")
-    walk.settled()
+    walk.wait_for("() => Boolean(document.activeElement && document.activeElement.closest('.row-more-menu'))",
+                  "fixture: '.' did not put the focus in the ⋯ menu")
     item = page.evaluate("() => Boolean(document.activeElement && document.activeElement.closest('.row-more-menu'))")
     check(item is True, "fixture: '.' did not put the focus in the ⋯ menu")
     kb.press(walk.cdp, "Control+/")
@@ -292,6 +300,8 @@ def from_reply(walk: Walk) -> None:
     page = walk.page
     page.focus("#scroll-area")
     kb.press(walk.cdp, "End")
+    walk.wait_for("() => Boolean(document.activeElement && document.activeElement.dataset && document.activeElement.dataset.id)",
+                  "fixture: End selected no message")
     walk.settled()
     row = page.evaluate("() => document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.id : null")
     check(isinstance(row, str), f"fixture: End selected no message: {row!r}")
@@ -398,6 +408,7 @@ def mac(walk: Walk) -> None:
             kb.press(walk.cdp, "Meta+Shift+?")
         else:
             press_raw(walk.cdp, "/", "Slash", 191, meta | shift)
+        walk.wait_for("() => !document.getElementById('screen-help').hidden", f"{how} on a Mac did not open Help")
         helped = walk.settled("screen-help")
         check(helped["screen"] == "help", f"{how} on a Mac did not open Help: {helped}")
         check(walk.last_key()["prevented"] is True, f"{how} on a Mac was left to the browser")

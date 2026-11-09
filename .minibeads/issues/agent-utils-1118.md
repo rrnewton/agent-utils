@@ -133,3 +133,71 @@ Kept, with the reason in each case:
 Solo on 2026-11-09 (Chromium 149.0.7827.55): all three files pass whole —
 threads-polish at both sizes including `read_mode_walk`, two-column including the
 older, replies, place and advance walks, desktop-layout at all its sizes.
+
+## Batch 2, 2026-11-09 (mu-settle)
+
+[muse watermelon] `keyboard_browser.py`, `composer_key_browser.py`,
+`search_chord_browser.py`, `keyboard_hides_bar_browser.py` and
+`fold_latency_browser.py` (75 `settled()` sites reviewed). These files have two
+different helpers. `Walk.settled` (keyboard, shared with composer-key and
+search-chord through `Walk`) is already a condition wait — the scroller's
+position unchanged over four samples — and stays for scroll positions and
+geometry a scroll settles into; its docstring now says what it cannot see (a
+key's focus, screen or scroll-start effect beginning after its quiet window),
+and `Walk` gained `wait_for(condition, why)` and `key_until(chord, condition,
+why)` in `Desk.wait_for`'s shape for those effects. `Desk.settled` here is
+batch 1's two-frame helper (hides-bar, fold-latency).
+
+Converted (each waits on the expression the following check reads, today's
+checks and messages kept after):
+
+- keyboard: Home/End and Ctrl+Home/End wait on the scroller reaching its end;
+  Settings' PgDn and PgUp in the message box wait on the scroll crossing half a
+  screen (the delayed-start flaw `moved()` already guarded against for paging);
+  `/`, Escape, the Ctrl+S chords (`to_box`, from the search field, on the call's
+  view), Settings open/leave, Ctrl+K and `m` wait on the focus or screen they
+  then check; the Settings Tab walk waits until the reached stop is brought
+  onto the screen; `e` and Ctrl/Cmd+E wait until the marked row shows Done;
+  `one_lit` with an expected row first waits until that row is the lit, focused
+  one (the previously lit row is also exactly one lit row); the four Enter
+  open/close checks in single-selection wait on the row's `data-collapsed`.
+- composer-key: the central `chord()` waits for the named box to hold the focus
+  and for this chord to have been heard (non-vacuous when the box already had
+  the focus, the draft case); `select_row` waits for a row to hold the focus.
+- search-chord: the central `searched()` waits for the search drawn, its field
+  focused, on the main screen; `close_search` waits for it hidden; the ⋯ menu's
+  focus, End's selected row, the typed slash in the box, and Help on a Mac wait
+  on the expressions read next.
+- keyboard-hides-bar (9 of 27): blur waits for the keyboard said closed and both
+  bars drawn; the new-line taps wait on the box's resulting value, focus and
+  keyboard state; the iOS steps wait through the new `wait_ios_flush` until the
+  box stands where `ios_flush` holds it (keyboard up, panned, sent to the foot,
+  after a send — the fixed 500 ms there is gone — and short-innerHeight), the
+  control bar gone, and the keyboard closed.
+- fold-latency: `select()` waits until the row is the selected one
+  (`data-selected`), the settle after it kept to flush the scroll's paint
+  outside the measured presses.
+
+Kept, with the reason in each case:
+
+- `Walk.settled` before scroll-position, stillness and moved-by-a-pixel checks,
+  scroll baselines (`spot`, the ring's list-follows reads), and after exact
+  `wait_for_function`/`wait_for_selector` pins (view keys, thread open/close,
+  two-columns): stillness is the condition those checks read.
+- The self-correcting reach-a-row loops (press until `ring()` names the row)
+  and Tab/Shift+Tab focus stops: focus moves inside the dispatch the CDP press
+  waits for, and each loop re-reads until it is true.
+- Negative windows: a bare `/`, a bare digit and AltGr changing nothing (a
+  condition wait would pass before the key travels); focused with no keyboard
+  yet in hides-bar; no-movement reads after viewport changes and pans.
+- Timed durations that are the subject: fold-latency's press pacing (four
+  presses 60 ms apart), its trace/keys deadline polls, the 1000 ms unpack soak
+  and the warm-up key's settle (all outside the measured interval, so the
+  presses are measured from a steady page); the held-Ctrl+Enter 400 ms and
+  Cmd+E out-of-sight 200 ms no-send windows; hides-bar's `SETTLE_WAIT_MS`
+  no-change windows and the wheel's 300 ms landing time.
+- Mid-cycle and between-action settles (fold-latency's unpack clicks, the
+  Show-read mode cycle), and load baselines after `wait_for_selector` where
+  only a screenshot follows.
+
+Solo on 2026-11-09 (Chromium 149.0.7827.55): all five files pass whole.

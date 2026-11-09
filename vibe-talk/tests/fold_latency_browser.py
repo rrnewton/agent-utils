@@ -219,6 +219,8 @@ def unpack_all(desk: Desk) -> None:
 def select(desk: Desk, row_id: str) -> None:
     desk.page.evaluate("(id) => { const li = document.querySelector(`#side-cards > li[data-unpack-thread][data-id='${id}']`);"
                        " li.scrollIntoView({block: 'center'}); selectRow(sidePane, li); }", row_id)
+    desk.wait_for(f"() => document.querySelector(\"#side-cards > li[data-unpack-thread][data-id='{row_id}']\")?.getAttribute('data-selected') === 'true'",
+                  f"the row {row_id} was not selected for the presses")
     desk.settled()
 
 

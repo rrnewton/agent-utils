@@ -490,7 +490,13 @@ class Walk:
         return value
 
     def settled(self, scroller: str = "scroll-area") -> Json:
-        """The state once the scroller has stopped moving: a key's scroll is animated."""
+        """The state once the scroller has stopped moving: a key's scroll is animated.
+
+        This waits on scroll stillness, not on frames, so it is the right wait before reading a
+        scroll position or geometry that a scroll settles into (`#1118 browser-fixed-frame-settle`).
+        It cannot see a key's other effect beginning late under load: a scroller that has not
+        started moving, and a focus or screen change still on its way, both read as at rest. Where
+        the next check reads such an effect, `wait_for` (or `key_until`) that effect first."""
         last = self.state(scroller)
         still = 0
         for _ in range(100):
@@ -504,6 +510,19 @@ class Walk:
 
     def key(self, chord: str, scroller: str = "scroll-area") -> Json:
         press(self.cdp, chord)
+        return self.settled(scroller)
+
+    def wait_for(self, condition: str, why: str, seconds: float = 10) -> None:
+        """Bounded wait on a page condition, failing as `why` (`#1118`): Desk.wait_for's shape."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and not self.page.evaluate(condition):
+            self.page.wait_for_timeout(25)
+        check(bool(self.page.evaluate(condition)), why)
+
+    def key_until(self, chord: str, condition: str, why: str, scroller: str = "scroll-area", seconds: float = 10) -> Json:
+        """Press `chord`, wait for the effect the caller checks, then the settled state."""
+        press(self.cdp, chord)
+        self.wait_for(condition, why, seconds)
         return self.settled(scroller)
 
     def shot(self, name: str) -> None:
@@ -566,11 +585,14 @@ def scroll_keys(walk: Walk, where: str) -> None:
     moved("PageDown", 1)
     moved("Shift+ ", -1)
     moved(" ", 1)
-    home = walk.key("Home")
+    home = walk.key_until("Home", "() => document.getElementById('scroll-area').scrollTop <= 1",
+                           f"{where}: Home did not take the list to its top")
     check(number(home, "top") <= 1, f"{where}: Home did not take the list to its top: {home}")
     check(on_list(home), f"{where}: after Home the focus is on {home['focus']!r}")
     walk.shot(f"{where}-home")
-    end = walk.key("End")
+    end = walk.key_until("End", "() => { const a = document.getElementById('scroll-area'); "
+                         "return a.scrollTop >= a.scrollHeight - a.clientHeight - 2; }",
+                         f"{where}: End did not take the list to its newest message")
     check(number(end, "top") >= number(end, "max") - 2, f"{where}: End did not take the list to its newest message: {end}")
     check(on_list(end), f"{where}: after End the focus is on {end['focus']!r}")
     walk.notes.append(f"{where}: PgUp/PgDn/Space/Shift+Space paged a {height:.0f}px list, Home and End reached its ends")
@@ -578,7 +600,9 @@ def scroll_keys(walk: Walk, where: str) -> None:
 
 def search_keys(walk: Walk) -> None:
     """"/" opens the search with its field focused; Escape closes it and hands the list the focus."""
-    opened = walk.key("/")
+    opened = walk.key_until("/", "() => !document.getElementById('search-field').hidden "
+                            "&& document.activeElement && document.activeElement.id === 'search-field'",
+                            "'/' did not open the search")
     check(opened["search"] is True, f"'/' did not open the search: {opened}")
     check(opened["focus"] == "search-field", f"'/' left the focus on {opened['focus']!r}, not the search field")
     walk.shot("search-slash")
@@ -586,7 +610,8 @@ def search_keys(walk: Walk) -> None:
     press(walk.cdp, "e")
     typed = walk.page.evaluate("() => document.getElementById('search-field').value")
     check(typed == "de", f"after '/' the search field did not take the typing: {typed!r}")
-    closed = walk.key("Escape")
+    closed = walk.key_until("Escape", "() => document.getElementById('search-field').hidden",
+                            "Escape did not close the search")
     check(closed["search"] is False, f"Escape did not close the search: {closed}")
     check(on_list(closed), f"after Escape the focus is on {closed['focus']!r}, not the list")
     walk.notes.append('"/" opened the search with the field focused, Escape closed it')
@@ -596,7 +621,8 @@ def write_keys(walk: Walk) -> None:
     """`#248 composer-key`: Ctrl+S, and Ctrl+Enter off any box, go to the message box; Save page refused."""
 
     def to_box(chord: str, where: str) -> None:
-        state = walk.key(chord)
+        state = walk.key_until(chord, "() => document.activeElement && document.activeElement.id === 'channel-compose-text'",
+                               f"{chord} {where} did not go to the message box")
         last = walk.last_key()
         check(last["prevented"] is True, f"{chord} {where} was left to the browser, whose Save page it opens: {last}")
         check(state["screen"] == "main", f"{chord} {where} left the reader on {state['screen']!r}")
@@ -608,7 +634,8 @@ def write_keys(walk: Walk) -> None:
     opened = walk.key("/")
     check(opened["focus"] == "search-field", f"'/' left the focus on {opened['focus']!r}")
     press(walk.cdp, "x")
-    state = walk.key("Control+s")
+    state = walk.key_until("Control+s", "() => document.activeElement && document.activeElement.id === 'channel-compose-text'",
+                           "Ctrl+S in the search field did not go to the message box")
     check(walk.last_key()["prevented"] is True, "Ctrl+S in the search field reached the browser's Save page")
     check(state["focus"] == "channel-compose-text", f"Ctrl+S in the search field left the focus on {state['focus']!r}")
     walk.shot("ctrl-s-from-search")
@@ -686,7 +713,8 @@ def call_view_write_keys(walk: Walk) -> None:
     walk.page.click("#view-switch")
     walk.page.wait_for_function("() => document.getElementById('view-switch').getAttribute('aria-pressed') === 'true'")
     walk.page.focus("#scroll-area")
-    state = walk.key("Control+s")
+    state = walk.key_until("Control+s", "() => document.activeElement && document.activeElement.id === 'compose-text'",
+                           "Ctrl+S on the call's view did not go to the agent's message box")
     check(walk.last_key()["prevented"] is True, "Ctrl+S on the call's view reached the browser's Save page")
     check(state["view"] == "voice", f"Ctrl+S on the call's view left it for {state['view']!r}")
     check(state["focus"] == "compose-text", f"Ctrl+S on the call's view left the focus on {state['focus']!r}")
@@ -703,7 +731,9 @@ def settings_keys(walk: Walk) -> None:
     walk.key("PageUp")
     for chord in (",", "Control+,"):
         before = walk.settled()
-        opened = walk.key(chord, "screen-settings")
+        opened = walk.key_until(chord, "() => !document.getElementById('screen-settings').hidden "
+                                "&& document.activeElement && document.activeElement.id === 'screen-settings'",
+                                f"{chord!r} did not open Settings", "screen-settings")
         check(opened["screen"] == "settings", f"{chord!r} did not open Settings: {opened}")
         check(opened["focus"] == "screen-settings", f"on Settings the focus is on {opened['focus']!r}")
         if chord != ",":
@@ -718,11 +748,13 @@ def settings_keys(walk: Walk) -> None:
         # first one paged to, could be near the foot with less than a page left to go.
         walk.page.evaluate("() => { document.getElementById('screen-settings').scrollTop = 0; }")
         start = walk.settled("screen-settings")
-        paged = walk.key("PageDown", "screen-settings")
+        paged = walk.key_until("PageDown", f"() => document.getElementById('screen-settings').scrollTop > {number(start, 'top') + number(start, 'height') * 0.5}",
+                               "PgDn on Settings did not scroll it", "screen-settings")
         check(number(paged, "top") > number(start, "top") + number(start, "height") * 0.5,
               f"PgDn on Settings did not scroll it: {start['top']} -> {paged['top']}")
         walk.shot(f"settings-{'comma' if chord == ',' else 'ctrl-comma'}")
-        back = walk.key("Escape")
+        back = walk.key_until("Escape", "() => !document.getElementById('screen-main').hidden",
+                              "Escape did not leave Settings")
         check(back["screen"] == "main", f"Escape did not leave Settings: {back}")
         check(on_list(back), f"back from Settings the focus is on {back['focus']!r}")
         check(abs(number(back, "top") - number(before, "top")) <= 2,
@@ -743,7 +775,8 @@ SETTINGS_FOLDS_OPENED = ["fold-settings-voice-agent", "fold-resuming", "fold-rel
 
 def settings_tab_order(walk: Walk) -> None:
     """Tab walks the three settings that read a message out in reading order, each ? first; Shift+Tab walks back."""
-    opened = walk.key(",", "screen-settings")
+    opened = walk.key_until(",", "() => !document.getElementById('screen-settings').hidden",
+                            '"," did not open Settings', "screen-settings")
     check(opened["screen"] == "settings", f'"," did not open Settings: {opened}')
     for fold in SETTINGS_FOLDS_OPENED:
         if walk.page.get_attribute(f"#{fold}", "aria-expanded") != "true":
@@ -757,6 +790,11 @@ def settings_tab_order(walk: Walk) -> None:
     forward = [walk.state("screen-settings")["focus"]]
     for _ in stops[1:]:
         reached = walk.key("Tab", "screen-settings")
+        walk.wait_for("() => { const held = document.activeElement; if (!held) return false; "
+                      "const b = held.getBoundingClientRect(); "
+                      "const s = document.getElementById('screen-settings').getBoundingClientRect(); "
+                      "return b.top >= s.top - 1 && b.bottom <= s.bottom + 1; }",
+                      f"Tab reached #{reached['focus']} without bringing it onto the screen")
         check(walk.page.evaluate(
             "() => { const b = document.activeElement.getBoundingClientRect(); "
             "const s = document.getElementById('screen-settings').getBoundingClientRect(); "
@@ -783,7 +821,8 @@ def composer_keys(walk: Walk) -> None:
         press(walk.cdp, letter)
     before = walk.settled()
     check(before["focus"] == "channel-compose-text", f"a click in the message box left the focus on {before['focus']!r}")
-    paged = walk.key("PageUp")
+    paged = walk.key_until("PageUp", f"() => document.getElementById('scroll-area').scrollTop <= {number(before, 'top') - number(before, 'height') * 0.5}",
+                           "PgUp in the message box did not page the list")
     delta = number(before, "top") - number(paged, "top")
     check(delta >= number(before, "height") * 0.5, f"PgUp in the message box did not page the list: moved {delta}px")
     check(paged["focus"] == "channel-compose-text", f"PgUp took the reader out of the box, to {paged['focus']!r}")
@@ -796,9 +835,12 @@ def composer_keys(walk: Walk) -> None:
     walk.key("End")
     value, at_end = walk.page.evaluate(caret)
     check(at_end == 5, f"End in the box did not move the caret to the end: {at_end}")
-    top = walk.key("Control+Home")
+    top = walk.key_until("Control+Home", "() => document.getElementById('scroll-area').scrollTop <= 1",
+                         "Ctrl+Home from the box did not take the list to its top")
     check(number(top, "top") <= 1, f"Ctrl+Home from the box did not take the list to its top: {top}")
-    newest = walk.key("Control+End")
+    newest = walk.key_until("Control+End", "() => { const a = document.getElementById('scroll-area'); "
+                            "return a.scrollTop >= a.scrollHeight - a.clientHeight - 2; }",
+                            "Ctrl+End from the box did not reach the newest message")
     check(number(newest, "top") >= number(newest, "max") - 2, f"Ctrl+End from the box did not reach the newest message: {newest}")
     check(newest["focus"] == "channel-compose-text", f"Ctrl+End took the reader out of the box, to {newest['focus']!r}")
     walk.page.evaluate("() => { const box = document.getElementById('channel-compose-text'); box.value = ''; "
@@ -868,6 +910,8 @@ def keymap_keys(walk: Walk, api: FakeApi) -> None:
     check(api.dismissals()[before:] == [[done]], f"e did not mark {done} Done on the server: {api.dismissals()}")
     # e leaves the chat service's read marker alone; Shift+E, below, is the key that moves it.
     check(api.upstream_reads() == [], f"e asked the chat service to mark a message read: {api.upstream_reads()}")
+    walk.wait_for(f"() => document.querySelector(\"#discord-log > li[data-id='{done}']\")?.dataset.archived === 'true'",
+                  "the message e marked does not show as Done")
     marked = walk.page.evaluate("(id) => document.querySelector(`#discord-log > li[data-id='${id}']`).dataset.archived", done)
     check(marked == "true", f"the message e marked does not show as Done: {marked!r}")
     check(after["id"] == ids[14], f"after e the ring went to {after['id']}, not the next unread {ids[14]}")
@@ -959,7 +1003,8 @@ def cmd_e_keys(walk: Walk, api: FakeApi, mod: str, words: str) -> None:
         row = ringed(walk, "k", f"{words}: k")
     target = str(row["id"])
     check(row["archived"] != "true", f"{words}: no message near the newest is left to mark Done")
-    to_box = walk.key("m")
+    to_box = walk.key_until("m", "() => document.activeElement && document.activeElement.id === 'channel-compose-text'",
+                            f"{words}: m did not go to the message box")
     check(to_box["focus"] == "channel-compose-text", f"{words}: m left the focus on {to_box['focus']!r}")
     for letter in "draft":
         press(walk.cdp, letter)
@@ -981,6 +1026,8 @@ def cmd_e_keys(walk: Walk, api: FakeApi, mod: str, words: str) -> None:
         if len(api.dismissals()) > before:
             break
         walk.page.wait_for_timeout(20)
+    walk.wait_for(f"() => document.querySelector(\"#discord-log > li[data-id='{target}']\")?.dataset.archived === 'true'",
+                  f"the message {words}+E marked does not show as Done")
     after = walk.page.evaluate(CMD_E_JS, target)
     check(api.dismissals()[before:] == [[target]],
           f"{words}+E in the box did not mark {target} Done on the server: {api.dismissals()[before:]} {after}")
@@ -1203,7 +1250,18 @@ def names(state: Json, key: str) -> list[str]:
 
 
 def one_lit(walk: Walk, why: str, expect: str | None = None) -> str:
-    """Exactly one row drawn lit, the focus on it, and (when given) the row `expect`; its `list:id`."""
+    """Exactly one row drawn lit, the focus on it, and (when given) the row `expect`; its `list:id`.
+
+    With `expect`, first wait for that row to be the lit, focused one (`#1118`): the row lit before
+    the step is also exactly one lit row, so reading after `settled()` alone can judge the step on
+    the selection it was meant to move away from."""
+    if expect is not None:
+        deadline = time.monotonic() + 10  # judged below, where the message names what is lit instead
+        while time.monotonic() < deadline:
+            held = walk.page.evaluate(LIT_JS)
+            if isinstance(held, dict) and held.get("lit") == [expect] and held.get("focus") == expect:
+                break
+            walk.page.wait_for_timeout(40)
     state = lit_state(walk)
     lit = names(state, "lit")
     check(len(lit) == 1, f"{why}: {len(lit)} rows are drawn lit, not one: {state}")
@@ -1315,12 +1373,14 @@ def single_selection(walk: Walk, api: FakeApi) -> None:
     one_lit(walk, "the mouse back on the long message", f"discord-log:{long_id}")
     folded = "(id) => document.querySelector(`#discord-log > li[data-id='${id}']`).dataset.collapsed"
     press(walk.cdp, "Enter")
-    walk.settled()
+    walk.wait_for(f"() => document.querySelector(\"#discord-log > li[data-id='{long_id}']\")?.dataset.collapsed === 'false'",
+                  "Enter did not open the message the mouse selected")
     check(walk.page.evaluate(folded, long_id) == "false", "Enter did not open the message the mouse selected")
     one_lit(walk, "Enter on the mouse's message", f"discord-log:{long_id}")
     walk.shot("single-enter-on-mouse-selection")
     press(walk.cdp, "Enter")
-    walk.settled()
+    walk.wait_for(f"() => document.querySelector(\"#discord-log > li[data-id='{long_id}']\")?.dataset.collapsed === 'true'",
+                  "Enter again did not close it")
     check(walk.page.evaluate(folded, long_id) == "true", "Enter again did not close it")
     check(keys_row != f"discord-log:{long_id}", "the keys and the mouse were on the same message; Enter proved nothing")
 
@@ -1352,14 +1412,16 @@ def single_selection(walk: Walk, api: FakeApi) -> None:
     mouse_move(walk, float(box["x"]), float(box["y"]))
     one_lit(walk, "the mouse onto the long message after a click on Show read", f"discord-log:{long_id}")
     press(walk.cdp, "Enter")
-    walk.settled()
+    walk.wait_for(f"() => document.querySelector(\"#discord-log > li[data-id='{long_id}']\")?.dataset.collapsed === 'false'",
+                  "Enter after a click on Show read did not open the message the mouse lit")
     check(walk.page.evaluate(folded, long_id) == "false",
           "Enter after a click on Show read did not open the message the mouse lit")
     check(walk.page.evaluate(mode) == mode_was, "Enter after a click on Show read pressed Show read again")
     one_lit(walk, "Enter on the mouse's message after a click on Show read", f"discord-log:{long_id}")
     walk.shot("single-enter-after-dock-click")
     press(walk.cdp, "Enter")
-    walk.settled()
+    walk.wait_for(f"() => document.querySelector(\"#discord-log > li[data-id='{long_id}']\")?.dataset.collapsed === 'true'",
+                  "Enter again did not close it")
     check(walk.page.evaluate(folded, long_id) == "true", "Enter again did not close it")
     check(keys_row != f"discord-log:{long_id}", "the keys were on the long message before the clicks; this proves nothing")
     # Off the list, for the steps that follow: the dock is not a row.
@@ -1544,7 +1606,8 @@ def view_keys(walk: Walk, mod: str, words: str) -> None:
 
 def picker_and_help_keys(walk: Walk) -> None:
     """Ctrl+K and a channel chosen gives the keys back to the list; Esc leaves the picker; Help's Back after "?"."""
-    opened = walk.key("Control+k")
+    opened = walk.key_until("Control+k", "() => document.activeElement && document.activeElement.id === 'discord-channel'",
+                            "Ctrl+K did not open the channel picker")
     check(opened["focus"] == "discord-channel", f"Ctrl+K left the focus on {opened['focus']!r}, not the channel picker")
     check(walk.last_key()["prevented"] is True, "Ctrl+K was left to the browser")
     left = walk.key("Escape")
