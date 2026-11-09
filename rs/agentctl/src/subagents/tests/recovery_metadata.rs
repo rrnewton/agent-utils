@@ -53,9 +53,11 @@ fn profile_resume_preserves_loaded_policy_and_literal_conversation_for_each_loca
         let fixture = Fixture::new();
         let profile = loaded_resume_profile(&fixture, harness, &[policy]);
         let mut options = resume_profile_options(&profile, conversation);
+        let project = fixture.root.join("project");
+        fs::create_dir_all(&project).unwrap();
         options.slot = Some(SlotLaunch {
             slot: "slot-a".to_owned(),
-            project: Some(fixture.root.clone()),
+            project: Some(project.clone()),
             isolation: Some("cgroup".to_owned()),
             executable: Some(fake_wrkslots(&fixture.root, &fixture.root, "ok")),
             ..SlotLaunch::default()
@@ -133,7 +135,10 @@ fn profile_resume_preserves_loaded_policy_and_literal_conversation_for_each_loca
             .to_string();
         assert_eq!(status["cwd"], cwd);
         assert_eq!(status["slot"], "slot-a");
-        assert_eq!(status["slot_project"], cwd);
+        assert_eq!(
+            status["slot_project"],
+            fs::canonicalize(&project).unwrap().display().to_string()
+        );
         assert_eq!(status["slot_isolation"], "cgroup");
         assert_eq!(status["environment_names"], json!(["REVIEW_MODE"]));
         assert!(!status.to_string().contains("literal $(setting)"));

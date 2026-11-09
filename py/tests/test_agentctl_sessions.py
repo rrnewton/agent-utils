@@ -955,6 +955,30 @@ def test_slot_start_boxes_the_pane_before_the_harness(tmp_path: Path, monkeypatc
     ), calls
 
 
+def test_discovered_slot_project_finds_the_holding_root_never_the_slot_itself(tmp_path: Path) -> None:
+    # #1140: discovery skips the slot directory's own config copy.
+    from agentctl.subagents import discovered_slot_project
+
+    project = tmp_path / "project"
+    slot = project / "worktrees/slots/s1"
+    slot.mkdir(parents=True)
+    (slot / ".wrkslots.yml").write_text("slot copy\n", encoding="utf-8")
+    assert discovered_slot_project(slot) is None
+    (project / ".wrkslots.yml").write_text("project\n", encoding="utf-8")
+    assert discovered_slot_project(slot) == str(project.resolve())
+
+
+def test_slot_start_refuses_a_project_that_is_the_slot_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #1140: starting from inside the slot without --slot-project used to
+    # record the slot as its own project; revive then double-nested.
+    sessions, _fake, _calls = setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("AGENTCTL_WRKSLOTS_BIN", str(_fake_wrkslots(tmp_path, tmp_path)))
+    with pytest.raises(AgentDeliveryError, match="--slot-project must name the project root"):
+        sessions.start_session("worker", cwd=str(tmp_path), slot="s1", slot_isolation="cgroup")
+
+
 def test_slot_start_leaves_isolation_to_the_project_configuration(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from agentctl.subagents import _slot_shell_command
 
@@ -981,8 +1005,11 @@ def test_slot_failures_are_refused_before_registry_or_tab_creation(
     harness = "muse" if behaviour == "root-muse" else "codex"
     behaviour = "root" if behaviour == "root-muse" else behaviour
     monkeypatch.setenv("AGENTCTL_WRKSLOTS_BIN", str(_fake_wrkslots(tmp_path, tmp_path, behaviour)))
+    project = tmp_path / "project"
+    project.mkdir(exist_ok=True)
     with pytest.raises(AgentDeliveryError, match=re.escape(expected)):
-        sessions.start_session("worker", cwd=str(tmp_path), harness=harness, slot="s9", slot_isolation=isolation)
+        sessions.start_session("worker", cwd=str(tmp_path), harness=harness, slot="s9",
+                               slot_isolation=isolation, slot_project=str(project))
     assert not (sessions.registry / "agents" / "worker").exists()
 
 
@@ -990,7 +1017,7 @@ def test_slot_needs_wrkslots_and_slot_options_need_slot(tmp_path: Path, monkeypa
     sessions, _fake, _calls = setup(tmp_path, monkeypatch)
     monkeypatch.delenv("AGENTCTL_WRKSLOTS_BIN", raising=False)
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
-    with pytest.raises(AgentDeliveryError, match="needs wrkslots on PATH"):
+    with pytest.raises(AgentDeliveryError, match="needs a wrkslots executable"):
         sessions.start_session("worker", cwd=str(tmp_path), slot="s1")
     with pytest.raises(AgentDeliveryError, match="interactive Herdr sessions only"):
         sessions.start_session("worker", cwd=str(tmp_path), mode="headless", slot="s1")
@@ -1031,7 +1058,10 @@ def test_root_slot_starts_the_harness_behind_the_relay(tmp_path: Path, monkeypat
 
     monkeypatch.setattr(fake, "report_pane_agent", report, raising=False)
     monkeypatch.setenv("AGENTCTL_WRKSLOTS_BIN", str(_fake_wrkslots(tmp_path, tmp_path, "root")))
-    status = sessions.start_session("worker", cwd=str(tmp_path), harness="codex", slot="s1")
+    holding = tmp_path / "project"
+    holding.mkdir()
+    status = sessions.start_session("worker", cwd=str(tmp_path), harness="codex", slot="s1",
+                                    slot_project=str(holding))
     assert status["lifecycle"] == "running" and status["agent_status"] == "idle"
     assert checked and all(item == identity for item in checked)
     assert reports and reports[-1] == ("codex", "idle")
@@ -1046,7 +1076,7 @@ def test_root_slot_starts_the_harness_behind_the_relay(tmp_path: Path, monkeypat
     assert status["slot_owner"] == {
         "slot": "s1", "action": "transferred", "owner_pid": 4242, "generation": 3,
     }
-    project = str(tmp_path.resolve())
+    project = str(holding.resolve())
     assert _owner_calls(tmp_path, "root") == [
         f"--project-root {project} status --slot s1 --format json",
         f"--project-root {project} --wait-lock 30 transfer-owner s1 --agent slot-agent "

@@ -6067,8 +6067,21 @@ const RELAY_WORKING_MARKER: &str = "esc to interrupt";
 /// the boxed harness line directly, with no interactive shell to take the environment line.
 const LAUNCH_ENV_RELAY_REFUSAL: &str = "profile config launch_env does not apply under root slot isolation; use userns or cgroup isolation, or remove launch_env";
 
-/// Environment variable naming the wrkslots executable, overriding `PATH`.
+/// Environment variable naming the wrkslots executable.
 pub const WRKSLOTS_BIN_ENV: &str = "AGENTCTL_WRKSLOTS_BIN";
+
+/// The project root holding `slot_dir`, discovered the way the slot manager
+/// resolves it when no root is forced: the nearest ancestor (never the slot
+/// directory itself, whose worktree copy of the config names the nested
+/// root that broke revives, #1140) carrying `.wrkslots.yml`.
+pub(crate) fn discovered_slot_project(slot_dir: &Path) -> Option<PathBuf> {
+    let canonical = fs::canonicalize(slot_dir).ok()?;
+    canonical
+        .ancestors()
+        .skip(1)
+        .find(|directory| directory.join(".wrkslots.yml").is_file())
+        .map(Path::to_path_buf)
+}
 
 /// The project's slot manager (#742): `AGENTCTL_WRKSLOTS_BIN`, then the `wrkslots` key
 /// of the project's `.agentctl/profiles.json`, then the team folder's `bin/wrkslots`.
@@ -6120,9 +6133,9 @@ pub fn slot_shell_command(
         .or_else(wrkslots_executable)
         .ok_or_else(|| {
             fail(if launch.project_box {
-                "--project-box needs wrkslots on PATH, in AGENTCTL_WRKSLOTS_BIN, or as \"wrkslots\" in the project's .agentctl/profiles.json"
+                "--project-box needs a wrkslots executable: AGENTCTL_WRKSLOTS_BIN, \"wrkslots\" in the project's .agentctl/profiles.json, or the team folder's bin/wrkslots (PATH is never consulted)"
             } else {
-                "--slot needs wrkslots on PATH, in AGENTCTL_WRKSLOTS_BIN, or as \"wrkslots\" in the project's .agentctl/profiles.json"
+                "--slot needs a wrkslots executable: AGENTCTL_WRKSLOTS_BIN, \"wrkslots\" in the project's .agentctl/profiles.json, or the team folder's bin/wrkslots (PATH is never consulted)"
             })
         })?;
     let slot = launch.slot.as_str();
@@ -9623,6 +9636,31 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 }
                 let launch = &launch;
                 let (line, slot_path, isolation) = slot_shell_command(launch, &project, &[])?;
+                let slot_path = fs::canonicalize(&slot_path).map_err(|_| {
+                    fail(format!(
+                        "slot directory is not a directory: {}",
+                        slot_path.display()
+                    ))
+                })?;
+                // The recorded project must be the root holding the slot, never
+                // the slot directory itself (#1140): revive forces the recorded
+                // root, so a self-referential record reads the slot's own config
+                // copy and double-nests. An explicit --slot-project is recorded
+                // as given; a defaulted one records the discovered root.
+                let recorded_project = if launch.project.is_some() {
+                    project.clone()
+                } else {
+                    discovered_slot_project(&slot_path).unwrap_or_else(|| project.clone())
+                };
+                if !launch.project_box && recorded_project == slot_path {
+                    return Err(fail(format!(
+                        "--slot-project must name the project root holding slot {:?}, not \
+                         the slot directory itself ({}); pass --slot-project with the \
+                         directory holding .wrkslots.yml",
+                        launch.slot,
+                        slot_path.display()
+                    )));
+                }
                 if launch.project_box {
                     launch_extra.insert(
                         "project_box".to_owned(),
@@ -9635,18 +9673,13 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                         }),
                     );
                 } else {
-                    slot_project = Some(project.display().to_string());
+                    slot_project = Some(recorded_project.display().to_string());
                     slot_isolation = Some(isolation.clone());
                     if let Some(wrkslots) = launch.executable.clone().or_else(wrkslots_executable) {
-                        slot_owner_target = Some((wrkslots, project.clone(), launch.slot.clone()));
+                        slot_owner_target =
+                            Some((wrkslots, recorded_project.clone(), launch.slot.clone()));
                     }
                 }
-                let slot_path = fs::canonicalize(&slot_path).map_err(|_| {
-                    fail(format!(
-                        "slot directory is not a directory: {}",
-                        slot_path.display()
-                    ))
-                })?;
                 if isolation == "root" {
                     // sudo stays the pane's foreground process under root isolation, so Herdr
                     // cannot start the harness; the boxed harness line runs in the pane
@@ -17411,6 +17444,8 @@ pub(crate) mod tests {
     #[test]
     fn launch_env_is_refused_under_root_slot_isolation() {
         let fixture = Fixture::new();
+        let project = fixture.root.join("project");
+        fs::create_dir_all(&project).unwrap();
         let executable = fake_wrkslots(&fixture.root, &fixture.root, "root");
         let error = fixture
             .manager()
@@ -17422,6 +17457,7 @@ pub(crate) mod tests {
                     workspace_id: Some("workspace".to_owned()),
                     slot: Some(SlotLaunch {
                         slot: "s1".to_owned(),
+                        project: Some(project),
                         executable: Some(executable),
                         ..SlotLaunch::default()
                     }),
@@ -17448,6 +17484,8 @@ pub(crate) mod tests {
     fn root_slot_starts_the_harness_behind_the_relay() {
         let fixture = Fixture::new();
         // The fake Herdr reports every pane at the fixture root, so the slot is there.
+        let project = fixture.root.join("project");
+        fs::create_dir_all(&project).unwrap();
         let executable = fake_wrkslots(&fixture.root, &fixture.root, "root");
         let status = fixture
             .manager()
@@ -17458,6 +17496,7 @@ pub(crate) mod tests {
                     workspace_id: Some("workspace".to_owned()),
                     slot: Some(SlotLaunch {
                         slot: "s1".to_owned(),
+                        project: Some(project),
                         executable: Some(executable),
                         ..SlotLaunch::default()
                     }),
@@ -17490,6 +17529,11 @@ pub(crate) mod tests {
     }
 
     fn start_in_slot(fixture: &Fixture, executable: PathBuf, isolation: Option<&str>) -> Value {
+        // The fake slot is the fixture root itself, so the holding project
+        // is named explicitly: a defaulted project would be the slot
+        // directory, which start now refuses (#1140).
+        let project = fixture.root.join("project");
+        fs::create_dir_all(&project).unwrap();
         fixture
             .manager()
             .start(
@@ -17500,6 +17544,7 @@ pub(crate) mod tests {
                     slot: Some(SlotLaunch {
                         slot: "s1".to_owned(),
                         isolation: isolation.map(str::to_owned),
+                        project: Some(project),
                         executable: Some(executable),
                         ..SlotLaunch::default()
                     }),
@@ -17531,7 +17576,7 @@ pub(crate) mod tests {
             json!({"slot": "s1", "action": "transferred", "owner_pid": 4242, "generation": 3}),
             "{status}"
         );
-        let project = fs::canonicalize(&fixture.root).unwrap();
+        let project = fs::canonicalize(fixture.root.join("project")).unwrap();
         let project = project.display();
         assert_eq!(
             owner_calls(&fixture, "root"),
@@ -17678,6 +17723,57 @@ fi
             .expect("send the script");
         let status = writer.wait().expect("wait for the script writer");
         assert!(status.success(), "could not write {}", path.display());
+    }
+
+    #[test]
+    fn discovered_slot_project_finds_the_holding_root_never_the_slot_itself() {
+        // #1140: discovery skips the slot directory's own config copy.
+        let fixture = Fixture::new();
+        let project = fixture.root.join("project");
+        let slot = project.join("worktrees/slots/s1");
+        fs::create_dir_all(&slot).unwrap();
+        fs::write(slot.join(".wrkslots.yml"), "slot copy\n").unwrap();
+        assert_eq!(discovered_slot_project(&slot), None);
+        fs::write(project.join(".wrkslots.yml"), "project\n").unwrap();
+        assert_eq!(
+            discovered_slot_project(&slot),
+            Some(fs::canonicalize(&project).unwrap())
+        );
+    }
+
+    #[test]
+    fn slot_start_refuses_a_project_that_is_the_slot_itself() {
+        // #1140: starting from inside the slot without --slot-project used
+        // to record the slot as its own project; revive then forced that
+        // root and double-nested. No holding root is discoverable above
+        // the fixture root, so the start must refuse and name the flag.
+        let fixture = Fixture::new();
+        let slot_path = fixture.root.clone();
+        let executable = fake_wrkslots(&fixture.root, &slot_path, "ok");
+        let error = fixture
+            .manager()
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    slot: Some(SlotLaunch {
+                        slot: "s1".to_owned(),
+                        isolation: Some("cgroup".to_owned()),
+                        executable: Some(executable),
+                        ..SlotLaunch::default()
+                    }),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("--slot-project must name the project root"),
+            "{error}"
+        );
+        assert!(fixture.manager().load("worker").is_err());
     }
 
     #[test]

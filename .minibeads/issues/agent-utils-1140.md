@@ -1,10 +1,11 @@
 ---
 title: 'slot-project-recorded-as-slot: a lane started from its slot records the slot as its own project and revive double-nests'
-status: open
+status: closed
 priority: 1
 issue_type: bug
-created_at: 2026-11-09T13:53:37.000000000+00:00
-updated_at: 2026-11-09T13:53:37.000000000+00:00
+created_at: 2026-11-09T13:53:37+00:00
+updated_at: 2026-11-09T15:20:54.907404530+00:00
+closed_at: 2026-11-09T15:20:54.907404400+00:00
 ---
 
 # Description
@@ -70,3 +71,26 @@ but no agentctl command supports it, so it is not the recommended path.
 Never create <slot>/worktrees/ or copy a config into the slot to satisfy
 the forced root; that mints the nested second registry the layout exists
 to prevent.
+
+## Resolution
+
+[watermelon-full-preview] Delivered with this closing commit, both
+editions. Start records the discovered holding root when --slot-project
+is defaulted (discovered_slot_project: nearest .wrkslots.yml ancestor,
+never the slot itself) and refuses before recording anything when the
+recorded project would be the slot directory. Revive heals existing
+records: a slot_project equal to the recorded cwd retries the slot
+shell-command unforced, accepts only the exact cwd and isolation, and
+writes the discovered root into the candidate and its launch spec
+(candidate policy accepts exactly that one-field heal); restore's slot
+hold/transfer calls heal the same way. The --slot/--project-box help and
+errors now name the real wrkslots lookup (Rust never consults PATH;
+Python keeps its PATH fallback last, so its wording names that order).
+Tests: discovery, start refusal, and revive heal in both editions (Rust
+heal at dry-run level - the fake Herdr reports every pane at the fixture
+root, so a real launch into a nested slot directory cannot be modelled;
+candidate writeback is covered in Python at policy level). Several slot
+fixtures that modelled the slot as its own project now name a holding
+project explicitly. Unverified limit: the three live consumer lanes still
+need the re-register (or a revive with the fixed build, which now heals
+them in place); no live slot has yet exercised the heal.

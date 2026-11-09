@@ -1319,16 +1319,16 @@ struct Start {
     /// Existing Herdr workspace ID; default: configured project workspace, else HERDR_WORKSPACE_ID, else the workspace of the caller's own agentcloud session registered by attach-self, else shared subagents; an explicit ID must match configured policy
     #[arg(long, value_name = "ID")]
     workspace_id: Option<String>,
-    /// Interactive only: box the agent to this wrkslots slot (plain-worktree or image-backed); the pane shell is replaced by the line `wrkslots shell-command SLOT` prints (per-slot slice limits and, except with cgroup isolation, a confined file-system view) before the harness starts, and the agent's cwd is the slot directory. Needs wrkslots on PATH or AGENTCTL_WRKSLOTS_BIN
+    /// Interactive only: box the agent to this wrkslots slot (plain-worktree or image-backed); the pane shell is replaced by the line `wrkslots shell-command SLOT` prints (per-slot slice limits and, except with cgroup isolation, a confined file-system view) before the harness starts, and the agent's cwd is the slot directory. Needs a wrkslots executable: AGENTCTL_WRKSLOTS_BIN, profiles.json "wrkslots", or the team folder's bin/wrkslots (PATH is never consulted)
     #[arg(long, value_name = "SLOT")]
     slot: Option<String>,
     /// With --slot: userns = limits plus the file-system view in a user namespace; root = the same view built through sudo -n, for harness launchers that need a setuid step (claude and codex only: the boxed harness runs behind sudo's terminal relay, so agentctl launches it itself, reads its state from Herdr's screen rules, and types prompts with screen verification; goals are unavailable); cgroup = limits only (default: the project's configuration.sandbox.isolation, else userns)
     #[arg(long, value_name = "MODE", value_parser = ["userns", "cgroup", "root"], requires = "slot")]
     slot_isolation: Option<String>,
-    /// With --slot: wrkslots project root (default: --cwd, searched upward for .wrkslots.yml)
+    /// With --slot: wrkslots project root (default: the nearest .wrkslots.yml root holding the slot, discovered upward from the slot directory; the slot directory itself is refused)
     #[arg(long, value_name = "DIR", requires = "slot")]
     slot_project: Option<PathBuf>,
-    /// Interactive only: run the agent as a (sub)coordinator in a wrkslots coordinator box (`wrkslots shell-command --box`): the same limits and file-system view as --slot, but with no slot, starting in --cwd, with every slot, the wrkslots registry, the slots' Git directories, and the agentctl registry in --cwd writable (or the whole project root with --box-writable project), so it can create slots and launch its own subagents into them. Subagents it launches start outside its box and box themselves into their own slot. Conflicts with --slot. Needs wrkslots on PATH or AGENTCTL_WRKSLOTS_BIN
+    /// Interactive only: run the agent as a (sub)coordinator in a wrkslots coordinator box (`wrkslots shell-command --box`): the same limits and file-system view as --slot, but with no slot, starting in --cwd, with every slot, the wrkslots registry, the slots' Git directories, and the agentctl registry in --cwd writable (or the whole project root with --box-writable project), so it can create slots and launch its own subagents into them. Subagents it launches start outside its box and box themselves into their own slot. Conflicts with --slot. Needs a wrkslots executable: AGENTCTL_WRKSLOTS_BIN, profiles.json "wrkslots", or the team folder's bin/wrkslots (PATH is never consulted)
     #[arg(long, conflicts_with = "slot")]
     project_box: bool,
     /// With --project-box: worktrees = the managed worktrees directory and the slots' Git directories; project = the whole project root (default: the project's configuration.sandbox.coordinator_writable, else worktrees)

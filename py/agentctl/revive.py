@@ -22,7 +22,8 @@ from agentctl.profiles import configuration_root, load_profiles, reasoning_argum
 from agentctl.subagents import (
     AgentRecord, ManagedAgents, _MAX_AGENT_RECORD_BYTES, _NAME, _SHA256,
     _PinnedAgentDirectory, _missing_target, _name, _native_session,
-    _rename_directory_noreplace_at, _slot_shell_command, harness_arguments,
+    _rename_directory_noreplace_at, _slot_shell_command, discovered_slot_project,
+    harness_arguments,
 )
 
 _TOKEN = re.compile(r"[a-z0-9-]{1,80}\Z")
@@ -310,6 +311,8 @@ class _LaunchPolicy:
     relay_command: str | None
     workspace_id: str | None
     relay_executable: str | None = None
+    # The discovered root replacing a self-referential slot_project (#1140).
+    healed_slot_project: str | None = None
 
 
 def _policy(manager: ManagedAgents, record: AgentRecord) -> _LaunchPolicy:
@@ -359,18 +362,27 @@ def _policy(manager: ManagedAgents, record: AgentRecord) -> _LaunchPolicy:
         if sorted({entry.partition("=")[0] for entry in environment}) != sorted(record.environment_names):
             raise AgentDeliveryError("recorded environment names cannot be reconstructed from the private launch profile")
     arguments = _expected_arguments(record)
-    slot_command = relay_command = relay_executable = None
+    slot_command = relay_command = relay_executable = healed_slot_project = None
     if record.slot is not None:
         if record.slot_project is None or record.slot_isolation is None:
             raise AgentDeliveryError("recorded slot lacks its project or isolation policy")
+        # Heal a self-referential recording (#1140): forcing the slot
+        # directory as its own root reads its config copy and
+        # double-nests, so retry unforced from the slot and record the
+        # discovered holding root in the new generation.
+        project, explicit = record.slot_project, True
+        if str(Path(record.slot_project).resolve()) == record.cwd:
+            discovered = discovered_slot_project(record.cwd)
+            if discovered is not None:
+                project, explicit, healed_slot_project = record.cwd, False, discovered
         slot_command, cwd, isolation = _slot_shell_command(record.slot, isolation=record.slot_isolation,
-            project=record.slot_project, explicit_project=True, registry=manager.registry)
+            project=project, explicit_project=explicit, registry=manager.registry)
         if str(Path(cwd).resolve()) != record.cwd or isolation != record.slot_isolation:
             raise AgentDeliveryError("recorded slot mapping or isolation changed")
         if isolation == "root":
             executable = manager.client._harness_executable(record.harness)
             relay_command, relay_cwd, relay_isolation = _slot_shell_command(record.slot, isolation=isolation,
-                project=record.slot_project, explicit_project=True, command=(executable, *arguments),
+                project=project, explicit_project=explicit, command=(executable, *arguments),
                 registry=manager.registry)
             if str(Path(relay_cwd).resolve()) != record.cwd or relay_isolation != isolation:
                 raise AgentDeliveryError("recorded slot relay policy changed")
@@ -392,7 +404,8 @@ def _policy(manager: ManagedAgents, record: AgentRecord) -> _LaunchPolicy:
     if workspace is None and project_workspace is None and isinstance(recorded_label, str):
         # Without project policy, return to the workspace the agent was launched or adopted in.
         workspace = manager.client.workspace_id_for_label(recorded_label)
-    return _LaunchPolicy(arguments, environment, slot_command, relay_command, workspace, relay_executable)
+    return _LaunchPolicy(arguments, environment, slot_command, relay_command, workspace, relay_executable,
+        healed_slot_project)
 
 
 def _old_process(record: AgentRecord) -> CustomProcessIdentity:
@@ -562,7 +575,9 @@ def _write_journal(manager: ManagedAgents, journal: dict[str, object]) -> None:
 
 def _new_candidate(old: AgentRecord, token: str, policy: _LaunchPolicy) -> AgentRecord:
     conversation = _revive_conversation(old)
+    slot_project = policy.healed_slot_project or old.slot_project
     candidate = replace(old, token=token, created_at=time.time(), lifecycle="starting",
+        slot_project=slot_project,
         adapter=_revived_adapter(old),
         resume=conversation, arguments=list(policy.arguments), native_session=_native_session(old.harness, conversation, "asserted"),
         workspace_id=None, tab_id=None, pane_id=None, session_agent=None, session_value=None,
@@ -575,7 +590,7 @@ def _new_candidate(old: AgentRecord, token: str, policy: _LaunchPolicy) -> Agent
     candidate.set_launch_spec(launch_spec.build(
         source="revive", captured_at=candidate.created_at, harness=old.harness,
         executable=policy.relay_executable, argv=policy.arguments, cwd=old.cwd, profile=old.profile,
-        environment_names=old.environment_names, slot=old.slot, slot_project=old.slot_project,
+        environment_names=old.environment_names, slot=old.slot, slot_project=slot_project,
         slot_isolation=old.slot_isolation,
         workspace_label=None if previous is None else cast("str | None", previous["workspace_label"]),
         native_session=(conversation, "asserted"),
@@ -585,6 +600,16 @@ def _new_candidate(old: AgentRecord, token: str, policy: _LaunchPolicy) -> Agent
     return candidate
 
 
+def _slot_project_matches(candidate: AgentRecord, old: AgentRecord) -> bool:
+    """The candidate's slot project is the old one's, or the discovered root
+    healing a self-referential recording (#1140)."""
+    if candidate.slot_project == old.slot_project:
+        return True
+    if old.slot_project is None or str(Path(old.slot_project).resolve()) != old.cwd:
+        return False
+    return candidate.slot_project == discovered_slot_project(old.cwd)
+
+
 def _same_policy(candidate: AgentRecord, old: AgentRecord) -> bool:
     return not (candidate.name != old.name
             or candidate.token == old.token or candidate.harness != old.harness
@@ -592,7 +617,7 @@ def _same_policy(candidate: AgentRecord, old: AgentRecord) -> bool:
             or candidate.mode != old.mode or candidate.backend != old.backend
             or candidate.model != old.model or candidate.profile != old.profile
             or candidate.reasoning_effort != old.reasoning_effort or candidate.environment_names != old.environment_names
-            or candidate.slot != old.slot or candidate.slot_project != old.slot_project
+            or candidate.slot != old.slot or not _slot_project_matches(candidate, old)
             or candidate.slot_isolation != old.slot_isolation or candidate.paused != old.paused
             or candidate.resume != _revive_conversation(old)
             or _conversation(candidate) != _revive_conversation(old)

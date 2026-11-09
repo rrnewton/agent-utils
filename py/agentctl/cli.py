@@ -128,8 +128,8 @@ def parser() -> argparse.ArgumentParser:
         help="interactive only: box the agent to this wrkslots slot (plain-worktree or image-backed); "
              "the pane shell is replaced by the line `wrkslots shell-command SLOT` prints (per-slot "
              "slice limits and, except with cgroup isolation, a confined file-system view) before "
-             "the harness starts, and the agent's cwd is the slot directory. Needs wrkslots on PATH "
-             "or AGENTCTL_WRKSLOTS_BIN")
+             "the harness starts, and the agent's cwd is the slot directory. Needs a wrkslots "
+             "executable: AGENTCTL_WRKSLOTS_BIN, profiles.json \"wrkslots\", or wrkslots on PATH")
     start.add_argument("--slot-isolation", choices=("userns", "cgroup", "root"), default=None,
         help="with --slot: userns = limits plus the file-system view in a user namespace; root = the "
              "same view built through sudo -n, for harness launchers that need a setuid step (claude "

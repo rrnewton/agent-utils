@@ -1215,10 +1215,20 @@ fn slot_agents(registry: &Path, names: &[String], config: &RestoreConfig) -> Vec
             let record: Value = serde_json::from_slice(&bytes).ok()?;
             let lifecycle = record["lifecycle"].as_str()?;
             matches!(lifecycle, "running" | "launch_failed").then_some(())?;
+            // Heal a self-referential slot_project for the hold/transfer
+            // calls too (#1140): forcing the slot directory as its own
+            // project root reads the slot's config copy and double-nests.
+            let recorded = PathBuf::from(record["slot_project"].as_str()?);
+            let cwd = Path::new(record["cwd"].as_str()?);
+            let project = if fs::canonicalize(&recorded).ok().as_deref() == Some(cwd) {
+                crate::subagents::discovered_slot_project(cwd).unwrap_or(recorded)
+            } else {
+                recorded
+            };
             Some(SlotAgent {
                 name: name.clone(),
                 slot: record["slot"].as_str()?.to_owned(),
-                project: PathBuf::from(record["slot_project"].as_str()?),
+                project,
                 running: lifecycle == "running",
             })
         })

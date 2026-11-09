@@ -2542,6 +2542,67 @@ fn revive_checks_recorded_slot_path_and_isolation_in_read_only_preflight() {
 }
 
 #[test]
+fn revive_heals_a_slot_project_recorded_as_the_slot_itself() {
+    // #1140: the record names its own slot directory as the project.
+    // Forcing that root resolves double-nested, so the plan retries
+    // unforced, the slot manager discovers the holding root, and only the
+    // exact recorded cwd and isolation are accepted. (Dry run: the fake
+    // Herdr reports every pane at the fixture root, so a real launch into
+    // the nested slot directory cannot be modelled here.)
+    let (fixture, mut old) = recoverable("claude", false);
+    let project = fixture.root.join("project");
+    let slot_dir = project.join("worktrees/slots/existing_slot");
+    fs::create_dir_all(&slot_dir).unwrap();
+    fs::write(project.join(".wrkslots.yml"), "project\n").unwrap();
+    fs::write(slot_dir.join(".wrkslots.yml"), "slot copy\n").unwrap();
+    let slot_dir = fs::canonicalize(&slot_dir).unwrap();
+    old.cwd = slot_dir.display().to_string();
+    old.slot = Some("existing_slot".to_owned());
+    old.slot_project = Some(slot_dir.display().to_string());
+    old.slot_isolation = Some("userns".to_owned());
+    let spec = old.launch_spec.as_mut().unwrap();
+    spec["cwd"] = json!(old.cwd);
+    spec["slot"] = json!(old.slot);
+    spec["slot_project"] = json!(old.slot_project);
+    spec["slot_isolation"] = json!(old.slot_isolation);
+    fixture.manager().save(&old).unwrap();
+    // The recorded pane is gone (a reboot took it), so the recovery proof
+    // is the missing-pane one and never compares the fake pane's cwd.
+    let pane = old.pane_id.clone().unwrap();
+    fixture
+        .client
+        .panes
+        .lock()
+        .unwrap()
+        .retain(|row| row.pane_id != pane);
+    fixture.client.herdr_closed.lock().unwrap().insert(pane);
+    // Like the real slot manager: a forced root resolves nested under it;
+    // unforced discovery from the slot resolves the slot itself.
+    let nested = slot_dir.join("worktrees/slots/existing_slot");
+    let argv_log = fixture.root.join("wrkslots-argv");
+    let bin = fixture.root.join("wrkslots-test");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncase \"$*\" in *--project-root*) \
+         printf '%s\\n' '{{\"command\":\"exec nested\",\"slot_path\":\"{}\",\"isolation\":\"userns\"}}' ;;\n\
+         *) printf '%s\\n' '{{\"command\":\"exec healed\",\"slot_path\":\"{}\",\"isolation\":\"userns\"}}' ;;\nesac\n",
+        argv_log.display(),
+        nested.display(),
+        slot_dir.display(),
+    );
+    fs::write(&bin, script).unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut manager = fixture.manager();
+    manager.revive_wrkslots_executable = Some(bin);
+    let plan = manager.revive("worker", true, None, TIMEOUT).unwrap();
+    assert_eq!(plan["action"], "revive", "{plan}");
+    let argv = fs::read_to_string(&argv_log).unwrap();
+    assert!(
+        !argv.contains("--project-root"),
+        "the heal must not force the recorded root: {argv}"
+    );
+}
+
+#[test]
 fn revive_reuses_the_recorded_slot_without_allocation_or_rebinding() {
     let (fixture, mut old) = recoverable("claude", false);
     old.slot = Some("existing_slot".to_owned());

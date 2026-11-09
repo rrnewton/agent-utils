@@ -1151,6 +1151,9 @@ struct LaunchPlan {
     slot_command: Option<String>,
     relay_command: Option<String>,
     relay_executable: Option<String>,
+    /// The discovered project root replacing a self-referential recorded
+    /// `slot_project` (#1140); written into the candidate and its spec.
+    healed_slot_project: Option<String>,
 }
 
 fn conversation(record: &AgentRecord) -> Result<NativeSession> {
@@ -1731,7 +1734,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let slot_executable = self.revive_wrkslots_executable.clone();
         #[cfg(not(test))]
         let slot_executable = configured_wrkslots(&self.registry)?;
-        let slot = if let Some(slot) = record.slot.as_ref() {
+        let mut slot = if let Some(slot) = record.slot.as_ref() {
             Some(SlotLaunch {
                 slot: slot.clone(),
                 isolation: Some(
@@ -1783,13 +1786,35 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         } else {
             None
         };
-        if let Some(slot) = slot.as_ref() {
-            let project = slot.project.as_ref().expect("recorded project");
-            let canonical = fs::canonicalize(project)
-                .map_err(|_| fail("recorded slot project is unavailable"))?;
-            if canonical != *project {
-                return Err(fail("recorded slot project changed"));
-            }
+        let mut healed_slot_project = None;
+        if let Some(slot) = slot.as_mut() {
+            let recorded = slot.project.clone().expect("recorded project");
+            // Heal a self-referential recording (#1140): the recorded root
+            // is the slot directory itself, so forcing it reads the slot's
+            // own config copy and double-nests. Retry unforced from the
+            // slot, letting the slot manager discover the real root, and
+            // record that root in the new generation. The exact cwd and
+            // isolation checks below still decide acceptance.
+            let heal_root =
+                if !slot.project_box && fs::canonicalize(&recorded).ok().as_ref() == Some(&cwd) {
+                    discovered_slot_project(&cwd)
+                } else {
+                    None
+                };
+            let working;
+            let project: &Path = if let Some(root) = &heal_root {
+                slot.project = None;
+                healed_slot_project = Some(root.display().to_string());
+                working = cwd.clone();
+                &working
+            } else {
+                let canonical = fs::canonicalize(&recorded)
+                    .map_err(|_| fail("recorded slot project is unavailable"))?;
+                if canonical != recorded {
+                    return Err(fail("recorded slot project changed"));
+                }
+                &recorded
+            };
             let (line, slot_path, isolation) = slot_shell_command(slot, project, &[])?;
             if fs::canonicalize(slot_path).ok().as_ref() != Some(&cwd)
                 || Some(&isolation) != slot.isolation.as_ref()
@@ -1850,6 +1875,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             slot_command,
             relay_command,
             relay_executable,
+            healed_slot_project,
         })
     }
 
@@ -2092,6 +2118,22 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         Ok(proof)
     }
 
+    /// The candidate's slot project is the old generation's, or the
+    /// discovered root healing a self-referential recording (#1140): the
+    /// old record named its own slot directory as the project.
+    fn slot_project_matches(&self, record: &AgentRecord, old: &AgentRecord) -> bool {
+        if record.slot_project == old.slot_project {
+            return true;
+        }
+        let Some(recorded) = old.slot_project.as_deref() else {
+            return false;
+        };
+        let cwd = Path::new(&old.cwd);
+        fs::canonicalize(recorded).ok().as_deref() == Some(cwd)
+            && discovered_slot_project(cwd)
+                .is_some_and(|root| record.slot_project.as_deref() == root.to_str())
+    }
+
     fn candidate_policy_matches(&self, record: &AgentRecord, old: &AgentRecord) -> Result<bool> {
         let native = revive_conversation(old)?;
         let expected_arguments = expected_arguments(old)?;
@@ -2112,7 +2154,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             && record.arguments == expected_arguments
             && record.environment_names == old.environment_names
             && record.slot == old.slot
-            && record.slot_project == old.slot_project
+            && self.slot_project_matches(record, old)
             && record.slot_isolation == old.slot_isolation
             && record.extra.get("project_box") == old.extra.get("project_box")
             && record.resume.as_deref() == Some(&native.value)
@@ -3461,6 +3503,11 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             &plan.native.value,
             "asserted",
         ));
+        // A healed slot project (#1140) replaces the self-referential
+        // recording in the new generation and its launch spec.
+        if let Some(healed) = &plan.healed_slot_project {
+            candidate.slot_project = Some(healed.clone());
+        }
         candidate.arguments = plan.arguments;
         candidate
             .extra

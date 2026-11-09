@@ -2214,6 +2214,48 @@ def test_revive_rechecks_slot_mapping_and_reuses_recorded_boxing(
         assert (record.slot, record.slot_project, record.slot_isolation) == (old.slot, old.slot_project, old.slot_isolation)
 
 
+def test_revive_heals_a_slot_project_recorded_as_the_slot_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #1140: forcing the recorded root (the slot directory itself) resolves
+    # double-nested; the policy retries unforced, records the discovered
+    # holding root in the candidate and its spec, and _same_policy accepts
+    # exactly that one-field heal on later verification.
+    from agentctl import revive as recovery
+
+    manager, _fake, old = prepare_revive(tmp_path, monkeypatch)
+    project = tmp_path / "project"
+    slot_dir = project / "worktrees/slots/worker-slot"
+    slot_dir.mkdir(parents=True)
+    (project / ".wrkslots.yml").write_text("project\n", encoding="utf-8")
+    (slot_dir / ".wrkslots.yml").write_text("slot copy\n", encoding="utf-8")
+    slot_dir = slot_dir.resolve()
+    old.cwd = str(slot_dir)
+    old.slot, old.slot_project, old.slot_isolation = "worker-slot", str(slot_dir), "userns"
+    spec = old.launch_spec
+    assert spec is not None
+    old.set_launch_spec({**spec, "cwd": old.cwd, "slot": old.slot,
+                         "slot_project": old.slot_project, "slot_isolation": old.slot_isolation})
+    manager._save(old)
+    seen: list[bool] = []
+
+    def shell_command(*_args: object, **kwargs: object) -> tuple[str, str, str]:
+        explicit = bool(kwargs.get("explicit_project"))
+        seen.append(explicit)
+        nested = slot_dir / "worktrees/slots/worker-slot"
+        return "boxed-shell-command", str(nested if explicit else slot_dir), "userns"
+
+    monkeypatch.setattr(recovery, "_slot_shell_command", shell_command)
+    policy = recovery._policy(manager, old)
+    assert seen == [False]
+    assert policy.healed_slot_project == str(project.resolve())
+    candidate = recovery._new_candidate(old, "a" * 32, policy)
+    assert candidate.slot_project == str(project.resolve())
+    assert candidate.launch_spec is not None
+    assert candidate.launch_spec["slot_project"] == str(project.resolve())
+    assert recovery._same_policy(candidate, old)
+
+
 def test_revive_cli_dry_run_and_batch_blocked_exit_are_reviewable_json(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
 ) -> None:

@@ -388,7 +388,10 @@ def relay_worker(
     monkeypatch.setattr(fake, "process_liveness",
                         lambda expected: "alive" if expected == identity else "unknown", raising=False)
     monkeypatch.setenv("AGENTCTL_WRKSLOTS_BIN", str(_fake_wrkslots(tmp_path, tmp_path, "root")))
-    sessions.start_session("worker", cwd=str(tmp_path), harness=harness, slot="s1")
+    holding = tmp_path / "project"
+    holding.mkdir()
+    sessions.start_session("worker", cwd=str(tmp_path), harness=harness, slot="s1",
+                           slot_project=str(holding))
     return sessions, fake, identity
 
 

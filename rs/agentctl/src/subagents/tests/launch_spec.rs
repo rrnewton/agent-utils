@@ -325,6 +325,8 @@ fn relay_worker_of(harness: &str) -> (Fixture, AgentRecord) {
         .client
         .report_session
         .store(harness == "codex", Ordering::Relaxed);
+    let project = fixture.root.join("project");
+    fs::create_dir_all(&project).unwrap();
     let executable = fake_wrkslots(&fixture.root, &fixture.root, "root");
     fixture
         .manager()
@@ -335,6 +337,7 @@ fn relay_worker_of(harness: &str) -> (Fixture, AgentRecord) {
                 workspace_id: Some("workspace".to_owned()),
                 slot: Some(SlotLaunch {
                     slot: "s1".to_owned(),
+                    project: Some(project),
                     executable: Some(executable),
                     ..SlotLaunch::default()
                 }),

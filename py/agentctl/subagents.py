@@ -3255,6 +3255,20 @@ class ManagedAgents:
                 slot, isolation=slot_isolation, project=project,
                 explicit_project=slot_project is not None, registry=self.registry,
             )
+            # The recorded project must be the root holding the slot, never
+            # the slot directory itself (#1140): revive forces the recorded
+            # root, so a self-referential record reads the slot's own config
+            # copy and double-nests. An explicit --slot-project is recorded
+            # as given; a defaulted one records the discovered root.
+            resolved_slot = str(Path(root).expanduser().resolve())
+            if slot_project is None:
+                launch_project = discovered_slot_project(root) or launch_project
+            if launch_project == resolved_slot:
+                raise AgentDeliveryError(
+                    f"--slot-project must name the project root holding slot {slot!r}, not "
+                    f"the slot directory itself ({resolved_slot}); pass --slot-project with "
+                    "the directory holding .wrkslots.yml"
+                )
             if effective_isolation == "root":
                 # sudo stays the pane's foreground process under root isolation,
                 # so Herdr cannot start the harness; the boxed harness line runs
@@ -6723,6 +6737,20 @@ RELAY_HARNESSES = ("claude", "codex")
 RELAY_WORKING_MARKER = "esc to interrupt"
 
 
+def discovered_slot_project(slot_dir: str | Path) -> str | None:
+    """The project root holding ``slot_dir``: the nearest ancestor (never the
+    slot directory itself, whose worktree copy of the config names the nested
+    root that broke revives, #1140) carrying ``.wrkslots.yml``."""
+    try:
+        canonical = Path(slot_dir).resolve()
+    except OSError:
+        return None
+    for parent in canonical.parents:
+        if (parent / ".wrkslots.yml").is_file():
+            return str(parent)
+    return None
+
+
 def wrkslots_executable(registry: str | Path | None = None) -> str | None:
     """The slot manager: ``AGENTCTL_WRKSLOTS_BIN``, then the project's configured
     ``wrkslots``, then ``wrkslots`` on PATH."""
@@ -6799,8 +6827,8 @@ def _slot_shell_command(
     executable = wrkslots_executable(registry)
     if not executable:
         raise AgentDeliveryError(
-            "--slot needs wrkslots on PATH, in AGENTCTL_WRKSLOTS_BIN, or as \"wrkslots\" "
-            "in the project's .agentctl/profiles.json"
+            "--slot needs a wrkslots executable: AGENTCTL_WRKSLOTS_BIN, \"wrkslots\" "
+            "in the project's .agentctl/profiles.json, or wrkslots on PATH"
         )
     argv = [executable, "shell-command", slot, "--format", "json"]
     if isolation is not None:
