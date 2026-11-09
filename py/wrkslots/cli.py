@@ -258,6 +258,7 @@ _CREATE_JOURNAL_REQUIRED = frozenset(
 )
 _CREATE_JOURNAL_OPTIONAL = frozenset(
     {
+        "x",
         "slot_type",
         "task_scope",
         "post_provision_hooks",
@@ -288,6 +289,7 @@ _FINISH_JOURNAL_REQUIRED = frozenset(
 )
 _FINISH_JOURNAL_OPTIONAL = frozenset(
     {
+        "x",
         "salvage",
         "validate_complete",
         "original_mode",
@@ -319,7 +321,7 @@ _LEGACY_VALIDATE_JOURNAL_REQUIRED = frozenset(
 _OWNERLESS_VALIDATE_JOURNAL_REQUIRED = frozenset(
     {"schema", "kind", "machine", "slot", "phase", "fenced", "authorization"}
 )
-_OWNERLESS_VALIDATE_JOURNAL_OPTIONAL = frozenset({"exclusion"})
+_OWNERLESS_VALIDATE_JOURNAL_OPTIONAL = frozenset({"exclusion", "x"})
 _OWNERLESS_VALIDATION_PHASES = frozenset(
     {"prepared", "fenced", "removing", "removed"}
 )
@@ -408,7 +410,7 @@ _ABSENT_AGENT_JOURNAL_REQUIRED = frozenset(
     }
 )
 _ABSENT_AGENT_JOURNAL_OPTIONAL = frozenset(
-    {"branch_witnesses", "remote_containment", "submodule_salvage", "liveness_unverifiable"}
+    {"x", "branch_witnesses", "remote_containment", "submodule_salvage", "liveness_unverifiable"}
 )
 # Any ref a remote advertises may prove that an absent checkout's recorded HEAD
 # is already preserved there. Branches, rescue refs such as
@@ -4174,6 +4176,50 @@ def _forward_compatible_config(
     if not ignored:
         return raw
     return {key: value for key, value in raw.items() if key not in ignored}
+
+
+# The journal extension slot (#1124): a field under ``x`` may only carry
+# information an older reader can safely ignore. Anything safety-relevant
+# must also bump ``x.min_wrkslots_version``, so old readers refuse loudly
+# instead of misclassifying. Contents are never stripped: provenance
+# compares the journal file with its hash-chained embedded copy by exact
+# JSON equality, so a reader that dropped the slot would manufacture a
+# mismatch. The cap keeps an extension from being replayed and re-hashed
+# at unbounded size through the append-only event log.
+_JOURNAL_EXTENSION_LIMIT_BYTES = 16 * 1024
+_JOURNAL_EXTENSION_KEYS = frozenset({"x"})
+
+
+def _journal_forward_compatible(raw: Mapping[str, object], label: str) -> None:
+    """Apply the journal extension slot's checks before exact keys (#1124).
+
+    ``x.min_wrkslots_version`` is checked first, so a reader older than the
+    journal requires refuses naming both versions, whatever keys the
+    journal has -- the journal analogue of #1109's config order.
+    """
+
+    if "x" not in raw:
+        return
+    extension = _as_mapping(raw["x"], f"{label}.x")
+    if "min_wrkslots_version" in extension:
+        required = _as_str(
+            extension["min_wrkslots_version"], f"{label}.x.min_wrkslots_version"
+        )
+        if _version_tuple(
+            required, f"{label}.x.min_wrkslots_version"
+        ) > _version_tuple(VERSION, "wrkslots version"):
+            raise StateError(
+                f"{label} requires wrkslots {required} or later "
+                f"(x.min_wrkslots_version); this is wrkslots {VERSION}. Run a newer "
+                "wrkslots for this project"
+            )
+    encoded = json.dumps(
+        extension, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    if len(encoded) > _JOURNAL_EXTENSION_LIMIT_BYTES:
+        raise StateError(
+            f"{label} extension exceeds the {_JOURNAL_EXTENSION_LIMIT_BYTES}-byte limit"
+        )
 
 
 def _load_config(explicit_root: str | None, machine_override: str | None) -> Config:
@@ -9944,6 +9990,21 @@ def _validate_journal_shape(
     slot = _validate_name(
         _as_str(raw.get("slot"), "recovery journal.slot"), "slot"
     )
+    _journal_forward_compatible(
+        raw,
+        {
+            "create": "create journal",
+            "import-existing": "import journal",
+            "finish": "finish journal",
+            "legacy-validate-remove": "legacy validate removal journal",
+            "ownerless-validate-remove": "ownerless validation journal",
+            "ownerless-agent-remove": "ownerless agent journal",
+            _OWNERLESS_CLONE_KIND: "ownerless clone journal",
+            "ownerless-agent-cache-relocate": "ownerless agent cache journal",
+            "recover-absent-validate-rows": "absent-validation-row journal",
+            "recover-absent-agent-row": "absent-agent-row journal",
+        }.get(kind, "recovery journal"),
+    )
     expected_paths = {_journal_path(config, machine)}
     if kind == "create":
         expected_paths.add(_create_journal_path(config, slot, machine))
@@ -10020,7 +10081,7 @@ def _validate_journal_shape(
         ):
             raise StateError("create journal has an invalid operation_id")
     elif kind == "import-existing":
-        _exact_keys(raw, _IMPORT_JOURNAL_REQUIRED, set(), "import journal")
+        _exact_keys(raw, _IMPORT_JOURNAL_REQUIRED, _JOURNAL_EXTENSION_KEYS, "import journal")
         record = _record_from_obj(raw["record"], "import journal.record")
         if record.machine != machine or record.slot != slot:
             raise StateError("import journal record does not match its shard or slot")
@@ -10115,7 +10176,7 @@ def _validate_journal_shape(
         _exact_keys(
             raw,
             _LEGACY_VALIDATE_JOURNAL_REQUIRED,
-            set(),
+            _JOURNAL_EXTENSION_KEYS,
             "legacy validate removal journal",
         )
         for field in (
@@ -10161,7 +10222,7 @@ def _validate_journal_shape(
         _exact_keys(
             raw,
             _ABSENT_VALIDATE_JOURNAL_REQUIRED,
-            set(),
+            _JOURNAL_EXTENSION_KEYS,
             "absent-validation-row journal",
         )
         _absent_validate_batch_items(dataclasses.replace(config, machine=machine), raw)
@@ -42026,10 +42087,11 @@ def _validate_batch_seal_journal(
     config: Config, path: Path, value: object
 ) -> tuple[Mapping[str, object], tuple[tuple[str, int, _PrivateCleanupTarget], ...]]:
     raw = _as_mapping(value, "validation-batch seal journal")
+    _journal_forward_compatible(raw, "validation-batch seal journal")
     _exact_keys(
         raw,
         {"schema", "kind", "machine", "created_at", "actor", "targets"},
-        set(),
+        _JOURNAL_EXTENSION_KEYS,
         "validation-batch seal journal",
     )
     if _as_int(raw["schema"], "validation-batch seal journal.schema") != (
@@ -49163,6 +49225,7 @@ def _recover_create(
     retry_running_hook: bool,
     abort_create: bool,
 ) -> None:
+    _journal_forward_compatible(raw, "create journal")
     _exact_keys(
         raw, _CREATE_JOURNAL_REQUIRED, _CREATE_JOURNAL_OPTIONAL, "create journal"
     )
@@ -49558,10 +49621,11 @@ def _recover_import_existing(
     *,
     abort_import: bool = False,
 ) -> None:
+    _journal_forward_compatible(raw, "import journal")
     _exact_keys(
         raw,
         _IMPORT_JOURNAL_REQUIRED,
-        set(),
+        _JOURNAL_EXTENSION_KEYS,
         "import journal",
     )
     machine = _as_str(raw["machine"], "import journal.machine")
@@ -49629,6 +49693,7 @@ def _recover_finish(
     live_use_recheck: _LiveUseRecheckBudget | None = None,
     discard_stale_image_copy: bool = False,
 ) -> None:
+    _journal_forward_compatible(raw, "finish journal")
     _exact_keys(
         raw, _FINISH_JOURNAL_REQUIRED, _FINISH_JOURNAL_OPTIONAL, "finish journal"
     )
@@ -50095,10 +50160,11 @@ def _restore_interrupted_private_finish_after_refusal(
 def _legacy_validate_recovery_inputs(
     config: Config, raw: Mapping[str, object]
 ) -> tuple[Path, Path, Path, str]:
+    _journal_forward_compatible(raw, "legacy validate removal journal")
     _exact_keys(
         raw,
         _LEGACY_VALIDATE_JOURNAL_REQUIRED,
-        set(),
+        _JOURNAL_EXTENSION_KEYS,
         "legacy validate removal journal",
     )
     if _as_int(raw["schema"], "legacy validate removal journal.schema") != SCHEMA:
@@ -53218,6 +53284,7 @@ def _ownerless_validation_paths(
 ) -> tuple[ValidationRecoveryAuthorization, Path, Path, str]:
     """Decode the durable ownerless-validation path identity without touching it."""
 
+    _journal_forward_compatible(raw, "ownerless validation journal")
     _exact_keys(
         raw,
         _OWNERLESS_VALIDATE_JOURNAL_REQUIRED,
@@ -55276,7 +55343,10 @@ def _preserve_ownerless_handoff(
 def _ownerless_agent_journal_inputs(
     config: Config, raw: Mapping[str, object]
 ) -> tuple[OwnerlessAgentAuthorization, Path, Path, Path | None, Path, tuple[Mapping[str, object], ...]]:
-    _exact_keys(raw, _OWNERLESS_AGENT_JOURNAL_REQUIRED, set(), "ownerless agent journal")
+    _journal_forward_compatible(raw, "ownerless agent journal")
+    _exact_keys(
+        raw, _OWNERLESS_AGENT_JOURNAL_REQUIRED, _JOURNAL_EXTENSION_KEYS, "ownerless agent journal"
+    )
     if (
         _as_int(raw["schema"], "ownerless agent journal.schema") != SCHEMA
         or raw["kind"] != "ownerless-agent-remove"
@@ -57433,7 +57503,10 @@ def _ownerless_clone_authorization_from_obj(value: object) -> OwnerlessCloneAuth
 def _ownerless_clone_journal_inputs(
     config: Config, raw: Mapping[str, object]
 ) -> tuple[OwnerlessCloneAuthorization, Path, Path, Path | None, str]:
-    _exact_keys(raw, _OWNERLESS_CLONE_JOURNAL_REQUIRED, set(), "ownerless clone journal")
+    _journal_forward_compatible(raw, "ownerless clone journal")
+    _exact_keys(
+        raw, _OWNERLESS_CLONE_JOURNAL_REQUIRED, _JOURNAL_EXTENSION_KEYS, "ownerless clone journal"
+    )
     if (
         _as_int(raw["schema"], "ownerless clone journal.schema") != SCHEMA
         or raw["kind"] != _OWNERLESS_CLONE_KIND
@@ -58027,10 +58100,11 @@ def _assert_ownerless_agent_cache_tree(path: Path) -> tuple[int, int, int]:
 def _ownerless_agent_cache_journal_inputs(
     config: Config, raw: Mapping[str, object]
 ) -> tuple[Path, Path, Path, Path | None, tuple[int, int, int]]:
+    _journal_forward_compatible(raw, "ownerless agent cache journal")
     _exact_keys(
         raw,
         _OWNERLESS_AGENT_CACHE_JOURNAL_REQUIRED,
-        set(),
+        _JOURNAL_EXTENSION_KEYS,
         "ownerless agent cache journal",
     )
     if (
@@ -60453,6 +60527,7 @@ def _absent_agent_journal_inputs(
     tuple[Mapping[str, object], ...],
     dict[str, object],
 ]:
+    _journal_forward_compatible(raw, "absent-agent-row journal")
     _exact_keys(
         raw,
         _ABSENT_AGENT_JOURNAL_REQUIRED,
@@ -67575,10 +67650,11 @@ def _absent_validate_batch_journal(
 def _absent_validate_batch_items(
     config: Config, raw: Mapping[str, object]
 ) -> tuple[int, tuple[tuple[AbsentValidateRow, ActiveRecord, dict[str, object]], ...]]:
+    _journal_forward_compatible(raw, "absent-validation-row journal")
     _exact_keys(
         raw,
         _ABSENT_VALIDATE_JOURNAL_REQUIRED,
-        set(),
+        _JOURNAL_EXTENSION_KEYS,
         "absent-validation-row journal",
     )
     if (

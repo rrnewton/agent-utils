@@ -22,7 +22,7 @@ type Result<T> = std::result::Result<T, String>;
 const SCHEMA: i64 = 2;
 /// The wrkslots version this build is, as `min_wrkslots_version` names it;
 /// always the Python edition's `wrkslots.__version__` (#1109).
-pub(crate) const WRKSLOTS_VERSION: &str = "0.8.0";
+pub(crate) const WRKSLOTS_VERSION: &str = "0.9.0";
 const REQUIRED: [&str; 7] = [
     "schema",
     "worktrees_dir",
@@ -57,7 +57,7 @@ const OPTIONAL: [&str; 19] = [
 /// Unknown keys this process has already warned it ignores (#1109).
 static WARNED_IGNORED_KEYS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
-fn version_tuple(text: &str, label: &str) -> Result<(u64, u64, u64)> {
+pub(crate) fn version_tuple(text: &str, label: &str) -> Result<(u64, u64, u64)> {
     let invalid = || {
         format!(
             "{label} must be a version MAJOR.MINOR.PATCH, such as {WRKSLOTS_VERSION}; found {}",

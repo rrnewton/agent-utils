@@ -29134,7 +29134,7 @@ def test_repair_updates_the_pre_packaging_control_symlink(tmp_path: Path) -> Non
         check=False,
     )
     assert old_command.returncode == 0, old_command.stderr
-    assert old_command.stdout.strip() == "wrkslots 0.8.0"
+    assert old_command.stdout.strip() == "wrkslots 0.9.0"
 
     repaired = _repair(project)
 

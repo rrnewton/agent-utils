@@ -2841,6 +2841,20 @@ lasts until the removal completes, or, after a crash, until a newer `recover` fi
 `recover` cannot. `status` and `doctor` are unaffected, and mutations refuse as they always do while
 a journal is outstanding. A completed removal leaves nothing an older version refuses.
 
+**Upgrading past 0.9.0 (#1124, the journal extension slot).** From 0.9.0, every journal may carry
+a top-level `x` object whose contents older readers ignore. This is the last journal-format flag
+day: a wrkslots before 0.9.0 does not know `x` and refuses any journal that carries one, on every
+command that reads it, so upgrade every client that shares a registry to 0.9.0 before any writer
+starts emitting `x`. A hand-restored quarantined journal carrying `x` fails the same way on an older
+host. From 0.9.0 on, a new journal field that older readers may safely ignore goes inside `x` and
+needs no upgrade of those readers. The rule for anything under `x`: **a field under `x` may only
+carry information an older reader can safely ignore; anything safety-relevant must also raise
+`x.min_wrkslots_version` to the release that introduced it, so older readers refuse loudly, naming
+both versions, instead of misclassifying.** The extension is capped at 16384 bytes, is never
+stripped on rewrite (provenance compares the journal file with its event-embedded copy exactly),
+and unknown top-level fields outside `x` still refuse, so a stray or misspelt field is never
+silently ignored.
+
 ## Quarantine a stranded create journal
 
 Classification reads every outstanding journal, so one stranded create journal that
