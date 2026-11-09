@@ -262,8 +262,8 @@ fn wait_for_certificate(host: &dyn Host, path: &Path, wait: Duration) -> bool {
 
 /// Where a registry's recorded report for `boot_id` may live, in read
 /// order: the per-registry `restore-reports/` subdirectory (the
-/// location the per-registry report is moving to), then the configured
-/// `report_dir`, then the legacy shared default. The shared default is
+/// location holding that registry's reports), then the configured
+/// `report_dir`, then the shared state-directory default. The shared default is
 /// only ever a fallback for one registry's own recorded outcome, never
 /// the basis of a multi-registry decision on its own: it is tried last,
 /// after the registry's own locations.
