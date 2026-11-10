@@ -232,3 +232,7 @@ export { createReadState } from "./readstate.ts";
 export type { ReadState, ReadStateDependencies, ReadStatePage } from "./readstate.ts";
 export { createPendingSends } from "./pendingsends.ts";
 export type { PendingSends, PendingSendsDependencies, PendingThreadsLike } from "./pendingsends.ts";
+export { LOADING_LINE_DELAY_MS, createChannelLoading } from "./channelloading.ts";
+export type { ChannelLoading, ChannelLoadingDependencies } from "./channelloading.ts";
+export { createHeldDone } from "./helddone.ts";
+export type { HeldDone, HeldDoneDependencies } from "./helddone.ts";

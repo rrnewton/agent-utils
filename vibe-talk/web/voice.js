@@ -4782,58 +4782,12 @@ const {
  * (null with none known yet, or none left), whether a read is out, and how the last one failed.
  */
 
-/**
- * Say that a read is on the wire, or that none is. `quiet` is a read behind rows already on screen
- * for a view switch, `#220 view-switch-instant`: the pill says it is refreshing and the list shows
- * no loading line, which over rows the reader is already reading would only say "wait".
- *
- * `delayed` is a refresh nobody asked for over rows on screen — the poll, the read behind a live
- * message, coming back to the page — and its line shows only if it is still out after
- * `LOADING_LINE_DELAY_MS`. `#226 page-energy-profile`: shown at once, the line and its spinner went
- * in above the whole history and came out again a moment later on every poll, laying the list out
- * twice and animating, which was most of what a refresh with nothing new still cost. The pill says
- * "refreshing…" all the while, and a slow refresh still shows the line.
- */
-function renderChannelLoading(loading, quiet = false, delayed = false) {
-  const indicator = el("channel-loading");
-  loadState().refreshing = loading;
-  if (loadState().lineTimer !== null) {
-    clearTimeout(loadState().lineTimer);
-    loadState().lineTimer = null;
-  }
-  if (loading && delayed && !quiet && indicator.hidden) {
-    loadState().lineTimer = setTimeout(() => {
-      loadState().lineTimer = null;
-      if (loadState().refreshing) indicator.hidden = false;
-    }, LOADING_LINE_DELAY_MS);
-  } else {
-    indicator.hidden = !loading || quiet;
-  }
-  // "Saved 14:05" and "Saved 14:05 · refreshing…" are different claims; only the second waits.
-  renderChannelFreshness();
-  if (!loading) return;
-  indicator.textContent = selection().view === "threads"
-    ? "Loading threads…"
-    : selection().view === "thread"
-      ? "Loading thread…"
-      : "Loading messages…";
-}
-
-/** How long a refresh nobody asked for may be out before its loading line shows: one second. `#226`. */
-const LOADING_LINE_DELAY_MS = 1000;
-// The timer that shows that line, or null. Kept per column: `loadState().lineTimer` (`freshLoadState`, `#624 voice-page-modularity`).
-
-/**
- * Whether a read was asked for by nothing the reader did — the poll, a live message, coming back to
- * the page, the stream's replay or an edit it carried — every reason a queued read stands for
- * included. `#226 page-energy-profile`.
- *
- * @param {{reason?: string | (string | undefined)[]} | undefined} options
- */
-function backgroundRead(options) {
-  const reasons = options && Array.isArray(options.reason) ? options.reason : [options ? options.reason : undefined];
-  return reasons.every((reason) => ["poll", "live", "visible", "replay", "mutation"].includes(String(reason)));
-}
+/** Saying a read is on the wire: web/src/view/channel's now (`createChannelLoading`, `#624`). */
+const channelLoading = createChannelLoading({
+  el: (id) => el(id), loadState: () => loadState(),
+  renderChannelFreshness: () => renderChannelFreshness(), selection: () => selection(),
+});
+const { renderChannelLoading, backgroundRead } = channelLoading;
 
 
 // (`createThreadStrip`, `#624 voice-page-modularity`): the strip on each row, the selection it
@@ -4944,103 +4898,14 @@ const timelineReader = createTimelineReader({
   now: () => Date.now(),
 });
 
-/**
- * What a Done or a put back changed in the store (web/src/core/channels `HeldDoneMark`).
- *
- * @typedef {import("./src/core/channels/index.ts").HeldDoneMark} HeldDoneMark
- */
-
-/**
- * Done, or put back, here: the store's read state for `ids` follows at once, as `doneState().archived` does,
- * so a reply dealt with from All, a thread or the Pinned list counts as read on Main straight away;
- * and no read sent before the write settles undoes it (`readSpeaksFor`). Answers what to give
- * `settleHeldDone` when the write has settled.
- *
- * `settles`: Done issued from Main's list, where a root's count of new replies is drawn, settles the
- * replies of its roots no read has placed (`settleUnknownReplies`). Done in All, in a thread or in the
- * Pinned list, where nothing says a root has new replies, does not. A put back, from anywhere, takes
- * back what Done settled (`unsettleReplies`).
- *
- * @param {string[]} ids
- * @param {boolean} done
- * @param {boolean} [settles]
- * @returns {HeldDoneMark}
- */
-function markHeldDone(ids, done, settles = false) {
-  const marked = ids.map(String);
-  // The epoch moves, and each has one more write on its way (`ReadLedger.writeStarted`).
-  readLedger.writeStarted(marked);
-  const canon = providerFacts.threading() && channelStore.current().channel === String(selectedChannelId())
-    ? channelStore.current() : null;
-  // The store's part (web/src/core/channels `markDoneIn`): its read state, and the gaps Done settles.
-  return markDoneIn(canon, marked, done, settles, stillToDo);
-}
-
-/** Whether Done issued now is issued from Main's list, where roots say they have new replies (`markHeldDone`). */
-const doneSettlesHere = () => providerFacts.threading() && selection().view === "main" && !pinsView().only;
-
-// `settleUnknownReplies` is web/src/core/channels's (`#624 voice-page-modularity`).
-
-// `unsettleReplies` is web/src/core/channels's (`#624 voice-page-modularity`).
-
-/**
- * The write `mark` stands for has settled, `ok` or not. Failed, exactly what it changed in the store
- * goes back — never a copy from before it, which would undo whatever reads folded meanwhile, and in
- * another channel's store would save this one's state into it.
- *
- * @param {HeldDoneMark} mark
- * @param {boolean} ok
- */
-function settleHeldDone(mark, ok) {
-  // The epoch moves, and each settles there once none is left on its way (`ReadLedger.writeSettled`).
-  readLedger.writeSettled(mark.ids);
-  // Failed, exactly what it changed in the store goes back (web/src/core/channels `settleDoneIn`).
-  settleDoneIn(mark, ok);
-}
-
-/**
- * The part of `mark` that names `ids`: for a write sent in batches, some of which the server took
- * before one failed. Each of Done's settlings goes with the part holding its thread's root.
- *
- * @param {HeldDoneMark} mark
- * @param {string[]} ids
- * @returns {HeldDoneMark}
- */
-function heldDonePart(mark, ids) {
-  const wanted = new Set(ids);
-  /** @param {[string, number]} entry */
-  const rootIn = ([thread]) => mark.canon !== null && mark.canon.messages.some((/** @type {any} */ message) =>
-    threadOf(message) === thread && message.thread.is_root === true && wanted.has(String(message.id)));
-  return {
-    ...mark,
-    ids: mark.ids.filter((id) => wanted.has(id)),
-    flipped: mark.flipped.filter((id) => wanted.has(id)),
-    settled: mark.settled.filter(rootIn),
-    unsettled: mark.unsettled.filter(rootIn),
-  };
-}
-
-/**
- * Send `ids` to a dismiss or restore `route` in batches the server accepts (`DISMISS_BATCH`), one
- * after another, adding the ids of each batch to `landed` as the server takes it: when one fails, the
- * batches before it stand on the server, and the caller takes back only the rest. Answers the ids
- * the server says it stored.
- *
- * @param {string} route
- * @param {string[]} ids
- * @param {string[]} landed
- * @returns {Promise<string[]>}
- */
-async function writeInBatches(route, ids, landed) {
-  const stored = [];
-  for (let start = 0; start < ids.length; start += DISMISS_BATCH) {
-    const batch = ids.slice(start, start + DISMISS_BATCH);
-    const part = await inboxPost(route, { messages: batch });
-    landed.push(...batch);
-    stored.push(...((part && part.messages) || batch).map(String));
-  }
-  return stored;
-}
+/** Done on held messages at once, and settling the write: web/src/view/channel's now (`createHeldDone`, `#624`). */
+const heldDone = createHeldDone({
+  readLedger, providerFacts, channelStore,
+  selectedChannelId: () => selectedChannelId(), selection: () => selection(),
+  pinsView: () => pinsView(), stillToDo: (message, done) => stillToDo(message, done),
+  inboxPost: (route, body) => inboxPost(route, /** @type {any} */ (body)),
+});
+const { markHeldDone, doneSettlesHere, settleHeldDone, heldDonePart, writeInBatches } = heldDone;
 
 
 
