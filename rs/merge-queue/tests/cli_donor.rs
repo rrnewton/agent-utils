@@ -1688,6 +1688,56 @@ fn a_paced_refusal_is_transient_and_faults_no_donor() {
     );
 }
 
+/// #1193 census route: the adapter labels its census refusal `host`, but
+/// the cause is a pacing refusal. The donor must not pause or fault: the
+/// job re-queues counted, no probe runs, no host fault is recorded.
+#[test]
+fn a_host_scoped_census_pacing_refusal_pauses_no_donor() {
+    let fx = Fixture::new("donor-paced-census");
+    let probes = fx.root.join("probes");
+    let validator = format!(
+        r#"if [ -n "$MQ_PROBE" ]; then echo probe >> {}; echo "GH-PACED REFUSED: budget"; exit 75; fi; if [ -n "$DONOR" ]; then echo "merge-queue adapter: census probe: GH-PACED REFUSED [bot] git_credential budget 1 per 10 s (burst 1) per host reached"; echo "MQ_COULD_NOT_RUN_SCOPE: host census-published-ref-unreachable"; echo COULD_NOT_RUN; exit 75; fi; exit 0"#,
+        probes.display()
+    );
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        &validator,
+        "--offload",
+        "decide",
+    ]);
+    set_config(&fx, |config| {
+        config["donors"] = serde_json::json!({"claim_timeout_secs": 4})
+    });
+    two_changes(&fx);
+    let clone = donor_clone(&fx, "donor-host");
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    let out = donor(&fx, &clone, "d1", &[("DONOR", "1")]);
+    let donor_err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(donor_err.contains("pacing-guard refusal"), "{donor_err}");
+    let (code, report, stderr) = finish(run);
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(report["ejected"].as_array().unwrap().is_empty(), "{report}");
+    assert_eq!(item_status(&fx, 1), "queued");
+    let job = &jobs(&fx)[0];
+    assert_eq!(job["could_not_run"].as_array().unwrap().len(), 1, "{job}");
+    assert!(
+        host_faults(&fx).get("d1").is_none(),
+        "no host fault: {}",
+        host_faults(&fx)
+    );
+    assert!(
+        !probes.exists(),
+        "a pacing refusal is never probed: {}",
+        probes.display()
+    );
+}
+
 /// #1193: pacing refusals past the bound stop being transient: the probe
 /// runs, fails (it loses the same race), and the donor is faulted, so a
 /// lasting outage still shows up.

@@ -1969,31 +1969,39 @@ impl Store {
             // fault queue-side so consecutive cycles escalate; it costs the
             // job no strike. A first host-scope refusal is probed first (see
             // above) and faults nothing here.
-            if let Some((true, reason)) = crate::validate::could_not_run_scope(&receipt.log_tail) {
-                let flap_passed = self
-                    .host_flap()
-                    .get(&receipt.donor.name)
-                    .is_some_and(|entry| entry["probe_passed"].as_bool() == Some(true));
-                if flap_passed {
-                    job.lease = None;
-                    job.state = if job.candidate_gone.is_some() {
-                        JobState::Cancelled
-                    } else {
-                        JobState::Queued
-                    };
-                    job.history.push(format!(
-                        "{}: host could not run after a passing probe: {reason} ({} on {}); \
+            // Pacing evidence overrides the host-scope label here too
+            // (#1193 census route): a pacing refusal is never a flap fault.
+            let paced_receipt = crate::validate::gh_paced_refusal(&receipt.log_tail)
+                || cause_field.is_some_and(crate::validate::gh_paced_refusal);
+            if !paced_receipt {
+                if let Some((true, reason)) =
+                    crate::validate::could_not_run_scope(&receipt.log_tail)
+                {
+                    let flap_passed = self
+                        .host_flap()
+                        .get(&receipt.donor.name)
+                        .is_some_and(|entry| entry["probe_passed"].as_bool() == Some(true));
+                    if flap_passed {
+                        job.lease = None;
+                        job.state = if job.candidate_gone.is_some() {
+                            JobState::Cancelled
+                        } else {
+                            JobState::Queued
+                        };
+                        job.history.push(format!(
+                            "{}: host could not run after a passing probe: {reason} ({} on {}); \
                          no verdict, no strike",
-                        now(),
-                        receipt.donor.name,
-                        receipt.donor.host
-                    ));
-                    self.note_host_fault(&receipt.donor.name, &reason);
-                    self.write(&job)?;
-                    return Err(format!(
-                        "host could not run after a passing probe ({reason}); no verdict, \
+                            now(),
+                            receipt.donor.name,
+                            receipt.donor.host
+                        ));
+                        self.note_host_fault(&receipt.donor.name, &reason);
+                        self.write(&job)?;
+                        return Err(format!(
+                            "host could not run after a passing probe ({reason}); no verdict, \
                          no strike, the donor is paused"
-                    ));
+                        ));
+                    }
                 }
             }
             let busy = crate::validate::could_not_run_busy(&receipt.log_tail);
@@ -3108,6 +3116,10 @@ pub const PROBE_LOCK_WAIT_ATTEMPTS: usize = 3;
 /// Delay between in-probe lock-wait retries.
 pub const PROBE_LOCK_WAIT_RETRY_SECS: u64 = 5;
 
+/// Delay before an in-probe pacing retry: one pacer slot (1 per 10 s per
+/// host) plus a margin (#1193 census route).
+pub const PROBE_PACED_RETRY_SECS: u64 = 11;
+
 /// The probe back-off after a pause whose current delay is `delay`: doubled,
 /// capped at ten minutes.
 fn doubled_probe_delay(delay: std::time::Duration) -> std::time::Duration {
@@ -3219,21 +3231,31 @@ impl Worker<'_> {
         // A probe that fails only on the validator's entry lock wait
         // (#1193 item 5) retries inside this probe, counted: the lock is
         // held by unrelated work (a cleanup drain), so waiting out the
-        // fault back-off only re-records the fault. Past the bound the
-        // probe fails as any probe does.
+        // fault back-off only re-records the fault. A probe that fails on
+        // pacing-guard output likewise retries after the pacer slot
+        // (#1193 census route): contention, not a host defect. Past the
+        // bound the probe fails as any probe does.
         for attempt in 1..=PROBE_LOCK_WAIT_ATTEMPTS {
             let (passed, output) = self.probe_once(cfg);
             if passed {
                 return true;
             }
-            if attempt == PROBE_LOCK_WAIT_ATTEMPTS || !output.contains(ENTRY_LOCK_WAIT_MARKER) {
+            let lock_wait = output.contains(ENTRY_LOCK_WAIT_MARKER);
+            let paced =
+                crate::validate::gh_paced_refusal(&output) || output.contains("GH-PACED WARNING");
+            if attempt == PROBE_LOCK_WAIT_ATTEMPTS || !(lock_wait || paced) {
                 return false;
             }
+            let (cause, delay) = if paced {
+                ("pacing-guard refusal", PROBE_PACED_RETRY_SECS)
+            } else {
+                ("entry lock wait", PROBE_LOCK_WAIT_RETRY_SECS)
+            };
             eprintln!(
-                "merge-queue donor {}: probe attempt {attempt} failed on the entry lock wait; retrying inside the probe (bound {PROBE_LOCK_WAIT_ATTEMPTS})",
+                "merge-queue donor {}: probe attempt {attempt} failed on the {cause}; retrying inside the probe (bound {PROBE_LOCK_WAIT_ATTEMPTS})",
                 self.options.name
             );
-            std::thread::sleep(std::time::Duration::from_secs(PROBE_LOCK_WAIT_RETRY_SECS));
+            std::thread::sleep(std::time::Duration::from_secs(delay));
         }
         false
     }
@@ -3860,7 +3882,12 @@ impl Worker<'_> {
                 } else {
                     0
                 };
-                let paced_transient = paced && paced_count < GH_PACED_FAULT_AFTER;
+                // Pacing evidence overrides even a host-scope label
+                // (#1193 census route): an adapter that labels its census
+                // refusal `host` must not pause the donor when the cause
+                // was the pacer. Host-scoped pacing refusals are transient
+                // at any count; unscoped ones keep the bound below.
+                let paced_transient = paced && (host_scope || paced_count < GH_PACED_FAULT_AFTER);
                 if paced_transient {
                     eprintln!(
                         "merge-queue donor {}: pacing-guard refusal ({paced_count} in a row, bound {GH_PACED_FAULT_AFTER}); transient, no host fault",
@@ -3871,7 +3898,7 @@ impl Worker<'_> {
                     && !crate::validate::could_not_run_busy(&log_text)
                     && !paced_transient
                     && !self.probe_host_validator(&job.validator);
-                if probe_failed || host_scope {
+                if (probe_failed || host_scope) && !paced_transient {
                     let reason = crate::validate::could_not_run_scope(&log_text)
                         .map(|(_, reason)| reason)
                         .unwrap_or_else(|| {
@@ -4693,6 +4720,71 @@ mod unit {
         assert!(store.host_fault_list().is_empty());
         publish(&store, "c2");
         assert!(store.claim("d1", "h1", 1).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_host_scoped_pacing_refusal_after_a_probe_pass_is_no_flap_fault() {
+        // #1193 census route: the adapter labels its census refusal
+        // `host`, and the donor's probe just passed, which would normally
+        // complete a flap cycle and record the fault. Pacing evidence
+        // overrides the label: counted requeue, no fault.
+        let mut store = Store::new(&temp("ghpaced-host-scope"));
+        store.could_not_run_limit = 99;
+        publish(&store, "c1");
+        let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        store.note_probe_pass("d1");
+        let error = store
+            .report(
+                &claimed.id,
+                &token,
+                refused_receipt(
+                    &claimed,
+                    "d1",
+                    "merge-queue adapter: census probe: GH-PACED REFUSED [bot] \
+                     git_credential budget 1 per 10 s (burst 1) per host reached\n\
+                     MQ_COULD_NOT_RUN_SCOPE: host census-published-ref-unreachable\n\
+                     COULD_NOT_RUN",
+                ),
+            )
+            .unwrap_err();
+        assert!(error.contains("queued again"), "{error}");
+        let after = store.read(&claimed.id).unwrap();
+        assert_eq!(after.state, JobState::Queued, "{after:?}");
+        assert_eq!(after.could_not_run.len(), 1, "{after:?}");
+        assert!(store.host_fault_list().is_empty());
+    }
+
+    #[test]
+    fn a_probe_that_is_paced_once_then_passes_records_no_fault() {
+        // #1193 census route: the first probe attempt is refused by the
+        // pacer; the in-probe retry after the pacer slot passes, so the
+        // probe passes (the caller faults only on a false return).
+        let work = temp("probe-paced");
+        let count = work.join("count");
+        let run = format!(
+            "n=$(cat {} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {}; \
+             if [ $n -lt 2 ]; then echo 'GH-PACED REFUSED: budget reached'; exit 75; fi; exit 0",
+            count.display(),
+            count.display()
+        );
+        let (options, route) = probe_worker(&work);
+        let worker = Worker {
+            options: &options,
+            route: &route,
+            host: "h1".to_owned(),
+            slots: Mutex::new(vec![0]),
+            host_pause: Mutex::new(None),
+            probe_passed: AtomicBool::new(false),
+            next_host_delay: Mutex::new(std::time::Duration::from_secs(60)),
+            last_validator: Mutex::new(None),
+            next_fault_probe: Mutex::new(std::time::Instant::now()),
+            fault_probe_current: Mutex::new(std::time::Duration::from_secs(60)),
+            paced_refusals: Mutex::new(0),
+        };
+        assert!(worker.probe_host_validator(&probe_cfg(run)));
+        assert_eq!(std::fs::read_to_string(&count).unwrap().trim(), "2");
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     fn probe_worker(work: &Path) -> (DonorOptions, Route) {

@@ -1,6 +1,6 @@
 ---
 title: 'ghpaced-transient: a GH-PACED refusal must not host-fault a donor'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-11-10T06:15:00.000000000+00:00
