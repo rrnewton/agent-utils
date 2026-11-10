@@ -7029,51 +7029,48 @@ const unpackOnScreen = () => cardsCycle() && (cardPacking.mode() !== "packed" ||
 //     (`placeMainCard`), and back when the list goes or the chip is let go. It is the one box: a reply
 //     opened anywhere hides it, and putting the reply down gives it back (`dockReply`).
 
-/** The device's choice of Main channel among the cards: "on", or anything else for cards alone. */
-const THREADS_MAIN_KEY = DEVICE_SETTINGS.threadsMain.key;
-
-/**
- * Whether the main channel's messages stand among the cards: Main channel pressed, kept on the server
- * (`#457 settings-server-side`) and read from the device here, as the page loads; a browser refusing storage
- * reads as cards alone (`DEVICE_SETTINGS.threadsMain.refused`). `#419 threads-view-main-messages`. One owner
- * in web/src/core/settings/switches.ts (`#624 voice-page-modularity`).
- *
- * @type {import("./src/core/settings/index.ts").KeptSwitch}
- */
-const mainRowsChoice = createKeptSwitch({
-  setting: DEVICE_SETTINGS.threadsMain,
-  deviceSettings: () => deviceSettings(),
+// The main channel's messages among the cards, and the order of the Threads view's cards, are
+// web/src/view/channel's now (`createMainCards`, `#624 voice-page-modularity`): both kept
+// choices' setting objects and storage handed in untouched.
+const mainCards = createMainCards({
+  makeMainChoice: () => createKeptSwitch({
+    setting: DEVICE_SETTINGS.threadsMain,
+    deviceSettings: () => deviceSettings(),
+  }),
+  threadsMainKey: DEVICE_SETTINGS.threadsMain.key,
+  storage: () => deviceStorage(),
+  leftById: leftEl,
+  threadListOnScreen: () => threadListOnScreen(),
+  sideMode: () => columns.side.mode,
+  threadListShown: () => layoutShown.threadList(),
+  forgetCards: () => cardsDrawn.forget(),
+  sideColumnUp: () => sideColumnUp(),
+  keepingCardPlace: (change, follow) => keepingCardPlace(change, follow),
+  renderSideColumn: () => renderSideColumn(),
+  setStatus: (text) => setStatus(text),
+  selectedCardId: () => {
+    const mark = markOf(sidePane);
+    return mark && mark.card !== false ? mark.id : null;
+  },
+  paneRowForId: (id) => paneRowFor(sidePane, id, true),
+  rowShown: (row) => rowShown(/** @type {any} */ (row)),
+  storeChannel: () => channelStore.current().channel,
+  storeMessages: () => channelStore.current().messages,
+  storeRemoved: () => channelStore.current().removed,
+  storeDismissed: () => channelStore.current().dismissed,
+  selectedChannelId: () => selectedChannelId(),
+  inView: (message, view, threadId) => inView(/** @type {any} */ (message), /** @type {any} */ (view), threadId),
+  hiddenEmpty: (message) => hiddenEmpty(/** @type {any} */ (message)),
+  hidingRead: () => hidingRead(),
+  stillToDo: (message, dismissed) => stillToDo(/** @type {any} */ (message), /** @type {any} */ (dismissed)),
+  sentFromThisPage: (message) => sentFromThisPage(/** @type {any} */ (message)),
+  whileMainRows: (act) => rowDrawing.whileMain(act),
+  glom: (messages) => glom(/** @type {any} */ (messages)),
+  discordNode: (group) => discordNode(/** @type {any} */ (group)),
+  answeredBy: (rows, viewing) => answeredBy(/** @type {any} */ (rows), viewing),
+  dressChannelRow: (row, pass) => dressChannelRow(row, /** @type {any} */ (pass)),
 });
-
-/** Whether Main's messages belong on screen among the cards: pressed, and the Threads view showing cards. */
-const mainRowsOnScreen = () => mainRowsChoice.on() && threadListOnScreen() && columns.side.mode === "list";
-
-/** Main channel: offered over the Threads view's cards, as Unpack msgs is, and pressed as the reader left it. */
-function renderMainToggle() {
-  const button = leftEl("side-main");
-  const offered = columns.side.mode === "list" && layoutShown.threadList();
-  if (button.hidden === offered) button.hidden = !offered;
-  const pressed = mainRowsChoice.on() ? "true" : "false";
-  if (button.getAttribute("aria-pressed") !== pressed) button.setAttribute("aria-pressed", pressed);
-}
-
-/** The reader pressed Main channel, or a: kept, and the cards drawn again. */
-function setMainRowsShown(on) {
-  mainRowsChoice.set(on);
-  mainRowsChoice.keep(on);
-  renderMainToggle();
-  cardsDrawn.forget();
-  if (sideColumnUp()) keepingCardPlace(renderSideColumn);
-  placeMainCard();
-}
-
-/** a, over the Threads view: Main's messages among the cards, or the cards alone again. Elsewhere, nothing. */
-function mainRowsFromKeyboard() {
-  if (!threadListOnScreen() || columns.side.mode !== "list") return false;
-  setMainRowsShown(!mainRowsChoice.on());
-  setStatus(mainRowsChoice.on() ? "The main channel's messages among the threads." : "The threads alone.");
-  return true;
-}
+const { THREADS_MAIN_KEY, mainRowsChoice, threadOrders, mainRowsOnScreen, renderMainToggle, setMainRowsShown, mainRowsFromKeyboard, cardOrderOnScreen, renderOrderToggle, setThreadOrder, nextThreadOrder, orderFromKeyboard, mainRowMessages, mainRows, placeMainCard } = mainCards;
 
 // --- the order of the Threads view's cards (#426 threads-sort-toggle) -----------------------------------
 //
@@ -7089,125 +7086,6 @@ function mainRowsFromKeyboard() {
 
 // The orders, their words and times, the cards put in one, and the order chosen, kept on this device,
 // are web/src/present/rows's (`createThreadOrder`, `#624 voice-page-modularity`).
-
-/** The order the Threads view's cards are in. */
-const threadOrders = createThreadOrder({ storage: () => deviceStorage() });
-
-/** The order the cards on screen are drawn in: the one chosen over the Threads view's cards, else the default. */
-const cardOrderOnScreen = () => (threadListOnScreen() && columns.side.mode === "list" ? threadOrders.current() : THREAD_ORDER_NAMES[0]);
-
-/** The order chip: offered over the Threads view's cards, as Main channel is, saying the order they are in. */
-function renderOrderToggle() {
-  const button = leftEl("side-order");
-  const offered = columns.side.mode === "list" && layoutShown.threadList();
-  if (button.hidden === offered) button.hidden = !offered;
-  const order = THREAD_ORDERS[threadOrders.current()];
-  const next = THREAD_ORDERS[threadOrderAfter(threadOrders.current())];
-  // Pressed in any order but the default, as the other chips are pressed when they change the list.
-  const pressed = threadOrders.current() === THREAD_ORDER_NAMES[0] ? "false" : "true";
-  if (button.getAttribute("aria-pressed") !== pressed) button.setAttribute("aria-pressed", pressed);
-  const label = `Order: ${order.name}`;
-  if (button.getAttribute("aria-label") !== label) button.setAttribute("aria-label", label);
-  const title = `In order of ${order.name.toLowerCase()}: ${order.says}. Press for ${next.name.toLowerCase()}`;
-  if (button.title !== title) button.title = title;
-  // The whole name, and on a phone the short one (web/voice.css).
-  setTextIfChanged(leftEl("side-order-whole"), order.name);
-  setTextIfChanged(leftEl("side-order-short"), order.short);
-}
-
-/**
- * The reader pressed the order chip, or d: the next order, kept, and the cards drawn in it,
- * the selected card kept where it is on screen (`keepingCardPlace` keeps it where it shows; otherwise
- * it is brought into view).
- */
-function setThreadOrder(order) {
-  threadOrders.set(order);
-  renderOrderToggle();
-  cardsDrawn.forget();
-  if (!sideColumnUp()) return;
-  const mark = markOf(sidePane);
-  const selected = mark && mark.card !== false ? mark.id : null;
-  keepingCardPlace(renderSideColumn, true);
-  const row = selected === null ? null : paneRowFor(sidePane, selected, true);
-  if (!row || !rowShown(row)) return;
-  const area = leftEl("side-scroll").getBoundingClientRect();
-  const box = row.getBoundingClientRect();
-  if ((box.top < area.top || box.bottom > area.bottom) && typeof row.scrollIntoView === "function") {
-    row.scrollIntoView({ block: "nearest", inline: "nearest" });
-  }
-}
-
-/** The next order after the one the cards are in. */
-const nextThreadOrder = () => threadOrderAfter(threadOrders.current());
-
-/** d, over the Threads view: the cards in the next order. Elsewhere, nothing. */
-function orderFromKeyboard() {
-  if (!threadListOnScreen() || columns.side.mode !== "list") return false;
-  setThreadOrder(nextThreadOrder());
-  setStatus(`Threads in order of ${THREAD_ORDERS[threadOrders.current()].name.toLowerCase()}.`);
-  return true;
-}
-
-/**
- * The main channel's messages that head no thread a card stands for, oldest first, as Main draws them:
- * the store's copies of Main's rows (`inView`), less the roots of `carded` and anything removed upstream,
- * no empty message where those are hidden, and under Hide read only what is still to do.
- *
- * @param {Set<string>} carded the threads the cards stand for, by id
- */
-function mainRowMessages(carded) {
-  if (channelStore.current().channel !== String(selectedChannelId())) return [];
-  const messages = channelStore.current().messages.filter((message) => {
-    if (!inView(message, "main", null) || channelStore.current().removed.has(String(message.id)) || hiddenEmpty(message)) return false;
-    const thread = threadOf(message);
-    if (thread !== null && message.thread.is_root === true && carded.has(thread)) return false;
-    return !hidingRead() || stillToDo(message, channelStore.current().dismissed) || sentFromThisPage(message);
-  });
-  return inTimeOrder(messages, "timestamp");
-}
-
-/**
- * Main's messages `messages`, one run between two cards, as rows of the cards' list: built and dressed
- * as every list's rows are, in the right column, whose list the keys and the mouse move them in.
- *
- * @param {Array<any>} messages
- * @param {ReplyTally} tally
- * @returns {HTMLElement[]}
- */
-function mainRows(messages, tally) {
-  // They offer the way into a thread, as All's do, and point at nothing (`rowDrawing.main`).
-  const rows = rowDrawing.whileMain(() => glom(messages).map((group) => {
-    const row = discordNode(group);
-    row.setAttribute("data-main-row", "");
-    row.className = `${row.className} main-row`;
-    return row;
-  }));
-  const viewing = String(selectedChannelId());
-  const pass = { tally, answered: answeredBy(rows, viewing), viewing, inMain: false, inAll: false };
-  for (const row of rows) dressChannelRow(row, pass);
-  return rows;
-}
-
-/**
- * The main channel's box as the last card of the list, while Main's messages are among the cards;
- * back in its place under the left column's list otherwise. The box's draft and where it posts are the
- * left column's, which is Main behind the list (`leftColumnToMain`).
- */
-function placeMainCard() {
-  const box = leftEl("channel-composer");
-  const list = leftEl("side-list");
-  // `#430 threads-main-own-sent`. And the outbox's receipts over it, as in Main: a send still on its
-  // way, or one that failed, is shown where it was sent from, not in the list hidden behind the cards.
-  const receipts = leftEl("outgoing-log");
-  const wanted = mainRowsOnScreen();
-  const there = box.parentNode === list;
-  if (wanted && !there) list.append(receipts, box);
-  else if (!wanted && there) {
-    leftEl("pane-discord").insertBefore(box, leftEl("column-reply"));
-    leftEl("pane-discord").insertBefore(receipts, box);
-  }
-  if (box.hasAttribute("data-main-card") !== wanted) box.toggleAttribute("data-main-card", wanted);
-}
 
 // --- runs of read threads over the cards (#432 read-mode-unify) ------------------------------------------
 //

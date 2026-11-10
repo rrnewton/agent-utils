@@ -3023,3 +3023,57 @@ test("`#624 voice-page-modularity`: the card at the top of a thread — drawn on
     globalThis.document = was;
   }
 });
+
+test("`#624 voice-page-modularity`: Main's messages among the cards and their order — kept choices named, rows filtered as Main's are — from the module alone", () => {
+  const { createMainCards } = CHANNEL_VIEW;
+  const log = [];
+  const el = (attrs = {}) => {
+    const made = { attrs: new Map(Object.entries(attrs)), children: [], className: "", parentNode: null, hidden: true, title: "",
+      hasAttribute: (name) => made.attrs.has(name), getAttribute: (name) => (made.attrs.has(name) ? made.attrs.get(name) : null),
+      setAttribute: (name, value) => made.attrs.set(name, String(value)), toggleAttribute: (name, on) => (on ? made.attrs.set(name, "") : made.attrs.delete(name)),
+      append: () => {}, insertBefore: () => {},
+      getBoundingClientRect: () => ({ top: 0, bottom: 10 }) };
+    return made;
+  };
+  const mainButton = el(); const orderButton = el();
+  const nodes = { "side-main": mainButton, "side-order": orderButton, "side-order-whole": el(), "side-order-short": el(), "side-scroll": el(),
+    "channel-composer": el(), "side-list": el(), "pane-discord": el(), "outgoing-log": el(), "column-reply": el() };
+  let mainOn = false;
+  const kept = new Map();
+  const storage = { getItem: (k) => kept.get(k) ?? null, setItem: (k, v) => kept.set(k, v), removeItem: (k) => kept.delete(k) };
+  const messages = [
+    { id: "m1", thread: null, timestamp: 1 }, { id: "m2", thread: { id: "t-of-m2", is_root: true }, timestamp: 2 }, { id: "m3", thread: null, timestamp: 3 },
+  ];
+  const owner = createMainCards({
+    makeMainChoice: () => ({ on: () => mainOn, set: (on) => { mainOn = on; }, keep: (on) => log.push(["keep-main", on]), stored: () => mainOn }),
+    threadsMainKey: "vibe-talk.voice.threads-main",
+    storage: () => storage,
+    leftById: (id) => nodes[id] || el(),
+    threadListOnScreen: () => true, sideMode: () => "list", threadListShown: () => true,
+    forgetCards: () => log.push("forget"), sideColumnUp: () => false,
+    keepingCardPlace: (change) => change(), renderSideColumn: () => log.push("side"),
+    setStatus: (text) => log.push(text), selectedCardId: () => null,
+    paneRowForId: () => null, rowShown: () => false,
+    storeChannel: () => "c1", storeMessages: () => messages, storeRemoved: () => new Set(),
+    storeDismissed: () => new Set(["m3"]), selectedChannelId: () => "c1",
+    inView: () => true, hiddenEmpty: () => false, hidingRead: () => true,
+    stillToDo: (message) => message.id !== "m3", sentFromThisPage: () => false,
+    whileMainRows: (act) => act(), glom: (rows) => rows, discordNode: () => el(),
+    answeredBy: () => null, dressChannelRow: () => {},
+  });
+  assert.equal(owner.THREADS_MAIN_KEY, "vibe-talk.voice.threads-main", "the Main choice's stored key changed");
+  assert.equal(owner.mainRowsOnScreen(), false, "Main's messages started among the cards");
+  // Under Hide read, the read main message (m3, Done) is left out; the thread root carded is left out.
+  assert.deepStrictEqual(owner.mainRowMessages(new Set(["t-of-m2"])).map((m) => m.id), ["m1"]);
+  // Pressing Main channel keeps the choice and offers the cards again.
+  owner.setMainRowsShown(true);
+  assert.equal(owner.mainRowsOnScreen(), true);
+  assert.equal(mainButton.getAttribute("aria-pressed"), "true");
+  assert.deepStrictEqual(log, [["keep-main", true], "forget"]);
+  // The order: the next after the one chosen, kept in the device's storage by its own key.
+  const first = owner.threadOrders.current();
+  owner.setThreadOrder(owner.nextThreadOrder());
+  assert.notEqual(owner.threadOrders.current(), first, "the order chip did not move the order on");
+  assert.equal(typeof kept.get("vibe-talk.voice.thread-order"), "string", "the order was not kept under its own key");
+  assert.equal(owner.cardOrderOnScreen(), owner.threadOrders.current());
+});

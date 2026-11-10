@@ -24,7 +24,7 @@ export {
 export { speechHoldFrom } from "../core/speech/index.ts";
 export { createServerFacts, isSlowFailure, readableFailure } from "../core/api/index.ts";
 
-export { channelPostsOnce, allReachesThread, createChannelDirectory, createChannelStore, createCopyOrder, createIdentities, createProviderFacts, createThreadPresence, createUnpackReads, exactReplyCount, heldNow, inTimeOrder, newerPage, refreshFailed, threadOf, timeOf, upsertThreadSummary } from "../core/channels/index.ts";
+export { channelPostsOnce, allReachesThread, createChannelDirectory, createChannelStore, createCopyOrder, createIdentities, createProviderFacts, createThreadPresence, createUnpackReads, exactReplyCount, heldNow, newerPage, refreshFailed, threadOf, timeOf, upsertThreadSummary } from "../core/channels/index.ts";
 export { createReadLedger } from "../core/annotations/index.ts";
 export { REOPENED_VIEWS, UI_STATE_CHARS, UI_STATE_KEY, UI_STATE_VERSION, createBackStack, createDeepLinks, createLayoutChoice, createLinkJumps, createNavigation, createUiState, createViewPlaces, createVisits, deepLinkQuery, visitKey } from "../core/navigation/index.ts";
 export {
@@ -105,7 +105,7 @@ export {
 export { briefAge, fullLocalAt, stamp } from "../present/time/index.ts";
 
 export { doneReadWords, failureWords, localReadWords, messagesWords, reachBackWords, reachClause, readableCause, refusalSentence, refusalWords, searchMomentWords, serviceReadWords } from "../present/notices/index.ts";
-export { LINK_KINDS_KEY, READ_MODES, READ_MODE_KEY, READ_MODE_SAID, THREADS_UNPACKED_KEY, THREAD_CARD_STATES_KEY, THREAD_ORDERS, THREAD_ORDER_KEY, THREAD_ORDER_NAMES, cardGapWords, cardRunText, combinedContent, countOf, createCardPacking, createLinkKinds, createReadMode, createThreadOrder, editedDrawn, gapWords, inThreadOrder, isNoise, mainRunsAmong, messageLook, quoteBlock, rawTextOf, reactionsDrawn, renderedHtmlOf, savedReadMode, threadOrderAfter, undoLabel, undoName, upstreamUrlOf } from "../present/rows/index.ts";
+export { LINK_KINDS_KEY, READ_MODES, READ_MODE_KEY, READ_MODE_SAID, THREADS_UNPACKED_KEY, THREAD_CARD_STATES_KEY, THREAD_ORDERS, THREAD_ORDER_KEY, THREAD_ORDER_NAMES, cardGapWords, cardRunText, combinedContent, countOf, createCardPacking, createLinkKinds, createReadMode, editedDrawn, gapWords, inThreadOrder, isNoise, mainRunsAmong, messageLook, quoteBlock, rawTextOf, reactionsDrawn, renderedHtmlOf, savedReadMode, undoLabel, undoName, upstreamUrlOf } from "../present/rows/index.ts";
 export { COLUMN_IDS, DAY_TITLED, PULL_WAIT_MS, REPLY_LANDING_GAP_PX, anchorOfRow, authorPasses, cardRunIds, createCardFlight, createCardPlaces, createColumnLinks, createColumnSplitter, createColumnReplies, createColumnWork, createColumnStateAccess, createColumns, createFootRooms, createLayoutShown, createLinkedMark, createPackSlides, createPullToRefresh, createQuoting, createReadingColumn, createReplyArrows, createSentRead, createReplyGathering, createReplySession, createChannelViews, createChannelScope, createChannelLoading, createMessageDetails, createStartsRead, createFilterPlace, createFreshRead, createHeldDone, createReadState, createPendingSends, createOlderPages, createOpeningView, createPlacing, createReplyCounts, createDoneAct, createLiveState, createSideCards, createThreadEntry, createTwoColumns, createRowDrawing, createRowGestures, createScrollKeeping, createUnderLists, createUnpackWatch, FOLLOW_REST_PX, fillCardText, freshenDayTitle, freshEntryState, freshDoneState, freshLoadState, freshOlderPages, freshScrollPlace, freshScrollTools, freshFilterState, freshGatherState, freshListState, freshReplyArrows, fromGatheredThread, idsOf, markCardLayout, messageTop, mountChannelViewControls, mountColumnSplitterControls, mountFilterChips, mountKeptSends, mountListControls, mountListGestures, mountListKeepers, mountListWatch, mountReadingJumps, mountReplyBox, mountSideControls, mountSideListControls, notNoiseButtonOf, quoteLabelFits, renderedText, rowIn, rowMessages, rowShown, rowTimeTabStop, sameCardPlace, shownRowFor, } from "../view/channel/index.ts";
 
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";
@@ -197,3 +197,5 @@ export { createReadActs } from "../view/channel/index.ts";
 export { createLitCards } from "../view/channel/index.ts";
 // the card at the top of an open thread (#624 mu-keyread)
 export { createThreadCardHead } from "../view/channel/index.ts";
+// the main channel's messages among the cards (#624 mu-keyread)
+export { createMainCards } from "../view/channel/index.ts";
