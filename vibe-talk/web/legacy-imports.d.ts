@@ -209,6 +209,7 @@ declare const createReplyCounts: LegacyImports["createReplyCounts"];
 declare const createPlacing: LegacyImports["createPlacing"];
 declare const createOlderPages: LegacyImports["createOlderPages"];
 declare const createOpeningView: LegacyImports["createOpeningView"];
+declare const createChannelDirectoryView: LegacyImports["createChannelDirectoryView"];
 declare const freshOlderPages: LegacyImports["freshOlderPages"];
 declare const createFilterPlace: LegacyImports["createFilterPlace"];
 declare const createLiveState: LegacyImports["createLiveState"];

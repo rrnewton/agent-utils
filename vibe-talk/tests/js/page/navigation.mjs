@@ -2812,7 +2812,7 @@ test("two windows left on two channels each reload on their own, and a new windo
 
   // THE CONTROL: with the window's own channel passed over, the first window reloads onto the
   // second's, as the owner's did, and this test fails.
-  const control = await run(brokenScript("  const own = windowItem(ACTIVE_CHANNEL_KEY);\n  if (own) return own;\n", ""));
+  const control = await run(await brokenModule([{ file: "src/view/shell/channeldirectory.ts", find: "    const own = deps.windowItem(deps.activeChannelKey);\n    if (own) return own;\n", replace: "" }]));
   assert.equal(control.oneAgain.el("discord-channel").value, OTHER_CHANNEL.id,
     "the test cannot tell a window's own channel from the one chosen last");
 });

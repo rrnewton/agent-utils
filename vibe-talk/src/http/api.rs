@@ -3614,6 +3614,7 @@ mod tests {
             "src/view/settings",
             "src/view/channel/readcore.ts",
             "src/view/channel/olderwalks.ts",
+            "src/view/shell/channeldirectory.ts",
         ])
     }
 

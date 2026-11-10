@@ -86,7 +86,7 @@ export {
   setClassWord,
   shownNode,
 } from "../view/dom/index.ts";
-export { SCREEN_TITLES, createActionMenu, createChipsOverComposer, createControlBar, createPromptsTray, createReaderRow, createReplySight, createPageNavigation, createScreens, createScreenShowing, createShellNotices, createUndoOffer, createUndoStamps, modHeld, mountDocumentListeners, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow } from "../view/shell/index.ts";
+export { SCREEN_TITLES, createActionMenu, createChannelDirectoryView, createChipsOverComposer, createControlBar, createPromptsTray, createReaderRow, createReplySight, createPageNavigation, createScreens, createScreenShowing, createShellNotices, createUndoOffer, createUndoStamps, modHeld, mountDocumentListeners, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow } from "../view/shell/index.ts";
 export {
   NEWLINE_KEYS,
   createComposerBoxes,

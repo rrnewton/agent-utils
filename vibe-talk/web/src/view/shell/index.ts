@@ -2,6 +2,8 @@
 // mounting, keyboard dispatch and boot order (the plan's step 17). Its public interface.
 
 export { PACK_VIEWS, createControlBar } from "./controlbar.ts";
+export { createChannelDirectoryView } from "./channeldirectory.ts";
+export type { ChannelDirectoryView, ChannelDirectoryViewDependencies } from "./channeldirectory.ts";
 export type { ControlBar, ControlBarDependencies } from "./controlbar.ts";
 export { BANNER_DISMISS_MS, STATUS_DISMISS_MS, createShellNotices } from "./notices.ts";
 export type { ShellNotices, ShellNoticesDependencies } from "./notices.ts";

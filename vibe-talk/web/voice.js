@@ -1304,6 +1304,28 @@ const viewScroll = createViewPlaces();
  */
 const providerFacts = createProviderFacts();
 /**
+ * What the server last said the channels and their services were — the channels on the list, the
+ * configured ones taken off it, each provider's description, the deployment-wide capabilities, whether
+ * the bridge registers and lists channels, and the chat service's own name: web/src/core/channels's
+ * (`createChannelDirectory`, `#624 voice-page-modularity`), with why each is kept.
+ */
+const channelDirectory = createChannelDirectory();
+
+
+/** Naming and grouping channels: web/src/view/shell's now (`createChannelDirectoryView`, `#624`). */
+const directoryView = createChannelDirectoryView({
+  directory: () => channelDirectory, activeChannelKey: ACTIVE_CHANNEL_KEY,
+  el: (id) => el(id), selectedChannelId: () => selectedChannelId(),
+  selectionOwner: () => selectionOwner(), renderLiveState: () => renderLiveState(),
+  keepWindowItem: (key, value) => keepWindowItem(key, value), windowItem: (key) => windowItem(key),
+  deviceStorage: () => deviceStorage(),
+  fromProvider: (provider, capabilities) => providerFacts.fromProvider(/** @type {any} */ (provider), /** @type {any} */ (capabilities)),
+  saveCacheChannels: () => messageCache.saveCacheChannels(),
+  learnProviderAccounts: (providers) => whoIsWho.learnProviderAccounts(providers),
+  boxes: () => channelSettings,
+});
+const { NO_CHANNEL_TO_READ, UNDESCRIBED_SERVICE, channelName, chatServiceName, learnProviders, providerOfChannel, serviceLabel, channelGroups, channelsGrouped, channelsInPickerOrder, applyChannelProvider, pickerName, knownChannel, storedActiveChannel, rememberActiveChannel, fillChannelSelect, adoptChannelList } = directoryView;
+/**
  * Whether the selected channel holds any thread at all, from its last history page (or yes while a thread is
  * open): one owner in web/src/core/channels/threadpresence.ts (`#624 voice-page-modularity`).
  *
@@ -9791,127 +9813,6 @@ function onWatchAllFrame(frame) {
   return undefined;
 }
 
-// --- what to call a channel ----------------------------------------------------------------------
-//
-// `#39 channel-alias`. A name of the OWNER's own for a channel, because saying which channel he
-// means has to be possible out loud: `1532416065114607829` is unsayable, and a configured label
-// like "build noise" is not what anyone says either.
-//
-// THREE things this deliberately is not, each of them said on the screen as well as here:
-//
-//   * It is NOT a rename in Discord. The server keeps the name and never tells Discord; the
-//     channel keeps whatever it is called there. The server states that on every answer and this
-//     page shows THAT sentence rather than writing its own — same rule `#50 todo-view` follows
-//     with `read_state_notice`, and for the same reason: a second copy of a policy is a second
-//     thing that can go stale.
-//   * It is NOT visible to anyone outside this deployment.
-//   * It is NOT the agent's to choose. The agent is HANDED it — `list_channels` and the digest
-//     header carry it — and the server offers no tool that sets one. This editor is the only way
-//     in, and it is behind the write token, which is the operator's.
-//
-// ONE RULE, IN ONE PLACE: the alias when there is one, the configured label otherwise. Every
-// render of a channel's name on this page goes through `channelName`, so the picker, the head of
-// the channel and the head of the to-do list cannot come to disagree about what it is called.
-
-/**
- * The name to show for a channel, from anything the server calls a channel.
- *
- * Trimmed and emptiness-checked rather than a bare `alias || label`: the server refuses a blank
- * one, so an empty string arriving here means something upstream is wrong, and a picker with a
- * blank entry in it is worse than one showing the configured label.
- */
-function channelName(channel) {
-  if (!channel) {
-    return "this channel";
-  }
-  const alias = typeof channel.alias === "string" ? channel.alias.trim() : "";
-  return alias || String(channel.label || channel.id || "this channel");
-}
-
-/**
- * What the server last said the channels and their services were — the channels on the list, the
- * configured ones taken off it, each provider's description, the deployment-wide capabilities, whether
- * the bridge registers and lists channels, and the chat service's own name: web/src/core/channels's
- * (`createChannelDirectory`, `#624 voice-page-modularity`), with why each is kept.
- */
-const channelDirectory = createChannelDirectory();
-
-const NO_CHANNEL_TO_READ =
-  "no channel to read — your channel list is empty. " +
-  "Add one, or show a hidden one again, in Settings.";
-
-/** The chat service as a noun phrase: its configured name, or a generic one. */
-function chatServiceName() {
-  return channelDirectory.providerName() || "the chat service";
-}
-
-/** Remember every provider's description, and the accounts each one speaks as. */
-function learnProviders(providers) {
-  whoIsWho.learnProviderAccounts(channelDirectory.learnProviders(providers));
-}
-
-/** The provider description for the channel `id`, or null when the server did not say. */
-function providerOfChannel(id) {
-  return channelDirectory.providerOf(id);
-}
-
-// --- channels grouped by service -----------------------------------------------------------------
-//
-// `#355 provider-grouped-channels`. One server may read several chat services, and a flat list of
-// their channels hides which is which: two called "general" are one name. So a channel picker
-// groups its channels under a header per service, in the order the server configures them, once
-// two or more services have channels. With one, or with a server that describes no services, the
-// list is exactly the flat one it always was. The closed picker shows the channel's name alone;
-// the open list carries the headers, so the bar keeps its width on a phone.
-
-/** The header a group shows: the service's name, with its key where two services share it. */
-function serviceLabel(key) {
-  const described = channelDirectory.providers().get(key);
-  const name = described && typeof described.name === "string" && described.name.trim()
-    ? described.name.trim()
-    : String(key);
-  const shared = [...channelDirectory.providers().values()].filter(
-    (other) => other !== described && typeof other.name === "string" && other.name.trim() === name
-  ).length > 0;
-  return shared ? `${name} (${key})` : name;
-}
-
-/** The header of the group of channels whose service this server no longer describes. */
-const UNDESCRIBED_SERVICE = "Not connected";
-
-/**
- * `channels` by service: one group per described service that has channels, in the server's
- * order, then the channels of no described service (an added channel whose bridge is no longer
- * configured), never dropped.
- *
- * @returns {{provider: string | null, heading: string, channels: any[]}[]}
- */
-function channelGroups(channels = channelDirectory.channels()) {
-  const groups = [...channelDirectory.providers().keys()].map((key) => ({
-    provider: /** @type {string | null} */ (key),
-    heading: serviceLabel(key),
-    channels: channels.filter((channel) => channel.provider === key),
-  }));
-  const rest = channels.filter(
-    (channel) => typeof channel.provider !== "string" || !channelDirectory.providers().has(channel.provider)
-  );
-  groups.push({ provider: null, heading: UNDESCRIBED_SERVICE, channels: rest });
-  return groups.filter((group) => group.channels.length > 0);
-}
-
-/** Whether the pickers show service groups: two or more services have channels. */
-function channelsGrouped() {
-  return channelGroups().length >= 2;
-}
-
-/**
- * The channels in the order the bar's picker shows them: grouped by service when it is, else the
- * server's own order. Alt+↑ and Alt+↓ step through this order, and a picker with nothing to keep
- * opens on its first.
- */
-function channelsInPickerOrder() {
-  return channelsGrouped() ? channelGroups().flatMap((group) => group.channels) : channelDirectory.channels();
-}
 
 /** Settings' channel box owns its service choice, editor and hidden list (#624 voice-page-modularity). */
 const channelSettings = mountChannelSettings({
@@ -9941,19 +9842,6 @@ const channelSettings = mountChannelSettings({
   setStatus: (text) => setStatus(text),
 });
 
-/**
- * Act on the selected channel's own provider: its threads, its read cursor, its live delivery.
- *
- * Called before anything reads the new channel, because whether to read a timeline or a flat
- * history is exactly the kind of decision that must not be made with another service's answer.
- */
-function applyChannelProvider() {
-  const provider = providerOfChannel(selectedChannelId());
-  providerFacts.fromProvider(provider, channelDirectory.capabilities());
-  renderLiveState();
-}
-
-// `sentenceStart` is web/src/foundation's (`#624 voice-page-modularity`).
 
 /**
  * Settings' channel browser (`#19 channel-browser`, `#371 channel-search-hash`): its search, its pages,
@@ -9978,115 +9866,6 @@ const channelDirectoryBox = mountChannelDirectory({
   setTimeout: (run, ms) => setTimeout(run, ms),
   clearTimeout: (timer) => clearTimeout(timer),
 });
-
-/**
- * A channel's name in a picker: its name without a leading '#'. `#371 channel-search-hash`.
- *
- * A native <select> finds an option by the first letters of its text as they are typed, so a Slack
- * channel listed as `#team-builds` was never reached by typing `team`. The '#' says only that it is
- * a Slack channel, which the picker's service header (or Settings' Service row) says already.
- * Everywhere else a channel keeps its name as written.
- */
-function pickerName(name) {
-  return name.replace(/^#+\s*/, "") || name;
-}
-
-function knownChannel(id) {
-  return channelDirectory.known(id);
-}
-
-/**
- * The channel to open on: the one this window was on, which a reload of it comes back to, and for a
- * brand-new window, which has none, the one chosen last in any window. `#265 window-channel-memory`.
- * One the server no longer lists gives way to its first, in `fillChannelSelect`, as it always has.
- */
-function storedActiveChannel() {
-  const own = windowItem(ACTIVE_CHANNEL_KEY);
-  if (own) return own;
-  try {
-    return deviceStorage().getItem(ACTIVE_CHANNEL_KEY) || "";
-  } catch (_error) {
-    return "";
-  }
-}
-
-/**
- * Keep the channel on the bar as this window's. `chosen`, when the reader changed to it: then it is
- * also the device's, the one a brand-new window opens on. A channel only put on the bar — the one a
- * new window opened on, a list redrawn — is this window's alone, so another window's choice is not
- * taken back by a window that merely reloaded. `#265 window-channel-memory`.
- */
-function rememberActiveChannel(chosen = false) {
-  const id = selectedChannelId();
-  keepWindowItem(ACTIVE_CHANNEL_KEY, id || null);
-  if (!chosen) return;
-  try {
-    if (id) deviceStorage().setItem(ACTIVE_CHANNEL_KEY, id);
-    else deviceStorage().removeItem(ACTIVE_CHANNEL_KEY);
-  } catch (_error) {
-    // Switching spaces still works when this browser cannot retain the preference.
-  }
-}
-
-/**
- * Redraw one channel picker from the directory's channels (`channelDirectory`), keeping it on the
- * channel it was showing.
- *
- * A rename is a redraw, NOT a change of channel. Rebuilding the options moves a `select` to its
- * first entry unless the value is put back, and doing that to `#discord-channel` would silently
- * move the Discord view to a different channel because a name changed somewhere else.
- */
-function fillChannelSelect(id) {
-  if (id === "settings-channel") return channelSettings.fillSettingsSelect();
-  const select = el(id);
-  // Restore only an ID still present in the server's current channel list. Settings has its own
-  // picker and must not change the remembered reading destination merely by editing a channel.
-  // The bar's picker shows the selection (`navigation`), so its channel is the selection's.
-  const chosen = selectedChannelId() || storedActiveChannel();
-  select.replaceChildren();
-  const optionFor = (channel) => {
-    const option = document.createElement("option");
-    option.value = channel.id;
-    option.textContent = pickerName(channelName(channel));
-    return option;
-  };
-  // `#355 provider-grouped-channels`. The bar's picker groups its channels by service once two or
-  // more have channels; each group is an <optgroup>, so the open list has a header per service.
-  const grouped = channelsGrouped();
-  if (grouped) {
-    for (const group of channelGroups()) {
-      const header = document.createElement("optgroup");
-      // The attribute, not the property of that name: reading or writing a `label` property is
-      // what the server's `#39 channel-alias` guard counts, as a channel named past its alias.
-      header.setAttribute("label", group.heading);
-      header.append(...group.channels.map(optionFor));
-      select.append(header);
-    }
-  } else {
-    for (const channel of channelDirectory.channels()) select.append(optionFor(channel));
-  }
-  const order = grouped ? channelsInPickerOrder() : channelDirectory.channels();
-  const showing = order.some((channel) => String(channel.id) === String(chosen))
-      ? chosen
-      : order.length > 0
-        ? order[0].id
-        : "";
-  // The bar's picker is redrawn onto the selection, which this keeps on its channel or moves to the
-  // first: through its owner, whose picker then shows it.
-  selectionOwner().selectChannel(String(showing));
-  rememberActiveChannel();
-}
-
-/** Take the server's whole answer about the list: both pickers, the hidden list, the cache. */
-function adoptChannelList(payload) {
-  if (payload && Array.isArray(payload.channels)) channelDirectory.setChannels(payload.channels);
-  if (payload && Array.isArray(payload.hidden_channels)) channelDirectory.setHidden(payload.hidden_channels);
-  messageCache.saveCacheChannels();
-  channelSettings.fillServiceSelect();
-  fillChannelSelect("discord-channel");
-  fillChannelSelect("settings-channel");
-  channelSettings.renderHiddenChannels();
-}
 
 // --- browsing channels ---------------------------------------------------------------------
 //
