@@ -1,12 +1,13 @@
 ---
 title: 'menu-above-chips: a message menu and every row popover draw above the floating chips'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-11-10T17:31:33+00:00
-updated_at: 2026-11-10T17:31:33+00:00
+updated_at: 2026-11-10T21:01:59+00:00
+closed_at: 2026-11-10T21:01:59+00:00
 ---
 
 # Description
@@ -41,3 +42,7 @@ Owner reply 324, 2026-11-10. Prior-report search before filing:
 The earlier report therefore appears to have been made in chat and never filed as a tracked issue, so it had no number and no owner and was lost between page iterations. This issue files it now with an owner and a browser test that asserts topmost-ness directly, so a future chip change cannot silently cover the menu again.
 
 Coordination: this is not scroll code, so there is no wait on 1210. Lanes for 1210 and 1209 edit channel rows and keepers, and the mention-jump lane for owner reply 312 edits the jump path. Keep edits in CSS and the menu module where possible; rebase onto moved code if the touched lines have moved.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as a8707fe5 (ea1f1b8f and a8707fe5), deployed by the coordinator on the owner UI fast-track. One overlay scale in :root (chips, strip, pill, menu, modal, debug) governs every floating layer; the row ellipsis menu renders in the top layer while open and stays where it opened. The jump-to-unread chip landed meanwhile inside the chips container and stacks on the chips layer below the menu layer, as agreed. Browser walk menu-above-chips at 1280x800 and 393x852 asserts every menu item topmost at its centre over the chips row; documents-browser 5/5 solo passes (load cause: three concurrent browser gates).
