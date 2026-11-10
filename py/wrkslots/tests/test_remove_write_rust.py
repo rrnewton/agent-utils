@@ -192,7 +192,7 @@ def _rust_remove(root: Path, *, fixture: bool = True) -> subprocess.CompletedPro
     )
 
 
-def _python_remove(root: Path) -> int:
+def _python_remove(root: Path, *, no_lock_budget: bool = False) -> int:
     args = argparse.Namespace(
         project_root=str(root), machine=None, slot="slot-a",
         coordinator_authorized=False, validate_complete=False,
@@ -201,6 +201,7 @@ def _python_remove(root: Path) -> int:
         completed_record=None, attest_agent_stopped=None,
         attest_agent_never_started=None, attest_note=None,
         archive_drifted_checkouts=False, adopt_legacy_change=False, wait_lock=0.0,
+        no_lock_budget=no_lock_budget,
     )
     return wrkslots_cli._cmd_remove(args)
 

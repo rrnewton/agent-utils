@@ -1,10 +1,12 @@
 ---
 title: "state-home-refusal-test-budget: the reclaim state-home refusal test races the 60-second batch lock budget on a busy host"
-status: open
+status: closed
+assignee: mu-createlock
 priority: 2
 issue_type: bug
 created_at: 2026-11-10T03:50:00.000000000+00:00
-updated_at: 2026-11-10T03:50:00.000000000+00:00
+updated_at: 2026-11-10T03:53:57.000000000+00:00
+closed_at: 2026-11-10T03:53:57.000000000+00:00
 ---
 
 # Description
@@ -32,3 +34,25 @@ Keep one separate test asserting that the budget still applies when it is set.
 
 Found by mu-createlock while gating #1177 abort-create-clone-branches (2026-11-09). Same load-sensitive census
 family as #1084/#1102 and the census-under-load failures seen in other gates that night.
+
+## Resolution
+
+Delivered by mu-createlock (opus 5.5), tests only; the production budget
+(`_AGENT_REMOVE_BATCH_ITEM_SECONDS = 60.0`) is unchanged. Root cause, found
+while fixing: the test's home user was `sleep 60`. Under gate load the
+test's setup and pre-lock checks took more than 60 s, so `sleep` had exited
+before the state-home census ran; the census then found no user, remove went
+on, and the item budget ran out later (at `git rev-parse`, or at the /proc
+scan after the path fence). Remove makes no budget check before the
+state-home census, so the budget alone could not pre-empt it. The fix:
+the home user is now `sleep 3600`, killed in `finally`; the refusal test runs
+remove with `--no-lock-budget`, under a 1-second item budget and a state-home
+census slowed by 1.5 s (the host's ~48 s census against 60 s, scaled down),
+and still reaches the state-home refusal. A new test,
+`test_remove_refuses_when_a_slow_census_spends_the_lock_budget`, keeps the
+budget on: the same slowed census spends it, and default remove refuses with
+the documented "used its 1-second budget for work before deletion ...
+'wrkslots remove --no-lock-budget'" message, keeping the slot and its state
+home. The Rust edition's remove has the same state-home gate
+(`reclaim_state::prepare_reclaim`) but no item budget, and these tests drive
+only the Python edition.
