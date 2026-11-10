@@ -56343,6 +56343,14 @@ def test_an_older_client_keeps_working_beside_an_owner_release(tmp_path: Path) -
 # ---------------------------------------------------------------------------
 
 
+
+def unused_shared_walk(
+    targets: Sequence[Path], *, proc_root: Path = Path("/proc")
+) -> wrkslots._AgentBatchFreshCensus:
+    """A batch's shared /proc walk that saw no process (#1175), for tests about other evidence."""
+    return wrkslots._AgentBatchFreshCensus(frozenset(targets), (), proc_root)
+
+
 def dead_agent_batch_project(
     tmp_path: Path, count: int = 3
 ) -> tuple[Path, Path, list[str]]:
@@ -57403,8 +57411,9 @@ def test_remove_agent_batch_shares_lsof_before_the_fence_and_scans_proc_after_it
     assert len(shared_calls) == 1
     assert len(shared_calls[0]) == 3
     assert payload["shared_process_censuses"] == 1
-    # One fresh /proc scan per item, before its registry locks (#1108).
-    assert payload["fresh_process_scans"] == 3
+    # One /proc walk for all three items, taken with the shared lsof census and
+    # read by each item before its registry locks (#1108, #1175).
+    assert payload["fresh_process_scans"] == 1
 
 
 def single_remove(project: Path, slot: str, *extra: str) -> tuple[int, str]:
@@ -58079,6 +58088,7 @@ def test_shared_agent_census_makes_only_the_slot_an_lsof_warning_concerns_unobse
         "_agent_batch_fresh_use",
         lambda path, _record, *, capture_generation: fresh.append(path),
     )
+    monkeypatch.setattr(wrkslots, "_agent_batch_fresh_uses", unused_shared_walk)
     context.capture([first, second])
     assert context.censused == frozenset({second})
     with pytest.raises(
@@ -58677,6 +58687,7 @@ def test_remove_agent_batch_removes_disk_image_slots(
     # ordinary lsof check itself is covered with live holders elsewhere.
     # `#389 gate-flakes`.
     monkeypatch.setattr(wrkslots, "_agent_batch_fresh_use", unused_fresh_scan)
+    monkeypatch.setattr(wrkslots, "_agent_batch_fresh_uses", unused_shared_walk)
     monkeypatch.setattr(wrkslots, "_observe_slot_use_once", unused_lsof_check)
     try:
         made, _repository, slots = dead_agent_batch_project(tmp_path, count=2)
@@ -59037,6 +59048,7 @@ def test_remove_agent_batch_refuses_before_fencing_an_image_slot_whose_budget_ra
     # refuse this item past its own bound before the fence this test is
     # about.  `#389 gate-flakes`.
     monkeypatch.setattr(wrkslots, "_agent_batch_fresh_use", unused_fresh_scan)
+    monkeypatch.setattr(wrkslots, "_agent_batch_fresh_uses", unused_shared_walk)
     try:
         made, _repository, slots = dead_agent_batch_project(tmp_path, count=1)
         assert made == project
@@ -62558,6 +62570,7 @@ def test_agent_remove_runs_no_process_scan_under_the_registry_locks(
     for name in (
         "_capture_agent_remove_batch_census",
         "_agent_batch_fresh_use",
+        "_agent_batch_fresh_uses",
         "_agent_batch_fenced_use",
         "_lsof_slot_use",
         "_proc_generations",
@@ -62570,7 +62583,9 @@ def test_agent_remove_runs_no_process_scan_under_the_registry_locks(
     assert returncode == 0, stderr
     assert not checkout(project, "slot01").exists()
     names = [name for name, _held in scans]
-    assert names.count("_agent_batch_fresh_use") == 1, scans
+    # The shared walk answers the unlocked check; no per-slot walk runs (#1175).
+    assert names.count("_agent_batch_fresh_uses") == 1, scans
+    assert names.count("_agent_batch_fresh_use") == 0, scans
     assert "_agent_batch_fenced_use" in names, scans
     assert [scan for scan in scans if scan[1]] == [], scans
 

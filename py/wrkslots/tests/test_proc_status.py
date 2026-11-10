@@ -1931,3 +1931,115 @@ def test_census_unreadable_maps_follow_the_exit_and_lsof_rules(
         ]
     finally:
         child.wait()
+
+
+_CHROOT_ONLY_CHILD = """
+import os, sys, time
+slot, outside = sys.argv[1], sys.argv[2]
+away = os.open(outside, os.O_RDONLY)
+os.chroot(slot)
+os.fchdir(away)
+os.close(away)
+print("ready", flush=True)
+time.sleep(600)
+"""
+
+
+def _rooted_in(slot: _GoneSlot) -> subprocess.Popen[bytes] | None:
+    """A child whose only use of the slot is its root (chroot in its own user namespace)."""
+    child = subprocess.Popen(
+        ["unshare", "-r", sys.executable, "-c", _CHROOT_ONLY_CHILD, str(slot.slot),
+         str(slot.outside)],
+        cwd=slot.outside, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    assert child.stdout is not None
+    if child.stdout.readline().strip() != b"ready":
+        child.wait()
+        return None
+    return child
+
+
+def _fresh_verdict(
+    read: Callable[[], cli._LiveUseObservation | None],
+) -> tuple[str, int | None, str]:
+    try:
+        observation = read()
+    except cli.Refusal as exc:
+        return ("refused", None, str(exc))
+    if observation is None:
+        return ("unused", None, "")
+    return ("live", observation.pid, str(observation.refusal))
+
+
+def test_one_shared_walk_answers_every_slot_as_its_own_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1175 census-single-pass: the batch's one /proc walk equals one walk per slot.
+
+    Real children use six slots in every way the walk reads (working directory,
+    root, executable, descriptor, mapping, and the owner cgroup through the
+    record), a seventh slot is unused, and one listed process has exited.  The
+    walk reads a proc root that lists exactly those processes.  For each slot,
+    record and generation mode, the shared walk's lookup returns or raises
+    exactly what the slot's own `_agent_batch_fresh_use` does.
+    """
+
+    (tmp_path / "outside").mkdir()
+    outside = (tmp_path / "outside").resolve()
+
+    def slot(name: str) -> _GoneSlot:
+        (tmp_path / name).mkdir()
+        return _GoneSlot((tmp_path / name).resolve(), outside)
+
+    slots = {name: slot(name) for name in ("cwd", "root", "exe", "fd", "map", "free")}
+    children: list[subprocess.Popen[bytes]] = []
+    try:
+        children.append(_in_cwd(slots["cwd"]))
+        children.append(_running_from(slots["exe"]))
+        children.append(_holding_fd(slots["fd"]))
+        children.append(_mapping_only(slots["map"], "600"))
+        rooted = _rooted_in(slots["root"])
+        if rooted is not None:
+            children.append(rooted)
+        vanished = subprocess.Popen(["/bin/true"])
+        vanished.wait()
+        proc_root = tmp_path / "proc"
+        proc_root.mkdir()
+        for pid in [child.pid for child in children] + [vanished.pid]:
+            (proc_root / str(pid)).symlink_to(f"/proc/{pid}")
+        targets = [entry.slot for entry in slots.values()]
+        shared = cli._agent_batch_fresh_uses(targets, proc_root=proc_root)
+        # A record whose owner cgroup is evidence and is the children's cgroup.
+        own_cgroup = cli._read_process_cgroup(Path(f"/proc/{children[0].pid}"))
+        monkeypatch.setattr(cli, "_owner_cgroup_is_evidence", lambda record: record is not None)
+        owner = dataclasses.make_dataclass("Owner", [("cgroup_path", str)])(own_cgroup)
+        record_type = dataclasses.make_dataclass("Record", [("owner", object)])
+        records = [None, record_type(owner)]
+        verdicts: dict[str, str] = {}
+        for name, entry in slots.items():
+            for record in records:
+                for capture_generation in (False, True):
+                    def own() -> cli._LiveUseObservation | None:
+                        return cli._agent_batch_fresh_use(
+                            entry.slot, record,
+                            capture_generation=capture_generation, proc_root=proc_root,
+                        )
+
+                    def looked_up() -> cli._LiveUseObservation | None:
+                        return shared.lookup(
+                            entry.slot, record,
+                            capture_generation=capture_generation,
+                        )
+
+                    expected = _fresh_verdict(own)
+                    assert _fresh_verdict(looked_up) == expected, (name, record, capture_generation)
+                    if record is None:
+                        verdicts[name] = expected[0]
+        expected_verdicts = {"cwd": "live", "exe": "live", "fd": "live", "map": "live",
+                             "free": "unused", "root": "live" if rooted is not None else "unused"}
+        assert verdicts == expected_verdicts, verdicts
+    finally:
+        for child in children:
+            child.kill()
+            child.wait()

@@ -22284,7 +22284,11 @@ class _MountTableVerdicts:
     def uses(self, pid_dir: Path) -> list[str]:
         """Return ``pid_dir``'s mount uses of the slot, as `_process_mounts_slot`."""
 
-        mountinfo = _read_process_mountinfo(pid_dir)
+        return self.uses_in(_read_process_mountinfo(pid_dir), pid_dir)
+
+    def uses_in(self, mountinfo: str | None, pid_dir: Path) -> list[str]:
+        """`uses` for a mount table already read from ``pid_dir`` (#1175: one read, many slots)."""
+
         if mountinfo is None:
             return []
         digest = hashlib.sha256(
@@ -48696,6 +48700,310 @@ def _agent_batch_fresh_use(
     return None
 
 
+@dataclasses.dataclass(frozen=True)
+class _FreshWalkEntry:
+    """What one process showed a batch's shared /proc walk (#1175 census-single-pass).
+
+    ``cgroup`` is the process's cgroup, or None with ``cgroup_error`` (and
+    ``cgroup_gone`` when the process had exited) when it could not be read.
+    ``outcomes`` maps each target whose answer this process decided to the use
+    found (``cwd=...``, ``fd/N=...``, ``map=...``, ``mount=...``) or to the
+    refusal its read raised; ``first`` marks a refusal raised before the cgroup
+    is consulted (the ownership read), as the per-slot scan raises it.
+    """
+
+    pid: int
+    start_ticks: int | None
+    pid_dir: Path
+    cgroup: str | None
+    cgroup_error: Refusal | None
+    cgroup_gone: bool
+    outcomes: Mapping[Path, str | Refusal]
+    first: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class _AgentBatchFreshCensus:
+    """One /proc walk that answers `_agent_batch_fresh_use` for many slots (#1175).
+
+    ``lookup`` replays the walk for one slot and record and returns, or raises,
+    exactly what `_agent_batch_fresh_use` would have for that slot at the time
+    of the walk: the first owner-cgroup match or use or refusal in walk order.
+    """
+
+    targets: frozenset[Path]
+    entries: tuple[_FreshWalkEntry, ...]
+    proc_root: Path
+
+    def lookup(
+        self, slot_path: Path, record: ActiveRecord | None, *, capture_generation: bool
+    ) -> _LiveUseObservation | None:
+        if slot_path not in self.targets:
+            raise StateError(f"slot {slot_path} is not a target of this shared /proc walk")
+        owner_cgroup = (
+            record.owner.cgroup_path
+            if record is not None
+            and record.owner is not None
+            and _owner_cgroup_is_evidence(record)
+            else None
+        )
+        for entry in self.entries:
+            outcome = entry.outcomes.get(slot_path)
+            if entry.first:
+                if isinstance(outcome, Refusal):
+                    raise outcome
+                continue
+            if owner_cgroup is not None:
+                if entry.cgroup_error is not None:
+                    if entry.cgroup_gone:
+                        continue
+                    raise Refusal(
+                        f"recorded cgroup use is indeterminate for PID {entry.pid}: "
+                        f"{entry.cgroup_error}"
+                    ) from entry.cgroup_error
+                if entry.cgroup == owner_cgroup:
+                    raise Refusal(
+                        f"live process {entry.pid} remains in recorded owner cgroup "
+                        f"{entry.cgroup}"
+                    )
+            if outcome is None:
+                continue
+            if isinstance(outcome, Refusal):
+                raise outcome
+            refusal = Refusal(
+                f"live {_walked_process_label(entry.pid_dir)} uses slot {slot_path}: "
+                f"{outcome}; stop it and retry"
+            )
+            if not capture_generation:
+                raise refusal
+            return _LiveUseObservation(entry.pid, entry.start_ticks, self.proc_root, refusal)
+        return None
+
+
+def _agent_batch_fresh_uses(
+    targets: Sequence[Path], *, proc_root: Path = Path("/proc")
+) -> _AgentBatchFreshCensus:
+    """Walk /proc once for every target, as `_agent_batch_fresh_use` walks it for one (#1175).
+
+    The same readers and the same order: every process's ownership, cgroup,
+    mount table, cwd, root, exe, descriptors and mappings, then the surviving
+    threads of an exited leader, and one more listing for processes born
+    meanwhile.  Each entry is read once whatever the number of targets, and a
+    target stops collecting evidence at its first use or refusal, where the
+    per-slot scan stops.  A read that would raise in the per-slot scan becomes
+    that refusal for the targets still collecting; the cgroup is read for every
+    process, because whether it is evidence depends on the record the lookup
+    is made for.  The walk ends early once every target is decided.
+    """
+
+    bases = {target: str(target) for target in targets}
+    prefixes = {target: base + "/" for target, base in bases.items()}
+    slot_bytes = {
+        target: base.encode("utf-8", errors="surrogateescape")
+        for target, base in bases.items()
+    }
+    devices: dict[Path, int | None] = {}
+    for target in targets:
+        try:
+            devices[target] = os.stat(target).st_dev
+        except OSError:
+            devices[target] = None
+    verdicts = {target: _MountTableVerdicts(target) for target in targets}
+
+    def within(target: Path, link: str | None) -> bool:
+        return link is not None and (link == bases[target] or link.startswith(prefixes[target]))
+
+    try:
+        pid_dirs = [path for path in proc_root.iterdir() if path.name.isdigit()]
+    except OSError as exc:
+        raise Refusal(f"cannot inspect live processes: {exc}") from exc
+    _census_churn_for_test()
+    current_pid = os.getpid()
+    undecided: list[Path] = list(dict.fromkeys(targets))
+    entries: list[_FreshWalkEntry] = []
+    pending = sorted(pid_dirs, key=lambda item: int(item.name), reverse=True)
+    follower = _ListingFollower(proc_root)
+
+    def relist() -> list[Path]:
+        try:
+            return follower.relist()
+        except Refusal as exc:
+            entries.append(_FreshWalkEntry(
+                -1, None, proc_root, None, None, True,
+                dict.fromkeys(undecided, exc), first=True,
+            ))
+            undecided.clear()
+            return []
+
+    while undecided and (pending or (pending := relist())):
+        pid_dir = pending.pop()
+        follower.visit(pid_dir)
+        pid = int(pid_dir.name)
+        if pid == current_pid:
+            continue
+        try:
+            generation = _read_process_stat(pid_dir)
+        except Refusal:
+            generation = None
+        start_ticks = None if generation is None else generation.start_ticks
+        try:
+            uids = _census_process_uids(pid_dir)
+        except Refusal as exc:
+            entries.append(_FreshWalkEntry(
+                pid, start_ticks, pid_dir, None, None, True,
+                dict.fromkeys(undecided, exc), first=True,
+            ))
+            undecided.clear()
+            break
+        if uids is None:
+            continue
+        cgroup: str | None = None
+        cgroup_error: Refusal | None = None
+        cgroup_gone = False
+        try:
+            cgroup = _read_process_cgroup(pid_dir)
+        except Refusal as exc:
+            cgroup_error = exc
+            cgroup_gone = not pid_dir.exists()
+        outcomes: dict[Path, str | Refusal] = {}
+        gone: list[tuple[Path, OSError]] = []
+
+        def collecting() -> list[Path]:
+            return [target for target in undecided if target not in outcomes]
+
+        try:
+            mountinfo = _read_process_mountinfo(pid_dir)
+        except Refusal as exc:
+            outcomes.update(dict.fromkeys(undecided, exc))
+            mountinfo = None
+        for target in collecting():
+            try:
+                mounts = verdicts[target].uses_in(mountinfo, pid_dir)
+            except Refusal as exc:
+                outcomes[target] = exc
+                continue
+            if mounts:
+                outcomes[target] = mounts[0]
+        for name in ("cwd", "root", "exe"):
+            if not collecting():
+                break
+            _fresh_link_outcomes(
+                pid_dir / name, name, collecting(), devices, within, outcomes, gone
+            )
+        if collecting():
+            fd_dir = pid_dir / "fd"
+            try:
+                descriptors = os.listdir(fd_dir)
+            except OSError as exc:
+                if exc.errno not in (errno.ENOENT, errno.ESRCH, errno.EACCES, errno.EPERM):
+                    refusal = Refusal(
+                        f"process use is indeterminate because {fd_dir} cannot be read: {exc}"
+                    )
+                    refusal.__cause__ = exc
+                    outcomes.update(dict.fromkeys(collecting(), refusal))
+                if exc.errno in _PROCESS_GONE_ERRNOS:
+                    gone.append((fd_dir, exc))
+                descriptors = []
+            for descriptor in descriptors:
+                if not collecting():
+                    break
+                _fresh_link_outcomes(
+                    fd_dir / descriptor, f"fd/{descriptor}", collecting(), devices, within,
+                    outcomes, gone,
+                )
+        if collecting():
+            maps_path = pid_dir / "maps"
+            try:
+                maps = maps_path.read_bytes()
+            except OSError as exc:
+                if exc.errno not in (errno.ENOENT, errno.ESRCH, errno.EACCES, errno.EPERM):
+                    refusal = Refusal(
+                        f"process use is indeterminate because {maps_path} cannot be read: {exc}"
+                    )
+                    refusal.__cause__ = exc
+                    outcomes.update(dict.fromkeys(collecting(), refusal))
+                if exc.errno in _PROCESS_GONE_ERRNOS:
+                    gone.append((maps_path, exc))
+                maps = b""
+            for target in collecting():
+                if slot_bytes[target] not in maps:
+                    continue
+                for line in maps.split(b"\n"):
+                    if slot_bytes[target] not in line:
+                        continue
+                    fields = line.split(maxsplit=5)
+                    if len(fields) != 6:
+                        continue
+                    mapped = fields[5].decode(
+                        "utf-8", errors="surrogateescape"
+                    ).removesuffix(" (deleted)")
+                    if within(target, os.path.normpath(mapped) if mapped.startswith("/") else None):
+                        outcomes[target] = f"map={mapped}"
+                        break
+        _note_process_gone(pid_dir, gone)
+        entries.append(_FreshWalkEntry(
+            pid, start_ticks, pid_dir, cgroup, cgroup_error, cgroup_gone, outcomes
+        ))
+        undecided[:] = [target for target in undecided if target not in outcomes]
+        if not undecided:
+            break
+        # Read after the process's own entries, so a leader that exited while
+        # they were read, and so showed nothing, still has its threads walked.
+        try:
+            pending.extend(reversed(_walked_zombie_leader_threads(pid_dir)))
+        except Refusal as exc:
+            entries.append(_FreshWalkEntry(
+                pid, start_ticks, pid_dir, cgroup, cgroup_error, cgroup_gone,
+                dict.fromkeys(undecided, exc), first=True,
+            ))
+            undecided.clear()
+    return _AgentBatchFreshCensus(frozenset(targets), tuple(entries), proc_root)
+
+
+def _fresh_link_outcomes(
+    path: Path,
+    label: str,
+    collecting: Sequence[Path],
+    devices: Mapping[Path, int | None],
+    within: Callable[[Path, str | None], bool],
+    outcomes: dict[Path, str | Refusal],
+    gone: list[tuple[Path, OSError]],
+) -> None:
+    """Read one /proc link once and record it as a use for each collecting target inside it.
+
+    A failed read is judged per target by `_readable_link_target`, whose device
+    and too-long-link proofs depend on the slot; the link is read again for
+    that, which only happens on errors other than exit or permission.
+    """
+
+    try:
+        raw = os.readlink(path)
+    except OSError as exc:
+        if exc.errno in _PROCESS_GONE_ERRNOS:
+            gone.append((path, exc))
+        if exc.errno in (errno.ENOENT, errno.ESRCH, errno.EINVAL, errno.EACCES, errno.EPERM):
+            return
+        for target in collecting:
+            try:
+                link = _readable_link_target(path, devices[target], target)
+            except Refusal as refusal:
+                outcomes[target] = refusal
+                continue
+            if within(target, link):
+                outcomes[target] = f"{label}={link}"
+        return
+    raw = raw.removesuffix(" (deleted)")
+    if not raw.startswith("/"):
+        return
+    link = os.path.normpath(raw)
+    for target in collecting:
+        if within(target, link):
+            outcomes[target] = f"{label}={link}"
+
+
+_AT_STATX_DONT_SYNC = 0x4000
+
+
 _AT_STATX_DONT_SYNC = 0x4000
 _STATX_TYPE = 0x1
 _STATX_INO = 0x100
@@ -49270,8 +49578,9 @@ class _AgentRemoveBatchContext:
     """The process-use evidence and item budget of one agent removal batch.
 
     Before an item takes the registry locks, ``observe_unlocked`` checks its
-    unfenced slot path against the shared lsof scan and runs a fresh /proc
-    scan; under the locks, ``observe`` serves the use checks before the path
+    unfenced slot path against the shared lsof scan and against the shared
+    /proc walk taken right after it (``fresh``, #1175 census-single-pass);
+    under the locks, ``observe`` serves the use checks before the path
     fence from that evidence and runs no scan (#1108
     remove-lock-hold-starves-validate).  After the fence, ``observe_fenced`` serves the checks that guard deletion
     with one /proc scan that compares identities with the fenced tree, and
@@ -49323,6 +49632,14 @@ class _AgentRemoveBatchContext:
     shared_census_seconds: float = 0.0
     fresh_scan_count: int = 0
     fresh_scan_seconds: float = 0.0
+    # One /proc walk for every target, taken with each shared lsof census
+    # (#1175 census-single-pass); None when it could not be taken, and each
+    # item then walks /proc itself.  ``fresh_served`` names the targets it
+    # has answered: a second check of the same target in one capture (after
+    # waiting for a holder to exit) walks /proc afresh.
+    fresh: _AgentBatchFreshCensus | None = None
+    fresh_served: set[Path] = dataclasses.field(default_factory=set)
+    fresh_walk_error: str | None = None
     unlocked_records: dict[Path, ActiveRecord] = dataclasses.field(default_factory=dict)
     fenced_scan_count: int = 0
     fenced_scan_seconds: float = 0.0
@@ -49371,7 +49688,39 @@ class _AgentRemoveBatchContext:
             and _directory_identity(target) == self.identities[target]
         )
         self.captured_at = time.monotonic()
+        self._capture_fresh_walk()
         _interrupt_for_test("after-agent-batch-shared-census")
+
+    def _capture_fresh_walk(self) -> None:
+        """Walk /proc once for every censused target, right after the shared lsof (#1175).
+
+        Before this, each item walked the whole host itself just before its
+        locks, which made a batch of N slots N walks.  The walk is an
+        optimisation: when it cannot be taken, each item walks for itself as
+        before, and the decisive scan after each fence is unchanged.
+        """
+
+        self.fresh = None
+        self.fresh_served = set()
+        targets = sorted(self.censused)
+        if not targets:
+            return
+        started = time.monotonic()
+        self.fresh_scan_count += 1
+        try:
+            self.fresh = _run_bounded_scan(
+                lambda _cancel: _agent_batch_fresh_uses(targets),
+                seconds=_AGENT_REMOVE_BATCH_SCAN_SECONDS,
+                on_timeout=lambda: Refusal(
+                    "the shared /proc walk exceeded its "
+                    f"{_AGENT_REMOVE_BATCH_SCAN_SECONDS:g}-second bound"
+                ),
+            )
+            self.fresh_walk_error = None
+        except Refusal as exc:
+            self.fresh_walk_error = str(exc)
+        finally:
+            self.fresh_scan_seconds += time.monotonic() - started
 
     def _assert_shared_evidence(self, check_path: Path, canonical_path: Path) -> None:
         if check_path != canonical_path:
@@ -49407,14 +49756,24 @@ class _AgentRemoveBatchContext:
     ) -> _LiveUseObservation | None:
         """Check an item's unfenced slot before the registry locks are taken.
 
-        The shared lsof evidence, then one fresh /proc scan for use that
-        began after it.  This is an early refusal with the ordinary messages,
-        made outside the locks because they protect the registry record, not
-        process use; the decisive check is the scan after the path fence
-        (see _remove_unlocked_use_pass).
+        The shared lsof evidence, then the /proc walk taken right after it
+        for every target (#1175), or one fresh /proc scan of this slot when
+        that walk is missing or already answered for it.  This is an early
+        refusal with the ordinary messages, made outside the locks because
+        they protect the registry record, not process use; the decisive check
+        is the scan after the path fence (see _remove_unlocked_use_pass).
         """
 
         self._assert_shared_evidence(check_path, canonical_path)
+        if (
+            self.fresh is not None
+            and canonical_path in self.fresh.targets
+            and canonical_path not in self.fresh_served
+        ):
+            self.fresh_served.add(canonical_path)
+            return self.fresh.lookup(
+                check_path, record, capture_generation=capture_generation
+            )
         started = time.monotonic()
         self.fresh_scan_count += 1
         try:
@@ -49594,8 +49953,8 @@ def _single_remove_agent_batch(
     slot: on a 33 GB slot of 68,888 entries, at load average about 260,
     one run took 9 to 18 seconds.  A batch of one
     instead runs that single ``lsof +D`` here, before the lock is taken, and
-    uses remove-agent-batch's checks: a fresh /proc scan, also before the lock
-    (#1108); under the lock, before the path fence, a check that the slot
+    uses remove-agent-batch's checks: a /proc scan, also before the lock
+    (#1108; the batch's shared walk, #1175); under the lock, before the path fence, a check that the slot
     directory is the one lsof covered; after the fence, the /proc scan that compares identities with
     the fenced tree, which falls back to the ordinary lsof check only when it
     cannot decide.  The item budget (_AGENT_REMOVE_BATCH_ITEM_SECONDS) bounds
@@ -73429,14 +73788,14 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "the exact owner that still applies, or the owner-consented handoff exception) "
             "and the same per-slot checks: registered liveness, handoff read, Git "
             "salvage to the recorded remote with read-back, path fence, and archive. "
-            "Only the lsof part of the process-use check is shared, and only before the "
-            "path fence: one lsof scan covers every requested slot, runs before any "
-            "registry lock is taken, and is repeated when it is older than "
+            "Only the process-use checks before the path fence are shared: one lsof scan "
+            "and, right after it, one reading of /proc cover every requested slot, run "
+            "before any registry lock is taken, and are repeated when they are older than "
             f"{_AGENT_REMOVE_BATCH_CENSUS_MAX_AGE_SECONDS:.0f} seconds. At each process-use "
             "check before the fence, the batch confirms the slot directory is the one that "
             "scan covered, refuses on any use that scan saw or any lsof warning that may "
-            "concern the slot, and scans /proc afresh for path, mapping, mount, and "
-            "owner-cgroup use. Nothing is deleted before the fence. Each process-use check "
+            "concern the slot, and looks up path, mapping, mount, and owner-cgroup use in "
+            "the shared /proc reading. Nothing is deleted before the fence. Each process-use check "
             "after it scans /proc once, comparing every process's working directory, root, "
             "executable, open files, and mappings with the fenced tree by path and by "
             "device and inode; when that scan cannot decide (for example, the tree spans "
