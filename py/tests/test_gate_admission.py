@@ -865,8 +865,8 @@ def test_concurrent_admission_mixed_versions_never_exceeds_the_cap(tmp_path: Pat
 
     def old_client() -> object:
         client = gate.Admission(root, 2)
-        client.tickets = legacy_tickets  # type: ignore[attr-defined, method-assign]
-        client.grant_blockers = legacy_blockers_for(client)  # type: ignore[attr-defined, method-assign]
+        client.tickets = legacy_tickets
+        client.grant_blockers = legacy_blockers_for(client)
         return client
     for index in range(6):
         extra: dict[str, object] = (
