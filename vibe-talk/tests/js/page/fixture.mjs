@@ -5171,6 +5171,7 @@ const TUNING_BANDS = {
   ID_CHARS: [32, 512, "chars of an element or focus id kept in one trace entry"],
   ANCHOR_ID_CHARS: [64, 1024, "chars of the reading anchor's id kept in one trace entry"],
   STACK_CHARS: [128, 4096, "chars of one write's stack kept in one trace entry"],
+  FOLLOW_REST_PX: [4, 20, "px above the rows' foot that still counts as resting on it for follow"],
   KEYBOARD_MIN_PX: [100, 220,
     "the least height an on-screen keyboard takes from the viewport before the page hides both bars for it: " +
     "lower takes a browser's toolbar sliding away, or a hardware keyboard's accessory strip, for a keyboard " +

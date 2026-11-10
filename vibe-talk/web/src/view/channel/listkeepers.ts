@@ -304,7 +304,7 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
     const note = (foot: boolean, context: string): void => {
       footing = { foot, width: area.clientWidth, height: area.clientHeight, context };
     };
-    note(area.scrollTop > 0 && atBottom(area), contextOf());
+    note(area.scrollTop > 0 && atBottom(area, FOLLOW_REST_PX), contextOf());
     for (const type of ["touchstart", "pointerdown", "wheel"]) {
       listen(area, type, () => { readerScrolled = true; }, { capture: true, passive: true });
     }
@@ -316,7 +316,7 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
       const reveal = !readerScrolled && Date.now() - typedAt < 150;
       readerScrolled = false;
       if (reveal && footing && !footing.foot) return;
-      note(area.scrollTop > 0 && atBottom(area), footing ? footing.context : contextOf());
+      note(area.scrollTop > 0 && atBottom(area, FOLLOW_REST_PX), footing ? footing.context : contextOf());
     }, { passive: true });
     mainFollowNow = () => footing !== null && footing.foot;
     const free = () => screens.screen() === "main" && screens.view() === "discord" && writingIn(area)
