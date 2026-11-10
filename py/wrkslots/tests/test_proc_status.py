@@ -5,13 +5,18 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import errno
+import json
 import re
 import os
 import selectors
 import shutil
 import signal
+import socket
+import stat
+import struct
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -20,7 +25,7 @@ from typing import Literal, TextIO, TypedDict, cast
 
 import pytest
 
-from wrkslots import cli
+from wrkslots import cli, sockdiag
 
 
 def scripted_status(
@@ -2228,3 +2233,700 @@ def test_seal_through_a_bind_mount_point_seals_the_mounted_root(tmp_path: Path) 
         pytest.skip(f"no unprivileged mount namespace here: {run.stderr.strip()}")
     assert run.returncode == 0, run.stderr
     assert run.stdout.split() == ["0o0", "0o0", "0o755"]
+
+
+# --- #1230 socket-liveness-proof -------------------------------------------------------------
+
+_SEQ, _PORT = 77, 4242
+
+
+def _nl(kind: int, flags: int, body: bytes = b"", *, seq: int = _SEQ, port: int = _PORT) -> bytes:
+    length = 16 + len(body)
+    return struct.pack("=IHHII", length, kind, flags, seq, port) + body + b"\0" * (-length % 4)
+
+
+def _nlattr(kind: int, payload: bytes) -> bytes:
+    length = 4 + len(payload)
+    return struct.pack("=HH", length, kind) + payload + b"\0" * (-length % 4)
+
+
+def _udiag(
+    ino: int, *, vfs: tuple[int, int] | None = None, name: bytes | None = None,
+    family: int = socket.AF_UNIX, extra: bytes = b"",
+) -> bytes:
+    body = struct.pack("=BBBBI2I", family, socket.SOCK_STREAM, 7, 0, ino, 5, 0)
+    if name is not None:
+        body += _nlattr(sockdiag.UNIX_DIAG_NAME, name)
+    if vfs is not None:
+        body += _nlattr(sockdiag.UNIX_DIAG_VFS, struct.pack("=II", *vfs))
+    return body + extra
+
+
+def _rec(ino: int, **kwargs: object) -> bytes:
+    return _nl(sockdiag.SOCK_DIAG_BY_FAMILY, 2, _udiag(ino, **kwargs))  # type: ignore[arg-type]
+
+
+def _done(status: int = 0) -> bytes:
+    return _nl(sockdiag.NLMSG_DONE, 2, struct.pack("=i", status))
+
+
+def _chunk(*messages: bytes, flags: int = 0, sender: tuple[int, int] = (0, 0)) -> tuple[bytes, int, tuple[int, int]]:
+    return (b"".join(messages), flags, sender)
+
+
+def test_sockdiag_parses_a_clean_multipart_dump() -> None:
+    sockets, total = sockdiag.parse_dump(
+        [_chunk(_rec(10, vfs=(5, 99), name=b"/x")), _chunk(_rec(11), _done())],
+        seq=_SEQ, port=_PORT,
+    )
+    assert [(item.sockfs_ino, item.vfs, item.name) for item in sockets] == [
+        (10, (5, 99), b"/x"), (11, None, None),
+    ]
+    assert total > 0
+
+
+@pytest.mark.parametrize(
+    ("chunks", "reason"),
+    [
+        ([_chunk(_rec(1))], "without NLMSG_DONE"),
+        ([_chunk(_nl(sockdiag.SOCK_DIAG_BY_FAMILY, 2 | sockdiag.NLM_F_DUMP_INTR, _udiag(1)), _done())], "interrupted"),
+        ([_chunk(_nl(sockdiag.NLMSG_ERROR, 0, struct.pack("=i", -1)))], "refused with error 1"),
+        ([_chunk(_nl(sockdiag.SOCK_DIAG_BY_FAMILY, 2, _udiag(1), seq=_SEQ + 1), _done())], "sequence"),
+        ([_chunk(_nl(sockdiag.SOCK_DIAG_BY_FAMILY, 2, _udiag(1), port=_PORT + 1), _done())], "port"),
+        ([_chunk(_rec(1), _done(), sender=(99, 0))], "not the kernel"),
+        ([_chunk(_rec(1), _done(), sender=(0, 1))], "not the kernel"),
+        ([_chunk(_rec(1), _done(), flags=socket.MSG_TRUNC)], "MSG_TRUNC"),
+        ([_chunk(_nl(sockdiag.SOCK_DIAG_BY_FAMILY, 2, _udiag(1, extra=struct.pack("=HH", 64, 1))), _done())], "overruns its record"),
+        ([_chunk(_rec(1, vfs=(1, 2), extra=_nlattr(sockdiag.UNIX_DIAG_VFS, b"\0" * 8)), _done())], "malformed UNIX_DIAG_VFS"),
+        ([_chunk(_nl(sockdiag.SOCK_DIAG_BY_FAMILY, 2, _udiag(1, extra=_nlattr(sockdiag.UNIX_DIAG_VFS, b"\0" * 4))), _done())], "malformed UNIX_DIAG_VFS"),
+        ([_chunk(_nl(sockdiag.SOCK_DIAG_BY_FAMILY, 2, b"\1\1")), _done()], "shorter than its header"),
+        ([_chunk(_rec(1, family=socket.AF_INET), _done())], "family"),
+        ([_chunk(_rec(1), _done(-5))], "ended with error 5"),
+        ([_chunk(_rec(1), _done(), _rec(2))], "data after NLMSG_DONE"),
+        ([_chunk(_rec(1), _done()), _chunk(_rec(2))], "data after NLMSG_DONE"),
+        ([_chunk(_nl(99, 2, b""), _done())], "unexpected netlink message type 99"),
+        ([_chunk(_rec(1)[:-4]), _chunk(_done())], "overruns its datagram"),
+        ([_chunk(struct.pack("=IHHII", 400, 20, 2, _SEQ, _PORT))], "overruns its datagram"),
+        ([_chunk(b"\0" * 8)], "truncated netlink message header"),
+    ],
+)
+def test_sockdiag_refuses_an_unauthenticated_or_incomplete_dump(
+    chunks: list[tuple[bytes, int, tuple[int, int]]], reason: str,
+) -> None:
+    with pytest.raises(sockdiag.DumpError, match=reason):
+        sockdiag.parse_dump(chunks, seq=_SEQ, port=_PORT)
+
+
+def test_sockdiag_refuses_a_dump_beyond_its_record_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sockdiag, "DUMP_RECORD_LIMIT", 1)
+    with pytest.raises(sockdiag.DumpError, match="record limit"):
+        sockdiag.parse_dump([_chunk(_rec(1), _rec(2), _done())], seq=_SEQ, port=_PORT)
+
+
+class _ScriptedTransport(sockdiag.Transport):
+    """A netlink peer that answers the request with scripted datagrams."""
+
+    def __init__(self, replies: Callable[[int], list[tuple[bytes, int, tuple[int, int]]]]) -> None:
+        self.replies = replies
+        self.pending: list[tuple[bytes, int, tuple[int, int]]] = []
+
+    def port(self) -> int:
+        return _PORT
+
+    def send(self, data: bytes) -> None:
+        seq = struct.unpack_from("=IHHII", data)[3]
+        self.pending = self.replies(seq)
+
+    def recv(self) -> tuple[bytes, int, tuple[int, int]]:
+        if not self.pending:
+            raise TimeoutError("no reply")
+        return self.pending.pop(0)
+
+    def close(self) -> None:
+        pass
+
+
+def test_sockdiag_dump_uses_its_own_random_sequence_and_refuses_a_stale_reply() -> None:
+    def good(seq: int) -> list[tuple[bytes, int, tuple[int, int]]]:
+        return [_chunk(_nl(20, 2, _udiag(3, vfs=(9, 8)), seq=seq), _nl(3, 2, b"\0" * 4, seq=seq))]
+
+    dump = sockdiag.dump_own_namespace(
+        deadline=time.monotonic() + 5, transport_factory=lambda _t: _ScriptedTransport(good)
+    )
+    assert [item.vfs for item in dump.sockets] == [(9, 8)]
+    with pytest.raises(sockdiag.DumpError, match="sequence"):
+        sockdiag.dump_own_namespace(
+            deadline=time.monotonic() + 5,
+            transport_factory=lambda _t: _ScriptedTransport(lambda seq: good(seq + 1)),
+        )
+    with pytest.raises(sockdiag.DumpError, match="timed out before NLMSG_DONE"):
+        sockdiag.dump_own_namespace(
+            deadline=time.monotonic() + 5,
+            transport_factory=lambda _t: _ScriptedTransport(lambda seq: good(seq)[:0] + [_chunk(_nl(20, 2, _udiag(1), seq=seq))]),
+        )
+
+
+def _synthetic_node(root: Path, ino: int, dev: int = 50) -> cli._SocketNode:
+    return cli._SocketNode(root / "node", root, "slot", dev, ino, 1, stat.S_IFSOCK | 0o755, (1, 2))
+
+
+def _synthetic_evidence(
+    *sockets: sockdiag.UnixSocket,
+    unenterable: dict[int, str] | None = None,
+    representatives: dict[int, list[int]] | None = None,
+    gaps: Sequence[str] = (),
+) -> cli._SocketEvidence:
+    dump = sockdiag.Dump(1, tuple(sockets), len(sockets), 0, 0.0)
+    return cli._SocketEvidence(
+        {1: dump}, dict(unenterable or {}), dict(representatives or {}), list(gaps), 0.0
+    )
+
+
+def _bound(ino: int, vfs: tuple[int, int] | None) -> sockdiag.UnixSocket:
+    return sockdiag.UnixSocket(ino, 0, socket.SOCK_STREAM, 7, vfs, None, None)
+
+
+def test_judge_treats_a_low32_inode_match_as_a_candidate_never_a_nonmatch(tmp_path: Path) -> None:
+    node = _synthetic_node(tmp_path, (3 << 32) | 7)
+    calls: list[cli._SocketNode] = []
+
+    def calibrate(seen: cli._SocketNode) -> int | None:
+        calls.append(seen)
+        return 900
+
+    live = cli._judge_socket_nodes([node], _synthetic_evidence(_bound(1, (7, 900))), calibrate=calibrate)
+    assert [verdict.verdict for verdict in live] == ["LIVE"] and calls == [node]
+    other_device = cli._judge_socket_nodes([node], _synthetic_evidence(_bound(1, (7, 901))), calibrate=calibrate)
+    assert [verdict.verdict for verdict in other_device] == ["NO-OWNER-EVIDENCE"]
+
+
+@pytest.mark.parametrize("calibration", ["skipped", "failed"])
+def test_judge_without_a_calibrated_device_leaves_a_candidate_unknown(tmp_path: Path, calibration: str) -> None:
+    node = _synthetic_node(tmp_path, 7)
+    verdicts = cli._judge_socket_nodes(
+        [node], _synthetic_evidence(_bound(1, (7, 900))),
+        calibrate=None if calibration == "skipped" else (lambda _n: None),
+    )
+    assert [verdict.verdict for verdict in verdicts] == ["UNKNOWN"]
+    assert "could not be calibrated" in verdicts[0].reason
+
+
+def test_judge_calibrates_only_on_a_candidate(tmp_path: Path) -> None:
+    calls: list[cli._SocketNode] = []
+
+    def calibrate(node: cli._SocketNode) -> int | None:
+        calls.append(node)
+        return 900
+
+    verdicts = cli._judge_socket_nodes(
+        [_synthetic_node(tmp_path, 7)], _synthetic_evidence(_bound(1, (8, 900)), _bound(2, None)),
+        calibrate=calibrate,
+    )
+    assert [verdict.verdict for verdict in verdicts] == ["NO-OWNER-EVIDENCE"] and calls == []
+
+
+def test_judge_names_every_visibility_gap_as_unknown(tmp_path: Path) -> None:
+    verdicts = cli._judge_socket_nodes(
+        [_synthetic_node(tmp_path, 7)],
+        _synthetic_evidence(gaps=["process 9's network namespace cannot be read", "another"]),
+        calibrate=None,
+    )
+    assert verdicts[0].verdict == "UNKNOWN"
+    assert verdicts[0].reason == "process 9's network namespace cannot be read (and 1 more visibility gaps)"
+
+
+def test_judge_unenterable_namespace_proves_live_by_name_but_never_dead(tmp_path: Path) -> None:
+    node = _synthetic_node(tmp_path, 7)
+    evidence = _synthetic_evidence(unenterable={5: "EPERM"}, representatives={5: [123]})
+    header = b"Num       RefCount Protocol Flags    Type St Inode Path\n"
+
+    def table(listing: bytes | None) -> Callable[[int], bytes | None]:
+        return lambda pid: listing if pid == 123 else None
+
+    named = header + b"0000000000000000: 00000002 00000000 00000000 0001 01 4242 " + str(node.path).encode() + b"\n"
+    assert cli._judge_socket_nodes([node], evidence, calibrate=None, table_reader=table(named))[0].verdict == "LIVE"
+    other = header + b"0000000000000000: 00000002 00000000 00000000 0001 01 4242 /elsewhere\n"
+    for listing in (other, None):
+        verdict = cli._judge_socket_nodes([node], evidence, calibrate=None, table_reader=table(listing))[0]
+        assert verdict.verdict == "UNKNOWN", listing
+        assert "cannot be entered" in verdict.reason or "cannot be read" in verdict.reason
+
+
+@contextlib.contextmanager
+def _bound_socket(path: Path, kind: int = socket.SOCK_STREAM, *, listen: bool = False) -> Iterator[socket.socket]:
+    sock = socket.socket(socket.AF_UNIX, kind)
+    try:
+        sock.bind(str(path))
+        if listen:
+            sock.listen()
+        yield sock
+    finally:
+        sock.close()
+
+
+def _dead_node(path: Path) -> None:
+    with _bound_socket(path):
+        pass
+
+
+def _only_node(root: Path) -> cli._SocketNode:
+    nodes = cli._socket_node_inventory({root: "slot"})
+    assert len(nodes) == 1
+    return nodes[0]
+
+
+@pytest.mark.parametrize(
+    ("kind", "listen", "expected"),
+    [
+        (socket.SOCK_STREAM, True, "listening"),
+        (socket.SOCK_STREAM, False, "a seqpacket connect() found a bound socket of another type"),
+        (socket.SOCK_SEQPACKET, False, "a stream connect() found a bound socket of another type"),
+        (socket.SOCK_SEQPACKET, True, "a stream connect() found a bound socket of another type"),
+        (socket.SOCK_DGRAM, False, "a stream connect() found a bound socket of another type"),
+    ],
+)
+def test_probe_finds_every_bound_socket_type(tmp_path: Path, kind: int, listen: bool, expected: str) -> None:
+    with _bound_socket(tmp_path / "s", kind, listen=listen):
+        outcome, detail = cli._probe_socket_node(_only_node(tmp_path))
+    assert outcome == "LIVE" and expected in detail
+
+
+def test_probe_refuses_only_a_node_no_socket_is_bound_to(tmp_path: Path) -> None:
+    _dead_node(tmp_path / "s")
+    assert cli._probe_socket_node(_only_node(tmp_path))[0] == "REFUSED"
+
+
+def test_probe_needs_the_parent_unchanged_across_the_whole_proof(tmp_path: Path) -> None:
+    _dead_node(tmp_path / "s")
+    node = _only_node(tmp_path)
+    parent_ctimes: dict[tuple[int, int], int] = {}
+    assert cli._probe_socket_node(node, parent_ctimes)[0] == "REFUSED"
+    time.sleep(0.01)
+    (tmp_path / "sibling").write_bytes(b"")
+    outcome, detail = cli._probe_socket_node(node, parent_ctimes)
+    assert outcome == "UNKNOWN" and "directory was replaced or changed" in detail
+
+
+@pytest.mark.parametrize("change", ["unlinked", "rebound", "replaced-by-file", "parent-replaced", "ctime"])
+def test_probe_never_refuses_a_changed_node(tmp_path: Path, change: str) -> None:
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    _dead_node(tree / "s")
+    node = _only_node(tree)
+    (tree / "s").unlink()
+    if change == "rebound":
+        with _bound_socket(tree / "s"):
+            outcome = cli._probe_socket_node(node)[0]
+    else:
+        if change == "replaced-by-file":
+            (tree / "s").write_bytes(b"")
+        elif change == "ctime":
+            _dead_node(tree / "s")
+            node = dataclasses.replace(_only_node(tree), ctime_ns=node.ctime_ns - 1)
+        elif change == "parent-replaced":
+            tree.rename(tmp_path / "old")
+            tree.mkdir()
+            _dead_node(tree / "s")
+        outcome = cli._probe_socket_node(node)[0]
+    assert outcome == ("DISAPPEARED" if change == "unlinked" else "UNKNOWN")
+
+
+@pytest.fixture
+def socket_world(monkeypatch: pytest.MonkeyPatch) -> set[int]:
+    """Only these PIDs count as same-UID processes, so host load cannot add gaps."""
+
+    allowed = {os.getpid()}
+    original = cli._process_uids
+    monkeypatch.setattr(
+        cli, "_process_uids",
+        lambda pid_dir: original(pid_dir) if pid_dir.name.isdigit() and int(pid_dir.name) in allowed else None,
+    )
+    return allowed
+
+
+def _prove(root: Path, *, probe: bool = True) -> list[cli._SocketVerdict]:
+    verdicts, _evidence = cli._prove_socket_nodes(
+        {root: "slot"}, deadline=time.monotonic() + 60, probe=probe, allow_calibration=True,
+    )
+    return verdicts
+
+
+def test_proof_calls_a_stale_node_dead_only_with_the_probe(tmp_path: Path, socket_world: set[int]) -> None:
+    _dead_node(tmp_path / "s")
+    assert [verdict.verdict for verdict in _prove(tmp_path, probe=False)] == ["NO-OWNER-EVIDENCE"]
+    dead = _prove(tmp_path)
+    assert [(verdict.verdict, verdict.evidence) for verdict in dead] == [("DEAD", "active")]
+    assert "refused before and after the second dump" in dead[0].reason
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["s"]
+
+
+@pytest.mark.parametrize("dump_evidence", [True, False])
+def test_proof_bound_stream_socket_that_refuses_connect_is_live(
+    tmp_path: Path, socket_world: set[int], monkeypatch: pytest.MonkeyPatch, dump_evidence: bool,
+) -> None:
+    if not dump_evidence:
+        # The dump can skip a live socket; the dual-type probe still finds it.
+        monkeypatch.setattr(cli._SocketEvidence, "bound", lambda _self: {})
+    with _bound_socket(tmp_path / "s"):
+        verdicts = _prove(tmp_path)
+    assert [verdict.verdict for verdict in verdicts] == ["LIVE"]
+    assert ("bound to this node's identity" if dump_evidence else "another type") in verdicts[0].reason
+
+
+def test_proof_socket_held_only_in_flight_is_live(tmp_path: Path, socket_world: set[int]) -> None:
+    sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        with _bound_socket(tmp_path / "s") as bound:
+            sender.sendmsg([b"x"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("=i", bound.fileno()))])
+        verdicts = _prove(tmp_path)
+        assert [verdict.verdict for verdict in verdicts] == ["LIVE"], verdicts
+    finally:
+        sender.close()
+        receiver.close()
+
+
+def test_proof_reruns_once_when_a_node_disappears(
+    tmp_path: Path, socket_world: set[int], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _dead_node(tmp_path / "gone")
+    inventories: list[int] = []
+    original_inventory = cli._socket_node_inventory
+
+    def inventory(targets: dict[Path, str]) -> list[cli._SocketNode]:
+        found = original_inventory(targets)
+        inventories.append(len(found))
+        return found
+
+    original_probe = cli._probe_socket_node
+
+    def probe(node: cli._SocketNode, *rest: dict[tuple[int, int], int]) -> tuple[str, str]:
+        node.path.unlink()
+        return original_probe(node, *rest)
+
+    monkeypatch.setattr(cli, "_socket_node_inventory", inventory)
+    monkeypatch.setattr(cli, "_probe_socket_node", probe)
+    assert _prove(tmp_path) == [] and inventories == [1, 0]
+
+
+def test_proof_second_disappearance_is_never_dead(
+    tmp_path: Path, socket_world: set[int], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _dead_node(tmp_path / "s")
+    monkeypatch.setattr(cli, "_probe_socket_node", lambda *_a: ("DISAPPEARED", "gone"))
+    assert [verdict.verdict for verdict in _prove(tmp_path)] == ["DISAPPEARED"]
+
+
+def test_require_dead_refuses_any_verdict_but_dead(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    node = _synthetic_node(tmp_path, 7)
+    budget = cli._ReadOnlyCommandBudget.start(timeout_seconds=22, stdout_limit=4096, stderr_limit=4096)
+    evidence = _synthetic_evidence()
+    for verdict in ("LIVE", "UNKNOWN", "NO-OWNER-EVIDENCE", "DISAPPEARED", "DEAD"):
+        monkeypatch.setattr(
+            cli, "_prove_socket_nodes",
+            lambda *_a, value=verdict, **_k: ([cli._SocketVerdict(node, value, "why")], evidence),
+        )
+        if verdict == "DEAD":
+            receipts, _resolver, low = cli._require_dead_socket_nodes({tmp_path: "slot"}, budget)
+            assert [receipt["verdict"] for receipt in receipts] == ["DEAD"] and low == {7}
+        else:
+            with pytest.raises(cli.Refusal, match=f"not proven dead: .*: {verdict}: why"):
+                cli._require_dead_socket_nodes({tmp_path: "slot"}, budget)
+
+
+def _unshare_holder(code: str, *args: str) -> subprocess.Popen[str]:
+    process = subprocess.Popen(
+        ["/usr/bin/unshare", "--user", "--map-root-user", "--net", "--", sys.executable, "-I", "-c", code, *args],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd="/",
+    )
+    assert process.stdout is not None
+    if process.stdout.readline() != "ready\n":
+        _stdout, stderr = process.communicate("q", timeout=10)
+        if process.returncode and re.fullmatch(
+            r"unshare: (unshare failed|write failed /proc/self/uid_map): "
+            r"(Operation not permitted|Permission denied)\n", stderr,
+        ):
+            pytest.skip(f"no user and network namespace for this test: {stderr.strip()}")
+        pytest.fail(f"namespace holder failed: rc={process.returncode} stderr={stderr!r}")
+    return process
+
+
+_HOLDER = textwrap.dedent('''
+    import os, socket, sys
+    os.chdir(sys.argv[1])
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    # A relative name: the holder's table names no path this proof could match.
+    sock.bind("held")
+    print("ready", flush=True)
+    sys.stdin.read(1)
+    sock.close()
+    print("closed", flush=True)
+    sys.stdin.read(1)
+''')
+
+
+def _release(holder: subprocess.Popen[str]) -> None:
+    assert holder.stdin is not None and holder.stdout is not None
+    holder.stdin.write("c")
+    holder.stdin.flush()
+    assert holder.stdout.readline() == "closed\n"
+
+
+@pytest.mark.parametrize("enterable", [True, False])
+def test_proof_socket_held_only_in_another_network_namespace(
+    tmp_path: Path, socket_world: set[int], monkeypatch: pytest.MonkeyPatch, enterable: bool,
+) -> None:
+    """The PrivateNetwork-style case: NOT DEAD while held, DEAD once released."""
+
+    _dead_node(tmp_path / "dead")
+    holder = _unshare_holder(_HOLDER, str(tmp_path))
+    try:
+        socket_world.add(holder.pid)
+        theirs = os.stat(f"/proc/{holder.pid}/ns/net").st_ino
+        assert theirs != sockdiag.own_netns()
+        if not enterable:
+            def refuse(_fd: int, netns: int, _deadline: float) -> sockdiag.Dump:
+                raise sockdiag.DumpError(f"cannot enter network namespace {netns}: [Errno 1] Operation not permitted")
+
+            monkeypatch.setattr(cli, "_dump_entered_namespace", refuse)
+        verdicts, evidence = cli._prove_socket_nodes(
+            {tmp_path: "slot"}, deadline=time.monotonic() + 60, probe=True, allow_calibration=True,
+        )
+        by_name = {verdict.node.path.name: verdict for verdict in verdicts}
+        assert by_name["held"].verdict == "LIVE"
+        if enterable:
+            assert theirs in evidence.dumps and f"network namespace {theirs}" in by_name["held"].reason
+            assert by_name["dead"].verdict == "DEAD" and by_name["dead"].gaps_overridden == ()
+        else:
+            # Only the seqpacket probe can see it: EPROTOTYPE, never DEAD.
+            assert theirs in evidence.unenterable
+            assert "seqpacket connect() found a bound socket of another type" in by_name["held"].reason
+            assert by_name["dead"].verdict == "DEAD"
+            assert any("cannot be entered" in gap for gap in by_name["dead"].gaps_overridden)
+            receipt = by_name["dead"].receipt(evidence)
+            assert any(
+                str(line).startswith("gap overridden by dual-type probe: network namespace")
+                for line in cast(list[object], receipt["gaps_overridden"])
+            )
+            budget = cli._ReadOnlyCommandBudget.start(timeout_seconds=60, stdout_limit=4096, stderr_limit=4096)
+            monkeypatch.setattr(cli, "_run_root_owned_command", lambda *_a, **_k: (1, b"", b"stubbed"))
+            with pytest.raises(cli.Refusal, match=r"not proven dead: .*/held: LIVE: "):
+                cli._require_dead_socket_nodes({tmp_path: "slot"}, budget)
+        _release(holder)
+        released = {verdict.node.path.name: verdict for verdict in _prove(tmp_path)}
+        assert {name: verdict.verdict for name, verdict in released.items()} == {"dead": "DEAD", "held": "DEAD"}
+        if not enterable:
+            assert all(verdict.gaps_overridden for verdict in released.values())
+    finally:
+        holder.communicate("q", timeout=10)
+
+
+def test_failed_probe_self_test_keeps_a_gap_unknown(
+    tmp_path: Path, socket_world: set[int], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _dead_node(tmp_path / "dead")
+    monkeypatch.setattr(cli, "_socket_probe_self_test", lambda: (False, "rigged answer"))
+    original = cli._socket_namespace_handles
+
+    def with_gap(gaps: list[str], privileged: object = None) -> cli._NamespaceScan:
+        gaps.append("same-UID process 9's network namespace cannot be read")
+        return original(gaps, None)
+
+    monkeypatch.setattr(cli, "_socket_namespace_handles", with_gap)
+    verdicts, evidence = cli._prove_socket_nodes(
+        {tmp_path: "slot"}, deadline=time.monotonic() + 60, probe=True, allow_calibration=True,
+    )
+    assert [verdict.verdict for verdict in verdicts] == ["UNKNOWN"]
+    assert "self-test failed: rigged answer" in verdicts[0].reason
+    assert verdicts[0].gaps_overridden == () and evidence.self_test == "failed: rigged answer"
+    monkeypatch.setattr(cli, "_socket_probe_self_test", lambda: (True, "ok"))
+    verdicts, _evidence = cli._prove_socket_nodes(
+        {tmp_path: "slot"}, deadline=time.monotonic() + 60, probe=True, allow_calibration=True,
+    )
+    assert [verdict.verdict for verdict in verdicts] == ["DEAD"]
+    assert verdicts[0].gaps_overridden == ("same-UID process 9's network namespace cannot be read",)
+
+
+def test_probe_self_test_passes_on_this_kernel_and_is_kept_per_boot(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "_SOCKET_SELF_TEST_CACHE", {})
+    passed, detail = cli._socket_probe_self_test()
+    if not passed and "could not be made" in detail:
+        pytest.skip(f"no user and network namespace: {detail}")
+    assert passed, detail
+    assert detail == (
+        "bound in another namespace: stream ECONNREFUSED/seqpacket EPROTOTYPE; "
+        "released: stream ECONNREFUSED/seqpacket ECONNREFUSED"
+    )
+    monkeypatch.setattr(cli, "_run_socket_probe_self_test", lambda: (False, "not run again"))
+    assert cli._socket_probe_self_test() == (passed, detail)
+
+
+def test_finish_journal_records_every_overridden_gap(tmp_path: Path) -> None:
+    def receipt(slot: str, gap: str) -> dict[str, object]:
+        return {"slot": slot, "verdict": "DEAD", "gaps_overridden": [gap]}
+
+    receipts = tuple(
+        receipt(str(tmp_path), f"gap overridden by dual-type probe: g{n}") for n in range(12)
+    ) + (receipt("/elsewhere", "other"),)
+    census = cli._ProcessPathCensus((), (), owner_cgroup_complete=False, socket_receipts=receipts)
+    extension = cli._socket_proof_extension(census, tmp_path)
+    assert extension is not None
+    assert extension["nodes"] == 12 and extension["gaps_overridden_count"] == 12
+    assert len(extension["gaps_overridden"]) == 8  # type: ignore[arg-type]
+    assert cli._socket_proof_extension(census, tmp_path / "none") is None
+    assert len(json.dumps(extension)) < cli._JOURNAL_EXTENSION_LIMIT_BYTES
+
+
+def test_namespace_rounds_dump_a_late_namespace_and_refuse_endless_churn(
+    socket_world: set[int], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = cli._socket_namespace_handles
+    reads: list[int] = []
+
+    def scan(gaps: list[str], privileged: object = None) -> cli._NamespaceScan:
+        result = original(gaps, None)
+        reads.append(1)
+        for fake in range(1, len(reads) if endless else min(len(reads), 2)):
+            result.handles.setdefault(10**12 + fake, [Path("/proc/self/ns/net")])
+        return result
+
+    monkeypatch.setattr(cli, "_socket_namespace_handles", scan)
+    endless = False
+    evidence = cli._collect_socket_evidence(deadline=time.monotonic() + 60)
+    assert evidence.rounds == 2 and 10**12 + 1 in evidence.unenterable
+    reads.clear()
+    endless = True
+    with pytest.raises(cli.Refusal, match="kept appearing after 4 rounds"):
+        cli._collect_socket_evidence(deadline=time.monotonic() + 60)
+
+
+def test_namespace_read_refuses_a_reused_pid(
+    socket_world: set[int], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = cli._quiet_start_ticks
+    seen: list[Path] = []
+
+    def ticks(pid_dir: Path) -> int | None:
+        value = original(pid_dir)
+        if pid_dir == Path(f"/proc/{os.getpid()}"):
+            seen.append(pid_dir)
+            return None if value is None else value + (len(seen) > 1)
+        return value
+
+    monkeypatch.setattr(cli, "_quiet_start_ticks", ticks)
+    with pytest.raises(cli.Refusal, match=f"PID {os.getpid()} was reused"):
+        cli._collect_socket_evidence(deadline=time.monotonic() + 60)
+
+
+def test_held_unix_socket_absent_from_every_dump_is_a_gap() -> None:
+    left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        held = {
+            os.fstat(sock.fileno()).st_ino: f"/proc/self/fd/{sock.fileno()}" for sock in (left, tcp)
+        }
+        unix_inode = os.fstat(left.fileno()).st_ino
+        empty: dict[int, sockdiag.Dump] = {1: sockdiag.Dump(1, (), 0, 0, 0.0)}
+        gaps = cli._orphaned_held_unix_sockets(held, held, empty)
+        assert len(gaps) == 1 and f"socket {unix_inode}" in gaps[0] and "1 held Unix" in gaps[0]
+        listed = {1: sockdiag.Dump(1, (_bound(unix_inode, None),), 1, 0, 0.0)}
+        assert cli._orphaned_held_unix_sockets(held, held, listed) == []
+        # A socket held before but not after the dumps may have been made or closed meanwhile.
+        assert cli._orphaned_held_unix_sockets(held, {}, empty) == []
+    finally:
+        for sock in (left, right, tcp):
+            sock.close()
+
+
+def test_calibration_matches_a_real_bound_socket_and_leaves_nothing(tmp_path: Path) -> None:
+    with _bound_socket(tmp_path / "s") as live:
+        node = _only_node(tmp_path)
+        before = sorted(os.listdir(tmp_path))
+        kernel_dev = cli._calibrate_socket_device(node, deadline=time.monotonic() + 30)
+        dump = sockdiag.dump_own_namespace(deadline=time.monotonic() + 30)
+        mine = [item for item in dump.sockets if item.sockfs_ino == os.fstat(live.fileno()).st_ino]
+    assert kernel_dev is not None and mine and mine[0].vfs == (sockdiag.low32(node.st_ino), kernel_dev)
+    assert sorted(os.listdir(tmp_path)) == before
+
+
+def test_stale_calibration_directories_are_found_and_removed_only_when_stale(tmp_path: Path) -> None:
+    ticks = cli._quiet_start_ticks(Path("/proc/self"))
+    assert ticks is not None
+
+    def calibration(name_ticks: int, tag: str, *, extra: bool = False) -> Path:
+        directory = tmp_path / f".wrkslots-calib.{os.getpid()}.{name_ticks}.{tag * 16}"
+        directory.mkdir()
+        os.mknod(directory / "s", stat.S_IFSOCK | 0o600)
+        if extra:
+            (directory / "keep").write_bytes(b"")
+        return directory
+
+    stale = calibration(ticks + 1, "a")
+    alive = calibration(ticks, "b")
+    foreign = calibration(ticks + 1, "c", extra=True)
+    (tmp_path / ".wrkslots-calib.not-a-match").mkdir()
+    assert cli._stale_socket_calibrations(tmp_path) == [stale]
+    assert cli._remove_stale_socket_calibrations(tmp_path) == [str(stale)]
+    assert not stale.exists() and alive.exists() and foreign.exists()
+
+
+def test_privileged_namespace_links_drop_a_batch_with_any_diagnostic(monkeypatch: pytest.MonkeyPatch) -> None:
+    budget = cli._ReadOnlyCommandBudget.start(timeout_seconds=22, stdout_limit=4096, stderr_limit=4096)
+    records = (
+        b"/proc/7/ns/net\0net:[11]\0/proc/7/fd\0\0/proc/7/fd/3\0net:[12]\0/proc/7/fd/4\0socket:[9]\0"
+        b"/proc/8/ns/net\0garbage\0"
+    )
+    for rc, stderr, expected in (
+        (0, b"", {7: (11, {12})}),
+        (1, b"", {}),
+        (0, b"find: '/proc/9/fd': No such file or directory\n", {}),
+    ):
+        monkeypatch.setattr(cli, "_run_root_owned_command", lambda *_a, value=(rc, records, stderr), **_k: value)
+        assert cli._privileged_namespace_links([7, 8], budget) == expected
+
+
+def _census(paths: Sequence[Path], *extra: str, tmp_path: Path) -> tuple[int, dict[str, object], Path]:
+    stub = tmp_path / "stubbin"
+    stub.mkdir(exist_ok=True)
+    log = tmp_path / "sudo-calls.log"
+    (stub / "sudo").write_text(f"#!/bin/sh\necho \"$@\" >> {log}\nexit 1\n")
+    (stub / "sudo").chmod(0o755)
+    env = dict(os.environ, PATH=f"{stub}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+               PYTHONPATH=str(Path(cli.__file__).resolve().parents[1]))
+    run = subprocess.run(
+        [sys.executable, "-m", "wrkslots", "socket-census", "--format", "json", *extra, *map(str, paths)],
+        capture_output=True, text=True, env=env, timeout=300, check=False,
+    )
+    return run.returncode, (json.loads(run.stdout) if run.stdout else {"stderr": run.stderr}), log
+
+
+def _census_verdicts(report: dict[str, object]) -> dict[str, object]:
+    nodes = report["nodes"]
+    assert isinstance(nodes, list)
+    return {Path(str(node["path"])).name: node["verdict"] for node in nodes}
+
+
+def test_socket_census_is_read_only_passive_and_runs_no_sudo(tmp_path: Path) -> None:
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    _dead_node(tree / "dead")
+    with _bound_socket(tree / "live", listen=True):
+        before = sorted(os.listdir(tree))
+        rc, report, log = _census([tree], tmp_path=tmp_path)
+        assert sorted(os.listdir(tree)) == before
+        verdicts = _census_verdicts(report)
+        assert verdicts["live"] == "LIVE" and verdicts["dead"] in ("NO-OWNER-EVIDENCE", "UNKNOWN")
+        assert report["mode"] == "passive" and report["counts"]["DEAD"] == 0  # type: ignore[index]
+        assert rc == 1 and report["dumps"] and not log.exists()
+        rc, report, log = _census([tree], "--probe", tmp_path=tmp_path)
+        assert sorted(os.listdir(tree)) == before and not log.exists()
+        verdicts = _census_verdicts(report)
+        assert verdicts["live"] == "LIVE" and verdicts["dead"] in ("DEAD", "UNKNOWN")
+
+
+def test_socket_census_takes_no_project_root(tmp_path: Path) -> None:
+    run = subprocess.run(
+        [sys.executable, "-m", "wrkslots", "--project-root", str(tmp_path), "socket-census", str(tmp_path)],
+        capture_output=True, text=True, timeout=60, check=False,
+        env=dict(os.environ, PYTHONPATH=str(Path(cli.__file__).resolve().parents[1])),
+    )
+    assert run.returncode == 2 and "takes no --project-root" in run.stderr

@@ -30,6 +30,7 @@ import selectors
 import shlex
 import shutil
 import signal
+import secrets
 import socket
 import stat
 import subprocess
@@ -46,7 +47,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set
 from pathlib import Path, PurePosixPath
 from typing import IO, NoReturn, Protocol, TextIO, TypedDict, TypeVar, cast, overload
 
-from wrkslots import __version__, imagecmd, sandbox, slotimage, worktreesimage, yamlconfig
+from wrkslots import __version__, imagecmd, sandbox, slotimage, sockdiag, worktreesimage, yamlconfig
 
 VERSION = __version__
 SCHEMA = 2
@@ -42663,6 +42664,19 @@ def _slot_findings(
                         "invalid-hold", record.slot, state.machine, hold_result.error
                     )
                 )
+            for stale in _stale_socket_calibrations(
+                _slot_directory(config, record.slot, record.slot_type)
+            ):
+                finding = _operational_finding(
+                    "stale-socket-calibration", record.slot, state.machine,
+                    f"{stale} is a socket-liveness calibration directory whose creator "
+                    "has exited (#1230); it holds only its unbound socket node",
+                )
+                finding["remedy"] = (
+                    "the next recovery of this slot removes it before its census, as "
+                    "does `wrkslots socket-census --probe` on the slot path"
+                )
+                findings.append(finding)
             process_state, process_detail = _process_state(record.owner)
             if process_state == "dead":
                 findings.append(
@@ -43337,18 +43351,63 @@ def _finish_journal_payload(
         )
     if finish.archive_nested:
         payload["archive_nested_cache_repositories"] = True
+    socket_proof = (
+        None if finish.private_cleanup is None
+        else _socket_proof_extension(finish.private_cleanup.shared_census, slot_path)
+    )
+    if socket_proof is not None:
+        # Audit only (#1230): an older reader that understands ``x`` may
+        # ignore it, so it raises no minimum version.
+        payload["x"] = {"socket_proof": socket_proof}
     group = None if finish.agent_batch is None else finish.agent_batch.group
     if group is not None:
         # A grouped member (#1201): its scoped journal says so, and that its
         # fence may be sealed between the group scan and its own finish.
         # Both are safety-relevant, so the release that reads them is the
         # minimum, and every older reader refuses the journal (#1124).
+        extension = payload.get("x")
         payload["x"] = {
+            **(dict(extension) if isinstance(extension, Mapping) else {}),
             "min_wrkslots_version": _GROUPED_FINISH_MIN_VERSION,
             "group": {"id": group.group_id, "size": group.size},
             "sealed": True,
         }
     return payload
+
+
+_SOCKET_PROOF_GAP_LIMIT = 8
+_SOCKET_PROOF_GAP_CHARS = 300
+
+
+def _socket_proof_extension(
+    census: _ProcessPathCensus, slot_path: Path
+) -> dict[str, object] | None:
+    """The finish journal's record of the socket nodes proven dead in ``slot_path`` (#1230).
+
+    Every visibility gap a dual-type probe overrode is named, so it stays
+    auditable.  Bounded to stay far inside the journal extension's limit.
+    """
+
+    mine = [receipt for receipt in census.socket_receipts if receipt.get("slot") == str(slot_path)]
+    if not mine:
+        return None
+    overridden = sorted({
+        str(line) for receipt in mine
+        for line in _list_or_empty(receipt.get("gaps_overridden"))
+    })
+    return {
+        "nodes": len(mine),
+        "verdict": "DEAD",
+        "probe": "stream+seqpacket before and after the second dump",
+        "gaps_overridden_count": len(overridden),
+        "gaps_overridden": [
+            line[:_SOCKET_PROOF_GAP_CHARS] for line in overridden[:_SOCKET_PROOF_GAP_LIMIT]
+        ],
+    }
+
+
+def _list_or_empty(value: object) -> list[object]:
+    return list(value) if isinstance(value, (list, tuple)) else []
 
 
 def _grouped_finish_member(
@@ -67891,6 +67950,8 @@ class _ProcessPathCensus:
     processes: tuple[_AbsentProcessObservation, ...]
     matches: tuple[tuple[int, str, str, str], ...]
     owner_cgroup_complete: bool = True
+    # One receipt per socket node proven dead (#1230), empty without nodes.
+    socket_receipts: tuple[dict[str, object], ...] = ()
 
     def assert_slot_unused(
         self,
@@ -68641,16 +68702,100 @@ def _batch_network_namespaces(
     return result
 
 
+_NON_UNIX_SOCKET_TABLES = (
+    "tcp", "tcp6", "udp", "udp6", "udplite", "udplite6", "raw", "raw6", "netlink", "packet",
+)
+
+
+def _held_sockets_of_unix_family(
+    inodes: AbstractSet[int],
+    holders: Mapping[int, set[int]],
+    namespaces: Mapping[str, Sequence[_AbsentProcessObservation]],
+    budget: _ReadOnlyCommandBudget,
+) -> set[int]:
+    """The held sockets among ``inodes`` not shown to be of a non-Unix family (#1230).
+
+    A readable holder's descriptor names its protocol in the sockfs extended
+    attribute system.sockprotoname; for other holders, the namespaces' own
+    TCP, UDP, raw, netlink and packet tables list their sockets' inodes.
+    """
+
+    remaining = set(inodes)
+    if not remaining:
+        return remaining
+    by_pid: dict[int, set[int]] = {}
+    for inode in remaining:
+        for pid in holders.get(inode, set()):
+            by_pid.setdefault(pid, set()).add(inode)
+    for pid, wanted in by_pid.items():
+        try:
+            descriptors = list(os.scandir(f"/proc/{pid}/fd"))
+        except OSError:
+            continue
+        for descriptor in descriptors:
+            try:
+                metadata = os.stat(descriptor.path)
+            except OSError:
+                continue
+            if not stat.S_ISSOCK(metadata.st_mode) or metadata.st_ino not in wanted:
+                continue
+            try:
+                protocol = os.getxattr(descriptor.path, "system.sockprotoname")
+            except OSError:
+                continue
+            if not protocol.rstrip(b"\0").startswith(b"UNIX"):
+                remaining.discard(metadata.st_ino)
+    if not remaining:
+        return remaining
+    for representatives in namespaces.values():
+        for process in representatives[:1]:
+            for table in _NON_UNIX_SOCKET_TABLES:
+                path = f"/proc/{process.pid}/net/{table}"
+                try:
+                    rc, contents, stderr = _run_root_owned_command(
+                        Path("/usr/bin/cat"), ("--", path), budget=budget
+                    )
+                except (OSError, Refusal):
+                    continue
+                if rc or stderr:
+                    continue
+                for line in contents.decode("ascii", errors="replace").split("\n")[1:]:
+                    fields = line.split()
+                    if not fields:
+                        continue
+                    column = fields[-1] if table in ("netlink", "packet") else (
+                        fields[9] if len(fields) > 9 else ""
+                    )
+                    if column.isdigit():
+                        remaining.discard(int(column))
+    return remaining
+
+
 def _batch_unix_socket_matches(
     processes: Sequence[_AbsentProcessObservation], targets: Mapping[Path, str],
     holders: Mapping[int, set[int]], budget: _ReadOnlyCommandBudget,
     *, selected_has_sockets: bool = False,
+    socket_proof: tuple[Mapping[int, tuple[int, int] | None], AbstractSet[int]] | None = None,
 ) -> tuple[tuple[int, str, str, str], ...]:
     """Associate namespace-local Unix names with the sockets held by processes.
 
     A process can retain a socket after changing network namespaces, so consult
     every observed namespace, not just the holder's current namespace.
+
+    ``socket_proof`` is the kernel evidence that proved every selected socket
+    node dead (#1230): each dumped socket's UNIX_DIAG_VFS identity by sockfs
+    inode, and the low 32 inode bits of every node.  A name this census cannot
+    attribute (relative, '@', or outside the selected trees) is then resolved
+    when the kernel shows its socket bound to no node of the selected trees, and
+    a held socket missing from every Unix table is accounted when the kernel
+    dumped it or its family is not Unix.
     """
+
+    def proven_elsewhere(inode: int) -> bool:
+        if socket_proof is None or inode not in socket_proof[0]:
+            return False
+        identity = socket_proof[0][inode]
+        return identity is None or identity[0] not in socket_proof[1]
 
     namespaces: dict[str, list[_AbsentProcessObservation]] = {}
     bindings = _batch_network_namespaces(processes, budget)
@@ -68726,22 +68871,26 @@ def _batch_unix_socket_matches(
                 # proc renders both abstract addresses and a filesystem-relative
                 # '@name' this way. With selected socket nodes its identity is
                 # unresolved; the prefix alone is never abstract proof.
-                if selected_has_sockets:
+                if selected_has_sockets and not proven_elsewhere(inode):
                     unresolved.update(pids)
                 continue
             if not name.is_absolute():
                 # A namespace table also lists sockets held by other processes.
                 # Only held descriptor identities belong to this census. Relative
                 # bind paths cannot be reconstructed from the holder's later cwd.
-                if selected_has_sockets:
+                if selected_has_sockets and not proven_elsewhere(inode):
                     unresolved.update(pids)
                 continue
             matched = _matching_absent_validate_target(name, targets, cache)
             if matched is None:
-                if selected_has_sockets:
+                if selected_has_sockets and not proven_elsewhere(inode):
                     # The bound name can be an outside hardlink of a socket node
                     # in a selected tree; its object identity remains unresolved.
                     unresolved.update(pids)
+                continue
+            if proven_elsewhere(inode):
+                # A stale name inside the tree: the kernel shows this socket
+                # bound to a node that is not in the selected trees (#1230).
                 continue
             if not pids:
                 raise Refusal(f"Unix socket remains bound inside {matched[0]} without a stable observed holder")
@@ -68752,7 +68901,12 @@ def _batch_unix_socket_matches(
     after = _batch_network_namespaces(selected_representatives, budget)
     if after != {process.pid: bindings[process.pid] for process in selected_representatives}:
         raise _ProcessEvidenceChanged("network namespace representatives changed during socket census")
-    if selected_has_sockets and set(holders) - accounted:
+    missing = set(holders) - accounted
+    if selected_has_sockets and socket_proof is not None:
+        # Dumped by the kernel (so accounted for by the proof), or not Unix.
+        missing = {inode for inode in missing if inode not in socket_proof[0]}
+        missing = _held_sockets_of_unix_family(missing, holders, namespaces, budget)
+    if selected_has_sockets and missing:
         # A socket can outlive the last process in its originating network
         # namespace. Its FD alone establishes neither its family nor its bound
         # name, so tables from current process namespaces cannot prove clear.
@@ -68762,6 +68916,1098 @@ def _batch_unix_socket_matches(
         # that an unresolved socket does not use another selected tree.
         raise Refusal("Unix socket census cannot attribute a relative bound pathname or alias")
     return tuple(matches)
+
+
+# --- #1230 socket-liveness-proof -------------------------------------------
+#
+# A selected tree that holds a filesystem Unix socket node used to be refused
+# outright: a node's lstat identity and the sockfs inodes in /proc/PID/fd are
+# different identity domains, so no comparison of them proves a socket dead.
+# The kernel's own association (NETLINK_SOCK_DIAG with UNIX_DIAG_VFS, see
+# wrkslots/sockdiag.py) does.  A node is DEAD only when every network
+# namespace a same-UID process can reach has been dumped and no socket in any
+# of them is bound to the node's identity, and then a no-payload connect() to
+# the node is refused with the node unchanged and a second dump still clean.
+# Anything less is LIVE or UNKNOWN, and both refuse.  Root and other users are
+# outside this model, as in the rest of the census: a socket node inside a
+# tree can be created only by a process that can write its directory.
+
+_SOCKET_CALIBRATION_RE = re.compile(r"\.wrkslots-calib\.([0-9]+)\.([0-9]+)\.([0-9a-f]{16})")
+"""A calibration directory: creator PID, creator start ticks, random tag."""
+_SOCKET_PROBE_PATH_LIMIT = 107
+_SOCKET_CHILD_SECONDS = 30.0
+_SOCKET_NAMESPACE_ROUNDS = 4
+"""Namespace-set reads before a still-growing set refuses (#1230)."""
+_SOCKET_CHILD_PARALLELISM = 8
+"""Namespace-dump children run at once."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _SocketNode:
+    """One filesystem socket node found in a selected tree."""
+
+    path: Path
+    root: Path
+    slot: str
+    st_dev: int
+    st_ino: int
+    nlink: int
+    mode: int
+    parent: tuple[int, int]
+    ctime_ns: int = 0
+    """The node's st_ctime_ns at inventory; a probe needs it unchanged."""
+
+    @property
+    def identity(self) -> tuple[int, int]:
+        return (self.st_dev, self.st_ino)
+
+
+@dataclasses.dataclass
+class _SocketEvidence:
+    """Every dumped network namespace, and every gap that keeps a node from DEAD."""
+
+    dumps: dict[int, sockdiag.Dump]
+    unenterable: dict[int, str]
+    representatives: dict[int, list[int]]
+    gaps: list[str]
+    seconds: float
+    rounds: int = 1
+    self_test: str | None = None
+    """The dual-type probe self-test's result, when a proof needed it."""
+
+    def bound(self) -> dict[int, list[tuple[int, sockdiag.UnixSocket]]]:
+        """Dumped sockets bound to a filesystem node, by the low 32 bits of its inode."""
+
+        found: dict[int, list[tuple[int, sockdiag.UnixSocket]]] = {}
+        for netns, dump in self.dumps.items():
+            for item in dump.sockets:
+                if item.vfs is not None:
+                    found.setdefault(item.vfs[0], []).append((netns, item))
+        return found
+
+    def resolver(self) -> dict[int, tuple[int, int] | None]:
+        """sockfs inode -> UNIX_DIAG_VFS identity (None: bound to no filesystem node)."""
+
+        return {
+            item.sockfs_ino: item.vfs for dump in self.dumps.values() for item in dump.sockets
+        }
+
+
+@dataclasses.dataclass
+class _SocketVerdict:
+    node: _SocketNode
+    verdict: str  # DEAD, LIVE, UNKNOWN, NO-OWNER-EVIDENCE, DISAPPEARED
+    reason: str
+    evidence: str = "passive"
+    probe: str | None = None
+    gaps: tuple[str, ...] = ()
+    """The visibility gaps that made a passive verdict UNKNOWN."""
+    gaps_overridden: tuple[str, ...] = ()
+    """The gaps a dual-type probe overrode to reach DEAD (lead, #1230)."""
+
+    def receipt(self, evidence: _SocketEvidence) -> dict[str, object]:
+        return {
+            "gaps_overridden": [
+                f"gap overridden by dual-type probe: {gap}" for gap in self.gaps_overridden
+            ],
+            "path": str(self.node.path),
+            "slot": self.node.slot,
+            "device": self.node.st_dev,
+            "inode": self.node.st_ino,
+            "verdict": self.verdict,
+            "reason": self.reason,
+            "evidence": self.evidence,
+            "probe": self.probe,
+            "namespaces_dumped": sorted(evidence.dumps),
+            "namespaces_unenterable": sorted(evidence.unenterable),
+        }
+
+
+def _socket_node_inventory(targets: Mapping[Path, str]) -> list[_SocketNode]:
+    """Every socket node below the selected trees, without following symlinks."""
+
+    nodes: list[_SocketNode] = []
+    for root, slot in targets.items():
+        pending = [root]
+        while pending:
+            directory = pending.pop()
+            try:
+                entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+            except OSError as exc:
+                raise Refusal(f"cannot list {directory} for socket nodes: {exc}") from exc
+            for entry in entries:
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    raise Refusal(f"cannot inspect {entry.path}: {exc}") from exc
+                if stat.S_ISDIR(metadata.st_mode):
+                    pending.append(Path(entry.path))
+                elif stat.S_ISSOCK(metadata.st_mode):
+                    parent = os.stat(directory, follow_symlinks=False)
+                    nodes.append(
+                        _SocketNode(
+                            Path(entry.path), root, slot, metadata.st_dev,
+                            metadata.st_ino, metadata.st_nlink, metadata.st_mode,
+                            (parent.st_dev, parent.st_ino), metadata.st_ctime_ns,
+                        )
+                    )
+    return nodes
+
+
+def _stale_socket_calibrations(root: Path) -> list[Path]:
+    """Calibration directories a crashed proof left at ``root`` (#1230).
+
+    Only an entry named like one, owned by this user, whose creator (PID and
+    start time) is gone, and that holds nothing but its socket ``s``.  Reading
+    only: doctor reports these, and recovery and ``socket-census --probe``
+    remove them.
+    """
+
+    stale: list[Path] = []
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return stale
+    for entry in entries:
+        match = _SOCKET_CALIBRATION_RE.fullmatch(entry.name)
+        if match is None:
+            continue
+        try:
+            metadata = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+            continue
+        if _quiet_start_ticks(Path(f"/proc/{match[1]}")) == int(match[2]):
+            continue
+        try:
+            children = [
+                (child.name, child.stat(follow_symlinks=False).st_mode)
+                for child in os.scandir(entry.path)
+            ]
+        except OSError:
+            continue
+        if all(name == "s" and stat.S_ISSOCK(mode) for name, mode in children):
+            stale.append(Path(entry.path))
+    return stale
+
+
+def _remove_stale_socket_calibrations(root: Path) -> list[str]:
+    """Remove the calibration directories :func:`_stale_socket_calibrations` finds."""
+
+    removed: list[str] = []
+    for directory in _stale_socket_calibrations(root):
+        try:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(directory / "s")
+            os.rmdir(directory)
+        except OSError:
+            continue
+        removed.append(str(directory))
+    return removed
+
+
+def _socket_netns_link(path: Path) -> int | None:
+    """The nsfs inode a ``net:[N]`` link names, or None for any other link."""
+
+    raw = os.readlink(path)
+    match = re.fullmatch(r"net:\[([0-9]+)\]", raw)
+    return None if match is None else int(match[1])
+
+
+_PrivilegedNamespaceReader = Callable[[Sequence[int]], dict[int, tuple[int, set[int]]]]
+"""PIDs -> (network namespace, namespaces held through descriptors), read as root."""
+
+
+@dataclasses.dataclass
+class _NamespaceScan:
+    """One read of the same-UID processes' network namespaces (#1230)."""
+
+    handles: dict[int, list[Path]]
+    """Namespace -> paths that open to it (possibly none)."""
+    members: dict[int, list[int]]
+    """Namespace -> same-UID PIDs in it."""
+    generations: dict[int, int | None]
+    """PID -> start ticks when read."""
+    held_sockets: dict[int, str]
+    """sockfs inode -> one readable descriptor path holding it."""
+
+
+def _socket_namespace_handles(
+    gaps: list[str],
+    privileged: _PrivilegedNamespaceReader | None = None,
+) -> _NamespaceScan:
+    """Every network namespace a same-UID process sits in, holds, or has mounted.
+
+    Also records every socket a readable same-UID process holds.  A same-UID
+    process whose namespace or descriptors this user cannot read (a
+    non-dumpable one) is resolved by ``privileged`` when given, and is
+    otherwise a gap.
+    """
+
+    me = os.getuid()
+    handles: dict[int, list[Path]] = {}
+    members: dict[int, list[int]] = {}
+    generations: dict[int, int | None] = {}
+    held_sockets: dict[int, str] = {}
+    mount_tables: set[str] = set()
+    unreadable: dict[int, str] = {}
+    for pid_dir in sorted(Path("/proc").iterdir(), key=lambda item: item.name):
+        if not pid_dir.name.isdigit():
+            continue
+        pid = int(pid_dir.name)
+        try:
+            uids = _process_uids(pid_dir)
+        except Refusal:
+            if pid_dir.exists():
+                gaps.append(f"process {pid}'s owner cannot be read")
+            continue
+        if uids is None or me not in (uids[0], uids[1]):
+            continue
+        generations[pid] = _quiet_start_ticks(pid_dir)
+        _socket_nsfs_mounts(pid_dir, mount_tables, handles)
+        try:
+            netns = _socket_netns_link(pid_dir / "ns" / "net")
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            if pid_dir.exists():
+                unreadable[pid] = f"same-UID process {pid}'s network namespace cannot be read: {exc}"
+            continue
+        if netns is None:
+            gaps.append(f"same-UID process {pid}'s network namespace link is malformed")
+            continue
+        try:
+            descriptors = list(os.scandir(pid_dir / "fd"))
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            unreadable[pid] = f"same-UID process {pid}'s descriptors cannot be read: {exc}"
+            continue
+        members.setdefault(netns, []).append(pid)
+        handles.setdefault(netns, []).append(pid_dir / "ns" / "net")
+        for descriptor in descriptors:
+            try:
+                link = os.readlink(descriptor.path)
+            except OSError:
+                continue
+            if link.startswith("socket:["):
+                held = re.fullmatch(r"socket:\[([0-9]+)\]", link)
+                if held is not None:
+                    held_sockets.setdefault(int(held[1]), descriptor.path)
+            elif link.startswith("net:["):
+                held = re.fullmatch(r"net:\[([0-9]+)\]", link)
+                if held is not None:
+                    handles.setdefault(int(held[1]), []).append(Path(descriptor.path))
+    resolved = privileged(sorted(unreadable)) if unreadable and privileged is not None else {}
+    for pid, message in sorted(unreadable.items()):
+        if pid in resolved:
+            netns, held_namespaces = resolved[pid]
+            members.setdefault(netns, []).append(pid)
+            handles.setdefault(netns, [])
+            for held_netns in held_namespaces:
+                handles.setdefault(held_netns, [])
+        elif _quiet_start_ticks(Path(f"/proc/{pid}")) == generations.get(pid):
+            gaps.append(message)
+    return _NamespaceScan(handles, members, generations, held_sockets)
+
+
+def _socket_nsfs_mounts(
+    pid_dir: Path, seen: set[str], handles: dict[int, list[Path]]
+) -> None:
+    """Record the network namespaces bind-mounted in ``pid_dir``'s mount table."""
+
+    try:
+        key = os.readlink(pid_dir / "ns" / "mnt")
+    except OSError:
+        key = None
+    if key in seen:
+        return
+    try:
+        table = (pid_dir / "mountinfo").read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError:
+        return
+    if key is None:
+        # A non-dumpable process hides its mount namespace link; key by content.
+        key = table
+        if key in seen:
+            return
+    seen.add(key)
+    for line in table.split("\n"):
+        fields = line.split(" ")
+        if " - nsfs " not in line or len(fields) < 5:
+            continue
+        match = re.fullmatch(r"net:\[([0-9]+)\]", fields[3])
+        if match is None:
+            continue
+        mount_point = _decode_mountinfo_field(fields[4])
+        handles.setdefault(int(match[1]), []).append(pid_dir / "root" / mount_point.lstrip("/"))
+
+
+def _privileged_namespace_links(
+    pids: Sequence[int], budget: _ReadOnlyCommandBudget
+) -> dict[int, tuple[int, set[int]]]:
+    """Read non-dumpable processes' namespace and descriptor links as root (#1230).
+
+    A batch whose find reports anything is dropped whole, so its PIDs stay
+    gaps: a partial descriptor list must never pass for a complete one.
+    """
+
+    roots: list[str] = []
+    for pid in pids:
+        roots.extend((f"/proc/{pid}/ns/net", f"/proc/{pid}/fd"))
+    suffix = ("-maxdepth", "1", "-printf", "%p\\0%l\\0")
+    result: dict[int, tuple[int, set[int]]] = {}
+    for arguments in _argument_batches(("-P",), roots, suffix):
+        try:
+            rc, stdout, stderr = _run_root_owned_command(
+                Path("/usr/bin/find"), arguments, budget=budget
+            )
+        except (OSError, Refusal):
+            continue
+        if rc or stderr:
+            continue
+        namespaces: dict[int, int] = {}
+        held: dict[int, set[int]] = {}
+        malformed: set[int] = set()
+        for path, link in _census_nul_records(stdout, 2, "namespace link find"):
+            namespace = re.fullmatch(r"/proc/([0-9]+)/ns/net", path)
+            descriptor = re.fullmatch(r"/proc/([0-9]+)/fd/[0-9]+", path)
+            target = re.fullmatch(r"net:\[([0-9]+)\]", link)
+            if namespace is not None:
+                if target is None:
+                    malformed.add(int(namespace[1]))
+                else:
+                    namespaces[int(namespace[1])] = int(target[1])
+            elif descriptor is not None and target is not None:
+                held.setdefault(int(descriptor[1]), set()).add(int(target[1]))
+        for pid, netns in namespaces.items():
+            if pid not in malformed:
+                result[pid] = (netns, held.get(pid, set()))
+    return result
+
+
+def _orphaned_held_unix_sockets(
+    before: Mapping[int, str], after: Mapping[int, str], dumps: Mapping[int, sockdiag.Dump],
+) -> list[str]:
+    """A gap for held Unix sockets that no dumped table lists (#1230).
+
+    A socket held both before and after the dumps existed throughout them, so
+    its namespace's dump must list it.  One that is absent, and that its
+    descriptor's ``system.sockprotoname`` does not show to be of another family,
+    lives in a namespace nothing visible sits in or holds, where a socket bound
+    to a node would be invisible.
+    """
+
+    dumped = {item.sockfs_ino for dump in dumps.values() for item in dump.sockets}
+    orphans: list[str] = []
+    for inode in sorted(set(before) & set(after) - dumped):
+        path = after[inode]
+        try:
+            protocol = os.getxattr(path, "system.sockprotoname")
+            if os.stat(path).st_ino != inode:
+                continue
+        except FileNotFoundError:
+            continue
+        except OSError:
+            protocol = b"?"
+        if not protocol.rstrip(b"\0").startswith(b"UNIX") and protocol != b"?":
+            continue
+        orphans.append(f"socket {inode} at {path}")
+    if not orphans:
+        return []
+    return [
+        f"{len(orphans)} held Unix socket(s) are in no dumped table, so their network "
+        f"namespace is not visible (first: {orphans[0]})"
+    ]
+
+
+def _decode_mountinfo_field(raw: str) -> str:
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), raw)
+
+
+def _dump_entered_namespace(handle_fd: int, netns: int, deadline: float) -> sockdiag.Dump:
+    """Dump another network namespace from a child that joins it (sockdiag.py)."""
+
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise sockdiag.DumpError("no time left to enter the namespace")
+    seconds = min(remaining, _SOCKET_CHILD_SECONDS)
+    try:
+        run = subprocess.run(
+            [sys.executable, "-I", str(Path(sockdiag.__file__).resolve()), "--netns-fd",
+             str(handle_fd), "--deadline-seconds", f"{seconds:.3f}"],
+            pass_fds=(handle_fd,), capture_output=True, timeout=seconds + 5,
+            check=False, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise sockdiag.DumpError(f"the namespace child failed: {exc}") from exc
+    try:
+        wire = json.loads(run.stdout)
+    except ValueError as exc:
+        raise sockdiag.DumpError("the namespace child returned no dump") from exc
+    if not isinstance(wire, dict):
+        raise sockdiag.DumpError("the namespace child returned a malformed dump")
+    return sockdiag.dump_from_wire(wire, expected_netns=netns)
+
+
+def _collect_socket_evidence(
+    *, deadline: float, privileged: _PrivilegedNamespaceReader | None = None,
+) -> _SocketEvidence:
+    """Dump every network namespace a same-UID process sits in, holds or has mounted.
+
+    The caller's own namespace is dumped in-process; any other is dumped by a
+    child that joins it, which works only for a namespace whose owning user
+    namespace the caller owns.  A namespace that cannot be entered is recorded:
+    its sockets can still prove a node LIVE by name, never DEAD.
+
+    The namespace set is read again after the dumps.  A namespace seen for the
+    first time is dumped too, round after round, until a read adds nothing; a
+    set still growing after ``_SOCKET_NAMESPACE_ROUNDS`` reads refuses.  (A
+    namespace created after the first read cannot hold a socket bound to a node
+    that already existed, since a socket's namespace is fixed when it is
+    created; an older namespace that only became visible later can, so it is
+    dumped rather than ignored.)  A PID reused meanwhile refuses.
+    """
+
+    started = time.monotonic()
+    gaps: list[str] = []
+    first = _socket_namespace_handles(gaps, privileged)
+    handles, members, generations = first.handles, first.members, first.generations
+    own = sockdiag.own_netns()
+    dumps: dict[int, sockdiag.Dump] = {}
+    unenterable: dict[int, str] = {}
+    try:
+        dumps[own] = sockdiag.dump_own_namespace(deadline=deadline)
+    except (sockdiag.DumpError, OSError) as exc:
+        raise Refusal(f"the socket-table dump of this network namespace failed: {exc}") from exc
+    rounds = 0
+    while True:
+        rounds += 1
+        opened: dict[int, int] = {}
+        try:
+            for netns in sorted(set(handles) - set(dumps) - set(unenterable)):
+                for handle in handles[netns]:
+                    try:
+                        fd = os.open(handle, os.O_RDONLY | os.O_CLOEXEC)
+                    except OSError:
+                        continue
+                    if os.fstat(fd).st_ino == netns:
+                        opened[netns] = fd
+                        break
+                    os.close(fd)
+                else:
+                    unenterable[netns] = "no handle to the namespace could be opened"
+            # One child per namespace, run side by side.
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=_SOCKET_CHILD_PARALLELISM
+            ) as pool:
+                futures = {
+                    netns: pool.submit(_dump_entered_namespace, fd, netns, deadline)
+                    for netns, fd in opened.items()
+                }
+                for netns, future in futures.items():
+                    try:
+                        dumps[netns] = future.result()
+                    except sockdiag.DumpError as exc:
+                        unenterable[netns] = str(exc)
+        finally:
+            for fd in opened.values():
+                os.close(fd)
+        after = _socket_namespace_handles(gaps, privileged)
+        after_handles, after_members, after_generations = (
+            after.handles, after.members, after.generations
+        )
+        for pid, generation in generations.items():
+            current = _quiet_start_ticks(Path(f"/proc/{pid}"))
+            if current is not None and current != generation:
+                raise Refusal(f"PID {pid} was reused while the socket tables were dumped")
+        for netns, paths in after_handles.items():
+            handles.setdefault(netns, []).extend(paths)
+        for netns, pids in after_members.items():
+            known = members.setdefault(netns, [])
+            known.extend(pid for pid in pids if pid not in known)
+        for pid, generation in after_generations.items():
+            generations.setdefault(pid, generation)
+        if not set(handles) - set(dumps) - set(unenterable):
+            break
+        if rounds >= _SOCKET_NAMESPACE_ROUNDS:
+            raise Refusal(
+                f"network namespaces kept appearing after {rounds} rounds of socket-table dumps"
+            )
+    orphans = _orphaned_held_unix_sockets(first.held_sockets, after.held_sockets, dumps)
+    if orphans:
+        # A unix_diag dump resumes each chunk by position in a hash bucket, so
+        # concurrent socket churn can skip a live socket; look once more.
+        try:
+            extra = sockdiag.dump_own_namespace(deadline=deadline)
+        except (sockdiag.DumpError, OSError) as exc:
+            raise Refusal(f"the socket-table dump of this network namespace failed: {exc}") from exc
+        merged = dict(dumps)
+        merged[-1] = extra
+        orphans = _orphaned_held_unix_sockets(first.held_sockets, after.held_sockets, merged)
+    gaps.extend(orphans)
+    return _SocketEvidence(
+        dumps, unenterable, members, list(dict.fromkeys(gaps)),
+        time.monotonic() - started, rounds,
+    )
+
+
+def _socket_node_names(
+    node: _SocketNode, nodes: Sequence[_SocketNode]
+) -> set[str]:
+    """Every selected path naming the node's inode (hard links included)."""
+
+    return {str(other.path) for other in nodes if other.identity == node.identity}
+
+
+def _unenterable_bound_names(
+    evidence: _SocketEvidence, reader: Callable[[int], bytes | None]
+) -> tuple[set[str], list[str]]:
+    """Absolute bound names in namespaces that could not be entered, and what was unread."""
+
+    names: set[str] = set()
+    unread: list[str] = []
+    for netns in sorted(evidence.unenterable):
+        contents: bytes | None = None
+        for pid in evidence.representatives.get(netns, []):
+            contents = reader(pid)
+            if contents is not None:
+                break
+        if contents is None:
+            unread.append(f"network namespace {netns}'s Unix table cannot be read")
+            continue
+        for line in contents.decode("utf-8", errors="surrogateescape").split("\n")[1:]:
+            fields = re.fullmatch(
+                r"[0-9a-fA-F]+:[ \t]+(?:[0-9a-fA-F]+[ \t]+){5}([0-9]+)(?: (.*))?", line
+            )
+            if fields is not None and fields[2] and fields[2].startswith("/"):
+                names.add(os.path.normpath(fields[2]))
+    return names, unread
+
+
+def _read_proc_unix_table(pid: int) -> bytes | None:
+    try:
+        return Path(f"/proc/{pid}/net/unix").read_bytes()
+    except OSError:
+        return None
+
+
+def _judge_socket_nodes(
+    nodes: Sequence[_SocketNode],
+    evidence: _SocketEvidence,
+    *,
+    calibrate: Callable[[_SocketNode], int | None] | None,
+    table_reader: Callable[[int], bytes | None] = _read_proc_unix_table,
+) -> list[_SocketVerdict]:
+    """Passive verdicts: LIVE, UNKNOWN, or NO-OWNER-EVIDENCE (never DEAD: that needs a probe)."""
+
+    bound = evidence.bound()
+    unenterable_names, unread = _unenterable_bound_names(evidence, table_reader)
+    calibrated: dict[int, int | None] = {}
+    verdicts: list[_SocketVerdict] = []
+    for node in nodes:
+        candidates = bound.get(sockdiag.low32(node.st_ino), [])
+        live: str | None = None
+        unknown: str | None = None
+        own_devices = (
+            {_kernel_dev_encoding(node.st_dev)} | _mount_superblock_devices(node.path)
+            if candidates
+            else set()
+        )
+        standard = [
+            (netns, item) for netns, item in candidates
+            if item.vfs is not None and item.vfs[1] in own_devices
+        ]
+        if standard:
+            # LIVE refuses, so it needs no calibration: a socket bound to this
+            # inode on a device with the node's own kernel encoding is enough.
+            netns, item = standard[0]
+            live = (
+                f"socket {item.sockfs_ino} (cookie {item.cookie}) in network namespace "
+                f"{netns} is bound to this node's identity"
+            )
+        elif candidates:
+            if node.st_dev not in calibrated:
+                calibrated[node.st_dev] = None if calibrate is None else calibrate(node)
+            kernel_dev = calibrated[node.st_dev]
+            if kernel_dev is None:
+                unknown = (
+                    "a socket is bound to a node with the same low 32 inode bits, and this "
+                    "node's device could not be calibrated to tell them apart"
+                )
+            else:
+                same = [
+                    (netns, item) for netns, item in candidates
+                    if item.vfs is not None and item.vfs[1] == kernel_dev
+                ]
+                if same:
+                    netns, item = same[0]
+                    live = (
+                        f"socket {item.sockfs_ino} (cookie {item.cookie}) in network namespace "
+                        f"{netns} is bound to this node's identity"
+                    )
+        if live is None and _socket_node_names(node, nodes) & unenterable_names:
+            live = "a socket in a network namespace that cannot be entered is bound to this name"
+        if live is not None:
+            verdicts.append(_SocketVerdict(node, "LIVE", live))
+            continue
+        gaps = [
+            f"network namespace {netns} cannot be entered ({reason}); its sockets can prove "
+            "a node live but never dead"
+            for netns, reason in sorted(evidence.unenterable.items())
+        ] + unread + list(evidence.gaps)
+        if unknown is not None:
+            verdicts.append(_SocketVerdict(node, "UNKNOWN", unknown))
+        elif gaps:
+            more = f" (and {len(gaps) - 1} more visibility gaps)" if len(gaps) > 1 else ""
+            verdicts.append(
+                _SocketVerdict(node, "UNKNOWN", gaps[0] + more, gaps=tuple(gaps))
+            )
+        else:
+            verdicts.append(
+                _SocketVerdict(node, "NO-OWNER-EVIDENCE", "no dumped socket is bound to this node")
+            )
+    return verdicts
+
+
+def _mount_superblock_devices(path: Path) -> set[int]:
+    """Kernel dev_t of the superblock(s) mounted at ``path``'s deepest mount point.
+
+    Read from this process's mountinfo (whose major:minor is the superblock's
+    device, which UNIX_DIAG_VFS reports; on btrfs, stat reports the
+    subvolume's device instead).  Used only to call a node LIVE, the direction
+    that refuses, so a stale or ambiguous table can only cause a refusal.
+    """
+
+    try:
+        table = Path("/proc/self/mountinfo").read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError:
+        return set()
+    target = os.path.realpath(path.parent)
+    best = -1
+    devices: set[int] = set()
+    for line in table.split("\n"):
+        fields = line.split(" ")
+        if len(fields) < 5 or ":" not in fields[2]:
+            continue
+        mount_point = _decode_mountinfo_field(fields[4])
+        if not (target == mount_point or target.startswith(mount_point.rstrip("/") + "/")):
+            continue
+        major, _colon, minor = fields[2].partition(":")
+        if not (major.isdigit() and minor.isdigit()):
+            continue
+        if len(mount_point) > best:
+            best, devices = len(mount_point), set()
+        if len(mount_point) == best:
+            devices.add((int(major) << 20) | int(minor))
+    return devices
+
+
+def _kernel_dev_encoding(st_dev: int) -> int:
+    """st_dev in the kernel's internal dev_t layout, as UNIX_DIAG_VFS reports a device."""
+
+    return (os.major(st_dev) << 20) | os.minor(st_dev)
+
+
+def _calibrate_socket_device(node: _SocketNode, *, deadline: float) -> int | None:
+    """The kernel dev_t UNIX_DIAG_VFS reports for ``node``'s st_dev, or None.
+
+    A calibration socket is bound in a fresh private directory at the node's
+    tree root (which must be on the node's device), found in a dump by its own
+    sockfs inode, and removed again; the root's identity is checked after.
+    """
+
+    root = node.root
+    try:
+        before = os.stat(root, follow_symlinks=False)
+    except OSError:
+        return None
+    if before.st_dev != node.st_dev:
+        return None
+    ticks = _quiet_start_ticks(Path("/proc/self"))
+    name = f".wrkslots-calib.{os.getpid()}.{ticks}.{secrets.token_hex(8)}"
+    root_fd = os.open(root, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    listener: socket.socket | None = None
+    made = False
+    try:
+        os.mkdir(name, 0o700, dir_fd=root_fd)
+        made = True
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
+        address = f"/proc/self/fd/{root_fd}/{name}/s"
+        if len(address) > _SOCKET_PROBE_PATH_LIMIT:
+            return None
+        listener.bind(address)
+        own = os.fstat(listener.fileno()).st_ino
+        placed = os.stat(f"{name}/s", dir_fd=root_fd, follow_symlinks=False)
+        if placed.st_dev != node.st_dev:
+            return None
+        dump = sockdiag.dump_own_namespace(deadline=deadline)
+        matches = [item for item in dump.sockets if item.sockfs_ino == own]
+        if len(matches) != 1 or matches[0].vfs is None:
+            return None
+        vfs_ino, kernel_dev = matches[0].vfs
+        if vfs_ino != sockdiag.low32(placed.st_ino):
+            return None
+        return kernel_dev
+    except (OSError, sockdiag.DumpError):
+        return None
+    finally:
+        if listener is not None:
+            listener.close()
+        if made:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(f"{name}/s", dir_fd=root_fd)
+            os.rmdir(name, dir_fd=root_fd)
+        os.close(root_fd)
+        after = os.stat(root, follow_symlinks=False)
+        if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+            raise Refusal(f"selected tree {root} changed identity during socket calibration")
+
+
+_SOCKET_PROBE_TYPES = (socket.SOCK_STREAM, socket.SOCK_SEQPACKET)
+"""connect() finds a node's socket by inode in one table for every namespace and
+answers EPROTOTYPE for a socket of another type, so a node refused by both a
+stream and a seqpacket probe has no socket of any type bound to it."""
+
+
+def _socket_connect_errno(address: str, kind: int) -> int:
+    """One non-blocking, no-payload connect(); its errno (0 on success), closed at once."""
+
+    probe = socket.socket(socket.AF_UNIX, kind | socket.SOCK_NONBLOCK | socket.SOCK_CLOEXEC)
+    try:
+        return probe.connect_ex(address)
+    finally:
+        probe.close()
+
+
+def _probe_socket_node(
+    node: _SocketNode, parent_ctimes: dict[tuple[int, int], int] | None = None,
+) -> tuple[str, str]:
+    """No-payload connect()s to the node, one per probe type: (outcome, detail).
+
+    outcome is LIVE, REFUSED (ECONNREFUSED to every type with the node
+    unchanged), DISAPPEARED, or UNKNOWN.  A bound stream socket that is not
+    listening refuses a stream probe but answers EPROTOTYPE to a seqpacket
+    one, and the converse, so REFUSED needs both; any other answer is final
+    and never retried.  The parent directory is pinned through an O_PATH
+    descriptor.  Before and after every connect() the node's identity (device,
+    inode, links, mode, ctime) must equal its inventory, and the parent's
+    (device, inode, ctime) must equal what the first probe of the proof saw,
+    kept in ``parent_ctimes``.
+    """
+
+    ctimes: dict[tuple[int, int], int] = {} if parent_ctimes is None else parent_ctimes
+    try:
+        parent_fd = os.open(node.path.parent, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError as exc:
+        return "UNKNOWN", f"cannot open the node's directory: {exc}"
+    try:
+        def parent_changed() -> bool:
+            seen = os.fstat(parent_fd)
+            return (seen.st_dev, seen.st_ino) != node.parent or (
+                ctimes.setdefault(node.parent, seen.st_ctime_ns) != seen.st_ctime_ns
+            )
+
+        if parent_changed():
+            return "UNKNOWN", "the node's directory was replaced or changed"
+
+        def current() -> tuple[int, int, int, int, int] | None:
+            try:
+                seen = os.stat(node.path.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return None
+            return (seen.st_dev, seen.st_ino, seen.st_nlink, seen.st_mode, seen.st_ctime_ns)
+
+        expected = (node.st_dev, node.st_ino, node.nlink, node.mode, node.ctime_ns)
+        address = f"/proc/self/fd/{parent_fd}/{node.path.name}"
+        if len(address.encode()) > _SOCKET_PROBE_PATH_LIMIT:
+            return "UNKNOWN", "the node's name is too long to probe"
+        for kind in _SOCKET_PROBE_TYPES:
+            label = "stream" if kind == socket.SOCK_STREAM else "seqpacket"
+            seen = current()
+            if seen is None:
+                return "DISAPPEARED", "the node disappeared before the probe"
+            if seen != expected:
+                return "UNKNOWN", "the node changed before the probe"
+            result = _socket_connect_errno(address, kind)
+            after = current()
+            if result == errno.ENOENT or after is None:
+                return "DISAPPEARED", "the node disappeared during the probe"
+            if after != expected:
+                return "UNKNOWN", "the node changed during the probe (a replacement)"
+            if parent_changed():
+                return "UNKNOWN", "the node's directory was replaced or changed during the probe"
+            if result in (0, errno.EINPROGRESS):
+                return "LIVE", f"a {label} connect() reached a listening socket"
+            if result == errno.EAGAIN:
+                return "LIVE", f"a {label} connect() found a listening socket with a full backlog"
+            if result == errno.EPROTOTYPE:
+                return "LIVE", f"a {label} connect() found a bound socket of another type"
+            if result != errno.ECONNREFUSED:
+                return "UNKNOWN", (
+                    f"a {label} connect() failed: {os.strerror(result)} (errno {result})"
+                )
+        return "REFUSED", "stream and seqpacket connect()s were refused with the node unchanged"
+    finally:
+        os.close(parent_fd)
+
+
+_SOCKET_SELF_TEST_CACHE: dict[str, tuple[bool, str]] = {}
+_SOCKET_SELF_TEST_SECONDS = 20.0
+
+
+def _socket_probe_self_test() -> tuple[bool, str]:
+    """Whether this kernel's connect() answers as the dual-type probe needs (#1230).
+
+    A gap may be overridden by the probe only while this passes.  A process
+    in a fresh unprivileged user and network namespace binds a non-listening
+    stream socket; from this namespace a stream probe must answer
+    ECONNREFUSED and a seqpacket probe EPROTOTYPE, and after it closes the
+    socket both must answer ECONNREFUSED.  Anything else, or no namespace,
+    fails.  The result is kept per boot ID, for this process only.
+    """
+
+    try:
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    except OSError:
+        boot = ""
+    if boot and boot in _SOCKET_SELF_TEST_CACHE:
+        return _SOCKET_SELF_TEST_CACHE[boot]
+    result = _run_socket_probe_self_test()
+    if boot:
+        _SOCKET_SELF_TEST_CACHE[boot] = result
+    return result
+
+
+def _run_socket_probe_self_test() -> tuple[bool, str]:
+    code = (
+        "import os, socket, sys\n"
+        "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+        "s.bind(sys.argv[1])\n"
+        "print(os.stat('/proc/self/ns/net').st_ino, flush=True)\n"
+        "sys.stdin.read(1)\n"
+        "s.close()\n"
+        "print('closed', flush=True)\n"
+        "sys.stdin.read(1)\n"
+    )
+    unshare = shutil.which("unshare") or "/usr/bin/unshare"
+    names = {0: "connected", **{number: name for number, name in errno.errorcode.items()}}
+    with tempfile.TemporaryDirectory(prefix="wrkslots-probe-selftest-") as work:
+        node = os.path.join(work, "s")
+        try:
+            holder = subprocess.Popen(
+                [unshare, "--user", "--map-root-user", "--net", "--",
+                 sys.executable, "-I", "-c", code, node],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, cwd="/",
+            )
+        except OSError as exc:
+            return False, f"self-test namespace could not be started: {exc}"
+        try:
+            assert holder.stdout is not None and holder.stdin is not None
+
+            def line() -> str:
+                assert holder.stdout is not None
+                with selectors.DefaultSelector() as selector:
+                    selector.register(holder.stdout, selectors.EVENT_READ)
+                    ready = selector.select(_SOCKET_SELF_TEST_SECONDS)
+                return holder.stdout.readline().strip() if ready else ""
+
+            netns = line()
+            if not netns.isdigit():
+                return False, "self-test namespace could not be made"
+            if int(netns) == sockdiag.own_netns():
+                return False, "self-test holder did not get its own network namespace"
+            held = tuple(_socket_connect_errno(node, kind) for kind in _SOCKET_PROBE_TYPES)
+            holder.stdin.write("c")
+            holder.stdin.flush()
+            if line() != "closed":
+                return False, "self-test holder did not close its socket"
+            released = tuple(_socket_connect_errno(node, kind) for kind in _SOCKET_PROBE_TYPES)
+        finally:
+            with contextlib.suppress(OSError):
+                holder.kill()
+            with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                holder.communicate(timeout=5)
+    detail = (
+        "bound in another namespace: stream " + "/seqpacket ".join(
+            names.get(number, str(number)) for number in held
+        ) + "; released: stream " + "/seqpacket ".join(
+            names.get(number, str(number)) for number in released
+        )
+    )
+    expected_held = (errno.ECONNREFUSED, errno.EPROTOTYPE)
+    expected_released = (errno.ECONNREFUSED, errno.ECONNREFUSED)
+    return held == expected_held and released == expected_released, detail
+
+
+def _prove_socket_nodes(
+    targets: Mapping[Path, str],
+    *,
+    deadline: float,
+    probe: bool,
+    allow_calibration: bool,
+    table_reader: Callable[[int], bytes | None] = _read_proc_unix_table,
+    privileged: _PrivilegedNamespaceReader | None = None,
+    stop_at_live: bool = False,
+) -> tuple[list[_SocketVerdict], _SocketEvidence]:
+    """Judge every socket node of ``targets``; DEAD needs the probe (#1230).
+
+    A node disappearing during the probe reruns the whole proof once; a second
+    disappearance stays DISAPPEARED.
+    """
+
+    for attempt in range(2):
+        nodes = _socket_node_inventory(targets)
+        if not nodes:
+            return [], _SocketEvidence({}, {}, {}, [], 0.0)
+        evidence = _collect_socket_evidence(deadline=deadline, privileged=privileged)
+        calibrated: dict[int, int | None] = {}
+
+        def calibrate_once(node: _SocketNode) -> int | None:
+            # Once per device for the whole proof: a second calibration would
+            # change a tree root's ctime between a node's probes.
+            if node.st_dev not in calibrated:
+                calibrated[node.st_dev] = _calibrate_socket_device(node, deadline=deadline)
+            return calibrated[node.st_dev]
+
+        calibrate = calibrate_once if allow_calibration else None
+        verdicts = _judge_socket_nodes(
+            nodes, evidence, calibrate=calibrate, table_reader=table_reader
+        )
+        if not probe or (stop_at_live and any(v.verdict == "LIVE" for v in verdicts)):
+            return verdicts, evidence
+        probed: dict[_SocketNode, tuple[str, str]] = {}
+        parent_ctimes: dict[tuple[int, int], int] = {}
+        for verdict in verdicts:
+            if verdict.verdict in ("NO-OWNER-EVIDENCE", "UNKNOWN"):
+                # A probe can make an UNKNOWN node LIVE; DEAD needs more below.
+                probed[verdict.node] = _probe_socket_node(verdict.node, parent_ctimes)
+        if any(outcome == "DISAPPEARED" for outcome, _detail in probed.values()) and attempt == 0:
+            continue
+        second = _collect_socket_evidence(deadline=deadline, privileged=privileged)
+        for node, (outcome, _detail) in list(probed.items()):
+            if outcome == "REFUSED":
+                # Again after the second dump: a bind that had made its node but
+                # not yet published its socket has finished by now.
+                probed[node] = _probe_socket_node(node, parent_ctimes)
+        rejudged = {
+            verdict.node: verdict
+            for verdict in _judge_socket_nodes(
+                nodes, second, calibrate=calibrate, table_reader=table_reader
+            )
+        }
+
+        def no_owner(seen: _SocketVerdict) -> bool:
+            return seen.verdict == "NO-OWNER-EVIDENCE" or (
+                seen.verdict == "UNKNOWN" and bool(seen.gaps)
+            )
+
+        final: list[_SocketVerdict] = []
+        for verdict in verdicts:
+            if verdict.node not in probed:
+                final.append(verdict)
+                continue
+            outcome, detail = probed[verdict.node]
+            again = rejudged[verdict.node]
+            if outcome == "REFUSED" and no_owner(verdict) and no_owner(again):
+                gaps = tuple(dict.fromkeys(verdict.gaps + again.gaps))
+                reason = (
+                    "no socket was bound to it: stream and seqpacket connect()s were refused "
+                    "before and after the second dump"
+                )
+                if not gaps:
+                    final.append(_SocketVerdict(
+                        verdict.node, "DEAD", reason + ", and no dump listed one",
+                        "active", detail,
+                    ))
+                    continue
+                # Lead's amendment (b): pathname sockets are found by inode in
+                # one table for every namespace, so a refusal from both types
+                # overrides a visibility gap, once the kernel passes the self-test.
+                if second.self_test is None:
+                    passed, report = _socket_probe_self_test()
+                    second.self_test = ("passed: " if passed else "failed: ") + report
+                if not second.self_test.startswith("passed: "):
+                    final.append(_SocketVerdict(
+                        verdict.node, "UNKNOWN",
+                        f"{gaps[0]}; the dual-type probe self-test {second.self_test}, so it "
+                        "cannot override a visibility gap",
+                        "active", detail, gaps=gaps,
+                    ))
+                    continue
+                more = f" (and {len(gaps) - 1} more)" if len(gaps) > 1 else ""
+                final.append(_SocketVerdict(
+                    verdict.node, "DEAD",
+                    f"{reason}; gap overridden by dual-type probe: {gaps[0]}{more}",
+                    "active", detail, gaps=gaps, gaps_overridden=gaps,
+                ))
+            elif outcome == "REFUSED":
+                final.append(_SocketVerdict(
+                    verdict.node, again.verdict if again.verdict != "NO-OWNER-EVIDENCE"
+                    else verdict.verdict, again.reason if again.verdict != "NO-OWNER-EVIDENCE"
+                    else verdict.reason, "active", detail, gaps=again.gaps,
+                ))
+            elif outcome == "LIVE":
+                final.append(_SocketVerdict(verdict.node, "LIVE", detail, "active", detail))
+            elif verdict.verdict == "UNKNOWN":
+                final.append(_SocketVerdict(
+                    verdict.node, "UNKNOWN", verdict.reason, "active", detail, gaps=verdict.gaps
+                ))
+            else:
+                final.append(_SocketVerdict(verdict.node, outcome, detail, "active", detail))
+        return final, second
+    raise AssertionError("unreachable")
+
+
+def _require_dead_socket_nodes(
+    targets: Mapping[Path, str], budget: _ReadOnlyCommandBudget,
+) -> tuple[tuple[dict[str, object], ...], dict[int, tuple[int, int] | None], set[int]]:
+    """Refuse unless every socket node of ``targets`` is proven DEAD (#1230).
+
+    Returns the receipts, the dumped sockets' VFS identities by sockfs inode
+    (for the bound-name census), and the low 32 inode bits of every node.
+    """
+
+    for target in targets:
+        _remove_stale_socket_calibrations(target)
+    verdicts, evidence = _prove_socket_nodes(
+        targets,
+        deadline=budget.deadline,
+        probe=True,
+        allow_calibration=True,
+        table_reader=lambda pid: _privileged_unix_table(pid, budget),
+        privileged=lambda pids: _privileged_namespace_links(pids, budget),
+        stop_at_live=True,
+    )
+    budget.remaining_seconds()
+    for verdict in verdicts:
+        if verdict.verdict != "DEAD":
+            raise Refusal(
+                f"selected tree contains a filesystem socket node that is not proven dead: "
+                f"{verdict.node.path}: {verdict.verdict}: {verdict.reason}"
+            )
+    receipts = tuple(verdict.receipt(evidence) for verdict in verdicts)
+    return (
+        receipts,
+        evidence.resolver(),
+        {sockdiag.low32(verdict.node.st_ino) for verdict in verdicts},
+    )
+
+
+def _privileged_unix_table(pid: int, budget: _ReadOnlyCommandBudget) -> bytes | None:
+    try:
+        rc, contents, stderr = _run_root_owned_command(
+            Path("/usr/bin/cat"), ("--", f"/proc/{pid}/net/unix"), budget=budget
+        )
+    except (OSError, Refusal):
+        return None
+    if rc or stderr or len(contents) > _UNIX_SOCKET_TABLE_BYTES_LIMIT:
+        return None
+    return contents
 
 
 def _capture_lsof_process_path_census(
@@ -68777,14 +70023,22 @@ def _capture_lsof_process_path_census(
     targets = {path: str(path) for path in slot_paths}
     if not targets:
         return _ProcessPathCensus((), (), owner_cgroup_complete=False)
+    for target in targets:
+        # A calibration directory a crashed proof left behind (#1230).
+        _remove_stale_socket_calibrations(target)
     before = {path: _open_directory_identity(path, "selected census tree") for path in targets}
     inodes, has_sockets = _selected_tree_inodes(targets, budget)
+    socket_receipts: tuple[dict[str, object], ...] = ()
+    socket_proof: tuple[dict[int, tuple[int, int] | None], set[int]] | None = None
     if has_sockets:
         # A Unix bound-name string does not authenticate the held filesystem
         # object: that name can be unlinked/rebound while a hardlink survives in
-        # another selected tree. Do not declare any member of this cohort unused
-        # without kernel socket-object identity evidence.
-        raise Refusal("selected tree contains a filesystem socket node; socket-object liveness is unproven")
+        # another selected tree.  Kernel socket-object identity evidence must
+        # prove every socket node dead first (#1230 socket-liveness-proof).
+        socket_receipts, resolver, node_low = _require_dead_socket_nodes(targets, budget)
+        socket_proof = (resolver, node_low)
+        # Calibration may have added and removed an entry; read the trees again.
+        inodes, has_sockets = _selected_tree_inodes(targets, budget)
     for attempt in range(3):
         budget.remaining_seconds()
         try:
@@ -68796,6 +70050,7 @@ def _capture_lsof_process_path_census(
             maps = _batch_maps_inode_matches(processes, targets, inodes, budget)
             unix = _batch_unix_socket_matches(
                 processes, targets, sockets, budget, selected_has_sockets=has_sockets,
+                socket_proof=socket_proof,
             )
             _recheck_thread_group_observations(processes, budget)
         except _ProcessEvidenceChanged:
@@ -68809,6 +70064,7 @@ def _capture_lsof_process_path_census(
             processes,
             (*mounts, *identities, *maps, *unix),
             owner_cgroup_complete=False,
+            socket_receipts=socket_receipts,
         )
     raise Refusal("batch process census is indeterminate")
 
@@ -73052,6 +74308,80 @@ _ARCHIVE_NESTED_CACHE_REPOSITORIES_HELP = (
 )
 
 
+def _cmd_socket_census(args: argparse.Namespace) -> int:
+    """Report the socket nodes under PATHs and the kernel evidence about each (#1230).
+
+    Read-only and project-free: normal-user reads of this host's socket tables
+    and same-UID processes, never sudo, never a project registry.  Without
+    --probe it is passive and never reports a node DEAD.  With --probe it also
+    makes the no-payload connect() and, where needed, a calibration socket, and
+    removes stale calibration directories at each PATH.
+    """
+
+    targets: dict[Path, str] = {}
+    for raw in args.paths:
+        path = Path(os.path.abspath(raw))
+        if path.is_symlink() or not path.is_dir():
+            raise Refusal(f"socket-census PATH must be a directory, not a symlink: {raw}")
+        targets[path] = str(path)
+    started = time.monotonic()
+    removed: list[str] = []
+    if args.probe:
+        for target in targets:
+            removed.extend(_remove_stale_socket_calibrations(target))
+    verdicts, evidence = _prove_socket_nodes(
+        targets,
+        deadline=started + args.timeout_seconds,
+        probe=bool(args.probe),
+        allow_calibration=bool(args.probe),
+        table_reader=_read_proc_unix_table,
+    )
+    counts = {
+        name: sum(1 for verdict in verdicts if verdict.verdict == name)
+        for name in ("DEAD", "LIVE", "UNKNOWN", "NO-OWNER-EVIDENCE", "DISAPPEARED")
+    }
+    gaps = list(evidence.gaps) + [
+        f"network namespace {netns} cannot be entered: {reason}"
+        for netns, reason in sorted(evidence.unenterable.items())
+    ]
+    payload: dict[str, object] = {
+        "schema": 1,
+        "mode": "active" if args.probe else "passive",
+        "paths": [str(path) for path in targets],
+        "nodes": [verdict.receipt(evidence) for verdict in verdicts],
+        "distinct_identities": len({verdict.node.identity for verdict in verdicts}),
+        "counts": counts,
+        "dumps": [
+            {"netns": dump.netns, "records": dump.records, "bytes": dump.bytes,
+             "seconds": round(dump.seconds, 3)}
+            for dump in evidence.dumps.values()
+        ],
+        "refused_visibility": gaps,
+        "namespace_rounds": evidence.rounds,
+        "probe_self_test": evidence.self_test,
+        "stale_calibrations_removed": removed,
+        "seconds": round(time.monotonic() - started, 3),
+    }
+    if args.format == "json":
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(
+            f"socket_census mode={payload['mode']} nodes={len(verdicts)} "
+            f"identities={payload['distinct_identities']} "
+            + " ".join(f"{name.lower()}={count}" for name, count in counts.items())
+            + f" dumps={len(evidence.dumps)} unenterable={len(evidence.unenterable)}"
+            + f" rounds={evidence.rounds} seconds={payload['seconds']}"
+        )
+        for verdict in verdicts:
+            print(
+                f"{verdict.verdict}: {verdict.node.path} device={verdict.node.st_dev} "
+                f"inode={verdict.node.st_ino} reason={verdict.reason}"
+            )
+        for gap in gaps:
+            print(f"REFUSED: {gap}")
+    return 0 if counts["LIVE"] == 0 and counts["UNKNOWN"] == 0 else 1
+
+
 def _cmd_quickstart(_args: argparse.Namespace) -> int:
     print(_QUICKSTART)
     return 0
@@ -73162,6 +74492,60 @@ usage or audit gate unknown, 3 fail-closed refusal.
         formatter_class=_HelpFormatter,
     )
     quickstart.set_defaults(handler=_cmd_quickstart)
+
+    socket_census = subparsers.add_parser(
+        "socket-census",
+        help="report whether Unix socket nodes under paths have a live socket (read-only)",
+        description=(
+            "Find every filesystem Unix socket node under each PATH and report what the "
+            "kernel shows about it, as destructive recovery would judge it: LIVE (a socket "
+            "is bound to it), UNKNOWN (a visibility gap, named), NO-OWNER-EVIDENCE, or, "
+            "only with --probe, DEAD.  The evidence is a NETLINK_SOCK_DIAG dump of every "
+            "network namespace a process of this user sits in, holds or has mounted; a dump "
+            "can prove a node LIVE but never dead.  Normal-user reads only: no sudo, no "
+            "project registry.  With --probe it also makes no-payload stream and seqpacket "
+            "connect()s, which find a socket of any type by inode in every namespace; DEAD "
+            "needs both refused before and after a second dump with the node and its "
+            "directory unchanged.  Such a refusal overrides a visibility gap (recorded as "
+            "overridden) once a self-test of the probe passes on this kernel.  Exit status "
+            "0 when no node is LIVE or UNKNOWN, 1 otherwise, 3 when the census refuses."
+        ),
+        epilog=(
+            "examples:\n"
+            "  wrkslots socket-census /path/to/checkout\n"
+            "  wrkslots socket-census --format json /path/a /path/b\n"
+            "  wrkslots socket-census --probe /path/to/checkout"
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    socket_census.add_argument(
+        "paths",
+        nargs="+",
+        metavar="PATH",
+        help="a directory to search for socket nodes (symlinks are not followed)",
+    )
+    socket_census.add_argument(
+        "--probe",
+        action="store_true",
+        help=(
+            "also connect() to each node without payload, binding a calibration socket in "
+            "a fresh .wrkslots-calib.* directory at PATH when an inode collides, and remove "
+            "stale calibration directories at each PATH (default: passive, writes nothing)"
+        ),
+    )
+    socket_census.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=120.0,
+        help="the bound on the whole census, in seconds (default: 120)",
+    )
+    socket_census.add_argument(
+        "--format",
+        choices=("human", "json"),
+        default="human",
+        help="result format (default: human)",
+    )
+    socket_census.set_defaults(handler=_cmd_socket_census)
 
     init = subparsers.add_parser(
         "init",
@@ -75641,6 +77025,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.wait_lock < 0 or not args.wait_lock < float("inf"):
         parser.error("--wait-lock must be a finite non-negative number")
+    if args.command == "socket-census" and args.project_root is not None:
+        parser.error("socket-census reads only PATHs and this host; it takes no --project-root")
     if args.command == "init":
         if args.heartbeat_ttl_seconds <= 0:
             parser.error("--heartbeat-ttl-seconds must be positive")

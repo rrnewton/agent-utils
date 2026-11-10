@@ -7633,9 +7633,13 @@ def test_batch_census_isolated_real_file_alias_mapping_and_socket(
             stderr_limit=64 * 1024, input_limit=wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT,
         )
         if kind in ("socket", "socket-at", "socket-space", "socket-orphan"):
-            with pytest.raises(wrkslots.Refusal, match="filesystem socket node; socket-object liveness is unproven"):
+            # #1230 socket-liveness-proof: the kernel shows each held socket
+            # bound to the node (by dump, or by the dual-type probe for the one
+            # in an orphaned namespace), so the node is LIVE, never DEAD.
+            with pytest.raises(wrkslots.Refusal, match=r"socket node that is not proven dead: .*: LIVE: ") as refused_socket:
                 held = wrkslots._capture_lsof_process_path_census((selected, unrelated), budget=budget)
                 held.assert_slot_unused(selected, None)
+            (tmp_path / "REFUSAL.txt").write_text(str(refused_socket.value) + "\n")
             # A selected tree without socket nodes remains a qualifying negative.
             census = wrkslots._capture_lsof_process_path_census((unrelated,), budget=budget)
             census.assert_slot_unused(unrelated, None)
@@ -8478,7 +8482,7 @@ def test_batch_census_two_selected_trees_cannot_mask_socket_holder(
             timeout_seconds=22, stdout_limit=16 * 1024 * 1024, stderr_limit=64 * 1024,
             input_limit=wrkslots._MOUNTINFO_CENSUS_BYTES_LIMIT,
         )
-        with pytest.raises(wrkslots.Refusal, match="filesystem socket node; socket-object liveness is unproven") as refused:
+        with pytest.raises(wrkslots.Refusal, match=r"socket node that is not proven dead: .*: LIVE: ") as refused:
             census = wrkslots._capture_lsof_process_path_census((first, second), budget=budget)
             # A's known match cannot make B's actual held socket safe to remove.
             census.assert_slot_unused(second, None)

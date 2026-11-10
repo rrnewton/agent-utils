@@ -1890,6 +1890,67 @@ With `--yes` it then:
 An interrupted release resumes with plain `wrkslots recover --coordinator-pid PID`, which checks
 the run-record and every salvage bundle again before it goes on. The run-record itself is kept.
 
+## Socket nodes in a tree being recovered
+
+A tree that destructive recovery reclaims may contain filesystem Unix socket nodes: the names a
+socket's `bind()` created. A node outlives its socket, so most are stale, but a live one means a
+process can still be reached through the tree. Earlier releases refused every tree holding one.
+Now each node must be proven DEAD first. Any other verdict refuses the whole tree, naming the node
+and the reason.
+
+A node is DEAD only when all of this holds:
+
+- No socket-table dump lists a socket bound to it. Each network namespace that a process of this
+  user sits in, holds a descriptor to, or has bind-mounted is dumped through `NETLINK_SOCK_DIAG`.
+  Namespaces that appear meanwhile are dumped too, round after round, until a read adds none (four
+  rounds at most, then it refuses). A dump records the low 32 bits of the bound node's inode and
+  the superblock's device. So an inode match counts as a candidate, never as a nonmatch, and
+  where the device numbers differ (as on btrfs), one is calibrated by binding a socket in a fresh
+  `.wrkslots-calib.*` directory at the tree's root. That directory is removed at once.
+- A stream `connect()` and a seqpacket `connect()`, with no payload, are both refused
+  (`ECONNREFUSED`), once before and once after the second dump. `connect()` looks a node's socket
+  up by inode, in one table shared by every network namespace. A socket of the other type answers
+  `EPROTOTYPE`, so only a node with no socket bound refuses both. Any other answer leaves the
+  node not dead: a connection (closed at once), `EPROTOTYPE`, `EAGAIN`, a permission error, or the
+  node disappearing.
+- The node's device, inode, link count, mode and change time, and its directory's device, inode
+  and change time, stay the same throughout.
+
+A dump alone never proves a node dead. The kernel resumes each reply chunk by position, so
+sockets closing at the same time can make it skip a live one. A dump can still prove a node LIVE.
+
+Some namespaces cannot be read or entered: a non-dumpable process of this user, or a namespace
+whose owning user namespace belongs to someone else (a service with `PrivateNetwork=yes`). These
+gaps do not block DEAD once both probes are refused, because the probes do not depend on
+namespaces. But they do so only after a self-test passes: a process in a fresh unprivileged user
+and network namespace binds a non-listening stream socket, and the probes from this namespace must
+answer exactly `ECONNREFUSED` for stream and `EPROTOTYPE` for seqpacket. The self-test runs at most
+once per boot in each process. If it fails, every gap leaves its node UNKNOWN. Each overridden gap
+is recorded in the verdict as "gap overridden by dual-type probe: ...". The finish journal of a
+reclaimed path records them under `x.socket_proof`, along with the number of nodes proven dead.
+
+A crash during calibration can leave a `.wrkslots-calib.<pid>.<start>.<tag>` directory behind.
+`doctor` reports one whose creator has exited as `stale-socket-calibration`, and the next recovery
+of that path removes it before its census.
+
+### See what recovery would decide: `socket-census`
+
+`wrkslots socket-census PATH...` reports every socket node under the paths, with the evidence about
+each. It needs no project, never runs `sudo`, and reads only what this user can read.
+
+```sh
+wrkslots socket-census /path/to/checkout
+wrkslots socket-census --format json /path/a /path/b
+wrkslots socket-census --probe /path/to/checkout
+```
+
+Without `--probe` it writes nothing and never reports a node DEAD. A node with no socket in any
+dump is reported as NO-OWNER-EVIDENCE, or as UNKNOWN when a namespace was out of reach; each such
+gap is listed as REFUSED. With `--probe` it also makes the connect probes and any calibration, and
+it removes stale calibration directories at each PATH. The report gives the number of dumps,
+namespace rounds and seconds taken, which is the cost recovery pays for the same paths. The exit
+status is 0 when no node is LIVE or UNKNOWN, 1 otherwise, and 3 when the census itself refuses.
+
 ## Recover registered validation rows with absent storage
 
 If external cleanup removed disposable validation directories without retiring their ACTIVE rows,
