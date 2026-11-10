@@ -59,5 +59,6 @@ Against a fake provider:
 # Notes
 
 - Mitigation in place since 2026-11-10 12:19 PM ET: `serve = false` (backup kept beside the config). Restore is part of acceptance, not a follow-up favour.
+- The provider shim (a deployed program outside this tree) logged `BrokenPipeError` tracebacks when the app closed a connection before a slow replies call answered, and counted the call `internal_error`. With serving restored this fix removes the pattern from the read path: cache-held views never wait on the shim, and refresh reads run detached to completion on their own connection. A cache-miss read still waits upstream, bounded by the existing stand-in waits. Quietly logging a client-gone write in the shim itself is a deployment-side change, noted here and not part of this fix.
 - Cosmetic, unrelated, no fix wanted here: one settled send can log `send_timing` twice (the posting task logs it, and the two-phase send's detached task logs it again after its own settle note). One upstream post either way.
 - Coordinates with the lanes holding the page trace/selection work, the redraw/reads work, and the voice-page code move: file map shared before editing shared files.
