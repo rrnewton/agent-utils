@@ -315,6 +315,25 @@ settingsReadouts.serverHost();
 // was within the slack of the foot of a list 36px short, and was taken to the foot as the room came back.
 // So #screen-main holds the room as last measured on it, which the lists and their boxes read, and changes
 // it only while it is shown; the status pill, which stands on every screen, reads the measure as it is.
+// `#1185 chip-height-snap`. Whether Main's reader is following its foot, as the foot keeper notes
+// it (one state, from the reader's own scrolls and landings): the keepers mount at the boot below,
+// long after these observers, so their answer is held here once made and the re-derived test used
+// until then.
+var mainFollowState = null;
+
+/**
+ * Whether the chips' and the strip's keepers may take Main's list to its foot as they resize:
+ * the follow state while the keepers can say it, with a filter's or a quick reply's hold still
+ * vetoing; the re-derived test (`followsNewest`) only before they mount. A reader resting a few
+ * pixels above the foot, inside the old slack, is not following, and is left where they are.
+ *
+ * @param {HTMLElement} area
+ */
+function chipsFollowFoot(area) {
+  if (!mainFollowState) return followsNewest(area);
+  return mainFollowState() && heldFilterRow() === null && !quickReplyHolds(area);
+}
+
 if (typeof window.ResizeObserver === "function") {
   new window.ResizeObserver(([entry]) => {
     const height = entry.contentRect.height;
@@ -324,7 +343,7 @@ if (typeof window.ResizeObserver === "function") {
     const landed = screens.screen() === "main" && screens.view() === "discord" && entryLandingHolds();
     // `#243 filter-keeps-selection`: nor one whose message a filter change holds in place. `#241 voice-composer`:
     // the call's transcript follows too, not only the channel.
-    const pinned = !landed && screens.screen() === "main" && followsNewest(area);
+    const pinned = !landed && screens.screen() === "main" && chipsFollowFoot(area);
     const room = height > 0 ? `calc(${height}px + 0.5rem)` : "0px";
     el("frame-body").style.setProperty("--scroll-tools-clearance", room);
     // `#433 read-strip-low`. The row's height itself, without the half-rem the room keeps over
@@ -361,7 +380,7 @@ if (typeof window.ResizeObserver === "function") {
     const room = height > 0 ? `calc(${height}px + 0.5rem)` : "0px";
     const area = el("scroll-area");
     const landed = screens.screen() === "main" && screens.view() === "discord" && entryLandingHolds();
-    const pinned = !landed && screens.screen() === "main" && followsNewest(area);
+    const pinned = !landed && screens.screen() === "main" && chipsFollowFoot(area);
     el("frame-body").style.setProperty("--read-steer-clearance", room);
     // `scrubber-full-width`. The height itself, without the air: on a phone the strip playing is a
     // row of its own over the dock, and the list ends at its top edge (`data-read-strip`). Held on
@@ -11976,7 +11995,7 @@ function cardsPlacedUnderLists() {
 // newest line as what is in it changes size, and the reply arrows measured again as layout changes. One owner in
 // web/src/view/channel/listkeepers.ts (`#624 voice-page-modularity`), mounted here, in the page's order; its
 // `unmount` waits for the ordered boot's teardown.
-application.track(mountListKeepers({
+const listKeepersMount = mountListKeepers({
   ...sizeWatching,
   el: (id) => el(id),
   leftEl: (id) => leftEl(id),
@@ -12012,7 +12031,9 @@ application.track(mountListKeepers({
   channelContextKey: () => channelContextKey(),
   pinsView: () => pinsView(),
   measureReplyArrows: () => measureReplyArrows(),
-}));
+});
+mainFollowState = () => listKeepersMount.followingMain();
+application.track(listKeepersMount);
 // The lists' gestures and scrolls (`#68 pull-to-refresh`, `#188 pull-refresh-bottom`, `#261 two-column-connectors`,
 // `#338 column-overscroll`, `#460 pack-gap-slide`): the pull on Main's list, each column's scroll moving the links'
 // ends, the wheel at the right column's foot, the reader's own wheel or key ending a slide, and the room past the

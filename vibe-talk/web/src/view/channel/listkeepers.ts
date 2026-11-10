@@ -78,6 +78,12 @@ export interface ListKeepersDependencies<Column> extends SizeWatching {
 export interface ListKeepers {
   /** Take the right column's scroll listener down and stop every watcher. */
   unmount(): void;
+  /**
+   * Whether Main's reader is following its foot (`#1185 chip-height-snap`): the one follow state,
+   * noted from the reader's own scrolls and landings, never from a programmatic scroll. False
+   * where sizes cannot be watched.
+   */
+  followingMain(): boolean;
 }
 
 /** Mount the keepers of the lists' readers. */
@@ -97,6 +103,8 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
   } = deps;
   const inColumn = <T>(column: Column, act: () => T): T => deps.inColumn(column, act);
   const BOTTOM_SLACK_PX = deps.bottomSlackPx;
+  /** Main's follow state as a question for the page (`followingMain`); the keeper below teaches it. */
+  let mainFollowNow: () => boolean = () => false;
   // `#218 desktop-dock`. On a desk the dock is one row of controls or two, and which depends on what
   // is in it — a call going live, a long channel name, a label changing length. When it grows it takes
   // that height from the bottom of #scroll-area, and a reader on the newest line is left that far above
@@ -305,6 +313,7 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
       if (reveal && footing && !footing.foot) return;
       note(area.scrollTop > 0 && atBottom(area), footing ? footing.context : contextOf());
     }, { passive: true });
+    mainFollowNow = () => footing !== null && footing.foot;
     const free = () => screens.screen() === "main" && screens.view() === "discord" && writingIn(area)
       && !entryLandingHolds() && heldFilterRow() === null && !searchWalkAnchored() && !quickReplyHolds(area);
     const mainFootKeeper = watch(() => {
@@ -352,5 +361,6 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
       unlisten();
       for (const watcher of watchers.splice(0)) watcher.disconnect();
     },
+    followingMain: () => mainFollowNow(),
   };
 }
