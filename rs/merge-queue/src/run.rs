@@ -8784,12 +8784,43 @@ impl<'a> Runner<'a> {
                 text.push_str(&format!("- `{test}`\n"));
             }
         }
+        // The lines naming the failure (#1198), from the deciding
+        // validations' logs (a donor validation's log head carries the
+        // receipt's picked lines): the first names the failing test or
+        // suite in the eject event below.
+        let failure_lines = if failed.is_empty() {
+            Vec::new()
+        } else {
+            let logs: Vec<PathBuf> = lock(&self.report)
+                .validations
+                .iter()
+                .filter(|v| v.failed().iter().any(|test| failed.contains(test)))
+                .map(|v| v.log.clone())
+                .collect();
+            let texts: Vec<String> = logs.iter().filter_map(|log| read_lossy(log)).collect();
+            crate::validate::failure_lines(
+                &texts.join("\n"),
+                &self.config.validator.failure_patterns,
+            )
+        };
+        if !failure_lines.is_empty() {
+            text.push_str("\nFailure lines:\n");
+            for line in &failure_lines {
+                text.push_str(&format!("- {line}\n"));
+            }
+        }
+        let failure_note = failure_lines
+            .first()
+            .map_or(String::new(), |line| format!("; first failure: {line}"));
         text.push_str(
             "\nValidation logs are under the run's `validations/` directory; `events.jsonl` has the sequence.\n",
         );
         std::fs::write(&report, text)
             .map_err(|error| format!("cannot write {}: {error}", report.display()))?;
-        self.event("eject", &format!("#{pr} ({kind}){class_note}: {reason}"));
+        self.event(
+            "eject",
+            &format!("#{pr} ({kind}){class_note}: {reason}{failure_note}"),
+        );
         self.fire_hook(
             "on_eject",
             &[pr],
@@ -10673,6 +10704,7 @@ fn local_verdict(ran: &Ran) -> crate::donor::Verdict {
             .iter()
             .map(ToString::to_string)
             .collect(),
+        failure_line: String::new(),
     }
 }
 
@@ -10682,8 +10714,18 @@ fn receipt_ran(receipt: &crate::donor::Receipt, dir: &std::path::Path) -> Result
     std::fs::write(
         &log,
         format!(
-            "merge-queue: validated by donor {} on {} (full log there: {})\n{}",
-            receipt.donor.name, receipt.donor.host, receipt.log_path, receipt.log_tail
+            "merge-queue: validated by donor {} on {} (full log there: {})\n{}{}",
+            receipt.donor.name,
+            receipt.donor.host,
+            receipt.log_path,
+            // The receipt's failure-naming lines ride at the head: the
+            // tail below may not hold them (#1198).
+            receipt
+                .failure_lines
+                .iter()
+                .map(|line| format!("merge-queue: failure: {line}\n"))
+                .collect::<String>(),
+            receipt.log_tail
         ),
     )
     .map_err(|error| format!("cannot write {}: {error}", log.display()))?;

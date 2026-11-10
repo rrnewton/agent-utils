@@ -150,6 +150,11 @@ pub struct Verdict {
     /// Attributed failed tests.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failed: Vec<String>,
+    /// First log line naming the failure (#1198), when the receipt carried
+    /// one (or its tail still holds one): the verdict detail an ejection
+    /// quotes so it names the failing test or suite.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub failure_line: String,
 }
 
 /// One donor's hold on a job.
@@ -367,6 +372,14 @@ impl Receipt {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
+            // The receipt's carried naming lines first; an older receipt
+            // without them falls back to what its tail still holds (#1198).
+            failure_line: self
+                .failure_lines
+                .first()
+                .cloned()
+                .or_else(|| crate::validate::first_failure_line(&self.log_tail, &[]))
+                .unwrap_or_default(),
         }
     }
 }
@@ -392,12 +405,20 @@ pub fn compare(local: &Verdict, donor: &Verdict) -> String {
             format!(" (failed: {})", v.failed.join(" "))
         }
     };
+    let naming = |v: &Verdict| {
+        if v.failure_line.is_empty() {
+            String::new()
+        } else {
+            format!(" (first failure: {})", v.failure_line)
+        }
+    };
     format!(
-        "mismatch: local {}{}, donor {}{}",
+        "mismatch: local {}{}, donor {}{}{}",
         word(local),
         failed(local),
         word(donor),
-        failed(donor)
+        failed(donor),
+        naming(donor)
     )
 }
 
@@ -474,6 +495,13 @@ pub struct Receipt {
     pub started_at: String,
     /// RFC 3339 UTC finish.
     pub finished_at: String,
+    /// Lines of the full runner log naming a failure (#1198), picked
+    /// before the tail cut below, bounded per receipt: the line naming a
+    /// failed suite can sit far above the tail. Receipts written before
+    /// this field existed parse with it empty, and the queue then picks
+    /// the naming line from `log_tail` as it can.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failure_lines: Vec<String>,
     /// The end of the runner's log.
     #[serde(default)]
     pub log_tail: String,
@@ -3880,6 +3908,12 @@ impl Worker<'_> {
                 cpu_ms: ran.cpu.map(|cpu| cpu.as_millis() as u64),
                 started_at,
                 finished_at: now(),
+                // Pick the failure-naming lines from the full log, before
+                // the tail cut above can leave them behind (#1198).
+                failure_lines: crate::validate::failure_lines(
+                    &log_text,
+                    &job.validator.failure_patterns,
+                ),
                 log_tail: log_text[tail_start..].to_owned(),
                 log_path: ran.log.display().to_string(),
             };
@@ -4984,6 +5018,34 @@ mod unit {
         let after = store.read(&claimed.id).unwrap();
         assert!(after.could_not_run.is_empty(), "{after:?}");
         assert!(store.host_fault_list().is_empty());
+    }
+
+    #[test]
+    fn a_red_receipts_verdict_names_the_failure_line() {
+        // #1198: the carried lines win; an older receipt falls back to tail.
+        let store = Store::new(&temp("failure-line"));
+        publish(&store, "c1");
+        let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
+        let mut red = receipt(&claimed, "d1");
+        red.exit = Some(1);
+        red.failure_lines = vec!["run-script-tests: FAILED suite-9 (status 3)".to_owned()];
+        red.log_tail = "teardown only\n".to_owned();
+        assert_eq!(
+            red.verdict().failure_line,
+            "run-script-tests: FAILED suite-9 (status 3)"
+        );
+        red.failure_lines = Vec::new();
+        red.log_tail = "FAILED node-1\n".to_owned();
+        assert_eq!(red.verdict().failure_line, "FAILED node-1");
+        // The compare detail names the donor's failure line.
+        let detail = compare(
+            &Verdict {
+                green: true,
+                ..Verdict::default()
+            },
+            &red.verdict(),
+        );
+        assert!(detail.contains("first failure: FAILED node-1"), "{detail}");
     }
 
     fn refused_receipt(job: &Job, donor: &str, log_tail: &str) -> Receipt {

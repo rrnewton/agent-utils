@@ -2340,6 +2340,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     },
                     tool_identity,
                     tool_refresh,
+                    failure_patterns: Vec::new(),
                     require_tool_identity_lines,
                     pre_claim_check: String::new(),
                     pre_claim_timeout_secs: 0,

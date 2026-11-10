@@ -159,6 +159,61 @@ pub fn refusal_line(log_text: &str) -> Option<&str> {
     refusal_cause(log_text)
 }
 
+/// Patterns naming a failure in a runner's log, beyond the tail: a suite
+/// or test failure line can scroll far above the bounded tail a receipt
+/// carries (#1198).
+pub const FAILURE_LINE_PATTERNS: [&str; 4] =
+    ["FAILED", "panicked at", "test result: FAILED", "error["];
+
+/// Most failure lines one receipt carries.
+pub const MAX_FAILURE_LINES: usize = 40;
+
+/// Byte bound for one receipt's failure lines.
+pub const MAX_FAILURE_BYTES: usize = 8 * 1024;
+
+/// Whether `line` names a failure under the built-in patterns or a
+/// configured extra (`validator.failure_patterns`, matched as substrings).
+pub fn names_failure(line: &str, extra: &[String]) -> bool {
+    FAILURE_LINE_PATTERNS
+        .iter()
+        .any(|pattern| line.contains(pattern))
+        || extra
+            .iter()
+            .any(|pattern| !pattern.is_empty() && line.contains(pattern.as_str()))
+}
+
+/// The lines of `log_text` that name a failure, in order, bounded to
+/// [`MAX_FAILURE_LINES`] lines and [`MAX_FAILURE_BYTES`] bytes in total,
+/// each cut as [`cut_line`] cuts. Picked from the whole log, so a failure
+/// named far above the tail is still carried (#1198).
+pub fn failure_lines(log_text: &str, extra: &[String]) -> Vec<String> {
+    let mut picked: Vec<String> = Vec::new();
+    let mut bytes = 0usize;
+    for line in log_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if picked.len() >= MAX_FAILURE_LINES || bytes >= MAX_FAILURE_BYTES {
+            break;
+        }
+        if names_failure(line, extra) {
+            let line = cut_line(line).to_owned();
+            bytes += line.len() + 1;
+            if bytes > MAX_FAILURE_BYTES && !picked.is_empty() {
+                break;
+            }
+            picked.push(line);
+        }
+    }
+    picked
+}
+
+/// The first line of `log_text` that names a failure, when it holds one.
+pub fn first_failure_line(log_text: &str, extra: &[String]) -> Option<String> {
+    failure_lines(log_text, extra).into_iter().next()
+}
+
 /// A log line cut to at most 200 chars, for a reason quoted in a receipt
 /// or a job record.
 pub fn cut_line(line: &str) -> &str {
@@ -1994,6 +2049,54 @@ mod unit {
         );
         let refused = "REFUSED: no image\nvalidate-lock RELEASED\n";
         assert_eq!(refusal_cause(refused), Some("REFUSED: no image"));
+    }
+
+    #[test]
+    fn failure_lines_name_a_failure_far_before_the_tail() {
+        // #1198: the naming line sits at the top; the tail is all noise.
+        let mut log = String::from("run-script-tests: FAILED suite-9 (status 3)\n");
+        for i in 0..500 {
+            log.push_str(&format!("noise line {i}\n"));
+        }
+        let picked = failure_lines(&log, &[]);
+        assert_eq!(picked, ["run-script-tests: FAILED suite-9 (status 3)"]);
+        assert_eq!(
+            first_failure_line(&log, &[]).as_deref(),
+            Some("run-script-tests: FAILED suite-9 (status 3)")
+        );
+        // Built-in patterns all name failures.
+        for line in [
+            "test x FAILED",
+            "thread 't' panicked at src/main.rs:1: boom",
+            "test result: FAILED. 1 passed; 1 failed",
+            "error[E0308]: mismatched types",
+        ] {
+            assert!(names_failure(line, &[]), "{line}");
+        }
+        assert!(!names_failure("all quiet here", &[]));
+    }
+
+    #[test]
+    fn failure_lines_hold_their_bounds_and_take_configured_patterns() {
+        let mut log = String::new();
+        for i in 0..80 {
+            log.push_str(&format!("FAILED node-{i}\n"));
+        }
+        let picked = failure_lines(&log, &[]);
+        assert_eq!(picked.len(), MAX_FAILURE_LINES);
+        let total: usize = picked.iter().map(|line| line.len() + 1).sum();
+        assert!(total <= MAX_FAILURE_BYTES + 200, "{total}");
+        // A configured extra pattern names lines the built-ins miss.
+        let custom = ["run-script-tests: done".to_owned()];
+        assert_eq!(
+            failure_lines(
+                "run-script-tests: done suite-9 status 3\nteardown\n",
+                &custom
+            ),
+            ["run-script-tests: done suite-9 status 3"]
+        );
+        // Without it, the suite name alone (no pattern) is not picked.
+        assert!(failure_lines("suite-9 exploded quietly\n", &[]).is_empty());
     }
 
     #[test]
