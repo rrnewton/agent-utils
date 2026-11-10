@@ -1561,17 +1561,14 @@ def _herdr_093_compatibility(harness: Harness, report: Report) -> None:
         "foreground_argv_mode": "missing",
     }
     case = harness.case("primary-herdr-093-codex", unknown)
-    # First calibrated positive start (#1067 cross-differential-load-aware):
-    # compared now is still the full startup proof sequence, but inside
-    # max(nominal, spawns x measured spawn) capped at 5 s - the harness
-    # measures scratch-fake spawn latency in this run (see
-    # `calibrated_budget`). An injected slowdown still fails: a per-probe
-    # delay beyond cap/probes expires the budget however slow the host
-    # measures, and only success-expecting literals are calibrated;
-    # every refuse/expire case below keeps its literal value.
+    # Success-expecting start (#1249 cross-differentials-robust): no
+    # harness budget is passed, so the product default (30 s) bounds the
+    # wait on fixture state. The removed calibration scaled a 0.1 s
+    # nominal by measured spawn latency; verdicts now depend only on
+    # the startup proof outcome, never on host spawn speed.
     started, _ = _pair(harness, report, case, "primary/herdr-093/codex/start", (
         "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
-        "--startup-timeout", harness.startup_timeout(0.1, probes=10), "--brief", "compatibility brief", *_COMMON,
+        "--brief", "compatibility brief", *_COMMON,
     ))
     status = _json(started)
     report.require("primary/herdr-093/codex/raw-status-and-once",
@@ -1659,7 +1656,7 @@ def _herdr_093_compatibility(harness: Harness, report: Report) -> None:
             "foreground_argv_mode": mode,
         })
         if _start(harness, report, muse, f"primary/herdr-093/muse/{mode}/start",
-                  "--harness", "muse", "--startup-timeout", harness.startup_timeout(0.2, probes=12)):
+                  "--harness", "muse"):
             report.require(f"primary/herdr-093/muse/{mode}/kernel-pin", all(
                 _valid_foreign_shell_identity(json.loads(
                     (root / "registry/agents/worker/agent.json").read_text(encoding="utf-8")

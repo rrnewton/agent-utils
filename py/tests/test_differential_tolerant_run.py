@@ -1,8 +1,8 @@
-"""The differential's tolerant runner: CPU-spent budgets and group cleanup.
+"""The differential's hang-guard runner: progress-aware waits and group cleanup.
 
-Also the in-run calibration that scales positive micro-budgets by measured
-spawn latency (#1067 cross-differential-load-aware): load-inflated spawns
-must pass, delays beyond the hard cap must still fail.
+The guard reports only hangs (no CPU or output progress, excessive CPU,
+or excessive wall time under a generous minutes-scale budget); it never
+judges how fast a child finished (cross-differentials-robust).
 """
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "cross"))
 
 from herdr_agent_differential import (  # noqa: E402
     _tree_cpu_seconds,
-    calibrated_budget,
     run_tolerant,
 )
 
@@ -105,18 +104,19 @@ def test_output_growth_counts_as_progress() -> None:
     assert done.stdout.splitlines() == [f"line {index}" for index in range(5)]
 
 
-def test_calibrated_budget_scales_with_spawn_latency_but_never_past_the_cap() -> None:
-    # No measurement keeps the strict nominal budget.
-    assert calibrated_budget(0.1, [], probes=6, cap_s=5.0) == 0.1
-    # Fast spawns keep the nominal floor.
-    assert calibrated_budget(0.2, [0.001, 0.002], probes=6, cap_s=5.0) == 0.2
-    # Slow spawns scale by probes x worst x margin (2.0): 6 x 0.25 x 2 = 3.
-    assert calibrated_budget(0.1, [0.125, 0.25], probes=6, cap_s=5.0) == 3.0
-    # The cap is hard however slow the host looks: an injected per-probe
-    # delay beyond cap/probes (here 6 s against a 5 s cap) still expires,
-    # so calibration cannot talk a real slowdown into a pass (#1067).
-    assert calibrated_budget(0.1, [10.0], probes=6, cap_s=5.0) == 5.0
-    assert 6 * 6.0 > calibrated_budget(0.1, [10.0], probes=6, cap_s=5.0)
+def test_slow_but_progressing_child_is_not_a_hang() -> None:
+    # A child slower than any micro-budget but steadily producing output
+    # finishes normally: the guard waits on progress, not on speed
+    # (cross-differentials-robust).
+    child = (
+        "import time\n"
+        "for index in range(3):\n"
+        "    print(f'step {index}', flush=True)\n"
+        "    time.sleep(0.6)\n"
+    )
+    done = run_tolerant([PY, "-c", child], timeout_s=1)
+    assert done.returncode == 0
+    assert done.stdout.splitlines() == [f"step {index}" for index in range(3)]
 
 
 def test_stdin_child_reads_its_payload_from_a_temp_file_fd() -> None:

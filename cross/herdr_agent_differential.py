@@ -26,7 +26,14 @@ from pathlib import Path
 from typing import cast
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-TIMEOUT_SECONDS = 30
+#: Hang guard for one paired invocation, in seconds. This is not a budget
+#: a verdict is judged against: an invocation that finishes at any speed
+#: passes, and only an invocation that stops making progress for this
+#: long, burns twice this much CPU, or runs four times this long in wall
+#: time is reported as hung (cross-differentials-robust). The value is in
+#: minutes so a runnable edition starved on a host above 75% CPU is never
+#: mistaken for a hang.
+TIMEOUT_SECONDS = 300
 
 
 def _tree_cpu_seconds(pid: int) -> float | None:
@@ -88,16 +95,17 @@ def run_tolerant(
     encoding: str | None = None,
     errors: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a child with a CPU-starvation-tolerant budget and group cleanup.
+    """Run a child under a generous hang guard, with group cleanup.
 
-    The budget is spent as CPU/idle time, not raw wall: a child that keeps
-    burning CPU gets up to four times the wall budget, a child that makes no
-    CPU or output progress for `timeout_s` is hung, and either way the whole
-    process group is killed so grandchildren cannot leak and hold fixture
-    locks (the old timeout path killed only the direct child and cascaded).
-    A genuinely slower child still fails: burning more than twice the budget
-    in CPU, or running past four times it in wall, times out however steady
-    its progress looks (#1067 cross-differential-load-aware).
+    `timeout_s` is a hang guard, never a verdict about speed: a child that
+    finishes at any speed passes. Only a child that makes no CPU or output
+    progress for `timeout_s`, burns more than twice that in CPU, or runs
+    past four times it in wall time is reported as hung (raised as
+    ``TimeoutExpired``), and the whole process group is killed so
+    grandchildren cannot leak and hold fixture locks. Callers pass
+    :data:`TIMEOUT_SECONDS` (minutes), so an edition merely starved of CPU
+    on a loaded host is never mistaken for a hang
+    (cross-differentials-robust).
     """
     stdout_file = tempfile.TemporaryFile(mode="w+")
     stderr_file = tempfile.TemporaryFile(mode="w+")
@@ -154,59 +162,13 @@ def run_tolerant(
     return subprocess.CompletedProcess(list(command), proc.returncode, stdout, stderr)
 
 
-#: In-run calibration for harness-chosen micro-budgets (#1067
-#: cross-differential-load-aware). A positive startup proof needs several
-#: sequential fake-Herdr spawns — one fresh Python interpreter per call —
-#: inside one wall budget the harness picks (0.1-0.2 s today). What load
-#: inflates is the spawn, not the judged work, so the harness measures a
-#: trivial scratch-fake spawn on this host in this run and scales only
-#: those positive budgets. The cap is hard: a per-probe delay beyond
-#: cap/probes (an injected slowdown, a real extra roundtrip) still expires,
-#: and a CPU-burning regression still hits `run_tolerant`'s 2x CPU cap.
-#: Negative cases (static wrong screens, budgets meant to expire) keep
-#: their literal values — calibration must never talk an expected timeout
-#: into a success.
-CALIBRATION_SAMPLES = 5
-CALIBRATION_MARGIN = 2.0
-CALIBRATION_MAX_AGE_S = 30.0
-STARTUP_TIMEOUT_CAP_S = 5.0
-
-
-def calibrated_budget(
-    nominal_s: float, probe_seconds: Sequence[float], *, probes: int, cap_s: float
-) -> float:
-    """Scale a positive micro-budget by measured spawn latency, hard-capped.
-
-    `probe_seconds` are edition-independent trivial-spawn measurements from
-    the same run; with so few samples the worst one is the honest bound.
-    No samples (the probe itself could not run) keeps the strict nominal
-    budget: calibration failure never inflates anything.
-    """
-    if not probe_seconds or probes < 1:
-        return nominal_s
-    worst = max(probe_seconds)
-    return min(cap_s, max(nominal_s, probes * worst * CALIBRATION_MARGIN))
-
-
-def _probe_seconds(command: Sequence[str], *, samples: int, cwd: Path) -> list[float]:
-    """Wall seconds per trivial probe run, or [] when a probe cannot run."""
-    measured: list[float] = []
-    for _ in range(samples):
-        started = time.monotonic()
-        try:
-            subprocess.run(
-                list(command),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=10,
-                cwd=cwd,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return []
-        measured.append(time.monotonic() - started)
-    return measured
+#: No wall-clock budget in this harness decides a verdict
+#: (cross-differentials-robust, retiring the #1067 calibration): a
+#: success-expecting invocation waits on the fixture's state or files
+#: with the generous hang guard in `run_tolerant`, and an
+#: expected-timeout case uses a fixture that cannot answer, so expiry is
+#: the only outcome at any host speed. There is deliberately no
+#: spawn-latency calibration left to widen.
 
 
 _MESSAGE_ID = re.compile(r"\b\d{20,}-\d+\b")
@@ -1323,8 +1285,6 @@ class Harness:
         self.rust = tuple(rust)
         self.serial = 0
         self.case_roots: list[Path] = []
-        self._probe_samples: list[float] = []
-        self._probe_measured_at = 0.0
         shell = os.path.realpath("/bin/bash")
         self.fixture_shell = subprocess.Popen(
             [shell, "--noprofile", "--norc"],
@@ -1433,51 +1393,6 @@ class Harness:
             "harness/no-host-cli", not calls,
             f"{len(calls)} call(s) reached a host CLI instead of a fixture: {calls!r}",
         )
-
-    def startup_timeout(self, nominal_s: float, *, probes: int = 6) -> str:
-        """Argv value for a positive `--startup-timeout`, calibrated in-run.
-
-        Only for starts expected to succeed: the proof sequence needs about
-        `probes` sequential fake spawns inside the budget, so the nominal
-        value is scaled by this host's measured spawn latency (see
-        `calibrated_budget`). Starts expected to time out or refuse keep
-        their literal values at the call site.
-        """
-        budget = calibrated_budget(
-            nominal_s,
-            self._fake_probe_seconds(),
-            probes=probes,
-            cap_s=STARTUP_TIMEOUT_CAP_S,
-        )
-        return f"{budget:g}"
-
-    def _fake_probe_seconds(self) -> list[float]:
-        """Trivial scratch-fake spawn latencies, re-measured when stale.
-
-        The scratch fake lives outside every judged case, so probing it
-        records no calls a case later compares; `agent list` exercises the
-        same interpreter spawn plus state read/write as a judged probe.
-        """
-        now = time.monotonic()
-        if self._probe_samples and now - self._probe_measured_at < CALIBRATION_MAX_AGE_S:
-            return self._probe_samples
-        root = self.root / "calibration"
-        root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        fixture = root / "fake-herdr"
-        if not fixture.exists():
-            fixture.write_text(f"#!{sys.executable}\n{_FAKE_HERDR}", encoding="utf-8")
-            fixture.chmod(0o700)
-        (root / "state.json").write_text(
-            json.dumps(
-                {"status": "idle", "calls": [], "submitted": []}, sort_keys=True
-            ),
-            encoding="utf-8",
-        )
-        self._probe_samples = _probe_seconds(
-            [str(fixture), "agent", "list"], samples=CALIBRATION_SAMPLES, cwd=root
-        )
-        self._probe_measured_at = now
-        return self._probe_samples
 
     def invoke(self, case: PairCase, arguments: Sequence[str]) -> tuple[Outcome, Outcome]:
         return (

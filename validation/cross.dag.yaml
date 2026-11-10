@@ -140,13 +140,12 @@ steps:
   # judged against harness budgets as small as 50 ms, beside the tools' own
   # 5 s / 10 s git check-ignore bounds), so under shared-gate contention the
   # two editions classify the same pane differently and the step goes red
-  # while passing every exclusive rerun
-  # (#725 validate-speed). #1067 cross-differential-load-aware makes those
-  # comparisons load-aware; a host opts the kept steps into the main phase
-  # with AGENT_UTILS_CROSS_IN_MAIN_PHASE=1 (see partition_gate_exclusive in
-  # scripts/validate.py) only after its own paired timing record passes.
-  # Unset keeps the exclusive phase, so the load-aware change is safe to
-  # land on its own. The label stays in both positions — it marks the
+  # while passing every exclusive rerun (#725 validate-speed).
+  # cross-differentials-robust removes those wall-clock verdicts one
+  # differential at a time; each step that qualifies (10 consecutive
+  # passes under topped-up load above 75% CPU, recorded in the tracking
+  # issue) drops the label and runs in the main phase, as
+  # agentctl.herdr-agent-differential already does. The label marks the
   # partition, not the selection. They deliberately do NOT carry the
   # validation-cross label: they are selected only when their own component
   # is selected (validation/components.json names the paths that can change
@@ -169,7 +168,11 @@ steps:
     desc: herdr-agent Python and Rust commands agree
     cmd: python3 cross/differential.py --tool herdr-agent
     jobs_flag: ""
-    labels: [component-agentctl, gate-exclusive]
+    # Main phase (cross-differentials-robust): this differential carries
+    # no wall-clock verdict and qualified with 10 consecutive passes
+    # under topped-up load above 75% CPU, so it no longer needs the
+    # gate-exclusive phase. The record is in its tracking issue.
+    labels: [component-agentctl]
     timeout: 9600
     cpu_timeout: 1200
     hint: *cross_hint

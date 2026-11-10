@@ -32,3 +32,7 @@ A separate lane owns bringing them back robust; this issue tracks that work. It 
 # Notes
 
 Filed by mu-gatefast in the same commit that disables the five steps, at the owner's direct instruction (reply 346, 2026-11-10). Related: #1067 cross-differential-load-aware (the earlier load-aware approach, now carried by this issue's bring-back work).
+
+[watermelon-full-preview] mu-crossrobust bring-back record. The owner's directive and the approved plan replace this issue's same-run-calibration wording: no wall-clock budget decides a verdict (calibration is deleted, not widened), expected-timeout cases use fixtures that cannot answer, and hang guards are generous (minutes) and reported as hangs. Qualification per differential is 10 consecutive passes under the qualification-only load generator (`cross/loadgen.py`, never in a gate; tops the host up to ~85% busy from /proc/stat with nice-19 SCHED_IDLE burners in a user unit, one at a time under a lock, waiting out competing validate-* units), plus solo passes. Selection stays component-scoped.
+
+- `cross.agentctl.herdr-agent-differential`: qualified 2026-11-10. Solo 5/5 passes (104 paired checks). Under load: 10/10 consecutive passes, host topped from 43.25% to 85.33% busy on 316 threads (132 burners), pass durations 148-344 s. Re-enabled in the main phase by dropping its `gate-exclusive` label.
