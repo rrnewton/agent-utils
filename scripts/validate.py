@@ -2007,6 +2007,58 @@ def self_test() -> int:
     return 0
 
 
+#: Local-pass record for the gate's local preflight (#1262
+#: gate-local-preflight): a successful real run writes one JSON file per
+#: working-tree hash in this directory, which `gate.py` checks before
+#: queueing a full gate. Override with $AGENT_UTILS_LOCAL_PREFLIGHT_DIR.
+LOCAL_PREFLIGHT_DIR_ENV = "AGENT_UTILS_LOCAL_PREFLIGHT_DIR"
+
+
+def _working_tree_hash(root: Path) -> str | None:
+    """Hash of the working tree (staged, unstaged, and untracked), or None.
+
+    Computed with a throwaway index, so the caller's real index is never
+    touched. `gate.py` computes the identical hash for the identical tree."""
+    try:
+        with tempfile.TemporaryDirectory(prefix="validate-tree-") as tmp:
+            env = {**os.environ, "GIT_INDEX_FILE": str(Path(tmp) / "index")}
+            def git(*argv: str) -> str:
+                done = subprocess.run(
+                    ["git", "-C", str(root), *argv],
+                    capture_output=True, text=True, env=env, check=False,
+                )
+                if done.returncode != 0:
+                    raise OSError(done.stderr.strip())
+                return done.stdout.strip()
+            git("read-tree", "HEAD")
+            git("add", "-A")
+            return git("write-tree")
+    except Exception:
+        return None
+
+
+def record_local_validate_pass(root: Path | None = None) -> None:
+    """Record this successful run as a local pass for its tree (#1262).
+
+    Best effort: a record failure must never change the run's result."""
+    try:
+        root = root or REPO_ROOT
+        tree = _working_tree_hash(root)
+        if tree is None:
+            return
+        override = os.environ.get(LOCAL_PREFLIGHT_DIR_ENV)
+        directory = (
+            Path(override) if override
+            else Path("~/.local/state/agent-utils/local-validate-passes").expanduser()
+        )
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{tree}.json").write_text(json.dumps({
+            "tree": tree, "finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }))
+    except Exception:
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--base", default="origin/main", help="compare against this ref (default: origin/main)")
@@ -2279,8 +2331,10 @@ def main(argv: list[str] | None = None) -> int:
         verdict = f"validate: PARTIAL - every selected node passed, but {'; '.join(reasons)}"
         announce_partial(verdict, coverage_state.lines, os.environ)
         print(f"\n{verdict}")
+        record_local_validate_pass()
         return 0
     print("\nvalidate: OK")
+    record_local_validate_pass()
     return 0
 
 

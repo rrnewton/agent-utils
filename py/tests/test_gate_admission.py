@@ -488,6 +488,68 @@ def test_a_non_timing_rerun_runs_shared_and_still_records_a_rerun(tmp_path: Path
     assert "runs in the shared class" in done.stdout
     rows = [json.loads(line) for line in (tmp_path / "ledger.jsonl").read_text().splitlines()]
     assert rows[-1]["kind"] == "exclusive-rerun" and rows[-1]["rerun"] is True
+def _fake_validate(tmp_path: Path) -> Path:
+    fake = tmp_path / "validate.py"
+    fake.write_text("print('validate: OK')\n")
+    return fake
+
+
+def _local_env(tmp_path: Path) -> dict[str, str]:
+    return {**_env(tmp_path), "GATE_LOCAL_PREFLIGHT_DIR": str(tmp_path / "local-passes")}
+
+
+def test_a_full_gate_without_a_local_pass_is_refused(tmp_path: Path) -> None:
+    """#1262: a full gate with no fresh local pass for its tree never queues."""
+    fake = _fake_validate(tmp_path)
+    done = subprocess.run([PY, str(GATE), "--", PY, str(fake)],
+                          env=_local_env(tmp_path), capture_output=True, text=True, timeout=60)
+    assert done.returncode == 65, done.stdout
+    assert "local preflight FAILED" in done.stdout
+    rows = [json.loads(line) for line in (tmp_path / "ledger.jsonl").read_text().splitlines()]
+    assert rows[-1]["kind"] == "preflight-refused"
+    assert rows[-1]["local_preflight"] == "missing"
+
+
+def test_a_full_gate_with_a_fresh_local_pass_or_the_escape_hatch_queues(tmp_path: Path) -> None:
+    """#1262: a fresh same-tree record admits; --no-local-preflight admits
+    and the ledger records its reason."""
+    gate = _gate_module()
+    fake = _fake_validate(tmp_path)
+    env = _local_env(tmp_path)
+    tree = gate._working_tree_hash(gate._repo_root())
+    assert tree
+    passes = tmp_path / "local-passes"
+    passes.mkdir()
+    (passes / f"{tree}.json").write_text(json.dumps(
+        {"tree": tree, "finished_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}))
+    done = subprocess.run([PY, str(GATE), "--", PY, str(fake)],
+                          env=env, capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stdout
+    assert "local preflight passed" in done.stdout
+    rows = [json.loads(line) for line in (tmp_path / "ledger.jsonl").read_text().splitlines()]
+    assert rows[-1]["local_preflight"] == "passed"
+
+    skipped = subprocess.run(
+        [PY, str(GATE), "--no-local-preflight", "docs-only change", "--", PY, str(fake)],
+        env={**env, "GATE_LOCAL_PREFLIGHT_DIR": str(tmp_path / "empty-passes")},
+        capture_output=True, text=True, timeout=60)
+    assert skipped.returncode == 0, skipped.stdout
+    rows = [json.loads(line) for line in (tmp_path / "ledger.jsonl").read_text().splitlines()]
+    assert rows[-1]["local_preflight"] == "skipped: --no-local-preflight docs-only change"
+
+
+def test_a_stale_local_pass_does_not_satisfy_the_gate(tmp_path: Path) -> None:
+    """#1262: a record older than the freshness window does not admit."""
+    gate = _gate_module()
+    fake = _fake_validate(tmp_path)
+    tree = gate._working_tree_hash(gate._repo_root())
+    passes = tmp_path / "local-passes"
+    passes.mkdir()
+    stale = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 48 * 3600))
+    (passes / f"{tree}.json").write_text(json.dumps({"tree": tree, "finished_utc": stale}))
+    done = subprocess.run([PY, str(GATE), "--", PY, str(fake)],
+                          env=_local_env(tmp_path), capture_output=True, text=True, timeout=60)
+    assert done.returncode == 65, done.stdout
 
 
 def test_a_rerun_must_name_a_few_selected_steps(tmp_path: Path) -> None:

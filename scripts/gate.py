@@ -880,6 +880,66 @@ def _timing_sensitive_steps(
         if step not in labels_by_tag
         or TIMING_SENSITIVE_LABEL in labels_by_tag[step]
     ]
+#: How fresh a local validate pass must be for a full gate (#1262).
+LOCAL_PREFLIGHT_MAX_AGE_S = 24 * 3600
+#: Directory of local-pass records written by validate.py (#1262). Shared
+#: with validate.py; either env name overrides it (gate tests use GATE_*).
+LOCAL_PREFLIGHT_DIR_ENVS = ("AGENT_UTILS_LOCAL_PREFLIGHT_DIR", "GATE_LOCAL_PREFLIGHT_DIR")
+
+
+def _local_preflight_dir() -> Path:
+    for name in LOCAL_PREFLIGHT_DIR_ENVS:
+        if os.environ.get(name):
+            return Path(os.environ[name])
+    return Path("~/.local/state/agent-utils/local-validate-passes").expanduser()
+
+
+def _working_tree_hash(root: Path) -> str | None:
+    """Hash of the working tree (staged, unstaged, untracked), or None.
+
+    Identical computation to validate.py's: a throwaway index, so the real
+    index is never touched."""
+    try:
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix="gate-tree-") as tmp:
+            env = {**os.environ, "GIT_INDEX_FILE": str(Path(tmp) / "index")}
+            def git(*argv: str) -> str:
+                done = subprocess.run(["git", "-C", str(root), *argv],
+                                      capture_output=True, text=True, env=env, check=False)
+                if done.returncode != 0:
+                    raise OSError(done.stderr.strip())
+                return done.stdout.strip()
+            git("read-tree", "HEAD")
+            git("add", "-A")
+            return git("write-tree")
+    except Exception:
+        return None
+
+
+def _is_full_gate(command: list[str]) -> bool:
+    """Whether `command` is a full validation gate (#1262): a validate.py
+    run that is not a step-selected, list-only, or self-test invocation."""
+    joined = " ".join(command)
+    return (
+        any(word.endswith("validate.py") for word in command)
+        and "--selected" not in joined
+        and "--list" not in command
+        and "--self-test" not in command
+    )
+
+
+def _fresh_local_pass(root: Path, now: float | None = None) -> bool:
+    """Whether a local validate pass for this exact tree is fresh (#1262)."""
+    tree = _working_tree_hash(root)
+    if tree is None:
+        return False
+    try:
+        record = json.loads((_local_preflight_dir() / f"{tree}.json").read_text())
+        import calendar
+        finished = calendar.timegm(time.strptime(record["finished_utc"], "%Y-%m-%dT%H:%M:%SZ"))
+        return (now or time.time()) - finished <= LOCAL_PREFLIGHT_MAX_AGE_S
+    except Exception:
+        return False
 
 
 def _rerun_problem(command: list[str]) -> str | None:
@@ -987,6 +1047,28 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
             return PREFLIGHT_EXIT
         print(f"gate: preflight passed in {seconds:.0f}s ({', '.join(PREFLIGHT_STEPS)})", flush=True)
         preflight = "passed"
+    # #1262: a full gate queues only after the same tree passed locally.
+    local_reason = getattr(args, "no_local_preflight", None)
+    if nested or rerun or not _is_full_gate(command):
+        local_preflight = "not-required"
+    elif local_reason is not None:
+        if not str(local_reason).strip():
+            print("gate: --no-local-preflight needs a reason", flush=True)
+            return 2
+        local_preflight = f"skipped: --no-local-preflight {local_reason}"
+        print(f"gate: local preflight skipped ({local_reason}); recorded in the ledger", flush=True)
+    elif _fresh_local_pass(_repo_root()):
+        local_preflight = "passed"
+        print("gate: local preflight passed (fresh local validate pass for this tree)", flush=True)
+    else:
+        print("gate: local preflight FAILED: no fresh local validate pass for this tree; "
+              "run `python3 scripts/validate.py --base github/main` locally first, "
+              "or pass --no-local-preflight REASON (recorded in the ledger)", flush=True)
+        now_s = time.time()
+        _record_ledger(args, command, now_s, now_s, PREFLIGHT_EXIT, set(), set(),
+                       "FAILED", kind="preflight-refused", preflight="local-preflight-missing",
+                       local_preflight="missing")
+        return PREFLIGHT_EXIT
     adm = Admission(state_dir(), args.slots)
     # #1146: the rerun ordering mark needs a live parent, checked with the
     # same liveness as a grant, before the parent slot is released below. An
@@ -1134,7 +1216,7 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
             sys.stdout.flush()
         _record_ledger(args, command, started, finished, rc,
                        passed_steps, failed_steps, verdict_word, pruned, queued_at,
-                       preflight=preflight, aborted=aborted, rerun_flag=rerun,
+                       preflight=preflight, aborted=aborted, rerun_flag=rerun, local_preflight=local_preflight,
                        nested_phase=nested_phase, phase_priority_source=phase_mark_source,
                        priority=priority, priority_reason=priority_reason)
     return rc
@@ -1212,6 +1294,7 @@ def _record_ledger(
     preflight: str | None = None,
     aborted: str | None = None,
     rerun_flag: bool = False,
+    local_preflight: str | None = None,
     nested_phase: bool = False,
     phase_priority_source: str | None = None,
     priority: str | None = None,
@@ -1251,6 +1334,7 @@ def _record_ledger(
             "exit_code": rc,
             "blackout_ignored": bool(getattr(args, "ignore_blackout", False)),
             "preflight": preflight,
+            "local_preflight": local_preflight,
             "aborted": aborted,
             "rerun": rerun_flag,
             "nested_phase": nested_phase,
@@ -2032,6 +2116,11 @@ def main(argv: list[str] | None = None) -> int:
                              "owner's request (default $GATE_PRIORITY_REASON); recorded in the "
                              "ticket, history and ledger and printed by `gate status` and "
                              "`gate queue`. Required with --priority owner; ignored otherwise")
+    parser.add_argument("--no-local-preflight", default=None, metavar="REASON",
+                        help="queue a full gate without a fresh local validate pass for this tree "
+                             "(#1262 gate-local-preflight); REASON is required and recorded in the "
+                             "ledger. Without it, a full gate needs a recorded local "
+                             "`validate.py --base github/main` pass for the same tree within 24h")
     parser.add_argument("--skip-preflight", action="store_true",
                         help="queue without the preflight. Before queueing, a top-level run checks "
                              "this checkout with the validation steps " + " and ".join(PREFLIGHT_STEPS)
