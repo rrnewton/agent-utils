@@ -489,10 +489,16 @@ def near_foot(reader: Reader, *, strict: bool) -> None:
         page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
         page.mouse.wheel(0, -60)
         reader.quiet(300)
-    page.evaluate("() => { const a = document.getElementById('scroll-area');"
-                  " a.scrollTop = a.scrollHeight - a.clientHeight - 18; }")
-    reader.quiet(500)
-    gap_before = reader.gap("scroll-area")
+    # Park inside the slack, retrying past any late landing (a summaries redraw queued by the
+    # soak can follow a reader still at the foot and undo the first parking).
+    gap_before = 0.0
+    for _ in range(3):
+        page.evaluate("() => { const a = document.getElementById('scroll-area');"
+                      " a.scrollTop = a.scrollHeight - a.clientHeight - 18; }")
+        reader.quiet(500)
+        gap_before = reader.gap("scroll-area")
+        if 12 < gap_before <= 24:
+            break
     reader.check(12 < gap_before <= 24,
                  f"near-foot: parked gap is {gap_before:.0f}px, not inside the slack outside the rest")
     anchor_id, baseline = reader.first()

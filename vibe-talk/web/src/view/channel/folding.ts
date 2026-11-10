@@ -268,7 +268,7 @@ export function createFolding(deps: FoldingDependencies): Folding {
       return deps.api(deps.withThreadQuery(
         `/api/v1/channels/${encodeURIComponent(channel)}/messages/${encodeURIComponent(id)}/summary${also}`, thread)) as Promise<SummaryAnswer | null>;
     },
-    render: () => renderSummaries(),
+    render: () => scheduleRenderSummaries(),
     failuresReported: (count: number, why: string) => deps.setStatus(summaryFailureWords(count, why)),
     askAgain: () => requestVisibleSummaries(),
   });
@@ -313,9 +313,42 @@ export function createFolding(deps: FoldingDependencies): Folding {
     entry.li.setAttribute("title", failed && summaryRows.mode() ? String(held.why || "") : "");
   }
 
+  /** Whether a summaries redraw is already asked for in the next frame. */
+  let summariesDue = false;
+
+  /**
+   * `#1210 ui-stability-no-async-shift`. Answers land one fetch at a time, each asking for a
+   * redraw: unbatched, ten answers in one frame are ten measure-mutate-correct passes with
+   * paints between them, and the reader sees every intermediate height. Asked for here instead,
+   * they are one redraw in the next frame — one preservingScroll, one correction — however many
+   * landed. In this column, captured now, as the below-count recount is. Where there are no
+   * frames to wait for, the redraw runs at once.
+   */
+  function scheduleRenderSummaries(): void {
+    if (summariesDue) return;
+    if (typeof requestAnimationFrame !== "function") {
+      renderSummaries();
+      return;
+    }
+    summariesDue = true;
+    const again = deps.inThisColumn(() => {
+      summariesDue = false;
+      renderSummaries();
+    });
+    requestAnimationFrame(() => again());
+  }
+
   function renderSummaries(): void {
     deps.preservingScroll(() => {
       for (const entry of FOLD_LISTS.flatMap((id) => foldsOf(leftEl(id)))) {
+        // `#1210`: a row about to draw summarised keeps the height it stands at folded, so the
+        // rows below it do not jump up as its body gives way to the summary line. Pinned once,
+        // before the state lands; expanding the row only ever grows past the floor.
+        const held = summaryRows.held(summaryKey(entry as never)) as { text?: string | null } | undefined;
+        if (summaryRows.mode() && held !== undefined && typeof held.text === "string" && held.text !== "" &&
+            entry.li.getAttribute("data-summarised") !== "true" && !entry.li.style.minHeight) {
+          entry.li.style.minHeight = `${entry.li.offsetHeight}px`;
+        }
         applySummaryState(entry);
         setFolded(entry, isFolded(entry));
       }
