@@ -133,6 +133,7 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
     ["cardMaxLines", "vibe-talk.voice.thread-card-max-lines", 5, [[1, "1"], [12, "12"]], 5],
     ["quoteReadPercent", "vibe-talk.voice.quote-read-percent", 5, [[0, "0"], [100, "100"]], 5],
     ["readSpeed", "vibe-talk.voice.read-speed", null, [[150, "150"], [null, null]], THROWN],
+    ["twoColumnSplit", "vibe-talk.voice.two-column-split", 50, [[30, "30"], [70, "70"]], THROWN],
   ];
   const refused = () => { throw new Error("SecurityError"); };
   const off = createDeviceSettings({ getItem: refused, setItem: refused, removeItem: refused });
