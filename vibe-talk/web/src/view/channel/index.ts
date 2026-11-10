@@ -146,6 +146,8 @@ export { createChannelViews } from "./channelviews.ts";
 export { createReplyCounts } from "./replycounts.ts";
 export { createPlacing } from "./placing.ts";
 export { createOlderPages, freshOlderPages } from "./olderpages.ts";
+export { createOpeningView } from "./openingview.ts";
+export type { OpeningRecord, OpeningView, OpeningViewDependencies } from "./openingview.ts";
 export type { OlderPages, OlderPagesDependencies, OlderPagesRecord } from "./olderpages.ts";
 export type { Placing, PlacingDependencies } from "./placing.ts";
 export type { ReplyCounts, ReplyCountsDependencies } from "./replycounts.ts";

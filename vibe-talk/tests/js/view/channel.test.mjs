@@ -2654,3 +2654,51 @@ test("`#624 voice-page-modularity`: a column's older-pages record and the channe
   assert.match(seen[0][0].detail, /Older messages load as you scroll up/);
   assert.equal(typeof owner.plainReach.gapFrom, "function");
 });
+
+test("`#624 voice-page-modularity`: which view a channel opens in and the saved place, from the module alone", () => {
+  const { createOpeningView } = CHANNEL_VIEW;
+  const store = new Map();
+  const recordState = {
+    chosen: { channelView: "thread", thread: { id: "t1", origin: "main", summary: null } },
+    place: null, forgotten: 0,
+  };
+  const threadKnown = new Set(["t1"]);
+  const canon = { channel: "c1", scope: null, messages: [], dismissals: [], dismissed: new Set(),
+    views: new Map(), threads: [], hasThreads: false,
+    unplaced: new Set(), unplacedSince: new Map(), unplacedAnswered: new Set(),
+    removed: new Map(), complete: null, replyGaps: new Map(), settledByDone: new Map() };
+  const owner = createOpeningView({
+    uiState: () => ({
+      chosenView: () => recordState.chosen, chosenViewsHeld: () => [],
+      forgetChosen: () => { recordState.forgotten += 1; recordState.chosen = undefined; },
+      setChosen: () => {}, remember: () => {}, heldPlace: () => recordState.place,
+      holdPlace: (held) => { recordState.place = held; }, settled: () => true,
+      saved: () => null,
+    }),
+    providerFacts: { threading: () => true },
+    reopenedViews: ["main", "flat", "thread"], uiStateKey: "k", uiStateVersion: 1, uiStateChars: 100000,
+    channelStore: () => ({ current: () => canon }), threadPresence: () => ({ forget: () => {} }),
+    columns: () => ({ main: null, side: null }), readModes: () => ({ hiding: () => false, mode: () => "show" }),
+    screens: () => ({ screen: () => "main", view: () => "discord" }), columnWork: () => ({ side: () => false }),
+    messageCache: () => ({ storedExactly: (k, v) => store.set(k, v) }),
+    captureScroll: () => ({ pinned: false, anchor: null, top: 0 }), channelContextKey: () => "c1",
+    deepLinkFromAddress: () => null, deepLinkReaderMoved: () => false,
+    el: () => ({ }), idsOf: () => [], inColumn: (_c, fn) => fn(), listPlaceTop: () => 0,
+    loadCanon: () => {}, renderColumns: () => {}, restoreChannelComposer: () => {},
+    restoreScroll: () => {}, scheduleBackSync: () => {}, selectedChannelId: () => "c1",
+    selection: () => ({ view: "flat", thread: null, threadId: null, origin: "main" }),
+    token: () => "t", tokenFingerprint: () => "f", upsertThreadSummary: () => {},
+    viewKey: (view, threadId) => (view === "thread" ? `thread:${threadId}` : view),
+    visibleList: () => ({ children: [] }),
+    windowStorage: () => ({ getItem: (k) => store.get(k) ?? null, setItem: (k, v) => store.set(k, v), removeItem: (k) => store.delete(k) }),
+    deepLinks: () => ({ applied: () => true }), sideColumnUp: () => false,
+  });
+  canon.messages.push({ id: "m1", thread: { id: "t1", is_root: false, root_message_id: "r1" } });
+  assert.deepStrictEqual(owner.openingChannelView(), { view: "thread", thread: "t1", summary: null, origin: "main" },
+    "the chosen thread did not reopen");
+  recordState.chosen = { channelView: "thread", thread: { id: "gone", origin: "main", summary: null } };
+  assert.deepStrictEqual(owner.openingChannelView(), { view: "flat", thread: null, summary: null, origin: "flat" },
+    "a lost thread was reopened instead of the default");
+  assert.equal(recordState.forgotten, 1, "the lost thread was not forgotten as it was passed over");
+  assert.equal(owner.defaultChannelView(), "flat");
+});

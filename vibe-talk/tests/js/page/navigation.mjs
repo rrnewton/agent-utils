@@ -2145,10 +2145,9 @@ test("a reload puts the reader back on the message they were reading, and on the
   assert.equal(page.pageReads, 1, "the reopen read more than one page");
 
   // THE CONTROL: with the return deleted the reader lands on the newest message, and this fails.
-  const control = await run(brokenScript(
-    "  restoreScroll({ pinned: false, anchor: row, top: listPlaceTop(el(\"scroll-area\")) + place.offset });",
-    "  void row;"
-  ));
+  const control = await run(await brokenModule([{ file: "src/view/channel/openingview.ts",
+    find: "    deps.restoreScroll({ pinned: false, anchor: row, top: deps.listPlaceTop(deps.el(\"scroll-area\")) + place.offset });",
+    replace: "    void row;" }]));
   assert.notEqual(control.before, control.left.top, "the test cannot tell a page that returns from one that does not");
 
   // The message is gone from the device — its snapshot given up to the quota — so there is nothing
@@ -2521,7 +2520,8 @@ test("a channel reopens in the view chosen in it, one nobody chose a view in ope
   await pickThread(page, "flat");
   await page.setVisibility("hidden");
   const mainByDefault = reloadTwoChannels(page.storage,
-    brokenScript('  return providerFacts.threading() ? "flat" : "main";', '  return "main";'));
+    await brokenModule([{ file: "src/view/channel/openingview.ts",
+      find: '    return deps.providerFacts.threading() ? "flat" : "main";', replace: '    return "main";' }]));
   await reopenedChannel(mainByDefault);
   assert.equal(mainByDefault.el("discord-channel").value, OTHER_CHANNEL.id);
   assert.equal(mainByDefault.el("thread-select").value, "flat", "All, picked, gave way to the default");
