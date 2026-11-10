@@ -44,6 +44,7 @@ declare const createReplySight: LegacyImports["createReplySight"];
 declare const createOncePerFrame: LegacyImports["createOncePerFrame"];
 declare const shownNode: LegacyImports["shownNode"];
 declare const elementIn: LegacyImports["elementIn"];
+declare const focusLost: LegacyImports["focusLost"];
 declare const focusMinimally: LegacyImports["focusMinimally"];
 declare const focusAtEnd: LegacyImports["focusAtEnd"];
 declare const isComposer: LegacyImports["isComposer"];

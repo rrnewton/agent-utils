@@ -3262,11 +3262,7 @@ const { composerGrowth, storedComposerGrow, applyComposerGrow, renderComposerGro
 // Where a key landed (isTextField, keepsOwnKeys, pressedBySpace, isLink, answersEnter, scrollsItself)
 // is read in web/src/view/dom/ (`#624 voice-page-modularity`).
 
-/** Whether nothing holds the focus: the body has it, as after a load or a control that hid itself. */
-function focusLost() {
-  const held = document.activeElement;
-  return !held || held === document.body || held === document.documentElement;
-}
+// Whether nothing holds the focus (`focusLost`) is web/src/view/dom's (`#624 voice-page-modularity`).
 
 // Whether a node and everything around it is shown (`shownNode`) is web/src/view/dom's.
 

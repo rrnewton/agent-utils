@@ -75,6 +75,7 @@ export {
   childByClass,
   createOncePerFrame,
   elementIn,
+  focusLost,
   focusMinimally,
   isTextField,
   keepsOwnKeys,

@@ -44,6 +44,22 @@ test("`#624 voice-page-modularity`: the DOM walks and the box helpers, on plain 
   assert.deepStrictEqual(calls, [["focus", { preventScroll: true }], ["scroll", { block: "nearest", inline: "nearest" }], ["caret", 5, 5]]);
 });
 
+test("`#624 voice-page-modularity`: whether nothing holds the focus, read from the document alone", () => {
+  const { focusLost } = VIEW_DOM;
+  const was = globalThis.document;
+  const body = { name: "body" };
+  const root = { name: "root" };
+  const held = { name: "held" };
+  try {
+    for (const [active, expected] of [[null, true], [undefined, true], [body, true], [root, true], [held, false]]) {
+      globalThis.document = { activeElement: active, body, documentElement: root };
+      assert.equal(focusLost(), expected, `activeElement ${active && active.name} misread`);
+    }
+  } finally {
+    globalThis.document = was;
+  }
+});
+
 test("`#624 voice-page-modularity`: where a key landed — a field typed in, a control keeping its own keys, a link — read from the target alone", () => {
   const { isTextField, keepsOwnKeys, pressedBySpace, isLink, answersEnter, scrollsItself } = VIEW_DOM;
   const node = (tagName, fields = {}) => ({ tagName, ...fields });

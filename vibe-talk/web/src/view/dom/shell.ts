@@ -12,6 +12,12 @@ export function elementIn(id: string, side: boolean, standIns: { readonly [id: s
   return document.getElementById(standIn || id);
 }
 
+/** Whether nothing holds the focus: the body has it, as after a load or a control that hid itself. */
+export function focusLost(): boolean {
+  const held = document.activeElement;
+  return !held || held === document.body || held === document.documentElement;
+}
+
 /**
  * Give `node`, a control in a list — a message box at its foot, an item of a row's menu — the focus,
  * scrolling only when it is off screen, and then the least that shows it. `#280 scroll-stability`. A
