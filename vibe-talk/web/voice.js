@@ -4164,7 +4164,7 @@ const cardLinesOwner = createCardLines({
   headingOf,
   threadNames: () => serverFacts.threadNames(),
   cardIsSummarized: (choice) => cardIsSummarized(choice),
-  pendingInto,
+  pendingInto: (thread) => pendingInto(thread),
   heldMessages: () => channelStore.current().messages,
   threadOf,
   threadWords: (choice) => threadWords(/** @type {any} */ (choice)),
@@ -4705,7 +4705,7 @@ const threadList = createThreadList({
   currentCanon: () => channelStore.current(),
   selectedChannelId,
   selection: () => selection(),
-  pendingThreadTimes,
+  pendingThreadTimes: () => pendingThreadTimes(),
   messageText: (m) => messageText(/** @type {any} */ (m)),
   timeOf: (m) => timeOf(m, "timestamp"),
   sideColumnUp: () => sideColumnUp(),
@@ -4876,63 +4876,6 @@ const {
   toggleAllThreadFocus, clearAllThreadFocus, threadStripFromKeyboard, syncUnreadReplies,
 } = threadStripOwner;
 
-/**
- * Whether message id `id` is at or after position `from`. Both are ids in the order the server keeps
- * them in, decimal numbers of any length (`MessageId::numeric`): longer is later, and at one length
- * the text compares as the number does. False for anything that is not such a number.
- */
-function atOrAfter(id, from) {
-  if (!/^[0-9]+$/.test(id) || !/^[0-9]+$/.test(from)) return false;
-  const [a, b] = [id.replace(/^0+(?=.)/, ""), from.replace(/^0+(?=.)/, "")];
-  return a.length !== b.length ? a.length > b.length : a >= b;
-}
-
-/**
- * What a page says about read state, into the store. `#222 unread-replies`.
- *
- * A page is the server's answer for every message on it, Done or not, whichever view it was read for
- * — so a read of All landing while the reader is in Main still tells the store which replies are
- * Done. Main's newest page and its deltas say more (`reply_dismissals`): every mark from a position
- * up, complete there, so every message the store holds from that position is Done exactly when it is
- * named, the replies Main never draws among them.
- *
- * Answers whether that changed anything the store held (`#226 page-energy-profile`).
- */
-function foldReadState(payload, view) {
-  let changed = false;
-  const mark = (id, done) => {
-    if (channelStore.current().dismissed.has(id) === done) return;
-    if (done) channelStore.current().dismissed.add(id);
-    else channelStore.current().dismissed.delete(id);
-    changed = true;
-  };
-  const done = new Set((payload.dismissed || []).map(String));
-  for (const message of payload.messages || []) {
-    const id = String(message.id);
-    if (!readSpeaksFor(payload, id)) continue;
-    mark(id, done.has(id));
-  }
-  const marks = payload.reply_dismissals;
-  if (view !== "main" || !marks) return changed;
-  const named = new Set(marks.messages.map(String));
-  const from = String(marks.from);
-  for (const message of channelStore.current().messages) {
-    const id = String(message.id);
-    if (!atOrAfter(id, from) || !readSpeaksFor(payload, id)) continue;
-    mark(id, named.has(id));
-  }
-  return changed;
-}
-
-/**
- * What one page says of the replies the store lacks for being old, by thread (web/src/core/channels
- * `noteReplyGapsIn`, `#222 unread-replies`), into the selected channel's store; a newest read of
- * Main may then be followed by one of All, behind it (`queueReadAllForCounts`).
- */
-function noteReplyGaps(payload, view, older, delta, before) {
-  noteReplyGapsIn(channelStore.current(), payload, view, older, delta, before, queueReadAllForCounts);
-}
-
 // `#222 unread-replies`. ALL, READ BEHIND MAIN, FOR ITS COUNTS. A device that has never read All —
 // a fresh profile, a cleared copy, opened in Main — holds no reply at all, so every root with replies
 // said "N new", Hide read kept every one, and that held through every poll and reload, and through
@@ -4963,28 +4906,6 @@ function noteReplyGaps(payload, view, older, delta, before) {
 // `createReadLedger`, `#624 voice-page-modularity`), here where they stood.
 const readLedger = createReadLedger();
 
-/** Whether `payload`'s read state for message `id` is newer than every local write to it. */
-function readSpeaksFor(payload, id) {
-  return readLedger.speaksFor(payload, id);
-}
-
-/**
- * When `payload`'s read was sent, as the epoch then. Now for a payload no read sent — the store drawn
- * as a page, say — which holds the local state already.
- */
-function sentEpochOf(payload) {
-  return readLedger.sentEpochOf(payload);
-}
-
-/**
- * Where `payload`'s read was sent in the order of every timeline read (`readOrder`). Now — after every
- * read sent so far — for a payload no read sent. `#308 live-reply-in-main`: of two newest pages of a
- * view, the one sent later is the newer, whichever lands first.
- */
-function sentNumberOf(payload) {
-  return readOrder.sentNumberOf(payload);
-}
-
 /**
  * Where each copy of a message in the store stands in the order of reads (`sentNumberOf`), the copy it
  * was put together on, and whether it says the message as it was posted (web/src/core/channels
@@ -4994,25 +4915,12 @@ function sentNumberOf(payload) {
 const copyLedger = createCopyOrder();
 
 
-/** Copy `copy`, the store's, stands at `at`, or later (`CopyOrder.orderCopy`). */
-function orderCopy(copy, at) {
-  copyLedger.orderCopy(copy, at);
-}
-
-/** Copy `copy`, put together here from `from`, stands where `from` stood (`CopyOrder.buildCopyOn`). */
-function buildCopyOn(copy, from) {
-  copyLedger.buildCopyOn(copy, from);
-}
-
-/** The store's copies of `messages` stand where the read numbered `number` was sent (`CopyOrder.orderCopiesRead`). */
-function orderCopiesRead(messages, number) {
-  copyLedger.orderCopiesRead(channelStore.current(), messages, number);
-}
-
-/** Whether the store's `copy` of message `id` is older than the read numbered `number` (`CopyOrder.copyOlderThan`). */
-function copyOlderThan(copy, id, number, held, says = false) {
-  return copyLedger.copyOlderThan(copy, id, number, held, says);
-}
+/** What reads say about read state, and where copies stand: web/src/view/channel's now (`createReadState`, `#624`). */
+const readState = createReadState({
+  channelStore, readLedger, copyLedger, readOrder,
+  queueReadAllForCounts: () => queueReadAllForCounts(),
+});
+const { atOrAfter, foldReadState, noteReplyGaps, readSpeaksFor, sentEpochOf, sentNumberOf, orderCopy, buildCopyOn, orderCopiesRead, copyOlderThan } = readState;
 
 /**
  * Sending the timeline's reads, the paths and reason words they carry, and joining what
@@ -5344,20 +5252,9 @@ const pendingThreads = createPendingThreads({
   idOf: (message) => message.id,
 });
 
-/** The thread `entry` posts into in the channel on screen, or null for the main channel or one not known. */
-function outgoingThreadOf(entry) {
-  return pendingThreads.threadOf(entry);
-}
-
-/** The sends in the outbox for the channel on screen that count in thread `thread`. */
-function pendingInto(thread) {
-  return pendingThreads.into(thread);
-}
-
-/** The threads of the channel on screen sends in the outbox go into, each with when its newest was written. */
-function pendingThreadTimes() {
-  return pendingThreads.times();
-}
+/** Which thread each send in the outbox goes into: web/src/view/channel's now (`createPendingSends`, `#624`). */
+const pendingSends = createPendingSends({ pendingThreads });
+const { outgoingThreadOf, pendingInto, pendingThreadTimes } = pendingSends;
 
 
 

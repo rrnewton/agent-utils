@@ -228,3 +228,7 @@ export { createChannelScope } from "./channelscope.ts";
 export type { ChannelScope, ChannelScopeDependencies, MutableFailure } from "./channelscope.ts";
 export { createFreshRead } from "./freshread.ts";
 export type { FreshRead, FreshReadDependencies, FreshDecisionLike, ReadPayload } from "./freshread.ts";
+export { createReadState } from "./readstate.ts";
+export type { ReadState, ReadStateDependencies, ReadStatePage } from "./readstate.ts";
+export { createPendingSends } from "./pendingsends.ts";
+export type { PendingSends, PendingSendsDependencies, PendingThreadsLike } from "./pendingsends.ts";
