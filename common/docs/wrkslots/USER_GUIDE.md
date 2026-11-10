@@ -3221,8 +3221,9 @@ therefore always shows the registry at one instant, as when the whole command he
 `unpushed` likewise snapshots the registry under a short lock and runs its Git probes and
 remote fetches outside it.
 
-Every read-only scan is wall-bounded: `--scan-timeout SECONDS` (default 180) caps one
-`status`, `doctor`, `audit` or `unpushed` run. A scan that passes the bound prints the
+Every read-only scan is wall-bounded: `--scan-timeout SECONDS` caps one `status`,
+`doctor`, `audit` or `unpushed` run (default 180; audit's default is 600, above what a
+legitimate large audit spends judging rows). A scan that passes the bound prints the
 results it has as partial (a `PARTIAL:` line, or `"partial": true` in JSON) and exits 2
 instead of running on, so a slow registry degrades the report, never the lock.
 

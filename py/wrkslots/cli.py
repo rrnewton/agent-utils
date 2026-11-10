@@ -41911,7 +41911,9 @@ def _cmd_audit(args: argparse.Namespace) -> int:
 
 
 def _cmd_audit_scan(args: argparse.Namespace) -> int:
-    scan_deadline = _scan_deadline(args)
+    scan_deadline = _scan_deadline(
+        args, default_seconds=_AUDIT_SCAN_TIMEOUT_DEFAULT_SECONDS
+    )
     if args.cache_work_limit < 1:
         raise Refusal("--cache-work-limit must be positive")
     if not (math.isfinite(args.cache_wall_seconds) and args.cache_wall_seconds > 0):
@@ -43136,9 +43138,15 @@ def _status_record(
 # still describes one snapshot instant, only a slightly older one.
 _PHASED_READ_RETRIES = 2
 
-#: Default wall bound for one read-only scan (status, doctor, audit, unpushed), in seconds.
+#: Default wall bound for one read-only scan (status, doctor, unpushed), in seconds.
 #: A scan that passes it reports partial results and exits non-zero (#1247).
 _READ_SCAN_TIMEOUT_DEFAULT_SECONDS = 180.0
+
+#: Audit's default bound is larger: a legitimate large audit already spends
+#: minutes judging rows and planning caches under its own per-subject budgets
+#: (a consumer audit measured 244 s at 105 slots, #1172), so the total bound
+#: must sit above that or healthy audits would report partial.
+_AUDIT_SCAN_TIMEOUT_DEFAULT_SECONDS = 600.0
 
 #: Bound for one legacy (per-agent) liveness command call. The batch authority already has a
 #: bound (_ABSENT_PROCESS_CENSUS_SECONDS); the per-agent spelling ran with no timeout at all,
@@ -43154,12 +43162,16 @@ class _ScanTimeout(Exception):
         self.snapshot = snapshot
 
 
-def _scan_deadline(args: argparse.Namespace) -> float:
+def _scan_deadline(
+    args: argparse.Namespace,
+    *,
+    default_seconds: float = _READ_SCAN_TIMEOUT_DEFAULT_SECONDS,
+) -> float:
     """Absolute monotonic deadline for this command's read-only scan."""
 
     seconds = getattr(args, "scan_timeout", None)
     if seconds is None:
-        seconds = _READ_SCAN_TIMEOUT_DEFAULT_SECONDS
+        seconds = default_seconds
     if not (math.isfinite(seconds) and seconds > 0):
         raise Refusal("--scan-timeout must be a finite positive number of seconds")
     return time.monotonic() + seconds
@@ -75893,12 +75905,12 @@ usage or audit gate unknown, 3 fail-closed refusal.
     audit.add_argument(
         "--scan-timeout",
         type=float,
-        default=_READ_SCAN_TIMEOUT_DEFAULT_SECONDS,
+        default=_AUDIT_SCAN_TIMEOUT_DEFAULT_SECONDS,
         metavar="SECONDS",
         help=(
             "wall bound for the read-only scan in seconds, separate from the cache "
             "budgets; past it the command prints partial results marked PARTIAL "
-            f"and exits 2 (default: {_READ_SCAN_TIMEOUT_DEFAULT_SECONDS:g})"
+            f"and exits 2 (default: {_AUDIT_SCAN_TIMEOUT_DEFAULT_SECONDS:g})"
         ),
     )
     audit.set_defaults(handler=_cmd_audit)
