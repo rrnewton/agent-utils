@@ -52,7 +52,10 @@ foot, and on it again after Safari's pan, as the list's end; the reader's wheel 
 back down to it, and a later pan moves nothing; with `innerHeight` already leaving out the keyboard (WebKit,
 for this page's `interactive-widget=resizes-content`) the box still lands on the keys, where #575 left it
 under them at the end of a list that would not scroll. Playwright's WebKit is no better a stand-in here:
-it draws no keyboard and pans no visual viewport either.
+it draws no keyboard and pans no visual viewport either. After a send, the row at the list's end is
+judged only once its geometry has held across several consecutive animation frames (#1243): under
+gate load the send's append and re-scroll used to land between the wait passing and the single read
+that judged it, so the check measured a geometry still moving.
 
 At 1280x800 with a mouse, the box focused and the window 336px shorter: both bars still drawn, since the
 stylesheet takes them away only where the pointer is coarse. No page error and no sideways scroll at any
@@ -140,6 +143,10 @@ KEYBOARD_PX = 336
 FOOT_SLACK_PX = 24
 # The tallest the dock may be while it holds only Stop: a 2.75rem row and its padding, and a little over.
 SLIM_DOCK_PX = 72
+# Consecutive animation-frame samples the row's geometry must hold, and the longest the wait for
+# that settled geometry may take, before the row is judged after a send (#1243).
+STABLE_FRAMES = 5
+STABLE_WAIT_S = 15.0
 
 # What is drawn, and where: the bars, the list, the box and its Send, and the reader's place in the list.
 STATE_JS = """() => {
@@ -718,6 +725,50 @@ def wait_ios_row(desk: Desk, why: str) -> None:
                   why)
 
 
+# One animation frame's row geometry at a time, until it holds still: the row's foot on the
+# keyboard's top, the list scrolled to its furthest, and the list's height unmoving (a sent row
+# still landing moves all three). Settles only after `frames` consecutive frames hold (#1243).
+ROW_STABLE_JS = """(args) => new Promise((resolve) => {
+  const series = [];
+  let held = 0;
+  const started = performance.now();
+  const sample = () => {
+    const v = window.visualViewport;
+    const area = document.getElementById('scroll-area');
+    const send = document.getElementById('channel-send').getBoundingClientRect();
+    const one = {gap: Math.round((v.offsetTop + v.height - send.bottom) * 10) / 10,
+                 scroll: Math.round(area.scrollTop),
+                 furthest: Math.round(area.scrollHeight - area.clientHeight),
+                 said: document.documentElement.getAttribute('data-keyboard')};
+    series.push(one);
+    const still = one.said === 'open' && one.gap >= -1 && one.gap <= args.slack
+      && one.scroll >= one.furthest - 1
+      && (held === 0 || series[series.length - 2].furthest === one.furthest);
+    held = still ? held + 1 : 0;
+    if (held >= args.frames) resolve({stable: true, series: series.slice(-48)});
+    else if (performance.now() - started > args.waitMs) resolve({stable: false, series: series.slice(-48)});
+    else requestAnimationFrame(sample);
+  };
+  requestAnimationFrame(sample);
+})"""
+
+
+def wait_ios_row_stable(desk: Desk, why: str) -> None:
+    """Wait until the row stands where `ios_row_flush` will hold it and stays there across
+    `STABLE_FRAMES` consecutive animation frames, the list's height unmoving, so the single read
+    after it judges a geometry that has stopped moving: under load the send's append and re-scroll
+    used to land between the old wait passing and that read (#1243). On timeout, fail with the
+    sampled series, so a row that never reaches the keyboard's top still fails and says how."""
+    found = desk.page.evaluate(ROW_STABLE_JS, {"frames": STABLE_FRAMES, "slack": FOOT_SLACK_PX,
+                                               "waitMs": int(STABLE_WAIT_S * 1000)})
+    assert isinstance(found, dict)
+    series = found.get("series")
+    shown = "; ".join(
+        f"gap {one.get('gap')} scroll {one.get('scroll')}/{one.get('furthest')} {one.get('said')}"
+        for one in series if isinstance(one, dict)) if isinstance(series, list) else str(series)
+    desk.check(found.get("stable") is True, f"{why}: the row never settled: {shown}")
+
+
 def wait_ios_flush(desk: Desk, why: str, *, above: float = 0) -> None:
     """Wait until the box stands where `ios_flush` will hold it (`#1118`), by the same measurements."""
     desk.wait_for("() => { const v = window.visualViewport; "
@@ -798,7 +849,7 @@ def ios_walk(desk: Desk, api: ReplyColumnsApi) -> None:
             break
         page.wait_for_timeout(100)
     desk.check(posted(api)[before:] == ["from the phone"], f"the keyboard's Enter did not send: {posted(api)[before:]}")
-    wait_ios_row(desk, "after a send: the row's foot is not on the keyboard's top")
+    wait_ios_row_stable(desk, "after a send: the row's foot is not on the keyboard's top")
     ios_row_flush(desk, ios_place(desk), "after a send")
     desk.shot("4-ios-after-send")
     page.evaluate("() => window.__iosClose()")

@@ -1,11 +1,12 @@
 ---
 title: 'keyboard-bar-settle: the keyboard-hides-bar check races the send re-scroll under load'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-foldlat
 created_at: 2026-11-10T18:33:14+00:00
-updated_at: 2026-11-10T18:33:14+00:00
+updated_at: 2026-11-10T19:25:00+00:00
+closed_at: 2026-11-10T19:25:00+00:00
 ---
 
 # Description
@@ -29,3 +30,18 @@ The failure is `keyboard-bar-ios: after a send: the row's foot is 112px from the
 # Notes
 
 Found while working #1231 fold-latency-deflake (lead, 2026-11-10). Owner: mu-foldlat after #1231 lands.
+
+## Resolution
+
+[opus 5] The after-send measurement in `vibe-talk/tests/keyboard_hides_bar_browser.py` now waits
+until the row's geometry is stable before judging it: `wait_ios_row_stable` samples the row's foot
+gap, the list's scroll and its furthest on every animation frame and settles only when the asserted
+condition (gap within the existing slack, scroll at the furthest, the list's height unmoving) holds
+across five consecutive frames, bounded at 15 s. The assertion itself (`ios_row_flush`) is
+unchanged and still judges a fresh single read taken right after the settle. On timeout the failure
+message prints the sampled series (`gap … scroll …/…` per frame), which a probe against unsettled
+geometry confirmed. Evidence on 2026-11-10: the updated check passed solo, then 10 of 10 with one
+gate admitted beside it at loadavg 103-137; a variant page whose keyboard room is 112 px too tall
+(the row left 129 px short of the keyboard's top, room 246 px) failed both solo and under that
+load. The step stays a shared DAG step; only the moment of measurement changed. The variant was
+built only under /tmp from copied sources; no page code changed.

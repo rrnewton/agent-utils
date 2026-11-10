@@ -2087,6 +2087,8 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # After a send, the row at the list's end is judged only once its geometry has held across several
+  # consecutive animation frames (#1243 keyboard-bar-settle); the assertion itself is unchanged.
   - group: check
     job: keyboard-hides-bar-browser
     desc: both bars away while the on-screen keyboard is up and back as it goes or the box loses the focus, the reader's place kept and a slim Stop while reading, in current Chromium at 393x852 by touch and 1280x800
