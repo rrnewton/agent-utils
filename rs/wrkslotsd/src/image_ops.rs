@@ -353,6 +353,111 @@ pub(crate) fn fuse_mount_spec(
     )
 }
 
+/// One ordered step of an image conversion, executed by the
+/// dispatch/core glue that owns registry locking, the slot-used
+/// census, and Git checkout creation and verification. The plan
+/// order mirrors `_convert_to_image` / `_convert_to_worktree`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ConvertStep {
+    /// Provision a fresh slot image at the staging location.
+    ProvisionImage,
+    /// Copy the slot tree (Python `copy_tree`).
+    CopyTree { from: PathBuf, to: PathBuf },
+    /// Create the checkouts inside the new image (glue).
+    CreateCheckouts,
+    /// Assert the slot is unused and verify its checkouts (glue).
+    VerifySlot,
+    /// Bind or unbind the slot in the worktrees image (glue).
+    SetWorktreesImageBind { bound: bool },
+    /// Discard stale image copies referencing the slot (glue).
+    DiscardStaleCopies,
+    /// Rename one path onto another, keeping bytes identical.
+    Rename { from: PathBuf, to: PathBuf },
+    /// Discard or destroy the converted image directory.
+    DiscardImageFiles,
+    /// Remove the old mount point and rename staging into place.
+    SwapStagingIn,
+}
+
+/// The conversion decision and ordered plan. `current` and
+/// `target` are representation names (`worktree` or `image`).
+/// An already-target conversion is a no-op with no steps.
+pub(crate) fn convert_plan(
+    current: &str,
+    target: &str,
+    slot_path: &Path,
+    image_directory: &Path,
+    staging: &Path,
+    keep_original: bool,
+) -> Vec<ConvertStep> {
+    if convert_already(current, target) {
+        return Vec::new();
+    }
+    if target == "image" {
+        let original = image_directory.join(pre_image_original_name());
+        let mut steps = vec![
+            ConvertStep::ProvisionImage,
+            ConvertStep::CopyTree {
+                from: slot_path.to_path_buf(),
+                to: staging.to_path_buf(),
+            },
+            ConvertStep::VerifySlot,
+            ConvertStep::Rename {
+                from: slot_path.to_path_buf(),
+                to: original.clone(),
+            },
+        ];
+        if !keep_original {
+            steps.push(ConvertStep::Rename {
+                from: original,
+                to: slot_path.to_path_buf(),
+            });
+        }
+        return steps;
+    }
+    // image -> worktree: copy out, tear the image down (or keep
+    // its directory), then swap the staging tree into place.
+    let mut steps = vec![ConvertStep::CopyTree {
+        from: slot_path.to_path_buf(),
+        to: staging.to_path_buf(),
+    }];
+    if keep_original {
+        steps.push(ConvertStep::Rename {
+            from: image_directory.to_path_buf(),
+            to: image_directory.with_file_name(format!(
+                ".{}.pre-worktree-image",
+                slot_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            )),
+        });
+    } else {
+        steps.push(ConvertStep::DiscardImageFiles);
+    }
+    steps.push(ConvertStep::SwapStagingIn);
+    steps
+}
+
+/// The already-target outcome line, as `_cmd_image_convert`
+/// prints it.
+pub(crate) fn convert_already_line(slot_type: &str, slot: &str, target: &str) -> String {
+    format!("{slot_type}/{slot} is already {target}-backed\n")
+}
+
+/// The successful conversion outcome line.
+pub(crate) fn convert_done_line(
+    slot_type: &str,
+    slot: &str,
+    target: &str,
+    slot_path: &Path,
+) -> String {
+    format!(
+        "converted {slot_type}/{slot} to {target} at {}\n",
+        slot_path.display()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,6 +543,24 @@ mod tests {
         assert_eq!(canonical[1], "sub\tf\t3\t644\t1700000000\t");
         let copy = copy_tree_spec(Path::new("/a"), Path::new("/b"));
         assert_eq!(copy.argv, ["cp", "-a", "--reflink=auto", "/a/.", "/b/"]);
+    }
+
+    #[test]
+    fn convert_plan_order_matches_python() {
+        let slot = Path::new("/slots/slot-a");
+        let image_dir = Path::new("/ctl/slot-images/agent/slot-a");
+        let staging = Path::new("/ctl/slot-images/agent/.slot-a.convert-0123abcd");
+        assert!(convert_plan("image", "image", slot, image_dir, staging, false).is_empty());
+        let to_image = convert_plan("worktree", "image", slot, image_dir, staging, false);
+        assert_eq!(to_image[0], ConvertStep::ProvisionImage);
+        assert!(matches!(to_image[1], ConvertStep::CopyTree { .. }));
+        let to_worktree = convert_plan("image", "worktree", slot, image_dir, staging, true);
+        assert!(matches!(to_worktree[0], ConvertStep::CopyTree { .. }));
+        assert_eq!(to_worktree.last(), Some(&ConvertStep::SwapStagingIn));
+        assert_eq!(
+            convert_already_line("agent", "slot-a", "image"),
+            "agent/slot-a is already image-backed\n"
+        );
     }
 
     #[test]
