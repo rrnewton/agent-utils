@@ -6030,10 +6030,27 @@ def _pregather_salvage_facts(
         _assert_handoff_read(
             config, record, _slot_directory(config, slot, record.slot_type)
         )
+        if archive_root is not None:
+            # An explicit local archive root has its own remote-recheck
+            # refusals under the lock; publishing into it early would
+            # create the archive a refused removal must not create.
+            return
         for checkout in record.checkouts:
             try:
+                if _submodule_salvage_checkouts(config, checkout, vcs):
+                    # A published-gitlink proof needs the submodule
+                    # sources the locked salvage assembles; without them
+                    # this would archive locally instead of proving
+                    # publication, so such checkouts publish under the
+                    # lock as before.
+                    continue
                 path = _stored_path(config, checkout.path, "checkout path")
                 facts = _salvage_candidate(config, record, checkout, vcs)
+                fingerprint = _salvage_fingerprint_or_none(
+                    config, checkout, path, vcs, source=None, mirror=None
+                )
+                if fingerprint is None:
+                    continue
                 receipt = _salvage_one_checkout(
                     config,
                     record,
@@ -6043,22 +6060,7 @@ def _pregather_salvage_facts(
                     prepared=facts,
                     archive_root=archive_root,
                 )
-                # Re-derive as the locked salvage will, so any index
-                # refresh that derivation causes is already reflected in
-                # the fingerprint the locked reuse compares against.
-                _salvage_candidate(
-                    config,
-                    record,
-                    checkout,
-                    vcs,
-                    path_override=path,
-                    salvage_unlisted_modules=True,
-                )
-                fingerprint = _salvage_fingerprint_or_none(
-                    config, checkout, path, vcs, source=None, mirror=None
-                )
-                if fingerprint is not None:
-                    receipts[checkout.name] = (fingerprint, receipt)
+                receipts[checkout.name] = (fingerprint, receipt)
             except Exception:
                 continue
     except Exception:
