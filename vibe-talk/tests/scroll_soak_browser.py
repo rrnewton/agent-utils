@@ -263,7 +263,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.add_init_script(READS_JS)
             page.add_init_script(CLS_JS)
-            reader = Reader(page, api, args.screenshots, label, touch)  # type: ignore[arg-type]
+            reader = Reader(page, api, args.screenshots, label, touch)
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             open_main(reader)
             soak_walk(reader, args.soak_seconds, summaries_on=args.summaries == "on", strict=args.strict)
