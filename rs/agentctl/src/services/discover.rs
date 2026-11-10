@@ -19,6 +19,11 @@ pub enum Kind {
     Watcher,
     /// `agentctl run-headless NAME`: a headless agent's wrapper.
     Headless,
+    /// `agentctl watch`: the repair and boot-health daemon (or, from
+    /// #1145 Phase 2, the combined repair+notify daemon).
+    Watch,
+    /// `agentctl restore` / `restore-teams`: a boot oneshot.
+    Restore,
 }
 
 impl Kind {
@@ -29,6 +34,8 @@ impl Kind {
             Self::Bridge => "chat run",
             Self::Watcher => "watch-agents",
             Self::Headless => "run-headless",
+            Self::Watch => "watch",
+            Self::Restore => "restore",
         }
     }
 }
@@ -134,8 +141,9 @@ impl Service {
     pub fn state_dirs(&self) -> Vec<PathBuf> {
         match self.kind {
             Kind::Bridge => self.bridge_state.iter().cloned().collect(),
-            Kind::Watcher => self.state_dir.iter().cloned().collect(),
+            Kind::Watcher | Kind::Watch => self.state_dir.iter().cloned().collect(),
             Kind::Headless => self.agent_directory().into_iter().collect(),
+            Kind::Restore => Vec::new(),
         }
     }
 
@@ -210,6 +218,18 @@ pub fn read_service(
     state: UnitState,
     registry: &Path,
 ) -> Result<Option<Service>, String> {
+    read_service_any(host, tables, state, Some(registry))
+}
+
+/// Read one unit whatever registry it names (`services turnover` discovery);
+/// `Ok(None)` when it is not an agentctl service at all. With a registry
+/// filter, only services of that registry are read in full.
+pub fn read_service_any(
+    host: &dyn Host,
+    tables: &dyn OptionTables,
+    state: UnitState,
+    registry: Option<&Path>,
+) -> Result<Option<Service>, String> {
     if !state.exec_start.contains("agentctl") {
         return Ok(None);
     }
@@ -266,8 +286,10 @@ pub fn read_service(
         })
     };
     let service_registry = resolve(reading.registry.as_deref().unwrap_or(".agentctl"));
-    if registry_identity(&service_registry) != registry_identity(registry) {
-        return Ok(None);
+    if let Some(registry) = registry {
+        if registry_identity(&service_registry) != registry_identity(registry) {
+            return Ok(None);
+        }
     }
     let binary = if binary_word.contains('/') {
         resolve(&binary_word)
@@ -282,15 +304,21 @@ pub fn read_service(
             .find(|candidate| candidate.is_file())
             .unwrap_or_else(|| PathBuf::from(&binary_word))
     };
+    let state_home = || {
+        environment
+            .iter()
+            .find(|(name, value)| name == "XDG_STATE_HOME" && value.starts_with('/'))
+            .map(|(_, value)| PathBuf::from(value))
+            .unwrap_or_else(|| home.join(".local/state"))
+    };
     let state_dir = match kind {
         Kind::Watcher => Some(match &reading.state_dir {
             Some(directory) => resolve(directory),
-            None => environment
-                .iter()
-                .find(|(name, value)| name == "XDG_STATE_HOME" && value.starts_with('/'))
-                .map(|(_, value)| PathBuf::from(value))
-                .unwrap_or_else(|| home.join(".local/state"))
-                .join("agentctl/agent-watch"),
+            None => state_home().join("agentctl/agent-watch"),
+        }),
+        Kind::Watch => Some(match &reading.state_dir {
+            Some(directory) => resolve(directory),
+            None => state_home().join("agentctl/watch"),
         }),
         _ => None,
     };
@@ -433,7 +461,13 @@ fn read_arguments(args: &[String], tables: &dyn OptionTables) -> Reading {
             let candidate: Vec<&str> = candidate.iter().map(String::as_str).collect();
             let known = matches!(
                 candidate.as_slice(),
-                ["chat"] | ["chat", "run"] | ["watch-agents"] | ["run-headless"]
+                ["chat"]
+                    | ["chat", "run"]
+                    | ["watch-agents"]
+                    | ["run-headless"]
+                    | ["watch"]
+                    | ["restore"]
+                    | ["restore-teams"]
             );
             if known && positionals.is_empty() {
                 values = tables.value_options(&candidate);
@@ -460,6 +494,8 @@ fn read_arguments(args: &[String], tables: &dyn OptionTables) -> Reading {
             reading.agent = positionals.first().cloned();
             Some(Kind::Headless)
         }
+        ["watch"] => Some(Kind::Watch),
+        ["restore"] | ["restore-teams"] => Some(Kind::Restore),
         _ => None,
     };
     reading
@@ -475,13 +511,30 @@ pub fn discover(
     tables: &dyn OptionTables,
     registry: &Path,
 ) -> Result<(Vec<Service>, Unreadable), String> {
+    discover_any(host, tables, Some(registry))
+}
+
+/// Every agentctl service on the host, whatever registry it names, in
+/// unit-name order (`services turnover` host discovery).
+pub fn discover_all(
+    host: &dyn Host,
+    tables: &dyn OptionTables,
+) -> Result<(Vec<Service>, Unreadable), String> {
+    discover_any(host, tables, None)
+}
+
+fn discover_any(
+    host: &dyn Host,
+    tables: &dyn OptionTables,
+    registry: Option<&Path>,
+) -> Result<(Vec<Service>, Unreadable), String> {
     let units = host.service_units()?;
     let states = host.show(&units)?;
     let mut services = Vec::new();
     let mut unreadable = Vec::new();
     for state in states {
         let unit = state.id.clone();
-        match read_service(host, tables, state, registry) {
+        match read_service_any(host, tables, state, registry) {
             Ok(Some(service)) => services.push(service),
             Ok(None) => {}
             Err(error) => unreadable.push((unit, error)),

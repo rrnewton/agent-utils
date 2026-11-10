@@ -729,6 +729,26 @@ fn probe(
                 ))
             }
         }
+        Kind::Watch => {
+            let directory = service
+                .state_dir
+                .as_ref()
+                .ok_or_else(|| Fatal("no state directory".into()))?;
+            let path = directory.join("health.json");
+            let report: Value = host
+                .read_file(&path)
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .ok_or_else(|| Pending(format!("{} is not readable yet", path.display())))?;
+            let checked = report["checked_at"].as_f64().unwrap_or(0.0);
+            if checked >= unix_seconds(started) {
+                Ok("watch health pass completed".to_owned())
+            } else {
+                Err(Pending(
+                    "no watch health pass has completed since the restart".to_owned(),
+                ))
+            }
+        }
+        Kind::Restore => Ok("active on the new binary".to_owned()),
         Kind::Headless => {
             let directory = service
                 .agent_directory()
@@ -919,9 +939,10 @@ pub fn refresh(
     // whose restart costs most.
     let mut ordered = selected;
     ordered.sort_by_key(|service| match service.kind {
-        Kind::Watcher => 0,
-        Kind::Bridge => 1,
-        Kind::Headless => 2,
+        Kind::Watcher | Kind::Watch => 0,
+        Kind::Restore => 1,
+        Kind::Bridge => 2,
+        Kind::Headless => 3,
     });
     let mut rows = Vec::new();
     let mut text = String::new();
@@ -957,7 +978,13 @@ pub fn refresh(
             rows.push(entry);
             continue;
         }
-        if !matches!(service.state.active_state.as_str(), "active" | "reloading") {
+        // An inactive restore oneshot is still moved: its binary is updated
+        // for the next boot without starting it (#1179 turnover).
+        let inactive_oneshot = service.kind == Kind::Restore
+            && !matches!(service.state.active_state.as_str(), "active" | "reloading");
+        if !matches!(service.state.active_state.as_str(), "active" | "reloading")
+            && !inactive_oneshot
+        {
             entry["action"] = json!("skipped");
             entry["reason"] = json!(format!(
                 "the unit is {}, not active",
@@ -999,6 +1026,33 @@ pub fn refresh(
             text.push_str(&format!("{label}: {old} -> {new} (dry run)\n"));
             for command in plan_commands(&plan) {
                 text.push_str(&format!("    {command}\n"));
+            }
+            rows.push(entry);
+            continue;
+        }
+        if inactive_oneshot {
+            if run.is_none() {
+                run = Some(RunDirectory::create(
+                    &options.refreshes_dir,
+                    snapshot,
+                    host.now(),
+                )?);
+            }
+            let directory = run.as_ref().expect("created above");
+            entry["rollback"] = json!(directory.path().join("ROLLBACK.sh"));
+            match apply_inactive(host, &plan, directory) {
+                Ok(detail) => {
+                    entry["action"] = json!("updated-inactive");
+                    entry["health"] = json!(detail);
+                    text.push_str(&format!("{label}: {old} -> {new}: {detail}\n"));
+                }
+                Err(error) => {
+                    exit_code = exit_code.max(1);
+                    stopped = true;
+                    entry["action"] = json!("failed-unchanged");
+                    entry["error"] = json!(error);
+                    text.push_str(&format!("{label}: {old} -> {new} FAILED: {error}\n"));
+                }
             }
             rows.push(entry);
             continue;
@@ -1203,6 +1257,101 @@ fn rollback_block(plan: &Plan, directory: &RunDirectory) -> Result<String, Strin
         }
     }
     Ok(block)
+}
+
+/// Move an inactive restore oneshot onto the snapshot without starting
+/// it: back up, write the drop-in, reload, and read the definition back.
+/// A transient oneshot has no definition to update while stopped, so it
+/// is refused unchanged.
+fn apply_inactive(
+    host: &dyn Host,
+    plan: &Plan,
+    directory: &RunDirectory,
+) -> Result<String, String> {
+    let service = &plan.service;
+    match host.cat(&service.unit) {
+        Ok(text) if text == service.text => {}
+        Ok(_) => {
+            return Err(
+                "the unit's definition changed since it was read; run refresh again".to_owned(),
+            )
+        }
+        Err(error) => return Err(error),
+    }
+    let Method::DropIn {
+        path,
+        content,
+        previous,
+        expected_exec,
+    } = &plan.method
+    else {
+        return Err(
+            "a transient restore unit cannot be updated while inactive; refresh it by hand"
+                .to_owned(),
+        );
+    };
+    directory.write(&format!("{}.before", service.unit), service.text.as_bytes())?;
+    let rollback = match previous {
+        Some(bytes) => {
+            let saved = format!("{}.previous-drop-in.conf", service.unit);
+            directory.write(&saved, bytes)?;
+            format!(
+                "\n# {}: back to {}\ncp {} {}\nsystemctl --user daemon-reload\n",
+                service.unit,
+                service.binary.display(),
+                shell_quote(&directory.path().join(saved).to_string_lossy()),
+                shell_quote(&path.to_string_lossy())
+            )
+        }
+        None => format!(
+            "\n# {}: back to {}\nrm -f {}\nsystemctl --user daemon-reload\n",
+            service.unit,
+            service.binary.display(),
+            shell_quote(&path.to_string_lossy())
+        ),
+    };
+    directory.append("ROLLBACK.sh", &rollback)?;
+    let parent = path.parent().ok_or("drop-in path has no directory")?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o755)
+        .create(parent)
+        .map_err(|error| format!("{}: {error}", parent.display()))?;
+    write_atomically(path, content.as_bytes())?;
+    let verified = host.daemon_reload().and_then(|()| {
+        let text = host.cat(&service.unit)?;
+        let parsed = UnitText::parse(&text);
+        let commands = parsed.effective("Service", "ExecStart");
+        let exec = commands
+            .last()
+            .map(|value| ExecCommand::parse(value))
+            .transpose()?;
+        if commands.len() == 1 && exec.as_ref().map(|exec| &exec.argv) == Some(expected_exec) {
+            Ok(())
+        } else {
+            Err(format!(
+                "after the reload the unit's ExecStart is not the planned one (is another drop-in sorted after {DROP_IN}?)"
+            ))
+        }
+    });
+    if let Err(error) = verified {
+        let restored = match previous {
+            Some(bytes) => write_atomically(path, bytes),
+            None => match fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(remove) if remove.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(remove) => Err(format!("{}: {remove}", path.display())),
+            },
+        }
+        .and_then(|()| host.daemon_reload());
+        return Err(match restored {
+            Ok(()) => error,
+            Err(restore_error) => {
+                format!("{error}; restoring the old drop-in failed: {restore_error}")
+            }
+        });
+    }
+    Ok("binary updated for its next run; the unit was not started".to_owned())
 }
 
 /// Change one service, check it, and roll it back on failure.

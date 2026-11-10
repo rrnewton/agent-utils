@@ -252,6 +252,45 @@ when the run was interrupted; 4 when a rollback failed too,
 so a service may be down: run the commands in the run's `ROLLBACK.sh`. Errors
 before any service is touched (no snapshot, another refresh running) exit 75.
 
+## services turnover
+
+```sh
+agentctl services turnover --report
+agentctl services turnover --from ~/team/agent-utils --dry-run
+agentctl services turnover --from ~/team/agent-utils
+```
+
+Turnover is the host-wide form of refresh (schema
+`agentctl-services-turnover/v1`): it discovers every user unit running an
+agentctl binary, whatever registry it names (`chat run`, `watch-agents`,
+`watch`, `restore`, `restore-teams`, `run-headless`), plus other
+agent-utils daemons by binary name, which it only reports (no snapshot
+carries them). A service is refreshed only when paths affecting it
+changed between its running binary's commit and the candidate
+(`--from` at `--revision`); an unchanged service is never restarted and
+reports `unchanged since <sha>`. Scope is opt-out: a pin at
+`REGISTRY/turnover.pin` or `REGISTRY/turnover-pins/<unit>.pin` (contents
+are the reason; an empty pin refuses the run) skips that registry or
+unit, and `ROOT/global.pin` pins the global binary. Per registry,
+restore, watchers and headless wrappers go first and bridges last; each
+refresh keeps refresh's backup, health check (bridges included, via
+`chat health`) and automatic rollback, and the first failure stops the
+run. An inactive restore oneshot has its binary updated for its next run
+without being started. The global binary (`--global-binary`, default
+`~/.local/bin/agentctl`) moves last of all, with its previous copy kept
+under `ROOT/global-backups/`. `--notify COMMAND` (or a registry's own
+`turnover-notify` file, which wins) runs before a registry's first
+refresh and after each of its units with `TURNOVER_PHASE`,
+`TURNOVER_REGISTRY`, `TURNOVER_UNIT`, `TURNOVER_OLD_SHA`,
+`TURNOVER_NEW_SHA` and `TURNOVER_VERDICT` set; its failure is reported,
+never fatal. `--report` changes nothing and exits 0 when all current,
+74 when some are behind, 75 on errors or unknown commits (a unit whose
+binary reports no commit is named with its remedy); `--dry-run` prints
+the ordered plan including pins and notify calls. A turnover run exits
+0, 1 or 4 with refresh's meanings. Run daily, also by a timer: with no
+affecting change it restarts nothing, which is what makes a separate
+global-binary timer redundant on any host running turnover on a timer.
+
 ## Trying it without touching real services
 
 Use a scratch registry and throwaway units:

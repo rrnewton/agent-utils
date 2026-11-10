@@ -22,6 +22,7 @@ pub mod discover;
 pub mod host;
 pub mod refresh;
 pub mod snapshot;
+pub mod turnover;
 pub mod unit;
 
 #[cfg(test)]

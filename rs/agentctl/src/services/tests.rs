@@ -10,10 +10,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-use super::discover::{discover, Kind, OptionTables};
+use super::discover::{discover, discover_all, Kind, OptionTables};
 use super::host::{Host, UnitState};
 use super::refresh::{definition, refresh, RefreshOptions, DROP_IN};
 use super::snapshot::{self, Snapshot};
+use super::turnover::{turnover, TurnoverOptions};
 use super::unit::{quote_word, shell_words, split_words, ExecCommand, UnitText};
 
 const OLD: &str = "1111111111111111111111111111111111111111";
@@ -51,6 +52,9 @@ struct FakeUnit {
     pid: Option<u32>,
 }
 
+/// One recorded turnover notify invocation.
+type NotifyCall = (PathBuf, Vec<(String, String)>);
+
 struct Fake {
     units: RefCell<BTreeMap<String, FakeUnit>>,
     exes: RefCell<BTreeMap<u32, PathBuf>>,
@@ -81,6 +85,8 @@ struct Fake {
     died: Cell<bool>,
     /// Every systemd-run and systemctl call, for assertions.
     calls: RefCell<Vec<String>>,
+    /// Turnover notify invocations: (program, TURNOVER_* environment).
+    notify_calls: RefCell<Vec<NotifyCall>>,
 }
 
 const UNIT_KEYS: [&str; 6] = [
@@ -114,6 +120,7 @@ impl Fake {
             die_after_health_runs: Cell::new(usize::MAX),
             died: Cell::new(false),
             calls: RefCell::default(),
+            notify_calls: RefCell::default(),
         }
     }
 
@@ -451,6 +458,15 @@ impl Host for Fake {
         args: &[String],
         _environment: &[(String, String)],
     ) -> Result<(i32, String), String> {
+        if _environment
+            .iter()
+            .any(|(name, _)| name.starts_with("TURNOVER_"))
+        {
+            self.notify_calls
+                .borrow_mut()
+                .push((_program.to_path_buf(), _environment.to_vec()));
+            return Ok((0, String::new()));
+        }
         assert!(args.iter().any(|arg| arg == "health"));
         self.health_runs.set(self.health_runs.get() + 1);
         if !self.died.get() && self.health_runs.get() > self.die_after_health_runs.get() {
@@ -1230,4 +1246,250 @@ fn the_bridge_must_run_with_the_snapshots_plugin_home() {
         )),
         "{error}"
     );
+}
+
+/// A real checkout with two commits: OLD, then NEW touching the crate.
+fn turnover_checkout(base: &Path) -> (PathBuf, String, String) {
+    let checkout = base.join("checkout");
+    fs::create_dir_all(checkout.join("rs/agentctl")).unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(args)
+            .env("GIT_CONFIG_COUNT", "2")
+            .env("GIT_CONFIG_KEY_0", "user.email")
+            .env("GIT_CONFIG_VALUE_0", "turnover@test")
+            .env("GIT_CONFIG_KEY_1", "user.name")
+            .env("GIT_CONFIG_VALUE_1", "turnover")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+    git(&["init", "--quiet"]);
+    fs::write(checkout.join("rs/agentctl/code.rs"), "old\n").unwrap();
+    fs::write(checkout.join("README.md"), "one\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "one"]);
+    let old = git(&["rev-parse", "HEAD"]);
+    fs::write(checkout.join("rs/agentctl/code.rs"), "new\n").unwrap();
+    fs::write(checkout.join("README.md"), "two\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "two"]);
+    let new = git(&["rev-parse", "HEAD"]);
+    (checkout, old, new)
+}
+
+fn turnover_options(world: &World, checkout: PathBuf) -> TurnoverOptions {
+    TurnoverOptions {
+        root: world.root.clone(),
+        drop_in_dir: world.fake.drop_in_dir.clone(),
+        checkout,
+        revision: "HEAD".to_owned(),
+        cargo: PathBuf::from("cargo"),
+        work_dir: world.root.clone(),
+        keep_work: false,
+        report_only: true,
+        dry_run: false,
+        health_timeout: Duration::from_secs(60),
+        headless_wait: Duration::from_secs(30),
+        notify: None,
+        global_binary: None,
+        interrupted: None,
+    }
+}
+
+#[test]
+fn turnover_report_decides_per_unit_and_names_pins() {
+    // #1179: host-wide discovery across registries, change-aware
+    // decisions, and a second registry's pin honoured and named.
+    let world = world();
+    let (checkout, old, new) = turnover_checkout(&world._temporary.0);
+    world
+        .fake
+        .commits
+        .borrow_mut()
+        .insert(PathBuf::from("/state/bin/agentctl-old"), old.clone());
+    // A second registry with a watcher and a whole-registry pin.
+    let other_registry = world._temporary.0.join("other/.agentctl");
+    fs::create_dir_all(&other_registry).unwrap();
+    fs::write(
+        other_registry.join("turnover.pin"),
+        "owner-managed bridge\n",
+    )
+    .unwrap();
+    world.fake.add_unit_file(
+        "other-watch.service",
+        &format!(
+            "[Service]\nExecStart=/state/bin/agentctl-old --registry {} watch-agents --state-dir /state/other-watch\nWorkingDirectory=/tmp\n",
+            other_registry.display()
+        ),
+    );
+    let options = turnover_options(&world, checkout);
+    let report = turnover(&world.fake, &Tables, &options).unwrap();
+    assert_eq!(report.exit_code, 74, "{}", report.text);
+    let rows = report.document["services"].as_array().unwrap();
+    let by_unit = |unit: &str| rows.iter().find(|row| row["unit"] == unit).expect(unit);
+    assert_eq!(by_unit("bridge.service")["decision"], "refresh");
+    assert_eq!(
+        by_unit("bridge.service")["changed_paths"],
+        json!(["rs/agentctl/code.rs"])
+    );
+    assert_eq!(by_unit("bridge.service")["running_commit"], old);
+    assert_eq!(by_unit("bridge.service")["candidate_commit"], new);
+    assert_eq!(by_unit("other-watch.service")["decision"], "pinned");
+    assert!(
+        by_unit("other-watch.service")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("owner-managed bridge"),
+        "{report:?}"
+    );
+    assert!(
+        report.text.contains("pinned: owner-managed bridge"),
+        "{}",
+        report.text
+    );
+    // Discovery saw both registries' units in one pass.
+    let (all, _) = discover_all(&world.fake, &Tables).unwrap();
+    assert!(all
+        .iter()
+        .any(|service| service.unit == "other-watch.service"));
+}
+
+#[test]
+fn turnover_report_is_unchanged_when_only_unrelated_paths_moved() {
+    // Reply 274: no affecting change, no restart; the row says since when.
+    let world = world();
+    let (checkout, old, _new) = turnover_checkout(&world._temporary.0);
+    // The candidate is the OLD commit: nothing can have changed.
+    let mut options = turnover_options(&world, checkout);
+    options.revision = old.clone();
+    world
+        .fake
+        .commits
+        .borrow_mut()
+        .insert(PathBuf::from("/state/bin/agentctl-old"), old.clone());
+    let report = turnover(&world.fake, &Tables, &options).unwrap();
+    let rows = report.document["services"].as_array().unwrap();
+    assert!(
+        rows.iter().all(|row| row["decision"] == "unchanged"),
+        "{}",
+        report.text
+    );
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+}
+
+#[test]
+fn turnover_refreshes_bridges_last_and_notifies_in_order() {
+    let world = world();
+    let (checkout, old, new) = turnover_checkout(&world._temporary.0);
+    // The candidate snapshot must exist under its real commit for the
+    // build step to reuse it instead of running cargo.
+    let release = world._temporary.0.join("release");
+    fs::create_dir_all(&release).unwrap();
+    for name in [
+        "agentctl",
+        "agentctl-slack-outbound",
+        "agentctl-slack-plugin",
+    ] {
+        fs::write(release.join(name), format!("#!/bin/sh\necho {name}\n")).unwrap();
+    }
+    let manifest = fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../chat-subscription-slack/manifest.json"),
+    )
+    .unwrap();
+    // Fabricate the candidate snapshot directly (install_snapshot's
+    // staged-binary check cannot be taught a real git SHA through the
+    // fake's commit map, whose staging path carries the test pid).
+    let _ = &manifest;
+    let destination = world.root.join("snapshots").join(&new[..12]);
+    fs::create_dir_all(destination.join("bin")).unwrap();
+    fs::create_dir_all(destination.join("home/plugins/slack")).unwrap();
+    for (from, to) in [
+        ("agentctl", snapshot::AGENTCTL),
+        ("agentctl-slack-outbound", snapshot::OUTBOUND),
+        ("agentctl-slack-plugin", snapshot::PLUGIN),
+    ] {
+        fs::copy(release.join(from), destination.join(to)).unwrap();
+    }
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../chat-subscription-slack/manifest.json"),
+        destination.join(snapshot::MANIFEST),
+    )
+    .unwrap();
+    let files: serde_json::Map<String, Value> = [
+        snapshot::AGENTCTL,
+        snapshot::OUTBOUND,
+        snapshot::PLUGIN,
+        snapshot::MANIFEST,
+    ]
+    .into_iter()
+    .map(|relative| {
+        (
+            relative.to_owned(),
+            json!({"sha256": world.fake.file_sha256(&destination.join(relative)), "bytes": 1}),
+        )
+    })
+    .collect();
+    fs::write(
+        destination.join("snapshot.json"),
+        json!({
+            "schema": snapshot::SNAPSHOT_SCHEMA,
+            "commit": new,
+            "built_at": 1_800_000_000_u64,
+            "source": {"test": true},
+            "files": files,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    world
+        .fake
+        .commits
+        .borrow_mut()
+        .insert(destination.join(snapshot::AGENTCTL), new.clone());
+    world
+        .fake
+        .commits
+        .borrow_mut()
+        .insert(PathBuf::from("/state/bin/agentctl-old"), old.clone());
+    // Point the prebuilt world snapshot (commit NEW const) aside: rename
+    // its directory so select-by-candidate in build finds only ours. The
+    // build step reuses an existing snapshot of the candidate commit.
+    let mut options = turnover_options(&world, checkout);
+    options.report_only = false;
+    options.notify = Some(vec!["/bin/true".to_owned()]);
+    let report = turnover(&world.fake, &Tables, &options).unwrap();
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    let notifies = world.fake.notify_calls.borrow();
+    let verdicts: Vec<&str> = notifies
+        .iter()
+        .map(|(_, env)| {
+            env.iter()
+                .find(|(name, _)| name == "TURNOVER_UNIT")
+                .map(|(_, value)| value.as_str())
+                .unwrap_or("?")
+        })
+        .collect();
+    // registry-start names the first unit; unit-done lines follow in
+    // refresh order with the bridge last.
+    let bridge_at = verdicts
+        .iter()
+        .rposition(|unit| *unit == "bridge.service")
+        .unwrap();
+    let watch_at = verdicts
+        .iter()
+        .position(|unit| *unit == "watch.service")
+        .unwrap();
+    assert!(watch_at < bridge_at, "notify order: {verdicts:?}");
+    assert!(notifies.iter().all(|(_, env)| env
+        .iter()
+        .any(|(name, value)| name == "TURNOVER_NEW_SHA" && value == &new)));
 }

@@ -553,6 +553,11 @@ enum ServicesCommand {
         after_help = "Examples:\n  agentctl --registry ~/project/.agentctl services refresh --dry-run\n  agentctl --registry ~/project/.agentctl services refresh\n  agentctl --registry ~/project/.agentctl services refresh --only chat-bridge --snapshot 1a2b3c4d\n\nOnly the agentctl binary changes, and for a bridge AGENTCTL_HOME, pointed at the snapshot's plugin\nhome so its Slack plugin matches. The outbound helper is part of the bridge's configuration\n(bridge.json) and is left alone; `services list` says when it differs from the snapshot's.\n\nA transient unit (made by systemd-run) is stopped and made again by systemd-run from its own\ndefinition, line for line. First, the same properties start a check unit whose shell only sleeps,\ngiven the planned command as arguments; it must read back as planned, so neither the change nor\nthe rollback can trip on a property systemd-run cannot express. A transient unit with drop-ins is\nrefused. A unit file gets the drop-in DROP_IN_DIR/UNIT.d/zz-agentctl-services.conf, then a daemon\nreload and a restart.\n\nEach service must pass the same health check before it is touched, or it is left alone. After the\nchange, for 30 seconds or more within --health-timeout counted from the new process's start\n(stopping the old process can take its full stop timeout; that time is added to the window and\nsaid in the report; a watcher gets at least its pass budget\nplus 90 s), the unit must stay active with the same main process running the new binary, then a\nbridge's `chat health` (run with the new binary) must not say DOWN, must see that process, which must\nrun with the snapshot's AGENTCTL_HOME, and its event stream must have delivered something since\nthe restart; a watcher must complete a pass\n(agent-watch.json checked_at after the restart); a headless wrapper must answer status on its\ncontrol socket from that process. A headless agent in a turn is waited for (--headless-wait), then\nskipped. Watchers go first, bridges next, headless wrappers last; the first failure stops the run.\n\nBefore changing a unit, ROOT/refreshes/STAMP-COMMIT12/ gets UNIT.before (its `systemctl cat`) and\nthe unit's commands in ROLLBACK.sh; report.json follows. Units that are not active are skipped.\nAn interrupt, hangup or termination signal does not stop a service halfway: the one in hand is\nfinished or rolled back, and the rest are not attempted. A SIGKILL can still leave a service\nstopped: run refresh in a terminal or a pane, not under a tool's timeout.\nExit status: 0 every selected service runs the snapshot and passed; 1 a service was refused or\nfailed and was rolled back (later services untouched); 4 a rollback failed too: run ROLLBACK.sh."
     )]
     Refresh(ServicesRefresh),
+    /// Turn every daemon on this host over to main, only where its code changed: build one snapshot, refresh each changed unpinned unit of every registry (bridges last, the global binary last of all), or only report who is behind
+    #[command(
+        after_help = "Examples:\n  agentctl services turnover --report\n  agentctl services turnover --from ~/project/agent-utils --dry-run\n  agentctl services turnover --from ~/project/agent-utils --notify 'agentctl send coordinator'\n\nDiscovery is host-wide: every user unit running an agentctl binary, whatever registry it names (chat run, watch-agents, watch, restore, restore-teams, run-headless), plus other agent-utils daemons by binary name (reported; no snapshot carries them). Scope is opt-out: a pin at REGISTRY/turnover.pin or REGISTRY/turnover-pins/<unit>.pin (contents are the reason; an empty pin is refused) skips that registry or unit, and ROOT/global.pin pins the global binary. A service refreshes only when paths affecting it changed between its running commit (its binary's --version) and the candidate (--from at --revision); unchanged services are not restarted. Per registry, restore, watchers and headless wrappers go first and bridges last; the global binary (--global-binary, default ~/.local/bin/agentctl) moves last of all, with a backup under ROOT/global-backups/. --notify COMMAND (or a registry's turnover-notify file, which wins) runs before a registry's first refresh and after each of its units with TURNOVER_PHASE, TURNOVER_REGISTRY, TURNOVER_UNIT, TURNOVER_OLD_SHA, TURNOVER_NEW_SHA and TURNOVER_VERDICT in its environment; its failure is reported, never fatal.\n\n--report changes nothing: one line per unit (kind, registry, unit, running and candidate commits, changed-path count, decision), exit 0 all current, 74 some behind, 75 errors or unknown commits. --dry-run prints the ordered plan including pins and notify calls. A turnover run exits 0 when everything current or refreshed is healthy, 1 when a refresh failed and rolled back, 4 when a rollback failed. --json prints schema agentctl-services-turnover/v1."
+    )]
+    Turnover(ServicesTurnover),
     /// Print the services guide
     Userguide,
 }
@@ -607,6 +612,49 @@ struct ServicesRefresh {
     #[arg(long, value_name = "DIR")]
     drop_in_dir: Option<PathBuf>,
     /// Print the report as JSON (schema agentctl-services-refresh/v1) instead of text
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args)]
+struct ServicesTurnover {
+    /// Read-only: report who is behind, per unit; build and move nothing. Exit 0 all current, 74 some behind, 75 errors or unknown commits
+    #[arg(long)]
+    report: bool,
+    /// Print the ordered plan (refresh order, pins, notify calls); change nothing
+    #[arg(long)]
+    dry_run: bool,
+    /// The Git checkout main is resolved and built from (default: $AGENT_UTILS_CHECKOUT, else the checkout containing the current directory)
+    #[arg(long = "from", value_name = "CHECKOUT")]
+    from: Option<PathBuf>,
+    /// The commit to turn over to, any revision Git accepts (default: HEAD)
+    #[arg(long, default_value = "HEAD", value_name = "REV")]
+    revision: String,
+    /// cargo executable for the snapshot build (default: cargo on PATH, else ~/.cargo/bin/cargo)
+    #[arg(long, value_name = "PATH")]
+    cargo: Option<PathBuf>,
+    /// Parent of the snapshot build's temporary directory (default: the system temporary directory)
+    #[arg(long, value_name = "DIR")]
+    work_dir: Option<PathBuf>,
+    /// Keep the snapshot build's temporary directory, for inspecting a failed build
+    #[arg(long)]
+    keep_work: bool,
+    /// Command run before a registry's first refresh and after each of its units, with TURNOVER_PHASE, TURNOVER_REGISTRY, TURNOVER_UNIT, TURNOVER_OLD_SHA, TURNOVER_NEW_SHA and TURNOVER_VERDICT set; a registry's own turnover-notify file wins. Its failure is reported, never fatal
+    #[arg(long, value_name = "COMMAND")]
+    notify: Option<String>,
+    /// The global agentctl binary moved last of all (default: ~/.local/bin/agentctl; an empty value skips it)
+    #[arg(long, value_name = "PATH")]
+    global_binary: Option<String>,
+    /// Seconds a restarted service has to pass its health check, 10-3600 (default: 120)
+    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(10..=3600), value_name = "SECONDS")]
+    health_timeout: u64,
+    /// Seconds to wait for a headless agent in a turn to go idle before skipping it, 0-86400 (default: 600)
+    #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(0..=86400), value_name = "SECONDS")]
+    headless_wait: u64,
+    /// Where drop-ins for unit-file services go (default: $XDG_CONFIG_HOME/systemd/user, else ~/.config/systemd/user)
+    #[arg(long, value_name = "DIR")]
+    drop_in_dir: Option<PathBuf>,
+    /// Print the report as JSON (schema agentctl-services-turnover/v1) instead of text
     #[arg(long)]
     json: bool,
 }
@@ -3122,6 +3170,110 @@ fn run_services(registry: &Path, value: Services) -> Result<i32, Failure> {
                 crate::services::refresh(&host, &CliOptionTables, &registry, &root, &options)
                     .map_err(failed)?;
             if refresh.json {
+                write_json(&report.document).map_err(Failure::Output)?;
+            } else {
+                write_text(&report.text).map_err(Failure::Output)?;
+            }
+            Ok(report.exit_code)
+        }
+        ServicesCommand::Turnover(turnover) => {
+            let checkout = match turnover.from {
+                Some(checkout) => absolute(&checkout)?,
+                None => match std::env::var_os(crate::build_info::CHECKOUT_ENV)
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(checkout) => PathBuf::from(checkout),
+                    None => {
+                        let output = std::process::Command::new("git")
+                            .args(["rev-parse", "--show-toplevel"])
+                            .output()
+                            .map_err(|error| failed(format!("cannot run git: {error}")))?;
+                        if !output.status.success() {
+                            return Err(Failure::Usage(
+                                "not inside a Git checkout; pass --from CHECKOUT".to_owned(),
+                            ));
+                        }
+                        PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+                    }
+                },
+            };
+            let cargo = match turnover.cargo {
+                Some(cargo) => cargo,
+                None => on_path("cargo")
+                    .or_else(|| {
+                        std::env::var_os("HOME")
+                            .map(|home| PathBuf::from(home).join(".cargo/bin/cargo"))
+                            .filter(|cargo| cargo.is_file())
+                    })
+                    .ok_or_else(|| {
+                        Failure::Usage(
+                            "cargo is not on PATH or in ~/.cargo/bin; pass --cargo".to_owned(),
+                        )
+                    })?,
+            };
+            let work_dir = match turnover.work_dir {
+                Some(directory) => absolute(&directory)?,
+                None => std::env::temp_dir(),
+            };
+            let drop_in_dir = match turnover.drop_in_dir {
+                Some(directory) => absolute(&directory)?,
+                None => crate::services::default_drop_in_dir().ok_or_else(|| {
+                    Failure::Usage(
+                        "neither XDG_CONFIG_HOME nor HOME is set; pass --drop-in-dir".to_owned(),
+                    )
+                })?,
+            };
+            let notify = match turnover.notify.as_deref() {
+                Some(command) => Some(
+                    crate::services::unit::shell_words(command)
+                        .map_err(|error| {
+                            Failure::Usage(format!("--notify cannot be read safely: {error}"))
+                        })?
+                        .into_iter()
+                        .take_while(|word| !word.operator)
+                        .map(|word| word.text)
+                        .collect::<Vec<_>>(),
+                ),
+                None => None,
+            };
+            let global_binary = match turnover.global_binary {
+                Some(path) if path.is_empty() => None,
+                Some(path) => Some(absolute(Path::new(&path))?),
+                None => std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".local/bin/agentctl")),
+            };
+            let mut options = crate::services::turnover::TurnoverOptions {
+                root: root.clone(),
+                drop_in_dir,
+                checkout,
+                revision: turnover.revision,
+                cargo,
+                work_dir,
+                keep_work: turnover.keep_work,
+                report_only: turnover.report,
+                dry_run: turnover.dry_run,
+                health_timeout: Duration::from_secs(turnover.health_timeout),
+                headless_wait: Duration::from_secs(turnover.headless_wait),
+                notify,
+                global_binary,
+                interrupted: None,
+            };
+            if !options.report_only && !options.dry_run {
+                let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                for signal in [
+                    signal_hook::consts::SIGINT,
+                    signal_hook::consts::SIGTERM,
+                    signal_hook::consts::SIGHUP,
+                ] {
+                    signal_hook::flag::register(signal, std::sync::Arc::clone(&flag)).map_err(
+                        |error| failed(format!("cannot handle signal {signal}: {error}")),
+                    )?;
+                }
+                options.interrupted = Some(flag);
+            }
+            let report = crate::services::turnover::turnover(&host, &CliOptionTables, &options)
+                .map_err(failed)?;
+            if turnover.json {
                 write_json(&report.document).map_err(Failure::Output)?;
             } else {
                 write_text(&report.text).map_err(Failure::Output)?;

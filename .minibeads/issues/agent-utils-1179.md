@@ -1,10 +1,11 @@
 ---
 title: 'services-turnover: one host command that turns every agent-utils daemon over to main, only where its code changed'
-status: open
+status: closed
 priority: 1
 issue_type: feature
-created_at: 2026-11-10T01:52:07.000000000+00:00
-updated_at: 2026-11-10T01:52:07.000000000+00:00
+created_at: 2026-11-10T01:52:07+00:00
+updated_at: 2026-11-10T02:50:09.009564675+00:00
+closed_at: 2026-11-10T02:50:09.009564435+00:00
 ---
 
 # Description
@@ -116,3 +117,25 @@ this issue ships the command, its report, and tests against fake unit
 dirs; the first live run is operator-run (a --report against the real
 host is safe to run anywhere). The install-units timer template for
 hosts without a daily turnover is a follow-up; v1 reports its absence.
+
+## Resolution
+
+[watermelon-full-preview] Delivered with this closing commit.
+`agentctl services turnover` discovers every agentctl unit on the host
+(discovery now also classifies `watch` and `restore`/`restore-teams`),
+decides per unit by changed affecting paths between its running commit
+and the candidate, and refreshes through the existing refresh path per
+registry with bridges last and the global binary last of all. Pins
+(registry and per-unit, reason required) skip and are named; unknown
+commits are reported prominently with their remedy; other agent-utils
+daemons are report-only since no snapshot carries them. --report is
+read-only with 0/74/75 exit classes for the daily timer; --dry-run
+prints the ordered plan including notify calls (TURNOVER_* environment,
+per-registry turnover-notify wins over --notify). An inactive restore
+oneshot is updated in place without being started. The report answers
+the timer question in its guide text: a host running turnover on a timer
+needs no separate global-binary timer. Tests cover per-unit decisions
+with a pinned second registry, unchanged-when-unrelated, bridges-last
+notify order, and the existing services suites stay green. Unverified:
+no live host refresh yet - the first live run stays with the coordinator
+and the other team's lead, as recorded in Notes.

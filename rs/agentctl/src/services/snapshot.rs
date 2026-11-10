@@ -197,6 +197,11 @@ fn private_dir(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
+/// Run git in a checkout (shared with turnover's changed-paths test).
+pub(crate) fn git_in(checkout: &Path, args: &[&str]) -> Result<String, String> {
+    git(checkout, args)
+}
+
 fn git(checkout: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
