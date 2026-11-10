@@ -338,3 +338,44 @@ body:has(#control-bar[data-placement="top"]) #doc-outline-pop {
 #doc-body h6 {
   scroll-margin-top: 8px;
 }
+
+/* Type filter buckets (`#1176 doc-kind-buckets`): a quiet row over the cards. */
+.doc-buckets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 10px;
+}
+.doc-bucket {
+  border: 1px solid #3a4a61;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  padding: 3px 10px;
+  font: inherit;
+  font-size: 0.85em;
+}
+.doc-bucket[aria-pressed="true"] {
+  background: #2e3d52;
+  border-color: #5b9dd9;
+  color: #fff;
+  font-weight: 700;
+}
+
+/* Issue header (`#1176 doc-kind-buckets`): front matter as a header, not YAML. */
+.doc-issue-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+  padding: 8px 10px;
+  border-bottom: 1px solid #3a4a61;
+  font-weight: 700;
+}
+.doc-issue-status {
+  border: 1px solid #5b9dd9;
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 0.85em;
+  font-weight: 400;
+}

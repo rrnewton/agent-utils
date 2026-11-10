@@ -43,7 +43,27 @@ const FETCH_RECENT_PATH = "/api/v1/documents/fetch-recent";
 const FRESHNESS_PATH = (key: string) => `/api/v1/documents/${encodeURIComponent(key)}/freshness`;
 const FETCH_RECENT_LIMIT = 10;
 
+/** The type-filter buckets of `#1176 doc-kind-buckets`: gists sit with pastes. */
+export type DocumentBucket = "markdown" | "pastes" | "issues" | "other";
+
+/** Which bucket a wire kind belongs to. */
+export function bucketOfKind(kind: string): DocumentBucket {
+  if (kind === "github_issue") return "issues";
+  if (kind === "paste" || kind === "github_gist") return "pastes";
+  if (kind === "github_markdown") return "markdown";
+  return "other";
+}
+
+const BUCKET_BUTTONS: readonly { bucket: DocumentBucket | "all"; label: string }[] = [
+  { bucket: "all", label: "All" },
+  { bucket: "markdown", label: "Markdown" },
+  { bucket: "pastes", label: "Pastes" },
+  { bucket: "issues", label: "Issues" },
+  { bucket: "other", label: "Other files" },
+];
+
 const ICON_PATHS: Record<string, string[]> = {
+  issue: ["M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z", "M12 8h.01", "M11 12h1v4h1"],
   github: [
     "M6 3v12",
     "M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6z",
@@ -67,7 +87,14 @@ function iconFor(kind: string): SVGSVGElement {
   svg.setAttribute("stroke-width", "1.7");
   svg.setAttribute("stroke-linecap", "round");
   svg.setAttribute("stroke-linejoin", "round");
-  const paths = kind.startsWith("github") ? ICON_PATHS.github : kind === "paste" ? ICON_PATHS.paste : ICON_PATHS.file;
+  const paths =
+    kind === "github_issue"
+      ? ICON_PATHS.issue
+      : kind === "paste" || kind === "github_gist"
+        ? ICON_PATHS.paste
+        : kind.startsWith("github")
+          ? ICON_PATHS.github
+          : ICON_PATHS.file;
   for (const d of paths ?? []) {
     const path = (ns ? document.createElementNS(ns, "path") : document.createElement("path")) as unknown as SVGPathElement;
     path.setAttribute("d", d);
@@ -125,6 +152,14 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
   const busy = new Set<string>();
   const errors = new Map<string, string>();
   let rowsNow: readonly DocumentRow[] = [];
+  // The type filter's state lives with the list's other view state (no new
+  // persistence key): `#1176 doc-kind-buckets`.
+  let bucketFilter: DocumentBucket | "all" = "all";
+
+  function visibleRows(): readonly DocumentRow[] {
+    if (bucketFilter === "all") return rowsNow;
+    return rowsNow.filter((row) => bucketOfKind(row.kind) === bucketFilter);
+  }
 
   function cardFor(row: DocumentRow): HTMLElement {
     const isBusy = busy.has(row.key);
@@ -145,7 +180,10 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     texts.className = "doc-texts";
     const title = document.createElement("span");
     title.className = "doc-title";
-    title.textContent = displayTitle(row);
+    title.textContent =
+      row.kind === "github_issue" && row.issue_number !== null && row.issue_number !== undefined
+        ? `#${row.issue_number} ${displayTitle(row)}`
+        : displayTitle(row);
     const subtitle = document.createElement("span");
     subtitle.className = "doc-subtitle";
     const failed = errors.get(row.key);
@@ -154,6 +192,9 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     else if (row.moved_to) subtitle.textContent = `moved to ${row.moved_to}`;
     else {
       subtitle.textContent = `${row.file_name} · ${mentionedAgo(row.last_mentioned_ms, Date.now())}`;
+      if (row.kind === "github_issue" && row.issue_status) {
+        subtitle.textContent += ` · ${row.issue_status}`;
+      }
       if (row.fetched && row.fetched_ms !== null) {
         subtitle.textContent += ` · ${fetchedAgo(row.fetched_ms, Date.now())}`;
         subtitle.title = new Date(row.fetched_ms).toLocaleString();
@@ -297,6 +338,30 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     }
   }
 
+  function bucketBar(): HTMLElement {
+    const bar = document.createElement("div");
+    bar.className = "doc-buckets";
+    bar.setAttribute("role", "group");
+    bar.setAttribute("aria-label", "Document type");
+    const hasOther = rowsNow.some((row) => bucketOfKind(row.kind) === "other");
+    for (const { bucket, label } of BUCKET_BUTTONS) {
+      // "Other files" exists only while a row needs it (`#1176`).
+      if (bucket === "other" && !hasOther && bucketFilter !== "other") continue;
+      const button = document.createElement("button");
+      button.setAttribute("type", "button");
+      button.className = "doc-bucket";
+      button.dataset.bucket = bucket;
+      button.textContent = label;
+      button.setAttribute("aria-pressed", String(bucketFilter === bucket));
+      listening.listen(button, "click", () => {
+        bucketFilter = bucket;
+        render(rowsNow);
+      });
+      bar.appendChild(button);
+    }
+    return bar;
+  }
+
   function render(rows: readonly DocumentRow[]): void {
     rowsNow = [...rows].sort(byOldest);
     listening.unmount();
@@ -312,8 +377,16 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     const head = document.createElement("p");
     head.className = "doc-list-head";
     head.textContent = `Oldest first · ${totalNow || rowsNow.length} documents · newest at the bottom`;
-    const cards = rowsNow.map(cardFor);
-    list.replaceChildren(head, ...cards);
+    const shown = visibleRows();
+    const cards = shown.map(cardFor);
+    if (shown.length === 0) {
+      const note = document.createElement("p");
+      note.className = "doc-empty";
+      note.textContent = "No documents of this type.";
+      list.replaceChildren(head, bucketBar(), note);
+      return;
+    }
+    list.replaceChildren(head, bucketBar(), ...cards);
     // Arrow keys walk the cards; Enter opens (above).
     listening.listen(list, "keydown", (event: KeyboardEvent) => {
       if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
@@ -397,9 +470,9 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
 
   return {
     refresh,
-    fetchVisible: () => fetchMany(rowsNow),
+    fetchVisible: () => fetchMany(visibleRows()),
     fetchSince: (cutoffMs: number) =>
-      fetchMany(rowsNow.filter((row) => (row.last_mentioned_ms ?? 0) >= cutoffMs)),
+      fetchMany(visibleRows().filter((row) => (row.last_mentioned_ms ?? 0) >= cutoffMs)),
     async fetchRecent(): Promise<number> {
       const answer = (await deps.api(FETCH_RECENT_PATH, {
         method: "POST",

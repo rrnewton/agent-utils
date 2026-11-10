@@ -43,6 +43,12 @@ pub enum DocKind {
     Paste,
     /// A Google Docs document. Recognised, not fetched yet.
     GoogleDoc,
+    /// A minibeads issue: a GitHub `blob/…/.minibeads/issues/<prefix>-<n>.md` page.
+    /// `#1176 doc-kind-buckets`.
+    GithubIssue,
+    /// A GitHub gist: `gist.github.com/<owner>/<id>` (the Pastes bucket's GitHub half).
+    /// `#1176 doc-kind-buckets`.
+    GithubGist,
 }
 
 impl DocKind {
@@ -54,6 +60,8 @@ impl DocKind {
             Self::GithubFile => "github_file",
             Self::Paste => "paste",
             Self::GoogleDoc => "google_doc",
+            Self::GithubIssue => "github_issue",
+            Self::GithubGist => "github_gist",
         }
     }
 }
@@ -166,6 +174,54 @@ fn dot_segment(segment: &str) -> bool {
     !segment.is_empty()
 }
 
+/// The issue number of a minibeads issue path (`.minibeads/issues/<prefix>-<n>.md`),
+/// or `None` when `path` is not exactly that shape. `#1176 doc-kind-buckets`.
+#[must_use]
+pub fn issue_number_of(path: &str) -> Option<u64> {
+    let mut parts = path.split('/');
+    if parts.next() != Some(".minibeads") || parts.next() != Some("issues") {
+        return None;
+    }
+    let file = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let stem = file.strip_suffix(".md")?;
+    let (prefix, digits) = stem.rsplit_once('-')?;
+    if !valid_name(prefix) || digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// The `status:` of a document's YAML front matter, when it opens with one.
+/// `#1176 doc-kind-buckets`: an issue's status (open, in_progress, closed).
+#[must_use]
+pub fn issue_status_of(content: &str) -> Option<String> {
+    let mut lines = content.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return None;
+    }
+    for line in lines {
+        if line.trim() == "---" {
+            return None;
+        }
+        if let Some(value) = line.trim().strip_prefix("status:") {
+            let value = value.trim().trim_matches('"').trim_matches('\'');
+            return (!value.is_empty()).then(|| value.to_owned());
+        }
+    }
+    None
+}
+
+fn valid_gist_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
 /// Recognise one address, or `None` when it is not a document this knows.
 ///
 /// Strict, as [`crate::link_labels`] is: no decoding, no dot segments, no
@@ -222,7 +278,9 @@ pub fn recognize_url(
             // Path segments are file names: dots are ordinary there.
         }
         let lower = file_path.to_ascii_lowercase();
-        let kind = if lower.ends_with(".md") || lower.ends_with(".markdown") {
+        let kind = if issue_number_of(&file_path).is_some() {
+            DocKind::GithubIssue
+        } else if lower.ends_with(".md") || lower.ends_with(".markdown") {
             DocKind::GithubMarkdown
         } else {
             DocKind::GithubFile
@@ -250,7 +308,9 @@ pub fn recognize_url(
         }
         let file_path = rest.join("/");
         let lower = file_path.to_ascii_lowercase();
-        let kind = if lower.ends_with(".md") || lower.ends_with(".markdown") {
+        let kind = if issue_number_of(&file_path).is_some() {
+            DocKind::GithubIssue
+        } else if lower.ends_with(".md") || lower.ends_with(".markdown") {
             DocKind::GithubMarkdown
         } else {
             DocKind::GithubFile
@@ -266,6 +326,51 @@ pub fn recognize_url(
                 path: file_path,
             },
             rest.last().copied().unwrap_or("").to_owned(),
+        ));
+    }
+    if host.eq_ignore_ascii_case("gist.github.com") {
+        // `gist.github.com/<owner>/<id>[/<revision>]`, or the bare `/<id>` form.
+        let (owner, id, revision) = match segments.as_slice() {
+            [id] => (None, *id, None),
+            [owner, id] => (Some(*owner), *id, None),
+            [owner, id, revision] => (Some(*owner), *id, Some(*revision)),
+            _ => return None,
+        };
+        if !valid_gist_id(id) || owner.is_some_and(|o| !valid_name(o)) {
+            return None;
+        }
+        return Some(mk(
+            DocKind::GithubGist,
+            format!("gist:{id}"),
+            Locator {
+                url: address.to_owned(),
+                owner: owner.map(str::to_owned),
+                repo: None,
+                ref_name: revision.map(str::to_owned),
+                path: id.to_owned(),
+            },
+            id.to_owned(),
+        ));
+    }
+    if host.eq_ignore_ascii_case("gist.githubusercontent.com") {
+        // `gist.githubusercontent.com/<owner>/<id>/raw[/<revision>/<file>…]`.
+        let [owner, id, raw, ..] = segments.as_slice() else {
+            return None;
+        };
+        if *raw != "raw" || !valid_name(owner) || !valid_gist_id(id) {
+            return None;
+        }
+        return Some(mk(
+            DocKind::GithubGist,
+            format!("gist:{id}"),
+            Locator {
+                url: address.to_owned(),
+                owner: Some((*owner).to_owned()),
+                repo: None,
+                ref_name: None,
+                path: (*id).to_owned(),
+            },
+            (*id).to_owned(),
         ));
     }
     if host.eq_ignore_ascii_case("docs.google.com") {
@@ -335,6 +440,17 @@ pub fn parse_key(key: &str, paste_prefixes: &[String]) -> Option<Recognized> {
         }
         let url = format!("https://github.com/{owner}/{repo}/blob/{ref}/{path}");
         let rec = recognize_url(&url, None, paste_prefixes)?;
+        return (rec.key == key).then_some(rec);
+    }
+    if let Some(id) = key.strip_prefix("gist:") {
+        if !valid_gist_id(id) {
+            return None;
+        }
+        let rec = recognize_url(
+            &format!("https://gist.github.com/{id}"),
+            None,
+            paste_prefixes,
+        )?;
         return (rec.key == key).then_some(rec);
     }
     if let Some(id) = key.strip_prefix("paste:") {
@@ -512,12 +628,21 @@ impl Index {
     ///
     /// Returns the I/O or JSON error when an existing file cannot be read.
     pub fn load(paste_prefixes: Vec<String>, path: std::path::PathBuf) -> Result<Self, String> {
-        let fold = match std::fs::read_to_string(&path) {
+        let mut fold = match std::fs::read_to_string(&path) {
             Ok(text) => serde_json::from_str(&text)
                 .map_err(|e| format!("documents index {}: {e}", path.display()))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Fold::default(),
             Err(e) => return Err(format!("documents index {}: {e}", path.display())),
         };
+        // Rows folded before `#1176 doc-kind-buckets` hold issue paths as ordinary
+        // markdown: re-classify them on read, with no migration.
+        for entry in fold.docs.values_mut() {
+            if entry.kind == DocKind::GithubMarkdown
+                && issue_number_of(&entry.locator.path).is_some()
+            {
+                entry.kind = DocKind::GithubIssue;
+            }
+        }
         Ok(Self {
             paste_prefixes,
             fold: RwLock::new(fold),
@@ -840,6 +965,8 @@ pub struct Fetched {
     pub outline: Vec<String>,
     /// Where the document lives now, when a moved fetch found it elsewhere.
     pub moved_to: Option<String>,
+    /// Front-matter status, for issues (`#1176 doc-kind-buckets`); else `None`.
+    pub issue_status: Option<String>,
 }
 
 /// Why a fetch or freshness check failed.
@@ -1404,6 +1531,68 @@ impl GithubFetcher {
         })
     }
 
+    /// Fetch one gist through the API (`#1176 doc-kind-buckets`): its files in
+    /// name order, joined; a truncated file is read from its raw address.
+    async fn get_gist(&self, entry: &Entry) -> Result<FetchedRaw, FetchError> {
+        let url = format!("{}/gists/{}", self.api_base, entry.locator.path);
+        let response = self.send_get(&url).await?;
+        if !response.status().is_success() {
+            return Err(FetchError::Failed(format!(
+                "GitHub answered {}",
+                response.status()
+            )));
+        }
+        let (body, _) = self.read_body(response).await?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| FetchError::Failed(e.to_string()))?;
+        let Some(files) = parsed.get("files").and_then(serde_json::Value::as_object) else {
+            return Err(FetchError::Failed(
+                "GitHub's answer held no gist files".to_owned(),
+            ));
+        };
+        let mut names: Vec<&String> = files.keys().collect();
+        names.sort();
+        let mut parts: Vec<String> = Vec::new();
+        for name in names {
+            let file = &files[name];
+            let truncated =
+                file.get("truncated").and_then(serde_json::Value::as_bool) == Some(true);
+            let content = match file.get("content").and_then(serde_json::Value::as_str) {
+                Some(text) if !truncated => text.to_owned(),
+                _ => {
+                    let raw_url = file
+                        .get("raw_url")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            FetchError::Failed("gist file held no content".to_owned())
+                        })?;
+                    let raw = self.send_get(raw_url).await?;
+                    if !raw.status().is_success() {
+                        return Err(FetchError::Failed(format!(
+                            "GitHub answered {}",
+                            raw.status()
+                        )));
+                    }
+                    self.read_body(raw).await?.0
+                }
+            };
+            parts.push(content);
+        }
+        if parts.is_empty() {
+            return Err(FetchError::Failed("the gist holds no files".to_owned()));
+        }
+        let content = if parts.len() == 1 {
+            parts.pop().unwrap_or_default()
+        } else {
+            parts.join("\n\n")
+        };
+        Ok(FetchedRaw {
+            version: Some(version_of(&content)),
+            content,
+            moved_to: None,
+        })
+    }
+
     async fn etag(&self, entry: &Entry) -> Result<Option<String>, FetchError> {
         let url = self.url(entry)?;
         let response = self.send_get(&url).await?;
@@ -1427,14 +1616,20 @@ impl GithubFetcher {
 impl Fetcher for GithubFetcher {
     async fn fetch(&self, entry: &Entry) -> Result<FetchedRaw, FetchError> {
         match entry.kind {
-            DocKind::GithubMarkdown | DocKind::GithubFile => self.get(entry).await,
+            DocKind::GithubMarkdown | DocKind::GithubFile | DocKind::GithubIssue => {
+                self.get(entry).await
+            }
+            DocKind::GithubGist => self.get_gist(entry).await,
             kind => Err(FetchError::Unsupported(kind.as_str())),
         }
     }
 
     async fn current_version(&self, entry: &Entry) -> Result<Option<String>, FetchError> {
         match entry.kind {
-            DocKind::GithubMarkdown | DocKind::GithubFile => self.etag(entry).await,
+            DocKind::GithubMarkdown | DocKind::GithubFile | DocKind::GithubIssue => {
+                self.etag(entry).await
+            }
+            DocKind::GithubGist => Ok(self.get_gist(entry).await?.version),
             kind => Err(FetchError::Unsupported(kind.as_str())),
         }
     }
@@ -1832,6 +2027,9 @@ impl Service {
             version: raw.version.unwrap_or_else(|| version_of(&raw.content)),
             fetched_ms: crate::cache::wall_ms(),
             outline,
+            issue_status: (entry.kind == DocKind::GithubIssue)
+                .then(|| issue_status_of(&raw.content))
+                .flatten(),
             content: raw.content,
             moved_to: raw.moved_to,
         };
@@ -1971,6 +2169,88 @@ mod tests {
     }
 
     #[test]
+    fn recognises_minibeads_issues_not_ordinary_markdown() {
+        for (url, number) in [
+            (
+                "https://github.com/octo/widgets/blob/main/.minibeads/issues/agent-utils-1176.md",
+                1176,
+            ),
+            (
+                "https://raw.githubusercontent.com/octo/widgets/main/.minibeads/issues/x-9.md",
+                9,
+            ),
+        ] {
+            let rec = recognize_url(url, None, &prefixes()).expect("issue recognised");
+            assert_eq!(rec.kind, DocKind::GithubIssue, "{url}");
+            assert_eq!(rec.kind.as_str(), "github_issue");
+            assert_eq!(issue_number_of(&rec.locator.path), Some(number), "{url}");
+        }
+        // Near-misses stay ordinary markdown (or an ordinary file for non-.md).
+        for url in [
+            "https://github.com/octo/widgets/blob/main/.minibeads/other/agent-utils-1.md",
+            "https://github.com/octo/widgets/blob/main/.minibeads/issues/no-number.md",
+            "https://github.com/octo/widgets/blob/main/.minibeads/issues/agent-utils-.md",
+            "https://github.com/octo/widgets/blob/main/docs/.minibeads/issues/a-1.md",
+            "https://github.com/octo/widgets/blob/main/.minibeads/issues/sub/a-1.md",
+        ] {
+            let rec = recognize_url(url, None, &prefixes()).expect("still a document");
+            assert_eq!(rec.kind, DocKind::GithubMarkdown, "{url}");
+        }
+        let txt = recognize_url(
+            "https://github.com/octo/widgets/blob/main/.minibeads/issues/agent-utils-1.txt",
+            None,
+            &prefixes(),
+        )
+        .expect("still a document");
+        assert_eq!(txt.kind, DocKind::GithubFile);
+    }
+
+    #[test]
+    fn recognises_gist_url_forms() {
+        for url in [
+            "https://gist.github.com/octo/0123456789abcdef0123456789abcdef",
+            "https://gist.github.com/0123456789abcdef0123456789abcdef",
+            "https://gist.github.com/octo/0123456789abcdef0123456789abcdef/deadbeef",
+            "https://gist.githubusercontent.com/octo/0123456789abcdef0123456789abcdef/raw/deadbeef/note.md",
+        ] {
+            let rec = recognize_url(url, None, &prefixes()).expect("gist recognised");
+            assert_eq!(rec.kind, DocKind::GithubGist, "{url}");
+            assert_eq!(rec.kind.as_str(), "github_gist");
+            assert_eq!(rec.key, "gist:0123456789abcdef0123456789abcdef", "{url}");
+        }
+        assert!(recognize_url("https://gist.github.com/", None, &prefixes()).is_none());
+    }
+
+    #[test]
+    fn kind_names_round_trip_through_serde() {
+        for (kind, name) in [
+            (DocKind::GithubMarkdown, "github_markdown"),
+            (DocKind::GithubFile, "github_file"),
+            (DocKind::Paste, "paste"),
+            (DocKind::GoogleDoc, "google_doc"),
+            (DocKind::GithubIssue, "github_issue"),
+            (DocKind::GithubGist, "github_gist"),
+        ] {
+            assert_eq!(kind.as_str(), name);
+            let json = serde_json::to_string(&kind).expect("serialise");
+            assert_eq!(json, format!("\"{name}\""));
+            assert_eq!(serde_json::from_str::<DocKind>(&json).expect("parse"), kind);
+        }
+    }
+
+    #[test]
+    fn issue_frontmatter_status_is_read() {
+        let doc = "---\ntitle: \"Fix it\"\nstatus: in_progress\n---\n\n# Body\n";
+        assert_eq!(issue_status_of(doc).as_deref(), Some("in_progress"));
+        assert_eq!(issue_status_of("# No frontmatter\n").as_deref(), None);
+        assert_eq!(
+            issue_status_of("---\ntitle: x\n---\n").as_deref(),
+            None,
+            "no status line, no status"
+        );
+    }
+
+    #[test]
     fn parse_key_round_trips_minted_keys() {
         // Every key recognize_url mints parses back to the same recognition.
         for url in [
@@ -1978,6 +2258,8 @@ mod tests {
             "https://github.com/octo/widgets/blob/main/data/x.json",
             "https://raw.githubusercontent.com/octo/widgets/main/docs/a.markdown",
             "https://github.com/o/r/blob/feature/x/docs/a.md",
+            "https://github.com/o/r/blob/main/.minibeads/issues/agent-utils-1176.md",
+            "https://gist.github.com/octo/0123456789abcdef0123456789abcdef",
             "https://paste.example/Ab12",
         ] {
             let minted = recognize_url(url, None, &prefixes()).expect("minted");
@@ -2373,6 +2655,47 @@ next body
             "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    #[test]
+    fn an_old_markdown_row_for_an_issue_path_reclassifies_on_load() {
+        let dir = std::env::temp_dir().join(format!("documents-reclassify-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("index.json");
+        let key = "github:o/r@main:.minibeads/issues/agent-utils-5.md";
+        let json = format!(
+            r#"{{"docs":{{"{key}":{{"key":"{key}","kind":"github_markdown","locator":{{"url":"https://github.com/o/r/blob/main/.minibeads/issues/agent-utils-5.md","owner":"o","repo":"r","ref_name":"main","path":".minibeads/issues/agent-utils-5.md"}},"file_name":"agent-utils-5.md","label":null,"mentions":[]}}}},"by_message":{{}},"revision":1,"changes":[]}}"#
+        );
+        std::fs::write(&path, json).expect("write fold");
+        let index = Index::load(prefixes(), path).expect("load");
+        assert_eq!(
+            index.get(key).expect("entry").kind,
+            DocKind::GithubIssue,
+            "an old markdown row for an issue path reads as an issue"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_gist_fetches_its_files_through_the_api() {
+        let body = r#"{"files":{"b.md":{"filename":"b.md","content":"second file","truncated":false},"a.md":{"filename":"a.md","content":"first file","truncated":false}}}"#;
+        let api = serve_once_each(vec![http("200 OK", "", body)]);
+        let fetcher = GithubFetcher::new(TokenSource::None, None, None).with_api_base(api);
+        let entry = parse_key("gist:0123456789abcdef0123456789abcdef", &prefixes())
+            .and_then(|rec| {
+                Some(Entry {
+                    key: rec.key,
+                    kind: rec.kind,
+                    locator: rec.locator,
+                    file_name: rec.file_name,
+                    label: None,
+                    mentions: Vec::new(),
+                })
+            })
+            .expect("gist entry");
+        let raw = block_on(fetcher.fetch(&entry)).expect("gist fetched");
+        assert_eq!(raw.content, "first file\n\nsecond file");
+        assert!(raw.version.is_some());
     }
 
     #[test]

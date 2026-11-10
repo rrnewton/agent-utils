@@ -22,8 +22,12 @@ export interface DocumentMention {
 export interface DocumentRow {
   /** Canonical document key. */
   key: string;
-  /** Document kind: `github_markdown`, `github_file`, `paste`, `google_doc`. */
+  /** Document kind: `github_markdown`, `github_file`, `paste`, `google_doc`, `github_issue`, `github_gist`. */
   kind: string;
+  /** Issue number, for `github_issue` rows; else null. `#1176 doc-kind-buckets`. */
+  issue_number: number | null;
+  /** Front-matter status, for fetched `github_issue` rows; else null. */
+  issue_status: string | null;
   /** The address as linked. */
   url: string;
   /** Last path segment. */

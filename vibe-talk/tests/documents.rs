@@ -280,6 +280,83 @@ async fn list_is_mention_order_dimmed_then_fetched_with_real_title() {
 }
 
 #[tokio::test]
+async fn issue_and_gist_rows_carry_their_kinds_and_issue_fields() {
+    // `#1176 doc-kind-buckets`: an issue link and a gist link fold beside a
+    // markdown link, each with its own kind; the issue row names its number
+    // before fetching and its status after.
+    let (mut state, _discord, _elevenlabs) = testing::state_parts();
+    let github = Arc::new(FakeGithub::default());
+    let issue_key = "github:octo/widgets@main:.minibeads/issues/agent-utils-1176.md";
+    github.put(
+        issue_key,
+        "---\ntitle: \"Buckets\"\nstatus: open\n---\n\n# Buckets\n\nbody\n",
+        "v9",
+    );
+    github.put(
+        "gist:0123456789abcdef0123456789abcdef",
+        "# Gist Note\n",
+        "v3",
+    );
+    let index = Arc::new(Index::new(Vec::new()));
+    for (id, at, text) in [
+        (
+            "1000000000000000011",
+            1_000_i64,
+            "https://github.com/octo/widgets/blob/main/.minibeads/issues/agent-utils-1176.md",
+        ),
+        (
+            "1000000000000000012",
+            2_000,
+            "https://gist.github.com/octo/0123456789abcdef0123456789abcdef",
+        ),
+        (
+            "1000000000000000013",
+            3_000,
+            "https://github.com/octo/widgets/blob/main/docs/plain.md",
+        ),
+    ] {
+        index.apply_message(READ_CHANNEL, id, Some(at), "agent", None, text);
+    }
+    state.documents = Arc::new(Service::new(index, github, 100, 1 << 20));
+    let app = router(state);
+
+    let (status, body) = call(&app, "GET", "/api/v1/documents", Some(READ_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let docs = body["documents"].as_array().expect("documents");
+    assert_eq!(docs.len(), 3, "{body}");
+    let by_kind: std::collections::HashMap<&str, &Value> = docs
+        .iter()
+        .map(|d| (d["kind"].as_str().expect("kind"), d))
+        .collect();
+    assert_eq!(by_kind["github_issue"]["issue_number"], 1176);
+    assert_eq!(by_kind["github_issue"]["issue_status"], Value::Null);
+    assert_eq!(
+        by_kind["github_gist"]["key"],
+        "gist:0123456789abcdef0123456789abcdef"
+    );
+    assert_eq!(by_kind["github_markdown"]["issue_number"], Value::Null);
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/api/v1/documents/fetch",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "key": issue_key })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(&app, "GET", "/api/v1/documents", Some(READ_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let docs = body["documents"].as_array().expect("documents");
+    let issue = docs
+        .iter()
+        .find(|d| d["kind"] == "github_issue")
+        .expect("issue row");
+    assert_eq!(issue["issue_status"], "open", "{body}");
+    assert_eq!(issue["title"], "Buckets");
+}
+
+#[tokio::test]
 async fn fetch_recent_and_freshness_and_since_sync() {
     let (app, github) = harness();
     let (status, body) = call(

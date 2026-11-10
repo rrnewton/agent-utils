@@ -1095,6 +1095,22 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1176 doc-kind-buckets`: one item of each kind in the Documents view.
+  - group: check
+    job: documents-buckets-browser
+    desc: the Documents kind buckets (markdown, pastes with gists, issues) and the issue header, against the real server (fake chat upstream) in current Chromium at 393x852
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/documents_buckets_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 90
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#1039 documents-read-parity` stage 3 against the real server binary: the reader's Read
   # through the shared owner — strip counts, device utterances a block at a time (a recorded
   # speechSynthesis), Next/Prev and the media nexttrack, Next-on-last finishing, the bar's

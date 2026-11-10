@@ -17,6 +17,7 @@
 
 import { createListening } from "../dom/index.ts";
 import { documentHeadingId, renderDocumentMarkdown } from "./render.ts";
+import { splitIssueHeader } from "./issueheader.ts";
 
 /** What the reader asks of the page. */
 export interface DocumentsReaderDependencies {
@@ -70,7 +71,14 @@ export interface DocumentsReader {
 
 /** What `GET /api/v1/documents/{key}` answers, as far as the reader uses it. */
 interface DocumentAnswer {
-  document: { title?: unknown; url?: unknown; moved_to?: unknown } | null;
+  document: {
+    title?: unknown;
+    url?: unknown;
+    moved_to?: unknown;
+    kind?: unknown;
+    issue_number?: unknown;
+    issue_status?: unknown;
+  } | null;
   content: unknown;
   outline: unknown;
 }
@@ -556,7 +564,17 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
       // The document's own address (backend data) is the base its relative
       // links derive their external destinations from.
       const sourceUrl = typeof answer.document?.url === "string" ? answer.document.url : undefined;
-      body.innerHTML = renderDocumentMarkdown(markdown, key, sourceUrl);
+      // An issue's front matter becomes its header, not raw YAML (`#1176`).
+      const issue =
+        answer.document?.kind === "github_issue"
+          ? splitIssueHeader(markdown, {
+              number: typeof answer.document.issue_number === "number" ? answer.document.issue_number : null,
+              status: typeof answer.document.issue_status === "string" ? answer.document.issue_status : null,
+              title: typeof answer.document.title === "string" ? answer.document.title : null,
+            })
+          : null;
+      body.innerHTML =
+        (issue ? issue.html : "") + renderDocumentMarkdown(issue ? issue.body : markdown, key, sourceUrl);
     } else {
       body.textContent = "This document is not available yet.";
       deps.onStatus?.("This document is not available yet.");

@@ -1258,3 +1258,62 @@ test("documents view: each step back stops the document being left, by its key (
     assert.equal(view.reading(), false);
   });
 });
+
+// ---- 5. kind buckets and the issue header (#1176 doc-kind-buckets) ---------------------------
+
+const ISSUEHEADER = await load("src/view/documents/issueheader.ts");
+
+test("documents buckets: kinds map to Markdown, Pastes, Issues, Other files", () => {
+  const mod = requireModule(LIST, "src/view/documents/list.ts");
+  assert.equal(typeof mod.bucketOfKind, "function", "list does not export bucketOfKind");
+  assert.equal(mod.bucketOfKind("github_markdown"), "markdown");
+  assert.equal(mod.bucketOfKind("paste"), "pastes");
+  assert.equal(mod.bucketOfKind("github_gist"), "pastes", "gists sit with pastes");
+  assert.equal(mod.bucketOfKind("github_issue"), "issues");
+  assert.equal(mod.bucketOfKind("github_file"), "other");
+  assert.equal(mod.bucketOfKind("google_doc"), "other");
+});
+
+test("documents list: the bucket filter shows one type at a time", async () => {
+  const rows = [
+    { ...docRow("md", 100), kind: "github_markdown" },
+    { ...docRow("issue", 200), kind: "github_issue", issue_number: 1176, issue_status: "open", title: "Buckets", file_name: "agent-utils-1176.md" },
+    { ...docRow("gist", 300), kind: "github_gist" },
+    { ...docRow("paste", 400), kind: "paste" },
+  ];
+  await withList(() => ({ documents: rows, total: 4 }), async ({ list, listEl, fire, keys }) => {
+    await list.refresh();
+    assert.deepEqual(keys(), ["md", "issue", "gist", "paste"]);
+    const issueCard = listEl.children.find((kid) => String(kid.className).includes("doc-card") && kid.getAttribute("data-key") === "issue");
+    assert.ok(issueCard.textContent.includes("#1176"), "the issue card names its number");
+    assert.ok(issueCard.textContent.includes("open"), "the issue card names its status");
+    const press = (bucket) => {
+      const bar = listEl.children.find((kid) => String(kid.className).includes("doc-buckets"));
+      assert.ok(bar, "no bucket filter bar");
+      const button = bar.children.find((kid) => kid.dataset && kid.dataset.bucket === bucket);
+      assert.ok(button, `no ${bucket} bucket button`);
+      fire(button, "click", {});
+    };
+    press("issues");
+    assert.deepEqual(keys(), ["issue"], "the Issues bucket shows only issues");
+    press("pastes");
+    assert.deepEqual(keys(), ["gist", "paste"], `the Pastes bucket holds gists and pastes (got ${keys().join(",")})`);
+    press("markdown");
+    assert.deepEqual(keys(), ["md"]);
+    press("all");
+    assert.deepEqual(keys(), ["md", "issue", "gist", "paste"]);
+  });
+});
+
+test("issue header: front matter splits into a header over the body", () => {
+  const mod = requireModule(ISSUEHEADER, "src/view/documents/issueheader.ts");
+  assert.equal(typeof mod.splitIssueHeader, "function", "issueheader does not export splitIssueHeader");
+  const split = mod.splitIssueHeader("---\ntitle: \"Fix <it>\"\nstatus: open\n---\n\n# Body\n\ntext\n", { number: 1176 });
+  assert.ok(split, "front matter did not split");
+  assert.ok(split.html.includes("#1176"), "the header names the number");
+  assert.ok(split.html.includes("open"), "the header names the status");
+  assert.ok(!split.html.includes("<it>"), "the header escapes its title");
+  assert.ok(split.body.includes("# Body"), "the body keeps its heading");
+  assert.equal(mod.splitIssueHeader("# No front matter\n"), null);
+  assert.equal(mod.splitIssueHeader("---\ntitle: x\n"), null, "an unterminated block is not a header");
+});

@@ -7298,8 +7298,13 @@ pub async fn show_channel(
 pub struct DocumentRow {
     /// Canonical document key.
     pub key: String,
-    /// Document kind: `github_markdown`, `github_file`, `paste`, `google_doc`.
+    /// Document kind: `github_markdown`, `github_file`, `paste`, `google_doc`,
+    /// `github_issue`, `github_gist`. `#1176 doc-kind-buckets`.
     pub kind: &'static str,
+    /// Issue number, for `github_issue` rows; else null. `#1176 doc-kind-buckets`.
+    pub issue_number: Option<u64>,
+    /// Front-matter status, for fetched `github_issue` rows; else null.
+    pub issue_status: Option<String>,
     /// The address as linked.
     pub url: String,
     /// Last path segment.
@@ -7329,6 +7334,10 @@ fn document_row(state: &AppState, entry: &crate::documents::Entry) -> DocumentRo
     DocumentRow {
         key: entry.key.clone(),
         kind: entry.kind.as_str(),
+        issue_number: (entry.kind == crate::documents::DocKind::GithubIssue)
+            .then(|| crate::documents::issue_number_of(&entry.locator.path))
+            .flatten(),
+        issue_status: cached.as_ref().and_then(|c| c.issue_status.clone()),
         url: entry.locator.url.clone(),
         file_name: entry.file_name.clone(),
         title: cached
