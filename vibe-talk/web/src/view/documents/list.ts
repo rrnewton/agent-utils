@@ -350,7 +350,7 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
       const button = document.createElement("button");
       button.setAttribute("type", "button");
       button.className = "doc-bucket";
-      button.dataset.bucket = bucket;
+      button.setAttribute("data-bucket", bucket);
       button.textContent = label;
       button.setAttribute("aria-pressed", String(bucketFilter === bucket));
       listening.listen(button, "click", () => {

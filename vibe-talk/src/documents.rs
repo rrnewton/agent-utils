@@ -2682,15 +2682,13 @@ next body
         let api = serve_once_each(vec![http("200 OK", "", body)]);
         let fetcher = GithubFetcher::new(TokenSource::None, None, None).with_api_base(api);
         let entry = parse_key("gist:0123456789abcdef0123456789abcdef", &prefixes())
-            .and_then(|rec| {
-                Some(Entry {
-                    key: rec.key,
-                    kind: rec.kind,
-                    locator: rec.locator,
-                    file_name: rec.file_name,
-                    label: None,
-                    mentions: Vec::new(),
-                })
+            .map(|rec| Entry {
+                key: rec.key,
+                kind: rec.kind,
+                locator: rec.locator,
+                file_name: rec.file_name,
+                label: None,
+                mentions: Vec::new(),
             })
             .expect("gist entry");
         let raw = block_on(fetcher.fetch(&entry)).expect("gist fetched");

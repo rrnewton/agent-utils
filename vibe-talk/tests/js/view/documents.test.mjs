@@ -1290,7 +1290,7 @@ test("documents list: the bucket filter shows one type at a time", async () => {
     const press = (bucket) => {
       const bar = listEl.children.find((kid) => String(kid.className).includes("doc-buckets"));
       assert.ok(bar, "no bucket filter bar");
-      const button = bar.children.find((kid) => kid.dataset && kid.dataset.bucket === bucket);
+      const button = bar.children.find((kid) => kid.getAttribute && kid.getAttribute("data-bucket") === bucket);
       assert.ok(button, `no ${bucket} bucket button`);
       fire(button, "click", {});
     };
@@ -1310,9 +1310,8 @@ test("issue header: front matter splits into a header over the body", () => {
   assert.equal(typeof mod.splitIssueHeader, "function", "issueheader does not export splitIssueHeader");
   const split = mod.splitIssueHeader("---\ntitle: \"Fix <it>\"\nstatus: open\n---\n\n# Body\n\ntext\n", { number: 1176 });
   assert.ok(split, "front matter did not split");
-  assert.ok(split.html.includes("#1176"), "the header names the number");
-  assert.ok(split.html.includes("open"), "the header names the status");
-  assert.ok(!split.html.includes("<it>"), "the header escapes its title");
+  assert.equal(split.heading, "#1176 Fix <it>", "the header names the number and title as text");
+  assert.equal(split.status, "open", "the header names the status");
   assert.ok(split.body.includes("# Body"), "the body keeps its heading");
   assert.equal(mod.splitIssueHeader("# No front matter\n"), null);
   assert.equal(mod.splitIssueHeader("---\ntitle: x\n"), null, "an unterminated block is not a header");

@@ -158,8 +158,8 @@ def main() -> int:
                 def bucket_keys(bucket: str) -> list[str]:
                     page.locator(f".doc-bucket[data-bucket='{bucket}']").click()
                     page.wait_for_timeout(300)
-                    return page.locator("#documents-list .doc-card").evaluate_all(
-                        "(els) => els.map((e) => e.getAttribute('data-key'))")
+                    return cast(list[str], page.locator("#documents-list .doc-card").evaluate_all(
+                        "(els) => els.map((e) => e.getAttribute('data-key'))"))
 
                 check(bucket_keys("issues") == ["github:octo/widgets@main:.minibeads/issues/agent-utils-1176.md"],
                       "the Issues bucket does not hold only the issue")

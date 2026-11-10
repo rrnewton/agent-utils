@@ -564,7 +564,8 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
       // The document's own address (backend data) is the base its relative
       // links derive their external destinations from.
       const sourceUrl = typeof answer.document?.url === "string" ? answer.document.url : undefined;
-      // An issue's front matter becomes its header, not raw YAML (`#1176`).
+      // An issue's front matter becomes its header, not raw YAML (`#1176`):
+      // the body renders from the split body, the header is prepended after.
       const issue =
         answer.document?.kind === "github_issue"
           ? splitIssueHeader(markdown, {
@@ -573,8 +574,24 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
               title: typeof answer.document.title === "string" ? answer.document.title : null,
             })
           : null;
-      body.innerHTML =
-        (issue ? issue.html : "") + renderDocumentMarkdown(issue ? issue.body : markdown, key, sourceUrl);
+      if (issue) markdown = issue.body;
+      body.innerHTML = renderDocumentMarkdown(markdown, key, sourceUrl);
+      if (issue) {
+        // The header is page-built text, never markup: elements and text only.
+        const head = document.createElement("div");
+        head.className = "doc-issue-header";
+        const heading = document.createElement("span");
+        heading.className = "doc-issue-title";
+        heading.textContent = issue.heading;
+        head.appendChild(heading);
+        if (issue.status !== null) {
+          const status = document.createElement("span");
+          status.className = "doc-issue-status";
+          status.textContent = issue.status;
+          head.appendChild(status);
+        }
+        body.insertBefore(head, body.firstChild);
+      }
     } else {
       body.textContent = "This document is not available yet.";
       deps.onStatus?.("This document is not available yet.");
