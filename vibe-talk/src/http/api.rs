@@ -964,6 +964,7 @@ pub async fn client_config(
             upstream_clear_supported: entry.client.supports_upstream_clear(),
             threading_supported: entry.client.supports_threading(),
             replies_in_thread: entry.client.replies_in_thread(),
+            broadcast_supported: entry.client.supports_broadcast(),
             idempotent_posts_supported: entry.client.supports_idempotent_posts(),
             live_delivery: live_delivery(&state, entry.live_poll_seconds),
             live_poll_seconds: entry.live_poll_seconds,
@@ -1015,6 +1016,7 @@ pub async fn client_config(
         upstream_clear_supported: state.chat.supports_upstream_clear(),
         threading_supported: state.chat.supports_threading(),
         replies_in_thread: state.chat.replies_in_thread(),
+        broadcast_supported: state.chat.supports_broadcast(),
         idempotent_posts_supported: state.chat.supports_idempotent_posts(),
         speech_prep_enabled: state.config.speakable.enabled,
         replay_enabled: crate::replay::offered(
@@ -5264,6 +5266,7 @@ fn fill_pin_links<'p>(
                 id: id.to_owned(),
                 root_message_id: None,
                 is_root: pin.snapshot.thread_root,
+                broadcast: false,
                 reply_count: None,
                 reply_count_exact: false,
             });

@@ -358,6 +358,10 @@
             "null"
           ]
         },
+        "broadcast_supported": {
+          "description": "Whether the selected provider has the thread-plus-broadcast concept: a thread reply can\nalso be sent to the channel, marked as such by the provider (`#1165\nreply-count-broadcast-only`). Sent only when true: absent, from this server or an older\none, means false, and the page treats an unmarked main-channel reply as main-only only\nwhere today's counts already do (its own Post-to-main sends).",
+          "type": "boolean"
+        },
         "channel_discovery_supported": {
           "description": "Whether the selected provider can list its channels for browsing. `#19 channel-browser`.",
           "type": "boolean"
@@ -1193,6 +1197,10 @@
     "MessageThread": {
       "description": "Thread membership attached to a message without conflating it with a reply reference.",
       "properties": {
+        "broadcast": {
+          "description": "Whether this thread reply was also sent to the channel itself — the provider's own\nbroadcast marker (Slack's `thread_broadcast` subtype). `#1165 reply-count-broadcast-only`:\nsuch a reply appears in both places, in its thread and on the channel, and counts toward\nits thread on the page; a reply a backend places only on the channel carries no marker\nand does not. Absent on the wire means false, which is also what an older server meant,\nand false on a root and on every reply of a backend with no broadcast to mark.",
+          "type": "boolean"
+        },
         "display_name": {
           "description": "On a thread's ROOT, the thread's name as [`ThreadSummary::display_name`] gives it: what a\nsummariser filed, served by the same rule (`#484 summary-card-threshold`). `#528\nthread-card-markdown-and-cap`: a page that holds a root draws its thread's summary card from\nthe read that brought the root, and from its saved copy on a reload, rather than waiting for\na read of the thread list. Absent on replies, until named, and from an older server.",
           "type": [
@@ -1760,6 +1768,10 @@
     "ProviderDescription": {
       "description": "One configured chat provider, as the page needs to know it.",
       "properties": {
+        "broadcast_supported": {
+          "description": "Whether this provider has the thread-plus-broadcast concept (`#1165\nreply-count-broadcast-only`). Sent only when true.",
+          "type": "boolean"
+        },
         "channel_discovery_supported": {
           "description": "Whether this provider can list its channels for browsing.",
           "type": "boolean"

@@ -61,6 +61,7 @@ fn message(
             id: thread_id.to_owned(),
             root_message_id: None,
             is_root,
+            broadcast: false,
             reply_count: None,
             reply_count_exact: false,
         }),

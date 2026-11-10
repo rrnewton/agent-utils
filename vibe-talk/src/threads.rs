@@ -116,6 +116,14 @@ pub struct MessageThread {
     pub root_message_id: Option<MessageId>,
     /// Whether this message is the original thread root.
     pub is_root: bool,
+    /// Whether this thread reply was also sent to the channel itself — the provider's own
+    /// broadcast marker (Slack's `thread_broadcast` subtype). `#1165 reply-count-broadcast-only`:
+    /// such a reply appears in both places, in its thread and on the channel, and counts toward
+    /// its thread on the page; a reply a backend places only on the channel carries no marker
+    /// and does not. Absent on the wire means false, which is also what an older server meant,
+    /// and false on a root and on every reply of a backend with no broadcast to mark.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub broadcast: bool,
     /// Number of replies, when the provider can supply it.
     pub reply_count: Option<u64>,
     /// Whether the reply count is exact rather than a provider estimate.

@@ -1,6 +1,6 @@
 ---
 title: "reply-count-broadcast-only: a main-channel reply counts toward its thread only when it appears in both places"
-status: open
+status: closed
 priority: 2
 issue_type: feature
 assignee: mu-refactor
@@ -27,6 +27,17 @@ answer. The same lane moves that code word for word first, then applies this rul
 the move stays reviewable as a pure move. Apply the rule wherever the count is derived (page, server or adapter),
 using the provider's own marker for a broadcast reply rather than guessing from text.
 
+Middle ground (lead, 2026-11-09, owner informed via liaison): framed by backend capability.
+1. Where the backend HAS thread-plus-broadcast (Slack, its marker present): a reply counts toward
+   Reply(N)/Thread(N)/tally/gather/unanswered only if it is in the thread, or in the thread AND
+   broadcast to main. A main-only message with a reply_to pointer adds no Reply count and no circle.
+2. Where a reply is ONLY a pointer, with no thread to also appear in (Discord-style native replies,
+   any backend reporting no broadcast capability), pointer replies keep counting on Reply(N).
+3. This page's own Post-to-main sends never count toward the quoted message's Reply(N).
+4. The capability is explicit: `broadcast_supported` in the wire contract (additive, optional,
+   sent only when true) plus per-message `MessageThread.broadcast`. Absent (an old server), the
+   page falls back to today's behaviour minus its own Post-to-main sends.
+
 # Acceptance Criteria
 
 - A broadcast reply (in both the thread and main) counts toward its thread.
@@ -37,3 +48,12 @@ using the provider's own marker for a broadcast reply rather than guessing from 
 # Notes
 
 Rule from the owner, 2026-11-09 (relayed by the lead coordinator). Follows #1052 post-to-main.
+
+## Resolution
+
+Delivered in this commit: `MessageThread.broadcast` carries the provider's also-sent-to-channel
+marker (Slack `thread_broadcast`; absent and false everywhere else), `broadcast_supported` names
+backends with the concept, and the page counts a main-channel reply naming a thread root toward
+that thread only with the marker on such a backend — thread-only and broadcast replies count,
+main-only and this page's Post-to-main sends do not, and an older server's data falls back as
+above. Server, module and page tests cover the three cases and the visible count.

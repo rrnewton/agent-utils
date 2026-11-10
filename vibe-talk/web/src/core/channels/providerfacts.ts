@@ -9,6 +9,7 @@ import type { DeploymentCapabilities } from "./directory.ts";
 /** A provider as the server describes it, as far as its facts are read. */
 export interface DescribedProvider {
   readonly threading_supported?: unknown;
+  readonly broadcast_supported?: unknown;
   readonly upstream_read_mark_supported?: unknown;
   readonly live_delivery?: unknown;
   readonly live_poll_seconds?: unknown;
@@ -27,6 +28,9 @@ export interface ProviderFacts {
   /** Whether the selected channel's service has threads. */
   threading(): boolean;
   setThreading(on: boolean): void;
+  /** Whether it has the thread-plus-broadcast concept (`#1165`). Default-off for older servers. */
+  broadcastSupported(): boolean;
+  setBroadcast(on: boolean): void;
   /** Whether it can move its own read cursor. Default-off for older servers. */
   upstreamReadMark(): boolean;
   /** `off`, `poll`, or `push`, as reported by the server. */
@@ -42,6 +46,7 @@ export interface ProviderFacts {
 /** No answer yet. */
 export function createProviderFacts(): ProviderFacts {
   let threadingSupported = false;
+  let broadcastCapable = false;
   let upstreamReadMarkSupported = false;
   let liveDelivery = "off";
   let livePollSeconds = 0;
@@ -50,6 +55,10 @@ export function createProviderFacts(): ProviderFacts {
     threading: () => threadingSupported,
     setThreading(on) {
       threadingSupported = on;
+    },
+    broadcastSupported: () => broadcastCapable,
+    setBroadcast(on) {
+      broadcastCapable = on;
     },
     upstreamReadMark: () => upstreamReadMarkSupported,
     liveDelivery: () => liveDelivery,
@@ -70,6 +79,9 @@ export function createProviderFacts(): ProviderFacts {
       threadingSupported = provider
         ? provider.threading_supported === true
         : capabilities.threading;
+      broadcastCapable = provider
+        ? provider.broadcast_supported === true
+        : capabilities.broadcast;
       upstreamReadMarkSupported = provider
         ? provider.upstream_read_mark_supported === true
         : capabilities.upstreamReadMark;

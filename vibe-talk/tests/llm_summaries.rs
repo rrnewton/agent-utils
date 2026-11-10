@@ -325,6 +325,7 @@ impl Threads {
             id: summary.id,
             root_message_id: Some(root.id.clone()),
             is_root: true,
+            broadcast: false,
             reply_count: summary.reply_count,
             reply_count_exact: true,
             hue: None,

@@ -825,6 +825,7 @@ mod tests {
                 id: id.to_owned(),
                 root_message_id: Some(MessageId(id.to_owned())),
                 is_root: true,
+                broadcast: false,
                 reply_count: Some(replies),
                 reply_count_exact: true,
             }),

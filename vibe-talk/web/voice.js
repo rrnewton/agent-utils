@@ -1912,7 +1912,7 @@ const replyCounts = createReplyCounts({
   stillToDo: (m, done) => stillToDo(m, done), threadCount: (count, exact) => threadCount(count, exact),
   threadHue: (id) => threadHue(id), threadReplyCount: (id, m) => threadReplyCount(id, /** @type {any} */ (m)),
   timeOf: (m, field) => timeOf(m, field), viewKey: (view, threadId) => viewKey(view, /** @type {any} */ (threadId)),
-  channelStore: () => channelStore, providerFacts,
+  channelStore: () => channelStore, providerFacts, broadcastSupported: () => providerFacts.broadcastSupported(),
   columns: () => columns, layoutShown: () => layoutShown, outbox: () => outbox, outboxDispatch: () => outboxDispatch,
   quoteOwner: () => quoteOwner,
 });
@@ -4478,6 +4478,8 @@ function hydrateFromCache() {
   const shell = cache.shell;
   providerFacts.setThreading(shell.threading_supported === true);
   channelDirectory.setCapability("threading", providerFacts.threading());
+  providerFacts.setBroadcast(shell.broadcast_supported === true);
+  channelDirectory.setCapability("broadcast", providerFacts.broadcastSupported());
   channelDirectory.setChannels(shell.channels);
   learnProviders(shell.providers);
   whoIsWho.setDeploymentCodingAgents(shell);
@@ -4489,7 +4491,7 @@ function hydrateFromCache() {
   channelSettings.fillServiceSelect();
   fillChannelSelect("settings-channel");
   const provider = providerOfChannel(selectedChannelId());
-  if (provider) providerFacts.setThreading(provider.threading_supported === true);
+  if (provider) { providerFacts.setThreading(provider.threading_supported === true); providerFacts.setBroadcast(provider.broadcast_supported === true); }
   channelSettings.renderChannelBox();
   // Before the composer and the rows: both are the view's. `#189 restore-ui-state`.
   openChannelView();

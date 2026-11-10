@@ -3060,6 +3060,41 @@ test("REPLY SAYS HOW MANY REPLIES A MESSAGE HAS: Reply, Reply (1), Reply (2), an
   assert.ok(PAGE_CODE.includes("`Reply (${count})`"), "the count is not drawn as Reply (N)");
 });
 
+test("`#1165 reply-count-broadcast-only`: a main-only reply to a thread root does not count; a broadcast and a thread-only reply do", async () => {
+  const post = { id: "1792765680.753759", root_message_id: "701", is_root: true, reply_count: null,
+    reply_count_exact: false };
+  const page = newPage();
+  page.threadingSupported = true;
+  page.broadcastSupported = true;
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "701", content: "state replication model", thread: post, ...OWNER }),
+    // Posted only to the channel (Post to main): a pointer at the root, in no thread.
+    message({ id: "702", content: "on the channel only", reply_to: "701", ...ALICE }),
+    // Also sent to the channel: in the thread and on it, by the provider's marker.
+    message({ id: "703", content: "in both places", reply_to: "701", thread: { ...post, is_root: false, broadcast: true }, ...ALICE }),
+    // In the thread only, as replies were before.
+    message({ id: "704", content: "in the thread only", thread: { ...post, is_root: false }, ...OWNER }),
+  ]);
+  assert.equal(replyButton(rowWithId(page, "701")).textContent, "Reply",
+    "the main-only reply was drawn as a count on Reply");
+  assert.equal(threadBadge(rowWithId(page, "701")).textContent, "Thread(2)",
+    "the broadcast and thread-only replies were not both counted in the thread");
+  // The scattered conversation as Slack (broadcast-capable): its main replies by pointer to the
+  // root draw no Reply count and no circle, where without the flag they keep Reply (2) (below).
+  const slack = newPage();
+  const scattered = scatteredThread();
+  slack.threadingSupported = true;
+  slack.broadcastSupported = true;
+  slack.threads = scattered.threads;
+  await signIn(slack);
+  await showDiscord(slack, scattered.messages);
+  assert.equal(replyButton(rowWithId(slack, "601")).textContent, "Reply",
+    "as Slack, main-only replies to the root were drawn as a count");
+  assert.equal(replyMarkerOf(rowWithId(slack, "601")), undefined,
+    "as Slack, main-only replies to the root drew the way down");
+});
+
 test("...a combined row counts the replies to any message it stands for, once each", async () => {
   const page = newPage();
   await signIn(page);

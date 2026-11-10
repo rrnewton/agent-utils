@@ -2407,6 +2407,9 @@ test("`#624 voice-page-modularity`: reply counts by pointer and the unanswered r
       { id: "r1", thread: { id: "t1", is_root: true, reply_count: 0, reply_count_exact: true, root_message_id: "r1" } },
       { id: "a1", reply_to: "r1", timestamp: "2026-01-01T00:00:01Z", thread: { id: "t1", is_root: false, root_message_id: "r1" } },
       { id: "a2", reply_to: "r1", timestamp: "2026-01-01T00:00:02Z" },
+      { id: "b1", reply_to: "r1", timestamp: "2026-01-01T00:00:03Z", thread: { id: "t1", is_root: false, root_message_id: "r1", broadcast: true } },
+      { id: "o1", timestamp: "2026-01-01T00:00:04Z" },
+      { id: "a3", reply_to: "o1", timestamp: "2026-01-01T00:00:05Z" },
     ] };
   const noop = () => {};
   const owner = createReplyCounts({
@@ -2427,7 +2430,7 @@ test("`#624 voice-page-modularity`: reply counts by pointer and the unanswered r
     stillToDo: () => true, threadCount: (n) => `${n}`, threadHue: () => "1",
     threadReplyCount: () => null, timeOf: (m) => Date.parse(m && m.timestamp) || NaN,
     viewKey: (view, threadId) => (view === "thread" && threadId ? `thread:${threadId}` : view),
-    channelStore: () => ({ current: () => canon }), providerFacts: { threading: () => true },
+    channelStore: () => ({ current: () => canon }), providerFacts: { threading: () => true }, broadcastSupported: () => true,
     columns: () => ({ main: null, side: null }), layoutShown: () => ({ columns: () => false }),
     outbox: () => ({ values: () => [] }), outboxDispatch: () => ({ retryPending: () => false }),
     quoteOwner: () => ({ held: () => null }),
@@ -2436,8 +2439,10 @@ test("`#624 voice-page-modularity`: reply counts by pointer and the unanswered r
   assert.equal(owner.unansweredRoot(canon.messages[0], 0, 1, null), false, "a held reply left the root unanswered");
   const rootRow = { ids: ["r1"], messages: [canon.messages[0]] };
   const { replies } = owner.heldReplies([rootRow]);
-  // a1 names its own thread's root: the thread chips count it, not Reply (N). a2 is by pointer.
-  assert.deepStrictEqual([...(replies.get("r1") || new Map()).keys()], ["a2"], "the pointer count was not the main reply alone");
+  // a1 (thread-only) and b1 (broadcast) name their own thread's root: the chips count them, not
+  // Reply (N). a2 is main-only (`#1165`): naming the root from the channel alone counts nowhere.
+  assert.deepStrictEqual([...(replies.get("r1") || new Map()).keys()], [], "a main-only reply counted toward the thread");
+  assert.deepStrictEqual([...(replies.get("o1") || new Map()).keys()], ["a3"], "a reply to an ordinary message no longer counted");
   const tally = owner.replyTally();
-  assert.equal(tally.threads.get("t1").held, 1, "the tally did not hold the thread reply");
+  assert.equal(tally.threads.get("t1").held, 2, "the tally did not hold the thread-only and broadcast replies");
 });

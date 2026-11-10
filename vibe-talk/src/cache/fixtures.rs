@@ -49,6 +49,7 @@ pub(crate) fn reply(id: &str, thread: &str, content: &str, created_ms: i64) -> M
             id: thread.to_owned(),
             root_message_id: Some(MessageId(thread.to_owned())),
             is_root: false,
+            broadcast: false,
             reply_count: None,
             reply_count_exact: false,
         }),

@@ -14,6 +14,7 @@ import type { ChannelInfo, ProviderDescription } from "../../contract/index.ts";
  */
 export interface DeploymentCapabilities {
   threading: boolean;
+  broadcast: boolean;
   upstreamReadMark: boolean;
   upstreamClear: boolean;
   idempotentPosts: boolean;
@@ -92,6 +93,7 @@ export function createChannelDirectory(): ChannelDirectory {
   let providerDescriptions = new Map<string, ProviderDescription>();
   const deploymentCapabilities: DeploymentCapabilities = {
     threading: false,
+    broadcast: false,
     upstreamReadMark: false,
     upstreamClear: false,
     idempotentPosts: false,

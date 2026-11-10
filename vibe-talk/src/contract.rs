@@ -185,6 +185,13 @@ pub struct ClientConfigResponse {
     /// true: absent, from this server or an older one, means false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub replies_in_thread: bool,
+    /// Whether the selected provider has the thread-plus-broadcast concept: a thread reply can
+    /// also be sent to the channel, marked as such by the provider (`#1165
+    /// reply-count-broadcast-only`). Sent only when true: absent, from this server or an older
+    /// one, means false, and the page treats an unmarked main-channel reply as main-only only
+    /// where today's counts already do (its own Post-to-main sends).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub broadcast_supported: bool,
     /// Whether a post sent again under the same `idempotency_key` is posted at most once.
     ///
     /// `#195 send-resilience`. The page retries a send whose answer it lost — a timeout, a 502 —
@@ -1245,6 +1252,10 @@ pub struct ProviderDescription {
     /// `#252 thread-button-state`. Sent only when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub replies_in_thread: bool,
+    /// Whether this provider has the thread-plus-broadcast concept (`#1165
+    /// reply-count-broadcast-only`). Sent only when true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub broadcast_supported: bool,
     /// Whether this provider posts a message sent again under the same key at most once. Sent
     /// only when true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

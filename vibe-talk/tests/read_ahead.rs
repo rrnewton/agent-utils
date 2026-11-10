@@ -62,6 +62,7 @@ fn message(id: &str, thread: Option<&str>) -> Message {
             id: thread.to_owned(),
             root_message_id: None,
             is_root: false,
+            broadcast: false,
             reply_count: None,
             reply_count_exact: false,
         }),

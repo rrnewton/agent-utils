@@ -278,6 +278,7 @@ mod tests {
             id: "t1".to_owned(),
             root_message_id: Some(MessageId("1".to_owned())),
             is_root: true,
+            broadcast: false,
             reply_count: Some(0),
             reply_count_exact: true,
         });

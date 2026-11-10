@@ -104,6 +104,7 @@
   "ClientConfigResponse": [
     {
       "app_name": "vibe-talk at work",
+      "broadcast_supported": true,
       "channel_discovery_supported": true,
       "channel_registration_supported": true,
       "channels": [
@@ -204,6 +205,7 @@
           "upstream_read_mark_supported": false
         },
         {
+          "broadcast_supported": true,
           "channel_discovery_supported": true,
           "channel_registration_supported": true,
           "coding_agents_named_only": true,
@@ -313,6 +315,7 @@
           "upstream_read_mark_supported": false
         },
         {
+          "broadcast_supported": true,
           "channel_discovery_supported": false,
           "channel_registration_supported": false,
           "coding_agents_named_only": true,
@@ -393,6 +396,7 @@
           "upstream_read_mark_supported": false
         },
         {
+          "broadcast_supported": true,
           "channel_discovery_supported": false,
           "channel_registration_supported": false,
           "coding_agents_named_only": true,

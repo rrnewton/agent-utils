@@ -63,6 +63,7 @@ fn thread_message(id: &str, n: i64, content: &str) -> Message {
             id: THREAD.to_owned(),
             root_message_id: Some(MessageId("t0".to_owned())),
             is_root: id == "t0",
+            broadcast: false,
             reply_count: None,
             reply_count_exact: false,
         }),

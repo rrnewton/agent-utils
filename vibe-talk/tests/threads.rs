@@ -38,6 +38,7 @@ fn message(id: &str, content: &str, thread: bool) -> Message {
             id: THREAD.to_owned(),
             root_message_id: Some(MessageId("10".to_owned())),
             is_root: id == "10",
+            broadcast: false,
             reply_count: Some(2),
             reply_count_exact: true,
         }),

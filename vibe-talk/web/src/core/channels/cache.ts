@@ -48,6 +48,7 @@ export type CacheEntry = SavedTimeline | SavedPage;
 export interface CacheShell {
   channels: ChannelInfo[];
   threading_supported: boolean;
+  broadcast_supported?: boolean;
   self_author_id: string | null;
   owner_author_id: string | null;
   owner_author_ids?: string[];
@@ -343,6 +344,7 @@ export function createMessageCache(deps: MessageCacheDependencies): MessageCache
       cache.shell = {
         channels,
         threading_supported: config.threading_supported === true,
+        broadcast_supported: config.broadcast_supported === true,
         self_author_id: config.self_author_id || null,
         owner_author_id: config.owner_author_id || null,
         coding_agent_ids: Array.isArray(config.coding_agent_ids) ? config.coding_agent_ids : [],

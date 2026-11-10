@@ -2153,6 +2153,9 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
         channel_registration_supported: page.channelRegistrationSupported,
         channel_discovery_supported: page.channelDiscoverySupported,
         threading_supported: page.threadingSupported,
+        // Absent unless a test says the backend has thread-plus-broadcast, as the server omits it when false.
+        // `#1165 reply-count-broadcast-only`.
+        broadcast_supported: page.broadcastSupported,
         // `#528 thread-card-markdown-and-cap`. Absent unless a test says the server names threads.
         thread_names_supported: page.threadNamesSupported,
         upstream_read_mark_supported: page.upstreamReadMarkSupported,
@@ -2303,6 +2306,7 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
      * `undefined` sends nothing, as the server does for every other provider.
      */
     repliesInThread: undefined,
+    broadcastSupported: undefined,
     /** The scope the server reports for the saved token; `undefined` plays a malformed answer. */
     tokenScope: "write",
     /** Every explicit provider read-boundary request. Separate from local Done/archive calls. */

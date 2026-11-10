@@ -990,6 +990,7 @@ mod tests {
                     id: "t1".to_owned(),
                     root_message_id: None,
                     is_root,
+                    broadcast: false,
                     reply_count: None,
                     reply_count_exact: false,
                 }),

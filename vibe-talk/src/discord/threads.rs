@@ -140,6 +140,7 @@ impl NativeThread {
             id: self.id.clone(),
             root_message_id: Some(MessageId(self.id.clone())),
             is_root: root,
+            broadcast: false,
             reply_count: self.replies,
             // Threads created before July 2022 have counters capped at 50. The wire count does
             // not promise exactness for every thread, so do not promote it to an exact count.
@@ -840,6 +841,7 @@ impl HttpDiscordClient {
                     id: message.id.0.clone(),
                     root_message_id: Some(message.id.clone()),
                     is_root: true,
+                    broadcast: false,
                     reply_count: Some(0),
                     reply_count_exact: false,
                 });
@@ -1743,6 +1745,7 @@ fn confirm_bridge_post(
                 id: thread.to_owned(),
                 root_message_id: None,
                 is_root: false,
+                broadcast: false,
                 reply_count: None,
                 reply_count_exact: false,
             });
@@ -3037,6 +3040,7 @@ mod tests {
                 id: "opaque/thread".into(),
                 root_message_id: None,
                 is_root: false,
+                broadcast: false,
                 reply_count: None,
                 reply_count_exact: false,
             })

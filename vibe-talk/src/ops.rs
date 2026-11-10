@@ -6036,6 +6036,7 @@ async fn post_each(
                             id: thread.clone(),
                             root_message_id: Some(one.id.clone()),
                             is_root: true,
+                            broadcast: false,
                             reply_count: None,
                             reply_count_exact: false,
                         });

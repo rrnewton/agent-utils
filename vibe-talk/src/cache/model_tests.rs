@@ -449,6 +449,7 @@ fn a_new_reply_counts_on_its_held_root() {
         id: "1700000000.000100".to_owned(),
         root_message_id: Some(MessageId("1700000000.000100".to_owned())),
         is_root: true,
+        broadcast: false,
         reply_count: Some(0),
         reply_count_exact: true,
     });

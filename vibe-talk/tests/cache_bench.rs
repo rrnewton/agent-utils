@@ -90,6 +90,7 @@ fn message(
             id: format!("t{t}"),
             root_message_id: None,
             is_root: false,
+            broadcast: false,
             reply_count: None,
             reply_count_exact: false,
         }),

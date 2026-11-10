@@ -324,6 +324,10 @@ impl ChatClient for Recorder {
         self.note("replies_in_thread");
         true
     }
+    fn supports_broadcast(&self) -> bool {
+        self.note("supports_broadcast");
+        true
+    }
     async fn fetch_timeline(
         &self,
         _channel: &ChannelId,
@@ -780,6 +784,8 @@ async fn every_method_reaches_the_wrapped_clients_own_override_and_each_upstream
     ran("supports_threading");
     assert!(client.replies_in_thread());
     ran("replies_in_thread");
+    assert!(client.supports_broadcast());
+    ran("supports_broadcast");
     assert_eq!(
         client
             .fetch_timeline(&channel, &request)

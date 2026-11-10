@@ -1218,6 +1218,7 @@ impl Raw {
             root_message_id: ids::message_id_from_ts(&thread_ts),
             id: thread_ts,
             is_root,
+            broadcast: self.is_broadcast(),
             reply_count,
             reply_count_exact: reply_count.is_some(),
         });
@@ -1367,6 +1368,11 @@ impl ChatClient for HttpSlackClient {
 
     /// Slack has no reply pointer: a reply is posted in the target's thread (`timeline::post`).
     fn replies_in_thread(&self) -> bool {
+        true
+    }
+
+    /// Slack's also-send-to-channel replies carry its `thread_broadcast` subtype.
+    fn supports_broadcast(&self) -> bool {
         true
     }
 
@@ -2050,6 +2056,7 @@ mod tests {
             root_message_id: Some(root_id.clone()),
             id: "1700000000.000100".to_owned(),
             is_root: false,
+            broadcast: false,
             reply_count: None,
             reply_count_exact: false,
         };
@@ -2096,6 +2103,40 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn a_broadcast_reply_carries_the_marker_and_an_ordinary_one_does_not() {
+        // `#1165 reply-count-broadcast-only`. Slack's own subtype says a thread reply was also
+        // sent to the channel; it reaches the page as the thread record's broadcast marker, and
+        // nothing without the subtype carries it.
+        let channel = ChannelId("C0123ABCDE".to_owned());
+        let resolved = std::collections::HashMap::new();
+        let channels = std::collections::HashMap::new();
+        for (extra, broadcast) in [
+            (serde_json::json!({"subtype": "thread_broadcast"}), true),
+            (serde_json::json!({}), false),
+        ] {
+            let mut value = serde_json::json!({
+                "ts": "1700000060.000200", "thread_ts": "1700000000.000100",
+                "user": "U0ADA", "text": "also in the channel",
+            });
+            value
+                .as_object_mut()
+                .expect("object")
+                .extend(extra.as_object().expect("extra").clone());
+            let message = Raw::parse(value)
+                .expect("raw")
+                .to_message(&channel, &resolved, &channels, None)
+                .expect("message");
+            assert_eq!(message.thread.expect("thread").broadcast, broadcast);
+        }
+        // Absent on the wire is not broadcast: a copy an older server filed reads back unmarked.
+        let filed: crate::threads::MessageThread = serde_json::from_str(
+            "{\"id\":\"1700000000.000100\",\"root_message_id\":null,\"is_root\":false,\"reply_count\":null,\"reply_count_exact\":false}",
+        )
+        .expect("an older copy");
+        assert!(!filed.broadcast);
     }
 
     #[tokio::test]

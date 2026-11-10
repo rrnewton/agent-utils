@@ -899,6 +899,7 @@ pub fn parse_message(value: &serde_json::Value) -> Result<Message, ChatError> {
                         id: id.to_owned(),
                         root_message_id: Some(MessageId(field("id")?)),
                         is_root: true,
+                        broadcast: false,
                         reply_count: thread
                             .get("message_count")
                             .and_then(serde_json::Value::as_u64),

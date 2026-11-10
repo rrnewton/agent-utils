@@ -26,6 +26,7 @@ export interface ReadAloudConfigTarget {
 export interface ClientConfigLike {
   read_aloud?: { backend?: string; label?: string; playback?: string; local_only?: boolean; chain?: string[] } | null;
   threading_supported?: boolean;
+  broadcast_supported?: boolean;
   live_poll_seconds?: unknown;
   live_delivery?: unknown;
   upstream_read_mark_supported?: unknown;
@@ -65,7 +66,7 @@ export interface ClientConfigDependencies {
   setTitle(title: string): void;
   readAloud(): ReadAloudConfigTarget;
   providerFacts: {
-    setThreading(on: boolean): void; threading(): boolean;
+    setThreading(on: boolean): void; threading(): boolean; setBroadcast(on: boolean): void; broadcastSupported(): boolean;
     fromConfig(config: ClientConfigLike): void;
     upstreamReadMark(): boolean; liveDelivery(): string; livePollSeconds(): number;
   };
@@ -153,6 +154,8 @@ export function createClientConfig(deps: ClientConfigDependencies): ClientConfig
     deps.readAloud().applyReadSpeed(deps.readAloud().readSpeed);
     deps.providerFacts.setThreading(config.threading_supported === true);
     deps.channelDirectory.setCapability("threading", deps.providerFacts.threading());
+    deps.providerFacts.setBroadcast(config.broadcast_supported === true);
+    deps.channelDirectory.setCapability("broadcast", deps.providerFacts.broadcastSupported());
     // `#528 thread-card-markdown-and-cap`: whether a long first message's summary may be on its way.
     deps.serverFacts.setThreadNames(config.thread_names_supported === true);
     deps.learnProviders(config.providers);

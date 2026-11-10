@@ -282,6 +282,14 @@ export interface ClientConfigResponse {
    */
   app_name?: string | null;
   /**
+   * Whether the selected provider has the thread-plus-broadcast concept: a thread reply can
+   * also be sent to the channel, marked as such by the provider (`#1165
+   * reply-count-broadcast-only`). Sent only when true: absent, from this server or an older
+   * one, means false, and the page treats an unmarked main-channel reply as main-only only
+   * where today's counts already do (its own Post-to-main sends).
+   */
+  broadcast_supported?: boolean;
+  /**
    * Whether the selected provider can list its channels for browsing. `#19 channel-browser`.
    */
   channel_discovery_supported: boolean;
@@ -1131,6 +1139,15 @@ export type MessageId = string;
  */
 export interface MessageThread {
   /**
+   * Whether this thread reply was also sent to the channel itself — the provider's own
+   * broadcast marker (Slack's `thread_broadcast` subtype). `#1165 reply-count-broadcast-only`:
+   * such a reply appears in both places, in its thread and on the channel, and counts toward
+   * its thread on the page; a reply a backend places only on the channel carries no marker
+   * and does not. Absent on the wire means false, which is also what an older server meant,
+   * and false on a root and on every reply of a backend with no broadcast to mark.
+   */
+  broadcast?: boolean;
+  /**
    * On a thread's ROOT, the thread's name as [`ThreadSummary::display_name`] gives it: what a
    * summariser filed, served by the same rule (`#484 summary-card-threshold`). `#528
    * thread-card-markdown-and-cap`: a page that holds a root draws its thread's summary card from
@@ -1538,6 +1555,11 @@ export interface ProposalSettled {
  * One configured chat provider, as the page needs to know it.
  */
 export interface ProviderDescription {
+  /**
+   * Whether this provider has the thread-plus-broadcast concept (`#1165
+   * reply-count-broadcast-only`). Sent only when true.
+   */
+  broadcast_supported?: boolean;
   /**
    * Whether this provider can list its channels for browsing.
    */

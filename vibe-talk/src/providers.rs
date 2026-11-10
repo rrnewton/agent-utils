@@ -806,6 +806,12 @@ impl ChatClient for ChatRouter {
             .any(|entry| entry.client.replies_in_thread())
     }
 
+    fn supports_broadcast(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.client.supports_broadcast())
+    }
+
     async fn fetch_timeline(
         &self,
         channel: &ChannelId,

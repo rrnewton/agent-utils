@@ -635,7 +635,7 @@ test("`#624 voice-page-modularity`: the channel directory holds what the server 
   const directory = createChannelDirectory();
   assert.deepStrictEqual([directory.channels(), directory.hidden(), directory.known("1"), directory.providerOf("1")],
     [[], [], null, null]);
-  assert.deepStrictEqual(directory.capabilities(), { threading: false, upstreamReadMark: false, upstreamClear: false,
+  assert.deepStrictEqual(directory.capabilities(), { threading: false, broadcast: false, upstreamReadMark: false, upstreamClear: false,
     idempotentPosts: false, repliesInThread: false, liveDelivery: "off", livePollSeconds: 0 });
   const kept = directory.learnProviders([{ key: "slack" }, null, { key: 3 }, { key: "discord" }, { key: "slack", name: "again" }]);
   assert.deepStrictEqual(kept.map((one) => one.key), ["slack", "discord", "slack"], "every provider that passes is kept");

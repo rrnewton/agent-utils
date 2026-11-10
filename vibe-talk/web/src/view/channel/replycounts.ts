@@ -60,9 +60,10 @@ export interface ReplyCountsDependencies {
   viewKey(view: string, threadId?: unknown): string;
   channelStore(): { current(): ChannelCanon };
   providerFacts: { threading(): boolean };
+  broadcastSupported(): boolean;
   columns(): { main: unknown; side: unknown };
   layoutShown(): { columns(): boolean };
-  outbox(): { values(): Iterable<{ channel: string; replyTo: string | null; parts: { reply_to?: unknown; id?: unknown; thread?: { is_root?: unknown; root_message_id?: unknown } | null }[]; state: string; id: string; postedCount: number; text: string; createdAt: number }> };
+  outbox(): { values(): Iterable<{ channel: string; replyTo: string | null; parts: { reply_to?: unknown; id?: unknown; thread?: { is_root?: unknown; root_message_id?: unknown } | null }[]; state: string; id: string; postedCount: number; postToMain?: boolean; text: string; createdAt: number }> };
   outboxDispatch(): { retryPending(id: string): boolean };
   quoteOwner(): { held(): { button: unknown } | null };
 }
@@ -595,8 +596,27 @@ export function createReplyCounts(deps: ReplyCountsDependencies): ReplyCounts {
     // `#934 voice-page-reply-parent-arrow`. A reply naming the root of the thread it is in: the thread's chips count it.
     const answersOwnRoot = (message: { reply_to?: unknown; thread?: { is_root?: unknown; root_message_id?: unknown } | null } | null | undefined) => Boolean(message && message.reply_to && message.thread &&
       message.thread!.is_root !== true && String(message.thread.root_message_id || "") === String(message.reply_to));
+    // `#1165 reply-count-broadcast-only`. A reply on the channel itself that names a thread's root
+    // counts toward that thread only when it is also in the thread: the provider's broadcast marker
+    // says so (`MessageThread.broadcast`). Unmarked, it is a main-only post (Post to main, or a
+    // backend that places replies only on the channel, or an older server that sends no marker) and
+    // is no reply of the thread's, however it points at its root. A reply in the thread naming a
+    // member of it, and any reply where there are no threads, are counted as they always were.
+    const heldThreads = new Set<string>();
+    for (const other of held.values()) {
+      const ofThread = threadOf(other);
+      if (ofThread && other.thread?.is_root !== true) heldThreads.add(ofThread);
+    }
+    const mainOnlyReply = (message: Message) => {
+      if (!deps.providerFacts.threading() || !deps.broadcastSupported() || !message.reply_to) return false;
+      if (message.thread?.broadcast === true || threadOf(message) !== null) return false;
+      const target = held.get(String(message.reply_to));
+      if (!target || target.thread?.is_root !== true) return false;
+      const thread = threadOf(target);
+      return thread !== null && heldThreads.has(thread);
+    };
     for (const [id, message] of held) {
-      if (!message.reply_to || answersOwnRoot(message)) continue;
+      if (!message.reply_to || answersOwnRoot(message) || mainOnlyReply(message)) continue;
       add(String(message.reply_to), id, deps.timeOf(message, "timestamp"));
       said.add(`${message.reply_to}\n${String(message.content || "").trim()}`);
     }
@@ -613,8 +633,8 @@ export function createReplyCounts(deps: ReplyCountsDependencies): ReplyCounts {
       if (entry.channel !== viewing || !entry.replyTo) continue;
       const first = entry.parts[0];
       if (first) {
-        if (first.reply_to && !answersOwnRoot(first)) add(String(first.reply_to), String(first.id), deps.timeOf(first, "timestamp"));
-      } else if ((entry.state === "sending" || deps.outboxDispatch().retryPending(entry.id)) && entry.postedCount === 0 &&
+        if (first.reply_to && !answersOwnRoot(first) && !(entry.postToMain === true && deps.providerFacts.threading())) add(String(first.reply_to), String(first.id), deps.timeOf(first, "timestamp"));
+      } else if (!(entry.postToMain === true && deps.providerFacts.threading()) && (entry.state === "sending" || deps.outboxDispatch().retryPending(entry.id)) && entry.postedCount === 0 &&
           pointers && staysPointer(entry.replyTo) && !said.has(`${entry.replyTo}\n${String(entry.text).trim()}`)) {
         add(String(entry.replyTo), `outgoing:${entry.id}`, entry.createdAt);
       }

@@ -43,6 +43,7 @@ fn message(id: &str, thread: &str, root: bool, minutes: u64) -> Message {
             id: thread.to_owned(),
             root_message_id: Some(MessageId(snowflake(minutes))),
             is_root: root,
+            broadcast: false,
             reply_count: Some(1),
             reply_count_exact: true,
         }),

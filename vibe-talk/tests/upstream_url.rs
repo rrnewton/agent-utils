@@ -43,6 +43,7 @@ fn slack_thread(root_ts: &str, is_root: bool) -> MessageThread {
         id: root_ts.to_owned(),
         root_message_id: Some(mid(root_ts)),
         is_root,
+        broadcast: false,
         reply_count: None,
         reply_count_exact: false,
     }
@@ -193,6 +194,7 @@ fn a_discord_clients_links_come_from_its_configured_guild() {
         id: "900000000000000004".to_owned(),
         root_message_id: Some(MessageId("900000000000000004".to_owned())),
         is_root: false,
+        broadcast: false,
         reply_count: None,
         reply_count_exact: false,
     };
@@ -208,6 +210,7 @@ fn a_discord_clients_links_come_from_its_configured_guild() {
         display_name: None,
         summary: None,
         is_root: true,
+        broadcast: false,
         ..thread
     };
     assert_eq!(
@@ -237,6 +240,7 @@ fn a_google_chat_bridges_links_come_from_its_resource_names() {
         id: "spaces/AAAa1/threads/BBBb2".to_owned(),
         root_message_id: None,
         is_root: false,
+        broadcast: false,
         reply_count: None,
         reply_count_exact: false,
     };

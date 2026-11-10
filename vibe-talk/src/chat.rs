@@ -900,6 +900,15 @@ pub trait ChatClient: Send + Sync {
         false
     }
 
+    /// Whether this backend has the thread-plus-broadcast concept: a thread reply can also be
+    /// sent to the channel, and carries the provider's own marker for it (Slack's
+    /// `thread_broadcast`). `#1165 reply-count-broadcast-only`: on such a backend a main-channel
+    /// reply counts toward its thread on the page only when it carries that marker; a backend
+    /// with no broadcast never sets either the marker or this. False by default.
+    fn supports_broadcast(&self) -> bool {
+        false
+    }
+
     /// Read one backward page of a channel view, with backend-owned opaque cursors.
     ///
     /// The backend must verify thread membership before any thread-specific read. Discovery that

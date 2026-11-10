@@ -533,6 +533,7 @@ fn root(id: &str, text: &str, created_ms: i64) -> Message {
         id: id.to_owned(),
         root_message_id: Some(MessageId(id.to_owned())),
         is_root: true,
+        broadcast: false,
         reply_count: Some(1),
         reply_count_exact: true,
     });

@@ -1534,6 +1534,10 @@ impl ChatClient for ProfiledClient {
         self.inner.replies_in_thread()
     }
 
+    fn supports_broadcast(&self) -> bool {
+        self.inner.supports_broadcast()
+    }
+
     async fn fetch_timeline(
         &self,
         channel: &ChannelId,
