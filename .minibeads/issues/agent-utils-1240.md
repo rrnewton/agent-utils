@@ -1,6 +1,6 @@
 ---
 title: 'chat-file-delete: chat reply and publish remove the message file once the text is durably stored'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -8,7 +8,8 @@ labels:
 - chat
 assignee: mu-chatdup
 created_at: 2026-11-10T17:54:21+00:00
-updated_at: 2026-11-10T17:54:21+00:00
+updated_at: 2026-11-10T18:33:00+00:00
+closed_at: 2026-11-10T18:33:00+00:00
 ---
 
 # Description
@@ -35,3 +36,5 @@ updated_at: 2026-11-10T17:54:21+00:00
 # Notes
 
 Background: a liaison reply directory held 633 files from one day (2026-11-10); only the 10-day /tmp cleaner removes them otherwise. Lands with or after #1239 chat-duplicate-refusal, whose refusal is one of the refused cases that must keep the file.
+
+Resolution (2026-11-10): delivered in this lane's commit. Rust chat reply and chat publish remove the --file after the durable store or accepted post and print "removed FILE" on standard error; refused or failed runs keep it, --keep-file opts out, --file - reads stdin, and a symlink or another uid's file is refused (exit 2) before anything is stored. Python chat reply mirrors it. The chat userguide, both --help texts, and the reply-command hint now say so. Focused tests cover stored-removed, refused-kept, failed-kept, --keep-file, stdin, symlink, and other-uid. The services run snapshots; nothing changes live until the next turnover.

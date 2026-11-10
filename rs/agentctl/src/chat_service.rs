@@ -698,7 +698,7 @@ pub fn publish(
     body: &str,
     slack_format: Option<SlackFormat>,
 ) -> Result<Value, ChatServiceError> {
-    publish_tagged(
+    publish_checked(
         state_root,
         channel_id,
         thread_id,
@@ -706,10 +706,48 @@ pub fn publish(
         body,
         slack_format,
         None,
+        false,
+    )
+}
+
+fn duplicate_refusal(found: &chat_runtime::DuplicateMatch) -> ChatServiceError {
+    ChatServiceError::Generation(format!(
+        "this is a {}% match to your previous message which went through at {} (id {}); \
+         are you sure you want to send? If so, run again with --allow-duplicates",
+        found.percent,
+        crate::chat_trace::et_clock(found.at_millis as f64 / 1000.0),
+        found.id,
+    ))
+}
+
+/// [`publish`] with the near-duplicate refusal of #1239 chat-duplicate-refusal in front of
+/// the helper: `allow_duplicates` sends a matching post anyway. A retry with the same
+/// request id is answered from the publish ledger and posts nothing again, never a refusal.
+#[allow(clippy::too_many_arguments)]
+pub fn publish_checked(
+    state_root: &Path,
+    channel_id: &str,
+    thread_id: Option<&str>,
+    request_id: &str,
+    body: &str,
+    slack_format: Option<SlackFormat>,
+    metadata: Option<Value>,
+    allow_duplicates: bool,
+) -> Result<Value, ChatServiceError> {
+    publish_tagged(
+        state_root,
+        channel_id,
+        thread_id,
+        request_id,
+        body,
+        slack_format,
+        metadata,
+        allow_duplicates,
     )
 }
 
 /// [`publish`] with Slack message metadata on the post (#832 chat-trace-format-tagging).
+#[allow(clippy::too_many_arguments)]
 pub fn publish_tagged(
     state_root: &Path,
     channel_id: &str,
@@ -718,6 +756,7 @@ pub fn publish_tagged(
     body: &str,
     slack_format: Option<SlackFormat>,
     metadata: Option<Value>,
+    allow_duplicates: bool,
 ) -> Result<Value, ChatServiceError> {
     let state = BridgeState::inspect(state_root)?;
     let configuration = state.config();
@@ -765,6 +804,37 @@ pub fn publish_tagged(
     if let Some(reply) = reply.as_ref() {
         chat_runtime::validate_reply_submission(reply)?;
     }
+    // #1239: a retry with the same request id is answered from the ledger and posts
+    // nothing again; a new id with a near-duplicate text is refused before the helper.
+    if let Some(recorded) = state.recorded_publish(request_id)? {
+        if recorded.channel_id != channel_id
+            || recorded.thread_id.as_deref() != thread_id
+            || recorded.body != body
+        {
+            return Err(ChatServiceError::Generation(
+                "chat publish request id already names a different channel, thread or text"
+                    .to_owned(),
+            ));
+        }
+        let mut receipt = json!({
+            "version": 1,
+            "id": request_id,
+            "action": "send",
+            "ok": true,
+            "receipt": {"message_id": recorded.message_id},
+        });
+        if let Some(thread) = thread_id {
+            receipt["thread_id"] = json!(thread);
+        }
+        return Ok(receipt);
+    }
+    if !allow_duplicates {
+        if let Some(found) =
+            state.duplicate_match(channel_id, thread_id, body, None, Some(request_id))?
+        {
+            return Err(duplicate_refusal(&found));
+        }
+    }
     let mut transport = state.outbound_transport()?.ok_or_else(|| {
         ChatServiceError::Generation(
             "chat publish requires an explicit outbound_command helper".to_owned(),
@@ -776,6 +846,21 @@ pub fn publish_tagged(
         Some(reply) => transport.send(reply)?,
         None => transport.publish_root(root)?,
     };
+    // #1239: record the accepted post for the duplicate refusal and same-id retries.
+    // The post already went through, so a recording failure is logged, never reported
+    // as a failed publish.
+    if let Err(error) = state.record_publish(chat_runtime::PublishLedgerPost {
+        request_id: request_id.to_owned(),
+        channel_id: channel_id.to_owned(),
+        thread_id: thread_id.map(str::to_owned),
+        body: body.to_owned(),
+        message_id: message_id.clone(),
+        at_millis: chat_runtime::unix_millis(),
+    }) {
+        service_log(format!(
+            "agentctl: chat publish {request_id} was posted but not recorded for duplicate checks: {error}"
+        ));
+    }
     let mut receipt = json!({
         "version": 1,
         "id": request_id,
@@ -1129,6 +1214,7 @@ fn publish_trace(
             body,
             None,
             Some(metadata),
+            true,
         ) {
             Err(ChatServiceError::Outbound(failure))
                 if failure.code == "request_invalid"
@@ -1144,7 +1230,9 @@ fn publish_trace(
             other => return other,
         }
     }
-    publish(state_root, channel, thread, request_id, body, None)
+    publish_checked(
+        state_root, channel, thread, request_id, body, None, None, true,
+    )
 }
 
 /// The agent's native session id from its registry record, for trace metadata (#832), or
@@ -1188,7 +1276,29 @@ pub fn reply(
     identifier: &str,
     body: &str,
 ) -> Result<ReplyCommandOutcome, ChatServiceError> {
+    reply_checked(state_root, key, identifier, body, false)
+}
+
+/// [`reply`] with the near-duplicate refusal of #1239 chat-duplicate-refusal in front of
+/// the store: `allow_duplicates` stores a matching reply anyway. A retry that the request
+/// already holds stays an `already_stored` success, never a refusal.
+pub fn reply_checked(
+    state_root: &Path,
+    key: &str,
+    identifier: &str,
+    body: &str,
+    allow_duplicates: bool,
+) -> Result<ReplyCommandOutcome, ChatServiceError> {
     let state = BridgeState::inspect(state_root)?;
+    if !allow_duplicates {
+        if let Some((channel, thread)) = state.request_destination(key)? {
+            if let Some(found) =
+                state.duplicate_match(&channel, Some(&thread), body, Some(key), None)?
+            {
+                return Err(duplicate_refusal(&found));
+            }
+        }
+    }
     let stored = match with_termination_deferred(|| state.submit_reply(key, identifier, body))? {
         ReplyStoreOutcome::Stored(stored) => stored,
         ReplyStoreOutcome::TryAgain(reason) => return Ok(ReplyCommandOutcome::TryAgain(reason)),
@@ -11792,7 +11902,13 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 "receipt": {"message_id": "spaces/allowed/messages/root"},
             })
         );
-        assert_eq!(state_namespace_snapshot(&root), state_before);
+        // #1239: the one new state entry is the publish ledger naming this post.
+        let mut after = state_namespace_snapshot(&root);
+        let ledger = after
+            .remove(std::path::Path::new("publishes.json"))
+            .expect("publish ledger recorded");
+        assert!(String::from_utf8_lossy(&ledger.2).contains(request_id));
+        assert_eq!(after, state_before);
         fs::remove_dir_all(fixture).expect("remove fixture");
     }
 
@@ -11961,7 +12077,134 @@ printf '{"version":1,"id":"%s","action":"ensure_reaction","ok":true,"receipt":{"
                 "thread_id": "spaces/allowed/threads/root",
             })
         );
-        assert_eq!(state_namespace_snapshot(&root), state_before);
+        // #1239: the one new state entry is the publish ledger naming this post.
+        let mut after = state_namespace_snapshot(&root);
+        let ledger = after
+            .remove(std::path::Path::new("publishes.json"))
+            .expect("publish ledger recorded");
+        assert!(String::from_utf8_lossy(&ledger.2).contains(request_id));
+        assert_eq!(after, state_before);
+        fs::remove_dir_all(fixture).expect("remove fixture");
+    }
+
+    #[test]
+    fn publish_refuses_a_duplicate_and_honours_override_same_id_and_window() {
+        let fixture = std::env::temp_dir().join(format!(
+            "agentctl-chat-publish-duplicate-{}-{}",
+            std::process::id(),
+            NEXT_STATE.fetch_add(1, AtomicOrdering::Relaxed)
+        ));
+        fs::create_dir(&fixture).expect("create fixture");
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).expect("private fixture");
+        let helper = fixture.join("helper");
+        fs::copy(
+            fs::canonicalize("/bin/sh").expect("canonical shell"),
+            &helper,
+        )
+        .expect("copy native helper");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).expect("private helper");
+        // Echo the request id back with one fixed message id, root or threaded alike.
+        let script = concat!(
+            "IFS= read -r request || exit 2; ",
+            "id=$(printf %s \"$request\" | cut -d'\"' -f6); ",
+            "printf '{\"version\":1,\"id\":\"%s\",\"action\":\"send\",\"ok\":true,",
+            "\"receipt\":{\"message_id\":\"spaces/allowed/messages/post\"}}\n' \"$id\""
+        )
+        .to_owned();
+        let root = fixture.join("state");
+        BridgeState::initialize(
+            &root,
+            BridgeConfiguration {
+                unknown: Default::default(),
+                subscription_plugin: "fixture".to_owned(),
+                subscription_environment: Vec::new(),
+                channel_ids: vec!["spaces/allowed".to_owned()],
+                allowed_senders: vec!["users/owner".to_owned()],
+                max_grant_seconds: crate::chat_runtime::DEFAULT_MAX_GRANT_SECONDS,
+                agent_name: "coordinator".to_owned(),
+                agent_label: "coordinator".to_owned(),
+                outbound_enabled: true,
+                ack_reaction: ReactionSetting::Disabled,
+                receipt_reaction: ReactionSetting::Inherit,
+                delivery_latency_reaction: Some(false),
+                delivery_latency_test_override: false,
+                reject_reaction: ReactionSetting::Inherit,
+                backend_configuration: None,
+                outbound_command: Some(chat_runtime::OutboundCommandConfiguration {
+                    unknown: Default::default(),
+                    executable: helper,
+                    arguments: vec!["-c".to_owned(), script],
+                    environment: Vec::new(),
+                    timeout_millis: 2_000,
+                    shutdown_grace_millis: 50,
+                }),
+                reply_alias_range: None,
+                slack_format: None,
+                slack_format_by_channel: std::collections::BTreeMap::new(),
+                relay_channels: Vec::new(),
+                labels: None,
+            },
+        )
+        .expect("initialize state");
+        let id = |suffix: &str| format!("123e4567-e89b-42d3-a456-426614174{suffix}");
+        let text = "the quarterly report is ready for review";
+        publish(&root, "spaces/allowed", None, &id("000"), text, None).expect("first publish");
+        // A new request id with the same text is refused before the helper.
+        let refused = publish(&root, "spaces/allowed", None, &id("001"), text, None)
+            .expect_err("duplicate publish");
+        assert!(
+            refused
+                .to_string()
+                .contains("match to your previous message"),
+            "{refused}"
+        );
+        assert!(
+            refused.to_string().contains("--allow-duplicates"),
+            "{refused}"
+        );
+        // The same request id is an idempotent success with the same receipt.
+        let retry =
+            publish(&root, "spaces/allowed", None, &id("000"), text, None).expect("same-id retry");
+        assert_eq!(
+            retry["receipt"]["message_id"],
+            "spaces/allowed/messages/post"
+        );
+        // The override posts, and another thread is not a duplicate.
+        publish_checked(
+            &root,
+            "spaces/allowed",
+            None,
+            &id("002"),
+            text,
+            None,
+            None,
+            true,
+        )
+        .expect("override publish");
+        publish(
+            &root,
+            "spaces/allowed",
+            Some("spaces/allowed/threads/one"),
+            &id("003"),
+            text,
+            None,
+        )
+        .expect("threaded publish");
+        // Age every recorded post out of the window: the text goes through again.
+        let ledger_path = root.join("publishes.json");
+        let mut ledger: Value =
+            serde_json::from_str(&fs::read_to_string(&ledger_path).expect("read ledger"))
+                .expect("ledger JSON");
+        for post in ledger["posts"].as_array_mut().expect("ledger posts") {
+            post["at_millis"] = json!(1);
+        }
+        fs::write(
+            &ledger_path,
+            serde_json::to_vec(&ledger).expect("ledger bytes"),
+        )
+        .expect("age ledger");
+        publish(&root, "spaces/allowed", None, &id("004"), text, None)
+            .expect("publish outside the window");
         fs::remove_dir_all(fixture).expect("remove fixture");
     }
 
@@ -18903,7 +19146,10 @@ in the reply block marked {id}, so that block was not sent."
 that ID was sent to you, so it was not sent, and no block with the same text will be sent to that \
 request. No open chat request has been sent to you."]
         );
-        assert!(runs[0].ends_with("--file FILE`, where ID is the reply ID of its request."));
+        assert!(runs[0].ends_with(
+            "--file FILE`, where ID is the reply ID of its request. \
+             The file is removed once the reply is stored; add --keep-file to keep it."
+        ));
         assert!(
             state.inspect_request(&key).expect("inspect request")["replies"]
                 .as_array()

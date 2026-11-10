@@ -1,6 +1,6 @@
 ---
 title: 'chat-duplicate-refusal: agentctl chat refuses a near-duplicate post in the same channel and thread'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -8,7 +8,8 @@ labels:
 - chat
 assignee: mu-chatdup
 created_at: 2026-11-10T17:54:21+00:00
-updated_at: 2026-11-10T17:54:21+00:00
+updated_at: 2026-11-10T18:33:00+00:00
+closed_at: 2026-11-10T18:33:00+00:00
 ---
 
 # Description
@@ -39,3 +40,5 @@ Today `agentctl chat reply` dedupes only the identical text within one request (
 # Notes
 
 Tracker search 2026-11-10: nothing open covers this. #448 send-dedupe is the vibe-talk page Retry path, a different path (closed). Related: the reply store's per-request text dedupe and the publish helper's per-UUID dedupe, which this refusal sits in front of.
+
+Resolution (2026-11-10): delivered in this lane's commit. Rust: BridgeState::duplicate_match scans recorded publishes (publishes.json) plus held replies in the same channel and thread over the last 30 minutes (normalized-token exact hash, then word-bag Jaccard at 0.99 or more); chat_service refuses before the helper or the store with the earlier post's ET time and id, --allow-duplicates overrides, and a same-request-id publish retry answers from the ledger without posting. Python reply carries the same refusal over its own records. Focused tests cover exact, near (one word in 220), different thread, same request id, override, and outside the window. The services run snapshots; nothing changes live until the next turnover.

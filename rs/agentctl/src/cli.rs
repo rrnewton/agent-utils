@@ -2,6 +2,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, IsTerminal as _, Read as _, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -1772,7 +1773,7 @@ enum ChatCommand {
     /// Publish one explicit operator message through the configured helper: a new root message,
     /// or with --thread-id a reply in an existing thread
     #[command(
-        after_help = "Examples:\n  agentctl chat publish --bridge-state ~/.local/state/agentctl/chat \\\n    --channel-id spaces/example --request-id \"$(uuidgen | tr A-F a-f)\" --file status.md\n  agentctl chat publish --bridge-state ~/.local/state/agentctl/chat \\\n    --channel-id spaces/example --thread-id spaces/example/threads/one \\\n    --request-id \"$(uuidgen | tr A-F a-f)\" --file check.md\n\nWithout --thread-id the message starts a new thread. With it, the message is a reply in that\nthread, which must be named under the channel (<channel>/threads/<id>); it may be a thread\nthe operator started with an earlier publish. Use the provider's thread name for the root\nmessage: in Slack the thread of <channel>/messages/<ts> is <channel>/threads/<ts>.\n\nOn success it prints one JSON object: version, id (the request UUID), action (send), ok, and\nreceipt.message_id, the provider's name for the posted message; a threaded publish adds\nthread_id. Retry an uncertain outcome only with the identical UUID, channel, thread and text.\nIt neither writes bridge state nor creates a reply route."
+        after_help = "Examples:\n  agentctl chat publish --bridge-state ~/.local/state/agentctl/chat \\\n    --channel-id spaces/example --request-id \"$(uuidgen | tr A-F a-f)\" --file status.md\n  agentctl chat publish --bridge-state ~/.local/state/agentctl/chat \\\n    --channel-id spaces/example --thread-id spaces/example/threads/one \\\n    --request-id \"$(uuidgen | tr A-F a-f)\" --file check.md\n\nWithout --thread-id the message starts a new thread. With it, the message is a reply in that\nthread, which must be named under the channel (<channel>/threads/<id>); it may be a thread\nthe operator started with an earlier publish. Use the provider's thread name for the root\nmessage: in Slack the thread of <channel>/messages/<ts> is <channel>/threads/<ts>.\n\nOn success it prints one JSON object: version, id (the request UUID), action (send), ok, and\nreceipt.message_id, the provider's name for the posted message; a threaded publish adds\nthread_id. Retry an uncertain outcome only with the identical UUID, channel, thread and text.\nEach accepted post is recorded in the state's publishes.json: the same UUID answers from that record and posts nothing again, and a new UUID matching a post in the same channel and thread from the last 30 minutes is refused unless --allow-duplicates is given. With --file the file is removed once the post is accepted (--keep-file keeps it; --file - reads standard input). It creates no reply route."
     )]
     Publish(ChatPublish),
     /// Run one bounded delivery, terminal-capture, and outbound recovery pass; its sends wait for
@@ -1788,7 +1789,7 @@ enum ChatCommand {
     /// Store one reply for an open request from a file, and wake a running service to send it.
     /// Normally an agent replies between the prompt's two marker lines instead
     #[command(
-        after_help = "Examples:\n  agentctl chat reply 001 --file reply.md\n  agentctl chat reply --bridge-state ~/.local/state/agentctl/chat \\\n    --request <KEY> --reply-id 001 --file reply.md\n\nFinding the bridge (#707 chat-prompt-anatomy): --bridge-state DIR, or --bridge NAME for\nREGISTRY/bridges/NAME, when given; else $AGENTCTL_CHAT_BRIDGE; else every bridge registered for\ndiscovery (REGISTRY/bridges/ and the per-user index $XDG_STATE_HOME/agentctl/chat-bridges/, which\n`chat run` writes at start). Of those it keeps the bridges whose target agent is you (the\nregistered agent whose harness runs this command, else $AGENTCTL_AGENT), and of those the one\nthat gave the reply ID, which also names the request, so --request is needed only with an\nexplicit state. REGISTRY is --registry, or when that is the default .agentctl and absent here,\nthe nearest .agentctl above the working directory. None or several fitting is an error naming\nthe bridges considered.\n\nUse this command only when the two marker lines cannot do the job. A reply printed between\nthe request's two marker lines is the normal way: it reaches the user in the chat and also stays\nin the agent's terminal, where the owner may be reading. Use the command to send a reply before\nthe agent's turn ends, such as a progress update during long work, or to send again a reply that\nwas written between the lines but did not reach the chat: one reported as not sent, or one that\n`agentctl chat sent` does not list, as when the screen was redrawn before the service read it.\nSend each reply one way only. A copy printed in the terminal without the marker lines sends\nnothing, so it is a safe way to show a reply sent by the command.\n\nWhen `chat run` has --offer-reply-command and outbound replies are enabled, each request prompt\nnames this command as `agentctl chat reply ID` when agents find the bridge by caller lookup;\notherwise `agentctl chat help ID --bridge-state DIR` prints the explicit form, with the\nservice's own executable, the state directory and the request key.\n\nThe command stores the file's text as a reply of that request, as if the service had read it\nbetween the reply ID's two marker lines on the agent's screen, and the service sends it like\nany reply it reads. Line breaks at the end of the file are dropped. A text the request already\nholds is not stored again, so running the command twice sends it once, and neither is a text\nthat reads the same as a held reply once drawn on the screen, so a reply sent this way and also\nread from the screen is sent once. It then asks a service\nrunning on the same state directory to send the reply at once; a service that cannot listen\nsends it at its next reconciliation, when the agent goes idle, or when it starts.\n\nOn success it prints one JSON object: request, reply_id, outcome (stored or already_stored),\nordinal, phase, and service_woken, which says whether the wake was sent to a socket of the\ncurrent user in the state directory; nothing confirms that a service received it. Exit\nstatus: 0 when the request holds the reply; 1 when the reply is refused, with the reason on\nstandard error and nothing stored, as for an empty or blank text or one over 30,000 bytes;\n1 also when the state cannot be read or written, or when the result cannot be printed after\nthe reply was stored; 75 when nothing was stored but the same command can succeed later; 2\nfor a usage error, which includes a file that cannot be read or is not UTF-8. It never\ncontacts Herdr, a helper, or a provider."
+        after_help = "Examples:\n  agentctl chat reply 001 --file reply.md\n  agentctl chat reply --bridge-state ~/.local/state/agentctl/chat \\\n    --request <KEY> --reply-id 001 --file reply.md\n\nFinding the bridge (#707 chat-prompt-anatomy): --bridge-state DIR, or --bridge NAME for\nREGISTRY/bridges/NAME, when given; else $AGENTCTL_CHAT_BRIDGE; else every bridge registered for\ndiscovery (REGISTRY/bridges/ and the per-user index $XDG_STATE_HOME/agentctl/chat-bridges/, which\n`chat run` writes at start). Of those it keeps the bridges whose target agent is you (the\nregistered agent whose harness runs this command, else $AGENTCTL_AGENT), and of those the one\nthat gave the reply ID, which also names the request, so --request is needed only with an\nexplicit state. REGISTRY is --registry, or when that is the default .agentctl and absent here,\nthe nearest .agentctl above the working directory. None or several fitting is an error naming\nthe bridges considered.\n\nUse this command only when the two marker lines cannot do the job. A reply printed between\nthe request's two marker lines is the normal way: it reaches the user in the chat and also stays\nin the agent's terminal, where the owner may be reading. Use the command to send a reply before\nthe agent's turn ends, such as a progress update during long work, or to send again a reply that\nwas written between the lines but did not reach the chat: one reported as not sent, or one that\n`agentctl chat sent` does not list, as when the screen was redrawn before the service read it.\nSend each reply one way only. A copy printed in the terminal without the marker lines sends\nnothing, so it is a safe way to show a reply sent by the command.\n\nWhen `chat run` has --offer-reply-command and outbound replies are enabled, each request prompt\nnames this command as `agentctl chat reply ID` when agents find the bridge by caller lookup;\notherwise `agentctl chat help ID --bridge-state DIR` prints the explicit form, with the\nservice's own executable, the state directory and the request key.\n\nThe command stores the file's text as a reply of that request, as if the service had read it\nbetween the reply ID's two marker lines on the agent's screen, and the service sends it like\nany reply it reads. Line breaks at the end of the file are dropped. A text the request already\nholds is not stored again, so running the command twice sends it once, and neither is a text\nthat reads the same as a held reply once drawn on the screen, so a reply sent this way and also\nread from the screen is sent once. A text matching a post in the same channel and thread from the\nlast 30 minutes at 99% or more is refused with the earlier post's ET time and id, unless\n--allow-duplicates is given; a text the request already holds is never refused. Once stored,\nthe file is removed and its removal printed (--keep-file keeps it; --file - reads standard\ninput; a symlink or another uid's file is refused before anything is stored). It then asks a service\nrunning on the same state directory to send the reply at once; a service that cannot listen\nsends it at its next reconciliation, when the agent goes idle, or when it starts.\n\nOn success it prints one JSON object: request, reply_id, outcome (stored or already_stored),\nordinal, phase, and service_woken, which says whether the wake was sent to a socket of the\ncurrent user in the state directory; nothing confirms that a service received it. Exit\nstatus: 0 when the request holds the reply; 1 when the reply is refused, with the reason on\nstandard error and nothing stored, as for an empty or blank text or one over 30,000 bytes;\n1 also when the state cannot be read or written, or when the result cannot be printed after\nthe reply was stored; 75 when nothing was stored but the same command can succeed later; 2\nfor a usage error, which includes a file that cannot be read or is not UTF-8. It never\ncontacts Herdr, a helper, or a provider."
     )]
     Reply(ChatReply),
     /// Stop accepting fenced replies for one exact retained request
@@ -2245,10 +2246,27 @@ struct ChatPublish {
     /// and AGENTCTL_SLACK_FORMAT for this publish only (Slack helper only)
     #[arg(long, value_name = "FORMAT", value_parser = slack_format_value)]
     slack_format: Option<crate::chat_runtime::SlackFormat>,
+    /// Post even when the text is a near-duplicate of a recent post in the same channel
+    /// and thread (without it, a match of 99% or more from the last 30 minutes is refused)
+    #[arg(long)]
+    allow_duplicates: bool,
+    /// Keep the --file after its text is posted (without it, the file is removed once the
+    /// post is accepted; --file - reads standard input and removes nothing)
+    #[arg(long)]
+    keep_file: bool,
 }
 
 impl ChatPublish {
     fn read_message(&self) -> Result<String, String> {
+        if self.file.as_deref() == Some(Path::new("-")) {
+            let bytes = read_stdin_bounded(MAX_CHAT_PUBLISH_BYTES, "chat publish message")?;
+            let text = String::from_utf8(bytes)
+                .map_err(|_| "standard input does not contain valid UTF-8".to_owned())?;
+            if text.trim().is_empty() {
+                return Err("chat publish message must not be empty".to_owned());
+            }
+            return Ok(text);
+        }
         Prompt {
             text: self.text.clone(),
             file: self.file.clone(),
@@ -2279,9 +2297,17 @@ struct ChatReply {
         conflicts_with = "reply_id_word"
     )]
     reply_id: Option<String>,
-    /// UTF-8 file containing the reply, read with a 30,000-byte bound
+    /// UTF-8 file containing the reply, read with a 30,000-byte bound; - reads standard input
     #[arg(long, value_name = "PATH")]
     file: PathBuf,
+    /// Store even when the text is a near-duplicate of a recent post in the same channel
+    /// and thread (without it, a match of 99% or more from the last 30 minutes is refused)
+    #[arg(long)]
+    allow_duplicates: bool,
+    /// Keep the --file after its text is stored (without it, the file is removed once the
+    /// reply is stored; --file - reads standard input and removes nothing)
+    #[arg(long)]
+    keep_file: bool,
 }
 
 impl ChatReply {
@@ -2289,6 +2315,22 @@ impl ChatReply {
     /// over the bound is refused like any reply the service refuses, and so is an empty or blank
     /// one, which the store refuses.
     fn read_reply(&self) -> Result<String, Failure> {
+        if self.file == Path::new("-") {
+            let maximum = crate::chat_runtime::MAX_REPLY_BYTES;
+            let bytes = read_stdin_bounded(maximum, "chat reply").map_err(Failure::Usage)?;
+            if bytes.len() > maximum {
+                return Err(Failure::Chat(
+                    crate::chat_service::ChatServiceError::Runtime(
+                        crate::chat_runtime::ChatRuntimeError::Invalid(format!(
+                            "chat reply exceeds {maximum} UTF-8 bytes"
+                        )),
+                    ),
+                ));
+            }
+            return String::from_utf8(bytes).map_err(|_| {
+                Failure::Usage("standard input does not contain valid UTF-8".to_owned())
+            });
+        }
         let maximum = crate::chat_runtime::MAX_REPLY_BYTES;
         let unreadable = |error: io::Error| {
             Failure::Usage(format!("cannot read {}: {error}", self.file.display()))
@@ -2916,6 +2958,59 @@ fn write_text(text: &str) -> io::Result<()> {
     let mut output = io::stdout().lock();
     output.write_all(text.as_bytes())?;
     output.flush()
+}
+
+/// Read standard input with the byte bound of a `--file` input (#1240 chat-file-delete):
+/// `--file -` reads stdin, for `chat reply` and `chat publish`.
+fn read_stdin_bounded(maximum: usize, label: &str) -> Result<Vec<u8>, String> {
+    let limit = u64::try_from(maximum).unwrap_or(u64::MAX).saturating_add(1);
+    let mut bytes = Vec::with_capacity(maximum.saturating_add(1));
+    io::stdin()
+        .take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read standard input: {error}"))?;
+    if bytes.len() > maximum {
+        return Err(format!("{label} exceeds {maximum} UTF-8 bytes"));
+    }
+    Ok(bytes)
+}
+
+/// The `--file` a successful `chat reply` or `chat publish` removes once its text is
+/// durably stored (#1240): `None` for `--keep-file` and for stdin (`--file -`). Only a
+/// regular file the caller owns may be removed: a symlink, another kind of file, or a
+/// file of another uid refuses the command before anything is stored, file kept.
+fn removable_chat_file(file: &Path, keep_file: bool) -> Result<Option<PathBuf>, Failure> {
+    if keep_file || file == Path::new("-") {
+        return Ok(None);
+    }
+    let refused = |reason: &str| {
+        Failure::Usage(format!(
+            "chat message file {} {reason}; it was kept (use --keep-file to keep any file)",
+            file.display()
+        ))
+    };
+    let metadata = fs::symlink_metadata(file)
+        .map_err(|error| Failure::Usage(format!("cannot read {}: {error}", file.display())))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(refused("is not a regular file"));
+    }
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(refused("is not owned by the caller"));
+    }
+    Ok(Some(file.to_path_buf()))
+}
+
+/// Remove a stored message file (#1240) and say so; a removal that fails is named on
+/// standard error without failing a command whose text is already stored.
+fn remove_chat_file(file: &Path) {
+    match fs::remove_file(file) {
+        Ok(()) => eprintln!("removed {}", file.display()),
+        Err(error) => eprintln!(
+            "agentctl: could not remove {} after storing its text: {error}",
+            file.display()
+        ),
+    }
 }
 
 /// The lineage action of a lifecycle command; `None` for everything else, dry runs included.
@@ -5825,20 +5920,30 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             Ok(0)
         }
         ChatCommand::Publish(value) => {
+            let removal = match &value.file {
+                Some(file) => removable_chat_file(file, value.keep_file)?,
+                None => None,
+            };
             let body = value.read_message().map_err(Failure::Usage)?;
-            let result = crate::chat_service::publish(
+            let result = crate::chat_service::publish_checked(
                 &value.state.dir(&registry),
                 &value.channel_id,
                 value.thread_id.as_deref(),
                 &value.request_id,
                 &body,
                 value.slack_format,
+                None,
+                value.allow_duplicates,
             )
             .map_err(Failure::Chat)?;
             write_json(&result).map_err(Failure::Output)?;
+            if let Some(file) = &removal {
+                remove_chat_file(file);
+            }
             Ok(0)
         }
         ChatCommand::Reply(value) => {
+            let removal = removable_chat_file(&value.file, value.keep_file)?;
             let body = value.read_reply()?;
             let reply_id = value
                 .reply_id_word
@@ -5860,11 +5965,20 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
                     (resolved.state, key)
                 }
             };
-            match crate::chat_service::reply(&state, &key, reply_id, &body)
-                .map_err(Failure::Chat)?
+            match crate::chat_service::reply_checked(
+                &state,
+                &key,
+                reply_id,
+                &body,
+                value.allow_duplicates,
+            )
+            .map_err(Failure::Chat)?
             {
                 crate::chat_service::ReplyCommandOutcome::Stored(result) => {
                     write_json(&result).map_err(Failure::Output)?;
+                    if let Some(file) = &removal {
+                        remove_chat_file(file);
+                    }
                     Ok(0)
                 }
                 crate::chat_service::ReplyCommandOutcome::TryAgain(reason) => {

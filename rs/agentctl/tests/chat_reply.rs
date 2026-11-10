@@ -182,6 +182,8 @@ impl Scratch {
     }
 
     /// Run `chat reply` for this state's request with `reply_id` and the reply file `file`.
+    /// Keeps the file, as these runs reuse one file for several replies; the runs that check
+    /// the file's removal (#1240) call `reply` without `--keep-file` themselves.
     fn reply_with(&self, reply_id: &str, file: &str) -> Run {
         self.reply(&[
             "--request",
@@ -190,7 +192,90 @@ impl Scratch {
             reply_id,
             "--file",
             file,
+            "--keep-file",
         ])
+    }
+
+    /// Admit one more request in `thread` from message `message_id`, and return its key and
+    /// reply ID: a second request the duplicate refusal (#1239) can be checked against.
+    fn admit_more(&self, thread: &str, message_id: &str, sequence: u64) -> (String, String) {
+        let bridge = BridgeState::open(&self.state).expect("open state");
+        let message = InboundMessage::new(
+            ChannelId::new("spaces/example").expect("channel"),
+            MessageId::new(message_id).expect("message"),
+            ThreadId::new(thread).expect("thread"),
+            SenderId::new("users/owner").expect("sender"),
+            "request",
+            "2026-09-30T12:00:00Z",
+            false,
+        )
+        .expect("inbound message");
+        let batch = DeliveryBatch::new(
+            EventSequence::new(sequence).expect("sequence"),
+            ProviderCursor::new(format!("cursor-{sequence}")).expect("cursor"),
+            DeliveryId::new(format!("delivery-{sequence}")).expect("delivery"),
+            vec![CommittableEvent::message_created(message)],
+        )
+        .expect("delivery batch");
+        let key = bridge
+            .admit_batch(&batch)
+            .expect("admit request")
+            .new_request_keys
+            .remove(0);
+        let reply_id = bridge
+            .next_reply_route(&key)
+            .expect("reply route")
+            .expect("open request")
+            .identifier;
+        (key, reply_id)
+    }
+
+    /// Run `chat reply --file -` for this state's request, with `body` on standard input.
+    fn reply_stdin(&self, body: &[u8]) -> Run {
+        use std::io::Write as _;
+        let home = self.root.join("home");
+        let registry = self.root.join("registry");
+        let state = self.state.to_str().expect("UTF-8 state").to_owned();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+            .current_dir(&self.root)
+            .env("HOME", &home)
+            .env("XDG_STATE_HOME", home.join(".local/state"))
+            .env_remove("AGENTCTL_AGENT")
+            .env_remove("AGENTCTL_CHAT_BRIDGE")
+            .env("AGENTCTL_CHAT_BRIDGE_INDEX", "off")
+            .arg("--registry")
+            .arg(&registry)
+            .arg("--herdr-bin")
+            .arg(self.root.join("absent-herdr"))
+            .args([
+                "chat",
+                "reply",
+                "--bridge-state",
+                state.as_str(),
+                "--request",
+                &self.key,
+                "--reply-id",
+                &self.reply_id,
+                "--file",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run agentctl");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(body)
+            .expect("write stdin");
+        let output = child.wait_with_output().expect("wait for agentctl");
+        Run {
+            code: output.status.code(),
+            stdout: String::from_utf8(output.stdout).expect("UTF-8 stdout"),
+            stderr: String::from_utf8(output.stderr).expect("UTF-8 stderr"),
+        }
     }
 
     /// The JSON object that a run storing a reply of this state's request prints.
@@ -413,14 +498,21 @@ fn a_reply_id_alone_finds_the_bridge_and_its_request_through_the_index() {
     // The short form a prompt prints, and the same with the ID in --reply-id.
     assert_stored(
         &scratch.chat(
-            &["reply", &scratch.reply_id, "--file", &reply],
+            &["reply", &scratch.reply_id, "--file", &reply, "--keep-file"],
             &environment,
         ),
         &scratch.result("stored", 1),
     );
     assert_stored(
         &scratch.chat(
-            &["reply", "--reply-id", &scratch.reply_id, "--file", &reply],
+            &[
+                "reply",
+                "--reply-id",
+                &scratch.reply_id,
+                "--file",
+                &reply,
+                "--keep-file",
+            ],
             &environment[..1],
         ),
         &scratch.result("already_stored", 1),
@@ -466,7 +558,10 @@ fn a_reply_id_alone_finds_the_bridge_and_its_request_through_the_index() {
     );
     // With nothing registered there is no bridge to find.
     assert_failed(
-        &scratch.chat(&["reply", &scratch.reply_id, "--file", &reply], &[]),
+        &scratch.chat(
+            &["reply", &scratch.reply_id, "--file", &reply, "--keep-file"],
+            &[],
+        ),
         1,
         "no chat bridge is registered for discovery",
     );
@@ -481,7 +576,10 @@ fn a_bridge_targeting_the_caller_is_chosen_and_an_ambiguous_one_is_refused() {
     // Both bridges target `worker` and know only their own long IDs, so the ID picks one.
     let environment = [("AGENTCTL_CHAT_BRIDGE_INDEX", index.as_path())];
     assert_stored(
-        &first.chat(&["reply", &first.reply_id, "--file", &reply], &environment),
+        &first.chat(
+            &["reply", &first.reply_id, "--file", &reply, "--keep-file"],
+            &environment,
+        ),
         &first.result("stored", 1),
     );
     // Without an ID, two bridges fit and the command names both.
@@ -515,7 +613,10 @@ fn a_bridge_under_the_registrys_bridges_directory_is_found_without_the_index() {
     fs::create_dir_all(&bridges).expect("bridges directory");
     std::os::unix::fs::symlink(&scratch.state, bridges.join("worker")).expect("link the state");
     assert_stored(
-        &scratch.chat(&["reply", &scratch.reply_id, "--file", &reply], &[]),
+        &scratch.chat(
+            &["reply", &scratch.reply_id, "--file", &reply, "--keep-file"],
+            &[],
+        ),
         &scratch.result("stored", 1),
     );
     // --bridge NAME names it too.
@@ -534,7 +635,7 @@ fn a_known_caller_never_reaches_a_bridge_that_targets_another_agent() {
     let reviewer = Path::new("reviewer");
     assert_failed(
         &scratch.chat(
-            &["reply", &scratch.reply_id, "--file", &reply],
+            &["reply", &scratch.reply_id, "--file", &reply, "--keep-file"],
             &[
                 ("AGENTCTL_CHAT_BRIDGE_INDEX", index.as_path()),
                 ("AGENTCTL_AGENT", reviewer),
@@ -612,7 +713,7 @@ fn migrate_state_moves_the_state_into_the_registry_and_the_old_path_keeps_workin
     assert!(sent.stdout.contains(&scratch.key), "{}", sent.stdout);
     assert_stored(
         &scratch.chat(
-            &["reply", &scratch.reply_id, "--file", &reply],
+            &["reply", &scratch.reply_id, "--file", &reply, "--keep-file"],
             &[("AGENTCTL_CHAT_BRIDGE_INDEX", index.as_path())],
         ),
         &scratch.result("already_stored", 1),
@@ -724,4 +825,319 @@ fn chat_held_lists_a_held_reply_and_send_takes_the_hold_off() {
     assert_eq!(held(&[]).stdout, "no replies are held\n");
     assert_failed(&held(&["--drop", &handle]), 1, "");
     assert_failed(&held(&["--drop", "not-a-handle"]), 1, "KEY/ORDINAL");
+}
+
+#[test]
+fn chat_reply_refuses_a_duplicate_in_the_same_thread_and_honours_the_override() {
+    let scratch = Scratch::new("duplicate");
+    let (other_key, other_id) = scratch.admit_more(
+        "spaces/example/threads/one",
+        "spaces/example/messages/two",
+        2,
+    );
+    let (elsewhere_key, elsewhere_id) = scratch.admit_more(
+        "spaces/example/threads/two",
+        "spaces/example/messages/three",
+        3,
+    );
+    let text = "the quarterly report is ready for review";
+    let first = scratch.file("first.md", text.as_bytes());
+    assert_stored(
+        &scratch.reply_with(&scratch.reply_id, &first),
+        &scratch.result("stored", 1),
+    );
+    // An exact repeat for another request in the same thread is refused, naming the
+    // earlier post and the override; nothing is stored for that request.
+    let repeat = scratch.file("repeat.md", text.as_bytes());
+    let refused = scratch.reply(&[
+        "--request",
+        &other_key,
+        "--reply-id",
+        &other_id,
+        "--file",
+        &repeat,
+    ]);
+    assert_failed(&refused, 1, "match to your previous message");
+    assert!(
+        refused.stderr.contains("--allow-duplicates"),
+        "{}",
+        refused.stderr
+    );
+    assert!(
+        Path::new(&repeat).exists(),
+        "a refused reply keeps its file"
+    );
+    // The override stores it.
+    let allowed = scratch.reply(&[
+        "--request",
+        &other_key,
+        "--reply-id",
+        &other_id,
+        "--file",
+        &repeat,
+        "--allow-duplicates",
+        "--keep-file",
+    ]);
+    assert_eq!(allowed.code, Some(0), "{}", allowed.stderr);
+    // The same text in a different thread is not a duplicate.
+    let elsewhere = scratch.file("elsewhere.md", text.as_bytes());
+    let stored = scratch.reply(&[
+        "--request",
+        &elsewhere_key,
+        "--reply-id",
+        &elsewhere_id,
+        "--file",
+        &elsewhere,
+        "--keep-file",
+    ]);
+    assert_eq!(stored.code, Some(0), "{}", stored.stderr);
+    // A retry the first request already holds stays an idempotent success.
+    assert_stored(
+        &scratch.reply_with(&scratch.reply_id, &first),
+        &scratch.result("already_stored", 1),
+    );
+}
+
+#[test]
+fn chat_reply_refuses_a_near_duplicate_and_ignores_one_outside_the_window() {
+    let scratch = Scratch::new("near-duplicate");
+    let (other_key, other_id) = scratch.admit_more(
+        "spaces/example/threads/one",
+        "spaces/example/messages/two",
+        2,
+    );
+    let words: Vec<String> = (0..220).map(|index| format!("word{index}")).collect();
+    let original = words.join(" ");
+    let mut changed = words.clone();
+    changed[100] = "changed".to_owned();
+    let changed = changed.join(" ");
+    let first = scratch.file("first.md", original.as_bytes());
+    assert_stored(
+        &scratch.reply_with(&scratch.reply_id, &first),
+        &scratch.result("stored", 1),
+    );
+    // One word changed in a long text is still a 99% match.
+    let near = scratch.file("near.md", changed.as_bytes());
+    let refused = scratch.reply(&[
+        "--request",
+        &other_key,
+        "--reply-id",
+        &other_id,
+        "--file",
+        &near,
+    ]);
+    assert_failed(&refused, 1, "99% match to your previous message");
+    // Age the held reply past the 30-minute window: the same text goes through.
+    let held_path = scratch
+        .state
+        .join("replies")
+        .join(format!("{}-000001.json", scratch.key));
+    let mut held: Value =
+        serde_json::from_str(&fs::read_to_string(&held_path).expect("read held reply"))
+            .expect("held reply JSON");
+    held["captured_at_millis"] = json!(1);
+    fs::write(
+        &held_path,
+        serde_json::to_vec(&held).expect("held reply bytes"),
+    )
+    .expect("age held reply");
+    let aged = scratch.reply(&[
+        "--request",
+        &other_key,
+        "--reply-id",
+        &other_id,
+        "--file",
+        &near,
+        "--keep-file",
+    ]);
+    assert_eq!(aged.code, Some(0), "{}", aged.stderr);
+}
+
+#[test]
+fn chat_reply_removes_the_file_once_stored_and_keeps_it_otherwise() {
+    let scratch = Scratch::new("file-removal");
+    // Stored, so removed, with the removal printed.
+    let stored_file = scratch.file("stored.md", b"answer\n");
+    let run = scratch.reply(&[
+        "--request",
+        &scratch.key,
+        "--reply-id",
+        &scratch.reply_id,
+        "--file",
+        &stored_file,
+    ]);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert!(run.stderr.contains("removed "), "{}", run.stderr);
+    assert!(!Path::new(&stored_file).exists());
+    // A failed run keeps its file.
+    let failed_file = scratch.file("failed.md", b"answer\n");
+    assert_failed(&scratch.reply_with("anything", &failed_file), 1, "reply ID");
+    assert!(Path::new(&failed_file).exists());
+    // --keep-file keeps it, silently.
+    let kept_file = scratch.file("kept.md", b"another answer\n");
+    let kept = scratch.reply_with(&scratch.reply_id, &kept_file);
+    assert_eq!(kept.code, Some(0), "{}", kept.stderr);
+    assert_eq!(kept.stderr, "");
+    assert!(Path::new(&kept_file).exists());
+    // A symlink is refused before anything is stored, link and target kept.
+    let target = scratch.file("target.md", b"third answer\n");
+    let link = scratch.root.join("link.md");
+    std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+    let refused = scratch.reply(&[
+        "--request",
+        &scratch.key,
+        "--reply-id",
+        &scratch.reply_id,
+        "--file",
+        link.to_str().expect("UTF-8 link"),
+    ]);
+    assert_failed(&refused, 2, "is not a regular file");
+    assert!(link.exists() && Path::new(&target).exists());
+    // A file of another uid is refused the same way (skipped when running as root,
+    // whose files every caller owns).
+    if unsafe { libc::geteuid() } != 0 {
+        let foreign = scratch.reply(&[
+            "--request",
+            &scratch.key,
+            "--reply-id",
+            &scratch.reply_id,
+            "--file",
+            "/etc/hostname",
+        ]);
+        assert_failed(&foreign, 2, "not owned by the caller");
+    }
+    // Nothing above stored a third reply: the next good one is ordinal 3.
+    let third = scratch.file("third.md", b"third answer\n");
+    let stored = scratch.reply_with(&scratch.reply_id, &third);
+    assert_eq!(stored.code, Some(0), "{}", stored.stderr);
+    let printed: Value = serde_json::from_str(&stored.stdout).expect("one JSON object");
+    assert_eq!(printed["ordinal"], 3);
+}
+
+#[test]
+fn chat_publish_removes_the_file_once_posted_and_keeps_it_when_refused() {
+    // A scratch state whose outbound helper echoes the request id with one message id.
+    let root =
+        std::env::temp_dir().join(format!("agentctl-chat-publish-file-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("home")).expect("create scratch directory");
+    let helper = root.join("helper");
+    fs::copy(fs::canonicalize("/bin/sh").expect("shell"), &helper).expect("copy helper");
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).expect("private helper");
+    let script = concat!(
+        "IFS= read -r request || exit 2; ",
+        "id=$(printf %s \"$request\" | cut -d'\"' -f6); ",
+        "printf '{\"version\":1,\"id\":\"%s\",\"action\":\"send\",\"ok\":true,",
+        "\"receipt\":{\"message_id\":\"spaces/example/messages/post\"}}\n' \"$id\""
+    )
+    .to_owned();
+    let state = root.join("state");
+    fs::create_dir(&state).expect("create state directory");
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).expect("private state");
+    BridgeState::initialize(
+        &state,
+        BridgeConfiguration {
+            unknown: Default::default(),
+            subscription_plugin: "fixture".to_owned(),
+            subscription_environment: Vec::new(),
+            channel_ids: vec!["spaces/example".to_owned()],
+            allowed_senders: vec!["users/owner".to_owned()],
+            max_grant_seconds: agentctl::chat_runtime::DEFAULT_MAX_GRANT_SECONDS,
+            agent_name: "worker".to_owned(),
+            agent_label: "worker".to_owned(),
+            outbound_enabled: true,
+            ack_reaction: agentctl::chat_runtime::ReactionSetting::Disabled,
+            receipt_reaction: agentctl::chat_runtime::ReactionSetting::Inherit,
+            delivery_latency_reaction: Some(false),
+            delivery_latency_test_override: false,
+            reject_reaction: agentctl::chat_runtime::ReactionSetting::Inherit,
+            backend_configuration: None,
+            outbound_command: Some(agentctl::chat_runtime::OutboundCommandConfiguration {
+                unknown: Default::default(),
+                executable: helper,
+                arguments: vec!["-c".to_owned(), script],
+                environment: Vec::new(),
+                timeout_millis: 2_000,
+                shutdown_grace_millis: 50,
+            }),
+            reply_alias_range: None,
+            slack_format: None,
+            slack_format_by_channel: std::collections::BTreeMap::new(),
+            relay_channels: Vec::new(),
+            labels: None,
+        },
+    )
+    .expect("initialize state");
+    let scratch = Scratch {
+        root: root.clone(),
+        state,
+        key: String::new(),
+        reply_id: String::new(),
+    };
+    let state_arg = scratch.state.to_str().expect("UTF-8 state").to_owned();
+    let publish = |uuid: &str, file: &str, extra: &[&str]| {
+        let mut words = vec![
+            "publish",
+            "--bridge-state",
+            state_arg.as_str(),
+            "--channel-id",
+            "spaces/example",
+            "--request-id",
+            uuid,
+            "--file",
+            file,
+        ];
+        words.extend_from_slice(extra);
+        scratch.chat(&words, &[])
+    };
+    let text = "the quarterly report is ready for review";
+    let first = scratch.file("post.md", text.as_bytes());
+    let posted = publish("123e4567-e89b-42d3-a456-426614174000", &first, &[]);
+    assert_eq!(posted.code, Some(0), "{}", posted.stderr);
+    assert!(posted.stderr.contains("removed "), "{}", posted.stderr);
+    assert!(!Path::new(&first).exists());
+    // A refused duplicate keeps its file.
+    let repeat = scratch.file("repeat.md", text.as_bytes());
+    let refused = publish("123e4567-e89b-42d3-a456-426614174001", &repeat, &[]);
+    assert_eq!(refused.code, Some(1), "{}", refused.stderr);
+    assert!(
+        refused.stderr.contains("match to your previous message"),
+        "{}",
+        refused.stderr
+    );
+    assert!(Path::new(&repeat).exists());
+    // --keep-file posts with the override and keeps the file, silently.
+    let kept = publish(
+        "123e4567-e89b-42d3-a456-426614174002",
+        &repeat,
+        &["--allow-duplicates", "--keep-file"],
+    );
+    assert_eq!(kept.code, Some(0), "{}", kept.stderr);
+    assert_eq!(kept.stderr, "");
+    assert!(Path::new(&repeat).exists());
+    // A symlink is refused before posting, link kept.
+    let link = scratch.root.join("link.md");
+    std::os::unix::fs::symlink(&repeat, &link).expect("create symlink");
+    let refused = publish(
+        "123e4567-e89b-42d3-a456-426614174003",
+        link.to_str().expect("UTF-8 link"),
+        &[],
+    );
+    assert_eq!(refused.code, Some(2), "{}", refused.stderr);
+    assert!(
+        refused.stderr.contains("is not a regular file"),
+        "{}",
+        refused.stderr
+    );
+    assert!(link.exists());
+}
+
+#[test]
+fn chat_reply_reads_standard_input_with_file_dash() {
+    let scratch = Scratch::new("stdin");
+    let run = scratch.reply_stdin(b"answer from stdin\n");
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.stderr, "");
+    let printed: Value = serde_json::from_str(&run.stdout).expect("one JSON object");
+    assert_eq!(printed["outcome"], "stored");
 }

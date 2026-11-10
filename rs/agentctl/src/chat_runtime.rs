@@ -3243,6 +3243,87 @@ fn reply_phase_name(phase: &ReplyPhase) -> &'static str {
     }
 }
 
+/// How far back `chat reply` and `chat publish` look for a near-duplicate post (#1239
+/// chat-duplicate-refusal): the last 30 minutes of this bridge's own outbound posts.
+pub(crate) const DUPLICATE_WINDOW_MILLIS: u64 = 30 * 60 * 1_000;
+/// Word-bag Jaccard at or above this is a near-duplicate.
+const DUPLICATE_SIMILARITY: f64 = 0.99;
+const MAX_PUBLISH_LEDGER_POSTS: usize = 512;
+const MAX_PUBLISH_LEDGER_BYTES: usize = 4 * 1_024 * 1_024;
+const PUBLISH_LEDGER_FILE: &str = "publishes.json";
+
+/// One accepted `chat publish`, recorded in the bridge state so a later publish or reply can
+/// be refused as a duplicate and a retry with the same request id can be answered without
+/// posting again (#1239).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PublishLedgerPost {
+    pub(crate) request_id: String,
+    pub(crate) channel_id: String,
+    pub(crate) thread_id: Option<String>,
+    pub(crate) body: String,
+    pub(crate) message_id: String,
+    pub(crate) at_millis: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct PublishLedger {
+    version: u32,
+    #[serde(default)]
+    posts: Vec<PublishLedgerPost>,
+}
+
+/// A recent outbound post too like the text about to go out (#1239).
+pub(crate) struct DuplicateMatch {
+    /// When the earlier post went through, in milliseconds since the epoch.
+    pub(crate) at_millis: u64,
+    /// The earlier post's provider message id, or its operation id before it has one.
+    pub(crate) id: String,
+    /// 100 for an exact match, otherwise the similarity as a whole percent (99).
+    pub(crate) percent: u32,
+}
+
+/// The words of `text`, lowercased, for duplicate comparison: punctuation and case aside,
+/// the same announcement reads the same.
+fn duplicate_tokens(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Bag Jaccard of two token lists: shared words over all words, counting repeats.
+fn duplicate_similarity(left: &[String], right: &[String]) -> f64 {
+    if left.is_empty() || right.is_empty() {
+        return 0.0;
+    }
+    fn counts(tokens: &[String]) -> BTreeMap<&str, u64> {
+        let mut map = BTreeMap::<&str, u64>::new();
+        for token in tokens {
+            *map.entry(token.as_str()).or_default() += 1;
+        }
+        map
+    }
+    let (left_counts, right_counts) = (counts(left), counts(right));
+    let mut shared = 0u64;
+    let mut total = 0u64;
+    for (word, left_count) in &left_counts {
+        let right_count = right_counts.get(word).copied().unwrap_or(0);
+        shared += (*left_count).min(right_count);
+        total += (*left_count).max(right_count);
+    }
+    for (word, right_count) in &right_counts {
+        if !left_counts.contains_key(word) {
+            total += right_count;
+        }
+    }
+    if total == 0 {
+        0.0
+    } else {
+        shared as f64 / total as f64
+    }
+}
+
 /// One retained request's prompt delivery, as `chat run` watches it: see
 /// [`BridgeState::delivery_entries`].
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -12918,6 +12999,160 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         ))
     }
 
+    fn publish_ledger_path(&self) -> PathBuf {
+        self.root.join(PUBLISH_LEDGER_FILE)
+    }
+
+    fn read_publish_ledger(&self) -> Result<PublishLedger> {
+        match read_document(&self.publish_ledger_path(), MAX_PUBLISH_LEDGER_BYTES) {
+            Ok(ledger) => Ok(ledger),
+            Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                Ok(PublishLedger::default())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The recorded publish with caller request id `request_id`, if any (#1239): a retry with
+    /// the same id is answered from this record and posts nothing again.
+    pub(crate) fn recorded_publish(&self, request_id: &str) -> Result<Option<PublishLedgerPost>> {
+        Ok(self
+            .read_publish_ledger()?
+            .posts
+            .into_iter()
+            .find(|post| post.request_id == request_id))
+    }
+
+    /// Record one accepted publish (#1239), keeping only the duplicate window and the newest
+    /// [`MAX_PUBLISH_LEDGER_POSTS`]. Runs under the state lock, like a reply store.
+    pub(crate) fn record_publish(&self, post: PublishLedgerPost) -> Result<()> {
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
+        let mut ledger = self.read_publish_ledger()?;
+        let cutoff = post.at_millis.saturating_sub(DUPLICATE_WINDOW_MILLIS);
+        ledger.posts.retain(|kept| kept.at_millis >= cutoff);
+        ledger.posts.push(post);
+        if ledger.posts.len() > MAX_PUBLISH_LEDGER_POSTS {
+            let excess = ledger.posts.len() - MAX_PUBLISH_LEDGER_POSTS;
+            ledger.posts.drain(..excess);
+        }
+        ledger.version = 1;
+        write_document(&self.publish_ledger_path(), &ledger)
+    }
+
+    /// The channel and thread a reply to `key` goes to, or `None` when no request has the key.
+    pub(crate) fn request_destination(&self, key: &str) -> Result<Option<(String, String)>> {
+        match self.read_request(key) {
+            Ok(request) => Ok(Some((
+                request.message.channel_id,
+                request.message.thread_id,
+            ))),
+            Err(ChatRuntimeError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The strongest recent duplicate of `body` among this bridge's outbound posts to
+    /// `channel` in `thread` (#1239): recorded publishes plus held replies that did not
+    /// permanently fail, inside [`DUPLICATE_WINDOW_MILLIS`]. `same_request` names the request
+    /// the new text answers: its own already-held copy of the same text is an idempotent
+    /// retry, never a duplicate. `own_request_id` names a publish retry's id, likewise.
+    /// Reads only the bridge's own records; never contacts a provider.
+    pub(crate) fn duplicate_match(
+        &self,
+        channel: &str,
+        thread: Option<&str>,
+        body: &str,
+        same_request: Option<&str>,
+        own_request_id: Option<&str>,
+    ) -> Result<Option<DuplicateMatch>> {
+        let tokens = duplicate_tokens(body);
+        if tokens.is_empty() {
+            return Ok(None);
+        }
+        // A retry of a text the same request already holds is idempotent, never a
+        // duplicate, even when another request has since posted the same text.
+        if let Some(key) = same_request {
+            if let Ok(request) = self.read_request(key) {
+                for ordinal in 1..request.next_reply_ordinal {
+                    if duplicate_tokens(&self.read_reply(key, ordinal)?.body) == tokens {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        let cutoff = unix_millis().saturating_sub(DUPLICATE_WINDOW_MILLIS);
+        let mut best: Option<(f64, u64, String)> = None;
+        let mut consider = |text: &str, at_millis: u64, id: String| {
+            if at_millis < cutoff {
+                return;
+            }
+            let other = duplicate_tokens(text);
+            let similarity = if other == tokens {
+                1.0
+            } else {
+                duplicate_similarity(&tokens, &other)
+            };
+            if similarity < DUPLICATE_SIMILARITY {
+                return;
+            }
+            let stronger = match &best {
+                None => true,
+                Some((best_similarity, best_at, _)) => {
+                    similarity > *best_similarity
+                        || (similarity == *best_similarity && at_millis > *best_at)
+                }
+            };
+            if stronger {
+                best = Some((similarity, at_millis, id));
+            }
+        };
+        for post in self.read_publish_ledger()?.posts {
+            if post.channel_id != channel || post.thread_id.as_deref() != thread {
+                continue;
+            }
+            if own_request_id == Some(post.request_id.as_str()) {
+                continue;
+            }
+            consider(&post.body, post.at_millis, post.message_id);
+        }
+        for (request, _) in self.request_records()? {
+            if request.message.channel_id != channel
+                || Some(request.message.thread_id.as_str()) != thread
+            {
+                continue;
+            }
+            for ordinal in 1..request.next_reply_ordinal {
+                let reply = self.read_reply(&request.key, ordinal)?;
+                if reply.phase == ReplyPhase::Failed {
+                    continue;
+                }
+                if same_request == Some(request.key.as_str())
+                    && duplicate_tokens(&reply.body) == tokens
+                {
+                    continue;
+                }
+                let at_millis = reply.sent_at_millis.unwrap_or(reply.captured_at_millis);
+                let id = reply
+                    .provider_message_id
+                    .clone()
+                    .unwrap_or(reply.send_request_id);
+                consider(&reply.body, at_millis, id);
+            }
+        }
+        Ok(best.map(|(similarity, at_millis, id)| DuplicateMatch {
+            at_millis,
+            id,
+            percent: if similarity >= 1.0 {
+                100
+            } else {
+                (similarity * 100.0) as u32
+            },
+        }))
+    }
+
     fn retire_for_capacity_locked(
         &self,
         checkpoint: &mut Checkpoint,
@@ -16148,7 +16383,7 @@ received.",
 /// way to send a reply that the marker lines cannot carry (#852 unknown-tui-bridge).
 const REPLY_COMMAND_HINT: &str = "If a reply cannot get through between the lines, write it to a \
 file and send it with `agentctl chat reply ID --file FILE`, where ID is the reply ID of its \
-request.";
+request. The file is removed once the reply is stored; add --keep-file to keep it.";
 
 /// The request a block under an unmatched ID was probably meant for: the only open request with
 /// no reply yet whose prompt may have been seen, when there is exactly one and its prompt is

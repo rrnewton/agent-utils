@@ -2824,6 +2824,59 @@ def test_input_source_reconnects_with_last_durable_cursor(
     assert len(list((rig.state / "requests").glob("*.json"))) == 1
 
 
+def _duplicate_state(tmp_path: Path, replied_at: str) -> tuple[Path, str, str]:
+    state = tmp_path / "state"
+    (state / "requests").mkdir(parents=True)
+    first, second = _key("one"), _key("two")
+    for key, name in ((first, "one"), (second, "two")):
+        _write(state / "requests" / f"{key}.json", {
+            "key": key,
+            "message": {"id": _SPACE + "/messages/" + name, "thread": _THREAD,
+                        "sender": "users/owner", "text": name,
+                        "created_at": "2026-01-02T00:00:00Z"},
+        })
+    bucket = (state / "replies" / "items" / first[:2] / first[2:4] / first
+              / "history" / "0000")
+    bucket.mkdir(parents=True)
+    _write(bucket / "000000.json", {
+        "text": "the quarterly report is ready for review",
+        "reply_id": _SPACE + "/messages/r1", "replied_at": replied_at,
+    })
+    return state, first, second
+
+
+def test_recent_duplicate_refusal_covers_exact_near_window_and_idempotence(
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    state, first, second = _duplicate_state(tmp_path, now)
+    refusal = chat_module._recent_duplicate_refusal(
+        state, second, "the quarterly report is ready for review")
+    assert refusal is not None
+    assert "100% match to your previous message" in refusal
+    assert "--allow-duplicates" in refusal
+    # The same request retrying its own text is idempotent, never refused.
+    assert chat_module._recent_duplicate_refusal(
+        state, first, "the quarterly report is ready for review") is None
+    # One word changed in a long text is a 99% match.
+    words = [f"word{index}" for index in range(220)]
+    bucket = (state / "replies" / "items" / first[:2] / first[2:4] / first
+              / "history" / "0000")
+    _write(bucket / "000000.json", {
+        "text": " ".join(words), "reply_id": _SPACE + "/messages/r1",
+        "replied_at": now,
+    })
+    changed = words.copy()
+    changed[100] = "changed"
+    refusal = chat_module._recent_duplicate_refusal(state, second, " ".join(changed))
+    assert refusal is not None and "99% match" in refusal
+    # Outside the 30-minute window the same text is not a duplicate.
+    old_state, _first, old_second = _duplicate_state(
+        tmp_path / "old", "2020-01-01T00:00:00Z")
+    assert chat_module._recent_duplicate_refusal(
+        old_state, old_second, "the quarterly report is ready for review") is None
+
+
 def test_service_shutdown_interrupts_reconciliation_instead_of_becoming_retry(
     rig: Rig, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

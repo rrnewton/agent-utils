@@ -601,6 +601,13 @@ authority. The command opens it once without following symlinks and refuses
 group/world-writable files, hard links, FIFOs, devices, files that grow while
 being read, and invalid UTF-8.
 
+Before storing, `reply` refuses a near-duplicate (#1239): a text matching a
+reply in the same thread from the last 30 minutes at 99% word similarity or
+more is refused, naming the earlier post's ET time and id, unless
+`--allow-duplicates` is given. Once the reply is stored the `--file` is
+removed and `removed FILE` printed (#1240); `--keep-file` keeps it, and
+`--file -` reads standard input. A refused or failed run keeps the file.
+
 You may run `reply` while the daemon is running. After the artifact is durable,
 the streaming runner receives a nonblocking private local notification and wakes
 immediately. A five-minute recovery scan covers a missed notification or a

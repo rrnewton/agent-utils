@@ -1035,6 +1035,20 @@ also exits 1, and so does a result that cannot be printed after the reply was
 stored. Exit 75 means nothing was stored and the same command can succeed later.
 A usage error exits 2, and so does a file that cannot be read or is not UTF-8.
 The command never contacts Herdr, a helper, or a provider. It is safe while
+
+Before storing, `reply` refuses a near-duplicate (#1239): a text that matches a
+post this bridge sent in the same channel and thread in the last 30 minutes —
+exactly, or with a word similarity of 99% or more — exits 1 naming the earlier
+post's ET time and id, and stores nothing. Run again with `--allow-duplicates`
+to send it anyway. A retry of a text the request already holds is still
+`already_stored`, never a refusal, and a reply in another thread is never a
+duplicate. The comparison reads only the bridge's own records.
+
+Once the reply is stored, `reply` removes the `--file` and prints `removed
+FILE` (#1240); a refused or failed run keeps it. `--keep-file` keeps it, and
+`--file -` reads standard input and removes nothing. Only a regular file the
+caller owns is removed: a symlink or another uid's file refuses the command
+(exit 2) before anything is stored.
 `chat run` runs, because it opens the state without the recovery that
 `chat run`, `chat tick` and `chat close` perform when they open it, and it holds
 off SIGHUP, SIGINT, SIGQUIT and SIGTERM while it stores the reply.
@@ -1086,8 +1100,17 @@ retried only with the identical UUID, channel, thread, and body. The command
 runs the helper only through the reviewed process supervisor, binds the
 returned message resource to the requested channel, and prints the exact v1
 success receipt, whose `receipt.message_id` names the posted message. It
-neither writes bridge state nor creates an event-loop reply route; this is an
-explicit operator action, not automatic subscription behavior.
+creates no event-loop reply route; this is an explicit operator action, not
+automatic subscription behavior. Each accepted post is recorded in the state
+directory's `publishes.json` (#1239): a retry with the same UUID, channel,
+thread and text is answered from that record and posts nothing again, and a
+new UUID whose text matches a post in the same channel and thread from the
+last 30 minutes (exactly, or at 99% word similarity or more) is refused
+before the helper runs, naming the earlier post's ET time and id, unless
+`--allow-duplicates` is given. A root post and a threaded post never match
+each other. With `--file`, the file is removed once the post is accepted and
+`removed FILE` is printed (#1240); `--keep-file` keeps it and `--file -`
+reads standard input, under the same ownership rules as `chat reply`.
 
 With `--thread-id THREAD` the message is instead a reply in an existing thread
 of the same channel, such as a thread the operator started with an earlier

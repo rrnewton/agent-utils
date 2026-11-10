@@ -4561,7 +4561,91 @@ def _wake_reply_owner(state: Path, key: str) -> None:
         pass
 
 
-def submit_reply(state: Path, key: str, text: str) -> None:
+def _duplicate_tokens(text: str) -> list[str]:
+    return re.findall(r"[^\W_]+", text.lower(), flags=re.UNICODE)
+
+
+def _duplicate_similarity(left: list[str], right: list[str]) -> float:
+    if not left or not right:
+        return 0.0
+    left_counts, right_counts = Counter(left), Counter(right)
+    shared = sum((left_counts & right_counts).values())
+    total = sum((left_counts | right_counts).values())
+    return shared / total if total else 0.0
+
+
+def _et_clock(moment: datetime) -> str:
+    try:
+        from zoneinfo import ZoneInfo
+
+        local = moment.astimezone(ZoneInfo("America/New_York"))
+    except Exception:
+        local = moment.astimezone(timezone.utc)
+    return local.strftime("%H:%M ET")
+
+
+def _recent_duplicate_refusal(state: Path, key: str, text: str) -> str | None:
+    """The refusal for a near-duplicate reply (#1239), or None: the same thread's stored
+    replies from the last 30 minutes, read from this bridge's own records only."""
+    try:
+        target = _read(state / "requests" / f"{key}.json")
+        message = target.get("message")
+        thread = message.get("thread") if isinstance(message, dict) else None
+        if not isinstance(thread, str):
+            return None
+        tokens = _duplicate_tokens(text)
+        if not tokens:
+            return None
+        now = datetime.now(timezone.utc)
+        best: tuple[float, datetime, str] | None = None
+        for path in sorted((state / "requests").glob("*.json")):
+            record = _read(path)
+            other = record.get("message")
+            if not isinstance(other, dict) or other.get("thread") != thread:
+                continue
+            other_key = record.get("key")
+            if not isinstance(other_key, str):
+                continue
+            base = state / "replies" / "items" / other_key[:2] / other_key[2:4] / other_key
+            for kind in ("history", "pending"):
+                for item_path in sorted((base / kind).glob("*/*.json")):
+                    item = _read(item_path)
+                    item_text = item.get("text")
+                    if not isinstance(item_text, str):
+                        continue
+                    if other_key == key and _duplicate_tokens(item_text) == tokens:
+                        return None
+                    replied = item.get("replied_at")
+                    if isinstance(replied, str):
+                        moment = _timestamp(replied)
+                    else:
+                        moment = datetime.fromtimestamp(
+                            item_path.stat().st_mtime, timezone.utc)
+                    if now - moment > timedelta(minutes=30):
+                        continue
+                    similarity = _duplicate_similarity(tokens, _duplicate_tokens(item_text))
+                    if similarity < 0.99:
+                        continue
+                    identifier = item.get("reply_id")
+                    label = identifier if isinstance(identifier, str) else other_key
+                    if best is None or similarity > best[0]:
+                        best = (similarity, moment, label)
+        if best is None:
+            return None
+        similarity, moment, label = best
+        percent = 100 if similarity >= 1.0 else int(similarity * 100)
+        return (
+            f"this is a {percent}% match to your previous message which went through at "
+            f"{_et_clock(moment)} (id {label}); are you sure you want to send? "
+            "If so, run again with --allow-duplicates"
+        )
+    except Exception:
+        # The scan is best-effort: a state it cannot read never blocks a reply, and a
+        # caller's recovery path may forbid directory scans outright.
+        return None
+
+
+def submit_reply(state: Path, key: str, text: str, *, allow_duplicates: bool = False) -> None:
     """Commit one final answer locally; the bridge alone has transport credentials."""
     saved = as_mapping(_read(state / "bridge.json").get("config"), "saved chat config")
     if Config.parse(saved).outbound_mode == "disabled":
@@ -4571,6 +4655,10 @@ def submit_reply(state: Path, key: str, text: str) -> None:
     body_bytes = len(text.encode("utf-8"))
     if not text.strip() or body_bytes > 30000:
         raise ValueError("reply must contain 1-30000 UTF-8 bytes")
+    if not allow_duplicates:
+        refusal = _recent_duplicate_refusal(state, key, text)
+        if refusal is not None:
+            raise ValueError(refusal)
     _private(state / "submissions")
     path = state / "submissions" / f"{key}.json"
     descriptor = _open_private_lock(
@@ -5457,8 +5545,13 @@ and '{prog} COMMAND --help' for command-specific options.
         help="opaque cursor from the preceding context result to read older messages; keep request and limit unchanged")
     subparsers["reply"].add_argument("--request", required=True, metavar="KEY",
         help="64-character hexadecimal request key supplied in the coordinator's reply instructions")
-    subparsers["reply"].add_argument("--file", type=Path, required=True, metavar="UTF8_FILE",
-        help="file containing the final answer, 1–30000 UTF-8 bytes; identical retries are safe")
+    subparsers["reply"].add_argument("--file", required=True, metavar="UTF8_FILE",
+        help="file containing the final answer, 1–30000 UTF-8 bytes, or - for standard input; "
+             "the file is removed once the reply is stored (see --keep-file); identical retries are safe")
+    subparsers["reply"].add_argument("--allow-duplicates", action="store_true",
+        help="store even when the text matches a recent reply in the same thread at 99 percent or more")
+    subparsers["reply"].add_argument("--keep-file", action="store_true",
+        help="keep the --file after its text is stored")
     subparsers["close"].add_argument("--request", required=True, metavar="KEY_OR_PREFIX",
         help="tagged request key or unique hexadecimal prefix; history is retained")
     subparsers["history"].add_argument("--request", required=True, metavar="KEY_OR_PREFIX",
@@ -5540,8 +5633,40 @@ commands. See '{prog} userguide' for exact scopes, lifecycle, and adapter protoc
             Bridge.initialize(args.state, config, after=args.after)
             print(json.dumps({"state": str(args.state.absolute()), "space": config.space}))
         elif args.command == "reply":
-            submit_reply(args.state, args.request, read_text(args.file, REPLY_INPUT))
+            if args.file == "-":
+                raw = sys.stdin.buffer.read(30001)
+                if len(raw) > 30000:
+                    raise ValueError("reply must contain 1-30000 UTF-8 bytes")
+                text = raw.decode("utf-8")
+                removable: Path | None = None
+            else:
+                file_path = Path(args.file)
+                removable = None
+                if not args.keep_file:
+                    info = file_path.lstat()
+                    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                        raise ValueError(
+                            f"chat message file {file_path} is not a regular file; "
+                            "it was kept (use --keep-file to keep any file)")
+                    if info.st_uid != os.getuid():
+                        raise ValueError(
+                            f"chat message file {file_path} is not owned by the caller; "
+                            "it was kept (use --keep-file to keep any file)")
+                    removable = file_path
+                text = read_text(file_path, REPLY_INPUT)
+            if args.allow_duplicates:
+                submit_reply(args.state, args.request, text, allow_duplicates=True)
+            else:
+                submit_reply(args.state, args.request, text)
             print(json.dumps({"outcome": "reply_queued", "request": args.request}))
+            if removable is not None:
+                try:
+                    removable.unlink()
+                    print(f"removed {removable}", file=sys.stderr)
+                except OSError as exc:
+                    print(
+                        f"agentctl: could not remove {removable} after storing its text: {exc}",
+                        file=sys.stderr)
         elif args.command == "close":
             key = close_replies(args.state, args.request)
             print(json.dumps({"outcome": "reply_capture_closed", "request": key}))
