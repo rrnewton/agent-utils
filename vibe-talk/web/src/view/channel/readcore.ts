@@ -1048,19 +1048,30 @@ function applyTimelinePage(payload: TimelineResponse, older = false, saved = fal
  * message has moved into that pixel. Kept to the offset as before when the message is not drawn.
  */
 
+let lastCachedGroups: readonly (readonly unknown[])[] = [];
+
 function renderCachedTimeline(): void {
   if (!providerFacts.threading() || selection().view === "threads") return;
   const keeps = readFilterKeeps();
   const shown = timelineRows().messages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message)));
   const redraw = () => {
     // An unchanged cached timeline rebuilds nothing (`#1209 selection-survives-updates`): the
-    // rows drawn already are these messages, so replacing them would only take the reader's
-    // selection with them. A changed one keeps the selection across the rebuild instead.
+    // very messages last drawn, object for object, so replacing their rows would only take the
+    // reader's selection with them. Same ids in new objects is a change (a thread read bringing
+    // its root's words again) and redraws, keeping the selection across it instead.
     const list = el("discord-log");
-    const drawn = [...list.children].map((row) => idsOf(row)[0]);
-    const incoming = glom(shown).map((group) => String(group[0]?.id ?? ""));
-    const keptSelection = deps.selectionIn && drawn.join("\n") !== incoming.join("\n") ? deps.selectionIn(list) : null;
-    if (drawn.join("\n") !== incoming.join("\n")) list.replaceChildren(...glom(shown).map(discordNode));
+    const groups = glom(shown);
+    const unchanged = groups.length === lastCachedGroups.length
+      && groups.every((group, at) => {
+        const last = lastCachedGroups[at];
+        return last !== undefined && group.length === last.length
+          && group.every((message, inGroup) => message === last[inGroup]);
+      });
+    const keptSelection = deps.selectionIn && !unchanged ? deps.selectionIn(list) : null;
+    if (!unchanged) {
+      list.replaceChildren(...groups.map(discordNode));
+      lastCachedGroups = groups;
+    }
     if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
     holdingReplyArrows(renderChannelRows);
     listState().backlog = shown.length;

@@ -176,6 +176,8 @@ export interface ElementById {
   "fold-connection-body": HTMLDivElement;
   "fold-control-bar": HTMLButtonElement;
   "fold-control-bar-body": HTMLDivElement;
+  "fold-debug": HTMLButtonElement;
+  "fold-debug-body": HTMLDivElement;
   "fold-dismissed": HTMLButtonElement;
   "fold-dismissed-body": HTMLDivElement;
   "fold-empty-messages": HTMLButtonElement;

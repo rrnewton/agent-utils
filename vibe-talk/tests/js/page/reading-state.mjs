@@ -5010,7 +5010,7 @@ test("`#243 filter-keeps-selection`: and nothing else moves it afterwards — no
   // THE CONTROL: with the hold taken out, the read follows the newest line and the message moves.
   const followed = await run(await brokenModule([
     { file: "src/view/channel/readcore.ts", find: "  if (how.keepPosition && keepFilterHold()) {", replace: "  if (false) {" },
-    { file: "src/view/channel/filterplace.ts", find: "    return deps.atBottom(area) && heldFilterRow() === null;", replace: "    return deps.atBottom(area);" }]));
+    { file: "src/view/channel/filterplace.ts", find: "    return deps.atBottom(area, deps.restSlackPx) && heldFilterRow() === null;", replace: "    return deps.atBottom(area, deps.restSlackPx);" }]));
   const before = yOf(followed, "40");
   followed.messages = [...followed.messages, message({ id: "41", content: longMessage("arrived") })];
   await reReadChannel(followed);
