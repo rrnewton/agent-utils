@@ -186,6 +186,7 @@
     artifactCatalogError: "",
     artifactCatalogPromise: null,
     axisTicks: [],
+    deepLinkProject: "",
     selectedTeam: "",
     query: "",
     searchScope: "labels",
@@ -1234,6 +1235,7 @@
     dom.glossaryOpen.hidden = !data.glossary.length && !data.glossary_path;
 
     renderSiteIdentity(data);
+    app.deepLinkProject = deepLinkProjectLabel();
     populateTeamFilter();
     populateSummaryFiles();
     var generated = data.generated_at ? "generated " + data.generated_at : "generation time unknown";
@@ -1244,6 +1246,7 @@
       (timezoneSource ? " (" + timezoneSource + ")" : "") +
       (app.timezoneStatus === "archive" ? "" : " · " + app.timezoneStatus);
     updateShardDiagnostics();
+    restoreTimelineFromHash();
     scheduleRender();
     openGlossaryFromHash();
   }
@@ -3663,7 +3666,7 @@
   function zoomToRange(start, end) {
     var safeStart = number(start, app.viewStart);
     var safeEnd = Math.max(safeStart + 1, number(end, app.viewEnd));
-    setView(safeStart, safeEnd);
+    setView(safeStart, safeEnd, "push");
   }
 
   function zoomToActivityRange(bounds, scope) {
@@ -5092,7 +5095,374 @@
     window.requestAnimationFrame(render);
   }
 
-  function setView(start, end) {
+  // Deep links: the timeline place as a hash, so a view can be pasted into a
+  // chat or an issue and reopened on the same window and team. Grammar
+  // (canonical order; parsing accepts any order):
+  //
+  //   #view=day&t=2026-11-08&start=1794096000000&end=1794182400000
+  //     &team=team-alpha&project=example-project
+  //
+  // `start`/`end` are the exact half-open window in epoch milliseconds and
+  // are authoritative when present as a valid pair. `view` (day, week,
+  // month, quarter, or range) and `t` (the window start's YYYY-MM-DD in the
+  // archive timezone) are the human-readable form of the same window: a
+  // hand-written link may carry only `view` and `t`, and it then names that
+  // calendar day, Monday-start week, month, or quarter in the archive
+  // timezone. `team` is a team slug; absent means all teams. `project` is
+  // the archive's primary project label and is advisory only -- there is no
+  // project filter to restore, so it never blocks applying the window and
+  // team. A recognised link names a complete place: no window means fit
+  // the data range, no team means all teams, and an unknown team slug
+  // falls back to all teams rather than an empty timeline.
+  //
+  // The existing `#glossary` and `#glossary/<id>` hashes are a separate
+  // namespace: they are never parsed as timeline state and never produced
+  // here. Continuous gestures (wheel, drag, keyboard steps) rewrite the
+  // current entry with replaceState, coalesced to one write per frame;
+  // deliberate jumps (zoomToRange, fit/Home, team selection) push a new
+  // entry so Back returns to the previous place. A replace never
+  // overwrites a glossary hash; a push stacks above it, so Back still
+  // returns to the glossary entry.
+  var deepLinkReplaceQueued = false;
+
+  function isGlossaryHash(hash) {
+    return hash === "#glossary" || hash.startsWith("#glossary/");
+  }
+
+  function deepLinkViewForSpan(startMs, endMs) {
+    var dayMs = 24 * 60 * 60 * 1000;
+    var span = endMs - startMs;
+    if (span <= 26 * 60 * 60 * 1000) {
+      return "day";
+    }
+    if (span <= 8 * dayMs) {
+      return "week";
+    }
+    if (span <= 32 * dayMs) {
+      return "month";
+    }
+    if (span <= 95 * dayMs) {
+      return "quarter";
+    }
+    return "range";
+  }
+
+  function parseDeepLinkDate(value) {
+    var match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value || "");
+    if (!match) {
+      return null;
+    }
+    var parts = {
+      year: Number(match[1]),
+      month: Number(match[2]),
+      day: Number(match[3])
+    };
+    var check = new Date(Date.UTC(parts.year, parts.month - 1, parts.day));
+    if (check.getUTCFullYear() !== parts.year ||
+        check.getUTCMonth() + 1 !== parts.month ||
+        check.getUTCDate() !== parts.day) {
+      return null;
+    }
+    return parts;
+  }
+
+  function deepLinkWallParts(milliseconds, timeZone) {
+    var options = {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23"
+    };
+    var parts;
+    try {
+      options.timeZone = timeZone || "UTC";
+      parts = new Intl.DateTimeFormat("en-US", options)
+        .formatToParts(new Date(milliseconds));
+    } catch (_error) {
+      options.timeZone = "UTC";
+      parts = new Intl.DateTimeFormat("en-US", options)
+        .formatToParts(new Date(milliseconds));
+    }
+    var wall = { year: 1970, month: 1, day: 1, hour: 0, minute: 0, second: 0 };
+    parts.forEach(function (part) {
+      if (part.type in wall) {
+        wall[part.type] = Number(part.value);
+      }
+    });
+    return wall;
+  }
+
+  function deepLinkDateText(milliseconds, timeZone) {
+    var wall = deepLinkWallParts(milliseconds, timeZone);
+    function pad(value) {
+      return (value < 10 ? "0" : "") + value;
+    }
+    return wall.year + "-" + pad(wall.month) + "-" + pad(wall.day);
+  }
+
+  function deepLinkZonedMidnightMs(year, month, day, timeZone) {
+    var target = Date.UTC(year, month - 1, day);
+    var guess = target;
+    for (var attempt = 0; attempt < 3; attempt += 1) {
+      var wall = deepLinkWallParts(guess, timeZone);
+      var wallAsUtc = Date.UTC(
+        wall.year, wall.month - 1, wall.day, wall.hour, wall.minute, wall.second
+      );
+      var difference = target - wallAsUtc;
+      if (!difference) {
+        break;
+      }
+      guess += difference;
+    }
+    return guess;
+  }
+
+  function deepLinkCalendarWindow(view, dateText, timeZone) {
+    var date = parseDeepLinkDate(dateText);
+    if (!date) {
+      return null;
+    }
+    function shifted(year, month, day) {
+      var utc = new Date(Date.UTC(year, month - 1, day));
+      return {
+        year: utc.getUTCFullYear(),
+        month: utc.getUTCMonth() + 1,
+        day: utc.getUTCDate()
+      };
+    }
+    function midnight(parts) {
+      return deepLinkZonedMidnightMs(parts.year, parts.month, parts.day, timeZone);
+    }
+    if (view === "day") {
+      return {
+        start_ms: midnight(date),
+        end_ms: midnight(shifted(date.year, date.month, date.day + 1))
+      };
+    }
+    if (view === "week") {
+      var weekday = new Date(
+        Date.UTC(date.year, date.month - 1, date.day)
+      ).getUTCDay();
+      var monday = shifted(date.year, date.month, date.day - ((weekday + 6) % 7));
+      return {
+        start_ms: midnight(monday),
+        end_ms: midnight(shifted(monday.year, monday.month, monday.day + 7))
+      };
+    }
+    if (view === "month") {
+      return {
+        start_ms: midnight({ year: date.year, month: date.month, day: 1 }),
+        end_ms: midnight(shifted(date.year, date.month + 1, 1))
+      };
+    }
+    if (view === "quarter") {
+      var quarterMonth = Math.floor((date.month - 1) / 3) * 3 + 1;
+      return {
+        start_ms: midnight({ year: date.year, month: quarterMonth, day: 1 }),
+        end_ms: midnight(shifted(date.year, quarterMonth + 3, 1))
+      };
+    }
+    return null;
+  }
+
+  function parseDeepLinkHash(hash) {
+    if (typeof hash !== "string" || !hash.startsWith("#") ||
+        hash.length < 2 || isGlossaryHash(hash)) {
+      return null;
+    }
+    var fields = {};
+    var recognised = false;
+    hash.slice(1).split("&").forEach(function (pair) {
+      var separator = pair.indexOf("=");
+      if (separator < 1) {
+        return;
+      }
+      var key = pair.slice(0, separator);
+      if (["start", "end", "team", "view", "t", "project"].indexOf(key) < 0) {
+        return;
+      }
+      recognised = true;
+      try {
+        fields[key] = decodeURIComponent(
+          pair.slice(separator + 1).replace(/\+/g, " ")
+        ).trim();
+      } catch (_error) {
+        fields[key] = "";
+      }
+    });
+    if (!recognised) {
+      return null;
+    }
+    function milliseconds(key) {
+      return /^-?\d+$/.test(fields[key] || "") ? Number(fields[key]) : null;
+    }
+    var startMs = milliseconds("start");
+    var endMs = milliseconds("end");
+    if (startMs === null || endMs === null || endMs <= startMs) {
+      startMs = null;
+      endMs = null;
+    }
+    var views = {
+      day: "day", daily: "day",
+      week: "week", weekly: "week",
+      month: "month", monthly: "month",
+      quarter: "quarter", quarterly: "quarter",
+      range: "range"
+    };
+    return {
+      start_ms: startMs,
+      end_ms: endMs,
+      team: fields.team || "",
+      view: views[(fields.view || "").toLowerCase()] || "",
+      t: parseDeepLinkDate(fields.t || "") ? fields.t : "",
+      project: fields.project || ""
+    };
+  }
+
+  function serializeDeepLinkState(state, timeZone) {
+    var startMs = Math.round(Number(state && state.start_ms));
+    var endMs = Math.round(Number(state && state.end_ms));
+    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) ||
+        endMs <= startMs) {
+      return "";
+    }
+    var pairs = [
+      "view=" + deepLinkViewForSpan(startMs, endMs),
+      "t=" + deepLinkDateText(startMs, timeZone),
+      "start=" + startMs,
+      "end=" + endMs
+    ];
+    if (state && state.team) {
+      pairs.push("team=" + encodeURIComponent(state.team));
+    }
+    if (state && state.project) {
+      pairs.push("project=" + encodeURIComponent(state.project));
+    }
+    return "#" + pairs.join("&");
+  }
+
+  function deepLinkProjectLabel() {
+    if (!app.data) {
+      return "";
+    }
+    var projects = aggregatedSiteIdentity(app.data.teams).projects;
+    if (projects.length === 1) {
+      return projects[0].label;
+    }
+    var primary = projects.filter(function (project) { return project.primary; });
+    return primary.length === 1 ? primary[0].label : "";
+  }
+
+  function currentDeepLinkHash() {
+    return serializeDeepLinkState({
+      start_ms: app.viewStart,
+      end_ms: app.viewEnd,
+      team: app.selectedTeam,
+      project: app.deepLinkProject
+    }, app.timezone);
+  }
+
+  function writeDeepLinkHistory(mode) {
+    if (!app.data || typeof window === "undefined" || !window.history) {
+      return;
+    }
+    if (mode === "replace" && isGlossaryHash(window.location.hash)) {
+      return;
+    }
+    var hash = currentDeepLinkHash();
+    if (!hash || hash === window.location.hash) {
+      return;
+    }
+    try {
+      if (mode === "push") {
+        window.history.pushState(null, "", hash);
+      } else {
+        window.history.replaceState(null, "", hash);
+      }
+    } catch (_error) {
+      // History writes are refused on some file: origins; the timeline
+      // itself must keep working there.
+    }
+  }
+
+  function syncDeepLink(mode) {
+    if (!app.data || mode === "none") {
+      return;
+    }
+    if (mode === "push") {
+      writeDeepLinkHistory("push");
+      return;
+    }
+    if (deepLinkReplaceQueued || typeof window === "undefined" ||
+        typeof window.requestAnimationFrame !== "function") {
+      if (!deepLinkReplaceQueued) {
+        writeDeepLinkHistory("replace");
+      }
+      return;
+    }
+    deepLinkReplaceQueued = true;
+    window.requestAnimationFrame(function () {
+      deepLinkReplaceQueued = false;
+      writeDeepLinkHistory("replace");
+    });
+  }
+
+  function applyDeepLinkState(parsed) {
+    var nextTeam = parsed.team && app.teamBySlug.has(parsed.team)
+      ? parsed.team
+      : "";
+    var teamChanged = nextTeam !== app.selectedTeam;
+    if (teamChanged) {
+      invalidateTranscriptSearchRequest();
+      app.selectedTeam = nextTeam;
+      dom.teamFilter.value = nextTeam;
+      dom.scroll.scrollTop = 0;
+      populateSummaryFiles();
+    }
+    var windowRange = null;
+    if (parsed.start_ms !== null && parsed.end_ms !== null) {
+      windowRange = { start_ms: parsed.start_ms, end_ms: parsed.end_ms };
+    } else if (parsed.view && parsed.t) {
+      windowRange = deepLinkCalendarWindow(parsed.view, parsed.t, app.timezone);
+    }
+    if (!windowRange) {
+      windowRange = {
+        start_ms: app.data.range.start_ms,
+        end_ms: app.data.range.end_ms
+      };
+    }
+    setView(windowRange.start_ms, windowRange.end_ms, "none");
+    if (teamChanged) {
+      scheduleRender();
+      refreshSearch();
+    }
+  }
+
+  function restoreTimelineFromHash() {
+    if (!app.data || typeof window === "undefined" ||
+        isGlossaryHash(window.location.hash)) {
+      return;
+    }
+    try {
+      var parsed = parseDeepLinkHash(window.location.hash);
+      if (parsed) {
+        applyDeepLinkState(parsed);
+        return;
+      }
+      if (window.location.hash === "" || window.location.hash === "#") {
+        applyDeepLinkState({
+          start_ms: null, end_ms: null, team: "", view: "", t: "", project: ""
+        });
+      }
+    } catch (_error) {
+      // A malformed link must not stop the timeline itself from loading.
+    }
+  }
+
+  function setView(start, end, historyMode) {
     if (!app.data || !Number.isFinite(start) || !Number.isFinite(end)) {
       return;
     }
@@ -5105,6 +5475,7 @@
     clearRangeSelectionState();
     app.viewStart = next.start_ms;
     app.viewEnd = next.end_ms;
+    syncDeepLink(historyMode || "replace");
     scheduleRender();
   }
 
@@ -5112,7 +5483,7 @@
     if (!app.data) {
       return;
     }
-    setView(app.data.range.start_ms, app.data.range.end_ms);
+    setView(app.data.range.start_ms, app.data.range.end_ms, "push");
   }
 
   function panTimelineByPixels(pixels) {
@@ -8413,6 +8784,7 @@
     populateSummaryFiles();
     scheduleRender();
     refreshSearch();
+    syncDeepLink("push");
   });
 
   dom.search.addEventListener("input", function () {
@@ -8487,6 +8859,8 @@
   dom.scroll.addEventListener("scroll", scheduleRender, { passive: true });
   dom.scroll.addEventListener("keydown", keyboardScrollTracks);
   window.addEventListener("hashchange", openGlossaryFromHash);
+  window.addEventListener("hashchange", restoreTimelineFromHash);
+  window.addEventListener("popstate", restoreTimelineFromHash);
 
   dom.modalClose.addEventListener("click", closeModal);
   dom.modalBackdrop.addEventListener("click", function (event) {
