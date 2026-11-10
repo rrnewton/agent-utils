@@ -162,7 +162,7 @@ export {
   mountUpstreamClear,
   restoreStoredSettings,
 } from "../view/settings/index.ts";
-export { blankResumeLast, createAudioRoute, createCallResume, createVoiceProvider } from "../core/call/index.ts";
+export { blankResumeLast, createAudioRoute, createCallDevices, createCallResume, createVoiceProvider } from "../core/call/index.ts";
 
 // read core (#624 mu-readcore)
 export { createAbandonedReads, createTimelineReader } from "../core/sync/index.ts";

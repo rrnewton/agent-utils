@@ -332,6 +332,7 @@ declare const mountResumePreference: LegacyImports["mountResumePreference"];
 declare const mountConnectionReadouts: LegacyImports["mountConnectionReadouts"];
 declare const blankResumeLast: LegacyImports["blankResumeLast"];
 declare const createAudioRoute: LegacyImports["createAudioRoute"];
+declare const createCallDevices: LegacyImports["createCallDevices"];
 declare const createCallResume: LegacyImports["createCallResume"];
 declare const createVoiceProvider: LegacyImports["createVoiceProvider"];
 declare const createTimelineReader: LegacyImports["createTimelineReader"];

@@ -25,6 +25,8 @@ export type { Boundary, Recap } from "./recap.ts";
 export { notSentDetail, reconnectSeamDetail, spokenOutcomeKind, spokenYesSeam } from "./seams.ts";
 export { createAudioRoute } from "./audioroute.ts";
 export type { AudioRoute, AudioRouteDependencies, CallAudioRoute } from "./audioroute.ts";
+export { createCallDevices } from "./devices.ts";
+export type { CallDeviceLike, CallDevicePreferences, CallDevices, CallDevicesDependencies, CallRouteLike, CallStreamLike, CallTrackLike } from "./devices.ts";
 export { createVoiceProvider } from "./provider.ts";
 export type { ConversationalVoice, VoiceProvider } from "./provider.ts";
 export { blankResumeLast, createCallResume } from "./resume.ts";

@@ -537,10 +537,10 @@ function voiceCall() {
     get fetchResume() { return fetchResume; },
     get showDetail() { return showDetail; },
     get micSettings() { return microphoneSettings.read; },
-    get openCallMicrophone() { return openCallMicrophone; },
+    get openCallMicrophone() { return /** @type {any} */ (openCallMicrophone); },
     get echoCancellationRefused() { return voiceTranscript().echoCancellationRefused; },
     get browserPorts() { return browserPorts; },
-    get applyCallOutput() { return applyCallOutput; },
+    get applyCallOutput() { return /** @type {any} */ (applyCallOutput); },
     get refreshAudioDeviceSelects() { return audioDevices.refresh; },
     get renderAudioRouteReadout() { return audioDevices.renderRoute; },
     get resumeViaProfile() { return voiceTranscript().resumeViaProfile; },
@@ -3781,6 +3781,29 @@ function audioConstraints(settings) {
  *
  * @type {import("./src/core/call/index.ts").AudioRoute}
  */
+/**
+ * The call's audio devices: what a label says a device is, which capture device a call opens,
+ * whether its output can be chosen, opening its microphone and aiming its playback (web/src/core/call
+ * `createCallDevices`, beside the route it writes).
+ *
+ * @type {import("./src/core/call/index.ts").CallDevices}
+ */
+const callDevices = createCallDevices({
+  route: {
+    begin: () => audioRoute.begin(),
+    noteInput: (label) => audioRoute.noteInput(label),
+    settleInput: (label) => audioRoute.settleInput(label),
+    noteSink: (sink) => audioRoute.noteSink(sink),
+    noteOutput: (label) => audioRoute.noteOutput(label),
+  },
+  openMicrophone: (constraints) => browserPorts().microphone.open(/** @type {any} */ (constraints)),
+  constraintsFor: (mic) => audioConstraints(mic),
+  mediaDevices: () => navigator.mediaDevices,
+  preferences: () => audioDevices.preferences(),
+  audioContextClass: () => browserPorts().audio.contextClass(),
+});
+const { deviceLabel, classifyAudioDevice, pickCallInput, outputSinkSupported, openCallMicrophone, applyCallOutput } = callDevices;
+
 const audioRoute = createAudioRoute({ classify: (label) => classifyAudioDevice(label) });
 
 const audioDevices = mountAudioDevices({
@@ -3795,141 +3818,9 @@ const audioDevices = mountAudioDevices({
   route: () => audioRoute.current(),
 });
 
-/**
- * The one read of a media device's, track's or track-settings' label in this section: the
- * channel-name guard in src/http/api.rs counts label reads across this file, and a device
- * label is not a channel label — so it goes through here, once, without that spelling.
- */
-function deviceLabel(device) {
-  const { label } = device || {};
-  return typeof label === "string" ? label : "";
-}
-
-/**
- * The kind of one device, from the label the browser reports: the closed set the call-end
- * record carries (`AudioRoute` in src/voice_health.rs). Bluetooth is matched FIRST, because a
- * Bluetooth headset's label also says "headset".
- */
-function classifyAudioDevice(label) {
-  const words = String(label || "").toLowerCase();
-  if (/bluetooth|airpods|hands[ -]?free|\bhfp\b|\bsco\b|\bble\b/.test(words)) return "bluetooth";
-  if (/usb/.test(words)) return "usb";
-  if (/speaker/.test(words)) return "speakerphone";
-  if (/earpiece|receiver/.test(words)) return "earpiece";
-  if (/headset|headphone|earbud|earphone/.test(words)) return "wired_headset";
-  return "other";
-}
-
-/**
- * The capture device a call should open, from `devices` (an `enumerateDevices()` list):
- * the reader's stored choice when it is still there; else a Bluetooth/headset input, so the
- * call's communication route follows the headset; else the browser's "communications" device;
- * else null, meaning keep the stream the default constraints already opened.
- */
-function pickCallInput(devices, prefs) {
-  const inputs = (devices || []).filter((d) => d && d.kind === "audioinput" && d.deviceId);
-  if (prefs.inputId) {
-    const chosen = inputs.find((d) => d.deviceId === prefs.inputId);
-    if (chosen) return chosen;
-  }
-  return inputs.find((d) => classifyAudioDevice(deviceLabel(d)) === "bluetooth")
-    || inputs.find((d) => d.deviceId === "communications" || /communications/.test(deviceLabel(d).toLowerCase()))
-    || null;
-}
-
-/**
- * Whether this browser lets the CALL choose an output: call playback is Web Audio, so the
- * form that matters is `AudioContext.setSinkId` (desktop Chromium). A media-element-only
- * `setSinkId` could not aim the call, so it does not earn the picker.
- */
-function outputSinkSupported() {
-  const Context = browserPorts().audio.contextClass();
-  return Boolean(Context && Context.prototype && "setSinkId" in Context.prototype);
-}
-
-/**
- * Open the call's microphone: the default constraints first (which is also what grants the
- * permission that lets `enumerateDevices` name anything), then — when a better capture device
- * is present — once more with that device named exactly. `session.stream`'s callers see only
- * the final stream; the first is stopped before the second opens.
- */
-async function openCallMicrophone(mic) {
-  let stream = await browserPorts().microphone.open(audioConstraints(mic));
-  audioRoute.begin();
-  const trackOf = (opened) => (opened && typeof opened.getTracks === "function" ? opened.getTracks()[0] : null);
-  const noteTrack = (opened) => {
-    const track = trackOf(opened);
-    let settings = {};
-    try {
-      settings = track && typeof track.getSettings === "function" ? track.getSettings() : {};
-    } catch (_error) {
-      settings = {};
-    }
-    const label = deviceLabel(track) || deviceLabel(settings);
-    audioRoute.noteInput(label);
-  };
-  noteTrack(stream);
-  if (!navigator.mediaDevices || typeof navigator.mediaDevices.enumerateDevices !== "function") return stream;
-  let devices = null;
-  try {
-    devices = await navigator.mediaDevices.enumerateDevices();
-  } catch (_error) {
-    return stream;
-  }
-  const chosen = pickCallInput(devices, audioDevices.preferences());
-  const current = trackOf(stream);
-  let currentId;
-  let currentLabel = "";
-  try {
-    const settings = current && typeof current.getSettings === "function" ? current.getSettings() : {};
-    currentId = settings.deviceId;
-    currentLabel = deviceLabel(current) || deviceLabel(settings);
-  } catch (_error) {
-    currentId = undefined;
-  }
-  if (!chosen || chosen.deviceId === currentId
-    || (deviceLabel(chosen) && currentLabel && deviceLabel(chosen) === currentLabel)) return stream;
-  const fallback = stream;
-  const constraints = audioConstraints(mic);
-  constraints.audio.deviceId = { exact: chosen.deviceId };
-  try {
-    stream = await browserPorts().microphone.open(constraints);
-  } catch (_error) {
-    // The chosen device went away between listing and opening: the stream already open
-    // carries the call rather than the call dying on a device race.
-    return fallback;
-  }
-  for (const track of fallback.getTracks()) track.stop();
-  noteTrack(stream);
-  audioRoute.settleInput(deviceLabel(chosen));
-  return stream;
-}
-
-/**
- * Aim the call's playback where the reader chose, where the browser allows it at all. On
- * Android Chrome neither sink API exists, so this does nothing there BY DESIGN: the output
- * follows the communication route `openCallMicrophone` set up. Read-aloud never comes here.
- */
-async function applyCallOutput(context) {
-  if (!context || typeof context.setSinkId !== "function") return;
-  const prefs = audioDevices.preferences();
-  if (!prefs.outputId) return;
-  try {
-    await context.setSinkId(prefs.outputId);
-    audioRoute.noteSink(String(context.sinkId || prefs.outputId));
-  } catch (_error) {
-    // The chosen output went away between Settings and the call: the default carries it,
-    // and the record keeps the route actually in use rather than the choice that failed.
-    return;
-  }
-  try {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    const chosen = (devices || []).find((d) => d.deviceId === prefs.outputId);
-    if (chosen) audioRoute.noteOutput(deviceLabel(chosen));
-  } catch (_error) {
-    // No list, no kind: the readout says the sink id instead.
-  }
-}
+// The devices themselves — deviceLabel, classifyAudioDevice, pickCallInput, outputSinkSupported,
+// openCallMicrophone and applyCallOutput — are web/src/core/call's now (`createCallDevices`, made
+// above with the route it writes, `#624 voice-page-modularity`).
 
 // --- the control bar ------------------------------------------------------------------------
 //
