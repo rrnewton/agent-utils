@@ -107,8 +107,8 @@ def parser() -> argparse.ArgumentParser:
     start.add_argument("--harness", default=None, metavar="KIND",
         help="native harness: codex/claude/muse interactive, codex/agy/muse headless (default: codex)")
     start.add_argument("--model", metavar="MODEL", help="native model name; omission preserves the harness default")
-    start.add_argument("--reasoning-effort", metavar="EFFORT",
-        help="structured harness effort; use the profile or this option, never a duplicate raw argument")
+    start.add_argument("--reasoning-effort", "--effort", dest="reasoning_effort", metavar="EFFORT",
+        help="structured harness effort (alias: --effort); use the profile or this option, never a duplicate raw argument")
     start.add_argument("--resume", metavar="SESSION",
         help="resume an explicit native conversation for local interactive Claude/Codex/Muse, optionally using --profile")
     start.add_argument("--harness-arg", action="append", default=[], metavar="ARG",
@@ -239,6 +239,14 @@ def parser() -> argparse.ArgumentParser:
         "(the Rust edition only; this edition refuses it)")
     revive.add_argument("--startup-timeout", type=_ascii_float, default=30.0, metavar="SECONDS",
         help="replacement harness startup deadline, greater than 0 and at most 300 seconds (default: 30)")
+
+    set_effort = command("set-effort", "Record a new reasoning effort for a live agent "
+        "(the Rust edition only; this edition refuses it).",
+        "agentctl set-effort coordinator high", named=True)
+    set_effort.add_argument("level", metavar="LEVEL",
+        help="new reasoning effort level, validated against the agent's harness")
+    set_effort.add_argument("--urgent", action="store_true",
+        help="allow the change while the agent is mid-turn (the running turn is never killed)")
 
     restart = command("restart", "Restart a live agent with its recorded session: exit the harness "
         "gracefully at an idle turn boundary, relaunch resuming its session, re-pin it, restore "
@@ -591,6 +599,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 75 if outcome.blocked else (76 if outcome.quarantined else 0)
         elif args.command == "goal":
             result = sessions.goal(name, _text(args, optional=True), goal_command=_goal_command(args), **options)
+        elif args.command == "set-effort":
+            raise ValueError("set-effort is implemented only by the Rust edition")
         elif args.command == "rename":
             result = sessions.rename(name, args.new_name)
         elif args.command == "revive":

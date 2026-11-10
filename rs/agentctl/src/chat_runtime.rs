@@ -6856,12 +6856,25 @@ impl BridgeState {
                 .map(|profile| format!("profile:{profile}"))
                 .unwrap_or_else(|| "unknown".to_owned()),
         };
+        // Recorded effort first (#1216: start/run-headless/set-effort store it on the
+        // record); the launch profile is only the fallback, and a genuinely
+        // unrecorded effort stays "unknown", never guessed.
         let effort = record["effective_reasoning_effort"]
             .as_str()
             .or_else(|| record["reasoning_effort"].as_str())
             .or_else(|| record["effort"].as_str())
-            .unwrap_or("unknown")
-            .to_owned();
+            .map(str::to_owned)
+            .or_else(|| {
+                let profile = record["profile"].as_str()?;
+                let document: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(registry.join("profiles.json")).ok()?,
+                )
+                .ok()?;
+                document["profiles"][profile]["reasoning_effort"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "unknown".to_owned());
         (
             model,
             effort,
