@@ -865,4 +865,16 @@ mod tests {
         // Herdr's own verdict stands whenever it has one.
         assert_eq!(Codex.settle_herdr_state("working", idle), None);
     }
+
+    #[test]
+    fn daybreak_fresh_screen_reads_idle() {
+        // Captured from a fresh Codex launch whose OSC title still said
+        // working (#1207 codex-start-ready), names and paths made
+        // neutral: the Daybreak banner over an empty composer is a
+        // launched, idle harness, and the screen proof must say so even
+        // though no turn has run yet.
+        let screen = include_str!("../../testdata/codex/daybreak-fresh-idle.ansi");
+        assert!(idle_composer(screen), "{screen:?}");
+        assert_eq!(Codex.settle_herdr_state("unknown", screen), Some("idle"));
+    }
 }

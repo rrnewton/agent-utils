@@ -105,7 +105,7 @@ elif args[:2] == ['agent', 'rename']:
     state['named'] = {'name': args[3], 'pane_id': args[2], 'tab_id': state['pane']['tab_id'], 'terminal_id': state['pane']['terminal_id']}
     print(json.dumps({'result': {'agent': state['named']}}))
 elif args[:2] == ['agent', 'explain']:
-    print('agent: codex\nstate: unknown\nmanifest: bundled 2026.09.23.1\nrule: none\nfallback_reason: codex_state_ambiguous')
+    print(state.get('explain') or 'agent: codex\nstate: unknown\nmanifest: bundled 2026.09.23.1\nrule: none\nfallback_reason: codex_state_ambiguous')
 else:
     raise SystemExit('unexpected test command')
 path.write_text(json.dumps(state))
@@ -390,6 +390,44 @@ fn herdr_093_timeout_that_drops_the_name_is_named_once_the_pane_is_proved_ready(
     fs::write(herdr.root.join("frame.json"), frame.to_string()).unwrap();
     start_once(&herdr, "codex", false);
     assert_eq!(frame_of(&herdr)["renames"], serde_json::json!([]));
+}
+
+/// A fresh Codex whose OSC title still says working while its screen already shows the
+/// idle Daybreak prompt (#1207 codex-start-ready): the visible prompt wins over the stale
+/// title, the launch is accepted, and the dropped name is applied. A working verdict from
+/// a screen rule, or a genuinely working screen, is never overridden by the title check.
+#[test]
+fn herdr_093_stale_title_working_yields_to_the_idle_daybreak_screen() {
+    const DAYBREAK_IDLE: &str = include_str!("../../../testdata/codex/daybreak-fresh-idle.ansi");
+    const WORKING: &str = include_str!("../../../testdata/codex/v0164-working.ansi");
+    const TITLE_WORKING: &str = "agent: codex\nstate: working\nmanifest: bundled 2026.09.23.1\nrule: osc_title_working (region=osc_title priority=1050)";
+    const SCREEN_WORKING: &str = "agent: codex\nstate: working\nmanifest: bundled 2026.09.23.1\nrule: codex_working (region=screen priority=900)";
+    let herdr = FakeExecutable::new("{}");
+    let executable = fs::canonicalize("/bin/sleep").unwrap();
+    let process = spawn_test_process(&executable);
+    let mut frame = configure_start(&herdr, process.0.id(), &executable, DAYBREAK_IDLE);
+    frame["named"] = Value::Null;
+    frame["launched_pane"]["agent_status"] = Value::from("working");
+    frame["explain"] = Value::from(TITLE_WORKING);
+    fs::write(herdr.root.join("frame.json"), frame.to_string()).unwrap();
+    start_once(&herdr, "codex", true);
+    let frame = frame_of(&herdr);
+    assert_eq!(frame["renames"], serde_json::json!([["pane", "worker"]]));
+    assert_eq!(frame["named"]["pane_id"], "pane");
+
+    for (explain, screen) in [(SCREEN_WORKING, DAYBREAK_IDLE), (TITLE_WORKING, WORKING)] {
+        let mut frame = configure_start(&herdr, process.0.id(), &executable, screen);
+        frame["named"] = Value::Null;
+        frame["launched_pane"]["agent_status"] = Value::from("working");
+        frame["explain"] = Value::from(explain);
+        fs::write(herdr.root.join("frame.json"), frame.to_string()).unwrap();
+        start_once(&herdr, "codex", false);
+        assert_eq!(
+            frame_of(&herdr)["renames"],
+            serde_json::json!([]),
+            "{explain} / {screen:?}"
+        );
+    }
 }
 
 /// Codex can still be drawing its composer when Herdr gives up; agentctl keeps looking for up

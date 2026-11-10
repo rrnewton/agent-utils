@@ -3270,8 +3270,16 @@ impl HerdrClient {
             }
             _ => false,
         };
+        // A `working` verdict counts only when Herdr's own explanation
+        // attributes it to the OSC title alone (#1207 codex-start-ready):
+        // a fresh Codex can leave its title saying working after it has
+        // already drawn its idle prompt, and the visible prompt then wins.
+        // A screen-derived working verdict is never overridden, and an
+        // explanation Herdr cannot give proves nothing (fail closed).
+        let stale_title_working =
+            info.status == "working" && self.title_working(&info.pane_id).unwrap_or(false);
         if info.agent.as_deref() != Some("codex")
-            || info.status != "unknown"
+            || (info.status != "unknown" && !stale_title_working)
             || !native_valid
             || info
                 .terminal_id
