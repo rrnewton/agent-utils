@@ -78,9 +78,15 @@ export interface ScrollTrace {
   stop(): void;
   /** What was traced, as one JSON text: `{v: 1, startedAt, entries}`. */
   report(): string;
+  /**
+   * A jump's target row, by message id, left the viewport soon after the jump landed
+   * (`#1224 mention-jump-in-view`): noted, and the minute posts itself as for a shift.
+   * The watcher that knows the jump is the caller's; the trace only keeps and sends.
+   */
+  noteJumpLost(id: string): void;
 }
 
-type TraceKind = "write" | "scroll" | "into" | "shift" | "mutate" | "selection";
+type TraceKind = "write" | "scroll" | "into" | "shift" | "mutate" | "selection" | "jump-lost";
 
 interface TraceEntry {
   readonly t: number;
@@ -470,5 +476,11 @@ export function createScrollTrace(deps: ScrollTraceDependencies): ScrollTrace {
     start,
     stop,
     report: () => JSON.stringify({ v: 1, startedAt, entries }),
+    noteJumpLost(id: string): void {
+      const area = deps.lookup("scroll-area");
+      if (!area) return;
+      note("jump-lost", area, null, null, capped(id, ANCHOR_ID_CHARS));
+      maybeAutoSend();
+    },
   };
 }

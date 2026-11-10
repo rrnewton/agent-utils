@@ -2669,6 +2669,13 @@ test("`#1208 scroll-trace-layout-shift`: shifts, replacements and a lost selecti
     assert.match(entries[1].stack, /m-9 removed LI#\[m-9\] added LI#\[m-9\]/);
     assert.match(entries[2].stack, /was m-9 len 12/);
     assert.ok(!("text" in entries[2]) && !JSON.stringify(entries[2]).includes("twelve chars!"), "selection words were traced");
+    // `#1224 mention-jump-in-view`: a jump target lost is noted, and posts itself a minute on.
+    clock = 140000;
+    trace.noteJumpLost("m-9");
+    const jumped = JSON.parse(trace.report()).entries.at(-1);
+    assert.equal(jumped.kind, "jump-lost");
+    assert.equal(jumped.stack, "m-9");
+    assert.equal(sent.length, 3, "a lost jump target did not post the trace by itself");
     trace.stop();
     assert.equal(doc.count("selectionchange"), 0, "stopping left the selection listener up");
   } finally {

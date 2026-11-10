@@ -60,6 +60,9 @@ pub enum TraceKind {
     Mutate,
     /// A live selection collapsed with no hand in it (`#1208`).
     Selection,
+    /// A jump's target row left the viewport soon after landing (`#1224`).
+    #[serde(rename = "jump-lost")]
+    JumpLost,
 }
 
 impl TraceKind {
@@ -71,6 +74,7 @@ impl TraceKind {
             Self::Shift => "shift",
             Self::Mutate => "mutate",
             Self::Selection => "selection",
+            Self::JumpLost => "jump-lost",
         }
     }
 }
@@ -395,6 +399,26 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_value(kind).expect("serializes"), word);
         }
+    }
+
+    #[test]
+    fn a_jump_lost_entry_reads_and_logs() {
+        let mut jumped = entry();
+        jumped.kind = TraceKind::JumpLost;
+        jumped.stack = "m-1".to_owned();
+        jumped.value = None;
+        let wire = serde_json::json!({
+            "v": 1, "startedAt": 10000.0,
+            "entries": [{
+                "t": 12345.5, "kind": "jump-lost", "id": "scroll-area", "from": null, "to": null,
+                "stack": "m-1", "focus": null, "composer": null, "vv": null,
+                "scrollHeight": 9000.0, "clientHeight": 700.0, "anchor": null
+            }]
+        });
+        let parsed: TraceReport = serde_json::from_value(wire).expect("a jump-lost entry reads");
+        parsed.validate().expect("valid");
+        assert!(parsed.entries[0].log_fields(0).contains("kind=jump-lost"));
+        let _ = jumped;
     }
 
     #[test]
