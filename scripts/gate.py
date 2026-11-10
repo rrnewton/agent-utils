@@ -99,6 +99,36 @@ Rollout is the coordinators': land with the switch off, watch
 `gate.py queue --explain` for a day, enable the first host in a quiet
 window, then the second after a clean day.
 
+Owner priority (#1180 gate-owner-priority): work the owner asked for must
+not wait behind every earlier ticket. `--priority owner` (or
+$GATE_PRIORITY=owner) with a required reason (--priority-reason or
+$GATE_PRIORITY_REASON, such as "#286 owner UI fast-track") records
+`priority`/`priority_reason` in the ticket and sorts it ahead of every
+queued ticket — owner tier first (FIFO inside it), then the rerun tier,
+then ordinary FIFO. It never preempts a running gate or a gate already in
+its exclusive phase: it only wins the next grant decisions. A genuine
+nested exclusive phase of an owner gate inherits the tier from its live
+parent's ticket; other children never see $GATE_PRIORITY (stripped from
+the child environment), so the tier cannot leak into unrelated gates.
+Owner arrivals can in principle starve ordinary tickets for as long as
+owner work keeps arriving; that is the stated policy, and every use is
+visible in `gate status`/`gate queue` and recorded in history and the
+ledger with its reason.
+
+Mixed versions: every slot runs its own checkout's gate.py, and older
+waiters ignore the priority fields entirely. The slot cap is unaffected:
+a grant still re-reads runs/ and writes the new run file inside one
+flock-held critical section in every client generation, so two processes
+can never both admit past the cap — ordering disagreements change who
+wins a freed slot, never how many run. Strict owner-first ordering holds
+among waiters running this build; an older waiter can still win the race
+for a freed slot until it drains (waiters are per-gate processes). The
+same change makes shared FIFO real among new waiters: a shared waiter now
+counts the shared tickets ahead of it in grant order against the slots,
+instead of racing every other shared waiter's 1s poll when a barrier
+lifts (the 2026-11-09 8:54 PM ET jump, where a ticket queued at 8:49 PM
+started while tickets queued at 6:15 PM still waited).
+
 `gate.py queue [--explain]` lists running runs and queued tickets in grant
 order; --explain says for each ticket why it waits: the running runs and the
 tickets ahead of it (and why each is ahead), a full shared box, or an active
@@ -167,10 +197,20 @@ def _child_environment(**overrides: str) -> dict[str, str]:
     must never inherit it. Force the explicit opt-out, which the engine
     resolver ranks above the host file, and point the file variable at a
     name that does not exist under the gate scratch directory.
+
+    Owner priority (#1180) is a property of this run's ticket, not of its
+    children: $GATE_PRIORITY is stripped, so no child that starts its own
+    gate inherits the tier by accident. A genuine nested exclusive phase
+    re-derives it from the parent's ticket instead (see `run_admitted`).
     """
 
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in ("GATE_PRIORITY", "GATE_PRIORITY_REASON")
+    }
     return {
-        **os.environ,
+        **env,
         "WRKSLOTS_RUST_READERS": "0",
         "WRKSLOTS_RUST_READERS_FILE": str(state_dir() / "no-wrkslots-rust-readers"),
         **overrides,
@@ -428,6 +468,17 @@ def _alive(pid: object) -> bool:
         return False
 
 
+def _tier(data: dict[str, object]) -> int:
+    """Grant tier of a ticket: 0 owner priority (#1180), 1 rerun-marked
+    (an explicit --rerun or a phase-priority mark, #1146), 2 ordinary.
+    Any priority value other than "owner" reads as ordinary, so a ticket
+    from a client that writes a value this build does not know degrades
+    to FIFO instead of crashing a waiter."""
+    if data.get("priority") == "owner":
+        return 0
+    return 1 if data.get("rerun") else 2
+
+
 class Admission:
     def __init__(self, root: Path, slots: int) -> None:
         self.root = root
@@ -467,13 +518,16 @@ class Admission:
                     path.unlink(missing_ok=True)
 
     def tickets(self) -> list[tuple[Path, dict[str, object]]]:
-        """Queued tickets in grant order: reruns first, then FIFO."""
+        """Queued tickets in grant order: owner tier, then reruns, then
+        FIFO. Filename order is enqueue order, so the stable tier sort
+        keeps arrival order inside each tier. A ticket written before the
+        priority fields existed reads as ordinary."""
         out = []
         for path in sorted((self.root / "queue").glob("*.json")):
             data = self._read(path)
             if data is not None:
                 out.append((path, data))
-        out.sort(key=lambda item: 0 if item[1].get("rerun") else 1)
+        out.sort(key=lambda item: _tier(item[1]))
         return out
 
     def runs(self) -> list[dict[str, object]]:
@@ -499,12 +553,15 @@ class Admission:
         rerun: bool = False,
         nested_phase: bool = False,
         phase_priority_source: str | None = None,
+        priority: str | None = None,
+        priority_reason: str | None = None,
     ) -> tuple[str, Path]:
         run_id = f"{time.time_ns()}-{uuid.uuid4().hex[:8]}"
         ticket: dict[str, object] = {
             "id": run_id, "pid": os.getpid(), "class": cls,
             "queued_at": time.time(), "command": command, "rerun": rerun,
             "nested_phase": nested_phase, "phase_priority": phase_priority_source,
+            "priority": priority, "priority_reason": priority_reason,
         }
         self._locked()
         try:
@@ -528,18 +585,39 @@ class Admission:
         ids = [str(data["id"]) for _, data in tickets]
         if run_id not in ids:
             return []
-        ahead = tickets[: ids.index(run_id)]
+        index = ids.index(run_id)
+        ahead = tickets[:index]
         if cls == "exclusive":
             return (
                 [("ticket", data, "ahead") for _, data in ahead]
                 + [("run", run, "running") for run in runs]
             )
+        # Shared (#1180): a ticket of a higher tier ahead blocks, as does
+        # an exclusive ticket of this waiter's tier or above — an owner
+        # ticket sorts ahead of every ordinary exclusive ticket, so only
+        # a same-tier exclusive can stand ahead of it. Otherwise the
+        # waiter takes a slot only behind the shared tickets ahead of it
+        # in grant order: runs plus shared-ahead must leave a slot free.
+        # Before this, shared waiters never blocked each other, so when a
+        # barrier lifted the freed slots went to whichever 1s poll fired
+        # first (2026-11-09 8:54 PM ET: a ticket queued at 8:49 PM started
+        # while tickets queued at 6:15 PM still waited) — a fairness bug
+        # against the FIFO this order claims, with unbounded starvation.
+        my_tier = _tier(tickets[index][1])
         blockers: list[tuple[str, dict[str, object], str]] = [
-            ("ticket", data, "ahead") for _, data in ahead if data.get("class") == "exclusive"
+            ("ticket", data, "ahead")
+            for _, data in ahead
+            if _tier(data) < my_tier
+            or (data.get("class") == "exclusive" and _tier(data) <= my_tier)
         ]
         blockers += [("run", run, "running") for run in runs if run.get("class") == "exclusive"]
-        if not blockers and len(runs) >= self.effective_slots():
-            blockers += [("run", run, "slots-full") for run in runs]
+        if not blockers:
+            ahead_shared = [data for _, data in ahead if data.get("class") != "exclusive"]
+            if len(runs) + len(ahead_shared) >= self.effective_slots():
+                if ahead_shared:
+                    blockers += [("ticket", data, "ahead") for data in ahead_shared]
+                else:
+                    blockers += [("run", run, "slots-full") for run in runs]
         return blockers
 
     def try_grant(self, run_id: str, cls: str) -> bool:
@@ -621,6 +699,43 @@ def _selected_steps(command: list[str]) -> list[str]:
     return [step for step in selected if step]
 
 
+def _priority_request(
+    args: argparse.Namespace,
+) -> tuple[str | None, str | None, str | None]:
+    """This caller's owner-priority request (#1180): (priority, reason,
+    problem). --priority wins over $GATE_PRIORITY and --priority-reason
+    over $GATE_PRIORITY_REASON. Unset/empty/`normal` means no priority.
+    `owner` requires a non-empty reason (an issue number, an owner
+    quote): the reason is recorded in the ticket, history and ledger
+    and printed by `status` and `queue`, so a fast-tracked gate can
+    always be traced to who asked. Any other value is refused rather
+    than silently run as ordinary."""
+
+    raw = getattr(args, "priority", None)
+    source = "--priority"
+    if raw is None:
+        raw = os.environ.get("GATE_PRIORITY")
+        source = "$GATE_PRIORITY"
+    value = (raw or "").strip().lower()
+    if value in ("", "normal"):
+        return None, None, None
+    if value != "owner":
+        return None, None, (
+            f"{source}={raw!r} is not a priority this gate knows "
+            "(use `owner` with a reason, or leave it unset for normal)"
+        )
+    reason_raw = getattr(args, "priority_reason", None)
+    if reason_raw is None:
+        reason_raw = os.environ.get("GATE_PRIORITY_REASON")
+    reason = (reason_raw or "").strip()
+    if not reason:
+        return None, None, (
+            "owner priority needs a reason: pass --priority-reason \"#1234 owner fast-track\" "
+            "or set $GATE_PRIORITY_REASON; it is recorded in the ticket and ledger"
+        )
+    return "owner", reason, None
+
+
 def _rerun_problem(command: list[str]) -> str | None:
     """Why `command` is not a short rerun of named steps, or None if it is."""
 
@@ -686,6 +801,10 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     active = active_blackout(windows, now)
     if active is not None and not ignore and not nested and getattr(args, "no_wait_blackout", False):
         return _refuse_blackout(active, now)
+    priority, priority_reason, priority_problem = _priority_request(args)
+    if priority_problem:
+        print(f"gate: {priority_problem}", flush=True)
+        return 2
     rerun = bool(getattr(args, "rerun", False))
     if rerun:
         problem = _rerun_problem(command)
@@ -728,6 +847,22 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
         print(f"gate: nested exclusive phase queues in the rerun tier ({phase_source})", flush=True)
     elif phase_source is not None and phase_source.endswith("; off"):
         print(f"gate: warning: phase priority off: {phase_source}", flush=True)
+    # #1180: an owner gate's own nested exclusive phase is part of the
+    # fast-tracked run. Children never inherit $GATE_PRIORITY (stripped in
+    # _child_environment), so re-derive the tier from the live parent's
+    # ticket, with the same liveness check as the phase mark. An explicit
+    # --rerun or an explicit priority of its own is never overridden.
+    if priority is None and nested_phase and parent_run:
+        parent = adm._read(state_dir() / "runs" / f"{parent_run}.json")
+        if parent is not None and parent.get("priority") == "owner":
+            inherited_reason = parent.get("priority_reason")
+            priority = "owner"
+            priority_reason = inherited_reason if isinstance(inherited_reason, str) else None
+            print(f"gate: nested exclusive phase inherits owner priority "
+                  f"from its parent gate ({priority_reason})", flush=True)
+    if priority == "owner":
+        print(f"gate: owner priority ({priority_reason}): this ticket sorts ahead of every "
+              "queued ticket; running gates are not preempted", flush=True)
     # A gate invoked from inside an admitted gate (validate.py running its
     # gate-exclusive steps) must not queue behind its own parent: the parent
     # process is blocked waiting for this call and will never finish. Release
@@ -739,6 +874,7 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     run_id, _ = adm.enqueue(
         args.cls, command, rerun or phase_marked,
         nested_phase=nested_phase, phase_priority_source=phase_mark_source,
+        priority=priority, priority_reason=priority_reason,
     )
     queued_at = time.time()
     last_pos = -1
@@ -826,7 +962,8 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
                     "finished_at": finished, "wait_s": round(waited, 2),
                     "run_s": round(finished - started, 2), "exit_code": rc,
                     "rerun": rerun, "nested_phase": nested_phase,
-                    "phase_priority": phase_mark_source})
+                    "phase_priority": phase_mark_source,
+                    "priority": priority, "priority_reason": priority_reason})
         # After the slot is released, so no other gate waits on it (#940). A
         # nested gate leaves it to its parent, which is still building.
         pruned = None if nested or getattr(args, "no_prune", False) else _prune_after_gate()
@@ -837,7 +974,8 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
         _record_ledger(args, command, started, finished, rc,
                        passed_steps, failed_steps, verdict_word, pruned, queued_at,
                        preflight=preflight, aborted=aborted, rerun_flag=rerun,
-                       nested_phase=nested_phase, phase_priority_source=phase_mark_source)
+                       nested_phase=nested_phase, phase_priority_source=phase_mark_source,
+                       priority=priority, priority_reason=priority_reason)
     return rc
 
 
@@ -915,6 +1053,8 @@ def _record_ledger(
     rerun_flag: bool = False,
     nested_phase: bool = False,
     phase_priority_source: str | None = None,
+    priority: str | None = None,
+    priority_reason: str | None = None,
 ) -> None:
     """Append one durable ledger line for the finished run (#827). Best effort:
     a ledger failure must never change the gate's own result. `queued_utc` and
@@ -953,6 +1093,8 @@ def _record_ledger(
             "rerun": rerun_flag,
             "nested_phase": nested_phase,
             "phase_priority": phase_priority_source,
+            "priority": priority,
+            "priority_reason": priority_reason,
             "log_path": None,
             "target_bytes_before": (pruned or {}).get("target_bytes_before"),
             "target_bytes_after": (pruned or {}).get("target_bytes_after"),
@@ -973,8 +1115,10 @@ def show_status(args: argparse.Namespace) -> int:
     adm._locked()
     try:
         adm._reap()
-        queue = [(str(d["id"]), str(d["class"])) for _, d in adm.tickets()]
-        runs = [(str(d["id"]), str(d.get("class"))) for d in adm.runs()]
+        ticket_data = [d for _, d in adm.tickets()]
+        queue = [(str(d["id"]), str(d["class"])) for d in ticket_data]
+        run_data = adm.runs()
+        runs = [(str(d["id"]), str(d.get("class"))) for d in run_data]
     finally:
         adm._unlocked()
     rows = adm.history()
@@ -982,6 +1126,11 @@ def show_status(args: argparse.Namespace) -> int:
     recent = [r for r in rows if float(str(r.get("finished_at", 0))) >= cutoff]
     waits = sorted(float(str(r["wait_s"])) for r in recent if "wait_s" in r)
     print(f"gate status: {len(runs)} running {runs}, {len(queue)} queued {queue}")
+    for data in run_data + ticket_data:
+        if data.get("priority") == "owner":
+            state = "running" if data in run_data else "queued"
+            print(f"gate status: owner priority {state} {data.get('id')} "
+                  f"({data.get('priority_reason')})")
     cap, problem = host_slot_cap()
     print(f"gate status: shared slots {adm.effective_slots()}"
           + (f" (host cap {cap} from {slots_config_path()})" if cap is not None else
@@ -1043,6 +1192,8 @@ def _is_inferred_phase(data: dict[str, object]) -> bool:
 
 
 def _ticket_label(data: dict[str, object]) -> str:
+    if data.get("priority") == "owner":
+        return f"owner priority ({data.get('priority_reason')})"
     if data.get("nested_phase"):
         if data.get("rerun"):
             return f"nested exclusive phase (rerun-tier mark on, {data.get('phase_priority')})"
@@ -1055,9 +1206,12 @@ def _ticket_label(data: dict[str, object]) -> str:
 
 
 def _why_ahead(ahead: dict[str, object], ticket: dict[str, object]) -> str:
-    if ahead.get("rerun") and not ticket.get("rerun"):
-        return "rerun tier"
-    if ahead.get("rerun"):
+    ahead_tier, ticket_tier = _tier(ahead), _tier(ticket)
+    if ahead_tier < ticket_tier:
+        return "owner tier" if ahead_tier == 0 else "rerun tier"
+    if ahead_tier == 0:
+        return "FIFO within owner tier"
+    if ahead.get("rerun") and ticket.get("rerun"):
         return "FIFO within rerun tier"
     return "FIFO"
 
@@ -1177,6 +1331,9 @@ def show_stats(args: argparse.Namespace) -> int:
           f"({args.since or 'all time'}, ledger {path})")
     print(f"gate stats: {sum(1 for r in reruns if r.get('rerun_passed'))}/{len(reruns)} "
           "exclusive rerun(s) passed")
+    owners = [row for row in rows if row.get("priority") == "owner"]
+    if owners:
+        print(f"gate stats: {len(owners)} owner-priority run(s) (#1180 fast-track)")
     if aborted:
         print(f"gate stats: {len(aborted)} run(s) aborted by a signal (not counted as first runs)")
     refused = sum(1 for row in rows if row.get("kind") == "preflight-refused")
@@ -1697,6 +1854,20 @@ def main(argv: list[str] | None = None) -> int:
                              "(FIFO among reruns); it still waits for running gates. "
                              "Example: gate.py --rerun -- common/bin/dagrun run --dag validation.dag.yaml "
                              "--keep-going --selected vibe-talk.check.fold-latency-browser")
+    parser.add_argument("--priority", choices=["normal", "owner"], default=None,
+                        help="queue priority (default $GATE_PRIORITY, else normal). `owner` "
+                             "fast-tracks work the owner asked for (#1180): the ticket is "
+                             "admitted ahead of every queued ticket, reruns included (FIFO "
+                             "among owner tickets), and never preempts a running gate or a "
+                             "gate already in its exclusive phase. Requires --priority-reason "
+                             "(or $GATE_PRIORITY_REASON). Example: GATE_PRIORITY=owner "
+                             "GATE_PRIORITY_REASON='#286 owner UI fast-track' scripts/gate.py "
+                             "-- python3 scripts/validate.py --all --keep-going")
+    parser.add_argument("--priority-reason", default=None,
+                        help="why this run is owner priority, such as the issue number or the "
+                             "owner's request (default $GATE_PRIORITY_REASON); recorded in the "
+                             "ticket, history and ledger and printed by `gate status` and "
+                             "`gate queue`. Required with --priority owner; ignored otherwise")
     parser.add_argument("--skip-preflight", action="store_true",
                         help="queue without the preflight. Before queueing, a top-level run checks "
                              "this checkout with the validation steps " + " and ".join(PREFLIGHT_STEPS)
@@ -1715,7 +1886,8 @@ def main(argv: list[str] | None = None) -> int:
         queue_parser = argparse.ArgumentParser(
             prog="gate queue",
             description=(
-                "List running runs and queued tickets in grant order. The header "
+                "List running runs and queued tickets in grant order (owner tier, "
+                "then rerun tier, then FIFO; #1180). The header "
                 "shows the phase-priority switch (#1146): on/off and what decided "
                 "it ($GATE_PHASE_PRIORITY=1/0, else `phase_priority = true` in the "
                 "per-host file $GATE_PHASE_PRIORITY_CONFIG or "
@@ -1731,7 +1903,8 @@ def main(argv: list[str] | None = None) -> int:
         queue_parser.add_argument("--explain", action="store_true",
                                   help="for each queued ticket, name what blocks it: the running "
                                        "runs it waits for, the tickets ahead of it and why each is "
-                                       "ahead (rerun tier or FIFO), a full shared box, or an active "
+                                       "ahead (owner tier, rerun tier, or FIFO), a full shared box, "
+                                       "or an active "
                                        "blackout; an unmarked exclusive-phase ticket also gets a "
                                        "starvation line counting reruns queued after it that stand "
                                        "ahead of it")

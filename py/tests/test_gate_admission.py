@@ -20,7 +20,8 @@ PY = sys.executable
 
 
 def _env(tmp_path: Path) -> dict[str, str]:
-    base = {key: value for key, value in os.environ.items() if key != "GATE_PHASE_PRIORITY"}
+    base = {key: value for key, value in os.environ.items()
+            if key not in ("GATE_PHASE_PRIORITY", "GATE_PRIORITY", "GATE_PRIORITY_REASON")}
     return {**base, "GATE_ADMISSION_DIR": str(tmp_path / "admission"),
             "GATE_LEDGER": str(tmp_path / "ledger.jsonl"), "GATE_PRUNE_TARGETS": "off",
             "GATE_SLOTS_CONFIG": str(tmp_path / "gate-slots.toml"),
@@ -668,6 +669,252 @@ def test_queue_explain_says_admissible_when_nothing_blocks(tmp_path: Path) -> No
                                capture_output=True, text=True, timeout=30)
     assert explained.returncode == 0, explained.stdout
     assert "admissible now" in explained.stdout
+
+
+def test_an_owner_priority_ticket_jumps_reruns_and_ordinary_gates(tmp_path: Path) -> None:
+    """#1180: an owner-priority ticket queued last is admitted ahead of a
+    rerun and an ordinary ticket alike, without preempting the running
+    gate; the ticket, history and ledger all carry the reason."""
+    order = tmp_path / "order.txt"
+
+    def note(tag: str) -> str:
+        return f"open({str(order)!r}, 'a').write({tag!r} + '\\n')"
+
+    gate = tmp_path / "release"
+    running = _start(tmp_path, "--exclusive", "--", PY, "-c",
+                     f"import os, time\nwhile not os.path.exists({str(gate)!r}): time.sleep(0.05)")
+    _wait_for_runs(tmp_path, 1)
+    ordinary = _start(tmp_path, "--", PY, "-c", note("ordinary"))
+    _wait_for_queue(tmp_path, 1)
+    rerun = _start(tmp_path, "--rerun", "--", PY, "-c", note("rerun"), "--selected", "a.step")
+    _wait_for_queue(tmp_path, 2)
+    env = {**_env(tmp_path), "GATE_PRIORITY": "owner",
+           "GATE_PRIORITY_REASON": "#286 owner UI fast-track"}
+    owner = _start_env(tmp_path, env, "--", PY, "-c", note("owner"))
+    _wait_for_queue(tmp_path, 3)
+    [ticket] = [json.loads(path.read_text())
+                for path in (tmp_path / "admission" / "queue").glob("*.json")
+                if json.loads(path.read_text()).get("priority") == "owner"]
+    assert ticket["priority_reason"] == "#286 owner UI fast-track"
+    assert ticket["rerun"] is False and ticket["class"] == "shared"
+    gate.write_text("")
+    for proc in (running, ordinary, rerun, owner):
+        out, _ = proc.communicate(timeout=60)
+        assert proc.returncode == 0, out
+    assert order.read_text().split() == ["owner", "rerun", "ordinary"]
+    [row] = [row for row in _ledger_rows(tmp_path) if row.get("priority") == "owner"]
+    assert row["priority_reason"] == "#286 owner UI fast-track"
+    history = [json.loads(line)
+               for line in (tmp_path / "admission" / "history.jsonl").read_text().splitlines()]
+    [hrow] = [row for row in history if row.get("priority") == "owner"]
+    assert hrow["priority_reason"] == "#286 owner UI fast-track"
+
+
+def test_owner_tickets_keep_arrival_order_and_a_normal_waiter_cannot_pass_them(
+    tmp_path: Path,
+) -> None:
+    """FIFO within the owner tier: with one free slot the earlier owner
+    ticket wins, and a normal shared waiter queued before both still
+    waits behind them (no poll race past a queued owner ticket)."""
+    order = tmp_path / "order.txt"
+
+    def note(tag: str) -> str:
+        return f"open({str(order)!r}, 'a').write({tag!r} + '\\n')"
+
+    gate = tmp_path / "release"
+    running = _start(tmp_path, "--exclusive", "--", PY, "-c",
+                     f"import os, time\nwhile not os.path.exists({str(gate)!r}): time.sleep(0.05)")
+    _wait_for_runs(tmp_path, 1)
+    ordinary = _start(tmp_path, "--slots", "1", "--", PY, "-c", note("ordinary"))
+    _wait_for_queue(tmp_path, 1)
+    first = _start(tmp_path, "--slots", "1", "--priority", "owner",
+                   "--priority-reason", "#286 first", "--",
+                   PY, "-c", note("owner1") + "; import time; time.sleep(2)")
+    _wait_for_queue(tmp_path, 2)
+    second = _start(tmp_path, "--slots", "1", "--priority", "owner",
+                    "--priority-reason", "#286 second", "--", PY, "-c", note("owner2"))
+    _wait_for_queue(tmp_path, 3)
+    gate.write_text("")
+    for proc in (running, ordinary, first, second):
+        out, _ = proc.communicate(timeout=60)
+        assert proc.returncode == 0, out
+    assert order.read_text().split() == ["owner1", "owner2", "ordinary"]
+
+
+def test_shared_tickets_are_granted_in_queue_order_when_slots_free(tmp_path: Path) -> None:
+    """#1180 anomaly regression: two shared waiters behind a barrier must
+    be granted in queue order, not in 1s-poll race order (2026-11-09
+    8:54 PM ET: a shared ticket queued hours later won the race)."""
+    order = tmp_path / "order.txt"
+
+    def note(tag: str) -> str:
+        return f"open({str(order)!r}, 'a').write({tag!r} + '\\n')"
+
+    gate = tmp_path / "release"
+    running = _start(tmp_path, "--exclusive", "--", PY, "-c",
+                     f"import os, time\nwhile not os.path.exists({str(gate)!r}): time.sleep(0.05)")
+    _wait_for_runs(tmp_path, 1)
+    first = _start(tmp_path, "--slots", "1", "--",
+                   PY, "-c", note("first") + "; import time; time.sleep(2)")
+    _wait_for_queue(tmp_path, 1)
+    second = _start(tmp_path, "--slots", "1", "--", PY, "-c", note("second"))
+    _wait_for_queue(tmp_path, 2)
+    gate.write_text("")
+    for proc in (running, first, second):
+        out, _ = proc.communicate(timeout=60)
+        assert proc.returncode == 0, out
+    assert order.read_text().split() == ["first", "second"]
+
+
+def test_owner_priority_requires_a_reason_and_a_known_value(tmp_path: Path) -> None:
+    no_reason = subprocess.run([PY, str(GATE), "--priority", "owner", "--", PY, "-c", "pass"],
+                               env=_env(tmp_path), capture_output=True, text=True, timeout=30)
+    assert no_reason.returncode == 2 and "reason" in no_reason.stdout
+    bad_env = subprocess.run([PY, str(GATE), "--", PY, "-c", "pass"],
+                             env={**_env(tmp_path), "GATE_PRIORITY": "urgent"},
+                             capture_output=True, text=True, timeout=30)
+    assert bad_env.returncode == 2 and "GATE_PRIORITY" in bad_env.stdout
+    child = ("import os; print('priority=' + os.environ.get('GATE_PRIORITY', '<unset>')); "
+             "print('reason=' + os.environ.get('GATE_PRIORITY_REASON', '<unset>'))")
+    stripped = subprocess.run(
+        [PY, str(GATE), "--priority", "owner", "--priority-reason", "#286", "--",
+         PY, "-c", child],
+        env={**_env(tmp_path), "GATE_PRIORITY": "owner", "GATE_PRIORITY_REASON": "#286"},
+        capture_output=True, text=True, timeout=30)
+    assert stripped.returncode == 0, stripped.stdout
+    assert "priority=<unset>" in stripped.stdout.splitlines()
+    assert "reason=<unset>" in stripped.stdout.splitlines()
+    help_text = subprocess.run([PY, str(GATE), "--help"], env=_env(tmp_path),
+                               capture_output=True, text=True, timeout=30)
+    assert "--priority" in help_text.stdout and "GATE_PRIORITY" in help_text.stdout
+
+
+def test_legacy_clients_see_an_owner_ticket_as_an_ordinary_one(tmp_path: Path) -> None:
+    """Mixed versions: a ticket written before the priority fields (and an
+    owner ticket read by such a client) changes nothing for the legacy
+    sort (`rerun`, then filename), while the new sort puts owner first."""
+    gate = _gate_module()
+    adm = gate.Admission(tmp_path / "admission", 2)
+    queue = tmp_path / "admission" / "queue"
+    rows = [
+        ("050-ordinary", "shared", False, {}),
+        ("100-owner", "shared", False,
+         {"priority": "owner", "priority_reason": "#286"}),
+        ("150-legacy", "shared", None, {}),  # no rerun field at all
+        ("200-rerun", "exclusive", True, {}),
+    ]
+    for run_id, cls, rerun, extra in rows:
+        data: dict[str, object] = {"id": run_id, "pid": os.getpid(), "class": cls,
+                                   "queued_at": 0, "command": [], **extra}
+        if rerun is not None:
+            data["rerun"] = rerun
+        (queue / f"{run_id}.json").write_text(json.dumps(data))
+    tickets = adm.tickets()
+    assert [str(data["id"]) for _, data in tickets] == [
+        "100-owner", "200-rerun", "050-ordinary", "150-legacy"]
+    # The deployed legacy algorithm on the same files: filename order,
+    # stable by the rerun field alone.
+    legacy = sorted(tickets, key=lambda item: item[0].name)
+    legacy.sort(key=lambda item: 0 if item[1].get("rerun") else 1)
+    assert [str(data["id"]) for _, data in legacy] == [
+        "200-rerun", "050-ordinary", "100-owner", "150-legacy"]
+
+
+def test_concurrent_admission_mixed_versions_never_exceeds_the_cap(tmp_path: Path) -> None:
+    """Mixed versions: one Admission ordering by the new tiers and one by
+    the legacy rerun-only sort grant against the same state dir; the flock
+    around check-and-write means runs/ never passes the cap, and exactly
+    the cap's worth of grants succeed."""
+    gate = _gate_module()
+    root = tmp_path / "admission"
+    # One Admission per thread below: real waiters are separate
+    # processes, each with its own lock fd; threads sharing one fd would
+    # share its flock. This first one just creates the state dirs.
+    gate.Admission(root, 2)
+
+    def legacy_tickets() -> list[tuple[Path, dict[str, object]]]:
+        out = []
+        for path in sorted((root / "queue").glob("*.json")):
+            data = gate.Admission._read(path)
+            if data is not None:
+                out.append((path, data))
+        out.sort(key=lambda item: 0 if item[1].get("rerun") else 1)
+        return out
+
+    def legacy_blockers_for(client: object):  # type: ignore[no-untyped-def]
+        def legacy_blockers(run_id: str, cls: str,
+                            tickets: list[tuple[Path, dict[str, object]]],
+                            runs: list[dict[str, object]]) -> list[tuple[str, dict[str, object], str]]:
+            # The deployed pre-#1180 rules, verbatim in effect: shared
+            # waiters ignore shared tickets ahead and know no priority.
+            ids = [str(data["id"]) for _, data in tickets]
+            if run_id not in ids:
+                return []
+            ahead = tickets[: ids.index(run_id)]
+            if cls == "exclusive":
+                return ([("ticket", data, "ahead") for _, data in ahead]
+                        + [("run", run, "running") for run in runs])
+            blockers: list[tuple[str, dict[str, object], str]] = [
+                ("ticket", data, "ahead") for _, data in ahead if data.get("class") == "exclusive"]
+            blockers += [("run", run, "running") for run in runs if run.get("class") == "exclusive"]
+            if not blockers and len(runs) >= client.effective_slots():  # type: ignore[attr-defined]
+                blockers += [("run", run, "slots-full") for run in runs]
+            return blockers
+
+        return legacy_blockers
+
+    def old_client() -> object:
+        client = gate.Admission(root, 2)
+        client.tickets = legacy_tickets  # type: ignore[attr-defined, method-assign]
+        client.grant_blockers = legacy_blockers_for(client)  # type: ignore[attr-defined, method-assign]
+        return client
+    for index in range(6):
+        extra: dict[str, object] = (
+            {"priority": "owner", "priority_reason": "#286"} if index == 5 else {})
+        _write_ticket(root, "queue", f"{index:03d}-t{index}", {
+            "id": f"{index:03d}-t{index}", "pid": os.getpid(), "class": "shared",
+            "queued_at": index, "command": [], "rerun": False, **extra})
+    import threading
+    granted: list[str] = []
+    lock = threading.Lock()
+
+    def attempt(client: object, run_id: str) -> None:
+        if client.try_grant(run_id, "shared"):  # type: ignore[attr-defined]
+            with lock:
+                granted.append(run_id)
+
+    clients = [gate.Admission(root, 2) if i % 2 == 0 else old_client() for i in range(6)]
+    threads = [threading.Thread(target=attempt, args=(client, f"{i:03d}-t{i}"))
+               for i, client in enumerate(clients)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert len(granted) == 2
+    assert len(list((root / "runs").glob("*.json"))) == 2
+
+
+def test_status_and_queue_name_the_owner_priority_and_reason(tmp_path: Path) -> None:
+    now = time.time()
+    root = tmp_path / "admission"
+    _write_ticket(root, "queue", "100-ordinary", {
+        "id": "100-ordinary", "pid": os.getpid(), "class": "shared",
+        "queued_at": now - 600, "rerun": False, "command": [PY, "-c", "pass"]})
+    _write_ticket(root, "queue", "200-owner", {
+        "id": "200-owner", "pid": os.getpid(), "class": "shared",
+        "queued_at": now - 60, "rerun": False,
+        "priority": "owner", "priority_reason": "#286 owner UI fast-track",
+        "command": [PY, "-c", "pass"]})
+    status = subprocess.run([PY, str(GATE), "status"], env=_env(tmp_path),
+                            capture_output=True, text=True, timeout=30)
+    assert status.returncode == 0, status.stdout
+    assert "owner" in status.stdout and "#286 owner UI fast-track" in status.stdout
+    explained = subprocess.run([PY, str(GATE), "queue", "--explain"], env=_env(tmp_path),
+                               capture_output=True, text=True, timeout=30)
+    assert explained.returncode == 0, explained.stdout
+    assert explained.stdout.index("200-owner") < explained.stdout.index("100-ordinary")
+    assert "owner priority (#286 owner UI fast-track)" in explained.stdout
+    assert "blocked by ticket 200-owner ahead (owner tier)" in explained.stdout
 
 
 FAILING_PREFLIGHT = (
