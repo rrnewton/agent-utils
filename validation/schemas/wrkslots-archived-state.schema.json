@@ -346,6 +346,11 @@
           "const": "git",
           "description": "Git.",
           "type": "string"
+        },
+        {
+          "const": "eden",
+          "description": "Eden.",
+          "type": "string"
         }
       ]
     }

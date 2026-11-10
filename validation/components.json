@@ -423,6 +423,7 @@
         "py/wrkslots/tests/test_doctor_audit_cli_rust.py",
         "py/wrkslots/tests/test_doctor_state_rust.py",
         "py/wrkslots/tests/test_e2e_stress.py",
+        "py/wrkslots/tests/test_eden.py",
         "py/wrkslots/tests/test_ensure_states_rust.py",
         "py/wrkslots/tests/test_event_memo.py",
         "py/wrkslots/tests/test_finish_write_rust.py",

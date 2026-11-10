@@ -318,6 +318,35 @@ pub(crate) fn checkout_from_obj(value: &Value, label: &str) -> Result<CheckoutRe
     }
     let vcs = as_str(&raw["vcs"], &format!("{label}.vcs"))?.to_owned();
     validate_name(&name, "checkout name")?;
+    if vcs != "git" && vcs != "eden" {
+        return Err(format!("unsupported VCS in {label}: {vcs:?}"));
+    }
+    if !is_sha(&start_point) {
+        return Err(format!(
+            "{label}.start_point must be a full lowercase commit"
+        ));
+    }
+    if !is_sha(&head) {
+        return Err(format!("{label}.head must be a full lowercase commit"));
+    }
+    if vcs == "eden" {
+        if branch != "eden" || remote != "eden" {
+            return Err(format!("{label} Eden markers must be 'eden'"));
+        }
+        if landed_ref != "refs/remotes/eden/main" {
+            return Err(format!("{label} Eden landed ref must be the fixed marker"));
+        }
+        if !containing.is_empty() {
+            return Err(format!("{label} Eden rows name no containing refs"));
+        }
+        return Ok(CheckoutRec {
+            name,
+            path,
+            repository,
+            remote,
+            landed_ref,
+        });
+    }
     validate_remote(&remote)?;
     if !is_digest(&digest) {
         return Err(format!(
@@ -325,18 +354,7 @@ pub(crate) fn checkout_from_obj(value: &Value, label: &str) -> Result<CheckoutRe
         ));
     }
     validate_ref(&branch, "branch")?;
-    if !is_sha(&start_point) {
-        return Err(format!(
-            "{label}.start_point must be a full lowercase Git commit"
-        ));
-    }
     validate_full_ref(&landed_ref, "landed ref")?;
-    if vcs != "git" {
-        return Err(format!("unsupported VCS in {label}: {vcs:?}"));
-    }
-    if !is_sha(&head) {
-        return Err(format!("{label}.head must be a full lowercase Git commit"));
-    }
     let prefix = format!("refs/remotes/{remote}/");
     if containing.iter().any(|item| !item.starts_with(&prefix)) {
         return Err(format!(

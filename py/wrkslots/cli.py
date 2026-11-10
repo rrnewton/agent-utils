@@ -7387,17 +7387,27 @@ def _checkout_from_obj(value: object, label: str) -> Checkout:
         vcs=_as_str(raw["vcs"], f"{label}.vcs"),
     )
     _validate_name(checkout.name, "checkout name")
+    if checkout.vcs not in ("git", "eden"):
+        raise StateError(f"unsupported VCS in {label}: {checkout.vcs!r}")
+    if not SHA_RE.fullmatch(checkout.start_point):
+        raise StateError(f"{label}.start_point must be a full lowercase commit")
+    if not SHA_RE.fullmatch(checkout.head):
+        raise StateError(f"{label}.head must be a full lowercase commit")
+    if checkout.vcs == "eden":
+        # Eden rows carry fixed markers in the git-shaped fields (see
+        # wrkslots.eden); live facts come from the daemon, not the row.
+        if checkout.branch != "eden" or checkout.remote != "eden":
+            raise StateError(f"{label} Eden markers must be 'eden'")
+        if checkout.landed_ref != "refs/remotes/eden/main":
+            raise StateError(f"{label} Eden landed ref must be the fixed marker")
+        if checkout.containing_remote_refs:
+            raise StateError(f"{label} Eden rows name no containing refs")
+        return checkout
     _validate_remote(checkout.remote)
     if not re.fullmatch(r"[0-9a-f]{64}", checkout.remote_url_sha256):
         raise StateError(f"{label}.remote_url_sha256 must be a lowercase SHA-256")
     _validate_ref(checkout.branch, "branch")
-    if not SHA_RE.fullmatch(checkout.start_point):
-        raise StateError(f"{label}.start_point must be a full lowercase Git commit")
     _validate_full_ref(checkout.landed_ref, "landed ref")
-    if checkout.vcs != "git":
-        raise StateError(f"unsupported VCS in {label}: {checkout.vcs!r}")
-    if not SHA_RE.fullmatch(checkout.head):
-        raise StateError(f"{label}.head must be a full lowercase Git commit")
     if any(
         not ref.startswith(f"refs/remotes/{checkout.remote}/")
         for ref in checkout.containing_remote_refs

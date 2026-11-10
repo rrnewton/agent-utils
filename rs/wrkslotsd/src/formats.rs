@@ -134,6 +134,8 @@ pub struct TaskScope {
 pub enum Vcs {
     /// Git.
     Git,
+    /// Eden.
+    Eden,
 }
 
 /// Import source format.

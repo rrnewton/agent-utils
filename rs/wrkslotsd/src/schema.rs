@@ -414,29 +414,49 @@ fn validate_checkouts(value: &Value, parent: &str) -> Result<Vec<Checkout>, Obse
         let path = string(&checkout["path"], &format!("{label}.path"))?;
         validate_relative_path(path, &format!("{label}.path"))?;
         string(&checkout["repository"], &format!("{label}.repository"))?;
-        validate_ref(
-            string(&checkout["branch"], &format!("{label}.branch"))?,
-            &format!("{label}.branch"),
+        let branch = string(&checkout["branch"], &format!("{label}.branch"))?;
+        let remote = string(&checkout["remote"], &format!("{label}.remote"))?;
+        let landed_ref = string(&checkout["landed_ref"], &format!("{label}.landed_ref"))?;
+        let containing = string_array(
+            &checkout["containing_remote_refs"],
+            &format!("{label}.containing_remote_refs"),
         )?;
+        let vcs = string(&checkout["vcs"], &format!("{label}.vcs"))?;
+        if vcs != "git" && vcs != "eden" {
+            return Err(invalid(format!("unsupported VCS in {label}")));
+        }
         digest(
             &checkout["start_point"],
             40,
             &format!("{label}.start_point"),
         )?;
-        let remote = string(&checkout["remote"], &format!("{label}.remote"))?;
+        digest(&checkout["head"], 40, &format!("{label}.head"))?;
+        if vcs == "eden" {
+            if branch != "eden" || remote != "eden" {
+                return Err(invalid(format!("{label} Eden markers must be 'eden'")));
+            }
+            if landed_ref != "refs/remotes/eden/main" {
+                return Err(invalid(format!(
+                    "{label} Eden landed ref must be the fixed marker"
+                )));
+            }
+            if !containing.is_empty() {
+                return Err(invalid(format!("{label} Eden rows name no containing refs")));
+            }
+            result.push(Checkout {
+                name,
+                path: path.to_owned(),
+            });
+            continue;
+        }
+        validate_ref(branch, &format!("{label}.branch"))?;
         validate_remote(remote, &format!("{label}.remote"))?;
         digest(
             &checkout["remote_url_sha256"],
             64,
             &format!("{label}.remote_url_sha256"),
         )?;
-        let landed_ref = string(&checkout["landed_ref"], &format!("{label}.landed_ref"))?;
         validate_full_ref(landed_ref, &format!("{label}.landed_ref"))?;
-        digest(&checkout["head"], 40, &format!("{label}.head"))?;
-        let containing = string_array(
-            &checkout["containing_remote_refs"],
-            &format!("{label}.containing_remote_refs"),
-        )?;
         let prefix = format!("refs/remotes/{remote}/");
         if containing
             .iter()
@@ -445,9 +465,6 @@ fn validate_checkouts(value: &Value, parent: &str) -> Result<Vec<Checkout>, Obse
             return Err(invalid(format!(
                 "{label}.containing_remote_refs names an unauthorized ref"
             )));
-        }
-        if string(&checkout["vcs"], &format!("{label}.vcs"))? != "git" {
-            return Err(invalid(format!("unsupported VCS in {label}")));
         }
         result.push(Checkout {
             name,

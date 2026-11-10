@@ -4,7 +4,7 @@ status: open
 priority: 1
 issue_type: task
 created_at: 2026-11-10T12:41:39.328513866+00:00
-updated_at: 2026-11-10T12:49:07.784050816+00:00
+updated_at: 2026-11-10T12:52:06.282677897+00:00
 ---
 
 # Description
@@ -18,3 +18,7 @@ Full design in ai_docs/transient/2026-11-10-wrkslots-eden-checkouts/DESIGN.md. S
 # Acceptance Criteria
 
 Phase 1: design recorded in this issue (or linked ai_docs report) covering slot model, create/remove with verified redirection cleanup, host-wide cap enforcement, salvage, census/holds, and measurement plan; reported to coordinator before any implementation. Phase 2 (separate approval): trial Eden checkout inside the image on a freed slot, with before/after btrfs metadata measurement.
+
+# Notes
+
+Phase 2 answers (2026-11-10, mu-eden). 1 Daemons: one shared daemon holds 8.3 GB private (19.5 GB resident) for 3 checkouts, with one root-owned privhelper. A per-slot config dir therefore costs roughly one extra daemon plus privhelper per Eden slot (GBs, tens of seconds startup); Phase 2 fakes assume this and the real trial must measure it. The cap of 3 still holds because create counts checkouts, not daemons, and refuses at 3. 2 Cap discovery: enumerate config dirs from running edenfs processes (their --edenDir argument in /proc/*/cmdline), plus the edenDirectory from eden config and every wrkslots Eden slot config dir, run eden list per dir, dedupe by mount path; any dir that cannot be queried refuses creation (fail closed). 3 Size: 256 GiB bounds mount-visible writes plus overlay and buck-out inside the subvolume; a real build is expected to fit, but at the qgroup limit writes fail with quota errors and the FUSE checkout wedges until space is freed, so remove and audit must report quota exhaustion explicitly and never hang on the mount. 4 Remove: uncommitted Sapling work is preserved as a patch plus a bundle of the draft stack in the salvage archive with read-back verification, like git bundles; salvage failure refuses removal.
