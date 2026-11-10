@@ -138,12 +138,13 @@ fn an_unstarted_front_does_not_block_a_green_disjoint_root() {
     fx.commit_all("seed tests");
     git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
     let gate = fx.root.join("front-gate");
-    // On the donor, the front candidate (holding tests/a) cannot run until
-    // the gate file exists; everything else passes. The front's first
-    // donor claim therefore gives the job back unvalidated, and the front
-    // flight stays unstarted while the disjoint roots validate green.
+    // On the donor, the front's own candidate (its tip commit changes only
+    // tests/a) cannot run until the gate file exists; everything else,
+    // stacked candidates included, passes. The front's donor claims
+    // therefore give the job back unvalidated, and the front flight stays
+    // unstarted while the disjoint roots validate green.
     let validator = format!(
-        r#"if [ -n "$MQ_PROBE" ]; then exit 0; fi; if [ -n "$DONOR" ] && [ -f tests/a ] && [ ! -e {} ]; then echo COULD_NOT_RUN; exit 75; fi; for t in $(ls tests); do printf '{{"id":"%s","outcome":"pass"}}\n' "$t" >> "$MQ_RESULTS"; done; exit 0"#,
+        r#"if [ -n "$MQ_PROBE" ]; then exit 0; fi; if [ -n "$DONOR" ] && [ "$(git diff --name-only HEAD^ HEAD)" = "tests/a" ] && [ ! -e {} ]; then echo COULD_NOT_RUN; exit 75; fi; for t in $(ls tests); do printf '{{"id":"%s","outcome":"pass"}}\n' "$t" >> "$MQ_RESULTS"; done; exit 0"#,
         gate.display()
     );
     fx.mq_ok(&[

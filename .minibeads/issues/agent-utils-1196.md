@@ -28,3 +28,5 @@ In `rs/merge-queue`:
 # Notes
 
 Full report: the 2026-11-10 front-starve report relayed to this lane (code read at c42f0c71; `next_decidable_index` near `rs/merge-queue/src/run.rs:5233-5320`). If the decision-order change conflicts with the singleton-ejection decision order, stack it on that change.
+
+Second data point (2026-11-10, 4:04 to 4:32 AM ET), on the serve's requeue-at-front path in the consumer's queue: six disjoint roots in serve plan order, every deciding job queued with zero attempts, yet position 4 was claimed before position 1. From the job records: position 4's job carried a plan index matched to the run's first plan (a recomposed flight), while position 1 (an intake flight) and other recomposed flights carried none, so indexed jobs sorted ahead of every unindexed one regardless of age. The green at position 4 then could not be decided behind unclaimed flights ahead, and was only landed after manual withdrawal of two changes ahead of it. Coverage: claim order now compares plan indices only between jobs that both carry one (mixed pairs fall back to age), beside the prefix-flight index at publish.

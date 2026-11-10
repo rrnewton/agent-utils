@@ -1396,8 +1396,11 @@ impl Store {
         }
         let compare_only_donor = self.compare_only.contains(donor);
         // Claim order (#1008): prioritized jobs first, then plan order, with
-        // job age (id) as the tiebreak. Jobs recorded before claim order
-        // existed carry neither value and sort by id among themselves.
+        // job age (id) as the tiebreak. Plan order only compares jobs that
+        // both carry an index: an index recorded against a stale plan (a
+        // recomposed or intake flight matched to the run's first plan,
+        // #1196 front-starve dp2) must not leapfrog an older unindexed job,
+        // so mixed pairs fall back to age.
         let Some(mut job) = jobs
             .into_iter()
             .filter(|job| {
@@ -1406,16 +1409,12 @@ impl Store {
                     && !job.declined_by.iter().any(|name| name == donor)
             })
             .min_by(|a, b| {
-                (
-                    std::cmp::Reverse(a.prioritized),
-                    a.plan_index.unwrap_or(usize::MAX),
-                    &a.id,
-                )
-                    .cmp(&(
-                        std::cmp::Reverse(b.prioritized),
-                        b.plan_index.unwrap_or(usize::MAX),
-                        &b.id,
-                    ))
+                std::cmp::Reverse(a.prioritized)
+                    .cmp(&std::cmp::Reverse(b.prioritized))
+                    .then_with(|| match (a.plan_index, b.plan_index) {
+                        (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.id.cmp(&b.id)),
+                        _ => a.id.cmp(&b.id),
+                    })
             })
         else {
             return Ok(None);
@@ -5991,6 +5990,32 @@ mod unit {
         let claim = |store: &Store| store.claim("d1", "h1", 10).unwrap().expect("a job").id;
         assert_eq!(claim(&store), made.id);
         assert_eq!(claim(&store), newer.id);
+    }
+
+    #[test]
+    fn an_index_from_a_stale_plan_does_not_leapfrog_an_older_unindexed_job() {
+        // #1196 front-starve dp2: a recomposed flight matched to the run's
+        // first plan carries that plan's index (3), while an older intake
+        // flight carries none. The older job claims first: plan order only
+        // compares jobs that both carry an index.
+        let store = Store::new(&temp("claim-order-stale-plan"));
+        let older_unindexed = publish_ordered(
+            &store,
+            "c1",
+            false,
+            None,
+            "20260101T000000000-c11111111111-00000001",
+        );
+        let newer_indexed = publish_ordered(
+            &store,
+            "c2",
+            false,
+            Some(3),
+            "20260101T000000000-c22222222222-00000002",
+        );
+        let claim = |store: &Store| store.claim("d1", "h1", 10).unwrap().expect("a job").id;
+        assert_eq!(claim(&store), older_unindexed.id);
+        assert_eq!(claim(&store), newer_indexed.id);
     }
 
     #[test]
