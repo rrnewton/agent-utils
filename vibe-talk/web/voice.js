@@ -11005,7 +11005,7 @@ application.track(mountColumnSplitterControls({
   move: (event) => columnSplitter.move(event),
   up: () => columnSplitter.up(),
   key: (event) => columnSplitter.key(event),
-  doubleClick: () => columnSplitter.doubleClick(),
+  doubleClick: (event) => columnSplitter.doubleClick(event),
 }));
 
 // The page's last document-level listeners (`#54 resume-recovery`): the page

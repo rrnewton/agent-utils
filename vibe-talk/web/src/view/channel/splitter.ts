@@ -1,8 +1,10 @@
 // The draggable separator between the desk's two columns (`#1186 two-column-splitter`; the owner,
 // 2026-11-09: "make it possible to grab and drag the middle separator to change the width of the two
 // columns"). It follows the reading-width grip's shape (web/src/view/settings `mountReadingWidth`):
-// pointer events with capture so mouse, touch and pen share one path, a `role=separator` the arrow
-// keys move, the choice kept on the device and stored once at the end of a drag.
+// a `role=separator` the arrow keys move, the choice kept on the device and stored once at the end
+// of a drag. The separator's own element only draws the line and takes the focus: the drag is
+// claimed from any press that lands on the boundary, ahead of the press's own business, so the
+// wheel, the scrollbars and every press elsewhere keep their native targets.
 //
 // The split is a percentage of the main screen's width, written as `--two-column-split`, which the
 // two-column grid in web/voice.css reads; the stylesheet still decides whether two columns show at
@@ -17,6 +19,9 @@ import { createListening } from "../dom/index.ts";
 
 /** The narrowest either column may be dragged to, in CSS pixels. */
 const MIN_COLUMN_PX = 300;
+
+/** How far either side of the boundary's line a press still claims the drag, in CSS pixels. */
+const CLAIM_PX = 8;
 
 /** Where one column's reader is, as the splitter keeps it across a width change. */
 export type SplitterPlace = unknown;
@@ -56,16 +61,16 @@ export interface ColumnSplitter {
   reset(): number;
   /** The split in force now. */
   split(): number;
-  /** The separator pressed: a drag begins. */
-  down(event: PointerEvent | undefined): void;
-  /** The separator dragged: the widths follow it, not yet kept. */
+  /** A press on the main screen: true (and a drag begins) when it lands on the boundary. */
+  down(event: PointerEvent | undefined): boolean;
+  /** The pointer moved over the main screen: a drag follows it, else the boundary's cursor. */
   move(event: PointerEvent | undefined): void;
-  /** The separator let go: the split it stopped at is kept. */
+  /** The pointer let go: the split it stopped at is kept. */
   up(): void;
   /** A key on the separator. */
   key(event: KeyboardEvent | undefined): void;
-  /** The separator double-clicked: the default split. */
-  doubleClick(): void;
+  /** A double-click on the main screen: true (and the default split) when it lands on the boundary. */
+  doubleClick(event: MouseEvent | undefined): boolean;
 }
 
 /** The column splitter, made where the page kept the split. */
@@ -135,23 +140,45 @@ export function createColumnSplitter(deps: ColumnSplitterDependencies): ColumnSp
     return Math.min(ceil, Math.max(floor, asked));
   }
 
+  /** Where the boundary stands, in the main screen `box`: the split's share of its width. */
+  function boundaryX(box: { left: number; width: number }): number {
+    return box.left + (box.width * split) / 100;
+  }
+
+  /** Whether `event` lands on the boundary, within the claim either side of its line. */
+  function onBoundary(event: PointerEvent | MouseEvent): boolean {
+    if (!deps.columnsOn()) return false;
+    const box = deps.lookup("screen-main").getBoundingClientRect();
+    return Math.abs(event.clientX - boundaryX(box)) <= CLAIM_PX;
+  }
+
   return {
     apply,
     changed,
     reset: () => changed(deps.defaultSplit),
     split: () => split,
     down(event) {
-      if (!deps.columnsOn()) return;
+      if (!event || !onBoundary(event)) return false;
       const box = deps.lookup("screen-main").getBoundingClientRect();
       drag = { left: box.left, width: box.width, places: capture() };
-      const separator = deps.lookup("column-splitter");
-      if (event && event.pointerId !== undefined && separator.setPointerCapture) {
-        // So the drag survives the pointer leaving the separator, which it does immediately.
-        separator.setPointerCapture(event.pointerId);
+      const screen = deps.lookup("screen-main");
+      if (event.pointerId !== undefined && screen.setPointerCapture) {
+        // The drag is the screen's until it lets go, wherever the pointer wanders.
+        try { screen.setPointerCapture(event.pointerId); } catch (_error) { /* no pointer to hold */ }
       }
+      const separator = deps.lookup("column-splitter") as HTMLElement & { focus?: (options?: unknown) => void };
+      if (separator.focus) separator.focus({ preventScroll: true });
+      return true;
     },
     move(event) {
-      if (!drag || !event) return;
+      if (!event) return;
+      if (!drag) {
+        // Resting on the boundary is col-resize, and nothing of the drag: the cursor alone.
+        const screen = deps.lookup("screen-main");
+        const wanted = onBoundary(event) ? "col-resize" : "";
+        if (screen.style.cursor !== wanted) screen.style.cursor = wanted;
+        return;
+      }
       const places = drag.places;
       apply(splitFor(event.clientX, drag));
       restore(places);
@@ -177,8 +204,10 @@ export function createColumnSplitter(deps: ColumnSplitterDependencies): ColumnSp
       }
       changed(next());
     },
-    doubleClick() {
+    doubleClick(event) {
+      if (!event || !onBoundary(event)) return false;
       changed(deps.defaultSplit);
+      return true;
     },
   };
 }
@@ -187,12 +216,12 @@ export function createColumnSplitter(deps: ColumnSplitterDependencies): ColumnSp
 export interface ColumnSplitterControlsDependencies {
   /** An element of the page by id. */
   lookup(id: string): HTMLElement;
-  /** The separator pressed, dragged, let go, keyed, or double-clicked. */
-  down(event: PointerEvent): unknown;
+  /** A press, a move, a let-go, a key, or a double-click: the first and last say whether they claimed the boundary. */
+  down(event: PointerEvent): boolean;
   move(event: PointerEvent): unknown;
   up(): unknown;
   key(event: KeyboardEvent): unknown;
-  doubleClick(): unknown;
+  doubleClick(event: MouseEvent): boolean;
 }
 
 /** The separator's listeners, mounted. */
@@ -201,15 +230,27 @@ export interface ColumnSplitterControls {
   unmount(): void;
 }
 
-/** Mount the separator's controls: its drag, its keys and its double-click reset. */
+/** Mount the separator's controls: presses near the boundary claimed ahead of every other
+ * handler (capture, so a row's own press never starts instead), the drag and the boundary's
+ * cursor on the screen, the keys on the separator itself, and its double-click reset. */
 export function mountColumnSplitterControls(deps: ColumnSplitterControlsDependencies): ColumnSplitterControls {
   const { listen, unmount } = createListening();
-  const separator = deps.lookup("column-splitter");
-  listen<PointerEvent>(separator, "pointerdown", (event) => deps.down(event));
-  listen<PointerEvent>(separator, "pointermove", (event) => deps.move(event));
-  listen<PointerEvent>(separator, "pointerup", () => deps.up());
-  listen<PointerEvent>(separator, "pointercancel", () => deps.up());
-  listen<KeyboardEvent>(separator, "keydown", (event) => deps.key(event));
-  listen<MouseEvent>(separator, "dblclick", () => deps.doubleClick());
+  const screen = deps.lookup("screen-main");
+  listen<PointerEvent>(screen, "pointerdown", (event) => {
+    if (deps.down(event)) {
+      event.stopPropagation();
+      event.preventDefault();
+    }
+  }, { capture: true });
+  listen<PointerEvent>(screen, "pointermove", (event) => deps.move(event));
+  listen<PointerEvent>(screen, "pointerup", () => deps.up());
+  listen<PointerEvent>(screen, "pointercancel", () => deps.up());
+  listen<MouseEvent>(screen, "dblclick", (event) => {
+    if (deps.doubleClick(event)) {
+      event.stopPropagation();
+      event.preventDefault();
+    }
+  }, { capture: true });
+  listen<KeyboardEvent>(deps.lookup("column-splitter"), "keydown", (event) => deps.key(event));
   return { unmount };
 }

@@ -206,7 +206,8 @@ test("`#229 desktop-two-column`: the layout button is a toggle in the bar, offer
   assert.match(cssBlockOutside(TWO_COLUMN_QUERY, "#side-column"), /display:\s*none/);
   assert.match(cssBlockIn(TWO_COLUMN_QUERY, '#screen-main[data-columns="two"] > #side-column'), /display:\s*grid/);
   assert.match(cssBlockIn(TWO_COLUMN_QUERY, '#screen-main[data-columns="two"]'),
-    /grid-template-columns:\s*minmax\(0, 1fr\) minmax\(0, 1fr\)/);
+    /grid-template-columns:\s*minmax\(260px, var\(--two-column-split, 50%\)\) minmax\(260px, 1fr\)/,
+    "the two columns are not the split the reader dragged the separator to (#1186)");
   // ...and it is the stylesheet's to say, never a query the script reads.
   assert.doesNotMatch(PAGE_CODE, /matchMedia|innerWidth|outerWidth|screen\.width/);
 

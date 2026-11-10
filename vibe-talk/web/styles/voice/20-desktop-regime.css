@@ -885,22 +885,21 @@
     z-index: 1;
   }
 
-  /* `#1186 two-column-splitter`. The separator the reader drags: a 14px hit strip centred on
-     the split, its line the columns' hairline made grabbable — a short pill at its middle at
-     rest, the full line lit under the pointer or the focus. It takes the drag itself
-     (`touch-action: none`), so a touch drag resizes instead of scrolling either column. */
+  /* `#1186 two-column-splitter`. The separator's line and grab pill, centred on the split: a
+     short pill at its middle, the full line lit while it holds the focus. It is never in the
+     way (`pointer-events: none`): the drag is claimed from presses near the boundary by the
+     script, so the wheel, the scrollbars and every other press land as they always did, and
+     the col-resize cursor over the boundary is the script's to set while the pointer rests
+     there. */
   #screen-main[data-columns="two"] > #column-splitter {
-    display: flex;
+    display: block;
     position: absolute;
     top: 0;
     bottom: 0;
     left: var(--two-column-split, 50%);
     width: 14px;
     transform: translateX(-50%);
-    align-items: center;
-    justify-content: center;
-    cursor: col-resize;
-    touch-action: none;
+    pointer-events: none;
     z-index: 2;
   }
 
@@ -917,20 +916,21 @@
 
   #column-splitter::after {
     content: "";
-    position: relative;
+    position: absolute;
+    top: 50%;
+    left: 50%;
     width: 4px;
     height: 40px;
     border-radius: 2px;
+    transform: translate(-50%, -50%);
     background: var(--edge);
   }
 
-  #column-splitter:hover::before,
   #column-splitter:focus-visible::before {
     width: 2px;
     background: var(--accent);
   }
 
-  #column-splitter:hover::after,
   #column-splitter:focus-visible::after {
     background: var(--accent);
   }

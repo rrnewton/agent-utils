@@ -974,11 +974,13 @@
 
           <!--
             `#1186 two-column-splitter`. The separator between the desk's two columns, grabbed and
-            dragged to change their widths. A sibling of #scroll-area, positioned against
-            #screen-main at the split (`--two-column-split`), so it adds no grid row. Drawn only
-            while two columns are on screen, in the desktop block of web/voice.css. A separator
-            with a name and a value, so assistive technology says where the split stands and the
-            arrow keys can move it; double-click resets it.
+            dragged to change their widths: its line and grab pill, drawn at the split
+            (`--two-column-split`) and never in the way — the drag is claimed from presses near
+            the boundary (web/src/view/channel/splitter.ts), so the wheel, the scrollbars and
+            every press elsewhere land exactly as they did. Drawn only while two columns are on
+            screen, in the desktop block of web/voice.css. A separator with a name and a value, so
+            assistive technology says where the split stands and the arrow keys can move it;
+            double-click resets it.
           -->
           <div id="column-splitter" role="separator" aria-orientation="vertical" tabindex="0"
                aria-label="Two-column split" aria-valuemin="30" aria-valuemax="70" aria-valuenow="50"

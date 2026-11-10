@@ -2581,11 +2581,13 @@ test("`#1186 two-column-splitter`: the separator drags, clamps, keeps each colum
   const separator = {
     setAttribute: (name, value) => attrs.set(name, String(value)),
     setPointerCapture: () => {},
+    focus: () => {},
     getBoundingClientRect: () => ({ left: 0, width: 1000 }),
   };
   const vars = new Map();
   const screenMain = {
-    style: { setProperty: (name, value) => vars.set(name, value) },
+    style: { setProperty: (name, value) => vars.set(name, value), cursor: "" },
+    setPointerCapture: () => {},
     getBoundingClientRect: () => ({ left: 0, width: 1000 }),
   };
   const kept = [];
@@ -2609,8 +2611,10 @@ test("`#1186 two-column-splitter`: the separator drags, clamps, keeps each colum
   assert.equal(vars.get("--two-column-split"), "70%");
   assert.equal(attrs.get("aria-valuenow"), "70");
   splitter.apply(50);
+  // A press away from the boundary claims nothing; one on it begins the drag.
+  assert.equal(splitter.down({ pointerId: 1, clientX: 100 }), false, "a press off the boundary claimed the drag");
+  assert.equal(splitter.down({ pointerId: 1, clientX: 500 }), true, "a press on the boundary did not claim the drag");
   // A drag to 300px of a 1000px screen: the percentage floor (30) and the pixel floor agree.
-  splitter.down({ pointerId: 1, preventDefault: () => {} });
   restored.length = 0;
   splitter.move({ clientX: 300 });
   assert.equal(splitter.split(), 30);
@@ -2624,7 +2628,8 @@ test("`#1186 two-column-splitter`: the separator drags, clamps, keeps each colum
   // The keys move it a point at a time and keep as they go; double-click is half and half again.
   splitter.key({ key: "ArrowLeft", preventDefault: () => {} });
   assert.equal(splitter.split(), 69);
-  splitter.doubleClick();
+  assert.equal(splitter.doubleClick({ clientX: 100 }), false, "a double-click off the boundary reset the split");
+  assert.equal(splitter.doubleClick({ clientX: 690 }), true);
   assert.equal(splitter.split(), 50);
   assert.equal(kept[kept.length - 1], 50);
 });

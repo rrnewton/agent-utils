@@ -5527,6 +5527,10 @@ const TUNING_BANDS = {
     "the narrowest either column may be dragged to (#1186 two-column-splitter): under a couple " +
     "of hundred pixels no column holds a readable line, and past half the narrowest two-column " +
     "window the two floors together leave nothing to drag"],
+  CLAIM_PX: [4, 16,
+    "how far either side of the columns' boundary a press still claims the drag (#1186 " +
+    "two-column-splitter): narrower and the line cannot be grabbed, wider and it takes presses " +
+    "meant for the rows beside it"],
   SUSPENSION_GRACE_MS: [500, 5000,
     "below about half a second it misses the close iOS delivers on the way back; above a few " +
     "seconds it excuses genuine failures the reader watched happen"],
