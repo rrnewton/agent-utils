@@ -984,17 +984,41 @@ def test_cross_main_phase_env_defaults_to_exclusive(
     }
     chosen = {"cross.solo", "cross.plain"}
     monkeypatch.delenv(validate.CROSS_MAIN_PHASE_ENV, raising=False)
-    assert validate.partition_gate_exclusive(steps, chosen) == (
-        ["cross.plain"], ["cross.solo"]
-    )
+    assert validate.partition_gate_exclusive(
+        steps, chosen, differentials_enabled=True
+    ) == (["cross.plain"], ["cross.solo"])
     monkeypatch.setenv(validate.CROSS_MAIN_PHASE_ENV, "0")
-    assert validate.partition_gate_exclusive(steps, chosen) == (
-        ["cross.plain"], ["cross.solo"]
-    )
+    assert validate.partition_gate_exclusive(
+        steps, chosen, differentials_enabled=True
+    ) == (["cross.plain"], ["cross.solo"])
     monkeypatch.setenv(validate.CROSS_MAIN_PHASE_ENV, "1")
-    assert validate.partition_gate_exclusive(steps, chosen) == (
-        ["cross.solo", "cross.plain"], []
-    )
+    assert validate.partition_gate_exclusive(
+        steps, chosen, differentials_enabled=True
+    ) == (["cross.solo", "cross.plain"], [])
+
+
+def test_cross_differentials_disabled_by_default() -> None:
+    """#1249: without the opt-in, no selection runs a gate-exclusive step."""
+    validate = _validate_module()
+    steps: dict[str, dict[str, object]] = {
+        "cross.solo": {"labels": [validate.GATE_EXCLUSIVE_LABEL], "deps": []},
+        "cross.dependent": {"labels": [], "deps": ["cross.solo"]},
+        "cross.plain": {"labels": [], "deps": []},
+    }
+    chosen = {"cross.solo", "cross.dependent", "cross.plain"}
+    for kwargs in (
+        {},
+        {"keep_all": True},
+        {"keep_all": True, "exclusive_phase": False},
+        {"components": frozenset({"agentctl"}), "keep_all": True},
+    ):
+        assert validate.partition_gate_exclusive(steps, chosen, **kwargs) == (
+            ["cross.plain"],
+            [],
+        )
+    assert validate.partition_gate_exclusive(
+        steps, chosen, differentials_enabled=True, exclusive_phase=True
+    ) == (["cross.plain"], ["cross.solo", "cross.dependent"])
 
 
 def test_all_cross_filter_keeps_only_components_a_path_selects() -> None:
@@ -1027,9 +1051,10 @@ def test_all_cross_filter_fails_closed() -> None:
 def test_all_list_names_skipped_cross_steps_and_cross_all_forces_them(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """#1190: `--all --list` on a page-only change names all five exclusive
-    steps as skipped and plans none of them; `--all --cross-all --list`
-    plans all five."""
+    """#1190/#1249: `--all --list` on a page-only change names all five
+    exclusive steps as skipped and plans none of them; `--all --cross-all
+    --list` still plans none (disabled by default, #1249); only
+    `--cross-differentials` plans them."""
     validate = _validate_module()
     monkeypatch.delenv(validate.CROSS_MAIN_PHASE_ENV, raising=False)
     monkeypatch.setattr(
@@ -1048,12 +1073,22 @@ def test_all_list_names_skipped_cross_steps_and_cross_all_forces_them(
         assert listed.count(tag) == 1, tag  # named once, as skipped; not a STEP line
     assert validate.main(["--all", "--cross-all", "--list"]) == 0
     forced = capsys.readouterr().out
-    assert "--cross-all" in forced
+    assert "cross differentials disabled by default" in forced
     for tag in (
         "cross.agentctl.differential-0",
         "cross.herdr-run.differential",
     ):
-        assert f"STEP  {tag}" in forced, tag
+        assert f"STEP  {tag}" not in forced, tag
+    assert validate.main(["--all", "--cross-differentials", "--list"]) == 0
+    opted = capsys.readouterr().out
+    for tag in (
+        "cross.agentctl.differential-0",
+        "cross.agentctl.differential-1",
+        "cross.agentctl.differential-2",
+        "cross.agentctl.herdr-agent-differential",
+        "cross.herdr-run.differential",
+    ):
+        assert f"STEP  {tag}" in opted, tag
 
 
 def test_the_keep_going_flag_reaches_the_graph_run(

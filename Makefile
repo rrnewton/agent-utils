@@ -51,6 +51,8 @@ endif
 # Run only the checks the current change can actually affect, and REPORT the rest as skipped.
 # `--all --cross-all` is the whole unfiltered portable contract and is what the nightly uses;
 # plain `--all` still path-filters the gate-exclusive cross steps (#1190); selection is for the edit-run loop.
+# The five cross differentials are disabled by default in both (#1249 cross-differentials-robust);
+# `python3 scripts/validate.py --cross-differentials --all` runs them on demand only.
 # See scripts/validate.py for the path -> check mapping and why each rule is what it is.
 validate:
 	python3 scripts/validate.py

@@ -23,12 +23,18 @@ Two safety properties, both tested in `--self-test`:
   cannot affect (#1180 Part B). **`--all --cross-all`** is the unfiltered contract the nightly
   and release paths use (`make validate-all`). Selection is a convenience for the edit-run
   loop, not a new definition of "validated".
+* **The five gate-exclusive cross differentials are disabled by default** (owner decision,
+  2026-11-10, reply 346; #1249 cross-differentials-robust tracks bringing them back without
+  wall-clock budgets): no default, `--all`, or `--cross-all` run selects them, so the
+  gate-exclusive phase is empty. `--cross-differentials` is the explicit opt-in that runs
+  them on demand, in the exclusive phase unless `AGENT_UTILS_CROSS_IN_MAIN_PHASE=1`.
 
 Usage:
     python3 scripts/validate.py                 # against origin/main
     python3 scripts/validate.py --base HEAD~1
     python3 scripts/validate.py --all           # the entire portable contract (cross steps path-filtered, #1190)
-    python3 scripts/validate.py --all --cross-all  # the entire contract, every cross step forced
+    python3 scripts/validate.py --all --cross-all  # the entire contract, every cross step forced except the disabled differentials (#1249)
+    python3 scripts/validate.py --cross-differentials --all  # on demand only: also run the five disabled cross differentials (#1249)
     python3 scripts/validate.py --keep-going    # report every independent failure, not just the first
     python3 scripts/validate.py --list          # print the plan, run nothing
     python3 scripts/validate.py --self-test     # check the mapping itself, offline
@@ -669,7 +675,25 @@ TIMING_COMMAND_MARKERS = (
 )
 
 
-#: DAG label for steps that run alone on the host by default: after the main
+#: The five gate-exclusive cross differentials are DISABLED by default.
+#: Owner decision (2026-11-10, reply 346, 3:23 PM ET), (one consuming-project name redacted): "Insane.
+#: I hate tests that are real time sensitive. We fought this battle with
+#: [redacted]. Disable those tests and have an agent work to bring them back
+#: when they're robust. Each product lane must make its tests fast, high
+#: signal, and robust to running on a hot machine (>75% cpu on 316 HW
+#: threads). AND there should be good test selection so we are not running
+#: tests for agent-util A when only B is modified. Anything else should be
+#: disabled until we can improve it." #1249 cross-differentials-robust
+#: tracks bringing them back without wall-clock budgets. Until then no
+#: default, `--all`, or `--cross-all` run selects them (the exclusive
+#: phase is empty); `--cross-differentials` runs them on demand.
+CROSS_DIFFERENTIALS_DISABLED_NOTE = (
+    "cross differentials disabled by default (owner reply 346, 2026-11-10; "
+    "#1249 cross-differentials-robust); --cross-differentials runs them on demand"
+)
+
+#: DAG label for steps that run alone on the host when opted in with
+#: `--cross-differentials`: after the main
 #: phase, under one fresh `gate.py --exclusive` admission per gate, one step
 #: at a time. These steps assert exact outcomes of small wall clocks inside
 #: the tools they compare (agentctl's Herdr probes against a Python fake
@@ -706,6 +730,7 @@ def partition_gate_exclusive(
     components: frozenset[str] | None = None,
     keep_all: bool = False,
     exclusive_phase: bool | None = None,
+    differentials_enabled: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Split chosen tags into the main phase and the gate-exclusive phase.
 
@@ -731,6 +756,12 @@ def partition_gate_exclusive(
     the exclusive phase; ``"1"`` puts every kept step in the main phase and
     returns an empty exclusive list (#1067 cross-differential-load-aware).
     Tests pass it explicitly so the ambient environment cannot flip them.
+
+    Unless `differentials_enabled` (the `--cross-differentials` opt-in),
+    every labelled step is dropped regardless of `keep_all`, `components`,
+    or `exclusive_phase`: the five differentials are disabled by default
+    (#1249 cross-differentials-robust; see the note above
+    ``GATE_EXCLUSIVE_LABEL``), so the exclusive phase is empty.
     """
     if exclusive_phase is None:
         exclusive_phase = not cross_in_main_phase()
@@ -741,7 +772,12 @@ def partition_gate_exclusive(
 
     labelled = {tag for tag in chosen if GATE_EXCLUSIVE_LABEL in labels(tag)}
     exclusive = set(labelled)
-    if not keep_all and components is not None:
+    if not differentials_enabled:
+        # Disabled by default (#1249): no caller selection — not the
+        # component filter, not keep_all (--cross-all), not the main-phase
+        # position — runs a labelled step. Only --cross-differentials does.
+        exclusive = set()
+    elif not keep_all and components is not None:
         # A filtered-out exclusive step is not selected at all: it must not
         # fall back into the main phase, where it would run beside every
         # other step — the exact condition the label exists to avoid.
@@ -1303,6 +1339,7 @@ def self_test() -> int:
         synthetic_steps,
         {"cross.solo", "cross.dependent", "cross.plain"},
         exclusive_phase=True,
+        differentials_enabled=True,
     )
     if main_tags != ["cross.plain"] or exclusive_tags != ["cross.solo", "cross.dependent"]:
         failures.append(
@@ -1314,6 +1351,7 @@ def self_test() -> int:
         synthetic_steps,
         {"cross.solo", "cross.dependent", "cross.plain"},
         exclusive_phase=False,
+        differentials_enabled=True,
     )
     if main_tags != ["cross.solo", "cross.dependent", "cross.plain"] or exclusive_tags != []:
         failures.append(
@@ -1333,6 +1371,7 @@ def self_test() -> int:
         {"cross.mine", "cross.theirs", "cross.plain", "cross.blocked"},
         components=frozenset({"agentctl"}),
         exclusive_phase=True,
+        differentials_enabled=True,
     )
     if scoped_main != ["cross.plain"] or scoped_exclusive != ["cross.mine"]:
         failures.append(
@@ -1346,6 +1385,7 @@ def self_test() -> int:
         {"cross.mine", "cross.theirs", "cross.plain", "cross.blocked"},
         components=frozenset({"agentctl"}),
         exclusive_phase=False,
+        differentials_enabled=True,
     )
     if scoped_main != ["cross.mine", "cross.plain"] or scoped_exclusive != []:
         failures.append(
@@ -1354,6 +1394,36 @@ def self_test() -> int:
             "selected, and its dependents, must still run nowhere; got "
             f"main={scoped_main} exclusive={scoped_exclusive}"
         )
+
+    # #1249: disabled by default — no keep_all, component, or phase
+    # selection runs a labelled step or its dependent; exclusive is empty.
+    disabled_partitions = [
+        partition_gate_exclusive(
+            synthetic_steps, {"cross.solo", "cross.dependent", "cross.plain"},
+            exclusive_phase=True,
+        ),
+        partition_gate_exclusive(
+            synthetic_steps, {"cross.solo", "cross.dependent", "cross.plain"},
+            exclusive_phase=False,
+        ),
+        partition_gate_exclusive(
+            synthetic_steps, {"cross.solo", "cross.dependent", "cross.plain"},
+            exclusive_phase=True, keep_all=True,
+        ),
+        partition_gate_exclusive(
+            synthetic_steps, {"cross.solo", "cross.dependent", "cross.plain"},
+            exclusive_phase=True, keep_all=True,
+            components=frozenset({"agentctl", "herdr-run"}),
+        ),
+    ]
+    for off_main, off_exclusive in disabled_partitions:
+        if off_main != ["cross.plain"] or off_exclusive != []:
+            failures.append(
+                "cross differentials disabled by default (#1249): labelled "
+                "steps and their dependents must run nowhere and the "
+                f"exclusive phase must be empty; got main={off_main} "
+                f"exclusive={off_exclusive}"
+            )
 
     if cross_in_main_phase({CROSS_MAIN_PHASE_ENV: "1"}) is not True or (
         cross_in_main_phase({}) is not False
@@ -1950,9 +2020,20 @@ def main(argv: list[str] | None = None) -> int:
         "--cross-all",
         action="store_true",
         help="keep every gate-exclusive cross differential regardless of path selection "
-        "(#1190): with --all it restores the pre-#1190 contract exactly and is what "
-        "release/nightly runs use (`make validate-all`); without --all it adds all five "
-        "on top of path selection. Example: python3 scripts/validate.py --all --cross-all",
+        "(#1190), except the five disabled by default (#1249 cross-differentials-robust): "
+        "with --all it is what release/nightly runs use (`make validate-all`); without --all "
+        "it adds the kept steps on top of path selection. It never selects the disabled "
+        "differentials on its own. Example: python3 scripts/validate.py --all --cross-all",
+    )
+    parser.add_argument(
+        "--cross-differentials",
+        action="store_true",
+        help="explicit opt-in: run the five gate-exclusive cross differentials on demand "
+        "(#1249 cross-differentials-robust). They are disabled by default (owner reply 346, "
+        "2026-11-10) and are selected by no default, --all, or --cross-all run. With this "
+        "flag they run in the exclusive phase, or in the main phase when "
+        "AGENT_UTILS_CROSS_IN_MAIN_PHASE=1. Example: python3 scripts/validate.py "
+        "--cross-differentials --all",
     )
     parser.add_argument("--list", action="store_true", help="print the plan and exit without running")
     parser.add_argument(
@@ -2004,8 +2085,8 @@ def main(argv: list[str] | None = None) -> int:
     # Since #1190, --all path-filters these steps too: the main phase still
     # runs the entire contract, but a gate-exclusive step whose component no
     # changed path (against --base) selects is skipped and named below,
-    # fail-closed per cross_filter_for_all. --cross-all forces all five in
-    # either mode and is the release/nightly contract (`make validate-all`).
+    # fail-closed per cross_filter_for_all. Since #1249 the five are disabled
+    # by default in either mode; only --cross-differentials runs them.
     cross_components = components
     cross_filtered = False
     cross_note: str | None = None
@@ -2020,7 +2101,10 @@ def main(argv: list[str] | None = None) -> int:
                 cross_components = filtered_components
                 cross_filtered = True
     cross_shared_trigger = _cross_shared_trigger(paths, selected)
-    if (cross_shared_trigger or args.cross_all) and not all_contract:
+    if (
+        (cross_shared_trigger or args.cross_all or args.cross_differentials)
+        and not all_contract
+    ):
         labelled: set[str] = set()
         for tag, step in graph_steps.items():
             raw_labels = step.get("labels")
@@ -2033,10 +2117,14 @@ def main(argv: list[str] | None = None) -> int:
         graph_steps,
         graph_chosen,
         components=cross_components,
-        keep_all=args.cross_all
+        keep_all=args.cross_differentials
+        or args.cross_all
         or cross_shared_trigger
         or (all_contract and not cross_filtered),
+        differentials_enabled=args.cross_differentials,
     )
+    if not args.cross_differentials:
+        print(f"validate: {CROSS_DIFFERENTIALS_DISABLED_NOTE}", flush=True)
     final_chosen = set(phases[0]) | set(phases[1])
     if args.all:
         labelled_all = []
@@ -2048,7 +2136,20 @@ def main(argv: list[str] | None = None) -> int:
                 labelled_all.append(tag)
         kept = [tag for tag in labelled_all if tag in final_chosen]
         skipped = [tag for tag in labelled_all if tag not in final_chosen]
-        if args.cross_all:
+        if not args.cross_differentials:
+            print(
+                f"validate: --all cross filter (#1190 cross-path-filter): keeping "
+                f"{len(kept)} of {len(labelled_all)} gate-exclusive step(s)"
+                + (
+                    f"; skipped [{', '.join(skipped)}] — disabled by default "
+                    "(#1249 cross-differentials-robust; "
+                    "--cross-differentials runs them on demand)"
+                    if skipped
+                    else "; skipped none"
+                ),
+                flush=True,
+            )
+        elif args.cross_all:
             print(
                 f"validate: --cross-all, keeping all {len(kept)} gate-exclusive "
                 "step(s) (#1190 cross-path-filter)",
@@ -2061,7 +2162,7 @@ def main(argv: list[str] | None = None) -> int:
                 + (f" [{', '.join(kept)}]" if kept else "")
                 + (
                     f"; skipped [{', '.join(skipped)}] — no changed path (vs {args.base}) "
-                    "selects their component; --cross-all forces all"
+                    "selects their component; --cross-differentials runs them on demand"
                     if skipped
                     else "; skipped none"
                 ),

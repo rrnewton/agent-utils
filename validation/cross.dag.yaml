@@ -119,8 +119,21 @@ steps:
       # inflating the other differential steps that continue to share the general baseline above.
       hard_mem_max_bytes: 536870912
 
+  # DISABLED by default (owner reply 346, 2026-11-10; #1249
+  # cross-differentials-robust; one consuming-project name redacted):
+  # "Insane. I hate tests that are real time
+  # sensitive. We fought this battle with [redacted]. Disable those tests and
+  # have an agent work to bring them back when they're robust. Each product
+  # lane must make its tests fast, high signal, and robust to running on a
+  # hot machine (>75% cpu on 316 HW threads). AND there should be good test
+  # selection so we are not running tests for agent-util A when only B is
+  # modified. Anything else should be disabled until we can improve it."
+  # scripts/validate.py selects the five below only with the explicit
+  # --cross-differentials opt-in; no default, --all, or --cross-all run
+  # selects them, so the gate-exclusive phase is empty.
+  #
   # The herdr-run and agentctl differentials below carry the gate-exclusive
-  # label: by default scripts/validate.py runs them after the main phase,
+  # label: when opted in, scripts/validate.py runs them after the main phase,
   # one at a time under one fresh gate.py --exclusive admission per gate.
   # They assert exact outcomes of small wall clocks inside agentctl (Herdr
   # probes against a Python fake Herdr — one fresh interpreter per call —
