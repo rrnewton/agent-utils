@@ -118,9 +118,9 @@ enum Commands {
         after_help = "Examples:\n  agentctl manage worker-1\n  agentctl manage worker-1 --by lieutenant\n  agentctl manage worker-1 --clear\n\nmanaged_by decides who controls an agent: whom watch-agents tells about it, and where it sits in\n`agentctl tree`. start records the calling agent as both created_by (provenance, never changed) and\nmanaged_by; adopt records the adopting agent as managed_by. With neither --by nor --clear, the\ncalling agent takes over: it must be a registered agent of this registry whose pinned harness is an\nancestor of this process. A manager that would make a cycle is refused. An agent with no manager\nanswers to the designated coordinator."
     )]
     Manage(Manage),
-    /// Change a registered agent's durable settings: whether it is a standing agent
+    /// Change a registered agent's durable settings: whether it is a standing agent, or which tab views it
     #[command(
-        after_help = "Examples:\n  agentctl set reviewer-1 --standing\n  agentctl set reviewer-1 --no-standing\n\nA standing agent rests idle between requests by design, such as a standing reviewer. watch-agents\nsends no idle-without-verdict notice about it; it still reports an approval or permission prompt, a\nguardrail refusal, a dead harness, a stall while working, input queued behind a turn, and owner\nrequests left undelivered. The setting is kept in the agent's record, so it follows the agent through\nrename, restore and revive; list and status show `standing: true`, and a watch-agents pass lists\nstanding agents under \"standing\". Prints the agent, the new setting and the previous one as JSON."
+        after_help = "Examples:\n  agentctl set reviewer-1 --standing\n  agentctl set reviewer-1 --no-standing\n  agentctl set coordinator --viewer-tab w1:t2\n  agentctl set coordinator --no-viewer-tab\n\nA standing agent rests idle between requests by design, such as a standing reviewer. watch-agents\nsends no idle-without-verdict notice about it; it still reports an approval or permission prompt, a\nguardrail refusal, a dead harness, a stall while working, input queued behind a turn, and owner\nrequests left undelivered. The setting is kept in the agent's record, so it follows the agent through\nrename, restore and revive; list and status show `standing: true`, and a watch-agents pass lists\nstanding agents under \"standing\". Prints the agent, the new setting and the previous one as JSON.\n\n--viewer-tab names the Herdr tab viewing a headless agent (its tail --follow or console tab):\nthe watch tab hygiene ranks that tab with the agent, so a designated coordinator's or bridge\ntarget's viewer stays first and a lane's viewer ranks as that lane, where an unnamed viewer tab\nwould sort last as unmanaged. It names a tab only; no pane id is read or changed. tail --follow\nrun inside Herdr records its own tab this way; --no-viewer-tab clears the name."
     )]
     Set(SetArgs),
     /// Print the control tree: the designated coordinator at the root and every agent under the agent that manages it, at any depth
@@ -429,7 +429,7 @@ struct Manage {
 }
 
 #[derive(Args)]
-#[command(group(clap::ArgGroup::new("setting").required(true).args(["standing", "no_standing"])))]
+#[command(group(clap::ArgGroup::new("setting").required(true).args(["standing", "no_standing", "viewer_tab", "no_viewer_tab"])))]
 struct SetArgs {
     #[command(flatten)]
     agent: Named,
@@ -439,6 +439,12 @@ struct SetArgs {
     /// Mark the agent not standing, restoring the idle-without-verdict notice (the default for every agent)
     #[arg(long)]
     no_standing: bool,
+    /// Name the Herdr tab viewing this agent (a headless agent's tail --follow or console tab, as w1:t2): tab hygiene ranks it with the agent, so a designated coordinator's viewer stays first; no pane id changes
+    #[arg(long, value_name = "TAB_ID")]
+    viewer_tab: Option<String>,
+    /// Clear the agent's named viewer tab, restoring the default unmanaged ranking for it
+    #[arg(long)]
+    no_viewer_tab: bool,
 }
 
 #[derive(Args)]
@@ -3283,7 +3289,27 @@ fn run_services(registry: &Path, value: Services) -> Result<i32, Failure> {
     }
 }
 
-fn run_tail(registry: &Path, value: Tail) -> Result<i32, Failure> {
+/// Record this `tail --follow` process's Herdr tab as the agent's viewer tab
+/// (#1225 workspace-goal-reconciler, Phase 1), when it runs inside Herdr
+/// (`HERDR_TAB_ID` is set). Best-effort: a failure warns and never stops the
+/// tail, and outside Herdr nothing is recorded.
+fn record_tail_viewer(registry: &Path, herdr_bin: &Path, name: &str) {
+    let Some(tab) = std::env::var_os("HERDR_TAB_ID").filter(|tab| !tab.is_empty()) else {
+        return;
+    };
+    let tab = tab.to_string_lossy().into_owned();
+    let recorded = HerdrClient::with_executable("direct", herdr_bin)
+        .map_err(AgentError::from)
+        .and_then(|client| {
+            let manager = ManagedAgents::new(&client, registry)?;
+            manager.set_viewer_tab(name, Some(tab))
+        });
+    if let Err(error) = recorded {
+        eprintln!("agentctl tail: viewer tab not recorded for {name}: {error}");
+    }
+}
+
+fn run_tail(registry: &Path, herdr_bin: &Path, value: Tail) -> Result<i32, Failure> {
     let name = &value.agent.name;
     if name.is_empty()
         || name.len() > 32
@@ -3318,6 +3344,9 @@ fn run_tail(registry: &Path, value: Tail) -> Result<i32, Failure> {
                 events.display()
             )));
         }
+    }
+    if value.follow {
+        record_tail_viewer(registry, herdr_bin, name);
     }
     let terminal = io::stdout().is_terminal();
     let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
@@ -4067,7 +4096,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             return Ok(0);
         }
         Commands::Tail(value) => {
-            return run_tail(&args.registry, value);
+            return run_tail(&args.registry, &args.herdr_bin, value);
         }
         Commands::Profiles(value) => {
             let root = crate::profiles::configuration_root(&value.cwd, &args.registry, true)?;
@@ -4461,7 +4490,11 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             CoordinatorCommand::Clear => manager.coordinator_clear()?,
         },
         Commands::Set(value) => {
-            manager.set_standing(&value.agent.name, value.standing && !value.no_standing)?
+            if value.viewer_tab.is_some() || value.no_viewer_tab {
+                manager.set_viewer_tab(&value.agent.name, value.viewer_tab)?
+            } else {
+                manager.set_standing(&value.agent.name, value.standing && !value.no_standing)?
+            }
         }
         Commands::Manage(value) => manager.manage(
             &value.agent.name,

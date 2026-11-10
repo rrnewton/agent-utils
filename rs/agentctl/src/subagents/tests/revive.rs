@@ -514,6 +514,37 @@ fn a_standing_agent_stays_standing_through_revive_until_set_otherwise() {
 }
 
 #[test]
+fn a_viewer_tab_is_named_and_cleared_without_touching_the_pane() {
+    // #1225 workspace-goal-reconciler, Phase 1: a headless agent's viewer
+    // tab lives on its record, shows in status, and clears cleanly; the
+    // record's pane id never moves.
+    let (fixture, old) = recoverable("claude", false);
+    let pane_before = fixture.manager().load("worker").unwrap().pane_id.clone();
+    let set = fixture
+        .manager()
+        .set_viewer_tab("worker", Some("w1:t7".to_owned()))
+        .unwrap();
+    assert_eq!(
+        set,
+        json!({"name": "worker", "viewer_tab_id": "w1:t7", "previous": null})
+    );
+    let record = fixture.manager().load("worker").unwrap();
+    assert_eq!(record.viewer_tab().as_deref(), Some("w1:t7"));
+    assert_eq!(record.pane_id, pane_before);
+    assert_eq!(
+        fixture.manager().status("worker").unwrap()["viewer_tab_id"],
+        "w1:t7"
+    );
+    let cleared = fixture.manager().set_viewer_tab("worker", None).unwrap();
+    assert_eq!(cleared["previous"], "w1:t7");
+    let record = fixture.manager().load("worker").unwrap();
+    assert_eq!(record.viewer_tab(), None);
+    assert_eq!(record.pane_id, pane_before, "no pane ids changed");
+    assert!(fixture.manager().status("worker").unwrap()["viewer_tab_id"].is_null());
+    let _ = old;
+}
+
+#[test]
 fn revive_keeps_the_control_edges_and_answers_to_its_former_token() {
     let (fixture, old) = recoverable("claude", false);
     let path = fixture.root.join("registry/agents/worker/agent.json");

@@ -463,6 +463,7 @@ fn agents_the_pass_has_no_time_for_are_reported_unchecked_and_keep_their_memory(
                 notified: false,
                 notified_at: None,
                 turn: None,
+                turn_stamp: None,
                 window: None,
             }),
             ..AgentMemory::default()

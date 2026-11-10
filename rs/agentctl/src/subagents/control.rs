@@ -28,6 +28,11 @@ const FORMER_TOKENS: &str = "former_tokens";
 /// A standing agent rests idle between requests by design, so `watch-agents` reports no
 /// idle-without-verdict episode for it (#901 watch-standing-agents).
 pub(crate) const STANDING: &str = "standing";
+/// The Herdr tab viewing this agent, when it has no pane of its own: a
+/// headless agent's `tail --follow` or console tab (#1225
+/// workspace-goal-reconciler, Phase 1). Hygiene ranks that tab with the
+/// agent; it is never the agent's pane.
+pub(crate) const VIEWER_TAB: &str = "viewer_tab_id";
 /// Earlier tokens a record keeps; older generations' edges are treated as stale.
 const FORMER_TOKENS_MAX: usize = 32;
 /// The edge was found by walking the caller's process ancestry to a pinned harness.
@@ -677,6 +682,41 @@ impl AgentRecord {
             None => self.extra.get(STANDING),
         };
         value == Some(&Value::Bool(true))
+    }
+
+    /// The Herdr tab viewing this agent ([`VIEWER_TAB`]), when one is named.
+    pub(super) fn viewer_tab(&self) -> Option<String> {
+        let value = match &self.nested {
+            Some(nested) => nested.extensions().get(VIEWER_TAB),
+            None => self.extra.get(VIEWER_TAB),
+        }?;
+        value.as_str().map(str::to_owned)
+    }
+
+    /// Name the Herdr tab viewing this agent, or clear it; a record with no
+    /// viewer carries no field.
+    pub(super) fn set_viewer_tab(&mut self, tab: Option<&str>) {
+        match &mut self.nested {
+            Some(nested) => {
+                let map = nested.extensions_mut();
+                match tab {
+                    Some(tab) => {
+                        map.insert(VIEWER_TAB.to_owned(), json!(tab));
+                    }
+                    None => {
+                        map.remove(VIEWER_TAB);
+                    }
+                }
+            }
+            None => match tab {
+                Some(tab) => {
+                    self.extra.insert(VIEWER_TAB.to_owned(), json!(tab));
+                }
+                None => {
+                    self.extra.remove(VIEWER_TAB);
+                }
+            },
+        }
     }
 
     /// Mark this agent standing, or not; a record that is not standing carries no field.
@@ -1343,16 +1383,25 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         if !is_coordinator(record) || record.is_cloud() {
             return Ok(None);
         }
-        let (Some(workspace), Some(tab)) =
-            (record.workspace_id.as_deref(), record.tab_id.as_deref())
-        else {
+        // A headless coordinator has no pane or tab of its own: its viewer
+        // tab is the tab to bring forward (#1225 Phase 1). Its workspace is
+        // the viewer tab's own, when the record names none.
+        let viewer = record.viewer_tab();
+        let tab = record.tab_id.as_deref().or(viewer.as_deref());
+        let workspace = record.workspace_id.as_deref().or_else(|| {
+            viewer
+                .as_deref()
+                .and_then(|tab| tab.split(':').next())
+                .filter(|workspace| !workspace.is_empty())
+        });
+        let (Some(workspace), Some(tab)) = (workspace, tab) else {
             return Ok(None);
         };
         let others = records
             .iter()
             .filter(|other| other.name != agent_name && is_coordinator(other))
             .filter(|other| other.workspace_id.as_deref() == Some(workspace))
-            .filter_map(|other| other.tab_id.clone())
+            .filter_map(|other| other.tab_id.clone().or_else(|| other.viewer_tab()))
             .collect();
         crate::tab_order::bring_forward(socket, workspace, tab, &others)
     }
@@ -1604,6 +1653,25 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             "name": record.name,
             "token": record.token,
             "managed_by": edge,
+            "previous": previous,
+        }))
+    }
+
+    /// Name the Herdr viewer tab of `agent_name`, or clear it (#1225
+    /// workspace-goal-reconciler, Phase 1): tab hygiene then ranks that tab
+    /// with the agent, and `bring_forward` can keep a headless coordinator's
+    /// viewer first. The tab is a view only; no pane id is read or changed.
+    pub fn set_viewer_tab(&self, agent_name: &str, tab: Option<String>) -> Result<Value> {
+        let _lock = self.lock(agent_name)?;
+        let mut record = self.load(agent_name)?;
+        let previous = record.viewer_tab();
+        record.set_viewer_tab(tab.as_deref());
+        if previous != tab {
+            self.save(&record)?;
+        }
+        Ok(json!({
+            "name": record.name,
+            "viewer_tab_id": tab,
             "previous": previous,
         }))
     }

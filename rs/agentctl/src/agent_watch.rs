@@ -646,6 +646,11 @@ struct Episode {
     /// and so a new episode, even when no working pass was seen between the two.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     turn: Option<u64>,
+    /// For `child-done`, the harness turn this verdict belongs to, in transcript
+    /// seconds (the turn's prompt, else its newest progress; a headless agent's
+    /// turn number): the identity [`AgentMemory::child_done_verdict`] is keyed on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    turn_stamp: Option<f64>,
     /// Seconds the condition may hold before it is due, when the finding sets its own (a gate
     /// step's p95, a progress metric's hours); otherwise the kind's threshold.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -711,6 +716,19 @@ struct AgentMemory {
     /// agent just went from working to idle (#862 watch-status-requests).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_status: Option<String>,
+    /// The `child-done` verdict last durably notified, whitespace-normalized
+    /// (#1226 watch-verdict-dedupe): an unchanged verdict is never re-notified,
+    /// however the screen changes around it. Kept apart from the live episode,
+    /// which a transient pass may end and restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    child_done_verdict: Option<String>,
+    /// The harness turn [`Self::child_done_verdict`] belongs to, when a
+    /// transcript or a headless turn number names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    child_done_turn_stamp: Option<f64>,
+    /// When [`Self::child_done_verdict`] was notified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    child_done_notified_at: Option<f64>,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -2033,6 +2051,57 @@ const CLOCK_SLACK_SECONDS: f64 = 600.0;
 /// resized between two passes, which rewraps the line, is still the same turn.
 const TURN_WORDS: usize = 8;
 
+/// A verdict line with its whitespace collapsed, for comparing two reads of it.
+fn normalized_verdict(verdict: &str) -> String {
+    verdict.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether two reads name the same verdict line: one may be a rewrapped
+/// fragment of the other, so a word-prefix of the other still matches (#1226).
+fn same_verdict(left: &str, right: &str) -> bool {
+    let left: Vec<&str> = left.split_whitespace().collect();
+    let right: Vec<&str> = right.split_whitespace().collect();
+    let (short, long) = if left.len() <= right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    !short.is_empty() && long[..short.len()] == short[..]
+}
+
+/// The harness turn a `child-done` verdict belongs to (#1226): a headless
+/// agent's turn number, else the transcript's turn prompt, else its newest
+/// progress, else the newest transcript progress remembered. `None` when
+/// nothing names a turn, and the verdict text alone is the identity.
+fn child_done_turn_stamp(observation: &Observation, memory: &AgentMemory) -> Option<f64> {
+    if let Some(view) = &observation.headless {
+        return Some(view.turn as f64);
+    }
+    observation
+        .transcript
+        .as_ref()
+        .and_then(|activity| activity.prompt_at.or(activity.last_progress_at))
+        .or(memory.transcript_progress)
+}
+
+/// Whether `detail` is the `child-done` verdict already notified for this
+/// agent (#1226): the same harness turn, when both reads name one, else the
+/// same verdict text (a rewrapped fragment counts). A screen change that
+/// leaves the verdict and its turn alone is not a new finish.
+fn child_done_already_notified(
+    memory: &AgentMemory,
+    detail: &str,
+    turn_stamp: Option<f64>,
+) -> bool {
+    let Some(stored) = &memory.child_done_verdict else {
+        return false;
+    };
+    if let (Some(stored_stamp), Some(stamp)) = (memory.child_done_turn_stamp, turn_stamp) {
+        return stored_stamp == stamp;
+    }
+    same_verdict(stored, &normalized_verdict(detail))
+}
+
 /// The turn identity of a verdict line: a hash of its first [`TURN_WORDS`] words.
 fn verdict_turn(verdict: &str) -> u64 {
     stable_hash(
@@ -2066,10 +2135,24 @@ fn owes_notice(state: &WatchState, agent: &str, kind: EpisodeKind) -> bool {
 /// Record that `notice` was durably queued: the agent's episode of that kind is reported. Only
 /// here does an episode become `notified`, so the report's `reported` means delivered.
 fn mark_notified(state: &mut WatchState, notice: &PendingNotice, now: f64) {
-    if let Some(episode) = state
-        .agents
-        .get_mut(&notice.agent)
-        .and_then(|memory| memory.episode.as_mut())
+    let Some(memory) = state.agents.get_mut(&notice.agent) else {
+        return;
+    };
+    // A notified finish is remembered apart from its episode (#1226): the
+    // episode may end and restart around a mass screen change, and the same
+    // verdict on the same harness turn must still not be notified again.
+    if notice.kind == EpisodeKind::ChildDone {
+        memory.child_done_verdict = Some(normalized_verdict(&notice.detail));
+        memory.child_done_turn_stamp = memory
+            .episode
+            .as_ref()
+            .filter(|episode| episode.kind == notice.kind)
+            .and_then(|episode| episode.turn_stamp);
+        memory.child_done_notified_at = Some(now);
+    }
+    if let Some(episode) = memory
+        .episode
+        .as_mut()
         .filter(|episode| episode.kind == notice.kind)
     {
         episode.notified = true;
@@ -2424,6 +2507,18 @@ fn update_episode(
     }
     let work_moved = remember_work(&mut memory, observation, now);
     remember_motion(&mut memory, observation, now, work_moved);
+    // A screen-only agent seen working has begun a new turn, so its last
+    // notified finish is spent (#1226). With a transcript the turn stamp
+    // itself tells a new turn from the old one, and a flicker through
+    // `working` must not spend it.
+    if observation.status == "working"
+        && observation.headless.is_none()
+        && observation.transcript.is_none()
+    {
+        memory.child_done_verdict = None;
+        memory.child_done_turn_stamp = None;
+        memory.child_done_notified_at = None;
+    }
     // A standing agent rests idle by design: only its idle-without-verdict finding is dropped.
     let found = classify(observation, options, &memory, now)
         .filter(|finding| {
@@ -2507,6 +2602,14 @@ fn update_episode(
     // has been stalled only since it stopped.
     // Idle is timed from the last screen change too: Herdr can report a Claude Code agent
     // idle while its output still streams, and new output is not idleness.
+    // A finish is keyed on its verdict and harness turn, not on the screen
+    // (#1226): its clock does not move when the screen changes around an
+    // unchanged verdict.
+    let turn_stamp = (kind == EpisodeKind::ChildDone)
+        .then(|| child_done_turn_stamp(observation, &memory))
+        .flatten();
+    let already_notified =
+        kind == EpisodeKind::ChildDone && child_done_already_notified(&memory, &detail, turn_stamp);
     let since = match (kind, given_since) {
         // The finding's own clock, kept steady across passes against a jittering screen timer.
         (_, Some(given)) => match &memory.episode {
@@ -2514,7 +2617,11 @@ fn update_episode(
             _ => given,
         },
         (EpisodeKind::Stalled, None) => memory.screen_changed_at,
-        (EpisodeKind::IdleNoVerdict | EpisodeKind::ChildDone, None) => match &memory.episode {
+        (EpisodeKind::ChildDone, None) => match &memory.episode {
+            Some(episode) if episode.kind == kind => episode.since,
+            _ => now,
+        },
+        (EpisodeKind::IdleNoVerdict, None) => match &memory.episode {
             Some(episode) if episode.kind == kind => episode.since.max(memory.screen_changed_at),
             _ => now,
         },
@@ -2528,6 +2635,13 @@ fn update_episode(
         .as_ref()
         .filter(|episode| episode.kind == kind && episode.notified)
         .map(|episode| episode.notified_at);
+    // An unchanged verdict already notified stays notified even when its
+    // episode was ended and restarted around a mass screen change (#1226).
+    let notified_at = if already_notified {
+        Some(memory.child_done_notified_at)
+    } else {
+        notified_at
+    };
     let notified = notified_at.is_some();
     let episode = Episode {
         kind,
@@ -2535,6 +2649,7 @@ fn update_episode(
         notified,
         notified_at: notified_at.flatten(),
         turn,
+        turn_stamp,
         window,
     };
     let due = now - since >= episode_window(&episode, options);
@@ -3500,6 +3615,7 @@ fn check_blocked(
                     notified: false,
                     notified_at: None,
                     turn: None,
+                    turn_stamp: None,
                     window: None,
                 };
                 let due = episode_window(&episode, options) <= 0.0;
@@ -8607,6 +8723,85 @@ mod tests {
             (300.0, "idle", second.as_str(), 3),
         ] {
             let mut probe = ScriptedProbe(vec![vec![observation("worker", status, Some(screen))]]);
+            pass(&mut probe, &mut notifier, &mut state, at, &options);
+            assert_eq!(notifier.sent.len(), sent, "at {at}: {:?}", notifier.sent);
+        }
+    }
+
+    #[test]
+    fn a_mass_screen_change_does_not_renotify_an_unchanged_verdict() {
+        // #1226: every pane's screen changes at one instant (a Herdr-wide
+        // redraw or a resize that rewraps the verdict line), and a later
+        // pass transiently loses the verdict altogether. Neither may
+        // re-notify a verdict that was already reported; only a genuinely
+        // new turn may.
+        let options = options();
+        let mut notifier = RecordingNotifier::default();
+        let mut state = WatchState::default();
+        let done_b = "◆ finished the other thing\nDONE: the other thing is complete\n❯\n";
+        let rewrapped_a = "◆ finished the thing\nDONE: the thing is\ncomplete\n❯\n";
+        let changed_b =
+            "◆ finished the other thing\nDONE: the other thing is complete\n· redrawn ·\n❯\n";
+        let hidden = "● Finished the change.\n\n❯\u{a0}\n";
+        let steps: Vec<(f64, Vec<Observation>, usize)> = vec![
+            (
+                0.0,
+                vec![
+                    observation("worker-a", "idle", Some(DONE_SCREEN)),
+                    observation("worker-b", "idle", Some(done_b)),
+                ],
+                2,
+            ),
+            // The mass change: both screens change at the same instant,
+            // one verdict rewrapped onto two rows, the other untouched
+            // apart from a new footer row.
+            (
+                60.0,
+                vec![
+                    observation("worker-a", "idle", Some(rewrapped_a)),
+                    observation("worker-b", "idle", Some(changed_b)),
+                ],
+                2,
+            ),
+            // A transient pass in which no verdict is visible at all.
+            (
+                120.0,
+                vec![
+                    observation("worker-a", "idle", Some(hidden)),
+                    observation("worker-b", "idle", Some(hidden)),
+                ],
+                2,
+            ),
+            // The original screens again: still the same two finishes.
+            (
+                180.0,
+                vec![
+                    observation("worker-a", "idle", Some(DONE_SCREEN)),
+                    observation("worker-b", "idle", Some(done_b)),
+                ],
+                2,
+            ),
+            // A working pass, then a genuinely new verdict: one new notice.
+            (
+                240.0,
+                vec![observation("worker-a", "working", Some("◆ working\n"))],
+                2,
+            ),
+            (
+                300.0,
+                vec![
+                    observation(
+                        "worker-a",
+                        "idle",
+                        Some("◆ finished more\nDONE: more is complete\n❯\n"),
+                    ),
+                    observation("worker-b", "idle", Some(done_b)),
+                ],
+                3,
+            ),
+        ];
+        for (at, observations, sent) in steps {
+            let mut probe = ScriptedProbe(vec![observations]);
             pass(&mut probe, &mut notifier, &mut state, at, &options);
             assert_eq!(notifier.sent.len(), sent, "at {at}: {:?}", notifier.sent);
         }

@@ -1,13 +1,14 @@
 ---
 title: 'watch-verdict-dedupe: watch-agents re-sends an unchanged DONE or BLOCKED verdict after a mass screen change'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agentctl
 - watch-agents
 created_at: 2026-11-10T16:54:43+00:00
-updated_at: 2026-11-10T16:54:43+00:00
+updated_at: 2026-11-10T17:51:28+00:00
+closed_at: 2026-11-10T17:51:28+00:00
 ---
 
 # Description
@@ -38,4 +39,10 @@ Where it lives: `rs/agentctl/src/agent_watch.rs`. A `child-done` episode's `sinc
 
 # Notes
 
-Related: #509 agentctl-child-done-notice (introduced the `child-done` episode, deduplicated per turn), #571 watch-agents-scale, #574 harness-adapters, #669 watch-notice-delivery, #675 watch-blocked-fast-alerts, #932 watch-agents-write-churn (which already saw a repeated `child-done` notice re-logged about every 62 s). To be updated with the trigger once it is found.
+Related: #509 agentctl-child-done-notice (introduced the `child-done` episode, deduplicated per turn), #571 watch-agents-scale, #574 harness-adapters, #669 watch-notice-delivery, #675 watch-blocked-fast-alerts, #932 watch-agents-write-churn (which already saw a repeated `child-done` notice re-logged about every 62 s).
+
+## Resolution
+
+[watermelon-full-preview] Trigger found, 2026-11-10: a Herdr-wide screen change at one instant (a redraw or resize, as when a tab is opened or retired) rewraps every pane's verdict line onto different rows or transiently hides it. The episode identity followed the screen: `verdict_turn` hashes the first eight words of the first physical row, so a narrower rewrap is a different turn hash and a fresh episode, and a pass that transiently loses the verdict ends the episode outright. Reproduced in a test before the fix: one rewrapped verdict produced a second notice in the next pass.
+
+Fix, in `rs/agentctl/src/agent_watch.rs`: a notified `child-done` verdict is now remembered on the agent's memory apart from its episode, keyed on the verdict line's text (a rewrapped fragment counts as the same verdict) plus the harness turn (a headless turn number, else the transcript's turn prompt or newest progress). An unchanged verdict on the same turn is never re-notified, however the screen changes around it, and the episode's clock no longer follows `screen_changed_at`. A new verdict, or a verdict on a later turn, still notifies once. Stall, idle, and approval detection still use screen changes as before. The Python edition refuses `watch-agents` as Rust-only, so no parity change was needed. Test: `a_mass_screen_change_does_not_renotify_an_unchanged_verdict` replays a simultaneous screen change for two agents, a transient verdict-less pass, and a later genuine finish, and asserts exactly the original two notices plus the one new finish.

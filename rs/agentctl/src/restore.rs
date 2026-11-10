@@ -3363,6 +3363,66 @@ fn alert<A: ManagedApi + ?Sized>(
 /// the record's `role` field.
 type ClaimedTab = (String, Option<String>, Option<String>, Option<String>);
 
+/// One viewer tab claimed in a hygiene pass (#1225 workspace-goal-reconciler,
+/// Phase 1): the agent it views, its launch profile, and its record's `role`
+/// field. A headless agent has no pane, so its `tail --follow` or console tab
+/// is claimed by tab alone and ranked with the agent it views.
+type ViewerTab = (String, Option<String>, Option<String>);
+
+/// The ranked tab entries of one workspace for [`hygiene_pass`]: each tab in
+/// `order` with the name and canonical role it sorts by. A tab claimed by an
+/// agent's pane ranks as that agent; a viewer tab with no pane claim ranks as
+/// the agent it views; anything else is unmanaged and sorts last.
+fn ranked_entries(
+    order: &[String],
+    claimed: &BTreeMap<String, ClaimedTab>,
+    viewer_tabs: &BTreeMap<String, ViewerTab>,
+    labels: &BTreeMap<String, String>,
+    roles: &BTreeMap<String, String>,
+    bridge_targets: &std::collections::BTreeSet<String>,
+    designated: Option<&str>,
+) -> Vec<(String, String, u8)> {
+    let role = |name: &str, profile: Option<&str>, record_role: Option<&str>| {
+        crate::tab_order::role_for(
+            name,
+            profile,
+            profile
+                .and_then(|profile| roles.get(profile))
+                .map(String::as_str),
+            record_role,
+            bridge_targets,
+            designated,
+        )
+    };
+    order
+        .iter()
+        .map(|tab| {
+            let lane = claimed
+                .values()
+                .find(|(_, lane_tab, _, _)| lane_tab.as_deref() == Some(tab.as_str()));
+            match lane {
+                Some((name, _, profile, record_role)) => (
+                    tab.clone(),
+                    name.clone(),
+                    role(name, profile.as_deref(), record_role.as_deref()),
+                ),
+                None => match viewer_tabs.get(tab) {
+                    Some((name, profile, record_role)) => (
+                        tab.clone(),
+                        name.clone(),
+                        role(name, profile.as_deref(), record_role.as_deref()),
+                    ),
+                    None => (
+                        tab.clone(),
+                        labels.get(tab).cloned().unwrap_or_default(),
+                        crate::tab_order::ROLE_UNMANAGED,
+                    ),
+                },
+            }
+        })
+        .collect()
+}
+
 /// Each launch profile's `role` in `<registry>/profiles.json`, by profile
 /// name; empty when the file is absent or unreadable, so ranking falls back
 /// to profile names alone.
@@ -3426,6 +3486,7 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
             .collect();
     let roles = profile_roles(registry);
     let mut claimed: BTreeMap<String, ClaimedTab> = BTreeMap::new();
+    let mut viewer_tabs: BTreeMap<String, ViewerTab> = BTreeMap::new();
     for name in &names {
         if let Ok(status) = manager.status(name) {
             if let Some(pane) = status["pane_id"].as_str() {
@@ -3439,6 +3500,18 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
                     ),
                 );
             }
+            // A headless record may name a viewer tab (#1225 Phase 1): that
+            // tab ranks with the agent, and no pane id is claimed or changed.
+            if let Some(viewer) = status["viewer_tab_id"].as_str() {
+                viewer_tabs.insert(
+                    viewer.to_owned(),
+                    (
+                        name.clone(),
+                        status["profile"].as_str().map(str::to_owned),
+                        status["role"].as_str().map(str::to_owned),
+                    ),
+                );
+            }
         }
     }
     let Ok(panes) = client.panes() else {
@@ -3446,7 +3519,9 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
     };
     let managed_workspaces: std::collections::BTreeSet<String> = panes
         .iter()
-        .filter(|pane| claimed.contains_key(&pane.pane_id))
+        .filter(|pane| {
+            claimed.contains_key(&pane.pane_id) || viewer_tabs.contains_key(&pane.tab_id)
+        })
         .map(|pane| pane.workspace_id.clone())
         .collect();
     // Canonical tab order, through the Herdr socket when reachable.
@@ -3456,36 +3531,15 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
                 continue;
             };
             let labels = client.tab_labels(workspace).unwrap_or_default();
-            let entries: Vec<(String, String, u8)> = order
-                .iter()
-                .map(|tab| {
-                    let lane = claimed
-                        .values()
-                        .find(|(_, lane_tab, _, _)| lane_tab.as_deref() == Some(tab.as_str()));
-                    match lane {
-                        Some((name, _, profile, record_role)) => (
-                            tab.clone(),
-                            name.clone(),
-                            crate::tab_order::role_for(
-                                name,
-                                profile.as_deref(),
-                                profile
-                                    .as_deref()
-                                    .and_then(|name| roles.get(name))
-                                    .map(String::as_str),
-                                record_role.as_deref(),
-                                &bridge_targets,
-                                config.coordinator.as_deref(),
-                            ),
-                        ),
-                        None => (
-                            tab.clone(),
-                            labels.get(tab).cloned().unwrap_or_default(),
-                            crate::tab_order::ROLE_UNMANAGED,
-                        ),
-                    }
-                })
-                .collect();
+            let entries = ranked_entries(
+                &order,
+                &claimed,
+                &viewer_tabs,
+                &labels,
+                &roles,
+                &bridge_targets,
+                config.coordinator.as_deref(),
+            );
             let desired = crate::tab_order::canonical_tabs(&entries);
             let mut current = order;
             for (index, tab) in desired.iter().enumerate() {
@@ -3507,7 +3561,10 @@ fn hygiene_pass<A: ManagedApi + ?Sized>(
     let now = host.now();
     let mut seen: std::collections::BTreeSet<String> = Default::default();
     for pane in &panes {
-        if claimed.contains_key(&pane.pane_id) || !managed_workspaces.contains(&pane.workspace_id) {
+        if claimed.contains_key(&pane.pane_id)
+            || viewer_tabs.contains_key(&pane.tab_id)
+            || !managed_workspaces.contains(&pane.workspace_id)
+        {
             continue;
         }
         if !client.pane_is_idle_shell(&pane.pane_id).unwrap_or(false) {
@@ -3689,6 +3746,81 @@ mod tests {
         assert_eq!(path, primary);
         assert_eq!(report["where"], "primary");
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_headless_coordinators_viewer_tab_stays_first_through_hygiene_ranking() {
+        // #1225 Phase 1: a headless designated coordinator has no pane, so
+        // hygiene claims its tail tab only as a viewer. It must rank first,
+        // a headless lane's viewer must rank as that lane, an unnamed tab
+        // last, and ranking must be idempotent with no pane ids involved.
+        let order = vec![
+            "w1:t4".to_owned(),
+            "w1:t3".to_owned(),
+            "w1:t2".to_owned(),
+            "w1:t1".to_owned(),
+        ];
+        let mut claimed: BTreeMap<String, ClaimedTab> = BTreeMap::new();
+        claimed.insert(
+            "w1:p9".to_owned(),
+            (
+                "lane-b".to_owned(),
+                Some("w1:t3".to_owned()),
+                Some("muse-worker".to_owned()),
+                None,
+            ),
+        );
+        let mut viewer_tabs: BTreeMap<String, ViewerTab> = BTreeMap::new();
+        viewer_tabs.insert("w1:t1".to_owned(), ("coord".to_owned(), None, None));
+        viewer_tabs.insert(
+            "w1:t2".to_owned(),
+            ("lane-a".to_owned(), Some("muse-worker".to_owned()), None),
+        );
+        let labels: BTreeMap<String, String> = BTreeMap::new();
+        let roles: BTreeMap<String, String> = BTreeMap::new();
+        let bridge: std::collections::BTreeSet<String> = Default::default();
+        let entries = ranked_entries(
+            &order,
+            &claimed,
+            &viewer_tabs,
+            &labels,
+            &roles,
+            &bridge,
+            Some("coord"),
+        );
+        let desired = crate::tab_order::canonical_tabs(&entries);
+        assert_eq!(desired, vec!["w1:t1", "w1:t2", "w1:t3", "w1:t4"]);
+        // A second pass over the desired order changes nothing, and the
+        // viewer claim never invents a pane for the headless agents.
+        let reordered_entries = ranked_entries(
+            &desired,
+            &claimed,
+            &viewer_tabs,
+            &labels,
+            &roles,
+            &bridge,
+            Some("coord"),
+        );
+        assert_eq!(
+            crate::tab_order::canonical_tabs(&reordered_entries),
+            desired
+        );
+        assert_eq!(claimed.len(), 1, "no pane ids were added or changed");
+        assert!(claimed.contains_key("w1:p9"));
+        // Without a named viewer tab the same tabs rank unmanaged and last.
+        let unnamed = ranked_entries(
+            &order,
+            &claimed,
+            &BTreeMap::new(),
+            &labels,
+            &roles,
+            &bridge,
+            Some("coord"),
+        );
+        assert_eq!(
+            crate::tab_order::canonical_tabs(&unnamed),
+            vec!["w1:t3", "w1:t4", "w1:t2", "w1:t1"]
+        );
     }
 
     #[test]

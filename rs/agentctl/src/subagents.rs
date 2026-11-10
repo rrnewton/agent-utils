@@ -11356,6 +11356,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if record.standing() {
             result[control::STANDING] = json!(true);
         }
+        if let Some(viewer) = record.viewer_tab() {
+            result[control::VIEWER_TAB] = json!(viewer);
+        }
         result["queue"] = json!(self.queue(agent_name)?);
         result["output"] = json!(self.directory(agent_name)?.join("output.json"));
         result["goal_source"] = if record.goal.is_some() {

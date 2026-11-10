@@ -1461,6 +1461,21 @@ the pass that first sees it; a larger value waits for the screen to hold still
 that long, which debounces a harness whose status says idle while it still
 streams.
 
+A finish is reported once per verdict and harness turn (#1226
+watch-verdict-dedupe): a screen change that leaves the verdict and its turn
+alone — a Herdr-wide redraw, or a resize that rewraps the verdict line onto
+different rows — never reports it again, while a new verdict, or the same
+verdict on a later turn, is reported in its own right.
+
+A headless agent's viewer tab can be named on its record with
+`agentctl set NAME --viewer-tab TAB_ID` (`--no-viewer-tab` clears it), and
+`agentctl tail --follow` run inside Herdr records its own tab that way
+(#1225 workspace-goal-reconciler, Phase 1). The `agentctl watch` tab hygiene
+then ranks that tab with the agent — a designated coordinator's or bridge
+target's viewer first, a lane's viewer as that lane — instead of last as an
+unmanaged tab. The name is a tab only: no pane id is read or changed, and a
+record with no viewer tab behaves as before.
+
 A standing agent rests idle between requests by design, such as a standing
 reviewer, so it is never reported `idle-no-verdict` (#901
 watch-standing-agents). Mark one with `agentctl set NAME --standing`, which
