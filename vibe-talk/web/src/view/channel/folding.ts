@@ -341,14 +341,6 @@ export function createFolding(deps: FoldingDependencies): Folding {
   function renderSummaries(): void {
     deps.preservingScroll(() => {
       for (const entry of FOLD_LISTS.flatMap((id) => foldsOf(leftEl(id)))) {
-        // `#1210`: a row about to draw summarised keeps the height it stands at folded, so the
-        // rows below it do not jump up as its body gives way to the summary line. Pinned once,
-        // before the state lands; expanding the row only ever grows past the floor.
-        const held = summaryRows.held(summaryKey(entry as never)) as { text?: string | null } | undefined;
-        if (summaryRows.mode() && held !== undefined && typeof held.text === "string" && held.text !== "" &&
-            entry.li.getAttribute("data-summarised") !== "true" && !entry.li.style.minHeight) {
-          entry.li.style.minHeight = `${entry.li.offsetHeight}px`;
-        }
         applySummaryState(entry);
         setFolded(entry, isFolded(entry));
       }
