@@ -243,3 +243,7 @@ export { LOADING_LINE_DELAY_MS, createChannelLoading } from "./channelloading.ts
 export type { ChannelLoading, ChannelLoadingDependencies } from "./channelloading.ts";
 export { createHeldDone } from "./helddone.ts";
 export type { HeldDone, HeldDoneDependencies } from "./helddone.ts";
+export { createMessageDetails } from "./messagedetails.ts";
+export type { MessageDetails, MessageDetailsDependencies } from "./messagedetails.ts";
+export { createStartsRead } from "./startsread.ts";
+export type { StartsRead, StartsReadDependencies, StartsReadWho } from "./startsread.ts";

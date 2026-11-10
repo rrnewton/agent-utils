@@ -5319,7 +5319,7 @@ const readingBookmark = createReadingBookmark({
   drawnBy,
   anchorOfRow,
   nextUndoAt,
-  stillToDo,
+  stillToDo: (message, done) => stillToDo(message, done),
   archived: () => doneState().archived,
   dismissed: () => channelStore.current().dismissed,
   heldMessages: () => channelStore.current().messages,
@@ -5351,49 +5351,14 @@ const bookmarkUndos = { current: bookmarkUndosCurrent };
 // (`createReplyGathering`, `#624 voice-page-modularity`).
 
 
-function toggleMessageDetails(li, messages) {
-  const message = messages[0];
-  const open = childByClass(li, "msg-details");
-  if (open) {
-    li.removeChild(open);
-    return;
-  }
-  const details = document.createElement("div");
-  details.className = "msg-details";
-  const who = document.createElement("div");
-  who.textContent = message.author_is_bot
-    ? `${message.author} (bot)`
-    : String(message.author || "");
-  const when = document.createElement("div");
-  when.textContent = fullLocalTime(message);
-  // `#320 slack-edited-mark`. When it was last edited, which a phone cannot hover the mark to learn.
-  const edited = rowEdited(messages);
-  const editedLine = document.createElement("div");
-  editedLine.className = "msg-edited";
-  editedLine.textContent = edited === null ? "" : edited.at === null ? "Edited" : `Edited ${fullLocalAt(edited.at)}`;
-  const id = document.createElement("div");
-  id.className = "msg-id";
-  // EVERY id, on a row that is showing more than one message. This sheet is the answer to "does
-  // that message really exist", and a combined row that named only its first constituent would
-  // make the second unreachable by exactly the affordance built to reach it — while also hiding
-  // the fact that the row is two messages at all.
-  id.textContent = `id ${messages.map((m) => String(m.id)).join(" + ")}`;
-  // THE BOOKMARK lives here as well as in the ⋯ menu and on Shift+B, rather than on a gesture of its
-  // own. Press-and-hold already opens this sheet, and a second long-press meaning something
-  // different from the first would be a gesture nobody could discover and everybody would trigger by
-  // accident. `#240 reading-bookmark`.
-  const mark = document.createElement("button");
-  mark.className = "chip";
-  mark.setAttribute("type", "button");
-  mark.textContent = bookmarkAbove(li) ? "Remove bookmark" : "Bookmark above";
-  mark.addEventListener("click", inThisColumn(() => {
-    toggleBookmarkAt(li);
-    const open = childByClass(li, "msg-details");
-    if (open) li.removeChild(open);
-  }));
-  details.append(who, when, ...(edited === null ? [] : [editedLine]), id, mark);
-  li.append(details);
-}
+/** A message's details sheet: web/src/view/channel's now (`createMessageDetails`, `#624`). */
+const messageDetails = createMessageDetails({
+  bookmarkAbove: (row) => bookmarkAbove(row),
+  toggleBookmarkAt: (row) => toggleBookmarkAt(row),
+  inThisColumn: (act) => inThisColumn(act),
+});
+const { toggleMessageDetails } = messageDetails;
+
 
 /**
  * Do the reader's OWN messages START read?
@@ -5438,64 +5403,16 @@ const ownReadApply = mountOwnReadApply({
   clearTimeout: (timer) => clearTimeout(timer),
 });
 
-/**
- * Whether `message` is one of the reader's own whose read state starts read: "Mark my own messages as
- * read" on, not read as noise already, and his by the server's own order (src/own_read.rs
- * `Choice::owns`) — who-is-who first, then the configured accounts (`isOwnerId`), then this bridge's
- * account unless the configuration names it as a coding agent. That last is narrower than how a row
- * is drawn (`bucketFor` draws the bridge's account as "me" regardless), because a guess wider than the
- * server's would draw an agent's message read that the server leaves unread. `#549 own-read-stored`.
- */
-function startsRead(message) {
-  if (!ownReadSwitch.on() || !message || isNoise(message)) return false;
-  const id = String(message.author_id || "");
-  if (!id) return false;
-  const chosen = whoIsWho.choiceOf(id);
-  if (chosen) return chosen === "me";
-  if (whoIsWho.isOwnerId(id)) return true;
-  return whoIsWho.isSelfId(id) && !whoIsWho.codingAgentsOf(messageChannel(message)).ids.has(id);
-}
+/** Whether the reader's own messages start read, and what is still to do: web/src/view/channel's now (`createStartsRead`, `#624`). */
+const startsReadOwner = createStartsRead({
+  ownReadSwitch, whoIsWho: () => whoIsWho,
+  messageChannel: (message) => messageChannel(message),
+  providerFacts, heldMessage: (id) => heldMessage(id), readLedger,
+  selectedChannelId: () => selectedChannelId(), channelStore,
+  doneState: () => doneState(), hiddenEmpty: (message) => hiddenEmpty(message),
+});
+const { startsRead, noteStartsRead, stillToDo } = startsReadOwner;
 
-/**
- * Draw each of `messages` that `startsRead` read now, before the server's answer for it arrives: one
- * this page just sent, or one of his the stream brought. The server decided it at the same first
- * sight, and records it (`src/own_read.rs`), so this only spares a row of his a moment drawn unread
- * between its arrival and the read that follows. Held as a write made here, settled at once
- * (`localReadWrites`): a read sent before it does not undo it, and a read sent after it speaks for the
- * message, so the server's answer is the one that stands. A message the page already holds keeps
- * the state its reads gave it. `#549 own-read-stored`.
- *
- * @param {any[]} messages
- */
-function noteStartsRead(messages) {
-  const fresh = messages.filter((message) => startsRead(message) &&
-    !(providerFacts.threading() && heldMessage(String(message.id))) && !readLedger.written(String(message.id)));
-  if (fresh.length === 0) return;
-  const epoch = readLedger.bump();
-  const here = String(selectedChannelId());
-  for (const message of fresh) {
-    const id = String(message.id);
-    readLedger.seed(id, epoch);
-    if (String(message.channel_id) !== here) continue;
-    if (providerFacts.threading() && channelStore.current().channel === here) channelStore.current().dismissed.add(id);
-    doneState().archived.add(id);
-  }
-}
-
-/**
- * Does this message belong in the list behind Hide read?
- *
- * ONE definition, for both places the threaded view filters. Not archived, not read automatically,
- * and not the reader's own words when they have said those are read. And for what Fold read
- * collapses and what entering a thread lands on (`#221 read-modes`, `rowIsRead`): a refinement of
- * what counts as unread belongs here, and reaches every read mode at once.
- *
- * `done` is the read state asked: the marks for the rows on screen by default, and the store's for
- * a reply Main does not draw (`#222 unread-replies`, `replyTally`).
- */
-function stillToDo(message, done = doneState().archived) {
-  return !done.has(String(message.id)) && !isNoise(message) && !hiddenEmpty(message);
-}
 
 
 /**
@@ -5537,7 +5454,7 @@ const rowGestures = createRowGestures({
   jumpReading: (index) => readAloudOwner().jumpReading(index),
   readAloud: (ids) => guardQuietly(() => readAloudOwner().readAloud(ids))(),
   idsOf: (row) => idsOf(/** @type {any} */ (row)),
-  toggleDetails: (row, messages) => toggleMessageDetails(row, messages),
+  toggleDetails: (row, messages) => toggleMessageDetails(row, /** @type {any} */ (messages)),
   swiped: (row, ids, dx) => {
     // THE SAME ACT the Done button performs, not a second notion of "dealt with": one dismissal,
     // recorded on the server, with `#50`'s undo behind it. That is what makes this gesture safe
@@ -8392,7 +8309,7 @@ const outboxDispatch = createOutboxDispatch({
   followsNewest: (side) => side
     ? sideShowing() && inColumn(columns.side, () => followsNewest(el("scroll-area")))
     : followsNewest(el("scroll-area")),
-  noteSelfAuthor, noteStartsRead, appendPart: (part) => appendToColumns(/** @type {any} */ (part)),
+  noteSelfAuthor, noteStartsRead: (parts) => noteStartsRead(/** @type {any} */ (parts)), appendPart: (part) => appendToColumns(/** @type {any} */ (part)),
   scrollToNewest: (side) => { if (side) inColumn(columns.side, scrollToNewest); else scrollToNewest(); },
   markSentRead: (entry) => guardQuietly(markSentRead)(entry),
   reportColumnReply, columnReplies, quietly: (run) => guardQuietly(run)(),

@@ -3855,12 +3855,19 @@ test("`#479 message-time-full-date`: a time's day is its name, a tap or Enter on
 test("the details sheet says the day in the same words, with the time and the zone", async () => {
   await inZone("America/New_York", async () => {
     const page = newPage();
-    const fullLocalTime = page.preludeBinding("fullLocalTime");
-    const before = localAt(2026, 8, 18, 17, 25);
+    const { dayLabel, fullLocalTime } = PRESENT_TIME;
+    // Two days back, not yesterday: its label is the same either side of a midnight the run
+    // crosses, so the real clock fullLocalTime reads cannot flip the words mid-test. The
+    // Yesterday words themselves are pinned in ONE DAY FORMATTER above, with a fixed now.
+    const now = new Date();
+    const before = localAt(now.getFullYear(), now.getMonth() + 1, now.getDate() - 2, 17, 25);
     const zoned = before.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", timeZoneName: "short" });
-    assert.equal(fullLocalTime({ timestamp: before.toISOString() }), `Yesterday, Aug 18, Tue, ${zoned}`);
-    assert.ok(fullLocalTime({ timestamp: localAt(2025, 8, 18).toISOString() }).startsWith("Aug 18, 2025, Mon, "),
+    assert.equal(fullLocalTime({ timestamp: before.toISOString() }), `${dayLabel(before, now)}, ${zoned}`);
+    const yearAgo = localAt(now.getFullYear() - 1, now.getMonth() + 1, now.getDate());
+    assert.ok(dayLabel(yearAgo, now).includes(String(now.getFullYear() - 1)),
       "another year's message did not say its year");
+    assert.ok(fullLocalTime({ timestamp: yearAgo.toISOString() }).startsWith(dayLabel(yearAgo, now)),
+      "another year's message did not say its day as the formatter does");
     assert.equal(fullLocalTime({ timestamp: "", spoken_time: "five past ten" }), "five past ten");
   });
 });
