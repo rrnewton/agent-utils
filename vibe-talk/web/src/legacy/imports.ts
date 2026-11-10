@@ -1,4 +1,4 @@
-export { createApplication, createKeyboardComposition } from "../app/index.ts";
+export { createApplication, createKeyboardComposition, createServerAccess } from "../app/index.ts";
 // What the legacy page script (web/voice.js) takes from the modules, and nothing else.
 //
 // `#624 voice-page-modularity`. The page's code moves out of web/voice.js into these modules a
@@ -22,7 +22,7 @@ export {
   searchSubject,
 } from "../core/search/index.ts";
 export { speechHoldFrom } from "../core/speech/index.ts";
-export { createApi, createServerFacts, isSlowFailure, readableFailure } from "../core/api/index.ts";
+export { createServerFacts, isSlowFailure, readableFailure } from "../core/api/index.ts";
 
 export { channelPostsOnce, allReachesThread, createChannelDirectory, createChannelStore, createCopyOrder, createIdentities, createProviderFacts, createThreadPresence, createUnpackReads, exactReplyCount, heldNow, inTimeOrder, newerPage, refreshFailed, threadOf, timeOf, upsertThreadSummary } from "../core/channels/index.ts";
 export { createReadLedger } from "../core/annotations/index.ts";
@@ -69,8 +69,7 @@ export {
   underDraft,
   unsentText,
 } from "../core/outbox/index.ts";
-export { DEFAULT_COLLAPSED_LINES, DEFAULT_TWO_COLUMN_SPLIT, DEVICE_SETTINGS, IDENTITY_KEY, MAX_COLLAPSED_LINES, MIN_COLLAPSED_LINES, clampTwoColumnSplit, createCardMaxLines, createCollapsedLines, createCredentials, createDeviceSettings, createEnterSends, createInAppLinks, createKeptSwitch, createQuoteReadPercent, createSettingsSync } from "../core/settings/index.ts";
-export { createWebPorts } from "../platform/web/index.ts";
+export { DEFAULT_COLLAPSED_LINES, DEFAULT_TWO_COLUMN_SPLIT, DEVICE_SETTINGS, IDENTITY_KEY, MAX_COLLAPSED_LINES, MIN_COLLAPSED_LINES, clampTwoColumnSplit, createCardMaxLines, createCollapsedLines, createCredentials, createEnterSends, createInAppLinks, createKeptSwitch, createQuoteReadPercent, createSettingsSync } from "../core/settings/index.ts";
 export {
   childByClass,
   createOncePerFrame,
@@ -102,7 +101,6 @@ export {
   mountQuickReplyListeners,
   wireNewlineKey,
 } from "../view/composer/index.ts";
-export { sentenceStart } from "../foundation/index.ts";
 
 export { briefAge, fullLocalAt, fullLocalTime, stamp } from "../present/time/index.ts";
 

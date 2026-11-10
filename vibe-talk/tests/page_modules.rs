@@ -15,6 +15,7 @@ use std::process::Command;
 const SUITES: &[&str] = &[
     "tests/js/app/application.test.mjs",
     "tests/js/app/keyboard.test.mjs",
+    "tests/js/app/server.test.mjs",
     "tests/js/core/annotations.test.mjs",
     "tests/js/core/api.test.mjs",
     "tests/js/core/call.test.mjs",

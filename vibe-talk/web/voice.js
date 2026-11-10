@@ -168,6 +168,20 @@ const columnWork = createColumnWork(columns);
 const { useColumn, inColumn } = columnWork;
 
 /**
+ * The page's way to the browser and the server: web/src/app's now (`createServerAccess`, `#624`),
+ * made here, before its first use; everything it holds is still made on first use, as the `var`s were.
+ */
+const serverAccess = createServerAccess({
+  token: () => token(),
+  readRefused: () => messageCache.dropMessageCache(),
+  noteAsked: () => readOrder.noteAsked(),
+  chatServiceOf: (channel) => chatServiceOf(channel),
+  selectedChannelId: () => selectedChannelId(),
+});
+const { browserPorts, deviceStorage, deviceStorageOnUse, clockOnUse, windowStorage, deviceSettings, theServer, api, apiDecoded, within } = serverAccess;
+
+
+/**
  * `#349 channel-settings-all`. The value of Settings' channel picker's first choice, All channels:
  * not an id any chat service gives a channel. Up here because the picker is filled during start-up.
  */
@@ -3542,147 +3556,6 @@ const autoplay = createAutoplay({
  */
 const readOrder = createReadOrder();
 
-/**
- * The browser's capabilities as the page's modules take them (web/src/platform/web, `#624
- * voice-page-modularity`): transport, timers, cancellation and storage. Each looks its browser
- * global up at every call, as the page's own calls did, so a browser refusing storage throws at the
- * same moment it always did. Made on first use; a `var` with no initialiser, like `serverApi`.
- *
- * @type {import("./src/platform/web/index.ts").WebPorts | undefined}
- */
-var webPorts;
-
-/** {@link webPorts}, made if it is not yet. */
-function browserPorts() {
-  if (!webPorts) webPorts = createWebPorts();
-  return webPorts;
-}
-
-/** The device's storage, `localStorage`, which every window of this origin shares. */
-function deviceStorage() {
-  return browserPorts().deviceStorage;
-}
-
-/**
- * {@link deviceStorage} for an owner made before the ports are: each call looks the port up, so making
- * the owner makes no port early.
- *
- * @returns {import("./src/ports/index.ts").StoragePort}
- */
-function deviceStorageOnUse() {
-  return {
-    getItem: (key) => deviceStorage().getItem(key),
-    setItem: (key, value) => deviceStorage().setItem(key, value),
-    removeItem: (key) => deviceStorage().removeItem(key),
-  };
-}
-
-/**
- * The page's clock for an owner made before the ports are, as {@link deviceStorageOnUse} is its storage.
- *
- * @returns {import("./src/ports/index.ts").ClockPort}
- */
-function clockOnUse() {
-  return {
-    setTimeout: (run, ms) => browserPorts().clock.setTimeout(run, ms),
-    clearTimeout: (handle) => browserPorts().clock.clearTimeout(handle),
-  };
-}
-
-/** This window's own storage, `sessionStorage`. */
-function windowStorage() {
-  return browserPorts().windowStorage;
-}
-
-/**
- * The settings this device keeps (web/src/core/settings `DEVICE_SETTINGS`), in its storage: each
- * setting's key, encoding and default said once there. Made on first use, like `webPorts`.
- *
- * @type {import("./src/core/settings/index.ts").DeviceSettings | undefined}
- */
-var pageDeviceSettings;
-
-/** {@link pageDeviceSettings}, made if it is not yet. */
-function deviceSettings() {
-  if (!pageDeviceSettings) pageDeviceSettings = createDeviceSettings(deviceStorage());
-  return pageDeviceSettings;
-}
-
-/**
- * The page's requests to vibe-talk (web/src/core/api, `#624 voice-page-modularity`), on the
- * browser's transport, timers and cancellation, made the first time the page asks anything. A `var`
- * with no initialiser, so a request made before this line has run finds it undefined rather than in
- * its dead zone, and this line, when it runs, does not throw away an instance already made.
- *
- * @type {import("./src/core/api/index.ts").ServerApi | undefined}
- */
-var serverApi;
-
-/** {@link serverApi}, made if it is not yet. */
-function theServer() {
-  if (!serverApi) {
-    serverApi = createApi(browserPorts(), {
-      token,
-      // A token the server no longer accepts, or a read it refuses, ends this device's copy of
-      // what that token read.
-      readRefused: () => messageCache.dropMessageCache(),
-      // `remote-ops-audit` W7. Every timeline read the page sends passes here, and is counted as it
-      // is sent, so a read given up on can tell whether any was sent after it (`abandonedReadStands`).
-      asking: (type) => {
-        if (type === "TimelineResponse") readOrder.noteAsked();
-      },
-      answerer: () => sentenceStart(chatServiceOf(selectedChannelId())),
-    });
-  }
-  return serverApi;
-}
-
-/**
- * One request to vibe-talk, with the token, and one error taxonomy out of it: every field of the
- * server's error answer passed through (web/src/core/api `request`).
- *
- * @param {string} path
- * @param {import("./src/core/api/index.ts").ApiRequestOptions} [options]
- * @returns {Promise<any>}
- */
-function api(path, options) {
-  return theServer().request(path, options);
-}
-
-/**
- * {@link api}, with the answer checked against the wire contract before anything reads it
- * (web/src/core/api `decoded`).
- *
- * @template {keyof VibeTalk.Contract} K
- * @param {K} type the contract type the route answers with
- * @param {string} path
- * @param {{method?: string, body?: unknown, signal?: AbortSignal}} [options]
- * @returns {Promise<VibeTalk.Contract[K]>}
- */
-function apiDecoded(type, path, options) {
-  return theServer().decoded(type, path, options);
-}
-
-/**
- * A request to vibe-talk that stops waiting after `ms`, failing as a timeout the reader can be
- * told about rather than as a "refreshing…" nobody ends (web/src/core/api `within`, `#195
- * send-resilience`). The poll does not read that view again until the read answers, the server's
- * own bound has passed, or a live event says the service is answering (`readHeld`,
- * `remote-ops-audit` W7).
- *
- * `abandoned`, when given, is handed the request still on the wire when the wait is given up, and
- * the request is then not aborted: its answer, if it comes, is the caller's to use or drop
- * (`abandonRead`). Without it the request is aborted, as it always was.
- *
- * @template T
- * @param {number} ms
- * @param {(signal: AbortSignal | undefined) => Promise<T>} request
- * @param {((answer: Promise<T>) => void) | null} [abandoned]
- * @returns {Promise<T>}
- */
-function within(ms, request, abandoned = null) {
-  return theServer().within(ms, /** @type {(signal: unknown) => Promise<T>} */ (request), abandoned);
-}
 
 // --- what a slow or failing chat service means, in words ------------------------------------------
 //
@@ -5513,7 +5386,7 @@ const ownReadSwitch = createKeptSwitch({
 /** Settings' apply-to-existing command owns its confirmation and Undo receipt. */
 const ownReadApply = mountOwnReadApply({
   lookup: (id) => el(id),
-  request: (path, options) => api(path, options),
+  request: (path, options) => /** @type {any} */ (api(path, options)),
   setStatus: (text) => setStatus(text),
   selectedChannel: () => selectedChannelId(),
   reloadChannel: (options) => timelineView.loadDiscord(options),
@@ -6493,7 +6366,7 @@ const {
 /** Settings' rule editor reads the channel's tally and asks it to refresh after a save. */
 const noiseSettings = mountNoiseRules({
   lookup: (id) => el(id),
-  request: (path, options) => api(path, options),
+  request: (path, options) => /** @type {any} */ (api(path, options)),
   guard: (run) => guardQuietly(run),
   status: (text) => setStatus(text),
   tally: () => noiseTally(),
@@ -8527,7 +8400,7 @@ const timelineView = createTimelineView({
   heldUnansweredRoot, copyLedger, removalRecord, removedAfterRead, ownPostStands,
   foldReadState, noteReplyGaps, noteServerPageBuild, renderColumns,
   threadPresenceNote: (hasThreads, inThread) => threadPresence.note(hasThreads, inThread),
-  screenBelongsToToken, readModes, readLedger, api, currentDiscordLoad: (generation, channel, readingTodo) => currentDiscordLoad(generation, channel, readingTodo),
+  screenBelongsToToken, readModes, readLedger, api: /** @type {any} */ (api), currentDiscordLoad: (generation, channel, readingTodo) => currentDiscordLoad(generation, channel, readingTodo),
   get noChannelWords() { return NO_CHANNEL_TO_READ; }, notePinsRevision, noteBookmark, plainReach, todoView,
   noiseRenderCount: () => noiseSettings.renderCount(), foldedOneIds, foldedOnes, readRuns, setReadMode,
   setJumpNewest, scrollToNewest, keepFilterHold, inThisColumn: (fn) => inThisColumn(fn), pinsView, searchOffered: () => searchOffered(),
@@ -9190,7 +9063,7 @@ const channelSettings = mountChannelSettings({
   history: () => channelHistoryBox,
   identities: () => identityList,
   folds: () => settingsFolds,
-  request: (path, options) => api(path, options),
+  request: (path, options) => /** @type {any} */ (api(path, options)),
   guard: (run) => guardQuietly(run),
   adoptChannelList: (payload) => adoptChannelList(payload),
   changeSelectedChannel: () => changeSelectedChannel(),
@@ -9211,7 +9084,7 @@ const channelSettings = mountChannelSettings({
  */
 const channelDirectoryBox = mountChannelDirectory({
   lookup: (id) => el(id),
-  request: (path, options) => api(path, options),
+  request: (path, options) => /** @type {any} */ (api(path, options)),
   known: (id) => knownChannel(id) !== null,
   showPanel: (which) => channelSettings.showChannelPanel(which),
   serviceName: () => channelSettings.settingsServiceName(),
