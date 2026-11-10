@@ -43,6 +43,17 @@
 # and 500/450 s at 8 (-42%/-46%), with no failed step at either cap, the cap-8 runs starting at equal
 # or higher load. The timing checks that hold every slot still run alone among browsers.
 #
+# DISABLED UNTIL ROBUST (#1250 vibe-talk-timing-robust; owner reply 346, 2026-11-10: tests
+# that are real-time-sensitive leave gating until they are fast, high-signal and robust on a
+# hot machine). Steps labelled `disabled-optin` below judge frame, scroll or audio-clock
+# timing, so `scripts/validate.py` excludes them from every default and `--all` run and
+# names them as skipped; `--include-disabled` (or AGENT_UTILS_INCLUDE_DISABLED=1) runs them
+# on demand, and a direct dagrun run of this fragment still runs them (the label is inert
+# here). Disabled at filing: check.fold-steps-browser, check.scroll-stability-browser,
+# check.typing-scroll-browser, check.read-pause-reply-browser. Each returns only as a
+# behaviour-only check proved under load (#1248 fold-latency-behaviour-verdict is the
+# pattern; fold-latency, keyboard and keyboard-hides-bar stay enabled under it).
+#
 # HOW TO RUN IT
 #
 #   dagrun run --dag vibe-talk/tests.dag.yaml
@@ -600,7 +611,7 @@ steps:
   - group: check
     job: read-pause-reply-browser
     desc: a read paused, the message replied to and sent, then resumed, by both voices in current Chromium at 393x852 touch, the read going on from where it was held; and in a paused read, at 393x852 by touch and 1280x800 by mouse, the Quoted reply chip and the strip's Quote reply topmost wherever the words are, the quick reply typed and dictated into and sent quoted; and React on a paused read (#821) at 360, 375 and 412 wide by touch and 1280x800, the held sentence lit and quoted, the arrows 52px with React at the row's far right, dictation by a stand-in recognition, the keyboard's microphone without one, and a one-block device-voice read
-    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    labels: [validation-vibe-talk, validation-vibe-talk-page, disabled-optin]
     cmd: cd vibe-talk && python3 tests/read_pause_reply_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1671,7 +1682,7 @@ steps:
   - group: check
     job: scroll-stability-browser
     desc: the message lists hold the reader's row through live messages, refreshes, a read landing after a scroll, summaries, focus moves, the view keys and the mouse crossing the cards with or without a card highlighted, follow only a reader on the newest line, and open threads and the thread list at their foot, in current Chromium at 1280x800 and 412x915; and the thread list holds the card being read while replies move other cards to its foot, at 393x852 and 1280x800
-    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    labels: [validation-vibe-talk, validation-vibe-talk-page, disabled-optin]
     cmd: cd vibe-talk && python3 tests/scroll_stability_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -2168,7 +2179,7 @@ steps:
   - group: check
     job: typing-scroll-browser
     desc: typing at the foot keeps the whole composer in view across arrivals, keyboard resizes and late row growth, reading scrollback holds, and hover scrolls neither column, in current Chromium at 412x915, 360x800 and 1280x800
-    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    labels: [validation-vibe-talk, validation-vibe-talk-page, disabled-optin]
     cmd: cd vibe-talk && python3 tests/typing_scroll_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -2404,7 +2415,7 @@ steps:
   - group: check
     job: fold-steps-browser
     desc: "the semicolon and colon keys, and Ctrl or Cmd with them from a message box, step the long messages round expand all, unread only and collapse all, drawn as said, the reader's row held within a pixel at every frame, or for a chord in a message box that box, in one column and two, in current Chromium at 1280x800"
-    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    labels: [validation-vibe-talk, validation-vibe-talk-page, disabled-optin]
     cmd: cd vibe-talk && python3 tests/fold_steps_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]

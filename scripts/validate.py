@@ -28,6 +28,11 @@ Two safety properties, both tested in `--self-test`:
   wall-clock budgets): no default, `--all`, or `--cross-all` run selects them, so the
   gate-exclusive phase is empty. `--cross-differentials` is the explicit opt-in that runs
   them on demand, in the exclusive phase unless `AGENT_UTILS_CROSS_IN_MAIN_PHASE=1`.
+* **Real-time-sensitive steps labelled `disabled-optin` are disabled by default** (same
+  owner decision; #1250 vibe-talk-timing-robust and #1252 timeline-benchmark-optin track
+  bringing them back as behaviour-only checks): no default or `--all` run selects them, and
+  every plan names them as skipped. `--include-disabled` (or
+  `AGENT_UTILS_INCLUDE_DISABLED=1`) is the explicit opt-in that runs them on demand.
 
 Usage:
     python3 scripts/validate.py                 # against origin/main
@@ -35,6 +40,7 @@ Usage:
     python3 scripts/validate.py --all           # the entire portable contract (cross steps path-filtered, #1190)
     python3 scripts/validate.py --all --cross-all  # the entire contract, every cross step forced except the disabled differentials (#1249)
     python3 scripts/validate.py --cross-differentials --all  # on demand only: also run the five disabled cross differentials (#1249)
+    python3 scripts/validate.py --include-disabled --all  # on demand only: also run steps disabled until robust (#1250, #1252)
     python3 scripts/validate.py --keep-going    # report every independent failure, not just the first
     python3 scripts/validate.py --list          # print the plan, run nothing
     python3 scripts/validate.py --self-test     # check the mapping itself, offline
@@ -825,6 +831,78 @@ def partition_gate_exclusive(
     )
 
 
+#: DAG label for real-time-sensitive steps DISABLED by default. Owner
+#: decision (2026-11-10, reply 346, 3:23 PM ET), (one consuming-project
+#: name redacted): "Insane. I hate tests that are real time sensitive.
+#: We fought this battle with [redacted]. Disable those tests and have
+#: an agent work to bring them back when they're robust. Each product
+#: lane must make its tests fast, high signal, and robust to running on
+#: a hot machine (>75% cpu on 316 HW threads). AND there should be good
+#: test selection so we are not running tests for agent-util A when only
+#: B is modified. Anything else should be disabled until we can improve
+#: it." #1250 vibe-talk-timing-robust (vibe-talk/tests.dag.yaml) and
+#: #1252 timeline-benchmark-optin (validation/timeline.dag.yaml) track
+#: bringing each labelled step back as a behaviour-only check; the
+#: comment above each labelled step names its issue. Until then no
+#: default or `--all` run selects them; `--include-disabled` (or
+#: ``AGENT_UTILS_INCLUDE_DISABLED=1``) runs them on demand. This is the
+#: sibling of the cross-differential disable above (#1249), which keeps
+#: its own label and opt-in because those steps also need an exclusive
+#: phase; labelled steps here need only exclusion.
+DISABLED_OPTIN_LABEL = "disabled-optin"
+
+#: Caller-environment switch for the `disabled-optin` steps. Only ``"1"``
+#: opts in, exactly like ``CROSS_MAIN_PHASE_ENV``.
+INCLUDE_DISABLED_ENV = "AGENT_UTILS_INCLUDE_DISABLED"
+
+DISABLED_OPTIN_NOTE = (
+    "timing-sensitive steps disabled by default (owner reply 346, "
+    "2026-11-10; #1250 vibe-talk-timing-robust, "
+    "#1252 timeline-benchmark-optin); --include-disabled runs them on demand"
+)
+
+
+def include_disabled_steps(environ: Mapping[str, str] | None = None) -> bool:
+    """Whether the caller opted the `disabled-optin` steps into the run."""
+    return (os.environ if environ is None else environ).get(INCLUDE_DISABLED_ENV) == "1"
+
+
+def drop_disabled_optin(
+    steps: dict[str, dict[str, object]],
+    chosen: set[str],
+    *,
+    include_disabled: bool = False,
+) -> tuple[set[str], list[str]]:
+    """Drop `disabled-optin` steps (and their dependents) unless opted in.
+
+    Returns the kept tags and, in graph order, the dropped labelled tags
+    (dependents dropped by cascade are not listed: the plan names the
+    disabled checks themselves). A chosen step that depends on a dropped
+    step is dropped too: dagrun would otherwise pull the disabled step
+    back in as a dependency, or fail for its absence. Dependencies OF a
+    disabled step (shared setup and build steps) are unaffected.
+    """
+
+    def labels(tag: str) -> set[str]:
+        raw = steps[tag].get("labels")
+        return {label for label in raw if isinstance(label, str)} if isinstance(raw, list) else set()
+
+    labelled = [tag for tag in steps if tag in chosen and DISABLED_OPTIN_LABEL in labels(tag)]
+    if include_disabled or not labelled:
+        return set(chosen), []
+    dropped = set(labelled)
+    changed = True
+    while changed:
+        changed = False
+        for tag in chosen - dropped:
+            raw_deps = steps[tag].get("deps")
+            deps = raw_deps if isinstance(raw_deps, list) else []
+            if any(dep in dropped for dep in deps if isinstance(dep, str)):
+                dropped.add(tag)
+                changed = True
+    return set(chosen) - dropped, labelled
+
+
 def _is_timing_gate(command: str) -> bool:
     if "cross/differential.py" in command:
         tokens = command.split()
@@ -1424,6 +1502,39 @@ def self_test() -> int:
                 f"exclusive phase must be empty; got main={off_main} "
                 f"exclusive={off_exclusive}"
             )
+
+    # #1250/#1252: steps labelled disabled-optin (and their dependents)
+    # run nowhere by default; the opt-in restores them unchanged. Their
+    # own dependencies (shared setup) stay selected either way.
+    timing_steps: dict[str, dict[str, object]] = {
+        "timing.setup": {"labels": [], "deps": []},
+        "timing.solo": {"labels": [DISABLED_OPTIN_LABEL], "deps": ["timing.setup"]},
+        "timing.dependent": {"labels": [], "deps": ["timing.solo"]},
+        "timing.plain": {"labels": [], "deps": ["timing.setup"]},
+    }
+    timing_chosen = {"timing.setup", "timing.solo", "timing.dependent", "timing.plain"}
+    kept_off, skipped_off = drop_disabled_optin(timing_steps, timing_chosen)
+    if kept_off != {"timing.setup", "timing.plain"} or skipped_off != ["timing.solo"]:
+        failures.append(
+            "disabled-optin by default (#1250/#1252): labelled steps and "
+            "their dependents must be dropped and named, shared setup kept; "
+            f"got kept={sorted(kept_off)} skipped={skipped_off}"
+        )
+    kept_on, skipped_on = drop_disabled_optin(
+        timing_steps, timing_chosen, include_disabled=True
+    )
+    if kept_on != timing_chosen or skipped_on != []:
+        failures.append(
+            "disabled-optin opt-in (#1250/#1252): --include-disabled must "
+            f"restore every step; got kept={sorted(kept_on)} skipped={skipped_on}"
+        )
+    if include_disabled_steps({INCLUDE_DISABLED_ENV: "1"}) is not True or (
+        include_disabled_steps({}) is not False
+    ) or include_disabled_steps({INCLUDE_DISABLED_ENV: "0"}) is not False:
+        failures.append(
+            "disabled-optin switch (#1250/#1252): only "
+            f"{INCLUDE_DISABLED_ENV}=1 may opt in"
+        )
 
     if cross_in_main_phase({CROSS_MAIN_PHASE_ENV: "1"}) is not True or (
         cross_in_main_phase({}) is not False
@@ -2087,6 +2198,15 @@ def main(argv: list[str] | None = None) -> int:
         "AGENT_UTILS_CROSS_IN_MAIN_PHASE=1. Example: python3 scripts/validate.py "
         "--cross-differentials --all",
     )
+    parser.add_argument(
+        "--include-disabled",
+        action="store_true",
+        help="explicit opt-in: run the real-time-sensitive steps labelled disabled-optin on "
+        "demand (#1250 vibe-talk-timing-robust, #1252 timeline-benchmark-optin). They are "
+        "disabled by default (owner reply 346, 2026-11-10) and are selected by no default "
+        "or --all run; AGENT_UTILS_INCLUDE_DISABLED=1 is the same opt-in. Example: "
+        "python3 scripts/validate.py --include-disabled --all",
+    )
     parser.add_argument("--list", action="store_true", help="print the plan and exit without running")
     parser.add_argument(
         "--keep-going",
@@ -2124,6 +2244,22 @@ def main(argv: list[str] | None = None) -> int:
     graph_steps, graph_chosen = selected_graph(
         selected, components, all_contract=all_contract
     )
+    # Steps labelled `disabled-optin` are disabled by default in every
+    # mode (owner reply 346; see DISABLED_OPTIN_LABEL): drop them (and
+    # their dependents) before the gate-exclusive partition, and name
+    # them in the plan so the skip is never silent. Only the explicit
+    # opt-in runs them.
+    graph_chosen, disabled_skipped = drop_disabled_optin(
+        graph_steps,
+        graph_chosen,
+        include_disabled=args.include_disabled or include_disabled_steps(),
+    )
+    if disabled_skipped:
+        print(
+            f"validate: {DISABLED_OPTIN_NOTE}; skipped "
+            f"[{', '.join(disabled_skipped)}]",
+            flush=True,
+        )
     # The gate-exclusive steps are component-selected (see
     # partition_gate_exclusive), so a cross-group trigger from another tool's
     # files under cross/ does not select them. A cross-group trigger from

@@ -1025,6 +1025,71 @@ def test_cross_differentials_disabled_by_default() -> None:
     ) == (["cross.plain"], ["cross.solo", "cross.dependent"])
 
 
+def test_timing_steps_disabled_by_default() -> None:
+    """#1250/#1252: without the opt-in, no selection runs a disabled-optin
+    step or its dependent; shared setup it depends on still runs."""
+    validate = _validate_module()
+    steps: dict[str, dict[str, object]] = {
+        "timing.setup": {"labels": [], "deps": []},
+        "timing.solo": {
+            "labels": [validate.DISABLED_OPTIN_LABEL],
+            "deps": ["timing.setup"],
+        },
+        "timing.dependent": {"labels": [], "deps": ["timing.solo"]},
+        "timing.plain": {"labels": [], "deps": ["timing.setup"]},
+    }
+    chosen = {"timing.setup", "timing.solo", "timing.dependent", "timing.plain"}
+    kept, skipped = validate.drop_disabled_optin(steps, chosen)
+    assert kept == {"timing.setup", "timing.plain"}
+    assert skipped == ["timing.solo"]
+    kept, skipped = validate.drop_disabled_optin(
+        steps, chosen, include_disabled=True
+    )
+    assert kept == chosen
+    assert skipped == []
+    assert validate.include_disabled_steps({validate.INCLUDE_DISABLED_ENV: "1"})
+    assert not validate.include_disabled_steps({})
+    assert not validate.include_disabled_steps({validate.INCLUDE_DISABLED_ENV: "0"})
+
+
+def test_all_list_names_skipped_timing_steps_and_optin_plans_them(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#1250: `--all --list` names every disabled-optin step as skipped and
+    plans none of them; only `--include-disabled` plans them. Steps handled
+    by #1248 (fold-latency, keyboard) are planned either way."""
+    validate = _validate_module()
+    monkeypatch.delenv(validate.INCLUDE_DISABLED_ENV, raising=False)
+    monkeypatch.setattr(
+        validate, "changed_paths", lambda _base: ["vibe-talk/web/index.html"]
+    )
+    disabled = (
+        "vibe-talk.check.fold-steps-browser",
+        "vibe-talk.check.scroll-stability-browser",
+        "vibe-talk.check.typing-scroll-browser",
+        "vibe-talk.check.read-pause-reply-browser",
+    )
+    assert validate.main(["--all", "--list"]) == 0
+    listed = capsys.readouterr().out
+    assert "timing-sensitive steps disabled by default" in listed
+    for tag in disabled:
+        assert listed.count(tag) == 1, tag  # named once, as skipped
+        assert f"STEP  {tag}" not in listed, tag
+    assert "STEP  vibe-talk.check.fold-latency-browser" in listed
+    assert "STEP  vibe-talk.check.keyboard-browser" in listed
+    assert "STEP  vibe-talk.check.pace-stepper-browser" in listed
+    assert "STEP  vibe-talk.check.read-aloud-views-browser" in listed
+    assert "STEP  vibe-talk.check.read-aloud-blocks-browser" in listed
+    assert "STEP  vibe-talk.check.wit-read-aloud-browser" in listed
+    assert "STEP  vibe-talk.check.local-read-aloud-browser" in listed
+    assert "STEP  vibe-talk.check.fallback-chain-browser" in listed
+    assert "STEP  vibe-talk.check.read-aloud-browser" in listed
+    assert validate.main(["--all", "--include-disabled", "--list"]) == 0
+    opted = capsys.readouterr().out
+    for tag in disabled:
+        assert f"STEP  {tag}" in opted, tag
+
+
 def test_all_cross_filter_keeps_only_components_a_path_selects() -> None:
     """#1190: under --all the gate-exclusive steps are still component-
     filtered by the changed paths, exactly as a path-selected gate does."""
