@@ -43,6 +43,8 @@ pub struct HeadlessStart {
     pub harness: String,
     /// Model passed to the harness as `--model`.
     pub model: Option<String>,
+    /// Reasoning effort passed as `--effort` and recorded on the agent record (#1216).
+    pub reasoning_effort: Option<String>,
     /// Further harness arguments, such as `--settings FILE` or `--permission-mode dontAsk`.
     pub arguments: Vec<String>,
     /// Session to resume (a UUID begun in the same working directory); a new one otherwise.
@@ -76,6 +78,21 @@ impl AgentRecord {
                 ))
             })
     }
+}
+
+/// `arguments` with any `--effort` setting replaced by `effort` (#1216).
+pub(crate) fn with_effort_argument(arguments: &[String], effort: &str) -> Vec<String> {
+    let mut kept = Vec::new();
+    let mut iter = arguments.iter();
+    while let Some(argument) = iter.next() {
+        if argument == "--effort" {
+            let _ = iter.next();
+        } else if !argument.starts_with("--effort=") {
+            kept.push(argument.clone());
+        }
+    }
+    kept.extend(["--effort".to_owned(), effort.to_owned()]);
+    kept
 }
 
 /// Records each harness process the wrapper starts as the record's `harness_identity`, the
@@ -228,6 +245,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 options.harness
             )));
         }
+        if let Some(effort) = options.reasoning_effort.as_deref() {
+            crate::profiles::validate_effort(&options.harness, effort)?;
+        }
         claude::validate_arguments(&options.arguments).map_err(fail)?;
         let cwd = fs::canonicalize(cwd)
             .map_err(|error| fail(format!("working directory {}: {error}", cwd.display())))?;
@@ -244,6 +264,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let mut arguments = Vec::new();
         if let Some(model) = options.model.as_deref() {
             arguments.extend(["--model".to_owned(), model.to_owned()]);
+        }
+        if let Some(effort) = options.reasoning_effort.as_deref() {
+            arguments.extend(["--effort".to_owned(), effort.to_owned()]);
         }
         arguments.extend(options.arguments.iter().cloned());
         let lock = self.lock(agent_name)?;
@@ -283,7 +306,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             slot: None,
             slot_project: None,
             slot_isolation: None,
-            reasoning_effort: None,
+            reasoning_effort: options.reasoning_effort.clone(),
             environment_names: Vec::new(),
             agentcloud: None,
             launch_spec: None,
@@ -409,7 +432,37 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         approvals: Option<HeadlessApprovals>,
         terminate: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<i32> {
-        let record = self.load(agent_name)?;
+        self.run_headless_with_effort(
+            agent_name,
+            claude_bin,
+            None,
+            tool_preview_lines,
+            approvals,
+            terminate,
+        )
+    }
+
+    /// `run_headless` with an optional effort override (#1216): a given level is
+    /// validated, recorded on the agent record, and applied to this launch; without
+    /// one, the recorded effort (from start or set-effort) is applied.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_headless_with_effort(
+        &self,
+        agent_name: &str,
+        claude_bin: Option<&Path>,
+        effort: Option<&str>,
+        tool_preview_lines: Option<usize>,
+        approvals: Option<HeadlessApprovals>,
+        terminate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<i32> {
+        let mut record = self.load(agent_name)?;
+        if let Some(effort) = effort {
+            crate::profiles::validate_effort(&record.harness, effort)?;
+            if record.reasoning_effort.as_deref() != Some(effort) {
+                record.reasoning_effort = Some(effort.to_owned());
+                self.save(&record)?;
+            }
+        }
         if !record.is_headless() {
             return Err(fail(format!(
                 "agent {agent_name:?} is not a headless agent (adapter {:?})",
@@ -443,6 +496,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             config.command = vec![launcher.display().to_string()];
         }
         config.arguments = record.arguments.clone();
+        if let Some(effort) = record.reasoning_effort.as_deref() {
+            config.arguments = with_effort_argument(&config.arguments, effort);
+        }
         if let Some(lines) = tool_preview_lines {
             config.tool_preview_lines = lines;
         }

@@ -1616,6 +1616,41 @@ fn registry_policy(registry: &Path) -> Result<Option<BTreeMap<String, Value>>, A
     Ok(Some(object))
 }
 
+/// Effort levels each harness accepts (#1216 agentctl-effort-option), or `None` when the
+/// harness has no structured effort mapping. Claude Code's `--effort` takes low through
+/// max; Muse takes none through ultra (ultra behind its env gate); Codex's
+/// `model_reasoning_effort` takes minimal through xhigh.
+pub(crate) fn effort_levels(harness: &str) -> Option<&'static [&'static str]> {
+    match harness {
+        "claude" => Some(&["low", "medium", "high", "xhigh", "max"]),
+        "muse" => Some(&[
+            "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+        ]),
+        "codex" => Some(&["minimal", "low", "medium", "high", "xhigh"]),
+        _ => None,
+    }
+}
+
+/// Refuse an effort a harness does not support, naming the harness and its levels.
+pub(crate) fn validate_effort(harness: &str, effort: &str) -> Result<(), AgentError> {
+    if !matches!(
+        effort,
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+    ) {
+        return Err(fail(format!("unsupported reasoning effort {effort:?}")));
+    }
+    match effort_levels(harness) {
+        Some(levels) if levels.contains(&effort) => Ok(()),
+        Some(levels) => Err(fail(format!(
+            "reasoning effort {effort:?} is not supported for harness {harness:?}; accepted levels: {}",
+            levels.join(", ")
+        ))),
+        None => Err(fail(format!(
+            "reasoning effort is not supported for harness {harness:?}"
+        ))),
+    }
+}
+
 pub(crate) fn reasoning_arguments(
     harness: &str,
     effort: Option<&str>,
@@ -1623,7 +1658,10 @@ pub(crate) fn reasoning_arguments(
     let Some(effort) = effort else {
         return Ok(Vec::new());
     };
-    if !matches!(
+    // agentcloud maps effort through its own create options, not a local harness adapter.
+    if harness != "agentcloud" {
+        validate_effort(harness, effort)?;
+    } else if !matches!(
         effort,
         "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
     ) {

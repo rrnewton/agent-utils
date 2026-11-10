@@ -273,6 +273,11 @@ enum Commands {
         after_help = "Examples:\n  agentctl run-headless coordinator\n  agentctl install-units --headless coordinator --dest ~/.config/systemd/user\n\nThe wrapper resumes the agent's recorded session when Claude Code has a transcript for it,\nrecovers inputs a previous wrapper left in flight from that transcript, writes the event log,\nand serves REGISTRY/agents/NAME/control.sock. SIGTERM closes the harness's input, waits up to 60 s for\nit to finish, and exits 0. An unexpected harness exit restarts it with --resume (backoff, at\nmost 5 in 10 minutes), then exits 1. Exit 75 when another wrapper already serves NAME."
     )]
     RunHeadless(RunHeadless),
+    /// Record a new reasoning effort for a live agent (#1216 agentctl-effort-option): headless agents apply it from the next wrapper launch, TUI agents at a safe point or on restart --resume; a mid-turn agent is never interrupted without --urgent
+    #[command(
+        after_help = "Examples:\n  agentctl set-effort coordinator high\n  agentctl set-effort coordinator medium --urgent\n\nThe level is validated against the agent's harness (Claude Code: low, medium, high, xhigh, max; Muse: none, minimal, low, medium, high, xhigh, max, ultra; Codex: minimal, low, medium, high, xhigh) and recorded in the agent record at once, overriding its profile. Headless agents apply it when their wrapper next launches (restart the unit or the wrapper to apply now); TUI agents apply it at a safe point through the harness control where one exists, otherwise on restart --resume. Without --urgent a mid-turn agent is left alone and the change is reported as recorded, not yet effective. Prints {name, effort, previous_effort, applies}."
+    )]
+    SetEffort(SetEffort),
     /// Interrupt a headless agent's running turn; queued inputs stay queued and run next
     #[command(after_help = "Example: agentctl interrupt coordinator")]
     Interrupt(Named),
@@ -942,9 +947,24 @@ fn answer_prompt<A: crate::subagents::ManagedApi + ?Sized>(
 }
 
 #[derive(Args)]
+struct SetEffort {
+    #[command(flatten)]
+    agent: Named,
+    /// New reasoning effort level, validated against the agent's harness (Claude Code: low, medium, high, xhigh, max; Muse: none, minimal, low, medium, high, xhigh, max, ultra; Codex: minimal, low, medium, high, xhigh)
+    #[arg(value_name = "LEVEL")]
+    level: String,
+    /// Allow the change to take effect even while the agent is mid-turn (the running turn itself is never killed; the new level applies from the next turn or launch)
+    #[arg(long)]
+    urgent: bool,
+}
+
+#[derive(Args)]
 struct RunHeadless {
     #[command(flatten)]
     agent: Named,
+    /// Reasoning effort for the headless harness (Claude Code levels: low, medium, high, xhigh, max); recorded in the agent record and overriding its profile, so later launches and latency stamps use it (default: the recorded effort, else the harness default)
+    #[arg(long, alias = "reasoning-effort", value_name = "LEVEL")]
+    effort: Option<String>,
     /// Claude Code executable (default: claude on PATH)
     #[arg(long, value_name = "PATH")]
     claude_bin: Option<PathBuf>,
@@ -1429,8 +1449,8 @@ struct Start {
     /// Model identifier passed unchanged to the Codex or Claude harness
     #[arg(long)]
     model: Option<String>,
-    /// Structured harness reasoning effort
-    #[arg(long)]
+    /// Structured harness reasoning effort (alias: --effort); per-harness levels — Claude Code: low, medium, high, xhigh, max; Muse: none, minimal, low, medium, high, xhigh, max, ultra; Codex: minimal, low, medium, high, xhigh (default: the profile's reasoning_effort, else the harness default)
+    #[arg(long, alias = "effort")]
     reasoning_effort: Option<String>,
     /// Existing native conversation ID for local interactive Claude, Codex, or Muse; can combine
     /// with --profile (example: --profile reviewer --resume CONVERSATION_ID)
@@ -3577,6 +3597,7 @@ fn writes_registry(command: &Commands) -> bool {
         | Commands::Drain(_)
         | Commands::Failed(_)
         | Commands::RunHeadless(_)
+        | Commands::SetEffort(_)
         | Commands::Interrupt(_)
         | Commands::Compact(_)
         | Commands::Cancel(_)
@@ -4518,10 +4539,13 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     ),
                     None => value.brief,
                 };
-                if reasoning_effort.is_some() || !environment.is_empty() || value.slot.is_some() {
+                if !environment.is_empty() || value.slot.is_some() {
                     return Err(Failure::Usage(
-                        "--reasoning-effort, --env and --slot do not apply to a headless Claude agent; pass harness options with --harness-arg".to_owned(),
+                        "--env and --slot do not apply to a headless Claude agent; pass harness options with --harness-arg".to_owned(),
                     ));
+                }
+                if let Some(effort) = reasoning_effort.as_deref() {
+                    crate::profiles::validate_effort(&harness, effort)?;
                 }
                 manager.start_headless(
                     &value.agent.name,
@@ -4529,6 +4553,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     crate::subagents::HeadlessStart {
                         harness,
                         model,
+                        reasoning_effort: reasoning_effort.clone(),
                         arguments: harness_args,
                         session: value.resume,
                         launch: !value.no_launch,
@@ -5060,6 +5085,9 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 document
             }
         }
+        Commands::SetEffort(value) => {
+            manager.set_effort(&value.agent.name, &value.level, value.urgent)?
+        }
         Commands::Interrupt(value) => manager.headless_control(&value.name, "interrupt")?,
         Commands::Approvals(value) => manager.headless_approvals(&value.name)?,
         Commands::Approve(value) => answer_prompt(
@@ -5113,9 +5141,10 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 signal_hook::flag::register(signal, terminate.clone())
                     .map_err(|error| Failure::Usage(format!("cannot handle signals: {error}")))?;
             }
-            return Ok(manager.run_headless(
+            return Ok(manager.run_headless_with_effort(
                 &value.agent.name,
                 value.claude_bin.as_deref(),
+                value.effort.as_deref(),
                 value.tool_preview_lines.map(|lines| lines as usize),
                 Some(crate::subagents::HeadlessApprovals {
                     enabled: !value.no_approvals,

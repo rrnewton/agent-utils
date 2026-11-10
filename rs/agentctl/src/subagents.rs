@@ -9484,6 +9484,37 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         self.start_inner(agent_name, cwd, options, None)
     }
 
+    /// Record a new reasoning effort for a live agent (#1216 agentctl-effort-option).
+    /// The level is validated against the agent's harness and stored at once; the
+    /// running harness is never interrupted. Headless wrappers read the record at
+    /// their next launch; TUI agents take it on `restart --resume` (or through the
+    /// harness's own effort control, applied by hand). `urgent` only records that
+    /// the caller accepts a mid-turn switch; it never kills a running turn.
+    pub fn set_effort(&self, agent_name: &str, level: &str, urgent: bool) -> Result<Value> {
+        let _lock = self.lock(agent_name)?;
+        let mut record = self.load(agent_name)?;
+        crate::profiles::validate_effort(&record.harness, level)?;
+        let previous = record.reasoning_effort.clone();
+        record.reasoning_effort = Some(level.to_owned());
+        // A recorded switch supersedes any earlier observed fallback until relaunch.
+        record.effective_reasoning_effort = None;
+        self.save(&record)?;
+        let applies = if record.is_headless() {
+            "next run-headless launch (restart the wrapper or its unit to apply now); the running turn is unchanged"
+        } else if urgent {
+            "recorded mid-turn by --urgent; the running turn is unchanged and the new level applies on restart --resume"
+        } else {
+            "on restart --resume, or at a safe point through the harness effort control; the running agent is unchanged"
+        };
+        Ok(json!({
+            "name": agent_name,
+            "effort": level,
+            "previous_effort": previous,
+            "urgent": urgent,
+            "applies": applies,
+        }))
+    }
+
     /// Start one fresh tab with an explicit structured reasoning effort.
     pub fn start_with_reasoning_effort(
         &self,
@@ -9629,6 +9660,19 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             ];
             assigned_arguments.extend(arguments);
             arguments = assigned_arguments;
+        }
+        // Muse ultra is env-gated (#1216): an explicit ultra effort carries the gate,
+        // as the muse-ultra profile does, unless the caller already set it.
+        if options.harness == "muse"
+            && reasoning_effort == Some("ultra")
+            && !options
+                .environment
+                .iter()
+                .any(|entry| entry.starts_with("MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT="))
+        {
+            options
+                .environment
+                .push("MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT=on".to_owned());
         }
         options.environment = environment_entries(&options.environment)?;
         // Placement policy is an input/start concern. Load it before creating
@@ -22693,6 +22737,8 @@ fi
     mod dead_adoption;
     /// `/goal` commands typed raw and proved by the harness's answer.
     mod goal_command;
+    /// Launch and live effort options, and their per-harness refusal.
+    mod effort;
     /// Takeover and handback of a headless agent: one writer per session.
     mod headless_takeover;
     /// Herdr readiness and adopted Muse process ownership compatibility.
