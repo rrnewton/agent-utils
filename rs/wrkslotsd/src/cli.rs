@@ -235,6 +235,9 @@ pub(crate) enum Readers {
         /// Total cache-glob planning time in seconds across every subject (audit plans outside the state lock after a short-lock snapshot)
         #[arg(long, value_name = "SECONDS", default_value_t = 30.0)]
         cache_plan_total_seconds: f64,
+        /// Registered rows the Python CLI judges at once; accepted with the same validation (at least 1) so the same command line runs here, where rows are judged one at a time
+        #[arg(long, value_name = "N")]
+        jobs: Option<i64>,
         /// Exit non-zero on attention (1) or unknown (2) slots
         #[arg(long)]
         gate: bool,
@@ -1989,22 +1992,27 @@ pub fn run() -> u8 {
                 cache_work_limit,
                 cache_wall_seconds,
                 cache_plan_total_seconds,
+                jobs,
                 gate,
                 all_machines,
                 format,
-            } => match crate::audit_state::audit_cli(
-                root.as_deref(),
-                machine.as_deref(),
-                crate::audit_state::CensusRequest {
-                    state: cache_census_state,
-                    work_limit: cache_work_limit,
-                    wall_seconds: cache_wall_seconds,
-                    plan_total_seconds: cache_plan_total_seconds,
-                },
-                gate,
-                format == "human",
-                all_machines,
-            ) {
+            } => match if jobs.is_some_and(|count| count < 1) {
+                Err("--jobs must be at least 1".to_string())
+            } else {
+                crate::audit_state::audit_cli(
+                    root.as_deref(),
+                    machine.as_deref(),
+                    crate::audit_state::CensusRequest {
+                        state: cache_census_state,
+                        work_limit: cache_work_limit,
+                        wall_seconds: cache_wall_seconds,
+                        plan_total_seconds: cache_plan_total_seconds,
+                    },
+                    gate,
+                    format == "human",
+                    all_machines,
+                )
+            } {
                 Ok((text, code)) => {
                     print!("{text}");
                     return u8::try_from(code).unwrap_or(1);

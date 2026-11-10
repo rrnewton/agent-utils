@@ -18,6 +18,9 @@ import fcntl
 import io
 import json
 import os
+import re
+import shutil
+import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -27,7 +30,8 @@ from typing import cast
 import pytest
 from wrkslots import cli as wrkslots_cli
 
-from wrkslots.tests.test_audit_state_rust import _fixture, _python
+from wrkslots.tests.rust_binary import rust_wrkslotsd
+from wrkslots.tests.test_audit_state_rust import AU_ROOT, _fixture, _git, _python
 
 # Registry judgment, not process evidence: see the pinned_process_evidence fixture.
 pytestmark = pytest.mark.usefixtures("pinned_process_evidence")
@@ -643,3 +647,126 @@ def test_registry_read_identity_sees_content_not_metadata(tmp_path: Path) -> Non
     (root / "worktrees" / "ACTIVE.global.intent.lock").write_text("")
     after = wrkslots_cli._registry_read_identity(config)
     assert wrkslots_cli._registry_read_identity(config) == after
+
+
+def _add_worktree_slot(root: Path, name: str, **changes: object) -> None:
+    """Another slot like slot-a, on its own branch and pushed, with ``changes`` to its row."""
+
+    base = root.parent
+    document = _read_active(root)
+    slots = cast(list[dict[str, object]], document["slots"])
+    record = copy.deepcopy(slots[0])
+    checkout = cast(list[dict[str, object]], record["checkouts"])[0]
+    branch = f"suite/{name}"
+    _git(
+        base / "upstream-repo", "worktree", "add", "-q", "-b", branch,
+        str(root / "worktrees" / name / "repo"), str(checkout["head"]),
+    )
+    _git(base / "upstream-repo", "push", "-q", "origin", branch)
+    record.update({"slot": name, "agent": f"agent-{name}", **changes})
+    checkout.update({"path": f"worktrees/{name}/repo", "branch": branch})
+    slots.append(record)
+    _write_active(root, document)
+
+
+def _verdict_mix_fixture(base: Path) -> Path:
+    root = _fixture(base)
+    for index in range(4):
+        _add_worktree_slot(root, f"plain-{index}")
+    _add_worktree_slot(root, "fresh", heartbeat_at=wrkslots_cli._utc_now())
+    _add_worktree_slot(root, "held")
+    _add_worktree_slot(root, "moved")
+    _add_worktree_slot(root, "absent")
+    _git(root / "worktrees" / "moved" / "repo", "checkout", "-q", "-b", "elsewhere")
+    shutil.rmtree(root / "worktrees" / "absent")
+    _git(base / "upstream-repo", "worktree", "prune")
+    _cli(root, "hold", "--reason", "fixture", "held")
+    return root
+
+
+def _comparable_audit(root: Path, tmp_path: Path, jobs: int) -> dict[str, object]:
+    payload: dict[str, object] = json.loads(
+        _cli(
+            root, "audit", "--format", "json", "--jobs", str(jobs),
+            "--cache-census-state", str(tmp_path / f"census-{jobs}.json"),
+        )
+    )
+    payload.pop("metrics")
+    payload.pop("disk")  # free space moves between the two runs
+    for row in cast(list[dict[str, object]], payload["slots"]):
+        row.pop("heartbeat_age_seconds", None)
+        row["reasons"] = [
+            re.sub(r"\b\d+s\b", "Ns", str(reason))
+            for reason in cast(list[object], row["reasons"])
+        ]
+    return payload
+
+
+@pytest.mark.parametrize("census_fails", [False, True])
+def test_pooled_audit_matches_serial_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, census_fails: bool
+) -> None:
+    root = _verdict_mix_fixture(tmp_path / "case")
+    if census_fails:
+        def census(paths: object, **_options: object) -> object:
+            raise wrkslots_cli.Refusal("fixture census refused")
+
+        monkeypatch.setattr(wrkslots_cli, "_capture_process_path_census", census)
+    original = wrkslots_cli._audit_record
+    threads: dict[int, set[str]] = {}
+    jobs_now = {"value": 0}
+
+    def judged(*args: object, **kwargs: object) -> object:
+        threads.setdefault(jobs_now["value"], set()).add(threading.current_thread().name)
+        time.sleep(0.05)  # long enough that a pool overlaps rows
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(wrkslots_cli, "_audit_record", judged)
+    results = {}
+    for jobs in (1, 4):
+        jobs_now["value"] = jobs
+        results[jobs] = _comparable_audit(root, tmp_path, jobs)
+    assert results[4] == results[1]
+    verdicts = {
+        str(row["slot"]): row["verdict"]
+        for row in cast(list[dict[str, object]], results[1]["slots"])
+    }
+    # Without a census nothing can be cleared for removal or recovery.
+    expected = {"BLOCKED", "HELD"} | (
+        {"UNKNOWN"} if census_fails else {"DELETABLE", "RECOVERABLE"}
+    )
+    assert expected <= set(verdicts.values()), verdicts
+    assert threads[1] == {threading.current_thread().name}, threads
+    assert len(threads[4]) > 1, threads
+
+
+def test_audit_refuses_jobs_below_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _fixture(tmp_path / "case")
+    code = wrkslots_cli.main(
+        ["--project-root", str(root), "audit", "--format", "json", "--jobs", "0"]
+    )
+    assert code != 0
+    assert "--jobs must be at least 1" in capsys.readouterr().err
+
+
+def test_other_edition_accepts_the_same_jobs_option(tmp_path: Path) -> None:
+    root = _fixture(tmp_path / "case")
+
+    def run(jobs: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                str(rust_wrkslotsd()), "audit-text", "--root", str(root),
+                "--cache-census-state", str(tmp_path / "rust-census.json"),
+                "--format", "json", "--jobs", jobs,
+            ],
+            cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
+        )
+
+    accepted = run("4")
+    assert accepted.returncode == 0, accepted.stderr
+    assert json.loads(accepted.stdout)["slots"]
+    refused = run("0")
+    assert refused.returncode != 0
+    assert "--jobs must be at least 1" in refused.stderr

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import concurrent.futures
 import contextvars
 import ctypes
 import dataclasses
@@ -1068,6 +1069,10 @@ _AUDIT_CACHE_WALL_SECONDS = 5.0
 # Total cache-glob planning time per audit, across every subject (planning runs outside
 # the state lock after a short-lock snapshot, #797).
 _AUDIT_CACHE_PLAN_TOTAL_SECONDS = 30.0
+# Rows audit judges at once (#1172). Judging a row is mostly Git subprocesses, so a few threads
+# overlap them; the default stays at four because audits share hosts with validation runs, where
+# those same subprocesses are already the load.
+_AUDIT_DEFAULT_JOBS = 4
 
 
 class Refusal(RuntimeError):
@@ -7743,7 +7748,8 @@ def _load_events(config: Config, machine: str | None = None) -> tuple[dict[str, 
             for name, identity in zip(names, chain.identities)
         ):
             return chain.events
-        del chains[key]
+        # pop, not del: audit judges rows on several threads (#1172).
+        chains.pop(key, None)
     events, trusted = _verify_event_paths(
         [directory / name for name in names], selected
     )
@@ -40744,6 +40750,15 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     )
     if not (math.isfinite(plan_total_seconds) and plan_total_seconds > 0):
         raise Refusal("--cache-plan-total-seconds must be finite and positive")
+    jobs = getattr(args, "jobs", None)
+    if jobs is None:
+        try:
+            cpus = len(os.sched_getaffinity(0))
+        except (AttributeError, OSError):
+            cpus = os.cpu_count() or 1
+        jobs = min(_AUDIT_DEFAULT_JOBS, cpus)
+    if jobs < 1:
+        raise Refusal("--jobs must be at least 1")
     config = _load_config(args.project_root, args.machine)
     metrics = _AuditMetrics()
     _prewarm_registry_read(lambda: _validate_global_state(config))
@@ -41044,8 +41059,9 @@ def _cmd_audit(args: argparse.Namespace) -> int:
     )
     metrics.finish("cache-census", cache_started, cache_work)
     records_started = metrics.start()
-    for record in records:
-        row, running = _audit_record(
+
+    def judge(record: ActiveRecord) -> tuple[dict[str, object], bool]:
+        return _audit_record(
             config,
             record,
             events=event_logs[record.machine],
@@ -41061,6 +41077,23 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                 ]
             ],
         )
+
+    # Rows are judged independently from the same snapshot, census and cache measurements, so
+    # judging them on several threads changes no verdict; results are taken in record order.
+    # Each row runs in its own copy of this context, so context-scoped state reaches it as it
+    # would serially.
+    if jobs > 1 and len(records) > 1:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(jobs, len(records)), thread_name_prefix="wrkslots-audit"
+        ) as pool:
+            futures = [
+                pool.submit(contextvars.copy_context().run, judge, record)
+                for record in records
+            ]
+            judged = [future.result() for future in futures]
+    else:
+        judged = [judge(record) for record in records]
+    for record, (row, running) in zip(records, judged):
         journal_slot = journal_slots.get(record.slot)
         if journal_slot is not None:
             reasons = row["reasons"]
@@ -71640,6 +71673,20 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "reports a cache error naming this allowance. Audit snapshots the registry "
             "under a short lock and plans outside it, so this bounds total planning time "
             f"(default: {_AUDIT_CACHE_PLAN_TOTAL_SECONDS:g})"
+        ),
+    )
+    audit.add_argument(
+        "--jobs",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "registered rows to judge at once; judging a row is mostly Git subprocesses, so a "
+            "few in parallel cut wall time without changing a verdict or the row order, though "
+            "not CPU time. The default, the smaller of "
+            f"{_AUDIT_DEFAULT_JOBS} and the CPUs this process may run on, stays low because audits share hosts "
+            "with validation runs whose Git subprocesses are already the load; 1 judges rows "
+            "one at a time"
         ),
     )
     audit.add_argument(

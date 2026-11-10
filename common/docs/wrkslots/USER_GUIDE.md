@@ -3002,6 +3002,13 @@ lock and repeat the measurement, asking again only about rows that changed; afte
 the last measurement runs under the lock. A report therefore always shows the registry at one
 instant, as when the whole command held the lock.
 
+`audit` already snapshots the registry under a short lock and measures outside it. It judges
+up to `--jobs` registered rows at once (default: the smaller of 4 and the CPUs it may run on).
+Judging a row is mostly Git subprocesses, so a few in parallel cut wall time; verdicts, reasons
+and row order are the same as one at a time, and CPU time is not reduced. The default stays low
+because audits share hosts with validation runs whose Git subprocesses are already the load;
+`--jobs 1` judges rows one at a time.
+
 ## Recovery and compatibility views
 
 Every mutation appends a numbered, hash-linked JSON event before refreshing the readable ACTIVE,
