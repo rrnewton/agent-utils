@@ -2793,3 +2793,36 @@ test("`#624 voice-page-modularity`: which view a channel opens in and the saved 
   assert.equal(recordState.forgotten, 1, "the lost thread was not forgotten as it was passed over");
   assert.equal(owner.defaultChannelView(), "flat");
 });
+
+test("`#624 voice-page-modularity`: the card refresh notes a changed page build once, steps collapsed lines off fields, and re-reads for a landed summary", async () => {
+  const { createCardRefresh } = CHANNEL_VIEW;
+  const log = [];
+  let buildSeen = "";
+  const refresh = createCardRefresh({
+    notePageBuild: (build) => { const changed = build !== buildSeen; buildSeen = build; return changed; },
+    pageBuildChanged: () => log.push("pageBuildChanged"),
+    view: () => "discord",
+    selectedChannelId: () => 42,
+    forgetThreadRead: (channel) => log.push(`forget ${channel}`),
+    refreshThreadDirectory: async () => { log.push("refreshThreads"); },
+    renderThreadHeading: () => log.push("heading"),
+    renderSideColumn: () => log.push("side"),
+    selectionView: () => "thread",
+    renderReplyLinks: () => log.push("replyLinks"),
+    isTextField: (target) => target === "field",
+    collapsedCurrent: () => 3,
+    collapsedChanged: (n) => { log.push(`collapsed ${n}`); return n; },
+    setStatus: (text) => log.push(`status ${text}`),
+  });
+  refresh.noteServerPageBuild({ page_build: "abc" });
+  refresh.noteServerPageBuild({ page_build: "abc" });
+  refresh.noteServerPageBuild(null);
+  assert.deepStrictEqual(log, ["pageBuildChanged", "pageBuildChanged"], "an unchanged or missing build was drawn, or a changed one was not");
+  log.length = 0;
+  assert.equal(refresh.collapsedLinesFromKeyboard(1, "field"), false);
+  assert.equal(refresh.collapsedLinesFromKeyboard(1, "row"), true);
+  assert.deepStrictEqual(log, ["collapsed 4", "status Collapsed messages show 4 lines."]);
+  log.length = 0;
+  await refresh.summaryWatchFired();
+  assert.deepStrictEqual(log, ["forget 42", "refreshThreads", "heading", "side", "replyLinks"]);
+});

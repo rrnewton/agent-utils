@@ -222,3 +222,5 @@ export { createThreadStrip } from "./threadstrip.ts";
 export type { ThreadStrip, ThreadStripDependencies } from "./threadstrip.ts";
 export { SCROLL_TRACE_MAX_ENTRIES, SCROLL_TRACE_WINDOW_MS, createScrollTrace } from "./scrolltrace.ts";
 export type { ScrollTrace, ScrollTraceAnchor, ScrollTraceDependencies } from "./scrolltrace.ts";
+export { createCardRefresh } from "./cardrefresh.ts";
+export type { CardRefresh, CardRefreshDependencies } from "./cardrefresh.ts";

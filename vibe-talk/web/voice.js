@@ -1230,20 +1230,8 @@ const settingsFolds = mountSettingsFolds({
   closeDismissed: () => dismissedSendsView.close(false),
 });
 
-/**
- * Open Help, optionally at one entry.
- *
- * `#85 voice-desktop-review`. The deep link is the thing that makes the split survivable: moving the
- * paragraphs off the settings screen is only an improvement if the paragraph about the switch you
- * are looking at is still one tap away. Without it this would be a filing cabinet.
- *
- * A null slug opens the top, which is what the standing "Open help" button at the head of Settings
- * wants: it is not about any one control.
- */
-function showHelp(slug) {
-  showScreen("help");
-  helpFolds.openAt(slug);
-}
+// Open Help, optionally at one entry (`#85 voice-desktop-review`): web/src/view/settings
+// `mountHelpScreen`, beside the folds below (`#624 voice-page-modularity`).
 
 // --- Help, folded ---------------------------------------------------------------------------------
 //
@@ -1260,6 +1248,17 @@ const helpFolds = mountHelpFolds({
   lookup: (id) => el(id),
   byId: (id) => document.getElementById(id),
 });
+
+/**
+ * Help's way in: the screen shown, opened at one entry (`mountHelpScreen`, web/src/view/settings).
+ *
+ * @type {import("./src/view/settings/index.ts").HelpScreen}
+ */
+const helpScreen = mountHelpScreen({
+  showScreen: (name) => showScreen(name),
+  openAt: (slug) => helpFolds.openAt(slug),
+});
+const { showHelp } = helpScreen;
 
 // The view the main screen shows ("voice" for the call's, "discord" for the channel's) is the screens'
 // (`Screens.view`, `#624 voice-page-modularity`).
@@ -4083,12 +4082,9 @@ const PAGE_BUILD = (() => {
  */
 const serverFacts = createServerFacts();
 
-/** Take what read `payload` says of the server's page build, and draw what it means for this page. */
-function noteServerPageBuild(payload) {
-  const build = payload && typeof payload.page_build === "string" ? payload.page_build : "";
-  if (!serverFacts.notePageBuild(build)) return;
-  settingsReadouts.pageBuild();
-}
+// What a read says of the server's page build, a summary landing, and the collapsed-lines chord
+// are web/src/view/channel's now (`createCardRefresh`, beside `createCardLines`, `#624
+// voice-page-modularity`), made below with the card lines it stands beside.
 
 /** Whether the server serves a newer page than this one runs: both builds known, and different. */
 const pageOutOfDate = () => PAGE_BUILD !== "" && serverFacts.pageBuild() !== "" && serverFacts.pageBuild() !== PAGE_BUILD;
@@ -4132,16 +4128,29 @@ const quoteReadPercent = createQuoteReadPercent({
 });
 
 
-/** A summary on its way is owed a read: the Threads list read now, past its spacing, and the cards drawn again. */
-async function summaryWatchFired() {
-  if (screens.view() !== "discord") return;
-  threadDirectoryReadAt.delete(String(selectedChannelId()));
-  await refreshThreadDirectory();
-  renderThreadHeading();
-  renderSideColumn();
-  // A thread open across the window: its root row is the card's inward child or not by the card's layout.
-  if (selection().view === "thread") renderReplyLinks();
-}
+/**
+ * The card lines' page-side acts: what a read says of the server's page build, a summary landing
+ * owed a re-read, and the collapsed-lines chord (web/src/view/channel `createCardRefresh`).
+ *
+ * @type {import("./src/view/channel/index.ts").CardRefresh}
+ */
+const cardRefresh = createCardRefresh({
+  notePageBuild: (build) => serverFacts.notePageBuild(build),
+  pageBuildChanged: () => settingsReadouts.pageBuild(),
+  view: () => screens.view(),
+  selectedChannelId: () => selectedChannelId(),
+  forgetThreadRead: (channel) => threadDirectoryReadAt.delete(channel),
+  refreshThreadDirectory: () => refreshThreadDirectory(),
+  renderThreadHeading: () => renderThreadHeading(),
+  renderSideColumn: () => renderSideColumn(),
+  selectionView: () => selection().view,
+  renderReplyLinks: () => renderReplyLinks(),
+  isTextField: (target) => isTextField(/** @type {any} */ (target)),
+  collapsedCurrent: () => collapsedLines.current(),
+  collapsedChanged: (n) => collapsedLinesChanged(n),
+  setStatus: (text) => setStatus(text),
+});
+const { noteServerPageBuild, summaryWatchFired, collapsedLinesFromKeyboard } = cardRefresh;
 
 // Thread card lines and how much a quote must cover are web/src/view/channel's now
 // (`createCardLines`, `#624 voice-page-modularity`): where a card stops, its head and
@@ -4186,32 +4195,19 @@ const {
   cardView, rootInward, cardSplit, cutForCard, watchPendingSummaries,
 } = cardLinesOwner;
 
+// The collapsed-lines chord (Ctrl+( / Ctrl+)) is the card refresh's above (`collapsedLinesFromKeyboard`).
+
 /**
- * Ctrl+( and Ctrl+) (Cmd on a Mac): one collapsed line fewer or more, and the status line says the
- * count it came to. Never in a text field, where the chord is the field's — a bracket typed, and
- * on some layouts a brace — so the key is left alone there and the browser keeps it; everywhere
- * else the chord is taken, at the ends of the range too, so it is never the browser's zoom
- * instead. A held chord steps on, as holding a zoom would, and stops at the end.
+ * The screen values as stored, read where the page restores its settings (web/src/view/settings
+ * `createStoredScreen`, beside the reading width's owner).
  *
- * @param {1 | -1} direction
- * @param {HTMLElement} target
+ * @type {import("./src/view/settings/index.ts").StoredScreen}
  */
-function collapsedLinesFromKeyboard(direction, target) {
-  if (isTextField(target)) return false;
-  const n = collapsedLinesChanged(collapsedLines.current() + direction);
-  setStatus(`Collapsed messages show ${collapsedLinesWords(n)}.`);
-  return true;
-}
-
-/** What was stored, clamped. A missing or corrupt entry is the default, never an error. */
-function storedMsgScale() {
-  return deviceSettings().get(DEVICE_SETTINGS.msgScale);
-}
-
-/** What was stored, clamped. A missing or corrupt entry is the default, never an error. */
-function storedReadingWidth() {
-  return deviceSettings().get(DEVICE_SETTINGS.readingWidth);
-}
+const storedScreen = createStoredScreen({
+  msgScale: () => deviceSettings().get(DEVICE_SETTINGS.msgScale),
+  readingWidth: () => deviceSettings().get(DEVICE_SETTINGS.readingWidth),
+});
+const { storedMsgScale, storedReadingWidth } = storedScreen;
 
 /**
  * The reading column's width, from Settings' slider or the handle on the column's edge, its drag and
@@ -4234,61 +4230,44 @@ const readingWidthControl = mountReadingWidth({
  */
 const awayClock = createAwayClock();
 
-function onVisibility() {
-  voiceCall().syncScreenWakeLock();
-  if (document.visibilityState === "hidden") {
-    awayClock.hide(Date.now());
-    // Only a call can be suspended. Hiding an idle page is not an event.
-    if (voiceCall().session.socket) {
-      voiceCall().hiddenDuringCall = true;
-    }
-    // `#226 page-energy-profile`. Nor is refreshing a channel nobody can see.
-    pauseWhileHidden();
-    return;
-  }
-  voiceCall().visibleAt = Date.now();
-  const away = awayClock.show(voiceCall().visibleAt);
-  // `#195 send-resilience`. A phone holds a hidden page's timers; a send whose wait ran out while
-  // the reader was away goes now, not a further wait after they are back.
-  resumeOutgoingRetries();
-  // `#226 page-energy-profile`. What the stream delivered while the page was hidden is drawn now,
-  // from the store, and the arrows a hidden page did not measure are measured.
-  const owed = catchUpHiddenArrivals();
-  if (replyArrows().owed) measureReplyArrows();
-  inOtherColumn(() => {
-    if (replyArrows().owed) measureReplyArrows();
-  });
-  const resume = hiddenStream.takeResume();
-  const pollDue = channelPoll.paused() && channelPoll.dueAt() <= voiceCall().visibleAt;
-  // `#203 incremental-refresh`. Coming back to the channel after a while is the moment a reader
-  // most wants it current, and a phone held the poll's timer the whole time it was away. Only what
-  // changed is asked for, so this costs one small read rather than the next poll's wait. `#226`:
-  // and after any absence the stream delivered something in, the poll came due in, or that let the
-  // stream go.
-  if ((away >= VISIBLE_REFRESH_MS || owed !== null || pollDue || resume !== null) &&
-      screens.view() === "discord" && providerFacts.threading() && serverFacts.configApplied() && selectedChannelId()) {
-    refreshQuietly(async () => {
-      try {
-        if (owed === "mutation") refreshAfterLiveMutation();
-        else {
-          const since = replayLedger.started();
-          await timelineView.loadDiscord({ keepPosition: true, reason: "visible" });
-          await readSideColumn("visible", since);
-        }
-      } finally {
-        // The stream comes back once that read has brought what it missed, so what it replays from
-        // the last event it saw is held already rather than drawn a row at a time.
-        resumeLiveStream(resume);
-      }
-    })();
-    resumePolling("fresh");
-    return;
-  }
-  // An edit the stream delivered is read for wherever the reader is, as it was when it arrived.
-  if (owed === "mutation") refreshAfterLiveMutation();
-  resumeLiveStream(resume);
-  resumePolling(pollDue ? "now" : "rest");
-}
+/**
+ * The page going hidden and coming back: what a hidden page owes on return, and the refresh a
+ * long absence earns (web/src/view/shell `createPageVisibility`, beside the document listeners).
+ *
+ * @type {import("./src/view/shell/index.ts").PageVisibility}
+ */
+const pageVisibility = createPageVisibility({
+  syncScreenWakeLock: () => voiceCall().syncScreenWakeLock(),
+  hidden: () => document.visibilityState === "hidden",
+  hide: (at) => awayClock.hide(at),
+  callSocketOpen: () => Boolean(voiceCall().session.socket),
+  noteHiddenDuringCall: () => { voiceCall().hiddenDuringCall = true; },
+  pauseWhileHidden: () => pauseWhileHidden(),
+  noteVisibleAt: (at) => { voiceCall().visibleAt = at; },
+  awayMs: (at) => awayClock.show(at),
+  resumeOutgoingRetries: () => resumeOutgoingRetries(),
+  catchUpHiddenArrivals: () => catchUpHiddenArrivals(),
+  replyArrowsOwed: () => Boolean(replyArrows().owed),
+  measureReplyArrows: () => measureReplyArrows(),
+  inOtherColumn: (act) => inOtherColumn(act),
+  takeStreamResume: () => hiddenStream.takeResume(),
+  pollPaused: () => channelPoll.paused(),
+  pollDueAt: () => channelPoll.dueAt(),
+  visibleRefreshMs: VISIBLE_REFRESH_MS,
+  view: () => screens.view(),
+  threading: () => providerFacts.threading(),
+  configApplied: () => serverFacts.configApplied(),
+  selectedChannelId: () => selectedChannelId(),
+  refreshQuietly: (run) => refreshQuietly(run),
+  refreshAfterLiveMutation: () => refreshAfterLiveMutation(),
+  replayStarted: () => replayLedger.started(),
+  loadDiscordVisible: () => timelineView.loadDiscord({ keepPosition: true, reason: "visible" }),
+  readSideColumn: (reason, since) => readSideColumn(reason, /** @type {any} */ (since)),
+  resumeLiveStream: (resume) => resumeLiveStream(/** @type {any} */ (resume)),
+  resumePolling: (mode) => resumePolling(mode),
+  now: () => Date.now(),
+});
+const { onVisibility } = pageVisibility;
 voiceCall().initializePageInstance();
 
 

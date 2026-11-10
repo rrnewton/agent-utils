@@ -511,3 +511,18 @@ test("`#624 voice-page-modularity`: the settings sync glue makes neither owner u
   glue.settingsSync();
   assert.deepStrictEqual(log.filter((line) => line === "make sync"), ["make sync"], "the reconciler was made twice");
 });
+
+test("`#624 voice-page-modularity`: Help's way in shows the screen, then opens the entry asked for; the stored screen values are the device's copies", () => {
+  const { mountHelpScreen, createStoredScreen } = VIEW_SETTINGS;
+  const log = [];
+  const screen = mountHelpScreen({
+    showScreen: (name) => log.push(`screen ${name}`),
+    openAt: (slug) => log.push(`open ${slug}`),
+  });
+  screen.showHelp("keyboard");
+  screen.showHelp(null);
+  assert.deepStrictEqual(log, ["screen help", "open keyboard", "screen help", "open null"]);
+  const stored = createStoredScreen({ msgScale: () => 125, readingWidth: () => 72 });
+  assert.equal(stored.storedMsgScale(), 125);
+  assert.equal(stored.storedReadingWidth(), 72);
+});

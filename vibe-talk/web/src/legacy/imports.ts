@@ -86,7 +86,7 @@ export {
   setClassWord,
   shownNode,
 } from "../view/dom/index.ts";
-export { SCREEN_TITLES, createActionMenu, createChannelDirectoryView, createChipsOverComposer, createControlBar, createPromptsTray, createReaderRow, createReplySight, createPageNavigation, createScreens, createScreenShowing, createShellNotices, createUndoOffer, createUndoStamps, modHeld, mountDocumentListeners, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow } from "../view/shell/index.ts";
+export { SCREEN_TITLES, createActionMenu, createChannelDirectoryView, createChipsOverComposer, createControlBar, createPromptsTray, createReaderRow, createReplySight, createPageNavigation, createScreens, createScreenShowing, createShellNotices, createPageVisibility, createUndoOffer, createUndoStamps, modHeld, mountDocumentListeners, mountKeyListeners, mountMenuOpeners, mountPageListeners, pageStep, swallow } from "../view/shell/index.ts";
 export {
   NEWLINE_KEYS,
   createComposerBoxes,
@@ -106,7 +106,7 @@ export { sentenceStart } from "../foundation/index.ts";
 export { briefAge, fullLocalAt, fullLocalTime, stamp } from "../present/time/index.ts";
 
 export { doneReadWords, failureWords, localReadWords, messagesWords, reachBackWords, reachClause, readableCause, refusalSentence, refusalWords, searchMomentWords, serviceReadWords } from "../present/notices/index.ts";
-export { LINK_KINDS_KEY, READ_MODES, READ_MODE_KEY, READ_MODE_SAID, THREADS_UNPACKED_KEY, THREAD_CARD_STATES_KEY, THREAD_ORDERS, THREAD_ORDER_KEY, THREAD_ORDER_NAMES, cardGapWords, cardRunText, collapsedLinesWords, combinedContent, countOf, createCardPacking, createLinkKinds, createReadMode, createReadRuns, createThreadOrder, editedDrawn, gapWords, inThreadOrder, isNoise, mainRunsAmong, messageLook, quoteBlock, rawTextOf, reactionsDrawn, renderedHtmlOf, rowEdited, savedReadMode, threadOrderAfter, undoLabel, undoName, upstreamUrlOf } from "../present/rows/index.ts";
+export { LINK_KINDS_KEY, READ_MODES, READ_MODE_KEY, READ_MODE_SAID, THREADS_UNPACKED_KEY, THREAD_CARD_STATES_KEY, THREAD_ORDERS, THREAD_ORDER_KEY, THREAD_ORDER_NAMES, cardGapWords, cardRunText, combinedContent, countOf, createCardPacking, createLinkKinds, createReadMode, createReadRuns, createThreadOrder, editedDrawn, gapWords, inThreadOrder, isNoise, mainRunsAmong, messageLook, quoteBlock, rawTextOf, reactionsDrawn, renderedHtmlOf, rowEdited, savedReadMode, threadOrderAfter, undoLabel, undoName, upstreamUrlOf } from "../present/rows/index.ts";
 export { COLUMN_IDS, DAY_TITLED, PULL_WAIT_MS, REPLY_LANDING_GAP_PX, anchorOfRow, authorPasses, cardRunIds, createCardFlight, createCardPlaces, createColumnLinks, createColumnSplitter, createColumnReplies, createColumnWork, createColumns, createFootRooms, createLayoutShown, createLinkedMark, createPackSlides, createPullToRefresh, createQuoting, createReadingColumn, createReplyArrows, createSentRead, createReplyGathering, createReplySession, createChannelViews, createFilterPlace, createOlderPages, createOpeningView, createPlacing, createReplyCounts, createDoneAct, createLiveState, createSideCards, createThreadEntry, createTwoColumns, createRowDrawing, createRowGestures, createScrollKeeping, createUnderLists, createUnpackWatch, FOLLOW_REST_PX, fillCardText, freshenDayTitle, freshEntryState, freshDoneState, freshOlderPages, freshFilterState, freshGatherState, freshListState, freshReplyArrows, fromGatheredThread, idsOf, markCardLayout, messageTop, mountChannelViewControls, mountColumnSplitterControls, mountFilterChips, mountKeptSends, mountListControls, mountListGestures, mountListKeepers, mountListWatch, mountReadingJumps, mountReplyBox, mountSideControls, mountSideListControls, notNoiseButtonOf, quoteLabelFits, renderedText, rowIn, rowMessages, rowShown, rowTimeTabStop, sameCardPlace, shownRowFor, } from "../view/channel/index.ts";
 
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";
@@ -130,6 +130,7 @@ export {
   mountChannelBoxListeners,
   createClientConfig,
   createSettingsSyncGlue,
+  createStoredScreen,
   createSignIn,
   mountChannelDirectory,
   mountChannelHistory,
@@ -138,6 +139,7 @@ export {
   mountDismissedSends,
   mountHelpFolds,
   mountHelpLinks,
+  mountHelpScreen,
   mountIdentityList,
   mountMessagePreferences,
   mountMicrophoneSettings,
@@ -177,6 +179,7 @@ export { SEARCH_OLDER_HITS, SEARCH_OLDER_MS, SEARCH_OLDER_PAGES, SEARCH_OLDER_TA
 export { createRowLinks } from "../view/channel/index.ts";
 export { headingLength, headingOf } from "../present/rows/index.ts";
 export { createCardLines, createReadingBookmark, createSpeakers } from "../view/channel/index.ts";
+export { createCardRefresh } from "../view/channel/index.ts";
 export { createPinnedMessages, createServerSearchCopy } from "../view/channel/index.ts";
 
 // outbox loads, drafts and sends (#624 mu-readcore O1)

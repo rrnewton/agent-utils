@@ -32,6 +32,30 @@ export interface ScreenSettingDependencies {
   keptAs(value: number): boolean;
 }
 
+/** What the stored screen values ask of the page: the device's copies, already clamped. */
+export interface StoredScreenDependencies {
+  /** The stored type size. */
+  msgScale(): number;
+  /** The stored reading width. */
+  readingWidth(): number;
+}
+
+/** The screen values as stored: what a restore puts on the page. */
+export interface StoredScreen {
+  /** What was stored, clamped. A missing or corrupt entry is the default, never an error. */
+  storedMsgScale(): number;
+  /** What was stored, clamped. A missing or corrupt entry is the default, never an error. */
+  storedReadingWidth(): number;
+}
+
+/** The stored copies, read where the page restores its settings. */
+export function createStoredScreen(deps: StoredScreenDependencies): StoredScreen {
+  return {
+    storedMsgScale: () => deps.msgScale(),
+    storedReadingWidth: () => deps.readingWidth(),
+  };
+}
+
 /** The text size's named commands. */
 export interface TextSize {
   /** Put a type size on the page, and return the one actually applied, which is the clamped one. */

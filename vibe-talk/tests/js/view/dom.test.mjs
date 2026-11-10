@@ -2438,3 +2438,52 @@ test("`#624 voice-page-modularity`: the control bar shows each pack member only 
   assert.equal(el("discord-channel").hidden, true, "a channel member showed on the call view");
   assert.equal(el("prompts-open").hidden, false, "a call member was hidden on the call view");
 });
+
+test("`#624 voice-page-modularity`: the page hidden pauses and notes a call; back briefly resumes at rest, back after long away re-reads and resumes fresh", async () => {
+  const { createPageVisibility } = VIEW_SHELL;
+  const log = [];
+  let hidden = true;
+  let away = 0;
+  const visibility = createPageVisibility({
+    syncScreenWakeLock: () => log.push("wakeLock"),
+    hidden: () => hidden,
+    hide: (at) => log.push(`hide ${at}`),
+    callSocketOpen: () => true,
+    noteHiddenDuringCall: () => log.push("hiddenDuringCall"),
+    pauseWhileHidden: () => log.push("pause"),
+    noteVisibleAt: (at) => log.push(`visibleAt ${at}`),
+    awayMs: () => away,
+    resumeOutgoingRetries: () => log.push("retries"),
+    catchUpHiddenArrivals: () => null,
+    replyArrowsOwed: () => false,
+    measureReplyArrows: () => log.push("arrows"),
+    inOtherColumn: (act) => act(),
+    takeStreamResume: () => null,
+    pollPaused: () => false,
+    pollDueAt: () => 0,
+    visibleRefreshMs: 60000,
+    view: () => "discord",
+    threading: () => true,
+    configApplied: () => true,
+    selectedChannelId: () => "c1",
+    refreshQuietly: (run) => () => { log.push("quiet"); void run(); },
+    refreshAfterLiveMutation: () => log.push("mutation"),
+    replayStarted: () => "since",
+    loadDiscordVisible: async () => { log.push("loadDiscord"); },
+    readSideColumn: async (reason, since) => { log.push(`side ${reason} ${since}`); },
+    resumeLiveStream: () => log.push("resumeStream"),
+    resumePolling: (mode) => log.push(`poll ${mode}`),
+    now: () => 1000,
+  });
+  visibility.onVisibility();
+  assert.deepStrictEqual(log, ["wakeLock", "hide 1000", "hiddenDuringCall", "pause"]);
+  log.length = 0;
+  hidden = false;
+  visibility.onVisibility();
+  assert.deepStrictEqual(log, ["wakeLock", "visibleAt 1000", "retries", "resumeStream", "poll rest"]);
+  log.length = 0;
+  away = 120000;
+  visibility.onVisibility();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepStrictEqual(log, ["wakeLock", "visibleAt 1000", "retries", "quiet", "loadDiscord", "poll fresh", "side visible since", "resumeStream"]);
+});

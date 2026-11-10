@@ -67,3 +67,7 @@ export { SAVE_LABEL, createSignIn } from "./signin.ts";
 export type { SignIn, SignInDependencies } from "./signin.ts";
 export { createSettingsSyncGlue } from "./syncglue.ts";
 export type { SettingsSyncGlue, SettingsSyncGlueDependencies, SettingsSyncLike, SettingsSyncViewLike } from "./syncglue.ts";
+export { mountHelpScreen } from "./helpscreen.ts";
+export type { HelpScreen, HelpScreenDependencies } from "./helpscreen.ts";
+export { createStoredScreen } from "./screen.ts";
+export type { StoredScreen, StoredScreenDependencies } from "./screen.ts";
