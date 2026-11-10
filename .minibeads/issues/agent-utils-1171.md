@@ -1,6 +1,6 @@
 ---
 title: "mq-close-comment: map every landed commit in the merge-queue closing comment"
-status: open
+status: closed
 priority: 2
 issue_type: feature
 assignee: ac-mqclose
