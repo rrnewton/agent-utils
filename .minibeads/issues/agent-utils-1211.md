@@ -1,6 +1,6 @@
 ---
 title: 'agentctl-console: a console that follows an agent and accepts typed owner input'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: mu-rsctl
@@ -32,3 +32,5 @@ The owner wants an agent console they can type to, not only watch: today `agentc
 # Notes
 
 Filed 2026-11-10 on an owner request (wanted for a headless coordinator restart the same day). Related: the `tail --follow` event rendering it reuses, #671 headless approvals (the `/approve` and `/deny` answers), and #609 sender-header-mandatory (the header grammar the console header follows).
+
+Closed 2026-11-10 as a duplicate of #670 agentctl-console (filed 2026-10-28 from the same owner request, with the governing design note at `ai_docs/transient/2026-10-28-agentctl-console/README.md`). The work continues under #670; this file's sender-framing spec is superseded by that design (console input is a plain user turn with no framing).
