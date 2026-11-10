@@ -2826,3 +2826,65 @@ test("`#624 voice-page-modularity`: the card refresh notes a changed page build 
   await refresh.summaryWatchFired();
   assert.deepStrictEqual(log, ["forget 42", "refreshThreads", "heading", "side", "replyLinks"]);
 });
+
+test("`#624 voice-page-modularity`: the read state's acts — Done copies caught up, the dismissal undone, the backlog armed then cleared — from the module alone", async () => {
+  const { createReadActs } = CHANNEL_VIEW;
+  const log = [];
+  const store = new Set(["a"]);
+  const held = { dismissed: new Set(["b"]) };
+  const doneArchived = { archived: new Set() };
+  let offer = null;
+  let armed = false;
+  const owner = createReadActs({
+    byId: () => ({ children: [] }), leftById: () => ({ children: [] }), inThisColumn: (fn) => fn,
+    selection: () => ({ view: "flat", threadId: null, thread: null }), threads: () => [],
+    readHiding: () => false, readRunsSuspended: () => false, threading: () => true,
+    eachColumnRenderCached: () => {}, openReadRun: () => {}, readRunRows: () => [],
+    threadIdOf: () => null, selectionThread: () => null,
+    makeDismissalOffer: () => ({ current: () => offer, set: (next) => { offer = next; } }),
+    makeInboxLedger: () => ({ leave: () => {} }),
+    storeDismissed: () => store, storeChannel: () => "c1", selectedChannelId: () => "c1",
+    heldDoneCopies: () => [held], sideShowing: () => false, activeColumn: () => "main",
+    sideColumn: () => "side", mainColumn: () => "main", sideLeft: () => false,
+    inColumn: (_column, act) => act(), doneState: () => doneArchived,
+    cardsWhileDressedAfter: (_up, act) => act(), sideColumnUp: () => false,
+    renderCachedTimeline: () => log.push("render"), syncUnreadReplies: () => log.push("counts"),
+    renderSideColumn: () => log.push("side"),
+    el: () => ({ children: [{ getAttribute: () => "false" }] }),
+    idsOf: () => ["a"], readFilterKeeps: () => () => true,
+    timelineMessages: () => [{ id: "a" }],
+    renderTodoControls: () => log.push("controls"),
+    restoreMessages: async (messages) => { log.push(["restore", ...messages]); },
+    undoBookmarkBump: async () => { log.push("bump"); },
+    listedMessages: () => [{ id: 1 }, { id: 2 }],
+    backlogIsArmed: () => armed, armBacklog: () => { armed = true; log.push("arm"); },
+    disarmBacklog: () => { armed = false; log.push("disarm"); },
+    setStatus: (text) => log.push(text),
+    dismissMessages: async (body) => { log.push(["dismiss", body.through, body.limit > 0]); },
+    throughBump: () => "bump-of-last",
+  });
+  // caughtUpDone: the same set back where nothing differs, a new one where it does.
+  const copy = new Set(["a"]);
+  assert.equal(owner.caughtUpDone(copy, ["a"]), copy, "an unchanged copy was replaced");
+  const wide = new Set(["b"]);
+  const caught = owner.caughtUpDone(wide, ["a", "b"]);
+  assert.notEqual(caught, wide);
+  assert.deepStrictEqual([...caught], ["a"], "a copy was not brought into line with the store");
+  // followDoneEverywhere: held copies are replaced into line with the store.
+  owner.followDoneEverywhere(["a", "b"], "main");
+  assert.deepStrictEqual([...held.dismissed], ["a"]);
+  assert.equal(owner.rowsMissDone(), false, "rows drawn Done as their copy says counted as missing");
+  // undoDismissal: nothing standing, nothing happens; standing, it restores exactly that set.
+  await owner.undoDismissal();
+  assert.deepStrictEqual(log, []);
+  owner.lastDismissal.set({ messages: ["m1", "m2"], bump: null });
+  await owner.undoDismissal();
+  assert.deepStrictEqual(log, ["controls", ["restore", "m1", "m2"]]);
+  assert.equal(owner.lastDismissal.current(), null);
+  // clearBacklog: the first tap arms and says the count, the second clears through the newest.
+  log.length = 0;
+  await owner.clearBacklog();
+  assert.deepStrictEqual(log, ["arm", "Tap again to clear 2 — undo will be offered afterwards."]);
+  await owner.clearBacklog();
+  assert.deepStrictEqual(log.slice(2), ["disarm", ["dismiss", "2", true]]);
+});

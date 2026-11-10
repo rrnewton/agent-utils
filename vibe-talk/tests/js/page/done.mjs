@@ -21,6 +21,9 @@ import { CHANNEL, CLEAR_ARMED_MS, CSS, CSS_CODE, DISCORD_POLL_MS, DONE_FLASH_FAD
 /** Done's act in its module (`createDoneAct`, `#624`): a patch there, a page built with patches, a slip there. */
 const doneActPatch = ([find, replace]) => ({ file: "src/view/channel/doneact.ts", find, replace });
 const brokenDoneAct = (...patches) => brokenModule(patches.map(doneActPatch));
+/** The read state's acts in their module (`createReadActs`, `#624`): a patch there, a page built with it. */
+const readActsPatch = ([find, replace]) => ({ file: "src/view/channel/readacts.ts", find, replace });
+const brokenReadActs = (find, replace) => brokenModule([readActsPatch([find, replace])]);
 const slipPatch = (line, nth = 1) => [line, `if ((globalThis.slipReached = (globalThis.slipReached || 0) + 1) === ${nth}) throw new Error("a slip in the page");\n${line}`];
 const slipInDoneAct = (line, nth = 1, patches = []) => brokenDoneAct(...patches, slipPatch(line, nth));
 
@@ -1924,8 +1927,8 @@ test("`#306 done-stale-across-views`: the right column's thread, put away with t
 
   // THE CONTROLS. Without the right column's copy brought into line while it is put away, or without its
   // rows drawn again as it comes back, the reply shows there as not Done.
-  const unfollowed = await run(brokenScript(
-    "  if (!sideShowing() && columnWork.active() !== columns.side && columns.side.left) {", "  if (false) {"));
+  const unfollowed = await run(await brokenReadActs(
+    "    if (!deps.sideShowing() && deps.activeColumn() !== deps.sideColumn() && deps.sideLeft()) {", "    if (false) {"));
   assert.equal(unfollowed.page.el("side-log").children.find((li) => li.getAttribute("data-id") === "202").getAttribute("data-archived"),
     "false", "without the right column's copy brought into line it showed the Done, so this test cannot see it");
   const undrawn = await run(brokenScript("      if (rowsMissDone()) renderCachedTimeline();\n      return undefined;",
@@ -1957,7 +1960,7 @@ test("`#306 done-stale-across-views`: a thread's card on the right counts an Und
   assert.equal(listCardSays(page, one).count, "1 reply · 1 unread", "the card does not count the reply the Undo put back");
   assert.deepStrictEqual(page.timelineCalls.slice(reads), [], "the card waited on a read to count the Undo");
   // THE CONTROL: without the cards drawn again after the Undo, the card says nothing unread.
-  const control = await run(brokenScript("    });\n  }\n  if (sideColumnUp()) renderSideColumn();\n}", "    });\n  }\n}"));
+  const control = await run(await brokenReadActs("      });\n    }\n    if (deps.sideColumnUp()) deps.renderSideColumn();\n  }", "      });\n    }\n  }"));
   assert.equal(listCardSays(control.page, one).count, "1 reply", "without the cards drawn again the card counted the Undo, so this test cannot see it");
 });
 
@@ -1969,13 +1972,13 @@ test("`#306 done-stale-across-views`: a thread's card on the right counts an Und
 // had refused, or dropped one it had kept.
 
 /** The left column's own catch-up after a Done or an Undo made in the right column, taken out for a negative control. */
-const LEFT_FOLLOWS = ["  if (madeIn === columns.side && !sideShowing()) {", "  if (false) {"];
+const LEFT_FOLLOWS = ["    if (madeIn === deps.sideColumn() && !deps.sideShowing()) {", "    if (false) {"];
 /** ...its rows drawn again where they disagree with its copy, taken out: only Main's counts drawn. */
-const LEFT_REDRAWS = ["        if (rowsMissDone()) renderCachedTimeline();\n        else syncUnreadReplies();",
-  "        syncUnreadReplies();"];
+const LEFT_REDRAWS = ["          if (rowsMissDone()) deps.renderCachedTimeline();\n          else deps.syncUnreadReplies();",
+  "          deps.syncUnreadReplies();"];
 /** ...Main's roots' counts of unread replies drawn again, taken out: only rows that disagree drawn. */
-const LEFT_COUNTS = ["        if (rowsMissDone()) renderCachedTimeline();\n        else syncUnreadReplies();",
-  "        if (rowsMissDone()) renderCachedTimeline();"];
+const LEFT_COUNTS = ["          if (rowsMissDone()) deps.renderCachedTimeline();\n          else deps.syncUnreadReplies();",
+  "          if (rowsMissDone()) deps.renderCachedTimeline();"];
 
 /**
  * Two columns over the channel of `threadData`, thread one & two on the right; a Done on message `id`
@@ -2062,7 +2065,7 @@ test("`#306 done-stale-across-views`: a Done or an Undo made in the right column
   // THE CONTROLS. Without the left column's own copy brought into line, Main shows each refusal as made,
   // and the next write from it saves the refused state; its root counts the reply wrongly. With the copy
   // brought into line but Main's counts not drawn again, the root counts the reply wrongly still.
-  const unfollowed = brokenScript(...LEFT_FOLLOWS);
+  const unfollowed = await brokenReadActs(...LEFT_FOLLOWS);
   for (const kind of ["dismiss", "restore"]) {
     const { page } = await refusedFromTheRight(kind, closeTheThread, "201", unfollowed);
     assert.equal(doneDrawn(page, "201"), String(kind === "dismiss"),
@@ -2076,7 +2079,7 @@ test("`#306 done-stale-across-views`: a Done or an Undo made in the right column
     "without the left column brought into line the root counted the reply put back, so this test cannot see it");
   assert.equal(rootUnread((await refusedFromTheRight("restore", closeTheThread, "202", unfollowed)).page), "1 unread",
     "without the left column brought into line the root counted the reply Done again, so this test cannot see it");
-  assert.equal(rootUnread((await refusedFromTheRight("dismiss", closeTheThread, "202", brokenScript(...LEFT_COUNTS))).page), null,
+  assert.equal(rootUnread((await refusedFromTheRight("dismiss", closeTheThread, "202", await brokenReadActs(...LEFT_COUNTS))).page), null,
     "without Main's counts drawn again the root counted the reply put back, so this test cannot see it");
 });
 
@@ -2113,19 +2116,19 @@ test("`#306 done-stale-across-views`: a Done or an Undo made in the right column
   // shows it as made still, though the snapshot is right.
   for (const kind of ["dismiss", "restore"]) {
     const made = String(kind === "dismiss");
-    const unfollowed = await refusedFromTheRight(kind, putColumnsAway, "201", brokenScript(...LEFT_FOLLOWS));
+    const unfollowed = await refusedFromTheRight(kind, putColumnsAway, "201", await brokenReadActs(...LEFT_FOLLOWS));
     assert.equal(doneDrawn(unfollowed.page, "201"), made,
       `without the left column brought into line All showed the refused ${kind} taken back, so this test cannot see it`);
     await doneButton(channelRow(unfollowed.page, "203")).click();
     await unfollowed.page.settle();
     assert.equal(savedDone(unfollowed.page, "201"), kind === "dismiss",
       `without the left column brought into line the snapshot kept the refused ${kind} out, so this test's claim about it is untested`);
-    const undrawn = await refusedFromTheRight(kind, putColumnsAway, "201", brokenScript(...LEFT_REDRAWS));
+    const undrawn = await refusedFromTheRight(kind, putColumnsAway, "201", await brokenReadActs(...LEFT_REDRAWS));
     assert.equal(doneDrawn(undrawn.page, "201"), made,
       `without All's rows drawn again All showed the refused ${kind} taken back, so this test cannot see it`);
   }
   for (const [patch, without] of [[LEFT_FOLLOWS, "the left column brought into line"], [LEFT_REDRAWS, "All's rows drawn again"]]) {
-    const control = await refusedFromTheRight("dismiss", putColumnsAway, "201", brokenScript(...patch), hideRead);
+    const control = await refusedFromTheRight("dismiss", putColumnsAway, "201", await brokenReadActs(...patch), hideRead);
     assert.deepStrictEqual(shownIds(control.page), ["200", "202", "203", "204"],
       `without ${without} Hide read brought the root back, so this test cannot see it`);
   }
@@ -2141,10 +2144,10 @@ test("`#306 done-stale-across-views`: a Done or an Undo made in the right column
 // the store.
 
 /** The right column's own catch-up after a Done or an Undo made in the left column, taken out for a negative control. */
-const RIGHT_FOLLOWS = ["  if (madeIn !== columns.side && sideShowing()) {", "  if (false) {"];
+const RIGHT_FOLLOWS = ["    if (madeIn !== deps.sideColumn() && deps.sideShowing()) {", "    if (false) {"];
 /** ...its rows drawn again where they disagree with its copy, taken out. */
-const RIGHT_REDRAWS = ["      if (rowsMissDone()) renderCachedTimeline();\n    });\n  }\n  if (sideColumnUp())",
-  "    });\n  }\n  if (sideColumnUp())"];
+const RIGHT_REDRAWS = ["        if (rowsMissDone()) deps.renderCachedTimeline();\n      });\n    }\n    if (deps.sideColumnUp()) deps.renderSideColumn();",
+  "      });\n    }\n    if (deps.sideColumnUp()) deps.renderSideColumn();"];
 
 /** The right column's thread closed, Main on the left beside the cards; then opened again from its root's tag. */
 const closedThenReopened = {
@@ -2251,20 +2254,20 @@ test("`#306 done-stale-across-views`: a Done or an Undo made in the left column 
   for (const how of [closedThenReopened, columnsOffThenOn]) {
     for (const kind of ["dismiss", "restore"]) {
       const made = String(kind === "dismiss");
-      const unfollowed = await answeredFromTheLeft(kind, how, { script: brokenScript(...RIGHT_FOLLOWS) });
+      const unfollowed = await answeredFromTheLeft(kind, how, { script: await brokenReadActs(...RIGHT_FOLLOWS) });
       assert.equal(sideDoneDrawn(unfollowed.page, "201"), made,
         `without the right column brought into line it showed the refused ${kind} taken back, ${how.says}, so this test cannot see it`);
       await doneButton(sideRow(unfollowed.page, "202")).click();
       await unfollowed.page.settle();
       assert.equal(savedDone(unfollowed.page, "201"), kind === "dismiss",
         `without the right column brought into line the snapshot kept the refused ${kind} out, ${how.says}, so this test's claim about it is untested`);
-      const undrawn = await answeredFromTheLeft(kind, how, { script: brokenScript(...RIGHT_REDRAWS) });
+      const undrawn = await answeredFromTheLeft(kind, how, { script: await brokenReadActs(...RIGHT_REDRAWS) });
       assert.equal(sideDoneDrawn(undrawn.page, "201"), made,
         `without the right column's rows drawn again it showed the refused ${kind} taken back, ${how.says}, so this test cannot see it`);
     }
   }
   for (const [patch, without] of [[RIGHT_FOLLOWS, "the right column brought into line"], [RIGHT_REDRAWS, "its rows drawn again"]]) {
-    const control = await answeredFromTheLeft("dismiss", columnsOffThenOn, { script: brokenScript(...patch), before: hideRead });
+    const control = await answeredFromTheLeft("dismiss", columnsOffThenOn, { script: await brokenReadActs(...patch), before: hideRead });
     assert.deepStrictEqual(sideIds(control.page), ["202"],
       `without ${without} Hide read brought the root back on the right, so this test cannot see it`);
   }
@@ -2303,7 +2306,7 @@ test("`#306 done-stale-across-views`: a Reply sent from the right column on a me
   // THE CONTROL: without the right column brought into line, the refused Done still shows there, so the
   // reply writes none and asks the chat service to mark read a message the server holds no Done for.
   for (const how of [closedThenReopened, columnsOffThenOn]) {
-    const { page, asked } = await run(how, brokenScript(...RIGHT_FOLLOWS));
+    const { page, asked } = await run(how, await brokenReadActs(...RIGHT_FOLLOWS));
     assert.deepStrictEqual(page.dismissCalls, [{ messages: ["201"] }],
       `without the right column brought into line the reply wrote a Done, ${how.says}, so this test cannot see it`);
     assert.deepStrictEqual(asked, ["201"],

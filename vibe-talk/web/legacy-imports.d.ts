@@ -181,7 +181,6 @@ declare const searchMomentWords: LegacyImports["searchMomentWords"];
 declare const serviceReadWords: LegacyImports["serviceReadWords"];
 declare const localReadWords: LegacyImports["localReadWords"];
 declare const isNoise: LegacyImports["isNoise"];
-declare const createReadRuns: LegacyImports["createReadRuns"];
 declare const messageLook: LegacyImports["messageLook"];
 declare const rawTextOf: LegacyImports["rawTextOf"];
 declare const renderedHtmlOf: LegacyImports["renderedHtmlOf"];
@@ -388,8 +387,8 @@ declare const setHiddenIfChanged: LegacyImports["setHiddenIfChanged"];
 declare const setTextIfChanged: LegacyImports["setTextIfChanged"];
 declare const createThreadList: LegacyImports["createThreadList"];
 declare const createOfflineCache: LegacyImports["createOfflineCache"];
-declare const createReadRunLines: LegacyImports["createReadRunLines"];
 declare const createThreadStrip: LegacyImports["createThreadStrip"];
 
 declare const channelPostsOnce: LegacyImports["channelPostsOnce"];
 declare const createScrollTrace: LegacyImports["createScrollTrace"];
+declare const createReadActs: LegacyImports["createReadActs"];

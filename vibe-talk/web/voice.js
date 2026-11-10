@@ -6035,218 +6035,71 @@ const readModes = createReadMode({ storage: () => deviceStorage() });
 // The read modes' lines and places are web/src/view/channel's now (`createReadRunLines`,
 // `#624 voice-page-modularity`): whether Hide read is leaving read messages out, the collapsed
 // run's line, and the rows a redraw replaced. The runs themselves stay readcore's.
-const readRuns = createReadRuns();
-
-const readRunLines = createReadRunLines({
+// The read state's acts beside Done's own are web/src/view/channel's now (`createReadActs`,
+// `#624 voice-page-modularity`): the read-run lines' construction, the dismissal offer and
+// inbox ledger, every copy of the Done state kept in line with the store's, and the
+// dismissal's Undo and the backlog's clear.
+const readActs = createReadActs({
   byId: el,
   leftById: leftEl,
   inThisColumn,
   selection: () => selection(),
   threads: () => channelStore.current().threads,
-  hiding: () => readModes.hiding(),
-  suspended: () => readRunsSuspended(),
+  readHiding: () => readModes.hiding(),
+  readRunsSuspended: () => readRunsSuspended(),
   threading: () => providerFacts.threading(),
   eachColumnRenderCached: () => eachColumn(renderCachedTimeline),
   openReadRun: (row) => openReadRun(/** @type {any} */ (row)),
   readRunRows: (row) => readRunRows(row),
   threadIdOf: (message) => threadOf(message),
   selectionThread: () => selection().thread,
+  makeDismissalOffer: () => createUndoOffer(),
+  makeInboxLedger: () => createInboxWriteLedger({
+    storage: deviceStorageOnUse(),
+    now: () => Date.now(),
+    makeRoom: () => messageCache.dropMessageCache(),
+    // This page load's own name, as the back stack's (`BACK_SESSION`): another page open on the device keeps
+    // its own writes.
+    page: BACK_SESSION,
+  }),
+  storeDismissed: () => channelStore.current().dismissed,
+  storeChannel: () => channelStore.current().channel,
+  selectedChannelId: () => selectedChannelId(),
+  heldDoneCopies: () => channelContexts.values(),
+  sideShowing: () => sideShowing(),
+  activeColumn: () => columnWork.active(),
+  sideColumn: () => columns.side,
+  mainColumn: () => columns.main,
+  sideLeft: () => Boolean(columns.side.left),
+  inColumn: (column, act) => inColumn(/** @type {any} */ (column), act),
+  doneState: () => doneState(),
+  cardsWhileDressedAfter: (up, act) => cardsDrawn.whileDressedAfter(up, act),
+  sideColumnUp: () => sideColumnUp(),
+  renderCachedTimeline: () => renderCachedTimeline(),
+  syncUnreadReplies: () => syncUnreadReplies(),
+  renderSideColumn: () => renderSideColumn(),
+  el: (id) => el(id),
+  idsOf: (row) => idsOf(/** @type {any} */ (row)),
+  readFilterKeeps: () => readFilterKeeps(),
+  timelineMessages: () => timelineRows().messages,
+  renderTodoControls: () => renderTodoControls(),
+  restoreMessages: (messages) => restoreMessages(messages),
+  undoBookmarkBump: (bump, restoring) => undoBookmarkBump(bump, restoring),
+  listedMessages: () => listedMessages(),
+  backlogIsArmed: () => backlogIsArmed(),
+  armBacklog: () => armBacklog(),
+  disarmBacklog: () => disarmBacklog(),
+  setStatus: (text) => setStatus(text),
+  dismissMessages: (body, bump) => dismissMessages(body, /** @type {any} */ (bump)),
+  throughBump: (row) => throughBump(/** @type {any} */ (row)),
 });
+const { readRuns, readRunLines, lastDismissal, inboxLedger, caughtUpDone, followDoneEverywhere, rowsMissDone, undoDismissal, clearBacklog } = readActs;
 const {
   hidingRead, liftingHideRead, readRunLine, readRunWords, runDaysOf, readRunCount,
   placeInReadRun, isOpenThreadRoot, openThreadRootId, foldedOneIds, liveUnpackedRow, liveCardRow,
 } = readRunLines;
 const foldedOnes = readRunLines.foldedOnes;
 
-
-/**
- * The exact set the last dismissal cleared, so the undo restores that and nothing else.
- *
- * Not a count and not "the last N": by the time the reader presses undo, N may name a different
- * set. Held as the server reported it, which is also what makes undoing a BULK clear exact (web/src/view/
- * shell `createUndoOffer`).
- *
- * @type {import("./src/view/shell/index.ts").UndoOffer<any>}
- */
-const lastDismissal = createUndoOffer();
-
-/** The Done and put-back writes not yet answered, kept on the device. */
-const inboxLedger = createInboxWriteLedger({
-  storage: deviceStorageOnUse(),
-  now: () => Date.now(),
-  makeRoom: () => messageCache.dropMessageCache(),
-  // This page load's own name, as the back stack's (`BACK_SESSION`): another page open on the device keeps
-  // its own writes.
-  page: BACK_SESSION,
-});
-// Done in Main still showed as not Done in All, loaded earlier in the session, for seconds, until
-// some later read redrew it. Each view keeps its own copy of which messages are Done (`doneState().archived`)
-// for when it is shown again — a view left in a column (`channelContexts`), and the right column's
-// thread while two columns are put away or show their cards — and only the list the Done was made in,
-// and the other column while it shows a thread (`mirrorArchived`), were told. Worse, a stale copy put
-// back was later written over the store (`syncCanonDismissed`), so the Done could go out of every view.
-//
-// So a Done or an Undo here, and a failed one taken back, brings every copy into line with the store
-// at once (`followDoneEverywhere`), which `markHeldDone` and `settleHeldDone` have already moved; the
-// cards on screen, which count unread replies from the store, are drawn again then; and a view whose
-// rows were drawn before is drawn again as it is shown, where they say otherwise (`rowsMissDone`).
-// No read is asked for any of it.
-//
-// A Done or an Undo made in the right column reaches the left one through `mirrorArchived`, which
-// works only while the right column shows a thread. Its thread closed, or two columns put away, while
-// the write was on its way, a refusal taken back in the right column left the left column showing it
-// as made, and the next write from the left saved that over the store. So the left column's own copy
-// is brought into line here too then, and its rows drawn again where they say otherwise.
-//
-// The mirror image, found in the fourth review round: a Done or an Undo made in the left column while
-// the right column's thread was put away reached the right column's copy (above), but nothing told the
-// `mirrorArchived` of the act; so when the right column showed the thread again (its thread opened
-// again, or two columns brought back) while the write was on its way, a refusal taken back in the left
-// column left the right one showing it as made. A reply from there then wrote no Done, its message
-// looking Done already, and asked the chat service to mark a message read whose Done had failed; and
-// the next write from the right saved the refused state over the store. So the right column showing a
-// thread is brought into line here too, after an act made in the left column.
-
-/**
- * `copy`, a copy of which messages are Done, with `ids` brought into line with the store's
- * (`channelStore.current().dismissed`): `copy` itself where none of them differs, else a new set, since `copy`
- * may be the very set a list on screen is drawn from.
- *
- * @param {Set<string>} copy
- * @param {string[]} ids
- * @returns {Set<string>}
- */
-function caughtUpDone(copy, ids) {
-  const moved = ids.filter((id) => copy.has(id) !== channelStore.current().dismissed.has(id));
-  if (moved.length === 0) return copy;
-  const next = new Set(copy);
-  for (const id of moved) {
-    if (channelStore.current().dismissed.has(id)) next.add(id);
-    else next.delete(id);
-  }
-  return next;
-}
-
-/**
- * Every copy of the read state of `ids` that the page holds out of sight, into line with the store's
- * (`channelStore.current().dismissed`), after a Done, a put back, or a failed one taken back: the views held in
- * either column, and the right column's own while it does not show a thread. Each copy is replaced
- * rather than changed in place, since one may be the very set a list on screen is drawn from. Then
- * the cards on screen, drawn from the store, are drawn again. `#306 done-stale-across-views`.
- *
- * `madeIn` is the column the Done or the Undo was made in. Made in the right column, which no longer
- * shows a thread (its thread closed, or two columns put away, while the write was on its way), the
- * left column on screen is brought into line as well, and drawn again: `mirrorArchived`, which tells it
- * while the right column shows a thread, does nothing then. Made in the left column, the right column
- * showing a thread is brought into line, and drawn again where its rows say otherwise: a thread shown
- * again since the act (its thread opened again, or two columns brought back) holds the copy brought
- * into line while it was put away, which the `mirrorArchived` of the act never changed, so the
- * `mirrorArchived` taking it back changes nothing in it.
- *
- * @param {string[]} ids
- * @param {ColumnFields} madeIn
- */
-function followDoneEverywhere(ids, madeIn) {
-  if (!providerFacts.threading() || channelStore.current().channel !== String(selectedChannelId())) return;
-  const named = ids.map(String);
-  /** @param {Set<string>} copy */
-  const caughtUp = (copy) => caughtUpDone(copy, named);
-  for (const held of channelContexts.values()) held.dismissed = caughtUp(held.dismissed);
-  if (!sideShowing() && columnWork.active() !== columns.side && columns.side.left) {
-    inColumn(columns.side, () => {
-      doneState().archived = caughtUp(doneState().archived);
-    });
-  }
-  if (madeIn === columns.side && !sideShowing()) {
-    // The cards, drawn at the end of this, dress the rows of what changed among them.
-    cardsDrawn.whileDressedAfter(sideColumnUp(), () => {
-      inColumn(columns.main, () => {
-        doneState().archived = caughtUp(doneState().archived);
-        // Its rows, or under Hide read which rows it draws; else Main's roots' counts of unread replies.
-        if (rowsMissDone()) renderCachedTimeline();
-        else syncUnreadReplies();
-      });
-    });
-  }
-  if (madeIn !== columns.side && sideShowing()) {
-    inColumn(columns.side, () => {
-      doneState().archived = caughtUp(doneState().archived);
-      // Its rows, or under Hide read which rows it draws. A thread draws no counts of unread replies.
-      if (rowsMissDone()) renderCachedTimeline();
-    });
-  }
-  if (sideColumnUp()) renderSideColumn();
-}
-
-/**
- * Whether the rows drawn in the column being worked on show a message's read state other than its own
- * copy (`doneState().archived`) says: a row drawn Done, or not, against it, or under Hide read a message drawn,
- * or left out, against it. Rows held while a Done or an Undo was made in another view keep the look
- * they had; their copy was brought into line at once (`followDoneEverywhere`), and this says they are
- * to be drawn again as they are shown. `#306 done-stale-across-views`.
- */
-function rowsMissDone() {
-  if (!providerFacts.threading() || selection().view === "threads") return false;
-  const rows = [...el("discord-log").children];
-  if (rows.some((row) => {
-    const ids = idsOf(row);
-    return ids.length > 0 && (row.getAttribute("data-archived") === "true") !== ids.every((id) => doneState().archived.has(id));
-  })) return true;
-  if (!hidingRead()) return false;
-  const keeps = readFilterKeeps();
-  const wanted = new Set(timelineRows().messages.filter(keeps).map((message) => String(message.id)));
-  const drawn = new Set(rows.flatMap(idsOf));
-  return wanted.size !== drawn.size || [...wanted].some((id) => !drawn.has(id));
-}
-
-/** Put back exactly what the last dismissal cleared, and the bookmark where that moved it from. */
-async function undoDismissal() {
-  if (lastDismissal.current() === null) {
-    return;
-  }
-  const undoing = lastDismissal.current();
-  lastDismissal.set(null);
-  renderTodoControls();
-  const restoring = restoreMessages(undoing.messages);
-  // `#240 reading-bookmark`. Back where it was, unless something moved it since.
-  if (undoing.bump) await undoBookmarkBump(undoing.bump, restoring);
-  else await restoring;
-}
-
-/** Declare bankruptcy on everything currently in the list. Two taps, and it says the count. */
-async function clearBacklog() {
-  const rows = [...el("discord-log").children];
-  if (rows.length === 0) {
-    return;
-  }
-  // MESSAGES, not rows: what the server is about to clear is Discord messages, and a combined row
-  // is more than one of them. A count of rows would promise to clear fewer than it did. In time
-  // order, so the newest is last even with replies gathered above older rows (`#215 reply-coalesce`).
-  const messages = listedMessages().map((message) => String(message.id));
-  if (!backlogIsArmed()) {
-    armBacklog();
-    setStatus(`Tap again to clear ${messages.length} — undo will be offered afterwards.`);
-    return;
-  }
-  disarmBacklog();
-  // THROUGH the newest row on screen, so the server decides the boundary from its own ordering
-  // rather than from a list of ids this page assembled. The boundary is included.
-  //
-  // ...and WITH the window this page read the list with. The server resolves `through` against a
-  // window of its own, so a boundary sent without one is resolved against the server's default —
-  // which, for a client reading a smaller page than the server's default, means clearing messages
-  // that were never on screen. The limit is what makes "everything above this row" mean the rows
-  // the reader was actually looking at.
-  //
-  // The boundary is the NEWEST message on screen, which on a combined bottom row is its LAST
-  // constituent rather than the id the row is filed under. Sending the row's identity would stop
-  // the sweep one message short and leave the trailing overflow in the queue.
-  const rowsNow = [...el("discord-log").children];
-  await dismissMessages({
-    through: messages[messages.length - 1],
-    limit: DISCORD_PAGE_LIMIT,
-  }, throughBump(rowsNow[rowsNow.length - 1]));
-}
 
 /**
  * Put the list in read mode `mode`. `#221 read-modes`. `#243 filter-keeps-selection`: a read mode is

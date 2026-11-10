@@ -218,6 +218,8 @@ export { createOfflineCache } from "./offlinecache.ts";
 export type { OfflineCacheDependencies } from "./offlinecache.ts";
 export { createReadRunLines } from "./readrunlines.ts";
 export type { ReadRunLines, ReadRunLinesDependencies } from "./readrunlines.ts";
+export { createReadActs } from "./readacts.ts";
+export type { HeldDoneCopy, ListedMessage, ReadActs, ReadActsDependencies, ReadDismissal, ReadDismissalOffer, ReadInboxLedger } from "./readacts.ts";
 export { createThreadStrip } from "./threadstrip.ts";
 export type { ThreadStrip, ThreadStripDependencies } from "./threadstrip.ts";
 export { SCROLL_TRACE_MAX_ENTRIES, SCROLL_TRACE_WINDOW_MS, createScrollTrace } from "./scrolltrace.ts";
