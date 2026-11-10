@@ -266,9 +266,99 @@ def host_slot_cap(path: Path | None = None) -> tuple[int | None, str | None]:
     except tomllib.TOMLDecodeError as exc:
         return 1, f"gate slots config {path} is not TOML ({exc}); capping at 1"
     value = raw.get("slots")
-    if set(raw) != {"slots"} or isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        return 1, f"gate slots config {path} must hold only `slots = N` with N >= 1; capping at 1"
+    if (
+        not set(raw) <= {"slots", "cpu_quota_cpus"}
+        or isinstance(value, bool) or not isinstance(value, int) or value < 1
+    ):
+        return 1, f"gate slots config {path} must hold `slots = N` with N >= 1 (and optionally `cpu_quota_cpus = N`); capping at 1"
     return value, None
+
+
+#: Default per-gate CPU quota in whole CPUs (#1254 gate-cpu-containment).
+DEFAULT_CPU_QUOTA_CPUS = 48
+
+
+def host_cpu_quota_cpus(path: Path | None = None) -> int:
+    """This host's per-gate CPU quota in CPUs (#1254).
+
+    `cpu_quota_cpus = N` in the gate-slots file sets it; $GATE_CPU_QUOTA_CPUS
+    overrides it (tests, one-off runs); no setting means
+    ``DEFAULT_CPU_QUOTA_CPUS``. An unusable value falls back to the default:
+    containment must never silently disappear because of a typo. An explicit
+    `path` is authoritative: the env override applies only to the default
+    lookup, so a test naming its own file gets that file's value even inside
+    a contained gate (which sets $GATE_CPU_QUOTA_CPUS for its children)."""
+    if path is not None:
+        try:
+            raw_file = tomllib.loads(path.read_text(encoding="utf-8"))
+            value = raw_file.get("cpu_quota_cpus")
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+                return value
+        except Exception:
+            pass
+        return DEFAULT_CPU_QUOTA_CPUS
+    raw_env = os.environ.get("GATE_CPU_QUOTA_CPUS")
+    if raw_env:
+        try:
+            value = int(raw_env)
+            if value >= 1:
+                return value
+        except ValueError:
+            pass
+        print(f"gate: $GATE_CPU_QUOTA_CPUS={raw_env!r} is not a positive integer; "
+              f"using the {DEFAULT_CPU_QUOTA_CPUS}-CPU default", flush=True)
+        return DEFAULT_CPU_QUOTA_CPUS
+    path = slots_config_path() if path is None else path
+    try:
+        raw = tomllib.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return DEFAULT_CPU_QUOTA_CPUS
+    value = raw.get("cpu_quota_cpus")
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+        return value
+    return DEFAULT_CPU_QUOTA_CPUS
+
+
+def _contained_command(
+    command: list[str], run_id: str, quota_cpus: int
+) -> tuple[list[str], bool]:
+    """`command` wrapped in a systemd user scope capped at `quota_cpus`.
+
+    Returns (command, contained). Uncontained when the caller opted out
+    ($GATE_CPU_CONTAINMENT=off) or no user systemd-run is available: the
+    gate says which happened and runs either way, because a host without a
+    user manager must not lose its gates (#1254)."""
+    if os.environ.get("GATE_CPU_CONTAINMENT") == "off":
+        print("gate: CPU containment off ($GATE_CPU_CONTAINMENT=off)", flush=True)
+        return command, False
+    systemd_run = shutil.which("systemd-run")
+    if systemd_run is None:
+        print("gate: systemd-run not found; running without CPU containment (#1254)", flush=True)
+        return command, False
+    unit = f"agent-utils-gate-{run_id}"
+    wrapped = [
+        systemd_run, "--user", "--scope", "--quiet", f"--unit={unit}",
+        "-p", f"CPUQuota={quota_cpus * 100}%",
+        "--", *command,
+    ]
+    return wrapped, True
+
+
+def _capped_environment(quota_cpus: int) -> dict[str, str]:
+    """Child environment lowering scheduler widths to the gate's share.
+
+    VALIDATE_MAX_CPUS sets dagrun's --max-cpus in validate.py; GOMAXPROCS
+    caps esbuild's Go runtime (its --service page builds were a top host
+    CPU user, #1254). A smaller caller value always wins."""
+    overrides = {"GATE_CPU_QUOTA_CPUS": str(quota_cpus)}
+    for name in ("VALIDATE_MAX_CPUS", "GOMAXPROCS"):
+        raw = os.environ.get(name)
+        try:
+            current = int(raw) if raw else None
+        except ValueError:
+            current = None
+        overrides[name] = str(min(current, quota_cpus) if current else quota_cpus)
+    return overrides
 
 
 #: The phase-priority switch (#1146) lives in its own per-host file for the
@@ -907,7 +997,13 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
             last_pos = pos
         time.sleep(1.0)
     waited = time.time() - queued_at
+    quota_cpus = host_cpu_quota_cpus()
+    run_command, contained = _contained_command(command, run_id, quota_cpus)
     print(f"gate: admitted after {waited:.0f}s (class={args.cls})", flush=True)
+    if contained:
+        print(f"gate: CPU containment: systemd scope agent-utils-gate-{run_id}, "
+              f"CPUQuota={quota_cpus * 100}% ({quota_cpus} CPUs, #1254 gate-cpu-containment)",
+              flush=True)
     started = time.time()
     rc = 1
     passed_steps: set[str] = set()
@@ -921,8 +1017,8 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
         for sig in _ABORT_SIGNALS:
             signal.signal(sig, _raise_aborted)
         proc = subprocess.Popen(
-            command,
-            env=_child_environment(GATE_ADMISSION_RUN_ID=run_id),
+            run_command,
+            env=_child_environment(GATE_ADMISSION_RUN_ID=run_id, **_capped_environment(quota_cpus)),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

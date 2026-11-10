@@ -403,6 +403,62 @@ def test_a_rerun_ticket_jumps_ordinary_queued_gates(tmp_path: Path) -> None:
     assert order.read_text().split() == ["rerun", "ordinary"]
 
 
+def test_cpu_quota_comes_from_the_slots_file_with_a_default(tmp_path: Path) -> None:
+    """#1254: cpu_quota_cpus in the gate-slots file sets the per-gate cap;
+    no setting means the 48-CPU default; an env override wins."""
+    gate = _gate_module()
+    slots = tmp_path / "gate-slots.toml"
+    slots.write_text("slots = 2\ncpu_quota_cpus = 12\n")
+    assert gate.host_cpu_quota_cpus(slots) == 12
+    assert gate.host_slot_cap(slots) == (2, None)
+    slots.write_text("slots = 3\n")
+    assert gate.host_cpu_quota_cpus(slots) == gate.DEFAULT_CPU_QUOTA_CPUS == 48
+    old = os.environ.get("GATE_CPU_QUOTA_CPUS")
+    os.environ["GATE_CPU_QUOTA_CPUS"] = "7"
+    try:
+        assert gate.host_cpu_quota_cpus() == 7
+        # An explicit file stays authoritative inside a contained gate,
+        # whose child environment sets $GATE_CPU_QUOTA_CPUS.
+        slots.write_text("slots = 2\ncpu_quota_cpus = 12\n")
+        assert gate.host_cpu_quota_cpus(slots) == 12
+    finally:
+        if old is None:
+            del os.environ["GATE_CPU_QUOTA_CPUS"]
+        else:
+            os.environ["GATE_CPU_QUOTA_CPUS"] = old
+
+
+def test_capped_environment_lowers_schedulers_but_keeps_a_smaller_caller_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1254: VALIDATE_MAX_CPUS (dagrun -j) and GOMAXPROCS (esbuild) are
+    capped at the quota; a smaller caller value is honoured."""
+    gate = _gate_module()
+    monkeypatch.delenv("VALIDATE_MAX_CPUS", raising=False)
+    monkeypatch.delenv("GOMAXPROCS", raising=False)
+    capped = gate._capped_environment(48)
+    assert capped["VALIDATE_MAX_CPUS"] == "48" and capped["GOMAXPROCS"] == "48"
+    monkeypatch.setenv("VALIDATE_MAX_CPUS", "8")
+    monkeypatch.setenv("GOMAXPROCS", "200")
+    capped = gate._capped_environment(48)
+    assert capped["VALIDATE_MAX_CPUS"] == "8" and capped["GOMAXPROCS"] == "48"
+
+
+def test_contained_command_wraps_in_a_quota_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1254: the admitted command runs in a systemd user scope with
+    CPUQuota = quota x 100%; the opt-out runs it bare."""
+    gate = _gate_module()
+    monkeypatch.delenv("GATE_CPU_CONTAINMENT", raising=False)
+    wrapped, contained = gate._contained_command(["echo", "hi"], "1234-abcd", 48)
+    assert contained and "CPUQuota=4800%" in wrapped and wrapped[-2:] == ["echo", "hi"]
+    assert any("agent-utils-gate-1234-abcd" in word for word in wrapped)
+    monkeypatch.setenv("GATE_CPU_CONTAINMENT", "off")
+    bare, contained = gate._contained_command(["echo", "hi"], "1234-abcd", 48)
+    assert not contained and bare == ["echo", "hi"]
+
+
 def test_a_rerun_must_name_a_few_selected_steps(tmp_path: Path) -> None:
     none = subprocess.run([PY, str(GATE), "--rerun", "--", PY, "-c", "pass"],
                           env=_env(tmp_path), capture_output=True, text=True, timeout=30)
