@@ -205,6 +205,7 @@ declare const createSentRead: LegacyImports["createSentRead"];
 declare const createReadingColumn: LegacyImports["createReadingColumn"];
 declare const createChannelViews: LegacyImports["createChannelViews"];
 declare const createChannelScope: LegacyImports["createChannelScope"];
+declare const createFreshRead: LegacyImports["createFreshRead"];
 declare const createReplyCounts: LegacyImports["createReplyCounts"];
 declare const createPlacing: LegacyImports["createPlacing"];
 declare const createOlderPages: LegacyImports["createOlderPages"];

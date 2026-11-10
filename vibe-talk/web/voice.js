@@ -5198,28 +5198,6 @@ async function writeInBatches(route, ids, landed) {
  */
 const standInRetries = createStandInRetries();
 
-/**
- * A read landed: say how fresh the rows are — now, or as of what the server could vouch for.
- *
- * `#617 cold-load-first-paint`: a page from the server's own copy says "Refresh failed" only when
- * that copy is older than `STALE_AS_OF_MS`; a younger one is as current as the pill says ("Updated"
- * at the copy's time). Either way the next read comes soon (`STAND_IN_RETRY_MS`).
- */
-function noteFreshRead(payload) {
-  const decision = timelineReader.freshDecision(payload);
-  loadState().freshAt = decision.freshAt;
-  const retryWanted = standInRetries.noteRead(decision.failed);
-  // A poll already armed comes forward; one armed after this read takes it up as it is armed.
-  if (decision.failed && retryWanted && channelPoll.armed()) {
-    scheduleDiscordPoll(Math.max(0, channelPoll.dueAt() - Date.now()));
-  }
-  setChannelFreshness(decision.freshness);
-  // `#206 pin-message`. Every landed read, delta included, says what revision the pins are at.
-  notePinsRevision(payload.pins_revision);
-  // `#240 reading-bookmark`. ...and where the bookmark is, which another device may have moved.
-  noteBookmark(payload);
-}
-
 
 
 
@@ -5246,54 +5224,18 @@ const ownPosts = createOwnPosts({
   now: () => Date.now(),
 });
 
-/** Whether `message` was sent from this page (`ownPosts`). */
-const sentFromThisPage = (message) => ownPosts.sentFromHere(String(message.id));
-
-/** Take back what earlier pages of the device sent in the grace (`ownPosts`). */
-function loadOwnPosts() {
-  ownPosts.load();
-}
-
-/**
- * Whether message `id` is one this page posted within OWN_POST_GRACE_MS: a page that does not carry
- * it is not evidence that it is gone.
- *
- * THE OWNER'S REPLY VANISHED. Sent to a Slack message nobody had answered, it was drawn, then gone
- * from every view, and the message it answered went back to "start a thread": "my sent message
- * disappeared, and I didn't see it anywhere on the screen." Reproduced: the stream's copy of the
- * reply asks for a newest page of All (`reason=live`), sent after the post, and the chat service
- * answered it from state that did not have the reply yet — a bridge's lag, Slack's own Flat memory of
- * a thread that had no replies (`#282 slack-flat-skip`). That page carries the message answered with
- * a count of none, so it answers for its whole thread (`allPageAnswersFor`) and took the reply out as
- * deleted upstream; nothing was left to draw it, the receipt having gone as the reply was drawn. The
- * page orders copies by when its reads were sent, which is sound only while every answer is at
- * least as new as every earlier one (replication model, R9 and F3). Until the server says how new
- * each copy is (C7), this page's own fresh post is taken out only once it is told of its removal
- * (`noteRemoved`), never by its absence from a page alone.
- *
- * For copies without the server's versions only. Where a page says its `observed_ms` and a newest
- * page's `settled_below_ms` and the store's copy says its own `observed_ms` (`#473
- * replication-c7-server-versions`; the answer to a post carries it), no stale page can drop a copy
- * observed after it began, and `pageFold` decides by those before this is asked. Either way the
- * page's own post is kept, so its receipt is a display aid (`sentReceiptRetires`, `#500
- * sent-receipts-pile-up`).
- */
-function ownPostStands(id) {
-  return ownPosts.stands(String(id));
-}
-
-/**
- * Whether the page's store keeps its own posts in channel `channel` against a page from older state
- * (`ownPostStands`, and the server's versions where said, `pageFold`): a channel with threads. Without
- * them a read replaces the rows, and the receipt is what draws a confirmed post a stale read left out.
- *
- * @param {string} channel
- */
-function storeKeepsOwnPosts(channel) {
-  const provider = providerOfChannel(channel);
-  return provider ? provider.threading_supported === true
-    : providerFacts.threading() && channel === String(selectedChannelId());
-}
+/** Noting a landed read and standing by own posts: web/src/view/channel's now (`createFreshRead`, `#624`). */
+const freshRead = createFreshRead({
+  timelineReader, standInRetries, ownPosts,
+  loadState: () => loadState(), channelPoll: () => channelPoll,
+  scheduleDiscordPoll: (ms) => scheduleDiscordPoll(ms),
+  setChannelFreshness: (state) => setChannelFreshness(/** @type {any} */ (state)),
+  notePinsRevision: (revision) => notePinsRevision(revision),
+  noteBookmark: (payload) => noteBookmark(payload),
+  providerOfChannel: (id) => providerOfChannel(id),
+  providerFacts, selectedChannelId: () => selectedChannelId(),
+});
+const { noteFreshRead, sentFromThisPage, loadOwnPosts, ownPostStands, storeKeepsOwnPosts } = freshRead;
 
 /**
  * Whether the receipt of `entry`, a send, retires now. The owner, 2026-10-24: "messages I sent stack up

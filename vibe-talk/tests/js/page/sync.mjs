@@ -3310,7 +3310,8 @@ test("`remote-ops-audit` W7: once the read given up on has answered, or failed, 
 /** A negative control: a placing read of All folded whatever the store has gained, lost or replaced since it was sent. */
 const FOLD_OVER_ANY_STORE = ["    const unchanged = heldAsSent(canon, read.held);\n", "    const unchanged = true;\n"];
 /** `#466 reply-promotes-thread`: a newest page taking the page's own fresh post out by its absence. */
-const OWN_POST_FORGOTTEN = ["function ownPostStands(id) {\n", "function ownPostStands(id) {\n  return false;\n"];
+const OWN_POST_FORGOTTEN = { file: "src/view/channel/freshread.ts",
+  find: "  function ownPostStands(id: unknown): boolean {\n", replace: "  function ownPostStands(id: unknown): boolean {\n    return false;\n" };
 
 /** `script` with one more thing broken on purpose, as `brokenScript` breaks one. */
 function brokenAlso(script, [find, replace]) {
@@ -4262,8 +4263,10 @@ for (const gained of ["own send", "poll"]) {
     // THE CONTROL, as round 3 did: folded over whatever the store gained since it was sent, the page
     // takes the message out as deleted.
     // The page's own fresh post is kept by `ownPostStands` too, so for it that goes as well.
-    const broken = await brokenPlacing(FOLD_OVER_ANY_STORE);
-    const control = await run(gained === "own send" ? brokenAlso(broken, OWN_POST_FORGOTTEN) : broken);
+    const broken = gained === "own send"
+      ? await brokenModule([placingPatch(FOLD_OVER_ANY_STORE), OWN_POST_FORGOTTEN])
+      : await brokenPlacing(FOLD_OVER_ANY_STORE);
+    const control = await run(broken);
     assert.ok(!shownIds(control.page).includes(control.id) && savedMessage(control.page, control.id) === null,
       "the placing page left the message alone anyway, so this test cannot see it");
   });
@@ -7623,7 +7626,7 @@ test("`#473 replication-c7-server-versions`: a newest page answered from older s
     const afterReread = shownIds(page).includes(mine.id);
     return { page, mine, clock, afterEcho, afterReread };
   };
-  const noGrace = brokenAlso(SCRIPT, OWN_POST_FORGOTTEN);
+  const noGrace = await brokenModule([OWN_POST_FORGOTTEN]);
   const { page, mine, clock, afterEcho, afterReread } = await run(noGrace);
   assert.ok(afterEcho, "a page whose read began before the post took the reply away");
   assert.ok(afterReread, "the next stale page took it away");
@@ -7636,7 +7639,7 @@ test("`#473 replication-c7-server-versions`: a newest page answered from older s
   assert.ok(!shownIds(page).includes(mine.id), "a page begun after the reply that lacks it did not take it away");
 
   // THE CONTROL: deciding by read-send order, with the interim grace gone too, the stale page takes it away.
-  const control = await run(await brokenModule([SERVER_VERSIONS_IGNORED], noGrace));
+  const control = await run(await brokenModule([SERVER_VERSIONS_IGNORED, OWN_POST_FORGOTTEN]));
   assert.ok(!(control.afterEcho && control.afterReread),
     "without the server's versions the reply still survived, so this test cannot see them");
 });

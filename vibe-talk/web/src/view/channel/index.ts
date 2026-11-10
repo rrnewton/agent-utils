@@ -226,3 +226,5 @@ export { createCardRefresh } from "./cardrefresh.ts";
 export type { CardRefresh, CardRefreshDependencies } from "./cardrefresh.ts";
 export { createChannelScope } from "./channelscope.ts";
 export type { ChannelScope, ChannelScopeDependencies, MutableFailure } from "./channelscope.ts";
+export { createFreshRead } from "./freshread.ts";
+export type { FreshRead, FreshReadDependencies, FreshDecisionLike, ReadPayload } from "./freshread.ts";
