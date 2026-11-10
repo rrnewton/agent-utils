@@ -12,13 +12,15 @@ so readers that arrive after it queue behind it instead of starving it.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import fcntl
+import io
 import json
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import cast
 
@@ -433,3 +435,91 @@ def test_nested_reader_does_not_queue_behind_a_writer_waiting_for_it(tmp_path: P
     thread.join(timeout=30)
     assert nested < 1.0, nested
     assert "error" not in result, result
+
+
+def _cli(root: Path, *argv: str) -> str:
+    stream = io.StringIO()
+    with contextlib.redirect_stdout(stream):
+        assert wrkslots_cli.main(["--project-root", str(root), *argv]) == 0
+    return stream.getvalue()
+
+
+def _add_events(root: Path, pairs: int) -> None:
+    for _ in range(pairs):
+        _cli(root, "hold", "--reason", "fixture", "slot-a")
+        _cli(root, "unhold", "slot-a")
+
+
+@pytest.mark.parametrize("command", ["doctor", "status", "audit", "unpushed"])
+def test_readers_verify_events_before_the_shared_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    root = _fixture(tmp_path / "case")
+    _add_events(root, 3)
+    # Every event file counts as stable, so the memo keeps all of them.
+    monkeypatch.setattr(wrkslots_cli, "_EVENT_MEMO_STABLE_NS", 0)
+    original_read = wrkslots_cli._event_from_path
+    original_locked = wrkslots_cli._locked
+    reads = {"outside": 0, "inside": 0}
+    inside = {"depth": 0}
+
+    def read(*args: object, **kwargs: object) -> object:
+        reads["inside" if inside["depth"] else "outside"] += 1
+        return original_read(*args, **kwargs)  # type: ignore[arg-type]
+
+    @contextlib.contextmanager
+    def locked(subject: Path, **kwargs: object) -> Iterator[None]:
+        with original_locked(subject, **kwargs):  # type: ignore[arg-type]
+            inside["depth"] += subject.name == "ACTIVE"
+            try:
+                yield
+            finally:
+                inside["depth"] -= subject.name == "ACTIVE"
+
+    monkeypatch.setattr(wrkslots_cli, "_event_from_path", read)
+    monkeypatch.setattr(wrkslots_cli, "_locked", locked)
+    argv = [command, "--format", "json"]
+    if command == "audit":
+        argv += ["--cache-census-state", str(tmp_path / "census.json")]
+    _cli(root, *argv)
+    assert reads["outside"] >= 7, reads
+    assert reads["inside"] == 0, reads
+
+
+def test_event_appended_after_the_prewarm_is_still_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _fixture(tmp_path / "case")
+    _add_events(root, 2)
+    monkeypatch.setattr(wrkslots_cli, "_EVENT_MEMO_STABLE_NS", 0)
+    config = wrkslots_cli._load_config(str(root), None)
+    original_locked = wrkslots_cli._locked
+    appended = {"done": False}
+
+    @contextlib.contextmanager
+    def locked(subject: Path, **kwargs: object) -> Iterator[None]:
+        if subject.name == "ACTIVE" and not appended["done"]:
+            # A writer lands between the unlocked prewarm and the locked read.
+            appended["done"] = True
+            wrkslots_cli._write_event_file(
+                config, config.machine, "slot-held", {"generation": 1, "reason": "late", "slot": "slot-a"}
+            )
+        with original_locked(subject, **kwargs):  # type: ignore[arg-type]
+            yield
+
+    monkeypatch.setattr(wrkslots_cli, "_locked", locked)
+    payload = json.loads(_cli(root, "doctor", "--format", "json"))
+    assert appended["done"]
+    # The fixture's import event, two hold/unhold pairs and the late hold.
+    assert payload["event_counts"] == {"node-a": 6}, payload["event_counts"]
+    rows = {str(row["slot"]): row for row in payload["active"]}
+    assert rows["slot-a"]["hold_reason"] == "late", rows["slot-a"]
+
+
+def test_status_leaves_no_context_behind_for_its_caller(tmp_path: Path) -> None:
+    root = _fixture(tmp_path / "case")
+    _cli(root, "status", "--format", "json")
+    # A later process observation in this process must report, not collect into
+    # the finished status's list.
+    assert wrkslots_cli._TEARING_DOWN_PIDNS.get() is None
+    assert wrkslots_cli._VERBOSE_DIAGNOSTICS.get() is False

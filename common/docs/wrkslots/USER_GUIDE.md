@@ -2989,6 +2989,11 @@ mutation for at most 10 seconds and then reads anyway, and a release that does n
 file reads and writes as it always did, so mixed releases on one registry never wait for each
 other indefinitely.
 
+Readers keep their share of the lock short. `status`, `doctor`, `audit` and `unpushed` verify the
+append-only event history once before they take the lock, which is most of the reading on a
+registry with tens of thousands of events; under the lock they then only confirm that each
+event file they verified is unchanged, and verify whatever arrived meanwhile.
+
 ## Recovery and compatibility views
 
 Every mutation appends a numbered, hash-linked JSON event before refreshing the readable ACTIVE,

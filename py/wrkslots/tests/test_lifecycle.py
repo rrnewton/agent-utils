@@ -37106,7 +37106,9 @@ def test_audit_does_not_replay_event_log_per_record(
 
     # Active state, archived state, audit row observations, and recovery
     # journals each inspect the log once; neither audit row adds another pass.
-    assert calls == ["testhost"] * 4
+    # The validation run once before the shared lock (#1172) adds its own
+    # active and archived reads, a constant two.
+    assert calls == ["testhost"] * 6
     assert rows["slot01"]["verdict"] == "HELD"
     assert not any(
         "unread HANDOFF.md" in reason for reason in rows["slot02"]["reasons"]

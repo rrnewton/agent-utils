@@ -9657,6 +9657,27 @@ def _validate_global_state(
         return _validate_global_state_once(config, require_repository=require_repository)
 
 
+def _prewarm_registry_read(read: Callable[[], object]) -> None:
+    """Run a reader's registry validation once before it takes the shared lock (#1172).
+
+    Verifying the append-only event chains dominates a reader's locked section: about 0.1 ms
+    per event file, so 7 s at 45,000 events, for status and doctor on every run. The command's
+    event memo keeps every verified event file whose identity has been stable for two seconds,
+    and every replay prefix, so running the same validation here first leaves the locked read
+    only an lstat per file plus whatever arrived meanwhile. The locked read decides: it
+    re-verifies anything whose identity changed, under exactly the rules it always used. Outside
+    a memo scope there is nothing to keep, and any failure here is left for the locked read to
+    report.
+    """
+
+    if not _ACTIVE_EVENT_MEMO:
+        return
+    try:
+        read()
+    except Exception:  # noqa: BLE001 -- the locked read repeats and reports it
+        return
+
+
 def _validate_global_state_once(
     config: Config,
     *,
@@ -40725,6 +40746,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         raise Refusal("--cache-plan-total-seconds must be finite and positive")
     config = _load_config(args.project_root, args.machine)
     metrics = _AuditMetrics()
+    _prewarm_registry_read(lambda: _validate_global_state(config))
     with _locked(config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock):
         registry_started = metrics.start()
         _refuse_partial_state(config, allow_validate_batch_seals=True)
@@ -41754,6 +41776,7 @@ def _cmd_unpushed(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     if args.slot is not None:
         _validate_name(args.slot, "slot")
+    _prewarm_registry_read(lambda: _validate_global_state(config))
     with _locked(config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock):
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         states, _archives = _validate_global_state(config)
@@ -42224,6 +42247,11 @@ def _image_attachment_findings(config: Config) -> list[dict[str, object]]:
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
+    _prewarm_registry_read(
+        lambda: _validate_global_state_beside_absent_batch(
+            config, require_repository=False, announce=False
+        )
+    )
     with _locked(
         config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock
     ):
@@ -42335,10 +42363,24 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
+    # Run in a copy of the caller's context: status sets _VERBOSE_DIAGNOSTICS and
+    # _TEARING_DOWN_PIDNS for itself, and an in-process caller (tests, a reader
+    # run twice by one process) must not inherit them afterwards, or later
+    # process observations would be collected into a finished status's list
+    # instead of reported.
+    return contextvars.copy_context().run(_cmd_status_in_context, args)
+
+
+def _cmd_status_in_context(args: argparse.Namespace) -> int:
     _VERBOSE_DIAGNOSTICS.set(bool(getattr(args, "verbose", False)))
     tearing_down: list[str] = []
     _TEARING_DOWN_PIDNS.set(tearing_down)
     config = _load_config(args.project_root, args.machine)
+    _prewarm_registry_read(
+        lambda: _validate_global_state_beside_absent_batch(
+            config, require_repository=False, announce=False
+        )
+    )
     with _locked(
         config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock
     ):
