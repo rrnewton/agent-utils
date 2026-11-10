@@ -204,6 +204,72 @@ test("documents render: a malicious document renders inert, its text still reada
   assert.ok(html.includes("alert(1)"), "the script payload's text vanished instead of rendering as text");
 });
 
+// `#1235 documents-list-continuation`: a list item wrapped over source lines (the marker line
+// plus 2-space-indented continuation lines, as editors wrap prose) is ONE item. Before the fix
+// each continuation fell out of the list as its own left-indented paragraph, so a 7-item list
+// drew as seven one-item lists alternating with seven paragraphs.
+test("documents render: wrapped list items stay one item each in one list", () => {
+  const { renderDocumentMarkdown } = requireModule(RENDER, "src/view/documents/render.ts");
+  const markdown = [
+    "- Live stream frames: message, message-update (edits, reactions),",
+    "  message-delete, settings. Each lands whenever the network says",
+    "  so and redraws or re-reads immediately (`view/stream.ts`).",
+    "- Timeline reads: first load, the poll, live-triggered",
+    "  re-reads. Each landing redraws through `settle`.",
+    "- Viewport events: keyboard and window resizes riding",
+    "  the same keepers.",
+  ].join("\n");
+  const html = htmlOf(renderDocumentMarkdown(markdown));
+  assert.equal((html.match(/<ul>/g) ?? []).length, 1, "the wrapped items split into several lists");
+  assert.equal((html.match(/<li>/g) ?? []).length, 3, "one list item per source item");
+  assert.ok(!html.includes("<p>"), "a continuation spilled as a separate paragraph");
+  assert.equal(
+    html,
+    "<ul>" +
+      "<li>Live stream frames: message, message-update (edits, reactions), message-delete, settings. " +
+      "Each lands whenever the network says so and redraws or re-reads immediately (<code>view/stream.ts</code>).</li>" +
+      "<li>Timeline reads: first load, the poll, live-triggered re-reads. Each landing redraws through <code>settle</code>.</li>" +
+      "<li>Viewport events: keyboard and window resizes riding the same keepers.</li>" +
+      "</ul>",
+    "each item holds its whole wrapped text, space-joined, inline code intact",
+  );
+});
+
+test("documents render: an ordered item's continuation joins it and numbering stays one list", () => {
+  const { renderDocumentMarkdown } = requireModule(RENDER, "src/view/documents/render.ts");
+  const html = htmlOf(renderDocumentMarkdown("1. Goal text that\n   continues here\n2. Next goal"));
+  assert.equal(
+    html,
+    "<ol><li>Goal text that continues here</li><li>Next goal</li></ol>",
+    "the continuation joins item 1 and item 2 stays in the same list",
+  );
+});
+
+test("documents render: list boundaries still end the list", () => {
+  const { renderDocumentMarkdown } = requireModule(RENDER, "src/view/documents/render.ts");
+  // A blank line ends the list; the prose after it is a paragraph.
+  assert.equal(
+    htmlOf(renderDocumentMarkdown("- one\n\nAfter the list.")),
+    "<ul><li>one</li></ul>\n<p>After the list.</p>",
+  );
+  // Unindented prose straight after an item is its own paragraph (a caption stays a caption),
+  // and a later bullet starts a new list.
+  assert.equal(
+    htmlOf(renderDocumentMarkdown("- one\nKnown limits: none.\n- two")),
+    "<ul><li>one</li></ul>\n<p>Known limits: none.</p>\n<ul><li>two</li></ul>",
+  );
+  // A heading ends the list.
+  assert.equal(
+    htmlOf(renderDocumentMarkdown("- one\n  still one\n## Next")),
+    '<ul><li>one still one</li></ul>\n<h2 id="doc-next">Next</h2>',
+  );
+  // A wrapped item at the very end of input, no trailing newline, keeps its tail.
+  assert.equal(
+    htmlOf(renderDocumentMarkdown("- tail item\n  with its tail")),
+    "<ul><li>tail item with its tail</li></ul>",
+  );
+});
+
 // ---- 3. list ---------------------------------------------------------------------------------
 
 // A minimal fake element in the style of the existing view tests: plain object with class/text/

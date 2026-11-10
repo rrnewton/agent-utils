@@ -49,4 +49,17 @@ Weigh all three on the same axes:
 
 # Notes
 
+Audit observed 2026-11-10 under #1235 (hand-rolled renderer, before that fix; corpus: the redraw-model document's list, `ai_docs/dagrun-profile-feedback-audit.md`, `ai_docs/2026-07-29-parallel-experiment-runner-design.md`, plus one probe per construct):
+
+- Wrapped continuation lines: spilled as separate paragraphs (the 7-item reference list drew as 7 one-item lists + 7 paragraphs). Fixed by #1235: 1 list, 7 items, 0 paragraphs. On the two full corpus documents the fix kept every item (92 and 67) while list elements fell 60 to 21 and 38 to 14 and paragraphs fell 126 to 77 and 75 to 41 — the spills rejoined their items.
+- Nested lists: drawn flat (indented sub-items become top-level items).
+- Loose lists: each item its own one-item list (blank line ends the list).
+- Lazy continuation: an unindented line ends the list (diverges from the host; kept deliberately in #1235 so a caption stays a caption).
+- Code fence inside an item: splits the list around the code block.
+- Ordered start-at-N: start number dropped, always renumbers from 1.
+- Task lists: bracket text literal, no checkbox.
+- Autolinks: bare addresses stay text.
+- Strikethrough, underscore emphasis, setext headings, reference-style links: literal or plain-paragraph output.
+- Table column alignment: ignored (structure renders). Blockquotes: lines flattened into one paragraph.
+
 [watermelon-full-preview] mu-docread. Parent: #1235 documents-list-continuation. Related: #1236 documents-reader-layout (the dress any renderer output wears), #1038 documents-outline-popup (heading ids any renderer must keep agreeing with). P2: the fast-tracked fixes land first; this decides the reader's longer-term rendering ground.

@@ -526,11 +526,24 @@ export function renderDocumentMarkdown(markdown: string, currentKey?: string, cu
       const isOrdered = unordered === null;
       const items: string[] = [];
       while (at < lines.length) {
-        const itemLine = (lines[at] ?? "").trim();
+        const raw = lines[at] ?? "";
+        const itemLine = raw.trim();
+        if (itemLine === "") break;
         const itemUnordered = /^[-*+]\s+(.*)$/.exec(itemLine);
         const itemOrdered = /^\d{1,9}[.)]\s+(.*)$/.exec(itemLine);
-        if (isOrdered ? itemOrdered === null : itemUnordered === null) break;
-        items.push((isOrdered ? itemOrdered?.[1] : itemUnordered?.[1]) ?? "");
+        const item = isOrdered ? itemOrdered : itemUnordered;
+        if (item !== null) {
+          items.push(item[1] ?? "");
+          at += 1;
+          continue;
+        }
+        // No item opens here. A block of its own (or an item of the other kind) ends the
+        // list, and so does prose at the left margin: a caption under a list stays a
+        // caption. An indented line is the current item wrapped over source lines
+        // (`#1235 documents-list-continuation`): it joins that item with a space, as the
+        // code host draws it, instead of spilling as a paragraph of its own.
+        if (startsBlock(lines, at) || !/^[ \t]/.test(raw) || items.length === 0) break;
+        items[items.length - 1] = `${items[items.length - 1]} ${itemLine}`;
         at += 1;
       }
       const tag = isOrdered ? "ol" : "ul";

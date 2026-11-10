@@ -43,8 +43,15 @@ _FILLER = (
     "document below scrolls for several viewports and each heading can be "
     "brought to the top of the scroller in turn.\n\n"
 )
+# The wrapped items are `#1235 documents-list-continuation`'s shape: an item over
+# source lines, its tail 2-space indented, must draw as one item.
 PASTE_BODY = (
-    "# Demo deployment report\n\nThe **nightly** run finished green.\n\n- one\n- two\n"
+    "# Demo deployment report\n\nThe **nightly** run finished green.\n\n"
+    "- Live frames arrive whenever the network\n"
+    "  says so and redraw at once.\n"
+    "- Timeline reads land in batches and\n"
+    "  settle the list afterwards.\n"
+    "- Viewport events ride along.\n"
     "\n## Setup\n\n" + _FILLER * 8
     + "### Setup details\n\n" + _FILLER * 8
     + "## Finish\n\n" + _FILLER * 10
@@ -240,6 +247,27 @@ def main() -> int:
                 page.wait_for_selector("#doc-body h1", timeout=20_000)
                 check("Demo deployment report" in (page.text_content("#doc-body") or ""),
                       "the reader did not render the fetched document")
+                # Wrapped items stay whole (`#1235 documents-list-continuation`): one
+                # list, one item per source item, each tail inside its item, and no
+                # spilled paragraph carrying a tail at the left margin.
+                wrapped = page.evaluate(
+                    """() => {
+                      const body = document.getElementById('doc-body');
+                      return {
+                        lists: body.querySelectorAll('ul').length,
+                        items: [...body.querySelectorAll('li')].map((li) => li.textContent),
+                        spills: [...body.querySelectorAll('p')]
+                          .filter((p) => /^(says so|settle the list)/.test(p.textContent || ''))
+                          .length,
+                      };
+                    }""")
+                check(wrapped["lists"] == 1, f"the wrapped list drew as {wrapped['lists']} lists")
+                check(wrapped["items"] == [
+                    "Live frames arrive whenever the network says so and redraw at once.",
+                    "Timeline reads land in batches and settle the list afterwards.",
+                    "Viewport events ride along.",
+                ], f"the wrapped items drew as {wrapped['items']}")
+                check(wrapped["spills"] == 0, "a wrapped tail spilled as its own paragraph")
                 check(page.locator("#control-pane").is_hidden(), "the call controls show over the reader")
 
                 # The title is the source link (#1038): href, new tab, no opener.
