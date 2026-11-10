@@ -1,11 +1,12 @@
 ---
 title: 'raw-message-page: scrollable main-channel composer with a Send raw message checkbox'
-status: in_progress
+status: closed
 priority: 1
 issue_type: feature
 assignee: mu-raw
 created_at: 2026-11-09T14:01:57.596871127+00:00
-updated_at: 2026-11-09T14:07:33.831477624+00:00
+updated_at: 2026-11-10T07:02:41.223897381+00:00
+closed_at: 2026-11-10T07:02:41.223897261+00:00
 claimed_at: 2026-11-09T14:02:35.611561613+00:00
 claimed_until: 2026-11-11T14:02:35.611468413+00:00
 ---

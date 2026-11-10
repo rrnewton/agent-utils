@@ -1,11 +1,12 @@
 ---
 title: 'raw-message-bridge: owner-only raw keystroke delivery to the bridged agent'
-status: in_progress
+status: closed
 priority: 1
 issue_type: feature
 assignee: mu-raw
 created_at: 2026-11-09T14:01:57.599336424+00:00
-updated_at: 2026-11-09T14:07:33.833788441+00:00
+updated_at: 2026-11-10T07:02:41.220752183+00:00
+closed_at: 2026-11-10T07:02:41.220752063+00:00
 claimed_at: 2026-11-09T14:02:35.614042985+00:00
 claimed_until: 2026-11-11T14:02:35.613931587+00:00
 ---
