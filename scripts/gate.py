@@ -66,7 +66,10 @@ its place and is granted only when the window ends. Running gates are never
 touched.
 
 Rerun tickets: --rerun marks a short solo rerun of a few already-run steps
-(an exclusive run of at most RERUN_MAX_STEPS `--selected` steps). It sorts
+(at most RERUN_MAX_STEPS `--selected` steps). Since #1260 it runs in the
+shared class unless a selected step is declared timing-sensitive in the
+DAG (`gate-exclusive`) or is unknown to the DAG, which fails closed to
+exclusive. It sorts
 ahead of every ordinary ticket (FIFO among reruns) and still waits for running
 gates to finish, so a two-minute rerun no longer waits behind every gate queued
 after the one it repeats. $GATE_BLACKOUT_NOW (ISO 8601) overrides the clock
@@ -826,6 +829,59 @@ def _priority_request(
     return "owner", reason, None
 
 
+#: DAG label declaring a step timing-sensitive: only such a step needs the
+#: whole host, so only a rerun naming one takes the exclusive class (#1260
+#: rerun-shared-class).
+TIMING_SENSITIVE_LABEL = "gate-exclusive"
+
+
+def _dag_step_labels() -> dict[str, set[str]]:
+    """Every flattened DAG step's labels, or {} when the graph cannot load.
+
+    An empty map makes every selected step unknown, and unknown steps fail
+    closed to exclusive in `_timing_sensitive_steps`."""
+    root = Path(__file__).resolve().parent.parent
+    try:
+        done = subprocess.run(
+            [str(root / "common" / "bin" / "dagrun"), "json", "--dag",
+             str(root / "validation.dag.yaml")],
+            capture_output=True, text=True, timeout=120, check=False,
+        )
+        raw = json.loads(done.stdout)
+        steps: dict[str, set[str]] = {}
+        for value in raw.get("steps", []):
+            if not isinstance(value, dict):
+                continue
+            group, job = value.get("group"), value.get("job")
+            labels = value.get("labels")
+            if isinstance(group, str) and isinstance(job, str):
+                steps[f"{group}.{job}"] = (
+                    {label for label in labels if isinstance(label, str)}
+                    if isinstance(labels, list) else set()
+                )
+        return steps
+    except Exception:
+        return {}
+
+
+def _timing_sensitive_steps(
+    selected: list[str],
+    labels_by_tag: dict[str, set[str]] | None = None,
+) -> list[str]:
+    """Selected steps that need the exclusive class (#1260).
+
+    A step is timing-sensitive only when the DAG declares it with
+    ``TIMING_SENSITIVE_LABEL``; a step the DAG does not name is unknown and
+    fails closed, because the gate cannot prove it is not timing-sensitive."""
+    if labels_by_tag is None:
+        labels_by_tag = _dag_step_labels()
+    return [
+        step for step in selected
+        if step not in labels_by_tag
+        or TIMING_SENSITIVE_LABEL in labels_by_tag[step]
+    ]
+
+
 def _rerun_problem(command: list[str]) -> str | None:
     """Why `command` is not a short rerun of named steps, or None if it is."""
 
@@ -901,7 +957,16 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
         if problem:
             print(f"gate: --rerun refused: {problem}", flush=True)
             return 2
-        args.cls = "exclusive"
+        # #1260: only a timing-sensitive selection needs the whole host.
+        sensitive = _timing_sensitive_steps(_selected_steps(command))
+        if sensitive:
+            args.cls = "exclusive"
+            print(f"gate: rerun names timing-sensitive step(s) "
+                  f"{', '.join(sensitive)}; runs exclusive", flush=True)
+        else:
+            args.cls = "shared"
+            print("gate: rerun names no timing-sensitive step; "
+                  "runs in the shared class (#1260 rerun-shared-class)", flush=True)
     if nested:
         preflight = "skipped: nested gate"
     elif rerun:
@@ -1167,7 +1232,8 @@ def _record_ledger(
             verdict_word or "", "pass" if rc == 0 else "fail"
         )
         if kind is None:
-            kind = "exclusive-rerun" if args.cls == "exclusive" else "gate"
+            # A shared-class rerun (#1260) is still a rerun in the ledger.
+            kind = "exclusive-rerun" if (args.cls == "exclusive" or rerun_flag) else "gate"
         line = {
             "queued_utc": _utc(queued) if queued is not None else None,
             "wait_s": round(started - queued, 2) if queued is not None else None,
@@ -1946,7 +2012,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="refuse a start inside a blackout window (exit 78) instead of queueing until it ends")
     parser.add_argument("--rerun", action="store_true",
                         help=f"a short solo rerun of at most {RERUN_MAX_STEPS} already-run steps named with "
-                             "--selected: runs exclusive and sorts ahead of every ordinary queued ticket "
+                             "--selected: runs in the shared class unless a selected step is declared "
+                             "timing-sensitive in the DAG (gate-exclusive) or unknown (#1260); "
+                             "sorts ahead of every ordinary queued ticket "
                              "(FIFO among reruns); it still waits for running gates. "
                              "Example: gate.py --rerun -- common/bin/dagrun run --dag validation.dag.yaml "
                              "--keep-going --selected vibe-talk.check.fold-latency-browser")

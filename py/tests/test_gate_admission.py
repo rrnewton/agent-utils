@@ -457,6 +457,37 @@ def test_contained_command_wraps_in_a_quota_scope(
     monkeypatch.setenv("GATE_CPU_CONTAINMENT", "off")
     bare, contained = gate._contained_command(["echo", "hi"], "1234-abcd", 48)
     assert not contained and bare == ["echo", "hi"]
+def test_timing_sensitive_steps_come_from_the_dag_declaration() -> None:
+    """#1260: only a gate-exclusive-labelled (or unknown) step is sensitive."""
+    gate = _gate_module()
+    labels = {
+        "python.tick-hub.test": {"validation-cross"},
+        "cross.agentctl.differential-0": ["component-agentctl", gate.TIMING_SENSITIVE_LABEL],
+    }
+    labels = {k: set(v) for k, v in labels.items()}
+    assert gate._timing_sensitive_steps(["python.tick-hub.test"], labels) == []
+    assert gate._timing_sensitive_steps(
+        ["python.tick-hub.test", "cross.agentctl.differential-0"], labels
+    ) == ["cross.agentctl.differential-0"]
+    assert gate._timing_sensitive_steps(["no.such.step"], labels) == ["no.such.step"]
+    real = gate._dag_step_labels()
+    assert gate.TIMING_SENSITIVE_LABEL in real["cross.agentctl.differential-0"]
+    assert gate._timing_sensitive_steps(["cross.agentctl.differential-0"], real)
+    assert gate._timing_sensitive_steps(["python.tick-hub.test"], real) == []
+
+
+def test_a_non_timing_rerun_runs_shared_and_still_records_a_rerun(tmp_path: Path) -> None:
+    """#1260: a rerun of known non-timing steps is admitted shared, keeps
+    the rerun ledger kind, and says which class it took."""
+    env = _env(tmp_path)
+    done = subprocess.run(
+        [PY, str(GATE), "--rerun", "--", PY, "-c", "print('validate: OK')",
+         "--selected", "python.tick-hub.test"],
+        env=env, capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stdout
+    assert "runs in the shared class" in done.stdout
+    rows = [json.loads(line) for line in (tmp_path / "ledger.jsonl").read_text().splitlines()]
+    assert rows[-1]["kind"] == "exclusive-rerun" and rows[-1]["rerun"] is True
 
 
 def test_a_rerun_must_name_a_few_selected_steps(tmp_path: Path) -> None:
