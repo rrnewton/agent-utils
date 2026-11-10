@@ -601,7 +601,9 @@ steps:
 
   # `#567 pace-stepper` in the browser engine: the Pace popover's [-] [100%] [+] stepper, no slider, at
   # 393x852 by touch (targets at least 44 px) and 1280x800: + to 130%, arrows, typed and clamped values,
-  # and a change mid-read reading the block again.
+  # and a change mid-read reading the block again, each waited for as drawn state or a fresh ticket for
+  # the same block (`#1250 vibe-talk-timing-robust`). The verdict is behaviour only; the ticket times
+  # are printed, and the old wait bounds are an opt-in `--benchmark` outside the gate.
   - group: check
     job: pace-stepper-browser
     desc: the Pace popover's stepper in current Chromium at 393x852 by touch and 1280x800, stepping, typing, clamping and a mid-read change
