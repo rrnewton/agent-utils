@@ -1,17 +1,23 @@
-"""Audit lock-free planning (#797).
+"""Audit lock-free planning (#797) and registry lock fairness (#1172).
 
 The audit takes its registry snapshot under a short shared ACTIVE lock,
 plans and censuses outside it, and revalidates before publishing.
 Revalidation is per record: a registry change invalidates only the rows
 whose own identity changed, appeared, or disappeared; unchanged rows
 keep the verdicts measured outside the lock.
+
+A writer waiting for the registry lock holds the writer-intent turnstile,
+so readers that arrive after it queue behind it instead of starving it.
 """
 
 from __future__ import annotations
 
 import copy
+import fcntl
 import json
 import os
+import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
@@ -286,3 +292,144 @@ def test_audit_seal_appearing_marks_only_affected_row_unknown(
     rows = _rows(payload)
     assert rows["slot-a"]["verdict"] == "UNKNOWN", rows["slot-a"]
     assert rows["slot-b"]["verdict"] != "UNKNOWN", rows["slot-b"]
+
+
+def _reader_stream(
+    subject: Path, stop: threading.Event, *, hold: float, offset: float
+) -> threading.Thread:
+    """Overlapping new-style readers: one always holds the lock while the stream runs."""
+
+    def run() -> None:
+        time.sleep(offset)
+        while not stop.is_set():
+            with wrkslots_cli._locked(subject, exclusive=False, wait_seconds=30):
+                time.sleep(hold)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
+
+
+def _timed_writer(subject: Path, wait_seconds: float) -> float:
+    started = time.monotonic()
+    with wrkslots_cli._locked(subject, exclusive=True, wait_seconds=wait_seconds):
+        return time.monotonic() - started
+
+
+def test_waiting_writer_is_not_starved_by_overlapping_readers(tmp_path: Path) -> None:
+    subject = tmp_path / "ACTIVE"
+    stop = threading.Event()
+    # Three readers each holding 0.6 s, staggered by 0.2 s: without the turnstile some reader
+    # always holds the shared lock, and the writer's poll never finds it free.
+    readers = [_reader_stream(subject, stop, hold=0.6, offset=0.2 * i) for i in range(3)]
+    try:
+        time.sleep(1.0)
+        waited = _timed_writer(subject, wait_seconds=20)
+    finally:
+        stop.set()
+        for reader in readers:
+            reader.join(timeout=30)
+    # Bounded by the readers already inside (at most one hold each), plus polling.
+    assert waited < 3.0, waited
+
+
+def test_old_style_reader_weakens_fairness_but_never_deadlocks(tmp_path: Path) -> None:
+    subject = tmp_path / "ACTIVE"
+    lock_path = wrkslots_cli._lock_path(subject)
+    stop = threading.Event()
+    old_done = threading.Event()
+
+    def old_reader() -> None:
+        # An older release: a shared flock on the registry lock, no turnstile.
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            for _ in range(4):
+                fcntl.flock(fd, fcntl.LOCK_SH)
+                time.sleep(0.4)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                time.sleep(0.05)
+        finally:
+            os.close(fd)
+            old_done.set()
+
+    old = threading.Thread(target=old_reader, daemon=True)
+    old.start()
+    readers = [_reader_stream(subject, stop, hold=0.3, offset=0.1 * i) for i in range(2)]
+    try:
+        time.sleep(0.3)
+        waited = _timed_writer(subject, wait_seconds=20)
+        # New readers still get the lock after the writer.
+        with wrkslots_cli._locked(subject, exclusive=False, wait_seconds=10):
+            pass
+    finally:
+        stop.set()
+        for reader in readers:
+            reader.join(timeout=30)
+        old.join(timeout=30)
+    assert old_done.is_set()
+    assert waited < 20, waited
+
+
+def test_stale_intent_file_does_not_block_readers_or_writers(tmp_path: Path) -> None:
+    subject = tmp_path / "ACTIVE"
+    intent = wrkslots_cli._registry_intent_path(subject)
+    assert intent is not None
+    # A crashed writer leaves the file; only a held flock means intent.
+    intent.write_text("")
+    with wrkslots_cli._locked(subject, exclusive=False, wait_seconds=0):
+        pass
+    with wrkslots_cli._locked(subject, exclusive=True, wait_seconds=0):
+        pass
+
+
+def test_reader_defers_to_a_stuck_writer_intent_only_briefly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    subject = tmp_path / "ACTIVE"
+    intent = wrkslots_cli._registry_intent_path(subject)
+    assert intent is not None
+    monkeypatch.setattr(wrkslots_cli, "_REGISTRY_INTENT_DEFER_SECONDS", 0.5)
+    fd = os.open(intent, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        # A writer that announced itself and never proceeds.
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        started = time.monotonic()
+        with wrkslots_cli._locked(subject, exclusive=False, wait_seconds=10):
+            waited = time.monotonic() - started
+        # A zero-wait reader does not defer at all.
+        with wrkslots_cli._locked(subject, exclusive=False, wait_seconds=0):
+            pass
+        # Another writer queues behind it and reports busy by name.
+        with pytest.raises(wrkslots_cli.Refusal, match="another writer is waiting"):
+            with wrkslots_cli._locked(subject, exclusive=True, wait_seconds=0.2):
+                pass
+    finally:
+        os.close(fd)
+    assert 0.4 <= waited < 5, waited
+
+
+def test_nested_reader_does_not_queue_behind_a_writer_waiting_for_it(tmp_path: Path) -> None:
+    subject = tmp_path / "ACTIVE"
+    writer_waiting = threading.Event()
+    result: dict[str, object] = {}
+
+    def writer() -> None:
+        writer_waiting.set()
+        try:
+            result["waited"] = _timed_writer(subject, wait_seconds=10)
+        except wrkslots_cli.Refusal as exc:
+            result["error"] = exc
+
+    with wrkslots_cli._locked(subject, exclusive=False, wait_seconds=0):
+        thread = threading.Thread(target=writer, daemon=True)
+        thread.start()
+        writer_waiting.wait(5)
+        time.sleep(0.3)
+        started = time.monotonic()
+        # The same thread reads again through a second descriptor: it must not wait for the
+        # writer, which waits for this very thread.
+        with wrkslots_cli._locked(subject, exclusive=False, wait_seconds=5):
+            nested = time.monotonic() - started
+    thread.join(timeout=30)
+    assert nested < 1.0, nested
+    assert "error" not in result, result

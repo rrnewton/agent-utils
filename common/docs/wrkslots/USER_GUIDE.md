@@ -2972,6 +2972,23 @@ ceilings to the user's whole `user-UID.slice` through `sudo -n systemctl set-pro
 so every process the user runs shares one outer bound, including agents that a harness moves
 into a slice of its own. `wrkslots limits show` prints the current values; `clear` removes them.
 
+## Registry locks and waiting
+
+Every command that reads or changes the registry takes the project's registry lock: readers
+(`status`, `doctor`, `audit`, `unpushed`) share it, and a mutation (`create`, `adopt`, `remove`,
+`heartbeat`, ...) takes it alone. `--wait-lock SECONDS` says how long a command waits for it
+before refusing as busy (default: no wait).
+
+A mutation that is waiting for the lock announces itself, and a reader that arrives after it
+waits behind it instead of joining the readers already inside, so a steady stream of
+overlapping readers cannot hold a mutation off: it waits at most for the readers that were
+already reading. The announcement is a lock on `ACTIVE.global.intent.lock` in the control
+directory, held only while the mutation waits. The file may stay behind and means nothing on
+its own; a mutation that dies drops its lock with its process. A reader defers to a waiting
+mutation for at most 10 seconds and then reads anyway, and a release that does not know the
+file reads and writes as it always did, so mixed releases on one registry never wait for each
+other indefinitely.
+
 ## Recovery and compatibility views
 
 Every mutation appends a numbered, hash-linked JSON event before refreshing the readable ACTIVE,

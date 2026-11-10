@@ -5432,9 +5432,32 @@ def _holds_lock(subject: Path) -> bool:
     return held.get(_lock_path(subject), 0) > 0
 
 
-@contextlib.contextmanager
-def _locked(subject: Path, *, exclusive: bool, wait_seconds: float) -> Iterator[None]:
-    path = _lock_path(subject)
+# Writer intent for the registry lock (#1172). flock grants a shared lock whenever no exclusive
+# one is held, so a writer polling for the exclusive lock waited as long as readers kept
+# overlapping: an adopt waited minutes behind back-to-back audits, doctors and statuses. A writer
+# now holds this turnstile exclusively while it waits for the registry lock, and a reader passes
+# through it (shared, then released at once) before taking the registry lock, so a reader that
+# arrives after a waiting writer queues behind it. The writer waits at most for the readers
+# already inside.
+#
+# Only the flock on an open descriptor counts, never the file's existence, so a writer that dies
+# leaves nothing that blocks: the kernel drops its lock with its last descriptor. A reader or
+# writer that does not know this file (an older release, another edition) takes the registry
+# lock exactly as before; it can only weaken the fairness, never deadlock with a new one. A
+# reader defers to a waiting writer for at most _REGISTRY_INTENT_DEFER_SECONDS and then takes
+# the registry lock anyway, so a writer that cannot proceed (one waiting on a reader that is
+# itself waiting on a child process that reads the registry) costs readers that much, not
+# their whole wait.
+_REGISTRY_INTENT_DEFER_SECONDS = 10.0
+
+
+def _registry_intent_path(subject: Path) -> Path | None:
+    if subject.name != "ACTIVE":
+        return None
+    return subject.parent / "ACTIVE.global.intent.lock"
+
+
+def _open_lock_file(path: Path, label: str) -> int:
     if path.parent.is_symlink() or not path.parent.is_dir():
         raise Refusal(f"unsafe lock parent: {path.parent}")
     try:
@@ -5444,28 +5467,75 @@ def _locked(subject: Path, *, exclusive: bool, wait_seconds: float) -> Iterator[
             0o600,
         )
     except OSError as exc:
-        raise Refusal(f"cannot open state lock {path}: {exc}") from exc
+        raise Refusal(f"cannot open {label} {path}: {exc}") from exc
     try:
         mode = os.fstat(fd).st_mode
     except OSError as exc:
         os.close(fd)
-        raise Refusal(f"cannot inspect state lock {path}: {exc}") from exc
+        raise Refusal(f"cannot inspect {label} {path}: {exc}") from exc
     if not stat.S_ISREG(mode):
         os.close(fd)
-        raise Refusal(f"state lock is not a regular file: {path}")
+        raise Refusal(f"{label} is not a regular file: {path}")
+    return fd
+
+
+def _flock_until(fd: int, operation: int, deadline: float) -> bool:
+    """Poll a non-blocking flock until ``deadline``; true when it was acquired."""
+
+    while True:
+        try:
+            fcntl.flock(fd, operation | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
+def _enter_registry_turnstile(
+    subject: Path, *, exclusive: bool, deadline: float
+) -> int | None:
+    """Pass the writer-intent turnstile; return the descriptor a writer must keep."""
+
+    intent = _registry_intent_path(subject)
+    # A thread that already holds the registry lock takes it again without queueing: waiting
+    # behind a writer that waits for this very thread would only time out.
+    if intent is None or _holds_lock(subject):
+        return None
+    fd = _open_lock_file(intent, "state lock intent")
+    if exclusive:
+        if _flock_until(fd, fcntl.LOCK_EX, deadline):
+            return fd
+        os.close(fd)
+        raise _LockBusy(
+            f"state lock is busy for {subject}; another writer is waiting for it; retry after "
+            "the current command exits"
+        )
+    try:
+        defer_until = min(deadline, time.monotonic() + _REGISTRY_INTENT_DEFER_SECONDS)
+        if _flock_until(fd, fcntl.LOCK_SH, defer_until):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+    return None
+
+
+@contextlib.contextmanager
+def _locked(subject: Path, *, exclusive: bool, wait_seconds: float) -> Iterator[None]:
+    path = _lock_path(subject)
+    fd = _open_lock_file(path, "state lock")
     operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
     deadline = time.monotonic() + wait_seconds
     try:
-        while True:
-            try:
-                fcntl.flock(fd, operation | fcntl.LOCK_NB)
-                break
-            except BlockingIOError as exc:
-                if time.monotonic() >= deadline:
-                    raise _LockBusy(
-                        f"state lock is busy for {subject}; retry after the current command exits"
-                    ) from exc
-                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        intent = _enter_registry_turnstile(subject, exclusive=exclusive, deadline=deadline)
+        try:
+            if not _flock_until(fd, operation, deadline):
+                raise _LockBusy(
+                    f"state lock is busy for {subject}; retry after the current command exits"
+                )
+        finally:
+            if intent is not None:
+                os.close(intent)
         held: dict[Path, int] = getattr(_HELD_LOCKS, "paths", None) or {}
         _HELD_LOCKS.paths = held
         held[path] = held.get(path, 0) + 1
