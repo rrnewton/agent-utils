@@ -329,21 +329,32 @@ var mainFollowState = null;
  *
  * @param {HTMLElement} area
  */
-function chipsFollowFoot(area) {
+function chipsFollowFoot(area, grew = 0) {
   if (!mainFollowState) return followsNewest(area);
-  return mainFollowState() && heldFilterRow() === null && !quickReplyHolds(area);
+  if (heldFilterRow() !== null || quickReplyHolds(area)) return false;
+  // The keeper's state, or the reader standing at the foot within its rest room where the state
+  // has not heard their landing (a screen coming back, a list whose scrolls were another's):
+  // past that room a reader resting up the list is left where they are (`#1185`). Either way the
+  // reader must stand within the slack plus THIS observer's own growth of the foot: content that
+  // grew elsewhere (a row at the foot laid out taller) strands a follower where they stand, and
+  // the jump to it is offered, not taken (`#207`).
+  if (!atBottom(area, BOTTOM_SLACK_PX + grew)) return false;
+  return mainFollowState() || atBottom(area, FOLLOW_REST_PX);
 }
 
+let scrollToolsHeight = 0;
 if (typeof window.ResizeObserver === "function") {
   new window.ResizeObserver(([entry]) => {
     const height = entry.contentRect.height;
+    const grew = Math.max(0, height - scrollToolsHeight);
+    scrollToolsHeight = height;
     const area = el("scroll-area");
     // `#221 read-modes`. A reader just landed on a thread's first unread is reading that, however near
     // the end of the list it is: the chips changed because the entry opened the message's fold.
     const landed = screens.screen() === "main" && screens.view() === "discord" && entryLandingHolds();
     // `#243 filter-keeps-selection`: nor one whose message a filter change holds in place. `#241 voice-composer`:
     // the call's transcript follows too, not only the channel.
-    const pinned = !landed && screens.screen() === "main" && chipsFollowFoot(area);
+    const pinned = !landed && screens.screen() === "main" && chipsFollowFoot(area, grew);
     const room = height > 0 ? `calc(${height}px + 0.5rem)` : "0px";
     el("frame-body").style.setProperty("--scroll-tools-clearance", room);
     // `#433 read-strip-low`. The row's height itself, without the half-rem the room keeps over
@@ -370,6 +381,7 @@ if (typeof window.ResizeObserver === "function") {
 // last message still scrolls clear. Zero while it is hidden (a `display: none` box measures
 // nothing), so none of that room is kept for a strip that is not there. Kept beside the chips'
 // measurement, and held on the hidden screen for the reason that one is (`#280`, above).
+let readSteerHeight = 0;
 if (typeof window.ResizeObserver === "function") {
   new window.ResizeObserver(() => {
     // The whole box, padding and border included: a content-box measure would leave what stacks
@@ -377,10 +389,12 @@ if (typeof window.ResizeObserver === "function") {
     // over whatever it stands on, stated here because the chips' room states it only while a
     // chip is showing.
     const height = el("read-steer").offsetHeight || 0;
+    const grew = Math.max(0, height - readSteerHeight);
+    readSteerHeight = height;
     const room = height > 0 ? `calc(${height}px + 0.5rem)` : "0px";
     const area = el("scroll-area");
     const landed = screens.screen() === "main" && screens.view() === "discord" && entryLandingHolds();
-    const pinned = !landed && screens.screen() === "main" && chipsFollowFoot(area);
+    const pinned = !landed && screens.screen() === "main" && chipsFollowFoot(area, grew);
     el("frame-body").style.setProperty("--read-steer-clearance", room);
     // `scrubber-full-width`. The height itself, without the air: on a phone the strip playing is a
     // row of its own over the dock, and the list ends at its top edge (`data-read-strip`). Held on

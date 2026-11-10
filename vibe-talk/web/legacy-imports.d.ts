@@ -210,6 +210,7 @@ declare const createFilterPlace: LegacyImports["createFilterPlace"];
 declare const createLiveState: LegacyImports["createLiveState"];
 declare const createDoneAct: LegacyImports["createDoneAct"];
 declare const freshDoneState: LegacyImports["freshDoneState"];
+declare const FOLLOW_REST_PX: LegacyImports["FOLLOW_REST_PX"];
 declare const freshFilterState: LegacyImports["freshFilterState"];
 declare const createSideCards: LegacyImports["createSideCards"];
 declare const createTwoColumns: LegacyImports["createTwoColumns"];

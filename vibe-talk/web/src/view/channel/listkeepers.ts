@@ -74,6 +74,11 @@ export interface ListKeepersDependencies<Column> extends SizeWatching {
   measureReplyArrows(): void;
 }
 
+/** How far above the rows' foot a reader still counts as resting on it when follow is noted:
+ * the room the list itself keeps past its foot (its end padding, and the keyboard's on a
+ * phone). A reader's own scroll up past this is reading, and follow is off (`#1185`). */
+export const FOLLOW_REST_PX = 12;
+
 /** The keepers, mounted. */
 export interface ListKeepers {
   /** Take the right column's scroll listener down and stop every watcher. */
@@ -326,7 +331,10 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
         if (footTop) area.scrollTop = footTop(area);
         else followFoot(area);
       }
-      if (was) note(was.foot, context);
+      // A change of what the list shows (another screen, view, channel or thread) places the
+      // reader itself: follow is re-seeded from where they stand now, not carried over it.
+      if (was && was.context !== context) note(area.scrollTop > 0 && atBottom(area, FOLLOW_REST_PX), context);
+      else if (was) note(was.foot, context);
     });
     for (const box of area.children) mainFootKeeper.observe(box);
   }
