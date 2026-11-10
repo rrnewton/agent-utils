@@ -8,6 +8,7 @@ import math
 import os
 import re
 import stat
+import subprocess
 import time
 import uuid
 from contextlib import nullcontext
@@ -23,7 +24,7 @@ from agentctl.subagents import (
     AgentRecord, ManagedAgents, _MAX_AGENT_RECORD_BYTES, _NAME, _SHA256,
     _PinnedAgentDirectory, _missing_target, _name, _native_session,
     _rename_directory_noreplace_at, _slot_shell_command, discovered_slot_project,
-    harness_arguments,
+    harness_arguments, wrkslots_executable,
 )
 
 _TOKEN = re.compile(r"[a-z0-9-]{1,80}\Z")
@@ -490,6 +491,53 @@ def _plan(record: AgentRecord, action: str, reason: str | None) -> dict[str, obj
         "action": action, "reason": reason}
 
 
+def _live_slot_owner(manager: ManagedAgents, record: AgentRecord) -> object | None:
+    """Slot ownership for a live-skip plan (#1130 restore-slot-rebind): read
+    the slot's status row and compare its owner pid with the pinned live
+    harness pid. ``None`` when the record names no slot; otherwise
+    ``"already-owned"`` when they match, or ``{"owed": ...}`` with the rebind
+    remedy. This never transfers over a live harness — only the publish path,
+    behind its death proof, rebinds — and a status read mutates nothing, so
+    an already-owned slot needs no new write.
+    """
+    slot = record.slot
+    if slot is None:
+        return None
+
+    def owed(reason: str) -> dict[str, object]:
+        return {"owed": f"{reason}; run `agentctl rebind-slot {record.name}`"}
+
+    identity = record.harness_identity or record.custom_process_identity
+    if identity is None:
+        return owed(f"slot {slot} ownership is unverified: the live harness has no pinned process")
+    project = record.slot_project
+    if project is None:
+        return owed(f"slot {slot} ownership is unverified: the record names no slot project")
+    executable = wrkslots_executable(manager.registry)
+    if not executable:
+        return owed(f"slot {slot} ownership is unverified: no wrkslots found")
+    try:
+        listed = subprocess.run(
+            [executable, "--project-root", project, "status", "--slot", slot, "--format", "json"],
+            cwd=project, capture_output=True, text=True, timeout=120, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return owed(f"slot {slot} ownership is unverified: wrkslots status failed: {exc}")
+    if listed.returncode != 0:
+        return owed(f"slot {slot} ownership is unverified: wrkslots status failed: {listed.stderr.strip()}")
+    try:
+        document = json.loads(listed.stdout)
+        row = next(item for item in document["active"] if item.get("slot") == slot)
+    except (ValueError, KeyError, TypeError, StopIteration, AttributeError):
+        return owed(f"slot {slot} ownership is unverified: slot {slot} is not active")
+    owner = row.get("owner")
+    owner_pid = owner.get("pid") if isinstance(owner, dict) else None
+    if owner_pid == identity.pid:
+        return "already-owned"
+    shown = f"pid {owner_pid}" if isinstance(owner_pid, int) else "no process"
+    return owed(f"slot {slot} is owned by {shown}, not by the live harness pid {identity.pid}")
+
+
 def plan(manager: ManagedAgents, name: str, *, expected_token: str | None = None) -> dict[str, object]:
     """Inspect one generation's recovery eligibility without changing state."""
     _name(name)
@@ -550,7 +598,11 @@ def plan(manager: ManagedAgents, name: str, *, expected_token: str | None = None
         if record.lifecycle != "running":
             return _plan(record, "skip", "record lifecycle is not running")
         if manager.client.process_liveness(_old_process(record)) == "alive":
-            return _plan(record, "skip", "recorded harness is still alive")
+            skipped = _plan(record, "skip", "recorded harness is still alive")
+            slot_owner = _live_slot_owner(manager, record)
+            if slot_owner is not None:
+                skipped["slot_owner"] = slot_owner
+            return skipped
         policy = _policy(manager, record)
         _name_available(manager, record)
         _proof(manager, record)
@@ -844,6 +896,19 @@ def _complete_locked(manager: ManagedAgents, journal: dict[str, object]) -> dict
     result = manager._status_record(candidate)
     result.update({"revived": True, "previous_token": original.token, "archive": str(archive),
                    "pane_closed": pane_closed, "tab_closed": pane_closed or current_proof["kind"] == "missing"})
+    # Bind the new harness as the slot's owner, as restart does (#1130
+    # restore-slot-rebind): a refusal is reported owed, never raised, so the
+    # revive still succeeds. Non-slot revives gain no key.
+    if candidate.slot is not None:
+        rebind = getattr(manager, "rebind_slot", None)
+        if rebind is None:
+            result["slot_owner"] = {"owed": "this edition cannot transfer slot ownership; run `agentctl rebind-slot`"}
+        else:
+            try:
+                rebind(name)
+                result["slot_owner"] = "transferred"
+            except Exception as error:
+                result["slot_owner"] = {"owed": str(error)}
     try:
         result["archived_prompts"] = _report_archived_prompts(manager, name, archive)
     except OSError as exc:

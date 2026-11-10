@@ -2682,6 +2682,160 @@ fn revive_reuses_the_recorded_slot_without_allocation_or_rebinding() {
     assert_eq!(fixture.client.environments.lock().unwrap().len(), 2);
 }
 
+/// Record `existing_slot` in the fixture root on `old` and its launch spec.
+fn record_existing_slot(fixture: &Fixture, old: &mut AgentRecord) {
+    old.slot = Some("existing_slot".to_owned());
+    old.slot_project = Some(fixture.root.display().to_string());
+    old.slot_isolation = Some("userns".to_owned());
+    let spec = old.launch_spec.as_mut().unwrap();
+    spec["slot"] = json!(old.slot);
+    spec["slot_project"] = json!(old.slot_project);
+    spec["slot_isolation"] = json!(old.slot_isolation);
+    fixture.manager().save(old).unwrap();
+}
+
+fn pinned_pid(record: &AgentRecord) -> u64 {
+    record
+        .harness_identity
+        .as_ref()
+        .or(record.custom_process_identity.as_ref())
+        .expect("pinned harness")
+        .pid
+}
+
+/// A fake `wrkslots` at the team folder's `bin/wrkslots` (where
+/// `project_wrkslots` finds it) answering shell-command, status (generation
+/// 3, owner `owner_pid`), and transfer-owner (refused while told to), and
+/// logging every call. Returns the executable and its call log.
+fn revive_fake_wrkslots(fixture: &Fixture, owner_pid: u64, refuse: bool) -> (PathBuf, PathBuf) {
+    let bin_directory = fixture.root.join("bin");
+    fs::create_dir_all(&bin_directory).unwrap();
+    let bin = bin_directory.join("wrkslots");
+    let calls = fixture.root.join("wrkslots-calls");
+    let refuse_path = fixture.root.join("owner-refuse");
+    if refuse {
+        fs::write(&refuse_path, b"").unwrap();
+    }
+    let status = json!({"active": [{
+        "slot": "existing_slot", "generation": 3, "agent": "slot-agent",
+        "owner": {"pid": owner_pid},
+    }]})
+    .to_string();
+    let shell = json!({
+        "command": "exec preserved-owner-policy",
+        "slot_path": fixture.root, "isolation": "userns",
+    })
+    .to_string();
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n\
+         *transfer-owner*) if [ -e '{}' ]; then echo 'REFUSED: slot existing_slot owner is live' >&2; exit 3; fi; echo transferred; exit 0 ;;\n\
+         *status*) printf '%s\\n' '{}'; exit 0 ;;\n\
+         *) printf '%s\\n' '{}'; exit 0 ;;\nesac\n",
+        calls.display(),
+        refuse_path.display(),
+        status,
+        shell,
+    );
+    fs::write(&bin, script).unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+    (bin, calls)
+}
+
+#[test]
+fn slotted_revive_transfers_the_slot_to_the_new_harness() {
+    // #1130 restore-slot-rebind: a standalone revive rebinds like restart does.
+    let (fixture, mut old) = recoverable("claude", false);
+    record_existing_slot(&fixture, &mut old);
+    let (bin, calls) = revive_fake_wrkslots(&fixture, pinned_pid(&old), false);
+    let mut manager = fixture.manager();
+    manager.revive_wrkslots_executable = Some(bin);
+    let result = manager.revive("worker", false, None, TIMEOUT).unwrap();
+    assert_eq!(result["revived"], true, "{result}");
+    assert_eq!(result["slot_owner"], "transferred", "{result}");
+    let new = manager.load("worker").unwrap();
+    let calls = fs::read_to_string(&calls).unwrap();
+    assert!(calls.contains("status --slot existing_slot"), "{calls}");
+    assert!(
+        calls.contains(&format!(
+            "transfer-owner existing_slot --agent slot-agent --owner-pid {} \
+             --expected-generation 3",
+            pinned_pid(&new)
+        )),
+        "{calls}"
+    );
+}
+
+#[test]
+fn slotted_revive_reports_owed_when_the_transfer_is_refused() {
+    let (fixture, mut old) = recoverable("claude", false);
+    record_existing_slot(&fixture, &mut old);
+    let (bin, _calls) = revive_fake_wrkslots(&fixture, pinned_pid(&old), true);
+    let mut manager = fixture.manager();
+    manager.revive_wrkslots_executable = Some(bin);
+    let result = manager.revive("worker", false, None, TIMEOUT).unwrap();
+    assert_eq!(result["revived"], true, "{result}");
+    assert!(
+        result["slot_owner"]["owed"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("REFUSED")),
+        "{result}"
+    );
+    assert!(manager.load("worker").is_ok(), "the revive still succeeds");
+}
+
+#[test]
+fn live_slotted_revive_plan_reports_ownership_without_transferring() {
+    // A second revive while the harness lives changes nothing: the plan
+    // reads the slot owner and reports already-owned, or owed with the
+    // rebind remedy, and never calls transfer-owner over a live harness.
+    for owner_matches in [true, false] {
+        let (fixture, mut old) = recoverable("claude", false);
+        record_existing_slot(&fixture, &mut old);
+        fixture.client.dead_panes.lock().unwrap().clear();
+        fixture.client.started.store(true, Ordering::Relaxed);
+        let owner = if owner_matches {
+            pinned_pid(&old)
+        } else {
+            999_999
+        };
+        let (bin, calls) = revive_fake_wrkslots(&fixture, owner, false);
+        let mut manager = fixture.manager();
+        manager.revive_wrkslots_executable = Some(bin);
+        let before = files(&fixture.root.join("registry"));
+        let plan = manager.revive("worker", true, None, TIMEOUT).unwrap();
+        assert_eq!(plan["action"], "skip", "{plan}");
+        if owner_matches {
+            assert_eq!(plan["slot_owner"], "already-owned", "{plan}");
+        } else {
+            assert!(
+                plan["slot_owner"]["owed"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("rebind-slot")),
+                "{plan}"
+            );
+        }
+        let calls = fs::read_to_string(&calls).unwrap_or_default();
+        assert!(calls.contains("status"), "{calls}");
+        assert!(!calls.contains("transfer-owner"), "{calls}");
+        assert_eq!(files(&fixture.root.join("registry")), before);
+    }
+}
+
+#[test]
+fn revive_without_a_slot_makes_no_wrkslots_calls() {
+    let (fixture, old) = recoverable("claude", false);
+    let (bin, calls) = revive_fake_wrkslots(&fixture, pinned_pid(&old), false);
+    let mut manager = fixture.manager();
+    manager.revive_wrkslots_executable = Some(bin);
+    let result = manager.revive("worker", false, None, TIMEOUT).unwrap();
+    assert_eq!(result["revived"], true, "{result}");
+    assert!(result.get("slot_owner").is_none(), "{result}");
+    assert!(
+        !calls.exists() || fs::read_to_string(&calls).unwrap().is_empty(),
+        "a non-slot revive never consults wrkslots"
+    );
+}
+
 // --- Native ids captured at start and adopt (#916 muse-native-session-id) -----------------------
 
 /// Pretend the agent's processes hold these files open until the guard drops.

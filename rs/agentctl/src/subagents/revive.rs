@@ -2216,6 +2216,57 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             "native_session":conversation(record).ok(), "action":action, "reason":reason })
     }
 
+    /// Slot ownership for a live-skip plan (#1130 restore-slot-rebind): read
+    /// the slot's status row and compare its owner pid with the pinned live
+    /// harness pid. `None` when the record names no slot; otherwise
+    /// `"already-owned"` when they match, or `{"owed": ...}` with the rebind
+    /// remedy. This never transfers over a live harness — only the
+    /// `finish_revive` path, behind its death proof, rebinds — and a status
+    /// read mutates nothing, so an already-owned slot needs no new write.
+    fn live_slot_owner(&self, record: &AgentRecord) -> Option<Value> {
+        let slot = record.slot.as_deref()?;
+        let owed = |reason: String| {
+            Some(json!({"owed": format!(
+                "{reason}; run `agentctl rebind-slot {}`", record.name
+            )}))
+        };
+        let Some(pid) = record
+            .harness_identity
+            .as_ref()
+            .or(record.custom_process_identity.as_ref())
+            .map(|identity| identity.pid)
+        else {
+            return owed(format!(
+                "slot {slot} ownership is unverified: the live harness has no pinned process"
+            ));
+        };
+        let Some(project) = record.slot_project.as_deref() else {
+            return owed(format!(
+                "slot {slot} ownership is unverified: the record names no slot project"
+            ));
+        };
+        let Some(wrkslots) = project_wrkslots(&self.registry) else {
+            return owed(format!(
+                "slot {slot} ownership is unverified: no wrkslots found"
+            ));
+        };
+        match crate::restore::slot_row(
+            &crate::restore::SystemHost,
+            &wrkslots,
+            Path::new(project),
+            slot,
+        ) {
+            Ok(row) if row["owner"]["pid"].as_u64() == Some(pid) => Some(json!("already-owned")),
+            Ok(row) => owed(format!(
+                "slot {slot} is owned by {}, not by the live harness pid {pid}",
+                row["owner"]["pid"]
+                    .as_u64()
+                    .map_or_else(|| "no process".to_owned(), |owner| format!("pid {owner}"))
+            )),
+            Err(error) => owed(format!("slot {slot} ownership is unverified: {error}")),
+        }
+    }
+
     /// Inspect the same generations that completion will use, without acquiring locks or saving.
     fn pending_revive_plan(&self, journal: &Journal, old: &AgentRecord, stopped: &[u8]) -> Value {
         let inspection = (|| -> Result<()> {
@@ -3299,11 +3350,12 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 ));
             }
             if self.revive_liveness(&record) == ProcessLiveness::Alive {
-                return Ok(self.revive_plan_document(
-                    &record,
-                    "skip",
-                    "recorded harness process is alive",
-                ));
+                let mut plan =
+                    self.revive_plan_document(&record, "skip", "recorded harness process is alive");
+                if let Some(slot_owner) = self.live_slot_owner(&record) {
+                    plan["slot_owner"] = slot_owner;
+                }
+                return Ok(plan);
             }
             return Ok(match self.preflight_revive(&record, startup_timeout) {
                 Ok(_) => self.revive_plan_document(
@@ -4154,6 +4206,15 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         result["archive"] = json!(archive_path);
         result["pane_closed"] = json!(!keep_pane);
         result["tab_closed"] = json!(tab_closed);
+        // Bind the new harness as the slot's owner, as restart does (#1130
+        // restore-slot-rebind): a refusal is reported owed, never raised, so
+        // the revive still succeeds. Non-slot revives gain no key.
+        if candidate.slot.is_some() {
+            result["slot_owner"] = match self.rebind_slot(&journal.name) {
+                Ok(_) => json!("transferred"),
+                Err(error) => json!({"owed": error.to_string()}),
+            };
+        }
         Ok(result)
     }
 

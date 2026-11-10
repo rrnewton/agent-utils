@@ -1613,7 +1613,12 @@ fn wrkslots_argv(wrkslots: &Path, project: &Path, arguments: &[&str]) -> Vec<Str
 }
 
 /// One slot's active row in `project`, read with `wrkslots status --slot SLOT --format json`.
-fn slot_row(host: &dyn Host, wrkslots: &Path, project: &Path, slot: &str) -> Result<Value> {
+pub(crate) fn slot_row(
+    host: &dyn Host,
+    wrkslots: &Path,
+    project: &Path,
+    slot: &str,
+) -> Result<Value> {
     // Wait on a busy state lock instead of dropping the bind (#786): `--wait-lock 30`
     // plus two retries cover the separate config lock, which reports the same refusal.
     let mut last_error = String::new();

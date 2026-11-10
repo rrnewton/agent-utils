@@ -2208,10 +2208,118 @@ def test_revive_rechecks_slot_mapping_and_reuses_recorded_boxing(
             manager.revive("worker")
         assert calls == [] and len(fake.launched) == 1
     else:
-        assert manager.revive("worker")["revived"] is True
+        result = manager.revive("worker")
+        assert result["revived"] is True
+        # This edition has no rebind_slot, so the transfer is reported owed
+        # (mirroring restart) rather than silently dropped (#1130).
+        assert result["slot_owner"] == {
+            "owed": "this edition cannot transfer slot ownership; run `agentctl rebind-slot`"}
         assert calls == [("w1:p2", "boxed-shell-command")]
         record = manager.get("worker")
         assert (record.slot, record.slot_project, record.slot_isolation) == (old.slot, old.slot_project, old.slot_isolation)
+
+
+def _prepare_slotted_revive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> tuple[ManagedAgents, FakeManagedClient, AgentRecord]:
+    """A dead slotted worker whose boxed relaunch needs no real wrkslots."""
+    from agentctl import revive as recovery
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    old.slot, old.slot_project, old.slot_isolation = "worker-slot", str(tmp_path), "userns"
+    spec = old.launch_spec
+    assert spec is not None
+    old.set_launch_spec({**spec, "slot": old.slot, "slot_project": old.slot_project,
+                         "slot_isolation": old.slot_isolation})
+    manager._save(old)
+    monkeypatch.setattr(recovery, "_slot_shell_command",
+        lambda *_args, **_kwargs: ("boxed-shell-command", str(tmp_path), "userns"))
+    monkeypatch.setattr(fake, "enter_slot_sandbox",
+        lambda _pane, _command, *, timeout: None, raising=False)
+    return manager, fake, old
+
+
+def test_revive_transfers_slot_ownership_and_reports_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #1130 restore-slot-rebind: a standalone revive rebinds like restart does.
+    manager, _fake, _old = _prepare_slotted_revive(tmp_path, monkeypatch)
+    rebound: list[str] = []
+    monkeypatch.setattr(manager, "rebind_slot", rebound.append, raising=False)
+    result = manager.revive("worker")
+    assert result["revived"] is True
+    assert result["slot_owner"] == "transferred"
+    assert rebound == ["worker"]
+
+
+def test_revive_reports_owed_when_the_slot_transfer_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake, _old = _prepare_slotted_revive(tmp_path, monkeypatch)
+
+    def refuse(_name: str) -> None:
+        raise AgentDeliveryError("slot rebind refused: transfer-owner refused: REFUSED")
+
+    monkeypatch.setattr(manager, "rebind_slot", refuse, raising=False)
+    result = manager.revive("worker")
+    assert result["revived"] is True
+    assert result["slot_owner"] == {
+        "owed": "slot rebind refused: transfer-owner refused: REFUSED"}
+    assert manager.get("worker").slot == "worker-slot"
+
+
+@pytest.mark.parametrize("owner_matches", [True, False])
+def test_live_slotted_revive_plan_reports_ownership_without_transferring(
+    owner_matches: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A second revive while the harness lives changes nothing: the plan
+    # reads the slot owner and reports already-owned, or owed with the
+    # rebind remedy, and never calls transfer-owner over a live harness.
+    manager, fake, old = prepare_revive(tmp_path, monkeypatch)
+    old.slot, old.slot_project, old.slot_isolation = "worker-slot", str(tmp_path), "userns"
+    spec = old.launch_spec
+    assert spec is not None
+    old.set_launch_spec({**spec, "slot": old.slot, "slot_project": old.slot_project,
+                         "slot_isolation": old.slot_isolation})
+    manager._save(old)
+    monkeypatch.setattr(fake, "process_liveness", lambda _identity: "alive", raising=False)
+    identity = old.harness_anchor if old.adapter == "herdr" else old.custom_process_identity
+    assert identity is not None
+    owner = identity.pid if owner_matches else 999999
+    calls = tmp_path / "wrkslots-calls"
+    script = tmp_path / "fake-wrkslots"
+    status = json.dumps({"active": [{
+        "slot": "worker-slot", "generation": 3, "agent": "slot-agent",
+        "owner": {"pid": owner}}]})
+    script.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {str(calls)!r}\n"
+        "case \"$*\" in *status*) "
+        f"printf '%s\\n' {status!r}; exit 0 ;; "
+        "*) echo unexpected >&2; exit 9 ;; esac\n",
+        encoding="utf-8")
+    script.chmod(0o755)
+    monkeypatch.setenv("AGENTCTL_WRKSLOTS_BIN", str(script))
+    plan = manager.revive("worker", dry_run=True)
+    assert plan["action"] == "skip"
+    if owner_matches:
+        assert plan["slot_owner"] == "already-owned"
+    else:
+        owed = plan["slot_owner"]
+        assert isinstance(owed, dict) and "rebind-slot" in str(owed["owed"])
+    logged = calls.read_text(encoding="utf-8")
+    assert "status" in logged and "transfer-owner" not in logged
+
+
+def test_revive_without_a_slot_reports_no_slot_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _fake, _old = prepare_revive(tmp_path, monkeypatch)
+    rebound: list[str] = []
+    monkeypatch.setattr(manager, "rebind_slot", rebound.append, raising=False)
+    result = manager.revive("worker")
+    assert result["revived"] is True
+    assert "slot_owner" not in result
+    assert rebound == []
 
 
 def test_revive_heals_a_slot_project_recorded_as_the_slot_itself(
