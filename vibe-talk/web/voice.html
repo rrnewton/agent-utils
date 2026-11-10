@@ -524,7 +524,10 @@
               </div>
             </div>
 
-            <div id="pane-discord" hidden>
+            <!-- `data-freshness` is static (#1210): the floating line's room at the list's head is
+                 reserved for as long as this pane is shown, so the scroller's geometry never
+                 changes when freshness appears, clears, or is reworded. -->
+            <div id="pane-discord" data-freshness hidden>
               <!--
                 NOTHING LIVES ABOVE THE MESSAGES ANY MORE, and that is the whole point.
                 `#83 channel-selector-in-bar` already found this once: a control placed here is

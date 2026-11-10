@@ -4307,7 +4307,9 @@ function renderChannelFreshness() {
   // along that line across the top of the list.
   pill.hidden = text === "" || screens.view() !== "discord" ||
     (!gesture.hidden && gesture.getAttribute("data-edge") !== "end") || searchField.open();
-  reserveFreshnessRoom(text !== "");
+  // No room is reserved or released here (#1210): the pane carries `data-freshness` statically,
+  // so the list's top edge stands at the floating line's foot for as long as the pane is shown
+  // and the scroller never resizes as freshness appears, clears, or is reworded.
 }
 
 
@@ -4348,29 +4350,25 @@ function renderSideFreshness() {
 }
 
 /**
- * `#32 freshness-pill-overlap`. The pill's height at the head of the channel's list, so that the pill
- * never covers the list's header. Keyed to there being something to say, not to the pill being
- * shown: giving way to a pull or to the other view must not shift the list.
+ * The page drew a snapshot for one channel and mode; `/client-config` may describe another.
  *
- * `#324 live-pill-covers-row`. The room is the list's top edge moved down to the floating line's
- * foot (web/voice.css), no longer padding at the head of the pane, which scrolled away and left the
- * pill over whatever row was passing. The attribute on the pane is still what asks for it.
- *
- * Through `holdingReader`, because the room is added ABOVE a reader who has scrolled down, and
- * browser scroll anchoring is suppressed for exactly this change — a change of the scroller's own
- * size above every row. Without it a failed refresh pushed the line being read, or the newest line,
- * down by the pill's height.
+ * `#189 restore-ui-state`. The view is decided again rather than reset to Main, so a channel the
+ * saved shell called threadless whose provider has threads after all opens in All — here, once —
+ * unless the reader chose a view. Nothing is read here: with the channel on screen, what asked for
+ * sign-in reads the view now up next — a reopen's owed read, or the poll of a page that opened
+ * offline — and a read of its own would be a second one.
  */
-function reserveFreshnessRoom(reserve) {
-  const pane = el("pane-discord");
-  if (pane.hasAttribute("data-freshness") === reserve) return;
-  const toggle = () => {
-    if (reserve) pane.setAttribute("data-freshness", "");
-    else pane.removeAttribute("data-freshness");
-  };
-  // The pane is not on screen in the other view; the list that is must not be moved on its behalf.
-  if (screens.view() === "discord") holdingReader(toggle);
-  else toggle();
+function reconcileChannelSnapshot(before) {
+  if (before.key === channelContextKey() && before.threading === providerFacts.threading()) return;
+  clearChannelScreen();
+  openChannelView();
+  threadPresence.forget();
+  hydrateChannelScope();
+  restoreChannelComposer();
+  voiceCall().renderControls();
+  // Threads or none, as sign-in says: one column or two decided again. `#229 desktop-two-column`.
+  renderColumns();
+  saveUiState();
 }
 
 // The record itself — read back from this window's storage and the device's, checked on the way back

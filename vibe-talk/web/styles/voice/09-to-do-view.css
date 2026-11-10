@@ -652,7 +652,12 @@
    it was, and the list scrolls as far, but nothing is drawn under the pill or the glass. The fade
    under the header shortens to the scroller's own top padding, so the first row is never faded.
    Only while the channel's pane is the one shown, and not while the search bar is open, which the
-   pill gives way to and which makes its own room. */
+   pill gives way to and which makes its own room.
+
+   `#1210 ui-stability-no-async-shift`. The pane carries `data-freshness` statically (voice.html),
+   so this room is held for as long as the pane is shown — before the first read says anything,
+   and across every rewording after it. The scroller's geometry is therefore constant; no script
+   reserves or releases the room, and nothing resizes the list when freshness changes. */
 #screen-main:not([data-searching]) > #scroll-area:has(> #pane-discord[data-freshness]:not([hidden])) {
   margin-top: calc(var(--float-line) + max(var(--freshness-box), var(--search-disc)) / 2);
   -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 0.35rem);
