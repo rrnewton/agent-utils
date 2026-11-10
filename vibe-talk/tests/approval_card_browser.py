@@ -2322,18 +2322,26 @@ def two_columns_opened_case(page: Page, url: str, voice: FakeVoice, api: FakeApi
             if page.evaluate(COLUMNS_ATTR_JS) != there or (start == 2 and page.evaluate(PICKED_VIEW_JS) != "flat"):
                 view_key(page, mod, start, None, there)
             wheel_to_foot(page)
+            # `#1135 raw-message-page`: the channel composer at the foot is taller by its new
+            # row, so 40px up from the foot can leave every Main row above the viewport; wheel
+            # on until a row straddles the top edge, the reader this case then tracks.
             wheel_up(page, 40)
             before_trip = still(page)
-            check(isinstance(before_trip["first"], dict) and 24 < rect(before_trip, "gap") < 100,
-                  f"{where}: the premise, a reader 40px up {label}: {before_trip}")
+            for _ in range(10):
+                if isinstance(before_trip["first"], dict):
+                    break
+                wheel_up(page, 20)
+                before_trip = still(page)
+            check(isinstance(before_trip["first"], dict) and 24 < rect(before_trip, "gap") < 260,
+                  f"{where}: the premise, a reader up {label} on a row straddling the top: {before_trip}")
             view_key(page, mod, 4 if start == 2 else 1, None, "two" if start == 2 else None)
             away = still(page)
             check(rect(away, "gap") <= 1,
-                  f"{where}: the premise, the reader 40px up {label} at the foot after the change ({away})")
+                  f"{where}: the premise, the reader up {label} at the foot after the change ({away})")
             view_key(page, mod, back_digit if start == 2 else 4, None, None if start == 2 else "two")
             returned = still(page)["first"]
             check(same_row(before_trip["first"], returned),
-                  f"{where}: the way back moved the row a reader 40px up {label} was on from {before_trip['first']}"
+                  f"{where}: the way back moved the row a reader up {label} was on from {before_trip['first']}"
                   f" to {returned}")
         check(not api.commits and not api.cancels and api.proposal is not None,
               f"{where}: a view key posted or withdrew the draft ({api.commits}, {api.cancels})")
@@ -2342,7 +2350,7 @@ def two_columns_opened_case(page: Page, url: str, voice: FakeVoice, api: FakeApi
         api.older_threads = 0
     return (f"{where}: a reader at the foot of Main and of All at the left column's foot by {mod}+4, Send tappable,"
             f" and at it again by {mod}+1 and {mod}+2; one 400px up either on their row; one 40px up All on their"
-            f" row again by {mod}+4 and {mod}+2, and one 40px up Main in two columns by {mod}+1 and {mod}+4")
+            f" row again by {mod}+4 and {mod}+2, and one up Main in two columns on their row by {mod}+1 and {mod}+4")
 
 
 # Point 18: the list on screen, the channel's or the call's, and the reader against it: how far above its foot

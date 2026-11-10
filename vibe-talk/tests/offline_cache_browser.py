@@ -4029,7 +4029,12 @@ def pin_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width:
             check(not chip["problems"], f"{label}, the pinned chip in the dark theme: {chip['problems']}")
 
             # The ⋯ menu, opened by a real tap: on the pinned row, whose chip takes room on its meta
-            # line, and closed by Escape; then on an unpinned one, left open for its Pin.
+            # line, and closed by Escape; then on an unpinned one, left open for its Pin. Row 200 is
+            # brought into view first (`#1135 raw-message-page`: the taller composer at the foot
+            # leaves it clipped above the list under the top bar, where no finger could reach it).
+            page.evaluate("() => document.querySelector('#discord-log > li[data-id=\"200\"]')"
+                          ".scrollIntoView({block: 'center'})")
+            page.wait_for_timeout(300)
             for row_id in ("201", "200"):
                 hidden = f"document.querySelector('#discord-log > li[data-id=\"{row_id}\"] .row-more-menu').hidden"
                 tap(f'#discord-log > li[data-id="{row_id}"] .row-more-button')

@@ -65,6 +65,23 @@ import page_sources
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType
 
+
+class CollapseApi(ColumnsApi):
+    """The two-column fixture with the runner thread's last reply one line long.
+
+    `#1135 raw-message-page` put a row under each channel box, so the composer at the foot of
+    the right column is taller and, at the foot, the last reply's top already sits above the
+    column's middle: the overscroll fit (`#338`) then has no room to give and PgDn opens
+    nothing, so the room this walk exercises never appears. A one-line last reply puts its
+    top below the middle at the foot, so the fit must open the room for PgDn to reveal.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        for row in self.messages:
+            if row["id"] == "221":
+                row["content"] = "Reply 221 in the thread."
+
 # (label, width, height, colour scheme, walk).
 SIZES = (
     ("phone-393-dark", 393, 852, "dark", "phone"),
@@ -179,7 +196,7 @@ def main() -> int:
 def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int, scheme: str,
          kind: str) -> str:
     """One reader at one size in one scheme, against a fresh fake API and a fresh browser profile."""
-    api = ColumnsApi()
+    api = CollapseApi()
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
