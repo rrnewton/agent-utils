@@ -16,6 +16,7 @@ pub mod cli;
 pub mod daemon;
 pub mod help_texts;
 pub mod lifecycle;
+pub mod mcp;
 pub mod ownership;
 pub mod procstat;
 pub mod registry;

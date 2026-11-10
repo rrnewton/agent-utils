@@ -17,6 +17,7 @@ agent-queue = { version = "0.1.0", path = "../agent-queue" }
 term-backend = { version = "0.1.0", path = "../term-backend" }
 chat-subscription = { version = "0.1.0", path = "../chat-subscription" }
 chat-subscription-plugin = { version = "0.1.0", path = "../chat-subscription-plugin" }
+base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 clap = { version = "4.5", features = ["derive"] }
 fs2 = "0.4"
@@ -24,6 +25,7 @@ libc = "0.2"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
+sha1 = "0.10"
 sha2 = "0.10"
 signal-hook = "0.4.4"
 unicode-width = { version = "0.2", default-features = false }

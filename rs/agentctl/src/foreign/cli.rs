@@ -1,8 +1,7 @@
 //! Command dispatcher for persistent foreign-harness workers.
 //!
-//! Every command but `mcp` (a later slice) runs on the Rust
-//! lifecycle; `mcp` refuses by name rather than silently doing
-//! something else.
+//! Every command runs on the Rust lifecycle; `mcp` (slice B3-8)
+//! serves the stdio JSON-RPC tool surface from [`super::mcp`].
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1224,10 +1223,7 @@ pub fn main(arguments: &[String]) -> i32 {
         "migrate" => migrate_command(rest),
         "inbox" => inbox_command(rest),
         "keeper" => keeper_command(rest),
-        "mcp" => {
-            eprintln!("herdr-subagents: the Rust edition has not ported 'mcp' yet");
-            2
-        }
+        "mcp" => super::mcp::run(),
         _ => unreachable!("command list checked"),
     }
 }
