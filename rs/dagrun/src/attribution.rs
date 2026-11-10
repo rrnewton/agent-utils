@@ -159,7 +159,7 @@ pub const STEP_NONCE_ENV: &str = "DAGRUN_STEP";
 /// The scheduler owns the path and installs it after the manifest-provided
 /// environment, so a DAG cannot redirect the evidence to a stale or shared
 /// file. The file format is documented in the crate README.
-pub const TEST_COUNTS_PATH_ENV: &str = "DAGRUN_TEST_COUNTS_PATH";
+pub use testrun_core::TEST_COUNTS_PATH_ENV;
 const MAX_COMPONENT_BYTES: usize = 255;
 
 /// Monotonic per-process counter making each step's nonce unique within this runner.

@@ -10,6 +10,7 @@ version, license, README, and embedded user guide.
 | `chat-subscription` | library | Model ordered inbound events, replay gaps, and durable acknowledgement boundaries. |
 | `chat-subscription-plugin` | library | Carry the subscription contract over a bounded, versioned process protocol. |
 | `chat-subscription-slack` | `agentctl-slack-plugin`, `agentctl-slack-outbound` | Slack subscription plugin and bot-identity reply helper for `agentctl chat`. |
+| `testrun-core` | library | Process-group CPU accounting from procfs and structured test-result reports, for test harnesses. |
 | `dagrun` | `dagrun`, `cpuset-alloc` | Run and inspect resource-aware CI DAGs; reserve hard-isolated CPU sets for benchmarks. |
 | `tick-hub` | `tick-hub` | Evaluate cadenced reminders and health checks in one deterministic tick. |
 | `pr-landing-planner` | `pr-landing-planner` | Produce advisory, conflict-aware pull-request landing plans. |
@@ -31,6 +32,11 @@ cargo install agentctl
 `herdr-run` reads `.herdr-run.yaml` with its own YAML-subset parser and depends on no YAML
 library. The golden corpora under `rs/herdr-run/testdata/` pin its text, configuration, policy,
 protocol, readiness, and run-record behaviour, and its unit tests load every one of them.
+
+`testrun-core` holds the process CPU accounting and structured test results that `dagrun`
+re-exports, for harnesses that want them without the runner. Its dependencies are fixed at
+serde (without derive), serde_json and libc; validation fails if a YAML crate, another build
+script or another proc-macro enters its tree.
 
 The two chat-subscription libraries are ordinary Cargo dependencies for provider
 and host implementations; they do not install command-line programs.

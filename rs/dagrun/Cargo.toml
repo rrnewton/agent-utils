@@ -42,6 +42,9 @@ signal-hook = "0.4.4"
 # sched_getaffinity/sched_setaffinity binding; the two calls are the ONLY `unsafe` this crate's own
 # code performs and are wrapped + documented in cgroup.rs. libc is already in the dependency tree.
 libc = "0.2"
+# Process-group CPU accounting, structured test results and the shared test-counts
+# environment variable; re-exported under this crate's original module paths.
+testrun-core = { version = "0.1.0", path = "../testrun-core" }
 
 [[bin]]
 name = "dagrun"

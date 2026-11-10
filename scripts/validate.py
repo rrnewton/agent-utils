@@ -1416,6 +1416,12 @@ def self_test() -> int:
         {"dagrun", "experiment-runner"},
     )
     expect(
+        ["rs/testrun-core/src/proccpu.rs"],
+        {RUST},
+        "the library dagrun re-exports re-tests dagrun and everything that depends on it",
+        {"dagrun", "experiment-runner"},
+    )
+    expect(
         ["cross/differential.py"],
         {CROSS},
         "the differential harness also selects its direct environment-regression tests",

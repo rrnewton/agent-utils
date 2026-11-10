@@ -29,7 +29,9 @@ pub mod io;
 pub mod memory_feedback;
 pub mod model;
 pub mod perflog;
-pub mod proccpu;
+pub use testrun_core::proccpu;
+#[cfg(test)]
+mod proccpu_fallback_tests;
 mod procstat;
 pub mod profile_capture;
 pub mod profile_enrich;
@@ -41,7 +43,7 @@ pub mod sizing;
 pub mod summary;
 pub mod sweep;
 pub mod sync;
-pub mod test_results;
+pub use testrun_core::test_results;
 pub mod viz;
 
 pub use ambient::{

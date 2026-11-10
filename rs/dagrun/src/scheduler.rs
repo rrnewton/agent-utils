@@ -6892,7 +6892,27 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
         std::fs::create_dir_all(&root).unwrap();
         let source = root.join("helper.c");
         let binary = root.join("helper");
-        std::fs::write(&source, include_str!("../tests/fixtures/proccpu-helper.c")).unwrap();
+        // The leader thread exits at once; its worker prints "worker" and ends the whole
+        // process when its input closes.
+        std::fs::write(
+            &source,
+            r#"#include <pthread.h>
+#include <stdio.h>
+#include <unistd.h>
+static void *worker(void *unused) {
+    (void)unused;
+    puts("worker"); fflush(stdout);
+    while (getchar() != EOF) {}
+    _exit(0);
+}
+int main(void) {
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, worker, NULL)) return 3;
+    pthread_exit(NULL);
+}
+"#,
+        )
+        .unwrap();
         assert!(Command::new("cc")
             .args(["-Wall", "-Wextra", "-Werror", "-pthread"])
             .arg(&source)
@@ -6902,7 +6922,6 @@ nextest-test-results: refusing because the selected set changed\n" as &[u8];
             .unwrap()
             .success());
         let mut child = Command::new(&binary)
-            .arg("leader")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()

@@ -93,7 +93,7 @@ def test_refuses_degenerate_process_groups(tmp_path: Path) -> None:
 
 
 def test_shared_canonical_lifecycle_corpus() -> None:
-    data: object = json.loads((Path(__file__).parents[2] / "rs/dagrun/tests/fixtures/proccpu-generation.json").read_text())
+    data: object = json.loads((Path(__file__).parents[2] / "rs/testrun-core/tests/fixtures/proccpu-generation.json").read_text())
     assert isinstance(data, list)
     for case in data:
         assert isinstance(case, dict)
@@ -189,7 +189,7 @@ def test_stat_and_fdinfo_refusals() -> None:
 
 @pytest.fixture
 def native_helper(tmp_path: Path) -> Path:
-    source = Path(__file__).parents[2] / "rs/dagrun/tests/fixtures/proccpu-helper.c"
+    source = Path(__file__).parents[2] / "rs/testrun-core/tests/fixtures/proccpu-helper.c"
     target = tmp_path / "cpu-helper"
     subprocess.run(["cc", "-Wall", "-Wextra", "-Werror", "-pthread", str(source), "-o", str(target)], check=True, timeout=30)
     return target
@@ -693,7 +693,7 @@ def test_native_shared_sampling_cost_and_availability(native_helper: Path, group
 
 def test_shared_session_cache_corpus() -> None:
     """The Rust edition runs the same corpus, so both make the same read decisions."""
-    data: object = json.loads((Path(__file__).parents[2] / "rs/dagrun/tests/fixtures/proccpu-session-cache.json").read_text())
+    data: object = json.loads((Path(__file__).parents[2] / "rs/testrun-core/tests/fixtures/proccpu-session-cache.json").read_text())
     assert isinstance(data, list)
 
     def allocator(raw: object) -> cpu._Allocator | None:

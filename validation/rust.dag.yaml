@@ -143,17 +143,29 @@ steps:
 
   - group: dagrun
     job: test
-    desc: dagrun Rust tests, including boxed integration tests
+    desc: dagrun and testrun-core Rust tests, including boxed integration tests
     cmd: >-
       host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
       RUST_TEST_THREADS=1 python3 scripts/case_timings.py run-cargo -- cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
-      --target "$host_target" --target-dir rs/target/validation-tests -p dagrun ${DAGRUN_EXTRA_ARGS}
+      --target "$host_target" --target-dir rs/target/validation-tests -p dagrun -p testrun-core ${DAGRUN_EXTRA_ARGS}
     cmdtype: cargo-test
     labels: [validation-workspace, validation-rust-workspace-tests, component-dagrun]
     delegated_children: true
     timeout: 28800
     cpu_timeout: 3600
     hint: *rust_test_hint
+
+  - group: dagrun
+    job: testrun-core-deps
+    desc: testrun-core's resolved dependency tree stays serde, serde_json and libc (no YAML crate, extra build script or extra proc-macro)
+    cmd: python3 scripts/check_testrun_core_deps.py --self-test && python3 scripts/check_testrun_core_deps.py
+    jobs_flag: ""
+    labels: [validation-workspace, validation-rust-workspace-tests, component-dagrun]
+    timeout: 1200
+    cpu_timeout: 300
+    hint:
+      est_duration_s: 5
+      classification: light
 
   - group: herdr-run
     job: test

@@ -428,6 +428,7 @@ dependencies = [
  "serde_json",
  "serde_norway",
  "signal-hook 0.4.4",
+ "testrun-core",
 ]
 
 [[package]]
@@ -1300,6 +1301,15 @@ dependencies = [
 name = "term-backend"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "testrun-core"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
  "serde_json",
 ]
 

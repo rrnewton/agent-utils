@@ -1,0 +1,27 @@
+[package]
+name = "testrun-core"
+version = "0.1.0"
+description = "Process-group CPU accounting from procfs and structured test-result reports for test harnesses"
+readme = "README.md"
+keywords = ["testing", "procfs", "cpu-time", "test-results"]
+categories = ["development-tools::testing", "os::linux-apis"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Deliberately small and fixed: serde (no derive feature), serde_json and libc, with
+# default features only, no build script and no proc-macro. The repository's
+# validation checks the resolved dependency tree on every change.
+[dependencies]
+libc = "0.2"
+serde = "1"
+serde_json = "1"
+
+[lib]
+name = "testrun_core"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

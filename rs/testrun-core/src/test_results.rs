@@ -11,6 +11,14 @@ use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
 
+/// Environment variable naming the path where a controlled test runner may write its
+/// structured test results.
+///
+/// The harness owns the path and sets it after any environment the run's own
+/// configuration provides, so a run cannot redirect the evidence to a stale or shared
+/// file.
+pub const TEST_COUNTS_PATH_ENV: &str = "DAGRUN_TEST_COUNTS_PATH";
+
 /// Suffix for the scheduler-owned recovery sibling of a structured-result path.
 ///
 /// A producer uses this only after the primary report has been fully validated

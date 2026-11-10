@@ -113,6 +113,7 @@
     "dagrun": {
       "source_prefixes": [
         "common/docs/dagrun/",
+        "common/docs/testrun-core/",
         "examples/",
         "py/bin/cpuset-alloc",
         "py/bin/dagrun",
@@ -120,7 +121,9 @@
         "rs/bin/cpuset-alloc",
         "rs/bin/dagrun",
         "rs/dagrun/",
+        "rs/testrun-core/",
         "scripts/check_dagrun_examples.py",
+        "scripts/check_testrun_core_deps.py",
         "scripts/dagrun_profile_chart.py",
         "scripts/dagrun_profile_report.py",
         "scripts/irq_survey.py",

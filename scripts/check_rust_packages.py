@@ -50,6 +50,7 @@ CRATES: tuple[Crate, ...] = (
     Crate("term-backend", (), "term_backend", ()),
     Crate("chat-subscription", (), "chat_subscription", ()),
     Crate("chat-subscription-plugin", (), "chat_subscription_plugin", ()),
+    Crate("testrun-core", (), "testrun_core", ()),
     Crate(
         "dagrun",
         ("dagrun", "cpuset-alloc"),
@@ -82,6 +83,7 @@ CRATES: tuple[Crate, ...] = (
 # precedes their registry availability. Dependents are patched to sources extracted from the exact
 # already-inspected dependency archives, never to the live checkout.
 LOCAL_PACKAGE_PATCHES: dict[str, tuple[str, ...]] = {
+    "dagrun": ("testrun-core",),
     "chat-subscription-plugin": ("chat-subscription",),
     "agentctl": (
         "agent-harness", "agent-queue", "chat-subscription", "chat-subscription-plugin",

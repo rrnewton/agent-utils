@@ -760,6 +760,19 @@ static REGISTRY: OnceLock<Mutex<Registry>> = OnceLock::new();
 fn registry() -> &'static Mutex<Registry> {
     REGISTRY.get_or_init(|| Mutex::new(Registry::default()))
 }
+/// The number of process-group registrations that are live in this process: every
+/// [`ProcessGroupCpu`] still alive, plus each group [`subtree_cpu_seconds`] still holds.
+/// Each one is sampled by every shared snapshot.
+pub fn live_registrations() -> Result<usize, Unavailable> {
+    let registry = registry()
+        .lock()
+        .map_err(|_| unavailable("poisoned CPU registry"))?;
+    Ok(registry
+        .owners
+        .values()
+        .filter(|owner| owner.strong_count() > 0)
+        .count())
+}
 impl Registry {
     fn create(&mut self, pgid: u32, path: &Path) -> Result<Arc<Owner>, Unavailable> {
         self.create_bounded(pgid, path, MAX_GROUPS)
@@ -1894,81 +1907,6 @@ mod tests {
             }
             drop(children);
             assert_eq!(fs::read_dir("/proc/self/fd").unwrap().count(), before);
-        }
-    }
-
-    #[test]
-    fn native_scheduler_retains_constructor_and_sample_failure_reasons() {
-        const CASE: &str = "AU_PROCCPU_REASON_CONTROL";
-        if let Ok(stage) = std::env::var(CASE) {
-            fn pressure() {
-                let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-                // SAFETY: only this isolated test subprocess lowers its own soft FD limit.
-                assert_eq!(
-                    unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) },
-                    0
-                );
-                let mut limit = unsafe { limit.assume_init() };
-                limit.rlim_cur = 64;
-                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
-            }
-            let watcher = match stage.as_str() {
-                "registration" => {
-                    pressure();
-                    None
-                }
-                "observation" => Some(std::thread::spawn(|| {
-                    let deadline = Instant::now() + Duration::from_secs(5);
-                    loop {
-                        if registry()
-                            .lock()
-                            .unwrap()
-                            .owners
-                            .values()
-                            .any(|owner| owner.strong_count() > 0)
-                        {
-                            pressure();
-                            return;
-                        }
-                        assert!(Instant::now() < deadline, "registration event deadline");
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                })),
-                _ => panic!("unknown isolated reason case"),
-            };
-            let cfg = crate::io::dag_from_json(r#"{"steps":[{"group":"g","job":"quiet","desc":"known refusal","cmd":"sleep 2.5","cpu_timeout":1,"timeout":30}]}"#).unwrap();
-            let result = crate::scheduler::run_dag(&cfg, 1, false, 0);
-            assert!(result.ok);
-            if let Some(watcher) = watcher {
-                watcher.join().unwrap();
-            }
-            return;
-        }
-        for stage in ["registration", "observation"] {
-            let logs = TmpRoot::new("reason-log");
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(logs.path(), fs::Permissions::from_mode(0o700)).unwrap();
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "proccpu::tests::native_scheduler_retains_constructor_and_sample_failure_reasons", "--nocapture"])
-                .env(CASE, stage).env(crate::attribution::LOG_DIR_ENV, logs.path()).output().unwrap();
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                output.status.success(),
-                "{stage}: {stderr} {}",
-                String::from_utf8_lossy(&output.stdout)
-            );
-            assert_eq!(stderr.matches("CANNOT be enforced").count(), 1, "{stderr}");
-            assert!(
-                stderr.contains(&format!("{stage} failed: descriptor reserve")),
-                "{stderr}"
-            );
-            if stage == "registration" {
-                assert!(
-                    stderr.contains("not retried after waiting starts"),
-                    "{stderr}"
-                );
-            }
-            println!("native scheduler reason {stage}: {stderr}");
         }
     }
 
