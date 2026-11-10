@@ -63,6 +63,7 @@ export interface FoldPane {
   context(): string;
   scroller(): HTMLElement;
   head(): number;
+  foot(): number;
 }
 
 /** The collapsed-lines count in force, as far as a fold reads it (core/settings owns it). */
@@ -514,19 +515,109 @@ export function createFolding(deps: FoldingDependencies): Folding {
   }
 
   /**
-   * `#1167 jump-to-unread-chip`. The newest unread row above the screen, or null: the offer is
-   * only for a reader whose whole screen is already read, with unread waiting above it.
+   * `#1167 jump-to-unread-chip`, held as `#1057` holds its count: the newest unread row above
+   * the screen, as last measured — which list and scroll position it was measured for, and
+   * the row's index and id there. A redraw that changed none of that reads no row's layout
+   * again; in a browser the measure is asked for in the next frame at most once, and where
+   * there are no frames to wait for it is measured now.
    */
+  let unreadHeld: { key: string; index: number; id: string | null } | null = null;
+  /** Whether a measure of the unread row above is already asked for in the next frame. */
+  let unreadDue = false;
+  /** Whether the chip is being drawn again by that measure, which asks for no further one. */
+  let unreadFresh = false;
+
+  function unreadKey(rows: HTMLElement[], pane: FoldPane): string {
+    const area = pane.scroller();
+    return `${deps.activeName()}|${deps.view()}|${pane.context()}|${area.scrollTop}|${area.clientHeight}|${rows.map((row) => `${row.getAttribute("data-id") || ""}:${deps.rowIsRead(row) ? 1 : 0}:${row.hidden ? 1 : 0}:${row.getAttribute("data-collapsed") || ""}:${row.getAttribute("class") || ""}`).join(",")}`;
+  }
+
+  /**
+   * Measure the newest unread row above the screen, or null: the offer is only for a reader
+   * whose whole screen is already read, with unread waiting above it. Row tops do not
+   * decrease, so a binary search finds the first row still on screen and only the rows on
+   * screen are measured after it; the rows above are asked only whether they are read,
+   * which is no layout at all. Every rectangle is read before the chip is written.
+   */
+  function measureUnreadAbove(rows: HTMLElement[], pane: FoldPane): HTMLElement | null {
+    const head = pane.head();
+    const foot = pane.foot();
+    let lo = 0;
+    let hi = rows.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if ((rows[mid] as HTMLElement).getBoundingClientRect().bottom > head) hi = mid;
+      else lo = mid + 1;
+    }
+    if (lo >= rows.length) return null;
+    let firstVisible = -1;
+    for (let at = lo; at < rows.length; at += 1) {
+      const box = (rows[at] as HTMLElement).getBoundingClientRect();
+      if (box.top >= foot) break;
+      if (box.bottom <= head) continue;
+      if (firstVisible < 0) firstVisible = at;
+      if (!deps.rowIsRead(rows[at] as HTMLElement)) return null;
+    }
+    if (firstVisible < 0) return null;
+    for (let at = firstVisible - 1; at >= 0; at -= 1) {
+      if (!deps.rowIsRead(rows[at] as HTMLElement)) return rows[at] as HTMLElement;
+    }
+    return null;
+  }
+
+  function holdUnread(rows: HTMLElement[], pane: FoldPane, target: HTMLElement | null): void {
+    unreadHeld = {
+      key: unreadKey(rows, pane),
+      index: target ? rows.indexOf(target) : -1,
+      id: target ? target.getAttribute("data-id") || null : null,
+    };
+  }
+
+  function heldUnread(rows: HTMLElement[]): HTMLElement | null {
+    if (!unreadHeld || unreadHeld.index < 0) return null;
+    const row = rows[unreadHeld.index] as HTMLElement | undefined;
+    return row && (row.getAttribute("data-id") || null) === unreadHeld.id ? row : null;
+  }
+
+  /** Measure the unread row above in the next frame, and draw the chip again where it moved. */
+  function scheduleUnread(): void {
+    if (unreadDue) return;
+    unreadDue = true;
+    const again = deps.inThisColumn(() => {
+      unreadDue = false;
+      if (deps.screen() !== "main" || deps.view() !== "discord" || deps.listEmptied()) return;
+      const pane = deps.channelPane();
+      const rows = deps.paneRows(pane);
+      const before = unreadHeld;
+      holdUnread(rows, pane, rows.length ? measureUnreadAbove(rows, pane) : null);
+      if (before && unreadHeld && before.key === unreadHeld.key && before.index === unreadHeld.index) return;
+      unreadFresh = true;
+      try {
+        renderJumpUnread();
+      } finally {
+        unreadFresh = false;
+      }
+    });
+    requestAnimationFrame(() => again());
+  }
+
   function unreadAboveTarget(): HTMLElement | null {
     if (deps.screen() !== "main" || deps.view() !== "discord" || deps.listEmptied()) return null;
     const pane = deps.channelPane();
     const rows = deps.paneRows(pane);
     if (rows.length === 0) return null;
-    const visible = rows.filter((row) => deps.rowInView(pane, row));
-    if (visible.length === 0 || visible.some((row) => !deps.rowIsRead(row))) return null;
-    const firstVisible = rows.indexOf(visible[0] as HTMLElement);
-    const above = rows.slice(0, firstVisible).filter((row) => !deps.rowIsRead(row));
-    return above.length ? (above[above.length - 1] as HTMLElement) : null;
+    if (unreadFresh) return heldUnread(rows);
+    if (unreadHeld && unreadHeld.key === unreadKey(rows, pane)) {
+      const held = heldUnread(rows);
+      if (held || unreadHeld.index < 0) return held;
+    }
+    if (typeof requestAnimationFrame === "function" && unreadHeld) {
+      scheduleUnread();
+      return heldUnread(rows);
+    }
+    const target = measureUnreadAbove(rows, pane);
+    holdUnread(rows, pane, target);
+    return target;
   }
 
   function renderJumpUnread(): void {
@@ -538,7 +629,15 @@ export function createFolding(deps: FoldingDependencies): Folding {
   }
 
   function jumpToUnread(): void {
-    const target = unreadAboveTarget();
+    const target = (() => {
+      if (deps.screen() !== "main" || deps.view() !== "discord" || deps.listEmptied()) return null;
+      const pane = deps.channelPane();
+      const rows = deps.paneRows(pane);
+      if (rows.length === 0) return null;
+      const measured = measureUnreadAbove(rows, pane);
+      holdUnread(rows, pane, measured);
+      return measured;
+    })();
     if (!target) {
       renderJumpUnread();
       return;
@@ -596,6 +695,7 @@ export function createFolding(deps: FoldingDependencies): Folding {
         el("summarise").hidden = true;
         if (deps.actionMenuOpen()) deps.renderActionMenu();
       }
+      renderJumpUnread();
       deps.applySearch();
       deps.placeBookmarkLine();
       renderJumpNewest();
@@ -615,6 +715,10 @@ export function createFolding(deps: FoldingDependencies): Folding {
     if (deps.actionMenuOpen()) deps.renderActionMenu();
     deps.renderSendUndo();
     deps.renderBookmarkUndo();
+    // The unread chip is measured here, before the search pass below measures the reply
+    // arrows and writes them: every rectangle of this redraw is read before any of its
+    // arrow writes, and the pass in `renderJumpNewest` below then finds the chip held.
+    renderJumpUnread();
     deps.applySearch();
     deps.placeBookmarkLine();
     renderJumpNewest();
