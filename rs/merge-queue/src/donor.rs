@@ -1985,7 +1985,7 @@ impl Store {
                 note.push_str("; busy admission refusal: never a host fault");
             }
             if crate::validate::gh_paced_refusal(&receipt.log_tail)
-                || cause_field.is_some_and(|field| crate::validate::gh_paced_refusal(field))
+                || cause_field.is_some_and(crate::validate::gh_paced_refusal)
             {
                 note.push_str("; pacing-guard refusal: transient, counted, not a host fault");
             }
