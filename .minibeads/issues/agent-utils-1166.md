@@ -1,10 +1,11 @@
 ---
 title: 'switcher-frame-panel: frame the view switcher tab row so the selected cell cannot bleed into Talk'
-status: open
+status: closed
 priority: 1
 issue_type: task
 created_at: 2026-11-09T22:31:16.847801059+00:00
-updated_at: 2026-11-09T22:31:16.847801059+00:00
+updated_at: 2026-11-10T20:39:12.697014130+00:00
+closed_at: 2026-11-10T20:39:12.697013909+00:00
 ---
 
 # Description

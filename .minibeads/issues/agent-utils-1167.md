@@ -1,10 +1,11 @@
 ---
 title: 'jump-to-unread-chip: a chip to jump to the last unread message above the view'
-status: open
+status: closed
 priority: 1
 issue_type: task
 created_at: 2026-11-09T22:31:16.852141660+00:00
-updated_at: 2026-11-09T22:31:16.852141660+00:00
+updated_at: 2026-11-10T20:39:12.700492707+00:00
+closed_at: 2026-11-10T20:39:12.700492497+00:00
 ---
 
 # Description
