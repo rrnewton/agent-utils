@@ -572,8 +572,8 @@ repository (`.git/modules/<name>/`) becomes a linked worktree of that repository
 the superproject's recorded gitlink. A hook's `git submodule update --init` then finds it
 populated and does nothing. The key is opt-in (list it in `ignorable_keys` so an older
 wrkslots ignores it with a warning): sharing prepares the primary submodule repositories
-and the recovery paths for shared layouts are still being extended, so the historical
-private clone stays the default until they are complete. The per-slot cost is the small worktree administration under
+and the recovery paths for shared layouts are still being extended, so the private
+clone stays the default until they are complete. The per-slot cost is the small worktree administration under
 `.git/modules/<name>/worktrees/`; objects and refs live once, in the primary repository, and
 `git gc` there computes reachability over every worktree, so no slot can be pruned out from
 under another. Submodules with no initialized primary module repository keep the stock
