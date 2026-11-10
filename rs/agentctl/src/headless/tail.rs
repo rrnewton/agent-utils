@@ -372,7 +372,7 @@ pub fn render_lines(event: &Event, cx: &Context<'_>) -> Vec<Line> {
                 data["origin"]["tty"].as_str().unwrap_or(""),
             ) {
                 (from, tty) if from.starts_with("console:") && !tty.is_empty() => {
-                    format!("{from} ({})", tty.rsplit('/').next().unwrap_or(tty))
+                    format!("{from} ({})", tty.strip_prefix("/dev/").unwrap_or(tty))
                 }
                 (from, _) => from.to_owned(),
             };
