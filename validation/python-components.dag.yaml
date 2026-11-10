@@ -191,7 +191,7 @@ steps:
       preferred_inner_jobs: 1
       # A full-load run reached the prior 160 MiB learned cap and recorded three OOM kills.
       # Keep an authored 256 MiB floor so the normal runtime margin supplies 320 MiB.
-      rss_baseline_bytes: 268435456
+      rss_baseline_bytes: 536870912
 
   - group: repository-infrastructure
     job: cli-no-optional-deps
@@ -317,7 +317,7 @@ steps:
       est_duration_s: 3
       classification: light
       preferred_inner_jobs: 1
-      rss_baseline_bytes: 268435456
+      rss_baseline_bytes: 603979776
 
   - group: repository-infrastructure
     job: package-contract
@@ -347,7 +347,7 @@ steps:
       est_duration_s: 3
       classification: light
       preferred_inner_jobs: 1
-      rss_baseline_bytes: 268435456
+      rss_baseline_bytes: 671088640
 
   - group: tick-hub
     job: test

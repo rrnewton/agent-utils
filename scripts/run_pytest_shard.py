@@ -204,6 +204,94 @@ class _TimingPlugin:
         )
 
 
+#: A run under a memory cap says once, naming the test just finished, when the capped cgroup's
+#: memory first passes this fraction of its memory.max (#1203).
+_MEMORY_WARN_FRACTION = 0.8
+_MIB = 1024 * 1024
+
+
+def _capped_memory_cgroup(
+    proc_cgroup: Path = Path("/proc/self/cgroup"), root: Path = Path("/sys/fs/cgroup")
+) -> tuple[Path, int] | None:
+    """The nearest cgroup-v2 directory above this process with a finite memory.max, and that cap.
+
+    Under dagrun that is the step's inner cgroup, whose cap an OOM kill enforces; elsewhere there
+    is usually none, and nothing is reported.
+    """
+    try:
+        lines = proc_cgroup.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    relative = next((line[3:] for line in lines if line.startswith("0::")), None)
+    if relative is None:
+        return None
+    directory = root / relative.lstrip("/")
+    while directory != root and root in directory.parents:
+        try:
+            raw = (directory / "memory.max").read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if raw.isdecimal():
+            return directory, int(raw)
+        directory = directory.parent
+    return None
+
+
+def _cgroup_bytes(directory: Path, name: str) -> int | None:
+    try:
+        raw = (directory / name).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return int(raw) if raw.isdecimal() else None
+
+
+@dataclass(eq=False)
+class _MemoryPeakPlugin:
+    """Say how close a capped run came to its memory cap (#1203 cross-skip-accounting-memory-cap).
+
+    dagrun reports an OOM kill at a step's inner cap as peak = cap, which says nothing about the
+    step's real need. So under a finite memory.max this prints, on stderr, one line when the
+    capped cgroup first passes 80% of the cap (flushed at once, so it survives a later kill and
+    names the test that got there) and the cgroup's memory.peak at the end of the session.
+    """
+
+    capped: tuple[Path, int] | None = None
+    warned: bool = False
+
+    def pytest_sessionstart(self, session: pytest.Session) -> None:
+        del session
+        self.capped = _capped_memory_cgroup()
+
+    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
+        if self.capped is None or self.warned or report.when != "teardown":
+            return
+        directory, cap = self.capped
+        current = _cgroup_bytes(directory, "memory.current")
+        if current is not None and current >= cap * _MEMORY_WARN_FRACTION:
+            self.warned = True
+            # The leading newline ends pytest's unterminated progress line.
+            print(
+                f"\nrun_pytest_shard: memory {current / _MIB:.1f} MiB of the "
+                f"{cap / _MIB:.1f} MiB cap after {report.nodeid}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
+        del session, exitstatus
+        if self.capped is None:
+            return
+        directory, cap = self.capped
+        peak = _cgroup_bytes(directory, "memory.peak")
+        if peak is not None:
+            print(
+                f"\nrun_pytest_shard: memory peak {peak / _MIB:.1f} MiB of the "
+                f"{cap / _MIB:.1f} MiB cap",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
 class _PerTestTimeout(AssertionError):
     """One test exceeded its per-test bound; the traceback names where it hung."""
 
@@ -282,7 +370,7 @@ class _TestTimeoutPlugin:
 
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Register the timing collector and the per-test timeout once each."""
+    """Register the timing collector, the per-test timeout and the memory report once each."""
 
     config.addinivalue_line(
         "markers",
@@ -292,6 +380,8 @@ def pytest_configure(config: pytest.Config) -> None:
         config.pluginmanager.register(
             _TestTimeoutPlugin(_env_test_timeout()), name="per-test-timeout"
         )
+    if not config.pluginmanager.hasplugin("memory-peak"):
+        config.pluginmanager.register(_MemoryPeakPlugin(), name="memory-peak")
     import case_timings
 
     if case_timings.requested_directory() is None:
@@ -892,6 +982,24 @@ def test_marker_disables_the_bound():
         _remove_temp_root(fixture_root)
 
 
+def _self_test_capped_memory_cgroup() -> None:
+    """The memory report finds the nearest finite memory.max above the process (#1203)."""
+    with tempfile.TemporaryDirectory() as scratch:
+        root = Path(scratch) / "cgroup"
+        leaf = root / "run.scope" / "step" / "leaf"
+        leaf.mkdir(parents=True)
+        (root / "run.scope" / "memory.max").write_text("max\n", encoding="utf-8")
+        (root / "run.scope" / "step" / "memory.max").write_text("335544320\n", encoding="utf-8")
+        (leaf / "memory.max").write_text("max\n", encoding="utf-8")
+        proc_cgroup = Path(scratch) / "proc-self-cgroup"
+        proc_cgroup.write_text("0::/run.scope/step/leaf\n", encoding="utf-8")
+        assert _capped_memory_cgroup(proc_cgroup, root) == (root / "run.scope" / "step", 335544320)
+        (root / "run.scope" / "step" / "memory.max").write_text("max\n", encoding="utf-8")
+        assert _capped_memory_cgroup(proc_cgroup, root) is None
+        proc_cgroup.write_text("1:name=systemd:/x\n", encoding="utf-8")
+        assert _capped_memory_cgroup(proc_cgroup, root) is None
+
+
 def _self_test() -> int:
     nodeids = [
         "tests/test_a.py::test_matrix[one]",
@@ -979,6 +1087,7 @@ def _self_test() -> int:
     _self_test_sweep()
     _self_test_mounts_under()
     _self_test_keep_on_failure()
+    _self_test_capped_memory_cgroup()
     print("run_pytest_shard --self-test: PASSED")
     return 0
 
@@ -1028,6 +1137,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 plugins=[
                     _ShardPlugin(index=index, count=count),
                     _TestTimeoutPlugin(timeout),
+                    _MemoryPeakPlugin(),
                 ],
             )
         )
