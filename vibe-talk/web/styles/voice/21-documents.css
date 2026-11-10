@@ -205,21 +205,88 @@
   display: none;
 }
 
-/* The reader: rendered document body in the reading width, tables scroll in their box. */
+/* In Documents the reading-width grip would stand over the reader it does not
+   govern — the reader has its own measure, below — with the text spilling
+   under it (`#1236 documents-reader-layout`); it is the message column's,
+   not this view's. The same gate as the search glass above, so no document
+   text can sit under it here. */
+#screen-main:has(#pane-docs:not([hidden])) #width-grip {
+  display: none;
+}
+
+/* The reader: rendered document body, tables scroll in their box. On a desk
+   it is held to its own reading measure (`#1236 documents-reader-layout`):
+   about 90ch and centred, by the desktop regime's own query
+   (`20-desktop-regime.css`), so its lines stop growing with the window; a
+   phone keeps the full width. The bound is the reader's own, not the
+   message column's `--reading-width` — the grip's contract is the message
+   column, and it is gated away above. */
 #doc-body {
   padding: 0 4px 24px;
   overflow-wrap: break-word;
+}
+@media (min-width: 900px) and (pointer: fine) {
+  #doc-body {
+    max-width: 90ch;
+    margin-inline: auto;
+  }
+}
+/* The reader's dress, as the code host dresses the same document (`#1236`):
+   a rule under the top two heading levels, air around a list with its items
+   kept dense inside it, and every other table body row on a slight ground. */
+#doc-body h1,
+#doc-body h2,
+#doc-body h3,
+#doc-body h4,
+#doc-body h5,
+#doc-body h6 {
+  margin: 1.2em 0 0.6em;
+}
+#doc-body > :first-child {
+  margin-top: 0;
+}
+#doc-body h1,
+#doc-body h2 {
+  padding-bottom: 0.3em;
+  border-bottom: 1px solid var(--edge);
+}
+#doc-body p {
+  margin: 0 0 1em;
+}
+#doc-body ul,
+#doc-body ol {
+  margin: 1em 0;
+  /* The wrapped line of an item hangs under its first word, by the list's
+     own padding, not under the bullet. */
+  padding-left: 2em;
+}
+#doc-body li {
+  margin: 0.25em 0;
+}
+#doc-body li > ul,
+#doc-body li > ol {
+  margin: 0.25em 0;
 }
 #doc-body table {
   display: block;
   overflow-x: auto;
   border-collapse: collapse;
+  margin: 0 0 1em;
 }
 #doc-body th,
 #doc-body td {
   border: 1px solid;
   padding: 4px 8px;
   text-align: left;
+}
+#doc-body thead th {
+  background-color: var(--panel);
+}
+/* `--row-hover` is the one surface already judged a visible step off the
+   resting ground in both schemes (`00-frame.css`); the ink over it is the
+   reader's own, unchanged. */
+#doc-body tbody tr:nth-child(even) {
+  background-color: var(--row-hover);
 }
 #doc-body pre {
   overflow-x: auto;

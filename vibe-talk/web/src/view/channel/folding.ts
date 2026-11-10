@@ -539,7 +539,22 @@ export function createFolding(deps: FoldingDependencies): Folding {
       return;
     }
     scrollTools().owed = false;
+    // `#1236 documents-reader-layout`. The fold items act on a message list —
+    // the channel's, or the call transcript's — and the Documents view shows
+    // neither, so none of them is offered there, whichever column this pass
+    // is for. `showView` runs this pass on every switch, which is what takes
+    // them away entering Documents and offers them again leaving it; the
+    // menu's other channel-only items are gated the same way in
+    // `renderControlBar` (`reader-toggle`, `autoplay-toggle`), and
+    // `summarise` below is already the channel's alone.
+    const inDocs = deps.view() === "docs";
     if (deps.side()) {
+      if (inDocs) {
+        el("collapse-all").hidden = true;
+        el("expand-all").hidden = true;
+        el("summarise").hidden = true;
+        if (deps.actionMenuOpen()) deps.renderActionMenu();
+      }
       deps.applySearch();
       deps.placeBookmarkLine();
       renderJumpNewest();
@@ -547,8 +562,8 @@ export function createFolding(deps: FoldingDependencies): Folding {
       return;
     }
     const folds = visibleFolds();
-    el("collapse-all").hidden = !folds.some((entry) => !isFolded(entry));
-    el("expand-all").hidden = !folds.some((entry) => isFolded(entry));
+    el("collapse-all").hidden = inDocs || !folds.some((entry) => !isFolded(entry));
+    el("expand-all").hidden = inDocs || !folds.some((entry) => isFolded(entry));
     el("summarise").hidden =
       deps.view() !== "discord" || !folds.some((entry) => entry.id !== null);
     (el("summarise") as HTMLButtonElement).disabled = summaryRows.disabledByServer() !== "";
