@@ -5954,6 +5954,35 @@ def _assert_lock_scope_fingerprint(
     )
 
 
+def _journal_fingerprint(config: Config) -> tuple[tuple[str, int, int], ...]:
+    """Cheap identity of journal and event files, for lock-scope rechecks."""
+
+    entries: list[tuple[str, int, int]] = []
+    for pattern in ("ACTIVE.*.journal", "CREATE.*.journal", "FINISH.*.journal"):
+        for path in config.control.glob(pattern):
+            try:
+                info = path.stat()
+            except OSError:
+                continue
+            entries.append((path.name, info.st_size, info.st_mtime_ns))
+    for directory in config.control.glob("EVENTS.*"):
+        if not directory.is_dir() or directory.is_symlink():
+            continue
+        try:
+            children = sorted(directory.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            try:
+                info = child.stat()
+            except OSError:
+                continue
+            entries.append(
+                (f"{directory.name}/{child.name}", info.st_size, info.st_mtime_ns)
+            )
+    return tuple(sorted(entries))
+
+
 def _pregather_salvage_facts(config: Config, slot: str) -> None:
     """Run removal's slow salvage-fact reads before the configuration lock.
 
@@ -33469,9 +33498,31 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
     pre_state = _load_active(config, require_repository=False)
     pre_record = _find_record(pre_state, args.slot)
     pre_events = _load_events(config, pre_record.machine)
-    with _mutation_locks(config, args.wait_lock, shared=True):
+    # _assert_no_journal's event-log load is the slow read the production
+    # dumps show; it runs here, lock-free. Under the lock only the cheap
+    # fingerprint is compared. A pre-existing journal keeps the old
+    # exclusive path, whose recovery side effects need it (#1194).
+    pre_journals = _outstanding_journals(config)
+    pre_journal_fingerprint = _journal_fingerprint(config)
+    pre_slot_path = _slot_directory(config, pre_record.slot, pre_record.slot_type)
+    pre_storage_absent = _assert_read_handoff_storage(config, pre_states, pre_record)
+    try:
+        pre_artifact: _HandoffArtifact | None = _resolve_handoff_artifact(
+            config, pre_record, pre_slot_path
+        )
+        pre_artifact_refusal: Refusal | None = None
+    except Refusal as exc:
+        pre_artifact = None
+        pre_artifact_refusal = exc
+    with _mutation_locks(config, args.wait_lock, shared=not pre_journals):
         _refuse_partial_state(config)
-        _assert_no_journal(config)
+        if pre_journals:
+            _assert_no_journal(config)
+        elif _journal_fingerprint(config) != pre_journal_fingerprint:
+            raise Refusal(
+                "a mutation journal appeared while the handoff was being "
+                "read; no read was recorded"
+            )
         if _file_sha256(_active_path(config)) != pre_active_sha256:
             raise Refusal(
                 f"slot {args.slot} changed while its handoff was being read; "
@@ -33486,21 +33537,20 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
                 "state: REFUSED -- no event was recorded. remedy: inspect its run evidence "
                 "under the project's validation evidence directory"
             )
-        storage_absent = _assert_read_handoff_storage(config, states, record)
-        slot_path = _slot_directory(config, record.slot, record.slot_type)
+        storage_absent = pre_storage_absent
+        slot_path = pre_slot_path
         artifact: _HandoffArtifact | None
         if args.expected_generation is not None:
             raise Refusal(
                 "--expected-generation applies only with the unavailable "
                 "--adopt-legacy-change compatibility flag"
             )
-        try:
-            artifact = _resolve_handoff_artifact(config, record, slot_path)
-        except Refusal as exc:
+        if pre_artifact_refusal is not None:
             raise Refusal(
-                f"{exc}. state: REFUSED -- no read was recorded; preserve both the "
-                "slot and any handoff sidecar"
-            ) from exc
+                f"{pre_artifact_refusal}. state: REFUSED -- no read was recorded; "
+                "preserve both the slot and any handoff sidecar"
+            ) from pre_artifact_refusal
+        artifact = pre_artifact
         if storage_absent:
             _refuse_absent_slot_without_sidecar(config, states, record, artifact)
         if artifact is None:
@@ -33527,34 +33577,55 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
 
     _write_and_flush_handoff(display_path, rendered)
 
+    pre2_journals = _outstanding_journals(config)
+    pre2_journal_fingerprint = _journal_fingerprint(config)
+    # Phase 2's heavy loads run lock-free too (#1194 note (a)): under the
+    # exclusive lock only fingerprints are compared before the event write.
+    pre2_active_sha256 = _file_sha256(_active_path(config))
+    pre2_states, _pre2_archives = _validate_global_state(
+        config, require_repository=False
+    )
+    pre2_record = _find_record(
+        _load_active(config, require_repository=False), args.slot
+    )
+    pre2_absent = _assert_read_handoff_storage(config, pre2_states, pre2_record)
+    pre2_slot_path = _slot_directory(config, pre2_record.slot, pre2_record.slot_type)
+    pre2_latest = _latest_handoff_read(
+        pre2_record, _load_events(config, pre2_record.machine)
+    )
+    pre2_sidecar = _load_handoff_sidecar(config, pre2_record)
+    pre2_artifact = _resolve_handoff_artifact(config, pre2_record, pre2_slot_path)
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
-        _assert_no_journal(config)
-        states, _archives = _validate_global_state(config, require_repository=False)
-        current_record = _find_record(
-            _load_active(config, require_repository=False), args.slot
-        )
+        if pre2_journals:
+            _assert_no_journal(config)
+        elif _journal_fingerprint(config) != pre2_journal_fingerprint:
+            raise Refusal(
+                "a mutation journal appeared while the handoff was being "
+                "recorded; no read was recorded"
+            )
+        if _file_sha256(_active_path(config)) != pre2_active_sha256:
+            raise Refusal(
+                f"slot {args.slot} changed while its handoff was displayed; "
+                "no read or retirement queue event was recorded"
+            )
+        states, _archives = pre2_states, _pre2_archives
+        current_record = pre2_record
         if _record_to_obj(current_record) != record_snapshot:
             raise Refusal(
                 f"slot {args.slot} changed while its handoff was displayed; no read or "
                 "retirement queue event was recorded"
             )
-        current_absent = _assert_read_handoff_storage(config, states, current_record)
-        current_slot_path = _slot_directory(
-            config, current_record.slot, current_record.slot_type
-        )
-        current_latest = _latest_handoff_read(
-            current_record, _load_events(config, current_record.machine)
-        )
+        current_absent = pre2_absent
+        current_slot_path = pre2_slot_path
+        current_latest = pre2_latest
         if current_latest != latest_snapshot:
             raise Refusal(
                 f"slot {args.slot} handoff read history changed while its contents were "
                 "displayed; no superseding read was recorded"
             )
-        current_sidecar = _load_handoff_sidecar(config, current_record)
-        current_artifact = _resolve_handoff_artifact(
-            config, current_record, current_slot_path
-        )
+        current_sidecar = pre2_sidecar
+        current_artifact = pre2_artifact
         if current_absent:
             _refuse_absent_slot_without_sidecar(
                 config, states, current_record, current_artifact
