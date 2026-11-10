@@ -54,6 +54,12 @@ pub enum TraceKind {
     Scroll,
     /// Code asked for an element to be shown (`scrollIntoView`), on any element.
     Into,
+    /// The layout moved under the reader (`#1208`): a `layout-shift` entry and its sources.
+    Shift,
+    /// A row was replaced for the same message (`#1208`).
+    Mutate,
+    /// A live selection collapsed with no hand in it (`#1208`).
+    Selection,
 }
 
 impl TraceKind {
@@ -62,6 +68,9 @@ impl TraceKind {
             Self::Write => "write",
             Self::Scroll => "scroll",
             Self::Into => "into",
+            Self::Shift => "shift",
+            Self::Mutate => "mutate",
+            Self::Selection => "selection",
         }
     }
 }
@@ -132,6 +141,12 @@ pub struct TraceEntry {
     pub client_height: f64,
     /// The first row the reader could see, where the page named one.
     pub anchor: Option<TraceAnchor>,
+    /// A layout shift's size, as a fraction of the viewport (`shift` only, `#1208`).
+    #[serde(default)]
+    pub value: Option<f64>,
+    /// Whether a hand had just been in a layout shift (`shift` only, `#1208`).
+    #[serde(default)]
+    pub input: Option<bool>,
 }
 
 /// One minute of a page's scrolls: `POST /api/v1/scroll-trace`. The field set IS the allowlist,
@@ -236,6 +251,9 @@ impl TraceEntry {
         }
         check_metric(&name("scrollHeight"), self.scroll_height)?;
         check_metric(&name("clientHeight"), self.client_height)?;
+        if let Some(value) = self.value {
+            check_metric(&name("value"), value)?;
+        }
         if let Some(anchor) = &self.anchor {
             check_text(&name("anchor.id"), &anchor.id, MAX_ANCHOR_ID_CHARS)?;
             check_metric(&name("anchor.offset"), anchor.offset)?;
@@ -270,7 +288,7 @@ impl TraceEntry {
         );
         format!(
             "i={at} t={} kind={} id={:?} from={} to={} focus={} composer={} vv={} \
-             scroll_height={} client_height={} anchor={} stack={:?}",
+             scroll_height={} client_height={} anchor={} value={} input={} stack={:?}",
             self.t,
             self.kind.as_str(),
             self.id,
@@ -282,6 +300,9 @@ impl TraceEntry {
             self.scroll_height,
             self.client_height,
             anchor,
+            number(self.value),
+            self.input
+                .map_or_else(|| "-".to_owned(), |yes| yes.to_string()),
             self.stack,
         )
     }
@@ -316,6 +337,8 @@ mod tests {
                 id: "m-1".to_owned(),
                 offset: -12.0,
             }),
+            value: None,
+            input: None,
         }
     }
 
@@ -350,7 +373,7 @@ mod tests {
             line,
             "i=0 t=12345.5 kind=write id=\"scroll-area\" from=400 to=900 \
              focus=\"channel-compose-text\" composer=600,660,390,60 vv=500,120 \
-             scroll_height=9000 client_height=700 anchor=\"m-1\"@-12 \
+             scroll_height=9000 client_height=700 anchor=\"m-1\"@-12 value=- input=- \
              stack=\"at followFoot (voice.js:1:2) | at render (voice.js:3:4)\""
         );
         // A stack that tries to look like more fields stays inside its quotes.

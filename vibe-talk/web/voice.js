@@ -11206,7 +11206,7 @@ function applyKeyboardDebug(on) {
 // Typing › "Scroll trace" keeps the last minute of each list's scrolls, with the code that asked for each
 // (web/src/view/channel/scrolltrace.ts), and "Send scroll trace" beside it posts that minute to the
 // server's log (`POST /api/v1/scroll-trace`). Off by default, kept on this device alone, and nothing is
-// sent until Send is pressed.
+// sent until Send is pressed or the trace itself sends its minute over a shift nobody made (`#1208`).
 
 /**
  * The first row the reader could see in `area`, named for the trace: its first message's id, and how
@@ -11229,6 +11229,23 @@ const scrollTrace = createScrollTrace({
   anchor: (area) => scrollTraceAnchor(area),
   elementPrototype: () => Element.prototype,
   now: () => performance.now(),
+  // `#1208 scroll-trace-layout-shift`: what else moved what the reader was looking at.
+  containers: () => ["discord-log", "pinned-log", "outgoing-log", "transcript", "thread-list", "side-log"]
+    .map((id) => leftEl(id)).filter((node) => node),
+  documentTarget: () => document,
+  selection: () => {
+    const sel = typeof document.getSelection === "function" ? document.getSelection() : null;
+    if (!sel) return null;
+    const node = sel.anchorNode;
+    const near = /** @type {Element | null} */ (node && (node.nodeType === 1 ? node : node.parentElement));
+    const row = near && typeof near.closest === "function" ? near.closest("[data-id], [data-context-id]") : null;
+    return {
+      collapsed: sel.isCollapsed,
+      length: String(sel).length,
+      desc: row ? (row.getAttribute("data-id") || row.getAttribute("data-context-id") || row.id || "") : (near ? near.id || near.tagName || "" : ""),
+    };
+  },
+  autoSend: (text) => { void sendScrollTrace(text); },
 });
 
 /** What was stored. ABSENT MEANS OFF. */
@@ -11250,11 +11267,12 @@ function applyScrollTrace(on) {
 }
 
 /** Post the minute the trace holds to the server's log, and say on the status line how it went. */
-async function sendScrollTrace() {
+async function sendScrollTrace(text) {
   try {
     // `report` says the trace as one JSON text; `api` carries a body it writes as JSON itself, as it
-    // carries the call-end record's.
-    await api("/api/v1/scroll-trace", { method: "POST", body: JSON.parse(scrollTrace.report()) });
+    // carries the call-end record's. The trace itself calls this with its minute when a shift or a
+    // selection loss it saw was nobody's act (`#1208`).
+    await api("/api/v1/scroll-trace", { method: "POST", body: JSON.parse(text || scrollTrace.report()) });
     setStatus("Scroll trace sent.");
   } catch (_error) {
     setStatus("Scroll trace could not be sent.");

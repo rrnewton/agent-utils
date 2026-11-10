@@ -2571,6 +2571,97 @@ test("`#1144 scrollback-typing-jump`: the scroll trace wraps, rings and restores
   assert.equal(main.scrollTop, 999, "the write itself still landed");
 });
 
+test("`#1208 scroll-trace-layout-shift`: shifts, replacements and a lost selection are traced and sent by themselves", () => {
+  const { createScrollTrace } = CHANNEL_VIEW;
+  const proto = {};
+  Object.defineProperty(proto, "scrollTop", {
+    configurable: true,
+    get() { return this._top || 0; },
+    set(value) { this._top = value; },
+  });
+  proto.scrollTo = function () {};
+  proto.scrollBy = function () {};
+  proto.scrollIntoView = function () {};
+  const listenersOf = () => {
+    const map = new Map();
+    return {
+      addEventListener: (type, fn) => map.set(type, [...(map.get(type) || []), fn]),
+      removeEventListener: (type, fn) => map.set(type, (map.get(type) || []).filter((each) => each !== fn)),
+      fire: (type) => { for (const fn of map.get(type) || []) fn(); },
+      count: (type) => (map.get(type) || []).length,
+    };
+  };
+  const main = Object.assign(Object.create(proto), {
+    id: "scroll-area", scrollHeight: 5000, clientHeight: 600, ...listenersOf(),
+    contains: () => false, getBoundingClientRect: () => ({ top: 0, bottom: 600, width: 300, height: 600 }),
+  });
+  const log = Object.assign(Object.create(proto), { id: "discord-log", ...listenersOf() });
+  const page = { "scroll-area": main, "channel-composer": null };
+  const doc = listenersOf();
+  let clock = 10000;
+  let sel = { collapsed: true, length: 0, desc: "" };
+  const sent = [];
+  let shiftRun = null;
+  let mutationRun = null;
+  const heldPO = globalThis.PerformanceObserver;
+  const heldMO = globalThis.MutationObserver;
+  globalThis.PerformanceObserver = class { constructor(run) { shiftRun = run; } observe() {} disconnect() { shiftRun = null; } };
+  globalThis.MutationObserver = class { constructor(run) { mutationRun = run; } observe() {} disconnect() { mutationRun = null; } };
+  try {
+    const trace = createScrollTrace({
+      lookup: (id) => page[id] ?? null,
+      activeElement: () => null,
+      viewport: () => ({ height: 600, offsetTop: 0 }),
+      anchor: () => ({ id: "m-1", offset: 0 }),
+      elementPrototype: () => proto,
+      now: () => clock,
+      stack: () => "Error\n at taker (a:1:1)\n at wrapper (b:2:2)\n at asker (c:3:3)",
+      containers: () => [log],
+      documentTarget: () => doc,
+      selection: () => sel,
+      autoSend: (text) => sent.push(text),
+    });
+    trace.start();
+    const row = (id) => ({
+      tagName: "LI", id: "", getAttribute: (name) => (name === "data-id" ? id : null), querySelector: () => null,
+    });
+    // A shift with a hand just in it is traced but never sent by itself.
+    doc.fire("pointerdown");
+    clock = 10100;
+    shiftRun({ getEntries: () => [{ value: 0.2, hadRecentInput: true, sources: [{ node: row("m-9"), previousRect: { x: 0, y: 300, width: 300, height: 40 }, currentRect: { x: 0, y: 320, width: 300, height: 40 } }] }] });
+    assert.equal(sent.length, 0, "a shift after the reader's own touch posted itself");
+    // A shift nobody made: traced with its sources, and sent at once - once a minute.
+    clock = 11000;
+    shiftRun({ getEntries: () => [{ value: 0.05, hadRecentInput: false, sources: [{ node: row("m-9"), previousRect: { x: 0, y: 300, width: 300, height: 40 }, currentRect: { x: 0, y: 260, width: 300, height: 40 } }] }] });
+    assert.equal(sent.length, 1, "a qualifying shift did not post the trace by itself");
+    clock = 12000;
+    shiftRun({ getEntries: () => [{ value: 0.05, hadRecentInput: false, sources: [] }] });
+    assert.equal(sent.length, 1, "a second qualifying shift inside the minute posted again");
+    // A row replaced for the same message, and a selection lost with no hand in it.
+    clock = 13000;
+    mutationRun([{ removedNodes: [row("m-9")], addedNodes: [row("m-9")] }]);
+    sel = { collapsed: false, length: 12, desc: "m-9" };
+    doc.fire("selectionchange");
+    sel = { collapsed: true, length: 0, desc: "" };
+    clock = 71500;
+    doc.fire("selectionchange");
+    assert.equal(sent.length, 2, "a lost selection did not post the trace by itself");
+    // The ring holds the last minute: the touched shift and the first qualifying one are gone.
+    const entries = JSON.parse(trace.report()).entries;
+    assert.deepStrictEqual(entries.map(({ kind }) => kind), ["shift", "mutate", "selection"]);
+    assert.equal(entries[0].value, 0.05);
+    assert.equal(entries[0].input, false);
+    assert.match(entries[1].stack, /m-9 removed LI#\[m-9\] added LI#\[m-9\]/);
+    assert.match(entries[2].stack, /was m-9 len 12/);
+    assert.ok(!("text" in entries[2]) && !JSON.stringify(entries[2]).includes("twelve chars!"), "selection words were traced");
+    trace.stop();
+    assert.equal(doc.count("selectionchange"), 0, "stopping left the selection listener up");
+  } finally {
+    globalThis.PerformanceObserver = heldPO;
+    globalThis.MutationObserver = heldMO;
+  }
+});
+
 test("`#1186 two-column-splitter`: the separator drags, clamps, keeps each column's place, and resets, from the module alone", () => {
   const { createColumnSplitter } = CHANNEL_VIEW;
   const clampSplit = (value) => {

@@ -1,17 +1,26 @@
-// What moved the lists (`#1144 scrollback-typing-jump`; `#624 voice-page-modularity`, new in
-// view/channel): while it runs, every write to either list's place — its `scrollTop`, its
-// `scrollTo`/`scrollBy` — then every `scrollIntoView` anywhere and every scroll either list
-// reports, with when and from where to where, the code that asked, the focus, the composer's
-// place, the viewport's, each list's heights and the first row the reader could see. The last
+// What moved the lists (`#1144 scrollback-typing-jump`, `#1208 scroll-trace-layout-shift`; `#624
+// voice-page-modularity`, new in view/channel): while it runs, every write to either list's place —
+// its `scrollTop`, its `scrollTo`/`scrollBy` — then every `scrollIntoView` anywhere and every scroll
+// either list reports, with when and from where to where, the code that asked, the focus, the
+// composer's place, the viewport's, each list's heights and the first row the reader could see.
+// And what moved what the reader was looking at without any scroll at all: a layout shift in the
+// viewport (its value, whether a hand was just in it, and its sources' before and after), a row
+// replaced for the same message, a selection lost with no hand in it. The last
 // [`SCROLL_TRACE_MAX_ENTRIES`] of them, over the last minute of them, are kept; `report` says them
-// as JSON for the page to post to the server's log. Off is wholly off: starting wraps
-// `Element.prototype`, stopping puts each piece back as it was. Nothing is kept anywhere else,
-// and nothing leaves the device until the page sends a report.
+// as JSON for the page to post to the server's log. A qualifying shift or selection loss posts it
+// by itself, at most once a minute. Off is wholly off: starting wraps `Element.prototype`,
+// stopping puts each piece back as it was.
 
 /** The most scrolls one trace holds. */
 export const SCROLL_TRACE_MAX_ENTRIES = 600;
 /** How far back, in milliseconds from the newest scroll, one trace holds. */
 export const SCROLL_TRACE_WINDOW_MS = 60000;
+/** The least while between one trace posting itself and the next, in milliseconds. */
+export const SCROLL_TRACE_AUTO_SEND_MS = 60000;
+/** How long after the reader's last touch, press or key a move still counts as theirs, in ms. */
+export const SCROLL_TRACE_INPUT_QUIET_MS = 500;
+/** A layout shift at or above this moved what the reader was looking at (a viewport fraction). */
+const SHIFT_MIN = 0.01;
 
 /** The two lists whose places are traced. */
 const TRACE_AREAS: readonly string[] = ["scroll-area", "side-scroll"];
@@ -50,6 +59,15 @@ export interface ScrollTraceDependencies {
   now(): number;
   /** A call stack's raw words. Absent: a new `Error`'s. */
   stack?(): string;
+  /** The row containers whose children are watched for a row replaced (absent: the two lists). */
+  containers?(): readonly Element[];
+  /** Where input and selection changes are heard (the document), or null where there is none. */
+  documentTarget?(): EventTarget | null;
+  /** The reader's selection now: whether it has collapsed, its length in characters (never its
+   * words), and a descriptor of where its anchor stood. Null where there is no selection. */
+  selection?(): { readonly collapsed: boolean; readonly length: number; readonly desc: string } | null;
+  /** Post a report without being asked (a qualifying shift or selection loss). */
+  autoSend?(report: string): void;
 }
 
 /** The trace's commands. */
@@ -62,7 +80,7 @@ export interface ScrollTrace {
   report(): string;
 }
 
-type TraceKind = "write" | "scroll" | "into";
+type TraceKind = "write" | "scroll" | "into" | "shift" | "mutate" | "selection";
 
 interface TraceEntry {
   readonly t: number;
@@ -77,6 +95,10 @@ interface TraceEntry {
   readonly scrollHeight: number;
   readonly clientHeight: number;
   readonly anchor: ScrollTraceAnchor | null;
+  /** A layout shift's size, as a fraction of the viewport (`shift` only). */
+  readonly value?: number;
+  /** Whether a hand had just been in a layout shift (`shift` only). */
+  readonly input?: boolean;
 }
 
 type ScrollFn = (this: Element, ...args: readonly unknown[]) => unknown;
@@ -148,8 +170,16 @@ export function createScrollTrace(deps: ScrollTraceDependencies): ScrollTrace {
     return anchor ? { id: capped(anchor.id, ANCHOR_ID_CHARS), offset: Math.round(anchor.offset) } : null;
   }
 
-  function note(kind: TraceKind, node: Element, from: number | null, to: number | null, stack: string): void {
-    if (!running || noting) return;
+  /** One node in a line: its kind, its own id, and the message it stands for where it names one. */
+  function describe(node: Element | null | undefined): string {
+    if (!node) return "gone";
+    const id = node.getAttribute ? (node.getAttribute("data-id") || node.getAttribute("data-context-id") || "") : "";
+    return capped(`${node.tagName || "?"}#${node.id || ""}${id ? `[${id}]` : ""}`, ID_CHARS);
+  }
+
+  function note(kind: TraceKind, node: Element, from: number | null, to: number | null, stack: string,
+    extra?: { readonly value?: number; readonly input?: boolean }): TraceEntry | null {
+    if (!running || noting) return null;
     noting = true;
     try {
       const t = deps.now();
@@ -157,7 +187,7 @@ export function createScrollTrace(deps: ScrollTraceDependencies): ScrollTrace {
       const composerEl = deps.lookup("channel-composer");
       const rect = composerEl ? composerEl.getBoundingClientRect() : null;
       const vv = deps.viewport();
-      entries.push({
+      const entry: TraceEntry = {
         t,
         kind,
         id: capped(node.id || "", ID_CHARS),
@@ -172,7 +202,10 @@ export function createScrollTrace(deps: ScrollTraceDependencies): ScrollTrace {
         scrollHeight: node.scrollHeight || 0,
         clientHeight: node.clientHeight || 0,
         anchor: anchorFor(node, kind),
-      });
+        ...(extra && extra.value !== undefined ? { value: extra.value } : {}),
+        ...(extra && extra.input !== undefined ? { input: extra.input } : {}),
+      };
+      entries.push(entry);
       while (entries.length > SCROLL_TRACE_MAX_ENTRIES) entries.shift();
       let oldest = entries[0];
       while (oldest !== undefined && t - oldest.t > SCROLL_TRACE_WINDOW_MS) {
@@ -180,10 +213,105 @@ export function createScrollTrace(deps: ScrollTraceDependencies): ScrollTrace {
         oldest = entries[0];
       }
       if (kind !== "into") lastTop.set(node, node.scrollTop);
+      return entry;
     } catch (_error) {
       // Tracing a scroll never breaks the scroll.
+      return null;
     } finally {
       noting = false;
+    }
+  }
+
+  /** When the reader last touched, pressed or keyed, and when the trace last posted itself. */
+  let lastInputAt = -Infinity;
+  let lastAutoAt = -Infinity;
+  /** The selection as last heard of: whether it had collapsed, and where a live one stood. */
+  let selectionWas: { collapsed: boolean; desc: string; length: number } = { collapsed: true, desc: "", length: 0 };
+
+  /** A qualifying shift or selection loss posts the minute, at most once its own minute. */
+  function maybeAutoSend(): void {
+    if (!deps.autoSend || !running) return;
+    const now = deps.now();
+    if (now - lastAutoAt < SCROLL_TRACE_AUTO_SEND_MS) return;
+    lastAutoAt = now;
+    try {
+      deps.autoSend(JSON.stringify({ v: 1, startedAt, entries }));
+    } catch (_error) {
+      // A report that cannot go changes nothing on the page.
+    }
+  }
+
+  /** The reader acting, heard on the document: their moves are theirs from here on. */
+  function noteInput(): void {
+    lastInputAt = deps.now();
+  }
+
+  function noteSelection(): void {
+    if (!deps.selection) return;
+    const sel = deps.selection();
+    if (!sel) return;
+    if (!selectionWas.collapsed && sel.collapsed
+      && deps.now() - lastInputAt >= SCROLL_TRACE_INPUT_QUIET_MS) {
+      const area = deps.lookup("scroll-area");
+      if (area) {
+        note("selection", area, null, null,
+          capped(`was ${selectionWas.desc} len ${selectionWas.length}`, STACK_CHARS));
+        maybeAutoSend();
+      }
+    }
+    selectionWas = { collapsed: sel.collapsed, desc: sel.desc, length: sel.length };
+  }
+
+  function noteShift(raw: unknown): void {
+    const shift = raw as {
+      readonly value?: unknown; readonly hadRecentInput?: unknown;
+      readonly sources?: readonly { readonly node?: Element | null;
+        readonly previousRect?: { x: number; y: number; width: number; height: number };
+        readonly currentRect?: { x: number; y: number; width: number; height: number } }[];
+    };
+    const value = typeof shift.value === "number" ? shift.value : 0;
+    const input = Boolean(shift.hadRecentInput);
+    const vv = deps.viewport();
+    const vvHeight = vv ? vv.height : 0;
+    const parts: string[] = [];
+    let inViewport = !shift.sources || shift.sources.length === 0;
+    for (const source of (shift.sources || []).slice(0, 3)) {
+      const r = source.currentRect;
+      if (r && r.y + r.height > 0 && r.y < vvHeight) inViewport = true;
+      const p = source.previousRect;
+      parts.push(`${describe(source.node)} ${p ? `${Math.round(p.x)},${Math.round(p.y)} ${Math.round(p.width)}x${Math.round(p.height)}` : "-"} -> ${r ? `${Math.round(r.x)},${Math.round(r.y)} ${Math.round(r.width)}x${Math.round(r.height)}` : "-"}`);
+    }
+    const area = deps.lookup("scroll-area");
+    if (!area) return;
+    note("shift", area, null, null, capped(parts.join(" ; "), STACK_CHARS), { value, input });
+    if (value >= SHIFT_MIN && !input && inViewport
+      && deps.now() - lastInputAt >= SCROLL_TRACE_INPUT_QUIET_MS) maybeAutoSend();
+  }
+
+  function noteMutations(records: readonly { readonly removedNodes: ArrayLike<Element>; readonly addedNodes: ArrayLike<Element> }[],
+    container: Element): void {
+    const idOf = (node: Element): string => {
+      if (!node || typeof node.getAttribute !== "function") return "";
+      const own = node.getAttribute("data-id") || node.getAttribute("data-context-id") || "";
+      if (own) return own;
+      const inner = typeof node.querySelector === "function" ? node.querySelector("[data-id]") : null;
+      return inner && typeof inner.getAttribute === "function" ? inner.getAttribute("data-id") || "" : "";
+    };
+    const removed = new Map<string, string>();
+    const added = new Map<string, string>();
+    for (const record of records) {
+      for (const node of Array.from(record.removedNodes)) {
+        const id = idOf(node);
+        if (id) removed.set(id, describe(node));
+      }
+      for (const node of Array.from(record.addedNodes)) {
+        const id = idOf(node);
+        if (id) added.set(id, describe(node));
+      }
+    }
+    for (const [id, gone] of removed) {
+      const back = added.get(id);
+      if (back) note("mutate", container, null, null, capped(`${id} removed ${gone} added ${back}`, STACK_CHARS));
     }
   }
 
@@ -276,6 +404,52 @@ export function createScrollTrace(deps: ScrollTraceDependencies): ScrollTrace {
       };
       area.addEventListener("scroll", onScroll, { passive: true });
       undo.push(() => area.removeEventListener("scroll", onScroll));
+    }
+
+    lastInputAt = -Infinity;
+    lastAutoAt = -Infinity;
+    selectionWas = { collapsed: true, desc: "", length: 0 };
+    const doc = deps.documentTarget ? deps.documentTarget() : null;
+    if (doc) {
+      for (const type of ["pointerdown", "keydown", "touchstart", "wheel"]) {
+        doc.addEventListener(type, noteInput, { capture: true, passive: true });
+        undo.push(() => doc.removeEventListener(type, noteInput, true));
+      }
+      doc.addEventListener("selectionchange", noteSelection);
+      undo.push(() => doc.removeEventListener("selectionchange", noteSelection));
+    }
+
+    const shifts = (globalThis as { PerformanceObserver?: unknown }).PerformanceObserver;
+    if (typeof shifts === "function") {
+      try {
+        const observer = new (shifts as new (run: (list: { getEntries(): readonly unknown[] }) => void) => {
+          observe(options: { type: string; buffered: boolean }): void; disconnect(): void;
+        })((list) => {
+          for (const entry of list.getEntries()) noteShift(entry);
+        });
+        observer.observe({ type: "layout-shift", buffered: true });
+        undo.push(() => observer.disconnect());
+      } catch (_error) {
+        // No layout-shift entries in this browser: the scrolls alone are traced.
+      }
+    }
+
+    const mutations = (globalThis as { MutationObserver?: unknown }).MutationObserver;
+    if (typeof mutations === "function") {
+      const containers = deps.containers ? deps.containers()
+        : TRACE_AREAS.map((id) => deps.lookup(id)).filter((area) => area !== null);
+      for (const container of containers) {
+        try {
+          const observer = new (mutations as new (run: (records: readonly {
+            removedNodes: ArrayLike<Element>; addedNodes: ArrayLike<Element>;
+          }[]) => void) => { observe(node: Element, options: { childList: boolean }): void; disconnect(): void;
+          })((records) => noteMutations(records, container));
+          observer.observe(container, { childList: true });
+          undo.push(() => observer.disconnect());
+        } catch (_error) {
+          // A container that will not be watched is left alone.
+        }
+      }
     }
   }
 
