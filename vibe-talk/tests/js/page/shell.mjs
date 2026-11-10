@@ -519,6 +519,20 @@ test("`#1078 bottom-bar-switcher`: the pane stands over the bar, Outline is in t
   assert.match(row, /background:\s*#[0-9a-f]/i, "outline rows have no stated dark ground");
   assert.doesNotMatch(row, /var\(--accent\)/, "outline rows are filled from the accent again");
   assert.match(cssBlock("#doc-outline-pop"), /background:\s*#[0-9a-f]/i, "the outline panel has no stated dark ground");
+  // `#1166 switcher-frame-panel`: the tab row stands in its own framed panel, and its current
+  // cell is a tint with ink text — never the Talk button's solid accent fill with white text.
+  const frame = cssBlock(".view-cards");
+  assert.match(frame, /background:\s*var\(--dock\)/, "the tab row has no opaque panel ground");
+  assert.match(frame, /border:\s*1px solid/, "the tab row has no frame border");
+  assert.match(frame, /box-shadow:/, "the tab row is not lifted off what it floats over");
+  assert.match(frame, /padding:\s*6px/, "the tab row has no padding inside its frame");
+  assert.match(frame, /pointer-events:\s*none/, "the frame itself still takes taps meant for what it floats over");
+  assert.match(cssBlock(".view-card"), /pointer-events:\s*auto/, "the cells no longer take taps");
+  const currentCell = cssBlock(".view-card-current");
+  assert.doesNotMatch(currentCell, /background:\s*var\(--accent/, "the current cell is filled from the accent again");
+  assert.match(currentCell, /background:\s*color-mix\(/, "the current cell is not a tint over its own ground");
+  assert.match(currentCell, /color:\s*var\(--ink/, "the current cell does not keep ink text");
+  assert.match(currentCell, /border-color:\s*var\(--accent/, "the current cell lost its accent border");
   // Tapping through: the row shows all three views as tabs, the highlight steps right and
   // wraps, and 600ms after the last tap the row goes and the switch says so.
   const page = newPage();

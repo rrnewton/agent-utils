@@ -22,6 +22,18 @@
   flex-direction: row;
   gap: 4px;
   z-index: 5;
+  /* Its own framed panel (`#1166 switcher-frame-panel`): opaque, bordered and
+     lifted off what it floats over, as the trays and the pace popover are. Bare,
+     the selected cell bled straight into the Talk button under it. */
+  padding: 6px;
+  background: var(--dock);
+  border: 1px solid var(--edge);
+  border-radius: 12px;
+  box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 35%);
+  /* The frame itself takes no tap: the panel is taller than the bare row was, and
+     over the reader controls above the bar its padding ate the taps meant for
+     them (the pace and read browser walks). Only its cells are buttons. */
+  pointer-events: none;
 }
 /* With the bar in the header the row opens downward, as the trays do: upward there
    would put it off the top of the screen. */
@@ -35,10 +47,12 @@
 /* While a call can be hung up the row is a signpost only: it hangs over the pane's row, and
    the way out of sound is never under it, even in the settle after a switch press. Choosing
    a view from a cell remains where no call is live. */
-:root:has(#hang-up:not([hidden])) .view-cards {
+:root:has(#hang-up:not([hidden])) .view-cards,
+:root:has(#hang-up:not([hidden])) .view-card {
   pointer-events: none;
 }
 .view-card {
+  pointer-events: auto;
   flex: 1 1 0;
   min-width: 0;
   padding: 6px 4px;
@@ -51,11 +65,17 @@
   text-align: center;
   cursor: pointer;
 }
-/* The view the last press landed on, lit as the switch is lit on the call's view. */
+/* The view the last press landed on. A tint over the cell's own ground with the
+   accent as its border and bar, and ordinary ink for its word (`#1166
+   switcher-frame-panel`): the solid accent fill it had was Talk's own blue, and
+   the two merged wherever the row floated over that button. */
 .view-card-current {
-  background: var(--accent, Highlight);
+  background: color-mix(in srgb, var(--accent, Highlight) 22%, var(--panel, Canvas));
   border-color: var(--accent, Highlight);
-  color: #fff;
+  box-shadow:
+    inset 0 0 0 1px var(--accent, Highlight),
+    inset 3px 0 0 var(--accent, Highlight);
+  color: var(--ink, CanvasText);
   font-weight: 700;
 }
 .view-card:focus-visible {
