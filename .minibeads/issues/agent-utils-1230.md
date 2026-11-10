@@ -33,7 +33,7 @@ DESIGN FIRST, reviewed by the lead before any code. The design must settle:
 
 # Notes
 
-Owner: cl-fence (devbig030) after #1201 batch-grouped-fencing, which works in the same census and fence code (lead, 2026-11-10).
+Owner: cl-fence after #1201 batch-grouped-fencing, which works in the same census and fence code (lead, 2026-11-10).
 
 ## Design as approved and built (lead, 2026-11-10)
 
@@ -60,7 +60,7 @@ Refinements found while building, all reported to the lead:
 - **Held-socket closure.** A Unix socket held both before and after the dumps but absent from every dump (re-checked against one extra dump) is a gap. Without it, the orphaned-namespace control would have looked dead in the dry run.
 - **Doctor stays read-only** (#1172). It reports a stale calibration directory as `stale-socket-calibration`; recovery and `socket-census --probe` remove it.
 
-Cost on devbig030 (1,100 same-UID processes, 190k descriptors, about 100k Unix sockets in the host namespace): one namespace scan takes 0.74 s; the host-namespace dump takes 0.35 s; the 10 other namespaces are dumped by parallel children. A passive census takes 2.5-4.5 s; `--probe` takes about twice that.
+Cost on the shared development host (1,100 same-UID processes, 190k descriptors, about 100k Unix sockets in the host namespace): one namespace scan takes 0.74 s; the host-namespace dump takes 0.35 s; the 10 other namespaces are dumped by parallel children. A passive census takes 2.5-4.5 s; `--probe` takes about twice that.
 
 Tests (all in `py/wrkslots/tests/test_proc_status.py`, plus the updated alias controls in `test_lifecycle.py`):
 
@@ -106,7 +106,7 @@ A consumer that loads its own pinned copy gets this only when its pin moves past
 
 Delivered in 3447358a and 63b81733 as described above.
 
-Cost measured on a consumer's live validate checkouts (2026-11-10 16:48 ET, devbig030, load average about 90). The run was one passive `socket-census` pass over all 31 idle checkouts, under nice -n 19 and ionice -c3:
+Cost measured on a consumer's live validate checkouts (2026-11-10 16:48 ET, on the shared development host, load average about 90). The run was one passive `socket-census` pass over all 31 idle checkouts, under nice -n 19 and ionice -c3:
 - 0 socket nodes in any of them, so no namespace scan, dump or probe ran, and nothing was refused.
 - 2.96 s wall, 0.97 s user and 1.93 s system CPU, 72 MB RSS.
 - 0 /proc entries read. The whole cost was the tree walk: about 398k entries in 42.8k directories.
