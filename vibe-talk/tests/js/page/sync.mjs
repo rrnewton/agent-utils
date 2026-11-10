@@ -7871,10 +7871,15 @@ test("`#611 timeline-read-failures`: a page the server answered from its own cop
   assert.equal(freshness(page).getAttribute("data-state"), "failed");
   assert.match(freshness(page).textContent, /^Refresh failed · showing messages from \d{2}:\d{2}$/);
 
-  // The next read the service answers says the rows are current again: armed for three seconds
-  // on, not the next poll (`#617 cold-load-first-paint`).
+  // The next read the service answers says the rows are current again: at the next poll, not
+  // in seconds (`#1227 poll-storm-stale-thread` supersedes `#617 cold-load-first-paint` here;
+  // what a refresh finds meanwhile reaches the page by live event).
   page.timeline = standard;
-  assert.ok(page.expireTimers(3000) > 0, "no soon read was armed");
+  const calls = page.timelineCalls.length;
+  page.expireTimers(3000);
+  await page.settle();
+  assert.equal(page.timelineCalls.length, calls, "a stale answer made the page read again in seconds");
+  assert.ok(page.expireTimers(DISCORD_POLL_MS) > 0, "no poll was armed");
   await page.settle();
   assert.equal(freshness(page).getAttribute("data-state"), "fresh");
 });
@@ -7938,7 +7943,7 @@ async function pollsOverAShortCopy(stillMore) {
   const polls = [];
   for (let i = 0; i < 4; i += 1) {
     const before = page.timelineCalls.length;
-    // The poll, and the soon reads after a page from the copy (`#617 cold-load-first-paint`).
+    // The poll (a page from the copy no longer reads again sooner: `#1227 poll-storm-stale-thread`).
     for (const due of [DISCORD_POLL_MS, 3000, 10000]) {
       page.expireTimers(due);
       await page.settle();

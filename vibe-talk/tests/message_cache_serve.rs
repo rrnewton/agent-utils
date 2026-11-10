@@ -2275,6 +2275,55 @@ async fn repeated_thread_reads_under_a_rate_limit_start_one_upstream_read_and_re
     let _ = body;
 }
 
+/// `#1227 poll-storm-stale-thread` (and `#617 cold-load-first-paint`'s guarantee on its new
+/// path): a thread answered from the cache whose scheduled refresh finds a new reply has that
+/// reply published by live event — the page is pushed it, with no read of its own in between.
+#[tokio::test]
+async fn a_refresh_behind_a_cached_thread_publishes_what_it_finds() {
+    let (state, fake, _clock, _dir) = slack_threads_deployment("thread-refresh-push", false).await;
+    state.message_cache.set_serve(true);
+    let root = slack_fake::ts(60, 0);
+    fake.with(|fixture| {
+        slack_fake::add_reply(
+            fixture,
+            SLACK_CH,
+            &root,
+            &slack_fake::ts(90, 0),
+            "pushed reply",
+        );
+    });
+    let body = ok(
+        &state,
+        &path(
+            SLACK_CH,
+            &format!("/timeline?view=thread&thread_id={root}&limit=50&reason=side"),
+        ),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert!(
+        !texts(&body).iter().any(|text| text == "pushed reply"),
+        "the cached answer predates the reply: {body}"
+    );
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let events = state
+                .live
+                .subscribe(&ChannelId(SLACK_CH.to_owned()), None)
+                .replay;
+            if events
+                .iter()
+                .any(|event| event.message.content == "pushed reply")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the refresh published the reply it found");
+}
+
 #[tokio::test]
 async fn slack_s_all_the_cache_holds_is_answered_at_once_and_the_read_behind_it_lands_for_the_next()
 {

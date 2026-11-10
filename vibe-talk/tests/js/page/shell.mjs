@@ -2140,16 +2140,19 @@ test("`#617 cold-load-first-paint`: a page from the server's own copy a minute o
   assert.doesNotMatch(freshness(page).textContent, /failed/i, freshness(page).textContent);
 });
 
-test("`#617 cold-load-first-paint`: after a page from the server's own copy the next read comes in seconds, not at the next poll", async () => {
+test("`#1227 poll-storm-stale-thread`: after a page from the server's own copy the next read comes at the next poll, not in seconds", async () => {
   const page = await threadPage("main");
   const standard = answeredFromCopy(page, 5 * 60_000);
   await reReadChannel(page);
   assert.equal(freshness(page).getAttribute("data-state"), "failed");
   page.timeline = standard;
   const reads = page.timelineCalls.length;
-  assert.ok(page.expireTimers(3000) > 0, "no read was armed within three seconds");
+  page.expireTimers(3000);
   await page.settle();
-  assert.ok(page.timelineCalls.length > reads, "the soon read was not sent");
+  assert.equal(page.timelineCalls.length, reads, "a stale answer made the page read again in seconds");
+  assert.ok(page.expireTimers(45000) > 0, "no poll was armed");
+  await page.settle();
+  assert.ok(page.timelineCalls.length > reads, "the next poll was not sent");
   assert.equal(freshness(page).getAttribute("data-state"), "fresh", freshness(page).textContent);
 });
 

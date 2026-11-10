@@ -2413,6 +2413,23 @@ fn spawn_behind_cache_first(
                 Ok((page, position)) => {
                     state.refresh_schedule.note_outcome(&view_key, true);
                     note_upstream_read(&state.message_cache, &channel, &request, &page, noted_ms);
+                    // `#1227 poll-storm-stale-thread`: what the refresh found that the
+                    // answer did not hold goes to the page by live event, as the poller's
+                    // read of it would put it there — the page no longer reads again in
+                    // seconds to collect it (`#617 cold-load-first-paint`'s guarantee, kept
+                    // on the push path). A message already out is not published again
+                    // (the hub remembers what it published).
+                    for message in &page.messages {
+                        if served.iter().any(|was| was.id == message.id) {
+                            continue;
+                        }
+                        match &message.thread {
+                            Some(thread) if !thread.is_root => {
+                                state.live.publish_reply(&channel, message.clone());
+                            }
+                            _ => state.live.publish(&channel, message.clone()),
+                        }
+                    }
                     state.landed.keep(
                         key,
                         request.after.clone(),
