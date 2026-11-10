@@ -1,10 +1,11 @@
 ---
 title: "two-column-splitter: drag the middle separator to change the two columns' widths"
-status: open
+status: closed
 priority: 1
 issue_type: task
 created_at: 2026-11-10T03:19:34.000000000+00:00
-updated_at: 2026-11-10T03:19:34.000000000+00:00
+updated_at: 2026-11-10T08:22:37.000000000+00:00
+closed_at: 2026-11-10T08:22:37.000000000+00:00
 ---
 
 # Description
@@ -84,3 +85,5 @@ Context: #1144 part 2a (on main, 716e218f) edited the
 two-column layout; 2b (scroll trace) is in a combined gate now.
 Parallel owner-UI lanes nearby: #1167 jump-to-unread-chip
 (mu-layout), #1168 read-toggle-two-way (mu-readtoggle).
+
+Resolution: landed on github/main as 4b989883 (owner-priority gate on e353537e; the one red step on that gate, vibe-talk.check.fold-latency-browser, was an untouched load flake, as the landing note records), deployed 2026-11-10 3:24 AM ET and live through its 15-minute health watch.
