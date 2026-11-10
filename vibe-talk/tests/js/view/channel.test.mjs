@@ -2484,4 +2484,88 @@ test("`#624 voice-page-modularity`: removals and the placing wait, from the modu
   canon.removed.set("m1", 1);
   assert.equal(owner.removedUpstream("m1"), true, "a removed message was not said removed upstream");
   assert.equal(owner.removedUpstream("other"), false, "a message nobody removed was said removed upstream");
+
+test("`#1144 scrollback-typing-jump`: the scroll trace wraps, rings and restores, from the module alone", () => {
+  const { createScrollTrace, SCROLL_TRACE_MAX_ENTRIES } = CHANNEL_VIEW;
+  // A stand-in Element.prototype: scrollTop kept per node, the three methods moving it.
+  const proto = {};
+  Object.defineProperty(proto, "scrollTop", {
+    configurable: true,
+    get() { return this._top || 0; },
+    set(value) { this._top = value; },
+  });
+  const heldTop = Object.getOwnPropertyDescriptor(proto, "scrollTop");
+  proto.scrollTo = function (...args) {
+    const top = typeof args[0] === "object" && args[0] !== null ? args[0].top : args[1];
+    if (typeof top === "number") this._top = top;
+  };
+  proto.scrollBy = function (...args) {
+    const top = typeof args[0] === "object" && args[0] !== null ? args[0].top : args[1];
+    if (typeof top === "number") this._top = (this._top || 0) + top;
+  };
+  proto.scrollIntoView = function () {};
+  const [heldTo, heldBy, heldInto] = [proto.scrollTo, proto.scrollBy, proto.scrollIntoView];
+  const area = (id) => {
+    const listeners = new Map();
+    return Object.assign(Object.create(proto), {
+      id, scrollHeight: 5000, clientHeight: 600, _listeners: listeners,
+      addEventListener: (type, fn) => listeners.set(type, fn),
+      removeEventListener: (type) => listeners.delete(type),
+      contains: (other) => other._inside === id,
+      getBoundingClientRect: () => ({ top: 10, bottom: 610, width: 300, height: 600 }),
+    });
+  };
+  const main = area("scroll-area");
+  const side = area("side-scroll");
+  const composer = { getBoundingClientRect: () => ({ top: 700, bottom: 760, width: 390, height: 60 }) };
+  const page = { "scroll-area": main, "side-scroll": side, "channel-composer": composer };
+  let clock = 1000;
+  const trace = createScrollTrace({
+    lookup: (id) => page[id] ?? null,
+    activeElement: () => ({ id: "channel-compose-text" }),
+    viewport: () => ({ height: 500, offsetTop: 120 }),
+    anchor: () => ({ id: "m-1", offset: -4 }),
+    elementPrototype: () => proto,
+    now: () => clock,
+    stack: () => "Error\n at taker (a:1:1)\n at wrapper (b:2:2)\n at asker (c:3:3)\n at caller (d:4:4)",
+  });
+  main.scrollTop = 50; // Before the start: nothing is traced.
+  trace.start();
+  trace.start(); // Twice is once: no double wrap, so one write is one entry.
+  clock = 1100; main.scrollTop = 200;
+  const stray = Object.assign(Object.create(proto), { id: "elsewhere", scrollHeight: 10, clientHeight: 5 });
+  stray.scrollTop = 5; // Not a list: its writes are not traced...
+  clock = 1200; stray.scrollIntoView(); // ...but asking to show it is.
+  clock = 1300; side.scrollBy({ top: 40 });
+  clock = 1400; side._top = 90; side._listeners.get("scroll")();
+  let entries = JSON.parse(trace.report()).entries;
+  assert.deepStrictEqual(entries.map(({ kind, id, from, to }) => [kind, id, from, to]), [
+    ["write", "scroll-area", 50, 200],
+    ["into", "elsewhere", null, null],
+    ["write", "side-scroll", 0, 40],
+    ["scroll", "side-scroll", 40, 90],
+  ]);
+  assert.equal(entries[0].stack, "at asker (c:3:3) | at caller (d:4:4)");
+  assert.equal(entries[0].focus, "channel-compose-text");
+  assert.deepStrictEqual([entries[0].composer, entries[0].vv, entries[0].anchor],
+    [{ top: 700, bottom: 760, width: 390, height: 60 }, { height: 500, offsetTop: 120 }, { id: "m-1", offset: -4 }]);
+  assert.equal(JSON.parse(trace.report()).startedAt, 1000);
+  // The ring: a full minute of writes keeps the newest SCROLL_TRACE_MAX_ENTRIES, and a write a
+  // minute past the held ones leaves it holding that write alone.
+  for (let at = 0; at < SCROLL_TRACE_MAX_ENTRIES + 5; at += 1) { clock = 2000 + at; main.scrollTop = at; }
+  entries = JSON.parse(trace.report()).entries;
+  assert.equal(entries.length, SCROLL_TRACE_MAX_ENTRIES);
+  assert.equal(entries[entries.length - 1].to, SCROLL_TRACE_MAX_ENTRIES + 4);
+  clock += 61_000; main.scrollTop = 7;
+  assert.deepStrictEqual(JSON.parse(trace.report()).entries.map(({ to }) => to), [7]);
+  // Stopping puts every piece back as it was, takes the listeners down, and ends the tracing.
+  trace.stop();
+  assert.deepStrictEqual(
+    [proto.scrollTo, proto.scrollBy, proto.scrollIntoView, Object.getOwnPropertyDescriptor(proto, "scrollTop").get,
+      Object.getOwnPropertyDescriptor(proto, "scrollTop").set, side._listeners.size],
+    [heldTo, heldBy, heldInto, heldTop.get, heldTop.set, 0]);
+  clock += 10; main.scrollTop = 999;
+  assert.deepStrictEqual(JSON.parse(trace.report()).entries.map(({ to }) => to), [7],
+    "what was traced stays for the report, and nothing joins it");
+  assert.equal(main.scrollTop, 999, "the write itself still landed");
 });

@@ -393,6 +393,7 @@ fn state_pieces_with(
         channel_registration_lock: Arc::new(tokio::sync::Mutex::new(())),
         voice_health_budget: Arc::new(crate::voice_health::LogBudget::new()),
         voice_end_budget: Arc::new(crate::voice_health::LogBudget::new()),
+        scroll_trace_budget: Arc::new(crate::voice_health::LogBudget::new()),
         pairing: Arc::new(crate::pairing::Pairing::new()),
         documents,
         headings: Arc::new(crate::heading::HeadingTags::new()),

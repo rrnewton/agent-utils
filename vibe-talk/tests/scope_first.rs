@@ -206,6 +206,13 @@ fn inventory() -> Vec<Route> {
             Write,
             Bytes("{}", vibe_talk::voice_health::MAX_BODY_BYTES),
         ),
+        // `#1144 scrollback-typing-jump`.
+        route(
+            "POST",
+            "/api/v1/scroll-trace",
+            Write,
+            Bytes("{}", vibe_talk::scroll_trace::MAX_BODY_BYTES),
+        ),
         // `#511 voice-explicit-send-only`.
         route(
             "POST",

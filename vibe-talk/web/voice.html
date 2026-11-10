@@ -2453,6 +2453,18 @@
                         Keyboard layout debug
                       </label>
                       <p id="keyboard-debug-hint" class="hint">Shows the sizes this page measures for a phone's keyboard and the message box over the top of the page, for a screenshot when the box is not where it should be.</p>
+                      <!--
+                        `#1144 scrollback-typing-jump`. What moved a list is knowable only on the phone it moved
+                        on. This keeps the last minute of each list's scrolls, with the code that asked for
+                        each; the button posts that minute to the server's log. OFF by default, kept on this
+                        device alone, and nothing is sent until the button is pressed.
+                      -->
+                      <label class="toggle">
+                        <input id="scroll-trace" type="checkbox" aria-describedby="scroll-trace-hint" />
+                        Scroll trace
+                      </label>
+                      <p id="scroll-trace-hint" class="hint">Keeps the last minute of each list's scrolls, with what asked for each, for sending to the server's log when a list jumps somewhere it should not.</p>
+                      <button id="scroll-trace-send" type="button">Send scroll trace</button>
                     </div>
                   </section>
 

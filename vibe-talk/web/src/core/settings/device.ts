@@ -192,6 +192,14 @@ export const DEVICE_SETTINGS = Object.freeze({
     write: (on: boolean) => (on ? "1" : null),
     refused: { value: false },
   } satisfies DeviceSetting<boolean>,
+  /** `#1144 scrollback-typing-jump`. Whether the lists' scrolls are traced, for the Send beside it
+   * to post to the server's log: kept "1", forgotten when off. */
+  scrollTrace: {
+    key: "vibe-talk.voice.scroll-trace",
+    read: (raw: string | null) => raw === "1",
+    write: (on: boolean) => (on ? "1" : null),
+    refused: { value: false },
+  } satisfies DeviceSetting<boolean>,
   /**
    * `#892 voice-page-optimistic-done`. Whether each key's time to its paint is said on the console
    * (web/src/view/shell/keytiming.ts): kept "1", forgotten when off. Set from the console; no control.

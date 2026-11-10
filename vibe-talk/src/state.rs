@@ -156,6 +156,9 @@ pub struct AppState {
     /// The same cap for `POST /api/v1/voice-end`, kept apart so a flood of one record cannot
     /// silence the other. `#268 voice-call-drops`.
     pub voice_end_budget: Arc<crate::voice_health::LogBudget>,
+    /// The same cap for `POST /api/v1/scroll-trace`, one spend per report however many lines its
+    /// entries make. `#1144 scrollback-typing-jump`; see [`crate::scroll_trace`].
+    pub scroll_trace_budget: Arc<crate::voice_health::LogBudget>,
     /// The paren tags each author has started messages with, per channel: what confirms a
     /// `(tag)` heading. `#242 rich-headers`; see [`crate::heading::HeadingTags`]. In memory and
     /// bounded, shared by every read and the live stream.

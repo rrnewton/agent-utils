@@ -1952,6 +1952,50 @@ pub async fn voice_end(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// `POST /api/v1/scroll-trace` — the last minute of the page's list scrolls, sent by the owner's
+/// "Send scroll trace" after a jump he could not explain. `#1144 scrollback-typing-jump`.
+///
+/// Closed like the voice records (see [`crate::scroll_trace::TraceReport`]), logged and not
+/// stored: one `scroll_trace` line for the report, then one `scroll_trace_entry` line per entry,
+/// in the order they happened. Bounded by its own [`crate::voice_health::LogBudget`], spent once
+/// per report however many lines its entries make. WRITE scope, like the voice records.
+pub async fn scroll_trace(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    body: axum::body::Bytes,
+) -> Result<Response, ApiError> {
+    let report: crate::scroll_trace::TraceReport = serde_json::from_slice(&body).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_scroll_trace",
+            "expected a scroll trace with only the documented fields and values",
+        )
+    })?;
+    report
+        .validate()
+        .map_err(|detail| ApiError::new(StatusCode::BAD_REQUEST, "invalid_scroll_trace", detail))?;
+    let spend = state.scroll_trace_budget.spend();
+    if spend == crate::voice_health::Spend::FirstRefusal {
+        tracing::warn!(
+            "scroll_trace_throttled max_lines={} window_s={}",
+            crate::voice_health::MAX_LINES_PER_WINDOW,
+            crate::voice_health::BUDGET_WINDOW.as_secs()
+        );
+    }
+    if !spend.allowed() {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "scroll_trace_throttled",
+            "too many scroll traces this minute; this one was not logged",
+        ));
+    }
+    tracing::info!("scroll_trace {}", report.header_fields());
+    for (at, entry) in report.entries.iter().enumerate() {
+        tracing::info!("scroll_trace_entry {}", entry.log_fields(at));
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
 /// `POST /api/v1/channels/{channel_id}/messages/{message_id}/speak`
 ///
 /// Read a message aloud, and hand back the AUDIO rather than a URL to it.

@@ -214,3 +214,5 @@ export { createReadRunLines } from "./readrunlines.ts";
 export type { ReadRunLines, ReadRunLinesDependencies } from "./readrunlines.ts";
 export { createThreadStrip } from "./threadstrip.ts";
 export type { ThreadStrip, ThreadStripDependencies } from "./threadstrip.ts";
+export { SCROLL_TRACE_MAX_ENTRIES, SCROLL_TRACE_WINDOW_MS, createScrollTrace } from "./scrolltrace.ts";
+export type { ScrollTrace, ScrollTraceAnchor, ScrollTraceDependencies } from "./scrolltrace.ts";

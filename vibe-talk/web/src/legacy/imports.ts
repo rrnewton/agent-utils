@@ -187,3 +187,5 @@ export { createOutboxDispatch } from "../core/outbox/index.ts";
 export { createSendTakeBack } from "../view/channel/index.ts";
 export { createThreadList } from "../view/channel/index.ts";
 export { createOfflineCache, createReadRunLines, createThreadStrip } from "../view/channel/index.ts";
+// scroll trace (#1144 scrollback-typing-jump part 2b)
+export { createScrollTrace } from "../view/channel/index.ts";

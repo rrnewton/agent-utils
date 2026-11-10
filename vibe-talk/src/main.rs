@@ -822,6 +822,7 @@ async fn main() -> anyhow::Result<()> {
         channel_registration_lock: Arc::new(tokio::sync::Mutex::new(())),
         voice_health_budget: Arc::new(vibe_talk::voice_health::LogBudget::new()),
         voice_end_budget: Arc::new(vibe_talk::voice_health::LogBudget::new()),
+        scroll_trace_budget: Arc::new(vibe_talk::voice_health::LogBudget::new()),
         pairing: Arc::new(vibe_talk::pairing::Pairing::new()),
         documents,
         headings: Arc::new(vibe_talk::heading::HeadingTags::new()),

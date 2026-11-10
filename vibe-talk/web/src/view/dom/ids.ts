@@ -480,6 +480,9 @@ export interface ElementById {
   "screens": HTMLDivElement;
   "scroll-area": HTMLDivElement;
   "scroll-tools": HTMLDivElement;
+  "scroll-trace": HTMLInputElement;
+  "scroll-trace-hint": HTMLParagraphElement;
+  "scroll-trace-send": HTMLButtonElement;
   "search-all-channels": HTMLInputElement;
   "search-count": HTMLSpanElement;
   "search-empty": HTMLParagraphElement;

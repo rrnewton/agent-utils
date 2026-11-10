@@ -11482,6 +11482,75 @@ function applyKeyboardDebug(on) {
   showKeyboardDebug(on);
 }
 
+// --- what moved a list, kept for the log -------------------------------------------------------------------
+//
+// `#1144 scrollback-typing-jump`. A list found somewhere the reader never put it says nothing about what
+// moved it, and the numbers that would are only on the phone it happened on. Settings › Screen and keys ›
+// Typing › "Scroll trace" keeps the last minute of each list's scrolls, with the code that asked for each
+// (web/src/view/channel/scrolltrace.ts), and "Send scroll trace" beside it posts that minute to the
+// server's log (`POST /api/v1/scroll-trace`). Off by default, kept on this device alone, and nothing is
+// sent until Send is pressed.
+
+/**
+ * The first row the reader could see in `area`, named for the trace: its first message's id, and how
+ * far below the list's top it stands.
+ *
+ * @param {HTMLElement} area
+ * @returns {import("./src/view/channel/index.ts").ScrollTraceAnchor | null}
+ */
+function scrollTraceAnchor(area) {
+  const row = scrollAnchor(area);
+  if (!row) return null;
+  const ids = idsOf(row);
+  return { id: ids[0] || row.id || "", offset: row.getBoundingClientRect().top - area.getBoundingClientRect().top };
+}
+
+const scrollTrace = createScrollTrace({
+  lookup: (id) => leftEl(id),
+  activeElement: () => document.activeElement,
+  viewport: () => window.visualViewport || null,
+  anchor: (area) => scrollTraceAnchor(area),
+  elementPrototype: () => Element.prototype,
+  now: () => performance.now(),
+});
+
+/** What was stored. ABSENT MEANS OFF. */
+function storedScrollTrace() {
+  // A browser refusing storage reads as off (`DEVICE_SETTINGS.scrollTrace.refused`).
+  return deviceSettings().get(DEVICE_SETTINGS.scrollTrace);
+}
+
+/** The reader's choice, kept on this device, its switch set to match. @param {boolean} on */
+function applyScrollTrace(on) {
+  try {
+    deviceSettings().keep(DEVICE_SETTINGS.scrollTrace, on);
+  } catch (_error) {
+    // A browser that refuses storage still traces for this session.
+  }
+  el("scroll-trace").checked = on;
+  if (on) scrollTrace.start();
+  else scrollTrace.stop();
+}
+
+/** Post the minute the trace holds to the server's log, and say on the status line how it went. */
+async function sendScrollTrace() {
+  try {
+    // `report` says the trace as one JSON text; `api` carries a body it writes as JSON itself, as it
+    // carries the call-end record's.
+    await api("/api/v1/scroll-trace", { method: "POST", body: JSON.parse(scrollTrace.report()) });
+    setStatus("Scroll trace sent.");
+  } catch (_error) {
+    setStatus("Scroll trace could not be sent.");
+  }
+}
+
+el("scroll-trace").addEventListener("change", () => applyScrollTrace(el("scroll-trace").checked));
+el("scroll-trace-send").addEventListener("click", () => {
+  void sendScrollTrace();
+});
+// As stored, so a reload with the trace on loses none of the minute it is on for.
+applyScrollTrace(storedScrollTrace());
+
 // Drawing the readout and its switch, and keeping it redrawn while it is drawn, are the keyboard owner's
 // (`showKeyboardDebug`, `renderKeyboardDebug`, above).
 

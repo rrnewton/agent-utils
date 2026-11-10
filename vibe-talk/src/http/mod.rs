@@ -272,6 +272,14 @@ fn routes(state: AppState) -> Router {
             "/api/v1/voice-end",
             post(api::voice_end).layer(DefaultBodyLimit::max(crate::voice_health::MAX_BODY_BYTES)),
         )
+        // `#1144 scrollback-typing-jump`. The last minute of the page's list scrolls, which the
+        // owner sends after a jump: one header line and one line per scroll. WRITE scope, like
+        // the voice records.
+        .route(
+            "/api/v1/scroll-trace",
+            post(api::scroll_trace)
+                .layer(DefaultBodyLimit::max(crate::scroll_trace::MAX_BODY_BYTES)),
+        )
         // `#511 voice-explicit-send-only`. What the page heard the user say, as each turn grows, so
         // the voice agent's ask to send can be checked against the user's own words. WRITE scope;
         // held in memory for minutes, never logged or stored.
