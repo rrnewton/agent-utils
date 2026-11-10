@@ -104,5 +104,12 @@ A consumer that loads its own pinned copy gets this only when its pin moves past
 
 ## Resolution
 
-Delivered as described above. Still pending, by the lead's request: the read-only `socket-census` cost measurement on a consumer's validate checkouts (paths come from the coordinator). Its numbers will be added here in an issue-only commit.
+Delivered in 3447358a and 63b81733 as described above.
+
+Cost measured on a consumer's live validate checkouts (2026-11-10 16:48 ET, devbig030, load average about 90). The run was one passive `socket-census` pass over all 31 idle checkouts, under nice -n 19 and ionice -c3:
+- 0 socket nodes in any of them, so no namespace scan, dump or probe ran, and nothing was refused.
+- 2.96 s wall, 0.97 s user and 1.93 s system CPU, 72 MB RSS.
+- 0 /proc entries read. The whole cost was the tree walk: about 398k entries in 42.8k directories.
+
+When a tree does hold a socket node, one passive census on the same host took 2.4 s. It read about 382k /proc links and 378k /proc directory entries over about 10k PID directories (two namespace scans), and made 3 dumps; the host's dump lists about 100k Unix sockets in about 0.35 s. `--probe`, which recovery uses, roughly doubles that and adds the once-per-boot self-test.
 
