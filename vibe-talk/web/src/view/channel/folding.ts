@@ -516,16 +516,12 @@ export function createFolding(deps: FoldingDependencies): Folding {
 
   /**
    * `#1167 jump-to-unread-chip`, held as `#1057` holds its count: the newest unread row above
-   * the screen, as last measured — which list and scroll position it was measured for, and
-   * the row's index and id there. A redraw that changed none of that reads no row's layout
-   * again; in a browser the measure is asked for in the next frame at most once, and where
-   * there are no frames to wait for it is measured now.
+   * the screen, as last measured — which list, scroll position and rows it was measured
+   * for, and the row's index and id there. A redraw that changed none of that reads no
+   * row's layout again, and no frame is ever asked for: the measure is lazy, made once in
+   * the pass that first needs it, and a hidden page is not measured at all (`#226`).
    */
   let unreadHeld: { key: string; index: number; id: string | null } | null = null;
-  /** Whether a measure of the unread row above is already asked for in the next frame. */
-  let unreadDue = false;
-  /** Whether the chip is being drawn again by that measure, which asks for no further one. */
-  let unreadFresh = false;
 
   function unreadKey(rows: HTMLElement[], pane: FoldPane): string {
     const area = pane.scroller();
@@ -579,41 +575,17 @@ export function createFolding(deps: FoldingDependencies): Folding {
     return row && (row.getAttribute("data-id") || null) === unreadHeld.id ? row : null;
   }
 
-  /** Measure the unread row above in the next frame, and draw the chip again where it moved. */
-  function scheduleUnread(): void {
-    if (unreadDue) return;
-    unreadDue = true;
-    const again = deps.inThisColumn(() => {
-      unreadDue = false;
-      if (deps.screen() !== "main" || deps.view() !== "discord" || deps.listEmptied()) return;
-      const pane = deps.channelPane();
-      const rows = deps.paneRows(pane);
-      const before = unreadHeld;
-      holdUnread(rows, pane, rows.length ? measureUnreadAbove(rows, pane) : null);
-      if (before && unreadHeld && before.key === unreadHeld.key && before.index === unreadHeld.index) return;
-      unreadFresh = true;
-      try {
-        renderJumpUnread();
-      } finally {
-        unreadFresh = false;
-      }
-    });
-    requestAnimationFrame(() => again());
-  }
-
   function unreadAboveTarget(): HTMLElement | null {
     if (deps.screen() !== "main" || deps.view() !== "discord" || deps.listEmptied()) return null;
     const pane = deps.channelPane();
     const rows = deps.paneRows(pane);
     if (rows.length === 0) return null;
-    if (unreadFresh) return heldUnread(rows);
+    // A hidden page is laid out for nobody: the held answer stands until it is shown
+    // again, when the next pass measures where the reader now is (`#226`).
+    if (document.hidden) return heldUnread(rows);
     if (unreadHeld && unreadHeld.key === unreadKey(rows, pane)) {
       const held = heldUnread(rows);
       if (held || unreadHeld.index < 0) return held;
-    }
-    if (typeof requestAnimationFrame === "function" && unreadHeld) {
-      scheduleUnread();
-      return heldUnread(rows);
     }
     const target = measureUnreadAbove(rows, pane);
     holdUnread(rows, pane, target);
