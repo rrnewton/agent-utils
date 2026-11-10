@@ -1,11 +1,12 @@
 ---
 title: 'fold-latency-deflake: the fold latency browser check fails under gate load and passes alone'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-foldlat
 created_at: 2026-11-10T17:49:28+00:00
-updated_at: 2026-11-10T17:49:28+00:00
+updated_at: 2026-11-10T18:35:00+00:00
+closed_at: 2026-11-10T18:35:00+00:00
 ---
 
 # Description
@@ -29,3 +30,26 @@ Its budgets follow #866: a main-thread work budget of 28 ms per key press (`--cp
 # Notes
 
 Lead request 2026-11-10 (P1). Related: #866 budget rule, #905 second-press budget, #532 restyle scope.
+
+## Resolution
+
+[opus 5] Made the check load-aware in place; it stays a shared DAG step
+(`vibe-talk.check.fold-latency-browser`, still holding every browser slot), not an exclusive tail
+step: the contention that failed it is between gates on the host, and an exclusive phase would
+serialise every gate behind this step while still sharing the host with non-gate load. Measured
+first, on this host: the untouched check passed alone at low load and failed every attempt at
+loadavg 141-170 with two gates admitted, with per-press work of 28-36 ms against reference factors
+of only x1.0-x1.9; a lane report the same day found the untouched base failing at loadavg near or
+above 110 and passing at low load. The fix, all in `vibe-talk/tests/fold_latency_browser.py`:
+the reference workload now brackets each press (run just before and just after, the slower counts);
+Shift+O judges eight folds and `e` eight Done marks across two threads, so the budget judges the
+median of eight with the largest quarter allowed to spike (#905 generalised); every press prints
+its work, wall and before/after reference times with the host's load sampled at that press (gate
+admission running count, loadavg, PSI memory and CPU), in every run and in the failure message; and
+a failing size is re-walked fresh (new server and browser profile) up to three attempts, passing
+only on a majority. The 28 ms budget (~1.5x the solo median, #866) and the #532 restyle assertion
+are unchanged. Evidence on 2026-11-10: 10 of 10 full runs passed with one gate admitted beside
+them (loadavg 52-107); at a deliberate bounded load (loadavg 135-138) the desk run passed on its
+first attempt, while a variant page with 45 ms of busy work added to the fold handler failed all
+three attempts alone (work about 66 ms per press) and failed again under that load. The mutation
+variant was built only under /tmp from copied sources; no page code changed.

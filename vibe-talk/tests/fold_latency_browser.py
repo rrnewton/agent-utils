@@ -9,20 +9,28 @@ to be instantly responsive locally."
 Against a fake API of twenty threads, one with twelve long replies and the rest with four, every thread
 unpacked in the Threads view (Unpack all):
 
-* Shift+O: four presses 60 ms apart on the last reply fold the four last replies, each folded in the frame
-  after its key; each press's handler work under `--cpu-ms` at the median and twice that for the second
-  largest press (#905), and from the key to the next frame drawn under the wall budget at the median.
+* Shift+O: eight presses 60 ms apart on the last reply fold the eight last replies, each folded in the
+  frame after its key; each press's handler work under `--cpu-ms` at the median and twice that for all
+  but the largest quarter of presses (#905), and from the key to the next frame drawn under the wall
+  budget at the median.
   The budgets follow the owner's rule (#866): the work budget bites at ~1.5x the measured solo median,
   and the wall budget is forgiving at 8x it, derived unless `--frame-ms` overrides it.
 
   Handler work is what a shared host cannot inflate (#998). It is the main thread's own CPU time for
   the key's dispatch, from the browser's trace (`EventDispatch` thread time), so time the renderer spent
   descheduled or throttled by its cgroup is not counted. It is divided by how much slower this browser
-  lays out a fixed, page-independent document at that moment, measured just before each press, so a
-  host whose memory and caches are contended (the gate's usual load, which a CPU-bound calibration loop
-  does not see) does not count either. Sustained main-thread work, the regression this exists to catch,
-  is CPU time the reference does not share, so it still fails.
-* e: the same on another thread's replies, each marked Done in the frame after its key, held to the same.
+  lays out a fixed, page-independent document at that moment, measured just before and just after each
+  press (the slower of the two brackets the press), so a host whose memory and caches are contended
+  (the gate's usual load, which a CPU-bound calibration loop does not see) does not count either.
+  Sustained main-thread work, the regression this exists to catch, is CPU time the reference does not
+  share, so it still fails. Every press's work, wall and reference times, with the host's load (gate
+  admission running count, loadavg, PSI memory and CPU) sampled at that press, are printed for each
+  run and in the failure message (#1231). A size that fails is re-walked fresh up to three attempts
+  in all and passes only when a majority of the attempts pass, so a transient spike that one
+  bracketed reference still missed cannot fail the gate, while work added to a handler fails every
+  attempt.
+* e: the same on two other threads' replies, four presses on each, each marked Done in the frame after
+  its key, held to the same.
 * style: hiding one row restyles a few elements, not the page: under `--restyle-max` elements in the
   browser's own trace (on a touch screen a rule of #429 keyboard-hides-bar restyled every element of the
   page, about 5,000, at every show or hide).
@@ -53,8 +61,13 @@ if TYPE_CHECKING:
 
 SIZES = (("phone-393", 393, 852, True), ("desk", 1280, 800, False))
 
+# A failing size is re-walked fresh this many attempts in all, and passes only when a majority of
+# them pass (#1231): a transient spike is one attempt, handler work added on purpose is all of them.
+MAX_ATTEMPTS = 3
+
 TARGET = "spaces/A/threads/target"
 OTHER = "spaces/A/threads/t18"
+OTHER2 = "spaces/A/threads/t17"
 PARA = ("The nightly run finished; the integration shard was retried twice and passed on the third attempt, "
         "and the artifact upload waited on the cache for most of an hour before it went through. ")
 
@@ -174,8 +187,8 @@ def arguments() -> argparse.Namespace:
                         help="deprecated alias for --cpu-ms")
     parser.add_argument("--ref-idle-ms", type=float, default=4.4,
                         help="time of the reference layout workload in an uncontended browser of this host class, "
-                             "in ms; each press's work is divided by how much slower it ran just before that "
-                             "press (default: 4.4, measured 2026-11-06)")
+                             "in ms; each press's work is divided by how much slower the slower of the "
+                             "reference runs bracketing that press ran (default: 4.4, measured 2026-11-06)")
     parser.add_argument("--restyle-max", type=int, default=500,
                         help="most elements hiding one row may restyle (default: 500)")
     parser.add_argument("--report-only", action="store_true",
@@ -252,15 +265,70 @@ REF_JS = """() => new Promise((resolve) => { const id = setTimeout(() => {
   resolve({id, ms: performance.now() - t0}); }, 0); })"""
 
 
+def _psi_avg10(path: Path) -> tuple[str, str]:
+    """(some, full) avg10 from a PSI pressure file; ("?", "?") when it cannot be read."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return "?", "?"
+    found: dict[str, str] = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] in ("some", "full"):
+            for token in parts[1:]:
+                if token.startswith("avg10="):
+                    found[parts[0]] = token.removeprefix("avg10=")
+    return found.get("some", "?"), found.get("full", "?")
+
+
+def _load_parts() -> tuple[str, str, str, str, str]:
+    """(gates running beside this one, loadavg 1/5/15, PSI memory some/full avg10, PSI CPU some
+    avg10), each "?" when its source cannot be read."""
+    admission = Path(os.environ.get("GATE_ADMISSION_DIR", "/tmp/dev-agent-utils-gate-admission")) / "runs"
+    try:
+        gates = str(sum(1 for _ in admission.glob("*.json")))
+    except OSError:
+        gates = "?"
+    try:
+        load = "/".join(Path("/proc/loadavg").read_text(encoding="utf-8").split()[:3])
+    except OSError:
+        load = "?"
+    mem_some, mem_full = _psi_avg10(Path("/proc/pressure/memory"))
+    cpu_some, _cpu_full = _psi_avg10(Path("/proc/pressure/cpu"))
+    return gates, load, mem_some, mem_full, cpu_some
+
+
+def load_evidence() -> str:
+    """The host's load as this run found it, so a red run names the contention it ran under and a
+    green one records what it survived (#1231)."""
+    gates, load, mem_some, mem_full, cpu_some = _load_parts()
+    return (f"host load: {gates} gate(s) running, loadavg {load}, "
+            f"PSI memory some/full avg10 {mem_some}/{mem_full}, PSI CPU some avg10 {cpu_some}")
+
+
+def load_snapshot() -> str:
+    """One press's load, compact enough to print beside every press (#1231)."""
+    gates, load, mem_some, mem_full, cpu_some = _load_parts()
+    return f"gates {gates}, loadavg {load}, PSI mem {mem_some}/{mem_full}, PSI cpu {cpu_some}"
+
+
 class Presses:
-    """One key's four presses: wall handler and key-to-frame times, when each watched row was drawn, the
+    """One key's presses: wall handler and key-to-frame times, when each watched row was drawn, the
     main thread's CPU time for each key's dispatch (None when the trace did not hold four), and the
-    reference workload's CPU time just before each press (its wall time, said so, when the trace did not
-    hold it)."""
+    reference workload's time bracketing each press: `ref_before` just before it, `ref_after` just
+    after it, and `ref` the slower of the two (its CPU time, or its wall time, said so, when the trace
+    did not hold it)."""
 
     def __init__(self, handler: list[float], frame: list[float], seen: dict[str, float],
-                 cpu: list[float] | None, ref: list[float]) -> None:
+                 cpu: list[float] | None, ref: list[float], ref_before: list[float],
+                 ref_after: list[float], loads: list[str], epoch: float = 0.0) -> None:
         self.handler, self.frame, self.seen, self.cpu, self.ref = handler, frame, seen, cpu, ref
+        self.ref_before, self.ref_after = ref_before, ref_after
+        # The host's load sampled at each press, printed beside it (#1231).
+        self.loads = loads
+        # When the first press started, on the page's own clock: a second batch's draw times are
+        # rebased onto the first batch's by the difference of the two epochs.
+        self.epoch = epoch
         self.ref_source = "CPU"
 
 
@@ -279,10 +347,10 @@ def timer_cpu_ms(events: list[Json], ids: list[int]) -> list[float] | None:
     return [cpu[id] for id in ids] if all(id in cpu for id in ids) else None
 
 
-def key_cpu_ms(events: list[Json]) -> list[float] | None:
-    """Thread CPU time of the four keys' dispatches, in order, from the trace's keydown EventDispatch
-    events. A Shift+O press also dispatches a keydown for Shift, which does next to nothing, so the four
-    largest are the measured keys'."""
+def key_cpu_ms(events: list[Json], count: int = 4) -> list[float] | None:
+    """Thread CPU time of the keys' dispatches, in order, from the trace's keydown EventDispatch
+    events. A Shift+O press also dispatches a keydown for Shift, which does next to nothing, so the
+    `count` largest are the measured keys'."""
     dispatches = []
     for event in events:
         args = event.get("args")
@@ -291,17 +359,20 @@ def key_cpu_ms(events: list[Json]) -> list[float] | None:
         if (event.get("name") == "EventDispatch" and isinstance(data, dict) and data.get("type") == "keydown"
                 and isinstance(cpu, (int, float))):
             dispatches.append((float(str(event.get("ts") or 0)), float(cpu) / 1000.0))
-    if len(dispatches) < 4:
+    if len(dispatches) < count:
         return None
-    largest = sorted(sorted(dispatches, key=lambda one: one[1])[-4:])
+    largest = sorted(sorted(dispatches, key=lambda one: one[1])[-count:])
     return [cpu for _ts, cpu in largest]
 
 
 def presses(desk: Desk, key: str, ids: list[str]) -> Presses:
-    """Four presses of `key` 60 ms apart, watching `ids` for the frame each is drawn folded or Done, with
-    the reference workload timed just before each press and the browser's trace holding each dispatch's
-    CPU time."""
+    """One press of `key` 60 ms apart per watched row, watching `ids` for the frame each is drawn folded
+    or Done, with the reference workload timed just before and just after each press and the browser's
+    trace holding each dispatch's CPU time. Eight presses where the thread holds them: the median of
+    eight is what the budget judges, and one contended press moves it far less than the median of
+    four (#1231)."""
     page = desk.page
+    count = len(ids)
     page.evaluate(REF_SETUP_JS)
     for _ in range(3):
         page.evaluate(REF_JS)  # warm: a new document's first layouts are not its steady cost
@@ -315,17 +386,23 @@ def presses(desk: Desk, key: str, ids: list[str]) -> Presses:
                                "traceConfig": {"includedCategories": ["devtools.timeline"]}})
     ref_wall: list[float] = []
     ref_ids: list[int] = []
-    for _ in range(4):
-        sample = page.evaluate(REF_JS)
-        assert isinstance(sample, dict)
-        ref_wall.append(float(str(sample["ms"])))
-        ref_ids.append(int(str(sample["id"])))
+    loads: list[str] = []
+    for _ in range(count):
+        before = page.evaluate(REF_JS)
+        assert isinstance(before, dict)
+        ref_wall.append(float(str(before["ms"])))
+        ref_ids.append(int(str(before["id"])))
         page.wait_for_timeout(30)
         page.keyboard.press(key)
         page.wait_for_timeout(60)
+        after = page.evaluate(REF_JS)
+        assert isinstance(after, dict)
+        ref_wall.append(float(str(after["ms"])))
+        ref_ids.append(int(str(after["id"])))
+        loads.append(load_snapshot())
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline and not page.evaluate(
-            "() => window.__keys.length === 4 && window.__keys.every((press) => press.frame !== null)"):
+            f"() => window.__keys.length === {count} && window.__keys.every((press) => press.frame !== null)"):
         page.wait_for_timeout(50)
     cdp.send("Tracing.end")
     deadline = time.monotonic() + 10
@@ -336,15 +413,37 @@ def presses(desk: Desk, key: str, ids: list[str]) -> Presses:
     assert isinstance(keys, list) and isinstance(seen, dict)
     first = float(keys[0]["start"]) if keys else 0.0
     ref_cpu = timer_cpu_ms(events, ref_ids)
+    bracketed = ref_cpu if ref_cpu is not None else ref_wall
+    # Each press is judged against the slower of the reference runs bracketing it: contention that
+    # lands on the press but had not yet landed on the run just before it is still counted (#1231).
+    ref_before = bracketed[0::2]
+    ref_after = bracketed[1::2]
     pressed = Presses([float(press["handler"] or 0) for press in keys], [float(press["frame"] or 0) for press in keys],
-                      {str(id): float(at) - first for id, at in seen.items()}, key_cpu_ms(events),
-                      ref_cpu if ref_cpu is not None else ref_wall)
+                      {str(id): float(at) - first for id, at in seen.items()}, key_cpu_ms(events, count),
+                      [max(pair) for pair in zip(ref_before, ref_after)], ref_before, ref_after, loads, epoch=first)
     if ref_cpu is None:
         pressed.ref_source = "wall (no trace)"
     return pressed
 
 
-def judge(desk: Desk, args: argparse.Namespace, what: str, pressed: Presses, ids: list[str]) -> str:
+def merged(first: Presses, second: Presses) -> Presses:
+    """Two batches of one key's presses as one: the second batch's draw times rebased onto the first
+    batch's first press, and CPU time kept only when both traces held every dispatch."""
+    offset = second.epoch - first.epoch
+    cpu = first.cpu + second.cpu if first.cpu is not None and second.cpu is not None else None
+    both = Presses(first.handler + second.handler, first.frame + second.frame,
+                   {**first.seen, **{row: at + offset for row, at in second.seen.items()}}, cpu,
+                   first.ref + second.ref, first.ref_before + second.ref_before,
+                   first.ref_after + second.ref_after, first.loads + second.loads, epoch=first.epoch)
+    both.ref_source = first.ref_source if first.ref_source == second.ref_source else "mixed"
+    return both
+
+
+def judge(desk: Desk, args: argparse.Namespace, what: str, pressed: Presses, ids: list[str]) -> tuple[bool, str]:
+    """Whether these presses are within budget, and the one line that says so: each press's work, wall
+    and reference times, the rows' draw times, and the host's load as the run found it. The line is
+    printed for every run, passing or not, so a failure the gate log truncates still names its
+    mechanism (#1231). The caller decides what a failure means; this only measures."""
     cpu_ms = args.cpu_ms
     frame_ms = args.frame_ms if args.frame_ms > 0 else 8 * cpu_ms
     handler, frame, seen = pressed.handler, pressed.frame, pressed.seen
@@ -356,25 +455,41 @@ def judge(desk: Desk, args: argparse.Namespace, what: str, pressed: Presses, ids
     else:
         measured, source = handler, "wall (no trace)"
     work = [ms / factor for ms, factor in zip(measured, factors)]
-    # The per-press ceiling is the second largest of the four, not the largest (#905): one press can
-    # still meet a stall the reference just before it missed, while sustained main-thread work, the
+    # The per-press ceiling is not the largest press (#905): the largest quarter of presses can still
+    # meet a stall the reference bracketing them missed, while sustained main-thread work, the
     # regression this budget exists to catch, lifts every press.
-    trimmed_max = sorted(work)[-2] if len(work) >= 2 else (work[0] if work else 0.0)
+    spikes = max(1, len(work) // 4)
+    trimmed_max = sorted(work)[-1 - spikes] if len(work) > spikes else (work[0] if work else 0.0)
     longtasks = desk.page.evaluate("() => window.__longtasks || 0")
+    per_press = "; ".join(
+        f"press {index + 1}: work {one_work:.0f} ms, wall {one_wall:.0f} ms, "
+        f"ref {one_ref:.1f} ms before/{pressed.ref_after[index]:.1f} ms after (x{one_factor:.2f}) "
+        f"[{pressed.loads[index] if index < len(pressed.loads) else 'load ?'}]"
+        for index, (one_work, one_wall, one_ref, one_factor) in enumerate(zip(work, handler, pressed.ref_before, factors)))
     said = (f"{what}: handlers {', '.join(f'{ms:.0f}' for ms in handler)} ms wall, "
             f"{', '.join(f'{ms:.0f}' for ms in measured)} ms {source}, "
             f"{', '.join(f'{ms:.0f}' for ms in work)} ms work at load {', '.join(f'x{f:.2f}' for f in factors)}"
             f" ({pressed.ref_source} reference), "
             f"key to frame {', '.join(f'{ms:.0f}' for ms in frame)} ms, "
             f"rows drawn at {', '.join(f'{seen.get(id, -1):.0f}' for id in ids)} ms"
-            f" (work budget {cpu_ms:.0f} ms, wall budget {frame_ms:.0f} ms, {longtasks} long tasks)")
-    if not args.report_only:
-        desk.check(len(handler) == 4, f"{what}: not four presses heard: {said}")
-        desk.check(all(id in seen for id in ids), f"{what}: not every press drew its row: {said}")
-        desk.check(statistics.median(work) <= cpu_ms and trimmed_max <= 2 * cpu_ms,
-                   f"{what}: over the {cpu_ms:.0f} ms work budget: {said}")
-        desk.check(statistics.median(frame) <= frame_ms, f"{what}: the frames came late: {said}")
-    return said
+            f" (work budget {cpu_ms:.0f} ms, wall budget {frame_ms:.0f} ms, {longtasks} long tasks); "
+            f"{per_press}; {load_evidence()}")
+    print(said, flush=True)
+    if args.report_only:
+        return True, said
+    heard = len(handler) == len(ids)
+    drawn = all(id in seen for id in ids)
+    within = bool(work) and statistics.median(work) <= cpu_ms and trimmed_max <= 2 * cpu_ms
+    framed = bool(frame) and statistics.median(frame) <= frame_ms
+    if not heard:
+        return False, f"{what}: not every press heard: {said}"
+    if not drawn:
+        return False, f"{what}: not every press drew its row: {said}"
+    if not within:
+        return False, f"{what}: over the {cpu_ms:.0f} ms work budget: {said}"
+    if not framed:
+        return False, f"{what}: the frames came late: {said}"
+    return True, said
 
 
 RESTYLE_JS = """() => { const rows = [...document.querySelectorAll('#side-cards > li[data-unpack-thread][data-id]')];
@@ -406,6 +521,28 @@ def restyled(page: Page) -> int:
 
 
 def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int, touch: bool) -> str:
+    """One size, re-walked fresh after a failure: passes at once, or when a majority of
+    `MAX_ATTEMPTS` fresh attempts pass, and otherwise fails with every attempt's measurements
+    (#1231). Each attempt is a new server and browser profile, so no fold or Done state leaks
+    from one attempt into the next."""
+    failures: list[str] = []
+    passing: list[str] = []
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            line = walk_once(chromium, args, label, width, height, touch)
+        except AssertionError as error:
+            failures.append(f"attempt {attempt}: {error}")
+            print(f"{label}: attempt {attempt} of {MAX_ATTEMPTS} failed: {error}", flush=True)
+            continue
+        if attempt == 1:
+            return line
+        passing.append(line)
+    if len(passing) * 2 > len(failures) + len(passing):
+        return f"{passing[-1]} (passed {len(passing)} of {len(failures) + len(passing)} attempts)"
+    raise AssertionError(f"{label}: failed a majority of attempts: " + " | ".join(failures))
+
+
+def walk_once(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int, touch: bool) -> str:
     api = LatencyApi()
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(api))
     server.daemon_threads = True
@@ -443,18 +580,28 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             target = page.evaluate(BLOCK_IDS_JS, TARGET)
             assert isinstance(target, list)
             select(desk, str(target[-1]))
-            folded = [str(one) for one in target[-4:]][::-1]
-            notes.append(judge(desk, args, "Shift+O", presses(desk, "Shift+O", folded), folded))
+            folded = [str(one) for one in target[-8:]][::-1]
+            within, said = judge(desk, args, "Shift+O", presses(desk, "Shift+O", folded), folded)
+            notes.append(said)
+            desk.check(within, said)
             desk.check(page.evaluate("(id) => document.querySelector(`#side-cards > li[data-unpack-thread][data-id='${id}']`)"
                                      ".getAttribute('data-read-run')", folded[-1]) == "head",
-                       "the four folds are not one line")
+                       "the eight folds are not one line")
             desk.shot("1-folded")
 
             other = page.evaluate(BLOCK_IDS_JS, OTHER)
             assert isinstance(other, list)
             select(desk, str(other[0]))
             marked = [str(one) for one in other[:4]]
-            notes.append(judge(desk, args, "e", presses(desk, "e", marked), marked))
+            first_batch = presses(desk, "e", marked)
+            other2 = page.evaluate(BLOCK_IDS_JS, OTHER2)
+            assert isinstance(other2, list)
+            select(desk, str(other2[0]))
+            marked2 = [str(one) for one in other2[:4]]
+            marked += marked2
+            within, said = judge(desk, args, "e", merged(first_batch, presses(desk, "e", marked2)), marked)
+            notes.append(said)
+            desk.check(within, said)
             desk.shot("2-done")
 
             count = restyled(page)

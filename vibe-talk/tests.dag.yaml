@@ -2001,8 +2001,10 @@ steps:
       est_duration_s: 30
 
   # `#532 shift-o-latency` in the browser engine: twenty threads of long replies unpacked in the Threads view;
-  # four Shift+O and four e, each drawn in the frame after its key, each handler held to 28 ms of main-thread
-  # work at the median (its CPU time, corrected by a layout reference, #998), and hiding one row restyling a few elements rather than the page (a #429 rule on a touch screen
+  # eight Shift+O and eight e, each drawn in the frame after its key, each handler held to 28 ms of main-thread
+  # work at the median (its CPU time, corrected by a layout reference bracketed around each press, #998,
+  # #1231), every press printed with the host's load at that press, a failing size re-walked fresh to a
+  # majority of three attempts, and hiding one row restyling a few elements rather than the page (a #429 rule on a touch screen
   # restyled about 5,000). Measured on 2026-10-26: about 20s wall.
   - group: check
     job: fold-latency-browser
