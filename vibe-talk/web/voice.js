@@ -1698,7 +1698,8 @@ const filterPlaceOwner = createFilterPlace({
   pinsView: () => pinsView(),
   visibleList: () => visibleList(),
   listEmptied: () => listEmptied(),
-  atBottom: (area) => atBottom(area),
+  atBottom: (area, slack) => (slack === undefined ? atBottom(area) : atBottom(area, slack)),
+  restSlackPx: FOLLOW_REST_PX,
   quickReplyHolds: (area) => quickReplyHolds(area),
   endSearchWalks: () => endSearchWalks(),
   scrollToNewest: () => scrollToNewest(),
@@ -1800,6 +1801,8 @@ const channelViews = createChannelViews({
   hiddenEmpty: (message) => hiddenEmpty(message),
   hidingRead: () => hidingRead(),
   renderChannelLoading: (busy, quiet) => renderChannelLoading(busy, quiet),
+  selectionIn: (area) => textSelectionIn(area),
+  restoreSelectionIn: (area, selection) => restoreTextSelectionIn(area, selection),
   restoreChannelComposer: () => restoreChannelComposer(),
   renderOlderControl: () => renderOlderControl(),
   restoreScroll: (position) => restoreScroll(/** @type {any} */ (position)),
@@ -2473,8 +2476,118 @@ const { finishPackSlide, slideKey, itemAfterBlock, slideIntoPlace } = packSlider
  * newest line (web/src/view/channel `createScrollKeeping`, `#624 voice-page-modularity`), in the column
  * being worked on. The page destructures them under their old names.
  */
+/**
+ * The reader's text selection in `area`, for keeping across a rebuild (`#1209
+ * selection-survives-updates`): the message it stands in and the ends' distances into that
+ * row's words, or null where it does not stand in one row of the list.
+ *
+ * @param {HTMLElement} area
+ * @returns {{ id: string, start: number, end: number } | null}
+ */
+/** The last live selection in a list row, kept as it changes: a switch or a rebuild takes the
+ * live one before any capture at rebuild time can see it (`#1209`). */
+let keptTextSelection = null;
+
+document.addEventListener("selectionchange", () => {
+  const live = textSelectionInNow(el("scroll-area"));
+  if (live) keptTextSelection = live;
+});
+// The reader's own hand lets the kept selection go: a rebuild after it must not resurrect it.
+for (const type of ["pointerdown", "keydown"]) {
+  document.addEventListener(type, () => { keptTextSelection = null; }, { capture: true, passive: true });
+}
+
+/**
+ * The reader's live text selection in `area`, as it stands now (no kept fallback).
+ *
+ * @param {HTMLElement} area
+ * @returns {{ id: string, start: number, end: number } | null}
+ */
+function textSelectionInNow(area) {
+  const sel = typeof getSelection === "function" ? getSelection() : null;
+  if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
+  const range = sel.getRangeAt(0);
+  const rowOf = (node) => {
+    let at = node && (node.nodeType === 1 ? node : node.parentElement);
+    while (at && at.parentNode) {
+      const parent = at.parentNode;
+      if (parent.id === "discord-log" || parent.id === "pinned-log" || parent.id === "transcript") return at;
+      at = parent;
+    }
+    return null;
+  };
+  const startRow = rowOf(range.startContainer);
+  const endRow = rowOf(range.endContainer);
+  let inArea = false;
+  for (let at = startRow; at; at = at.parentNode) if (at === area) { inArea = true; break; }
+  if (!startRow || startRow !== endRow || !inArea) return null;
+  const ids = idsOf(startRow);
+  if (!ids.length) return null;
+  const before = document.createRange();
+  before.setStart(startRow, 0);
+  before.setEnd(range.startContainer, range.startOffset);
+  const until = document.createRange();
+  until.setStart(startRow, 0);
+  until.setEnd(range.endContainer, range.endOffset);
+  return { id: ids[0], start: before.toString().length, end: until.toString().length };
+}
+
+function textSelectionIn(area) {
+  const live = textSelectionInNow(area);
+  if (live) return live;
+  // Nothing live: the last selection kept. Its row may not stand in this list yet (a switch
+  // drew another view's first): putting it back looks for the row after the rebuild, and
+  // finds nothing where it never comes back.
+  return keptTextSelection;
+}
+
+/**
+ * Put a selection kept by `textSelectionIn` back on the rebuilt row in `area`, by its words.
+ *
+ * @param {HTMLElement} area
+ * @param {{ id: string, start: number, end: number }} kept
+ */
+function restoreTextSelectionIn(area, kept) {
+  keptTextSelection = kept;
+  const sel = typeof getSelection === "function" ? getSelection() : null;
+  if (!sel) return;
+  const rows = area.id === "discord-log" || area.id === "pinned-log" || area.id === "transcript"
+    ? [...area.children] : [...area.querySelectorAll("li")];
+  const row = rows.find((candidate) => idsOf(candidate).includes(kept.id));
+  if (!row) return;
+  const point = (at) => {
+    let left = at;
+    const visit = (node) => {
+      if (node.nodeType === 3) {
+        if (left <= node.textContent.length) return [node, left];
+        left -= node.textContent.length;
+        return null;
+      }
+      for (const child of node.childNodes) {
+        const found = visit(child);
+        if (found) return found;
+      }
+      // An element holding its words itself, with no text node under it: the point is in it.
+      if (node.childNodes.length === 0 && node.textContent) return [node, Math.min(left, node.textContent.length)];
+      return null;
+    };
+    return visit(row);
+  };
+  const from = point(kept.start);
+  const to = point(kept.end);
+  if (!from || !to) return;
+  const range = document.createRange();
+  range.setStart(from[0], from[1]);
+  range.setEnd(to[0], to[1]);
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
 const scrollKeeping = createScrollKeeping({
   el: (id) => el(id),
+  restSlackPx: FOLLOW_REST_PX,
+  selectionIn: (area) => textSelectionIn(area),
+  restoreSelectionIn: (area, selection) => restoreTextSelectionIn(area, selection),
   onMain: () => screens.screen() === "main",
   currentView: () => screens.view(),
   channelView: () => selection().view,
@@ -8260,6 +8373,8 @@ const timelineView = createTimelineView({
   noiseRenderCount: () => noiseSettings.renderCount(), foldedOneIds, foldedOnes, readRuns, setReadMode,
   setJumpNewest, scrollToNewest, keepFilterHold, inThisColumn: (fn) => inThisColumn(fn), pinsView, searchOffered: () => searchOffered(),
   pullToRefresh, heldFilterRow, scrollAnchor, followsNewest, visibleList, noiseSettings,
+  selectionIn: (area) => textSelectionIn(area),
+  restoreSelectionIn: (area, selection) => restoreTextSelectionIn(area, selection),
   combineOn: () => combineSwitch.on(), columns, sideShowing, openThreadRootId,
   isOpenThreadRoot, readRunWords, placeInReadRun, runDaysOf, renderReplyLinks, leftEl,
   cardRunKey, cardRunRows, screensScreen: () => screens.screen(), searchField, authorChosen: () => authorFilters.chosen(), searchTyped, stillToDo, cardsDrawnForget: () => cardsDrawn.forget(), renderSideColumn, keepSelection,
@@ -10101,7 +10216,7 @@ const scrollTrace = createScrollTrace({
     .map((id) => leftEl(id)).filter((node) => node),
   documentTarget: () => document,
   selection: () => {
-    const sel = typeof document.getSelection === "function" ? document.getSelection() : null;
+    const sel = typeof getSelection === "function" ? getSelection() : null;
     if (!sel) return null;
     const node = sel.anchorNode;
     const near = /** @type {Element | null} */ (node && (node.nodeType === 1 ? node : node.parentElement));

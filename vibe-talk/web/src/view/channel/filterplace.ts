@@ -81,7 +81,9 @@ export interface FilterPlaceDependencies {
   pinsView(): { only: boolean };
   visibleList(): HTMLElement;
   listEmptied(): boolean;
-  atBottom(area: HTMLElement): boolean;
+  atBottom(area: HTMLElement, slack?: number): boolean;
+  /** How far above the foot rest still counts as following it (`FOLLOW_REST_PX`). */
+  restSlackPx: number;
   quickReplyHolds(area: HTMLElement): boolean;
   endSearchWalks(): void;
   scrollToNewest(): void;
@@ -300,7 +302,10 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
   function followsNewest(area: HTMLElement): boolean {
     // `#727 vt-selection-quick-reply`. Never a list held still for a quick reply.
     if (deps.quickReplyHolds(area)) return false;
-    return deps.atBottom(area) && heldFilterRow() === null;
+    // Rest, not the slack (`#1209`'s near-foot case, owner reply 298): a reader parked above
+    // the list's own end room is reading, and an arrival offers them the jump instead of
+    // taking them to the foot.
+    return deps.atBottom(area, deps.restSlackPx) && heldFilterRow() === null;
   }
 
   /**

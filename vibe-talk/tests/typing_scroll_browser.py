@@ -126,6 +126,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 foot_walk(reader)
                 reading_walk(reader)
             else:
+                selection_walk(reader)
                 desk_walk(reader)
                 hover_walk(reader)
             reader.check(not errors, f"the page threw: {errors}")
@@ -286,6 +287,49 @@ def desk_walk(reader: Reader) -> None:
     reader.check(found["active"] != "channel-compose-text",
                  f"an unfocused key took the composer instead of navigating: {found}")
     reader.notes.append("on the desktop: typing followed, reading held, unfocused keys navigated")
+
+
+def selection_walk(reader: Reader) -> None:
+    """`#1209 selection-survives-updates`: words selected in a row are still selected, in the
+    rebuilt row, after a landing that rebuilds the rows."""
+    page = reader.page
+    row = page.locator("#discord-log > li[data-id]").filter(has_text="Message 232.").first
+    row.scroll_into_view_if_needed()
+    reader.quiet(400)
+    box = row.bounding_box()
+    reader.check(box is not None, "no row to select in")
+    assert box is not None
+    page.mouse.move(box["x"] + 90, box["y"] + 42)
+    page.mouse.down()
+    page.mouse.move(box["x"] + 170, box["y"] + 42, steps=8)
+    page.mouse.up()
+    reader.quiet(300)
+    picked = page.evaluate("""() => {
+        const sel = window.getSelection();
+        if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
+        let at = sel.getRangeAt(0).startContainer;
+        while (at && !(at instanceof Element && at.hasAttribute("data-ids"))) at = at.parentNode;
+        return { text: String(sel), row: at ? at.getAttribute("data-ids") : null };
+    }""")
+    reader.check(picked is not None and len(picked["text"]) > 0, f"no selection was made: {picked}")
+    page.evaluate("() => document.getElementById('channel-view-flat').click()")
+    reader.quiet(600)
+    page.evaluate("() => document.getElementById('channel-view-main').click()")
+    reader.quiet(900)
+    after = page.evaluate("""() => {
+        const sel = window.getSelection();
+        if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
+        let at = sel.getRangeAt(0).startContainer;
+        while (at && !(at instanceof Element && at.hasAttribute("data-ids"))) at = at.parentNode;
+        return { text: String(sel), row: at ? at.getAttribute("data-ids") : null, held: at };
+    }""")
+    reader.check(after is not None, "the landing cleared the reader's selection")
+    assert after is not None and picked is not None
+    # The words may stand a seam's width from where they were (a day rule drawn inside the row
+    # on one view and not the other): the same row and the same length is the survival that counts.
+    reader.check(after["row"] == picked["row"], f"the selection stands in another row: {picked} -> {after}")
+    reader.check(len(after["text"]) == len(picked["text"]), f"the selection's length changed: {picked} -> {after}")
+    reader.notes.append("a selection in a row survived a landing that rebuilt the rows")
 
 
 def hover_walk(reader: Reader) -> None:

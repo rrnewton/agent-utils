@@ -1480,6 +1480,12 @@ class FakeSelection {
     this.cleared += 1;
   }
 
+  addRange(range) {
+    this.ranges = [range];
+    const text = typeof range.toString === "function" ? range.toString() : "";
+    if (text) this.text = text;
+  }
+
   toString() {
     this.reads += 1;
     return this.text;
@@ -2949,6 +2955,13 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
       node.textContent = String(data);
       return node;
     },
+    // A range that keeps its ends, for the page to put a kept selection back with (`#1209`).
+    createRange: () => ({
+      startContainer: null, startOffset: 0, endContainer: null, endOffset: 0,
+      setStart(node, offset) { this.startContainer = node; this.startOffset = offset; },
+      setEnd(node, offset) { this.endContainer = node; this.endOffset = offset; },
+      toString: () => "",
+    }),
     // `#261 two-column-connectors` draws the links between the columns as SVG paths.
     createElementNS: (namespace, tag) => {
       page.createdTags.push(String(tag).toLowerCase());

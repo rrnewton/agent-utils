@@ -254,6 +254,9 @@ export interface TimelineViewDependencies {
   pullToRefresh: { fingerDown(): boolean };
   heldFilterRow(): Element | null;
   scrollAnchor(area: HTMLElement): Element | null;
+  /** The reader's text selection in `area` and putting it back (`#1209`), as the scroll keeper's. */
+  selectionIn?(area: HTMLElement): { id: string; start: number; end: number } | null;
+  restoreSelectionIn?(area: HTMLElement, selection: { id: string; start: number; end: number }): void;
   followsNewest(area: HTMLElement): boolean;
   visibleList(): HTMLElement;
   noiseSettings: { renderCount(): void };
@@ -1007,8 +1010,12 @@ function applyTimelinePage(payload: TimelineResponse, older = false, saved = fal
     const heldThreads = new Set([...cards.children].map((row) => row.getAttribute("data-context-id")));
     cards.replaceChildren(...threadCards(timelineRows().threads.filter((t) => !heldThreads.has(String(t.id)))), ...cards.children);
   } else {
-    el("discord-log").replaceChildren(...glom(shown).map(discordNode));
+    // The reader's text selection is kept across the rebuild, as at a landing (`#1209`).
+    const list = el("discord-log");
+    const keptSelection = deps.selectionIn ? deps.selectionIn(list) : null;
+    list.replaceChildren(...glom(shown).map(discordNode));
     el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
+    if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
   }
   // The arrows are measured once, by the pass over the search every caller ends with. `#226`.
   holdingReplyArrows(renderChannelRows);
@@ -1046,7 +1053,15 @@ function renderCachedTimeline(): void {
   const keeps = readFilterKeeps();
   const shown = timelineRows().messages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message)));
   const redraw = () => {
-    el("discord-log").replaceChildren(...glom(shown).map(discordNode));
+    // An unchanged cached timeline rebuilds nothing (`#1209 selection-survives-updates`): the
+    // rows drawn already are these messages, so replacing them would only take the reader's
+    // selection with them. A changed one keeps the selection across the rebuild instead.
+    const list = el("discord-log");
+    const drawn = [...list.children].map((row) => idsOf(row)[0]);
+    const incoming = glom(shown).map((group) => String(group[0]?.id ?? ""));
+    const keptSelection = deps.selectionIn && drawn.join("\n") !== incoming.join("\n") ? deps.selectionIn(list) : null;
+    if (drawn.join("\n") !== incoming.join("\n")) list.replaceChildren(...glom(shown).map(discordNode));
+    if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
     holdingReplyArrows(renderChannelRows);
     listState().backlog = shown.length;
     renderTodoControls();
@@ -1550,7 +1565,10 @@ function applyNewestPage(payload: TimelineResponse, saved = false): number {
   const keptRows = kept.filter(isMessageRow);
   plainReach.noteNewest(saved, keptRows.length, before.length, messages.length,
     messages.length > 0 ? (messages[0] as Message).timestamp : undefined);
+  // The reader's text selection is kept across the rebuild, as at a landing (`#1209`).
+  const keptSelection = deps.selectionIn ? deps.selectionIn(list) : null;
   list.replaceChildren(...kept, ...glom(messages).map(discordNode));
+  if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
   // The archive BEFORE the derivation that reads it. `kept` rows were already on screen and their
   // ids are still in the set from the read that brought them, so a reset here would un-grey them.
   noteArchived(payload, kept.length === 0);
@@ -2188,8 +2206,12 @@ async function loadTodo(options?: TimelineReadOptions): Promise<void> {
     // number a reader stops believing.
     const messages = served.filter((m) => !hiddenEmpty(m));
     const list = el("discord-log");
+    // The rebuild takes the reader's text selection with the rows: kept, and put back after
+    // (`#1209 selection-survives-updates`).
+    const keptSelection = deps.selectionIn ? deps.selectionIn(list) : null;
     list.replaceChildren(...glom(messages).map(discordNode));
     renderChannelRows();
+    if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
     // The walk back belongs to the UNFILTERED channel. Leaving a cursor armed here would let a
     // scroll to the top prepend unfiltered rows into a filtered list.
     olderPages().moreAbove = false;

@@ -528,6 +528,21 @@ test("`#624 voice-page-modularity`: the reader is left on the message their eye 
   assert.deepStrictEqual(calls.at(-1), ["chip", "voice", 2], "a reader scrolled away is told, not moved");
   keep.followIfPinned(true, 1, "voice");
   assert.deepStrictEqual(calls.at(-1), ["chip", "voice", 1], "a turn for a list not on screen raises its chip");
+  // `#1209 selection-survives-updates`: a text selection in a row is kept across the rebuild and
+  // put back after the reader is.
+  const kept = { id: "b", start: 2, end: 5 };
+  const order = [];
+  const keep2 = createScrollKeeping({
+    el: (id) => els[id], onMain: () => true, currentView: () => "discord", channelView: () => "main", pinnedOnly: () => false,
+    heldFilterRow: () => null, searchWalk: () => null, atBottom: () => false,
+    scrollToNewest: () => order.push("newest"), renderJumpNewest: () => order.push("jump"),
+    setJumpNewest: () => {},
+    selectionIn: () => { order.push("capture"); return kept; },
+    restoreSelectionIn: (area2, sel) => order.push(["restore", sel]),
+  });
+  keep2.preservingScroll(() => order.push("mutate"));
+  assert.deepStrictEqual(order, ["capture", "mutate", "jump", ["restore", kept]],
+    "the selection was not kept across the change, or not put back after the reader");
   keep.followIfPinned(true, 1, "discord");
   assert.equal(calls.at(-1), "newest");
 });

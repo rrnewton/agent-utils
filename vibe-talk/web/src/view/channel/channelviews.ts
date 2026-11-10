@@ -123,6 +123,9 @@ export interface ChannelViewsDependencies {
   hidingRead(): boolean;
   renderChannelLoading(busy: boolean, quiet?: boolean): void;
   restoreChannelComposer(): void;
+  /** The reader's text selection in `area` and putting it back (`#1209`), as the scroll keeper's. */
+  selectionIn?(area: HTMLElement): { id: string; start: number; end: number } | null;
+  restoreSelectionIn?(area: HTMLElement, selection: { id: string; start: number; end: number }): void;
   renderOlderControl(): void;
   restoreScroll(position: unknown): void;
   renderCachedTimeline(): void;
@@ -605,9 +608,13 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
     deps.listState().newestId = held ? held.newest : null;
     // The rows on screen stay until the new view's replace them, unless there is nothing to draw.
     if (held || (!covered && rows.length === 0)) {
-      deps.el("discord-log").replaceChildren(...(held ? held.rows : []));
+      // The reader's text selection is kept across the swap, as at a landing (`#1209`).
+      const list = deps.el("discord-log");
+      const keptSelection = deps.selectionIn ? deps.selectionIn(list) : null;
+      list.replaceChildren(...(held ? held.rows : []));
       deps.el("thread-list").replaceChildren(...(held ? held.cards : []));
       deps.el("channel-summary").replaceChildren(...(held ? held.seam : []));
+      if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
     }
     deps.el("timeline-notice").hidden = true;
     deps.loadState().freshAt = held ? held.freshAt : 0;

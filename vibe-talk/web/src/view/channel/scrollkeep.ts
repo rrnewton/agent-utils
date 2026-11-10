@@ -37,14 +37,23 @@ export interface ScrollKeepingDependencies {
   heldFilterRow(): HTMLElement | null;
   /** The walk for the search in the column being worked on, or null. */
   searchWalk(): AnchoredWalk | null;
-  /** Whether `area` is at its newest line (`atBottom`). */
-  atBottom(area: HTMLElement): boolean;
+  /** Whether `area` is at its newest line (`atBottom`), within `slack` where one is named. */
+  atBottom(area: HTMLElement, slack?: number): boolean;
+  /** How far above the foot rest still counts as following it (`FOLLOW_REST_PX`). */
+  restSlackPx: number;
   /** Take the reader to the newest line (`scrollToNewest`). */
   scrollToNewest(): void;
   /** Decide the jump to the newest from where the reader is (`renderJumpNewest`). */
   renderJumpNewest(): void;
   /** Raise the jump to the newest over `view`, counting `turns` new turns (`setJumpNewest`). */
   setJumpNewest(on: boolean, view: string, turns: number): void;
+  /**
+   * The reader's text selection in `area`, where one stands (`#1209 selection-survives-updates`):
+   * the message it stands in and its ends' distances into that row's words, or null. And putting
+   * such a selection back where the row was rebuilt (`restoreSelectionIn`). Absent: unkept.
+   */
+  selectionIn?(area: HTMLElement): { id: string; start: number; end: number } | null;
+  restoreSelectionIn?(area: HTMLElement, selection: { id: string; start: number; end: number }): void;
 }
 
 /**
@@ -144,8 +153,13 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
    */
   function preservingScroll(mutate: () => void): void {
     const mark = captureScroll();
+    // A rebuild inside takes the reader's text selection with the rows it replaces: kept, and
+    // put back on the rebuilt row after (`#1209 selection-survives-updates`).
+    const area = el("scroll-area");
+    const selection = deps.selectionIn ? deps.selectionIn(area) : null;
     mutate();
     restoreScroll(mark);
+    if (selection && deps.restoreSelectionIn) deps.restoreSelectionIn(area, selection);
   }
 
   /**
@@ -192,7 +206,8 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     }
     const anchor = scrollAnchor(area);
     return {
-      pinned: deps.atBottom(area),
+      // Rest, not the slack, as `followsNewest` reads it (`#1209`'s near-foot case).
+      pinned: deps.atBottom(area, deps.restSlackPx),
       anchor,
       top: anchor ? anchor.getBoundingClientRect().top : 0,
     };
