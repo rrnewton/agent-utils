@@ -1477,7 +1477,9 @@ mod tests {
                     registry.snapshot = Some(Snapshot {
                         spent,
                         took,
-                        captured: Instant::now(),
+                        // Dated in the future, so it stays inside the freshness window
+                        // however long a loaded host delays this thread.
+                        captured: Instant::now() + Duration::from_secs(3600),
                         reads: 0,
                         keys: HashSet::from([owner.key]),
                         values: Ok(HashMap::from([(owner.key, 0)])),
@@ -1525,7 +1527,9 @@ mod tests {
         registry.snapshot = Some(Snapshot {
             spent: Duration::ZERO,
             took: Duration::ZERO,
-            captured: Instant::now(),
+            // Dated in the future, so both reads below reuse it however long a loaded host
+            // delays this thread.
+            captured: Instant::now() + Duration::from_secs(3600),
             reads: 0,
             keys: HashSet::from([owner.key]),
             values: Err(unavailable("injected scanner EACCES")),

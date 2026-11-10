@@ -406,7 +406,9 @@ def test_a_snapshot_over_either_budget_is_refused() -> None:
                 cpu._snapshot_error = None
                 cpu._snapshot_spent = spent
                 cpu._snapshot_took = took
-                cpu._snapshot_at = time.monotonic()
+                # Dated in the future, so it stays inside the freshness window however
+                # long a loaded host delays this thread.
+                cpu._snapshot_at = time.monotonic() + 3600
             try:
                 return reader.seconds()
             except cpu.Unavailable as exc:
