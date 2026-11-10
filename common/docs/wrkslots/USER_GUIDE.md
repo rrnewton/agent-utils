@@ -2606,6 +2606,32 @@ fence and use census; a lock with any other reason still refuses removal. `workt
 and `doctor` report image slots whose lock is missing (`worktrees-image-lock-missing`); take it by
 hand with the same command until the slot is next migrated or recreated.
 
+A failed mount at configuration load warns once per process on stderr (`wrkslots: WARNING:
+worktrees image not mounted: ...`, the same grammar as the per-slot image warning) and leaves
+stdout clean for JSON output; `wrkslots image status` and `wrkslots worktrees-image status` both
+report the image's state and mount point. Reviving slot agents while the image is down would
+start them in the bare mount points underneath, so mount the image before any restore runs. The
+first wrkslots command does that as a side effect, but a boot-time restore should not rely on
+ordering luck: install a unit that runs the mount first (the mount command follows the configured
+`mount_at` layout):
+
+```ini
+[Unit]
+Description=Mount the wrkslots worktrees image
+Before=<your-restore-unit>.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=wrkslots --project-root /path/to/project worktrees-image mount
+
+[Install]
+WantedBy=default.target
+```
+
+Order your restore unit `After=` this one (or rely on its `Before=`), so a failed mount is a
+failed boot step with a journal entry, not a team revived into empty directories.
+
 ## Running commands and agents inside a slot's box
 
 `wrkslots run SLOT -- COMMAND` runs COMMAND boxed to one slot. The box does not depend on how the

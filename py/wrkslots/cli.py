@@ -570,6 +570,10 @@ _VERSION_PATTERN = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*
 _CONFIG_KEY_NAME_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
 #: Unknown keys this process has already warned it ignores (#1109).
 _WARNED_IGNORED_CONFIG_KEYS: set[str] = set()
+#: Project roots this process has already warned have an unmounted
+#: worktrees image: one warning per process, however often a command
+#: loads the configuration.
+_WARNED_UNMOUNTED_WORKTREES_IMAGE: set[Path] = set()
 #: The comment above each key of the optional ``identity`` section (#1096).
 IDENTITY_DOCS: dict[str, str] = {
     "name": "user.name for commits made in new slots.",
@@ -4419,7 +4423,12 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         # load (the per-slot image precedent): after a reboot the slots
         # are back at their original real paths before lifecycle logic
         # inspects them. Failures leave the classified state in place;
-        # slot-writing commands refuse on it below.
+        # slot-writing commands refuse on it below. A failure is warned
+        # about, once per process and on stderr only (the per-slot
+        # "slot image not mounted" grammar), so a caller reviving
+        # agents can see the image is down instead of reviving them
+        # into bare mount points, and JSON on stdout stays parseable.
+        mount_failure: str | None = None
         try:
             worktreesimage.ensure_image_mounted(
                 config.root, config.control, config.worktrees_image, config.worktrees
@@ -4430,13 +4439,21 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
                 config.worktrees,
                 config.worktrees_image,
             )
-        except worktreesimage.WorktreesImageError:
-            pass
+        except worktreesimage.WorktreesImageError as exc:
+            mount_failure = str(exc)
         object.__setattr__(
             config,
             "worktrees_image_state",
             worktreesimage.current_state(config.root, config.worktrees, config.worktrees_image),
         )
+        if config.worktrees_image_state != worktreesimage.MOUNTED:
+            if config.root not in _WARNED_UNMOUNTED_WORKTREES_IMAGE:
+                _WARNED_UNMOUNTED_WORKTREES_IMAGE.add(config.root)
+                reason = mount_failure or config.worktrees_image_state
+                print(
+                    f"wrkslots: WARNING: worktrees image not mounted: {reason}",
+                    file=sys.stderr,
+                )
     _activate_representation(config)
     return config
 

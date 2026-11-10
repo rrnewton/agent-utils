@@ -51,7 +51,8 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
         description=(
             "List image-backed slots with apparent ceiling, host-allocated bytes, used bytes "
             "and inodes inside the image, and mount state. Also prints the representation "
-            "new slots will get."
+            "new slots will get, and, when a worktrees_image section applies on this host, "
+            "the project image's mount state and mount point."
         ),
         formatter_class=formatter,
     )
@@ -1329,10 +1330,26 @@ def _cmd_image_status(args: argparse.Namespace) -> int:
         reports = [slotimage.usage(image) for image in slotimage.all_images(config.control)]
     except slotimage.ImageError as exc:
         raise _refuse(str(exc)) from exc
+    wt_report = (
+        worktreesimage.status_report(config.root, config.worktrees, config.worktrees_image)
+        if config.worktrees_image is not None
+        else None
+    )
     if args.format == "json":
-        print(json.dumps({"new_slot_representation": config.slot_representation, "images": reports}, indent=2))
+        payload: dict[str, object] = {
+            "new_slot_representation": config.slot_representation,
+            "images": reports,
+        }
+        if wt_report is not None:
+            payload["worktrees_image"] = wt_report
+        print(json.dumps(payload, indent=2))
         return 0
     print(f"new slots: {config.slot_representation}")
+    if wt_report is not None:
+        print(
+            f"worktrees image: {wt_report['state']} at {wt_report['mount_point']} "
+            f"(mount_at={wt_report['mount_at']})"
+        )
     if not reports:
         print("no image-backed slots")
     for report in reports:

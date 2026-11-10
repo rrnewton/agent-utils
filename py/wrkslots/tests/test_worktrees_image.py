@@ -936,6 +936,115 @@ def test_doctor_shows_the_host_name_source(
     assert report["machine"] == "testhost (host name (machine: auto))"
 
 
+def _image_project(tmp_path: Path, mount_at_line: str = "") -> Path:
+    """A loadable project whose worktrees_image applies on image-host."""
+
+    root = tmp_path / "project"
+    (root / "worktrees" / "slots").mkdir(parents=True)
+    (root / "live.py").write_text("# probe\n", encoding="utf-8")
+    (root / ".wrkslots.yml").write_text(
+        "schema: 2\n"
+        "machine: image-host\n"
+        "worktrees_dir: worktrees/slots\n"
+        "default_remote: origin\n"
+        "default_landed_ref: refs/remotes/origin/main\n"
+        "heartbeat_ttl_seconds: 60\n"
+        "liveness_command: live.py\n"
+        "layout: flat\n"
+        "worktrees_image:\n"
+        "  path: worktrees.img\n"
+        "  size_bytes: 2147483648\n"
+        f"{mount_at_line}"
+        "  machines: [image-host]\n",
+        encoding="utf-8",
+    )
+    return root
+
+
+def _fail_the_mount(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(*args: object) -> None:
+        raise worktreesimage.WorktreesImageError("mount: permission denied (fake)")
+
+    monkeypatch.setattr(worktreesimage, "ensure_image_mounted", fail)
+    monkeypatch.setattr(
+        worktreesimage, "current_state", lambda *a: worktreesimage.NOT_MOUNTED
+    )
+
+
+@pytest.mark.parametrize(
+    "mount_at_line", ["", "  mount_at: worktrees_dir\n"], ids=["binds", "direct"]
+)
+def test_failed_mount_warns_once_on_stderr_in_both_modes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    mount_at_line: str,
+) -> None:
+    root = _image_project(tmp_path, mount_at_line)
+    _fail_the_mount(monkeypatch)
+    first = cli._load_config(str(root), "image-host")
+    second = cli._load_config(str(root), "image-host")
+    assert first.worktrees_image_state == worktreesimage.NOT_MOUNTED
+    assert second.worktrees_image_state == worktreesimage.NOT_MOUNTED
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.count("worktrees image not mounted") == 1
+    assert "permission denied (fake)" in captured.err
+
+
+def test_warning_leaves_json_stdout_parseable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import argparse
+    import json as json_module
+
+    root = _image_project(tmp_path)
+    _fail_the_mount(monkeypatch)
+    config = cli._load_config(str(root), "image-host")
+    cli._atomic_write_json(
+        cli._active_path(config),
+        cli._active_to_obj(cli.ActiveState(machine="image-host", revision=0, slots=())),
+    )
+    cli._atomic_write_json(
+        cli._archive_path(config),
+        cli._archive_to_obj(cli.ArchiveState(machine="image-host", revision=0, records=())),
+    )
+    capsys.readouterr()  # the load above already warned, once
+    args = argparse.Namespace(
+        project_root=str(root), machine="image-host", wait_lock=0.0,
+        all_machines=False, format="json",
+    )
+    assert cli._cmd_doctor(args) == 0
+    captured = capsys.readouterr()
+    report = json_module.loads(captured.out)
+    assert report["worktrees_image"] == "applies: state=not-mounted"
+    assert "worktrees image not mounted" not in captured.err  # once per process
+
+
+def test_image_status_reports_the_worktrees_image_when_configured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import argparse
+    import json as json_module
+
+    from wrkslots import imagecmd
+
+    root = _image_project(tmp_path, "  mount_at: worktrees_dir\n")
+    _fail_the_mount(monkeypatch)
+    human = argparse.Namespace(
+        project_root=str(root), machine="image-host", format="human"
+    )
+    assert imagecmd._cmd_image_status(human) == 0
+    out = capsys.readouterr().out
+    assert "worktrees image: not-mounted at " in out
+    assert "(mount_at=worktrees_dir)" in out
+    as_json = argparse.Namespace(
+        project_root=str(root), machine="image-host", format="json"
+    )
+    assert imagecmd._cmd_image_status(as_json) == 0
+    payload = json_module.loads(capsys.readouterr().out)
+    assert payload["worktrees_image"]["state"] == "not-mounted"
+    assert payload["worktrees_image"]["mount_at"] == "worktrees_dir"
+
+
 # --- #1162 worktrees-image-at-slots-dir: direct layout, quota modes, locks ---
 
 

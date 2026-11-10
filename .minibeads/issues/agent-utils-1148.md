@@ -1,6 +1,6 @@
 ---
 title: 'worktrees-image-mount-failure-silent: a failed image mount at config load is swallowed, and restore revives slot agents into bare paths'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-09T17:35:00.000000000+00:00
@@ -37,3 +37,9 @@ reason. (This restore half is tracked with the slot-rebind work on the restore s
 # Notes
 
 Order of the worktrees-image set: #1147 (records race), #1148 (silent mount failure), #1149 (migrate original), then #1150 (migrate liveness) and #1151 (help and small items). Rust parity follows in the Rust worktrees-image handlers.
+
+## Resolution
+
+Wrkslots side delivered. Config load no longer swallows a failed worktrees-image mount: it prints `wrkslots: WARNING: worktrees image not mounted: <reason>` (the per-slot warning grammar) once per process, on stderr only, in both `mount_at` modes, and still loads with the classified state so slot-writing commands refuse as before. `wrkslots image status` reports the project image's state and mount point (human line and JSON `worktrees_image`) whenever the section applies on the host; `worktrees-image status` and `doctor` already did. Tests drive fake mount failures in both modes, prove the warning fires once across repeated loads, and prove `doctor --format json` stdout stays parseable with the warning outstanding. The mount-unit story is documented in the USER_GUIDE (a oneshot unit running `wrkslots worktrees-image mount`, ordered before the restore unit).
+
+Two pieces remain outside this change, as sequenced: the restore-side rule (skip slot agents whose recorded bind is missing, reviving others) belongs to the slot-rebind work on the restore side, and generating/installing the mount unit belongs to `agentctl install-units`. Rust parity: mirror the load-time warning (same text, once per process, stderr) and the conditional `image status` worktrees-image reporting (filed with the landing PUSH).
