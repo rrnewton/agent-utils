@@ -213,6 +213,13 @@
   display: none;
 }
 
+/* `#1135 raw-message-page`: while the card holds the channel, it is the send surface; the
+   composer's own row (Send raw message, Cancel, Send) gives back its height so the card's
+   Send keeps its thumb reach (the small-phones walk measures it), and returns with the card. */
+#pane-discord:has(> #post-confirm:not([hidden])) #channel-composer > .composer-actions {
+  display: none;
+}
+
 #screen-main[data-draft] #send-text,
 #screen-main[data-draft] #channel-send {
   min-width: 0;

@@ -98,8 +98,19 @@
 }
 
 /* `#1135 raw-message-page`: the channel boxes' row holds one line at a phone's width — its choice
-   gives up room first, its words wrapping, and Send sizes to its word as the reply's does. */
+   gives up room first, its words wrapping, and Send sizes to its word as the reply's does. At a
+   large type size the row wraps to a second line instead of widening the composer past its
+   column (a 360px phone at 150% type measured the list 4px wide of the screen). */
+.composer-actions {
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
 .composer-actions > .toggle {
+  min-width: 0;
+}
+
+.composer-actions > button {
   min-width: 0;
 }
 
