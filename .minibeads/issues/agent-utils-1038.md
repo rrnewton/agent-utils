@@ -1,11 +1,12 @@
 ---
 title: 'documents-outline-popup: replace the reader TOC with a pop-up outline and link the title to its source'
-status: open
+status: closed
 priority: 1
 issue_type: task
 assignee: mu-docreader
-created_at: 2026-11-08T01:19:06.000000000+00:00
-updated_at: 2026-11-08T01:19:06.000000000+00:00
+created_at: 2026-11-08T01:19:06+00:00
+updated_at: 2026-11-10T06:29:28.689240684+00:00
+closed_at: 2026-11-10T06:29:28.689240524+00:00
 ---
 
 # Description
@@ -30,3 +31,7 @@ Today `view/documents/reader.ts` draws the outline as a flat list of buttons at 
 # Notes
 
 [watermelon-full-preview] mu-docreader, thread 214 batch B. Sibling work: #1039 documents-read-parity, #1040 documents-voice-agent.
+
+## Resolution
+
+Landed as f0dbded8 (the outline pop-up and the title source link) + f7b844b5 (the keyboard remainder: bare `g` and Mod+`g` toggle the outline through the keymap, help-listed; the open outline is a `menu:outline` back level, so Escape and the back gesture close it before the document step). Heading levels are derived client-side from the rendered `h1`–`h6` in `#doc-body`; HERE marking follows scrolling via an IntersectionObserver rooted on `#scroll-area`; the old top-of-reader TOC is gone. Gate accounting: the owner-tier path-selected gate (--base github/main) on e0bf9593 finished green (152 passes, exit 0). Main had moved meanwhile (e9b60be6 and #1176 touching voice.js and reader.ts in different hunks), so the commit was rebased onto f01bc7ff and landed with --allow-overlap after combined-tree checks: typecheck clean, dom+documents+shell-navigation suites 90/90, and all three documents browser checks (list/reader/outline, buckets, read-aloud) passing against a release binary rebuilt on the combined tree. The landed tree is byte-identical to the checked combined tree (4e068216). Earlier full-gate reds on the pre-fix tree were classified in the thread-214 landing report: one real (the keymap inventory test, fixed in the commit), the rest outside the diff (screenshot port collisions #1037, wrkslots census-budget #1188, merge-queue CPU budget #1051).

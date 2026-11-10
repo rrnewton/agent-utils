@@ -1,11 +1,12 @@
 ---
 title: 'documents-read-parity: give the document reader the message read-aloud controls'
-status: open
+status: closed
 priority: 1
 issue_type: task
 assignee: mu-docreader
-created_at: 2026-11-08T01:19:06.000000000+00:00
-updated_at: 2026-11-08T01:19:06.000000000+00:00
+created_at: 2026-11-08T01:19:06+00:00
+updated_at: 2026-11-10T06:29:28.691783261+00:00
+closed_at: 2026-11-10T06:29:28.691783061+00:00
 ---
 
 # Description
@@ -29,3 +30,7 @@ Today `view/documents/reader.ts` speaks the document by sending each `plainChunk
 # Notes
 
 [watermelon-full-preview] mu-docreader, thread 214 batch B. Sibling work: #1038 documents-outline-popup, #1040 documents-voice-agent.
+
+## Resolution
+
+Landed in stages: dabe4890 (server speech tickets: POST /api/v1/documents/{key}/speech/prepare minting tickets from server-cached content only), 36576d0e (player extraction), f19485c5 (`readDocument` on the shared read-aloud owner, `Playing.kind` gating the message-only end behaviours), ae67aed1 (test-fixture fix), then stage 3: 5484c9bd + 85501d44 (the reader wired to the shared owner, kind-aware stop on view change, `docs` in the control bar's audio-source views). The reader now reads through the same singleton as messages — pop-up scrubber, device/cloud toggle, Next/Prev by block, media keys, pause/resume, and finish-on-last — with no fork of read-aloud.ts/readcontrols.ts. As designed, segmented device reads were NOT applied to messages: message device reads are deliberately unchanged, and document reads never archive, dismiss, or mark anything read. Browser evidence: documents_read_browser passes at 393x852 and 1280x800 (strip, device blocks, Next/Prev, media next, finish-on-last, device/cloud toggle, Back-stop), and the existing message read-aloud suites stayed green through every stage's gate. Stages 1+2 went live on devbig014 2026-11-08 (c178389c); stage 3 followed on main. Known v1 caveats, accepted at design time: no per-block light in the reader DOM, and documents over 16 KiB get plain-paragraph speech blocks.
