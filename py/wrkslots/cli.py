@@ -5983,7 +5983,9 @@ def _journal_fingerprint(config: Config) -> tuple[tuple[str, int, int], ...]:
     return tuple(sorted(entries))
 
 
-def _pregather_salvage_facts(config: Config, slot: str) -> None:
+def _pregather_salvage_facts(
+    config: Config, slot: str, archive_root: Path | None = None
+) -> None:
     """Run removal's slow salvage-fact reads before the configuration lock.
 
     The facts land in _SALVAGE_FACTS_MEMO (live for the whole removal via
@@ -6007,6 +6009,45 @@ def _pregather_salvage_facts(config: Config, slot: str) -> None:
         for checkout in record.checkouts:
             try:
                 _salvage_candidate(config, record, checkout, vcs)
+            except Exception:
+                continue
+        # Publication too, when the owner is already gone (the prefetch
+        # conditions): the remote answer, the salvage push, and the local
+        # bundle all happen here, before the lock. Under the lock the
+        # receipt is reused only while its fingerprint still matches, so
+        # nothing stale is ever trusted (#1194). Publication is additive:
+        # if the locked removal then refuses, the slot and its published
+        # salvage both remain, exactly as a prefetch bundle leaves them.
+        receipts = _PREGATHERED_SALVAGE_RECEIPTS.get()
+        if receipts is None:
+            return
+        owner_gone = (
+            _owner_record_is_absent(record) or _process_state(record.owner)[0] == "dead"
+        ) and _heartbeat_diagnosis(record)[1]
+        if not owner_gone:
+            return
+        _assert_not_held(config, record)
+        _assert_handoff_read(
+            config, record, _slot_directory(config, slot, record.slot_type)
+        )
+        for checkout in record.checkouts:
+            try:
+                path = _stored_path(config, checkout.path, "checkout path")
+                facts = _salvage_candidate(config, record, checkout, vcs)
+                receipt = _salvage_one_checkout(
+                    config,
+                    record,
+                    checkout,
+                    vcs,
+                    path_override=path,
+                    prepared=facts,
+                    archive_root=archive_root,
+                )
+                fingerprint = _salvage_fingerprint_or_none(
+                    config, checkout, path, vcs, source=None, mirror=None
+                )
+                if fingerprint is not None:
+                    receipts[checkout.name] = (fingerprint, receipt)
             except Exception:
                 continue
     except Exception:
@@ -13580,6 +13621,14 @@ _SUBMODULE_INVENTORY_MEMO: contextvars.ContextVar[
     dict[tuple[object, ...], _SubmoduleInventoryEvidence] | None
 ] = contextvars.ContextVar("wrkslots_submodule_inventory_memo", default=None)
 
+#: Salvage receipts published before the configuration lock (#1194), by
+#: checkout name, each with the _salvage_fingerprint it was published from.
+#: Under the lock a receipt is reused only while that fingerprint still
+#: matches; anything else is published there as before.
+_PREGATHERED_SALVAGE_RECEIPTS: contextvars.ContextVar[
+    dict[str, tuple[tuple[object, ...], dict[str, object]]] | None
+] = contextvars.ContextVar("wrkslots_pregathered_salvage_receipts", default=None)
+
 
 @contextlib.contextmanager
 def _remote_containment_scope() -> Iterator[None]:
@@ -13590,9 +13639,11 @@ def _remote_containment_scope() -> Iterator[None]:
     created = _CREATED_SHARED_SALVAGE_BUNDLES.set(set())
     facts = _SALVAGE_FACTS_MEMO.set({})
     inventories = _SUBMODULE_INVENTORY_MEMO.set({})
+    receipts = _PREGATHERED_SALVAGE_RECEIPTS.set({})
     try:
         yield
     finally:
+        _PREGATHERED_SALVAGE_RECEIPTS.reset(receipts)
         _SUBMODULE_INVENTORY_MEMO.reset(inventories)
         _SALVAGE_FACTS_MEMO.reset(facts)
         _CREATED_SHARED_SALVAGE_BUNDLES.reset(created)
@@ -26972,6 +27023,22 @@ def _salvage_agent_slot(
                 "source no longer declares it; preserve the slot and commit "
                 "or publish that work by hand"
             )
+        pregathered = _PREGATHERED_SALVAGE_RECEIPTS.get()
+        if (
+            pregathered is not None
+            and not detached
+            and drift is None
+            and checkout.name in pregathered
+        ):
+            expected_fingerprint, stored_receipt = pregathered[checkout.name]
+            if (
+                _salvage_fingerprint_or_none(
+                    config, checkout, path, vcs, source=None, mirror=None
+                )
+                == expected_fingerprint
+            ):
+                receipts.append(dict(stored_receipt))
+                continue
         receipts.append(
             _salvage_one_checkout(
                 config,
@@ -46777,7 +46844,7 @@ def _cmd_remove_in_scope(
     if private_cleanup is None and not bool(args.validate_complete):
         # Slow salvage facts and the use census are gathered here, before
         # the registry lock (#1194); see _pregather_salvage_facts.
-        _pregather_salvage_facts(config, args.slot)
+        _pregather_salvage_facts(config, args.slot, salvage_archive_root)
         # Network work happens here, before the registry lock, not under it.
         _prefetch_remote_containment(
             config,
