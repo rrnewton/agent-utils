@@ -1009,6 +1009,18 @@ _AGENT_REMOVE_BATCH_ITEM_SECONDS = 60.0
 # is capped so one item cannot hold the registry lock without bound.
 _AGENT_REMOVE_BATCH_ITEM_PER_SUBMODULE_SECONDS = 15.0
 _AGENT_REMOVE_BATCH_ITEM_MAX_SECONDS = 600.0
+# #1201 batch-grouped-fencing: remove-agent-batch fences up to this many
+# consecutive items, scans /proc once for all of them, then finishes each.
+# A batch of one (ordinary remove) is never grouped.
+_AGENT_REMOVE_BATCH_GROUP_MAX = 8
+# A member whose group scan is older than this when the member reaches its
+# check after the fence scans alone instead (#1201).
+_AGENT_REMOVE_BATCH_GROUP_FRESH_SECONDS = 60.0
+# The release whose readers understand a grouped member's journal (#1201):
+# a scoped FINISH journal of an agent slot whose fence may be sealed (mode
+# 0) between its group scan and its own finish.  Written as
+# x.min_wrkslots_version, so every older reader refuses it (#1124).
+_GROUPED_FINISH_MIN_VERSION = "0.10.0"
 
 
 def _agent_remove_batch_item_seconds(
@@ -10568,7 +10580,10 @@ def _validate_journal_shape(
         if record.machine != machine or record.slot != slot:
             raise StateError("finish journal record does not match its shard or slot")
         _finish_journal_owner(raw)
-        if path == _finish_journal_path(config, slot, machine) and (
+        grouped = _grouped_finish_member(raw, record, "finish journal")
+        if grouped and path != _finish_journal_path(config, slot, machine):
+            raise StateError("a grouped member's finish journal must be its scoped journal")
+        if path == _finish_journal_path(config, slot, machine) and not grouped and (
             record.slot_type != "validate"
             or raw.get("validate_complete") is not True
             or "validation_removal_proof" in raw
@@ -29698,9 +29713,18 @@ def _recover_dead_actor_journals(config: Config) -> None:
         )
 
 
-def _assert_no_journal(config: Config) -> None:
+def _assert_no_journal(
+    config: Config, *, allowed: AbstractSet[Path] = frozenset()
+) -> None:
+    """Refuse while any mutation journal is outstanding.
+
+    ``allowed`` names journals this process wrote and still holds open: the
+    fenced members of a remove-agent-batch group awaiting their finish
+    (#1201).  Every other journal refuses as always.
+    """
+
     _recover_dead_actor_journals(config)
-    journals = _outstanding_journals(config)
+    journals = [path for path in _outstanding_journals(config) if path not in allowed]
     if journals:
         detail = ""
         try:
@@ -43313,7 +43337,138 @@ def _finish_journal_payload(
         )
     if finish.archive_nested:
         payload["archive_nested_cache_repositories"] = True
+    group = None if finish.agent_batch is None else finish.agent_batch.group
+    if group is not None:
+        # A grouped member (#1201): its scoped journal says so, and that its
+        # fence may be sealed between the group scan and its own finish.
+        # Both are safety-relevant, so the release that reads them is the
+        # minimum, and every older reader refuses the journal (#1124).
+        payload["x"] = {
+            "min_wrkslots_version": _GROUPED_FINISH_MIN_VERSION,
+            "group": {"id": group.group_id, "size": group.size},
+            "sealed": True,
+        }
     return payload
+
+
+def _grouped_finish_member(
+    raw: Mapping[str, object], record: ActiveRecord, label: str
+) -> bool:
+    """Whether a finish journal is a grouped agent removal's member (#1201).
+
+    Such a journal carries ``x.group`` (``id``: 32 hex digits; ``size``: the
+    group's member count, 2 to _AGENT_REMOVE_BATCH_GROUP_MAX) and
+    ``x.sealed: true``, names an agent slot, and requires
+    _GROUPED_FINISH_MIN_VERSION; a journal with only some of these refuses.
+    """
+
+    extension = raw.get("x")
+    if not isinstance(extension, Mapping) or (
+        "group" not in extension and "sealed" not in extension
+    ):
+        return False
+    group = _as_mapping(extension.get("group"), f"{label}.x.group")
+    _exact_keys(group, {"id", "size"}, frozenset(), f"{label}.x.group")
+    if not re.fullmatch(r"[0-9a-f]{32}", _as_str(group["id"], f"{label}.x.group.id")):
+        raise StateError(f"{label}.x.group.id must be 32 lowercase hex digits")
+    size = _as_int(group["size"], f"{label}.x.group.size")
+    if not 2 <= size <= _AGENT_REMOVE_BATCH_GROUP_MAX:
+        raise StateError(
+            f"{label}.x.group.size must be 2 to {_AGENT_REMOVE_BATCH_GROUP_MAX}, not {size}"
+        )
+    if extension.get("sealed") is not True:
+        raise StateError(f"{label}.x.sealed must be true for a grouped member")
+    required = extension.get("min_wrkslots_version")
+    if not isinstance(required, str) or _version_tuple(
+        required, f"{label}.x.min_wrkslots_version"
+    ) < _version_tuple(_GROUPED_FINISH_MIN_VERSION, "grouped finish version"):
+        raise StateError(
+            f"{label} of a grouped member must require wrkslots "
+            f"{_GROUPED_FINISH_MIN_VERSION} or later"
+        )
+    if record.slot_type != "agent":
+        raise StateError(f"{label} of a grouped member must name an agent slot")
+    return True
+
+
+def _grouped_sibling_journals(
+    config: Config, path: Path, raw: Mapping[str, object]
+) -> frozenset[Path]:
+    """The other outstanding journals of the group ``raw`` belongs to, if any (#1201).
+
+    A sibling is a scoped FINISH journal of this machine whose ``x.group.id``
+    is the same.  A journal that cannot be read is not a sibling, so it is
+    still classified, and refuses, as before.
+    """
+
+    extension = raw.get("x")
+    group = extension.get("group") if isinstance(extension, Mapping) else None
+    group_id = group.get("id") if isinstance(group, Mapping) else None
+    if not isinstance(group_id, str):
+        return frozenset()
+    siblings: set[Path] = set()
+    for candidate in config.control.glob("FINISH.*.journal"):
+        if candidate == path or candidate.is_symlink() or not candidate.is_file():
+            continue
+        try:
+            other = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, ValueError):
+            continue
+        if not isinstance(other, dict) or other.get("kind") != "finish":
+            continue
+        if other.get("machine") != config.machine:
+            continue
+        other_x = other.get("x")
+        other_group = other_x.get("group") if isinstance(other_x, Mapping) else None
+        if isinstance(other_group, Mapping) and other_group.get("id") == group_id:
+            siblings.add(candidate)
+    return frozenset(siblings)
+
+
+def _seal_group_fence(fenced: Path) -> None:
+    """Make a grouped member's fenced directory unreadable until its finish (#1201).
+
+    Mode 0 refuses a same-user open, listing or chdir into the tree, so a
+    walker of the slots directory gains no reference to it between the
+    group scan and the member's finish.  The member's journal already says
+    ``x.sealed``, so recovery restores ``original_mode`` before it reads
+    the tree.  chmod on an image or bind mount point changes the mounted
+    file system's root directory, which is the tree.
+    """
+
+    os.chmod(fenced, 0, follow_symlinks=False)
+
+
+def _unseal_group_fence(
+    config: Config, record: ActiveRecord, journal: Mapping[str, object]
+) -> None:
+    """Restore a sealed member's fenced directory to its ``original_mode`` (#1201).
+
+    Repeatable, and a no-op for a journal that is not a sealed member's or
+    whose fenced directory is gone.
+    """
+
+    extension = journal.get("x")
+    if not isinstance(extension, Mapping) or extension.get("sealed") is not True:
+        return
+    fenced = _finish_fenced_slot(config, record, journal)
+    try:
+        observed = os.lstat(fenced)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise Refusal(f"cannot inspect sealed fence {fenced}: {exc}") from exc
+    if not stat.S_ISDIR(observed.st_mode):
+        return
+    mode = _as_int(journal.get("original_mode"), "finish journal.original_mode")
+    if mode > 0o7777:
+        raise StateError("finish journal.original_mode exceeds permission bits")
+    if stat.S_IMODE(observed.st_mode) == mode:
+        return
+    try:
+        os.chmod(fenced, mode, follow_symlinks=False)
+    except OSError as exc:
+        raise Refusal(f"cannot unseal fence {fenced}: {exc}") from exc
 
 
 def _archive_entry(
@@ -44825,6 +44980,8 @@ def _rollback_path_fence(
         raise Refusal(f"canonical slot reappeared before path-fence rollback: {original}")
     if not fenced.is_dir() or fenced.is_symlink():
         raise Refusal(f"fenced slot is missing or unsafe during rollback: {fenced}")
+    # A sealed grouped member gets its mode back first (#1201).
+    _unseal_group_fence(config, record, journal)
     try:
         _rename_slot_path(config, fenced, original)
         private_identity = _finish_private_census_identity(journal)
@@ -45098,6 +45255,9 @@ def _begin_or_resume_path_fence(
         raise Refusal(f"fenced slot is missing or unsafe: {fenced}")
     if original.exists() or original.is_symlink():
         raise Refusal(f"canonical slot still exists after path fence: {original}")
+    # A sealed grouped member (#1201) is readable again before its Git
+    # registrations are repaired.
+    _unseal_group_fence(config, record, journal)
     if finish.private_cleanup is not None:
         _seal_cleanup_path_private(config, fenced)
     removed_names = {
@@ -46942,7 +47102,14 @@ def _cmd_remove_in_scope(
             allow_validate_batch_seals=private_cleanup is not None,
         )
         if not scoped_validation_finish:
-            _assert_no_journal(config)
+            _assert_no_journal(
+                config,
+                allowed=(
+                    frozenset()
+                    if agent_batch is None
+                    else frozenset(agent_batch.group_journals)
+                ),
+            )
         states, archives = _validate_global_state(
             config, require_repository=False
         )
@@ -47676,6 +47843,7 @@ def _cmd_remove_in_scope(
             journal_path=(
                 _finish_journal_path(config, record.slot)
                 if scoped_validation_finish
+                or (agent_batch is not None and agent_batch.group is not None)
                 else _journal_path(config)
             ),
             defer_private_census=private_cleanup is not None,
@@ -47772,6 +47940,54 @@ def _cmd_remove_in_scope(
                         config, prepared_private_finish, exc
                     )
                 raise
+    if (
+        prepared_deferred_finish is not None
+        and agent_batch is not None
+        and agent_batch.group is not None
+    ):
+        # A grouped member stops here, fenced and journaled (#1201): the
+        # batch scans every member's fence at once, then runs this rest.
+        assert finish_context is not None
+        deferred = prepared_deferred_finish
+        context = finish_context
+
+        def finish_member() -> int:
+            return _finish_removal_tail(
+                config, args, agent_batch, deferred, context, record,
+                coordinator=coordinator, runner=runner, handoff_writer=handoff_writer,
+                proof_fd=proof_fd, wait_deadline=wait_deadline, emit=emit,
+            )
+
+        agent_batch.defer_member(config, deferred, finish_context, finish_member)
+        return 0
+    return _finish_removal_tail(
+        config, args, agent_batch, prepared_deferred_finish, finish_context, record,
+        coordinator=coordinator, runner=runner, handoff_writer=handoff_writer,
+        proof_fd=proof_fd, wait_deadline=wait_deadline, emit=emit,
+    )
+
+
+def _finish_removal_tail(
+    config: Config,
+    args: argparse.Namespace,
+    agent_batch: _AgentRemoveBatchContext | None,
+    prepared_deferred_finish: _PreparedDeferredFinish | None,
+    finish_context: _FinishContext | None,
+    record: ActiveRecord,
+    *,
+    coordinator: ProcessIdentity,
+    runner: ProcessIdentity,
+    handoff_writer: ProcessIdentity | None,
+    proof_fd: int | None,
+    wait_deadline: float | None,
+    emit: bool,
+) -> int:
+    """The end of one removal: deferred deletion, completion and report.
+
+    Ordinary remove runs it straight after the fence; a grouped batch member
+    runs it after its group's scan (#1201).
+    """
+
     if prepared_deferred_finish is not None:
         assert finish_context is not None
         # The fenced tree is deleted with no registry lock held, so a
@@ -49513,6 +49729,426 @@ def _agent_batch_fenced_use(
     return None
 
 
+@dataclasses.dataclass(frozen=True)
+class _FencedGroupMember:
+    """One fenced slot of a remove-agent-batch group (#1201 batch-grouped-fencing)."""
+
+    fenced_path: Path
+    canonical_path: Path
+    record: ActiveRecord | None
+    whole_device: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class _FencedGroupUse:
+    """A use the group scan found in one member, as that member's own scan reports it."""
+
+    pid: int
+    start_ticks: int | None
+    proc_root: Path
+    refusal: Refusal
+
+
+# What the group scan decided for one member: a use, a refusal its own scan
+# would raise, a scan that cannot decide (lsof decides), or no use (None).
+_FencedGroupVerdict = _FencedGroupUse | Refusal | _UndecidedFencedUse | None
+
+
+@dataclasses.dataclass
+class _FencedGroupTarget:
+    """One member's fenced tree, as `_agent_batch_fenced_use` prepares it."""
+
+    member: _FencedGroupMember
+    tree_device: int
+    tree_inodes: frozenset[int]
+    sockets: frozenset[int]
+    mapping_device: int
+    owner_cgroup: str | None
+    mount_verdicts: _MountTableVerdicts
+    base: str = ""
+    prefix: str = ""
+    identity_match: str = ""
+
+    def __post_init__(self) -> None:
+        self.base = str(self.member.fenced_path)
+        self.prefix = self.base + "/"
+        self.identity_match = (
+            ", which is on the fenced slot's own image file system"
+            if self.member.whole_device
+            else ", which is an entry of the fenced slot by device and inode"
+        )
+
+    def within(self, target: str) -> bool:
+        return target == self.base or target.startswith(self.prefix)
+
+    def in_tree(self, identity: tuple[int, int]) -> bool:
+        device, inode = identity
+        return device == self.tree_device and (
+            self.member.whole_device or inode in self.tree_inodes
+        )
+
+    def map_use(self, maps: bytes, pid: int, pid_dir: Path) -> str | _UndecidedFencedUse | None:
+        """The member's first mapping use in ``maps``, read as its own scan reads it."""
+
+        mapping_major = os.major(self.mapping_device)
+        mapping_minor = os.minor(self.mapping_device)
+        seen: set[bytes] = set()
+        for line in maps.split(b"\n") if maps else ():
+            fields = line.split(maxsplit=5)
+            if len(fields) < 5 or fields[4] == b"0":
+                continue
+            if len(fields) == 6:
+                mapped = fields[5].decode("utf-8", errors="surrogateescape")
+                target = mapped.removesuffix(" (deleted)")
+                if target.startswith("/") and self.within(os.path.normpath(target)):
+                    return f"map={mapped}"
+            key = fields[3] + b" " + fields[4]
+            if key in seen:
+                continue
+            seen.add(key)
+            major, _separator, minor = fields[3].partition(b":")
+            try:
+                same_filesystem = (int(major, 16), int(minor, 16)) == (
+                    mapping_major,
+                    mapping_minor,
+                )
+                inode = int(fields[4])
+            except ValueError:
+                return _UndecidedFencedUse(f"malformed mapping in {pid_dir / 'maps'}")
+            if not same_filesystem or not (
+                self.member.whole_device or inode in self.tree_inodes
+            ):
+                continue
+            if self.mapping_device != self.tree_device:
+                return _UndecidedFencedUse(
+                    f"process {pid} maps inode {inode} on the fenced slot's filesystem, "
+                    "whose volumes stat reports under their own devices"
+                )
+            return f"map={line.decode('utf-8', errors='surrogateescape')}{self.identity_match}"
+        return None
+
+
+def _fenced_group_target(
+    member: _FencedGroupMember, stop: threading.Event
+) -> _FencedGroupTarget | _UndecidedFencedUse:
+    """Prepare one member as `_agent_batch_fenced_use` prepares its slot, or say why not."""
+
+    tree = _fenced_tree_inodes(member.fenced_path, stop)
+    if isinstance(tree, _UndecidedFencedUse):
+        return tree
+    sockets = _unix_socket_inodes_within((member.canonical_path, member.fenced_path))
+    if isinstance(sockets, _UndecidedFencedUse):
+        return sockets
+    mount = _mount_device(member.fenced_path)
+    if mount is None:
+        return _UndecidedFencedUse(f"cannot identify the filesystem of {member.fenced_path}")
+    mapping_device, filesystem = mount
+    if filesystem not in _FENCED_SCAN_FILESYSTEMS:
+        return _UndecidedFencedUse(
+            f"{member.fenced_path} is on a {filesystem} filesystem, whose mappings this "
+            "scan does not compare"
+        )
+    record = member.record
+    return _FencedGroupTarget(
+        member,
+        tree[0],
+        tree[1],
+        sockets,
+        mapping_device,
+        (
+            record.owner.cgroup_path
+            if record is not None
+            and record.owner is not None
+            and _owner_cgroup_is_evidence(record)
+            else None
+        ),
+        _MountTableVerdicts(member.fenced_path),
+    )
+
+
+def _agent_batch_group_fenced_uses(
+    members: Sequence[_FencedGroupMember],
+    *,
+    cancel: threading.Event | None = None,
+    proc_root: Path = Path("/proc"),
+) -> dict[Path, _FencedGroupVerdict]:
+    """One /proc scan of a group's fenced slots (#1201 batch-grouped-fencing).
+
+    For each member, keyed by its canonical path, this decides what
+    `_agent_batch_fenced_use` run for that member alone decides on the same
+    host: the first use in the same process order (cwd, root, exe,
+    descriptors, mappings, after mount tables and the owner cgroup), the
+    refusal it would raise, or the reason it cannot decide.  Each process's
+    evidence is read once, and only as far as some member still needs it.
+    A read that fails leaves undecided exactly the members still waiting on
+    it, since each of their own scans would have stopped there; the rest go
+    on.  The scan ends when every member is decided or the listing, with
+    its one re-listing, is exhausted.  Image proofs and the lsof fallback
+    stay with the caller.
+    """
+
+    stop = threading.Event() if cancel is None else cancel
+    verdicts: dict[Path, _FencedGroupVerdict] = {}
+    targets: list[_FencedGroupTarget] = []
+    for member in members:
+        prepared = _fenced_group_target(member, stop)
+        if isinstance(prepared, _UndecidedFencedUse):
+            verdicts[member.canonical_path] = prepared
+        else:
+            targets.append(prepared)
+
+    def decide(target: _FencedGroupTarget, verdict: _FencedGroupVerdict) -> None:
+        verdicts[target.member.canonical_path] = verdict
+
+    def still_open() -> list[_FencedGroupTarget]:
+        return [t for t in targets if t.member.canonical_path not in verdicts]
+
+    def refuse_open(exc: Refusal) -> dict[Path, _FencedGroupVerdict]:
+        for target in still_open():
+            decide(target, exc)
+        return verdicts
+
+    if not targets:
+        return verdicts
+    try:
+        pid_dirs = [path for path in proc_root.iterdir() if path.name.isdigit()]
+    except OSError as exc:
+        return refuse_open(Refusal(f"cannot inspect live processes: {exc}"))
+    _census_churn_for_test()
+    current_pid = os.getpid()
+    pending = sorted(pid_dirs, key=lambda item: int(item.name), reverse=True)
+    follower = _ListingFollower(proc_root)
+    while still_open():
+        if not pending:
+            try:
+                pending = follower.relist()
+            except Refusal as exc:
+                return refuse_open(exc)
+            if not pending:
+                break
+        pid_dir = pending.pop()
+        follower.visit(pid_dir)
+        if stop.is_set():
+            raise _ScanCancelled
+        pid = int(pid_dir.name)
+        if pid == current_pid:
+            continue
+        try:
+            generation = _read_process_stat(pid_dir)
+        except Refusal:
+            generation = None
+        start_ticks = None if generation is None else generation.start_ticks
+        try:
+            if _census_process_uids(pid_dir) is None:
+                continue
+        except Refusal as exc:
+            return refuse_open(exc)
+        active = still_open()
+        cgroup_members = [t for t in active if t.owner_cgroup is not None]
+        if cgroup_members:
+            # A member whose cgroup read finds the process gone skips it, as
+            # its own scan does; a gone process has no threads to add later.
+            try:
+                cgroup: str | None = _read_process_cgroup(pid_dir)
+                cgroup_error: Refusal | None = None
+            except Refusal as exc:
+                cgroup, cgroup_error = None, exc
+            gone = cgroup_error is not None and not pid_dir.exists()
+            for target in cgroup_members:
+                if cgroup_error is not None:
+                    if gone:
+                        active.remove(target)
+                    else:
+                        decide(
+                            target,
+                            Refusal(
+                                f"recorded cgroup use is indeterminate for PID {pid}: "
+                                f"{cgroup_error}"
+                            ),
+                        )
+                elif cgroup == target.owner_cgroup:
+                    decide(
+                        target,
+                        Refusal(f"live process {pid} remains in recorded owner cgroup {cgroup}"),
+                    )
+            active = [t for t in active if t.member.canonical_path not in verdicts]
+        if not active:
+            # Every member still open skipped the process; their own scans
+            # add no threads for it.
+            continue
+        uses: dict[Path, list[str]] = {}
+        try:
+            mountinfo = _read_process_mountinfo(pid_dir)
+        except Refusal as exc:
+            for target in active:
+                decide(target, exc)
+            active = []
+            mountinfo = None
+        for target in list(active):
+            try:
+                uses[target.member.canonical_path] = target.mount_verdicts.uses_in(
+                    mountinfo, pid_dir
+                )
+            except Refusal as exc:
+                decide(target, exc)
+                active.remove(target)
+        gone_reads: list[tuple[Path, OSError]] = []
+
+        def looking() -> list[_FencedGroupTarget]:
+            return [
+                t
+                for t in active
+                if not uses[t.member.canonical_path]
+                and t.member.canonical_path not in verdicts
+            ]
+
+        def failed(read: Path, exc: OSError, waiting: Sequence[_FencedGroupTarget]) -> bool:
+            """Note a failed read; True when it skips, else the waiting members cannot decide."""
+
+            if exc.errno in _PROCESS_GONE_ERRNOS:
+                gone_reads.append((read, exc))
+            if exc.errno in _FENCED_SCAN_SKIPPED_ERRNOS:
+                return True
+            for target in waiting:
+                decide(target, _UndecidedFencedUse(f"{read}: {exc}"))
+            return False
+
+        for name in ("cwd", "root", "exe"):
+            waiting = looking()
+            if not waiting:
+                break
+            current = pid_dir / name
+            try:
+                raw = os.readlink(current)
+            except OSError as exc:
+                failed(current, exc, waiting)
+                continue
+            target_path = raw.removesuffix(" (deleted)")
+            by_identity: list[_FencedGroupTarget] = []
+            for target in waiting:
+                if target_path.startswith("/") and target.within(
+                    os.path.normpath(target_path)
+                ):
+                    uses[target.member.canonical_path].append(f"{name}={target_path}")
+                else:
+                    by_identity.append(target)
+            if by_identity:
+                try:
+                    identity = _cached_file_identity(str(current))
+                except OSError as exc:
+                    failed(current, exc, by_identity)
+                    continue
+                for target in by_identity:
+                    if target.in_tree(identity):
+                        uses[target.member.canonical_path].append(
+                            f"{name}={raw}{target.identity_match}"
+                        )
+        waiting = looking()
+        descriptors: list[str] = []
+        if waiting:
+            current = pid_dir / "fd"
+            try:
+                descriptors = os.listdir(current)
+            except OSError as exc:
+                failed(current, exc, waiting)
+        for descriptor in descriptors:
+            waiting = looking()
+            if not waiting:
+                break
+            current = pid_dir / "fd" / descriptor
+            try:
+                raw = os.readlink(current)
+            except OSError as exc:
+                if failed(current, exc, waiting):
+                    continue
+                break
+            if raw.startswith("socket:[") and raw.endswith("]"):
+                inode_text = raw[len("socket:["):-1]
+                for target in waiting:
+                    if inode_text.isdigit() and int(inode_text) in target.sockets:
+                        uses[target.member.canonical_path].append(
+                            f"fd/{descriptor}={raw} is bound below the slot"
+                        )
+                continue
+            if not raw.startswith("/"):
+                continue
+            normalized = os.path.normpath(raw.removesuffix(" (deleted)"))
+            by_identity = []
+            for target in waiting:
+                if target.within(normalized):
+                    uses[target.member.canonical_path].append(f"fd/{descriptor}={raw}")
+                else:
+                    by_identity.append(target)
+            if by_identity:
+                try:
+                    identity = _cached_file_identity(str(current))
+                except OSError as exc:
+                    failed(current, exc, by_identity)
+                    continue
+                for target in by_identity:
+                    if target.in_tree(identity):
+                        uses[target.member.canonical_path].append(
+                            f"fd/{descriptor}={raw}{target.identity_match}"
+                        )
+        waiting = looking()
+        if waiting:
+            current = pid_dir / "maps"
+            try:
+                maps = current.read_bytes()
+            except OSError as exc:
+                failed(current, exc, waiting)
+                maps = b""
+            for target in looking():
+                found = target.map_use(maps, pid, pid_dir)
+                if isinstance(found, _UndecidedFencedUse):
+                    decide(target, found)
+                elif found is not None:
+                    uses[target.member.canonical_path].append(found)
+        _note_process_gone(pid_dir, gone_reads)
+        for target in active:
+            path = target.member.canonical_path
+            if path in verdicts or not uses[path]:
+                continue
+            decide(
+                target,
+                _FencedGroupUse(
+                    pid,
+                    start_ticks,
+                    proc_root,
+                    Refusal(
+                        f"live {_walked_process_label(pid_dir)} uses slot "
+                        f"{target.member.fenced_path}: {uses[path][0]}; stop it and retry"
+                    ),
+                ),
+            )
+        # A member's own scan adds a leader's threads after a process that
+        # it read and that showed it no use.
+        if any(t.member.canonical_path not in verdicts for t in active):
+            try:
+                pending.extend(reversed(_walked_zombie_leader_threads(pid_dir)))
+            except Refusal as exc:
+                return refuse_open(exc)
+    for target in still_open():
+        decide(target, None)
+    return verdicts
+
+
+def _fenced_group_result(
+    verdict: _FencedGroupVerdict, *, capture_generation: bool
+) -> _LiveUseObservation | _UndecidedFencedUse | None:
+    """Return, or raise, what `_agent_batch_fenced_use` does for this verdict."""
+
+    if isinstance(verdict, Refusal):
+        raise verdict
+    if isinstance(verdict, _FencedGroupUse):
+        if not capture_generation:
+            raise verdict.refusal
+        return _LiveUseObservation(
+            verdict.pid, verdict.start_ticks, verdict.proc_root, verdict.refusal
+        )
+    return verdict
+
+
 _ScanResult = TypeVar("_ScanResult")
 
 
@@ -49631,6 +50267,36 @@ def _run_item_scan(
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class _FenceGroup:
+    """One remove-agent-batch group (#1201): its id and member count, journaled per member."""
+
+    group_id: str
+    size: int
+
+
+@dataclasses.dataclass
+class _GroupedMember:
+    """A fenced group member awaiting its finish (#1201).
+
+    ``scan_record`` is the record its checks after the fence will pass
+    (`_record_for_slot_use_check`), so the group scan compares the same
+    owner cgroup.  ``deadline`` is its paused item budget and ``paused_at``
+    when it paused, so the wait for the rest of the group is not charged.
+    """
+
+    slot: str
+    record: ActiveRecord
+    journal: Mapping[str, object]
+    canonical: Path
+    fenced: Path
+    scan_record: ActiveRecord | None
+    finish: Callable[[], int]
+    deadline: _ItemDeadline | None
+    item_seconds: float
+    paused_at: float
+
+
 @dataclasses.dataclass
 class _AgentRemoveBatchContext:
     """The process-use evidence and item budget of one agent removal batch.
@@ -49719,6 +50385,185 @@ class _AgentRemoveBatchContext:
     # budget still bounds the work up to the first deletion exactly as
     # when the whole removal ran under the lock.  Cleared per item.
     active_item_deadline: _ItemDeadline | None = None
+    # #1201 batch-grouped-fencing.  ``group`` is set while the batch fences
+    # a group of two or more: each member's removal journals in its scoped
+    # FINISH journal and stops after the fence (``defer_member``).  The
+    # batch then scans every member's fence at once (``scan_group``), seals
+    # them (``seal_group``), and finishes each in turn (``resume_member``);
+    # ``observe_fenced`` serves a member's first check after the fence from
+    # the group verdict while it is fresh.
+    group: _FenceGroup | None = None
+    group_members: list[_GroupedMember] = dataclasses.field(default_factory=list)
+    group_journals: set[Path] = dataclasses.field(default_factory=set)
+    group_verdicts: dict[Path, _FencedGroupVerdict] = dataclasses.field(default_factory=dict)
+    group_served: set[Path] = dataclasses.field(default_factory=set)
+    group_scanned_at: float = 0.0
+    group_scan_count: int = 0
+    group_scan_seconds: float = 0.0
+    group_fallbacks: list[str] = dataclasses.field(default_factory=list)
+    group_size_max: int = 0
+    group_seal_failures: list[str] = dataclasses.field(default_factory=list)
+
+    def begin_group(self, size: int) -> None:
+        """Start fencing a group of ``size`` members (#1201); a size below 2 is no group."""
+
+        self.end_group()
+        if size >= 2:
+            self.group = _FenceGroup(uuid.uuid4().hex, size)
+            self.group_size_max = max(self.group_size_max, size)
+
+    def end_group(self) -> None:
+        self.group = None
+        self.group_members = []
+        self.group_journals = set()
+        self.group_verdicts = {}
+        self.group_served = set()
+
+    def defer_member(
+        self,
+        config: Config,
+        prepared: _PreparedDeferredFinish,
+        finish: _FinishContext,
+        continuation: Callable[[], int],
+    ) -> None:
+        """Hold one fenced member's finish until its group has been scanned (#1201)."""
+
+        record = prepared.record
+        self.group_journals.add(prepared.journal_path)
+        self.group_members.append(
+            _GroupedMember(
+                slot=record.slot,
+                record=record,
+                journal=prepared.journal,
+                canonical=_slot_directory(config, record.slot, record.slot_type),
+                fenced=_finish_fenced_slot(config, record, prepared.journal),
+                scan_record=_record_for_slot_use_check(
+                    record,
+                    validate_complete=finish.validate_complete,
+                    allow_live_validate_owner=finish.allow_live_validate_owner,
+                    owner_consented=finish.owner_consented,
+                ),
+                finish=continuation,
+                deadline=self.active_item_deadline,
+                item_seconds=self.item_seconds,
+                paused_at=time.monotonic(),
+            )
+        )
+
+    def scan_group(self) -> None:
+        """Scan every fenced member at once, after the last fence (#1201).
+
+        An image-backed member first proves its fenced mount is the image's
+        only live file system, as ``observe_fenced`` does; a doubt is its
+        verdict.  When the scan runs out of its bound, no member has a
+        verdict and each scans alone.
+        """
+
+        self.group_verdicts = {}
+        self.group_served = set()
+        members: list[_FencedGroupMember] = []
+        for member in self.group_members:
+            image_file = self.image_targets.get(member.canonical)
+            if image_file is not None:
+                doubt = self._image_fence_doubt(image_file, member.fenced)
+                if doubt is not None:
+                    self.group_verdicts[member.canonical] = doubt
+                    continue
+            members.append(
+                _FencedGroupMember(
+                    member.fenced,
+                    member.canonical,
+                    member.scan_record,
+                    whole_device=image_file is not None,
+                )
+            )
+        started = time.monotonic()
+        if self.group_members and started <= max(m.paused_at for m in self.group_members):
+            raise StateError("a group's fenced scan must start after its last fence")
+        self.group_scanned_at = started
+        self.group_scan_count += 1
+        try:
+            verdicts = _run_bounded_scan(
+                lambda cancel: _agent_batch_group_fenced_uses(members, cancel=cancel),
+                seconds=_AGENT_REMOVE_BATCH_SCAN_SECONDS,
+                on_timeout=lambda: Refusal(
+                    "the group's /proc scan after the fences exceeded its "
+                    f"{_AGENT_REMOVE_BATCH_SCAN_SECONDS:g}-second bound"
+                ),
+            )
+        except Refusal as exc:
+            self.group_fallbacks.append(f"group scan: {exc}")
+            verdicts = {}
+        finally:
+            self.group_scan_seconds += time.monotonic() - started
+        self.group_verdicts.update(verdicts)
+        _interrupt_for_test("after-agent-batch-group-scan")
+
+    def seal_group(self) -> None:
+        """Seal each member's fence until its own finish (#1201); a failure leaves it as today."""
+
+        for member in self.group_members:
+            try:
+                _seal_group_fence(member.fenced)
+            except OSError as exc:
+                self.group_seal_failures.append(f"{member.fenced}: {exc}")
+        _interrupt_for_test("after-agent-batch-group-seal")
+
+    def resume_member(self, config: Config, member: _GroupedMember) -> None:
+        """Make ``member`` the current item again, its fence readable (#1201)."""
+
+        _unseal_group_fence(config, member.record, member.journal)
+        deadline = member.deadline
+        if deadline is not None:
+            # The budget bounds this member's own work: the time it waited
+            # for the rest of its group is not charged.
+            deadline.started_at += time.monotonic() - member.paused_at
+        self.active_item_deadline = deadline
+        self.item_seconds = member.item_seconds
+        self.nested_git_evidence.clear()
+        self.last_seconds_before_deletion = None
+
+    def _group_verdict(
+        self, check_path: Path, canonical_path: Path, record: ActiveRecord | None
+    ) -> tuple[_FencedGroupVerdict] | None:
+        """The group verdict for a member's first check after its fence, when it applies."""
+
+        if canonical_path not in self.group_verdicts or canonical_path in self.group_served:
+            return None
+        self.group_served.add(canonical_path)
+        member = next(
+            (item for item in self.group_members if item.canonical == canonical_path), None
+        )
+        if member is None or member.fenced != check_path or member.scan_record != record:
+            self.group_fallbacks.append(
+                f"{canonical_path}: the check after the fence is not the one the group scanned"
+            )
+            return None
+        age = time.monotonic() - self.group_scanned_at
+        if age > _AGENT_REMOVE_BATCH_GROUP_FRESH_SECONDS:
+            self.group_fallbacks.append(
+                f"{canonical_path}: the group scan is {age:.1f} s old, past "
+                f"{_AGENT_REMOVE_BATCH_GROUP_FRESH_SECONDS:g} s; scanned alone"
+            )
+            return None
+        return (self.group_verdicts[canonical_path],)
+
+    def _image_fence_doubt(self, image_file: Path, check_path: Path) -> Refusal | None:
+        started = time.monotonic()
+        self.image_fence_check_count += 1
+        try:
+            doubt = slotimage.sole_file_system_doubt(image_file, check_path)
+        except (OSError, slotimage.ImageError) as exc:
+            doubt = f"cannot inspect the image's mounts: {exc}"
+        finally:
+            self.image_fence_check_seconds += time.monotonic() - started
+        if doubt is None:
+            return None
+        return Refusal(
+            f"fenced image-backed slot {check_path} may not hold the only live "
+            f"file system of {image_file}: {doubt}; a process may still use the "
+            "slot through another one"
+        )
 
     def capture(self, targets: Sequence[Path]) -> None:
         """Replace the shared evidence with one new scan of ``targets``."""
@@ -49907,37 +50752,33 @@ class _AgentRemoveBatchContext:
         if _directory_identity(check_path) is None:
             raise Refusal(f"fenced slot {check_path} is missing or is not a directory")
         image_file = self.image_targets.get(canonical_path)
-        if image_file is not None:
+        grouped = self._group_verdict(check_path, canonical_path, record)
+        verdict: _LiveUseObservation | _UndecidedFencedUse | None
+        if grouped is not None:
+            # The group scan, taken after this member's fence and every
+            # other member's (#1201), with the image proof before it.
+            verdict = _fenced_group_result(grouped[0], capture_generation=capture_generation)
+        else:
+            if image_file is not None:
+                doubt = self._image_fence_doubt(image_file, check_path)
+                if doubt is not None:
+                    raise doubt
             started = time.monotonic()
-            self.image_fence_check_count += 1
+            self.fenced_scan_count += 1
             try:
-                doubt = slotimage.sole_file_system_doubt(image_file, check_path)
-            except (OSError, slotimage.ImageError) as exc:
-                doubt = f"cannot inspect the image's mounts: {exc}"
-            finally:
-                self.image_fence_check_seconds += time.monotonic() - started
-            if doubt is not None:
-                raise Refusal(
-                    f"fenced image-backed slot {check_path} may not hold the only live "
-                    f"file system of {image_file}: {doubt}; a process may still use the "
-                    "slot through another one"
+                verdict = _run_item_scan(
+                    lambda cancel: _agent_batch_fenced_use(
+                        check_path,
+                        canonical_path,
+                        record,
+                        capture_generation=capture_generation,
+                        cancel=cancel,
+                        whole_device=image_file is not None,
+                    ),
+                    "the /proc scan after the path fence",
                 )
-        started = time.monotonic()
-        self.fenced_scan_count += 1
-        try:
-            verdict = _run_item_scan(
-                lambda cancel: _agent_batch_fenced_use(
-                    check_path,
-                    canonical_path,
-                    record,
-                    capture_generation=capture_generation,
-                    cancel=cancel,
-                    whole_device=image_file is not None,
-                ),
-                "the /proc scan after the path fence",
-            )
-        finally:
-            self.fenced_scan_seconds += time.monotonic() - started
+            finally:
+                self.fenced_scan_seconds += time.monotonic() - started
         if not isinstance(verdict, _UndecidedFencedUse):
             return verdict
         self.fenced_lsof_fallbacks.append(verdict.reason)
@@ -50275,9 +51116,13 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
         "lock; retry the remaining slots"
     )
 
+    # Grouped members fenced and awaiting their finish (#1201): never
+    # refused as remaining, since they finish before the batch reports.
+    awaiting: dict[str, int] = {}
+
     def stop_remaining(reason: str) -> None:
         for later_slot, later_generation in requested:
-            if later_slot not in decided:
+            if later_slot not in decided and later_slot not in awaiting:
                 refuse(later_slot, later_generation, reason)
 
     wait_seconds = (
@@ -50354,96 +51199,167 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
     error: str | None = None
     # The item being attempted, so that an unexpected error can name it.
     current: tuple[str, int, float] | None = None
+    pending_error: Exception | None = None
+    pending_current: tuple[str, int, float] | None = None
     try:
-        for index, (slot, generation, slot_path) in enumerate(eligible):
-            if context.shared_census_count == 0 or (
-                time.monotonic() - context.captured_at
-                > _AGENT_REMOVE_BATCH_CENSUS_MAX_AGE_SECONDS
-            ):
-                try:
-                    context.capture(remaining_targets[index:])
-                except Refusal as exc:
-                    stop_remaining(str(exc))
-                    break
-            if index:
-                # Waiters poll the registry lock every 50 ms; leave them a window
-                # between items so a batch never starves heartbeats.
-                time.sleep(_AGENT_REMOVE_BATCH_YIELD_SECONDS)
-            item_record = records.get(slot)
-            if item_record is not None:
-                # Scale this item's budget by the salvage work it
-                # carries (#954); counted here, before the lock.
-                context.item_seconds = _agent_remove_batch_item_seconds(
-                    len(item_record.checkouts),
-                    _salvage_submodule_count(config, item_record, _GitVcs()),
-                )
-            item_args = argparse.Namespace(**vars(args))
-            item_args.command = "remove"
-            item_args.slot = slot
-            item_args.expected_generation = generation
-            item_args.validate_complete = False
-            item_args.validation_proof_manifest = None
-            item_args.completed_record = None
-            item_args.wait_lock = wait_seconds
-            item_started = time.monotonic()
-            current = (slot, generation, item_started)
-            context.nested_git_evidence.clear()
-            context.last_seconds_before_deletion = None
-            context.active_item_deadline = None
+        stopped = False
+
+        def item_refused(slot: str, generation: int, exc: Refusal, item_started: float) -> bool:
+            """Report one refused item; True when the batch must stop after it."""
+
+            nonlocal recovery_required
+            seconds = round(time.monotonic() - item_started, 3)
+            # StateError is a Refusal too.  Whether the batch can go on
+            # depends only on whether the item left an interrupted removal,
+            # not on the class of the exception: an invariant check raises
+            # StateError before any journal exists, and a refusal after the
+            # finish journal was written normally rolls the journal back.
+            # When it cannot, the journal stays for 'wrkslots recover' and no
+            # later item can proceed.
             try:
-                _cmd_remove(item_args, emit=False, agent_batch=context)
-            except Refusal as exc:
-                seconds = round(time.monotonic() - item_started, 3)
-                # StateError is a Refusal too.  Whether the batch can go on
-                # depends only on whether the item left an interrupted removal,
-                # not on the class of the exception: an invariant check raises
-                # StateError before any journal exists, and a refusal after the
-                # finish journal was written normally rolls the journal back.
-                # When it cannot, the journal stays for 'wrkslots recover' and no
-                # later item can proceed.
-                try:
-                    interrupted = _interrupted_removal_journal(config, slot, wait_seconds)
-                except Refusal as check:
-                    refuse(
-                        slot,
-                        generation,
-                        f"{exc}; {unconfirmed_reason(check)}",
-                        seconds=seconds,
-                    )
-                    stop_remaining(unconfirmed_stop)
-                    break
-                if interrupted is None:
-                    refuse(slot, generation, str(exc), seconds=seconds)
-                else:
-                    recovery_required = True
-                    refuse(
-                        slot,
-                        generation,
-                        f"{exc}; {recovery_reason(interrupted)}",
-                        seconds=seconds,
-                        recovery_required=True,
-                    )
-                    stop_remaining(
-                        "batch stopped: an earlier item left an interrupted removal; run "
-                        "'wrkslots recover' and retry the remaining slots"
-                    )
-                    break
-            else:
-                decided.add(slot)
-                before_deletion = context.last_seconds_before_deletion
-                removed.append(
-                    {
-                        "slot": slot,
-                        "generation": generation,
-                        "seconds": round(time.monotonic() - item_started, 3),
-                        "seconds_before_deletion": (
-                            None if before_deletion is None else round(before_deletion, 3)
-                        ),
-                        "disposable_nested_repositories": list(context.nested_git_evidence),
-                    }
+                interrupted = _interrupted_removal_journal(config, slot, wait_seconds)
+            except Refusal as check:
+                refuse(
+                    slot,
+                    generation,
+                    f"{exc}; {unconfirmed_reason(check)}",
+                    seconds=seconds,
                 )
-            current = None
-            _interrupt_for_test("after-agent-batch-item")
+                stop_remaining(unconfirmed_stop)
+                return True
+            if interrupted is None:
+                refuse(slot, generation, str(exc), seconds=seconds)
+                return False
+            recovery_required = True
+            refuse(
+                slot,
+                generation,
+                f"{exc}; {recovery_reason(interrupted)}",
+                seconds=seconds,
+                recovery_required=True,
+            )
+            stop_remaining(
+                "batch stopped: an earlier item left an interrupted removal; run "
+                "'wrkslots recover' and retry the remaining slots"
+            )
+            return True
+
+        def item_removed(slot: str, generation: int, item_started: float) -> None:
+            decided.add(slot)
+            before_deletion = context.last_seconds_before_deletion
+            removed.append(
+                {
+                    "slot": slot,
+                    "generation": generation,
+                    "seconds": round(time.monotonic() - item_started, 3),
+                    "seconds_before_deletion": (
+                        None if before_deletion is None else round(before_deletion, 3)
+                    ),
+                    "disposable_nested_repositories": list(context.nested_git_evidence),
+                }
+            )
+
+        # Items are fenced in groups of up to _AGENT_REMOVE_BATCH_GROUP_MAX
+        # (#1201): every member is fenced, the fences are scanned once
+        # together and sealed, then each member finishes in turn.  A group of
+        # one runs straight through, exactly as before grouping.
+        for group_start in range(0, len(eligible), _AGENT_REMOVE_BATCH_GROUP_MAX):
+            if stopped:
+                break
+            group_items = eligible[group_start : group_start + _AGENT_REMOVE_BATCH_GROUP_MAX]
+            context.begin_group(len(group_items))
+            deferred: list[tuple[str, int, float, _GroupedMember]] = []
+            for offset, (slot, generation, slot_path) in enumerate(group_items):
+                index = group_start + offset
+                if context.shared_census_count == 0 or (
+                    time.monotonic() - context.captured_at
+                    > _AGENT_REMOVE_BATCH_CENSUS_MAX_AGE_SECONDS
+                ):
+                    try:
+                        context.capture(remaining_targets[index:])
+                    except Refusal as exc:
+                        stop_remaining(str(exc))
+                        stopped = True
+                        break
+                if index:
+                    # Waiters poll the registry lock every 50 ms; leave them a window
+                    # between items so a batch never starves heartbeats.
+                    time.sleep(_AGENT_REMOVE_BATCH_YIELD_SECONDS)
+                item_record = records.get(slot)
+                if item_record is not None:
+                    # Scale this item's budget by the salvage work it
+                    # carries (#954); counted here, before the lock.
+                    context.item_seconds = _agent_remove_batch_item_seconds(
+                        len(item_record.checkouts),
+                        _salvage_submodule_count(config, item_record, _GitVcs()),
+                    )
+                item_args = argparse.Namespace(**vars(args))
+                item_args.command = "remove"
+                item_args.slot = slot
+                item_args.expected_generation = generation
+                item_args.validate_complete = False
+                item_args.validation_proof_manifest = None
+                item_args.completed_record = None
+                item_args.wait_lock = wait_seconds
+                item_started = time.monotonic()
+                current = (slot, generation, item_started)
+                context.nested_git_evidence.clear()
+                context.last_seconds_before_deletion = None
+                context.active_item_deadline = None
+                members_before = len(context.group_members)
+                try:
+                    _cmd_remove(item_args, emit=False, agent_batch=context)
+                except Refusal as exc:
+                    if item_refused(slot, generation, exc, item_started):
+                        stopped = True
+                        current = None
+                        break
+                except Exception as exc:  # reported below, after the fenced finish
+                    # Members already fenced still finish (#1201); the error is
+                    # then reported for this item exactly as before grouping.
+                    pending_error, pending_current = exc, current
+                    if len(context.group_members) > members_before:
+                        # Fenced before the error: finish it rather than strand it.
+                        deferred.append(
+                            (slot, generation, item_started, context.group_members[-1])
+                        )
+                        awaiting[slot] = generation
+                    stopped = True
+                    break
+                else:
+                    if len(context.group_members) > members_before:
+                        # Fenced and journaled; it finishes after the group scan.
+                        deferred.append(
+                            (slot, generation, item_started, context.group_members[-1])
+                        )
+                        awaiting[slot] = generation
+                    else:
+                        item_removed(slot, generation, item_started)
+                current = None
+                _interrupt_for_test("after-agent-batch-item")
+            if deferred:
+                # Members already fenced finish even when the batch stops: a
+                # refusal never leaves a fence behind for 'wrkslots recover'.
+                context.scan_group()
+                context.seal_group()
+                for slot, generation, item_started, member in deferred:
+                    current = (slot, generation, item_started)
+                    try:
+                        context.resume_member(config, member)
+                        member.finish()
+                    except Refusal as exc:
+                        awaiting.pop(slot, None)
+                        if item_refused(slot, generation, exc, item_started):
+                            stopped = True
+                    else:
+                        awaiting.pop(slot, None)
+                        item_removed(slot, generation, item_started)
+                    current = None
+                    _interrupt_for_test("after-agent-batch-item")
+            context.end_group()
+            if pending_error is not None:
+                current = pending_current
+                raise pending_error
     except Exception as exc:  # the report must survive any failure
         # Each item is atomic in the registry, so the removals already made
         # stand.  Report them, the item that failed, and the slots not yet
@@ -50493,9 +51409,30 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
                 seconds=round(time.monotonic() - failed_started, 3),
                 **extra,
             )
+        for waiting_slot, waiting_generation in sorted(awaiting.items()):
+            if waiting_slot in decided:
+                continue
+            # Fenced as a group member and journaled in its scoped journal
+            # (#1201); 'wrkslots recover --slot' finishes or rolls it back.
+            recovery_required = True
+            refuse(
+                waiting_slot,
+                waiting_generation,
+                f"unexpected error before this fenced group member finished: {error}; "
+                f"run 'wrkslots recover --slot {waiting_slot}'",
+                recovery_required=True,
+            )
+        awaiting.clear()
         stop_remaining("batch stopped after an unexpected error; retry the remaining slots")
     order = {slot: position for position, (slot, _generation) in enumerate(requested)}
     refused.sort(key=lambda item: order[_as_str(item["slot"], "refused slot")])
+    # Several interrupted members can be outstanding at once, and plain
+    # 'recover' then asks for one exact slot (#1201).
+    recovery_commands = [
+        f"wrkslots recover --slot {_as_str(item['slot'], 'refused slot')}"
+        for item in refused
+        if item.get("recovery_required")
+    ]
     return {
         "schema": 1,
         "batch_limit": AGENT_REMOVE_BATCH_LIMIT,
@@ -50518,6 +51455,13 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
         "image_lsof_checks": context.image_lsof_check_count,
         "image_lsof_check_seconds": round(context.image_lsof_check_seconds, 3),
         "item_budget_seconds": context.item_seconds,
+        "recovery_commands": recovery_commands,
+        "group_size_max": context.group_size_max,
+        "group_fenced_scans": context.group_scan_count,
+        "group_fenced_scan_seconds": round(context.group_scan_seconds, 3),
+        "group_fallbacks": len(context.group_fallbacks),
+        "group_fallback_reasons": list(context.group_fallbacks),
+        "group_seal_failures": list(context.group_seal_failures),
         "seconds": round(time.monotonic() - started, 3),
     }
 
@@ -50535,6 +51479,7 @@ def _cmd_remove_agent_batch(args: argparse.Namespace) -> int:
             f"shared_process_censuses={payload['shared_process_censuses']} "
             f"fresh_process_scans={payload['fresh_process_scans']} "
             f"fenced_process_scans={payload['fenced_process_scans']} "
+            f"group_fenced_scans={payload['group_fenced_scans']} "
             f"fenced_lsof_fallbacks={payload['fenced_lsof_fallbacks']} "
             f"item_budget_seconds={payload['item_budget_seconds']:g} "
             f"seconds={payload['seconds']}"
@@ -50561,6 +51506,9 @@ def _cmd_remove_agent_batch(args: argparse.Namespace) -> int:
             print(f"ERROR: {payload['error']}")
         if payload["recovery_required"]:
             print("RECOVERY REQUIRED: run 'wrkslots recover' before another removal")
+            # Several interrupted members need one exact slot each (#1201).
+            for line in _as_list(payload["recovery_commands"], "recovery commands"):
+                print(f"RECOVER: {line}")
     # Success means every requested slot was removed.  Any refusal, including
     # a batch that removed nothing, and any unexpected error is exit status 1.
     return 0 if removed and not refused and payload["error"] is None else 1
@@ -52236,6 +53184,14 @@ def _recover_finish(
     private_identity = _finish_private_census_identity(raw)
     if private_identity is not None and original_mode is None:
         raise StateError("private finish journal has no original directory mode")
+    if _grouped_finish_member(raw, record, "finish journal"):
+        if path != _finish_journal_path(config, record.slot):
+            raise StateError("a grouped member's finish journal must be its scoped journal")
+        if original_mode is None:
+            raise StateError("a grouped member's finish journal has no original directory mode")
+        # Everything below may read the fenced tree; a sealed member's mode
+        # is restored first (#1201).
+        _unseal_group_fence(config, record, raw)
     removal_proof = (
         None
         if raw.get("validation_removal_proof") is None
@@ -71459,7 +72415,9 @@ def _cmd_recover(
             recovery_record = _record_from_obj(
                 raw.get("record"), "finish journal.record"
             )
-            excluded = frozenset({path})
+            # The other members of a grouped removal (#1201) are fenced
+            # removals of other slots, disjoint from this one.
+            excluded = frozenset({path}) | _grouped_sibling_journals(config, path, raw)
             coexisting_creates = _classify_disjoint_create_journals_for_record(
                 config,
                 recovery_states,

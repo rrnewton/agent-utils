@@ -467,6 +467,22 @@ fn finish_shape(
     is_finish_path: bool,
 ) -> Result<()> {
     journal_forward_compatible(raw, "finish journal")?;
+    // A grouped remove-agent-batch member (#1201) has a fence that may be
+    // sealed (mode 0) until the Python edition finishes it; this edition
+    // neither resumes nor rolls back finish journals, so it refuses one
+    // by name instead of judging its shape.
+    if raw
+        .get("x")
+        .and_then(Value::as_object)
+        .is_some_and(|extension| {
+            extension.contains_key("group") || extension.contains_key("sealed")
+        })
+    {
+        return Err(
+            "finish journal is a grouped agent removal's member (x.group, #1201); this edition does not read grouped removals: finish it with the Python edition's 'wrkslots recover --slot SLOT'"
+                .to_owned(),
+        );
+    }
     exact_keys(
         raw,
         &[

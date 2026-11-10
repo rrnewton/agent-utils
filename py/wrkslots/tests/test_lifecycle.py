@@ -1089,6 +1089,34 @@ def terminate_process_id(process_id: int) -> None:
         pass
 
 
+TEST_ALLOW_IMAGE_FIXTURES = "WRKSLOTS_TEST_ALLOW_IMAGE_FIXTURES"
+"""The opt-in a fixture needs before these helpers create an image-backed project."""
+
+
+def _refuse_unrequested_image_fixture(project: Path) -> None:
+    """Refuse to make an image-backed fixture project nobody asked for.
+
+    `init` gives a NEW project disk-image slots unless
+    WRKSLOTS_INIT_REPRESENTATION says otherwise, and image slots attach real
+    loop devices through the root helper.  conftest.py sets that variable to
+    worktree for the suite, but a script that imports these helpers directly
+    does not load conftest, and in a lane slot (WRKSLOTS_SLOT_REPRESENTATION
+    =image) it once built real image fixtures on a host where sudo must be
+    stubbed.  So an image-backed fixture needs WRKSLOTS_TEST_ALLOW_IMAGE_
+    FIXTURES=1 as well, whatever else the environment says (#1201).
+    """
+
+    if (project / ".wrkslots.yml").exists():
+        return
+    representation = os.environ.get("WRKSLOTS_INIT_REPRESENTATION", "image")
+    if representation == "image" and os.environ.get(TEST_ALLOW_IMAGE_FIXTURES) != "1":
+        raise RuntimeError(
+            f"refusing to create an image-backed fixture project at {project}: "
+            "set WRKSLOTS_INIT_REPRESENTATION=worktree (as conftest.py does), or "
+            f"{TEST_ALLOW_IMAGE_FIXTURES}=1 for a test that means to use real slot images"
+        )
+
+
 def initialize(
     project: Path,
     *,
@@ -1102,6 +1130,7 @@ def initialize(
     liveness_batch: bool = False,
     salvage_push_remotes: tuple[str, ...] = (),
 ) -> None:
+    _refuse_unrequested_image_fixture(project)
     liveness = project / "liveness.py"
     if not liveness.exists():
         liveness.write_text(
@@ -29209,7 +29238,7 @@ def test_repair_updates_the_pre_packaging_control_symlink(tmp_path: Path) -> Non
         check=False,
     )
     assert old_command.returncode == 0, old_command.stderr
-    assert old_command.stdout.strip() == "wrkslots 0.9.0"
+    assert old_command.stdout.strip() == "wrkslots 0.10.0"
 
     repaired = _repair(project)
 
@@ -56797,8 +56826,9 @@ def fenced_slot_path(project: Path, slot: str) -> Path | None:
     return fenced[0] if fenced else None
 
 
+@pytest.mark.parametrize("group_max", [1, 8])
 def test_remove_agent_batch_checks_the_fenced_path_by_identity_before_deleting(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, group_max: int,
 ) -> None:
     """A use that begins after the fence, through an outside hard link, blocks.
 
@@ -56809,6 +56839,9 @@ def test_remove_agent_batch_checks_the_fenced_path_by_identity_before_deleting(
     single-slot remove.  When that scan cannot decide, the ordinary lsof
     check of the fenced path decides instead.
     """
+
+    # #1201: one item per group is the per-item path; eight is one group.
+    monkeypatch.setattr(wrkslots, "_AGENT_REMOVE_BATCH_GROUP_MAX", group_max)
 
     project, _repository, slots = dead_agent_batch_project(tmp_path)
     alias = tmp_path / "outside-alias.txt"
@@ -56856,7 +56889,10 @@ def test_remove_agent_batch_checks_the_fenced_path_by_identity_before_deleting(
     reason = str(cast(list[Mapping[str, object]], payload["refused"])[0]["reason"])
     assert f"live process {holders[0].pid} uses slot" in reason
     assert ".slot02.fenced.1." in reason
-    assert payload["fenced_process_scans"] == 3
+    if group_max == 1:
+        assert payload["fenced_process_scans"] == 3
+    else:
+        assert payload["group_fenced_scans"] == 1
     if payload["fenced_lsof_fallbacks"] == 0:
         assert f"={alias}, which is an entry of the fenced slot by device and inode" in reason
     assert payload["recovery_required"] is False
@@ -56948,16 +56984,21 @@ def test_remove_agent_batch_checks_the_fenced_path_against_other_mount_namespace
     assert registry_journals(project) == []
 
 
+@pytest.mark.parametrize("group_max", [1, 8])
 def test_remove_agent_batch_stops_and_names_recover_when_an_item_leaves_its_journal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, group_max: int,
 ) -> None:
     """A refusal whose fence cannot be rolled back stops the batch.
 
     The item's finish journal stays for 'wrkslots recover'; the batch reports
     recovery_required, refuses every later item without trying it, and a
-    later batch naming the slot refuses before its shared scan.
+    later batch naming the slot refuses before its shared scan.  Grouped
+    (#1201), the later item was already fenced with the group, so it still
+    finishes, and the journal left is the item's own scoped journal, named
+    in recovery_commands.
     """
 
+    monkeypatch.setattr(wrkslots, "_AGENT_REMOVE_BATCH_GROUP_MAX", group_max)
     project, _repository, slots = dead_agent_batch_project(tmp_path)
     holders: list[subprocess.Popen[str]] = []
     original = wrkslots._interrupt_for_test
@@ -56979,11 +57020,32 @@ def test_remove_agent_batch_stops_and_names_recover_when_an_item_leaves_its_jour
         for holder in holders:
             terminate_process(holder)
 
-    journal = project / "worktrees" / "ACTIVE.testhost.journal"
+    grouped = group_max > 1
+    journal = project / "worktrees" / (
+        "FINISH.8.testhost.6.slot02.journal" if grouped else "ACTIVE.testhost.journal"
+    )
     assert returncode == 1, stderr
+    assert payload["recovery_required"] is True
+    assert payload["recovery_commands"] == ["wrkslots recover --slot slot02"]
+    if grouped:
+        assert batch_slots(payload, "removed") == ["slot01", "slot03"]
+        assert batch_slots(payload, "refused") == ["slot02"]
+        (first,) = cast(list[Mapping[str, object]], payload["refused"])
+        assert first["recovery_required"] is True
+        assert "path-fence rollback failed: injected rollback failure" in str(first["reason"])
+        assert str(first["reason"]).endswith(
+            f"an interrupted removal is recorded in {journal}; run 'wrkslots recover' "
+            "before another removal"
+        )
+        assert journal.exists()
+        assert not checkout(project, "slot03").exists()
+        monkeypatch.setattr(wrkslots, "_interrupt_for_test", original)
+        again_code, again, again_stderr = in_process_agent_batch(project, ["slot02"])
+        assert again_code == 1, again_stderr
+        assert again["recovery_required"] is True
+        return
     assert batch_slots(payload, "removed") == ["slot01"]
     assert batch_slots(payload, "refused") == ["slot02", "slot03"]
-    assert payload["recovery_required"] is True
     first, later = cast(list[Mapping[str, object]], payload["refused"])
     assert first["recovery_required"] is True
     assert "path-fence rollback failed: injected rollback failure" in str(first["reason"])
@@ -57342,6 +57404,9 @@ def test_remove_agent_batch_describes_the_item_an_unexpected_error_interrupted(
     """
 
     project, _repository, slots = dead_agent_batch_project(tmp_path)
+    # The wrapper below treats _cmd_remove as the whole removal; a grouped
+    # member's call only fences it (#1201), so this runs the per-item path.
+    monkeypatch.setattr(wrkslots, "_AGENT_REMOVE_BATCH_GROUP_MAX", 1)
     original = wrkslots._cmd_remove
     config = wrkslots._load_config(str(project), "testhost")
     journal = wrkslots._journal_path(config)
@@ -57518,13 +57583,16 @@ def test_remove_agent_batch_refuses_validation_and_absent_rows_per_item(
 
 
 def test_remove_agent_batch_leaves_no_state_an_older_client_refuses_between_items(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A batch killed between items leaves only ordinary single-slot state.
 
-    Each item's journal and events are written and retired inside that item's
-    own registry-lock hold, exactly as by `remove`, so no batch-level file can
-    make a client that predates this command refuse.
+    Each ungrouped item's journal and events are written and retired inside
+    that item's own registry-lock hold, exactly as by `remove`, so no
+    batch-level file can make a client that predates this command refuse.
+    A grouped member killed while fenced (#1201) leaves its own scoped
+    journal, which every reader before 0.10.0 refuses by design;
+    'recover --slot' finishes it and leaves ordinary state.
     """
 
     project, _repository, slots = dead_agent_batch_project(tmp_path)
@@ -57537,18 +57605,29 @@ def test_remove_agent_batch_leaves_no_state_an_older_client_refuses_between_item
     assert active_slot_names(project) == slots
     assert registry_journals(project) == before == []
 
-    interrupted = remove_agent_batch(
-        project, slots, env={"WRKSLOTS_TEST_INTERRUPT": "after-agent-batch-item"}
+    assert _forked_agent_batch(project, slots, "after-agent-batch-item", 1) == 86
+    journals = _grouped_journals(project)
+    assert sorted(journals) == ["slot01"]
+    extension = cast(Mapping[str, object], journals["slot01"]["x"])
+    assert extension["min_wrkslots_version"] == "0.10.0"
+    recovered = command(
+        project, "recover", "--coordinator-pid", str(os.getpid()), "--slot", "slot01"
     )
-    assert interrupted.returncode == 86
+    assert recovered.returncode == 0, recovered.stderr
     assert active_slot_names(project) == ["slot02", "slot03"]
-    assert not checkout(project, "slot01").exists()
+    assert registry_journals(project) == []
+
+    # Ungrouped (one item per group), a kill between items leaves nothing.
+    monkeypatch.setattr(wrkslots, "_AGENT_REMOVE_BATCH_GROUP_MAX", 1)
+    assert _forked_agent_batch(project, ["slot02", "slot03"], "after-agent-batch-item", 1) == 86
+    assert active_slot_names(project) == ["slot03"]
+    assert not checkout(project, "slot02").exists()
     assert registry_journals(project) == []
     config = wrkslots._load_config(str(project), "testhost")
     wrkslots._refuse_partial_state(config)
     wrkslots._assert_no_journal(config)
 
-    single = remove(project, "slot02")
+    single = remove(project, "slot03")
     assert single.returncode == 0, single.stderr
     made = create(project, slot="slot04", agent="codex-4", branch="codex/slot04")
     assert made.returncode == 0, made.stderr
@@ -57568,8 +57647,9 @@ def test_remove_agent_batch_leaves_no_state_an_older_client_refuses_between_item
     assert status.returncode == 0, status.stderr
 
 
+@pytest.mark.parametrize("group_max", [1, 8])
 def test_remove_agent_batch_shares_lsof_before_the_fence_and_scans_proc_after_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, group_max: int,
 ) -> None:
     """The batch shares one lsof scan among the checks made before the fence.
 
@@ -57579,6 +57659,9 @@ def test_remove_agent_batch_shares_lsof_before_the_fence_and_scans_proc_after_it
     scan only for an item whose /proc scan cannot decide.  Default remove of
     one agent slot is a batch of one.
     """
+
+    # #1201: one item per group is the per-item path; eight is one group.
+    monkeypatch.setattr(wrkslots, "_AGENT_REMOVE_BATCH_GROUP_MAX", group_max)
 
     project, _repository, slots = dead_agent_batch_project(tmp_path, count=5)
     ordinary_calls: list[Path] = []
@@ -57653,9 +57736,13 @@ def test_remove_agent_batch_shares_lsof_before_the_fence_and_scans_proc_after_it
 
     assert returncode == 0, stderr
     assert batch_slots(payload, "removed") == slots[2:]
-    # One /proc scan per item after its fence.  An ordinary lsof scan, of that
-    # item's fenced path, runs only for each scan that could not decide.
-    assert payload["fenced_process_scans"] == 3
+    # One /proc scan per item after its fence, or one per group (#1201).  An
+    # ordinary lsof scan, of that item's fenced path, runs only for each scan
+    # that could not decide.
+    if group_max == 1:
+        assert payload["fenced_process_scans"] == 3
+    else:
+        assert (payload["fenced_process_scans"], payload["group_fenced_scans"]) == (0, 1)
     fallbacks = payload["fenced_lsof_fallbacks"]
     assert isinstance(fallbacks, int) and 0 <= fallbacks <= 3
     assert len(ordinary_calls) == fallbacks
@@ -58083,6 +58170,7 @@ def test_remove_of_an_image_backed_agent_slot_checks_use_outside_the_lock(
     except slotimage.ImageError as exc:
         pytest.skip(f"no slot image backend on this host: {exc}")
     monkeypatch.setenv("WRKSLOTS_INIT_REPRESENTATION", "image")
+    monkeypatch.setenv(TEST_ALLOW_IMAGE_FIXTURES, "1")
     project = tmp_path / "project"
     held: list[str] = []
     shared_calls: list[tuple[tuple[Path, ...], bool]] = []
@@ -58825,8 +58913,9 @@ def test_agent_batch_fenced_scan_is_undecided_for_a_tree_that_spans_devices(
     )
 
 
+@pytest.mark.parametrize("group_max", [1, 8])
 def test_remove_agent_batch_removes_a_slot_whose_fence_changed_its_device_and_inode(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, group_max: int,
 ) -> None:
     """The check after the fence does not require the identity from before it.
 
@@ -58837,6 +58926,9 @@ def test_remove_agent_batch_removes_a_slot_whose_fence_changed_its_device_and_in
     after the fence, and expects the batch to remove it after scanning it, as
     single-slot remove would.
     """
+
+    # #1201: one item per group is the per-item path; eight is one group.
+    monkeypatch.setattr(wrkslots, "_AGENT_REMOVE_BATCH_GROUP_MAX", group_max)
 
     project, _repository, slots = dead_agent_batch_project(tmp_path, count=2)
     before: dict[str, tuple[int, int] | None] = {}
@@ -58863,7 +58955,8 @@ def test_remove_agent_batch_removes_a_slot_whose_fence_changed_its_device_and_in
     assert returncode == 0, (stderr, payload)
     assert batch_slots(payload, "removed") == ["slot01", "slot02"]
     assert batch_slots(payload, "refused") == []
-    assert payload["fenced_process_scans"] == 2
+    assert payload["fenced_process_scans"] == (2 if group_max == 1 else 0)
+    assert payload["group_fenced_scans"] == (0 if group_max == 1 else 1)
     assert payload["recovery_required"] is False
     assert active_slot_names(project) == []
     assert fenced_slot_path(project, "slot01") is None
@@ -58872,8 +58965,9 @@ def test_remove_agent_batch_removes_a_slot_whose_fence_changed_its_device_and_in
 
 
 @pytest.mark.ordinary_environment
+@pytest.mark.parametrize("group_max", [1, 8])
 def test_remove_agent_batch_removes_disk_image_slots(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, group_max: int,
 ) -> None:
     """The batch removes slots kept in disk images, the default for a new project.
 
@@ -58889,11 +58983,15 @@ def test_remove_agent_batch_removes_disk_image_slots(
     sudo, or fuse2fs with /dev/fuse.
     """
 
+    # #1201: one item per group is the per-item path; eight is one group.
+    monkeypatch.setattr(wrkslots, "_AGENT_REMOVE_BATCH_GROUP_MAX", group_max)
+
     try:
         slotimage.resolve_backend("auto")
     except slotimage.ImageError as exc:
         pytest.skip(f"no slot image backend on this host: {exc}")
     monkeypatch.setenv("WRKSLOTS_INIT_REPRESENTATION", "image")
+    monkeypatch.setenv(TEST_ALLOW_IMAGE_FIXTURES, "1")
     project = tmp_path / "project"
 
     def unused_fresh_scan(
@@ -58958,7 +59056,9 @@ def test_remove_agent_batch_removes_disk_image_slots(
         assert returncode == 0, (stderr, payload)
         assert batch_slots(payload, "removed") == slots
         assert batch_slots(payload, "refused") == []
-        assert payload["fenced_process_scans"] == 2
+        assert payload["fenced_process_scans"] == (2 if group_max == 1 else 0)
+        assert payload["group_fenced_scans"] == (0 if group_max == 1 else 1)
+        assert payload["group_seal_failures"] == []
         # No lsof check of an image-backed slot before its fence (#1142); after
         # it, a proof that the fenced mount is the image's only file system,
         # and lsof only where the scan cannot decide (always with FUSE).
@@ -59058,6 +59158,7 @@ def test_remove_agent_batch_refuses_a_detached_holder_of_an_image_slot_after_its
     kernel_image_backend_or_skip()
     skip_without_mount_namespaces()
     monkeypatch.setenv("WRKSLOTS_INIT_REPRESENTATION", "image")
+    monkeypatch.setenv(TEST_ALLOW_IMAGE_FIXTURES, "1")
     project = tmp_path / "project"
     alias = tmp_path / "alias-mount-point"
     alias.mkdir()
@@ -59139,6 +59240,7 @@ def test_remove_refuses_an_image_slot_whose_fence_mounted_another_device_while_t
     except slotimage.ImageError as exc:
         pytest.skip(f"no slot image backend on this host: {exc}")
     monkeypatch.setenv("WRKSLOTS_INIT_REPRESENTATION", "image")
+    monkeypatch.setenv(TEST_ALLOW_IMAGE_FIXTURES, "1")
     project = tmp_path / "project"
     original_doubt = slotimage.sole_file_system_doubt
     original_attachments = slotimage.image_attachments
@@ -59272,6 +59374,7 @@ def test_remove_agent_batch_refuses_before_fencing_an_image_slot_whose_budget_ra
     except slotimage.ImageError as exc:
         pytest.skip(f"no slot image backend on this host: {exc}")
     monkeypatch.setenv("WRKSLOTS_INIT_REPRESENTATION", "image")
+    monkeypatch.setenv(TEST_ALLOW_IMAGE_FIXTURES, "1")
     project = tmp_path / "project"
     original_preconditions = wrkslots._reclaim_preconditions
     original_rename = wrkslots._rename_slot_path
@@ -59349,6 +59452,7 @@ def test_recover_finishes_an_image_slot_removal_interrupted_at_its_fence(
     except slotimage.ImageError as exc:
         pytest.skip(f"no slot image backend on this host: {exc}")
     monkeypatch.setenv("WRKSLOTS_INIT_REPRESENTATION", "image")
+    monkeypatch.setenv(TEST_ALLOW_IMAGE_FIXTURES, "1")
     project = tmp_path / "project"
     try:
         made, _repository, _slots = dead_agent_batch_project(tmp_path, count=1)
@@ -59381,10 +59485,14 @@ def test_recover_finishes_an_image_slot_removal_interrupted_at_its_fence(
         destroy_leftover_images(project)
 
 
+@pytest.mark.parametrize("group_max", [1, 8])
 def test_remove_agent_batch_falls_back_to_lsof_when_the_fenced_scan_cannot_decide(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, group_max: int,
 ) -> None:
     """An undecided scan runs the ordinary lsof check of the fenced path, which refuses a use."""
+
+    # #1201: one item per group is the per-item path; eight is one group.
+    monkeypatch.setattr(wrkslots, "_AGENT_REMOVE_BATCH_GROUP_MAX", group_max)
 
     project, _repository, slots = dead_agent_batch_project(tmp_path, count=2)
     alias = tmp_path / "outside-alias.txt"
@@ -59417,6 +59525,11 @@ def test_remove_agent_batch_falls_back_to_lsof_when_the_fenced_scan_cannot_decid
         original(point)
 
     monkeypatch.setattr(wrkslots, "_agent_batch_fenced_use", undecided)
+    monkeypatch.setattr(
+        wrkslots,
+        "_fenced_group_target",
+        lambda member, _stop: undecided(member.fenced_path),
+    )
     monkeypatch.setattr(wrkslots, "_lsof_slot_use", count_ordinary)
     monkeypatch.setattr(wrkslots, "_interrupt_for_test", start_holder_after_fence)
     try:
@@ -59432,7 +59545,8 @@ def test_remove_agent_batch_falls_back_to_lsof_when_the_fenced_scan_cannot_decid
     reason = str(cast(list[Mapping[str, object]], payload["refused"])[0]["reason"])
     assert f"live process {holders[0].pid} uses slot" in reason
     assert ".slot01.fenced.1." in reason
-    assert payload["fenced_process_scans"] == 2
+    assert payload["fenced_process_scans"] == (2 if group_max == 1 else 0)
+    assert payload["group_fenced_scans"] == (0 if group_max == 1 else 1)
     assert payload["fenced_lsof_fallbacks"] == 2
     fallback_reasons = cast(list[str], payload["fenced_lsof_fallback_reasons"])
     assert [text.split(".fenced.")[0] for text in fallback_reasons] == [
@@ -59565,6 +59679,360 @@ def test_remove_agent_batch_removes_a_slot_with_nested_submodules_within_scaled_
 
     assert returncode == 0, (stderr, payload)
     assert batch_slots(payload, "removed") == ["slot02"]
+
+
+def test_fixture_helpers_refuse_an_image_project_without_the_opt_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1201: make_project refuses image slots unless WRKSLOTS_TEST_ALLOW_IMAGE_FIXTURES=1.
+
+    Neither the init default (image, with WRKSLOTS_INIT_REPRESENTATION unset)
+    nor an explicit image request makes an image-backed fixture by itself,
+    whatever WRKSLOTS_SLOT_REPRESENTATION says; nothing is initialized.
+    """
+
+    monkeypatch.setenv("WRKSLOTS_SLOT_REPRESENTATION", "image")
+    monkeypatch.delenv(TEST_ALLOW_IMAGE_FIXTURES, raising=False)
+    for index, requested in enumerate((None, "image")):
+        if requested is None:
+            monkeypatch.delenv("WRKSLOTS_INIT_REPRESENTATION", raising=False)
+        else:
+            monkeypatch.setenv("WRKSLOTS_INIT_REPRESENTATION", requested)
+        root = tmp_path / f"case{index}"
+        root.mkdir()
+        with pytest.raises(RuntimeError, match=TEST_ALLOW_IMAGE_FIXTURES):
+            make_project(root)
+        assert not (root / "project" / ".wrkslots.yml").exists()
+    monkeypatch.setenv("WRKSLOTS_INIT_REPRESENTATION", "worktree")
+    (tmp_path / "plain").mkdir()
+    project, _repository, _remote = make_project(tmp_path / "plain")
+    config = wrkslots._load_config(str(project), None)
+    assert config.slot_representation == "worktree"
+
+def _grouped_journals(project: Path) -> dict[str, dict[str, object]]:
+    """Each outstanding scoped FINISH journal by slot."""
+
+    found: dict[str, dict[str, object]] = {}
+    for path in sorted((project / "worktrees").glob("FINISH.*.journal")):
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        found[str(raw["slot"])] = raw
+    return found
+
+
+def _counting(
+    monkeypatch: pytest.MonkeyPatch, name: str, calls: list[str]
+) -> None:
+    real = getattr(wrkslots, name)
+
+    def counted(*args: object, **kwargs: object) -> object:
+        calls.append(name)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(wrkslots, name, counted)
+
+
+def test_remove_agent_batch_fences_groups_and_scans_each_group_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1201 batch-grouped-fencing: one fenced /proc scan per group, sealed fences.
+
+    With groups of two, five items form groups of 2, 2 and 1: two group
+    scans and one ordinary fenced scan.  While a group is fenced, each member
+    has its own scoped FINISH journal naming the group, the fence is sealed
+    (mode 0) after the scan, and the registry journal is unused; the group of
+    one journals and scans exactly as before grouping.
+    """
+
+    assert wrkslots._AGENT_REMOVE_BATCH_GROUP_MAX == 8
+    assert wrkslots._AGENT_REMOVE_BATCH_GROUP_FRESH_SECONDS == 60.0
+    assert wrkslots._GROUPED_FINISH_MIN_VERSION == "0.10.0"
+    project, _repository, slots = dead_agent_batch_project(tmp_path, 5)
+    monkeypatch.setattr(wrkslots, "_AGENT_REMOVE_BATCH_GROUP_MAX", 2)
+    calls: list[str] = []
+    _counting(monkeypatch, "_agent_batch_group_fenced_uses", calls)
+    _counting(monkeypatch, "_agent_batch_fenced_use", calls)
+    seen: list[tuple[str, object]] = []
+    original = wrkslots._interrupt_for_test
+    control = project / "worktrees"
+
+    def observe(point: str) -> None:
+        if point == "after-agent-batch-group-scan":
+            journals = _grouped_journals(project)
+            seen.append(("scan", {
+                slot: cast(Mapping[str, object], raw["x"]) for slot, raw in journals.items()
+            }))
+            assert not (control / f"ACTIVE.{wrkslots._load_config(str(project), None).machine}.journal").exists()
+        elif point == "after-agent-batch-group-seal":
+            modes: dict[str, int] = {}
+            for path in sorted(control.glob(".slot0*.fenced.*")):
+                modes[path.name.split(".")[1]] = stat.S_IMODE(os.lstat(path).st_mode)
+                if os.geteuid() != 0:
+                    with pytest.raises(PermissionError):
+                        os.scandir(path).close()
+            seen.append(("seal", modes))
+        elif point == "after-path-fence" and fenced_slot_path(project, "slot05") is not None:
+            seen.append(("single", sorted(_grouped_journals(project))))
+        original(point)
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", observe)
+    returncode, payload, stderr = in_process_agent_batch(project, slots)
+
+    assert returncode == 0, (stderr, payload)
+    assert batch_slots(payload, "removed") == slots
+    assert payload["group_fenced_scans"] == 2
+    assert payload["fenced_process_scans"] == 1
+    assert payload["group_size_max"] == 2
+    assert payload["group_fallbacks"] == 0
+    assert calls == ["_agent_batch_group_fenced_uses"] * 2 + ["_agent_batch_fenced_use"]
+    # Walks: the shared census walk, plus one per group (the last group is one item).
+    assert payload["fresh_process_scans"] == 1
+    scans = [value for kind, value in seen if kind == "scan"]
+    assert [sorted(cast(dict[str, object], item)) for item in scans] == [
+        ["slot01", "slot02"], ["slot03", "slot04"]
+    ]
+    for item in scans:
+        extensions = cast(dict[str, Mapping[str, object]], item)
+        groups = {str(cast(Mapping[str, object], x["group"])["id"]) for x in extensions.values()}
+        assert len(groups) == 1
+        for x in extensions.values():
+            assert x["min_wrkslots_version"] == "0.10.0"
+            assert x["sealed"] is True
+            assert cast(Mapping[str, object], x["group"])["size"] == 2
+    assert [value for kind, value in seen if kind == "seal"] == [
+        {"slot01": 0, "slot02": 0}, {"slot03": 0, "slot04": 0}
+    ]
+    assert [value for kind, value in seen if kind == "single"] == [[]]
+    assert active_slot_names(project) == []
+    assert registry_journals(project) == []
+    assert sorted(control.glob(".slot0*.fenced.*")) == []
+
+
+def test_remove_agent_batch_member_scans_alone_once_its_group_scan_is_stale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1201: a member that reaches its check after T_fresh scans its fence alone.
+
+    A holder opens a file in the third member's fenced tree after the group
+    scan (before the seal, standing in for any use the group scan cannot
+    have seen).  The second member's finish outlasts T_fresh, so the third
+    member does not take the stale group verdict: its own scan finds the
+    holder, and it alone is refused and its fence rolled back.
+    """
+
+    project, _repository, slots = dead_agent_batch_project(tmp_path)
+    holders: list[subprocess.Popen[str]] = []
+    items = 0
+    original = wrkslots._interrupt_for_test
+    held_relative = (checkout(project, "slot03") / "seed.txt").relative_to(
+        checkout(project, "slot03").parent
+    )
+
+    def observe(point: str) -> None:
+        nonlocal items
+        if point == "after-agent-batch-group-scan":
+            fenced = fenced_slot_path(project, "slot03")
+            assert fenced is not None
+            holders.append(start_ready_holder(
+                "import sys, time; handle = open(sys.argv[1]); "
+                "print('ready', flush=True); time.sleep(120)",
+                fenced / held_relative, cwd=tmp_path, holders=[],
+            ))
+        elif point == "after-agent-batch-item":
+            items += 1
+            if items == 5:
+                # Three fences, then the first two finishes, each well within
+                # T_fresh; from now on every group verdict counts as stale.
+                monkeypatch.setattr(wrkslots, "_AGENT_REMOVE_BATCH_GROUP_FRESH_SECONDS", 0.0)
+        original(point)
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", observe)
+    try:
+        returncode, payload, stderr = in_process_agent_batch(project, slots)
+    finally:
+        for holder in holders:
+            terminate_process(holder)
+
+    assert returncode == 1, (stderr, payload)
+    assert batch_slots(payload, "removed") == ["slot01", "slot02"]
+    assert batch_slots(payload, "refused") == ["slot03"]
+    reason = str(cast(list[Mapping[str, object]], payload["refused"])[0]["reason"])
+    assert f"live process {holders[0].pid} uses slot" in reason
+    assert payload["group_fenced_scans"] == 1
+    # Its own scan, then the ordinary live-use rechecks of a found holder.
+    assert cast(int, payload["fenced_process_scans"]) >= 1
+    reasons = cast(list[str], payload["group_fallback_reasons"])
+    assert len(reasons) == 1 and "slot03" in reasons[0] and "past 0 s" in reasons[0]
+    assert payload["recovery_required"] is False
+    assert active_slot_names(project) == ["slot03"]
+    assert checkout(project, "slot03").is_dir()
+    assert stat.S_IMODE(os.lstat(checkout(project, "slot03").parent).st_mode) != 0
+    assert fenced_slot_path(project, "slot03") is None
+    assert registry_journals(project) == []
+
+
+def test_remove_agent_batch_member_refused_before_its_fence_leaves_the_group(
+    tmp_path: Path,
+) -> None:
+    """#1201: a member refused before its fence leaves the group; the rest go on.
+
+    A process works in the second slot, so the second item is refused in its
+    unlocked pass, before any fence; the first and third are fenced, scanned
+    together once and removed.
+    """
+
+    project, _repository, slots = dead_agent_batch_project(tmp_path)
+    holder = subprocess.Popen(["sleep", "120"], cwd=checkout(project, "slot02"), text=True)
+    try:
+        returncode, payload, stderr = in_process_agent_batch(project, slots)
+    finally:
+        terminate_process(holder)
+
+    assert returncode == 1, (stderr, payload)
+    assert batch_slots(payload, "removed") == ["slot01", "slot03"]
+    assert batch_slots(payload, "refused") == ["slot02"]
+    reason = str(cast(list[Mapping[str, object]], payload["refused"])[0]["reason"])
+    assert f"live process {holder.pid}" in reason
+    assert payload["group_fenced_scans"] == 1
+    assert payload["fenced_process_scans"] == 0
+    assert payload["recovery_required"] is False
+    assert active_slot_names(project) == ["slot02"]
+    assert fenced_slot_path(project, "slot02") is None
+    assert registry_journals(project) == []
+
+
+def test_remove_agent_batch_member_refused_after_its_fence_finishes_the_fenced_and_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1201: a refusal after a member's fence in phase F stops the batch, as today.
+
+    The second member's removal refuses just after its fence (an injected
+    failure where the Git registration repair can fail), leaving its scoped
+    journal for recovery, exactly as one item's interrupted removal does.
+    The batch fences nothing more; the first member, already fenced, is
+    still scanned and removed, and the report names the exact recovery
+    command.  'wrkslots recover --slot slot02' then finishes the removal.
+    """
+
+    project, _repository, slots = dead_agent_batch_project(tmp_path)
+    original = wrkslots._interrupt_for_test
+
+    def fail_second_fence(point: str) -> None:
+        if point == "after-path-fence" and fenced_slot_path(project, "slot02") is not None:
+            raise wrkslots.Refusal("injected failure after the fence")
+        original(point)
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", fail_second_fence)
+    returncode, payload, stderr = in_process_agent_batch(project, slots)
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", original)
+
+    assert returncode == 1, (stderr, payload)
+    assert batch_slots(payload, "removed") == ["slot01"]
+    assert batch_slots(payload, "refused") == ["slot02", "slot03"]
+    refused = {
+        str(row["slot"]): row for row in cast(list[Mapping[str, object]], payload["refused"])
+    }
+    assert "injected failure after the fence" in str(refused["slot02"]["reason"])
+    assert refused["slot02"]["recovery_required"] is True
+    assert "batch stopped" in str(refused["slot03"]["reason"])
+    assert payload["recovery_required"] is True
+    assert payload["recovery_commands"] == ["wrkslots recover --slot slot02"]
+    assert payload["group_fenced_scans"] == 1
+    assert sorted(_grouped_journals(project)) == ["slot02"]
+
+    recovered = command(
+        project, "recover", "--coordinator-pid", str(os.getpid()), "--slot", "slot02"
+    )
+    assert recovered.returncode == 0, recovered.stderr
+    assert active_slot_names(project) == ["slot03"]
+    assert fenced_slot_path(project, "slot02") is None
+    assert registry_journals(project) == []
+
+
+def _forked_agent_batch(
+    project: Path, slots: Sequence[str], point: str, occurrence: int
+) -> int:
+    """Kill an in-process batch at the ``occurrence``-th ``point``, as a crash would."""
+
+    child = os.fork()
+    if child == 0:
+        seen = 0
+        original = wrkslots._interrupt_for_test
+
+        def crash(name: str) -> None:
+            nonlocal seen
+            if name == point:
+                seen += 1
+                if seen == occurrence:
+                    os._exit(86)
+            original(name)
+
+        wrkslots._interrupt_for_test = crash  # type: ignore[assignment]
+        try:
+            with open(os.devnull, "w", encoding="utf-8") as sink:
+                with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                    wrkslots.main(agent_batch_arguments(project, slots))
+        except BaseException:
+            os._exit(255)
+        os._exit(0)
+    _pid, status = os.waitpid(child, 0)
+    return os.waitstatus_to_exitcode(status)
+
+
+@pytest.mark.parametrize(
+    ("point", "occurrence", "fenced", "sealed"),
+    [
+        ("after-path-fence", 2, ["slot01", "slot02"], False),
+        ("after-agent-batch-group-scan", 1, ["slot01", "slot02", "slot03"], False),
+        ("after-agent-batch-group-seal", 1, ["slot01", "slot02", "slot03"], True),
+        ("after-remove-before-journal", 1, ["slot01", "slot02", "slot03"], True),
+    ],
+)
+def test_recover_finishes_each_member_of_a_crashed_group(
+    tmp_path: Path, point: str, occurrence: int, fenced: list[str], sealed: bool,
+) -> None:
+    """#1201: a batch killed with several members fenced leaves one journal per member.
+
+    Killed after the second fence, after the group scan, after the seal, or
+    in the middle of the first member's deletion: every fenced member has
+    its scoped journal and its fence (sealed after the seal, except the
+    member whose deletion had begun), nothing else is fenced, and plain
+    'recover' asks for one exact slot.  'doctor' still reads the registry.
+    'recover --slot' finishes each member, restoring a sealed fence's mode
+    first, and leaves no journal or fence behind.
+    """
+
+    project, _repository, slots = dead_agent_batch_project(tmp_path)
+    assert _forked_agent_batch(project, slots, point, occurrence) == 86
+    journals = _grouped_journals(project)
+    assert sorted(journals) == fenced
+    control = project / "worktrees"
+    fences = {
+        path.name.split(".")[1]: stat.S_IMODE(os.lstat(path).st_mode)
+        for path in control.glob(".slot0*.fenced.*")
+    }
+    assert sorted(fences) == fenced
+    expected_sealed = (
+        [slot for slot in fenced if slot != "slot01"]
+        if point == "after-remove-before-journal"
+        else fenced if sealed else []
+    )
+    assert sorted(slot for slot, mode in fences.items() if mode == 0) == expected_sealed
+    for raw in journals.values():
+        assert cast(Mapping[str, object], raw["x"])["sealed"] is True
+    plain = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+    assert plain.returncode != 0
+    assert "multiple interrupted mutations" in plain.stderr
+    doctor = command(project, "doctor", "--format", "json")
+    assert doctor.returncode in (0, 1), doctor.stderr
+    assert json.loads(doctor.stdout)
+    for slot in fenced:
+        recovered = command(
+            project, "recover", "--coordinator-pid", str(os.getpid()), "--slot", slot
+        )
+        assert recovered.returncode == 0, (slot, recovered.stderr)
+    assert active_slot_names(project) == [slot for slot in slots if slot not in fenced]
+    assert sorted(control.glob(".slot0*.fenced.*")) == []
+    assert registry_journals(project) == []
 
 
 def test_remove_agent_batch_refuses_an_item_whose_budget_is_spent_before_its_fence(

@@ -22,7 +22,7 @@ type Result<T> = std::result::Result<T, String>;
 const SCHEMA: i64 = 2;
 /// The wrkslots version this build is, as `min_wrkslots_version` names it;
 /// always the Python edition's `wrkslots.__version__` (#1109).
-pub(crate) const WRKSLOTS_VERSION: &str = "0.9.0";
+pub(crate) const WRKSLOTS_VERSION: &str = "0.10.0";
 const REQUIRED: [&str; 7] = [
     "schema",
     "worktrees_dir",

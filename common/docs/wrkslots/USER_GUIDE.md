@@ -1363,6 +1363,29 @@ The JSON report counts those confirmations in `image_fence_checks`, with their t
 `image_fence_check_seconds`, and the image-backed slots whose scan `lsof` decided (always, with
 FUSE) in `image_lsof_checks` and `image_lsof_check_seconds`.
 
+Slots are fenced in groups of up to 8 consecutive slots (#1201). Each slot of a group goes through
+everything above up to its path fence, in its own lock hold. The batch then scans `/proc` once for
+every fenced slot of the group together, with the same comparisons and the same answer, slot by
+slot, as the scan after each fence described above, and finishes each slot in turn. So a batch of N
+slots reads `/proc` about once per group, plus the shared reading, instead of once per slot. The
+group scan starts only after the group's last fence. Each slot's verdict is its own: a slot found in
+use, or whose scan cannot decide (then `lsof` decides), is refused or checked alone, and the others
+go on. Between the group scan and its own finish, each slot's fenced directory is sealed (mode 0),
+so a same-user process that lists the slots directory cannot open its way into a fenced tree that
+the scan has already cleared. The slot's mode is restored just before its own salvage checks. A slot
+that reaches its check after the fence more than 60 seconds after its group scan scans alone
+instead. A slot refused before its fence leaves the group. A slot refused just after its fence
+leaves its journal for `wrkslots recover`, as a single interrupted removal does, and the batch fences
+nothing more; slots already fenced still finish. While a group is fenced, each of its slots has its
+own journal, `FINISH.<machine>.<slot>.journal` (an ungrouped slot, and ordinary `remove`, keep the
+machine's single journal). After a crash, plain `wrkslots recover` therefore asks for one slot:
+run `wrkslots recover --slot SLOT` for each, which restores a sealed directory's mode first. The
+report lists those commands in `recovery_commands` (human output: `RECOVER:` lines), and counts
+group scans in `group_fenced_scans` and `group_fenced_scan_seconds`, the largest group in
+`group_size_max`, slots that scanned alone instead in `group_fallbacks` and
+`group_fallback_reasons`, and seals that failed in `group_seal_failures`. The 60-second budget
+below counts only each slot's own work: the wait for the rest of its group is not charged.
+
 Each slot's work before its first deletion is limited to 60 seconds, counted from when the slot
 takes the registry lock, so that other clients waiting for the lock are not kept waiting past their
 own limits. The limit scales with the salvage work the slot carries: each initialized submodule
@@ -1412,7 +1435,7 @@ reported. When the lock is not taken within the lock wait, the batch stops witho
 `wrkslots recover`. The human output is one summary line,
 
 ```text
-requested=3 removed=2 refused=1 shared_process_censuses=1 fresh_process_scans=1 fenced_process_scans=2 fenced_lsof_fallbacks=0 item_budget_seconds=60 seconds=131.4
+requested=3 removed=2 refused=1 shared_process_censuses=1 fresh_process_scans=1 fenced_process_scans=0 group_fenced_scans=1 fenced_lsof_fallbacks=0 item_budget_seconds=60 seconds=131.4
 ```
 
 followed by one `REMOVED:` or `REFUSED:` line per slot; `--format json` prints the same content as
@@ -3064,6 +3087,13 @@ both versions, instead of misclassifying.** The extension is capped at 16384 byt
 stripped on rewrite (provenance compares the journal file with its event-embedded copy exactly),
 and unknown top-level fields outside `x` still refuse, so a stray or misspelt field is never
 silently ignored.
+
+**Upgrading to 0.10.0 (#1201, grouped fences).** A `remove-agent-batch` group's slots journal in
+scoped `FINISH.<machine>.<slot>.journal` files that carry `x.group`, `x.sealed` and
+`x.min_wrkslots_version: 0.10.0`. Every older reader refuses such a journal and touches nothing: a
+0.9.0 reader by the version, an older one by the unknown `x`, and the other edition (which never
+resumes a finish journal) by name. Only a 0.10.0 or later `wrkslots recover --slot SLOT` finishes
+one. A batch that completes leaves no such journal behind.
 
 ## Quarantine a stranded create journal
 

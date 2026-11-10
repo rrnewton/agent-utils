@@ -737,3 +737,52 @@ def test_parse_journal_min_version_refuses_before_key_checks(tmp_path: Path) -> 
     result = _rust(root, name)
     assert result.returncode == 1
     assert expected in result.stderr
+
+
+def _grouped_member_journal(**extension: object) -> dict[str, object]:
+    """A grouped remove-agent-batch member's finish journal (#1201)."""
+
+    return {
+        **_finish_journal(),
+        "original_mode": 0o755,
+        "x": {
+            "min_wrkslots_version": "0.10.0",
+            "group": {"id": "c" * 32, "size": 3},
+            "sealed": True,
+            **extension,
+        },
+    }
+
+
+def test_grouped_member_journal_python_reads_it_rust_refuses_it(tmp_path: Path) -> None:
+    """#1201 batch-grouped-fencing: this edition reads a grouped member's journal; Rust refuses.
+
+    The Python edition accepts the scoped FINISH journal of an agent slot only
+    as a grouped member (x.group, x.sealed, x.min_wrkslots_version 0.10.0),
+    and refuses each malformed variant.  The Rust edition, which never resumes
+    or rolls back a finish journal, refuses a grouped member by name.
+    """
+
+    root = _root(tmp_path)
+    name = "FINISH.6.node-a.6.slot-a.journal"
+    grouped = _grouped_member_journal()
+    path = _write(root, name, grouped)
+    assert _expected(root, path) == grouped
+    result = _rust(root, name)
+    assert result.returncode == 1
+    assert "grouped agent removal's member (x.group, #1201)" in result.stderr
+    variants: list[tuple[str, dict[str, object], str]] = [
+        (name, _grouped_member_journal(sealed=False), "x.sealed must be true"),
+        (name, _grouped_member_journal(group={"id": "c" * 32, "size": 1}), "x.group.size"),
+        (name, _grouped_member_journal(group={"id": "C" * 32, "size": 3}), "x.group.id"),
+        (name, _grouped_member_journal(min_wrkslots_version="0.9.0"),
+         "must require wrkslots 0.10.0"),
+        ("ACTIVE.node-a.journal", _grouped_member_journal(), "must be its scoped journal"),
+        (name, {**_finish_journal()}, "scoped finish journal is not a direct"),
+    ]
+    for variant_name, payload, fragment in variants:
+        variant = _write(root, variant_name, payload)
+        with pytest.raises(Exception) as caught:
+            _expected(root, variant)
+        assert fragment in str(caught.value), (fragment, caught.value)
+        variant.unlink()

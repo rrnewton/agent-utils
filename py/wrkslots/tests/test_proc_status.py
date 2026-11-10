@@ -8,6 +8,7 @@ import errno
 import re
 import os
 import selectors
+import shutil
 import signal
 import subprocess
 import sys
@@ -15,7 +16,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
-from typing import Literal, TextIO, TypedDict
+from typing import Literal, TextIO, TypedDict, cast
 
 import pytest
 
@@ -2043,3 +2044,187 @@ def test_one_shared_walk_answers_every_slot_as_its_own_walk(
         for child in children:
             child.kill()
             child.wait()
+
+
+_SOCKET_CHILD = """
+import socket, sys, time
+server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+server.bind(sys.argv[1])
+print("ready", flush=True)
+time.sleep(600)
+"""
+
+_TWO_TREES_CHILD = """
+import os, sys, time
+held = open(sys.argv[2], "rb")
+os.chdir(sys.argv[1])
+print("ready", flush=True)
+time.sleep(600)
+"""
+
+
+def _ready_child(argv: list[str], cwd: Path) -> subprocess.Popen[bytes]:
+    child = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+    assert child.stdout is not None and child.stdout.readline().strip() == b"ready"
+    return child
+
+
+def _group_outcome(
+    read: Callable[[], cli._LiveUseObservation | cli._UndecidedFencedUse | None],
+) -> tuple[str, int | None, str]:
+    try:
+        observed = read()
+    except cli.Refusal as exc:
+        return ("refused", None, str(exc))
+    if observed is None:
+        return ("unused", None, "")
+    if isinstance(observed, cli._UndecidedFencedUse):
+        return ("undecided", None, observed.reason)
+    return ("live", observed.pid, str(observed.refusal))
+
+
+def test_one_group_scan_decides_each_member_as_its_own_fenced_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1201 batch-grouped-fencing: one group scan equals one fenced scan per member.
+
+    Real children use fenced trees by working directory, descriptor,
+    executable, mapping only, a socket bound below the tree, and a hard
+    link outside it (identity only); one child holds two trees at once; one
+    tree is unused, one has an unreadable directory (undecided, unless root
+    reads it), and one is an image-style member that matches by device.
+    A record whose owner cgroup is the children's refuses its member.  The
+    proc root lists those children and one exited process.  For each
+    member and generation mode, the group verdict returns or raises exactly
+    what `_agent_batch_fenced_use` does for that member alone.
+    """
+
+    (tmp_path / "outside").mkdir()
+    outside = (tmp_path / "outside").resolve()
+    names = ("cwd", "fd", "exe", "map", "sock", "link", "both-cwd", "both-fd", "free",
+             "unreadable", "device", "cgroup")
+    trees: dict[str, _GoneSlot] = {}
+    for name in names:
+        (tmp_path / f".{name}.fenced.1.x").mkdir()
+        trees[name] = _GoneSlot((tmp_path / f".{name}.fenced.1.x").resolve(), outside)
+    children: list[subprocess.Popen[bytes]] = []
+    blocked = trees["unreadable"].slot / "blocked"
+    try:
+        children.append(_in_cwd(trees["cwd"]))
+        children.append(_holding_fd(trees["fd"]))
+        children.append(_running_from(trees["exe"]))
+        children.append(_mapping_only(trees["map"], "600"))
+        children.append(_ready_child(
+            [sys.executable, "-c", _SOCKET_CHILD, str(trees["sock"].slot / "s")], outside))
+        (trees["link"].slot / "original").write_bytes(b"l")
+        os.link(trees["link"].slot / "original", outside / "alias")
+        children.append(_ready_child(
+            [sys.executable, "-c", _TWO_TREES_CHILD.replace(
+                "os.chdir(sys.argv[1])", "pass"), str(outside), str(outside / "alias")],
+            outside))
+        (trees["both-fd"].slot / "held").write_bytes(b"b")
+        children.append(_ready_child(
+            [sys.executable, "-c", _TWO_TREES_CHILD, str(trees["both-cwd"].slot),
+             str(trees["both-fd"].slot / "held")], outside))
+        blocked.mkdir()
+        blocked.chmod(0)
+        vanished = subprocess.Popen(["/bin/true"])
+        vanished.wait()
+        proc_root = tmp_path / "proc"
+        proc_root.mkdir()
+        for pid in [child.pid for child in children] + [vanished.pid]:
+            (proc_root / str(pid)).symlink_to(f"/proc/{pid}")
+        own_cgroup = cli._read_process_cgroup(Path(f"/proc/{children[0].pid}"))
+        monkeypatch.setattr(cli, "_owner_cgroup_is_evidence", lambda record: record is not None)
+        owner = dataclasses.make_dataclass("Owner", [("cgroup_path", str)])(own_cgroup)
+        record = cast(cli.ActiveRecord, dataclasses.make_dataclass("Record", [("owner", object)])(owner))
+        members = [
+            cli._FencedGroupMember(
+                trees[name].slot,
+                tmp_path / name,
+                record if name == "cgroup" else None,
+                whole_device=name == "device",
+            )
+            for name in names
+        ]
+        group = cli._agent_batch_group_fenced_uses(members, proc_root=proc_root)
+        assert set(group) == {member.canonical_path for member in members}
+        kinds: dict[str, str] = {}
+        for name, member in zip(names, members):
+            for capture_generation in (False, True):
+                def own() -> cli._LiveUseObservation | cli._UndecidedFencedUse | None:
+                    return cli._agent_batch_fenced_use(
+                        member.fenced_path, member.canonical_path, member.record,
+                        capture_generation=capture_generation, proc_root=proc_root,
+                        whole_device=member.whole_device,
+                    )
+
+                def grouped() -> cli._LiveUseObservation | cli._UndecidedFencedUse | None:
+                    return cli._fenced_group_result(
+                        group[member.canonical_path], capture_generation=capture_generation
+                    )
+
+                expected = _group_outcome(own)
+                assert _group_outcome(grouped) == expected, (name, capture_generation)
+                kinds[name] = expected[0]
+        root_reads = os.geteuid() == 0 or os.access(blocked, os.R_OK)
+        assert kinds == {
+            "cwd": "live", "fd": "live", "exe": "live", "map": "live", "sock": "live",
+            "link": "live", "both-cwd": "live", "both-fd": "live", "free": "unused",
+            "unreadable": "unused" if root_reads else "undecided", "device": "live",
+            "cgroup": "refused",
+        }, kinds
+        # One member alone is the same scan as a group of one.
+        alone = cli._agent_batch_group_fenced_uses(members[:1], proc_root=proc_root)
+        assert _group_outcome(lambda: cli._fenced_group_result(
+            alone[members[0].canonical_path], capture_generation=True)) == _group_outcome(
+            lambda: cli._fenced_group_result(
+                group[members[0].canonical_path], capture_generation=True))
+    finally:
+        with contextlib.suppress(OSError):
+            blocked.chmod(0o700)
+        for child in children:
+            child.kill()
+            child.wait()
+
+
+_SEAL_THROUGH_BIND = """
+import os, subprocess, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from wrkslots import cli
+source, mount_point = Path(sys.argv[2]), Path(sys.argv[3])
+subprocess.run(["mount", "--bind", str(source), str(mount_point)], check=True)
+cli._seal_group_fence(mount_point)
+sealed = (oct(os.stat(source).st_mode & 0o7777), oct(os.stat(mount_point).st_mode & 0o7777))
+os.chmod(mount_point, 0o755)
+print(*sealed, oct(os.stat(source).st_mode & 0o7777))
+"""
+
+
+def test_seal_through_a_bind_mount_point_seals_the_mounted_root(tmp_path: Path) -> None:
+    """#1201: chmod on a fenced mount point seals the mounted tree's root.
+
+    A worktrees-image slot's fence is a bind mount of its subvolume, and an
+    image slot's fence a mount of its file system; either way the fenced
+    path is a mount point.  In a user and mount namespace of its own, a bind
+    mount's point is sealed: the bound directory itself shows mode 0, and
+    restoring through the point restores it.
+    """
+
+    if shutil.which("unshare") is None or shutil.which("mount") is None:
+        pytest.skip("needs unshare and mount")
+    source = tmp_path / "subvolume"
+    mount_point = tmp_path / ".slot01.fenced.1.x"
+    source.mkdir(mode=0o755)
+    mount_point.mkdir(mode=0o755)
+    (source / "file").write_text("x")
+    run = subprocess.run(
+        ["unshare", "-rm", sys.executable, "-I", "-c", _SEAL_THROUGH_BIND,
+         str(Path(cli.__file__).resolve().parents[1]), str(source), str(mount_point)],
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    if run.returncode != 0 and "Operation not permitted" in run.stderr:
+        pytest.skip(f"no unprivileged mount namespace here: {run.stderr.strip()}")
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.split() == ["0o0", "0o0", "0o755"]
