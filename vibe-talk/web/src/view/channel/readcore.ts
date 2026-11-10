@@ -1048,37 +1048,17 @@ function applyTimelinePage(payload: TimelineResponse, older = false, saved = fal
  * message has moved into that pixel. Kept to the offset as before when the message is not drawn.
  */
 
-let lastCachedGroups: readonly (readonly unknown[])[] = [];
-let lastCachedNodes: readonly Element[] = [];
-
 function renderCachedTimeline(): void {
   if (!providerFacts.threading() || selection().view === "threads") return;
   const keeps = readFilterKeeps();
   const shown = timelineRows().messages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message)));
   const redraw = () => {
-    // An unchanged cached timeline rebuilds nothing (`#1209 selection-survives-updates`): the
-    // very messages last drawn, object for object, so replacing their rows would only take the
-    // reader's selection with them. Same ids in new objects is a change (a thread read bringing
-    // its root's words again) and redraws, keeping the selection across it instead.
+    // The selection is kept across the rebuild (`#1209 selection-survives-updates`); removing
+    // the rebuild itself for unchanged rows is the keyed patching of #1229, since what a row
+    // shows also stands in state outside its messages (a Done, a fold, a summary).
     const list = el("discord-log");
-    const groups = glom(shown);
-    // And the rows drawn must still be the ones this redraw left: another path redrawing in
-    // between (a search stepping its read rows aside and back) makes the remembered groups
-    // stale even where the messages themselves never changed.
-    const unchanged = groups.length === lastCachedGroups.length
-      && groups.every((group, at) => {
-        const last = lastCachedGroups[at];
-        return last !== undefined && group.length === last.length
-          && group.every((message, inGroup) => message === last[inGroup]);
-      })
-      && list.children.length === lastCachedNodes.length
-      && [...list.children].every((row, at) => row === lastCachedNodes[at]);
-    const keptSelection = deps.selectionIn && !unchanged ? deps.selectionIn(list) : null;
-    if (!unchanged) {
-      list.replaceChildren(...groups.map(discordNode));
-      lastCachedGroups = groups;
-      lastCachedNodes = [...list.children];
-    }
+    const keptSelection = deps.selectionIn ? deps.selectionIn(list) : null;
+    list.replaceChildren(...glom(shown).map(discordNode));
     if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
     holdingReplyArrows(renderChannelRows);
     listState().backlog = shown.length;
