@@ -118,6 +118,23 @@ owner work keeps arriving; that is the stated policy, and every use is
 visible in `gate status`/`gate queue` and recorded in history and the
 ledger with its reason.
 
+Admission fairness (#1219 gate-admission-fairness, interleave):
+admission stays tier-first (owner, then rerun-marked, then ordinary,
+FIFO inside each tier) with one added rule: after N consecutive
+owner-tier admissions (N from the host setting below, default 2), if
+any non-owner ticket is waiting, the oldest non-owner ticket is
+admitted next. The shared ordering function computes that from the
+admission history plus the current runs by `started_at` — the
+trailing consecutive genuine-owner admissions — and rewrites and
+promotes nothing, so an older waiter that ignores the rule just sees
+FIFO-by-tier, the flock around check-and-write is unchanged, and the
+slot cap cannot be exceeded. A ticket marked with an `interleave:`
+reason by an external stopgap is a normal ticket for ordering and
+counting, never owner tier. Tickets also record their cwd (a field
+older code ignores); `gate queue` prints position, class, priority,
+age and cwd, and a warning names the oldest normal wait over two
+hours, in the queue view and in a waiting gate's own output.
+
 Mixed versions: every slot runs its own checkout's gate.py, and older
 waiters ignore the priority fields entirely. The slot cap is unaffected:
 a grant still re-reads runs/ and writes the new run file inside one
@@ -561,13 +578,94 @@ def _alive(pid: object) -> bool:
         return False
 
 
+#: A normal ticket waiting longer than this is starving (#1219): the
+#: queue view and a waiting gate's own output name the oldest such wait.
+STARVATION_WARN_S = 2 * 3600.0
+
+
+def _starvation_warning(
+        tickets: list[tuple[Path, dict[str, object]]], now: float) -> str | None:
+    """The starvation warning for these queued tickets, or None: the
+    oldest normal (non-owner) wait past STARVATION_WARN_S."""
+    waits = [
+        now - _float_or(data.get("queued_at"), now)
+        for _, data in tickets if not _is_owner_ticket(data)
+    ]
+    old = [wait for wait in waits if wait > STARVATION_WARN_S]
+    if not old:
+        return None
+    return (f"warning: {len(old)} normal ticket(s) have waited over 2h; "
+            f"oldest {_age_text(max(old))} (#1219 gate-admission-fairness)")
+
+
+#: Interleave host setting (#1219): after this many consecutive owner
+#: admissions the oldest waiting non-owner ticket goes next.
+INTERLEAVE_DEFAULT = 2
+
+#: Its own per-host file, for the same reason as the slot cap: an older
+#: gate.py refuses a slots or blackout file holding unknown keys.
+DEFAULT_INTERLEAVE_CONFIG = Path("~/.local/etc/agent-utils/gate-interleave.toml")
+
+
+def interleave_config_path() -> Path:
+    return Path(
+        os.environ.get("GATE_INTERLEAVE_CONFIG") or DEFAULT_INTERLEAVE_CONFIG
+    ).expanduser()
+
+
+def interleave_after() -> tuple[int, str]:
+    """How many consecutive owner admissions trigger an interleave, and
+    what decided it. $GATE_INTERLEAVE_AFTER (the test and override hook)
+    wins over the per-host file (only `after_owners = N`); no valid
+    setting means the default 2. An unusable value never changes it."""
+
+    raw = os.environ.get("GATE_INTERLEAVE_AFTER")
+    if raw is not None:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value >= 1:
+            return value, f"env GATE_INTERLEAVE_AFTER={raw}"
+        return INTERLEAVE_DEFAULT, f"env GATE_INTERLEAVE_AFTER={raw!r} is not a positive count; default 2"
+    path = interleave_config_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return INTERLEAVE_DEFAULT, "default 2"
+    try:
+        parsed = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return INTERLEAVE_DEFAULT, f"host file {path} is not TOML; default 2"
+    value = parsed.get("after_owners")
+    if set(parsed) != {"after_owners"} or isinstance(value, bool) \
+            or not isinstance(value, int) or value < 1:
+        return INTERLEAVE_DEFAULT, f"host file {path} must hold only `after_owners = N` (N >= 1); default 2"
+    return value, f"host file {path}"
+
+
+def _is_interleave_marked(data: dict[str, object]) -> bool:
+    """Marked `interleave:` by the external stopgap (#1219): a normal
+    ticket for every ordering and counting purpose, never owner tier."""
+    reason = data.get("priority_reason")
+    return isinstance(reason, str) and reason.startswith("interleave:")
+
+
+def _is_owner_ticket(data: dict[str, object]) -> bool:
+    return data.get("priority") == "owner" and not _is_interleave_marked(data)
+
+
 def _tier(data: dict[str, object]) -> int:
-    """Grant tier of a ticket: 0 owner priority (#1180), 1 rerun-marked
-    (an explicit --rerun or a phase-priority mark, #1146), 2 ordinary.
-    Any priority value other than "owner" reads as ordinary, so a ticket
-    from a client that writes a value this build does not know degrades
-    to FIFO instead of crashing a waiter."""
-    if data.get("priority") == "owner":
+    """Grant tier of a ticket: -1 the interleave-selected oldest
+    non-owner ticket (#1219, an in-memory mark the ordering function
+    sets, never written to a ticket file), 0 owner priority (#1180),
+    1 rerun-marked (an explicit --rerun or a phase-priority mark,
+    #1146), 2 ordinary. Any priority value other than "owner" reads as
+    ordinary, so a ticket from a client that writes a value this build
+    does not know degrades to FIFO instead of crashing a waiter."""
+    if data.get("interleave_selected"):
+        return -1
+    if _is_owner_ticket(data):
         return 0
     return 1 if data.get("rerun") else 2
 
@@ -610,16 +708,44 @@ class Admission:
                 if data is None or not _alive(data.get("pid")):
                     path.unlink(missing_ok=True)
 
+    def _trailing_owner_admissions(self) -> int:
+        """Consecutive genuine-owner admissions at the tail of the
+        admission record (#1219): current runs plus finished history,
+        by started_at, each admission counted once. An interleave-
+        marked admission is a normal admission and breaks the streak."""
+        by_id: dict[str, tuple[float, bool]] = {}
+        for data in [*self.runs(), *self.history()]:
+            started = data.get("started_at")
+            if not isinstance(started, (int, float)) or isinstance(started, bool):
+                continue
+            by_id[str(data.get("id"))] = (float(started), _is_owner_ticket(data))
+        count = 0
+        for _started, owner in sorted(by_id.values(), reverse=True):
+            if not owner:
+                break
+            count += 1
+        return count
+
     def tickets(self) -> list[tuple[Path, dict[str, object]]]:
         """Queued tickets in grant order: owner tier, then reruns, then
-        FIFO. Filename order is enqueue order, so the stable tier sort
-        keeps arrival order inside each tier. A ticket written before the
-        priority fields existed reads as ordinary."""
+        FIFO — except that after `interleave_after()` consecutive owner
+        admissions the oldest waiting non-owner ticket sorts first for
+        the next grant (#1219, marked only in memory as
+        `interleave_selected`; no ticket file is rewritten). Filename
+        order is enqueue order, so the stable tier sort keeps arrival
+        order inside each tier. A ticket written before the priority
+        fields existed reads as ordinary."""
         out = []
         for path in sorted((self.root / "queue").glob("*.json")):
             data = self._read(path)
             if data is not None:
                 out.append((path, data))
+        non_owners = [item for item in out if not _is_owner_ticket(item[1])]
+        threshold, _source = interleave_after()
+        if non_owners and self._trailing_owner_admissions() >= threshold:
+            oldest = min(non_owners, key=lambda item: (
+                _float_or(item[1].get("queued_at"), 0.0), item[0].name))
+            oldest[1]["interleave_selected"] = True
         out.sort(key=lambda item: _tier(item[1]))
         return out
 
@@ -655,6 +781,7 @@ class Admission:
             "queued_at": time.time(), "command": command, "rerun": rerun,
             "nested_phase": nested_phase, "phase_priority": phase_priority_source,
             "priority": priority, "priority_reason": priority_reason,
+            "cwd": os.getcwd(),
         }
         self._locked()
         try:
@@ -727,6 +854,7 @@ class Admission:
             for path, data in tickets:
                 if str(data["id"]) == run_id:
                     data["started_at"] = time.time()
+                    data.pop("interleave_selected", None)
                     (self.root / "runs" / path.name).write_text(json.dumps(data))
                     path.unlink()
                     return True
@@ -1091,7 +1219,7 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     # --rerun or an explicit priority of its own is never overridden.
     if priority is None and nested_phase and parent_run:
         parent = adm._read(state_dir() / "runs" / f"{parent_run}.json")
-        if parent is not None and parent.get("priority") == "owner":
+        if parent is not None and _is_owner_ticket(parent):
             inherited_reason = parent.get("priority_reason")
             priority = "owner"
             priority_reason = inherited_reason if isinstance(inherited_reason, str) else None
@@ -1114,6 +1242,9 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
         priority=priority, priority_reason=priority_reason,
     )
     queued_at = time.time()
+    starvation = _starvation_warning(adm.tickets(), queued_at)
+    if starvation:
+        print(f"gate: {starvation}", flush=True)
     last_pos = -1
     blackout_noted: BlackoutWindow | None = None
     while True:
@@ -1373,7 +1504,7 @@ def show_status(args: argparse.Namespace) -> int:
     waits = sorted(float(str(r["wait_s"])) for r in recent if "wait_s" in r)
     print(f"gate status: {len(runs)} running {runs}, {len(queue)} queued {queue}")
     for data in run_data + ticket_data:
-        if data.get("priority") == "owner":
+        if _is_owner_ticket(data):
             state = "running" if data in run_data else "queued"
             print(f"gate status: owner priority {state} {data.get('id')} "
                   f"({data.get('priority_reason')})")
@@ -1438,6 +1569,10 @@ def _is_inferred_phase(data: dict[str, object]) -> bool:
 
 
 def _ticket_label(data: dict[str, object]) -> str:
+    if data.get("interleave_selected"):
+        return "interleave (oldest non-owner, admitted next after owner admissions)"
+    if _is_interleave_marked(data):
+        return f"interleave-marked normal ticket ({data.get('priority_reason')})"
     if data.get("priority") == "owner":
         return f"owner priority ({data.get('priority_reason')})"
     if data.get("nested_phase"):
@@ -1454,6 +1589,8 @@ def _ticket_label(data: dict[str, object]) -> str:
 def _why_ahead(ahead: dict[str, object], ticket: dict[str, object]) -> str:
     ahead_tier, ticket_tier = _tier(ahead), _tier(ticket)
     if ahead_tier < ticket_tier:
+        if ahead_tier < 0:
+            return "interleave (oldest non-owner after owner admissions)"
         return "owner tier" if ahead_tier == 0 else "rerun tier"
     if ahead_tier == 0:
         return "FIFO within owner tier"
@@ -1478,8 +1615,11 @@ def show_queue(args: argparse.Namespace) -> int:
     finally:
         adm._unlocked()
     enabled, source = phase_priority()
+    after, after_source = interleave_after()
     print(f"gate queue: {len(runs)} running, {len(tickets)} queued (grant order)")
     print(f"gate queue: phase priority {'on' if enabled else 'off'} ({source})")
+    print(f"gate queue: interleave after {after} consecutive owner admission(s) "
+          f"({after_source}); oldest non-owner admitted next (#1219)")
     cap, problem = host_slot_cap()
     print(f"gate queue: shared slots {adm.effective_slots()}"
           + (f" (host cap {cap} from {slots_config_path()})" if cap is not None else
@@ -1491,15 +1631,20 @@ def show_queue(args: argparse.Namespace) -> int:
         print(f"gate queue: blackout {blackout.describe()}: no gate may start; "
               f"starts resume {nxt:%Y-%m-%d %H:%M %Z}")
     now_s = time.time()
+    warning = _starvation_warning(tickets, now_s)
+    if warning:
+        print(f"gate queue: {warning}")
     for run in runs:
         print(f"gate queue: running {run.get('id')} class={run.get('class')} "
-              f"for {_age_text(now_s - _float_or(run.get('started_at'), now_s))}: "
+              f"for {_age_text(now_s - _float_or(run.get('started_at'), now_s))} "
+              f"cwd={run.get('cwd') or '-'}: "
               f"{_command_summary(run)}")
     for index, (_, data) in enumerate(tickets):
         run_id = str(data.get("id"))
         print(f"gate queue: #{index + 1} {run_id} class={data.get('class')} "
               f"{_ticket_label(data)}, queued "
-              f"{_age_text(now_s - _float_or(data.get('queued_at'), now_s))} ago: "
+              f"{_age_text(now_s - _float_or(data.get('queued_at'), now_s))} ago "
+              f"cwd={data.get('cwd') or '-'}: "
               f"{_command_summary(data)}")
         if not getattr(args, "explain", False):
             continue
@@ -2140,7 +2285,13 @@ def main(argv: list[str] | None = None) -> int:
             prog="gate queue",
             description=(
                 "List running runs and queued tickets in grant order (owner tier, "
-                "then rerun tier, then FIFO; #1180). The header "
+                "then rerun tier, then FIFO; #1180), except that after N "
+                "consecutive owner admissions the oldest non-owner ticket is "
+                "next (#1219 interleave; N is $GATE_INTERLEAVE_AFTER or "
+                "`after_owners = N` in $GATE_INTERLEAVE_CONFIG or "
+                "~/.local/etc/agent-utils/gate-interleave.toml, default 2). "
+                "Each line shows position, class, priority, age and cwd, and a "
+                "warning names the oldest normal wait over 2h. The header "
                 "shows the phase-priority switch (#1146): on/off and what decided "
                 "it ($GATE_PHASE_PRIORITY=1/0, else `phase_priority = true` in the "
                 "per-host file $GATE_PHASE_PRIORITY_CONFIG or "

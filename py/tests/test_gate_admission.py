@@ -21,10 +21,12 @@ PY = sys.executable
 
 def _env(tmp_path: Path) -> dict[str, str]:
     base = {key: value for key, value in os.environ.items()
-            if key not in ("GATE_PHASE_PRIORITY", "GATE_PRIORITY", "GATE_PRIORITY_REASON")}
+            if key not in ("GATE_PHASE_PRIORITY", "GATE_PRIORITY", "GATE_PRIORITY_REASON",
+                           "GATE_INTERLEAVE_AFTER", "GATE_INTERLEAVE_CONFIG")}
     return {**base, "GATE_ADMISSION_DIR": str(tmp_path / "admission"),
             "GATE_LEDGER": str(tmp_path / "ledger.jsonl"), "GATE_PRUNE_TARGETS": "off",
             "GATE_SLOTS_CONFIG": str(tmp_path / "gate-slots.toml"),
+            "GATE_INTERLEAVE_CONFIG": str(tmp_path / "gate-interleave.toml"),
             "GATE_PHASE_PRIORITY_CONFIG": str(tmp_path / "gate-phase-priority.toml"),
             # A lane may run the suite under GATE_SLOTS=1; the tests assume the default.
             "GATE_SLOTS": "2",
@@ -1170,6 +1172,176 @@ def test_a_dead_queue_ticket_never_blocks_admission(tmp_path: Path) -> None:
     assert proc.returncode == 0
     assert "queued at position" not in out
     assert time.time() > 0  # the dead ticket was reaped, not waited on
+
+
+def test_an_owner_ticket_stays_ahead_of_a_long_waiting_normal(tmp_path: Path) -> None:
+    """#1219: the owner tier is absolute — a fresh owner ticket ranks
+    ahead of a normal ticket that has waited many hours, and FIFO holds
+    inside each tier. No field promotes a normal ticket."""
+    gate = _gate_module()
+    adm = gate.Admission(tmp_path / "admission", 2)
+    queue = tmp_path / "admission" / "queue"
+    now = time.time()
+    rows = [
+        ("100-old-normal", "shared", False, {}, now - 12 * 3600),
+        ("200-rerun", "exclusive", True, {}, now - 30),
+        ("300-owner", "shared", False,
+         {"priority": "owner", "priority_reason": "#1 owner UI"}, now - 10),
+        ("400-young-normal", "shared", False, {}, now - 60),
+    ]
+    for run_id, cls, rerun, extra, queued in rows:
+        (queue / f"{run_id}.json").write_text(json.dumps(
+            {"id": run_id, "pid": os.getpid(), "class": cls, "queued_at": queued,
+             "command": [], "rerun": rerun, **extra}))
+    assert [str(d["id"]) for _, d in adm.tickets()] == [
+        "300-owner", "200-rerun", "100-old-normal", "400-young-normal"]
+
+
+def test_queue_shows_cwd_and_warns_about_starved_normals(tmp_path: Path) -> None:
+    """#1219: the read-only queue view shows position, class, priority,
+    age and cwd (a dash for tickets predating the field), and warns when
+    a normal ticket has waited over 2h. It must not rewrite tickets."""
+    now = time.time()
+    root = tmp_path / "admission"
+    _write_ticket(root, "queue", "100-starved", {
+        "id": "100-starved", "pid": os.getpid(), "class": "shared",
+        "queued_at": now - 3 * 3600, "rerun": False,
+        "cwd": "/slots/alpha/repo", "command": [PY, "-c", "pass"]})
+    _write_ticket(root, "queue", "200-legacy", {
+        "id": "200-legacy", "pid": os.getpid(), "class": "shared",
+        "queued_at": now - 30, "rerun": False, "command": [PY, "-c", "pass"]})
+    before = (root / "queue" / "100-starved.json").read_text()
+    shown = subprocess.run([PY, str(GATE), "queue", "--explain"], env=_env(tmp_path),
+                           capture_output=True, text=True, timeout=30)
+    assert shown.returncode == 0, shown.stdout
+    assert "#1 100-starved" in shown.stdout and "cwd=/slots/alpha/repo" in shown.stdout
+    assert "cwd=-" in shown.stdout, "a ticket predating the cwd field shows a dash"
+    assert "warning: 1 normal ticket(s) have waited over 2h" in shown.stdout
+    assert (root / "queue" / "100-starved.json").read_text() == before
+
+
+def _history_rows(root: Path, rows: list[dict[str, object]]) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "history.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows))
+
+
+def test_interleave_puts_oldest_non_owner_next_after_two_owners(tmp_path: Path) -> None:
+    """#1219 interleave: with two consecutive owner admissions in the
+    record, the oldest non-owner ticket sorts ahead of waiting owners,
+    in memory only — its ticket file is never rewritten."""
+    gate = _gate_module()
+    root = tmp_path / "admission"
+    adm = gate.Admission(root, 2)
+    now = time.time()
+    _history_rows(root, [
+        {"id": "h1", "started_at": now - 300, "priority": "owner"},
+        {"id": "h2", "started_at": now - 200, "priority": "owner"},
+    ])
+    queue = root / "queue"
+    rows = [
+        ("100-normal-old", {}, now - 3600),
+        ("200-normal-young", {}, now - 60),
+        ("300-owner", {"priority": "owner", "priority_reason": "#1"}, now - 30),
+        ("400-owner", {"priority": "owner", "priority_reason": "#1"}, now - 20),
+    ]
+    for run_id, extra, queued in rows:
+        (queue / f"{run_id}.json").write_text(json.dumps(
+            {"id": run_id, "pid": os.getpid(), "class": "shared", "queued_at": queued,
+             "command": [], "rerun": False, **extra}))
+    before = (queue / "100-normal-old.json").read_text()
+    tickets = adm.tickets()
+    assert [str(d["id"]) for _, d in tickets] == [
+        "100-normal-old", "300-owner", "400-owner", "200-normal-young"]
+    assert tickets[0][1].get("interleave_selected") is True
+    assert (queue / "100-normal-old.json").read_text() == before
+
+
+def test_interleave_marked_tickets_are_normal(tmp_path: Path) -> None:
+    """#1219: a stopgap ticket marked interleave: in its reason orders
+    as ordinary FIFO and breaks an owner streak, never owner tier."""
+    gate = _gate_module()
+    root = tmp_path / "admission"
+    adm = gate.Admission(root, 2)
+    now = time.time()
+    _history_rows(root, [
+        {"id": "h1", "started_at": now - 300, "priority": "owner"},
+        {"id": "h2", "started_at": now - 200, "priority": "owner",
+         "priority_reason": "interleave: oldest normal"},
+    ])
+    assert adm._trailing_owner_admissions() == 0
+    queue = root / "queue"
+    (queue / "100-marked.json").write_text(json.dumps(
+        {"id": "100-marked", "pid": os.getpid(), "class": "shared",
+         "queued_at": now - 3600, "command": [], "rerun": False,
+         "priority": "owner", "priority_reason": "interleave: oldest normal"}))
+    (queue / "200-owner.json").write_text(json.dumps(
+        {"id": "200-owner", "pid": os.getpid(), "class": "shared",
+         "queued_at": now - 60, "command": [], "rerun": False,
+         "priority": "owner", "priority_reason": "#1 owner UI"}))
+    assert [str(d["id"]) for _, d in adm.tickets()] == ["200-owner", "100-marked"]
+
+
+def test_interleave_host_setting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = _gate_module()
+    config = tmp_path / "gate-interleave.toml"
+    monkeypatch.setenv("GATE_INTERLEAVE_CONFIG", str(config))
+    monkeypatch.delenv("GATE_INTERLEAVE_AFTER", raising=False)
+    assert gate.interleave_after() == (2, "default 2")
+    config.write_text("after_owners = 3\n")
+    value, source = gate.interleave_after()
+    assert value == 3 and "host file" in source
+    monkeypatch.setenv("GATE_INTERLEAVE_AFTER", "1")
+    value, source = gate.interleave_after()
+    assert value == 1 and source.startswith("env")
+    monkeypatch.setenv("GATE_INTERLEAVE_AFTER", "bogus")
+    value, _ = gate.interleave_after()
+    assert value == 2
+
+
+def test_interleaved_admission_order_end_to_end(tmp_path: Path) -> None:
+    """#1219: 5 owner and 3 normal tickets behind a busy box, one slot,
+    admit O O N O O N O N."""
+    order = tmp_path / "order.txt"
+
+    def note(tag: str) -> str:
+        return (f"open({str(order)!r}, 'a').write({tag!r} + '\\n'); "
+                "import time; time.sleep(1)")
+
+    gate_file = tmp_path / "release"
+    running = _start(tmp_path, "--exclusive", "--", PY, "-c",
+                     f"import os, time\nwhile not os.path.exists({str(gate_file)!r}): time.sleep(0.05)")
+    _wait_for_runs(tmp_path, 1)
+    normals = []
+    for i in (1, 2, 3):
+        normals.append(_start(tmp_path, "--slots", "1", "--", PY, "-c", note(f"N{i}")))
+        _wait_for_queue(tmp_path, i)
+    owner_env = {**_env(tmp_path), "GATE_PRIORITY": "owner",
+                 "GATE_PRIORITY_REASON": "#1 owner UI"}
+    owners = []
+    for i in (1, 2, 3, 4, 5):
+        owners.append(_start_env(tmp_path, owner_env, "--slots", "1", "--",
+                                 PY, "-c", note(f"O{i}")))
+        _wait_for_queue(tmp_path, 3 + i)
+    gate_file.write_text("")
+    for proc in [running, *normals, *owners]:
+        out, _ = proc.communicate(timeout=120)
+        assert proc.returncode == 0, out
+    assert order.read_text().split() == [
+        "O1", "O2", "N1", "O3", "O4", "N2", "O5", "N3"]
+
+
+def test_no_starvation_warning_for_young_or_owner_waits(tmp_path: Path) -> None:
+    gate = _gate_module()
+    now = time.time()
+    tickets = [
+        (Path("a.json"), {"queued_at": now - 3 * 3600, "priority": "owner"}),
+        (Path("b.json"), {"queued_at": now - 60}),
+    ]
+    assert gate._starvation_warning(tickets, now) is None
+    tickets.append((Path("c.json"), {"queued_at": now - 3 * 3600}))
+    warning = gate._starvation_warning(tickets, now)
+    assert warning is not None and "oldest 3.0h" in warning
 
 
 # ------------------------------------------------- cargo target pruning (#940)

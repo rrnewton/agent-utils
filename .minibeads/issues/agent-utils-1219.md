@@ -25,78 +25,64 @@ queue and is not this issue. #1044 gate-priority-ticket asked for a bound
 in its first design but #1180 landed the owner tier explicitly unbounded;
 this issue adds the bound.
 
-Goal: bounded waiting for every ticket (shared, exclusive, rerun-tier
-phases included) while keeping the owner fast track for fresh work.
+Goal: keep the owner's explicit fast-track rule (owner UI gates go to
+the head of the queue, behind only a gate already in its exclusive
+phase) while bounding how long normal tickets can starve behind a
+stream of owner admissions, and make starvation visible early.
 
 # Design
 
-Picked: aging. A ticket that has waited at least 30 minutes (by its
-recorded queued_at) joins the owner tier, ordered by queued_at, so no
-ticket queued after it can be granted ahead of it. Young owner tickets
-still jump every young normal ticket, so the fast track is unchanged
-whenever the queue drains within 30 minutes, which is the normal case.
+Final design (owner decision, 2026-11-10 3:19 PM ET): INTERLEAVE,
+replacing the aging, time-credit and visibility-only designs recorded
+in earlier revisions of this issue. Those are withdrawn.
 
-- Bound: let A = 30 min. After queued_at + A a ticket can be overtaken
-  only by tickets already queued ahead of it at that moment, a finite
-  set of at most Q grants (plus gates already running). Its wait is at
-  most A plus the time those Q grants and the running gates take; the
-  grant-count bound is exact, and no later arrival can extend it. One
-  mechanism covers owner starvation, rerun starvation, and the exclusive
-  head: an aged exclusive ticket becomes unpassable, and shared tickets
-  behind it were already waiting for it by the class rules.
-- Rejected: a per-window owner quota or 1-in-K oldest-normal guarantee
-  (#1044's bound). It needs a shared grant counter every client
-  generation updates identically; old waiters grant without counting,
-  so the bound silently breaks exactly during the mixed-version weeks,
-  and it bounds only owner-versus-normal, not the rerun tier or the
-  exclusive head. Rejected: letting shared tickets bypass an old
-  exclusive head. That starves the exclusive ticket instead (the mirror
-  bug) and still leaves owner arrivals jumping it.
-- How ranking is decided today: there is no central scheduler. Each
-  waiter, under the admission flock, re-reads the queue, sorts it, and
-  grants itself only if nothing blocks it. The new rule therefore lives
-  in that same sort and blocker check, computed from queued_at, which
-  every ticket already records. No new files, no format change: aging
-  reads only fields old tickets already have, and unknown priority
-  values already degrade to ordinary.
-- Mixed versions: old waiters ignore aging and could deadlock against
-  it (an old exclusive waiter sees a later rerun ahead of it; a new
-  rerun waiter sees the aged exclusive ahead of it; both wait). So a
-  new-code waiter, while holding the flock on its grant path, promotes
-  each aged ticket in place: the ticket file gains an aged-promotion
-  mark plus the two ordering values old code already sorts by
-  (owner priority with an aged reason, and the rerun ordering mark),
-  keeping its original priority recorded beside the mark. Every client
-  generation then computes the aged ticket at the front, the old
-  waiter's own next poll grants it, and views converge within one poll
-  cycle. The flock around check-and-write is unchanged in every
-  generation, so the slot cap cannot be exceeded; ordering disagreement
-  never affects how many run, only who, and promotion removes the
-  disagreement. A genuine owner run's nested phase must not inherit
-  priority from an aged-promoted parent ticket.
-- Queue view: gate.py queue already lists grant order, class, label and
-  age. Tickets gain a recorded cwd (old code ignores the new field;
-  older tickets show none), and the queue and running lines print it,
-  plus an aged-promoted label naming the wait that earned it.
+- Admission order stays tier-first: owner, then rerun-marked, then
+  ordinary, FIFO within each tier.
+- One rule added: after N consecutive owner-tier admissions, if any
+  non-owner ticket is waiting, the oldest non-owner ticket is admitted
+  next. N is a host setting, default 2 (environment and per-host-file
+  knob, in the pattern of the other gate host settings).
+- The rule is computed in the shared ordering function from the
+  admission history plus the current runs, ordered by started_at:
+  count the trailing consecutive genuine-owner admissions, and when
+  the count reaches N the oldest waiting non-owner ticket sorts ahead
+  for the next grant. Nothing is rewritten and nothing is promoted:
+  ticket files are never modified to change their tier, so mixed
+  versions agree — an old waiter that ignores the rule just sees
+  FIFO-by-tier, the flock around check-and-write is unchanged, and the
+  slot cap cannot be exceeded. A nested exclusive phase keeps its
+  existing rerun-tier behaviour.
+- Tickets an external stopgap marked with an interleave: reason are
+  normal tickets for every ordering and counting purpose, never owner
+  tier.
+- Queue view: tickets record their cwd (a field older code ignores);
+  gate.py queue prints position, class, priority, age and cwd for
+  running and queued tickets, and a warning line names the oldest
+  normal (non-owner) wait once any normal ticket has waited more than
+  2 h, as does a waiting gate's own output.
 
 # Acceptance Criteria
 
-- A normal ticket aged past the threshold is granted ahead of owner and
-  rerun tickets queued after it; owner and aged tickets together order
-  by queued_at; a young owner ticket still jumps young normal tickets.
-- An aged exclusive ticket at the head cannot be passed by any later
-  ticket, and shared tickets behind it still wait for it.
-- Mixed-version test: an aged ticket whose waiter uses the legacy sort
-  and blockers, racing a new-code waiter that legacy order puts ahead,
-  still gets granted (promotion is visible to the legacy sort, no
-  deadlock), and concurrent mixed grants never exceed the slot cap.
-- gate.py queue shows position, class, priority or aged label, age and
-  the ticket cwd for queued and running tickets, including tickets
-  written before the cwd field existed.
+- Five owner tickets and three normal tickets queued behind a busy box
+  admit in the order O O N O O N O N; after a non-owner admission the
+  consecutive-owner count restarts.
+- A nested exclusive phase keeps its rerun-tier behaviour; FIFO holds
+  inside each tier when the interleave rule is not due.
+- A ticket marked with an interleave: reason orders and counts as a
+  normal ticket, and no ticket file is rewritten by the rule.
+- gate.py queue shows position, class, priority, age and the ticket
+  cwd for queued and running tickets, including tickets written before
+  the cwd field existed, stays read-only, and warns when a normal
+  ticket has waited more than 2 h.
 - Focused tests in py/tests/test_gate_admission.py pass; the full gate
-  runs at normal priority (this is not owner UI work).
+  runs at normal priority. This is P0 infrastructure (owner decision).
 
 # Notes
 
 Filed by mu-gatefair from the 2026-11-10 admission evidence above.
-Threshold is a named constant with an environment override for tests.
+Design history: a 30 min aging threshold, then a 120 min owner credit,
+then a visibility-only design, all withdrawn 2026-11-10; the shipped
+design is the interleave rule above (owner decision, reply 344). A
+stopgap on the gate host promotes the oldest normal ticket after two
+owner admissions until this lands; its interleave:-marked tickets are
+normal tickets here.
