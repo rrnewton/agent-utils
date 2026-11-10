@@ -5792,7 +5792,9 @@ def _adopt_held_config_lock(claim: _HeldConfigLockClaim, lock_path: Path) -> int
 
 
 @contextlib.contextmanager
-def _locked_config(path: Path, wait_seconds: float) -> Iterator[None]:
+def _locked_config(
+    path: Path, wait_seconds: float, *, exclusive: bool = True
+) -> Iterator[None]:
     lock_path = path.parent
     claim = _held_config_lock_claim
     if claim is not None:
@@ -5820,10 +5822,11 @@ def _locked_config(path: Path, wait_seconds: float) -> Iterator[None]:
         os.close(fd)
         raise Refusal(f"configuration lock is not a directory: {lock_path}")
     deadline = time.monotonic() + wait_seconds
+    operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
     try:
         while True:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, operation | fcntl.LOCK_NB)
                 break
             except BlockingIOError as exc:
                 if time.monotonic() >= deadline:
@@ -5850,11 +5853,16 @@ def _mutation_locks(
     wait_seconds: float,
     *,
     deadline: float | None = None,
+    shared: bool = False,
 ) -> Iterator[None]:
     effective_deadline = (
         time.monotonic() + wait_seconds if deadline is None else deadline
     )
-    with _locked_config(config.config_path, _remaining_lock_wait(effective_deadline)):
+    with _locked_config(
+        config.config_path,
+        _remaining_lock_wait(effective_deadline),
+        exclusive=not shared,
+    ):
         current = _load_config(str(config.root), config.machine)
         if current != config:
             raise Refusal(
@@ -5864,15 +5872,116 @@ def _mutation_locks(
         global_subject = config.control / "ACTIVE"
         with _locked(
             global_subject,
-            exclusive=True,
+            exclusive=not shared,
             wait_seconds=_remaining_lock_wait(effective_deadline),
         ):
             with _locked(
                 _active_path(config),
-                exclusive=True,
+                exclusive=not shared,
                 wait_seconds=_remaining_lock_wait(effective_deadline),
             ):
                 yield
+
+
+#: Bounded, counted re-gathers when a lock-scope fingerprint changes between
+#: the lock-free gather and the revalidation under the lock (#1194).
+LOCK_SCOPE_REVALIDATION_ATTEMPTS = 3
+
+
+def _file_sha256(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+@dataclasses.dataclass(frozen=True)
+class _LockScopeFingerprint:
+    """Cheap identity of everything a lock-free gather depended on (#1194).
+
+    Recomputing it under the lock costs one file hash and one rev-parse per
+    checkout, never a status walk, a census, or a salvage publication.
+    """
+
+    generation: int
+    record_sha256: str
+    active_sha256: str | None
+    config_sha256: str | None
+    heads: tuple[tuple[str, str, str], ...]
+
+
+def _lock_scope_fingerprint(
+    config: Config, record: ActiveRecord, vcs: _GitVcs
+) -> _LockScopeFingerprint:
+    heads: list[tuple[str, str, str]] = []
+    for checkout in record.checkouts:
+        path = _stored_path(config, checkout.path, "checkout path")
+        try:
+            head = vcs.head(path)
+        except Exception:
+            head = ""
+        heads.append((checkout.name, head, checkout.remote_url_sha256))
+    return _LockScopeFingerprint(
+        generation=record.generation,
+        record_sha256=_record_sha256(record),
+        active_sha256=_file_sha256(_active_path(config)),
+        config_sha256=_file_sha256(config.config_path),
+        heads=tuple(heads),
+    )
+
+
+def _assert_lock_scope_fingerprint(
+    expected: _LockScopeFingerprint, actual: _LockScopeFingerprint, slot: str
+) -> None:
+    if expected == actual:
+        return
+    changed = [
+        name
+        for (name, head, _remote), (_name, now, _remote_now) in zip(
+            expected.heads, actual.heads, strict=False
+        )
+        if head != now
+    ]
+    detail = (
+        f"checkout HEAD changed for {', '.join(changed)}"
+        if changed
+        else "slot generation, record, or configuration changed"
+    )
+    raise Refusal(
+        f"slot {slot} changed between the lock-free gather and the "
+        f"configuration lock ({detail}); nothing was written under the lock "
+        "from the stale gather"
+    )
+
+
+def _pregather_salvage_facts(config: Config, slot: str) -> None:
+    """Run removal's slow salvage-fact reads before the configuration lock.
+
+    The facts land in _SALVAGE_FACTS_MEMO (live for the whole removal via
+    _remote_containment_scope); under the lock _salvage_candidate reuses
+    each one only while _salvage_fingerprint still matches, so a checkout
+    that changed is re-read and re-judged there, never trusted stale.
+    The process census is gathered before the lock for the same reason:
+    processes never take this lock, so holding it during the census never
+    protected against a process starting in the slot later; the census
+    judges the moment it runs, inside or outside the lock, and every
+    refusal it raises is unchanged (#1194). A refusal here is dropped:
+    the locked path asks the same questions and reports them there.
+    """
+
+    try:
+        state = _load_active(config, require_repository=False)
+        record = next((item for item in state.slots if item.slot == slot), None)
+        if record is None or record.slot_type != "agent":
+            return
+        vcs = _GitVcs()
+        for checkout in record.checkouts:
+            try:
+                _salvage_candidate(config, record, checkout, vcs)
+            except Exception:
+                continue
+    except Exception:
+        return
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -33350,11 +33459,26 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
             "--adopt-legacy-change is unavailable because handoff sidecars are "
             "immutable once published; preserve both artifacts for manual review"
         )
-    with _mutation_locks(config, args.wait_lock):
+    # The slow reads (global-state validation and the event log) run before
+    # any lock: even a shared flock blocks ci-hub's exclusive population lock,
+    # so no hold here may last longer than a fingerprint recheck (#1194).
+    pre_active_sha256 = _file_sha256(_active_path(config))
+    pre_states, _pre_archives = _validate_global_state(
+        config, require_repository=False
+    )
+    pre_state = _load_active(config, require_repository=False)
+    pre_record = _find_record(pre_state, args.slot)
+    pre_events = _load_events(config, pre_record.machine)
+    with _mutation_locks(config, args.wait_lock, shared=True):
         _refuse_partial_state(config)
         _assert_no_journal(config)
-        states, _archives = _validate_global_state(config, require_repository=False)
-        state = _load_active(config, require_repository=False)
+        if _file_sha256(_active_path(config)) != pre_active_sha256:
+            raise Refusal(
+                f"slot {args.slot} changed while its handoff was being read; "
+                "no read was recorded"
+            )
+        states, _archives = pre_states, _pre_archives
+        state = pre_state
         record = _find_record(state, args.slot)
         if record.slot_type != "agent":
             raise Refusal(
@@ -33399,7 +33523,7 @@ def _cmd_read_handoff(args: argparse.Namespace) -> int:
             else artifact.path
         )
         record_snapshot = _record_to_obj(record)
-        latest_snapshot = _latest_handoff_read(record, _load_events(config, record.machine))
+        latest_snapshot = _latest_handoff_read(record, pre_events)
 
     _write_and_flush_handoff(display_path, rendered)
 
@@ -46580,6 +46704,9 @@ def _cmd_remove_in_scope(
         except Refusal as exc:
             unlocked_refusal = exc
     if private_cleanup is None and not bool(args.validate_complete):
+        # Slow salvage facts and the use census are gathered here, before
+        # the registry lock (#1194); see _pregather_salvage_facts.
+        _pregather_salvage_facts(config, args.slot)
         # Network work happens here, before the registry lock, not under it.
         _prefetch_remote_containment(
             config,
@@ -69506,6 +69633,7 @@ def _recover_absent_validate_rows(
     coordinator: ProcessIdentity,
     *,
     safety_prechecked: bool = False,
+    census_prechecked: bool = False,
     processes: _RecoveryProcesses | None = None,
 ) -> tuple[AbsentValidateRow, ...]:
     if path != _journal_path(config):
@@ -69617,7 +69745,7 @@ def _recover_absent_validate_rows(
         _assert_absent_validate_rows_safe(
             config,
             remaining,
-            host_process_census=archived_prefix < len(items),
+            host_process_census=archived_prefix < len(items) and not census_prechecked,
         )
         active_state = _write_active_rows_removed(
             config,
@@ -69717,6 +69845,24 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
             coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
         else:
             coordinator = None
+        # The privileged process census runs before the lock (#1194):
+        # processes never take this lock, so holding it during the census
+        # never protected against a process starting in a row later; the
+        # census judges the moment it runs and its refusals are unchanged.
+        # Under the lock the rows are fingerprint-checked and the storage,
+        # owner and retained-handle checks still run; only the host census
+        # is skipped when this pre-census covered the same rows.
+        census_prechecked = False
+        if args.apply:
+            try:
+                pre_planned = _plan_absent_validate_rows(config, requested)
+                if pre_planned:
+                    _assert_absent_validate_rows_safe(
+                        config, [record for _item, record, _entry in pre_planned]
+                    )
+                    census_prechecked = True
+            except Exception:
+                census_prechecked = False
         with _mutation_locks(config, args.wait_lock):
             _refuse_partial_state(config)
             journals = _outstanding_journals(config)
@@ -69772,7 +69918,9 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
                     )
                     return 0
                 assert coordinator is not None
-                _recover_absent_validate_rows(config, path, raw, coordinator)
+                _recover_absent_validate_rows(
+                    config, path, raw, coordinator, census_prechecked=census_prechecked
+                )
                 _emit_absent_validate_outcomes(
                     [
                         (
@@ -69834,6 +69982,7 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
                     journal,
                     coordinator,
                     safety_prechecked=True,
+                    census_prechecked=census_prechecked,
                 )
                 after_states, after_archives = _validate_global_state(config)
                 target_slots = {item.slot for item in requested}

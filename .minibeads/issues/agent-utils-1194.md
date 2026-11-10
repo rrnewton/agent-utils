@@ -25,3 +25,5 @@ No configuration-lock hold over a few seconds for remove and read-handoff on a s
 # Notes
 
 Rust check (report only, for the Rust wrkslots owner): rs/wrkslotsd does not flock the project root directory for salvage or census work. Its flock_wait/acquire_lock (rs/wrkslotsd/src/ensure_states.rs, reused by hold_write.rs) takes an exclusive flock on a per-state lock file for short state reads/writes, and its audit census is a reader. No multi-second salvage-under-lock pattern was found there; the long-hold pattern is Python-only (py/wrkslots/cli.py).
+
+Census note (not a weakening): processes never take the configuration lock, so holding it during the process census never protected against a process starting in the slot later. The census judges the moment it runs, inside or outside the lock; moving it before the lock changes no refusal. The same argument is recorded in code comments at the gather sites.
