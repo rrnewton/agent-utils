@@ -2446,3 +2446,42 @@ test("`#624 voice-page-modularity`: reply counts by pointer and the unanswered r
   const tally = owner.replyTally();
   assert.equal(tally.threads.get("t1").held, 2, "the tally did not hold the thread-only and broadcast replies");
 });
+
+test("`#624 voice-page-modularity`: removals and the placing wait, from the module alone", () => {
+  const { createPlacing } = CHANNEL_VIEW;
+  const canon = { channel: "c1", scope: null, messages: [], threads: [], views: new Map(), dismissed: new Set(),
+    hasThreads: false, unplaced: new Set(), unplacedSince: new Map(), unplacedAnswered: new Set(),
+    removed: new Map(), complete: null, replyGaps: new Map(), passedOver: new Set(), settledByDone: new Map() };
+  canon.messages.push({ id: "m1" });
+  let waits = true;
+  const owner = createPlacing({
+    channelStore: () => ({ current: () => canon }), providerFacts: { threading: () => true },
+    broadcastSupported: () => false,
+    unplacedArrivals: () => ({ count: () => 0 }),
+    placingReadInFlight: () => ({ busy: () => false, begin: () => {}, end: () => {} }),
+    readOrder: () => ({ asked: () => 7 }),
+    readHolds: () => ({ channelWaits: () => waits }),
+    liveEvents: () => ({ seen: () => 0, news: () => 0, removals: () => 0 }),
+    abandonedReads: () => ({ holdKey: () => "k", abandon: () => null }),
+    channelReads: () => ({ busy: () => false }), copyLedger: () => ({}),
+    timelineReader: () => ({ readTimeline: async () => ({}) }),
+    columns: () => ({ main: null, side: null }), jumpNewestWanted: () => ({ discord: false }),
+    timelineReconcileMs: 1, readTimeoutMs: () => 1, hiddenNow: () => false,
+    eachColumn: () => {}, el: () => ({ children: [] }),
+    foldTimelineDelta: () => true, foldTimelinePage: () => {},
+    hiddenEmpty: () => false, hidingRead: () => false, inColumn: (_c, fn) => fn(),
+    isCursorRefusal: () => false, noteArchived: () => {}, projectView: () => null,
+    readFilterKeeps: () => () => true, renderCachedTimeline: () => {},
+    renderChannelNavigation: () => {}, renderScrollTools: () => {}, saveChannelScope: () => {},
+    selectedChannelId: () => "c1", selection: () => ({ view: "main", threadId: null }),
+    sentNumberOf: () => 0, settleAfterRead: () => {}, syncUnreadReplies: () => {},
+    timelineRows: () => ({ messages: [] }), viewKey: (view) => view,
+    within: async (_ms, fn) => fn(), channelReadPosition: () => ({}), catchUpFromAll: () => {},
+  });
+  assert.equal(owner.placeUnplacedWaits("c1"), true, "the placing read did not wait on a held read");
+  waits = false;
+  assert.equal(owner.placeUnplacedWaits("c1"), false, "the placing read still waited with nothing held");
+  canon.removed.set("m1", 1);
+  assert.equal(owner.removedUpstream("m1"), true, "a removed message was not said removed upstream");
+  assert.equal(owner.removedUpstream("other"), false, "a message nobody removed was said removed upstream");
+});

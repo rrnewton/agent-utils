@@ -142,6 +142,8 @@ export { createLiveState } from "./livestate.ts";
 export { createDoneAct, freshDoneState } from "./doneact.ts";
 export { createChannelViews } from "./channelviews.ts";
 export { createReplyCounts } from "./replycounts.ts";
+export { createPlacing } from "./placing.ts";
+export type { Placing, PlacingDependencies } from "./placing.ts";
 export type { ReplyCounts, ReplyCountsDependencies } from "./replycounts.ts";
 export type { DismissalOffer, DoneAct, DoneActDependencies, DoneLedger, DoneState } from "./doneact.ts";
 export type { LiveFollowSwitch, LiveState, LiveStateDependencies, LiveStorage } from "./livestate.ts";

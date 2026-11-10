@@ -30,6 +30,10 @@ import { ALICE, BOTTOM_SLACK_PX, CHANNEL, CHARS_PER_LINE, COUNTS_ALL_READ_MS, CS
   timelineAnswer, turnTodoOn, twoColumnServer, twoColumns, unreadChip, viewOf, watchTurns, wideCard,
   withLiveChannel, withReplies, yOf } from "./fixture.mjs";
 
+/** Placing in its module (`createPlacing`, `#624`): a patch there, and a page built with patches. */
+const placingPatch = ([find, replace]) => ({ file: "src/view/channel/placing.ts", find, replace });
+const brokenPlacing = (...patches) => brokenModule(patches.map(placingPatch));
+
 test("returning to the channel RE-READS it, instead of showing what was true the first time", async () => {
   const page = newPage();
   await signIn(page);
@@ -3304,12 +3308,13 @@ test("`remote-ops-audit` W7: once the read given up on has answered, or failed, 
 });
 
 /** A negative control: a placing read of All folded whatever the store has gained, lost or replaced since it was sent. */
-const FOLD_OVER_ANY_STORE = ["  const unchanged = heldAsSent(canon, read.held);\n", "  const unchanged = true;\n"];
+const FOLD_OVER_ANY_STORE = ["    const unchanged = heldAsSent(canon, read.held);\n", "    const unchanged = true;\n"];
 /** `#466 reply-promotes-thread`: a newest page taking the page's own fresh post out by its absence. */
 const OWN_POST_FORGOTTEN = ["function ownPostStands(id) {\n", "function ownPostStands(id) {\n  return false;\n"];
 
 /** `script` with one more thing broken on purpose, as `brokenScript` breaks one. */
 function brokenAlso(script, [find, replace]) {
+  if (typeof script !== "string") return { ...script, script: brokenAlso(script.script, [find, replace]) };
   assert.ok(script.includes(find), `the negative control patches ${JSON.stringify(find)}, which is not there`);
   return script.replace(find, replace);
 }
@@ -3509,11 +3514,10 @@ test("`#308 live-reply-in-main` x `#280 scroll-stability`: the reply leaving Mai
   assert.equal(jumpSaysArrived(page), false, "a message leaving Main was offered as news");
 
   // THE CONTROLS: the jump still counting what left, and the reader taken to the newest line.
-  const counting = await run(brokenScript("    if (!newer && gone > 0 && typeof counted === \"number\") {",
-    "    if (false) {"));
+  const counting = await run(await brokenPlacing(["      if (!newer && gone > 0 && typeof counted === \"number\") {", "      if (false) {"]));
   assert.equal(jumpSaysArrived(counting.page), true, "the jump never counted the reply, so this test cannot see it");
-  const thrown = await run(brokenScript("settleAfterRead(shown, { keepPosition: true, area, ...position, ownAct: !newer });",
-    "settleAfterRead(shown, { area, ...position, keepPosition: false, ownAct: !newer });"));
+  const thrown = await run(await brokenPlacing(["    deps.settleAfterRead(shown, { keepPosition: true, area, ...position, ownAct: !newer });",
+    "    deps.settleAfterRead(shown, { area, ...position, keepPosition: false, ownAct: !newer });"]));
   assert.notDeepStrictEqual(readerOn(thrown.page), thrown.before, "the reader stayed put anyway, so this test cannot see it");
 });
 
@@ -3635,9 +3639,9 @@ test("`#308 live-reply-in-main` x `remote-ops-audit` W7: a placing read given up
 
   // THE CONTROLS: without the wait, the pull's read ending asks again at once; held for no view, the
   // poll of Main goes beside it.
-  const control = await run(brokenScript(" ||\n      placeUnplacedWaits(channel)) return;", ") return;"));
+  const control = await run(await brokenPlacing([" ||\n        placeUnplacedWaits(channel)) return;", ") return;"]));
   assert.equal(control.placing(), 2, "the placing read waited anyway, so this test cannot see it");
-  const unheld = await run(brokenScript("  const key = inColumn(columns.main, abandonedReads.holdKey);\n", "  const key = \"elsewhere\";\n"));
+  const unheld = await run(await brokenPlacing(["    const key = deps.inColumn(deps.columns().main, deps.abandonedReads().holdKey);\n", "    const key = \"elsewhere\";\n"]));
   assert.ok(unheld.polled > 0, "the poll of Main waited for a placing read held for no view, so this test cannot see it");
 });
 
@@ -3689,9 +3693,9 @@ test("`#308 live-reply-in-main` x `remote-ops-audit` W7: the late answer of a pl
   // THE CONTROLS: a late answer dropped, as round 1 did, leaves the reply on Main; held for no view,
   // the poll of Main goes beside the placing read, and its answer, replaced, is not folded: it only
   // places what it carries (`placeFromAnswer`, review round 3), and brings nothing else of All.
-  const dropped = await run(brokenScript("(late) => landPlacingRead(late, read),", "() => {},"));
+  const dropped = await run(await brokenPlacing(["(late) => landPlacingRead(late as PlacingPayload, read),", "() => {},"]));
   assert.ok(shownIds(dropped.page).includes("300"), "the late answer placed the reply anyway, so this test cannot see it");
-  const unheld = await run(brokenScript("  const key = inColumn(columns.main, abandonedReads.holdKey);\n", "  const key = \"elsewhere\";\n"));
+  const unheld = await run(await brokenPlacing(["    const key = deps.inColumn(deps.columns().main, deps.abandonedReads().holdKey);\n", "    const key = \"elsewhere\";\n"]));
   assert.ok(unheld.polled > 0 && !heldIds(unheld.page).includes("204"),
     "the poll of Main waited, or the late answer stood beside it, so this test cannot see it");
 });
@@ -3713,7 +3717,7 @@ test("`#308 live-reply-in-main`: a placing read that lands brings Main current, 
   assert.ok(!shownIds(page).includes("300"), "the placing read left the reply on Main");
   assertCurrent(page, "All's answer did not bring Main current");
 
-  const control = await run(brokenScript("  followPlacement();\n  eachColumn(catchUpFromAll);\n", "  followPlacement();\n"));
+  const control = await run(await brokenPlacing(["    followPlacement();\n    deps.eachColumn(deps.catchUpFromAll);\n", "    followPlacement();\n"]));
   assert.notEqual(freshness(control.page).getAttribute("data-state"), "fresh",
     "Main was current without All's answer, so this test cannot see it");
 });
@@ -3750,8 +3754,8 @@ test("`#308 live-reply-in-main`: a placing page of All that lands after the stre
 
   // THE CONTROL: folded regardless — of the stream, and of the store having gained the aside since it
   // was sent (review round 4) — the page sent before the aside takes it out as deleted.
-  const control = await run(brokenScriptEach(["  const quiet = liveEvents.seen(channel) === read.live;",
-    "  const quiet = true;"], FOLD_OVER_ANY_STORE));
+  const control = await run(await brokenPlacing(["    const quiet = deps.liveEvents().seen(channel) === read.live;",
+    "    const quiet = true;"], FOLD_OVER_ANY_STORE));
   assert.ok(!shownIds(control.page).includes("207"),
     "the stale placing page left the aside alone anyway, so this test cannot see it");
 });
@@ -3808,7 +3812,7 @@ for (const kind of ["thread reply", "channel message"]) {
       }
 
       // THE CONTROL: placing as soon as Main's read is given up on, as round 1 did, reads beside it.
-      const control = await run(brokenScript(" ||\n      placeUnplacedWaits(channel)) return;", ") return;"));
+      const control = await run(await brokenPlacing([" ||\n        placeUnplacedWaits(channel)) return;", ") return;"]));
       assert.ok(control.beside > 0, "no placing read went beside Main's read without the wait, so this test cannot see it");
     });
   }
@@ -3995,7 +3999,7 @@ for (const change of ["removed", "edited"]) {
     // THE CONTROL: with nothing to say which was sent first, the older page is folded over the newer,
     // if also folded whatever the store has lost or replaced since it was sent (review rounds 4 and 5).
     const unordered = { file: "src/core/channels/fold.ts", find: "      cover.fullSent = deps.numberOf();\n", replace: "" };
-    const control = await run(await brokenModule([unordered], brokenScriptEach(FOLD_OVER_ANY_STORE)));
+    const control = await run(await brokenModule([unordered, placingPatch(FOLD_OVER_ANY_STORE)]));
     assert.ok(change === "removed" ? shownIds(control.page).includes("202") : !savedMessage(control.page, "202").content.endsWith("edited"),
       "the older page was not folded anyway, so this test cannot see it");
   });
@@ -4102,7 +4106,7 @@ for (const mode of ["delta", "newest"]) {
 
     // THE CONTROLS: a placing page the stream has overtaken thrown away whole, as round 2 did, is asked
     // again on every edit; and one the store no longer holds, not put back, is lost.
-    const thrown = await run(brokenScript("  if (!folded) {\n", "  if (!folded && !delta && !quiet) return false;\n  if (!folded) {\n"));
+    const thrown = await run(await brokenPlacing(["    if (!folded) {\n", "    if (!folded && !delta && !quiet) return false;\n    if (!folded) {\n"]));
     assert.ok(thrown.held.length > 1, "the stale placing page was not asked again anyway, so this test cannot see it");
     if (mode === "delta") {
       assert.deepStrictEqual(thrown.onMain, [true, true, true], "the reply left Main anyway, so this test cannot see it");
@@ -4151,7 +4155,7 @@ test("`#308 live-reply-in-main` x `remote-ops-audit` W7: behind a slow bridge ed
   assert.ok(kept && kept.thread && kept.thread.id === first.id, `the reply is not held in its thread: ${JSON.stringify(kept)}`);
 
   // THE CONTROL, as round 2 did: a replaced late answer thrown away whole.
-  const control = await run(brokenScript("            if (unused) placeFromAnswer(unused, read);\n", ""));
+  const control = await run(await brokenPlacing(["              if (unused) placeFromAnswer(unused as PlacingPayload, read);\n", ""]));
   assert.ok(shownIds(control.page).includes("300"), "the reply left Main anyway, so this test cannot see it");
 });
 
@@ -4258,7 +4262,7 @@ for (const gained of ["own send", "poll"]) {
     // THE CONTROL, as round 3 did: folded over whatever the store gained since it was sent, the page
     // takes the message out as deleted.
     // The page's own fresh post is kept by `ownPostStands` too, so for it that goes as well.
-    const broken = brokenScript(...FOLD_OVER_ANY_STORE);
+    const broken = await brokenPlacing(FOLD_OVER_ANY_STORE);
     const control = await run(gained === "own send" ? brokenAlso(broken, OWN_POST_FORGOTTEN) : broken);
     assert.ok(!shownIds(control.page).includes(control.id) && savedMessage(control.page, control.id) === null,
       "the placing page left the message alone anyway, so this test cannot see it");
@@ -4396,10 +4400,10 @@ for (const placing of ["newest", "delta"]) {
         // taken though the reply was removed after it was sent (`#316 late-counts-resurrect`), brings the
         // reply back itself: landing first, as it is; landing after Main's read took the reply out, only
         // if also folded whatever the store has lost since (`heldAsSent`).
-        const unremoved = ["  const unremoved = liveEvents.removals(channel) === read.removals;\n",
-          "  const unremoved = true;\n"];
-        const folded = await run(await brokenModule([REMOVALS_FORGOTTEN], landsFirst === "placing"
-          ? brokenScriptEach(unremoved) : brokenScriptEach(unremoved, FOLD_OVER_ANY_STORE)));
+        const unremoved = ["    const unremoved = deps.liveEvents().removals(channel) === read.removals;\n",
+          "    const unremoved = true;\n"];
+        const folded = await run(await brokenModule([REMOVALS_FORGOTTEN, placingPatch(unremoved),
+          ...(landsFirst === "placing" ? [] : [placingPatch(FOLD_OVER_ANY_STORE)])]));
         assert.ok(inThread(folded), "the placing delta left the reply gone anyway, so this test cannot see it");
       }
     });
@@ -4472,7 +4476,7 @@ for (const placing of ["newest", "delta"]) {
 
     // THE CONTROL, as round 4 did: folded whatever the store has replaced since it was sent, the
     // placing read puts back the root as it was before the edit.
-    const control = await run(brokenScript(...FOLD_OVER_ANY_STORE));
+    const control = await run(await brokenPlacing(FOLD_OVER_ANY_STORE));
     assert.equal(savedMessage(control.page, "201").content, "first thread root", "the edit survived anyway, so this test cannot see it");
   });
 }
