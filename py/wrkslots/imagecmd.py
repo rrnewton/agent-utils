@@ -257,8 +257,9 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
             "worktrees image, verify the copy file by file (contents, modes, link "
             "targets, and each checkout's HEAD and status), swap it in at the "
             "same path, and reclaim the verified original. The registry record "
-            "and slot path do not change. Refuses for a held slot, a slot whose "
-            "owner is not proven dead, or while any process uses the slot."
+            "and slot path do not change. Refuses for an unregistered slot, a "
+            "held slot, a slot whose owner is not proven dead, or while any "
+            "process uses the slot."
         ),
         formatter_class=formatter,
     )
@@ -893,57 +894,56 @@ def _lock_slot_checkouts(config: "cli.Config", slot: str, slot_type: str) -> Non
         )
 
 
-def _slot_record(
-    config: "cli.Config", slot: str, slot_type: str
-) -> "cli.ActiveRecord | None":
-    from wrkslots import cli
-
-    try:
-        state = cli._load_active(config)
-    except (cli.Refusal, cli.StateError, OSError):
-        return None
-    return next(
-        (item for item in state.slots if item.slot == slot and item.slot_type == slot_type),
-        None,
-    )
-
-
 def _assert_migratable(
     config: "cli.Config", slot: str, slot_type: str, slot_path: Path
 ) -> None:
-    """The migrate-layout census bar for one slot (#1149/#1150 pieces).
+    """The migrate-layout census bar for one slot (#1150).
 
-    A registered slot must have no hold, an owner the registered
-    liveness authority proves dead (or none), and no process the
-    process-use census finds in it. An unregistered directory has no
-    row to prove those from; the census still runs by path.
+    The slot must be registered (no row means no hold or liveness
+    proof exists), have no hold, have an owner the registered
+    liveness authority proves dead, and have no process the
+    process-use census finds in it. Callers hold the mutation locks,
+    so the proofs cannot go stale mid-copy.
     """
 
     from wrkslots import cli
 
-    record = _slot_record(config, slot, slot_type)
-    if record is not None:
+    try:
         state = cli._load_active(config)
-        hold = cli._load_record_holds(config, [state]).get((record.machine, record.slot))
-        if hold is None or hold.error is not None or hold.value is not None:
-            detail = hold.error if hold is not None and hold.error else "slot is held"
-            raise _refuse(f"slot {slot}: {detail}; unhold it before migrate")
-        owner_state, owner_detail = cli._owner_liveness_states(config, [record])[
-            (record.machine, record.slot, record.generation)
-        ]
-        if owner_state != "dead":
-            raise _refuse(
-                f"slot {slot}: owner is not proven dead ({owner_state}: "
-                f"{owner_detail}); stop its agent before migrate"
-            )
+    except (cli.Refusal, cli.StateError, OSError) as exc:
+        raise _refuse(
+            f"cannot read the slot registry to prove slot {slot} is safe to "
+            f"migrate: {exc}"
+        ) from exc
+    record = next(
+        (item for item in state.slots if item.slot == slot and item.slot_type == slot_type),
+        None,
+    )
+    if record is None:
+        raise _refuse(
+            f"slot {slot} is not registered on machine {config.machine}; migrate "
+            "needs its registry row to prove it is unheld and its owner is dead - "
+            "create or register the slot first ('wrkslots status' lists the rows "
+            "this host knows)"
+        )
+    hold = cli._load_record_holds(config, [state]).get((record.machine, record.slot))
+    if hold is None or hold.error is not None or hold.value is not None:
+        detail = hold.error if hold is not None and hold.error else "slot is held"
+        raise _refuse(f"slot {slot}: {detail}; unhold it before migrate")
+    owner_state, owner_detail = cli._owner_liveness_states(config, [record])[
+        (record.machine, record.slot, record.generation)
+    ]
+    if owner_state != "dead":
+        raise _refuse(
+            f"slot {slot}: owner is not proven dead ({owner_state}: "
+            f"{owner_detail}); stop its agent before migrate"
+        )
     try:
         cli._assert_slot_unused(
             slot_path,
             cli._record_for_slot_use_check(
                 record, validate_complete=False, allow_live_validate_owner=False
-            )
-            if record is not None
-            else None,
+            ),
         )
     except cli.Refusal as exc:
         raise _refuse(f"slot {slot} is in use; migrate only a stopped slot: {exc}") from exc
@@ -958,6 +958,20 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
             f"worktrees image is {config.worktrees_image_state}; run "
             "'wrkslots worktrees-image mount' first"
         )
+    # The census proofs and the copy run under the mutation locks
+    # (#1150), so a hold placed or an owner revived mid-copy cannot
+    # slip past them.
+    with cli._mutation_locks(config, args.wait_lock):
+        return _cmd_migrate_locked(config, settings, args)
+
+
+def _cmd_migrate_locked(
+    config: "cli.Config",
+    settings: worktreesimage.WorktreesImageSettings,
+    args: argparse.Namespace,
+) -> int:
+    from wrkslots import cli
+
     slot_path = cli._slot_directory(config, args.slot, args.slot_type)
     if not slot_path.is_dir():
         raise _refuse(f"slot directory is missing: {slot_path}")

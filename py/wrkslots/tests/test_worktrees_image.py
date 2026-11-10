@@ -12,6 +12,7 @@ import os
 import shutil
 import socket
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -1148,12 +1149,15 @@ def test_binds_migrate_reclaims_the_original(
     monkeypatch.setattr(
         worktreesimage, "current_state", lambda *a: worktreesimage.MOUNTED
     )
+    monkeypatch.setattr(imagecmd, "_lock_slot_checkouts", lambda *a: None)
     config = cli._load_config(str(root), "image-host")
+    _register_slot(config)
     slot_path = config.worktrees / "s1"
     slot_path.mkdir(parents=True, exist_ok=True)
     (slot_path / "work.txt").write_text("work\n", encoding="utf-8")
     args = argparse.Namespace(
-        project_root=str(root), machine="image-host", slot="s1", slot_type="agent"
+        project_root=str(root), machine="image-host", slot="s1",
+        slot_type="agent", wait_lock=0.0,
     )
     assert imagecmd._cmd_migrate(args) == 0
     assert "(original reclaimed)" in capsys.readouterr().out
@@ -1161,6 +1165,140 @@ def test_binds_migrate_reclaims_the_original(
     assert (mount_dir / "s1" / "work.txt").read_text(encoding="utf-8") == "work\n"
     assert list(config.worktrees.glob(".s1.premigrate-*")) == []
     assert worktreesimage.load_binds(config.control) == {"s1": "s1"}
+
+
+def _register_slot(config: cli.Config, owner: cli.ProcessIdentity | None = None) -> cli.ActiveRecord:
+    identity = cli.ProcessIdentity(
+        pid=123, start_ticks=456, boot_id="boot", host_id="host", cgroup_path="/"
+    )
+    checkout = cli.Checkout(
+        name="repo", path="worktrees/slots/s1", repository=".", branch="main",
+        start_point="0" * 40, remote="origin", remote_url_sha256="0" * 64,
+        landed_ref="refs/remotes/origin/main", head="0" * 40,
+    )
+    record = cli.ActiveRecord(
+        slot="s1", agent="worker-a", task="t1", purpose="probe",
+        slot_type="agent", machine=config.machine, generation=1,
+        created_at="2026-11-05T00:00:00+00:00",
+        heartbeat_at="2026-11-05T00:00:00+00:00", heartbeat_ttl_seconds=600,
+        owner=owner, coordinator_lease=identity, coordinator_recovery_note=None,
+        handoff=None, checkouts=(checkout,), layout="flat",
+    )
+    cli._atomic_write_json(
+        cli._active_path(config),
+        cli._active_to_obj(
+            cli.ActiveState(machine=config.machine, revision=0, slots=(record,))
+        ),
+    )
+    cli._atomic_write_json(
+        cli._archive_path(config),
+        cli._archive_to_obj(cli.ArchiveState(machine=config.machine, revision=0, records=())),
+    )
+    return record
+
+
+def _migrate_fakes(monkeypatch: pytest.MonkeyPatch) -> None:
+    from wrkslots import imagecmd
+
+    monkeypatch.setattr(worktreesimage, "_run", _FakeBtrfs().run)
+    monkeypatch.setattr(worktreesimage, "mount_id_at", lambda point: 9)
+    monkeypatch.setattr(worktreesimage, "ensure_image_mounted", lambda *a: None)
+    monkeypatch.setattr(worktreesimage, "ensure_binds", lambda *a: [])
+    monkeypatch.setattr(worktreesimage, "current_state", lambda *a: worktreesimage.MOUNTED)
+    monkeypatch.setattr(imagecmd, "_lock_slot_checkouts", lambda *a: None)
+
+
+def test_migrate_refuses_an_unregistered_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import argparse
+
+    from wrkslots import imagecmd
+
+    root = _image_project(tmp_path)
+    _migrate_fakes(monkeypatch)
+    config = cli._load_config(str(root), "image-host")
+    cli._atomic_write_json(
+        cli._active_path(config),
+        cli._active_to_obj(cli.ActiveState(machine="image-host", revision=0, slots=())),
+    )
+    cli._atomic_write_json(
+        cli._archive_path(config),
+        cli._archive_to_obj(cli.ArchiveState(machine="image-host", revision=0, records=())),
+    )
+    (config.worktrees / "s1").mkdir(parents=True, exist_ok=True)
+    args = argparse.Namespace(
+        project_root=str(root), machine="image-host", slot="s1",
+        slot_type="agent", wait_lock=0.0,
+    )
+    with pytest.raises(cli.Refusal, match="not registered.*registry row"):
+        imagecmd._cmd_migrate(args)
+
+
+def test_migrate_refuses_held_and_live_owner_slots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from wrkslots import imagecmd
+
+    root = _image_project(tmp_path)
+    _migrate_fakes(monkeypatch)
+    config = cli._load_config(str(root), "image-host")
+    record = _register_slot(config)
+    slot_path = config.worktrees / "s1"
+    slot_path.mkdir(parents=True, exist_ok=True)
+    key = (record.machine, record.slot)
+    monkeypatch.setattr(
+        cli, "_load_record_holds",
+        lambda cfg, states: {key: cli._HoldResult(value={"reason": "keep"})},
+    )
+    with pytest.raises(cli.Refusal, match="unhold it before migrate"):
+        imagecmd._assert_migratable(config, "s1", "agent", slot_path)
+    monkeypatch.setattr(cli, "_load_record_holds", lambda cfg, states: {key: cli._HoldResult(None)})
+    monkeypatch.setattr(
+        cli, "_owner_liveness_states",
+        lambda cfg, records: {(record.machine, record.slot, record.generation): ("alive", "pid 1")},
+    )
+    with pytest.raises(cli.Refusal, match="not proven dead"):
+        imagecmd._assert_migratable(config, "s1", "agent", slot_path)
+
+
+def test_migrate_refuses_a_slot_used_only_through_an_open_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import sys
+
+    from wrkslots import imagecmd
+
+    root = _image_project(tmp_path)
+    _migrate_fakes(monkeypatch)
+    config = cli._load_config(str(root), "image-host")
+    record = _register_slot(config)
+    slot_path = config.worktrees / "s1"
+    slot_path.mkdir(parents=True, exist_ok=True)
+    held_file = slot_path / "held.bin"
+    held_file.write_bytes(b"x")
+    key = (record.machine, record.slot)
+    monkeypatch.setattr(cli, "_load_record_holds", lambda cfg, states: {key: cli._HoldResult(None)})
+    monkeypatch.setattr(
+        cli, "_owner_liveness_states",
+        lambda cfg, records: {(record.machine, record.slot, record.generation): ("dead", "gone")},
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time,sys; f=open(sys.argv[1],'rb'); time.sleep(60)", str(held_file)],
+        cwd="/tmp",
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            fds = list(Path(f"/proc/{child.pid}/fd").glob("*"))
+            if any(os.readlink(fd) == str(held_file) for fd in fds):
+                break
+            time.sleep(0.05)
+        with pytest.raises(cli.Refusal, match="in use"):
+            imagecmd._assert_migratable(config, "s1", "agent", slot_path)
+    finally:
+        child.terminate()
+        child.wait(timeout=10)
 
 
 # --- #1162 worktrees-image-at-slots-dir: direct layout, quota modes, locks ---
