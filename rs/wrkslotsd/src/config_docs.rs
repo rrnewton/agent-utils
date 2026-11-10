@@ -79,6 +79,7 @@ pub(crate) const WORKTREES_IMAGE_DOCS: &[(&str, &str)] = &[
     ("fs", "File system inside the worktrees image. Only btrfs is supported."),
     ("mount", "How the worktrees image is mounted: kernel (sudo -n mount -o loop) or auto (the same; btrfs has no unprivileged FUSE fallback). fuse is refused."),
     ("slot_quota_bytes", "Optional per-slot qgroup limit in bytes (referenced, post-compression). Each new slot becomes a btrfs subvolume inside the image."),
+    ("machines", "Optional list of machine names (the configuration's machine identity) the worktrees image applies on. A host not listed behaves exactly as if the section were absent, so the section is safe to commit: the image exists on the named hosts only. Absent means every host."),
     ("mount_at", "Where the image mounts: binds (default; mounted beside the control files, one bind mount per slot) or worktrees_dir (mounted at the slots directory, slot subvolumes as its top-level entries, no binds). Change it only with `wrkslots worktrees-image migrate-layout`."),
     ("quota_mode", "Quota accounting for a new image: simple (default; btrfs simple quotas where the kernel and btrfs-progs support them, else full qgroups) or full. Mounting never changes an existing image's mode; status reports the active one."),
 ];

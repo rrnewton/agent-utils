@@ -401,3 +401,32 @@ def test_doctor_publishes_the_registry_after_a_change_mid_read_like_python(
     assert first["task"] == "changed while measuring", first
     python_document = cast(dict[str, object], json.loads(python_result.stdout))
     assert _normalized(rust_document) == _normalized(python_document)
+
+
+def test_doctor_worktrees_image_scope_matches_python(tmp_path: Path) -> None:
+    for label, machines in (("listed", "[node-a]"), ("unlisted", "[other-host]")):
+        base = tmp_path / label
+        base.mkdir()
+        root = _root(base)
+        _fixture(root)
+        config_path = root / ".wrkslots.yml"
+        config_path.write_text(
+            config_path.read_text()
+            + f"worktrees_image: {{path: wt.img, size_bytes: 2147483648, machines: {machines}}}\n"
+        )
+        python = _python(root, "doctor", "--format", "json")
+        rust = _rust(root, "doctor-text", "--format", "json")
+        # stderr may carry Python's once-per-process load warning
+        # (#1148 follow-up); the scope field itself must match.
+        assert rust.returncode == python.returncode
+        assert _normalized(json.loads(rust.stdout)) == _normalized(json.loads(python.stdout))
+        assert json.loads(rust.stdout)["worktrees_image"].startswith(
+            "applies:" if machines == "[node-a]" else "skipped:"
+        )
+        text_python = _python(root, "doctor")
+        text_rust = _rust(root, "doctor-text")
+        assert (text_rust.returncode, text_rust.stdout) == (
+            text_python.returncode,
+            text_python.stdout,
+        )
+        assert "worktrees-image:" in text_rust.stdout

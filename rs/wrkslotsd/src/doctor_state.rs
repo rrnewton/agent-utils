@@ -485,6 +485,43 @@ fn doctor_cli_once(
         }
         records.push(record);
     }
+    // The worktrees-image scope line, only when a section is
+    // configured, with the Python doctor's exact strings.
+    let wt_scope = if let Some(reason) = config
+        .get("worktrees_image_skipped")
+        .and_then(Value::as_str)
+    {
+        Some(format!("skipped: {reason}"))
+    } else if let Some(raw_settings) = config.get("worktrees_image").filter(|v| v.is_object()) {
+        crate::worktrees_image::settings_from_obj(raw_settings)
+            .ok()
+            .map(|_settings| {
+                // Python doctor's state comes from current_state,
+                // classifying the mount beside the slots directory.
+                let entries = std::fs::read_to_string("/proc/self/mountinfo")
+                    .map(|text| crate::image_mounts::parse_mountinfo(&text))
+                    .unwrap_or_default();
+                let mount_dir = cfg
+                    .worktrees
+                    .parent()
+                    .map(|parent| parent.join(crate::worktrees_image::IMAGE_MOUNT_NAME))
+                    .unwrap_or_default();
+                let exists = mount_dir.is_dir();
+                let empty = if exists {
+                    std::fs::read_dir(&mount_dir)
+                        .map(|mut it| it.next().is_none())
+                        .unwrap_or(false)
+                } else {
+                    true
+                };
+                format!(
+                    "applies: state={}",
+                    crate::worktrees_image::classify_mount(&mount_dir, &entries, exists, empty)
+                )
+            })
+    } else {
+        None
+    };
     if !human {
         let event_counts: serde_json::Map<String, Value> = machines
             .iter()
@@ -495,7 +532,7 @@ fn doctor_cli_once(
                 )
             })
             .collect();
-        let envelope = json!({
+        let mut envelope = json!({
             "schema": 2,
             "project_root": cfg.root.to_string_lossy(),
             "worktrees_dir": cfg.worktrees.to_string_lossy(),
@@ -507,6 +544,9 @@ fn doctor_cli_once(
             "max_active_slots": cap,
             "findings": findings,
         });
+        if let (Some(scope), Some(object)) = (&wt_scope, envelope.as_object_mut()) {
+            object.insert("worktrees_image".to_string(), json!(scope));
+        }
         return Ok(format!(
             "{}\n",
             serde_json::to_string_pretty(&envelope)
@@ -528,6 +568,9 @@ fn doctor_cli_once(
         cap_text,
         findings.len(),
     );
+    if let Some(scope) = &wt_scope {
+        out.push_str(&format!("worktrees-image: {scope}\n"));
+    }
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for item in &findings {
         if let Some(kind) = item.get("kind").and_then(Value::as_str) {

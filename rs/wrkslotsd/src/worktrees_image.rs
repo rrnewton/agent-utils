@@ -34,6 +34,7 @@ pub(crate) struct WorktreesImageSettings {
     pub(crate) filesystem: String,
     pub(crate) mount: String,
     pub(crate) slot_quota_bytes: Option<i64>,
+    pub(crate) machines: Option<Vec<String>>,
     pub(crate) mount_at: String,
     pub(crate) quota_mode: String,
 }
@@ -46,6 +47,70 @@ impl WorktreesImageSettings {
     pub(crate) fn direct(&self) -> bool {
         self.mount_at == "worktrees_dir"
     }
+
+    /// The mount point under the configured layout, mirroring
+    /// Python `mount_point`: beside control for binds, or the
+    /// slots directory itself when direct.
+    pub(crate) fn mount_point(&self, control: &Path, worktrees: &Path) -> PathBuf {
+        if self.direct() {
+            worktrees.to_path_buf()
+        } else {
+            image_mount_dir(control)
+        }
+    }
+
+    /// Whether this section applies on the host named `machine`,
+    /// mirroring Python `WorktreesImageSettings.applies_on`.
+    pub(crate) fn applies_on(&self, machine: &str) -> bool {
+        self.machines
+            .as_ref()
+            .is_none_or(|machines| machines.iter().any(|name| name == machine))
+    }
+
+    /// Why this section is skipped on `machine`, or None when it
+    /// applies, with Python `_parse_worktrees_image`'s exact text.
+    pub(crate) fn skipped_reason(&self, machine: &str) -> Option<String> {
+        if self.applies_on(machine) {
+            return None;
+        }
+        let named = self
+            .machines
+            .as_ref()
+            .map(|machines| machines.join(", "))
+            .unwrap_or_default();
+        Some(format!(
+            "configuration.worktrees_image applies on machines [{named}] only; this host is {machine}"
+        ))
+    }
+}
+
+/// The one host-scope decision, mirroring Python
+/// `_parse_worktrees_image`: validate on every host, then return
+/// the settings for this host or `(None, skip reason)`. A section
+/// whose image path lives inside the slots directory it mounts is
+/// refused before the scope decision, as in the oracle.
+pub(crate) fn parse_worktrees_image(
+    value: Option<&Value>,
+    root: &Path,
+    worktrees: &Path,
+    machine: &str,
+) -> Result<(Option<WorktreesImageSettings>, Option<String>), String> {
+    let Some(value) = value else {
+        return Ok((None, None));
+    };
+    let settings = settings_from_obj(value)?;
+    let image = crate::image_mounts::normalize_absolute(&settings.image_file(root));
+    let slots = crate::image_mounts::normalize_absolute(worktrees);
+    if image.starts_with(&slots) {
+        return Err(
+            "configuration.worktrees_image.path must live outside the slots directory it mounts"
+                .to_string(),
+        );
+    }
+    if let Some(reason) = settings.skipped_reason(machine) {
+        return Ok((None, Some(reason)));
+    }
+    Ok((Some(settings), None))
 }
 
 fn py_repr(value: &Value) -> String {
@@ -67,6 +132,7 @@ pub(crate) fn settings_from_obj(value: &Value) -> Result<WorktreesImageSettings,
         "fs",
         "mount",
         "slot_quota_bytes",
+        "machines",
         "mount_at",
         "quota_mode",
     ];
@@ -120,7 +186,7 @@ pub(crate) fn settings_from_obj(value: &Value) -> Result<WorktreesImageSettings,
         ));
     }
     let quota = map.get("slot_quota_bytes");
-    if let Some(quota) = quota {
+    if let Some(quota) = quota.filter(|value| !value.is_null()) {
         if quota.as_i64().map(|value| value < 1).unwrap_or(true) {
             return Err(
                 "configuration.worktrees_image.slot_quota_bytes must be a positive integer"
@@ -148,12 +214,49 @@ pub(crate) fn settings_from_obj(value: &Value) -> Result<WorktreesImageSettings,
             py_repr(&json!(quota_mode))
         ));
     }
+    // Validated on every host, named or not: a malformed scope
+    // must never silently read as applies-everywhere or nowhere.
+    let machines = match map.get("machines") {
+        None => None,
+        Some(value) => {
+            let Some(names) = value.as_array() else {
+                return Err(
+                    "configuration.worktrees_image.machines must be a non-empty list of unique non-empty machine names"
+                        .to_string(),
+                );
+            };
+            let mut parsed: Vec<String> = Vec::new();
+            for name in names {
+                let Some(name) = name.as_str() else {
+                    return Err(
+                        "configuration.worktrees_image.machines must be a non-empty list of unique non-empty machine names"
+                            .to_string(),
+                    );
+                };
+                if name.trim().is_empty() || parsed.iter().any(|seen| seen == name) {
+                    return Err(
+                        "configuration.worktrees_image.machines must be a non-empty list of unique non-empty machine names"
+                            .to_string(),
+                    );
+                }
+                parsed.push(name.to_string());
+            }
+            if parsed.is_empty() {
+                return Err(
+                    "configuration.worktrees_image.machines must be a non-empty list of unique non-empty machine names"
+                        .to_string(),
+                );
+            }
+            Some(parsed)
+        }
+    };
     Ok(WorktreesImageSettings {
         relative_path: raw_path.replace('\\', "/"),
         size_bytes: size.unwrap_or_default(),
         filesystem: filesystem.to_string(),
         mount: mount.to_string(),
         slot_quota_bytes: quota.and_then(Value::as_i64),
+        machines,
         mount_at: mount_at.to_string(),
         quota_mode: quota_mode.to_string(),
     })
@@ -254,14 +357,29 @@ pub(crate) fn load_bind_records(control: &Path) -> Result<BTreeMap<String, BindR
     Ok(records)
 }
 
-/// Persist bind records atomically, mirroring `save_bind_records`
-/// (sorted keys, indent 2, trailing newline, temp-then-replace).
-pub(crate) fn save_bind_records(
+pub(crate) const RECORD_LOCK_NAME: &str = ".worktrees-image.json.lock";
+
+fn write_bind_records_locked(
     control: &Path,
     records: &BTreeMap<String, BindRecord>,
 ) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NONCE: AtomicU64 = AtomicU64::new(0);
     let path = record_path(control);
-    let temporary = control.join(format!("{RECORD_NAME}.tmp"));
+    let nonce = format!(
+        "{}.{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0),
+        NONCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let temporary = control.join(format!(
+        "{RECORD_NAME}.tmp.{}.{}",
+        std::process::id(),
+        nonce
+    ));
     let binds: serde_json::Map<String, Value> = records
         .iter()
         .map(|(slot, record)| {
@@ -280,10 +398,59 @@ pub(crate) fn save_bind_records(
         "{}\n",
         serde_json::to_string_pretty(&payload).unwrap_or_default()
     );
-    std::fs::write(&temporary, text)
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
         .map_err(|error| format!("cannot write worktrees image record {temporary:?}: {error}"))?;
-    std::fs::rename(&temporary, &path)
-        .map_err(|error| format!("cannot replace worktrees image record {path:?}: {error}"))
+    if let Err(error) = file
+        .write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!(
+            "cannot write worktrees image record {temporary:?}: {error}"
+        ));
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!(
+            "cannot replace worktrees image record {path:?}: {error}"
+        ));
+    }
+    std::fs::File::open(control)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|error| format!("cannot sync worktrees image directory {control:?}: {error}"))
+}
+
+/// The only bind-record mutation path, mirroring Python
+/// `_update_bind_records`: hold the one flock, load, mutate, and
+/// write only if something changed. Mounts stay outside the lock.
+pub(crate) fn update_bind_records(
+    control: &Path,
+    mutate: impl FnOnce(BTreeMap<String, BindRecord>) -> BTreeMap<String, BindRecord>,
+) -> Result<BTreeMap<String, BindRecord>, String> {
+    let _ = std::fs::create_dir_all(control);
+    let lock_path = control.join(RECORD_LOCK_NAME);
+    let _lock = crate::ensure_states::acquire_lock(&lock_path, &lock_path)?;
+    let before = load_bind_records(control)?;
+    let after = mutate(before.clone());
+    if after != before {
+        write_bind_records_locked(control, &after)?;
+    }
+    Ok(after)
+}
+
+/// Persist bind records atomically beside the registry, under the
+/// same records flock as every other bind-record writer.
+pub(crate) fn save_bind_records(
+    control: &Path,
+    records: &BTreeMap<String, BindRecord>,
+) -> Result<(), String> {
+    let replacement = records.clone();
+    update_bind_records(control, move |_| replacement)?;
+    Ok(())
 }
 
 /// Sorted `(relative path, kind, size)` for every migratable entry
@@ -541,6 +708,8 @@ pub(crate) struct WtCtx<'a> {
     pub(crate) control: &'a Path,
     pub(crate) worktrees: &'a Path,
     pub(crate) entries: &'a [MountEntry],
+    /// Why the configured section is skipped on this host, when it is.
+    pub(crate) skipped: Option<&'a str>,
 }
 
 fn wt_refusal(message: &str) -> HandlerOutcome {
@@ -553,19 +722,47 @@ fn wt_refusal(message: &str) -> HandlerOutcome {
     }
 }
 
-fn wt_settings(
-    settings: Option<WorktreesImageSettings>,
-) -> Result<WorktreesImageSettings, HandlerOutcome> {
-    settings.ok_or_else(|| {
-        wt_refusal(
-            "no worktrees_image configured; add a worktrees_image section (path, size_bytes, fs: btrfs, mount: kernel) to enable it",
-        )
-    })
+fn wt_refusal_for(message: &str, command: &str) -> HandlerOutcome {
+    HandlerOutcome {
+        exit: 3,
+        stdout: String::new(),
+        stderr: format!(
+            "REFUSED: {message}\nREMEDY: run 'wrkslots {command} --help', correct the named condition, then rerun 'wrkslots {command}' with the required arguments\n"
+        ),
+    }
 }
 
-fn run_one(
+fn wt_settings_for(
+    settings: Option<WorktreesImageSettings>,
+    skipped: Option<&str>,
+    command: &str,
+) -> Result<WorktreesImageSettings, HandlerOutcome> {
+    if let Some(settings) = settings {
+        return Ok(settings);
+    }
+    if let Some(reason) = skipped {
+        return Err(wt_refusal_for(
+            &format!("worktrees_image does not apply on this host: {reason}"),
+            command,
+        ));
+    }
+    Err(wt_refusal_for(
+        "no worktrees_image configured; add a worktrees_image section (path, size_bytes, fs: btrfs, mount: kernel) to enable it",
+        command,
+    ))
+}
+
+fn wt_settings(
+    settings: Option<WorktreesImageSettings>,
+    skipped: Option<&str>,
+) -> Result<WorktreesImageSettings, HandlerOutcome> {
+    wt_settings_for(settings, skipped, "worktrees-image")
+}
+
+fn run_one_for(
     runner: &dyn crate::image_ops::PrivilegedRunner,
     spec: &CommandSpec,
+    command: &str,
 ) -> Result<crate::image_ops::RunOutcome, HandlerOutcome> {
     match runner.run(spec) {
         Ok(outcome) if outcome.returncode == 0 => Ok(outcome),
@@ -575,13 +772,20 @@ fn run_one(
             } else {
                 outcome.stderr.trim()
             };
-            Err(wt_refusal(&format!(
-                "{} failed: {detail}",
-                spec.argv.join(" ")
-            )))
+            Err(wt_refusal_for(
+                &format!("{} failed: {detail}", spec.argv.join(" ")),
+                command,
+            ))
         }
-        Err(message) => Err(wt_refusal(&message)),
+        Err(message) => Err(wt_refusal_for(&message, command)),
     }
+}
+
+fn run_one(
+    runner: &dyn crate::image_ops::PrivilegedRunner,
+    spec: &CommandSpec,
+) -> Result<crate::image_ops::RunOutcome, HandlerOutcome> {
+    run_one_for(runner, spec, "worktrees-image")
 }
 
 fn dir_facts(path: &Path) -> (bool, bool) {
@@ -658,7 +862,7 @@ pub(crate) fn wt_status(
     settings: Option<WorktreesImageSettings>,
     format: &str,
 ) -> HandlerOutcome {
-    let settings = match wt_settings(settings) {
+    let settings = match wt_settings(settings, ctx.skipped) {
         Ok(settings) => settings,
         Err(outcome) => return outcome,
     };
@@ -750,7 +954,7 @@ pub(crate) fn wt_create(
     settings: Option<WorktreesImageSettings>,
     runner: &dyn crate::image_ops::PrivilegedRunner,
 ) -> HandlerOutcome {
-    let settings = match wt_settings(settings) {
+    let settings = match wt_settings(settings, ctx.skipped) {
         Ok(settings) => settings,
         Err(outcome) => return outcome,
     };
@@ -774,6 +978,11 @@ pub(crate) fn wt_create(
             stdout: String::new(),
             stderr: format!("{error}\n"),
         };
+    }
+    // Image files are owner-only from creation (#1151).
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&image_file, std::fs::Permissions::from_mode(0o600));
     }
     let plan = create_format_plan(&image_file);
     // chattr first, then truncate, then mkfs.
@@ -818,7 +1027,7 @@ pub(crate) fn wt_mount(
     mount_id: &dyn Fn(&Path) -> Option<i64>,
     runner: &dyn crate::image_ops::PrivilegedRunner,
 ) -> HandlerOutcome {
-    let settings = match wt_settings(settings) {
+    let settings = match wt_settings(settings, ctx.skipped) {
         Ok(settings) => settings,
         Err(outcome) => return outcome,
     };
@@ -842,27 +1051,45 @@ pub(crate) fn wt_mount(
             }
         }
     }
-    // ensure_binds at plan level: bind each recorded slot whose
-    // target is not in the injected mount table.
-    if let Ok(mut records) = load_bind_records(ctx.control) {
+    // ensure_binds: fenced canonical slots and mounted targets
+    // are left alone; a record whose subvolume is gone is skipped
+    // without error or re-creation. Each bind mounts first, then
+    // records under the records flock.
+    if let Ok(records) = load_bind_records(ctx.control) {
         let mounted_points: Vec<PathBuf> = ctx
             .entries
             .iter()
             .map(|e| crate::image_mounts::normalize_absolute(&e.mount_point))
             .collect();
-        let mut changed = false;
-        for (slot, record) in records.clone() {
+        for (slot, record) in records {
+            let canonical = ctx.worktrees.join(&slot);
             let target = record
                 .target
                 .clone()
                 .map(PathBuf::from)
-                .unwrap_or_else(|| ctx.worktrees.join(&slot));
+                .unwrap_or_else(|| canonical.clone());
+            if target == canonical {
+                let fenced_prefix = format!(".{slot}.fenced.");
+                let has_fenced = std::fs::read_dir(ctx.worktrees)
+                    .map(|entries| {
+                        entries.flatten().any(|entry| {
+                            entry
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with(&fenced_prefix)
+                        })
+                    })
+                    .unwrap_or(false);
+                if has_fenced {
+                    continue;
+                }
+            }
             if mounted_points.contains(&crate::image_mounts::normalize_absolute(&target)) {
                 continue;
             }
             let source = mount_dir.join(&record.subvolume);
             if !source.is_dir() {
-                return wt_refusal(&format!("slot subvolume is missing: {}", source.display()));
+                continue;
             }
             let _ = std::fs::create_dir_all(&target);
             for spec in bind_plan(&source, &target) {
@@ -870,18 +1097,17 @@ pub(crate) fn wt_mount(
                     return outcome;
                 }
             }
-            records.insert(
-                slot.clone(),
-                BindRecord {
-                    subvolume: record.subvolume,
-                    mount_id: mount_id(&target),
-                    target: Some(target.to_string_lossy().into_owned()),
-                },
-            );
-            changed = true;
-        }
-        if changed {
-            let _ = save_bind_records(ctx.control, &records);
+            let recorded = BindRecord {
+                subvolume: record.subvolume.clone(),
+                mount_id: mount_id(&target),
+                target: Some(target.to_string_lossy().into_owned()),
+            };
+            if let Err(message) = update_bind_records(ctx.control, move |mut current| {
+                current.insert(slot.clone(), recorded);
+                current
+            }) {
+                return wt_refusal(&message);
+            }
         }
     }
     HandlerOutcome {
@@ -901,7 +1127,7 @@ pub(crate) fn wt_unmount(
     settings: Option<WorktreesImageSettings>,
     runner: &dyn crate::image_ops::PrivilegedRunner,
 ) -> HandlerOutcome {
-    let settings = match wt_settings(settings) {
+    let settings = match wt_settings(settings, ctx.skipped) {
         Ok(settings) => settings,
         Err(outcome) => return outcome,
     };
@@ -927,7 +1153,7 @@ pub(crate) fn wt_grow(
     to_size_bytes: i64,
     runner: &dyn crate::image_ops::PrivilegedRunner,
 ) -> HandlerOutcome {
-    let settings = match wt_settings(settings) {
+    let settings = match wt_settings(settings, ctx.skipped) {
         Ok(settings) => settings,
         Err(outcome) => return outcome,
     };
@@ -967,7 +1193,7 @@ pub(crate) fn wt_trim(
     settings: Option<WorktreesImageSettings>,
     runner: &dyn crate::image_ops::PrivilegedRunner,
 ) -> HandlerOutcome {
-    let settings = match wt_settings(settings) {
+    let settings = match wt_settings(settings, ctx.skipped) {
         Ok(settings) => settings,
         Err(outcome) => return outcome,
     };
@@ -983,6 +1209,184 @@ pub(crate) fn wt_trim(
             }
         }
         Err(outcome) => outcome,
+    }
+}
+
+/// Whether any process's cwd is inside `path`, mirroring Python
+/// `process_inside` (a /proc scan; unreadable /proc counts as use).
+pub(crate) fn process_inside(path: &Path) -> bool {
+    let target = path.to_string_lossy().into_owned();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return true;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.bytes().all(|b| b.is_ascii_digit()) || name.is_empty() {
+            continue;
+        }
+        if let Ok(cwd) = std::fs::read_link(entry.path().join("cwd")) {
+            let cwd = cwd.to_string_lossy().into_owned();
+            if cwd == target || cwd.starts_with(&format!("{target}/")) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn copy_tree_skip_special(source: &Path, destination: &Path) -> Result<(), String> {
+    // Mirrors shutil.copytree(symlinks=True, ignore=_skip_special):
+    // links are recreated, special files are skipped.
+    std::fs::create_dir_all(destination).map_err(|e| {
+        format!(
+            "cannot copy {} to {}: {e}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(source)
+        .map_err(|e| format!("cannot copy {}: {e}", source.display()))?
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    entries.sort();
+    for entry in entries {
+        let target = destination.join(entry.file_name().expect("name"));
+        let meta = entry.symlink_metadata().map_err(|e| e.to_string())?;
+        let kind = meta.file_type();
+        if kind.is_symlink() {
+            let pointed = std::fs::read_link(&entry).map_err(|e| e.to_string())?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&pointed, &target).map_err(|e| e.to_string())?;
+        } else if kind.is_dir() {
+            copy_tree_skip_special(&entry, &target)?;
+        } else if kind.is_file() {
+            std::fs::copy(&entry, &target).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// `wrkslots migrate SLOT` (#1161): copy one idle slot into the
+/// worktrees image and bind it at the same path. `state` is the
+/// injected mount classification of the image mount directory;
+/// `mount_id` records a bind's live id. The registry/lock side
+/// stays with the dispatch glue, as in the other handlers.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn wt_migrate(
+    ctx: &WtCtx<'_>,
+    settings: Option<WorktreesImageSettings>,
+    slot: &str,
+    slot_path: &Path,
+    state: &str,
+    process_in_use: bool,
+    owner_ids: (u32, u32),
+    mount_id: &dyn Fn(&Path) -> Option<i64>,
+    runner: &dyn crate::image_ops::PrivilegedRunner,
+) -> HandlerOutcome {
+    let settings = match wt_settings_for(settings, ctx.skipped, "migrate") {
+        Ok(settings) => settings,
+        Err(outcome) => return outcome,
+    };
+    if state != MOUNTED {
+        return wt_refusal_for(
+            &format!("worktrees image is {state}; run 'wrkslots worktrees-image mount' first"),
+            "migrate",
+        );
+    }
+    if !slot_path.is_dir() {
+        return wt_refusal_for(
+            &format!("slot directory is missing: {}", slot_path.display()),
+            "migrate",
+        );
+    }
+    let records = match load_bind_records(ctx.control) {
+        Ok(records) => records,
+        Err(message) => return wt_refusal_for(&message, "migrate"),
+    };
+    if records.contains_key(slot) {
+        return HandlerOutcome {
+            exit: 0,
+            stdout: format!("{slot} is already bound from the worktrees image\n"),
+            stderr: String::new(),
+        };
+    }
+    if process_in_use {
+        return wt_refusal_for(
+            &format!(
+                "a process is working inside {}; migrate only a stopped slot",
+                slot_path.display()
+            ),
+            "migrate",
+        );
+    }
+    let before = listing_signature(slot_path);
+    let mount_dir = image_mount_dir(ctx.control);
+    let subvolume = mount_dir.join(slot);
+    if subvolume.exists() {
+        return wt_refusal_for(
+            &format!(
+                "image subvolume already exists: {}; inspect it first",
+                subvolume.display()
+            ),
+            "migrate",
+        );
+    }
+    for spec in subvolume_plan(
+        &subvolume,
+        settings.slot_quota_bytes,
+        owner_ids.0,
+        owner_ids.1,
+    ) {
+        if let Err(outcome) = run_one_for(runner, &spec, "migrate") {
+            return outcome;
+        }
+    }
+    if let Err(message) = copy_tree_skip_special(slot_path, &subvolume) {
+        // A failed copy leaves no partial subvolume behind.
+        let delete = spec(sudo_argv(&[
+            "btrfs".to_string(),
+            "subvolume".to_string(),
+            "delete".to_string(),
+            subvolume.to_string_lossy().into_owned(),
+        ]));
+        let _ = runner.run(&delete);
+        return HandlerOutcome {
+            exit: 1,
+            stdout: String::new(),
+            stderr: format!("{message}\n"),
+        };
+    }
+    if listing_signature(&subvolume) != before {
+        return wt_refusal_for(
+            "migrated copy does not match the slot file by file; original kept",
+            "migrate",
+        );
+    }
+    // bind_slot: bind at the original path, then record it.
+    let source = mount_dir.join(slot);
+    for spec in bind_plan(&source, slot_path) {
+        if let Err(outcome) = run_one_for(runner, &spec, "migrate") {
+            return outcome;
+        }
+    }
+    let recorded = BindRecord {
+        subvolume: slot.to_string(),
+        mount_id: mount_id(slot_path),
+        target: Some(slot_path.to_string_lossy().into_owned()),
+    };
+    let slot_name = slot.to_string();
+    let _ = update_bind_records(ctx.control, move |mut current| {
+        current.insert(slot_name, recorded);
+        current
+    });
+    HandlerOutcome {
+        exit: 0,
+        stdout: format!(
+            "migrated {slot} into the worktrees image, bound at {} (original kept beneath)\n",
+            slot_path.display()
+        ),
+        stderr: String::new(),
     }
 }
 
@@ -1165,6 +1569,7 @@ mod tests {
             filesystem: "btrfs".to_string(),
             mount: "kernel".to_string(),
             slot_quota_bytes: None,
+            machines: None,
             mount_at: "binds".to_string(),
             quota_mode: "simple".to_string(),
         };
@@ -1173,6 +1578,7 @@ mod tests {
             control: &control,
             worktrees: &worktrees,
             entries: &[],
+            skipped: None,
         };
 
         // Unconfigured refuses for every handler entry point.
@@ -1233,6 +1639,146 @@ mod tests {
         assert_eq!(trimmed.stdout, "trimmed\n");
         let unmounted = wt_unmount(&ctx, Some(settings), &fake);
         assert_eq!(unmounted.exit, 0);
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn migrate_handlers_match_contract() {
+        use crate::image_ops::RunOutcome;
+        use std::cell::RefCell;
+        struct Fake {
+            calls: RefCell<Vec<Vec<String>>>,
+        }
+        impl crate::image_ops::PrivilegedRunner for Fake {
+            fn run(&self, spec: &CommandSpec) -> Result<RunOutcome, String> {
+                self.calls.borrow_mut().push(spec.argv.clone());
+                Ok(RunOutcome {
+                    returncode: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let root = temp_root("migrate");
+        let control = root.join("control");
+        let worktrees = root.join("worktrees");
+        let mount_dir = image_mount_dir(&control);
+        std::fs::create_dir_all(&mount_dir).expect("mount dir");
+        let slot_path = worktrees.join("slot-a");
+        std::fs::create_dir_all(slot_path.join("sub")).expect("slot");
+        std::fs::write(slot_path.join("sub/file.txt"), "abc").expect("file");
+        let settings = WorktreesImageSettings {
+            relative_path: "wt.img".into(),
+            size_bytes: 1073741824,
+            filesystem: "btrfs".into(),
+            mount: "kernel".into(),
+            slot_quota_bytes: None,
+            machines: None,
+            mount_at: "binds".to_string(),
+            quota_mode: "simple".to_string(),
+        };
+        let ctx = WtCtx {
+            root: &root,
+            control: &control,
+            worktrees: &worktrees,
+            entries: &[],
+            skipped: None,
+        };
+        let fake = Fake {
+            calls: RefCell::new(Vec::new()),
+        };
+        let outcome = wt_migrate(
+            &ctx,
+            Some(settings.clone()),
+            "slot-a",
+            &slot_path,
+            MOUNTED,
+            false,
+            (1000, 1000),
+            &|_| Some(9),
+            &fake,
+        );
+        assert_eq!(outcome.exit, 0, "{}", outcome.stderr);
+        assert!(outcome.stdout.contains("original kept beneath"));
+        assert!(mount_dir.join("slot-a/sub/file.txt").exists());
+        let again = wt_migrate(
+            &ctx,
+            Some(settings.clone()),
+            "slot-a",
+            &slot_path,
+            MOUNTED,
+            false,
+            (1000, 1000),
+            &|_| Some(9),
+            &fake,
+        );
+        assert!(again.stdout.contains("already bound"));
+        let unmounted = wt_migrate(
+            &ctx,
+            Some(settings),
+            "slot-b",
+            &slot_path,
+            NOT_MOUNTED,
+            false,
+            (1000, 1000),
+            &|_| None,
+            &fake,
+        );
+        assert_eq!(unmounted.exit, 3);
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn machines_scope_matches_python() {
+        let base = json!({"path": "wt.img", "size_bytes": 1073741824});
+        let mut scoped = base.clone();
+        scoped["machines"] = json!(["image-host"]);
+        let settings = settings_from_obj(&scoped).expect("scoped");
+        assert!(settings.applies_on("image-host"));
+        assert!(!settings.applies_on("donor-host"));
+        assert_eq!(
+            settings.skipped_reason("donor-host").as_deref(),
+            Some("configuration.worktrees_image applies on machines [image-host] only; this host is donor-host")
+        );
+        let root = Path::new("/proj");
+        let worktrees = Path::new("/proj/worktrees");
+        let (named, skipped) =
+            parse_worktrees_image(Some(&scoped), root, worktrees, "image-host").expect("named");
+        assert!(named.is_some() && skipped.is_none());
+        let (unnamed, reason) =
+            parse_worktrees_image(Some(&scoped), root, worktrees, "donor-host").expect("unnamed");
+        assert!(unnamed.is_none());
+        assert!(reason.expect("reason").contains("image-host"));
+        let (unscoped, skipped) =
+            parse_worktrees_image(Some(&base), root, worktrees, "any-host").expect("unscoped");
+        assert!(unscoped.is_some() && skipped.is_none());
+        for machines in [
+            json!([]),
+            json!("image-host"),
+            json!([""]),
+            json!(["  "]),
+            json!([7]),
+            json!(["a", "a"]),
+            json!(["a", 1]),
+        ] {
+            let mut bad = base.clone();
+            bad["machines"] = machines;
+            assert!(settings_from_obj(&bad).is_err(), "{bad}");
+        }
+        // Handler refusal on an unlisted host has Python's wording.
+        let root = temp_root("scope");
+        let control = root.join("control");
+        let worktrees = root.join("worktrees");
+        let ctx = WtCtx {
+            root: &root,
+            control: &control,
+            worktrees: &worktrees,
+            entries: &[],
+            skipped: Some("configuration.worktrees_image applies on machines [image-host] only; this host is donor-host"),
+        };
+        let outcome = wt_status(&ctx, None, "human");
+        assert_eq!(outcome.exit, 3);
+        assert!(outcome.stderr.contains("worktrees_image does not apply on this host: configuration.worktrees_image applies on machines [image-host] only"), "{}", outcome.stderr);
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }

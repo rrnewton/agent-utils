@@ -81,6 +81,11 @@ def _expected(root: Path) -> dict[str, object]:
             if config.worktrees_image is None
             else {
                 "fs": config.worktrees_image.filesystem,
+                "machines": (
+                    None
+                    if config.worktrees_image.machines is None
+                    else list(config.worktrees_image.machines)
+                ),
                 "mount": config.worktrees_image.mount,
                 "mount_at": config.worktrees_image.mount_at,
                 "path": config.worktrees_image.relative_path,
@@ -89,6 +94,7 @@ def _expected(root: Path) -> dict[str, object]:
                 "slot_quota_bytes": config.worktrees_image.slot_quota_bytes,
             }
         ),
+        "worktrees_image_skipped": config.worktrees_image_skipped,
     }
 
 
@@ -343,3 +349,43 @@ def test_a_newer_min_wrkslots_version_refuses_naming_both_versions(tmp_path: Pat
     assert result.returncode == 1
     # The Rust edition names the same version as the Python package.
     assert message in result.stderr, result.stderr
+
+
+def test_validate_config_worktrees_image_machines_listed(tmp_path: Path) -> None:
+    root = _root(
+        tmp_path,
+        "worktrees_image: {path: wt.img, size_bytes: 2147483648, machines: [node-a]}\n",
+    )
+    result = _rust(root)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == _expected(root)
+
+
+def test_validate_config_worktrees_image_machines_unlisted(tmp_path: Path) -> None:
+    root = _root(
+        tmp_path,
+        "worktrees_image: {path: wt.img, size_bytes: 2147483648, machines: [other-host]}\n",
+    )
+    result = _rust(root)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == _expected(root)
+
+
+@pytest.mark.parametrize(
+    "machines",
+    ["[]", "[node-a, node-a]", "[7]", "['']"],
+)
+def test_validate_config_worktrees_image_machines_invalid(
+    tmp_path: Path, machines: str
+) -> None:
+    root = _root(
+        tmp_path,
+        f"worktrees_image: {{path: wt.img, size_bytes: 2147483648, machines: {machines}}}\n",
+    )
+    with pytest.raises(Exception) as caught:
+        wrkslots_cli._load_config(str(root), None)
+    fragment = "configuration.worktrees_image.machines must be a non-empty list"
+    assert fragment in str(caught.value)
+    result = _rust(root)
+    assert result.returncode == 1
+    assert fragment in result.stderr

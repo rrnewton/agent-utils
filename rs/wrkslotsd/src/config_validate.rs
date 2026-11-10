@@ -679,8 +679,9 @@ fn worktrees_image_settings(raw: &Map<String, Value>) -> Result<Value> {
                     | "fs"
                     | "mount"
                     | "slot_quota_bytes"
+                    | "machines"
                     | "mount_at"
-                    | "quota_mode"
+                    | "quota_mode",
             )
         })
         .collect();
@@ -760,8 +761,37 @@ fn worktrees_image_settings(raw: &Map<String, Value>) -> Result<Value> {
             "configuration.worktrees_image.quota_mode must be one of simple, full, not {quota_mode:?}"
         ));
     }
+    // Validated on every host, named or not, with the Python
+    // edition's exact refusal.
+    let machines = match section.get("machines") {
+        None => Value::Null,
+        Some(value) => {
+            let invalid = || {
+                "configuration.worktrees_image.machines must be a non-empty list of unique non-empty machine names"
+                    .to_owned()
+            };
+            let Some(names) = value.as_array() else {
+                return Err(invalid());
+            };
+            let mut parsed: Vec<String> = Vec::new();
+            for name in names {
+                let Some(name) = name.as_str() else {
+                    return Err(invalid());
+                };
+                if name.trim().is_empty() || parsed.iter().any(|seen| seen == name) {
+                    return Err(invalid());
+                }
+                parsed.push(name.to_string());
+            }
+            if parsed.is_empty() {
+                return Err(invalid());
+            }
+            json!(parsed)
+        }
+    };
     Ok(json!({
         "fs": filesystem,
+        "machines": machines,
         "mount": mount,
         "mount_at": mount_at,
         "path": path,
@@ -1451,6 +1481,34 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
             text.to_owned()
         }
     };
+    // The one host-scope decision: an unlisted host sees the
+    // section as absent, plus why it was skipped.
+    let wt_validated = worktrees_image_settings(raw)?;
+    let (wt_value, wt_skipped) = if wt_validated.is_null() {
+        (Value::Null, Value::Null)
+    } else {
+        let machines: Vec<String> = wt_validated
+            .get("machines")
+            .and_then(Value::as_array)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|name| name.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if machines.is_empty() || machines.iter().any(|name| name == &machine) {
+            (wt_validated, Value::Null)
+        } else {
+            (
+                Value::Null,
+                json!(format!(
+                    "configuration.worktrees_image applies on machines [{}] only; this host is {machine}",
+                    machines.join(", ")
+                )),
+            )
+        }
+    };
     Ok(json!({
         "cache_globs": cache_globs,
         "config_path": path.to_string_lossy(),
@@ -1478,7 +1536,8 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
         "sandbox": sandbox_settings(raw)?,
         "slot_representation": representation,
         "worktrees": worktrees.to_string_lossy(),
-        "worktrees_image": worktrees_image_settings(raw)?,
+        "worktrees_image": wt_value,
+        "worktrees_image_skipped": wt_skipped,
     }))
 }
 
