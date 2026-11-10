@@ -74,6 +74,37 @@ fn headless_start_records_its_effort_and_set_effort_switches_it() {
 }
 
 #[test]
+fn run_headless_declared_refuses_an_agent_with_no_declared_effort() {
+    let fixture = Fixture::new();
+    let manager = fixture.manager();
+    manager
+        .start_headless(
+            "lead",
+            &fixture.root,
+            HeadlessStart {
+                harness: "claude".to_owned(),
+                launch: false,
+                ..HeadlessStart::default()
+            },
+        )
+        .unwrap();
+    let terminate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let error = manager
+        .run_headless_declared("lead", None, None, None, None, terminate)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("no reasoning effort declared"),
+        "{error}"
+    );
+    // Declaring one on the call satisfies the rule without touching the record first.
+    let terminate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let error = manager
+        .run_headless_declared("lead", None, Some("ultra"), None, None, terminate)
+        .unwrap_err();
+    assert!(error.to_string().contains("accepted levels"), "{error}");
+}
+
+#[test]
 fn headless_start_refuses_an_unsupported_effort() {
     let fixture = Fixture::new();
     let manager = fixture.manager();

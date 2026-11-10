@@ -442,6 +442,37 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         )
     }
 
+    /// CLI entry for `run-headless` (#1216, owner reply 321): refuses when neither
+    /// `--effort` nor the agent record declares an effort, so a wrapper never runs
+    /// at a harness or machine default.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_headless_declared(
+        &self,
+        agent_name: &str,
+        claude_bin: Option<&Path>,
+        effort: Option<&str>,
+        tool_preview_lines: Option<usize>,
+        approvals: Option<HeadlessApprovals>,
+        terminate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<i32> {
+        if effort.is_none() && self.load(agent_name)?.reasoning_effort.is_none() {
+            let levels = crate::profiles::effort_levels("claude")
+                .map(|levels| levels.join(", "))
+                .unwrap_or_default();
+            return Err(fail(format!(
+                "no reasoning effort declared for headless agent {agent_name:?}: record one with agentctl set-effort {agent_name} LEVEL or pass --effort LEVEL (accepted levels: {levels})"
+            )));
+        }
+        self.run_headless_with_effort(
+            agent_name,
+            claude_bin,
+            effort,
+            tool_preview_lines,
+            approvals,
+            terminate,
+        )
+    }
+
     /// `run_headless` with an optional effort override (#1216): a given level is
     /// validated, recorded on the agent record, and applied to this launch; without
     /// one, the recorded effort (from start or set-effort) is applied.

@@ -4531,6 +4531,19 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     None,
                 )
             };
+            // #1216 (owner reply 321): effort is always declared by the agentctl layer,
+            // never left to a harness or machine default. A profile's reasoning_effort
+            // or an explicit --effort/--reasoning-effort satisfies this; neither refuses.
+            if reasoning_effort.is_none() {
+                let levels = crate::profiles::effort_levels(&harness)
+                    .map(|levels| levels.join(", "))
+                    .unwrap_or_else(|| {
+                        "none, minimal, low, medium, high, xhigh, max, ultra".to_owned()
+                    });
+                return Err(Failure::Usage(format!(
+                    "no reasoning effort declared for harness {harness:?}: declare reasoning_effort in the launch profile or pass --effort LEVEL (accepted levels: {levels})"
+                )));
+            }
             if mode == "headless" && harness == "claude" && value.profile.is_none() {
                 let brief = match value.file {
                     Some(path) => Some(
@@ -5141,7 +5154,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 signal_hook::flag::register(signal, terminate.clone())
                     .map_err(|error| Failure::Usage(format!("cannot handle signals: {error}")))?;
             }
-            return Ok(manager.run_headless_with_effort(
+            return Ok(manager.run_headless_declared(
                 &value.agent.name,
                 value.claude_bin.as_deref(),
                 value.effort.as_deref(),

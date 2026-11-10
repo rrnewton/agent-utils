@@ -46,7 +46,11 @@ created from.
    stale start.
 2. Start the subagent with `agentctl start NAME --slot SLOT ...`, using an owner-configured
    profile when one fits (`agentctl profiles --cwd .`). Never invent harness flags, models, or
-   permission settings; profiles are owner policy.
+   permission settings; profiles are owner policy. Choose an effort for every lane you start:
+   declare it in the profile (`reasoning_effort`) or pass `--effort LEVEL` — a launch with
+   neither is refused. Default to `xhigh`; reserve `ultra` for real parallel work (owner
+   reply 261). Change a live lane with `agentctl set-effort NAME LEVEL`; it takes effect at
+   its next natural restart, never by forcing one.
 3. Give a complete brief: the goal and why, the slot and branch, how to validate, where to record
    findings, how to report back, and when to stop.
 4. Use a fresh agent for a fresh task. A new major task gets a new agent started from a handoff
