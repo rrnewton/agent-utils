@@ -253,6 +253,11 @@ enum Commands {
         after_help = "Examples:\n  agentctl tail coordinator --follow\n  agentctl tail coordinator --last 50 --types assistant.text,turn.\n  agentctl tail coordinator --json --since 4180\n  agentctl tail coordinator --at 4182\n\nThe log is REGISTRY/agents/NAME/events/<generation>.jsonl (schema v1, one JSON object per line; see\n`agentctl userguide`). Any number of tails may run beside the agent; closing one never touches it.\nA hole in the sequence (pruned or unreadable lines) prints as a gap line. Not to be confused with\n`agentctl read --output tail`, which reads an interactive agent's pane."
     )]
     Tail(Tail),
+    /// Follow a local headless agent and type to it: the tail --follow rendering above an owner input line, each line queued by the wrapper as a plain user turn with its origin logged
+    #[command(
+        after_help = "Examples:\n  agentctl console coordinator\n  agentctl console coordinator --last 50 --types assistant.text,turn.\n\nLocal headless agents only, and only for the owner at a terminal: standard input and output must be terminals in the foreground, AGENTCTL_AGENT must be unset, and no coding-agent harness may be an ancestor; the wrapper re-checks the peer of every line. Enter sends the line as a plain user turn (no sender framing); a bracketed paste is one message; approve aN and deny aN [reason] answer a headless approval and are never sent as messages; Ctrl-C clears the line, then leaves. Leaving never touches the agent. `tail` stays the read-only follower."
+    )]
+    Console(Console),
     /// List the harness sessions an agent name has run, oldest first: how each began (start, adopt, resume, fresh, rebound, takeover, handback), how it ended, and its transcript; read-only
     #[command(
         after_help = "Examples:\n  agentctl history cl-foo\n  agentctl history cl-foo --all --json\n  agentctl history --session 10154bdf-b1c8-411a-80b2-55d024f32713\n\nLifecycle commands (start, adopt, attach-self, stop, retire-stale-registration, revive, rename,\nrestore, takeover, handback, bind-session, anchor) append to REGISTRY/.lineage/NAME/entries.jsonl after they run (schema agentctl-lineage/v1).\nThe lineage is advisory: routing never reads it, and generations nothing recorded (before this\nbuild, or by another build) are filled in from REGISTRY/archive/ and the live record, marked\nunrecorded. A line groups one continuous piece of work; start begins a new one. Times are\nlocal (set TZ to choose the zone). Exit 1 when the name has no entries, archived generations or\nlive record."
@@ -785,6 +790,54 @@ struct Tail {
     /// Print the event with this sequence number and the rest of its turn, then exit; exit 1 when it does not exist
     #[arg(long, value_name = "SEQ", conflicts_with_all = ["follow", "since", "last"])]
     at: Option<u64>,
+}
+
+#[derive(Args)]
+struct Console {
+    #[command(flatten)]
+    agent: Named,
+    /// Print only the last N matching events before the input line (default: the last 200)
+    #[arg(long, value_name = "N")]
+    last: Option<usize>,
+    /// Comma-separated event types to print; a trailing dot matches a prefix (example: tool.,turn.completed)
+    #[arg(long, value_name = "TYPES", value_delimiter = ',')]
+    types: Vec<String>,
+    /// Columns to wrap at, at least 20 (default: the terminal's width, read again before each event so a resized pane rewraps; 100 when standard output is not a terminal)
+    #[arg(long, value_name = "COLS")]
+    width: Option<usize>,
+    /// Plain text: no colors, Markdown markers kept as written (default when standard output is not a terminal, NO_COLOR is set and not empty, or TERM is dumb)
+    #[arg(long, conflicts_with_all = ["pretty"])]
+    plain: bool,
+    /// Colors and styled Markdown even when standard output is not a terminal, as for `less -R`
+    #[arg(long)]
+    pretty: bool,
+    /// Lines of a tool result shown under the call before the rest is folded into "… N more lines"; 0 shows none (default: 4)
+    #[arg(long, default_value = "4", value_name = "N")]
+    tool_lines: usize,
+}
+
+/// Run `agentctl console NAME`: the tail rendering above an owner input
+/// line, in this process, until the owner leaves it.
+fn run_console(
+    manager: &crate::subagents::ManagedAgents<'_, dyn crate::subagents::ManagedApi>,
+    registry: &Path,
+    value: Console,
+) -> Result<i32, Failure> {
+    let terminal = io::stdout().is_terminal();
+    let no_color = std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
+        || std::env::var_os("TERM").is_some_and(|value| value == "dumb");
+    let options = crate::headless::tail::TailOptions {
+        follow: true,
+        last: value.last,
+        types: value.types,
+        width: value.width.unwrap_or(100).max(20),
+        auto_width: value.width.is_none() && terminal,
+        pretty: value.pretty || (terminal && !no_color && !value.plain),
+        tool_lines: value.tool_lines,
+        console: true,
+        ..crate::headless::tail::TailOptions::default()
+    };
+    crate::console::run(manager, registry, &value.agent.name, options).map_err(Failure::Usage)
 }
 
 #[derive(Args)]
@@ -3482,6 +3535,7 @@ fn writes_registry(command: &Commands) -> bool {
         Commands::RetireStaleRegistration(value) => !value.dry_run,
         Commands::Coordinator(value) => !matches!(value.command, CoordinatorCommand::Show),
         Commands::Start(_)
+        | Commands::Console(_)
         | Commands::Adopt(_)
         | Commands::AttachSelf(_)
         | Commands::Manage(_)
@@ -4862,6 +4916,9 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             &value.agent.name,
             Some((value.option, value.text.as_deref())),
         )?,
+        Commands::Console(value) => {
+            return run_console(&manager, &args.registry, value);
+        }
         Commands::Send(value) => {
             if value.model.is_some() {
                 return Err(Failure::Usage(

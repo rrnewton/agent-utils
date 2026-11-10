@@ -20,6 +20,7 @@ mod chat_transcript;
 pub mod cli;
 pub mod client;
 pub mod codex_goal;
+pub mod console;
 pub(crate) mod credentials;
 pub mod error;
 pub mod failed_digest;

@@ -30,6 +30,7 @@ unicode-width = { version = "0.2", default-features = false }
 
 [dev-dependencies]
 agent-queue = { version = "0.1.0", path = "../agent-queue", features = ["test-hooks"] }
+libc = "0.2"
 
 [[bin]]
 name = "agentctl"

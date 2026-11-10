@@ -3019,6 +3019,7 @@ agentctl start coordinator --mode headless --harness claude --cwd ~/work/project
 agentctl install-units --headless coordinator --dest ~/.config/systemd/user
 systemctl --user daemon-reload && systemctl --user enable --now agentctl-headless-coordinator.service
 agentctl tail coordinator --follow          # in a Herdr tab: the view of the agent
+agentctl console coordinator                # the same view, plus an owner input line
 agentctl send coordinator 'Status of the open lanes?'
 agentctl send coordinator --urgent 'Stop what you are doing and answer this'
 agentctl interrupt coordinator              # end the running turn
@@ -3029,6 +3030,18 @@ agentctl compact coordinator                # queue /compact for the turn bounda
 agentctl status coordinator                 # agent_status from the wrapper, queue counts
 agentctl stop coordinator                   # clean stop, archive record, queue and log
 ```
+
+`agentctl console NAME` is the owner's seat at a headless agent: the
+`tail --follow` rendering above a raw-mode input line. It runs only for
+the owner at a terminal (both standard streams are terminals in the
+foreground, `AGENTCTL_AGENT` is unset, and no coding-agent harness is
+an ancestor), and only for local headless agents. Enter queues the line
+through the wrapper as a plain user turn — byte for byte as typed, with
+no sender framing — logged with its origin (`from console:USER`); a
+bracketed paste is one message, and `approve aN` / `deny aN [reason]`
+answer a waiting approval instead of being sent. Ctrl-C clears the line,
+then leaves; leaving never touches the agent. `tail` stays the
+read-only follower for pipes, scripts, and extra views.
 
 `start --mode headless --harness claude` registers an `adapter: harness-wrapper`,
 `mode: headless` record with a new session UUID (`--resume UUID` keeps an existing
