@@ -24,8 +24,8 @@ function makeAccess() {
   const asked = [];
   globalThis.localStorage = device;
   globalThis.sessionStorage = windowStore;
+  device.setItem("vibe-talk.token", "tok-123");
   const access = APP.createServerAccess({
-    token: () => "tok-123",
     readRefused: () => asked.push("refused"),
     noteAsked: () => asked.push("noteAsked"),
     chatServiceOf: () => "Slack",
@@ -65,4 +65,18 @@ test("a request carries the token and hands back the answer", async () => {
   access.clockOnUse().setTimeout(() => { ran = true; }, 0);
   await new Promise((resolve) => setTimeout(resolve, 10));
   assert.equal(ran, true, "the clock on use runs on the browser's timers");
+});
+
+test("the token is the device's, and a token under the old name is a sign-out by the rename", () => {
+  const { access, device } = makeAccess();
+  device.removeItem("vibe-talk.token");
+  assert.equal(access.token(), "");
+  assert.equal(access.signedOutByRename(), false);
+  device.setItem("gent-talk.token", "old-token-aaaaaaaaaaaa");
+  assert.equal(access.signedOutByRename(), true, "a token under the old name is a sign-out by the rename");
+  assert.equal(access.token(), "", "the old token is not silently taken up");
+  access.credentialStore().keep("write-token-aaaaaaaaaaaaaaaa");
+  assert.equal(access.token(), "write-token-aaaaaaaaaaaaaaaa");
+  assert.equal(access.signedOutByRename(), false, "a token under the current name ends the rename's sign-out");
+  assert.equal(access.credentialStore(), access.credentialStore(), "the credential store is one instance");
 });

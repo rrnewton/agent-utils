@@ -176,7 +176,7 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
   same("inColumn(columns.side, () => { ++loadState().generation; loadState().freshness = 'slow'; })");
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.load.generation, columns.side.load.freshness, loadState().freshness])")),
     [1, "slow", "fresh"]);
-  assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshLoadState())")),
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(page.preludeBinding("freshLoadState")())),
     { freshness: "fresh", freshAt: 0, refreshing: false, lineTimer: null, generation: 0 });
   // And entering a view.
   assert.equal(same("inColumn(columns.side, () => entryState()) === columns.side.entry && entryState() === columns.main.entry"), true);
@@ -189,7 +189,7 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
   // And its scroll tools' pass.
   same("inColumn(columns.side, () => { scrollTools().held += 1; })");
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.tools.held, scrollTools().held])")), [1, 0]);
-  assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshScrollTools())")), { held: 0, owed: false });
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(page.preludeBinding("freshScrollTools")())), { held: 0, owed: false });
   // And its filters' hold.
   assert.equal(same("inColumn(columns.side, () => filterState()) === columns.side.filter && filterState() === columns.main.filter"), true);
   assert.deepStrictEqual(JSON.parse(JSON.stringify(page.preludeBinding("freshFilterState")())), { hold: null });

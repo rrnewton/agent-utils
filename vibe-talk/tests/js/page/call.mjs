@@ -6882,7 +6882,7 @@ test("`#337 voice-relay-silent`: a message in another watched channel reaches th
   assert.doesNotMatch(page.el("discord-log").text(), /tests are green/,
     "another channel's message was drawn into the channel on screen");
   // The negative control: the page that followed only the channel on screen never hears it.
-  const control = await run(brokenScript("function startWatchAll() {\n", "function startWatchAll() {\n  return;\n"));
+  const control = await run(await brokenModule([{ file: "src/view/voice/watchframe.ts", find: "  function startWatchAll(): void {\n", replace: "  function startWatchAll(): void {\n    return;\n" }]));
   assert.equal(control.page.watchOpens.length, 0);
   assert.deepEqual(relayedPrompts(control.socket), [], "the control relayed it, so the stream of every channel is not what carries it");
 });

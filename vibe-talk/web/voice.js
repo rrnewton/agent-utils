@@ -166,19 +166,19 @@ const columns = createColumns({
  */
 const columnWork = createColumnWork(columns);
 const { useColumn, inColumn } = columnWork;
+const { loadState, scrollPlace, scrollTools } = createColumnStateAccess(columnWork);
 
 /**
  * The page's way to the browser and the server: web/src/app's now (`createServerAccess`, `#624`),
  * made here, before its first use; everything it holds is still made on first use, as the `var`s were.
  */
 const serverAccess = createServerAccess({
-  token: () => token(),
   readRefused: () => messageCache.dropMessageCache(),
   noteAsked: () => readOrder.noteAsked(),
   chatServiceOf: (channel) => chatServiceOf(channel),
   selectedChannelId: () => selectedChannelId(),
 });
-const { browserPorts, deviceStorage, deviceStorageOnUse, clockOnUse, windowStorage, deviceSettings, theServer, api, apiDecoded, within } = serverAccess;
+const { browserPorts, deviceStorage, deviceStorageOnUse, clockOnUse, windowStorage, deviceSettings, credentialStore, token, signedOutByRename, theServer, api, apiDecoded, within } = serverAccess;
 
 
 /**
@@ -764,30 +764,6 @@ function readAloudOwner() {
 }
 
 
-/**
- * The device's API token, on its own handle (web/src/core/settings, `#624 voice-page-modularity`),
- * kept in the device's storage. Made on first use; a `var` with no initialiser, like `serverApi`.
- *
- * @type {import("./src/core/settings/index.ts").Credentials | undefined}
- */
-var pageCredentials;
-
-/** {@link pageCredentials}, made if it is not yet. */
-function credentialStore() {
-  if (!pageCredentials) pageCredentials = createCredentials(deviceStorage());
-  return pageCredentials;
-}
-
-/** The token, or "" for none. Throws where the browser refuses storage. */
-const token = () => credentialStore().token();
-
-/**
- * True when this browser has no token under the current key but does have one under the key this
- * page used before the rename. Never throws (`Credentials.signedOutByRename`).
- */
-function signedOutByRename() {
-  return credentialStore().signedOutByRename();
-}
 
 // --- navigation orchestration (`#304`, `#423`, `#462`, `#543`, `#580`) -------------------------
 //
@@ -4178,54 +4154,6 @@ const messageCache = createOfflineCache({
   stillToDo: (message, done) => stillToDo(message, /** @type {any} */ (done)),
 }).cache;
 
-/**
- * A column's own record of its reads' state (`#624 voice-page-modularity`, plan step 15, as
- * `freshOlderPages`): `freshness` and `freshAt` and `refreshing` below; `lineTimer`, the loading line's
- * timer (`renderChannelLoading`); `generation`, bumped by each read the column starts, so a completed
- * read can tell whether it still describes the column (`currentDiscordLoad`).
- *
- * @returns {{freshness: string, freshAt: number, refreshing: boolean, lineTimer: any, generation: number}}
- */
-function freshLoadState() {
-  return { freshness: "fresh", freshAt: 0, refreshing: false, lineTimer: null, generation: 0 };
-}
-
-/**
- * A column's own record of where its list stands against its newest message (`#624
- * voice-page-modularity`, plan step 15): `jumpWanted`, the arrival its jump is for;
- * `inScrollback`, whether it is in its scrollback. The folds owner reads them
- * (web/src/view/channel/folding.ts).
- *
- * @returns {{jumpWanted: boolean | number, inScrollback: boolean}}
- */
-function freshScrollPlace() {
-  return { jumpWanted: false, inScrollback: false };
-}
-
-/**
- * A column's own record of its scroll tools' pass: `held`, how many redraws are under way that
- * pass over the scroll tools once, at their end; `owed`, whether a pass was asked for inside one.
- *
- * @returns {{held: number, owed: boolean}}
- */
-function freshScrollTools() {
-  return { held: 0, owed: false };
-}
-
-/** The column being worked on's record of where its list stands (`freshScrollPlace`). */
-function scrollPlace() {
-  return columnWork.active().place;
-}
-
-/** The column being worked on's record of its scroll tools' pass (`freshScrollTools`). */
-function scrollTools() {
-  return columnWork.active().tools;
-}
-
-/** The column being worked on's record of its reads' state (`freshLoadState`). */
-function loadState() {
-  return columnWork.active().load;
-}
 
 /*
  * How the channel rows on screen relate to the server: "fresh" from a read in this page, "saved"
@@ -8785,49 +8713,17 @@ const watchAll = createWatchAll({
   guard: (run) => guardQuietly(run)(),
 });
 
-/** Follow every watched channel for the call that has just connected. */
-function startWatchAll() {
-  watchAll.start();
-}
-
-/** Stop following every channel. Idempotent. */
-function stopWatchAll() {
-  watchAll.stop();
-}
-
-/**
- * One frame of the stream of every channel, its cursor (the cursor over every channel) already taken
- * down by `watchAll`, and dropped there on a reset. A message is relayed as one from the channel's own
- * stream is, under the same guards and the same ledger.
- *
- * @returns {"reset" | undefined} `reset` when the server said it cannot fill the gap
- */
-function onWatchAllFrame(frame) {
-  if (frame.event === "reset") {
-    refreshServerSettings().catch(() => {});
-    if (voiceCall().canSendText() && relayMode() !== "off") voiceCall().reportUnrelayed([], "gap");
-    return "reset";
-  }
-  if (frame.event === "settings") {
-    onSettingsFrame(frame);
-    return undefined;
-  }
-  if (frame.event !== "message" || !frame.data) return undefined;
-  let payload = null;
-  try {
-    payload = JSON.parse(frame.data);
-  } catch (_error) {
-    return undefined;
-  }
-  if (!VibeTalkContract.is("LiveMessageEvent", payload)) return undefined;
-  if (payload.self_posted) noteSelfAuthor(payload.message.author_id);
-  if (payload.self_posted && typeof payload.client_key === "string") settleFromServer(payload.client_key);
-  voiceCall().relayToAgent(payload.message, payload.self_posted, payload.replayed, {
-    fromTail: payload.from_tail === true,
-    resumed: watchAll.resumed(),
-  });
-  return undefined;
-}
+/** What one frame of that stream means: web/src/view/voice's now (`createWatchFrame`, `#624`). */
+const watchFrameOwner = createWatchFrame({
+  watchAll: () => watchAll,
+  refreshServerSettings: () => refreshServerSettings(),
+  voiceCall: () => voiceCall(),
+  relayMode: () => relayMode(),
+  onSettingsFrame: (frame) => onSettingsFrame(frame),
+  noteSelfAuthor: (id) => noteSelfAuthor(id),
+  settleFromServer: (key) => settleFromServer(key),
+});
+const { startWatchAll, stopWatchAll, onWatchAllFrame } = watchFrameOwner;
 
 
 /** Settings' channel box owns its service choice, editor and hidden list (#624 voice-page-modularity). */

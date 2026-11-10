@@ -8,15 +8,14 @@ import { createWebPorts } from "../platform/web/index.ts";
 import type { WebPorts } from "../platform/web/index.ts";
 import { createApi } from "../core/api/index.ts";
 import type { ApiRequestOptions, ServerApi } from "../core/api/index.ts";
-import { createDeviceSettings } from "../core/settings/index.ts";
-import type { DeviceSettings } from "../core/settings/index.ts";
+import { createCredentials, createDeviceSettings } from "../core/settings/index.ts";
+import type { Credentials, DeviceSettings } from "../core/settings/index.ts";
 import { sentenceStart } from "../foundation/index.ts";
 import type { CancelSignal, ClockPort, StoragePort, TimerHandle } from "../ports/index.ts";
 import type { Contract } from "../contract/index.ts";
 
 /** What the page's server access asks of the page, at the moment of use. */
 export interface ServerAccessDependencies {
-  token(): string;
   readRefused(): void;
   noteAsked(): void;
   chatServiceOf(channel: unknown): string;
@@ -31,6 +30,9 @@ export interface ServerAccess {
   clockOnUse(): ClockPort;
   windowStorage(): StoragePort;
   deviceSettings(): DeviceSettings;
+  credentialStore(): Credentials;
+  token(): string;
+  signedOutByRename(): boolean;
   theServer(): ServerApi;
   api(path: string, options?: ApiRequestOptions): Promise<unknown>;
   apiDecoded<K extends keyof Contract>(type: K, path: string, options?: ApiRequestOptions): Promise<Contract[K]>;
@@ -102,6 +104,30 @@ export function createServerAccess(deps: ServerAccessDependencies): ServerAccess
   }
 
   /**
+   * The device's API token, on its own handle (web/src/core/settings, `#624 voice-page-modularity`),
+   * kept in the device's storage. Made on first use, like `serverApi`.
+   *
+   */
+  let pageCredentials: Credentials | undefined;
+
+  /** {@link pageCredentials}, made if it is not yet. */
+  function credentialStore(): Credentials {
+    if (!pageCredentials) pageCredentials = createCredentials(deviceStorage());
+    return pageCredentials;
+  }
+
+  /** The token, or "" for none. Throws where the browser refuses storage. */
+  const token = (): string => credentialStore().token();
+
+  /**
+   * True when this browser has no token under the current key but does have one under the key this
+   * page used before the rename. Never throws (`Credentials.signedOutByRename`).
+   */
+  function signedOutByRename(): boolean {
+    return credentialStore().signedOutByRename();
+  }
+
+  /**
    * The page's requests to vibe-talk (web/src/core/api, `#624 voice-page-modularity`), on the
    * browser's transport, timers and cancellation, made the first time the page asks anything.
    *
@@ -112,7 +138,7 @@ export function createServerAccess(deps: ServerAccessDependencies): ServerAccess
   function theServer(): ServerApi {
     if (!serverApi) {
       serverApi = createApi(browserPorts(), {
-        token: () => deps.token(),
+        token,
         // A token the server no longer accepts, or a read it refuses, ends this device's copy of
         // what that token read.
         readRefused: () => deps.readRefused(),
@@ -163,6 +189,6 @@ export function createServerAccess(deps: ServerAccessDependencies): ServerAccess
 
   return {
     browserPorts, deviceStorage, deviceStorageOnUse, clockOnUse, windowStorage,
-    deviceSettings, theServer, api, apiDecoded, within,
+    deviceSettings, credentialStore, token, signedOutByRename, theServer, api, apiDecoded, within,
   };
 }

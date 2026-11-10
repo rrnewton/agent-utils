@@ -188,3 +188,89 @@ export function createColumns<Older, Arrows, Load, Entry, Pins, Tools, Filter, L
     side: { ...column("side", fresh.selection()), mode: "list", fromCards: false },
   };
 }
+
+/** A column's record of its reads' state (`freshLoadState`). */
+export interface LoadState {
+  freshness: string;
+  freshAt: number;
+  refreshing: boolean;
+  lineTimer: ReturnType<typeof setTimeout> | null;
+  generation: number;
+}
+
+/** A column's record of where its list stands against its newest message (`freshScrollPlace`). */
+export interface ColumnListPlace {
+  jumpWanted: boolean | number;
+  inScrollback: boolean;
+}
+
+/** A column's record of its scroll tools' pass (`freshScrollTools`). */
+export interface ScrollToolsState {
+  held: number;
+  owed: boolean;
+}
+
+/**
+ * A column's own record of its reads' state (`#624 voice-page-modularity`, plan step 15, as
+ * `freshOlderPages`): `freshness` and `freshAt` and `refreshing` below; `lineTimer`, the loading line's
+ * timer (`renderChannelLoading`); `generation`, bumped by each read the column starts, so a completed
+ * read can tell whether it still describes the column (`currentDiscordLoad`).
+ *
+ */
+export function freshLoadState(): LoadState {
+  return { freshness: "fresh", freshAt: 0, refreshing: false, lineTimer: null, generation: 0 };
+}
+
+/**
+ * A column's own record of where its list stands against its newest message (`#624
+ * voice-page-modularity`, plan step 15): `jumpWanted`, the arrival its jump is for;
+ * `inScrollback`, whether it is in its scrollback. The folds owner reads them
+ * (web/src/view/channel/folding.ts).
+ *
+ * @returns {{jumpWanted: boolean | number, inScrollback: boolean}}
+ */
+export function freshScrollPlace(): ColumnListPlace {
+  return { jumpWanted: false, inScrollback: false };
+}
+
+/**
+ * A column's own record of its scroll tools' pass: `held`, how many redraws are under way that
+ * pass over the scroll tools once, at their end; `owed`, whether a pass was asked for inside one.
+ *
+ * @returns {{held: number, owed: boolean}}
+ */
+export function freshScrollTools(): ScrollToolsState {
+  return { held: 0, owed: false };
+}
+
+/**
+ * The working column's own records under their page names: its reads' state (`loadState`), where
+ * its list stands (`scrollPlace`) and its scroll tools' pass (`scrollTools`).
+ */
+export interface ColumnStateAccess {
+  loadState(): LoadState;
+  scrollPlace(): ColumnListPlace;
+  scrollTools(): ScrollToolsState;
+}
+
+/** The column state access over the working column (`columnWork`). */
+export function createColumnStateAccess(
+  columnWork: ColumnWorkReader<{ load: LoadState; place: ColumnListPlace; tools: ScrollToolsState } & WorkedColumn>,
+): ColumnStateAccess {
+  /** The column being worked on's record of where its list stands (`freshScrollPlace`). */
+  function scrollPlace(): ColumnListPlace {
+    return columnWork.active().place;
+  }
+
+  /** The column being worked on's record of its scroll tools' pass (`freshScrollTools`). */
+  function scrollTools(): ScrollToolsState {
+    return columnWork.active().tools;
+  }
+
+  /** The column being worked on's record of its reads' state (`freshLoadState`). */
+  function loadState(): LoadState {
+    return columnWork.active().load;
+  }
+
+  return { loadState, scrollPlace, scrollTools };
+}
