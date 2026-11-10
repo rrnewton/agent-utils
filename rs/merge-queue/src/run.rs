@@ -974,12 +974,26 @@ enum Culprit {
 /// the verdict) are derived. Kept apart from the validations themselves, so a search can
 /// pause while its probes run as ordinary window flights and resume when they return,
 /// instead of joining them on the spot.
+/// Evidence that a culprit search's focus passes on the base itself
+/// (#1187 mq-singleton-eject).
+#[derive(Clone, Copy, Default)]
+struct BaseEvidence {
+    /// The base is a validated queue landing.
+    queue_landing: bool,
+    /// A recorded green at the base tree covers the focus.
+    recorded_green: bool,
+}
+
 struct CulpritSearch {
     candidate: Candidate,
     focus: Selection,
     obs: BTreeMap<usize, Obs>,
     /// Prefixes the probes in flight are measuring, aligned with their jobs.
     probes: Vec<usize>,
+    /// The prefix-0 pass came from `trust_base`, not from a measurement.
+    base_synthetic: bool,
+    /// The base (prefix 0) is a validated queue landing.
+    base_queue_landing: bool,
 }
 
 impl CulpritSearch {
@@ -990,6 +1004,7 @@ impl CulpritSearch {
         first_deterministic: bool,
         trust_base: bool,
         confirm_reruns: bool,
+        base: BaseEvidence,
     ) -> Self {
         // Off, one sighting of any failure confirms it.
         let unconfirmed = (!confirm_reruns).then_some(UNCONFIRMED_ONCE);
@@ -1008,7 +1023,14 @@ impl CulpritSearch {
                 },
             },
         );
-        if trust_base && !candidate.prs.is_empty() {
+        // Evidence the focus passes on the base itself. A recorded green at
+        // the base tree is measured evidence; a `trust_base` pass is only an
+        // assumption, and only for a base this queue landed after validating
+        // it. On any other base (a direct push) the synthetic pass counts as
+        // no evidence: prefix 0 stays unknown and is probed before a
+        // singleton at index 0 can be blamed.
+        let mut base_synthetic = false;
+        if !candidate.prs.is_empty() && base.recorded_green {
             obs.insert(
                 0,
                 Obs {
@@ -1016,12 +1038,23 @@ impl CulpritSearch {
                     ..Obs::default()
                 },
             );
+        } else if trust_base && base.queue_landing && !candidate.prs.is_empty() {
+            obs.insert(
+                0,
+                Obs {
+                    passes: 1,
+                    ..Obs::default()
+                },
+            );
+            base_synthetic = true;
         }
         Self {
             candidate: candidate.clone(),
             focus: focus.clone(),
             obs,
             probes: Vec::new(),
+            base_synthetic,
+            base_queue_landing: base.queue_landing,
         }
     }
 
@@ -1191,6 +1224,33 @@ struct RedWork {
     attributed: bool,
     deterministic: bool,
     search: CulpritSearch,
+    /// Another disjoint batch failed the same test on the same base: the
+    /// base is suspect, so a singleton verdict holds instead of ejecting.
+    base_suspect: bool,
+}
+
+/// One red batch's failure on its base, for base-suspect detection.
+#[derive(Clone, Debug)]
+struct BaseSighting {
+    parent: String,
+    prs: Vec<i64>,
+    failed: BTreeSet<TestId>,
+}
+
+/// Failures shared with a disjoint batch on the same base (no change in
+/// common): the base-suspect signal. A batch never matches itself, and a
+/// different base never matches.
+fn disjoint_shared_failure(
+    sightings: &[BaseSighting],
+    parent: &str,
+    prs: &[i64],
+    failed: &BTreeSet<TestId>,
+) -> BTreeSet<TestId> {
+    sightings
+        .iter()
+        .filter(|s| s.parent == parent && s.prs.iter().all(|pr| !prs.contains(pr)))
+        .flat_map(|s| s.failed.intersection(failed).cloned().collect::<Vec<_>>())
+        .collect()
 }
 
 /// What advancing a red batch's search does next.
@@ -1396,6 +1456,8 @@ pub struct Runner<'a> {
     /// Plan generation stamped on donor jobs; bumped whenever the serve
     /// order changes, so indices from a superseded plan stop counting.
     plan_generation: Mutex<u64>,
+    /// Red batches seen on each base in this run, for base-suspect holds.
+    base_sightings: Mutex<Vec<BaseSighting>>,
 }
 
 /// A green that went stale in this run: where it was green, and what had
@@ -1572,6 +1634,7 @@ impl<'a> Runner<'a> {
             stale_greens: Mutex::new(BTreeMap::new()),
             claim_order: Mutex::new(Vec::new()),
             plan_generation: Mutex::new(initial_plan_generation),
+            base_sightings: Mutex::new(Vec::new()),
         })
     }
 
@@ -4068,6 +4131,63 @@ impl<'a> Runner<'a> {
     /// [`covered_by`].
     fn covered(&self, commit: &str, selection: &Selection) -> bool {
         covered_by(&lock(&self.report).validations, commit, selection)
+    }
+
+    /// Base evidence for a culprit search on `candidate`: whether the base
+    /// (prefix 0) is a validated queue landing, and whether a recorded green
+    /// at the base tree already covers `focus`. A landing is a tip this run
+    /// landed, or a focused landing still owed a complete run (persisted
+    /// across runs); anything else reached the branch outside the queue.
+    fn base_evidence(&self, candidate: &Candidate, focus: &Selection) -> BaseEvidence {
+        let queue_landing = lock(&self.report)
+            .landed
+            .iter()
+            .any(|landed| landed.tip == candidate.parent)
+            || self
+                .state
+                .obligations()
+                .map(|all| all.iter().any(|o| o.landed == candidate.parent))
+                .unwrap_or(false);
+        BaseEvidence {
+            queue_landing,
+            recorded_green: self.covered(&candidate.parent, focus),
+        }
+    }
+
+    /// Record a red batch on its base; the shared failures when a disjoint
+    /// batch already failed the same test on the same base (base suspect).
+    fn note_base_failure(
+        &self,
+        candidate: &Candidate,
+        failed: &BTreeSet<TestId>,
+    ) -> Option<BTreeSet<TestId>> {
+        let mut sightings = lock(&self.base_sightings);
+        let shared = disjoint_shared_failure(&sightings, &candidate.parent, &candidate.prs, failed);
+        sightings.push(BaseSighting {
+            parent: candidate.parent.clone(),
+            prs: candidate.prs.clone(),
+            failed: failed.clone(),
+        });
+        if shared.is_empty() {
+            None
+        } else {
+            Some(shared)
+        }
+    }
+
+    /// Whether a disjoint batch already failed a shared test on this base.
+    fn base_suspect_shared(
+        &self,
+        candidate: &Candidate,
+        failed: &BTreeSet<TestId>,
+    ) -> Option<BTreeSet<TestId>> {
+        let sightings = lock(&self.base_sightings);
+        let shared = disjoint_shared_failure(&sightings, &candidate.parent, &candidate.prs, failed);
+        if shared.is_empty() {
+            None
+        } else {
+            Some(shared)
+        }
     }
 
     /// Build, then eject whatever did not combine (and set its dependents aside).
@@ -9345,6 +9465,22 @@ impl<'a> Runner<'a> {
         let attributed = !ran.results.unattributed && !seen_failed.is_empty();
         // Every failure of the red run is a deterministic check: seen once, it is confirmed.
         let deterministic = ran.deterministic_red();
+        let mut base = self.base_evidence(candidate, &focus);
+        let suspect = self.note_base_failure(candidate, &seen_failed);
+        if suspect.is_some() {
+            base = BaseEvidence::default();
+        }
+        if let Some(shared) = &suspect {
+            self.event(
+                "base-suspect",
+                &format!(
+                    "base {} is suspect: disjoint batches on it fail {}; holding {} for a base probe, nothing ejected and nothing new started on it",
+                    short(&candidate.parent),
+                    ids(&shared.iter().cloned().collect::<Vec<_>>()),
+                    list(&candidate.prs)
+                ),
+            );
+        }
         let search = CulpritSearch::new(
             candidate,
             &focus,
@@ -9352,6 +9488,7 @@ impl<'a> Runner<'a> {
             deterministic,
             self.config.trust_base,
             self.config.validator.confirm_reruns,
+            base,
         );
         Ok(RedStart::Work(Box::new(RedWork {
             chosen: chosen.clone(),
@@ -9363,6 +9500,7 @@ impl<'a> Runner<'a> {
             attributed,
             deterministic,
             search,
+            base_suspect: suspect.is_some(),
         })))
     }
 
@@ -9542,9 +9680,47 @@ impl<'a> Runner<'a> {
                 } => {
                     flaky.extend(flaked);
                     let culprit = current.prs[index];
+                    // A suspect base is held and probed, never blamed on a
+                    // singleton: two disjoint batches failed the same test
+                    // on it.
+                    if index == 0 {
+                        let shared = self.base_suspect_shared(&current, &failed);
+                        if work.base_suspect || shared.is_some() {
+                            let shared = shared.unwrap_or_else(|| failed.clone());
+                            self.event(
+                                "base-suspect",
+                                &format!(
+                                    "base {} is suspect: disjoint batches on it fail {}; holding {} for a base probe, nothing ejected",
+                                    short(&current.parent),
+                                    ids(&shared.iter().cloned().collect::<Vec<_>>()),
+                                    list(&current.prs)
+                                ),
+                            );
+                            return Ok(Some(BatchOutcome::Stop(
+                                format!(
+                                    "base {} is suspect: disjoint batches on it fail {}; held for a base probe, nothing ejected",
+                                    short(&current.parent),
+                                    ids(&shared.iter().cloned().collect::<Vec<_>>())
+                                ),
+                                current.prs.clone(),
+                            )));
+                        }
+                    }
+                    let base_note = if index != 0 {
+                        String::new()
+                    } else if work.search.base_synthetic {
+                        " (assumed: trust_base)".to_owned()
+                    } else if !work.search.base_queue_landing {
+                        format!(
+                            "; the base {} is not a queue landing (it reached the branch outside a validated landing)",
+                            short(&current.parent)
+                        )
+                    } else {
+                        String::new()
+                    };
                     let reason = if failed.is_empty() {
                         format!(
-                            "{} with #{culprit} on top of {} ({confirmation}) and pass without it",
+                            "{} with #{culprit} on top of {} ({confirmation}) and pass without it{base_note}",
                             crate::validate::NO_RECORDED_RESULT,
                             if index == 0 {
                                 format!("the base {}", short(&current.parent))
@@ -9554,7 +9730,7 @@ impl<'a> Runner<'a> {
                         )
                     } else {
                         format!(
-                            "{} fail with #{culprit} on top of {} ({confirmation}) and pass without it",
+                            "{} fail with #{culprit} on top of {} ({confirmation}) and pass without it{base_note}",
                             ids(&failed.iter().cloned().collect::<Vec<_>>()),
                             if index == 0 {
                                 format!("the base {}", short(&current.parent))
@@ -9699,6 +9875,11 @@ impl<'a> Runner<'a> {
         work.flaky = flaky;
         work.carried = carried;
         work.attributed = attributed;
+        let base = if work.base_suspect {
+            BaseEvidence::default()
+        } else {
+            self.base_evidence(&current, &focus)
+        };
         work.search = CulpritSearch::new(
             &current,
             &focus,
@@ -9706,6 +9887,7 @@ impl<'a> Runner<'a> {
             work.deterministic,
             self.config.trust_base,
             self.config.validator.confirm_reruns,
+            base,
         );
         Ok(None)
     }
@@ -11273,5 +11455,188 @@ mod unit {
             "the poll exits promptly, took {:?}",
             started.elapsed()
         );
+    }
+
+    fn singleton_candidate() -> Candidate {
+        Candidate {
+            prs: vec![7],
+            parent: "b".repeat(40),
+            tip: "c".repeat(40),
+            prefixes: vec!["c".repeat(40)],
+            base: "b".repeat(40),
+        }
+    }
+
+    fn probe_ran(failed_test: Option<&str>) -> Ran {
+        let mut results = TestResults::default();
+        if let Some(test) = failed_test {
+            results.record(TestResult {
+                id: TestId::step(test),
+                outcome: Outcome::Fail,
+                duration_ms: None,
+                log: None,
+            });
+        } else {
+            results.record(TestResult {
+                id: TestId::step("t"),
+                outcome: Outcome::Pass,
+                duration_ms: None,
+                log: None,
+            });
+        }
+        Ran {
+            results,
+            exit: Some(if failed_test.is_some() { 1 } else { 0 }),
+            elapsed: Duration::ZERO,
+            log: PathBuf::new(),
+            cancelled: false,
+            interrupted: None,
+            handle: None,
+            refused: false,
+            flaky_passes: Vec::new(),
+            infra_blocked: Vec::new(),
+            rerun_exempt: failed_test
+                .map(|test| vec![TestId::step(test)])
+                .unwrap_or_default(),
+            suspect: Vec::new(),
+            cannot_execute: None,
+            effective_selection: None,
+            cpu: None,
+            donor: None,
+            early_red: false,
+            printed_tool_identity: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn trust_base_on_a_direct_push_base_probes_before_blaming_a_singleton() {
+        // #1187 mq-singleton-eject: trust_base with no queue landing and no
+        // recorded green is no evidence, so no Found verdict is decided and
+        // prefix 0 is probed first.
+        let candidate = singleton_candidate();
+        let failed: BTreeSet<TestId> = [TestId::step("t")].into_iter().collect();
+        let focus = Selection::of(failed.iter().cloned());
+        let mut search = CulpritSearch::new(
+            &candidate,
+            &focus,
+            &failed,
+            true,
+            true,
+            true,
+            BaseEvidence::default(),
+        );
+        assert!(!search.base_synthetic);
+        assert!(search.verdict().is_none());
+        assert!(search.probe_points(1).contains(&0));
+        // The base fails the same test alone: the base is red, not the change.
+        let verdict = search
+            .record(&[0], vec![Ok((1, probe_ran(Some("t"))))], true)
+            .unwrap();
+        assert!(verdict.is_none());
+        assert!(matches!(search.verdict(), Some(Culprit::BaseRed(_, _))));
+    }
+
+    #[test]
+    fn trust_base_on_a_direct_push_base_ejects_only_after_a_passing_probe() {
+        let candidate = singleton_candidate();
+        let failed: BTreeSet<TestId> = [TestId::step("t")].into_iter().collect();
+        let focus = Selection::of(failed.iter().cloned());
+        let mut search = CulpritSearch::new(
+            &candidate,
+            &focus,
+            &failed,
+            true,
+            true,
+            true,
+            BaseEvidence::default(),
+        );
+        assert!(search.verdict().is_none());
+        let verdict = search
+            .record(&[0], vec![Ok((1, probe_ran(None)))], true)
+            .unwrap();
+        assert!(verdict.is_none());
+        assert!(matches!(
+            search.verdict(),
+            Some(Culprit::Found { index: 0, .. })
+        ));
+        assert!(!search.base_synthetic);
+        assert!(!search.base_queue_landing);
+    }
+
+    #[test]
+    fn a_queue_landed_base_is_still_trusted_without_a_probe() {
+        let candidate = singleton_candidate();
+        let failed: BTreeSet<TestId> = [TestId::step("t")].into_iter().collect();
+        let focus = Selection::of(failed.iter().cloned());
+        let search = CulpritSearch::new(
+            &candidate,
+            &focus,
+            &failed,
+            true,
+            true,
+            true,
+            BaseEvidence {
+                queue_landing: true,
+                recorded_green: false,
+            },
+        );
+        assert!(search.base_synthetic);
+        assert!(search.base_queue_landing);
+        assert!(matches!(
+            search.verdict(),
+            Some(Culprit::Found { index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn a_recorded_green_on_the_base_is_measured_evidence() {
+        let candidate = singleton_candidate();
+        let failed: BTreeSet<TestId> = [TestId::step("t")].into_iter().collect();
+        let focus = Selection::of(failed.iter().cloned());
+        let search = CulpritSearch::new(
+            &candidate,
+            &focus,
+            &failed,
+            true,
+            true,
+            true,
+            BaseEvidence {
+                queue_landing: false,
+                recorded_green: true,
+            },
+        );
+        assert!(!search.base_synthetic);
+        assert!(matches!(
+            search.verdict(),
+            Some(Culprit::Found { index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn disjoint_batches_failing_the_same_test_mark_the_base_suspect() {
+        let failed: BTreeSet<TestId> = [TestId::step("t")].into_iter().collect();
+        let other: BTreeSet<TestId> = [TestId::step("u")].into_iter().collect();
+        let sightings = vec![BaseSighting {
+            parent: "b".repeat(40),
+            prs: vec![7],
+            failed: failed.clone(),
+        }];
+        // Disjoint, same base, same test: suspect.
+        assert_eq!(
+            disjoint_shared_failure(&sightings, &"b".repeat(40), &[8], &failed),
+            failed
+        );
+        // Same batch never matches itself.
+        assert!(disjoint_shared_failure(&sightings, &"b".repeat(40), &[7], &failed).is_empty());
+        // A different test or a different base never matches.
+        assert!(disjoint_shared_failure(&sightings, &"b".repeat(40), &[8], &other).is_empty());
+        assert!(disjoint_shared_failure(&sightings, &"d".repeat(40), &[8], &failed).is_empty());
+        // Overlapping batches are not disjoint.
+        let overlapping = vec![BaseSighting {
+            parent: "b".repeat(40),
+            prs: vec![7, 8],
+            failed: failed.clone(),
+        }];
+        assert!(disjoint_shared_failure(&overlapping, &"b".repeat(40), &[8], &failed).is_empty());
     }
 }

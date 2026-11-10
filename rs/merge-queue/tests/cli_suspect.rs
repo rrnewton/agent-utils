@@ -192,7 +192,9 @@ fn a_second_suspect_red_of_the_same_head_is_blamed_as_any_red_is() {
         ejected[0]["reason"].as_str().unwrap().contains(UNCONFIRMED),
         "{second}"
     );
-    assert_eq!(calls(&fx), vec!["all", "tests e", "all"]);
+    // Run two adds a probe of the base itself (#1187: the seed base is no
+    // queue landing, so it is measured before the blame).
+    assert_eq!(calls(&fx), vec!["all", "tests e", "all", "tests e"]);
 }
 
 #[test]
@@ -210,7 +212,8 @@ fn any_failure_that_is_not_suspect_is_blamed_at_once() {
         ejected[0]["reason"].as_str().unwrap().contains(UNCONFIRMED),
         "{report}"
     );
-    assert_eq!(calls(&fx), vec!["all"]);
+    // Plus the base probe (#1187: the seed base is no queue landing).
+    assert_eq!(calls(&fx), vec!["all", "tests c c2"]);
 }
 
 #[test]
@@ -220,5 +223,6 @@ fn without_the_flag_a_timeout_is_blamed_at_once() {
     fx.mq_ok(&["submit", "4", "--head", "d"]);
     let report = run(&fx);
     assert_eq!(report["ejected"].as_array().unwrap().len(), 1, "{report}");
-    assert_eq!(calls(&fx), vec!["all"]);
+    // Plus the base probe (#1187: the seed base is no queue landing).
+    assert_eq!(calls(&fx), vec!["all", "tests d"]);
 }

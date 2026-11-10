@@ -92,8 +92,10 @@ fn a_deterministic_check_red_once_is_ejected_without_a_rerun() {
     fx.branch("a", &[("tests/check.paths", "FAIL\n")]);
     fx.mq_ok(&["submit", "1", "--head", "a"]);
     let r = report(&fx, &[]);
-    // One validation: the batch. No same-commit confirmation was spent on it.
-    assert_eq!(purposes(&r), vec!["batch"], "{r}");
+    // The batch, plus one probe of the base itself: the seed base is no
+    // queue landing, so `trust_base` does not spare it (#1187
+    // mq-singleton-eject). No same-commit confirmation was spent on it.
+    assert_eq!(purposes(&r), vec!["batch", "probe"], "{r}");
     let ejected = &r["ejected"][0];
     assert_eq!(ejected["pr"], 1, "{r}");
     assert_eq!(ejected["kind"], "failed-tests");
@@ -118,7 +120,8 @@ fn a_failure_outside_the_named_checks_still_needs_its_second_sighting() {
     fx.mq_ok(&["submit", "1", "--head", "a"]);
     let r = report(&fx, &[]);
     // `unit_a` is not a named check: the batch's red is confirmed by a rerun of the same commit.
-    assert_eq!(purposes(&r), vec!["batch", "probe"], "{r}");
+    // The second probe is the base itself (#1187: the seed base is no queue landing).
+    assert_eq!(purposes(&r), vec!["batch", "probe", "probe"], "{r}");
     let validations = r["validations"].as_array().unwrap();
     assert_eq!(validations[0]["commit"], validations[1]["commit"]);
     let ejected = &r["ejected"][0];
@@ -154,12 +157,13 @@ fn a_deterministic_culprit_in_a_batch_needs_no_confirming_probe() {
             .contains("seen once: a deterministic check"),
         "{r}"
     );
-    // One round of probes (two at once: the probe width is the window): #1 alone passes, and
+    // One round of probes (the probe width is the window): the base itself
+    // (#1187: the seed base is no queue landing), #1 alone passes, and
     // #1+#2 fails the check once, which confirms it. Without the marker, a second round probes
     // #1+#2 again to see the failure twice. The full candidate is never probed again.
     assert_eq!(
         purposes(&r),
-        vec!["batch", "probe", "probe", "remainder"],
+        vec!["batch", "probe", "probe", "probe", "remainder"],
         "{r}"
     );
     let validations = r["validations"].as_array().unwrap();

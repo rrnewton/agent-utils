@@ -57,10 +57,12 @@ fn a_failure_that_passes_on_a_same_commit_rerun_lands_as_flaky() {
     let r: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
     assert_eq!(r["landed"][0]["prs"], serde_json::json!([1]));
     assert_eq!(r["landed"][0]["flaky"], serde_json::json!(["x"]));
-    // Two runs only: the full batch run, and a rerun of just `x` at the same commit, handed the
-    // first run's handle. The trusted base was not probed.
+    // The full batch run, a rerun of just `x` at the same commit (handed the
+    // first run's handle), and a probe of the base itself: the seed base is
+    // no queue landing, so `trust_base` does not spare it (#1187
+    // mq-singleton-eject).
     let validations = r["validations"].as_array().unwrap();
-    assert_eq!(validations.len(), 2, "{r}");
+    assert_eq!(validations.len(), 3, "{r}");
     assert_eq!(validations[0]["commit"], validations[1]["commit"]);
     assert_eq!(
         std::fs::read_to_string(&reruns).unwrap().trim(),
@@ -149,7 +151,9 @@ fn a_failure_the_validator_calls_green_flaky_on_rerun_is_held_not_landed() {
         "{}",
         r["stopped"]
     );
-    assert_eq!(r["validations"].as_array().unwrap().len(), 2, "{r}");
+    // Batch, same-commit rerun, and the base probe (#1187: the seed base
+    // is no queue landing, so it is probed too).
+    assert_eq!(r["validations"].as_array().unwrap().len(), 3, "{r}");
     assert_eq!(item["status"], "queued", "{item}");
     assert_eq!(item["flaky_nodes"], serde_json::json!(["x"]), "{item}");
     assert!(item.get("hold_verdict").is_none(), "{item}");

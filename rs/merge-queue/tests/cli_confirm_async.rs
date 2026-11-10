@@ -268,7 +268,13 @@ fn a_green_probe_rerun_lands_the_red_as_flaky() {
     let (code, report, stderr) = finish(run);
     assert_eq!(code, Some(0), "{stderr}");
     assert_eq!(item_status(&fx, 1), "landed");
-    assert_eq!(purposes(&report), vec!["batch", "probe"], "{report}");
+    // The seed base is no queue landing, so the search probes it (prefix 0)
+    // beside the rerun of the batch itself (#1187 mq-singleton-eject).
+    assert_eq!(
+        purposes(&report),
+        vec!["batch", "probe", "probe"],
+        "{report}"
+    );
     let landed = report["landed"].as_array().unwrap();
     assert_eq!(landed.len(), 1, "{report}");
 }
@@ -325,12 +331,13 @@ fn two_reds_probe_side_by_side() {
     assert_eq!(code, Some(0), "{stderr}");
     assert_eq!(item_status(&fx, 1), "ejected", "{report}");
     assert_eq!(item_status(&fx, 2), "ejected", "{report}");
+    // Each red probes its own rerun and the (unlanded) seed base (#1187).
     assert_eq!(
         purposes(&report)
             .iter()
             .filter(|purpose| *purpose == "probe")
             .count(),
-        2,
+        4,
         "{report}"
     );
 }
@@ -385,21 +392,24 @@ fn a_cancelled_probe_is_handled_without_blaming_the_run() {
     let clone = donor_clone(&fx, "donor-host");
     let run = spawn_run(&fx, &["--depth", "2"]);
     let mut donor = spawn_donor(&fx, &clone, "d1");
-    // The probe is published and leased (its validation gated) before the
-    // cancellation: two jobs, the second one leased.
+    // The probes are published and leased (their validations gated) before
+    // the cancellation: the batch plus its probe round (the rerun and, the
+    // seed base being no queue landing, the base itself; #1187).
     wait_for(
-        "the probe job to be leased",
+        "the probe jobs to be leased",
         Duration::from_secs(60),
-        || jobs(&fx).len() >= 2 && jobs(&fx).iter().any(|job| job["state"] == "leased"),
+        || jobs(&fx).len() >= 3 && jobs(&fx).iter().any(|job| job["state"] == "leased"),
     );
-    let probe_id = jobs(&fx)
+    let probe_ids: Vec<String> = jobs(&fx)
         .into_iter()
-        .find(|job| job["state"] == "leased")
+        .filter(|job| job["state"] != "done")
         .map(|job| job["id"].as_str().unwrap().to_owned())
-        .unwrap();
+        .collect();
     donor.kill().unwrap();
     let _ = donor.wait();
-    cancel_job_file(&fx, &probe_id);
+    for probe_id in &probe_ids {
+        cancel_job_file(&fx, probe_id);
+    }
     let (code, report, stderr) = finish(run);
     assert_eq!(code, Some(0), "{stderr}");
     // No verdict from the probe: the red run itself decides, and the
@@ -472,20 +482,15 @@ fn a_restart_recovers_a_probe_that_is_still_out() {
     let _ = donor_child.wait();
     assert_eq!(item_status(&fx, 1), "queued");
     // A fresh run revalidates and re-probes; the verdict still decides it.
+    // A persistent donor (see two_reds_probe_side_by_side): an
+    // `--until-idle` donor can exit before the second probe of the round
+    // (the rerun and the unlanded seed base; #1187) is published.
     std::fs::write(gates.join("probe"), "").unwrap();
     let second = spawn_run(&fx, &["--depth", "2"]);
-    wait_for(
-        "a queued job for the second run",
-        Duration::from_secs(60),
-        || jobs(&fx).iter().any(|job| job["state"] == "queued"),
-    );
-    let out = donor(&fx, &clone, "d2");
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let mut donor2 = spawn_donor(&fx, &clone, "d2");
     let (code, _report, stderr) = finish(second);
+    donor2.kill().unwrap();
+    let _ = donor2.wait();
     assert_eq!(code, Some(0), "{stderr}");
     assert_eq!(item_status(&fx, 1), "ejected");
 }
