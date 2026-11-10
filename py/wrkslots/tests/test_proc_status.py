@@ -16,6 +16,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import textwrap
 import threading
 import time
@@ -2724,7 +2725,7 @@ def test_failed_probe_self_test_keeps_a_gap_unknown(
     tmp_path: Path, socket_world: set[int], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _dead_node(tmp_path / "dead")
-    monkeypatch.setattr(cli, "_socket_probe_self_test", lambda: (False, "rigged answer"))
+    monkeypatch.setattr(cli, "_socket_probe_self_test", lambda *_a: (False, "rigged answer"))
     original = cli._socket_namespace_handles
 
     def with_gap(gaps: list[str], privileged: object = None) -> cli._NamespaceScan:
@@ -2738,7 +2739,7 @@ def test_failed_probe_self_test_keeps_a_gap_unknown(
     assert [verdict.verdict for verdict in verdicts] == ["UNKNOWN"]
     assert "self-test failed: rigged answer" in verdicts[0].reason
     assert verdicts[0].gaps_overridden == () and evidence.self_test == "failed: rigged answer"
-    monkeypatch.setattr(cli, "_socket_probe_self_test", lambda: (True, "ok"))
+    monkeypatch.setattr(cli, "_socket_probe_self_test", lambda *_a: (True, "ok"))
     verdicts, _evidence = cli._prove_socket_nodes(
         {tmp_path: "slot"}, deadline=time.monotonic() + 60, probe=True, allow_calibration=True,
     )
@@ -2756,8 +2757,93 @@ def test_probe_self_test_passes_on_this_kernel_and_is_kept_per_boot(monkeypatch:
         "bound in another namespace: stream ECONNREFUSED/seqpacket EPROTOTYPE; "
         "released: stream ECONNREFUSED/seqpacket ECONNREFUSED"
     )
-    monkeypatch.setattr(cli, "_run_socket_probe_self_test", lambda: (False, "not run again"))
+    monkeypatch.setattr(cli, "_run_socket_probe_self_test", lambda *_a: (False, "not run again"))
     assert cli._socket_probe_self_test() == (passed, detail)
+
+
+@pytest.mark.parametrize("ending", ["pass", "rigged-failure", "holder-never-starts", "holder-dies"])
+def test_probe_self_test_directory_is_0700_and_removed_on_every_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest, ending: str,
+) -> None:
+    # A short parent, as /run/user/<uid> is: a socket path is limited to 108 bytes.
+    parent = Path(tempfile.mkdtemp(prefix="wst-", dir="/tmp"))
+    request.addfinalizer(lambda: shutil.rmtree(parent, ignore_errors=True))
+    if ending == "rigged-failure":
+        monkeypatch.setattr(cli, "_socket_connect_errno", lambda *_a: 0)
+    elif ending == "holder-never-starts":
+        monkeypatch.setattr(shutil, "which", lambda _name: str(tmp_path / "no-such-unshare"))
+    elif ending == "holder-dies":
+        monkeypatch.setattr(shutil, "which", lambda _name: "/bin/false")
+    made: list[tuple[str, int]] = []
+    original_mkdir = os.mkdir
+
+    def mkdir(path: str | os.PathLike[str], mode: int = 0o777, **kwargs: int) -> None:
+        original_mkdir(path, mode, **kwargs)
+        if Path(path).parent == parent:
+            made.append((Path(path).name, stat.S_IMODE(os.stat(path).st_mode)))
+
+    monkeypatch.setattr(os, "mkdir", mkdir)
+    passed, detail = cli._run_socket_probe_self_test(parent)
+    assert list(parent.iterdir()) == [], detail
+    assert len(made) == 1 and made[0][1] == 0o700
+    assert cli._SOCKET_SELF_TEST_RE.fullmatch(made[0][0])
+    if ending == "pass":
+        if not passed and "could not be made" in detail:
+            pytest.skip(f"no user and network namespace: {detail}")
+        assert passed, detail
+    else:
+        assert not passed
+        assert {
+            "rigged-failure": "bound in another namespace: stream connected",
+            "holder-never-starts": "could not be started",
+            "holder-dies": "could not be made",
+        }[ending] in detail
+
+
+def test_probe_self_test_ignores_tmpdir_and_never_runs_inside_a_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "target"
+    (target / "tmp").mkdir(parents=True)
+    monkeypatch.setenv("TMPDIR", str(target / "tmp"))
+    chosen = cli._socket_self_test_parent()
+    assert chosen in (Path(f"/run/user/{os.getuid()}"), Path("/tmp"))
+    assert not os.path.realpath(chosen).startswith(os.path.realpath(target))
+    monkeypatch.setattr(cli, "_socket_self_test_parent", lambda: target / "tmp")
+    monkeypatch.setattr(cli, "_SOCKET_SELF_TEST_CACHE", {})
+
+    def never(_parent: Path) -> tuple[bool, str]:
+        raise AssertionError("the self-test ran inside a census target")
+
+    monkeypatch.setattr(cli, "_run_socket_probe_self_test", never)
+    passed, detail = cli._socket_probe_self_test((tmp_path / "other", target))
+    assert not passed and f"is inside census target {target}" in detail
+    assert cli._SOCKET_SELF_TEST_CACHE == {} and list((target / "tmp").iterdir()) == []
+
+
+def test_probe_self_test_sweeps_only_stale_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ticks = cli._quiet_start_ticks(Path("/proc/self"))
+    assert ticks is not None
+
+    def leftover(name_ticks: int, tag: str, *, extra: bool = False) -> Path:
+        directory = tmp_path / f"wrkslots-probe-selftest.{os.getpid()}.{name_ticks}.{tag * 16}"
+        directory.mkdir(mode=0o700)
+        os.mknod(directory / "s", stat.S_IFSOCK | 0o600)
+        if extra:
+            (directory / "keep").write_bytes(b"")
+        return directory
+
+    stale = leftover(ticks + 1, "a")
+    alive = leftover(ticks, "b")
+    foreign = leftover(ticks + 1, "c", extra=True)
+    other = tmp_path / "wrkslots-probe-selftest-legacy"
+    other.mkdir()
+    monkeypatch.setattr(shutil, "which", lambda _name: str(tmp_path / "no-such-unshare"))
+    passed, _detail = cli._run_socket_probe_self_test(tmp_path)
+    assert not passed
+    assert not stale.exists() and alive.exists() and foreign.exists() and other.exists()
 
 
 def test_finish_journal_records_every_overridden_gap(tmp_path: Path) -> None:

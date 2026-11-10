@@ -1925,7 +1925,11 @@ gaps do not block DEAD once both probes are refused, because the probes do not d
 namespaces. But they do so only after a self-test passes: a process in a fresh unprivileged user
 and network namespace binds a non-listening stream socket, and the probes from this namespace must
 answer exactly `ECONNREFUSED` for stream and `EPROTOTYPE` for seqpacket. The self-test runs at most
-once per boot in each process. If it fails, every gap leaves its node UNKNOWN. Each overridden gap
+once per boot in each process. Its socket node is in a fresh 0700
+`wrkslots-probe-selftest.<pid>.<start>.<tag>` directory under `/run/user/<uid>` (or `/tmp` when that
+is missing), never under `TMPDIR`. The directory is removed on every path, and stale ones from a
+crashed run are swept first. If that location lies inside a path being judged, the self-test does
+not run and counts as failed. If it fails, every gap leaves its node UNKNOWN. Each overridden gap
 is recorded in the verdict as "gap overridden by dual-type probe: ...". The finish journal of a
 reclaimed path records them under `x.socket_proof`, along with the number of nodes proven dead.
 

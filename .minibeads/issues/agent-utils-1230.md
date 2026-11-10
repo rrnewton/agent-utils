@@ -94,6 +94,14 @@ The other edition's census has no socket-node proof and keeps refusing socket no
 
 A consumer that loads its own pinned copy gets this only when its pin moves past the landing commit. Until then its cleanup keeps refusing socket-node trees, which is safe.
 
+## Follow-up: the self-test's directory (lead, 2026-11-10)
+
+[opus 5.5] Landed in 3447358a, the self-test used `tempfile.TemporaryDirectory`, which honours TMPDIR, so a caller whose TMPDIR was inside a slot would have put the self-test's node in that slot's tree. The lead approved landing first, with these follow-up points:
+1. TMPDIR is ignored: the directory goes under /run/user/<uid> when that is a directory this user owns, else under /tmp.
+2. The self-test does not run, and counts as failed so the override stays off, when that parent resolves inside any census target.
+3. The directory is named `wrkslots-probe-selftest.<pid>.<start-ticks>.<random>`, made 0700, and removed on every path. Each run first sweeps stale ones: owned by this user, creator gone, holding only `s`.
+4. Tests cover removal after a pass, a rigged failure, a holder that never starts and a holder that dies, the 0700 mode, a TMPDIR inside a target being ignored, the in-target refusal, and the sweep.
+
 ## Resolution
 
 Delivered as described above. Still pending, by the lead's request: the read-only `socket-census` cost measurement on a consumer's validate checkouts (paths come from the coordinator). Its numbers will be added here in an issue-only commit.

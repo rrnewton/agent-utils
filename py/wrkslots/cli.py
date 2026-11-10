@@ -69065,13 +69065,23 @@ def _stale_socket_calibrations(root: Path) -> list[Path]:
     remove them.
     """
 
+    return _stale_socket_directories(root, _SOCKET_CALIBRATION_RE)
+
+
+def _stale_socket_directories(root: Path, pattern: re.Pattern[str]) -> list[Path]:
+    """Entries of ``root`` named by ``pattern`` (creator PID, start ticks, tag) left by a crash.
+
+    Only a directory owned by this user, whose creator is gone (no process
+    with that PID and start time), holding nothing but a socket node ``s``.
+    """
+
     stale: list[Path] = []
     try:
         entries = list(os.scandir(root))
     except OSError:
         return stale
     for entry in entries:
-        match = _SOCKET_CALIBRATION_RE.fullmatch(entry.name)
+        match = pattern.fullmatch(entry.name)
         if match is None:
             continue
         try:
@@ -69097,8 +69107,14 @@ def _stale_socket_calibrations(root: Path) -> list[Path]:
 def _remove_stale_socket_calibrations(root: Path) -> list[str]:
     """Remove the calibration directories :func:`_stale_socket_calibrations` finds."""
 
+    return _remove_stale_socket_directories(root, _SOCKET_CALIBRATION_RE)
+
+
+def _remove_stale_socket_directories(root: Path, pattern: re.Pattern[str]) -> list[str]:
+    """Remove what :func:`_stale_socket_directories` finds; the paths removed."""
+
     removed: list[str] = []
-    for directory in _stale_socket_calibrations(root):
+    for directory in _stale_socket_directories(root, pattern):
         try:
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(directory / "s")
@@ -69757,9 +69773,30 @@ def _probe_socket_node(
 
 _SOCKET_SELF_TEST_CACHE: dict[str, tuple[bool, str]] = {}
 _SOCKET_SELF_TEST_SECONDS = 20.0
+_SOCKET_SELF_TEST_RE = re.compile(
+    r"wrkslots-probe-selftest\.([0-9]+)\.([0-9]+)\.([0-9a-f]{16})"
+)
+"""A self-test directory: creator PID, creator start ticks, random tag."""
 
 
-def _socket_probe_self_test() -> tuple[bool, str]:
+def _socket_self_test_parent() -> Path:
+    """Where the self-test makes its directory: never TMPDIR, never a slot.
+
+    The per-user runtime directory /run/user/<uid> when it is a real
+    directory owned by this user, else /tmp.
+    """
+
+    runtime = Path(f"/run/user/{os.getuid()}")
+    try:
+        metadata = os.stat(runtime, follow_symlinks=False)
+    except OSError:
+        return Path("/tmp")
+    if stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == os.getuid():
+        return runtime
+    return Path("/tmp")
+
+
+def _socket_probe_self_test(targets: Sequence[Path] = ()) -> tuple[bool, str]:
     """Whether this kernel's connect() answers as the dual-type probe needs (#1230).
 
     A gap may be overridden by the probe only while this passes.  A process
@@ -69767,22 +69804,35 @@ def _socket_probe_self_test() -> tuple[bool, str]:
     stream socket; from this namespace a stream probe must answer
     ECONNREFUSED and a seqpacket probe EPROTOTYPE, and after it closes the
     socket both must answer ECONNREFUSED.  Anything else, or no namespace,
-    fails.  The result is kept per boot ID, for this process only.
+    fails.  It also fails, without running, when its directory's parent lies
+    inside one of the census ``targets``, so its node can never be one of
+    theirs.  A result is kept per boot ID, for this process only.
     """
 
+    parent = _socket_self_test_parent()
+    resolved = os.path.realpath(parent)
+    for target in targets:
+        root = os.path.realpath(target)
+        if resolved == root or resolved.startswith(root.rstrip("/") + "/"):
+            return False, f"its directory's parent {parent} is inside census target {target}"
     try:
         boot = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
     except OSError:
         boot = ""
     if boot and boot in _SOCKET_SELF_TEST_CACHE:
         return _SOCKET_SELF_TEST_CACHE[boot]
-    result = _run_socket_probe_self_test()
+    result = _run_socket_probe_self_test(parent)
     if boot:
         _SOCKET_SELF_TEST_CACHE[boot] = result
     return result
 
 
-def _run_socket_probe_self_test() -> tuple[bool, str]:
+def _run_socket_probe_self_test(parent: Path) -> tuple[bool, str]:
+    """Run the self-test in a fresh 0700 directory under ``parent``, removed on every path.
+
+    Stale self-test directories a crashed run left there are swept first.
+    """
+
     code = (
         "import os, socket, sys\n"
         "s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
@@ -69795,8 +69845,15 @@ def _run_socket_probe_self_test() -> tuple[bool, str]:
     )
     unshare = shutil.which("unshare") or "/usr/bin/unshare"
     names = {0: "connected", **{number: name for number, name in errno.errorcode.items()}}
-    with tempfile.TemporaryDirectory(prefix="wrkslots-probe-selftest-") as work:
-        node = os.path.join(work, "s")
+    _remove_stale_socket_directories(parent, _SOCKET_SELF_TEST_RE)
+    ticks = _quiet_start_ticks(Path("/proc/self"))
+    work = parent / f"wrkslots-probe-selftest.{os.getpid()}.{ticks}.{secrets.token_hex(8)}"
+    try:
+        os.mkdir(work, 0o700)
+    except OSError as exc:
+        return False, f"self-test directory could not be made: {exc}"
+    node = os.path.join(work, "s")
+    try:
         try:
             holder = subprocess.Popen(
                 [unshare, "--user", "--map-root-user", "--net", "--",
@@ -69832,6 +69889,11 @@ def _run_socket_probe_self_test() -> tuple[bool, str]:
                 holder.kill()
             with contextlib.suppress(OSError, subprocess.TimeoutExpired):
                 holder.communicate(timeout=5)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(node)
+        with contextlib.suppress(OSError):
+            os.rmdir(work)
     detail = (
         "bound in another namespace: stream " + "/seqpacket ".join(
             names.get(number, str(number)) for number in held
@@ -69929,7 +69991,7 @@ def _prove_socket_nodes(
                 # one table for every namespace, so a refusal from both types
                 # overrides a visibility gap, once the kernel passes the self-test.
                 if second.self_test is None:
-                    passed, report = _socket_probe_self_test()
+                    passed, report = _socket_probe_self_test(tuple(targets))
                     second.self_test = ("passed: " if passed else "failed: ") + report
                 if not second.self_test.startswith("passed: "):
                     final.append(_SocketVerdict(
