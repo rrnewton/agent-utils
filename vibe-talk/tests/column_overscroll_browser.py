@@ -286,6 +286,7 @@ def arguments() -> argparse.Namespace:
 # (`#624 voice-page-modularity`).
 FOOT_ROOMS = "src/view/channel/footroom.ts"
 LIST_KEEPERS = "src/view/channel/listkeepers.ts"
+LIT_CARDS = "src/view/channel/litcards.ts"
 
 # Each negative control: its name, the file of the page it changes, the texts it takes out and what it puts in
 # their place, and the checks (by their tags) one of which must be the one that fails. A patch naming a file of its
@@ -302,8 +303,8 @@ CONTROLS: tuple[Control, ...] = (
     ("no rest asked of the wheel", FOOT_ROOMS,
      (("const OVERSCROLL_REST_MS = 150;\n", "const OVERSCROLL_REST_MS = 0;\n"),), ("DETENT",)),
     ("the last card's change of size neither fitted to nor held", "voice.js",
-     (("  fitOverscroll(pane.scroller());\n  pane.scroller().scrollTop += row.getBoundingClientRect().top - before;\n",
-       "  pane.scroller().scrollTop += row.getBoundingClientRect().top - before;\n"),
+     ((LIT_CARDS, "    deps.fitOverscroll(pane.scroller());\n    pane.scroller().scrollTop += row.getBoundingClientRect().top - before;\n",
+       "    pane.scroller().scrollTop += row.getBoundingClientRect().top - before;\n"),
       (LIST_KEEPERS, "      holdOverscrollReader(area);\n      const was = footing;\n", "      const was = footing;\n")),
      ("HIGHLIGHT",)),
     ("the search not what the room was opened over", "voice.js",

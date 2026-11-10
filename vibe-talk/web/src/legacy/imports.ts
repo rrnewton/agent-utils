@@ -193,3 +193,5 @@ export { createOfflineCache, createThreadStrip } from "../view/channel/index.ts"
 export { createScrollTrace } from "../view/channel/index.ts";
 // read state's acts beside Done's (#624 mu-keyread)
 export { createReadActs } from "../view/channel/index.ts";
+// one card highlighted (#624 mu-keyread)
+export { createLitCards } from "../view/channel/index.ts";

@@ -4608,10 +4608,10 @@ const threadList = createThreadList({
   sideCardReplies,
   sideCardUnread,
   threadIsRead,
-  cardOpener,
-  toggleLitCard,
-  paintLitCard,
-  enterCard,
+  cardOpener: (prefix, replies, unread, open) => cardOpener(prefix, replies, unread, open),
+  toggleLitCard: (id, row) => toggleLitCard(id, row),
+  paintLitCard: (row, id) => paintLitCard(row, id),
+  enterCard: (id, summary, row) => enterCard(id, summary, row),
   cardMessageCount,
   searchable,
   threadHue: (id) => threadHue(String(id)),
@@ -5832,7 +5832,7 @@ const serverSearchCopy = createServerSearchCopy({
     `/api/v1/channels/${encodeURIComponent(channel)}/history/prioritize`, { method: "POST" }),
   fetchHistoryState: (channel) => apiDecoded("ChannelHistoryState", `/api/v1/channels/${encodeURIComponent(channel)}/history`),
   scheduleServerSearch: () => scheduleServerSearch(),
-  cardsOnScreen,
+  cardsOnScreen: () => cardsOnScreen(),
   inColumn,
   syncUnreadReplies: () => syncUnreadReplies(),
   saveChannelScope,
@@ -7471,227 +7471,41 @@ function foldCardRuns(list) {
 //     to the cards, the keys on the card entered, as Esc and the X come back to them; in one column ←,
 //     Esc and Back come back to the Threads list, as they always did.
 
-/**
- * By channel, the thread whose card is highlighted, for this session.
- *
- * @type {Map<string, string>}
- */
-const litCards = new Map();
-
-/** The thread whose card is highlighted in the channel on screen, or null. */
-function litCard() {
-  // `#440 thread-card-pack-toggle`. The Threads view highlights no card: a press there packs and unpacks.
-  if (cardsCycle()) return null;
-  return litCards.get(String(selectedChannelId())) || null;
-}
-
-/** The thread a card of either list stands for. */
-const cardThread = (/** @type {HTMLElement} */ row) =>
-  String(row.getAttribute(row.hasAttribute("data-card") ? "data-id" : "data-context-id"));
-
-/**
- * Draw `row`, the card of thread `id`, highlighted or not: `data-highlighted` on it, which the stylesheet
- * draws, and its button saying whether the card is expanded. Written only where it changes.
- *
- * @param {HTMLElement} row
- * @param {string} id
- */
-function paintLitCard(row, id) {
-  const lit = litCard() === id;
-  if (row.hasAttribute("data-highlighted") !== lit) {
-    if (lit) row.setAttribute("data-highlighted", "true");
-    else row.removeAttribute("data-highlighted");
-  }
-  const button = childByClass(row, row.hasAttribute("data-card") ? "side-card" : "thread-open");
-  // In the Threads view, whether the card is shown whole, unpacked or not (`#440 thread-card-pack-toggle`).
-  const whole = cardsCycle() && row.hasAttribute("data-card") ? row.getAttribute("data-card-state") !== "collapsed" : lit;
-  const expanded = whole ? "true" : "false";
-  if (button && button.getAttribute("aria-expanded") !== expanded) button.setAttribute("aria-expanded", expanded);
-}
-
-/** Draw every card of both lists as the highlight now stands, and the links between the columns with it. */
-function paintLitCards() {
-  for (const list of ["side-cards", "thread-list"]) {
-    for (const row of /** @type {HTMLElement[]} */ ([...leftEl(list).children])) {
-      if (row.hasAttribute("data-unpack-thread") || row.hasAttribute("data-main-row")) continue;
-      paintLitCard(row, cardThread(row));
-    }
-  }
-  noteLinkedSelection();
-}
-
-/**
- * A press on card `row`, of thread `id`: highlighted, or put out when it is the one highlighted. The card
- * stays where it was on the screen, and is then shown whole where it fits: a card grown past the foot of
- * its list comes up as far as shows it, and one taking the highlight from a card above it does not jump
- * up as that one shrinks.
- *
- * @param {string} id
- * @param {HTMLElement} row
- */
-function toggleLitCard(id, row) {
-  const channel = String(selectedChannelId());
-  if (litCards.get(channel) === id) litCards.delete(channel);
-  else litCards.set(channel, id);
-  const pane = row.parentNode === leftEl("side-cards") ? sidePane : channelPane;
-  const before = rowShown(row) ? row.getBoundingClientRect().top : null;
-  paintLitCards();
-  if (before === null || !row.parentNode) return;
-  // `#338 column-overscroll`. In the room past the right column's foot, the room is fitted to the card as it
-  // now is before the card is put back: the last card put out would otherwise be held by the end of the list
-  // the browser clamped to, and dropped by what it lost.
-  fitOverscroll(pane.scroller());
-  pane.scroller().scrollTop += row.getBoundingClientRect().top - before;
-  bringIntoView(pane, row);
-  noteOverscrollReader(pane.scroller());
-}
-
-/**
- * A card's way into its thread: "3 replies · 2 unread", the owner's "N reply M unread" bit, a button of
- * its own beside the card's, which only highlights. Its parts are named for its list, by `prefix`:
- * "side-card" on the right, "thread-card" in the Threads list. With no count and nothing unread it says
- * "Open thread". A screen reader hears what it does, in the words it shows.
- *
- * @param {string} prefix
- * @param {string} replies "3 replies", "about 3 replies", or "".
- * @param {string} unread "2 unread", "2+ unread", "1 new", or "".
- * @param {() => void} open
- */
-function cardOpener(prefix, replies, unread, open) {
-  const button = document.createElement("button");
-  button.className = `${prefix}-open`;
-  button.setAttribute("type", "button");
-  button.append(...cardCountParts(prefix, replies, unread, "Open thread"));
-  const said = [replies, unread].filter(Boolean).join(" · ");
-  button.setAttribute("aria-label", said ? `Open this thread, ${said}` : "Open thread");
-  button.setAttribute("title", "Open this thread");
-  sayRowShortcut(button, `${prefix}-open`);
-  button.addEventListener("click", open);
-  return button;
-}
-
-/**
- * What a card says of its thread's replies, "3 replies · 2 unread", as the parts it is drawn in: the
- * count, and the unread in the accent (`${prefix}-replies`, `${prefix}-unread`). The one place those
- * words and that accent are made, for the button into a card's thread (`cardOpener`) and for the card
- * at the top of an open thread (`paintThreadCard`, `#298 thread-card-header`). With neither, `empty`
- * alone, or nothing for "".
- *
- * @param {string} prefix
- * @param {string} replies "3 replies", "about 3 replies", or "".
- * @param {string} unread "2 unread", "2+ unread", "1 new", or "".
- * @param {string} [empty]
- * @returns {Node[]}
- */
-function cardCountParts(prefix, replies, unread, empty = "") {
-  /** @type {Node[]} */
-  const parts = [];
-  if (replies || (!unread && empty)) {
-    const count = document.createElement("span");
-    count.className = `${prefix}-replies`;
-    count.textContent = replies || empty;
-    parts.push(count);
-  }
-  if (unread) {
-    const fresh = document.createElement("span");
-    fresh.className = `${prefix}-unread`;
-    fresh.textContent = unread;
-    if (parts.length) parts.push(document.createTextNode(" · "));
-    parts.push(fresh);
-  }
-  return parts;
-}
-
-/**
- * Into the thread of card `row`, by its replies button or →. In two columns on the right, noted as
- * entered from the cards so that ← goes back out to them (`threadOutFromKeyboard`); in one column as
- * any thread opens, its Back the way to the Threads list. From the thread list, across the window, its
- * Back, Esc and ← the way back to the list (`openThreadFromList`, `#281 view-keys`).
- *
- * `#298 thread-card-header`. On the right the keys go into the thread with it, from a click as from →:
- * the button pressed was in the cards, which have just gone, and a browser drops the focus of a control
- * that goes on the page's body, where the next key and the next redraw of Main would not find the
- * right column (`#284 redraw-keeps-pane`).
- *
- * @param {string} id
- * @param {any} summary
- * @param {HTMLElement} row
- */
-function enterCard(id, summary, row) {
-  if (row.parentNode !== leftEl("side-cards")) return openThread(id, summary);
-  if (layoutShown.threadList()) return openThreadFromList(id, summary);
-  const opened = selectSideThread(id, summary);
-  columns.side.fromCards = true;
-  if (sideShowing()) focusList(sidePane);
-  return opened;
-}
-
-/** The right column's card of thread `id`, or null. */
-function cardRowOnRight(/** @type {string | null} */ id) {
-  if (id === null) return null;
-  return /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]).find((row) => row.getAttribute("data-id") === id) || null;
-}
-
-/** The thread whose card is highlighted while that card shows on the right beside Main, which the links follow; else null. */
-function litCardOnRight() {
-  if (!columnLinksShown() || columns.side.mode !== "list") return null;
-  const row = cardRowOnRight(litCard());
-  return row && rowShown(row) ? String(row.getAttribute("data-id")) : null;
-}
-
-/**
- * The thread cards on screen: the right column's while two columns show them, or the thread list does
- * (`#281 view-keys`: the same cards, across the window), or the Threads list in one column. Null
- * otherwise.
- *
- * @returns {HTMLElement | null}
- */
-function cardsOnScreen() {
-  if (!channelOnScreen()) return null;
-  if (sideColumnUp()) return columns.side.mode === "list" ? leftEl("side-cards") : null;
-  return inColumn(columns.main, () => (selection().view === "threads" && !pinsView().only ? leftEl("thread-list") : null));
-}
-
-/**
- * The card → goes into, on the cards on screen — the right column's while the key is for that column,
- * or the Threads list in one column: the card whose own button holds the focus, as Tab leaves it, which
- * is the card the key was pressed on; else, with the keys on a message unpacked under a card, that card,
- * as → on a message of All goes into its thread (`#407 unpack-row-parity`); else the highlighted card
- * while it shows; else, on the right, the card the keys are on, while it is on screen. Null anywhere
- * else.
- *
- * @param {HTMLElement} target
- * @returns {HTMLElement | null}
- */
-function cardForArrow(target) {
-  const list = cardsOnScreen();
-  const right = list === leftEl("side-cards");
-  if (!list || (right && paneFor(target) !== sidePane)) return null;
-  const rows = /** @type {HTMLElement[]} */ ([...list.children])
-    .filter((row) => !row.hasAttribute("data-unpack-thread") && !row.hasAttribute("data-main-row") && rowShown(row));
-  const held = rows.find((row) => row !== target && nodeWithin(row, target));
-  if (held) return held;
-  const keyed = right ? keyContext(target).row : null;
-  const under = keyed ? keyed.getAttribute("data-unpack-thread") : null;
-  if (under !== null) return rows.find((row) => cardThread(row) === under) || null;
-  const lit = litCard();
-  const chosen = lit === null ? undefined : rows.find((row) => cardThread(row) === lit);
-  if (chosen) return chosen;
-  if (!right) return null;
-  const { row } = keyContext(target);
-  return row && row.hasAttribute("data-card") && rowInView(sidePane, row) ? row : null;
-}
-
-/** Esc: the highlighted card on screen put out. Whether there was one. */
-function putOutLitCard() {
-  const list = cardsOnScreen();
-  const lit = litCard();
-  const row = list && lit !== null
-    ? /** @type {HTMLElement[]} */ ([...list.children]).find((one) => cardThread(one) === lit && rowShown(one)) : undefined;
-  if (!row || lit === null) return false;
-  toggleLitCard(lit, row);
-  return true;
-}
+// By channel, the thread whose card is highlighted, for this session, and the cards' acts over
+// it are web/src/view/channel's now (`createLitCards`, `#624 voice-page-modularity`). Entering a
+// thread stays the page's: `enterCard` only calls its entry acts, handed in below.
+const litCardsOwner = createLitCards({
+  cardsCycle: () => cardsCycle(),
+  selectedChannelId: () => selectedChannelId(),
+  leftById: leftEl,
+  noteLinkedSelection: () => noteLinkedSelection(),
+  rowShown: (row) => rowShown(/** @type {any} */ (row)),
+  sidePane: () => sidePane,
+  channelPane: () => channelPane,
+  fitOverscroll: (area) => fitOverscroll(area),
+  bringIntoView: (pane, row) => bringIntoView(/** @type {any} */ (pane), row),
+  noteOverscrollReader: (area) => noteOverscrollReader(area),
+  sayRowShortcut: (button, className) => sayRowShortcut(button, className),
+  openThread: (id, summary) => openThread(id, /** @type {any} */ (summary)),
+  openThreadFromList: (id, summary) => openThreadFromList(id, /** @type {any} */ (summary)),
+  selectSideThread: (id, summary) => selectSideThread(id, /** @type {any} */ (summary)),
+  markSideFromCards: () => { columns.side.fromCards = true; },
+  threadListShown: () => layoutShown.threadList(),
+  sideShowing: () => sideShowing(),
+  focusList: (pane) => focusList(/** @type {any} */ (pane)),
+  columnLinksShown: () => columnLinksShown(),
+  sideMode: () => columns.side.mode,
+  channelOnScreen: () => channelOnScreen(),
+  sideColumnUp: () => sideColumnUp(),
+  inMainColumn: (act) => inColumn(columns.main, act),
+  selectionView: () => selection().view,
+  pinsOnly: () => pinsView().only,
+  paneFor: (target) => paneFor(/** @type {any} */ (target)),
+  nodeWithin: (root, node) => nodeWithin(root, node),
+  keyRow: (target) => keyContext(/** @type {any} */ (target)).row,
+  rowInView: (pane, row) => rowInView(/** @type {any} */ (pane), row),
+});
+const { litCard, cardThread, paintLitCard, paintLitCards, toggleLitCard, cardOpener, cardCountParts, enterCard, cardRowOnRight, litCardOnRight, cardsOnScreen, cardForArrow, putOutLitCard } = litCardsOwner;
 
 // --- the card at the top of an open thread --------------------------------------------------------
 //

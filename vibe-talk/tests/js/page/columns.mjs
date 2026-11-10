@@ -3240,7 +3240,8 @@ test("`#298 thread-card-header` x `#284 redraw-keeps-pane`: a click on a card's 
   assert.deepStrictEqual(await run(SCRIPT), { keys: true, closed: true, fromCard: true },
     "the keys did not follow a click into the thread on the right, or a key on its card went to Main");
   // The controls: the keys left where the click found them, and the heading's keys left to Main.
-  const stayed = await run(brokenScript("  if (sideShowing()) focusList(sidePane);\n", ""));
+  const stayed = await run(await brokenModule([{ file: "src/view/channel/litcards.ts",
+    find: "    if (deps.sideShowing()) deps.focusList(deps.sidePane());\n", replace: "" }]));
   assert.equal(stayed.closed, false, "the negative control closed the thread anyway, so the check above proves nothing");
   const heading = await run(await brokenModule([{ file: "src/view/shell/keyselection.ts",
     find: "      if (pane === side && node && nodeWithin(deps.leftById(\"side-heading\"), node)) return pane;\n", replace: "" }]));

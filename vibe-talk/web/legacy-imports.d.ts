@@ -392,3 +392,4 @@ declare const createThreadStrip: LegacyImports["createThreadStrip"];
 declare const channelPostsOnce: LegacyImports["channelPostsOnce"];
 declare const createScrollTrace: LegacyImports["createScrollTrace"];
 declare const createReadActs: LegacyImports["createReadActs"];
+declare const createLitCards: LegacyImports["createLitCards"];

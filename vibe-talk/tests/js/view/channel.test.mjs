@@ -2910,3 +2910,56 @@ test("`#624 voice-page-modularity`: the read state's acts — Done copies caught
   await owner.clearBacklog();
   assert.deepStrictEqual(log.slice(2), ["disarm", ["dismiss", "2", true]]);
 });
+
+test("`#624 voice-page-modularity`: one card highlighted — per channel, toggled by a press, put out by Esc — from the module alone", () => {
+  const { createLitCards } = CHANNEL_VIEW;
+  const el = (attrs = {}, children = []) => {
+    const made = { attrs: new Map(Object.entries(attrs)), children, className: "", parentNode: null,
+      hasAttribute: (name) => made.attrs.has(name), getAttribute: (name) => (made.attrs.has(name) ? made.attrs.get(name) : null),
+      setAttribute: (name, value) => made.attrs.set(name, String(value)), removeAttribute: (name) => made.attrs.delete(name),
+      getBoundingClientRect: () => ({ top: 10 }) };
+    for (const child of children) child.parentNode = made;
+    return made;
+  };
+  const button = el({}, []); button.className = "side-card";
+  const cardA = el({ "data-id": "t1", "data-card": "" }, [button]);
+  const cardB = el({ "data-id": "t2", "data-card": "" }, []);
+  const sideCards = el({}, [cardA, cardB]);
+  let channel = "c1";
+  let cycle = false;
+  const owner = createLitCards({
+    cardsCycle: () => cycle, selectedChannelId: () => channel,
+    leftById: (id) => (id === "side-cards" ? sideCards : el({}, [])),
+    noteLinkedSelection: () => {}, rowShown: () => true,
+    sidePane: () => ({ scroller: () => ({ scrollTop: 0 }) }), channelPane: () => ({ scroller: () => ({ scrollTop: 0 }) }),
+    fitOverscroll: () => {}, bringIntoView: () => {}, noteOverscrollReader: () => {},
+    sayRowShortcut: () => {}, openThread: () => "open", openThreadFromList: () => "list",
+    selectSideThread: () => "side", markSideFromCards: () => {}, threadListShown: () => false,
+    sideShowing: () => false, focusList: () => {}, columnLinksShown: () => false,
+    sideMode: () => "list", channelOnScreen: () => true, sideColumnUp: () => true,
+    inMainColumn: (act) => act(), selectionView: () => "flat", pinsOnly: () => false,
+    paneFor: () => null, nodeWithin: () => false, keyRow: () => null, rowInView: () => false,
+  });
+  assert.equal(owner.litCard(), null, "a card started highlighted");
+  owner.toggleLitCard("t1", cardA);
+  assert.equal(owner.litCard(), "t1");
+  assert.equal(cardA.getAttribute("data-highlighted"), "true", "the pressed card was not drawn lit");
+  assert.equal(button.getAttribute("aria-expanded"), "true");
+  // Another channel keeps its own highlight, or none.
+  channel = "c2";
+  assert.equal(owner.litCard(), null, "one channel's highlight showed in another");
+  channel = "c1";
+  // The same card pressed again puts it out.
+  owner.toggleLitCard("t1", cardA);
+  assert.equal(owner.litCard(), null, "the highlighted card pressed again stayed lit");
+  assert.equal(cardA.hasAttribute("data-highlighted"), false);
+  // Esc puts out the highlighted card on screen, and says whether there was one.
+  owner.toggleLitCard("t1", cardA);
+  assert.equal(owner.putOutLitCard(), true, "Esc found no highlighted card to put out");
+  assert.equal(owner.litCard(), null, "Esc left the card lit");
+  assert.equal(owner.putOutLitCard(), false, "Esc claimed a card where none was lit");
+  // In the Threads view's cycle nothing highlights.
+  cycle = true;
+  owner.toggleLitCard("t2", cardB);
+  assert.equal(owner.litCard(), null, "the Threads view highlighted a card");
+});
