@@ -1262,6 +1262,39 @@ def test_migrate_refuses_held_and_live_owner_slots(
         imagecmd._assert_migratable(config, "s1", "agent", slot_path)
 
 
+def test_create_image_file_is_owner_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(worktreesimage, "_run", _FakeBtrfs().run)
+    target = tmp_path / "worktrees.img"
+    worktreesimage.create_image(target, 2 * GIB)
+    assert oct(target.stat().st_mode & 0o777) == "0o600"
+    assert target.stat().st_size == 2 * GIB
+
+
+def test_create_before_enabling_needs_no_section(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import argparse
+
+    from wrkslots import imagecmd
+
+    root = _machine_project(tmp_path, "machine: node-a\n")  # no worktrees_image
+    monkeypatch.setattr(worktreesimage, "_run", _FakeBtrfs().run)
+    args = argparse.Namespace(
+        project_root=str(root), machine=None,
+        path="pre.img", size_bytes=2 * GIB,
+    )
+    assert imagecmd._cmd_wt_image_create(args) == 0
+    assert "created" in capsys.readouterr().out
+    assert (root / "pre.img").is_file()
+    lone = argparse.Namespace(
+        project_root=str(root), machine=None, path="pre2.img", size_bytes=None
+    )
+    with pytest.raises(cli.Refusal, match="must be given together"):
+        imagecmd._cmd_wt_image_create(lone)
+
+
 def test_migrate_refuses_a_slot_used_only_through_an_open_fd(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

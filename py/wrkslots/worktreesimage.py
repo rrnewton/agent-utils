@@ -20,8 +20,8 @@ keeps plain directories or per-slot ext4 images (``slotimage.py``).
 
 Nothing here changes lifecycle policy. The safety rule is narrow and
 hard: when the feature is configured, slot-writing commands refuse
-unless the slots directory verifiably *is* the configured image mounted
-as btrfs. An unmounted, empty mount point is never written into, so
+unless the configured mount point verifiably *is* the configured image
+mounted as btrfs. An unmounted, empty mount point is never written into, so
 slots can never be created silently on the host underneath the mount.
 """
 
@@ -397,7 +397,9 @@ def create_image(image_file: Path, size_bytes: int) -> None:
     if image_file.exists():
         raise WorktreesImageError(f"worktrees image already exists: {image_file}")
     image_file.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(image_file, os.O_CREAT|os.O_EXCL|os.O_WRONLY, 0o644)
+    # 0600, like the per-slot images: the file holds every slot, so no
+    # other local user may read slots out of it.
+    descriptor = os.open(image_file, os.O_CREAT|os.O_EXCL|os.O_WRONLY, 0o600)
     os.close(descriptor)
     try:
         _run(["chattr", "+C", str(image_file)])
@@ -471,7 +473,7 @@ def mount_image(
 
 
 def unmount_image(mount_point: Path) -> None:
-    """Unmount the worktrees image from the slots directory."""
+    """Unmount the worktrees image from ``mount_point``."""
 
     _run(["umount", str(mount_point)], sudo=True)
 

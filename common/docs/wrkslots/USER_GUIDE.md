@@ -2569,6 +2569,13 @@ image on load, and slot-writing commands refuse unless it is verifiably mounted,
 written onto the host file system underneath an empty mount point. Scope the section to the hosts
 that have the image with its `machines` list (see "Host-scoped sections").
 
+Enabling takes three steps, in either order for the first two: create the image file
+(`wrkslots worktrees-image create`, or `worktrees-image create --path <file> --size-bytes <n>`
+before the section exists), add the `worktrees_image` section naming that file, then
+`wrkslots worktrees-image mount`. Until the image exists and is mounted, slot-writing commands
+refuse — including `create` — so run no slot command between enabling the section and mounting.
+The image file is created owner-only (0600): it holds every slot.
+
 `mount_at` chooses the layout:
 
 - `binds` (the default): the image mounts at `<control>/.slots-image` and each slot subvolume is

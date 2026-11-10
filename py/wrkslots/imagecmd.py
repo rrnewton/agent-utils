@@ -201,7 +201,24 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
     )
     wt_actions = wt_image.add_subparsers(dest="worktrees_image_command", metavar="ACTION")
     wt_create = wt_actions.add_parser(
-        "create", help="create the sparse btrfs image file (does not mount it)"
+        "create",
+        help="create the sparse btrfs image file (does not mount it)",
+        description=(
+            "Create the configured image file. With --path and --size-bytes "
+            "together, create that file without reading a worktrees_image "
+            "section, so the image can exist before the section is enabled "
+            "(enabling first also works: run this before any slot-writing "
+            "command, which refuse while the image is unmounted)."
+        ),
+        formatter_class=formatter,
+    )
+    wt_create.add_argument(
+        "--path", metavar="PATH", default=None,
+        help="project-relative backing file to create; needs --size-bytes (default: the configured path)",
+    )
+    wt_create.add_argument(
+        "--size-bytes", type=int, default=None, metavar="BYTES",
+        help="apparent size in bytes for --path (default: the configured size_bytes)",
     )
     wt_create.set_defaults(handler=_cmd_wt_image_create)
     wt_mount = wt_actions.add_parser("mount", help="mount the worktrees image at its configured mount point")
@@ -758,6 +775,23 @@ def _wt_settings(
 
 
 def _cmd_wt_image_create(args: argparse.Namespace) -> int:
+    if (args.path is None) != (args.size_bytes is None):
+        raise _refuse("--path and --size-bytes must be given together")
+    if args.path is not None:
+        # Before enabling: no section to read yet (#1151). The same
+        # validation as a configured section applies to the pair.
+        from wrkslots import cli
+
+        root = cli._discover_root(args.project_root)
+        try:
+            settings = worktreesimage.settings_from_obj(
+                {"path": args.path, "size_bytes": args.size_bytes}
+            )
+            worktreesimage.create_image(settings.image_file(root), settings.size_bytes)
+        except worktreesimage.WorktreesImageError as exc:
+            raise _refuse(str(exc)) from exc
+        print(f"created {settings.image_file(root)} ({settings.size_bytes} bytes, sparse btrfs)")
+        return 0
     config, settings = _wt_settings(args)
     try:
         worktreesimage.create_image(settings.image_file(config.root), settings.size_bytes)
