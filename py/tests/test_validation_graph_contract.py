@@ -997,6 +997,65 @@ def test_cross_main_phase_env_defaults_to_exclusive(
     )
 
 
+def test_all_cross_filter_keeps_only_components_a_path_selects() -> None:
+    """#1190: under --all the gate-exclusive steps are still component-
+    filtered by the changed paths, exactly as a path-selected gate does."""
+    validate = _validate_module()
+    page, _note = validate.cross_filter_for_all(["vibe-talk/web/index.html"])
+    assert page is not None and "agentctl" not in page and "herdr-run" not in page
+    agentctl, _note = validate.cross_filter_for_all(["py/agentctl/agent.py"])
+    assert agentctl is not None and "agentctl" in agentctl and "herdr-run" not in agentctl
+    herdr, _note = validate.cross_filter_for_all(["rs/herdr-run/src/main.rs"])
+    assert herdr is not None and "herdr-run" in herdr and "agentctl" not in herdr
+
+
+def test_all_cross_filter_fails_closed() -> None:
+    """#1190: an unclassified path or a shared cross trigger keeps all five
+    gate-exclusive steps under --all (components None means keep-all)."""
+    validate = _validate_module()
+    for paths in (
+        ["newtop/file.txt"],  # no prefix rule, no owning component
+        ["cross/differential.py"],  # the shared differential runner
+        ["common/bin/dagrun"],  # shared launcher: every paired tool at once
+        ["vibe-talk/web/index.html", "newtop/file.txt"],  # one bad path poisons
+    ):
+        components, note = validate.cross_filter_for_all(paths)
+        assert components is None, (paths, note)
+        assert note  # the plan always says why
+
+
+def test_all_list_names_skipped_cross_steps_and_cross_all_forces_them(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#1190: `--all --list` on a page-only change names all five exclusive
+    steps as skipped and plans none of them; `--all --cross-all --list`
+    plans all five."""
+    validate = _validate_module()
+    monkeypatch.delenv(validate.CROSS_MAIN_PHASE_ENV, raising=False)
+    monkeypatch.setattr(
+        validate, "changed_paths", lambda _base: ["vibe-talk/web/index.html"]
+    )
+    assert validate.main(["--all", "--list"]) == 0
+    listed = capsys.readouterr().out
+    assert "cross filter (#1190" in listed and "skipped" in listed
+    for tag in (
+        "cross.agentctl.differential-0",
+        "cross.agentctl.differential-1",
+        "cross.agentctl.differential-2",
+        "cross.agentctl.herdr-agent-differential",
+        "cross.herdr-run.differential",
+    ):
+        assert listed.count(tag) == 1, tag  # named once, as skipped; not a STEP line
+    assert validate.main(["--all", "--cross-all", "--list"]) == 0
+    forced = capsys.readouterr().out
+    assert "--cross-all" in forced
+    for tag in (
+        "cross.agentctl.differential-0",
+        "cross.herdr-run.differential",
+    ):
+        assert f"STEP  {tag}" in forced, tag
+
+
 def test_the_keep_going_flag_reaches_the_graph_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

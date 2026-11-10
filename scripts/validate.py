@@ -17,13 +17,18 @@ Two safety properties, both tested in `--self-test`:
 
 * **An unrecognised path selects EVERYTHING.** Adding a new top-level directory must not silently
   opt out of validation. Unknown means unknown, and unknown means run the lot.
-* **`--all` is always available**, and is what the nightly portable-contract path should use.
-  Selection is a convenience for the edit-run loop, not a new definition of "validated".
+* **`--all` is always available**. It runs the entire main-phase contract; since #1190 its
+  gate-exclusive cross steps are still path-filtered (fail-closed, named in the plan), because
+  at gate prices half of all heads were paying ~22 minutes for differentials their paths
+  cannot affect (#1180 Part B). **`--all --cross-all`** is the unfiltered contract the nightly
+  and release paths use (`make validate-all`). Selection is a convenience for the edit-run
+  loop, not a new definition of "validated".
 
 Usage:
     python3 scripts/validate.py                 # against origin/main
     python3 scripts/validate.py --base HEAD~1
-    python3 scripts/validate.py --all           # the entire portable contract, no selection
+    python3 scripts/validate.py --all           # the entire portable contract (cross steps path-filtered, #1190)
+    python3 scripts/validate.py --all --cross-all  # the entire contract, every cross step forced
     python3 scripts/validate.py --keep-going    # report every independent failure, not just the first
     python3 scripts/validate.py --list          # print the plan, run nothing
     python3 scripts/validate.py --self-test     # check the mapping itself, offline
@@ -343,6 +348,40 @@ def _cross_shared_trigger(paths: list[str], selected: frozenset[str]) -> bool:
         if groups is not None and CROSS in groups:
             return True
     return False
+
+
+def cross_filter_for_all(
+    paths: list[str], *, manifest: Manifest | None = None
+) -> tuple[frozenset[str] | None, str]:
+    """Which components' gate-exclusive steps an `--all` run keeps (#1190).
+
+    Returns (components, plan note) for `partition_gate_exclusive`, where
+    components `None` means keep every gate-exclusive step. The filter is
+    the existing path selection, fail-closed: a path `selection_for` would
+    fail-safe on (no prefix rule and no owning component) or a shared cross
+    trigger keeps all five, because either can change every paired
+    implementation at once. A change that selects no paired tool's
+    component — a page-only edit above all — keeps none of them: on
+    2026-11-09 that was half of all gated heads, at ~22 minutes of
+    whole-host serialization each (#1180 Part B).
+    """
+
+    active_manifest = manifest if manifest is not None else load_manifest()
+    selected, _because, components, _component_because = selection_for(
+        paths, manifest=active_manifest
+    )
+    unclassified = [
+        path
+        for path in paths
+        if _longest_prefix_groups(path) is None
+        and not components_for_paths([path], active_manifest)[0]
+    ]
+    if unclassified:
+        shown = ", ".join(sorted(unclassified)[:3])
+        return None, f"unclassified path(s) ({shown}) — keeping all gate-exclusive steps"
+    if _cross_shared_trigger(paths, selected):
+        return None, "shared cross trigger — keeping all gate-exclusive steps"
+    return components, "path-filtered by changed paths"
 
 
 def selection_for(
@@ -679,10 +718,11 @@ def partition_gate_exclusive(
     (validation/components.json) says which paths can change each tool's
     behaviour, and a change that cannot affect a tool must not pay for its
     wall-clock-sensitive differential — above all not at exclusive-admission
-    prices. `keep_all` is for `--all`, the unclassified-path fail-safe (which
-    selects every group), and cross-group triggers from outside `cross/`
-    (workspace manifests, shared launchers) that can change every paired
-    implementation at once.
+    prices. `keep_all` is for `--cross-all`, the unclassified-path fail-safe
+    (which selects every group), and cross-group triggers from outside
+    `cross/` (workspace manifests, shared launchers) that can change every
+    paired implementation at once. Since #1190, `--all` passes the
+    fail-closed `cross_filter_for_all` components instead of keeping all.
 
     `exclusive_phase` chooses where the kept steps run, never which steps
     are kept: the component filter and the dropped-dependent cascade are
@@ -1897,7 +1937,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--all",
         action="store_true",
-        help="run the entire portable, current-toolchain contract, selecting nothing",
+        help="run the entire portable, current-toolchain contract, selecting nothing "
+        "(the gate-exclusive cross steps are still path-filtered, #1190; see --cross-all)",
+    )
+    parser.add_argument(
+        "--cross-all",
+        action="store_true",
+        help="keep every gate-exclusive cross differential regardless of path selection "
+        "(#1190): with --all it restores the pre-#1190 contract exactly and is what "
+        "release/nightly runs use (`make validate-all`); without --all it adds all five "
+        "on top of path selection. Example: python3 scripts/validate.py --all --cross-all",
     )
     parser.add_argument("--list", action="store_true", help="print the plan and exit without running")
     parser.add_argument(
@@ -1941,12 +1990,31 @@ def main(argv: list[str] | None = None) -> int:
     # files under cross/ does not select them. A cross-group trigger from
     # outside cross/ — workspace manifests, shared launchers, examples — can
     # change every paired implementation at once, so it keeps them all, as
-    # do --all and the unclassified-path fail-safe (both make all_contract or
-    # select every group). The shared differential runner
-    # (cross/differential.py, owned by repository-infrastructure in the map)
-    # is named explicitly for the same reason.
+    # does the unclassified-path fail-safe (which selects every group). The
+    # shared differential runner (cross/differential.py, owned by
+    # repository-infrastructure in the map) is named explicitly for the same
+    # reason.
+    #
+    # Since #1190, --all path-filters these steps too: the main phase still
+    # runs the entire contract, but a gate-exclusive step whose component no
+    # changed path (against --base) selects is skipped and named below,
+    # fail-closed per cross_filter_for_all. --cross-all forces all five in
+    # either mode and is the release/nightly contract (`make validate-all`).
+    cross_components = components
+    cross_filtered = False
+    cross_note: str | None = None
+    if args.all and not args.cross_all:
+        try:
+            all_paths = changed_paths(args.base)
+        except SystemExit as exc:  # undeterminable paths: fail closed
+            cross_note = f"changed paths unavailable ({exc.code}) — keeping all"
+        else:
+            filtered_components, cross_note = cross_filter_for_all(all_paths)
+            if filtered_components is not None:
+                cross_components = filtered_components
+                cross_filtered = True
     cross_shared_trigger = _cross_shared_trigger(paths, selected)
-    if cross_shared_trigger and not all_contract:
+    if (cross_shared_trigger or args.cross_all) and not all_contract:
         labelled: set[str] = set()
         for tag, step in graph_steps.items():
             raw_labels = step.get("labels")
@@ -1958,10 +2026,47 @@ def main(argv: list[str] | None = None) -> int:
     phases = partition_gate_exclusive(
         graph_steps,
         graph_chosen,
-        components=components,
-        keep_all=all_contract or cross_shared_trigger,
+        components=cross_components,
+        keep_all=args.cross_all
+        or cross_shared_trigger
+        or (all_contract and not cross_filtered),
     )
     final_chosen = set(phases[0]) | set(phases[1])
+    if args.all:
+        labelled_all = []
+        for tag in sorted(graph_chosen):
+            raw_labels = graph_steps[tag].get("labels")
+            if isinstance(raw_labels, list) and GATE_EXCLUSIVE_LABEL in {
+                label for label in raw_labels if isinstance(label, str)
+            }:
+                labelled_all.append(tag)
+        kept = [tag for tag in labelled_all if tag in final_chosen]
+        skipped = [tag for tag in labelled_all if tag not in final_chosen]
+        if args.cross_all:
+            print(
+                f"validate: --cross-all, keeping all {len(kept)} gate-exclusive "
+                "step(s) (#1190 cross-path-filter)",
+                flush=True,
+            )
+        elif cross_filtered:
+            print(
+                f"validate: --all cross filter (#1190 cross-path-filter): keeping "
+                f"{len(kept)} of {len(labelled_all)} gate-exclusive step(s)"
+                + (f" [{', '.join(kept)}]" if kept else "")
+                + (
+                    f"; skipped [{', '.join(skipped)}] — no changed path (vs {args.base}) "
+                    "selects their component; --cross-all forces all"
+                    if skipped
+                    else "; skipped none"
+                ),
+                flush=True,
+            )
+        else:
+            print(
+                f"validate: --all cross filter (#1190 cross-path-filter): keeping all "
+                f"{len(kept)} gate-exclusive step(s) — {cross_note}",
+                flush=True,
+            )
     if cross_in_main_phase():
         print(
             f"validate: {CROSS_MAIN_PHASE_ENV}=1, gate-exclusive differentials "

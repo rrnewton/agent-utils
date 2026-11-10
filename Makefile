@@ -49,13 +49,14 @@ $(error TEST_SUITE must be exactly one of: all, python, rust)
 endif
 
 # Run only the checks the current change can actually affect, and REPORT the rest as skipped.
-# `--all` is the whole portable contract and is what the nightly uses; selection is for the edit-run loop.
+# `--all --cross-all` is the whole unfiltered portable contract and is what the nightly uses;
+# plain `--all` still path-filters the gate-exclusive cross steps (#1190); selection is for the edit-run loop.
 # See scripts/validate.py for the path -> check mapping and why each rule is what it is.
 validate:
 	python3 scripts/validate.py
 
 validate-all:
-	python3 scripts/validate.py --all
+	python3 scripts/validate.py --all --cross-all
 
 # The agent-teams exactly-once soak (design 9.7): optional, nobody's push waits for it.
 # The gate runs the bounded pass; this sweeps more seeds of the same harness.
