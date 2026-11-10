@@ -44,7 +44,7 @@
  * was ever applied before it. Both halves are still here, and both are still asserted. */
 #status-line {
   position: absolute;
-  z-index: 5;
+  z-index: var(--z-pill);
   inset-inline: 0;
   /* Follow the actual tool height, including wrapped rows and larger phone fonts. Both layers
      stay outside the scrolling content, so showing a banner never moves the reader's place. On the
@@ -87,7 +87,7 @@
  * screen. The pill now stacks over the strip while both are up (`#status-line`). */
 #read-steer {
   position: absolute;
-  z-index: 5;
+  z-index: var(--z-strip);
   inset-inline: 0;
   bottom: calc(var(--chips-foot, 0.5rem) + var(--scroll-tools-height, 0px));
   width: max-content;

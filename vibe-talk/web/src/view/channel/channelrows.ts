@@ -442,8 +442,99 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
     const menu = document.createElement("span");
     menu.className = "row-more-menu";
     menu.hidden = true;
+    // `#1228 menu-above-chips`. While open the menu renders in the top layer, above the floating
+    // chips, the read strip, the freshness pill and the composer. Inside the list it could never
+    // get there: the scroller is one stacking context (contain and mask in the stylesheet) and a
+    // read row is another (opacity and filter), so a z-index on the menu competed only inside its
+    // row. The top layer has no such parent. Where it is unavailable the menu stays in the list on
+    // the overlay scale's menu layer (09-to-do-view.css) — still above the chips wherever the two
+    // stacking contexts meet, and the closed menu's place either way.
+    menu.setAttribute("popover", "manual");
+    type TopLayerMenu = HTMLElement & {
+      showPopover?: () => void;
+      hidePopover?: () => void;
+      matches?: (selector: string) => boolean;
+    };
+    const topMenu = menu as TopLayerMenu;
+    const topLayerOpen = (): boolean => {
+      try {
+        return typeof topMenu.matches === "function" && topMenu.matches(":popover-open");
+      } catch {
+        return false;
+      }
+    };
+    // Place the top-layer menu from its row: right-aligned to the row, under its meta line, flipped
+    // above the line where below would leave the viewport. Viewport coordinates, because the top
+    // layer is fixed; nothing is placed where the row has no layout (the page suite's fake DOM),
+    // which reads only the hidden state.
+    const placeTopMenu = (): void => {
+      if (typeof window === "undefined" || typeof menu.getBoundingClientRect !== "function") return;
+      const rowBox = li.getBoundingClientRect();
+      const metaBox = meta.getBoundingClientRect();
+      const menuBox = menu.getBoundingClientRect();
+      if (!rowBox.width || !menuBox.height) return;
+      const gap = 4;
+      const edge = 8;
+      const width = Math.min(menuBox.width || rowBox.width, Math.max(0, window.innerWidth - edge * 2));
+      let left = rowBox.right - (width || menuBox.width);
+      left = Math.min(Math.max(left, edge), Math.max(edge, window.innerWidth - (width || menuBox.width) - edge));
+      let top = metaBox.bottom + gap;
+      if (top + menuBox.height > window.innerHeight - edge && metaBox.top - menuBox.height - gap >= edge) {
+        top = metaBox.top - menuBox.height - gap;
+      }
+      top = Math.min(Math.max(top, edge), Math.max(edge, window.innerHeight - menuBox.height - edge));
+      menu.style.left = `${left}px`;
+      menu.style.top = `${top}px`;
+      menu.style.right = "auto";
+    };
+    // A fixed menu cannot follow its row through a scroll or a resize; native menus close instead.
+    // The listeners live only while the menu is in the top layer, and are taken down with it.
+    let detachTopMenu: (() => void) | null = null;
+    const watchTopMenu = (): void => {
+      detachTopMenu?.();
+      let scroller: HTMLElement | null = null;
+      for (let node = li.parentNode as HTMLElement | null; node; node = node.parentNode as HTMLElement | null) {
+        if (node.id === "scroll-area" || node.id === "side-scroll") {
+          scroller = node;
+          break;
+        }
+      }
+      const onScroll = (): void => closeMenu();
+      const onResize = (): void => closeMenu();
+      scroller?.addEventListener("scroll", onScroll);
+      window.addEventListener("resize", onResize);
+      detachTopMenu = (): void => {
+        scroller?.removeEventListener("scroll", onScroll);
+        window.removeEventListener("resize", onResize);
+        detachTopMenu = null;
+      };
+    };
     const setMenu = (open: boolean): void => {
-      menu.hidden = !open;
+      if (open) {
+        menu.hidden = false;
+        if (typeof topMenu.showPopover === "function") {
+          try {
+            if (!topLayerOpen()) topMenu.showPopover();
+            placeTopMenu();
+            watchTopMenu();
+          } catch {
+            // The in-list fallback above: shown by hidden alone, on the menu layer.
+          }
+        }
+      } else {
+        detachTopMenu?.();
+        if (typeof topMenu.hidePopover === "function" && topLayerOpen()) {
+          try {
+            topMenu.hidePopover();
+          } catch {
+            // Already down; hidden below is the state the page reads.
+          }
+        }
+        menu.style.left = "";
+        menu.style.top = "";
+        menu.style.right = "";
+        menu.hidden = true;
+      }
       moreButton.setAttribute("aria-expanded", open ? "true" : "false");
       if (open) rowMenus.opened({ root: more, close: closeMenu, button: moreButton });
       else rowMenus.closed(closeMenu);

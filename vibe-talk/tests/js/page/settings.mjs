@@ -2616,8 +2616,14 @@ test("`#351 settings-polish`: the status pill, floating over Settings' box, is l
   // ...and nothing round the pop-out is made a box of its own that the pill could be drawn over.
   assert.deepStrictEqual([...page.elements.values()].filter((node) => node.hasAttribute("data-dim-box")).map((node) => node.id), [],
     "a box round the pop-out is still set apart from the pill");
-  // The stylesheet: the pop-out is drawn over the frame's overlays, the pill among them.
-  const zOf = (selector) => Number((/z-index:\s*(-?\d+)/.exec(cssBlock(selector)) || [])[1]);
+  // The stylesheet: the pop-out is drawn over the frame's overlays, the pill among them. Layers
+  // come from the one scale in :root (`#1228 menu-above-chips`), so resolve its names.
+  const rootBlock = cssBlock(":root");
+  const zOf = (selector) => {
+    const named = /z-index:\s*var\((--z-[a-z]+)\)/.exec(cssBlock(selector));
+    if (named) return Number((new RegExp(`${named[1]}:\\s*(-?\\d+)`).exec(rootBlock) || [])[1]);
+    return Number((/z-index:\s*(-?\d+)/.exec(cssBlock(selector)) || [])[1]);
+  };
   assert.ok(zOf(".data-popout") > zOf("#status-line"),
     `the pop-out's z-index, ${zOf(".data-popout")}, does not put it over the pill's, ${zOf("#status-line")}`);
   // A pill that comes up while the pop-out is up is under it in the same way.

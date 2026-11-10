@@ -275,7 +275,7 @@
   position: absolute;
   top: 0;
   left: 0;
-  z-index: 6;
+  z-index: var(--z-modal);
   min-height: 2.5rem;
   padding: 0 0.95rem;
   border: 1px solid var(--accent);
@@ -303,7 +303,7 @@
   position: absolute;
   top: 0;
   left: 0;
-  z-index: 6;
+  z-index: var(--z-modal);
   box-sizing: border-box;
   display: grid;
   gap: 0.4rem;

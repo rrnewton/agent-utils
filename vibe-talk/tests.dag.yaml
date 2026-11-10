@@ -617,6 +617,23 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1228 menu-above-chips` in the browser engine: a row's ellipsis menu over the floating chips
+  # row at 1280x800 and 393x852, every item the topmost element at its centre.
+  - group: check
+    job: menu-above-chips-browser
+    desc: a row menu above the floating chips in current Chromium at 1280x800 and 393x852, every item topmost at its centre
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/menu_above_chips_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 25
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#49 post-confirmation-card-hold` in the browser engine: a real touch on Send the moment a first
   # card appears in a typed call commits nothing, and Send enables itself after the hold.
   - group: check

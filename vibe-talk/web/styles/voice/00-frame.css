@@ -168,6 +168,25 @@
      other card's edge and every other link between the columns. Half `--muted` and half `--edge`, so
      it is plainly grey, quieter than any thread's colour, and still a line on the panel. */
   --thread-grey: #626975;
+  /* `#1228 menu-above-chips`. The one overlay scale for the page. Every floating layer takes its
+     z-index from here, never a bare number, so the order below is the order on screen wherever the
+     layers meet. A larger row-internal z-index (0, 1, -1 on a row's own parts) is not an overlay and
+     stays as it is: it orders a row against itself, never against a floating layer.
+       chips      the floating chips, the freshness pill and the pull report, over the list
+       strip      the read-aloud strip, directly on the chips row
+       pill       the transient status pill, over the strip while both are up
+       menu       every menu and popover opened over the list, above chips, strip and pill
+       modal      a modal pop-out, over a menu
+       debug      the keyboard debug readout, over everything, taking no touch
+     The row menu also renders in the top layer while open (see channelrows.ts), because a z-index
+     inside the scrolling list can never rise above a sibling of the list: the list itself is one
+     stacking context (contain and mask), so its children's z-indexes compete only among themselves. */
+  --z-chips: 20;
+  --z-strip: 30;
+  --z-pill: 40;
+  --z-menu: 50;
+  --z-modal: 60;
+  --z-debug: 2147483647;
 }
 
 @media (prefers-color-scheme: light) {

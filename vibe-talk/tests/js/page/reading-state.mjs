@@ -87,6 +87,31 @@ test("the ⋯ menu hangs from the row's meta line, so a ⋯ wrapped to the left 
   assert.doesNotMatch(menu, /white-space: nowrap/, "the menu's labels cannot wrap, so it outgrows the row");
 });
 
+test("the overlay scale puts every menu and popover above the chips, the strip and the pill", () => {
+  // `#1228 menu-above-chips`. One scale in :root, every floating layer on it. This suite lays
+  // nothing out, so it pins the scale and the top-layer rule; the Chromium walk in
+  // tests/menu_above_chips_browser.py proves a menu item is the topmost element at its centre.
+  const root = cssBlock(":root");
+  const layer = (name) => Number((new RegExp(`${name}:\\s*(\\d+)`).exec(root) || [])[1]);
+  assert.ok(layer("--z-chips") < layer("--z-strip"), "the read strip is not above the chips");
+  assert.ok(layer("--z-strip") < layer("--z-pill"), "the status pill is not above the strip");
+  assert.ok(layer("--z-pill") < layer("--z-menu"), "a menu is not above the pill");
+  assert.ok(layer("--z-menu") < layer("--z-modal"), "a modal is not above a menu");
+  assert.match(cssBlock("#scroll-tools"), /z-index: var\(--z-chips\)/);
+  assert.match(cssBlock("#channel-freshness-anchor"), /z-index: var\(--z-chips\)/);
+  assert.match(cssBlock("#read-steer"), /z-index: var\(--z-strip\)/);
+  assert.match(cssBlock("#status-line"), /z-index: var\(--z-pill\)/);
+  assert.match(cssBlock(".row-more-menu"), /z-index: var\(--z-menu\)/);
+  assert.match(cssBlock(".popover"), /z-index: var\(--z-menu\)/);
+  assert.match(cssBlock(".data-popout"), /z-index: var\(--z-modal\)/);
+  assert.match(cssBlock(".row-more-menu:popover-open"), /position: fixed/, "the open menu leaves the list's stacking context");
+  // No bare overlay number remains where the scale applies: a new bare 5 or 30 would fight it
+  // silently. Row-internal 0, 1 and -1 order a row against itself and are not overlays.
+  for (const selector of ["#scroll-tools", "#pull-refresh", "#read-steer", "#status-line", ".row-more-menu"]) {
+    assert.doesNotMatch(cssBlock(selector), /z-index:\s*-?\d+\s*;/, `${selector} keeps a bare z-index`);
+  }
+});
+
 test("Pin shows on the row at once, sends the row as what to keep, and the answer confirms it", async () => {
   const page = newPage();
   await signIn(page);

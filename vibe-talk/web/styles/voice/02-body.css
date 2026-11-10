@@ -874,9 +874,9 @@
 
 .data-popout {
   position: absolute;
-  /* Above the frame's overlays, the status pill's 5 among them (`#351 settings-polish`): a modal is
+  /* Above the frame's overlays, the status pill among them (`#351 settings-polish`): a modal is
      drawn over everything. Brought on screen by its foot, its buttons stand where the pill floats. */
-  z-index: 6;
+  z-index: var(--z-modal);
   left: -0.3rem;
   right: -0.3rem;
   top: 0;
@@ -1025,7 +1025,7 @@
   top: 0;
   left: 0;
   right: 0;
-  z-index: 2147483647;
+  z-index: var(--z-debug);
   margin: 0;
   padding: 0.25rem 0.4rem;
   background: rgb(0 0 0 / 0.8);

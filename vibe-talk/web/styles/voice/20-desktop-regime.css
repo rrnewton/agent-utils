@@ -650,7 +650,7 @@
   #width-grip {
     display: block;
     position: absolute;
-    z-index: 3;
+    z-index: var(--z-chips);
     top: 0;
     bottom: 0;
     left: 50%;
@@ -900,7 +900,7 @@
     width: 14px;
     transform: translateX(-50%);
     pointer-events: none;
-    z-index: 2;
+    z-index: var(--z-chips);
   }
 
   #column-splitter::before {
@@ -1200,7 +1200,7 @@ li.discord-message[data-root-continuation] > .thread-replies {
 
 #side-tools {
   position: absolute;
-  z-index: 2;
+  z-index: var(--z-chips);
   left: 50%;
   bottom: 0.5rem;
   width: calc(min(var(--reading-width), 100%) - 1.2rem);
@@ -1706,7 +1706,7 @@ li.discord-message[data-root-continuation] > .thread-replies {
 /* Over the list it flies across. */
 .thread-card-header[data-flying] {
   position: relative;
-  z-index: 3;
+  z-index: var(--z-chips);
   animation: card-flight var(--card-flight) cubic-bezier(0.2, 0, 0, 1) backwards;
 }
 

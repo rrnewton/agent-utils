@@ -243,7 +243,7 @@
   position: absolute;
   bottom: calc(100% + 0.4rem);
   right: calc(0.6rem + env(safe-area-inset-right));
-  z-index: 5;
+  z-index: var(--z-menu);
   min-width: 14rem;
   padding: 0.7rem 0.8rem;
   border: 1px solid var(--edge);
