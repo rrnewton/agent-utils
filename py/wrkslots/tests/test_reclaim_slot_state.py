@@ -37,7 +37,15 @@ def _unpushed_repo(home: Path) -> str:
     return _git(repo, "rev-parse", "HEAD")
 
 
-def test_remove_reclaims_state_home_and_bundles_unpushed_git(tmp_path: Path) -> None:
+def test_remove_reclaims_state_home_and_bundles_unpushed_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1195: the reclaim, not host speed, is under test. A state-home census
+    # slowed past the production item budget (the gate host's two ~48 s
+    # censuses against 60 s, scaled down: 1.5 s against 1 s) still lets the
+    # reclaim succeed under the test budget of _python_remove.
+    monkeypatch.setattr(wrkslots_cli, "_AGENT_REMOVE_BATCH_ITEM_SECONDS", 1.0)
+    _slow_census(monkeypatch, 1.5)
     root = _fixture(tmp_path / "case")
     home = _home(root)
     head = _unpushed_repo(home)
@@ -104,7 +112,7 @@ def test_remove_refuses_when_a_slow_census_spends_the_lock_budget(
     monkeypatch.setattr(wrkslots_cli, "_AGENT_REMOVE_BATCH_ITEM_SECONDS", 1.0)
     _slow_census(monkeypatch, 1.5)
     with pytest.raises(wrkslots_cli.Refusal) as refused:
-        _python_remove(root)
+        _python_remove(root, budget_seconds=None)
     message = str(refused.value)
     assert "used its 1-second budget for work before deletion" in message
     assert "'wrkslots remove --no-lock-budget'" in message

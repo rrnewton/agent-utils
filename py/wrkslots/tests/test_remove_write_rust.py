@@ -192,7 +192,20 @@ def _rust_remove(root: Path, *, fixture: bool = True) -> subprocess.CompletedPro
     )
 
 
-def _python_remove(root: Path, *, no_lock_budget: bool = False) -> int:
+#: The item budget an in-process test remove runs under (#1195
+#: reclaim-test-budget-sibling): far above a loaded gate host's /proc census
+#: (about 48 s each), so a test of what remove does is not refused for host
+#: speed. It keeps the default single-item path, unlike --no-lock-budget.
+#: Tests of the budget itself pass ``budget_seconds=None`` and set their own.
+_TEST_REMOVE_ITEM_SECONDS = 3600.0
+
+
+def _python_remove(
+    root: Path,
+    *,
+    no_lock_budget: bool = False,
+    budget_seconds: float | None = _TEST_REMOVE_ITEM_SECONDS,
+) -> int:
     args = argparse.Namespace(
         project_root=str(root), machine=None, slot="slot-a",
         coordinator_authorized=False, validate_complete=False,
@@ -203,7 +216,14 @@ def _python_remove(root: Path, *, no_lock_budget: bool = False) -> int:
         archive_drifted_checkouts=False, adopt_legacy_change=False, wait_lock=0.0,
         no_lock_budget=no_lock_budget,
     )
-    return wrkslots_cli._cmd_remove(args)
+    if budget_seconds is None:
+        return wrkslots_cli._cmd_remove(args)
+    production = wrkslots_cli._AGENT_REMOVE_BATCH_ITEM_SECONDS
+    wrkslots_cli._AGENT_REMOVE_BATCH_ITEM_SECONDS = budget_seconds
+    try:
+        return wrkslots_cli._cmd_remove(args)
+    finally:
+        wrkslots_cli._AGENT_REMOVE_BATCH_ITEM_SECONDS = production
 
 
 def _scrub_doc(doc: dict[str, object]) -> dict[str, object]:
@@ -794,6 +814,7 @@ _INTERRUPTED_REMOVE = """
 import sys
 sys.path.insert(0, sys.argv[1])
 from wrkslots import cli
+cli._AGENT_REMOVE_BATCH_ITEM_SECONDS = 3600.0  # _TEST_REMOVE_ITEM_SECONDS (#1195)
 sys.exit(cli.main([
     "--project-root", sys.argv[2], "remove", "slot-a",
     "--coordinator-pid", sys.argv[3], "--expected-generation", "1",
