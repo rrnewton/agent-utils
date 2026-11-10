@@ -120,12 +120,13 @@ pub fn could_not_run_busy(log_text: &str) -> bool {
 }
 
 /// Whether a refusal's output names the host credential pacing guard: a
-/// git call was refused because logins are paced per host and the waiter
-/// past its wait bound gave up (`GH-PACED REFUSED` on stderr, exit 75).
-/// Shared-budget contention, not a host defect: transient, never a host
-/// fault (see `donor.rs`).
+/// git call was refused (or throttled into giving up) because logins are
+/// paced per host (`GH-PACED REFUSED` / `GH-PACED WARNING` on stderr,
+/// exit 75). The adapter that prints those lines is authoritative about
+/// its refusal cause (#1241 paced-edges). Shared-budget contention, not
+/// a host defect: transient, never a host fault (see `donor.rs`).
 pub fn gh_paced_refusal(log_text: &str) -> bool {
-    log_text.contains("GH-PACED REFUSED")
+    log_text.contains("GH-PACED REFUSED") || log_text.contains("GH-PACED WARNING")
 }
 
 /// The line of a refusal's log that names why it refused — its cause, in
@@ -2073,6 +2074,11 @@ mod unit {
         // wait bound with this line (exit 75). Nothing else counts.
         assert!(gh_paced_refusal(
             "git fetch failed\nGH-PACED REFUSED: login budget exhausted, try later\nCOULD_NOT_RUN"
+        ));
+        // #1241 paced-edges: a WARNING-only pacing failure counts too; the
+        // adapter is authoritative about its refusal cause.
+        assert!(gh_paced_refusal(
+            "GH-PACED WARNING: throttled, slot in 10 s\nCOULD_NOT_RUN"
         ));
         assert!(!gh_paced_refusal("COULD_NOT_RUN: slots full"));
         assert!(!gh_paced_refusal(""));

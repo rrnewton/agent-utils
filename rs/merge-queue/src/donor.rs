@@ -1971,8 +1971,36 @@ impl Store {
             // above) and faults nothing here.
             // Pacing evidence overrides the host-scope label here too
             // (#1193 census route): a pacing refusal is never a flap fault.
+            // It also records no strike (#1241 paced-edges): host-wide
+            // contention must not cancel a candidate's job at the bound.
+            // The donor's consecutive pacing count, the claim timeout,
+            // and the item deferral bound still bound the loop.
             let paced_receipt = crate::validate::gh_paced_refusal(&receipt.log_tail)
                 || cause_field.is_some_and(crate::validate::gh_paced_refusal);
+            if paced_receipt {
+                job.lease = None;
+                job.state = if job.candidate_gone.is_some() {
+                    JobState::Cancelled
+                } else {
+                    JobState::Queued
+                };
+                job.history.push(format!(
+                    "{}: {} on {} could not run the validation ({detail}); no verdict, no strike (pacing-guard refusal: transient, counted only donor-side), {}",
+                    now(),
+                    receipt.donor.name,
+                    receipt.donor.host,
+                    if job.state == JobState::Queued {
+                        "queued again"
+                    } else {
+                        "cancelled (the queue no longer wants the candidate)"
+                    }
+                ));
+                self.write(&job)?;
+                return Err(format!(
+                    "the receipt says validation could not run ({detail}); no verdict, \
+                     no strike (pacing), the job is queued again"
+                ));
+            }
             if !paced_receipt {
                 if let Some((true, reason)) =
                     crate::validate::could_not_run_scope(&receipt.log_tail)
@@ -4686,11 +4714,11 @@ mod unit {
 
     #[test]
     fn a_pacing_guard_refusal_requeues_counted_with_no_host_fault() {
-        // #1193 ghpaced-transient: exit 75 because the credential pacing
-        // guard refused a git login. Queue side: the job is queued again
-        // with a counted strike (the per-job bound still applies), the
-        // history names the pacing cause, and no host fault is recorded;
-        // the donor takes the next job normally.
+        // #1193 ghpaced-transient, #1241 paced-edges: exit 75 because the
+        // credential pacing guard refused a git login. Queue side: the job
+        // is queued again with no strike (pacing cannot reach the per-job
+        // bound), the history names the pacing cause, and no host fault
+        // is recorded; the donor takes the next job normally.
         let mut store = Store::new(&temp("ghpaced-refusal"));
         store.could_not_run_limit = 99;
         publish(&store, "c1");
@@ -4710,13 +4738,10 @@ mod unit {
         assert!(error.contains("queued again"), "{error}");
         let after = store.read(&claimed.id).unwrap();
         assert_eq!(after.state, JobState::Queued, "{after:?}");
-        assert_eq!(after.could_not_run.len(), 1, "{after:?}");
+        assert!(after.could_not_run.is_empty(), "{after:?}");
         let history = after.history.join("\n");
         assert!(history.contains("GH-PACED REFUSED"), "{history}");
-        assert!(
-            history.contains("pacing-guard refusal: transient"),
-            "{history}"
-        );
+        assert!(history.contains("no strike (pacing"), "{history}");
         assert!(store.host_fault_list().is_empty());
         publish(&store, "c2");
         assert!(store.claim("d1", "h1", 1).unwrap().is_some());
@@ -4751,7 +4776,7 @@ mod unit {
         assert!(error.contains("queued again"), "{error}");
         let after = store.read(&claimed.id).unwrap();
         assert_eq!(after.state, JobState::Queued, "{after:?}");
-        assert_eq!(after.could_not_run.len(), 1, "{after:?}");
+        assert!(after.could_not_run.is_empty(), "{after:?}");
         assert!(store.host_fault_list().is_empty());
     }
 
