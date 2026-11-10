@@ -1,11 +1,12 @@
 ---
 title: 'documents-reader-layout: give the reader heading rules, a reading measure, zebra tables, and no dead grip or channel menu items'
-status: open
+status: closed
 priority: 1
 issue_type: task
 assignee: mu-docread
 created_at: 2026-11-10T17:56:44+00:00
-updated_at: 2026-11-10T17:56:44+00:00
+updated_at: 2026-11-10T20:43:44+00:00
+closed_at: 2026-11-10T20:43:44+00:00
 ---
 
 # Description
@@ -35,3 +36,7 @@ Verified state: `vibe-talk/web/styles/voice/21-documents.css` gives `#doc-body` 
 # Notes
 
 [watermelon-full-preview] mu-docread, owner reply 338 batch, piece B of three. Siblings: #1235 documents-list-continuation, #1237 documents-collapsible-sections. Prior work: #1038 documents-outline-popup (same stylesheet and pane), the width grip's own history, #820 voice-page-action-menu. If the grip gate needs an overlay stacking change, follow the z-index scale owned by #1228 menu-above-chips and tell that lane. Page-only change: path-selected validation covers it.
+
+## Resolution
+
+Landed as cd1cc25b on github/main (9065e862 and 9dfaf108 replayed onto gated base b80c4d8d). `21-documents.css` now centres `#doc-body` at 90ch in the desktop regime (phone full width), rules `h1`/`h2`, gives lists air around dense items, and zebra-stripes table body rows; `#width-grip` is gated out of the Documents view by the same `:has(#pane-docs)` pattern as the search glass; the fold items' `hidden` state is forced while the view is `docs` in `renderScrollTools`, which `showView` runs on every switch. The browser coverage lives in its own `tests/documents_layout_browser.py` (dag job `documents-layout-browser`), split from `documents_browser.py` so this piece gated in parallel with #1235. Gate accounting: the owner-tier path-selected gate on 9dfaf108 finished fully green (143 passed, 0 failed, validate OK), including the new layout check at 393x852 and 1280x800 — bounded centred column on the desk, full width on the phone, no grip box or hit over the text, alternating row grounds, heading rules, no "Expand all" in Documents and both restored in the channel. No `voice.js` or z-index change was needed. Unverified: light-scheme zebra contrast was asserted only as alternating computed grounds, not eyeballed; the owner's phone remains the final check there.

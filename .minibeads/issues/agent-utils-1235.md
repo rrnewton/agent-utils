@@ -1,11 +1,12 @@
 ---
 title: 'documents-list-continuation: a wrapped list item spills its tail as a separate paragraph in the reader'
-status: open
+status: closed
 priority: 1
 issue_type: task
 assignee: mu-docread
 created_at: 2026-11-10T17:56:44+00:00
-updated_at: 2026-11-10T17:56:44+00:00
+updated_at: 2026-11-10T20:43:44+00:00
+closed_at: 2026-11-10T20:43:44+00:00
 ---
 
 # Description
@@ -29,3 +30,7 @@ Verified cause (correcting the first guess that server chat rendering leaked int
 # Notes
 
 [watermelon-full-preview] mu-docread, owner reply 338 batch, piece A of three. Siblings: #1236 documents-reader-layout, #1237 documents-collapsible-sections. Prior reader work: #1038 documents-outline-popup, #1039 documents-read-parity, #628 documents-index-server. The server-side list rules of #237 nested-lists are chat-message rules and do not apply here. Page-only change: path-selected validation covers it. The hand-rolled renderer's other GFM gaps (nested and loose lists, lazy continuation, code in items, ordered start-at-N, task lists, autolinks) are audited against real documents under this issue and weighed for the longer term in #1238 documents-markdown-library (hand-rolled vs a client library vs server comrak + ammonia in a plain-GFM document mode); this issue fixes only the continuation spill.
+
+## Resolution
+
+Landed as c70a94a2 on github/main (be1fe1bc replayed from its fork point). The list branch of `renderDocumentMarkdown` now joins an indented continuation line to its item with a space; blank lines, other blocks, other-kind items, and unindented prose still end the list. Evidence: the reference 7-item list rendered 7 one-item lists plus 7 paragraphs before and 1 list of 7 items after (probe and unit tests); `documents.test.mjs` 44/44 including 3 tests observed failing first; `documents_browser.py` gained the wrapped-list reader assertion and passed in the gate. Gate accounting: the owner-tier path-selected gate on be1fe1bc finished 153 passed / 1 failed, the sole failure `vibe-talk.check.fold-latency-browser`, classified as a shared-load flake on untouched code (three owner gates concurrent; the step missed its 28 ms budget at load x1.55 here and passed at x1.00 inside #1236's green run; the same step failed on unrelated heads the same afternoon and has its own #1231 fold-latency-deflake). Landed on the coordinator's direction under owner reply 346 (real-time-sensitive checks must not gate; being disabled separately), with the queued solo rerun cancelled. Unverified: nothing else; the renderer's remaining GFM gaps are #1238 documents-markdown-library's to weigh.
