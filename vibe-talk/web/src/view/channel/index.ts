@@ -224,3 +224,5 @@ export { SCROLL_TRACE_MAX_ENTRIES, SCROLL_TRACE_WINDOW_MS, createScrollTrace } f
 export type { ScrollTrace, ScrollTraceAnchor, ScrollTraceDependencies } from "./scrolltrace.ts";
 export { createCardRefresh } from "./cardrefresh.ts";
 export type { CardRefresh, CardRefreshDependencies } from "./cardrefresh.ts";
+export { createChannelScope } from "./channelscope.ts";
+export type { ChannelScope, ChannelScopeDependencies, MutableFailure } from "./channelscope.ts";

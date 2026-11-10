@@ -33,6 +33,7 @@ const SUITES: &[&str] = &[
     "tests/js/present/settings.test.mjs",
     "tests/js/present/time.test.mjs",
     "tests/js/view/channel.test.mjs",
+    "tests/js/view/channel-scope.test.mjs",
     "tests/js/view/readcore.test.mjs",
     "tests/js/view/composer.test.mjs",
     "tests/js/view/documents.test.mjs",

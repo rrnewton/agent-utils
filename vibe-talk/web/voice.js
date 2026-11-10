@@ -4424,237 +4424,48 @@ const viewKey = (view = selection().view, thread = selection().threadId) => (vie
 
 
 
-/** The read state of the rows on screen is the store's read state for those rows. */
-function syncCanonDismissed() {
-  if (!providerFacts.threading() || channelStore.current().channel !== String(selectedChannelId())) return;
-  // `#407 unpack-row-parity`. Over the cards the right column has no rows on screen to speak for.
-  if (columnWork.side() && columns.side.mode !== "thread") return;
-  for (const message of timelineRows().messages) {
-    const id = String(message.id);
-    if (doneState().archived.has(id)) channelStore.current().dismissed.add(id);
-    else channelStore.current().dismissed.delete(id);
-  }
-}
-
-
-
-
-
-
-/**
- * Record what the channel holds. Called after every read that succeeded and after every local
- * change to the rows — a live arrival, an acknowledged send, an archive — so a reload shows what
- * the reader last saw.
- *
- * NOT in the legacy to-do filter: that list is `/todo`, a filtered answer, and saving it as the
- * channel would show a reload a channel with its dealt-with messages missing.
- */
-function saveChannelScope() {
-  if (!selectedChannelId() || (readModes.hiding() && !providerFacts.threading()) || !screenBelongsToToken()) return;
-  const cache = messageCache.readMessageCache();
-  if (!cache) return;
-  const key = String(selectedChannelId());
-  const now = Date.now();
-  /** @type {import("./src/core/channels/index.ts").CacheEntry | null} */
-  let entry = null;
-  if (providerFacts.threading()) {
-    if (channelStore.current().channel !== key) return;
-    syncCanonDismissed();
-    // The store as the device keeps it (web/src/core/channels `savedTimelineOf`).
-    entry = savedTimelineOf(channelStore.current(), now, bookmarkToSave(key));
-  } else {
-    // In time order, gathered replies or not (`#215 reply-coalesce`): a reload draws these as they
-    // are saved, and nothing it draws is gathered.
-    const messages = listedMessages();
-    const shown = new Set(messages.map((message) => String(message.id)));
-    entry = {
-      mode: "page",
-      savedAt: loadState().freshAt || now,
-      usedAt: now,
-      messages,
-      threads: [],
-      more: olderPages().moreAbove !== false,
-      cursor: null,
-      // `#578 search-status-clarity`: where the rows saved stop being one stretch, if they do.
-      gapFrom: plainReach.gapFrom(),
-      dismissed: [...doneState().archived].filter((id) => shown.has(id)),
-      bookmark: bookmarkToSave(key),
-    };
-  }
-  messageCache.trimCacheEntry(entry, MESSAGE_CACHE_ROWS);
-  cache.scopes[key] = entry;
-  messageCache.writeMessageCache(cache, key);
-}
-
-/**
- * Draw the selected channel's saved rows, if this device has them: the store's projection of the
- * current view in timeline mode, the saved page in legacy mode.
- */
-function hydrateChannelScope() {
-  const channel = selectedChannelId();
-  if (!channel || (readModes.hiding() && !providerFacts.threading())) return false;
-  screenBelongsToToken();
-  if (providerFacts.threading()) {
-    if (channelStore.current().channel !== String(channel)) loadCanon(channel);
-    inheritAllCover(selection().view, selection().threadId, selection().thread);
-    return drawProjection();
-  }
-  const cache = messageCache.readMessageCache();
-  const key = String(channel);
-  const entry = cache ? cache.scopes[key] : undefined;
-  if (!entry || entry.mode !== "page") return false;
-  entry.usedAt = Date.now();
-  messageCache.writeMessageCache(cache, key);
-  restoreSavedBookmark(key, entry.bookmark);
-  const payload = {
-    channel: knownChannel(channel),
-    messages: entry.messages,
-    has_more: entry.more,
-    next_before: entry.cursor || null,
-    dismissed: entry.dismissed,
-  };
-  try {
-    el("discord-log").replaceChildren();
-    const loaded = applyNewestPage(/** @type {any} */ (payload), true);
-    plainReach.restore(entry.gapFrom);
-    renderChannelSeam(channelSummary(loaded, olderPager.loadedIsWhole(olderPages().moreAbove), channelName(payload.channel)));
-  } catch (_error) {
-    clearChannelScreen();
-    messageCache.forgetChannelScopes((id) => id === key);
-    return false;
-  }
-  const rows = entry.messages;
-  listState().newestId = rows.length > 0 ? String(rows[rows.length - 1].id) : null;
-  loadState().freshAt = entry.savedAt;
-  setChannelFreshness("saved");
-  renderOutgoingMessages();
-  return true;
-}
-
-/**
- * Before `/client-config` answers: put the channel picker and the saved rows up from the shell, so
- * a reload opens on the application rather than on the sign-in form and an empty channel.
- */
-function hydrateFromCache() {
-  const cache = messageCache.readMessageCache();
-  if (!cache || !cache.shell) return false;
-  const shell = cache.shell;
-  providerFacts.setThreading(shell.threading_supported === true);
-  channelDirectory.setCapability("threading", providerFacts.threading());
-  providerFacts.setBroadcast(shell.broadcast_supported === true);
-  channelDirectory.setCapability("broadcast", providerFacts.broadcastSupported());
-  channelDirectory.setChannels(shell.channels);
-  learnProviders(shell.providers);
-  whoIsWho.setDeploymentCodingAgents(shell);
-  if (shell.self_author_id) noteSelfAuthor(shell.self_author_id);
-  whoIsWho.setOwnerAuthorId(shell.owner_author_id);
-  whoIsWho.learnOwnerIds(shell.owner_author_ids);
-  fillChannelSelect("discord-channel");
-  // `#355 provider-grouped-channels`. Settings by service, from the saved shell as from client-config.
-  channelSettings.fillServiceSelect();
-  fillChannelSelect("settings-channel");
-  const provider = providerOfChannel(selectedChannelId());
-  if (provider) { providerFacts.setThreading(provider.threading_supported === true); providerFacts.setBroadcast(provider.broadcast_supported === true); }
-  channelSettings.renderChannelBox();
-  // Before the composer and the rows: both are the view's. `#189 restore-ui-state`.
-  openChannelView();
-  restoreChannelComposer();
-  hydrateChannelScope();
-  return true;
-}
-
-/** Take every channel row off the screen and out of memory. */
-function clearChannelScreen() {
-  // From the left column, whichever column's read found the credential refused. `#229`.
-  if (columnWork.side()) return inColumn(columns.main, clearChannelScreen);
-  ++loadState().generation;
-  readAloudOwner().stopReading();
-  readAloudOwner().readingMode = false;
-  channelContexts.clear();
-  channelStore.open();
-  timelineRows().messages = [];
-  timelineRows().threads = [];
-  doneState().archived = new Set();
-  olderPages().moreAbove = false;
-  olderPages().cursor = null;
-  channelReads.payCursor();
-  listState().newestId = null;
-  el("discord-log").replaceChildren();
-  el("thread-list").replaceChildren();
-  el("channel-summary").replaceChildren();
-  el("timeline-notice").hidden = true;
-  // The pins this credential read go with the rest of what it read. The bookmarks are kept: they
-  // are the server's, read again with the channel, and a write of one still on its way is kept track
-  // of for the read that follows (`noteBookmark`). Only another credential forgets them
-  // (`forgetBookmarks`). The rows the line was drawn on are gone.
-  forgetPins();
-  readingBookmark.forgetDrawn();
-  el("pinned-log").replaceChildren();
-  renderOlderControl();
-  loadState().freshAt = 0;
-  setChannelFreshness("fresh");
-  screenIdentity.claim(tokenFingerprint(token()));
-  // `#229 desktop-two-column`. What the right column read goes with the rest, and the threads selected
-  // there, which this credential read.
-  sideThreads.clear();
-  resetSideColumn();
-}
-
-/**
- * Whether the rows on screen were read for the token saved now. When another tab or the main app
- * has replaced it, they are cleared here — false — so they can be neither saved under the new
- * identity nor merged into its first read.
- */
-function screenBelongsToToken() {
-  if (screenIdentity.belongsTo(tokenFingerprint(token()))) return true;
-  clearChannelScreen();
-  forgetBookmarks();
-  // Reading the envelope deletes it when it, too, belongs to the previous token.
-  messageCache.readMessageCache();
-  return false;
-}
-
-/** Sign-out, another token, or a refusal: nothing this credential read may stay behind. */
-function forgetMessages() {
-  if (columnWork.side()) return inColumn(columns.main, forgetMessages);
-  // `#277 reply-in-column`. A reply open in a column answers a message that is going; its words are
-  // kept as a draft, as every reply put down is.
-  putDockedReplyAway();
-  messageCache.dropMessageCache();
-  clearChannelScreen();
-  forgetBookmarks();
-  // `#892 voice-page-optimistic-done`. Nor the Done writes it kept to send again.
-  inboxLedger.clear();
-  // ...nor where the reader was in it: the record names a thread this credential read, and the
-  // next one opens the channel as a first visit does. `#189 restore-ui-state`.
-  uiState.forget();
-  openChannelView();
-  restoreChannelComposer();
-}
-
-/** A channel read failed. Say so over the rows it leaves standing — or take them away. */
-function noteChannelReadFailure(error) {
-  // `#195 send-resilience`. Whatever reports this — the banner, for a read the reader asked for —
-  // says what it means rather than the server's diagnosis of it.
-  if (error) error.message = readableChannelFailure(error);
-  if (error && error.refused) {
-    forgetMessages();
-    return;
-  }
-  if (error && error.status === 404 && error.code === "unknown_channel") {
-    const channel = String(selectedChannelId());
-    messageCache.forgetChannelScopes((id) => id === channel);
-    clearChannelScreen();
-    return;
-  }
-  // With nothing on screen the error itself is the whole report.
-  if (loadState().freshAt) {
-    setChannelFreshness(error && error.network ? "offline" : isSlowFailure(error) ? "slow" : "failed");
-    // `#195 send-resilience`. Said, over the rows it is about: a refresh nobody asked for needs no
-    // banner on top of it. See `refreshQuietly`.
-    if (error) error.shownInPill = true;
-  }
-}
+/** Saving the channel's scope, drawing it back, and clearing it: web/src/view/channel's now (`createChannelScope`, `#624`). */
+const channelScope = createChannelScope({
+  providerFacts, channelStore, channelDirectory, messageCache,
+  selectedChannelId: () => selectedChannelId(), selection: () => selection(),
+  columnWork, columns: () => columns,
+  timelineRows: () => timelineRows(), doneState: () => doneState(),
+  loadState: () => loadState(), listState: () => listState(), olderPages: () => olderPages(),
+  readModes: () => readModes,
+  bookmarkToSave: (channel) => bookmarkToSave(channel),
+  listedMessages: () => listedMessages(),
+  plainReach: () => plainReach,
+  loadCanon: (channel) => loadCanon(/** @type {any} */ (channel)),
+  inheritAllCover: (view, threadId, thread) => inheritAllCover(view, /** @type {any} */ (threadId), /** @type {any} */ (thread)),
+  drawProjection: () => drawProjection(),
+  knownChannel: (id) => knownChannel(id), channelName: (channel) => channelName(channel),
+  restoreSavedBookmark: (key, bookmark) => restoreSavedBookmark(key, bookmark),
+  el: (id) => el(id),
+  applyNewestPage: (payload, saved) => applyNewestPage(/** @type {any} */ (payload), saved),
+  olderPager: () => olderPager,
+  channelSummary: (loaded, whole, name) => channelSummary(loaded, whole, name),
+  renderChannelSeam: (summary) => renderChannelSeam(summary),
+  setChannelFreshness: (state) => setChannelFreshness(/** @type {any} */ (state)),
+  renderOutgoingMessages: () => renderOutgoingMessages(),
+  learnProviders: (providers) => learnProviders(providers),
+  providerOfChannel: (id) => providerOfChannel(id),
+  fillChannelSelect: (id) => fillChannelSelect(id),
+  whoIsWho: () => whoIsWho, noteSelfAuthor: (id) => noteSelfAuthor(id),
+  channelSettings: () => channelSettings,
+  openChannelView: () => openChannelView(), restoreChannelComposer: () => restoreChannelComposer(),
+  inColumn: (column, act) => inColumn(/** @type {any} */ (column), act),
+  readAloudOwner: () => readAloudOwner(),
+  channelContexts, channelReads: () => channelReads,
+  forgetPins: () => forgetPins(), readingBookmark: () => readingBookmark,
+  renderOlderControl: () => renderOlderControl(),
+  screenIdentity, token: () => token(), sideThreads,
+  resetSideColumn: () => resetSideColumn(), forgetBookmarks: () => forgetBookmarks(),
+  putDockedReplyAway: () => putDockedReplyAway(), inboxLedger: () => inboxLedger,
+  uiState: () => uiState, readableChannelFailure: (error) => readableChannelFailure(error), isSlowFailure: (error) => isSlowFailure(/** @type {any} */ (error)),
+  channelContextKey: () => channelContextKey(), threadPresence,
+  voiceCall: () => voiceCall(), renderColumns: () => renderColumns(), saveUiState: () => saveUiState(),
+});
+const { syncCanonDismissed, saveChannelScope, hydrateChannelScope, hydrateFromCache, clearChannelScreen, screenBelongsToToken, forgetMessages, noteChannelReadFailure, reconcileChannelSnapshot } = channelScope;
 
 function setChannelFreshness(state) {
   loadState().freshness = state;
@@ -4757,28 +4568,6 @@ function reserveFreshnessRoom(reserve) {
   // The pane is not on screen in the other view; the list that is must not be moved on its behalf.
   if (screens.view() === "discord") holdingReader(toggle);
   else toggle();
-}
-
-/**
- * The page drew a snapshot for one channel and mode; `/client-config` may describe another.
- *
- * `#189 restore-ui-state`. The view is decided again rather than reset to Main, so a channel the
- * saved shell called threadless whose provider has threads after all opens in All — here, once —
- * unless the reader chose a view. Nothing is read here: with the channel on screen, what asked for
- * sign-in reads the view now up next — a reopen's owed read, or the poll of a page that opened
- * offline — and a read of its own would be a second one.
- */
-function reconcileChannelSnapshot(before) {
-  if (before.key === channelContextKey() && before.threading === providerFacts.threading()) return;
-  clearChannelScreen();
-  openChannelView();
-  threadPresence.forget();
-  hydrateChannelScope();
-  restoreChannelComposer();
-  voiceCall().renderControls();
-  // Threads or none, as sign-in says: one column or two decided again. `#229 desktop-two-column`.
-  renderColumns();
-  saveUiState();
 }
 
 // The record itself — read back from this window's storage and the device's, checked on the way back

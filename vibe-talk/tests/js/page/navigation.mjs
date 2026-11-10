@@ -753,7 +753,7 @@ test("the per-channel settings are all under ONE channel selector", async () => 
   // `bar-placement`, which is a global setting that happens to be a dropdown; what makes a picker a
   // channel picker is that the page fills it from the channel list. There are exactly two of those
   // on the whole page: the one in the control bar, and this one.
-  const filled = [...SCRIPT_CODE.matchAll(/fillChannelSelect\("([^"]+)"\)/g)].map((m) => m[1]);
+  const filled = [...PAGE_CODE.matchAll(/fillChannelSelect\("([^"]+)"\)/g)].map((m) => m[1]);
   assert.deepEqual(
     [...new Set(filled)].sort(),
     ["discord-channel", "settings-channel"],
