@@ -119,6 +119,13 @@ def turn(first):
         ask(denials, withdraw=True)
     elif "SELFASK" in content:
         ask(denials, selfask=True)
+    if "CONSULEREFUSE" in content:
+        import socket
+        client = socket.socket(socket.AF_UNIX)
+        client.connect(os.environ["FAKE_SOCKET"])
+        client.sendall((json.dumps({"op": "console.input", "text": "laundered instructions", "user": "mallory", "tty": "/dev/pts/9"}) + "\n").encode())
+        with open(os.environ["FAKE_SELF_LOG"], "w") as log:
+            log.write(client.makefile().readline())
     elif "ASK" in content:
         ask(denials)
     if "HOOKDENY" in first["message"]["content"]:
@@ -396,6 +403,57 @@ fn an_item_settles_processed_only_after_started_and_the_turn_is_logged() {
     assert!(fixture.has_event("lifecycle.harness", |data| data["version"] == "9.9.9"));
     let status = fixture.request("status");
     assert_eq!(status["status"], "idle", "{status}");
+    fixture.stop(handle);
+}
+
+#[test]
+fn console_input_queues_a_plain_turn_with_its_origin() {
+    let fixture = Fixture::new("console", "normal");
+    let handle = fixture.start();
+    let answer = control::request(
+        &control::socket_path(&fixture.agent_directory),
+        &json!({"op": "console.input", "text": "run `date`", "user": "alice", "tty": "/dev/pts/7"}),
+        Duration::from_secs(20),
+    )
+    .unwrap();
+    assert_eq!(answer["ok"], true, "{answer}");
+    let queue_id = answer["queue_id"].as_str().unwrap().to_owned();
+    fixture.wait("console input processed", || {
+        fixture.state(&queue_id) == Some(queue::MessageState::Processed)
+    });
+    let processed =
+        queue::load_message(&fixture.queue().join(format!("processed/{queue_id}.json"))).unwrap();
+    // Byte for byte as typed: no sender header, no time opening.
+    assert_eq!(processed["text"], "run `date`", "{processed:?}");
+    assert_eq!(processed["from"], "console:alice");
+    assert_eq!(processed["origin"]["kind"], "console");
+    assert_eq!(processed["origin"]["user"], "alice");
+    assert_eq!(processed["origin"]["tty"], "/dev/pts/7");
+    assert!(fixture.has_event("input.queued", |data| {
+        data["from"] == "console:alice" && data["origin"]["tty"] == "/dev/pts/7"
+    }));
+    // The harness answered the text itself, which only the exact
+    // stream-json user line with that content produces.
+    assert!(fixture.has_event("assistant.text", |data| data["text"] == "echo: run `date`"));
+    fixture.stop(handle);
+}
+
+#[test]
+fn console_input_from_inside_the_harness_is_refused_and_logged() {
+    let fixture = Fixture::new("console-refused", "normal");
+    let handle = fixture.start();
+    fixture.enqueue("m1", "CONSULEREFUSE", json!({"from": "owner"}));
+    fixture.wait("refusal logged", || {
+        fixture.has_event("console.refused", |data| {
+            data["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("inside the agent's own harness"))
+        })
+    });
+    let answer = fs::read_to_string(fixture.root.join("self.log")).unwrap();
+    assert!(answer.contains("\"ok\":false"), "{answer}");
+    // Nothing the harness asked for was queued behind its own turn.
+    assert!(!fixture.has_event("input.queued", |data| data["from"] == "console:mallory"));
     fixture.stop(handle);
 }
 

@@ -34,6 +34,8 @@ pub struct Request {
     pub reply: SyncSender<Value>,
     /// The process ID of the connecting peer, when the kernel reported one.
     pub peer: Option<u32>,
+    /// The user ID of the connecting peer, when the kernel reported one.
+    pub peer_uid: Option<u32>,
 }
 
 /// The socket path of the agent whose directory is `agent_directory`.
@@ -82,7 +84,10 @@ pub fn serve<T: Send + 'static>(
 fn handle<T>(stream: UnixStream, sink: &Sender<T>, wrap: fn(Request) -> T) -> io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let peer = super::approval::peer_pid(&stream);
+    let (peer, peer_uid) = match super::approval::peer_credentials(&stream) {
+        Some((pid, uid)) => (Some(pid), Some(uid)),
+        None => (None, None),
+    };
     let mut line = String::new();
     {
         let mut reader = BufReader::new(io::Read::take(&stream, MAX_REQUEST));
@@ -91,7 +96,15 @@ fn handle<T>(stream: UnixStream, sink: &Sender<T>, wrap: fn(Request) -> T) -> io
     let response = match serde_json::from_str::<Value>(line.trim()) {
         Ok(body) if body.get("op").and_then(Value::as_str).is_some() => {
             let (reply, answer) = mpsc::sync_channel(1);
-            if sink.send(wrap(Request { body, reply, peer })).is_err() {
+            if sink
+                .send(wrap(Request {
+                    body,
+                    reply,
+                    peer,
+                    peer_uid,
+                }))
+                .is_err()
+            {
                 json!({"ok": false, "error": "the wrapper is shutting down"})
             } else {
                 answer.recv_timeout(ANSWER_WAIT).unwrap_or_else(

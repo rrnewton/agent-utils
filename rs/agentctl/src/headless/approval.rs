@@ -182,6 +182,14 @@ pub fn valid_by(by: &str) -> bool {
 /// The process ID of the peer of a connected Unix socket, from `SO_PEERCRED`.
 #[must_use]
 pub fn peer_pid(stream: &UnixStream) -> Option<u32> {
+    peer_credentials(stream).map(|(pid, _uid)| pid)
+}
+
+/// The `(process ID, user ID)` of the peer of a connected Unix socket, from
+/// `SO_PEERCRED`; `console.input` also proves the peer runs as the wrapper's
+/// own user, which a process ID alone cannot say.
+#[must_use]
+pub fn peer_credentials(stream: &UnixStream) -> Option<(u32, u32)> {
     let mut credentials = libc::ucred {
         pid: 0,
         uid: 0,
@@ -198,7 +206,7 @@ pub fn peer_pid(stream: &UnixStream) -> Option<u32> {
             &mut length,
         )
     };
-    (result == 0 && credentials.pid > 0).then(|| credentials.pid.unsigned_abs())
+    (result == 0 && credentials.pid > 0).then(|| (credentials.pid.unsigned_abs(), credentials.uid))
 }
 
 /// The parent of process `pid`, from `/proc/PID/stat`.

@@ -252,6 +252,21 @@ struct PendingApproval {
 
 /// How long the queued chat message that carried an accepted answer is looked for, to be taken
 /// as consumed instead of typed.
+/// Longest console input the wrapper queues (#670): the control socket
+/// reads 64 KiB lines, and JSON escaping needs the room.
+pub const CONSOLE_INPUT_MAX_BYTES: usize = 48 * 1024;
+
+/// An excerpt of refused console text that records its shape without
+/// quoting it: the first four characters and the byte count.
+fn masked_excerpt(text: &str) -> String {
+    let visible: String = text.chars().take(4).collect();
+    if text.chars().count() > 4 {
+        format!("{visible}…({} bytes)", text.len())
+    } else {
+        visible
+    }
+}
+
 const CONSUME_WINDOW: Duration = Duration::from_secs(600);
 /// Longest reason an approver may give with a denial, in bytes.
 const ANSWER_REASON_BYTES: usize = 500;
@@ -725,6 +740,7 @@ impl Wrapper {
                         document.get("text").and_then(Value::as_str).unwrap_or_default(),
                         events::EXCERPT_BYTES,
                     ),
+                    "origin": document.get("origin").cloned().unwrap_or(Value::Null),
                 });
                 let queue_id = current.queue_id.clone();
                 self.emit("input.queued", Some(&queue_id), data)?;
@@ -1104,6 +1120,7 @@ impl Wrapper {
                 })).collect::<Vec<_>>(),
             }),
             "approval" => self.approval_answer(&request.body, request.peer)?,
+            "console.input" => self.console_input(&request.body, request.peer, request.peer_uid)?,
             "interrupt" => {
                 let input = self
                     .harness
@@ -1287,6 +1304,83 @@ impl Wrapper {
     /// chat:SENDER`, naming the prompt's ID) or the owner at a terminal (`console:USER`), never
     /// from the agent itself. An answer not taken is logged as `approval.refused`, which a
     /// bridge posts back to its channel.
+    /// Queue one owner-typed console line as a plain user turn (#670
+    /// agentctl-console). The peer is proved as for an approval answer —
+    /// never the harness or a process running as this agent — and must
+    /// also run as the wrapper's own user. The text is queued byte for
+    /// byte with its origin; a refused request is logged with a masked
+    /// excerpt, since it records a laundering attempt.
+    fn console_input(
+        &mut self,
+        body: &Value,
+        peer: Option<u32>,
+        peer_uid: Option<u32>,
+    ) -> Result<Value> {
+        let text = body["text"].as_str().unwrap_or_default().to_owned();
+        let user = body["user"].as_str().unwrap_or_default().to_owned();
+        let tty = body["tty"].as_str().unwrap_or_default().to_owned();
+        if text.is_empty() || text.len() > CONSOLE_INPUT_MAX_BYTES {
+            return Ok(json!({"ok": false, "class": "invalid",
+                "error": format!("console text must be 1..={CONSOLE_INPUT_MAX_BYTES} bytes")}));
+        }
+        if !approval::valid_by(&format!("console:{user}"))
+            || tty.is_empty()
+            || tty.len() > 200
+            || tty.chars().any(char::is_control)
+        {
+            return Ok(json!({"ok": false, "class": "invalid",
+                "error": "console input must name its user and terminal".to_owned()}));
+        }
+        let refuse = |wrapper: &mut Self, error: String| -> Result<Value> {
+            wrapper.emit(
+                "console.refused",
+                None,
+                json!({"peer_pid": peer, "message": error, "excerpt": masked_excerpt(&text)}),
+            )?;
+            Ok(json!({"ok": false, "class": "refused", "error": error}))
+        };
+        let harness = self.harness.as_ref().map(|harness| harness.child.id());
+        // Not peer_refusal's cgroup clause: a console legitimately runs
+        // in the owner's session scope beside a terminal-started
+        // wrapper. The laundering guards are the descendant and
+        // agent-ancestry checks, plus the user ID below.
+        if let Some(error) = approval::peer_refusal(peer, harness, &self.config.agent, false) {
+            return refuse(self, error);
+        }
+        // SAFETY: getuid cannot fail.
+        let own_uid = unsafe { libc::getuid() };
+        if peer_uid != Some(own_uid) {
+            return refuse(
+                self,
+                format!("console input must come from the wrapper's own user (uid {own_uid})"),
+            );
+        }
+        let origin = json!({
+            "kind": "console", "user": user, "uid": own_uid, "tty": tty,
+            "peer_pid": peer, "session": self.config.session,
+        });
+        let from = format!("console:{user}");
+        let enqueued = queue::enqueue_into(
+            &self.queue_root,
+            queue::Lane::InboxV2,
+            None,
+            true,
+            &Blocking,
+            |identifier| {
+                json!({"id": identifier, "text": text, "queued_at": unix_seconds(),
+                       "delivery_attempts": 0, "from": from, "origin": origin,
+                       "priority": "normal", "deliver": "turn-boundary"})
+            },
+        );
+        match enqueued {
+            Ok(queue_id) => {
+                self.rescan = true;
+                Ok(json!({"ok": true, "queue_id": queue_id}))
+            }
+            Err(error) => Ok(json!({"ok": false, "class": "queue", "error": error.to_string()})),
+        }
+    }
+
     fn approval_answer(&mut self, body: &Value, peer: Option<u32>) -> Result<Value> {
         let by = body["by"].as_str().unwrap_or_default().to_owned();
         let id = body["id"]

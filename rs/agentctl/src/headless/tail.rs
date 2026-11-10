@@ -43,6 +43,8 @@ pub struct TailOptions {
     pub at: Option<u64>,
     /// How often `--follow` looks for new events.
     pub poll: Duration,
+    /// Render for the interactive console (approval hints).
+    pub console: bool,
 }
 
 impl Default for TailOptions {
@@ -59,6 +61,7 @@ impl Default for TailOptions {
             tool_lines: DEFAULT_TOOL_LINES,
             at: None,
             poll: Duration::from_millis(250),
+            console: false,
         }
     }
 }
@@ -143,6 +146,9 @@ pub struct Context<'a> {
     pub tool_lines: usize,
     /// Senders of inputs seen so far, by queue ID, for turn headers.
     pub senders: &'a HashMap<String, String>,
+    /// Render for the interactive console, which can answer approvals:
+    /// approval requests gain a hint naming the keys to type.
+    pub console: bool,
 }
 
 impl Context<'_> {
@@ -236,6 +242,7 @@ pub fn render(event: &Event, width: usize) -> Vec<String> {
         pretty: false,
         tool_lines: DEFAULT_TOOL_LINES,
         senders: &senders,
+        console: false,
     };
     render_lines(event, &context)
         .iter()
@@ -358,9 +365,20 @@ pub fn render_lines(event: &Event, cx: &Context<'_>) -> Vec<Line> {
             &[s(palette::STATUS, &format!("   · {}", text_of(data, "status")))],
         ),
         "input.queued" => {
+            // A console input names its terminal: `from console:alice
+            // (pts/7)` (#670 agentctl-console).
+            let from = match (
+                text_of(data, "from"),
+                data["origin"]["tty"].as_str().unwrap_or(""),
+            ) {
+                (from, tty) if from.starts_with("console:") && !tty.is_empty() => {
+                    format!("{from} ({})", tty.rsplit('/').next().unwrap_or(tty))
+                }
+                (from, _) => from.to_owned(),
+            };
             let mut header = vec![
                 s(palette::INPUT, "← "),
-                s(palette::INPUT, text_of(data, "from")),
+                s(palette::INPUT, &from),
                 s(
                     palette::DETAIL,
                     &format!(
@@ -638,6 +656,13 @@ pub fn render_lines(event: &Event, cx: &Context<'_>) -> Vec<Line> {
                 ),
                 palette::APPROVAL.dimmed(),
             ));
+            if cx.console {
+                lines.extend(cx.detail(
+                    "   in this console: ",
+                    &format!("type `approve {id}` or `deny {id} [reason]`"),
+                    palette::APPROVAL.dimmed(),
+                ));
+            }
             lines
         }
         "approval.decided" => {
@@ -771,6 +796,7 @@ impl Printer<'_> {
             pretty: self.options.pretty,
             tool_lines: self.options.tool_lines,
             senders: &self.senders,
+            console: self.options.console,
         };
         render_lines(event, &context)
             .iter()
@@ -1762,6 +1788,7 @@ mod tests {
                     pretty,
                     tool_lines: 4,
                     senders: &senders,
+                    console: false,
                 };
                 for event in snapshot_events() {
                     for line in render_lines(&event, &context) {
