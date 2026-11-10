@@ -1719,6 +1719,7 @@ pub fn enqueue(root: &Path, text: &str, message_id: Option<&str>) -> AgentResult
 /// Persist one prompt; one with a `not_after` or a `supersede_key` goes to `inbox.v2/`, which
 /// drainers that do not honour expiry never read. A supersede key forces the serializing lock:
 /// the scan-and-set-aside must be exact against a concurrent drain.
+#[allow(clippy::too_many_arguments)]
 fn enqueue_internal(
     root: &Path,
     text: &str,
