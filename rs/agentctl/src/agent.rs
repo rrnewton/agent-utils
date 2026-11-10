@@ -103,7 +103,6 @@ pub struct QueueResult {
     pub cancelled: Vec<String>,
     /// Prompt identifiers this send's `supersede_key` set aside untyped at enqueue: older
     /// pending copies of the same notice, retained in `cancelled/` as superseded.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub superseded: Vec<String>,
     /// Readiness or identity failure that stopped FIFO progress.
     pub blocked: Option<String>,

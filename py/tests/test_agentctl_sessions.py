@@ -22,6 +22,8 @@ from agentctl.errors import (
     AgentCtlError, AgentDeliveryError, AgentPending, AgentPossiblySubmitted, HerdrUnavailable,
 )
 from agentctl.profiles import (
+    LaunchProfile,
+    blocking_question_warning,
     configuration_root,
     load_configuration, load_profiles, reasoning_arguments, validate_muse_headless_arguments,
     validate_raw_harness_arguments, validate_structured_harness_argument_conflicts,
@@ -253,6 +255,24 @@ def _write_project_configuration(tmp_path: Path, workspace: object) -> Path:
     }), encoding="utf-8")
     path.chmod(0o600)
     return path
+
+
+def test_a_muse_profile_without_the_question_kill_flag_warns() -> None:
+    # #1158, mirroring the Rust edition: only Muse is detectable from argv.
+    bare = LaunchProfile(
+        "coord", "muse", "interactive", None, None, ("--trust-workspace",), (),
+    )
+    warning = blocking_question_warning("muse", bare.argv)
+    assert warning is not None and "--disable-request-user-input" in warning
+    assert bare.public()["blocking_question_warning"] == warning
+    guarded = LaunchProfile(
+        "coord", "muse", "interactive", None, None,
+        ("--trust-workspace", "--disable-request-user-input"), (),
+    )
+    assert blocking_question_warning("muse", guarded.argv) is None
+    assert "blocking_question_warning" not in guarded.public()
+    assert blocking_question_warning("claude", bare.argv) is None
+    assert blocking_question_warning("codex", bare.argv) is None
 
 
 def test_project_configuration_exposes_a_bounded_workspace_policy(tmp_path: Path) -> None:

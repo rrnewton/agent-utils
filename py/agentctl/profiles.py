@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -57,6 +58,27 @@ _MAX_CONFIG_BYTES = 256 * 1024
 _SYSTEM_GIT = Path("/usr/bin/git")
 
 
+def blocking_question_warning(harness: str, argv: Sequence[str]) -> str | None:
+    """Why this launch can park on a blocking question tool, if detectable (#1158).
+
+    Only Muse is detectable from launch arguments alone: its
+    ``request_user_input`` is withheld per run by
+    ``--disable-request-user-input`` and Muse has no persistent settings
+    key for it. Claude Code's AskUserQuestion is denied in its own settings
+    files and Codex's request_user_input in its host config
+    (``tools.experimental_request_user_input``), neither of which a profile's
+    arguments show; the userguide names both.
+    """
+    if harness == "muse" and "--disable-request-user-input" not in argv:
+        return (
+            "does not pass --disable-request-user-input: a Muse launched this way can park "
+            "its turn on request_user_input at the terminal, unread, until a person answers; "
+            "a chat-driven coordinator (or any unattended lane) must pass it and ask over "
+            "chat instead"
+        )
+    return None
+
+
 class _DuplicateKey(ValueError):
     pass
 
@@ -88,6 +110,9 @@ class LaunchProfile:
         if self.agentcloud is not None:
             result["agentcloud"] = dict(self.agentcloud)
             result["requires_edition"] = "rust"
+        warning = blocking_question_warning(self.harness, self.argv)
+        if warning is not None:
+            result["blocking_question_warning"] = warning
         return result
 
 

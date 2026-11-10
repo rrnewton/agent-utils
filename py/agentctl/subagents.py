@@ -56,6 +56,7 @@ from agentctl.errors import (
     MisrouteRecovered, ProbableMisroute, RecipientChanged, RecoveryAction, _with_recovery,
 )
 from agentctl.profiles import (
+    blocking_question_warning,
     reasoning_arguments,
     validate_structured_harness_argument_conflicts,
     LaunchEnv,
@@ -3214,6 +3215,11 @@ class ManagedAgents:
                 structured_resume=resume is not None,
             )
         structured_effort = reasoning_arguments(harness, reasoning_effort)
+        # #1158: a launch that can park on an in-TUI question says so at once,
+        # while someone is still watching the start.
+        if (warning := blocking_question_warning(
+                harness, (*structured_effort, *harness_args))) is not None:
+            print(f"agentctl: warning: {name}: this launch {warning}", file=sys.stderr)
         # Load the launch environment before the name is taken, so a missing team
         # file or directory refuses the start cleanly.
         launch_env = self._project_launch_env()
