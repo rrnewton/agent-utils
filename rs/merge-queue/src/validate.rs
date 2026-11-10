@@ -119,6 +119,15 @@ pub fn could_not_run_busy(log_text: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
+/// Whether a refusal's output names the host credential pacing guard: a
+/// git call was refused because logins are paced per host and the waiter
+/// past its wait bound gave up (`GH-PACED REFUSED` on stderr, exit 75).
+/// Shared-budget contention, not a host defect: transient, never a host
+/// fault (see `donor.rs`).
+pub fn gh_paced_refusal(log_text: &str) -> bool {
+    log_text.contains("GH-PACED REFUSED")
+}
+
 /// The line of a refusal's log that names why it refused — its cause, in
 /// the order a reader would trust: the structured stale-base scope line,
 /// else the first line holding `REFUSED`, else the first scope line, else
@@ -2056,6 +2065,17 @@ mod unit {
         assert!(!could_not_run_busy(
             "interrupted 'finish' mutation ACTIVE.node-a.journal cannot coexist\nCOULD_NOT_RUN"
         ));
+    }
+
+    #[test]
+    fn a_pacing_guard_refusal_is_named_by_its_stderr_line() {
+        // #1193 ghpaced-transient: the guard refuses a git login past its
+        // wait bound with this line (exit 75). Nothing else counts.
+        assert!(gh_paced_refusal(
+            "git fetch failed\nGH-PACED REFUSED: login budget exhausted, try later\nCOULD_NOT_RUN"
+        ));
+        assert!(!gh_paced_refusal("COULD_NOT_RUN: slots full"));
+        assert!(!gh_paced_refusal(""));
     }
 
     #[test]

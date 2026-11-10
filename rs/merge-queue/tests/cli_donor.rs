@@ -1601,6 +1601,135 @@ fn could_not_run_receipts_are_bounded_and_the_batch_is_refused() {
     assert_eq!(item_status(&fx, 1), "queued");
 }
 
+/// A persistent donor (no `--until-idle`), killed by the test.
+fn spawn_donor(fx: &Fixture, clone: &Path, name: &str, env: &[(&str, &str)]) -> Child {
+    let route = route(fx);
+    let clone_text = clone.display().to_string();
+    command(
+        &fx.root,
+        &[
+            "donor",
+            "run",
+            "--queue",
+            &route,
+            "--clone",
+            &clone_text,
+            "--name",
+            name,
+            "--poll-secs",
+            "1",
+            "--mismatch-backoff-secs",
+            "0",
+        ],
+        env,
+    )
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .unwrap()
+}
+
+/// #1193 ghpaced-transient: a validation refused by the credential pacing
+/// guard (exit 75, `GH-PACED REFUSED`) is transient: the job is re-queued
+/// with a counted strike, no probe runs, and no host fault is recorded.
+#[test]
+fn a_paced_refusal_is_transient_and_faults_no_donor() {
+    let fx = Fixture::new("donor-paced-transient");
+    let probes = fx.root.join("probes");
+    let validator = format!(
+        r#"if [ -n "$MQ_PROBE" ]; then echo probe >> {}; exit 1; fi; if [ -n "$DONOR" ]; then echo "GH-PACED REFUSED: login budget exhausted"; echo COULD_NOT_RUN; exit 75; fi; exit 0"#,
+        probes.display()
+    );
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        &validator,
+        "--offload",
+        "decide",
+    ]);
+    set_config(&fx, |config| {
+        config["donors"] = serde_json::json!({"claim_timeout_secs": 4})
+    });
+    two_changes(&fx);
+    let clone = donor_clone(&fx, "donor-host");
+    let run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    let out = donor(&fx, &clone, "d1", &[("DONOR", "1")]);
+    let donor_err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        donor_err.contains("pacing-guard refusal (1 in a row"),
+        "{donor_err}"
+    );
+    let (code, report, stderr) = finish(run);
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(report["ejected"].as_array().unwrap().is_empty(), "{report}");
+    assert_eq!(item_status(&fx, 1), "queued");
+    let job = &jobs(&fx)[0];
+    assert_eq!(job["could_not_run"].as_array().unwrap().len(), 1, "{job}");
+    assert!(
+        job["history"]
+            .to_string()
+            .contains("pacing-guard refusal: transient"),
+        "{job}"
+    );
+    assert!(
+        host_faults(&fx).get("d1").is_none(),
+        "no host fault: {}",
+        host_faults(&fx)
+    );
+    assert!(
+        !probes.exists(),
+        "a pacing refusal is never probed: {}",
+        probes.display()
+    );
+}
+
+/// #1193: pacing refusals past the bound stop being transient: the probe
+/// runs, fails (it loses the same race), and the donor is faulted, so a
+/// lasting outage still shows up.
+#[test]
+fn paced_refusals_past_the_bound_fault_the_donor() {
+    let fx = Fixture::new("donor-paced-bound");
+    let probes = fx.root.join("probes");
+    let validator = format!(
+        r#"if [ -n "$MQ_PROBE" ]; then echo probe >> {}; exit 1; fi; echo "GH-PACED REFUSED: login budget exhausted"; echo COULD_NOT_RUN; exit 75"#,
+        probes.display()
+    );
+    fx.mq_ok(&[
+        "init",
+        "--validator",
+        "command",
+        "--validator-run",
+        &validator,
+        "--offload",
+        "decide",
+        "--max-batch",
+        "1",
+    ]);
+    set_config(&fx, |config| {
+        config["donors"] = serde_json::json!({"claim_timeout_secs": 30})
+    });
+    two_changes(&fx);
+    let clone = donor_clone(&fx, "donor-host");
+    let mut run = spawn_run(&fx, &[]);
+    wait_for("a published job", Duration::from_secs(30), || {
+        !jobs(&fx).is_empty()
+    });
+    let mut donor = spawn_donor(&fx, &clone, "d1", &[]);
+    wait_for("the donor to be faulted", Duration::from_secs(90), || {
+        host_faults(&fx).get("d1").is_some()
+    });
+    assert!(probes.exists(), "the probe ran at the bound");
+    donor.kill().unwrap();
+    let _ = donor.wait();
+    run.kill().unwrap();
+    let _ = run.wait();
+}
+
 /// With one donor host-faulted and another known donor healthy but idle, the
 /// claim timeout still fires: the host-pause hold applies only while every
 /// eligible donor is faulted (the user guide's rule).

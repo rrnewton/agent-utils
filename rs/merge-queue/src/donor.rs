@@ -1984,6 +1984,11 @@ impl Store {
             if busy {
                 note.push_str("; busy admission refusal: never a host fault");
             }
+            if crate::validate::gh_paced_refusal(&receipt.log_tail)
+                || cause_field.is_some_and(|field| crate::validate::gh_paced_refusal(field))
+            {
+                note.push_str("; pacing-guard refusal: transient, counted, not a host fault");
+            }
             job.history.push(note);
             self.write(&job)?;
             return Err(format!(
@@ -3026,7 +3031,16 @@ struct Worker<'a> {
     /// When the next no-pause fault re-probe is due, and its current delay.
     next_fault_probe: Mutex<std::time::Instant>,
     fault_probe_current: Mutex<std::time::Duration>,
+    /// Consecutive pacing-guard refusals (#1193 ghpaced-transient): below
+    /// [`GH_PACED_FAULT_AFTER`] they are transient (no probe, no fault);
+    /// at the bound the ordinary probe-and-fault path runs, so a lasting
+    /// outage still faults. An admitted validation resets the count.
+    paced_refusals: Mutex<usize>,
 }
+
+/// Consecutive pacing-guard refusals after which the donor stops treating
+/// them as transient and lets the probe decide a host fault (#1193).
+pub const GH_PACED_FAULT_AFTER: usize = 3;
 
 /// The probe back-off after a pause whose current delay is `delay`: doubled,
 /// capped at ten minutes.
@@ -3725,8 +3739,33 @@ impl Worker<'_> {
                 let stale_job = crate::validate::stale_base_refusal(&log_text).is_some();
                 let host_scope =
                     crate::validate::could_not_run_scope(&log_text).is_some_and(|(host, _)| host);
+                // A pacing-guard refusal (#1193 ghpaced-transient) is
+                // shared-budget contention, not a host defect, and a probe
+                // cannot fix it: below the bound it is transient (no probe,
+                // no fault, no pause; the receipt re-queues the job). At
+                // the bound the ordinary probe path decides, so a lasting
+                // outage still faults.
+                let paced = crate::validate::gh_paced_refusal(&log_text);
+                let paced_count = if paced {
+                    let mut count = self
+                        .paced_refusals
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *count += 1;
+                    *count
+                } else {
+                    0
+                };
+                let paced_transient = paced && paced_count < GH_PACED_FAULT_AFTER;
+                if paced_transient {
+                    eprintln!(
+                        "merge-queue donor {}: pacing-guard refusal ({paced_count} in a row, bound {GH_PACED_FAULT_AFTER}); transient, no host fault",
+                        self.options.name
+                    );
+                }
                 let probe_failed = !stale_job
                     && !crate::validate::could_not_run_busy(&log_text)
+                    && !paced_transient
                     && !self.probe_host_validator(&job.validator);
                 if probe_failed || host_scope {
                     let reason = crate::validate::could_not_run_scope(&log_text)
@@ -3790,6 +3829,11 @@ impl Worker<'_> {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     std::time::Duration::from_secs(FAULT_PROBE_FIRST_SECS);
+                // Pacing contention is over too (#1193).
+                *self
+                    .paced_refusals
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = 0;
             }
             let body = serde_json::to_vec(&Report {
                 token: token.to_owned(),
@@ -3881,6 +3925,7 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
             std::time::Instant::now() + std::time::Duration::from_secs(FAULT_PROBE_FIRST_SECS),
         ),
         fault_probe_current: Mutex::new(std::time::Duration::from_secs(FAULT_PROBE_FIRST_SECS)),
+        paced_refusals: Mutex::new(0),
     };
     let backoff: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     let active = AtomicUsize::new(0);
@@ -4504,6 +4549,44 @@ mod unit {
         assert!(!history.contains("RETIRE-RETAINED"), "{history}");
         assert!(store.host_fault_list().is_empty());
         // The next job is taken normally by the same donor.
+        publish(&store, "c2");
+        assert!(store.claim("d1", "h1", 1).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_pacing_guard_refusal_requeues_counted_with_no_host_fault() {
+        // #1193 ghpaced-transient: exit 75 because the credential pacing
+        // guard refused a git login. Queue side: the job is queued again
+        // with a counted strike (the per-job bound still applies), the
+        // history names the pacing cause, and no host fault is recorded;
+        // the donor takes the next job normally.
+        let mut store = Store::new(&temp("ghpaced-refusal"));
+        store.could_not_run_limit = 99;
+        publish(&store, "c1");
+        let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        let error = store
+            .report(
+                &claimed.id,
+                &token,
+                refused_receipt(
+                    &claimed,
+                    "d1",
+                    "GH-PACED REFUSED: login budget exhausted\nCOULD_NOT_RUN",
+                ),
+            )
+            .unwrap_err();
+        assert!(error.contains("queued again"), "{error}");
+        let after = store.read(&claimed.id).unwrap();
+        assert_eq!(after.state, JobState::Queued, "{after:?}");
+        assert_eq!(after.could_not_run.len(), 1, "{after:?}");
+        let history = after.history.join("\n");
+        assert!(history.contains("GH-PACED REFUSED"), "{history}");
+        assert!(
+            history.contains("pacing-guard refusal: transient"),
+            "{history}"
+        );
+        assert!(store.host_fault_list().is_empty());
         publish(&store, "c2");
         assert!(store.claim("d1", "h1", 1).unwrap().is_some());
     }
