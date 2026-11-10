@@ -2963,3 +2963,63 @@ test("`#624 voice-page-modularity`: one card highlighted — per channel, toggle
   owner.toggleLitCard("t2", cardB);
   assert.equal(owner.litCard(), null, "the Threads view highlighted a card");
 });
+
+test("`#624 voice-page-modularity`: the card at the top of a thread — drawn once per signature, folded by a press under its own kept key — from the module alone", () => {
+  const { createThreadCardHead } = CHANNEL_VIEW;
+  const was = globalThis.document;
+  const log = [];
+  const el = (attrs = {}, children = []) => {
+    const made = { attrs: new Map(Object.entries(attrs)), children, className: "", parentNode: null, style: null,
+      hidden: false, scrollTop: 0,
+      hasAttribute: (name) => made.attrs.has(name), getAttribute: (name) => (made.attrs.has(name) ? made.attrs.get(name) : null),
+      setAttribute: (name, value) => made.attrs.set(name, String(value)), removeAttribute: (name) => made.attrs.delete(name),
+      append: (...kids) => made.children.push(...kids), getBoundingClientRect: () => ({ top: 0 }) };
+    for (const child of children) child.parentNode = made;
+    return made;
+  };
+  const card = el({ id: "thread-card" }); card.id = "thread-card"; card.style = { values: new Map(), getPropertyValue: (k) => card.style.values.get(k) || "", setProperty: (k, v) => card.style.values.set(k, v), removeProperty: (k) => card.style.values.delete(k) };
+  const textButton = el({ id: "thread-card-text" }); textButton.id = "thread-card-text";
+  const ageNode = el({ id: "thread-card-age" }); ageNode.id = "thread-card-age";
+  const countNode = el({ id: "thread-card-count" }); countNode.id = "thread-card-count";
+  countNode.replaceChildren = (...kids) => { countNode.children = kids; };
+  const byId = { "thread-card": card, "thread-card-text": textButton, "thread-card-age": ageNode, "thread-card-count": countNode,
+    "side-thread-card": el({}), "side-thread-card-text": el({}), "scroll-area": el({}), "side-scroll": el({}) };
+  let folded = false;
+  const choice = { id: "t1", root: { thread: {} }, at: 1000, started: 900 };
+  const tally = { threads: new Map([["t1", { held: 2, unread: 1 }]]), records: new Map(), summaries: new Map(), byRoot: new Map() };
+  globalThis.document = { createElement: () => el({}) };
+  try {
+    const owner = createThreadCardHead({
+      makeFoldChoice: () => ({ on: () => folded, keep: (on) => log.push(["keep", on]), set: (on) => { folded = on; }, stored: () => folded }),
+      foldKey: "vibe-talk.voice.thread-card-folded",
+      leftById: (id) => byId[id] || el({}),
+      unansweredRoot: () => false, threadReplyCount: () => 2, exactReplyCount: () => 2,
+      cardView: () => ({ text: "About this", mode: "plain", cut: null }),
+      briefAge: () => "3h", sideCardReplies: () => "2 replies", sideCardUnread: () => "1 unread",
+      cardIsSummarized: () => false, watchPendingSummaries: () => {}, threadHue: () => 25,
+      markCardLayout: () => {}, fillCardText: (words, _view, text) => { words.textContent = text; },
+      setTextIfChanged: (node, text) => { node.textContent = text; }, fullLocalAt: () => "then",
+      cardCountParts: () => ["parts"], scheduleColumnLinks: () => log.push("links"),
+      drawnOnPage: () => false, atBottom: () => false, overscrollRoom: () => 0,
+      fitOverscroll: () => {}, followFoot: () => {}, sideShowing: () => false,
+      sideThreadChoice: () => null, replyTally: () => tally,
+    });
+    assert.equal(owner.THREAD_CARD_FOLD_KEY, "vibe-talk.voice.thread-card-folded", "the fold's stored key changed");
+    owner.paintThreadCard(card, choice, tally);
+    assert.equal(card.getAttribute("data-thread"), "t1");
+    assert.equal(card.style.values.get("--thread-hue"), "25");
+    assert.deepStrictEqual(log, ["links"]);
+    // The same signature draws nothing again.
+    owner.paintThreadCard(card, choice, tally);
+    assert.deepStrictEqual(log, ["links"], "an unchanged card was drawn again");
+    // A press on the card folds it under the kept choice, and the bar says so.
+    owner.threadCardPressed(card, { target: textButton });
+    assert.deepStrictEqual(log.slice(1), [["keep", true], "links"]);
+    assert.equal(card.hasAttribute("data-folded"), true, "the folded card was not drawn as a bar");
+    assert.equal(textButton.getAttribute("aria-expanded"), "false");
+    owner.setThreadCardFolded(false);
+    assert.equal(card.hasAttribute("data-folded"), false, "the opened card stayed a bar");
+  } finally {
+    globalThis.document = was;
+  }
+});

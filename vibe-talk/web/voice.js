@@ -7461,88 +7461,43 @@ const { litCard, cardThread, paintLitCard, paintLitCards, toggleLitCard, cardOpe
 //   * IT IS JOINED TO ITS ROOT. In two columns the line from the thread's first message on Main goes to
 //     it (`columnLinkPairs`, web/src/view/channel/columnlinks.ts), as it went to its card in the list.
 
-/**
- * By the id of each card at the top of a thread, what it was last drawn from, so a pass that changes
- * nothing writes nothing to it.
- *
- * @type {Map<string, string>}
- */
-const threadCardsDrawn = new Map();
-
-/**
- * Whether thread `choice` is one nobody has answered, by the rule its grey Thread tag is drawn by
- * (`unansweredRoot`): no colour is spent on it.
- *
- * @param {import("./src/present/rows/index.ts").ThreadChoice} choice
- * @param {ReplyTally} tally
- */
-function threadUnanswered(choice, tally) {
-  const root = choice.root;
-  if (!root || !root.thread) return false;
-  const entry = tally.threads.get(choice.id);
-  return unansweredRoot(root, threadReplyCount(choice.id, root), entry ? entry.held : 0,
-    exactReplyCount(choice.id, root, tally));
-}
-
-/**
- * Draw `card`, the card at the top of a thread, for thread `choice`, from `tally`: what the thread is
- * about, how long since it moved, its replies and unread, and its colour — or grey, for a thread nobody
- * has answered. Its parts are the elements whose ids are the card's and `-text`, `-age` and `-count`.
- * Written only when what it would draw has changed.
- *
- * @param {HTMLElement} card
- * @param {import("./src/present/rows/index.ts").ThreadChoice | null} choice
- * @param {ReplyTally} tally
- */
-function paintThreadCard(card, choice, tally) {
-  if (!choice) return;
-  const view = cardView(choice);
-  const text = view.text;
-  const age = briefAge(Number.isFinite(choice.at) ? choice.at : choice.started);
-  const replies = sideCardReplies(choice, tally);
-  const unread = sideCardUnread(choice, tally);
-  const unanswered = threadUnanswered(choice, tally);
-  const summarized = cardIsSummarized(choice);
-  // `#528 thread-card-markdown-and-cap`. Waiting for its summary, it reads the Threads list again soon.
-  watchPendingSummaries([choice], card.id);
-  const signature = JSON.stringify([choice.id, view.mode, text, summarized, age, replies, unread, unanswered]);
-  if (threadCardsDrawn.get(card.id) === signature) return;
-  threadCardsDrawn.set(card.id, signature);
-  if (card.getAttribute("data-thread") !== choice.id) card.setAttribute("data-thread", choice.id);
-  // `#428 summary-cards-full`. As a list card's text, this card's summary, when that is what it says, is drawn whole.
-  if (summarized !== card.hasAttribute("data-summarised-card")) {
-    if (summarized) card.setAttribute("data-summarised-card", "");
-    else card.removeAttribute("data-summarised-card");
-  }
-  const state = unanswered ? "start" : "open";
-  if (card.getAttribute("data-thread-state") !== state) card.setAttribute("data-thread-state", state);
-  const hue = String(threadHue(choice.id));
-  if (unanswered) card.style.removeProperty("--thread-hue");
-  else if (card.style.getPropertyValue("--thread-hue") !== hue) card.style.setProperty("--thread-hue", hue);
-  const button = leftEl(`${card.id}-text`);
-  let words = childByClass(button, "side-card-text");
-  if (!words) {
-    words = document.createElement("span");
-    words.className = "side-card-text";
-    button.append(words);
-  }
-  // `#528 thread-card-markdown-and-cap`: its root's formatted words, as a list card's.
-  markCardLayout(card, view.mode, view.cut);
-  fillCardText(words, view, text);
-  if (button.getAttribute("title") !== text) button.setAttribute("title", text);
-  setTextIfChanged(leftEl(`${card.id}-age`), age);
-  // `#479 message-time-full-date`. Hovering the open thread's age says the day it last moved, whole.
-  const cardLastMoved = Number.isFinite(choice.at) ? choice.at : choice.started;
-  const ageNode = leftEl(`${card.id}-age`);
-  const ageTitle = Number.isFinite(cardLastMoved) ? fullLocalAt(new Date(cardLastMoved)) : null;
-  if (ageTitle && ageNode.getAttribute("title") !== ageTitle) ageNode.setAttribute("title", ageTitle);
-  // A span, not the list card's button: the thread is open already. Never "Open thread".
-  const count = leftEl(`${card.id}-count`);
-  count.replaceChildren(...cardCountParts("side-card", replies, unread));
-  if (count.hidden !== (!replies && !unread)) count.hidden = !replies && !unread;
-  // The link to the card goes, or comes, with the thread's first reply.
-  scheduleColumnLinks();
-}
+// The card at the top of an open thread, and its fold to a bar, are web/src/view/channel's now
+// (`createThreadCardHead`, `#624 voice-page-modularity`): what each card was last drawn from,
+// its drawing, and the reader's fold choice kept on the device — the setting's own key and
+// stored form, handed in untouched.
+const threadCardHead = createThreadCardHead({
+  makeFoldChoice: () => createKeptSwitch({
+    setting: DEVICE_SETTINGS.threadCardFolded,
+    deviceSettings: () => deviceSettings(),
+  }),
+  foldKey: DEVICE_SETTINGS.threadCardFolded.key,
+  leftById: leftEl,
+  unansweredRoot: (root, count, held, exact) => unansweredRoot(/** @type {any} */ (root), /** @type {any} */ (count), held, /** @type {any} */ (exact)),
+  threadReplyCount: (id, root) => threadReplyCount(id, /** @type {any} */ (root)),
+  exactReplyCount: (id, root, tally) => exactReplyCount(id, /** @type {any} */ (root), tally),
+  cardView: (choice) => cardView(choice),
+  briefAge: (at) => briefAge(at),
+  sideCardReplies: (choice, tally) => sideCardReplies(choice, tally),
+  sideCardUnread: (choice, tally) => sideCardUnread(choice, tally),
+  cardIsSummarized: (choice) => cardIsSummarized(choice),
+  watchPendingSummaries: (choices, cardId) => watchPendingSummaries(/** @type {any} */ (choices), cardId),
+  threadHue: (id) => threadHue(id),
+  markCardLayout: (card, mode, cut) => markCardLayout(card, mode, /** @type {any} */ (cut)),
+  fillCardText: (words, view, text) => fillCardText(words, /** @type {any} */ (view), text),
+  setTextIfChanged: (node, text) => setTextIfChanged(node, text),
+  fullLocalAt: (when) => fullLocalAt(when),
+  cardCountParts: (prefix, replies, unread) => cardCountParts(prefix, replies, unread),
+  scheduleColumnLinks: () => scheduleColumnLinks(),
+  drawnOnPage: (node) => drawnOnPage(node),
+  atBottom: (area, slack) => atBottom(area, slack),
+  overscrollRoom: (area) => overscrollRoom(area),
+  fitOverscroll: (area) => fitOverscroll(area),
+  followFoot: (area) => followFoot(area),
+  sideShowing: () => sideShowing(),
+  sideThreadChoice: () => /** @type {any} */ (sideThreadChoice()),
+  replyTally: () => replyTally(),
+});
+const { threadCardsDrawn, THREAD_CARD_FOLD_KEY, THREAD_CARD_LISTS, threadCardFoldChoice, threadUnanswered, paintThreadCard, renderThreadCardFold, threadCardPressed, setThreadCardFolded, paintSideThreadCard } = threadCardHead;
 
 // --- the card at the top of a thread folded to a bar ------------------------------------------------
 //
@@ -7565,93 +7520,6 @@ function paintThreadCard(card, choice, tally) {
 //     room past the right column's foot fitted again, `#338 column-overscroll`).
 //   * It replaces `#298`'s press on clamped text opening the card over the list: the press has one
 //     meaning on the card now, as it has on a message.
-
-const THREAD_CARD_FOLD_KEY = DEVICE_SETTINGS.threadCardFolded.key;
-
-/** The cards at the top of a thread, one per column, and the list each heads. */
-const THREAD_CARD_LISTS = [["thread-card", "scroll-area"], ["side-thread-card", "side-scroll"]];
-
-/**
- * Whether the cards at the top of a thread are folded to a bar: the reader's choice, kept on the device and
- * read from it here, as the page loads. ABSENT MEANS OPEN; a browser refusing storage reads as open
- * (`DEVICE_SETTINGS.threadCardFolded.refused`). One owner in web/src/core/settings/switches.ts
- * (`#624 voice-page-modularity`).
- *
- * @type {import("./src/core/settings/index.ts").KeptSwitch}
- */
-const threadCardFoldChoice = createKeptSwitch({
-  setting: DEVICE_SETTINGS.threadCardFolded,
-  deviceSettings: () => deviceSettings(),
-});
-
-/** Draw the cards at the top of a thread folded or open, as `threadCardFoldChoice` says: written only where it changed. */
-function renderThreadCardFold() {
-  for (const [id] of THREAD_CARD_LISTS) {
-    const card = leftEl(id);
-    if (card.hasAttribute("data-folded") !== threadCardFoldChoice.on()) {
-      if (threadCardFoldChoice.on()) card.setAttribute("data-folded", "");
-      else card.removeAttribute("data-folded");
-    }
-    const button = leftEl(`${id}-text`);
-    const expanded = threadCardFoldChoice.on() ? "false" : "true";
-    if (button.getAttribute("aria-expanded") !== expanded) button.setAttribute("aria-expanded", expanded);
-  }
-}
-
-/**
- * A click on `card`, the card at the top of a thread: folded or opened, unless it was on the X or a link
- * in it, which do their own acts, or it ended a selection of the card's text made with the mouse.
- *
- * @param {HTMLElement} card
- * @param {Event} event
- */
-function threadCardPressed(card, event) {
-  for (let node = /** @type {Node | null} */ (event.target); node && node !== card; node = node.parentNode) {
-    const tag = String(/** @type {HTMLElement} */ (node).tagName || "").toLowerCase();
-    if (tag === "a" || (tag === "button" && node !== leftEl(`${card.id}-text`))) return;
-  }
-  const selection = typeof getSelection === "function" ? getSelection() : null;
-  if (selection && !selection.isCollapsed && nodeWithin(card, selection.anchorNode)) return;
-  setThreadCardFolded(!threadCardFoldChoice.on());
-}
-
-/**
- * Fold the cards at the top of a thread to a bar, or open them: kept, and drawn, with every list a card
- * on screen heads scrolled by as far as its top moved, so the rows the reader sees stay where they were.
- * A reader exactly on the newest line is kept on it (`followFoot`); one a little above it stays where
- * they are, not pulled down the slack. In the room past the right column's foot (`#338
- * column-overscroll`) the room is fitted to the column at once: a fold leaves the reader where they are
- * in it, and an opening too, except at the room's end, which keeps its own rule — the last card's top no
- * higher than the middle of the column, which a shorter column has lower — and so lets the rows there
- * down by at most half the card's growth, in the frame the card opens rather than one after.
- *
- * @param {boolean} folded
- */
-function setThreadCardFolded(folded) {
-  threadCardFoldChoice.keep(folded);
-  const held = THREAD_CARD_LISTS.filter(([card]) => drawnOnPage(leftEl(card))).map(([, id]) => {
-    const area = leftEl(id);
-    return { area, top: area.getBoundingClientRect().top, scrolled: area.scrollTop,
-      foot: atBottom(area, 1) && overscrollRoom(area) === 0 };
-  });
-  threadCardFoldChoice.set(folded);
-  renderThreadCardFold();
-  // From the scroll position read before, not the one now: a list grown under a reader near its foot has
-  // been clamped to its new end by the layout that measured it, and adding to that put them further up.
-  for (const { area, top, scrolled, foot } of held) {
-    area.scrollTop = scrolled + area.getBoundingClientRect().top - top;
-    fitOverscroll(area);
-    if (foot) followFoot(area);
-  }
-  // The line from the root meets the card, or the bar, at its middle.
-  scheduleColumnLinks();
-}
-
-/** The right column's card at the top of its thread, as the rows now stand, after a pass over either column's rows. */
-function paintSideThreadCard(tally = replyTally()) {
-  if (!sideShowing()) return;
-  paintThreadCard(leftEl("side-thread-card"), /** @type {any} */ (sideThreadChoice()), tally);
-}
 
 // --- the card moving up as its thread opens ----------------------------------------------------------
 //

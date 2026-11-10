@@ -195,3 +195,5 @@ export { createScrollTrace } from "../view/channel/index.ts";
 export { createReadActs } from "../view/channel/index.ts";
 // one card highlighted (#624 mu-keyread)
 export { createLitCards } from "../view/channel/index.ts";
+// the card at the top of an open thread (#624 mu-keyread)
+export { createThreadCardHead } from "../view/channel/index.ts";

@@ -2921,7 +2921,8 @@ test("`#298 thread-card-header`: the card at the top counts the thread's replies
     "the card at the top did not follow the live reply and the Done");
   assert.equal(writes, 0, "a pass that changed nothing wrote to the card at the top");
   // The control: drawn on every pass, the card is written to by a pass that changes nothing.
-  const always = await run(brokenScript("  if (threadCardsDrawn.get(card.id) === signature) return;\n", ""));
+  const always = await run(await brokenModule([{ file: "src/view/channel/threadcardhead.ts",
+    find: "    if (threadCardsDrawn.get(card.id) === signature) return;\n", replace: "" }]));
   assert.ok(always.writes > 0, "the negative control wrote nothing either, so the check above proves nothing");
 });
 
@@ -2979,8 +2980,8 @@ test("`#388 thread-header-collapse`: a press on the card at the top of the right
   await page.settle();
   assert.ok(cardsUp(page), "the X did not close the thread");
   // The control: a card that takes every press inside it as its own folds on its X and on a link.
-  const blind = await run(brokenScript(
-    "if (tag === \"a\" || (tag === \"button\" && node !== leftEl(`${card.id}-text`))) return;", ""));
+  const blind = await run(await brokenModule([{ file: "src/view/channel/threadcardhead.ts",
+    find: "      if (tag === \"a\" || (tag === \"button\" && node !== deps.leftById(`${card.id}-text`))) return;", replace: "" }]));
   assert.deepStrictEqual(blind.seen.slice(-2).map(({ folded }) => folded), [true, false],
     "the negative control did not fold on the link and open again on the X, so the check above proves nothing");
 });
@@ -3407,7 +3408,8 @@ test("`#298 thread-card-header`: the card across the window counts the thread's 
   assert.equal(writes, 0, "a pass that changed nothing wrote to the card across the window");
   // The controls: drawn on every pass, the card is written to by a pass that changes nothing; drawn
   // only with the heading, it misses the Done.
-  const always = await run(brokenScript("  if (threadCardsDrawn.get(card.id) === signature) return;\n", ""));
+  const always = await run(await brokenModule([{ file: "src/view/channel/threadcardhead.ts",
+    find: "    if (threadCardsDrawn.get(card.id) === signature) return;\n", replace: "" }]));
   assert.ok(always.writes > 0, "the negative control wrote nothing either, so the check above proves nothing");
   const heading = await run(brokenScript(
     "  if (!columnWork.side() && selection().view === \"thread\") paintThreadCard(leftEl(\"thread-card\"), openThreadChoice(), tally);\n", ""));
