@@ -16,10 +16,13 @@ from __future__ import annotations
 import gzip
 import hashlib
 import http.client
+import os
 import re
+import selectors
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -72,15 +75,99 @@ REQUESTS: list[Request] = [
 ]
 
 
-def _free_port() -> int:
-    for port in range(29920, 29950):
-        with socket.socket() as probe:
-            try:
-                probe.bind(("127.0.0.1", port))
-            except OSError:
-                continue
-            return port
-    raise AssertionError("no free port in the test range")
+_BANNER_TIMEOUT_S = 15.0
+_BANNER_PORT = re.compile(r"http://127\.0\.0\.1:(\d+)/")
+
+
+def _stop_process(process: subprocess.Popen[bytes]) -> None:
+    """Terminate, wait bounded, then kill: no path leaves the child behind."""
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+class _RunningServer:
+    """One `wrkviz serve` child on an OS-assigned port, banner-bounded.
+
+    The banner wait is the hang this guards (#1189): reading it with a bare
+    ``readline()`` blocks forever when a server never writes a full line
+    (buffered stdout, stuck startup), and the old probe-then-bind port range
+    raced other gates. Binding port 0 removes the race; the deadline turns a
+    silent server into a test failure carrying its stderr so far.
+    """
+
+    def __init__(self, command: list[str], archive_dir: Path, timeout_s: float = _BANNER_TIMEOUT_S) -> None:
+        self.command = command
+        self.archive_dir = archive_dir
+        self.timeout_s = timeout_s
+        self.process: subprocess.Popen[bytes]
+        self.banner = ""
+        self.port = 0
+        self.stderr_text = ""
+        self._stderr_chunks: list[bytes] = []
+        self._stderr_thread: threading.Thread | None = None
+
+    def _drain_stderr(self) -> None:
+        assert self.process.stderr is not None
+        while chunk := self.process.stderr.read(65536):
+            self._stderr_chunks.append(chunk)
+
+    def _read_banner(self) -> str:
+        assert self.process.stdout is not None
+        selector = selectors.DefaultSelector()
+        selector.register(self.process.stdout, selectors.EVENT_READ)
+        buffer = b""
+        deadline = time.monotonic() + self.timeout_s
+        try:
+            while b"\n" not in buffer:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(
+                        f"server banner did not arrive within {self.timeout_s}s; "
+                        f"stderr so far: {b''.join(self._stderr_chunks).decode(errors='replace')[-500:]!r}"
+                    )
+                if not selector.select(timeout=remaining):
+                    continue
+                chunk = os.read(self.process.stdout.fileno(), 4096)
+                if not chunk:
+                    raise AssertionError(
+                        "server exited "
+                        f"({self.process.poll()}) before its banner; "
+                        f"stderr: {b''.join(self._stderr_chunks).decode(errors='replace')[-500:]!r}"
+                    )
+                buffer += chunk
+        finally:
+            selector.close()
+        return buffer.splitlines()[0].decode(errors="replace") + "\n"
+
+    def __enter__(self) -> "_RunningServer":
+        self.process = subprocess.Popen(
+            [*self.command, "serve", "--output", str(self.archive_dir), "--port", "0"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
+        try:
+            self.banner = self._read_banner()
+            match = _BANNER_PORT.search(self.banner)
+            if match is None:
+                raise AssertionError(f"server banner carries no port: {self.banner!r}")
+            self.port = int(match.group(1))
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        _stop_process(self.process)
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=5)
+        self.stderr_text = b"".join(self._stderr_chunks).decode(errors="replace")
 
 
 @pytest.fixture(scope="module")
@@ -121,17 +208,12 @@ def archive(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 def _serve(command: list[str], archive_dir: Path) -> tuple[str, list[Observed], str]:
-    port = _free_port()
-    process = subprocess.Popen(
-        [*command, "serve", "--output", str(archive_dir), "--port", str(port)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    )
-    try:
-        assert process.stdout is not None
-        banner = process.stdout.readline()
+    server = _RunningServer(command, archive_dir)
+    with server:
+        banner = server.banner
         observed: list[Observed] = []
         etag = ""
-        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=10)
         for method, path, headers in REQUESTS:
             connection.request(method, path, headers=headers)
             response = connection.getresponse()
@@ -154,10 +236,7 @@ def _serve(command: list[str], archive_dir: Path) -> tuple[str, list[Observed], 
         observed.append((response.version, response.status, response.reason, selected, response.read()))
         connection.close()
         time.sleep(0.3)
-    finally:
-        process.terminate()
-        _, stderr = process.communicate(timeout=10)
-    log = re.sub(r"\[[^\]]*\]", "[T]", stderr)
+    log = re.sub(r"\[[^\]]*\]", "[T]", server.stderr_text)
     return banner, observed, log
 
 
@@ -245,17 +324,10 @@ RAW_REQUESTS: list[bytes] = [
 
 
 def _raw_serve(command: list[str], archive_dir: Path) -> list[bytes]:
-    port = _free_port()
-    process = subprocess.Popen(
-        [*command, "serve", "--output", str(archive_dir), "--port", str(port)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-    )
-    try:
-        assert process.stdout is not None
-        process.stdout.readline()
+    with _RunningServer(command, archive_dir) as server:
         observed: list[bytes] = []
         for request in RAW_REQUESTS:
-            with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+            with socket.create_connection(("127.0.0.1", server.port), timeout=10) as sock:
                 sock.sendall(request)
                 chunks: list[bytes] = []
                 while True:
@@ -265,9 +337,6 @@ def _raw_serve(command: list[str], archive_dir: Path) -> list[bytes]:
                     chunks.append(chunk)
                 observed.append(b"".join(chunks))
         time.sleep(0.3)
-    finally:
-        process.terminate()
-        process.communicate(timeout=10)
     return [
         re.sub(rb"(Date|Server): [^\r]+", rb"\1: X", response)
         for response in observed
@@ -278,3 +347,16 @@ def test_serve_raw_requests_match_python(archive: Path, rust_wrkviz: Path) -> No
     oracle = _raw_serve([sys.executable, str(PYTHON_WRKVIZ)], archive)
     result = _raw_serve([str(rust_wrkviz)], archive)
     assert result == oracle
+
+
+def test_serve_banner_timeout_kills_child(archive: Path) -> None:
+    # A server that never prints its banner must fail within the bound, with
+    # the child dead on every path out -- the 2026-11-09 gate hang (#1189).
+    fake = [sys.executable, "-c", "import time; time.sleep(60)"]
+    server = _RunningServer(fake, archive, timeout_s=1.0)
+    started = time.monotonic()
+    with pytest.raises(AssertionError, match="banner"):
+        with server:
+            pass
+    assert time.monotonic() - started < 20
+    assert server.process.poll() is not None

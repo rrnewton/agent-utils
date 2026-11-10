@@ -1,10 +1,11 @@
 ---
 title: "wrkviz-serve-test-hang: a wrkviz serve differential test can hang a gate shard forever; bound every Python test"
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-10T03:55:00.000000000+00:00
-updated_at: 2026-11-10T03:55:00.000000000+00:00
+updated_at: 2026-11-10T04:26:31.000000000+00:00
+closed_at: 2026-11-10T04:26:31.000000000+00:00
 ---
 
 # Description

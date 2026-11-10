@@ -21,6 +21,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import fcntl
 import hashlib
 import json
@@ -54,6 +55,12 @@ KEEP_ENV = "AGENT_UTILS_KEEP_PYTEST_BASETEMP"
 _STALE_SECONDS = 24 * 3600
 _POLL_SECONDS = 0.01
 _TERM_GRACE_SECONDS = 1.0
+#: Default bound for one test (setup + call + teardown) in every Python shard. The
+#: slowest recorded legitimate case is ~275 s; 600 s bounds a hang to one gate slot
+#: for minutes instead of hours (#1189). Override per test with
+#: ``@pytest.mark.timeout(seconds)`` (0 disables) or per run with --test-timeout.
+_DEFAULT_TEST_TIMEOUT_SECONDS = 600.0
+_TEST_TIMEOUT_ENV = "AGENT_UTILS_PYTEST_TEST_TIMEOUT"
 _SignalHandler = Callable[[int, FrameType | None], object] | int | None
 
 
@@ -197,9 +204,94 @@ class _TimingPlugin:
         )
 
 
-def pytest_configure(config: pytest.Config) -> None:
-    """Register the timing collector once, only when a directory was requested."""
+class _PerTestTimeout(AssertionError):
+    """One test exceeded its per-test bound; the traceback names where it hung."""
 
+
+def _env_test_timeout() -> float:
+    raw = os.environ.get(_TEST_TIMEOUT_ENV, "")
+    if not raw:
+        return _DEFAULT_TEST_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError as error:
+        raise ValueError(f"{_TEST_TIMEOUT_ENV} must be a number of seconds: {raw!r}") from error
+    if value < 0 or value != value:
+        raise ValueError(f"{_TEST_TIMEOUT_ENV} must be >= 0 seconds: {raw!r}")
+    return value
+
+
+# eq=False for the same plugin-identity reason as _ShardPlugin below.
+@dataclass(eq=False)
+class _TestTimeoutPlugin:
+    """Fail one test that runs past its bound instead of holding a gate slot.
+
+    SIGALRM on the main thread interrupts whatever the test is blocked in
+    (a pipe read, a sleep, a lock) and raises _PerTestTimeout with a stack
+    dump, so the failure names the hang instead of silently eating the shard.
+    Fixture/context-manager teardown then runs normally, which is what kills
+    children a well-behaved test spawned. Tests on non-main threads and
+    platforms without setitimer simply run unbounded rather than failing
+    spuriously.
+    """
+
+    default_seconds: float = _DEFAULT_TEST_TIMEOUT_SECONDS
+
+    def pytest_configure(self, config: pytest.Config) -> None:
+        config.addinivalue_line(
+            "markers",
+            "timeout(seconds): per-test timeout override for run_pytest_shard (0 disables)",
+        )
+
+    def _limit_for(self, item: pytest.Item) -> float:
+        marker = item.get_closest_marker("timeout")
+        if marker is not None and marker.args:
+            return float(marker.args[0])
+        return self.default_seconds
+
+    @pytest.hookimpl(wrapper=True)
+    def pytest_runtest_protocol(
+        self, item: pytest.Item, nextitem: pytest.Item | None
+    ) -> object:
+        del nextitem
+        limit = self._limit_for(item)
+        if limit <= 0 or not hasattr(signal, "setitimer"):
+            return (yield)
+        import threading
+
+        if threading.current_thread() is not threading.main_thread():
+            return (yield)
+
+        def _expire(signum: int, frame: FrameType | None) -> None:
+            del signum, frame
+            faulthandler.dump_traceback(file=sys.stderr)
+            raise _PerTestTimeout(
+                f"{item.nodeid} exceeded its per-test timeout of {limit:g}s "
+                "(run_pytest_shard default; mark @pytest.mark.timeout(seconds) to override)"
+            )
+
+        previous_handler = signal.signal(signal.SIGALRM, _expire)
+        previous_timer = signal.setitimer(signal.ITIMER_REAL, limit)
+        try:
+            return (yield)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+            if previous_timer[0] > 0:
+                signal.setitimer(signal.ITIMER_REAL, previous_timer[0], previous_timer[1])
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register the timing collector and the per-test timeout once each."""
+
+    config.addinivalue_line(
+        "markers",
+        "timeout(seconds): per-test timeout override for run_pytest_shard (0 disables)",
+    )
+    if not config.pluginmanager.hasplugin("per-test-timeout"):
+        config.pluginmanager.register(
+            _TestTimeoutPlugin(_env_test_timeout()), name="per-test-timeout"
+        )
     import case_timings
 
     if case_timings.requested_directory() is None:
@@ -415,7 +507,19 @@ def _normalize_returncode(returncode: int) -> int:
     return returncode if returncode >= 0 else 128 - returncode
 
 
-def _run_supervised(index: int, count: int, pytest_args: Sequence[str]) -> int:
+def _parse_timeout(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("test timeout must be a number of seconds") from error
+    if seconds < 0 or seconds != seconds:
+        raise argparse.ArgumentTypeError("test timeout must be >= 0 seconds")
+    return seconds
+
+
+def _run_supervised(
+    index: int, count: int, pytest_args: Sequence[str], test_timeout: float | None = None
+) -> int:
     """Run pytest in an owned session and remove its basetemp on cancellation.
 
     Python's default SIGTERM disposition bypasses ``finally`` blocks. Keeping the
@@ -452,6 +556,11 @@ def _run_supervised(index: int, count: int, pytest_args: Sequence[str]) -> int:
             f"{index}/{count}",
             "--_worker-basetemp",
             str(temp_root),
+            *(
+                ["--_worker-test-timeout", str(test_timeout)]
+                if test_timeout is not None
+                else []
+            ),
             "--",
             *pytest_args,
         ]
@@ -737,6 +846,52 @@ def _self_test_keep_on_failure() -> None:
         _remove_temp_root(fixture_root)
 
 
+def _self_test_timeout() -> None:
+    """Prove a hanging test fails within its bound instead of holding the shard."""
+
+    fixture_root = Path(tempfile.mkdtemp(prefix="agent-utils-sharder-timeout-"))
+    test_file = fixture_root / "test_timeout_proof.py"
+    test_file.write_text(
+        """\
+import time
+
+import pytest
+
+
+def test_hangs_forever():
+    time.sleep(60)
+
+
+def test_quick():
+    assert True
+
+
+@pytest.mark.timeout(0)
+def test_marker_disables_the_bound():
+    time.sleep(2)
+""",
+        encoding="utf-8",
+    )
+    private_tmp = fixture_root / "tmp"
+    private_tmp.mkdir()
+    environment = _fixture_environment(private_tmp)
+    started = time.monotonic()
+    try:
+        run = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--shard", "0/1",
+             "--test-timeout", "1", "--", "-q", "-p", "no:cacheprovider", str(test_file)],
+            cwd=fixture_root, env=environment, capture_output=True, text=True, timeout=120,
+        )
+        elapsed = time.monotonic() - started
+        output = run.stdout + run.stderr
+        assert run.returncode != 0, output
+        assert elapsed < 30, f"hanging test was not bounded (took {elapsed:.1f}s): {output}"
+        assert "exceeded its per-test timeout" in output, output
+        assert "test_hangs_forever" in output, output
+    finally:
+        _remove_temp_root(fixture_root)
+
+
 def _self_test() -> int:
     nodeids = [
         "tests/test_a.py::test_matrix[one]",
@@ -820,6 +975,7 @@ def _self_test() -> int:
     assert len({plugin, twin, plugin}) == 2
     assert plugin != twin
     _self_test_sigterm_cleanup()
+    _self_test_timeout()
     _self_test_sweep()
     _self_test_mounts_under()
     _self_test_keep_on_failure()
@@ -831,11 +987,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--shard", type=_parse_shard, metavar="INDEX/COUNT")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument(
+        "--test-timeout", type=_parse_timeout, default=None, metavar="SECONDS",
+        help="per-test bound for the shard (0 disables; "
+        f"default {_DEFAULT_TEST_TIMEOUT_SECONDS:g}s or ${_TEST_TIMEOUT_ENV})",
+    )
     parser.add_argument("--_worker-basetemp", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--_worker-test-timeout", type=_parse_timeout, default=None, help=argparse.SUPPRESS)
     parser.add_argument("pytest_args", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     if args.self_test:
-        if args.shard is not None or args.pytest_args or args._worker_basetemp is not None:
+        if (
+            args.shard is not None
+            or args.pytest_args
+            or args._worker_basetemp is not None
+            or args.test_timeout is not None
+            or args._worker_test_timeout is not None
+        ):
             parser.error("--self-test does not accept --shard or pytest arguments")
         return _self_test()
     if args.shard is None:
@@ -849,13 +1017,21 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     index, count = args.shard
     if args._worker_basetemp is not None:
+        timeout = (
+            args._worker_test_timeout
+            if args._worker_test_timeout is not None
+            else _env_test_timeout()
+        )
         return int(
             pytest.main(
                 [*pytest_args, "--basetemp", str(args._worker_basetemp)],
-                plugins=[_ShardPlugin(index=index, count=count)],
+                plugins=[
+                    _ShardPlugin(index=index, count=count),
+                    _TestTimeoutPlugin(timeout),
+                ],
             )
         )
-    return _run_supervised(index, count, pytest_args)
+    return _run_supervised(index, count, pytest_args, test_timeout=args.test_timeout)
 
 
 if __name__ == "__main__":
