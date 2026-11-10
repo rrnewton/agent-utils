@@ -35,7 +35,7 @@ const SETTINGS_FOLDS: readonly string[] = Object.freeze([
   "card-max-lines",
   "control-bar",
   "opening-links",
-  "typing",
+  "typing", "debug",
   "keyboard",
   "settings-storage",
   "storage",

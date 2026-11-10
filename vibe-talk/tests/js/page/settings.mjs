@@ -1419,7 +1419,7 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
   // whether the Slack app is on this device is the device's own business, so it is one of the
   // per-device choices and is never synced.
   assert.deepStrictEqual(groupsIn("Screen and keys"),
-    ["Text size", "Reading width", "Control bar", "Opening links", "Typing", "Keyboard"]);
+    ["Text size", "Reading width", "Control bar", "Opening links", "Typing", "Debug", "Keyboard"]);
   // `#457 settings-server-side`: the one per-device section says so beside its title.
   assert.match(HTML, /<h2 id="settings-screen-title"><button class="fold-toggle" id="fold-settings-screen"[^>]*>Screen and keys<\/button><span class="settings-scope-note">\(client side\)<\/span><\/h2>/,
     "Screen and keys does not say (client side) beside its title");
@@ -2732,8 +2732,8 @@ function foldProblems(html, css, script) {
 test("`#346 settings-collapsible`: every section but Server and every group in them folds, hidden until found", () => {
   assert.deepStrictEqual(foldProblems(HTML, CSS_CODE, PAGE_CODE), []);
   // 31 since `#481 slack-app-deep-link` added Opening links, 35 since `#728 vt-quote-read-threshold`
-  // added Quoted replies, counted and checked above.
-  assert.equal(scriptFolds(PAGE_CODE).length, 35, "a fold went missing from the list, or one was added unchecked");
+  // added Quoted replies, 36 since `#1212 settings-debug-section` added Debug, counted and checked above.
+  assert.equal(scriptFolds(PAGE_CODE).length, 36, "a fold went missing from the list, or one was added unchecked");
 });
 
 test("`#346 settings-collapsible`: the check refuses a fold out of find's reach, an unfolding group, and a list that disagrees (negative controls)", () => {

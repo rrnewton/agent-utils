@@ -2503,6 +2503,18 @@
                         Enter to send
                       </label>
                       <p id="enter-sends-hint" class="hint" aria-live="polite"></p>
+                    </div>
+                  </section>
+
+                  <section class="settings-group">
+                    <div class="group-head">
+                      <h3><button class="fold-toggle" id="fold-debug" type="button" aria-expanded="false" aria-controls="fold-debug-body">Debug</button></h3>
+                    </div>
+                    <div class="fold-body" id="fold-debug-body" hidden="until-found">
+                      <!--
+                        `#1212 settings-debug-section`. The diagnostic switches, in one place, for turning
+                        on only while debugging the app; future ones go here. All off by default.
+                      -->
                       <!--
                         `#610 mobile-keyboard-compose`. Where a phone's keyboard leaves the message box depends on
                         numbers only the phone has. This draws them over the top of the page, live, for a
