@@ -1,11 +1,12 @@
 ---
-title: "gate-owner-priority: fast-track owner-requested gates ahead of the queue"
-status: open
+title: 'gate-owner-priority: fast-track owner-requested gates ahead of the queue'
+status: closed
 priority: 0
 issue_type: feature
 assignee: mu-gateprio
-created_at: 2026-11-09T23:10:00.000000000-05:00
-updated_at: 2026-11-09T23:10:00.000000000-05:00
+created_at: 2026-11-10T04:10:00+00:00
+updated_at: 2026-11-10T07:10:36.233476557+00:00
+closed_at: 2026-11-10T07:10:15.130652815+00:00
 ---
 
 # Description
@@ -61,3 +62,5 @@ Part B (measured exclusive-phase bottleneck report with batching/splitting propo
 Filed by mu-gateprio for coordb from owner replies 286/288 (2026-11-09 9:00–9:01 PM ET). Slot
 gateprio, branch mu-gateprio/gate-owner-priority. Tests use a temporary queue directory; the live
 admission queue is read-only.
+
+[watermelon-full-preview] Closed by mu-gateprio 2026-11-10. Part A landed f75f1185 (owner tier in scripts/gate.py: ahead of reruns, FIFO among owners, no preemption, mixed-version cap via runs/ under flock; shared-FIFO poll-race fairness bug fixed). Live proof: own gate admitted 115s from position 1/7, exclusive phase inherited owner tier, cap never over 3; seven owner-UI lanes used the tier the same night. Watcharch anomaly: 6:14-8:54 PM exclusive convoy = documented rerun policy with no aging floor (policy gap); 8:54:59 PM jump = fairness bug, fixed. Part B: harness ai_docs/2026-11-10-gate-exclusive-bottleneck.md (8402bc4). P0 split to #1190. Gate exceptions named to coordb: lint-only rerun for 2 unused type ignores; wrkslots shard-3 waived under #1188 signature.

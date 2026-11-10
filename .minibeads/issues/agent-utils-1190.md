@@ -1,11 +1,12 @@
 ---
-title: "cross-path-filter: path-filter the gate-exclusive cross steps even under validate --all"
-status: open
+title: 'cross-path-filter: path-filter the gate-exclusive cross steps even under validate --all'
+status: closed
 priority: 1
 issue_type: feature
 assignee: mu-gateprio
-created_at: 2026-11-09T23:55:00.000000000-05:00
-updated_at: 2026-11-09T23:55:00.000000000-05:00
+created_at: 2026-11-10T04:55:00+00:00
+updated_at: 2026-11-10T07:10:36.237156178+00:00
+closed_at: 2026-11-10T07:10:15.127883790+00:00
 ---
 
 # Description
@@ -59,3 +60,5 @@ Filed by mu-gateprio for coordb (owner replies 286/288 via #1180). Estimated
 saving on 2026-11-09 load: 3.7 h/day of host serialization. P1 batching and
 P2 overlap re-measure after this plus phase-priority (#1146, enabled
 2026-11-09) have a day of data.
+
+[watermelon-full-preview] Closed by mu-gateprio 2026-11-10. Landed feff80eb: validate --all path-filters gate-exclusive cross steps via existing component selection vs --base, fail-closed (unclassified path, shared cross trigger, undeterminable paths keep all five), kept/skipped named in plan; --cross-all forces all five; make validate-all = --all --cross-all (old unfiltered contract). Gate: 240 main + 7 exclusive passed; sole failure python.wrkslots.shard-5 budget Refusal proven pre-existing on unmodified github/main 49304752 (plain local pytest in nested worktree) and noted on #1188 (5694af68); landed citing base failure per coordb rule.
