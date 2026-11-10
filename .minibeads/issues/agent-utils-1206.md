@@ -217,3 +217,52 @@ Filed by mu-submod (2026-11-10) from the coordinator's brief
 (2026-11-10 8:05 AM ET). Design above is awaiting the coordinator's OK before
 implementation (brief step c). Scratch evidence: /tmp/scratch3.sh,
 /tmp/scratch5.sh (ephemeral, this host).
+
+Design approved by the coordinator 2026-11-10 with four points: (1) primary
+preparation explicit/idempotent/logged with a doctor check mode, refusing
+non-expected states; (2) migration dry-run by default, live-use census or
+per-slot --owner-consent, bytes per slot in the dry run; (3) measure gc/fetch
+side effects at about 100 linked worktrees; (4) #1096 identity --worktree
+scoped for shared submodules.
+
+Implementation notes (mu-submod, 2026-11-10): create shares before hooks via
+_share_checkout_submodules; preparation is _prepare_shared_submodule_repo
+(logged, _shared_module_prep_state refuses unexpected states); doctor emits
+shared-submodule-unprepared / shared-submodule-private findings; retirement
+narrows _submodule_private_tips for shared worktrees to their own
+HEAD/per-worktree refs/reflogs and _GitVcs.remove_worktree removes only the
+stale shared registration; migration is `share-submodules SLOT [--apply]
+[--owner-consent]`. Two consequences found while implementing: a shared
+slot's submodule origin is the shared repository's own remote (not a stock
+clone's local-mirror URL; per-worktree remote.origin.url overrides were
+rejected because they break the exactly-one-fetch-URL authority check), and
+scripts/setup-hooks.sh installers still run in shared submodules (they are
+the same repository the primary's installer configures).
+
+Scope change after the first full gate (mu-submod, 2026-11-10): the first
+implementation shared by default, and the gate failed 161 lifecycle tests,
+all in paths that assume the stock layout (recover-absent-agent-row
+submodule recovery, abort-create administration pruning, the Rust edition's
+create differential). Those paths do not yet handle shared layouts, so a
+default-on create would manufacture slots their recovery cannot judge.
+Sharing is therefore opt-in as `share_submodules: true` in the project
+configuration (absent/false keeps the historical private clone; list the
+key in ignorable_keys for older readers). Regular remove, salvage, doctor
+and the share-submodules migration handle shared slots now; absent-agent
+recovery parity and the Rust edition are follow-ups, and the default stays
+off until they land. The consumer project gets the full disk win by setting
+the one key.
+
+Measured side effects (scratch, git 2.53.0-Meta, /tmp/submod-measure,
+/tmp/measure100.sh): leaf repository of 300 commits; primary
+.git/modules/leaf 116,138 bytes. One stock slot's private module clone:
+116,154 bytes per slot. 100 shared linked worktrees: 50,692 bytes of
+worktree administration in total (about 507 bytes per slot), shared
+repository 116,138 -> 168,118 bytes for all 100 slots. Raw creation of 100
+(superproject + leaf worktree adds) 11.97 s, removal 8.67 s.
+`git gc --prune=now` in the shared repository with 100 worktrees: 0.26 s
+(0.29 s with a private slot commit present, which survived).
+`git fetch` of one new upstream commit: 0.098 s shared vs 0.047 s in a stock
+private clone (tiny repository; no order-of-magnitude cost). Earlier trial
+(60-commit leaf): stock per-slot clone 47,112 bytes vs primary-plus-one-shared
+47,598 bytes total.

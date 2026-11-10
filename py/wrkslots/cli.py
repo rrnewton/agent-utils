@@ -555,6 +555,7 @@ OPTIONAL_CONFIG_KEYS = frozenset(
         "repo_cache_globs",
         "post_provision_hooks",
         "identity",
+        "share_submodules",
         "salvage_push_remotes",
         "reclaimable_ignored_paths",
         "disk_advisory_bytes",
@@ -653,6 +654,13 @@ CONFIG_KEY_DOCS: dict[str, str] = {
         "Git author identity ({name, email}) that create sets privately in each new slot: "
         "`git config --worktree` in the slot's own checkout, plain `git config` in each "
         "populated submodule. Absent means create leaves the identity alone."
+    ),
+    "share_submodules": (
+        "Share submodule object stores across slots (#1206): when true, create makes each "
+        "slot's submodules linked worktrees of the primary .git/modules repositories "
+        "instead of full private clones, preparing those repositories (config only, "
+        "logged). Absent or false means the historical private clone per slot. List the "
+        "key in ignorable_keys so an older wrkslots ignores it instead of refusing."
     ),
     "retire_freeze": (
         "When set, every retirement and removal on this host refuses with code retire-freeze "
@@ -1216,6 +1224,12 @@ class Config:
     #: Git author identity set slot-privately in every new checkout (#1096);
     #: None, the meaning when the key is absent, leaves identity alone.
     identity: SlotIdentity | None = None
+    #: #1206: create makes each slot's submodules linked worktrees of the
+    #: primary module repositories instead of private clones. Opt-in,
+    #: because it prepares (config only, logged) the primary submodule
+    #: repositories and recovery paths for shared layouts are still being
+    #: extended; absent means the historical private-clone behaviour.
+    share_submodules: bool = False
     #: Remote URLs salvage may push to; every other remote gets a local bundle.
     salvage_push_remotes: tuple[str, ...] = ()
     #: Checkout-relative build-output subtrees that leave a frozen clone pristine.
@@ -4395,6 +4409,9 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         if "identity" not in raw
         else _slot_identity(raw["identity"], "configuration.identity")
     )
+    if "share_submodules" in raw and not isinstance(raw["share_submodules"], bool):
+        raise StateError("configuration.share_submodules must be true or false")
+    share_submodules = raw.get("share_submodules", False) is True
     salvage_push_remotes = (
         ()
         if "salvage_push_remotes" not in raw
@@ -4466,6 +4483,7 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         post_provision_hooks=post_provision_hooks,
         post_provision_hook_slot_types=post_provision_hook_slot_types,
         identity=identity,
+        share_submodules=share_submodules,
         salvage_push_remotes=salvage_push_remotes,
         reclaimable_ignored_paths=reclaimable_ignored_paths,
         disk_advisory_bytes=disk_values[0],
@@ -16347,6 +16365,43 @@ def _credential_pacing_deadline(what: str) -> float:
 WORKTREES_IMAGE_LOCK_REASON = "in worktrees image"
 
 
+def _remove_shared_submodule_admin(shared_admin: Sequence[tuple[Path, Path]]) -> None:
+    """Remove shared submodule worktree registrations whose checkout is gone (#1206).
+
+    Each entry is a (git dir, common dir) pair captured before the
+    superproject worktree was removed. The administration directory is
+    deleted only when its gitdir file still names a .git file that no
+    longer exists, i.e. exactly the stale entry `git worktree prune` would
+    drop for this slot and no other. The shared repository (objects, refs,
+    other worktrees) is never touched. Best effort: a failure is reported
+    on stderr and leaves a prunable registration, not a failed removal.
+    """
+
+    for git_dir, common in shared_admin:
+        try:
+            gitdir_file = git_dir / "gitdir"
+            if not gitdir_file.is_file():
+                continue
+            registered = Path(gitdir_file.read_text(encoding="utf-8").strip())
+            if registered.exists():
+                continue
+            if git_dir.parent != common / "worktrees" or git_dir.is_symlink():
+                continue
+            shutil.rmtree(git_dir)
+            print(
+                f"wrkslots: removed shared submodule worktree registration "
+                f"{git_dir} (objects remain in {common})",
+                file=sys.stderr,
+            )
+        except OSError as exc:
+            print(
+                f"wrkslots: WARNING could not remove shared submodule "
+                f"registration {git_dir}: {exc}; run git worktree prune in "
+                "the primary submodule repository",
+                file=sys.stderr,
+            )
+
+
 class _GitVcs:
     """The small Git boundary used by slot operations."""
 
@@ -19615,11 +19670,26 @@ class _GitVcs:
         if force:
             args.append("--force")
         args.extend(("--", str(checkout)))
+        # #1206: inventory shared submodule worktrees before removal.
+        # `git worktree remove` deletes the slot's submodule checkouts but
+        # leaves their registrations under the shared repository's
+        # worktrees/; those are removed below, once the checkout is gone.
+        # Salvage of their private tips has already run (remove flow), and
+        # the shared object store itself is never touched.
+        shared_admin: list[tuple[Path, Path]] = []
+        try:
+            for relative in self.initialized_submodules(checkout):
+                dirs = _submodule_git_dirs(self, checkout / relative)
+                if dirs is not None and _is_shared_submodule_gitdir(*dirs):
+                    shared_admin.append(dirs)
+        except Exception:
+            shared_admin = []
         bind_root = _is_owned_worktrees_bind_root(checkout) or _is_owned_direct_subvolume_root(
             checkout
         )
         if not bind_root and not _is_owned_image_root(checkout):
             self._run(repository, args)
+            _remove_shared_submodule_admin(shared_admin)
             return
         # A flat image-backed checkout's root is the image's mount point, which
         # cannot be removed; a flat worktrees-image checkout's root is its
@@ -19631,6 +19701,7 @@ class _GitVcs:
         # with the slot directory afterwards.
         result = self._run(repository, args, check=False)
         if result.returncode == 0:
+            _remove_shared_submodule_admin(shared_admin)
             return
         residue = frozenset() if bind_root else slotimage.REPRESENTATION_RESIDUE
         leftover = [
@@ -19644,6 +19715,7 @@ class _GitVcs:
                 f"git worktree remove failed for image-backed checkout {checkout}: "
                 f"{detail[-1] if detail else 'no output'}"
             )
+        _remove_shared_submodule_admin(shared_admin)
 
     def remote_ref_sha(
         self,
@@ -26513,53 +26585,78 @@ def _submodule_private_history(
     git_directory = Path(
         vcs._run(path, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
     )
-    now_ts = time.time() if now is None else now
-    cutoff = _prune_expire_cutoff(vcs, path, now_ts)
-    reflog_by_ref = _reflog_entries_by_ref((common, git_directory))
-    all_reflog_endpoints: set[str] = set()
-    for entries in reflog_by_ref.values():
-        for entry in entries:
-            all_reflog_endpoints.update(
-                value for value in (entry.old, entry.new) if set(value) != {"0"}
-            )
-    # Roots from reflogs: every ref's entries count, except that a
-    # remote-tracking ref's fetch-recorded endpoints count only while
-    # recent (or when that ref was ever pushed from here), as (e) rules.
-    positives: set[str] = set()
-    for ref, entries in reflog_by_ref.items():
-        if ref.startswith("refs/remotes/"):
-            pushed = any("update by push" in entry.message for entry in entries)
+    shared_submodule = _is_shared_submodule_gitdir(git_directory, common)
+    if shared_submodule:
+        # #1206: removal deletes only this worktree's administration (its
+        # HEAD, index and reflogs), never the shared object store, so the
+        # commits at risk are exactly the ones this worktree's own HEAD,
+        # per-worktree refs and reflogs reach. Other slots' private commits
+        # live in the same store and are not this slot's to salvage.
+        all_reflog_endpoints = _reflog_endpoints(
+            _reflog_files_under(git_directory / "logs")
+        )
+        pseudorefs = _private_pseudoref_commits(vcs, path)
+        positives: set[str] = set(all_reflog_endpoints) | pseudorefs
+        ref_commits: dict[str, str] = {}
+        head = vcs._run(path, ["rev-parse", "--verify", "HEAD"], check=False)
+        if head.returncode == 0 and head.stdout.strip():
+            positives.add(head.stdout.strip())
+        for line in vcs._run(
+            path,
+            ["for-each-ref", "--format=%(objectname) %(refname)", "refs/worktree/"],
+        ).stdout.splitlines():
+            sha, _sp, refname = line.partition(" ")
+            if sha and refname:
+                ref_commits[refname] = sha
+                positives.add(sha)
+    else:
+        now_ts = time.time() if now is None else now
+        cutoff = _prune_expire_cutoff(vcs, path, now_ts)
+        reflog_by_ref = _reflog_entries_by_ref((common, git_directory))
+        all_reflog_endpoints: set[str] = set()
+        for entries in reflog_by_ref.values():
             for entry in entries:
-                if pushed or cutoff is None or entry.timestamp >= cutoff:
-                    positives.update(
-                        value
-                        for value in (entry.old, entry.new)
-                        if set(value) != {"0"}
-                    )
-        else:
-            for entry in entries:
-                positives.update(
+                all_reflog_endpoints.update(
                     value for value in (entry.old, entry.new) if set(value) != {"0"}
                 )
-    pseudorefs = _private_pseudoref_commits(vcs, path)
-    positives |= pseudorefs
-    ref_commits: dict[str, str] = {}
-    for line in vcs._run(
-        path, ["for-each-ref", "--format=%(objectname) %(*objectname) %(refname)"]
-    ).stdout.splitlines():
-        fields = line.split(" ", 2)
-        if len(fields) != 3:
-            continue
-        direct, peeled, refname = fields
-        positives.add(direct)
-        if SHA_RE.fullmatch(peeled or direct):
-            ref_commits[refname] = peeled or direct
+        # Roots from reflogs: every ref's entries count, except that a
+        # remote-tracking ref's fetch-recorded endpoints count only while
+        # recent (or when that ref was ever pushed from here), as (e) rules.
+        positives: set[str] = set()
+        for ref, entries in reflog_by_ref.items():
+            if ref.startswith("refs/remotes/"):
+                pushed = any("update by push" in entry.message for entry in entries)
+                for entry in entries:
+                    if pushed or cutoff is None or entry.timestamp >= cutoff:
+                        positives.update(
+                            value
+                            for value in (entry.old, entry.new)
+                            if set(value) != {"0"}
+                        )
+            else:
+                for entry in entries:
+                    positives.update(
+                        value for value in (entry.old, entry.new) if set(value) != {"0"}
+                    )
+        pseudorefs = _private_pseudoref_commits(vcs, path)
+        positives |= pseudorefs
+        ref_commits: dict[str, str] = {}
+        for line in vcs._run(
+            path, ["for-each-ref", "--format=%(objectname) %(*objectname) %(refname)"]
+        ).stdout.splitlines():
+            fields = line.split(" ", 2)
+            if len(fields) != 3:
+                continue
+            direct, peeled, refname = fields
+            positives.add(direct)
+            if SHA_RE.fullmatch(peeled or direct):
+                ref_commits[refname] = peeled or direct
     # Every commit object, named or not (a dropped stash, for one): the whole
     # repository is deleted, so an unreferenced commit is kept too.  The
     # commits salvage itself writes here (committer wrkslots@localhost) are
     # left out, so a recheck derives the same salvage commit; whatever they
     # keep is reached from the commit's other roots.
-    every_commit = [
+    every_commit = [] if shared_submodule else [
         line.strip()
         for line in vcs._run(
             path,
@@ -32660,9 +32757,11 @@ def _apply_slot_git_identity(
     gives every worktree its own ``config.worktree`` and changes nothing
     else. ``user.name`` and ``user.email`` themselves are never written to
     the shared config, so the main checkout and sibling slots keep theirs.
-    Each populated submodule is a clone private to this slot, so it gets a
-    plain ``git config``. Every write is idempotent: recovery repeats the
-    step from the start.
+    A populated submodule whose repository is private to this slot gets a
+    plain ``git config``; one shared with the primary and sibling slots
+    (#1206, see _is_shared_submodule_gitdir) gets ``git config --worktree``,
+    so the write stays in that submodule worktree's own config.worktree.
+    Every write is idempotent: recovery repeats the step from the start.
 
     A submodule that is initialised but not populated, or whose Git
     directory is not private to this slot, is reported and skipped; a
@@ -32786,7 +32885,35 @@ def _set_submodule_git_identity(
                 outcomes.append((display, "not set: Git cannot open this submodule"))
                 continue
             module_dir = Path(git_dir.stdout.strip()).resolve()
-            if module_dir != Path(common.stdout.strip()).resolve() or not any(
+            common_dir = Path(common.stdout.strip()).resolve()
+            if _is_shared_submodule_gitdir(module_dir, common_dir):
+                # #1206: a shared submodule's repository is common to every
+                # slot, so a plain `git config` would leak this slot's
+                # identity to all peers. Scope it per worktree instead.
+                ext = vcs._run(
+                    nested,
+                    ["config", "--get", "extensions.worktreeConfig"],
+                    check=False,
+                )
+                if ext.returncode != 0 or ext.stdout.strip() != "true":
+                    outcomes.append(
+                        (
+                            display,
+                            "not set: shared submodule repository does not "
+                            "enable extensions.worktreeConfig",
+                        )
+                    )
+                    continue
+                try:
+                    for key, value in settings:
+                        vcs._run(nested, ["config", "--worktree", key, value])
+                except Refusal as exc:
+                    outcomes.append((display, f"not set: {exc}"))
+                    continue
+                outcomes.append((display, "set"))
+                visit(nested, f"{display}/")
+                continue
+            if module_dir != common_dir or not any(
                 module_dir.is_relative_to(root) for root in private_roots
             ):
                 outcomes.append(
@@ -32804,6 +32931,384 @@ def _set_submodule_git_identity(
 
     visit(checkout, "")
     return outcomes
+
+
+# --- Shared submodule object stores (#1206 wrkslots-shared-submodule-objects) ---
+#
+# Git's stock behaviour clones every submodule of a linked worktree into
+# <admin>/modules/<name>/ with a full private object store (2-28G each in the
+# reported consumer case). Instead, a slot's submodule checkout can be a
+# linked worktree of the primary's .git/modules/<name> repository: one object
+# store, one ref store, and gc reachability computed over every worktree
+# HEAD and reflog, so a primary `git gc --prune=now` cannot delete objects a
+# slot still needs (the alternates failure mode). The per-slot cost is the
+# worktree administration under .git/modules/<name>/worktrees/<id>/.
+
+
+def _is_shared_submodule_gitdir(git_dir: Path, common_dir: Path) -> bool:
+    """Whether ``git_dir`` is a linked worktree of the repository ``common_dir``."""
+
+    return git_dir != common_dir and git_dir.parent == common_dir / "worktrees"
+
+
+def _submodule_git_dirs(
+    vcs: _GitVcs, path: Path
+) -> tuple[Path, Path] | None:
+    """Resolved (git dir, common dir) of ``path``, or None when Git cannot open it."""
+
+    git_dir = vcs._run(path, ["rev-parse", "--absolute-git-dir"], check=False)
+    common = vcs._run(
+        path, ["rev-parse", "--path-format=absolute", "--git-common-dir"], check=False
+    )
+    if git_dir.returncode != 0 or common.returncode != 0:
+        return None
+    return Path(git_dir.stdout.strip()).resolve(), Path(common.stdout.strip()).resolve()
+
+
+def _declared_submodules(vcs: _GitVcs, repository: Path) -> list[tuple[str, str]]:
+    """(name, path) pairs ``repository``'s .gitmodules declares, in file order."""
+
+    modules = repository / ".gitmodules"
+    if modules.is_symlink() or not modules.is_file():
+        return []
+    listed = vcs._run(
+        repository, ["config", "--file", str(modules), "-z", "--list"], check=False
+    )
+    if listed.returncode != 0:
+        return []
+    declared: dict[str, str] = {}
+    for entry in listed.stdout.split("\0"):
+        key, separator, value = entry.partition("\n")
+        if not separator or not key.startswith("submodule."):
+            continue
+        name, _dot, option = key[len("submodule.") :].rpartition(".")
+        if name and option == "path":
+            declared[name] = value
+    return list(declared.items())
+
+
+def _shared_module_prep_state(
+    vcs: _GitVcs, source_submodule: Path
+) -> tuple[str, str, Path | None]:
+    """State of the primary submodule repository at ``source_submodule`` (#1206).
+
+    Returns (state, detail, common_dir). States: ``no-module`` (the source
+    checkout is not populated, so there is no primary repository to share),
+    ``prepared`` (extensions.worktreeConfig on, core.worktree held only in
+    the main worktree's config.worktree and naming this checkout),
+    ``unprepared`` (safe to prepare: core.worktree, when present, names this
+    checkout), and ``unexpected`` (anything else; detail says why, and the
+    caller refuses with that remedy rather than rewriting the repository).
+    """
+
+    if not _submodule_worktree_populated(source_submodule):
+        return "no-module", "source submodule is not populated", None
+    dirs = _submodule_git_dirs(vcs, source_submodule)
+    if dirs is None:
+        return "unexpected", f"Git cannot open the submodule at {source_submodule}", None
+    git_dir, common = dirs
+    if git_dir != common:
+        return (
+            "unexpected",
+            f"the source submodule at {source_submodule} is itself a linked "
+            f"worktree (git dir {git_dir}, common dir {common}); share from "
+            "the checkout that owns the module repository instead",
+            common,
+        )
+
+    def shared_get(key: str) -> str | None:
+        result = vcs._run(
+            source_submodule, ["config", "--file", str(common / "config"), "--get", key],
+            check=False,
+        )
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    bare = shared_get("core.bare")
+    if bare is not None and bare.lower() == "true":
+        return "unexpected", f"{common} sets core.bare=true; a bare module repository has no main worktree to share from", common
+    source = source_submodule.resolve()
+    worktree_config = common / "config.worktree"
+    held: str | None = None
+    if worktree_config.is_file() and not worktree_config.is_symlink():
+        result = vcs._run(
+            source_submodule,
+            ["config", "--file", str(worktree_config), "--get", "core.worktree"],
+            check=False,
+        )
+        held = result.stdout.strip() if result.returncode == 0 else None
+    if held is not None and Path(held).resolve() != source:
+        return (
+            "unexpected",
+            f"{worktree_config} already holds core.worktree={held}, which is "
+            f"not this submodule checkout ({source}); refusing to rewrite it",
+            common,
+        )
+    shared_worktree = shared_get("core.worktree")
+    if shared_worktree is not None:
+        resolved = Path(shared_worktree)
+        if not resolved.is_absolute():
+            resolved = common / resolved
+        if resolved.resolve() != source:
+            return (
+                "unexpected",
+                f"{common}/config holds core.worktree={shared_worktree}, which "
+                f"does not name this submodule checkout ({source}); refusing "
+                "to rewrite a repository whose main worktree is elsewhere",
+                common,
+            )
+        return "unprepared", "core.worktree is still in the shared config", common
+    if shared_get("extensions.worktreeConfig") == "true" and held is not None:
+        return "prepared", "core.worktree is held per-worktree", common
+    return "unprepared", "extensions.worktreeConfig is not enabled yet", common
+
+
+def _prepare_shared_submodule_repo(vcs: _GitVcs, source_submodule: Path) -> bool:
+    """Prepare the primary submodule repository at ``source_submodule`` for sharing.
+
+    Explicit, idempotent and logged (stderr): enables
+    ``extensions.worktreeConfig`` in the module repository's shared config
+    and moves ``core.worktree`` into the main worktree's ``config.worktree``.
+    Without this, `git worktree add` on a submodule repository rewrites the
+    shared core.worktree to the new slot path and every command in the
+    primary submodule then fails. Only the repository config changes; the
+    primary working tree and HEAD are verified unchanged. Returns True when
+    it changed anything. Raises Refusal, with a remedy, when the repository
+    is not in the expected state (see _shared_module_prep_state).
+    """
+
+    state, detail, common = _shared_module_prep_state(vcs, source_submodule)
+    if state == "prepared":
+        print(
+            f"shared-submodule: primary repository {common} already prepared "
+            f"for {source_submodule} (no change)",
+            file=sys.stderr,
+        )
+        return False
+    if state != "unprepared" or common is None:
+        raise Refusal(
+            f"cannot share the submodule at {source_submodule}: {detail}. "
+            "remedy: inspect that repository, restore it to a populated "
+            "primary submodule checkout whose core.worktree names it (or "
+            "remove the submodule from the slot's post-provision hooks so it "
+            "keeps a private clone), then rerun"
+        )
+    head_before = vcs.head(source_submodule)
+    source = source_submodule.resolve()
+    vcs._run(
+        source_submodule,
+        ["config", "--file", str(common / "config"), "extensions.worktreeConfig", "true"],
+    )
+    vcs._run(
+        source_submodule,
+        ["config", "--file", str(common / "config.worktree"), "core.worktree", str(source)],
+    )
+    shared = vcs._run(
+        source_submodule,
+        ["config", "--file", str(common / "config"), "--get", "core.worktree"],
+        check=False,
+    )
+    if shared.returncode == 0:
+        vcs._run(
+            source_submodule,
+            ["config", "--file", str(common / "config"), "--unset", "core.worktree"],
+        )
+    if vcs.head(source_submodule) != head_before:
+        raise Refusal(
+            f"preparing {common} for sharing changed the HEAD of {source_submodule}; "
+            "preserve the repository and inspect it before rerunning"
+        )
+    print(
+        f"shared-submodule: prepared primary repository {common} for sharing "
+        f"(extensions.worktreeConfig=true; core.worktree moved to "
+        f"{common / 'config.worktree'} naming {source}; config only, "
+        "working tree untouched)",
+        file=sys.stderr,
+    )
+    return True
+
+
+def _share_checkout_submodules(
+    vcs: _GitVcs, source_repository: Path, slot_checkout: Path, *, _depth: int = 0
+) -> list[str]:
+    """Make ``slot_checkout``'s unpopulated submodules shared linked worktrees.
+
+    For each declared submodule whose source checkout (``source_repository``
+    at the same relative path) owns an initialized module repository,
+    prepare that repository (_prepare_shared_submodule_repo, logged) and add
+    a linked worktree of it at the slot's submodule path, detached at the
+    superproject's recorded gitlink, so a later `git submodule update --init`
+    hook is a no-op. Submodules with no source module repository keep the
+    stock hook-clone behaviour and are reported as unshared; ones already
+    populated (shared on an earlier pass, or a private clone a hook made)
+    are left exactly as they are. Returns one outcome line per submodule.
+    """
+
+    outcomes: list[str] = []
+    if _depth > 8:
+        return [f"{slot_checkout}: submodule nesting too deep to share"]
+    for name, raw in _declared_submodules(vcs, slot_checkout):
+        relative = Path(raw)
+        if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+            outcomes.append(f"{raw}: not shared: unsafe path in .gitmodules")
+            continue
+        slot_sub = slot_checkout / relative
+        source_sub = source_repository / relative
+        if _submodule_worktree_populated(slot_sub):
+            dirs = _submodule_git_dirs(vcs, slot_sub)
+            shared = dirs is not None and _is_shared_submodule_gitdir(*dirs)
+            outcomes.append(
+                f"{raw}: {'shared (already)' if shared else 'populated, left as-is'}"
+            )
+            if shared:
+                outcomes.extend(
+                    _share_checkout_submodules(vcs, source_sub, slot_sub, _depth=_depth + 1)
+                )
+            continue
+        tree = vcs._run(slot_checkout, ["ls-tree", "-z", "HEAD", "--", raw], check=False)
+        fields = tree.stdout.split("\0")[0].split() if tree.returncode == 0 else []
+        if len(fields) < 3 or fields[1] != "commit":
+            continue  # Not a gitlink at HEAD; nothing to populate.
+        gitlink = fields[2]
+        state, _detail, common = _shared_module_prep_state(vcs, source_sub)
+        if state == "no-module" or common is None:
+            outcomes.append(
+                f"{raw}: not shared: the source checkout has no initialized "
+                "module repository for it; post-provision hooks keep the "
+                "stock per-slot clone"
+            )
+            continue
+        _prepare_shared_submodule_repo(vcs, source_sub)
+        if slot_sub.is_dir() and not any(slot_sub.iterdir()):
+            slot_sub.rmdir()
+        vcs._run(source_sub, ["worktree", "add", "--detach", str(slot_sub), gitlink])
+        print(
+            f"shared-submodule: {slot_checkout}/{raw} is a linked worktree of "
+            f"{common} at {gitlink} (objects shared, no per-slot clone)",
+            file=sys.stderr,
+        )
+        outcomes.append(f"{raw}: shared")
+        outcomes.extend(
+            _share_checkout_submodules(vcs, source_sub, slot_sub, _depth=_depth + 1)
+        )
+    return outcomes
+
+
+def _share_created_submodules(
+    config: Config, created: Sequence[Checkout], vcs: _GitVcs
+) -> None:
+    """Share submodules for every checkout ``create`` just added (#1206)."""
+
+    if not config.share_submodules:
+        return
+    for checkout in created:
+        _relative, repository = _stored_repository_path(config, checkout.repository)
+        path = _stored_path(config, checkout.path, "shared-submodule checkout path")
+        for outcome in _share_checkout_submodules(vcs, repository, path):
+            print(
+                f"shared-submodule: checkout={checkout.name} submodule {outcome}",
+                file=sys.stderr,
+            )
+
+
+def _shared_submodule_doctor_findings(
+    config: Config, states: Sequence[ActiveState]
+) -> list[dict[str, object]]:
+    """Doctor check mode for #1206: report shareable-but-unshared submodules.
+
+    Read-only. For every active checkout, a submodule whose primary
+    repository exists but is not prepared, or whose slot copy is still a
+    private clone, is a finding; diagnosis authorizes nothing, and the
+    remedy names the dry-run migration command.
+    """
+
+    findings: list[dict[str, object]] = []
+    vcs = _GitVcs()
+
+    def visit(
+        record: ActiveRecord, machine: str, slot_sub: Path, source_sub: Path, display: str
+    ) -> None:
+        try:
+            state, detail, common = _shared_module_prep_state(vcs, source_sub)
+            if state in ("unprepared", "unexpected"):
+                findings.append(
+                    _operational_finding(
+                        "shared-submodule-unprepared",
+                        record.slot,
+                        machine,
+                        f"submodule {display}: primary repository {common} is "
+                        f"not prepared for sharing ({detail}); create prepares "
+                        "it explicitly (logged, config only) or refuses with a "
+                        "remedy",
+                    )
+                )
+            dirs = _submodule_git_dirs(vcs, slot_sub)
+            if dirs is not None and not _is_shared_submodule_gitdir(*dirs):
+                if dirs[0] == dirs[1]:
+                    findings.append(
+                        _operational_finding(
+                            "shared-submodule-private",
+                            record.slot,
+                            machine,
+                            f"submodule {display}: slot copy is a private clone "
+                            f"at {dirs[1]} ({_directory_bytes(dirs[1])} bytes); "
+                            f"run `wrkslots share-submodules {record.slot}` "
+                            "(dry-run) to see the reclaimable bytes",
+                        )
+                    )
+                    return
+            for _name, raw in _declared_submodules(vcs, slot_sub):
+                nested = Path(raw)
+                if nested.is_absolute() or ".." in nested.parts:
+                    continue
+                if _submodule_worktree_populated(slot_sub / nested):
+                    visit(
+                        record,
+                        machine,
+                        slot_sub / nested,
+                        source_sub / nested,
+                        f"{display}/{raw}",
+                    )
+        except Exception:
+            return
+
+    for state in states:
+        for record in state.slots:
+            for checkout in record.checkouts:
+                try:
+                    _relative, repository = _stored_repository_path(
+                        config, checkout.repository
+                    )
+                    path = _stored_path(config, checkout.path, "doctor checkout path")
+                except Exception:
+                    continue
+                if not path.is_dir():
+                    continue
+                for _name, raw in _declared_submodules(vcs, path):
+                    relative = Path(raw)
+                    if relative.is_absolute() or ".." in relative.parts:
+                        continue
+                    if _submodule_worktree_populated(path / relative):
+                        visit(
+                            record,
+                            state.machine,
+                            path / relative,
+                            repository / relative,
+                            f"{checkout.name}/{raw}",
+                        )
+    return findings
+
+
+def _directory_bytes(path: Path) -> int:
+    """Allocated-content bytes below ``path`` (file sizes, no symlink following)."""
+
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for name in filenames:
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+            except OSError:
+                continue
+    return total
 
 
 # A repository's own Git hook installer, run by 'create' after the slot is
@@ -32988,7 +33493,13 @@ def _run_setup_hook_installers(
     <common>/worktrees/<checkout>/modules/, and false of the checkout itself,
     whose configuration is shared by every worktree of the repository, so a
     hook setting made once in the primary checkout already applies there and
-    re-running the installer would rewrite state other slots use.  The script
+    re-running the installer would rewrite state other slots use.  A shared
+    submodule (#1206, a linked worktree of the primary's module repository)
+    also qualifies: it is the same repository the primary's own installer
+    configures, so running it keeps the slot's behaviour identical to a
+    private clone's, and its plain `git config` writes land in that shared
+    repository's config, as they would from the primary submodule checkout.
+    The script
     must be a regular, executable file; it runs from the repository root, with
     stdin closed, ambient GIT_DIR-style variables removed, and a bound of
     SETUP_HOOKS_TIMEOUT_SECONDS.  The slot is already registered, so a failure
@@ -33036,13 +33547,20 @@ def _run_setup_hook_installers(
                 )
                 continue
             try:
-                _, common_dir = _setup_hooks_git_dirs(repository)
+                repository_git_dir, common_dir = _setup_hooks_git_dirs(repository)
             except (Refusal, StateError, OSError, ValueError) as exc:
                 results.append(
                     SetupHookResult(str(repository), "inspection-failed", detail=str(exc))
                 )
                 continue
-            if not common_dir.is_relative_to(slot_git_dir):
+            if not common_dir.is_relative_to(slot_git_dir) and not (
+                # A shared submodule (#1206) is a linked worktree of the
+                # primary's module repository; the checkout itself is also
+                # a linked worktree, but of the superproject repository, and
+                # stays excluded.
+                repository.resolve() != checkout_path.resolve()
+                and _is_shared_submodule_gitdir(repository_git_dir, common_dir)
+            ):
                 results.append(
                     SetupHookResult(
                         str(repository),
@@ -33420,6 +33938,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 # exact lock (WORKTREES_IMAGE_LOCK_REASON).
                 vcs.lock_worktree(repository, destination)
             _interrupt_for_test("after-create-worktree")
+        # #1206: share submodules before hooks run, so a hook's
+        # `git submodule update --init` finds them populated and shared.
+        _share_created_submodules(config, created, vcs)
         hook_journal = _create_journal_payload(
             config,
             args,
@@ -43266,6 +43787,321 @@ def _audit_slot_root_listing(
     return slots, sorted(others, key=lambda item: (item[0], item[1].name))
 
 
+def _share_submodules_inventory(
+    vcs: _GitVcs, record: ActiveRecord, config: Config
+) -> list[dict[str, object]]:
+    """Per-submodule sharing inventory of one slot, for share-submodules (#1206)."""
+
+    entries: list[dict[str, object]] = []
+
+    def visit(slot_sub: Path, source_sub: Path, display: str) -> None:
+        dirs = _submodule_git_dirs(vcs, slot_sub)
+        if dirs is None:
+            entries.append(
+                {"submodule": display, "state": "blocked", "detail": "Git cannot open this submodule"}
+            )
+            return
+        git_dir, common = dirs
+        head_result = vcs._run(slot_sub, ["rev-parse", "--verify", "HEAD"], check=False)
+        head = head_result.stdout.strip() if head_result.returncode == 0 else ""
+        if _is_shared_submodule_gitdir(git_dir, common):
+            entries.append(
+                {
+                    "submodule": display,
+                    "state": "shared",
+                    "head": head,
+                    "admin_bytes": _directory_bytes(git_dir),
+                    "reclaimable_bytes": 0,
+                }
+            )
+        elif git_dir == common:
+            prep_state, prep_detail, shared_common = _shared_module_prep_state(vcs, source_sub)
+            origin = vcs._run(
+                slot_sub, ["config", "--get", "remote.origin.url"], check=False
+            )
+            entry: dict[str, object] = {
+                "submodule": display,
+                "state": "private",
+                "head": head,
+                "private_bytes": _directory_bytes(common),
+                "reclaimable_bytes": _directory_bytes(common),
+                "private_repository": str(common),
+                "slot_path": str(slot_sub),
+                "source_path": str(source_sub),
+                "origin_url": origin.stdout.strip() if origin.returncode == 0 else "",
+            }
+            if prep_state == "no-module" or shared_common is None:
+                entry["state"] = "blocked"
+                entry["detail"] = (
+                    "the source checkout has no initialized module repository "
+                    "to share; nothing to convert against"
+                )
+                entry["reclaimable_bytes"] = 0
+            else:
+                # Tips the shared store must hold before conversion: HEAD
+                # and every ref of the private repository.
+                tips = {head} if head else set()
+                for line in vcs._run(
+                    slot_sub, ["for-each-ref", "--format=%(objectname)"]
+                ).stdout.splitlines():
+                    if line.strip():
+                        tips.add(line.strip())
+                reachable: set[str] = set()
+                listed = vcs._run(source_sub, ["rev-list", "--all"], check=False)
+                if listed.returncode == 0:
+                    reachable = {line.strip() for line in listed.stdout.splitlines()}
+                entry["unreachable_tips"] = sorted(tip for tip in tips if tip not in reachable)
+                entry["prep_state"] = prep_state
+                entry["prep_detail"] = prep_detail
+            entries.append(entry)
+        else:
+            entries.append(
+                {
+                    "submodule": display,
+                    "state": "blocked",
+                    "detail": f"unexpected submodule git dir layout: git dir {git_dir}, common dir {common}",
+                }
+            )
+            return
+        for _name, raw in _declared_submodules(vcs, slot_sub):
+            nested = Path(raw)
+            if nested.is_absolute() or ".." in nested.parts:
+                continue
+            if _submodule_worktree_populated(slot_sub / nested):
+                visit(slot_sub / nested, source_sub / nested, f"{display}/{raw}")
+
+    for checkout in record.checkouts:
+        _relative, repository = _stored_repository_path(config, checkout.repository)
+        path = _stored_path(config, checkout.path, "share-submodules checkout path")
+        if not path.is_dir():
+            continue
+        for _name, raw in _declared_submodules(vcs, path):
+            relative = Path(raw)
+            if relative.is_absolute() or ".." in relative.parts:
+                continue
+            if _submodule_worktree_populated(path / relative):
+                visit(path / relative, repository / relative, f"{checkout.name}/{raw}")
+    return entries
+
+
+def _cmd_share_submodules(args: argparse.Namespace) -> int:
+    """Convert a slot's private submodule clones to shared linked worktrees (#1206).
+
+    Dry-run by default: reports per-submodule private bytes and reclaimable
+    bytes and changes nothing. With --apply, each private submodule's tips
+    are first transferred into the primary module repository (fetched under
+    refs/wrkslots/share-migration/, read back), the primary repository is
+    prepared (logged, config only), the slot checkout is re-added as a
+    linked worktree of it at the same HEAD, and only then is the private
+    store deleted. Conversion refuses while a live process uses the slot
+    (the _stray_live_uses census remove also uses), unless the caller
+    passes --owner-consent for this one slot; it also refuses a held slot,
+    a dirty or on-branch submodule, and any tip it cannot transfer.
+    """
+
+    config = _load_config(args.project_root, args.machine)
+    _validate_name(args.slot, "slot")
+    vcs = _GitVcs()
+
+    def run() -> int:
+        record = _find_record(_load_active(config), args.slot)
+        if args.apply:
+            hold = _load_hold(config, record.slot, record.machine)
+            if hold is not None:
+                raise Refusal(
+                    f"slot {record.slot} is held ({_as_str(hold['reason'], 'slot hold.reason')}); "
+                    "unhold it before converting its submodules"
+                )
+        slot_path = _slot_directory(config, record.slot, record.slot_type)
+        entries = _share_submodules_inventory(vcs, record, config)
+        live = _stray_live_uses(slot_path) if slot_path.is_dir() else []
+        private_repos_all = [
+            Path(str(entry["private_repository"]))
+            for entry in entries
+            if entry.get("state") == "private"
+        ]
+        total = sum(
+            cast(int, entry.get("reclaimable_bytes", 0))
+            for entry in entries
+            if entry.get("state") == "private"
+            and not any(
+                Path(str(entry["private_repository"])) != other
+                and Path(str(entry["private_repository"])).is_relative_to(other)
+                for other in private_repos_all
+            )
+        )
+        if not args.apply:
+            if args.format == "json":
+                print(
+                    json.dumps(
+                        {
+                            "slot": record.slot,
+                            "applied": False,
+                            "live_uses": live,
+                            "total_reclaimable_bytes": total,
+                            "submodules": entries,
+                        },
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+            else:
+                print(f"share-submodules slot={record.slot} dry-run (nothing changed)")
+                for entry in entries:
+                    line = f"  {entry['submodule']}: {entry['state']}"
+                    if entry.get("state") == "private":
+                        line += (
+                            f" private_bytes={entry['private_bytes']} "
+                            f"reclaimable_bytes={entry['reclaimable_bytes']} "
+                            f"unreachable_tips={len(cast(list[object], entry.get('unreachable_tips', [])))}"
+                        )
+                    if entry.get("detail"):
+                        line += f" ({entry['detail']})"
+                    print(line)
+                print(f"total_reclaimable_bytes={total}")
+                for use in live:
+                    print(f"live use: {use} (conversion needs --owner-consent)")
+            return 0
+        # --apply preflight: refuse everything up front, convert nothing yet.
+        if live and not args.owner_consent:
+            raise Refusal(
+                f"slot {record.slot} is in live use ({'; '.join(live)}); "
+                "converting it would move its submodule HEADs mid-flight. "
+                "remedy: stop the slot's agent, or pass --owner-consent for "
+                "this one slot if its owner accepts the conversion"
+            )
+        private = [entry for entry in entries if entry.get("state") == "private"]
+        blocked = [entry for entry in entries if entry.get("state") == "blocked"]
+        if blocked:
+            raise Refusal(
+                "cannot convert slot "
+                f"{record.slot}: submodule {blocked[0]['submodule']} is blocked "
+                f"({blocked[0].get('detail')}); preserve it and rerun when it can be converted"
+            )
+        for entry in private:
+            slot_sub = Path(str(entry["slot_path"]))
+            status = vcs._run(slot_sub, ["status", "--porcelain"], check=False)
+            if status.returncode != 0 or status.stdout.strip():
+                raise Refusal(
+                    f"submodule {entry['submodule']} has uncommitted changes; "
+                    "commit or stash them before conversion"
+                )
+            branch = vcs._run(slot_sub, ["symbolic-ref", "-q", "HEAD"], check=False)
+            if branch.returncode == 0:
+                raise Refusal(
+                    f"submodule {entry['submodule']} is on a branch "
+                    f"({branch.stdout.strip()}); check out its recorded "
+                    "gitlink (detached) before conversion"
+                )
+            if entry.get("prep_state") not in ("unprepared", "prepared"):
+                raise Refusal(
+                    f"cannot share submodule {entry['submodule']}: "
+                    f"{entry.get('prep_detail')}. remedy: inspect the primary "
+                    "submodule repository and rerun"
+                )
+        # Transfer every unreachable tip into the shared store and read back.
+        converted: list[dict[str, object]] = []
+        private_repos: list[Path] = []
+        for entry in private:
+            slot_sub = Path(str(entry["slot_path"]))
+            source_sub = Path(str(entry["source_path"]))
+            private_repo = Path(str(entry["private_repository"]))
+            private_repos.append(private_repo)
+            keep = re.sub(r"[^A-Za-z0-9._-]+", "-", str(entry["submodule"])).strip("-.")
+            refspecs = [
+                "+refs/heads/*:refs/wrkslots/share-migration/" + f"{record.slot}/{keep}/heads/*",
+                "+refs/tags/*:refs/wrkslots/share-migration/" + f"{record.slot}/{keep}/tags/*",
+                f"HEAD:refs/wrkslots/share-migration/{record.slot}/{keep}/head",
+            ]
+            vcs._run(source_sub, ["fetch", "--no-tags", str(private_repo), *refspecs])
+            reachable = {
+                line.strip()
+                for line in vcs._run(source_sub, ["rev-list", "--all"]).stdout.splitlines()
+            }
+            missing = [
+                tip
+                for tip in cast(list[object], entry.get("unreachable_tips", []))
+                if str(tip) not in reachable
+            ]
+            if missing or str(entry["head"]) not in reachable:
+                raise Refusal(
+                    f"transfer into the shared repository for submodule "
+                    f"{entry['submodule']} did not hold every tip "
+                    f"(missing {missing}); the private store at "
+                    f"{private_repo} is untouched"
+                )
+            _prepare_shared_submodule_repo(vcs, source_sub)
+            head = str(entry["head"])
+            if slot_sub.is_dir() and not slot_sub.is_symlink():
+                shutil.rmtree(slot_sub)
+            vcs._run(source_sub, ["worktree", "add", "--detach", str(slot_sub), head])
+            now = vcs._run(slot_sub, ["rev-parse", "--verify", "HEAD"], check=False)
+            if now.returncode != 0 or now.stdout.strip() != head:
+                raise Refusal(
+                    f"converted submodule {entry['submodule']} is not at its "
+                    f"previous HEAD {head}; the private store at "
+                    f"{private_repo} is still on disk, inspect before rerunning"
+                )
+            converted.append(entry)
+            print(
+                f"shared-submodule: converted {entry['submodule']} at {slot_sub} "
+                f"to a linked worktree of the primary repository (HEAD {head})",
+                file=sys.stderr,
+            )
+        # A nested private repository lives inside its parent's, so only
+        # the outermost deletions reclaim (and count) bytes.
+        outermost = [
+            repo
+            for repo in private_repos
+            if not any(
+                repo != other and repo.is_relative_to(other) for other in private_repos
+            )
+        ]
+        reclaimed = 0
+        for repo in outermost:
+            if repo.is_dir():
+                reclaimed += cast(int,
+                    next(
+                        entry["private_bytes"]
+                        for entry in private
+                        if entry["private_repository"] == str(repo)
+                    )
+                )
+                shutil.rmtree(repo)
+        for repo in private_repos:
+            if repo.is_dir():
+                shutil.rmtree(repo)
+        if args.format == "json":
+            print(
+                json.dumps(
+                    {
+                        "slot": record.slot,
+                        "applied": True,
+                        "owner_consent": bool(args.owner_consent),
+                        "reclaimed_bytes": reclaimed,
+                        "converted": [str(entry["submodule"]) for entry in converted],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            for entry in converted:
+                print(
+                    f"converted {entry['submodule']}: reclaimed "
+                    f"{entry['private_bytes']} private bytes"
+                )
+            print(f"share-submodules slot={record.slot} applied reclaimed_bytes={reclaimed}")
+        return 0
+
+    if args.apply:
+        with _mutation_locks(config, args.wait_lock):
+            _refuse_partial_state(config)
+            _assert_no_journal(config)
+            return run()
+    return run()
+
+
 def _cmd_audit(args: argparse.Namespace) -> int:
     restore_memory_limit = _apply_scan_memory_limit(args)
     _bound_event_retention()
@@ -45337,6 +46173,9 @@ def _cmd_doctor_scan(args: argparse.Namespace) -> int:
                 if item["machine"] is None or item["machine"] == config.machine
             ]
         )
+        # #1206 check mode: primary submodule repositories that create
+        # would need to prepare, and slot submodules still privately cloned.
+        findings.extend(_shared_submodule_doctor_findings(config, states))
         doctor_records = [record for state in states for record in state.slots]
         doctor_liveness = cache.owner_liveness(config, doctor_records)
         rows = [
@@ -55489,6 +56328,7 @@ def _recover_create(
     updated_journal["hook_failure"] = None
     updated_journal["failure_policy"] = "leave-for-inspection"
     _write_journal(config, updated_journal, journal_path=path)
+    _share_created_submodules(config, created, vcs)
     hook_progress = _run_post_provision_hooks(
         config,
         created,
@@ -78482,6 +79322,36 @@ usage or audit gate unknown, 3 fail-closed refusal.
         ),
     )
     clean_caches.set_defaults(handler=_cmd_clean_caches)
+
+    share_submodules = subparsers.add_parser(
+        "share-submodules",
+        help="convert a slot's private submodule clones to shared linked worktrees (dry-run by default)",
+        description=(
+            "Report (dry-run, the default) or convert one slot's privately cloned "
+            "submodules into linked worktrees of the primary .git/modules repositories "
+            "(#1206), so their object stores are shared instead of duplicated per slot. "
+            "--apply transfers every private tip into the shared repository first, "
+            "prepares it (logged, config only), re-adds the slot checkout at the same "
+            "HEAD, and only then deletes the private store. Conversion refuses while a "
+            "live process uses the slot unless --owner-consent is given for this slot."
+        ),
+    )
+    share_submodules.add_argument("slot", help="the active slot to inspect or convert")
+    share_submodules.add_argument(
+        "--apply",
+        action="store_true",
+        help="convert (without it, only report reclaimable bytes and change nothing)",
+    )
+    share_submodules.add_argument(
+        "--owner-consent",
+        action="store_true",
+        help=(
+            "convert this one slot even though a live process uses it; use only when "
+            "the slot's owner accepts its submodule HEADs being re-added mid-flight"
+        ),
+    )
+    share_submodules.add_argument("--format", choices=("human", "json"), default="human")
+    share_submodules.set_defaults(handler=_cmd_share_submodules)
 
     finish = subparsers.add_parser(
         "finish",

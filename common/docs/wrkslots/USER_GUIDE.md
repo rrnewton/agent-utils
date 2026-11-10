@@ -561,6 +561,51 @@ string, runs in every slot type. The create journal records the hooks for its sl
 wrkslots before 0.8.0 refuses a mapping entry as not a string, so set `min_wrkslots_version: 0.8.0`
 when you use one: an older reader then names the version it needs instead.
 
+## Shared submodule object stores
+
+Git's stock behaviour clones every submodule of a linked worktree into that worktree's own
+Git directory (`<common>/worktrees/<slot>/modules/<name>/`), a full private object store per
+slot (#1206). With `share_submodules: true` in the configuration, `create` instead shares:
+after adding the worktree and before the post-provision
+hooks run, each declared submodule whose primary checkout owns an initialized module
+repository (`.git/modules/<name>/`) becomes a linked worktree of that repository, detached at
+the superproject's recorded gitlink. A hook's `git submodule update --init` then finds it
+populated and does nothing. The key is opt-in (list it in `ignorable_keys` so an older
+wrkslots ignores it with a warning): sharing prepares the primary submodule repositories
+and the recovery paths for shared layouts are still being extended, so the historical
+private clone stays the default until they are complete. The per-slot cost is the small worktree administration under
+`.git/modules/<name>/worktrees/`; objects and refs live once, in the primary repository, and
+`git gc` there computes reachability over every worktree, so no slot can be pruned out from
+under another. Submodules with no initialized primary module repository keep the stock
+per-slot clone and are reported as `not shared` in the create output.
+
+Sharing needs the primary submodule repository prepared: `extensions.worktreeConfig` enabled
+in its shared config, and `core.worktree` moved into the main worktree's `config.worktree`
+(without this, `git worktree add` rewrites the shared `core.worktree` to the slot path and the
+primary submodule breaks). That preparation is explicit, idempotent and logged on stderr as
+`shared-submodule: prepared primary repository ...`; it changes only that repository's config,
+never its working tree, and it refuses with a remedy when the repository is not in the expected
+state. `wrkslots doctor` reports both an unprepared primary repository
+(`shared-submodule-unprepared`) and a slot submodule that is still a private clone
+(`shared-submodule-private`).
+
+Existing slots are converted by `share-submodules`, dry-run by default:
+
+```sh
+wrkslots share-submodules slot01
+wrkslots share-submodules slot01 --apply
+wrkslots share-submodules slot01 --apply --owner-consent
+```
+
+The dry run prints the private and reclaimable bytes per submodule and changes nothing.
+`--apply` first transfers every tip the private repository holds into the shared repository
+(under `refs/wrkslots/share-migration/`, read back), prepares the primary repository, re-adds
+the slot checkout at the same HEAD, and only then deletes the private store. It refuses a held
+slot, a dirty or on-branch submodule, and any live use of the slot (the same process census
+`remove` uses) unless `--owner-consent` is passed for that one slot. Removing a slot salvages
+its shared submodules' private work first (as it does for private clones), removes only their
+worktree registrations, and never deletes the shared `.git/modules/<name>` store.
+
 ## Git hook installers in new submodules
 
 A repository can ship its own Git hook installer as an executable `scripts/setup-hooks.sh`, which
