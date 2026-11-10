@@ -9,7 +9,8 @@ This is not cgroup accounting. Escaped process groups and activity between sampl
 can be missed. Missing, ambiguous or resource-limited observations are unavailable,
 never zero. Successful observations are shared for at most half a second.
 One shared observation retains at most 1024 members across 256 registered groups,
-with a one-second scan deadline and 64 descriptors reserved below the soft limit.
+with a one-second budget of the scanning thread's CPU time (and a ten-second wall
+backstop) and 64 descriptors reserved below the soft limit.
 Descriptor pressure can lower this ceiling. A shared refusal affects all readers
 of that snapshot; it does not permit a partial population to be reported.
 """
@@ -26,7 +27,7 @@ import time
 import weakref
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Callable, NamedTuple, Protocol
 
 __all__ = ["CPU_SOURCE_CGROUP", "CPU_SOURCE_PROCFS", "ProcessGroupCpu", "Unavailable", "subtree_cpu_seconds"]
 
@@ -38,7 +39,10 @@ _MAX_GROUPS = 256
 _MAX_ENTRIES = 65536
 _FD_RESERVE = 64
 _MAX_INTERRUPTS = 16
+# The scan's budget of the scanning thread's CPU time.
 _SCAN_SECONDS = 1.0
+# The scan's wall-clock backstop, for a scan that blocks without using CPU.
+_SCAN_WALL_SECONDS = 10.0
 _SNAPSHOT_TTL_S = 0.5
 _U64_MAX = (1 << 64) - 1
 
@@ -58,12 +62,38 @@ def _clk_tck() -> float:
     return float(value)
 
 
-def _check(deadline: float) -> None:
-    if time.monotonic() >= deadline:
+class _Deadline(NamedTuple):
+    """The end of a scan's budgets: ``cpu`` on ``time.thread_time`` and ``wall`` on
+    ``time.monotonic``.
+
+    A snapshot runs on the one thread that holds ``_lock``, so that thread's CPU clock
+    counts exactly the scan's work. Wall time also counts how long a loaded host keeps
+    the thread waiting to run: under load a scan that needed about 200-350 ms of CPU
+    took up to a second of wall time, and a one-second wall bound refused it.
+
+    The CPU budget never fires while the thread is blocked without running, so the much
+    larger wall backstop bounds blocking that accumulates across steps, such as slow
+    procfs reads that each eventually return. Both are checked only between system
+    calls: no check on this thread can interrupt a single call that never returns.
+    """
+
+    cpu: float
+    wall: float
+
+
+def _deadline() -> _Deadline:
+    """The budgets of one scan, starting now."""
+    return _Deadline(time.thread_time() + _SCAN_SECONDS, time.monotonic() + _SCAN_WALL_SECONDS)
+
+
+def _check(deadline: _Deadline) -> None:
+    if time.thread_time() >= deadline.cpu:
         raise Unavailable("scan deadline")
+    if time.monotonic() >= deadline.wall:
+        raise Unavailable("scan wall deadline")
 
 
-def _native(call: Callable[[], int], deadline: float) -> int:
+def _native(call: Callable[[], int], deadline: _Deadline) -> int:
     for _ in range(_MAX_INTERRUPTS + 1):
         _check(deadline)
         result = call()
@@ -79,14 +109,14 @@ def _libc() -> ctypes.CDLL:
     return ctypes.CDLL(None, use_errno=True)
 
 
-def _openat(directory: int, path: str, deadline: float) -> int:
+def _openat(directory: int, path: str, deadline: _Deadline) -> int:
     libc = _libc()
     libc.openat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
     libc.openat.restype = ctypes.c_int
     return _native(lambda: int(libc.openat(directory, os.fsencode(path), os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)), deadline)
 
 
-def _pidfd(pid: int, deadline: float) -> int:
+def _pidfd(pid: int, deadline: _Deadline) -> int:
     # CPython's pidfd_open is one direct syscall, including on older libc versions
     # without a pidfd_open symbol. Bound its EINTR handling here, without an ABI table.
     for _ in range(_MAX_INTERRUPTS + 1):
@@ -104,7 +134,7 @@ class _Pollfd(ctypes.Structure):
     _fields_ = [("fd", ctypes.c_int), ("events", ctypes.c_short), ("revents", ctypes.c_short)]
 
 
-def _poll(fd: int, deadline: float) -> int:
+def _poll(fd: int, deadline: _Deadline) -> int:
     libc = _libc()
     libc.poll.argtypes = [ctypes.POINTER(_Pollfd), ctypes.c_ulong, ctypes.c_int]
     libc.poll.restype = ctypes.c_int
@@ -113,7 +143,7 @@ def _poll(fd: int, deadline: float) -> int:
     return 0 if count == 0 else int(event.revents)
 
 
-def _read(fd: int, deadline: float, limit: int = _MAX_RECORD) -> str:
+def _read(fd: int, deadline: _Deadline, limit: int = _MAX_RECORD) -> str:
     """Offset zero is essential: procfs must regenerate the phase-two record."""
     data = bytearray()
     libc = _libc()
@@ -297,7 +327,7 @@ class _Proc:
                 raise Unavailable("root is not procfs")
             statusfd = self.open("self/status")
             try:
-                status = _read(statusfd, time.monotonic() + _SCAN_SECONDS)
+                status = _read(statusfd, _deadline())
             finally:
                 os.close(statusfd)
             namespaces = [line.split()[1:] for line in status.splitlines() if line.startswith("NSpid:")]
@@ -306,7 +336,7 @@ class _Proc:
             if namespaces != [[str(os.getpid())]]:
                 raise Unavailable("procfs PID namespace mismatch")
             with os.fdopen(self.open("self/stat"), "rb") as record:
-                own = _stat(_read(record.fileno(), time.monotonic() + _SCAN_SECONDS))
+                own = _stat(_read(record.fileno(), _deadline()))
             if own.pid != os.getpid():
                 raise Unavailable("procfs PID namespace mismatch")
         except BaseException:
@@ -318,10 +348,10 @@ class _Proc:
             os.close(self.fd)
             self.fd = -1
 
-    def open(self, path: str, deadline: float | None = None) -> int:
-        return _openat(self.fd, path, time.monotonic() + _SCAN_SECONDS if deadline is None else deadline)
+    def open(self, path: str, deadline: _Deadline | None = None) -> int:
+        return _openat(self.fd, path, _deadline() if deadline is None else deadline)
 
-    def _record(self, path: str, deadline: float, limit: int = _MAX_RECORD) -> str | None:
+    def _record(self, path: str, deadline: _Deadline, limit: int = _MAX_RECORD) -> str | None:
         try:
             fd = self.open(path, deadline)
         except OSError:
@@ -333,7 +363,7 @@ class _Proc:
         finally:
             os.close(fd)
 
-    def allocator(self, deadline: float) -> _Allocator | None:
+    def allocator(self, deadline: _Deadline) -> _Allocator | None:
         """The allocator position, or None if procfs does not report it."""
         loadavg = self._record("loadavg", deadline)
         stat = self._record("stat", deadline, _MAX_STAT_RECORD)
@@ -343,21 +373,21 @@ class _Proc:
             return None
         return _Allocator(position[0], position[1], forks)
 
-    def pid_max(self, deadline: float) -> int | None:
+    def pid_max(self, deadline: _Deadline) -> int | None:
         text = self._record("sys/kernel/pid_max", deadline)
         try:
             return None if text is None else int(text.strip())
         except ValueError:
             return None
 
-    def pid(self, pidfd: int, deadline: float) -> int:
+    def pid(self, pidfd: int, deadline: _Deadline) -> int:
         fd = self.open(f"self/fdinfo/{pidfd}", deadline)
         try:
             return _fd_pid(_read(fd, deadline))
         finally:
             os.close(fd)
 
-    def pair(self, pid: int, deadline: float) -> _Pair:
+    def pair(self, pid: int, deadline: _Deadline) -> _Pair:
         _check(deadline)
         _allow_fds(3)
         pidfd = _pidfd(pid, deadline)
@@ -389,7 +419,7 @@ class _Pair:
             os.close(self.statfd)
             self.pidfd = self.statfd = -1
 
-    def valid(self, deadline: float) -> bool:
+    def valid(self, deadline: _Deadline) -> bool:
         _check(deadline)
         bits = _poll(self.pidfd, deadline)
 
@@ -426,12 +456,12 @@ def _accept(bits: int, original: _Stat, fresh: Callable[[], _Stat | None]) -> bo
 class _Observation(Protocol):
     original: _Stat
 
-    def valid(self, deadline: float) -> bool: ...
+    def valid(self, deadline: _Deadline) -> bool: ...
     def close(self) -> None: ...
 
 
 class _Source(Protocol):
-    def samples(self, groups: set[int], deadline: float) -> list[_Observation]: ...
+    def samples(self, groups: set[int], deadline: _Deadline) -> list[_Observation]: ...
 
 
 class _KernelSource:
@@ -444,7 +474,7 @@ class _KernelSource:
         self.cache = _SessionCache() if cache is None else cache
         self.reads = 0
 
-    def _consider(self, pid: int, groups: set[int], rows: list[_Observation], deadline: float) -> None:
+    def _consider(self, pid: int, groups: set[int], rows: list[_Observation], deadline: _Deadline) -> None:
         """Read pid's stat, cache its session and, if it is in one of groups, pair it."""
         self.reads += 1
         try:
@@ -468,7 +498,7 @@ class _KernelSource:
         else:
             rows.append(pair)
 
-    def samples(self, groups: set[int], deadline: float) -> list[_Observation]:
+    def samples(self, groups: set[int], deadline: _Deadline) -> list[_Observation]:
         rows: list[_Observation] = []
         try:
             pid_max = self.proc.pid_max(deadline)
@@ -503,7 +533,7 @@ class _KernelSource:
             raise
 
 
-def _scan(source: _Source, groups: set[int], deadline: float) -> dict[int, int]:
+def _scan(source: _Source, groups: set[int], deadline: _Deadline) -> dict[int, int]:
     rows = source.samples(groups, deadline)
     try:
         # This barrier is global to the whole aggregate. Do not validate chunks while
@@ -531,7 +561,9 @@ _snapshot_at = float("-inf")
 _snapshot: dict[int, int] = {}
 _snapshot_keys: set[int] = set()
 _snapshot_error: str | None = None
-_snapshot_started = float("-inf")
+# The scanning thread's CPU time, and the wall time, the last snapshot took.
+_snapshot_spent = 0.0
+_snapshot_took = 0.0
 _snapshot_reads = 0
 _census = _SessionCache()
 
@@ -569,7 +601,7 @@ class ProcessGroupCpu:
                     raise Unavailable("owner bound")
                 proc = _Proc(proc_root)
                 self.proc = proc
-                owner = proc.pair(pgid, time.monotonic() + _SCAN_SECONDS)
+                owner = proc.pair(pgid, _deadline())
                 self.owner = owner
                 if owner.original.group != pgid:
                     raise Unavailable("owner is not the process-group leader")
@@ -597,7 +629,7 @@ class ProcessGroupCpu:
     def __del__(self) -> None:
         self.close()
 
-    def _authenticate(self, deadline: float) -> None:
+    def _authenticate(self, deadline: _Deadline) -> None:
         if self.owner is None or self.proc is None:
             raise Unavailable("closed owner")
         if self.proc.pid(self.owner.pidfd, deadline) != self.pgid:
@@ -610,10 +642,10 @@ class ProcessGroupCpu:
 
     def seconds(self) -> float:
         """Return checked own+waited CPU seconds from one authenticated observation."""
-        global _snapshot_at, _snapshot, _snapshot_keys, _snapshot_error, _snapshot_started, _snapshot_reads
+        global _snapshot_at, _snapshot, _snapshot_keys, _snapshot_error, _snapshot_spent, _snapshot_took, _snapshot_reads
         try:
             with _lock:
-                deadline = time.monotonic() + _SCAN_SECONDS
+                deadline = _deadline()
                 self._authenticate(deadline)
                 assert self.proc is not None
                 if not self.shared:
@@ -631,7 +663,8 @@ class ProcessGroupCpu:
                         except (OSError, Unavailable):
                             continue
                         active.append(owner)
-                    _snapshot_started = time.monotonic()
+                    started = time.thread_time()
+                    started_wall = time.monotonic()
                     _snapshot_keys = {owner.key for owner in owners}
                     source = _KernelSource(self.proc, {owner.session for owner in active}, _census)
                     try:
@@ -651,10 +684,14 @@ class ProcessGroupCpu:
                         _snapshot = values
                         _snapshot_error = None
                     _snapshot_reads = source.reads
+                    _snapshot_spent = time.thread_time() - started
                     _snapshot_at = time.monotonic()
+                    _snapshot_took = _snapshot_at - started_wall
                 self._authenticate(deadline)
-                if _snapshot_at - _snapshot_started > _SCAN_SECONDS:
+                if _snapshot_spent > _SCAN_SECONDS:
                     raise Unavailable("scan deadline")
+                if _snapshot_took > _SCAN_WALL_SECONDS:
+                    raise Unavailable("scan wall deadline")
                 if _snapshot_error is not None:
                     raise Unavailable(_snapshot_error)
                 if self.key not in _snapshot:
@@ -685,7 +722,7 @@ def subtree_cpu_seconds(pgid: int, *, proc_root: Path | None = None) -> float | 
             entry = _compat.get(pgid)
             if entry is not None:
                 try:
-                    entry[0]._authenticate(now + _SCAN_SECONDS)
+                    entry[0]._authenticate(_deadline())
                 except (OSError, Unavailable):
                     entry[0].close()
                     del _compat[pgid]

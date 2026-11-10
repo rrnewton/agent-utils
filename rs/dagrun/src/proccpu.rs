@@ -8,7 +8,8 @@
 //! This is not cgroup accounting: escaped groups and activity between samples can be
 //! missed. Ambiguous, missing or resource-limited evidence is unavailable, never zero.
 //! One shared observation retains at most 1024 members across 256 registered groups,
-//! with a one-second scan deadline and 64 descriptors reserved below the soft limit.
+//! with a one-second budget of the scanning thread's CPU time (and a ten-second wall
+//! backstop) and 64 descriptors reserved below the soft limit.
 //!
 //! Linux cannot list the members of a process group, so each snapshot walks every PID in
 //! procfs. It does not re-read every PID's stat: a [`SessionCache`] remembers the session
@@ -40,7 +41,10 @@ const MAX_GROUPS: usize = 256;
 const MAX_ENTRIES: usize = 65536;
 const FD_RESERVE: u64 = 64;
 const MAX_INTERRUPTS: usize = 16;
+/// The scan's budget of the scanning thread's CPU time.
 const SCAN_TIME: Duration = Duration::from_secs(1);
+/// The scan's wall-clock backstop, for a scan that blocks without using CPU.
+const SCAN_WALL_TIME: Duration = Duration::from_secs(10);
 const SNAPSHOT_TTL: Duration = Duration::from_millis(500);
 
 /// No complete authenticated observation is available; this is distinct from zero CPU.
@@ -60,9 +64,56 @@ impl From<io::Error> for Unavailable {
 fn unavailable(reason: &str) -> Unavailable {
     Unavailable(reason.into())
 }
-fn check(deadline: Instant) -> Result<(), Unavailable> {
-    if Instant::now() >= deadline {
+/// The CPU time the calling thread has used, or `Duration::MAX` if the clock cannot be
+/// read, so every [`check`] then refuses.
+fn thread_cpu() -> Duration {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a valid, writable timespec for the duration of the call.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) } != 0 {
+        return Duration::MAX;
+    }
+    match (u64::try_from(now.tv_sec), u32::try_from(now.tv_nsec)) {
+        (Ok(seconds), Ok(nanos)) if nanos < 1_000_000_000 => Duration::new(seconds, nanos),
+        _ => Duration::MAX,
+    }
+}
+/// The end of a scan's budgets: [`SCAN_TIME`] on the scanning thread's CPU clock, and
+/// the [`SCAN_WALL_TIME`] backstop on the wall clock.
+///
+/// A snapshot runs on the one thread that holds the registry lock, so that thread's CPU
+/// clock counts exactly the scan's work. Wall time also counts how long a loaded host
+/// keeps the thread waiting to run: under load a scan that needed about 200-350 ms of
+/// CPU took up to a second of wall time, and a one-second wall bound refused it.
+///
+/// The CPU budget never fires while the thread is blocked without running, so the much
+/// larger wall backstop bounds blocking that accumulates across steps, such as slow
+/// procfs reads that each eventually return. Both are checked only between system
+/// calls: no check on this thread can interrupt a single call that never returns.
+#[derive(Clone, Copy, Debug)]
+struct Deadline {
+    cpu: Duration,
+    wall: Instant,
+}
+impl Deadline {
+    /// The budgets of one scan, starting now.
+    fn scan() -> Self {
+        Self::within(SCAN_TIME, SCAN_WALL_TIME)
+    }
+    fn within(cpu: Duration, wall: Duration) -> Self {
+        Self {
+            cpu: thread_cpu().saturating_add(cpu),
+            wall: Instant::now() + wall,
+        }
+    }
+}
+fn check(deadline: Deadline) -> Result<(), Unavailable> {
+    if thread_cpu() >= deadline.cpu {
         Err(unavailable("scan deadline"))
+    } else if Instant::now() >= deadline.wall {
+        Err(unavailable("scan wall deadline"))
     } else {
         Ok(())
     }
@@ -108,13 +159,13 @@ fn allow_fds(required: u64) -> Result<(), Unavailable> {
     }
     Ok(())
 }
-fn read_record(file: &File, deadline: Instant) -> Result<String, Unavailable> {
+fn read_record(file: &File, deadline: Deadline) -> Result<String, Unavailable> {
     read_record_io(file, deadline).map_err(Unavailable::from)
 }
-fn read_record_io(file: &File, deadline: Instant) -> io::Result<String> {
+fn read_record_io(file: &File, deadline: Deadline) -> io::Result<String> {
     read_bounded(file, deadline, MAX_RECORD)
 }
-fn read_bounded(file: &File, deadline: Instant, max: usize) -> io::Result<String> {
+fn read_bounded(file: &File, deadline: Deadline, max: usize) -> io::Result<String> {
     let mut data = Vec::with_capacity(1024);
     let mut interrupts = 0;
     let mut block = [0_u8; 1024];
@@ -325,7 +376,7 @@ impl Proc {
             return Err(unavailable("root is not procfs"));
         }
         let proc = Self { root };
-        let deadline = Instant::now() + SCAN_TIME;
+        let deadline = Deadline::scan();
         let status = read_record(&proc.open("self/status", deadline)?, deadline)?;
         verify_namespace_status(status.as_bytes(), std::process::id())?;
         let own = stat(&read_record(&proc.open("self/stat", deadline)?, deadline)?)?;
@@ -334,7 +385,7 @@ impl Proc {
         }
         Ok(proc)
     }
-    fn open(&self, path: &str, deadline: Instant) -> io::Result<File> {
+    fn open(&self, path: &str, deadline: Deadline) -> io::Result<File> {
         let path = CString::new(path).map_err(io::Error::other)?;
         for _ in 0..=MAX_INTERRUPTS {
             check(deadline).map_err(io::Error::other)?;
@@ -358,7 +409,7 @@ impl Proc {
         Err(io::Error::other("open interrupted repeatedly"))
     }
     /// The allocator position, or `None` if procfs does not report it.
-    fn allocator(&self, deadline: Instant) -> Option<Allocator> {
+    fn allocator(&self, deadline: Deadline) -> Option<Allocator> {
         let loadavg = read_record_io(&self.open("loadavg", deadline).ok()?, deadline).ok()?;
         let (last_pid, tasks) = parse_loadavg(&loadavg)?;
         let stat = read_bounded(
@@ -373,18 +424,18 @@ impl Proc {
             forks: parse_forks(&stat)?,
         })
     }
-    fn pid_max(&self, deadline: Instant) -> Option<u32> {
+    fn pid_max(&self, deadline: Deadline) -> Option<u32> {
         read_record_io(&self.open("sys/kernel/pid_max", deadline).ok()?, deadline)
             .ok()?
             .trim()
             .parse()
             .ok()
     }
-    fn pid(&self, pidfd: &File, deadline: Instant) -> Result<i64, Unavailable> {
+    fn pid(&self, pidfd: &File, deadline: Deadline) -> Result<i64, Unavailable> {
         let record = self.open(&format!("self/fdinfo/{}", pidfd.as_raw_fd()), deadline)?;
         fd_pid(&read_record(&record, deadline)?)
     }
-    fn pair(&self, pid: u32, deadline: Instant) -> Result<Pair, PairError> {
+    fn pair(&self, pid: u32, deadline: Deadline) -> Result<Pair, PairError> {
         check(deadline)?;
         allow_fds(3)?;
         let (pidfd, file, original) = bind_pair(
@@ -408,7 +459,7 @@ impl Proc {
         })
     }
 }
-fn open_pidfd(pid: u32, deadline: Instant) -> Result<File, PairError> {
+fn open_pidfd(pid: u32, deadline: Deadline) -> Result<File, PairError> {
     for _ in 0..=MAX_INTERRUPTS {
         check(deadline)?;
         // SAFETY: pidfd_open takes scalar arguments and returns a new owned descriptor.
@@ -465,13 +516,13 @@ struct Pair {
 }
 trait Observation {
     fn original(&self) -> &Stat;
-    fn valid(&self, deadline: Instant) -> Result<bool, Unavailable>;
+    fn valid(&self, deadline: Deadline) -> Result<bool, Unavailable>;
 }
 impl Observation for Pair {
     fn original(&self) -> &Stat {
         &self.original
     }
-    fn valid(&self, deadline: Instant) -> Result<bool, Unavailable> {
+    fn valid(&self, deadline: Deadline) -> Result<bool, Unavailable> {
         let mut event = libc::pollfd {
             fd: self.pidfd.as_raw_fd(),
             events: libc::POLLIN,
@@ -534,7 +585,7 @@ trait Source {
     fn samples(
         &self,
         groups: &HashSet<u32>,
-        deadline: Instant,
+        deadline: Deadline,
     ) -> Result<Vec<Self::Row>, Unavailable>;
 }
 /// The live procfs source. `sessions` are the sessions of the registered groups, and
@@ -554,7 +605,7 @@ impl KernelSource<'_> {
         pid: u32,
         groups: &HashSet<u32>,
         rows: &mut Vec<Pair>,
-        deadline: Instant,
+        deadline: Deadline,
     ) -> Result<(), Unavailable> {
         self.reads.set(self.reads.get() + 1);
         let hint = match self
@@ -584,9 +635,17 @@ impl KernelSource<'_> {
         Ok(())
     }
 }
+#[cfg(test)]
+thread_local! {
+    /// Makes the next live procfs scan on this thread wait off-CPU this long before it
+    /// walks procfs, standing in for a scan a loaded host does not schedule.
+    static STALL_NEXT_SCAN: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+}
 impl Source for KernelSource<'_> {
     type Row = Pair;
-    fn samples(&self, groups: &HashSet<u32>, deadline: Instant) -> Result<Vec<Pair>, Unavailable> {
+    fn samples(&self, groups: &HashSet<u32>, deadline: Deadline) -> Result<Vec<Pair>, Unavailable> {
+        #[cfg(test)]
+        std::thread::sleep(STALL_NEXT_SCAN.with(|stall| stall.replace(Duration::ZERO)));
         let pid_max = self.proc.pid_max(deadline);
         let start = self.proc.allocator(deadline);
         self.cache.borrow_mut().begin(start, pid_max);
@@ -636,7 +695,7 @@ impl Source for KernelSource<'_> {
 fn scan<S: Source>(
     source: &S,
     groups: &HashSet<u32>,
-    deadline: Instant,
+    deadline: Deadline,
 ) -> Result<HashMap<u32, u64>, Unavailable> {
     let rows = source.samples(groups, deadline)?;
     // Global phase barrier: never validate a chunk before later original samples.
@@ -663,7 +722,7 @@ struct Owner {
     pair: Pair,
 }
 impl Owner {
-    fn authenticate(&self, deadline: Instant) -> Result<(), Unavailable> {
+    fn authenticate(&self, deadline: Deadline) -> Result<(), Unavailable> {
         if self.proc.pid(&self.pair.pidfd, deadline)? != i64::from(self.pgid) {
             return Err(unavailable("owner generation gone"));
         }
@@ -678,7 +737,10 @@ impl Owner {
     }
 }
 struct Snapshot {
-    started: Instant,
+    /// The scanning thread's CPU time for the whole snapshot.
+    spent: Duration,
+    /// The wall time the whole snapshot took.
+    took: Duration,
     captured: Instant,
     /// Stat files the snapshot read, of the PIDs it walked.
     #[cfg(test)]
@@ -720,7 +782,7 @@ impl Registry {
         }
         let proc = Proc::new(path)?;
         let pair = proc
-            .pair(pgid, Instant::now() + SCAN_TIME)
+            .pair(pgid, Deadline::scan())
             .map_err(Unavailable::from)?;
         if pair.original.group != pgid {
             return Err(unavailable("owner is not the process-group leader"));
@@ -740,7 +802,7 @@ impl Registry {
         Ok(owner)
     }
     fn seconds(&mut self, owner: &Owner) -> Result<f64, Unavailable> {
-        let deadline = Instant::now() + SCAN_TIME;
+        let deadline = Deadline::scan();
         owner.authenticate(deadline)?;
         let fresh = self.snapshot.as_ref().is_some_and(|snapshot| {
             snapshot.captured.elapsed() <= SNAPSHOT_TTL && snapshot.keys.contains(&owner.key)
@@ -759,7 +821,8 @@ impl Registry {
                 cache: std::cell::RefCell::new(&mut self.census),
                 reads: std::cell::Cell::new(0),
             };
-            let started = Instant::now();
+            let started = thread_cpu();
+            let started_wall = Instant::now();
             let values = scan(&source, &groups, deadline).map(|totals| {
                 let mut values = HashMap::new();
                 for entry in active {
@@ -774,9 +837,12 @@ impl Registry {
             });
             #[cfg(test)]
             let reads = source.reads.get();
+            let spent = thread_cpu().saturating_sub(started);
+            let captured = Instant::now();
             self.snapshot = Some(Snapshot {
-                started,
-                captured: Instant::now(),
+                spent,
+                took: captured.duration_since(started_wall),
+                captured,
                 #[cfg(test)]
                 reads,
                 keys: owners.iter().map(|entry| entry.key).collect(),
@@ -788,8 +854,11 @@ impl Registry {
             .snapshot
             .as_ref()
             .ok_or_else(|| unavailable("missing snapshot"))?;
-        if snapshot.captured.duration_since(snapshot.started) > SCAN_TIME {
+        if snapshot.spent > SCAN_TIME {
             return Err(unavailable("scan deadline"));
+        }
+        if snapshot.took > SCAN_WALL_TIME {
+            return Err(unavailable("scan wall deadline"));
         }
         let ticks = snapshot
             .values
@@ -839,7 +908,7 @@ pub fn subtree_cpu_seconds(pgid: u32) -> Option<f64> {
         .get(&pgid)
         .map(|(owner, _)| Arc::clone(owner));
     let owner = match cached {
-        Some(owner) if owner.authenticate(Instant::now() + SCAN_TIME).is_ok() => owner,
+        Some(owner) if owner.authenticate(Deadline::scan()).is_ok() => owner,
         _ => {
             registry.compatibility.remove(&pgid);
             registry.create(pgid, Path::new("/proc")).ok()?
@@ -968,7 +1037,7 @@ mod tests {
         fn original(&self) -> &Stat {
             &self.original
         }
-        fn valid(&self, _deadline: Instant) -> Result<bool, Unavailable> {
+        fn valid(&self, _deadline: Deadline) -> Result<bool, Unavailable> {
             accept(self.bits, &self.original, || self.fresh.clone())
         }
     }
@@ -978,7 +1047,7 @@ mod tests {
         fn samples(
             &self,
             groups: &HashSet<u32>,
-            _deadline: Instant,
+            _deadline: Deadline,
         ) -> Result<Vec<Row>, Unavailable> {
             let mut rows = Vec::new();
             for entry in fs::read_dir(self.0)? {
@@ -997,14 +1066,10 @@ mod tests {
     // Fixture adaptation only: fake lifecycle observations feed the same two-phase
     // aggregation. Live APIs never authenticate an ordinary directory as procfs.
     fn synthetic_seconds(pgid: u32, root: &Path) -> Option<f64> {
-        scan(
-            &Files(root),
-            &HashSet::from([pgid]),
-            Instant::now() + SCAN_TIME,
-        )
-        .ok()?
-        .get(&pgid)
-        .and_then(|ticks| clk_tck().ok().map(|rate| *ticks as f64 / rate))
+        scan(&Files(root), &HashSet::from([pgid]), Deadline::scan())
+            .ok()?
+            .get(&pgid)
+            .and_then(|ticks| clk_tck().ok().map(|rate| *ticks as f64 / rate))
     }
 
     #[test]
@@ -1015,7 +1080,7 @@ mod tests {
             fn samples(
                 &self,
                 groups: &HashSet<u32>,
-                _deadline: Instant,
+                _deadline: Deadline,
             ) -> Result<Vec<Row>, Unavailable> {
                 self.0["rows"]
                     .as_array()
@@ -1057,11 +1122,7 @@ mod tests {
             serde_json::from_str(include_str!("../tests/fixtures/proccpu-generation.json"))
                 .unwrap();
         for case in cases.as_array().unwrap() {
-            let result = scan(
-                &Corpus(case),
-                &HashSet::from([100]),
-                Instant::now() + SCAN_TIME,
-            );
+            let result = scan(&Corpus(case), &HashSet::from([100]), Deadline::scan());
             if case["error"] == true {
                 assert!(result.is_err(), "{}", case["name"]);
             } else {
@@ -1086,7 +1147,7 @@ mod tests {
             fn original(&self) -> &Stat {
                 &self.row
             }
-            fn valid(&self, _deadline: Instant) -> Result<bool, Unavailable> {
+            fn valid(&self, _deadline: Deadline) -> Result<bool, Unavailable> {
                 assert_eq!(&self.events.borrow()[..3], &["sample", "sample", "sample"]);
                 self.events.borrow_mut().push("validate");
                 Ok(true)
@@ -1098,7 +1159,7 @@ mod tests {
             fn samples(
                 &self,
                 _groups: &HashSet<u32>,
-                _deadline: Instant,
+                _deadline: Deadline,
             ) -> Result<Vec<OrderedRow>, Unavailable> {
                 Ok((0..3)
                     .map(|index| {
@@ -1122,7 +1183,7 @@ mod tests {
             scan(
                 &OrderedSource(Rc::clone(&events)),
                 &HashSet::from([100]),
-                Instant::now() + SCAN_TIME
+                Deadline::scan()
             )
             .unwrap()[&100],
             3
@@ -1231,17 +1292,17 @@ mod tests {
         let pair = reader
             .owner
             .proc
-            .pair(zombie, Instant::now() + SCAN_TIME)
+            .pair(zombie, Deadline::scan())
             .map_err(Unavailable::from)
             .unwrap();
         assert_eq!(pair.original.state, 'Z');
         assert!(pair.original.ticks > 0);
-        assert!(pair.valid(Instant::now() + SCAN_TIME).unwrap());
+        assert!(pair.valid(Deadline::scan()).unwrap());
         let before = reader.seconds().unwrap();
         assert!(before >= pair.original.ticks as f64 / clk_tck().unwrap());
         child.send(b'r');
         assert_eq!(child.line(), "reaped");
-        assert!(!pair.valid(Instant::now() + SCAN_TIME).unwrap());
+        assert!(!pair.valid(Deadline::scan()).unwrap());
         registry().lock().unwrap().snapshot = None;
         assert!(reader.seconds().unwrap() >= before);
         child.send(b'x');
@@ -1252,16 +1313,17 @@ mod tests {
         let mut child = Native::start("leader");
         assert_eq!(child.line(), "worker");
         let reader = ProcessGroupCpu::new(child.child.id()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let wait_until = Instant::now() + Duration::from_secs(5);
         loop {
-            let current = stat(&read_record(&reader.owner.pair.file, deadline).unwrap()).unwrap();
+            let current =
+                stat(&read_record(&reader.owner.pair.file, Deadline::scan()).unwrap()).unwrap();
             if current.state == 'Z' {
                 break;
             }
-            assert!(Instant::now() < deadline);
+            assert!(Instant::now() < wait_until);
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert!(reader.owner.pair.valid(deadline).unwrap());
+        assert!(reader.owner.pair.valid(Deadline::scan()).unwrap());
         let before = reader.seconds().unwrap();
         child.send(b'b');
         assert_eq!(child.line(), "worked");
@@ -1296,6 +1358,134 @@ mod tests {
         );
         assert!(registry.seconds(&second).is_err());
     }
+
+    /// A scan that waits to be scheduled has done no work. Under load a scan that needed
+    /// a few hundred milliseconds of CPU took up to a second of wall time, and a
+    /// one-second wall bound refused it. An off-CPU stall longer than the whole CPU
+    /// budget must still yield a reading.
+    #[test]
+    fn an_off_cpu_stall_does_not_use_up_the_scan_budget() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut registry = Registry::default();
+        let owner = registry.create(child.id(), Path::new("/proc"));
+        let reading = owner.map(|owner| {
+            STALL_NEXT_SCAN.with(|stall| stall.set(SCAN_TIME + Duration::from_millis(200)));
+            let started = Instant::now();
+            let reading = registry.seconds(&owner);
+            (started.elapsed(), reading)
+        });
+        let _ = child.kill();
+        let _ = child.wait();
+        let (elapsed, reading) = reading.unwrap();
+        assert!(elapsed > SCAN_TIME, "the stall did not happen");
+        assert!(reading.unwrap() >= 0.0);
+    }
+
+    /// The CPU budget still bounds the work: a scan that keeps the thread busy past it
+    /// is refused, rather than allowed to run on.
+    #[test]
+    fn scan_work_past_the_cpu_budget_is_refused() {
+        struct Burner;
+        impl Source for Burner {
+            type Row = Row;
+            fn samples(
+                &self,
+                _groups: &HashSet<u32>,
+                deadline: Deadline,
+            ) -> Result<Vec<Row>, Unavailable> {
+                let started = Instant::now();
+                loop {
+                    check(deadline)?;
+                    // Give up long past the budget, so a missing check cannot hang.
+                    if started.elapsed() > Duration::from_secs(30) {
+                        return Ok(Vec::new());
+                    }
+                    std::hint::black_box((0..1_000u64).sum::<u64>());
+                }
+            }
+        }
+        // A small CPU budget and a wall backstop far beyond the give-up point, so only
+        // the CPU budget can refuse, however loaded the host is.
+        let deadline = Deadline::within(Duration::from_millis(50), Duration::from_secs(60));
+        let refused = scan(&Burner, &HashSet::new(), deadline);
+        assert_eq!(refused.unwrap_err(), unavailable("scan deadline"));
+    }
+
+    /// The wall backstop bounds a scan that blocks without using CPU, which the CPU
+    /// budget alone would let run on forever.
+    #[test]
+    fn a_blocked_scan_past_the_wall_backstop_is_refused() {
+        struct Blocked;
+        impl Source for Blocked {
+            type Row = Row;
+            fn samples(
+                &self,
+                _groups: &HashSet<u32>,
+                deadline: Deadline,
+            ) -> Result<Vec<Row>, Unavailable> {
+                let started = Instant::now();
+                loop {
+                    check(deadline)?;
+                    // Give up long past the backstop, so a missing check cannot hang.
+                    if started.elapsed() > Duration::from_secs(5) {
+                        return Ok(Vec::new());
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        let deadline = Deadline::within(SCAN_TIME, Duration::from_millis(200));
+        let started = Instant::now();
+        let refused = scan(&Blocked, &HashSet::new(), deadline);
+        assert_eq!(refused.unwrap_err(), unavailable("scan wall deadline"));
+        assert!(started.elapsed() >= Duration::from_millis(200));
+    }
+
+    /// A finished snapshot is refused when it overran either budget: its CPU time, or
+    /// its wall time past the backstop.
+    #[test]
+    fn a_snapshot_over_either_budget_is_refused() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut registry = Registry::default();
+        let readings = registry
+            .create(child.id(), Path::new("/proc"))
+            .map(|owner| {
+                let mut reading = |spent, took| {
+                    registry.snapshot = Some(Snapshot {
+                        spent,
+                        took,
+                        captured: Instant::now(),
+                        reads: 0,
+                        keys: HashSet::from([owner.key]),
+                        values: Ok(HashMap::from([(owner.key, 0)])),
+                    });
+                    registry.seconds(&owner)
+                };
+                let over = Duration::from_millis(1);
+                [
+                    reading(SCAN_TIME + over, Duration::ZERO),
+                    reading(Duration::ZERO, SCAN_WALL_TIME + over),
+                    reading(SCAN_TIME, SCAN_WALL_TIME),
+                ]
+            });
+        let _ = child.kill();
+        let _ = child.wait();
+        let [cpu, wall, within] = readings.unwrap();
+        assert_eq!(cpu.unwrap_err(), unavailable("scan deadline"));
+        assert_eq!(wall.unwrap_err(), unavailable("scan wall deadline"));
+        assert_eq!(within.unwrap(), 0.0);
+    }
+
     #[test]
     fn scanner_member_bound_and_cached_error_are_unavailable() {
         let mut child = Native::start("zombie");
@@ -1314,13 +1504,14 @@ mod tests {
                 reads: std::cell::Cell::new(0),
             },
             &HashSet::from([owner.pgid]),
-            Instant::now() + SCAN_TIME,
+            Deadline::scan(),
         );
         assert_eq!(bounded.unwrap_err(), unavailable("member bound"));
         // A stored refusal is reused as a refusal; it cannot become a real zero or a
         // successful scan merely because a second monitor consumes the shared snapshot.
         registry.snapshot = Some(Snapshot {
-            started: Instant::now(),
+            spent: Duration::ZERO,
+            took: Duration::ZERO,
             captured: Instant::now(),
             reads: 0,
             keys: HashSet::from([owner.key]),
@@ -1449,7 +1640,7 @@ mod tests {
         let before = reader.seconds().unwrap();
         child.send(b'e');
         assert_eq!(child.line(), "executed");
-        let deadline = Instant::now() + SCAN_TIME;
+        let deadline = Deadline::scan();
         assert_eq!(
             reader
                 .owner
@@ -1487,11 +1678,11 @@ mod tests {
         let pair = reader
             .owner
             .proc
-            .pair(tracee, Instant::now() + SCAN_TIME)
+            .pair(tracee, Deadline::scan())
             .map_err(Unavailable::from)
             .unwrap();
         let waited = || {
-            let text = read_record(&reader.owner.pair.file, Instant::now() + SCAN_TIME).unwrap();
+            let text = read_record(&reader.owner.pair.file, Deadline::scan()).unwrap();
             let fields: Vec<_> = text
                 .rsplit_once(')')
                 .unwrap()
@@ -1502,7 +1693,7 @@ mod tests {
         };
         assert_eq!(pair.original.state, 'Z');
         assert!(pair.original.ticks > 0);
-        assert!(pair.valid(Instant::now() + SCAN_TIME).unwrap());
+        assert!(pair.valid(Deadline::scan()).unwrap());
         assert!(fs::read_to_string(format!("/proc/{tracee}/status"))
             .unwrap()
             .contains(&format!("TracerPid:\t{}\n", child.child.id())));
@@ -1518,16 +1709,16 @@ mod tests {
             before_waited,
             "ptracer EXIT_TRACE must not credit child CPU"
         );
-        assert!(pair.valid(Instant::now() + SCAN_TIME).unwrap());
+        assert!(pair.valid(Deadline::scan()).unwrap());
         assert_eq!(
-            stat(&read_record(&pair.file, Instant::now() + SCAN_TIME).unwrap())
+            stat(&read_record(&pair.file, Deadline::scan()).unwrap())
                 .unwrap()
                 .state,
             'Z'
         );
         child.send(b'r');
         assert_eq!(child.line(), "reaped");
-        assert!(!pair.valid(Instant::now() + SCAN_TIME).unwrap());
+        assert!(!pair.valid(Deadline::scan()).unwrap());
         registry().lock().unwrap().snapshot = None;
         let after = reader.seconds().unwrap();
         assert!(after >= before);

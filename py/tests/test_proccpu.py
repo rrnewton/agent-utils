@@ -31,7 +31,7 @@ class _Row:
         self.error = error
         self.closed = False
 
-    def valid(self, deadline: float) -> bool:
+    def valid(self, deadline: cpu._Deadline) -> bool:
         def read() -> cpu._Stat | None:
             if self.error:
                 raise cpu.Unavailable(self.error)
@@ -47,7 +47,7 @@ class _Files:
     def __init__(self, root: Path) -> None:
         self.root = root
 
-    def samples(self, groups: set[int], deadline: float) -> list[cpu._Observation]:
+    def samples(self, groups: set[int], deadline: cpu._Deadline) -> list[cpu._Observation]:
         rows: list[cpu._Observation] = []
         for path in sorted(self.root.iterdir()):
             original = cpu._stat((path / "stat").read_text())
@@ -58,7 +58,7 @@ class _Files:
 
 def _synthetic_seconds(pgid: int, root: Path) -> float | None:
     try:
-        totals = cpu._scan(_Files(root), {pgid}, time.monotonic() + 1)
+        totals = cpu._scan(_Files(root), {pgid}, cpu._deadline())
     except (OSError, cpu.Unavailable):
         return None
     return None if pgid not in totals else totals[pgid] / os.sysconf("SC_CLK_TCK")
@@ -100,7 +100,7 @@ def test_shared_canonical_lifecycle_corpus() -> None:
         events: list[str] = []
         rows: list[_Row] = []
         class Source:
-            def samples(self, groups: set[int], deadline: float) -> list[cpu._Observation]:
+            def samples(self, groups: set[int], deadline: cpu._Deadline) -> list[cpu._Observation]:
                 for raw in case["rows"]:
                     events.append(f"sample:{raw['pid']}")
                     original = cpu._Stat(raw["pid"], raw["group"], "R", raw["ticks"])
@@ -110,7 +110,7 @@ def test_shared_canonical_lifecycle_corpus() -> None:
                     rows.append(_Row(original, raw["poll"], fresh, raw.get("error", "")))
                 return list(rows)
         try:
-            result = cpu._scan(Source(), {100}, time.monotonic() + 1)
+            result = cpu._scan(Source(), {100}, cpu._deadline())
         except cpu.Unavailable:
             assert case.get("error"), case["name"]
         else:
@@ -122,18 +122,18 @@ def test_shared_canonical_lifecycle_corpus() -> None:
 def test_scan_samples_all_members_before_validating() -> None:
     events: list[str] = []
     class Row(_Row):
-        def valid(self, deadline: float) -> bool:
+        def valid(self, deadline: cpu._Deadline) -> bool:
             assert events[:3] == ["sample:0", "sample:1", "sample:2"]
             events.append("validate")
             return True
     class Source:
-        def samples(self, groups: set[int], deadline: float) -> list[cpu._Observation]:
+        def samples(self, groups: set[int], deadline: cpu._Deadline) -> list[cpu._Observation]:
             rows: list[cpu._Observation] = []
             for index in range(3):
                 events.append(f"sample:{index}")
                 rows.append(Row(cpu._Stat(100 + index, 100, "R", 1)))
             return rows
-    assert cpu._scan(Source(), {100}, time.monotonic() + 1) == {100: 3}
+    assert cpu._scan(Source(), {100}, cpu._deadline()) == {100: 3}
     assert events == ["sample:0", "sample:1", "sample:2", "validate", "validate", "validate"]
 
 
@@ -142,20 +142,20 @@ def test_pairing_reads_fdinfo_after_stat_open_and_rejects_reuse(monkeypatch: pyt
     class Proc(cpu._Proc):
         def __init__(self) -> None:
             pass
-        def open(self, path: str, deadline: float | None = None) -> int:
+        def open(self, path: str, deadline: cpu._Deadline | None = None) -> int:
             events.append("stat-open")
             return os.open("/dev/null", os.O_RDONLY)
-        def pid(self, pidfd: int, deadline: float) -> int:
+        def pid(self, pidfd: int, deadline: cpu._Deadline) -> int:
             events.append("fdinfo")
             return -1
-    def pidfd(pid: int, deadline: float) -> int:
+    def pidfd(pid: int, deadline: cpu._Deadline) -> int:
         events.append("pidfd")
         return os.open("/dev/null", os.O_RDONLY)
     monkeypatch.setattr(cpu, "_pidfd", pidfd)
     monkeypatch.setattr(cpu, "_stat", lambda text: cpu._Stat(100, 100, "Z", 999))
     before = len(list(Path("/proc/self/fd").iterdir()))
     with pytest.raises(cpu.Unavailable, match="generation mismatch"):
-        Proc().pair(100, time.monotonic() + 1)
+        Proc().pair(100, cpu._deadline())
     assert events == ["pidfd", "stat-open", "fdinfo"]
     assert len(list(Path("/proc/self/fd").iterdir())) == before
 
@@ -168,10 +168,10 @@ def test_bounded_interrupts_and_deadline() -> None:
         ctypes.set_errno(errno.EINTR)
         return -1
     with pytest.raises(cpu.Unavailable, match="interrupted"):
-        cpu._native(interrupted, time.monotonic() + 1)
+        cpu._native(interrupted, cpu._deadline())
     assert calls == cpu._MAX_INTERRUPTS + 1
     with pytest.raises(cpu.Unavailable, match="deadline"):
-        cpu._native(interrupted, time.monotonic() - 1)
+        cpu._native(interrupted, cpu._Deadline(time.thread_time() - 1, time.monotonic() + 60))
     assert calls == cpu._MAX_INTERRUPTS + 1
 
 
@@ -208,8 +208,8 @@ def _seconds(reader: cpu.ProcessGroupCpu) -> float:
     """`reader.seconds()`, retrying only a scan-deadline refusal.
 
     One observation authenticates and scans /proc within the product's
-    one-second bound; on a loaded host the scan may not get that second, and
-    the reader rightly refuses with "scan deadline". These tests assert what
+    one-second budget of thread CPU time; a cold census on a busy host can use
+    that up, and the reader rightly refuses with "scan deadline". These tests assert what
     an observation says, not that the host ran it within the bound on the
     first try, so ask again until one lands or 30 s pass. Any other refusal
     is the answer and propagates at once. `#389 gate-flakes`.
@@ -232,17 +232,17 @@ def test_native_unreaped_zombie_and_reaping_keep_cpu_and_close_fds(native_helper
         reader = cpu.ProcessGroupCpu(child.pid)
         try:
             assert reader.proc is not None
-            pair = reader.proc.pair(zombie, time.monotonic() + 1)
+            pair = reader.proc.pair(zombie, cpu._deadline())
             try:
                 assert pair.original.state == "Z"
                 assert pair.original.ticks > 0
-                assert cpu._poll(pair.pidfd, time.monotonic() + 1) & select.POLLIN
-                assert pair.valid(time.monotonic() + 1)
+                assert cpu._poll(pair.pidfd, cpu._deadline()) & select.POLLIN
+                assert pair.valid(cpu._deadline())
                 first = _seconds(reader)
                 assert first >= pair.original.ticks / cpu._clk_tck()
                 child.stdin.write("r"); child.stdin.flush()
                 assert _line(child) == "reaped"
-                assert not pair.valid(time.monotonic() + 1)
+                assert not pair.valid(cpu._deadline())
                 # Force an observation after reaping without sleeping for cache expiry.
                 with cpu._lock:
                     cpu._snapshot_at = float("-inf")
@@ -265,12 +265,12 @@ def test_native_exited_leader_with_live_worker(native_helper: Path) -> None:
         reader = cpu.ProcessGroupCpu(child.pid)
         try:
             assert reader.owner is not None
-            deadline = time.monotonic() + 5
-            while cpu._stat(cpu._read(reader.owner.statfd, deadline)).state != "Z":
-                assert time.monotonic() < deadline
+            wait_until = time.monotonic() + 5
+            while cpu._stat(cpu._read(reader.owner.statfd, cpu._deadline())).state != "Z":
+                assert time.monotonic() < wait_until
                 time.sleep(.001)
-            assert cpu._poll(reader.owner.pidfd, deadline) == 0
-            assert reader.owner.valid(deadline)
+            assert cpu._poll(reader.owner.pidfd, cpu._deadline()) == 0
+            assert reader.owner.valid(cpu._deadline())
             before = _seconds(reader)
             child.stdin.write("b"); child.stdin.flush()
             assert _line(child) == "worked"
@@ -291,7 +291,7 @@ def test_native_cache_reuses_success_and_refusal_but_requires_owner(native_helpe
         second = cpu.ProcessGroupCpu(child.pid)
         original = cpu._KernelSource.samples
         calls = 0
-        def failure(source: cpu._KernelSource, groups: set[int], deadline: float) -> list[cpu._Observation]:
+        def failure(source: cpu._KernelSource, groups: set[int], deadline: cpu._Deadline) -> list[cpu._Observation]:
             nonlocal calls
             calls += 1
             raise cpu.Unavailable("injected scanner EACCES")
@@ -320,6 +320,108 @@ def test_native_cache_reuses_success_and_refusal_but_requires_owner(native_helpe
             first.close(); second.close()
             if child.poll() is None:
                 child.kill(); child.wait(timeout=5)
+
+
+def test_an_off_cpu_stall_does_not_use_up_the_scan_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A scan that waits to be scheduled has done no work.
+
+    Under load a scan that needed a few hundred milliseconds of CPU took up to a
+    second of wall time, and a one-second wall bound refused it. An off-CPU stall
+    longer than the whole CPU budget must still yield a reading.
+    """
+    with subprocess.Popen(["/bin/sleep", "30"], start_new_session=True) as child:
+        reader = cpu.ProcessGroupCpu(child.pid)
+        original = cpu._KernelSource.samples
+
+        def stalled(source: cpu._KernelSource, groups: set[int], deadline: cpu._Deadline) -> list[cpu._Observation]:
+            time.sleep(cpu._SCAN_SECONDS + 0.2)
+            return original(source, groups, deadline)
+
+        try:
+            monkeypatch.setattr(cpu._KernelSource, "samples", stalled)
+            with cpu._lock:
+                cpu._snapshot_at = float("-inf")
+            started = time.monotonic()
+            # Every attempt stalls, so a wall-time CPU budget would refuse them all;
+            # the retry only absorbs a cold census that really used up its CPU budget.
+            value = _seconds(reader)
+            assert time.monotonic() - started > cpu._SCAN_SECONDS, "the stall did not happen"
+            assert value >= 0.0
+        finally:
+            reader.close()
+            child.kill(); child.wait(timeout=5)
+
+
+def test_scan_work_past_the_cpu_budget_is_refused() -> None:
+    """The CPU budget still bounds the work: a scan that keeps the thread busy past it is refused."""
+
+    class Burner:
+        def samples(self, groups: set[int], deadline: cpu._Deadline) -> list[cpu._Observation]:
+            started = time.monotonic()
+            while True:
+                cpu._check(deadline)
+                # Give up long past the budget, so a missing check cannot hang.
+                if time.monotonic() - started > 30:
+                    return []
+                sum(range(1000))
+
+    # A small CPU budget and a wall backstop far beyond the give-up point, so only
+    # the CPU budget can refuse, however loaded the host is.
+    deadline = cpu._Deadline(time.thread_time() + 0.05, time.monotonic() + 60)
+    with pytest.raises(cpu.Unavailable, match="^scan deadline$"):
+        cpu._scan(Burner(), set(), deadline)
+
+
+def test_a_blocked_scan_past_the_wall_backstop_is_refused() -> None:
+    """The wall backstop bounds a scan that blocks without using CPU, which the CPU
+    budget alone would let run on forever."""
+
+    class Blocked:
+        def samples(self, groups: set[int], deadline: cpu._Deadline) -> list[cpu._Observation]:
+            started = time.monotonic()
+            while True:
+                cpu._check(deadline)
+                # Give up long past the backstop, so a missing check cannot hang.
+                if time.monotonic() - started > 5:
+                    return []
+                time.sleep(0.01)
+
+    deadline = cpu._Deadline(time.thread_time() + cpu._SCAN_SECONDS, time.monotonic() + 0.2)
+    started = time.monotonic()
+    with pytest.raises(cpu.Unavailable, match="^scan wall deadline$"):
+        cpu._scan(Blocked(), set(), deadline)
+    assert time.monotonic() - started >= 0.2
+
+
+def test_a_snapshot_over_either_budget_is_refused() -> None:
+    """A finished snapshot is refused when it overran either budget: its CPU time, or
+    its wall time past the backstop."""
+    with subprocess.Popen(["/bin/sleep", "30"], start_new_session=True) as child:
+        reader = cpu.ProcessGroupCpu(child.pid)
+
+        def reading(spent: float, took: float) -> float | str:
+            with cpu._lock:
+                cpu._snapshot_keys = {reader.key}
+                cpu._snapshot = {reader.key: 0}
+                cpu._snapshot_error = None
+                cpu._snapshot_spent = spent
+                cpu._snapshot_took = took
+                cpu._snapshot_at = time.monotonic()
+            try:
+                return reader.seconds()
+            except cpu.Unavailable as exc:
+                return str(exc)
+
+        try:
+            over = 0.001
+            assert reading(cpu._SCAN_SECONDS + over, 0.0) == "scan deadline"
+            assert reading(0.0, cpu._SCAN_WALL_SECONDS + over) == "scan wall deadline"
+            assert reading(cpu._SCAN_SECONDS, cpu._SCAN_WALL_SECONDS) == 0.0
+        finally:
+            reader.close()
+            with cpu._lock:
+                cpu._snapshot_at = float("-inf")
+            child.kill(); child.wait(timeout=5)
 
 
 def test_resource_and_scan_errors_are_unavailable_without_fd_leaks(native_helper: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -403,9 +505,9 @@ def test_native_nonleader_exec_preserves_held_identity(native_helper: Path) -> N
             before = _seconds(reader)
             child.stdin.write("e"); child.stdin.flush()
             assert _line(child) == "executed"
-            assert reader.proc.pid(reader.owner.pidfd, time.monotonic() + 1) == child.pid
-            assert cpu._stat(cpu._read(reader.owner.statfd, time.monotonic() + 1)).pid == child.pid
-            assert reader.owner.valid(time.monotonic() + 1)
+            assert reader.proc.pid(reader.owner.pidfd, cpu._deadline()) == child.pid
+            assert cpu._stat(cpu._read(reader.owner.statfd, cpu._deadline())).pid == child.pid
+            assert reader.owner.valid(cpu._deadline())
             child.stdin.write("b"); child.stdin.flush()
             assert _line(child) == "worked"
             with cpu._lock:
@@ -429,14 +531,14 @@ def test_native_ptrace_reparent_keeps_zombie_until_real_parent_reaps(native_help
         reader = cpu.ProcessGroupCpu(child.pid)
         try:
             assert reader.proc is not None and reader.owner is not None
-            pair = reader.proc.pair(tracee, time.monotonic() + 1)
+            pair = reader.proc.pair(tracee, cpu._deadline())
             def waited_ticks() -> int:
                 assert reader.owner is not None
-                fields = cpu._read(reader.owner.statfd, time.monotonic() + 1).rsplit(")", 1)[1].split()
+                fields = cpu._read(reader.owner.statfd, cpu._deadline()).rsplit(")", 1)[1].split()
                 return int(fields[13]) + int(fields[14])
             try:
                 assert pair.original.state == "Z" and pair.original.ticks > 0
-                assert pair.valid(time.monotonic() + 1)
+                assert pair.valid(cpu._deadline())
                 assert f"TracerPid:\t{child.pid}\n" in Path(f"/proc/{tracee}/status").read_text()
                 before_waited = waited_ticks()
                 before = _seconds(reader)
@@ -444,11 +546,11 @@ def test_native_ptrace_reparent_keeps_zombie_until_real_parent_reaps(native_help
                 assert _line(child) == "detached"
                 assert "TracerPid:\t0\n" in Path(f"/proc/{tracee}/status").read_text()
                 assert waited_ticks() == before_waited, "ptracer EXIT_TRACE branch must not credit child CPU"
-                assert pair.valid(time.monotonic() + 1)
-                assert cpu._stat(cpu._read(pair.statfd, time.monotonic() + 1)).state == "Z"
+                assert pair.valid(cpu._deadline())
+                assert cpu._stat(cpu._read(pair.statfd, cpu._deadline())).state == "Z"
                 child.stdin.write("r"); child.stdin.flush()
                 assert _line(child) == "reaped"
-                assert not pair.valid(time.monotonic() + 1)
+                assert not pair.valid(cpu._deadline())
                 with cpu._lock:
                     cpu._snapshot_at = float("-inf")
                 after = _seconds(reader)
@@ -526,7 +628,7 @@ def test_clock_rate_errors_are_typed_at_owned_and_compatibility_apis(native_help
 
 def test_missing_namespace_metadata_is_distinct_and_closes_fds(native_helper: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     original = cpu._read
-    def without_namespace(fd: int, deadline: float) -> str:
+    def without_namespace(fd: int, deadline: cpu._Deadline) -> str:
         text = original(fd, deadline)
         if os.readlink(f"/proc/self/fd/{fd}").endswith("/status"):
             return "\n".join(line for line in text.splitlines() if not line.startswith("NSpid:"))
