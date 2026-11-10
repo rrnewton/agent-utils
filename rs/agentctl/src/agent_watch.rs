@@ -1199,6 +1199,13 @@ pub trait Probe {
     /// Observe every agent that should be watched this pass. An error means the team
     /// could not be listed at all; the pass reports it and starts no episodes.
     fn observe(&mut self) -> Result<Vec<Observation>>;
+    /// Every agent name currently registered, when the probe can list its registry.
+    /// `None` when that is unknown: persisted watcher state must never be pruned on
+    /// a guess. The production probe lists the registry (live records only; the
+    /// archive is history, not membership, #1154).
+    fn registered_names(&mut self) -> Option<BTreeSet<String>> {
+        None
+    }
     /// For each registered agent that senders are waiting to deliver to, its name and the
     /// [`crate::lock_wait::contention`] report. The default sees no waits.
     fn delivery_waits(&mut self) -> Vec<(String, Value)> {
@@ -3331,6 +3338,22 @@ fn watch_agents_once(
                             > FINISHED_MEMORY_SECONDS)
                 })
         });
+        // An agent that is no longer registered (archived, or its record removed)
+        // is terminal, whatever its persisted episode or owed notice says (#1154
+        // watch-agents-archived): a recreated watcher must not replay its stale
+        // pending notices or keep its episode memory. Only a successful registry
+        // listing prunes; an unknown listing changes nothing.
+        if let Some(registered) = probe.registered_names() {
+            state
+                .pending
+                .retain(|notice| registered.contains(&notice.agent));
+            let live_keys: Vec<String> = state.pending.iter().map(PendingNotice::key).collect();
+            for batch in &mut state.batches {
+                batch.keys.retain(|key| live_keys.contains(key));
+            }
+            state.batches.retain(|batch| !batch.keys.is_empty());
+            state.agents.retain(|name, _| registered.contains(name));
+        }
     }
     // The auto-interrupt policy ([`AutoDeliver`]): a stuck turn with input queued behind it is
     // interrupted and the input delivered, and the coordinator is told why in a line of its own.
@@ -5318,6 +5341,11 @@ fn message_excerpt(text: &str) -> String {
 }
 
 impl<A: ManagedApi + ?Sized> Probe for ManagedProbe<'_, A> {
+    fn registered_names(&mut self) -> Option<BTreeSet<String>> {
+        agent_queue::registry::names(&self.registry)
+            .ok()
+            .map(|names| names.into_iter().collect())
+    }
     fn queued_senders(&mut self, agent: &str) -> Vec<(String, String, String)> {
         let Ok(directory) = agent_queue::registry::directory(&self.registry, agent) else {
             return Vec::new();
@@ -6115,6 +6143,100 @@ mod tests {
                 self.0.remove(0)
             })
         }
+    }
+
+    /// A probe over a registry holding exactly `registered`, observing `seen`.
+    struct RegistryProbe {
+        registered: Vec<String>,
+        seen: Vec<Observation>,
+    }
+
+    impl Probe for RegistryProbe {
+        fn observe(&mut self) -> Result<Vec<Observation>> {
+            Ok(std::mem::take(&mut self.seen))
+        }
+        fn registered_names(&mut self) -> Option<BTreeSet<String>> {
+            Some(self.registered.iter().cloned().collect())
+        }
+    }
+
+    fn owed(agent: &str, kind: EpisodeKind, since: f64) -> PendingNotice {
+        PendingNotice {
+            agent: agent.to_owned(),
+            kind,
+            since,
+            detail: format!("{agent} stale detail"),
+            next: Vec::new(),
+            recipient: None,
+            redirected: false,
+            delivery: None,
+            retry: Retry::default(),
+        }
+    }
+
+    #[test]
+    fn an_archived_agents_owed_notices_and_memory_are_never_replayed() {
+        // #1154 watch-agents-archived: state written while `arch-gone` was live
+        // holds its owed idle notice, its owed finish, and its episode memory.
+        // The agent has since been archived (not registered; one archived record
+        // even says running, which changes nothing). A recreated watcher whose
+        // registry holds only `live-one` must send nothing about `arch-gone`.
+        let options = options();
+        let mut state = WatchState::default();
+        state
+            .pending
+            .push(owed("arch-gone", EpisodeKind::IdleNoVerdict, 100.0));
+        state
+            .pending
+            .push(owed("arch-gone", EpisodeKind::ChildDone, 110.0));
+        state
+            .pending
+            .push(owed("live-one", EpisodeKind::IdleNoVerdict, 120.0));
+        state.agents.insert(
+            "arch-gone".to_owned(),
+            AgentMemory {
+                episode: Some(Episode {
+                    kind: EpisodeKind::Dead,
+                    since: 90.0,
+                    notified: false,
+                    notified_at: None,
+                    turn: None,
+                    turn_stamp: None,
+                    window: None,
+                }),
+                ..AgentMemory::default()
+            },
+        );
+        let mut probe = RegistryProbe {
+            registered: vec!["live-one".to_owned(), "coordinator".to_owned()],
+            seen: vec![observation("live-one", "working", Some("working…"))],
+        };
+        let mut notifier = RecordingNotifier::default();
+        let report = watch_agents_once(&mut probe, &mut notifier, &mut state, 1_000.0, &options);
+        assert!(
+            state.pending.is_empty(),
+            "owed notices survive only for registered agents: {report}"
+        );
+        assert!(
+            !state.agents.contains_key("arch-gone"),
+            "archived episode memory is dropped: {report}"
+        );
+        assert!(
+            notifier
+                .sent
+                .iter()
+                .all(|(_, text, _)| !text.contains("arch-gone")),
+            "nothing about the archived agent is sent: {:?}",
+            notifier.sent
+        );
+        assert!(
+            notifier
+                .sent
+                .iter()
+                .any(|(_, text, _)| text.contains("live-one")),
+            "the live agent's owed notice is still sent: {:?}",
+            notifier.sent
+        );
     }
 
     /// A probe that reports one stale queued prompt, as a drain pass found it.
