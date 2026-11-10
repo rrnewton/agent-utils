@@ -473,41 +473,30 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
       const metaBox = meta.getBoundingClientRect();
       const menuBox = menu.getBoundingClientRect();
       if (!rowBox.width || !menuBox.height) return;
+      const viewWidth = document.documentElement.clientWidth;
+      const viewHeight = document.documentElement.clientHeight;
       const gap = 4;
       const edge = 8;
-      const width = Math.min(menuBox.width || rowBox.width, Math.max(0, window.innerWidth - edge * 2));
+      const width = Math.min(menuBox.width || rowBox.width, Math.max(0, viewWidth - edge * 2));
       let left = rowBox.right - (width || menuBox.width);
-      left = Math.min(Math.max(left, edge), Math.max(edge, window.innerWidth - (width || menuBox.width) - edge));
+      left = Math.min(Math.max(left, edge), Math.max(edge, viewWidth - (width || menuBox.width) - edge));
       let top = metaBox.bottom + gap;
-      if (top + menuBox.height > window.innerHeight - edge && metaBox.top - menuBox.height - gap >= edge) {
+      if (top + menuBox.height > viewHeight - edge && metaBox.top - menuBox.height - gap >= edge) {
         top = metaBox.top - menuBox.height - gap;
       }
-      top = Math.min(Math.max(top, edge), Math.max(edge, window.innerHeight - menuBox.height - edge));
+      top = Math.min(Math.max(top, edge), Math.max(edge, viewHeight - menuBox.height - edge));
       menu.style.left = `${left}px`;
       menu.style.top = `${top}px`;
       menu.style.right = "auto";
     };
-    // A fixed menu cannot follow its row through a scroll or a resize; native menus close instead.
-    // The listeners live only while the menu is in the top layer, and are taken down with it.
+    // The top-layer menu stays where it opened while the list scrolls behind it, as a native
+    // popover does; a scroll or a resize leaves it where the reader opened it, and the next
+    // outside tap, Escape or Back closes it. (Following the row would move it between a tap's
+    // measuring and its landing; closing on scroll would let the scroll that positioned the row
+    // close the menu it opened.)
     let detachTopMenu: (() => void) | null = null;
     const watchTopMenu = (): void => {
-      detachTopMenu?.();
-      let scroller: HTMLElement | null = null;
-      for (let node = li.parentNode as HTMLElement | null; node; node = node.parentNode as HTMLElement | null) {
-        if (node.id === "scroll-area" || node.id === "side-scroll") {
-          scroller = node;
-          break;
-        }
-      }
-      const onScroll = (): void => closeMenu();
-      const onResize = (): void => closeMenu();
-      scroller?.addEventListener("scroll", onScroll);
-      window.addEventListener("resize", onResize);
-      detachTopMenu = (): void => {
-        scroller?.removeEventListener("scroll", onScroll);
-        window.removeEventListener("resize", onResize);
-        detachTopMenu = null;
-      };
+      detachTopMenu = null;
     };
     const setMenu = (open: boolean): void => {
       if (open) {

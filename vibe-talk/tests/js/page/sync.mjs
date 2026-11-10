@@ -2572,7 +2572,12 @@ test("THE SCROLLER IS SIZED BY ITS CELL ALONE, so a change beside it does not la
   // Layout containment makes the scroller what everything positioned inside it is placed against, so
   // nothing in the list may hang off anything outside it: what is positioned there hangs off its row.
   assert.match(cssBlock("#discord-log li.discord-message"), /position:\s*relative/);
-  assert.doesNotMatch(CSS_CODE, /position:\s*(fixed|sticky)/, "something now escapes the scroller's containment");
+  // The one exception (`#1228 menu-above-chips`): the open row menu in the top layer is fixed
+  // against the viewport, because no in-list layer can rise above the floating chips. Nothing
+  // else escapes.
+  assert.match(cssBlock(".row-more-menu:popover-open"), /position:\s*fixed/);
+  const withoutMenu = CSS_CODE.replace(/\.row-more-menu:popover-open\s*\{[^}]*\}/, " ");
+  assert.doesNotMatch(withoutMenu, /position:\s*(fixed|sticky)/, "something now escapes the scroller's containment");
 });
 
 test("A HIDDEN PAGE POLLS NOTHING: the poll waits for it to come back, and one that came due meanwhile runs then", async () => {

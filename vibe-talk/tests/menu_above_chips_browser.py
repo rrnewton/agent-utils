@@ -147,24 +147,24 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             desk.settled()
             button = f"#discord-log > li[data-id='{QUESTION_ID}'] .row-more-button"
             if phone:
-                found = page.locator(button).bounding_box()
-                check(found is not None, f"{label}: the ellipsis is not drawn")
-                assert found is not None
-                page.touchscreen.tap(found["x"] + found["width"] / 2, found["y"] + found["height"] / 2)
+                box = page.locator(button).bounding_box()
+                check(box is not None, f"{label}: the ellipsis is not drawn")
+                assert box is not None
+                page.touchscreen.tap(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
             else:
                 page.click(button)
             desk.wait_for(
                 f"() => !document.querySelector('#discord-log > li[data-id=\"{QUESTION_ID}\"] .row-more-menu').hidden",
                 "the ellipsis menu did not open")
             desk.settled()
-            found: Json = page.evaluate(TOPMOST_JS, QUESTION_ID)
-            assert isinstance(found, dict)
-            checks = found["checks"]
+            topmost: Json = page.evaluate(TOPMOST_JS, QUESTION_ID)
+            assert isinstance(topmost, dict)
+            checks = topmost["checks"]
             assert isinstance(checks, list)
-            desk.check(bool(found["open"]), f"the menu is not open: {found}")
-            desk.check(bool(found["overlap"]),
-                       f"the menu does not overlap the chips row, so nothing was proved: {found}")
-            desk.check(bool(found["topLayer"]), f"the menu is not in the top layer: {found}")
+            desk.check(bool(topmost["open"]), f"the menu is not open: {topmost}")
+            desk.check(bool(topmost["overlap"]),
+                       f"the menu does not overlap the chips row, so nothing was proved: {topmost}")
+            desk.check(bool(topmost["topLayer"]), f"the menu is not in the top layer: {topmost}")
             desk.check(any("Open in" in str(one["text"]) for one in checks),
                        f"the owner's item is not in the menu: {checks}")
             for one in checks:
@@ -172,7 +172,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                            f"menu item {one['text']!r} is covered at its centre by {one['top']!r}")
             desk.shot("menu-over-chips")
             desk.notes.append(f"{len(checks)} menu items topmost over the chips, "
-                              f"menu {found['menu']} over chips {found['chips']}")
+                              f"menu {topmost['menu']} over chips {topmost['chips']}")
             check(not errors, f"{label}: the page threw: {errors}")
             context.close()
             return f"{version} at {width}x{height}: " + "; ".join(desk.notes)
