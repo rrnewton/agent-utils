@@ -895,9 +895,10 @@ admission directory named by `$GATE_ADMISSION_DIR` (the gate runner's default ad
 directory when it is unset); a
 running or queued ticket whose pid's working directory is inside the slot marks it, and so does
 any live gate, validation or cargo build process working inside it. A queued ticket counts as
-running, because its gate will build into the slot's caches soon. Under `--yes` such a slot is
-`SKIPPED` with `gate_reason` naming the pid, and its reclaimable bytes stay in the row; `--only`
-on it refuses. `--force-running` overrides the rule and is recorded as `force_running` in the
+running, because its gate will build into the slot's caches soon. One read of the admission
+directory and one listing of `/proc` answer every slot of the run, whatever their number. Under
+`--yes` such a slot is `SKIPPED` with `gate_reason` naming the pid, and its reclaimable bytes stay
+in the row; `--only` on it refuses. `--force-running` overrides the rule and is recorded as `force_running` in the
 report.
 
 With neither selector, the command is a read-only report over all visible registered, journaled, and

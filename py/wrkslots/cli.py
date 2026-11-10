@@ -40266,24 +40266,69 @@ def _nested_cargo_targets(
     return tuple(sorted(found))
 
 
-def _gate_running_in_slot(
-    roots: Sequence[Path],
-) -> tuple[int, str] | None:
-    """A gate running or queued in one of ``roots``: ``(pid, state)`` (#1029).
+_GATE_PROCESS_TOKENS = ("dagrun", "validate.py", "gate.py")
+"""Command-line words that mark a process in a slot as a gate's (#1029)."""
+
+
+def _list_proc_pid_dirs(proc_root: Path) -> list[Path]:
+    """One listing of ``proc_root``: every entry, in the directory's order.
+
+    ``clean-caches`` makes exactly one such listing per run (#1202
+    clean-caches-single-walk); tests count calls to it.
+    """
+
+    return list(proc_root.iterdir())
+
+
+def _gates_running_in_slots(
+    roots: Mapping[str, Path | None],
+    *,
+    proc_root: Path = Path("/proc"),
+) -> dict[str, tuple[int, str]]:
+    """Each slot with a gate running or queued in its root: ``(pid, state)`` (#1029).
 
     The gate admission directory ($GATE_ADMISSION_DIR, default
     /tmp/dev-agent-utils-gate-admission) names a pid in runs/*.json and
     queue/*.json; that pid's cwd decides the slot. A queued ticket counts
     as running: its gate will build into the slot's caches soon. Fall
-    back to any live dagrun, validate.py or cargo process whose cwd is
-    inside the slot.
+    back to any live dagrun, validate.py, gate.py or cargo process whose
+    cwd is inside the slot. A slot whose root is ``None`` has no gate.
+
+    The answer for each slot is the one a scan of that slot alone gives:
+    the first ticket in runs-then-queue order whose pid's cwd is inside
+    the root, else the first such process in ``proc_root``'s listing
+    order. But the tickets are read once and ``proc_root`` is listed
+    once for every slot together (#1202 clean-caches-single-walk): each
+    process's cwd is read once and looked up among the roots by its
+    ancestors, and its command line is read only when the cwd lies in
+    some slot. The listing is skipped when no slot is left to answer.
     """
 
-    resolved = tuple(root.resolve() for root in roots)
+    slots_by_root: dict[Path, list[str]] = {}
+    for slot in sorted(roots):
+        root = roots[slot]
+        if root is not None:
+            slots_by_root.setdefault(root.resolve(), []).append(slot)
 
-    def inside(cwd: Path) -> bool:
-        return any(cwd == root or _path_is_within(cwd, root) for root in resolved)
+    def containing(cwd: Path) -> list[str]:
+        text = str(cwd)
+        if text[:1] == "/" and text[:2] != "//":
+            # For an ordinary absolute path, "inside" is lexical: the path
+            # itself or one of its parents is the root.
+            found: list[str] = []
+            for candidate in (cwd, *cwd.parents):
+                found.extend(slots_by_root.get(candidate, ()))
+            return found
+        return [
+            slot
+            for root, slots in slots_by_root.items()
+            if cwd == root or _path_is_within(cwd, root)
+            for slot in slots
+        ]
 
+    gates: dict[str, tuple[int, str]] = {}
+    if not slots_by_root:
+        return gates
     base = Path(os.environ.get("GATE_ADMISSION_DIR") or "/tmp/dev-agent-utils-gate-admission")
     for state, folder in (("running", "runs"), ("queued", "queue")):
         try:
@@ -40301,35 +40346,47 @@ def _gate_running_in_slot(
             if not isinstance(pid, int) or isinstance(pid, bool):
                 continue
             try:
-                cwd = Path(os.readlink(f"/proc/{pid}/cwd"))
+                cwd = Path(os.readlink(proc_root / str(pid) / "cwd"))
             except OSError:
                 continue
-            if inside(cwd):
-                return pid, state
+            for slot in containing(cwd):
+                gates.setdefault(slot, (pid, state))
+    pending = sum(len(slots) for slots in slots_by_root.values()) - len(gates)
+    if pending == 0:
+        return gates
     try:
-        proc_entries = list(Path("/proc").iterdir())
+        proc_entries = _list_proc_pid_dirs(proc_root)
     except OSError:
-        return None
+        return gates
+    own_pid = os.getpid()
     for entry in proc_entries:
         if not entry.name.isdigit():
             continue
         pid = int(entry.name)
-        if pid == os.getpid():
+        if pid == own_pid:
             continue
         try:
             cwd = Path(os.readlink(entry / "cwd"))
-            if not inside(cwd):
-                continue
+        except OSError:
+            continue
+        open_slots = [slot for slot in containing(cwd) if slot not in gates]
+        if not open_slots:
+            continue
+        try:
             argv = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(
                 "utf-8", "replace"
             )
         except OSError:
             continue
-        if any(token in argv for token in ("dagrun", "validate.py", "gate.py")) or (
+        if any(token in argv for token in _GATE_PROCESS_TOKENS) or (
             " cargo " in f" {argv} "
         ):
-            return pid, "running"
-    return None
+            for slot in open_slots:
+                gates[slot] = (pid, "running")
+            pending -= len(open_slots)
+            if pending == 0:
+                break
+    return gates
 
 
 def _clean_caches_skip_reason(config: Config, cache: CacheDirectory) -> str | None:
@@ -40459,13 +40516,14 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
         force_running = bool(getattr(args, "force_running", False))
         gate_by_slot: dict[str, tuple[int, str]] = {}
         if not force_running:
-            for gate_slot in sorted(cache_slots):
-                slot_root = _cache_slot_root(config, cache_slots[gate_slot])
-                gate = _gate_running_in_slot(
-                    (slot_root,) if slot_root is not None else ()
-                )
-                if gate is not None:
-                    gate_by_slot[gate_slot] = gate
+            # One read of the admission tickets and one /proc listing
+            # answer every slot (#1202 clean-caches-single-walk).
+            gate_by_slot = _gates_running_in_slots(
+                {
+                    gate_slot: _cache_slot_root(config, cache_slots[gate_slot])
+                    for gate_slot in sorted(cache_slots)
+                }
+            )
         dry_run = bool(getattr(args, "dry_run", False))
         for gate_slot in sorted(requested & set(gate_by_slot)):
             if not dry_run:

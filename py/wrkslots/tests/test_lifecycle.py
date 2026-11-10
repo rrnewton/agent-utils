@@ -32563,6 +32563,265 @@ def test_clean_caches_skips_a_slot_whose_gate_is_running(
         sleeper.wait()
 
 
+def _gate_in_slot_alone(
+    roots: Sequence[Path], *, proc_root: Path
+) -> tuple[int, str] | None:
+    """The per-slot gate scan as clean-caches ran it before #1202, the reference.
+
+    This is `_gate_running_in_slot` at c67e35d6 with the proc root as a
+    parameter: one admission read and one whole /proc walk for one slot.
+    """
+
+    resolved = tuple(root.resolve() for root in roots)
+
+    def inside(cwd: Path) -> bool:
+        return any(
+            cwd == root or wrkslots._path_is_within(cwd, root) for root in resolved
+        )
+
+    base = Path(os.environ.get("GATE_ADMISSION_DIR") or "/tmp/dev-agent-utils-gate-admission")
+    for state, folder in (("running", "runs"), ("queued", "queue")):
+        try:
+            entries = sorted((base / folder).glob("*.json"))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                data = json.loads(entry.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            pid = data.get("pid")
+            if not isinstance(pid, int) or isinstance(pid, bool):
+                continue
+            try:
+                cwd = Path(os.readlink(proc_root / str(pid) / "cwd"))
+            except OSError:
+                continue
+            if inside(cwd):
+                return pid, state
+    try:
+        proc_entries = list(proc_root.iterdir())
+    except OSError:
+        return None
+    for entry in proc_entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        try:
+            cwd = Path(os.readlink(entry / "cwd"))
+            if not inside(cwd):
+                continue
+            argv = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                "utf-8", "replace"
+            )
+        except OSError:
+            continue
+        if any(token in argv for token in ("dagrun", "validate.py", "gate.py")) or (
+            " cargo " in f" {argv} "
+        ):
+            return pid, "running"
+    return None
+
+
+def _idle_child(cwd: Path, *words: str) -> subprocess.Popen[bytes]:
+    """A sleeping child in ``cwd`` whose command line carries ``words``."""
+
+    return subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(120)", *words],
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _admission_ticket(admission: Path, folder: str, name: str, payload: object) -> None:
+    (admission / folder).mkdir(parents=True, exist_ok=True)
+    (admission / folder / f"{name}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_one_gate_index_answers_every_slot_as_its_own_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1202 clean-caches-single-walk: one index equals a scan per slot.
+
+    Slots with a running ticket, a queued ticket, both a ticket and a gate
+    process (the ticket wins), a dagrun child, a cargo child, two gate
+    children (the first listed wins), a gate child in a subdirectory, an
+    idle child that is no gate, a decoy (a gate child in ``b-c`` beside
+    slot ``b``), a ticket whose pid exited, and a slot with no root.  The
+    proc root lists exactly those processes, a malformed ticket and a
+    non-pid entry.  The index gives each slot what the slot's own scan
+    gives, and reads the proc root once.
+    """
+
+    names = ("run", "queue", "both", "dagrun", "cargo", "two", "deep", "idle", "b", "b-c",
+             "gone", "free")
+    slots = {}
+    for name in names:
+        (tmp_path / "slots" / name).mkdir(parents=True)
+        slots[name] = (tmp_path / "slots" / name).resolve()
+    (slots["deep"] / "sub" / "dir").mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    admission = tmp_path / "admission"
+    monkeypatch.setenv("GATE_ADMISSION_DIR", str(admission))
+    children: list[subprocess.Popen[bytes]] = []
+    try:
+        def child(cwd: Path, *words: str) -> int:
+            children.append(_idle_child(cwd, *words))
+            return children[-1].pid
+
+        run_pid = child(slots["run"], "sleeper")
+        queue_pid = child(slots["queue"], "sleeper")
+        both_ticket = child(slots["both"], "sleeper")
+        child(slots["both"], "validate.py")
+        dagrun_pid = child(slots["dagrun"], "dagrun", "run")
+        cargo_pid = child(slots["cargo"], "cargo", "build")
+        child(slots["two"], "gate.py")
+        child(slots["two"], "gate.py")
+        deep_pid = child(slots["deep"] / "sub" / "dir", "validate.py")
+        child(slots["idle"], "cargo-ish", "sleeper")
+        decoy_pid = child(slots["b-c"], "dagrun")
+        outside_ticket = child(outside, "sleeper")
+        vanished = subprocess.Popen(["/bin/true"])
+        vanished.wait()
+        _admission_ticket(admission, "runs", "a-run", {"pid": run_pid})
+        _admission_ticket(admission, "runs", "b-both", {"pid": both_ticket})
+        _admission_ticket(admission, "runs", "c-gone", {"pid": vanished.pid})
+        _admission_ticket(admission, "runs", "d-outside", {"pid": outside_ticket})
+        _admission_ticket(admission, "runs", "e-bool", {"pid": True})
+        _admission_ticket(admission, "queue", "a-queue", {"pid": queue_pid})
+        _admission_ticket(admission, "queue", "b-list", [queue_pid])
+        (admission / "queue" / "c-bad.json").write_text("{", encoding="utf-8")
+        proc_root = tmp_path / "proc"
+        proc_root.mkdir()
+        for pid in [entry.pid for entry in children] + [vanished.pid]:
+            (proc_root / str(pid)).symlink_to(f"/proc/{pid}")
+        (proc_root / "self").symlink_to("/proc/self")
+        listings: list[Path] = []
+        real_listing = wrkslots._list_proc_pid_dirs
+
+        def counted(root: Path) -> list[Path]:
+            listings.append(root)
+            return real_listing(root)
+
+        monkeypatch.setattr(wrkslots, "_list_proc_pid_dirs", counted)
+        roots: dict[str, Path | None] = {name: path for name, path in slots.items()}
+        roots["rootless"] = None
+        index = wrkslots._gates_running_in_slots(roots, proc_root=proc_root)
+        assert listings == [proc_root]
+        alone = {
+            name: _gate_in_slot_alone((path,) if path is not None else (), proc_root=proc_root)
+            for name, path in roots.items()
+        }
+        assert index == {name: gate for name, gate in alone.items() if gate is not None}
+        assert {name: index.get(name) for name in (*names, "rootless")} == {
+            "run": (run_pid, "running"),
+            "queue": (queue_pid, "queued"),
+            "both": (both_ticket, "running"),
+            "dagrun": (dagrun_pid, "running"),
+            "cargo": (cargo_pid, "running"),
+            "two": index["two"],
+            "deep": (deep_pid, "running"),
+            "idle": None,
+            "b": None,
+            "b-c": (decoy_pid, "running"),
+            "gone": None,
+            "free": None,
+            "rootless": None,
+        }
+        # A set every ticket answers needs no listing; no roots need nothing.
+        listings.clear()
+        assert wrkslots._gates_running_in_slots(
+            {"run": slots["run"], "queue": slots["queue"]}, proc_root=proc_root
+        ) == {"run": (run_pid, "running"), "queue": (queue_pid, "queued")}
+        assert wrkslots._gates_running_in_slots({"rootless": None}, proc_root=proc_root) == {}
+        assert listings == []
+    finally:
+        for entry in children:
+            entry.kill()
+            entry.wait()
+
+
+def test_clean_caches_lists_proc_once_per_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#1202 clean-caches-single-walk: one /proc listing per run, any number of slots.
+
+    Six slots with caches: one with a running ticket, one with a queued
+    ticket, one with a cargo child and no ticket, three free.  An
+    in-process ``clean-caches --yes`` lists /proc once and skips exactly
+    the three gated slots with today's reasons; ``--force-running`` lists
+    it not at all and cleans them.
+    """
+
+    project, _repository, _remote = make_project(tmp_path, cache_globs=("target",))
+    names = [f"slot0{index}" for index in range(1, 7)]
+    trees = {}
+    for index, name in enumerate(names):
+        assert create(project, slot=name, agent=f"codex-{index}", branch=f"codex/{index}").returncode == 0
+        trees[name] = checkout(project, name)
+        (trees[name] / "target" / "debug").mkdir(parents=True)
+        (trees[name] / "target" / "debug" / "artifact").write_bytes(b"x" * 1024)
+    admission = tmp_path / "gate-admission"
+    monkeypatch.setenv("GATE_ADMISSION_DIR", str(admission))
+    children = [
+        _idle_child(trees["slot01"], "sleeper"),
+        _idle_child(trees["slot02"], "sleeper"),
+        _idle_child(trees["slot03"], "cargo", "test"),
+    ]
+    try:
+        _admission_ticket(admission, "runs", "one", {"pid": children[0].pid})
+        _admission_ticket(admission, "queue", "two", {"pid": children[1].pid})
+        listings: list[Path] = []
+        real_listing = wrkslots._list_proc_pid_dirs
+
+        def counted(root: Path) -> list[Path]:
+            listings.append(root)
+            return real_listing(root)
+
+        monkeypatch.setattr(wrkslots, "_list_proc_pid_dirs", counted)
+
+        def clean(*extra: str) -> dict[str, dict[str, object]]:
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                returncode = wrkslots.main(
+                    ["--project-root", str(project), "clean-caches", "--yes",
+                     "--format", "json", *extra]
+                )
+            assert returncode == 0
+            return {row["slot"]: row for row in json.loads(stdout.getvalue())["slots"]}
+
+        rows = clean()
+        assert listings == [Path("/proc")]
+        assert {name: rows[name]["action"] for name in names} == {
+            "slot01": "SKIPPED", "slot02": "SKIPPED", "slot03": "SKIPPED",
+            "slot04": "REMOVED", "slot05": "REMOVED", "slot06": "REMOVED",
+        }
+        assert rows["slot01"]["gate_reason"] == f"gate running (pid {children[0].pid})"
+        assert rows["slot02"]["gate_reason"] == f"gate queued (pid {children[1].pid})"
+        assert rows["slot03"]["gate_reason"] == f"gate running (pid {children[2].pid})"
+        for name in names[:3]:
+            assert (trees[name] / "target").is_dir()
+        for name in names[3:]:
+            assert not (trees[name] / "target").exists()
+        listings.clear()
+        forced = clean("--force-running")
+        assert listings == []
+        assert {name: forced[name]["action"] for name in names[:3]} == dict.fromkeys(
+            names[:3], "REMOVED"
+        )
+    finally:
+        for entry in children:
+            entry.kill()
+            entry.wait()
+
+
 def cargo_target(path: Path, *, profile_only: bool = False) -> Path:
     """Make ``path`` a cargo-shaped target directory holding one artifact."""
 
