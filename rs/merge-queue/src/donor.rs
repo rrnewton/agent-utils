@@ -270,6 +270,15 @@ pub struct Job {
     /// order was recorded, and for jobs no planned batch matches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_index: Option<usize>,
+    /// The plan generation [`Self::plan_index`] was recorded under (#1196
+    /// front-starve): claims honour an index only from the store's current
+    /// generation, so an index matched to a superseded plan is ignored.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub plan_generation: u64,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 impl Job {
@@ -1291,9 +1300,48 @@ impl Store {
             rooted,
             prioritized,
             plan_index,
+            plan_generation: self.current_plan_generation(),
         };
         self.write(&job)?;
         Ok(job)
+    }
+
+    /// The store's current plan generation (0 before any plan was stamped).
+    pub fn current_plan_generation(&self) -> u64 {
+        std::fs::read_to_string(self.dir.join("plan-generation.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|value| value["generation"].as_u64())
+            .unwrap_or(0)
+    }
+
+    /// Advance the plan generation and restamp queued jobs with their
+    /// current indices (#1196 front-starve): jobs not named keep their old
+    /// generation, so claims ignore their now-stale indices.
+    pub fn set_plan_generation(
+        &self,
+        generation: u64,
+        restamps: &[(String, Option<usize>)],
+    ) -> Result<(), String> {
+        let _lock = self.lock()?;
+        write_private(
+            &self.dir.join("plan-generation.json"),
+            serde_json::json!({"generation": generation})
+                .to_string()
+                .as_bytes(),
+        )?;
+        for (id, index) in restamps {
+            let Ok(mut job) = self.read(id) else {
+                continue;
+            };
+            if job.state != JobState::Queued {
+                continue;
+            }
+            job.plan_generation = generation;
+            job.plan_index = *index;
+            self.write(&job)?;
+        }
+        Ok(())
     }
 
     /// Publish the compare-only duplicate of `main`: the same candidate for donors that
@@ -1396,11 +1444,19 @@ impl Store {
         }
         let compare_only_donor = self.compare_only.contains(donor);
         // Claim order (#1008): prioritized jobs first, then plan order, with
-        // job age (id) as the tiebreak. Plan order only compares jobs that
-        // both carry an index: an index recorded against a stale plan (a
-        // recomposed or intake flight matched to the run's first plan,
-        // #1196 front-starve dp2) must not leapfrog an older unindexed job,
-        // so mixed pairs fall back to age.
+        // job age (id) as the tiebreak. Only an index recorded under the
+        // current plan generation counts (#1196 front-starve): an index
+        // matched to a superseded plan (a recomposed flight restamped
+        // against the run's first plan) is ignored, and a job with a
+        // current index claims ahead of one without.
+        let generation = self.current_plan_generation();
+        let effective = |job: &Job| {
+            if job.plan_generation == generation {
+                job.plan_index
+            } else {
+                None
+            }
+        };
         let Some(mut job) = jobs
             .into_iter()
             .filter(|job| {
@@ -1411,9 +1467,11 @@ impl Store {
             .min_by(|a, b| {
                 std::cmp::Reverse(a.prioritized)
                     .cmp(&std::cmp::Reverse(b.prioritized))
-                    .then_with(|| match (a.plan_index, b.plan_index) {
+                    .then_with(|| match (effective(a), effective(b)) {
                         (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.id.cmp(&b.id)),
-                        _ => a.id.cmp(&b.id),
+                        (Some(_), None) => std::cmp::Ordering::Less,
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => a.id.cmp(&b.id),
                     })
             })
         else {
@@ -5994,28 +6052,35 @@ mod unit {
 
     #[test]
     fn an_index_from_a_stale_plan_does_not_leapfrog_an_older_unindexed_job() {
-        // #1196 front-starve dp2: a recomposed flight matched to the run's
-        // first plan carries that plan's index (3), while an older intake
-        // flight carries none. The older job claims first: plan order only
-        // compares jobs that both carry an index.
+        // #1196 front-starve dp2, replayed: positions 1-4 where position 4
+        // (v15) carries index 3 matched to the run's first plan and
+        // position 1 (v10) carries none. Once the serve order advances a
+        // generation and restamps v10 at position 0, the donor claims v10
+        // first; v15's stale index no longer counts.
         let store = Store::new(&temp("claim-order-stale-plan"));
-        let older_unindexed = publish_ordered(
+        let v10 = publish_ordered(
             &store,
             "c1",
             false,
             None,
             "20260101T000000000-c11111111111-00000001",
         );
-        let newer_indexed = publish_ordered(
+        let v15 = publish_ordered(
             &store,
             "c2",
             false,
             Some(3),
             "20260101T000000000-c22222222222-00000002",
         );
+        store
+            .set_plan_generation(1, &[(v10.id.clone(), Some(0))])
+            .unwrap();
         let claim = |store: &Store| store.claim("d1", "h1", 10).unwrap().expect("a job").id;
-        assert_eq!(claim(&store), older_unindexed.id);
-        assert_eq!(claim(&store), newer_indexed.id);
+        assert_eq!(claim(&store), v10.id);
+        assert_eq!(claim(&store), v15.id);
+        let v10_after = store.read(&v10.id).unwrap();
+        assert_eq!(v10_after.plan_generation, 1);
+        assert_eq!(v10_after.plan_index, Some(0));
     }
 
     #[test]

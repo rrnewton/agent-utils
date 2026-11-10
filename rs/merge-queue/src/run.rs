@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use crate::git::{Combined, Git};
 use crate::model::{
     now, Discharge, HeldCandidate, HeldChange, Item, ItemStatus, KeptValidation, Obligation, Plan,
-    PlannedBatch, Ruling,
+    Ruling,
 };
 use crate::ops::{self, repo};
 use crate::plan::short;
@@ -598,17 +598,16 @@ enum BatchOutcome {
 /// the planned batch it is a speculative prefix of. Prefix flights of a
 /// multi-change batch otherwise record no index and claim behind every
 /// indexed job, however early their flight sits.
-fn plan_index_for(batches: &[PlannedBatch], job: &Job) -> Option<usize> {
-    if let Some(batch) = batches.iter().find(|batch| batch.prs == job.prs) {
-        return Some(batch.index);
+fn plan_index_for(batches: &[Vec<i64>], job: &Job) -> Option<usize> {
+    if let Some(index) = batches.iter().position(|batch| batch == &job.prs) {
+        return Some(index);
     }
     if job.purpose != "batch" {
         return None;
     }
     batches
         .iter()
-        .find(|batch| batch.prs.len() >= job.prs.len() && batch.prs[..job.prs.len()] == job.prs[..])
-        .map(|batch| batch.index)
+        .position(|batch| batch.len() >= job.prs.len() && batch[..job.prs.len()] == job.prs[..])
 }
 
 /// Worktree slots for concurrent validations, reused between candidates.
@@ -1391,6 +1390,12 @@ pub struct Runner<'a> {
     /// Candidates that were green on a previous base in this run and went
     /// stale only because other changes landed (see `stale-green-stacked`).
     stale_greens: Mutex<BTreeMap<i64, StaleGreen>>,
+    /// Current serve order for donor claim indices (#1196 front-starve):
+    /// flight batches in window order, then pending batches.
+    claim_order: Mutex<Vec<Vec<i64>>>,
+    /// Plan generation stamped on donor jobs; bumped whenever the serve
+    /// order changes, so indices from a superseded plan stop counting.
+    plan_generation: Mutex<u64>,
 }
 
 /// A green that went stale in this run: where it was green, and what had
@@ -1502,6 +1507,10 @@ impl<'a> Runner<'a> {
                 }
             }
         }
+        let initial_plan_generation = donors
+            .as_ref()
+            .map(|donors| donors.store.current_plan_generation())
+            .unwrap_or(0);
         // One slot per concurrent validation, plus one for selection queries.
         let slots = Slots::new(
             git.clone(),
@@ -1561,6 +1570,8 @@ impl<'a> Runner<'a> {
             stopped_logged: Mutex::new(false),
             stopping: AtomicBool::new(false),
             stale_greens: Mutex::new(BTreeMap::new()),
+            claim_order: Mutex::new(Vec::new()),
+            plan_generation: Mutex::new(initial_plan_generation),
         })
     }
 
@@ -4460,7 +4471,19 @@ impl<'a> Runner<'a> {
         let (prioritized, plan_index) = {
             let report = lock(&self.report);
             let plan = &report.plan;
-            let plan_index = plan_index_for(&plan.batches, job);
+            let claim_order = lock(&self.claim_order).clone();
+            let plan_index = if claim_order.is_empty() {
+                plan_index_for(
+                    &plan
+                        .batches
+                        .iter()
+                        .map(|batch| batch.prs.clone())
+                        .collect::<Vec<_>>(),
+                    job,
+                )
+            } else {
+                plan_index_for(&claim_order, job)
+            };
             let prioritized = job.prs.iter().any(|pr| {
                 plan.items
                     .iter()
@@ -5278,6 +5301,40 @@ impl<'a> Runner<'a> {
             .is_ok_and(|job| job.state == crate::donor::JobState::Queued)
     }
 
+    /// Record the current serve order for donor claims (#1196
+    /// front-starve): when it changes, the plan generation advances and
+    /// queued donor jobs are restamped with their position, so an index
+    /// matched to a superseded plan stops counting at claim time. `tips`
+    /// names the candidate tip at each leading (flight) position of
+    /// `order`, for restamping already-published jobs.
+    fn update_claim_order(&self, order: Vec<Vec<i64>>, tips: &[String]) {
+        {
+            let mut current = lock(&self.claim_order);
+            if *current == order {
+                return;
+            }
+            *current = order;
+        }
+        let generation = {
+            let mut generation = lock(&self.plan_generation);
+            *generation += 1;
+            *generation
+        };
+        let Some(donors) = &self.donors else {
+            return;
+        };
+        let published = lock(&donors.published).clone();
+        let restamps: Vec<(String, Option<usize>)> = published
+            .iter()
+            .filter_map(|(id, commit)| {
+                tips.iter()
+                    .position(|tip| tip == commit)
+                    .map(|position| (id.clone(), Some(position)))
+            })
+            .collect();
+        let _ = donors.store.set_plan_generation(generation, &restamps);
+    }
+
     fn next_decidable_index(
         &self,
         flights: &VecDeque<Flight>,
@@ -5688,6 +5745,11 @@ impl<'a> Runner<'a> {
             report.base_start = plan.base_sha.clone();
         }
         report.plan = plan.clone();
+        drop(report);
+        self.update_claim_order(
+            plan.batches.iter().map(|batch| batch.prs.clone()).collect(),
+            &[],
+        );
         Ok(())
     }
 
@@ -6277,6 +6339,18 @@ impl<'a> Runner<'a> {
         );
         self.ask_background(batches.iter().flatten().copied());
         *pending = batches;
+        self.update_claim_order(
+            view.flights
+                .iter()
+                .map(|flight| flight.prs.clone())
+                .chain(pending.iter().cloned())
+                .collect(),
+            &view
+                .flights
+                .iter()
+                .map(|flight| flight.tip.clone())
+                .collect::<Vec<_>>(),
+        );
         Ok(())
     }
 
@@ -7607,6 +7681,19 @@ impl<'a> Runner<'a> {
                         });
                         started += 1;
                         lock(&self.report).windows.push(window);
+                        self.update_claim_order(
+                            flights
+                                .iter()
+                                .filter(|flight| flight.probe_for.is_none())
+                                .map(|flight| flight.candidate.prs.clone())
+                                .chain(pending.iter().cloned())
+                                .collect(),
+                            &flights
+                                .iter()
+                                .filter(|flight| flight.probe_for.is_none())
+                                .map(|flight| flight.candidate.tip.clone())
+                                .collect::<Vec<_>>(),
+                        );
                         self.publish_window(
                             flights
                                 .iter()
@@ -11122,18 +11209,7 @@ mod unit {
         // #1196 front-starve: speculative prefix flights of one planned
         // batch claim under that batch's index; exact batches match
         // directly, and non-batch jobs keep no index (age order).
-        let batches = vec![
-            PlannedBatch {
-                index: 0,
-                prs: vec![10, 11, 12],
-                note: String::new(),
-            },
-            PlannedBatch {
-                index: 1,
-                prs: vec![13],
-                note: String::new(),
-            },
-        ];
+        let batches = vec![vec![10, 11, 12], vec![13]];
         let job = |purpose: &'static str, prs: Vec<i64>| Job {
             purpose,
             prs,
