@@ -3042,6 +3042,15 @@ struct Worker<'a> {
 /// them as transient and lets the probe decide a host fault (#1193).
 pub const GH_PACED_FAULT_AFTER: usize = 3;
 
+/// Probe output line naming a validator entry lock wait (item 5 of #1193).
+pub const ENTRY_LOCK_WAIT_MARKER: &str = "entry lock wait";
+
+/// Total probe attempts when each fails only on the entry lock wait.
+pub const PROBE_LOCK_WAIT_ATTEMPTS: usize = 3;
+
+/// Delay between in-probe lock-wait retries.
+pub const PROBE_LOCK_WAIT_RETRY_SECS: u64 = 5;
+
 /// The probe back-off after a pause whose current delay is `delay`: doubled,
 /// capped at ten minutes.
 fn doubled_probe_delay(delay: std::time::Duration) -> std::time::Duration {
@@ -3150,7 +3159,42 @@ impl Worker<'_> {
         if cfg.kind != "command" || cfg.run.trim().is_empty() {
             return true;
         }
+        // A probe that fails only on the validator's entry lock wait
+        // (#1193 item 5) retries inside this probe, counted: the lock is
+        // held by unrelated work (a cleanup drain), so waiting out the
+        // fault back-off only re-records the fault. Past the bound the
+        // probe fails as any probe does.
+        for attempt in 1..=PROBE_LOCK_WAIT_ATTEMPTS {
+            let (passed, output) = self.probe_once(cfg);
+            if passed {
+                return true;
+            }
+            if attempt == PROBE_LOCK_WAIT_ATTEMPTS || !output.contains(ENTRY_LOCK_WAIT_MARKER) {
+                return false;
+            }
+            eprintln!(
+                "merge-queue donor {}: probe attempt {attempt} failed on the entry lock wait; retrying inside the probe (bound {PROBE_LOCK_WAIT_ATTEMPTS})",
+                self.options.name
+            );
+            std::thread::sleep(std::time::Duration::from_secs(PROBE_LOCK_WAIT_RETRY_SECS));
+        }
+        false
+    }
+
+    /// One probe run: whether it passed, and its combined output (for the
+    /// lock-wait classification; the probe's results file is separate).
+    fn probe_once(&self, cfg: &crate::state::ValidatorConfig) -> (bool, String) {
         let results = self.options.work.join("probe-results.jsonl");
+        let output_path = self
+            .options
+            .work
+            .join(format!("probe-output-{}.log", std::process::id()));
+        let Ok(output_file) = std::fs::File::create(&output_path) else {
+            return (false, String::new());
+        };
+        let Ok(stderr_file) = output_file.try_clone() else {
+            return (false, String::new());
+        };
         let mut command = std::process::Command::new("sh");
         command
             .arg("-c")
@@ -3159,24 +3203,27 @@ impl Worker<'_> {
             .env(crate::validate::PROBE_ENV, "1")
             .env("MQ_RESULTS", &results)
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+            .stdout(std::process::Stdio::from(output_file))
+            .stderr(std::process::Stdio::from(stderr_file));
         let Ok(mut child) = command.spawn() else {
-            return false;
+            return (false, String::new());
         };
         let started = std::time::Instant::now();
-        loop {
+        let passed = loop {
             match child.try_wait() {
-                Ok(Some(status)) => return status.success(),
+                Ok(Some(status)) => break status.success(),
                 Ok(None) if started.elapsed() <= std::time::Duration::from_secs(60) => {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 _ => {
                     let _ = child.kill();
-                    return false;
+                    break false;
                 }
             }
-        }
+        };
+        let output = std::fs::read_to_string(&output_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&output_path);
+        (passed, output)
     }
 
     /// The job's configured pre-claim check (`validator.pre_claim_check`):
@@ -4589,6 +4636,103 @@ mod unit {
         assert!(store.host_fault_list().is_empty());
         publish(&store, "c2");
         assert!(store.claim("d1", "h1", 1).unwrap().is_some());
+    }
+
+    fn probe_worker(work: &Path) -> (DonorOptions, Route) {
+        (
+            DonorOptions {
+                queue: vec!["true".to_owned()],
+                clone: work.to_path_buf(),
+                remote: String::new(),
+                name: "d1".to_owned(),
+                jobs: 1,
+                poll: std::time::Duration::from_secs(1),
+                work: work.to_path_buf(),
+                mismatch_backoff: std::time::Duration::ZERO,
+                until_idle: true,
+                cap_file: None,
+            },
+            Route::new(vec!["true".to_owned()]).unwrap(),
+        )
+    }
+
+    fn probe_cfg(run: String) -> crate::state::ValidatorConfig {
+        crate::state::ValidatorConfig {
+            kind: "command".to_owned(),
+            run,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_probe_that_waits_on_the_entry_lock_retries_inside_the_probe() {
+        // #1193 item 5: the first probe fails only on the entry lock wait,
+        // the retry passes, so the probe passes and no fault is recorded
+        // (the caller faults only on a false return).
+        let work = temp("probe-lock-wait");
+        let count = work.join("count");
+        let run = format!(
+            "n=$(cat {} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {}; \
+             if [ $n -lt 2 ]; then echo 'validation entry lock wait bound expired'; exit 1; fi; exit 0",
+            count.display(),
+            count.display()
+        );
+        let (options, route) = probe_worker(&work);
+        let worker = Worker {
+            options: &options,
+            route: &route,
+            host: "h1".to_owned(),
+            slots: Mutex::new(vec![0]),
+            host_pause: Mutex::new(None),
+            probe_passed: AtomicBool::new(false),
+            next_host_delay: Mutex::new(std::time::Duration::from_secs(60)),
+            last_validator: Mutex::new(None),
+            next_fault_probe: Mutex::new(std::time::Instant::now()),
+            fault_probe_current: Mutex::new(std::time::Duration::from_secs(60)),
+            paced_refusals: Mutex::new(0),
+        };
+        assert!(worker.probe_host_validator(&probe_cfg(run)));
+        assert_eq!(
+            std::fs::read_to_string(&count).unwrap().trim(),
+            "2",
+            "one lock-wait failure, one retry"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn repeated_entry_lock_waits_fail_the_probe_visibly() {
+        // Past the bound the probe fails as any probe does (the caller
+        // records the fault): exactly the bounded attempts ran.
+        let work = temp("probe-lock-wait-bound");
+        let count = work.join("count");
+        let run = format!(
+            "n=$(cat {} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {}; \
+             echo 'validation entry lock wait bound expired'; exit 1",
+            count.display(),
+            count.display()
+        );
+        let (options, route) = probe_worker(&work);
+        let worker = Worker {
+            options: &options,
+            route: &route,
+            host: "h1".to_owned(),
+            slots: Mutex::new(vec![0]),
+            host_pause: Mutex::new(None),
+            probe_passed: AtomicBool::new(false),
+            next_host_delay: Mutex::new(std::time::Duration::from_secs(60)),
+            last_validator: Mutex::new(None),
+            next_fault_probe: Mutex::new(std::time::Instant::now()),
+            fault_probe_current: Mutex::new(std::time::Duration::from_secs(60)),
+            paced_refusals: Mutex::new(0),
+        };
+        assert!(!worker.probe_host_validator(&probe_cfg(run)));
+        assert_eq!(
+            std::fs::read_to_string(&count).unwrap().trim(),
+            PROBE_LOCK_WAIT_ATTEMPTS.to_string(),
+            "the bounded attempts ran"
+        );
+        let _ = std::fs::remove_dir_all(&work);
     }
 
     #[test]

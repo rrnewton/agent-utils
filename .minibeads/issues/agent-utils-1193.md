@@ -18,6 +18,7 @@ In `rs/merge-queue`:
 - Classify a could-not-run whose cause is a pacing-guard refusal (the refusal line on the validator's stderr) as transient, beside the existing busy and stale-base classifications in `validate.rs`.
 - Donor side (`Worker::validate` in `donor.rs`): a pacing refusal is never probed and never records a host fault; the receipt still re-queues the job. Count consecutive pacing refusals, and past a bounded count record the fault after all, so a lasting outage still shows up and eventually faults.
 - Queue side (receipt handling in `donor.rs`): the re-queued job keeps its counted could-not-run strike, so the existing per-job bound still applies; the history names the pacing cause.
+- Probe side (item 5): a host probe that fails only on the validator entry lock wait retries inside the same probe (bounded, counted) instead of waiting out the fault back-off and re-recording the fault; past the bound it fails as any probe does.
 
 # Acceptance Criteria
 
