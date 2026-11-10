@@ -3214,10 +3214,17 @@ event file they verified is unchanged, and verify whatever arrived meanwhile.
 `status` and `doctor` hold the lock only to read the registry. They release it while they ask
 the liveness command, inspect Git worktrees and disks, and read processes, then take it again
 briefly to confirm that the registry is exactly what they read: every control file's contents
-and each machine's event count and last event. If it changed, they read it again under that
-lock and repeat the measurement, asking again only about rows that changed; after two repeats
-the last measurement runs under the lock. A report therefore always shows the registry at one
-instant, as when the whole command held the lock.
+and each machine's event count and last event. If it changed, they read it again and repeat
+the measurement, asking again only about rows that changed; the measurement never runs under
+the lock, and after two repeats the latest snapshot's measurement is published as-is. A report
+therefore always shows the registry at one instant, as when the whole command held the lock.
+`unpushed` likewise snapshots the registry under a short lock and runs its Git probes and
+remote fetches outside it.
+
+Every read-only scan is wall-bounded: `--scan-timeout SECONDS` (default 180) caps one
+`status`, `doctor`, `audit` or `unpushed` run. A scan that passes the bound prints the
+results it has as partial (a `PARTIAL:` line, or `"partial": true` in JSON) and exits 2
+instead of running on, so a slow registry degrades the report, never the lock.
 
 `audit` already snapshots the registry under a short lock and measures outside it. It judges
 up to `--jobs` registered rows at once (default: the smaller of 4 and the CPUs it may run on).

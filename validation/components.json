@@ -444,6 +444,7 @@
         "py/wrkslots/tests/test_proc_status.py",
         "py/wrkslots/tests/test_quarantine_journal_rust.py",
         "py/wrkslots/tests/test_read_handoff_write_rust.py",
+        "py/wrkslots/tests/test_read_scan_bounds.py",
         "py/wrkslots/tests/test_reanchor_liveness.py",
         "py/wrkslots/tests/test_reap_stray_rust.py",
         "py/wrkslots/tests/test_reap_stray_worktrees.py",

@@ -537,11 +537,11 @@ def _liveness_hook(
     original = wrkslots_cli._owner_liveness_states
     calls: list[list[str]] = []
 
-    def liveness(config: object, records: object) -> object:
+    def liveness(config: object, records: object, **kwargs: object) -> object:
         slots = sorted(record.slot for record in records)  # type: ignore[attr-defined]
         calls.append(slots)
         during(len(calls), slots)
-        return original(config, records)  # type: ignore[arg-type]
+        return original(config, records, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(wrkslots_cli, "_owner_liveness_states", liveness)
     return calls
@@ -608,7 +608,7 @@ def test_reader_sees_an_event_written_while_it_measured(
 
 
 @pytest.mark.parametrize("command", ["status", "doctor"])
-def test_reader_measures_under_the_lock_when_the_registry_keeps_changing(
+def test_reader_never_measures_under_the_lock_when_the_registry_keeps_changing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
 ) -> None:
     root = _fixture(tmp_path / "case")
@@ -626,10 +626,12 @@ def test_reader_measures_under_the_lock_when_the_registry_keeps_changing(
     payload = json.loads(_cli(root, command, "--format", "json"))
     rows = {str(row["slot"]): row for row in payload["active"]}
     retries = wrkslots_cli._PHASED_READ_RETRIES
-    # One measurement, the retries, then the last one under the lock.
-    assert len(calls) == retries + 2, calls
-    assert free == [True] * (retries + 1) + [False], free
-    assert rows["slot-a"]["task"] == f"change {retries + 1}", rows["slot-a"]
+    # One measurement plus the retakes, every one outside the lock (#1247):
+    # a scan never holds the registry lock while it measures, so the writer
+    # gets in every time, and the published rows are the last snapshot's.
+    assert len(calls) == retries + 1, calls
+    assert free == [True] * (retries + 1), free
+    assert rows["slot-a"]["task"] == f"change {retries}", rows["slot-a"]
 
 
 def test_registry_read_identity_sees_content_not_metadata(tmp_path: Path) -> None:

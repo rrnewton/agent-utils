@@ -33,4 +33,15 @@ Related: #786 agentctl-start-slot-bind-busy-lock (a `status` read refused on a b
 
 # Notes
 
-Report evidence only at filing time; no measurement has been made yet. The spinning process had exited before this lane could read its stack, so the root cause must be reproduced on a local registry.
+Report evidence only at filing time; no measurement had been made yet. The spinning process had exited before this lane could read its stack, so the root cause was reproduced on a local registry.
+
+## Root cause (mu-statuslock, 2026-11-10)
+
+Measured on the local registry (35 slots, 1,595 events, 75 Git worktree registrations) with cProfile and operation counts, plus a synthetic-fixture scaling probe (10/40/160 slots, 0-640 stale registrations):
+
+- The storage scan is linear, not quadratic: Git calls are exactly slots+2 (one `worktree_identity` probe per checkout; the per-repository common-directory and worktree-list calls are cached across slots sharing a repository), and stale registrations add findings without adding Git calls (160 slots with 640 stale registrations: same 322 subprocesses, same wall as without). The report's hypothesis that the inconsistency count drives the slowness does not hold.
+- The scan's real cost is per-slot subprocesses: one liveness command per agent slot plus one Git identity probe per checkout (locally 72 subprocesses, 2.4 s of a 3.3 s `status`). The legacy per-agent liveness spelling ran with no timeout at all, so one hung or slow probe stalled the whole scan behind it; on a loaded host with 100+ slots this alone reaches minutes.
+- Lock scope made that a host-wide outage. `unpushed` held the shared registry lock across every per-checkout Git probe and remote fetch by construction. `status` and `doctor` measure outside the lock, but when the registry's content identity changed during a measurement (any heartbeat renewal or event append changes it), then after two retakes the last measurement ran under the shared lock again. On a busy registry a reader therefore ended up measuring under the lock for the whole scan while every mutation waited. No read-only scan had any wall bound, so nothing ever gave up.
+- One genuinely quadratic scan fed the same commands: `_handoff_write_publication` rescanned the whole event log for every handoff-write intent (via `_owner_before_handoff_write_intent`), with a full record parse per historical event. Every `status`, `doctor` and handoff check of a released slot paid intents x events parses.
+
+Fix: measurements never run under the lock (the latest snapshot's measurement is published unconfirmed after the retakes; it still describes one snapshot instant); `unpushed` snapshots under a short lock and scans outside it; every read-only scan takes `--scan-timeout` (default 180 s) and past the bound prints partial results marked PARTIAL (`"partial": true` in JSON) and exits 2; one liveness call is bounded at 15 s; handoff publication is a single pass parsing each historical record once. Tests count Git calls and record parses, never wall time.

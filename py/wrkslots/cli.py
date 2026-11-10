@@ -8984,39 +8984,50 @@ def _owner_before_handoff_write_intent(
             break
         kind = event.get("kind")
         payload = _as_mapping(event["payload"], f"{kind} event payload")
-        if kind == "state-imported":
-            imported = _as_mapping(
-                payload.get("active"), "append-only imported active state"
-            )
-            owner = None
-            for index, value in enumerate(
-                _as_list(imported.get("slots"), "append-only imported active state.slots")
-            ):
-                candidate = _record_from_obj(
-                    value, f"append-only imported active state.slots[{index}]"
-                )
-                if (
-                    candidate.machine == record.machine
-                    and candidate.slot == record.slot
-                    and candidate.generation == record.generation
-                ):
-                    owner = candidate.owner
-                    break
-        elif kind == "active-state-recorded" and payload.get("slot") == record.slot:
-            raw_record = payload.get("record")
-            if raw_record is None:
-                owner = None
-                continue
+        owner = _handoff_owner_step(owner, record, kind, payload)
+    return owner
+
+
+def _handoff_owner_step(
+    owner: ProcessIdentity | None,
+    record: ActiveRecord,
+    kind: object,
+    payload: Mapping[str, object],
+) -> ProcessIdentity | None:
+    """One event's effect on the owner _owner_before_handoff_write_intent tracks."""
+
+    if kind == "state-imported":
+        imported = _as_mapping(
+            payload.get("active"), "append-only imported active state"
+        )
+        owner = None
+        for index, value in enumerate(
+            _as_list(imported.get("slots"), "append-only imported active state.slots")
+        ):
             candidate = _record_from_obj(
-                raw_record, "append-only active-record event.record"
+                value, f"append-only imported active state.slots[{index}]"
             )
-            owner = (
-                candidate.owner
-                if candidate.machine == record.machine
+            if (
+                candidate.machine == record.machine
                 and candidate.slot == record.slot
                 and candidate.generation == record.generation
-                else None
-            )
+            ):
+                owner = candidate.owner
+                break
+    elif kind == "active-state-recorded" and payload.get("slot") == record.slot:
+        raw_record = payload.get("record")
+        if raw_record is None:
+            return None
+        candidate = _record_from_obj(
+            raw_record, "append-only active-record event.record"
+        )
+        owner = (
+            candidate.owner
+            if candidate.machine == record.machine
+            and candidate.slot == record.slot
+            and candidate.generation == record.generation
+            else None
+        )
     return owner
 
 
@@ -9026,9 +9037,16 @@ def _handoff_write_publication(
 ) -> tuple[int, Mapping[str, object], bool] | None:
     intents: dict[int, Mapping[str, object]] = {}
     completed: set[int] = set()
+    # One pass (#1247): the owner before each intent is the running owner the
+    # events so far establish. Rescanning the whole log per intent made this
+    # quadratic in (intents x events) with a full record parse per historical
+    # event, on every status, doctor and handoff check of a released slot.
+    owner_at_intent: ProcessIdentity | None = None
     for event in events:
         kind = event.get("kind")
         payload = _as_mapping(event["payload"], f"{kind} event payload")
+        if kind in ("state-imported", "active-state-recorded"):
+            owner_at_intent = _handoff_owner_step(owner_at_intent, record, kind, payload)
         if kind == "handoff-write-intended":
             if payload.get("slot") != record.slot or payload.get("generation") != record.generation:
                 continue
@@ -9048,9 +9066,6 @@ def _handoff_write_publication(
                 raise StateError("handoff write intent lacks an owner identity")
             intent_sequence = _as_int(
                 event["sequence"], "handoff write intent sequence", minimum=1
-            )
-            owner_at_intent = _owner_before_handoff_write_intent(
-                record, events, intent_sequence
             )
             if owner_at_intent is None or writer != owner_at_intent:
                 raise StateError(
@@ -20747,23 +20762,30 @@ def _liveness_batch_diagnostic(value: str) -> str:
 
 
 def _registered_liveness_states(
-    config: Config, records: Sequence[ActiveRecord]
+    config: Config,
+    records: Sequence[ActiveRecord],
+    *,
+    deadline: float | None = None,
 ) -> dict[tuple[str, str, int], tuple[str, str]]:
     """Read liveness once when a typed batch authority is configured.
 
     A broken batch is one broken observation, not permission to fall back to a
     different protocol whose answers might disagree. Every requested subject
-    therefore becomes unverifiable together.
+    therefore becomes unverifiable together. ``deadline`` bounds the legacy
+    per-agent spelling (#1247); the batch spelling already runs bounded.
     """
 
     if not records:
         return {}
     if config.liveness_batch_command is None:
-        return {
-            (record.machine, record.slot, record.generation):
-            _registered_liveness_state(config, record)
-            for record in records
-        }
+        answers: dict[tuple[str, str, int], tuple[str, str]] = {}
+        for record in records:
+            if deadline is not None:
+                _check_scan_deadline(deadline)
+            answers[(record.machine, record.slot, record.generation)] = (
+                _registered_liveness_state(config, record)
+            )
+        return answers
     request = _liveness_batch_request(config, records)
     command = (
         [sys.executable, str(config.liveness_batch_command)]
@@ -20989,11 +21011,18 @@ def _registered_liveness_answer_raw(config: Config, record: ActiveRecord) -> _Li
                 capture_output=True,
                 check=False,
                 env=env,
+                timeout=_LIVENESS_CALL_TIMEOUT_SECONDS,
             )
         else:
             completed = _run_within_item_budget(
                 command, seconds=seconds, what=what, env=env, errors="replace"
             )
+    except subprocess.TimeoutExpired:
+        return _LivenessAnswer(
+            "unverifiable",
+            f"registered liveness command did not answer within "
+            f"{_LIVENESS_CALL_TIMEOUT_SECONDS:g} seconds",
+        )
     except OSError as exc:
         return _LivenessAnswer(
             "unverifiable", f"registered liveness command could not run: {exc}"
@@ -21797,14 +21826,17 @@ def _validation_run_liveness_states(
 
 
 def _owner_liveness_states(
-    config: Config, records: Sequence[ActiveRecord]
+    config: Config,
+    records: Sequence[ActiveRecord],
+    *,
+    deadline: float | None = None,
 ) -> dict[tuple[str, str, int], tuple[str, str]]:
     """Ask each row's liveness authority: the run for validation rows,
     the registered liveness command for agent rows."""
 
     validation = [record for record in records if record.slot_type == "validate"]
     agents = [record for record in records if record.slot_type != "validate"]
-    result = _registered_liveness_states(config, agents)
+    result = _registered_liveness_states(config, agents, deadline=deadline)
     result.update(_validation_run_liveness_states(config, validation))
     return result
 
@@ -41852,6 +41884,34 @@ def _audit_slot_root_listing(
 
 
 def _cmd_audit(args: argparse.Namespace) -> int:
+    try:
+        return _cmd_audit_scan(args)
+    except _ScanTimeout as exc:
+        # Partial results (#1247): the scan stopped at its wall bound, so no
+        # verdicts are published; the marker keeps that from reading as clean.
+        detail = str(exc)
+        if getattr(args, "format", "human") == "json":
+            print(
+                json.dumps(
+                    {
+                        "schema": SCHEMA,
+                        "partial": True,
+                        "scan_timeout": detail,
+                        "state": "unknown",
+                        "summary": detail,
+                        "slots": [],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            print(f"PARTIAL: {detail}")
+        return 2
+
+
+def _cmd_audit_scan(args: argparse.Namespace) -> int:
+    scan_deadline = _scan_deadline(args)
     if args.cache_work_limit < 1:
         raise Refusal("--cache-work-limit must be positive")
     if not (math.isfinite(args.cache_wall_seconds) and args.cache_wall_seconds > 0):
@@ -41963,10 +42023,13 @@ def _cmd_audit(args: argparse.Namespace) -> int:
                 "validation_seals": len(seal_targets),
             },
         )
+    _check_scan_deadline(scan_deadline)
     liveness_started = metrics.start()
     # Validation rows are answered by their runs, agent rows by the
     # registered command; see _validation_run_liveness_states.
-    registered_liveness = _owner_liveness_states(config, records)
+    registered_liveness = _owner_liveness_states(
+        config, records, deadline=scan_deadline
+    )
     agent_subjects = sum(record.slot_type != "validate" for record in records)
     metrics.finish(
         "liveness",
@@ -41982,6 +42045,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
             "validation_run_subjects": len(records) - agent_subjects,
         },
     )
+    _check_scan_deadline(scan_deadline)
     census_started = metrics.start()
     process_census: _ProcessPathCensus | None = None
     process_census_error: str | None = None
@@ -42169,6 +42233,7 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         storage_error=cache_storage_error,
     )
     metrics.finish("cache-census", cache_started, cache_work)
+    _check_scan_deadline(scan_deadline)
     records_started = metrics.start()
 
     def judge(record: ActiveRecord) -> tuple[dict[str, object], bool]:
@@ -42920,22 +42985,29 @@ def _cmd_unpushed(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     if args.slot is not None:
         _validate_name(args.slot, "slot")
+    deadline = _scan_deadline(args)
     _prewarm_registry_read(lambda: _validate_global_state(config))
+    # Snapshot under a short shared lock, scan outside it (#1247). This
+    # command used to hold the lock across every per-checkout Git probe and
+    # remote fetch, starving mutations for the whole run.
     with _locked(config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock):
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         states, _archives = _validate_global_state(config)
-        _assert_command_registry_storage(config, states, args)
-        records = [
-            record
-            for state in states
-            if state.machine == config.machine
-            for record in state.slots
-            if args.slot is None or record.slot == args.slot
-        ]
-        rows: list[dict[str, object]] = []
-        vcs = _GitVcs()
+    _assert_command_registry_storage(config, states, args)
+    records = [
+        record
+        for state in states
+        if state.machine == config.machine
+        for record in state.slots
+        if args.slot is None or record.slot == args.slot
+    ]
+    rows: list[dict[str, object]] = []
+    vcs = _GitVcs()
+    partial_detail: str | None = None
+    try:
         for record in records:
             for checkout in record.checkouts:
+                _check_scan_deadline(deadline)
                 path = _stored_path(config, checkout.path, "checkout path")
                 head = vcs.verify_existing_worktree(
                     _stored_repository_path(config, checkout.repository)[1], path
@@ -42973,10 +43045,17 @@ def _cmd_unpushed(args: argparse.Namespace) -> int:
                         ),
                     }
                 )
-    payload = {"schema": SCHEMA, "slots": rows}
+    except _ScanTimeout as exc:
+        partial_detail = str(exc)
+    payload: dict[str, object] = {"schema": SCHEMA, "slots": rows}
+    if partial_detail is not None:
+        payload["partial"] = True
+        payload["scan_timeout"] = partial_detail
     if args.format == "json":
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
+        if partial_detail is not None:
+            print(f"PARTIAL: {partial_detail}")
         for row in rows:
             print(f"{row['state']}: {row['slot']}/{row['checkout']} HEAD={row['head']}")
             if row["state"] == "UNPUSHED-OR-STALE":
@@ -42990,7 +43069,7 @@ def _cmd_unpushed(args: argparse.Namespace) -> int:
                     print(
                         f"  compare={row['diagnostic_command']} (empty output means content present)"
                     )
-    return 0
+    return 2 if partial_detail is not None else 0
 
 
 def _status_record(
@@ -43047,9 +43126,52 @@ def _status_record(
 # lock that the registry is exactly what the snapshot read. A report is published only from a
 # measurement whose snapshot was still current, so it shows the registry at one instant; when the
 # registry changed, the snapshot is retaken under that same lock and the measurement repeated,
-# reusing the per-row observations whose rows did not change. After _PHASED_READ_RETRIES repeats
-# the last measurement runs under the lock, as the whole command used to.
+# reusing the per-row observations whose rows did not change.
+#
+# #1247: the retried measurement used to run under the lock, as the whole command once did. On a
+# busy registry the content identity changes whenever any heartbeat or event lands, so a reader
+# under load fell back to measuring under the shared lock and starved every mutation for the
+# whole scan. A measurement now never runs under the lock: after _PHASED_READ_RETRIES changed
+# snapshots the latest snapshot's measurement, taken outside the lock, is published as-is. It
+# still describes one snapshot instant, only a slightly older one.
 _PHASED_READ_RETRIES = 2
+
+#: Default wall bound for one read-only scan (status, doctor, audit, unpushed), in seconds.
+#: A scan that passes it reports partial results and exits non-zero (#1247).
+_READ_SCAN_TIMEOUT_DEFAULT_SECONDS = 180.0
+
+#: Bound for one legacy (per-agent) liveness command call. The batch authority already has a
+#: bound (_ABSENT_PROCESS_CENSUS_SECONDS); the per-agent spelling ran with no timeout at all,
+#: so one hung probe stalled the whole scan behind it (#1247).
+_LIVENESS_CALL_TIMEOUT_SECONDS = 15.0
+
+
+class _ScanTimeout(Exception):
+    """A read-only scan passed its wall bound; ``snapshot`` is its last registry snapshot."""
+
+    def __init__(self, detail: str, snapshot: object = None) -> None:
+        super().__init__(detail)
+        self.snapshot = snapshot
+
+
+def _scan_deadline(args: argparse.Namespace) -> float:
+    """Absolute monotonic deadline for this command's read-only scan."""
+
+    seconds = getattr(args, "scan_timeout", None)
+    if seconds is None:
+        seconds = _READ_SCAN_TIMEOUT_DEFAULT_SECONDS
+    if not (math.isfinite(seconds) and seconds > 0):
+        raise Refusal("--scan-timeout must be a finite positive number of seconds")
+    return time.monotonic() + seconds
+
+
+def _check_scan_deadline(deadline: float, snapshot: object = None) -> None:
+    if time.monotonic() >= deadline:
+        raise _ScanTimeout(
+            "read-only scan exceeded its --scan-timeout bound; "
+            "rerun with a larger bound if a full scan is required",
+            snapshot,
+        )
 
 
 def _registry_read_identity(config: Config) -> tuple[object, ...]:
@@ -43135,6 +43257,7 @@ def _storage_subject_key(states: Sequence[ActiveState]) -> str:
 class _PhasedReadCache:
     """Observations a repeated measurement may reuse: each is keyed by exactly what it read."""
 
+    deadline: float | None = None
     storage: dict[str, tuple[StorageInconsistency, ...]] = dataclasses.field(
         default_factory=dict
     )
@@ -43179,7 +43302,7 @@ class _PhasedReadCache:
         }
         missing = [record for key, record in keyed.items() if key not in self.liveness]
         if missing:
-            answered = _owner_liveness_states(config, missing)
+            answered = _owner_liveness_states(config, missing, deadline=self.deadline)
             for record in missing:
                 self.liveness[
                     (record.machine, record.slot, record.generation, _record_sha256(record))
@@ -43196,8 +43319,16 @@ def _phased_registry_read(
     wait_seconds: float,
     snapshot: Callable[[], _PhasedSnapshot],
     measure: Callable[[_PhasedSnapshot], _PhasedResult],
+    *,
+    deadline: float | None = None,
 ) -> tuple[_PhasedSnapshot, _PhasedResult]:
-    """Snapshot under the shared lock, measure outside it, publish only a current measurement."""
+    """Snapshot under the shared lock, measure outside it, publish only a current measurement.
+
+    The measurement never runs under the lock (#1247). When the registry keeps changing, the
+    latest snapshot's measurement is published unconfirmed after _PHASED_READ_RETRIES retakes;
+    it still describes that one snapshot. ``deadline`` bounds the whole read: past it,
+    _ScanTimeout carries the latest snapshot so the caller can report partial results.
+    """
 
     subject = config.control / "ACTIVE"
     with _locked(subject, exclusive=False, wait_seconds=wait_seconds):
@@ -43205,14 +43336,23 @@ def _phased_registry_read(
         identity = _registry_read_identity(config)
     retries = 0
     while True:
-        result = measure(taken)
+        if deadline is not None:
+            _check_scan_deadline(deadline, taken)
+        try:
+            result = measure(taken)
+        except _ScanTimeout as exc:
+            if exc.snapshot is None:
+                exc.snapshot = taken
+            raise
+        if deadline is not None:
+            _check_scan_deadline(deadline, taken)
         with _locked(subject, exclusive=False, wait_seconds=wait_seconds):
             if _registry_read_identity(config) == identity:
                 return taken, result
+            if retries >= _PHASED_READ_RETRIES:
+                return taken, result
             taken = snapshot()
             identity = _registry_read_identity(config)
-            if retries >= _PHASED_READ_RETRIES:
-                return taken, measure(taken)
         retries += 1
 
 
@@ -43648,7 +43788,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             config, require_repository=False, announce=False
         )
     )
-    cache = _PhasedReadCache()
+    deadline = _scan_deadline(args)
+    cache = _PhasedReadCache(deadline=deadline)
 
     def snapshot() -> tuple[
         list[ActiveState],
@@ -43720,9 +43861,41 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         ]
         return states, findings, rows
 
-    _taken, (states, findings, rows) = _phased_registry_read(
-        config, args.wait_lock, snapshot, measure
-    )
+    partial_detail: str | None = None
+    try:
+        _taken, (states, findings, rows) = _phased_registry_read(
+            config, args.wait_lock, snapshot, measure, deadline=deadline
+        )
+    except _ScanTimeout as exc:
+        # Partial results from the last snapshot (#1247): only the findings
+        # the snapshot itself carries; storage, drift and liveness unmeasured.
+        partial_detail = str(exc)
+        snap_states, registry_tail = exc.snapshot  # type: ignore[misc]
+        states = (
+            snap_states
+            if args.all_machines
+            else [state for state in snap_states if state.machine == config.machine]
+        )
+        attachments, control_findings = registry_tail
+        findings = [dict(item) for item in (*attachments, *control_findings)]
+        if not args.all_machines:
+            findings = [
+                item
+                for item in findings
+                if item["machine"] is None or item["machine"] == config.machine
+            ]
+        hold_results = _load_record_holds(config, snap_states)
+        rows = [
+            _status_record(
+                config,
+                record,
+                hold_result=hold_results[(record.machine, record.slot)],
+                tolerate_hold_error=True,
+                liveness=("unverifiable", "scan timed out before liveness was measured"),
+            )
+            for state in states
+            for record in state.slots
+        ]
     cap = config.max_active_slots
     wt_scope = (
         f"skipped: {config.worktrees_image_skipped}"
@@ -43755,12 +43928,19 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
                     "active": rows,
                     "max_active_slots": cap,
                     "findings": findings,
+                    **(
+                        {"partial": True, "scan_timeout": partial_detail}
+                        if partial_detail is not None
+                        else {}
+                    ),
                 },
                 indent=2,
                 sort_keys=True,
             )
         )
     else:
+        if partial_detail is not None:
+            print(f"PARTIAL: {partial_detail}")
         print(
             f"project={config.root} worktrees={config.worktrees} control={config.control} "
             f"layout={config.layout} "
@@ -43782,8 +43962,9 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             print(f"{item['kind']}: {where}: {item['detail']}")
     # Diagnosis never authorizes anything, so it does not fail the caller for
     # finding problems; a non-zero exit here would push callers toward `|| true`
-    # and lose the real refusals too.
-    return 0
+    # and lose the real refusals too. A scan that passed its wall bound is the
+    # one exception (#1247): partial results must not read as a clean bill.
+    return 2 if partial_detail is not None else 0
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -43805,7 +43986,8 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
             config, require_repository=False, announce=False
         )
     )
-    cache = _PhasedReadCache()
+    deadline = _scan_deadline(args)
+    cache = _PhasedReadCache(deadline=deadline)
 
     def snapshot() -> tuple[
         list[ActiveState], list[str], tuple[StorageInconsistency, ...]
@@ -43876,9 +44058,42 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
         ]
         return states, storage_inconsistencies, records
 
-    (_states, journals, _items), (states, storage_inconsistencies, records) = (
-        _phased_registry_read(config, args.wait_lock, snapshot, measure)
-    )
+    partial_detail: str | None = None
+    try:
+        (_states, journals, _items), (states, storage_inconsistencies, records) = (
+            _phased_registry_read(
+                config, args.wait_lock, snapshot, measure, deadline=deadline
+            )
+        )
+    except _ScanTimeout as exc:
+        # Partial results from the last snapshot (#1247): rows are named, but
+        # liveness and storage were not measured before the bound.
+        partial_detail = str(exc)
+        snap_states, journals, journal_inconsistencies = exc.snapshot  # type: ignore[misc]
+        states = (
+            snap_states
+            if args.all_machines
+            else [state for state in snap_states if state.machine == config.machine]
+        )
+        storage_inconsistencies = tuple(journal_inconsistencies)
+        hold_results = _load_record_holds(config, states)
+        records = [
+            _status_record(
+                config,
+                record,
+                hold_result=hold_results[(record.machine, record.slot)],
+                tolerate_hold_error=True,
+                storage_inconsistencies=tuple(
+                    item
+                    for item in storage_inconsistencies
+                    if item.machine == record.machine and item.slot == record.slot
+                ),
+                liveness=("unverifiable", "scan timed out before liveness was measured"),
+            )
+            for state in states
+            for record in state.slots
+            if args.slot is None or record.slot == args.slot
+        ]
     if tearing_down and not _VERBOSE_DIAGNOSTICS.get():
         print(
             f"wrkslots: {len(tearing_down)} tearing-down PID namespaces ignored",
@@ -43902,12 +44117,19 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
                     "registry_storage_inconsistencies": [
                         item.to_obj() for item in storage_inconsistencies
                     ],
+                    **(
+                        {"partial": True, "scan_timeout": partial_detail}
+                        if partial_detail is not None
+                        else {}
+                    ),
                 },
                 indent=2,
                 sort_keys=True,
             )
         )
-        return 0
+        return 2 if partial_detail is not None else 0
+    if partial_detail is not None:
+        print(f"PARTIAL: {partial_detail}")
     print(
         f"project={config.root} worktrees={config.worktrees} control={config.control} "
         f"layout={config.layout} "
@@ -43943,7 +44165,7 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
     for item in storage_inconsistencies:
         print(f"INCONSISTENT {_format_storage_inconsistency(item)}")
         print(f"  REMEDY: {item.remedy}")
-    return 0
+    return 2 if partial_detail is not None else 0
 
 
 def _finish_journal_owner(raw: Mapping[str, object]) -> ProcessIdentity | None:
@@ -75544,6 +75766,17 @@ usage or audit gate unknown, 3 fail-closed refusal.
         default="human",
         help="output format (default: human)",
     )
+    status.add_argument(
+        "--scan-timeout",
+        type=float,
+        default=_READ_SCAN_TIMEOUT_DEFAULT_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "wall bound for the read-only scan in seconds; past it the command "
+            "prints partial results marked PARTIAL and exits 2 "
+            f"(default: {_READ_SCAN_TIMEOUT_DEFAULT_SECONDS:g})"
+        ),
+    )
     status.set_defaults(handler=_cmd_status)
 
     doctor = subparsers.add_parser(
@@ -75556,6 +75789,17 @@ usage or audit gate unknown, 3 fail-closed refusal.
     )
     doctor.add_argument("--all-machines", action="store_true", help="read every ACTIVE shard")
     doctor.add_argument("--format", choices=("human", "json"), default="human")
+    doctor.add_argument(
+        "--scan-timeout",
+        type=float,
+        default=_READ_SCAN_TIMEOUT_DEFAULT_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "wall bound for the read-only scan in seconds; past it the command "
+            "prints partial results marked PARTIAL and exits 2 "
+            f"(default: {_READ_SCAN_TIMEOUT_DEFAULT_SECONDS:g})"
+        ),
+    )
     doctor.set_defaults(handler=_cmd_doctor)
 
     audit = subparsers.add_parser(
@@ -75646,6 +75890,17 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "evidence is unavailable; blocked live evidence is retained without a finding"
         ),
     )
+    audit.add_argument(
+        "--scan-timeout",
+        type=float,
+        default=_READ_SCAN_TIMEOUT_DEFAULT_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "wall bound for the read-only scan in seconds, separate from the cache "
+            "budgets; past it the command prints partial results marked PARTIAL "
+            f"and exits 2 (default: {_READ_SCAN_TIMEOUT_DEFAULT_SECONDS:g})"
+        ),
+    )
     audit.set_defaults(handler=_cmd_audit)
 
     unpushed = subparsers.add_parser(
@@ -75655,6 +75910,17 @@ usage or audit gate unknown, 3 fail-closed refusal.
     )
     unpushed.add_argument("--slot")
     unpushed.add_argument("--format", choices=("human", "json"), default="human")
+    unpushed.add_argument(
+        "--scan-timeout",
+        type=float,
+        default=_READ_SCAN_TIMEOUT_DEFAULT_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "wall bound for the read-only scan in seconds; past it the command "
+            "prints partial results marked PARTIAL and exits 2 "
+            f"(default: {_READ_SCAN_TIMEOUT_DEFAULT_SECONDS:g})"
+        ),
+    )
     unpushed.set_defaults(handler=_cmd_unpushed)
 
     create = subparsers.add_parser(
