@@ -1049,6 +1049,7 @@ function applyTimelinePage(payload: TimelineResponse, older = false, saved = fal
  */
 
 let lastCachedGroups: readonly (readonly unknown[])[] = [];
+let lastCachedNodes: readonly Element[] = [];
 
 function renderCachedTimeline(): void {
   if (!providerFacts.threading() || selection().view === "threads") return;
@@ -1061,16 +1062,22 @@ function renderCachedTimeline(): void {
     // its root's words again) and redraws, keeping the selection across it instead.
     const list = el("discord-log");
     const groups = glom(shown);
+    // And the rows drawn must still be the ones this redraw left: another path redrawing in
+    // between (a search stepping its read rows aside and back) makes the remembered groups
+    // stale even where the messages themselves never changed.
     const unchanged = groups.length === lastCachedGroups.length
       && groups.every((group, at) => {
         const last = lastCachedGroups[at];
         return last !== undefined && group.length === last.length
           && group.every((message, inGroup) => message === last[inGroup]);
-      });
+      })
+      && list.children.length === lastCachedNodes.length
+      && [...list.children].every((row, at) => row === lastCachedNodes[at]);
     const keptSelection = deps.selectionIn && !unchanged ? deps.selectionIn(list) : null;
     if (!unchanged) {
       list.replaceChildren(...groups.map(discordNode));
       lastCachedGroups = groups;
+      lastCachedNodes = [...list.children];
     }
     if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
     holdingReplyArrows(renderChannelRows);
