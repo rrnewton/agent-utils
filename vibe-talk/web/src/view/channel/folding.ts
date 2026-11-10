@@ -129,6 +129,8 @@ export interface FoldingDependencies {
   markOf(pane: unknown): unknown;
   rowInView(pane: unknown, row: HTMLElement): boolean;
   paneRows(pane: unknown): HTMLElement[];
+  bringIntoView(pane: unknown, row: HTMLElement): void;
+  takeRow(pane: unknown, row: HTMLElement, focus: boolean): void;
   anchorAt(row: HTMLElement): { row: HTMLElement } | null;
   isTextField(node: HTMLElement): boolean;
   nodeWithin(area: HTMLElement, node: HTMLElement): boolean;
@@ -161,6 +163,8 @@ export interface Folding {
   freshScrollTools(): ScrollToolsPass;
   setJumpNewest(wanted: boolean, view?: string, arrived?: number | null): void;
   renderJumpNewest(): void;
+  renderJumpUnread(): void;
+  jumpToUnread(): void;
   visibleFolds(): FoldEntry[];
   holdingScrollTools<T>(draw: () => T): T;
   renderScrollTools(): void;
@@ -506,8 +510,45 @@ export function createFolding(deps: FoldingDependencies): Folding {
     if (button.hasAttribute("data-unsent") !== (unsent !== null)) button.toggleAttribute("data-unsent", unsent !== null);
     deps.renderJumpBookmark();
     deps.refreshReadingJump();
+    renderJumpUnread();
   }
 
+  /**
+   * `#1167 jump-to-unread-chip`. The newest unread row above the screen, or null: the offer is
+   * only for a reader whose whole screen is already read, with unread waiting above it.
+   */
+  function unreadAboveTarget(): HTMLElement | null {
+    if (deps.screen() !== "main" || deps.view() !== "discord" || deps.listEmptied()) return null;
+    const pane = deps.channelPane();
+    const rows = deps.paneRows(pane);
+    if (rows.length === 0) return null;
+    const visible = rows.filter((row) => deps.rowInView(pane, row));
+    if (visible.length === 0 || visible.some((row) => !deps.rowIsRead(row))) return null;
+    const firstVisible = rows.indexOf(visible[0] as HTMLElement);
+    const above = rows.slice(0, firstVisible).filter((row) => !deps.rowIsRead(row));
+    return above.length ? (above[above.length - 1] as HTMLElement) : null;
+  }
+
+  function renderJumpUnread(): void {
+    const chip = el("jump-unread");
+    const shown = unreadAboveTarget() !== null;
+    if (chip.hidden === shown) chip.hidden = !shown;
+    const name = "Jump to the newest unread message above";
+    if (chip.getAttribute("aria-label") !== name) chip.setAttribute("aria-label", name);
+  }
+
+  function jumpToUnread(): void {
+    const target = unreadAboveTarget();
+    if (!target) {
+      renderJumpUnread();
+      return;
+    }
+    deps.readerActed();
+    const pane = deps.channelPane();
+    deps.takeRow(pane, target, true);
+    deps.bringIntoView(pane, target);
+    renderScrollTools();
+  }
 
   function visibleFolds(): FoldEntry[] {
     if (deps.searchLinks()) return [];
@@ -684,7 +725,7 @@ export function createFolding(deps: FoldingDependencies): Folding {
     collapsedLines, summaryRows, expandedIds, jumpNewestWanted, inScrollback,
     foldsOf, setFolded, isFolded, foldable, applySummarizeCollapsed, storedSummarizeCollapsed,
     summariesSettingLanded, renderSummaries, requestVisibleSummaries, setSummaryMode,
-    freshScrollPlace, freshScrollTools, setJumpNewest, renderJumpNewest, visibleFolds,
+    freshScrollPlace, freshScrollTools, setJumpNewest, renderJumpNewest, renderJumpUnread, jumpToUnread, visibleFolds,
     holdingScrollTools, renderScrollTools, setAllFolded, foldStepFromKeyboard,
   };
 }

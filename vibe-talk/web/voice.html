@@ -1065,6 +1065,18 @@
               <span id="jump-bookmark-label">Bookmark</span>
             </button>
             <!--
+              `#1167 jump-to-unread-chip`. The way back up to the newest unread message above the
+              screen, beside the bookmark chip: up only while everything on screen is already read
+              and something above it is not. A tap lands on that message. See `renderJumpUnread`.
+            -->
+            <button id="jump-unread" class="chip" type="button" aria-label="Jump to the newest unread message above" hidden>
+              <svg class="chip-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 19V6" />
+                <path d="M6 11.5 12 5l6 6.5" />
+              </svg>
+              <span id="jump-unread-label">Unread</span>
+            </button>
+            <!--
               `#837 voice-page-jump-to-reading`. The way back to the message being read aloud, playing or
               held, beside the other two ways back: up only while none of the rows it is read in is on the
               screen. A tap brings it back, centred. On a phone it stays while the read plays, when the

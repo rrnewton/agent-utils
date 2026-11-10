@@ -10,6 +10,7 @@ export interface ReadingJumpsDependencies {
   leftLookup(id: string): HTMLElement;
   /** To the bookmark, to where the reader was reading, and back to the reply left. */
   jumpToBookmark(): unknown;
+  jumpToUnread(): unknown;
   jumpToReading(): unknown;
   backToReply(): unknown;
 }
@@ -24,6 +25,7 @@ export interface ReadingJumps {
 export function mountReadingJumps(deps: ReadingJumpsDependencies): ReadingJumps {
   const { listen, unmount } = createListening();
   listen<Event>(deps.lookup("jump-bookmark"), "click", () => deps.jumpToBookmark());
+  listen<Event>(deps.lookup("jump-unread"), "click", () => deps.jumpToUnread());
   listen<Event>(deps.leftLookup("jump-reading"), "click", () => deps.jumpToReading());
   listen<Event>(deps.lookup("back-to-reply"), "click", () => deps.backToReply());
   return { unmount };

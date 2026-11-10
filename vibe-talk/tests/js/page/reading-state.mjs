@@ -469,6 +469,66 @@ test("entering a thread lands on its first unread message, unfolded, at the head
   assert.equal(rowWithId(page, runId(3)).getAttribute("data-collapsed"), "true", "entry opened a message already read");
 });
 
+test("#1167 jump-to-unread-chip: at the foot, with everything on screen read and unread above, the chip jumps to the newest unread above", async () => {
+  const page = newPage();
+  const messages = tallChannel(30);
+  for (const m of messages) if (m.id !== "3" && m.id !== "5") page.dealtWith.add(m.id);
+  await signIn(page);
+  await showDiscord(page, messages);
+  const area = page.el("scroll-area");
+  assert.ok(atBottomOf(area), "the premise: the channel did not open on its newest line");
+  const chip = page.el("jump-unread");
+  assert.equal(chip.hidden, false, "read screen with unread above offered no way up");
+  assert.equal(page.el("jump-unread-label").textContent, "Unread");
+  assert.equal(chip.getAttribute("aria-label"), "Jump to the newest unread message above");
+  const before = statusText(page);
+  await chip.click();
+  await page.settle();
+  const target = rowWithId(page, "5");
+  assert.ok(atTheHead(page, target), "the jump did not land on the newest unread above the screen");
+  assert.equal(chip.hidden, true, "the chip stayed once an unread message was on screen");
+  assert.ok(!atBottomOf(area), "the jump left the reader following the newest line");
+  assert.equal(statusText(page), before, "the jump said something in the status line");
+  page.messages = [...messages, message({ id: "31", content: "said while you were up" })];
+  await pollOnce(page);
+  assert.ok(atTheHead(page, rowWithId(page, "5")), "an arrival after the jump followed the newest line anyway");
+  assert.ok(!atBottomOf(area), "an arrival after the jump took the reader back to the foot");
+});
+
+test("#1167 jump-to-unread-chip: no chip when nothing above is unread, and none while an unread message is on screen", async () => {
+  const allRead = newPage();
+  const messages = tallChannel(30);
+  for (const m of messages) allRead.dealtWith.add(m.id);
+  await signIn(allRead);
+  await showDiscord(allRead, messages);
+  assert.ok(atBottomOf(allRead.el("scroll-area")), "the premise: the all-read channel did not open on its newest line");
+  assert.equal(allRead.el("jump-unread").hidden, true, "the chip showed with nothing unread above");
+
+  const onScreen = newPage();
+  for (const m of messages) if (m.id !== "3" && m.id !== "30") onScreen.dealtWith.add(m.id);
+  await signIn(onScreen);
+  await showDiscord(onScreen, messages);
+  assert.ok(atBottomOf(onScreen.el("scroll-area")), "the premise: the channel did not open on its newest line");
+  assert.equal(onScreen.el("jump-unread").hidden, true, "the chip showed while an unread message was on screen");
+});
+
+test("#1167 jump-to-unread-chip: in a single thread too, at its foot the chip jumps back up to its unread message", async () => {
+  const page = newPage();
+  const messages = runThread(page, { tail: [["own", true], ["agent", true], ["agent", true], ["own", true]] });
+  await enterRunThread(page, messages);
+  const area = page.el("scroll-area");
+  area.scrollTop = area.scrollHeight - area.clientHeight;
+  await area.dispatch("scroll");
+  await page.settle();
+  assert.ok(atBottomOf(area), "the premise: the thread was not taken to its foot");
+  const chip = page.el("jump-unread");
+  assert.equal(chip.hidden, false, "the thread at its foot offered no way up to its unread message");
+  await chip.click();
+  await page.settle();
+  assert.ok(atTheHead(page, rowWithId(page, runId(500))), "the jump did not land on the thread's unread message");
+  assert.equal(chip.hidden, true, "the chip stayed once the unread message was on screen");
+});
+
 test("...a thread with nothing unread opens on its newest message, folded, as it always has", async () => {
   const page = newPage();
   const messages = runThread(page);

@@ -306,6 +306,8 @@ export interface ElementById {
   "jump-newest-label": HTMLSpanElement;
   "jump-reading": HTMLButtonElement;
   "jump-reading-label": HTMLSpanElement;
+  "jump-unread": HTMLButtonElement;
+  "jump-unread-label": HTMLSpanElement;
   "keyboard-debug": HTMLInputElement;
   "keyboard-debug-hint": HTMLParagraphElement;
   "keyboard-debug-readout": HTMLPreElement;

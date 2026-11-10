@@ -388,6 +388,20 @@
   border-color: var(--accent);
 }
 
+/* `#1167 jump-to-unread-chip`. Beside the bookmark chip, in the accent like the way back it is. */
+#jump-unread {
+  position: relative;
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* The same 44px target as the chips beside it, drawn as nothing. */
+#jump-unread::after {
+  content: "";
+  position: absolute;
+  inset: min(0px, calc((100% - 2.75rem) / 2));
+}
+
 #jump-bookmark[data-direction="down"] .bookmark-arrow {
   transform: rotate(180deg);
 }

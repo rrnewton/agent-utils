@@ -2662,6 +2662,8 @@ const folding = createFolding({
   markOf: (pane) => markOf(/** @type {any} */ (pane)),
   rowInView: (pane, row) => rowInView(/** @type {any} */ (pane), row),
   paneRows: (pane) => paneRows(/** @type {any} */ (pane)),
+  bringIntoView: (pane, row) => bringIntoView(/** @type {any} */ (pane), row),
+  takeRow: (pane, row, focus) => takeRow(/** @type {any} */ (pane), row, focus),
   anchorAt,
   isTextField,
   nodeWithin,
@@ -2676,7 +2678,7 @@ const {
   summaryRows, jumpNewestWanted, inScrollback,
   foldsOf, setFolded, isFolded, foldable, applySummarizeCollapsed, storedSummarizeCollapsed,
   summariesSettingLanded, renderSummaries, requestVisibleSummaries, setSummaryMode,
-  setJumpNewest, renderJumpNewest,
+  setJumpNewest, renderJumpNewest, renderJumpUnread, jumpToUnread,
   holdingScrollTools, renderScrollTools, setAllFolded, foldStepFromKeyboard,
 } = folding;
 
@@ -9775,6 +9777,7 @@ application.track(mountReadingJumps({
   lookup: (id) => el(id),
   leftLookup: (id) => leftEl(id),
   jumpToBookmark: () => guardQuietly(jumpToBookmark)(),
+  jumpToUnread: () => jumpToUnread(),
   jumpToReading: () => readingJump.jump(),
   backToReply: () => backToReply(),
 }));

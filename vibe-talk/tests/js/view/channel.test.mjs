@@ -1572,11 +1572,11 @@ test("`#624 voice-page-modularity`: the ways back reach the bookmark, the readin
   const fire = (id) => nodes[id].listeners.map((one) => one.listener({ type: "click" }));
   const act = (name) => (...args) => { log.push(`${name} ${args.length}`); return name; };
   const jumps = mountReadingJumps({ lookup: (id) => target(id), leftLookup: (id) => target(`left:${id}`),
-    jumpToBookmark: act("bookmark"), jumpToReading: act("reading"), backToReply: act("reply") });
-  assert.deepStrictEqual(log, ["listen jump-bookmark click", "listen left:jump-reading click", "listen back-to-reply click"]);
+    jumpToBookmark: act("bookmark"), jumpToUnread: act("unread"), jumpToReading: act("reading"), backToReply: act("reply") });
+  assert.deepStrictEqual(log, ["listen jump-bookmark click", "listen jump-unread click", "listen left:jump-reading click", "listen back-to-reply click"]);
   log.length = 0;
-  assert.deepStrictEqual([...fire("jump-bookmark"), ...fire("left:jump-reading"), ...fire("back-to-reply")], ["bookmark", "reading", "reply"]);
-  assert.deepStrictEqual(log, ["bookmark 0", "reading 0", "reply 0"]);
+  assert.deepStrictEqual([...fire("jump-bookmark"), ...fire("jump-unread"), ...fire("left:jump-reading"), ...fire("back-to-reply")], ["bookmark", "unread", "reading", "reply"]);
+  assert.deepStrictEqual(log, ["bookmark 0", "unread 0", "reading 0", "reply 0"]);
   jumps.unmount();
   assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
 });
