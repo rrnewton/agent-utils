@@ -1,12 +1,12 @@
 ---
-title: "state-home-refusal-test-budget: the reclaim state-home refusal test races the 60-second batch lock budget on a busy host"
+title: 'state-home-refusal-test-budget: the reclaim state-home refusal test races the 60-second batch lock budget on a busy host'
 status: closed
-assignee: mu-createlock
 priority: 2
 issue_type: bug
-created_at: 2026-11-10T03:50:00.000000000+00:00
-updated_at: 2026-11-10T03:53:57.000000000+00:00
-closed_at: 2026-11-10T03:53:57.000000000+00:00
+assignee: mu-createlock
+created_at: 2026-11-10T03:50:00+00:00
+updated_at: 2026-11-10T07:08:58.864511450+00:00
+closed_at: 2026-11-10T03:53:57+00:00
 ---
 
 # Description
@@ -56,3 +56,5 @@ the documented "used its 1-second budget for work before deletion ...
 home. The Rust edition's remove has the same state-home gate
 (`reclaim_state::prepare_reclaim`) but no item budget, and these tests drive
 only the Python edition.
+
+[watermelon-full-preview] 2026-11-09 late ET, mu-gateprio: the sibling test test_remove_reclaims_state_home_and_bundles_unpushed_git in the same file now fails the same way: Refusal "used its 60-second budget" at git rev-parse (pre-deletion checks), at the /proc scan after the path fence, and at git rev-parse --git-path MERGE_HEAD, across one full gate, one exclusive solo, and one plain local pytest on unmodified github/main (49304752) in a nested worktree - pre-existing, independent of #1190. Host load ~52 at the local run. The #1188 fix covered test_remove_refuses_when_a_process_uses_the_state_home; this test drives the same remove-agent-batch budget path and needs the same treatment (test-only budget or --no-lock-budget in the fixture). Evidence: /tmp/gateprio-control-test.log, /tmp/gateprio-rerunP0.log on devbig014.
