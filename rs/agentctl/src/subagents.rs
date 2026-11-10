@@ -13721,6 +13721,33 @@ its drain would also type, so it was not queued",
         }
     }
 
+    /// Whether `pane` is provably the pane a `launch_failed` record
+    /// launched into, from the record's own identity alone: the pane,
+    /// workspace, and cwd all match the record, and the pane still holds
+    /// the recorded harness kind over either the idle shell the harness
+    /// left behind or — only when the launch pinned no harness process
+    /// whose verification could contradict it — the still-running
+    /// harness itself (#1207 codex-start-ready). Requiring the running
+    /// harness and the idle shell at once stranded a native launch whose
+    /// startup wait timed out: the harness kept running, so the shell
+    /// was never idle, and the by-name check then failed because Herdr
+    /// had dropped the agent name. A pinned custom identity keeps the
+    /// stricter proof: its own verification above governs, and a
+    /// replacement process in the pane is refused.
+    fn launch_failed_pane_is_own(&self, record: &AgentRecord, pane: &str) -> Result<bool> {
+        let info = self.client.pane_info(pane)?;
+        let cwd_matches = info.cwd == record.cwd
+            || fs::canonicalize(&info.cwd)
+                .ok()
+                .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.cwd).ok());
+        Ok(info.pane_id == pane
+            && Some(&info.workspace_id) == record.workspace_id.as_ref()
+            && cwd_matches
+            && info.agent.as_deref() == Some(&record.harness)
+            && (record.custom_process_identity.is_none()
+                || self.client.pane_is_idle_shell(pane)?))
+    }
+
     fn checked_or_launch_failed(&self, record: &AgentRecord, pane: &str) -> Result<()> {
         if record.adapter == "herdr-relay"
             && matches!(record.lifecycle.as_str(), "starting" | "launch_failed")
@@ -13751,6 +13778,11 @@ its drain would also type, so it was not queued",
             return Ok(());
         }
         if record.adapter != "herdr-pane" {
+            if record.lifecycle == "launch_failed"
+                && self.launch_failed_pane_is_own(record, pane)?
+            {
+                return Ok(());
+            }
             if record.lifecycle != "launch_failed" || self.client.pane_info(pane)?.agent.is_some() {
                 self.checked(record)?;
             }
@@ -13779,20 +13811,11 @@ its drain would also type, so it was not queued",
                 return Ok(());
             }
         }
-        if record.lifecycle == "launch_failed" && record.pane_reported_by_agentctl {
-            let info = self.client.pane_info(pane)?;
-            let cwd_matches = info.cwd == record.cwd
-                || fs::canonicalize(&info.cwd)
-                    .ok()
-                    .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.cwd).ok());
-            if info.pane_id == pane
-                && Some(&info.workspace_id) == record.workspace_id.as_ref()
-                && cwd_matches
-                && info.agent.as_deref() == Some(&record.harness)
-                && self.client.pane_is_idle_shell(pane)?
-            {
-                return Ok(());
-            }
+        if record.lifecycle == "launch_failed"
+            && record.pane_reported_by_agentctl
+            && self.launch_failed_pane_is_own(record, pane)?
+        {
+            return Ok(());
         }
         if record.lifecycle == "starting" && record.custom_process_identity.is_none() {
             return Err(fail(format!(

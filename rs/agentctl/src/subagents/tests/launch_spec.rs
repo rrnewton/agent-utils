@@ -772,6 +772,39 @@ fn promote_marks_a_failed_relay_launch_running_when_its_pinned_harness_runs() {
 }
 
 #[test]
+fn stop_closes_a_launch_failed_pane_whose_name_was_never_applied() {
+    // #1207 codex-start-ready: the startup wait timed out, Herdr dropped
+    // the agent name, and the harness kept running in the recorded pane.
+    // `stop` must still find that pane by the record's own identity and
+    // close exactly it; a by-name resolution cannot, because the name
+    // was never applied.
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let mut record = fixture.manager().load("worker").unwrap();
+    record.lifecycle = "launch_failed".to_owned();
+    record.error = Some("timed out waiting for agent startup".to_owned());
+    record.pane_reported_by_agentctl = true;
+    let pane = record.pane_id.clone().unwrap();
+    fixture.manager().save(&record).unwrap();
+    fixture
+        .client
+        .agent_get_missing
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    fixture
+        .client
+        .custom_alive
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let stopped = fixture.manager().stop("worker").unwrap();
+    assert_eq!(stopped["pane_closed"], true, "{stopped}");
+    assert_eq!(
+        *fixture.client.closed.lock().unwrap(),
+        vec![pane],
+        "only the recorded pane is closed"
+    );
+    assert!(fixture.manager().load("worker").is_err());
+}
+
+#[test]
 fn deliver_while_working_queues_behind_a_working_claude_behind_a_root_slot_relay() {
     let (fixture, _) = relay_worker_of("claude");
     *fixture.client.relay_verdict.lock().unwrap() =
