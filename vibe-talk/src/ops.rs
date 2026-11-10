@@ -2198,15 +2198,31 @@ async fn read_or_stand_in(
                 }));
             }
             match state.message_cache.claim_refresh(key.clone()) {
-                Some(claim) => spawn_behind_cache_first(
-                    state,
-                    channel,
-                    request,
-                    read,
-                    claim,
-                    key,
-                    held.messages.clone(),
-                ),
+                Some(claim) => {
+                    // `#1227 poll-storm-stale-thread`: the server's own schedule, not the
+                    // page's read rate, starts the refresh. Inside its period (or a failure's
+                    // back-off) the answer stands as it is and no upstream read begins. The
+                    // schedule is spent only when a refresh really starts: a read that finds
+                    // one already running leaves the schedule as it found it.
+                    let view_key = RefreshKey::view(
+                        channel.clone(),
+                        request.view,
+                        request.thread_id.as_deref(),
+                    );
+                    if state.refresh_schedule.try_schedule(&view_key) {
+                        spawn_behind_cache_first(
+                            state,
+                            channel,
+                            request,
+                            read,
+                            claim,
+                            key,
+                            held.messages.clone(),
+                        );
+                    } else {
+                        drop(read);
+                    }
+                }
                 // One already running (a served page's refresh, an earlier answer's read, a read
                 // that waited): that one fills the cache. Only the read behind an answer from the
                 // cache lands for the next read; after the others the next read reads again, as it
@@ -2388,8 +2404,14 @@ fn spawn_behind_cache_first(
                 .message_cache
                 .cache()
                 .map_or_else(crate::store::now_ms, |cache| cache.now_ms());
+            let view_key = RefreshKey::view(
+                channel.clone(),
+                request.view,
+                request.thread_id.as_deref(),
+            );
             match read.run().await {
                 Ok((page, position)) => {
+                    state.refresh_schedule.note_outcome(&view_key, true);
                     note_upstream_read(&state.message_cache, &channel, &request, &page, noted_ms);
                     state.landed.keep(
                         key,
@@ -2407,6 +2429,7 @@ fn spawn_behind_cache_first(
                     publish_serve_corrections(&state, &channel, served).await;
                 }
                 Err(error) if stand_in_for(&error).is_none() => {
+                    state.refresh_schedule.note_outcome(&view_key, false);
                     // An expired cursor or an access answer: the next read answers with it, as it
                     // would have read it itself, where the page learns to read the newest page or
                     // that the channel is gone. Never hidden behind the cache for good.
@@ -2436,6 +2459,7 @@ fn spawn_behind_cache_first(
                     );
                 }
                 Err(error) => {
+                    state.refresh_schedule.note_outcome(&view_key, false);
                     tracing::info!(
                         consumer = "cache_first",
                         view = ?request.view,

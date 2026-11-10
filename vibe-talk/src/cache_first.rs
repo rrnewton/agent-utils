@@ -25,7 +25,11 @@
 //! nobody had opened went to the provider first and waited out its rate limits on the request.
 //!
 //! The upstream read it stands for is begun behind the answer, one per view at a time (the
-//! refresh claim, as every read of a view shares it), and fills the cache. Its answer is kept here
+//! refresh claim, as every read of a view shares it), and fills the cache. `#1227
+//! poll-storm-stale-thread`: only on this server's own schedule ([`RefreshSchedule`]) — at
+//! most one refresh of a view per poll period, backed off after failures — never merely
+//! because a page read again, so a failing route cannot be kept busy by the reads waiting
+//! on it. The page's answer still says the copy may be stale; it no longer asks sooner. Its answer is kept here
 //! for [`LANDED_KEPT`] ([`Landed`]): the next read of the same view from the same cursor, the
 //! page's own soon read, is answered with it, once, as if it had joined that read. So a cold load
 //! paints from the cache in one round trip to this server, and a few seconds later lands the
@@ -57,6 +61,111 @@ use crate::cache::sink::RefreshKey;
 use crate::read_reason::ReadReason;
 use crate::threads::{TimelinePage, TimelineRequest, TimelineView};
 use crate::timeline_forward::GenericPosition;
+
+/// How often the server starts an upstream refresh of one view behind answers from the cache:
+/// the page's normal poll cadence, so a view is refreshed at most once per poll period however
+/// often pages read it. `#1227 poll-storm-stale-thread`.
+pub const REFRESH_EVERY: Duration = Duration::from_secs(45);
+
+/// The first back-off after a failed refresh of a view; each further failure doubles it, to
+/// [`REFRESH_BACKOFF_MAX`]. A success clears it. `#1227 poll-storm-stale-thread`.
+pub const REFRESH_BACKOFF_BASE: Duration = Duration::from_secs(60);
+
+/// The longest back-off after repeated failed refreshes of a view. `#1227 poll-storm-stale-thread`.
+pub const REFRESH_BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+/// When each view may next be refreshed upstream, and how its refreshes have fared: the server's
+/// own schedule for the reads it begins behind answers from the cache, so a page's read rate
+/// never sets the upstream read rate. One entry per view read. `#1227 poll-storm-stale-thread`.
+#[derive(Debug, Default)]
+pub struct RefreshSchedule {
+    slots: Mutex<HashMap<RefreshKey, Slot>>,
+}
+
+/// One view's place in [`RefreshSchedule`].
+#[derive(Debug)]
+struct Slot {
+    /// When the view may next be refreshed.
+    next_at: Instant,
+    /// Failed refreshes in a row.
+    failures: u32,
+}
+
+impl RefreshSchedule {
+    /// Nothing scheduled yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether a refresh of `view` may start now; when it may, this attempt is the one
+    /// scheduled, and the next may not start for [`REFRESH_EVERY`] (or the back-off a failure
+    /// sets). Atomic, so two page reads at once schedule one refresh.
+    #[must_use]
+    pub fn try_schedule(&self, view: &RefreshKey) -> bool {
+        let now = Instant::now();
+        let mut inner = self.lock();
+        match inner.get_mut(view) {
+            Some(slot) if slot.next_at > now => false,
+            Some(slot) => {
+                slot.next_at = now + REFRESH_EVERY;
+                true
+            }
+            None => {
+                inner.insert(
+                    view.clone(),
+                    Slot {
+                        next_at: now + REFRESH_EVERY,
+                        failures: 0,
+                    },
+                );
+                true
+            }
+        }
+    }
+
+    /// Note how the refresh of `view` begun by [`Self::try_schedule`] ended: a success clears
+    /// its back-off; a failure backs the next attempt off, doubling to [`REFRESH_BACKOFF_MAX`].
+    pub fn note_outcome(&self, view: &RefreshKey, answered: bool) {
+        let now = Instant::now();
+        let mut inner = self.lock();
+        let slot = inner.entry(view.clone()).or_insert(Slot {
+            next_at: now + REFRESH_EVERY,
+            failures: 0,
+        });
+        if answered {
+            slot.failures = 0;
+            return;
+        }
+        slot.failures = slot.failures.saturating_add(1);
+        let shift = slot.failures.saturating_sub(1).min(16);
+        let backoff = REFRESH_BACKOFF_BASE
+            .saturating_mul(1u32 << shift)
+            .min(REFRESH_BACKOFF_MAX)
+            .max(REFRESH_EVERY);
+        slot.next_at = slot.next_at.max(now + backoff);
+    }
+
+    /// Whether a refresh of `view` may start now, without scheduling one. For tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_due(&self, view: &RefreshKey) -> bool {
+        let now = Instant::now();
+        self.lock().get(view).is_none_or(|slot| slot.next_at <= now)
+    }
+
+    /// Make every view's next refresh `by` sooner. For tests of the back-off.
+    #[doc(hidden)]
+    pub fn age(&self, by: Duration) {
+        for slot in self.lock().values_mut() {
+            slot.next_at = slot.next_at.checked_sub(by).unwrap_or(slot.next_at);
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<RefreshKey, Slot>> {
+        self.slots.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// How long an upstream read begun behind an answer from the cache answers the next read after it.
 /// The page reads again 3 s and then 10 s after such an answer, so the second of those finds a
@@ -385,6 +494,35 @@ mod tests {
         landed.note_read(view(), 9, now);
         landed.note_read(view(), 7, now);
         assert_eq!(landed.read_ms(&view()), Some(9));
+    }
+
+    #[test]
+    fn a_view_refreshes_once_per_period_however_often_it_is_read() {
+        let schedule = RefreshSchedule::new();
+        assert!(schedule.try_schedule(&view()), "the first refresh");
+        assert!(!schedule.try_schedule(&view()), "a read a moment later");
+        schedule.age(REFRESH_EVERY);
+        assert!(schedule.try_schedule(&view()), "one period on");
+    }
+
+    #[test]
+    fn a_failed_refresh_backs_off_and_a_success_clears_it() {
+        let schedule = RefreshSchedule::new();
+        assert!(schedule.try_schedule(&view()));
+        schedule.note_outcome(&view(), false);
+        schedule.age(REFRESH_EVERY);
+        assert!(
+            !schedule.try_schedule(&view()),
+            "still backed off one period after a failure"
+        );
+        schedule.age(REFRESH_BACKOFF_MAX);
+        assert!(schedule.try_schedule(&view()), "the back-off ends");
+        schedule.note_outcome(&view(), true);
+        schedule.age(REFRESH_EVERY);
+        assert!(
+            schedule.try_schedule(&view()),
+            "success cleared the back-off"
+        );
     }
 
     #[tokio::test]

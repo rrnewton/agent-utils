@@ -401,6 +401,7 @@ fn state_pieces_with(
         voice_tickets: Arc::new(crate::voice_tickets::VoiceTickets::new()),
         read_ahead: Arc::new(crate::read_ahead::ReadAhead::new()),
         landed: Arc::new(crate::cache_first::Landed::new()),
+        refresh_schedule: Arc::new(crate::cache_first::RefreshSchedule::new()),
         recent_view_shadow: Arc::new(crate::recent_view::Shadow::new()),
         agent_override: Arc::new(crate::voice_prompt::OverrideAnswers::new()),
         voice_bridge,

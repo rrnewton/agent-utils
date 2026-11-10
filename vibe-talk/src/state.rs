@@ -96,6 +96,10 @@ pub struct AppState {
     /// message cache, for the page's next read of the same view. `#622 cache-first-reads`; see
     /// [`crate::cache_first`].
     pub landed: Arc<crate::cache_first::Landed>,
+    /// When each view may next be refreshed upstream behind an answer from the cache, and how
+    /// its refreshes have fared. `#1227 poll-storm-stale-thread`; see
+    /// [`crate::cache_first::RefreshSchedule`].
+    pub refresh_schedule: Arc<crate::cache_first::RefreshSchedule>,
     /// The letters standing in for the long ids and hashes in channel text.
     ///
     /// Here rather than per request because the point of a letter is that it means the same account

@@ -143,23 +143,18 @@ test("`#624 voice-page-modularity`: the order timeline reads were sent in, from 
   assert.equal(order.now(), 2.5, "something put in now did not stand between reads");
 });
 
-test("`#624 voice-page-modularity`: the quick retries after a stand-in read, from the module alone", () => {
-  const { createStandInRetries, STAND_IN_RETRY_MS, DISCORD_POLL_MS } = SYNC;
+test("`#1227 poll-storm-stale-thread`: a stand-in read never shortens the poll, from the module alone", () => {
+  const { createStandInRetries, DISCORD_POLL_MS } = SYNC;
   const retries = createStandInRetries();
   assert.equal(retries.take(DISCORD_POLL_MS), DISCORD_POLL_MS, "a poll came early with no stand-in read before it");
-  // Each stand-in read wants the next quick retry, until they are spent.
-  const waits = [];
-  for (let read = 0; read <= STAND_IN_RETRY_MS.length; read += 1) {
-    const wanted = retries.noteRead(true);
-    waits.push([wanted, retries.take(DISCORD_POLL_MS)]);
+  // However many stale answers land in a row, the wait stays the normal cadence.
+  for (let read = 0; read < 5; read += 1) {
+    assert.equal(retries.noteRead(true), false, "a stand-in read wanted a sooner poll");
+    assert.equal(retries.take(DISCORD_POLL_MS), DISCORD_POLL_MS, "the poll was shortened after a stand-in read");
   }
-  assert.deepStrictEqual(waits, [...STAND_IN_RETRY_MS.map((ms) => [true, ms]), [false, DISCORD_POLL_MS]]);
-  // A shorter wait already armed is kept; a current read starts the retries again.
-  retries.noteRead(false);
-  assert.equal(retries.noteRead(true), true, "a current read did not start the quick retries again");
-  assert.equal(retries.take(1000), 1000);
+  assert.equal(retries.take(1000), 1000, "a shorter wait already armed was lengthened");
   assert.equal(retries.noteRead(false), false);
-  assert.equal(retries.take(DISCORD_POLL_MS), DISCORD_POLL_MS, "a retry wanted before a current read was still taken");
+  assert.equal(retries.take(DISCORD_POLL_MS), DISCORD_POLL_MS);
 });
 
 test("`#624 voice-page-modularity`: which read a refresh makes, and how fresh it is, from the module alone", () => {

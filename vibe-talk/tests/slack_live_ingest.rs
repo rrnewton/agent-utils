@@ -190,6 +190,65 @@ async fn relist(state: &AppState) -> vibe_talk::relist::RelistPass {
     .await
 }
 
+/// `#1227 poll-storm-stale-thread`: with the event stream dropped (no records pushed at
+/// all), the poller's next tick still publishes a thread reply that arrived upstream and a
+/// reaction added to a message it holds — the live path, not a page poll, carries both.
+#[tokio::test]
+async fn with_the_stream_dropped_a_tick_publishes_a_thread_reply_and_a_reaction() {
+    let fake = Fake::start(fixture(), 20).await;
+    let state = deployment(&fake, "");
+    let mut cursor = seeded(&state).await;
+    let root = fake.with(|fake| fake.history[CH][4]["ts"].as_str().expect("ts").to_owned());
+    let root_id = id_of(&root);
+
+    // Upstream only: a reply in the root's thread, and a reaction on the root. Nothing is
+    // pushed to this server.
+    fake.with(|fake| {
+        slack_fake::add_reply(fake, CH, &root, &now_ts(0, 700), "while you were gone");
+        let message = fake
+            .history
+            .get_mut(CH)
+            .expect("history")
+            .iter_mut()
+            .find(|message| message["ts"] == root)
+            .expect("the root");
+        message["reactions"] = json!([{"name": "eyes", "users": ["UGRACE001"], "count": 1}]);
+    });
+
+    let tick = poll_once(
+        state.chat.as_ref(),
+        &state.live,
+        &channel(),
+        LIMIT,
+        &mut cursor,
+    )
+    .await
+    .expect("the tick reads");
+    assert!(tick.published > 0, "the tick published: {tick:?}");
+    let events = published(&state);
+    let reply = events
+        .iter()
+        .find(|event| event.message.content == "while you were gone")
+        .expect("the thread reply was published");
+    assert_eq!(reply.kind, LiveKind::Create);
+    let thread = reply.message.thread.as_ref().expect("a thread");
+    assert_eq!((thread.id.as_str(), thread.is_root), (root.as_str(), false));
+    let reacted = events
+        .iter()
+        .rev()
+        .find(|event| event.message.id == root_id)
+        .and_then(|event| event.message.reactions.clone())
+        .unwrap_or_default();
+    assert_eq!(
+        reacted
+            .iter()
+            .map(|reaction| (reaction.emoji.as_str(), reaction.count))
+            .collect::<Vec<_>>(),
+        [("👀", 1)],
+        "the reaction was published: {events:?}"
+    );
+}
+
 /// Seed the poller as its first tick does, and return its cursor.
 async fn seeded(state: &AppState) -> Option<u64> {
     let mut cursor = None;

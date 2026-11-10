@@ -45,7 +45,8 @@ export function createFreshRead(deps: FreshReadDependencies): FreshRead {
    *
    * `#617 cold-load-first-paint`: a page from the server's own copy says "Refresh failed" only when
    * that copy is older than `STALE_AS_OF_MS`; a younger one is as current as the pill says ("Updated"
-   * at the copy's time). Either way the next read comes soon (`STAND_IN_RETRY_MS`).
+   * at the copy's time). The next read comes at the normal poll cadence either way
+   * (`#1227 poll-storm-stale-thread`): a stale copy never makes the page ask sooner.
    */
   function noteFreshRead(payload: ReadPayload): void {
     const decision = deps.timelineReader.freshDecision(payload);

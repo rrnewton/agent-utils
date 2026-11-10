@@ -830,6 +830,7 @@ async fn main() -> anyhow::Result<()> {
         voice_tickets: Arc::new(vibe_talk::voice_tickets::VoiceTickets::new()),
         read_ahead: Arc::new(vibe_talk::read_ahead::ReadAhead::new()),
         landed: Arc::new(vibe_talk::cache_first::Landed::new()),
+        refresh_schedule: Arc::new(vibe_talk::cache_first::RefreshSchedule::new()),
         recent_view_shadow: Arc::new(vibe_talk::recent_view::Shadow::new()),
         agent_override: Arc::new(vibe_talk::voice_prompt::OverrideAnswers::new()),
         voice_bridge,

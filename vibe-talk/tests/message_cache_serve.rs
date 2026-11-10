@@ -2172,6 +2172,109 @@ async fn landed(state: &AppState, key: &RefreshKey, after: Option<&str>) {
     .expect("the read behind the answer landed");
 }
 
+/// `#1227 poll-storm-stale-thread`: with the replies route rate-limited, repeated reads of an
+/// open thread are answered from the cache at once, say so, and start ONE upstream read between
+/// them — the server's schedule, not the read rate, sets the upstream rate. When the limit
+/// lifts and the schedule's back-off passes, a later read brings what arrived, with no reload.
+#[tokio::test]
+async fn repeated_thread_reads_under_a_rate_limit_start_one_upstream_read_and_recover() {
+    let (state, fake, clock, _dir) = slack_threads_deployment("thread-poll-storm", false).await;
+    state.message_cache.set_serve(true);
+    // Listed longer ago than a live-fed view reads nothing behind (`#695 vt-behind-reads`), so
+    // these reads would each refresh behind their answers if the schedule let them.
+    clock.advance(vibe_talk::ops::LISTED_FRESH.as_millis() as i64 + SECOND);
+    let root = slack_fake::ts(60, 0);
+    let thread_path = path(
+        SLACK_CH,
+        &format!("/timeline?view=thread&thread_id={root}&limit=50&reason=side"),
+    );
+    // A one-second Retry-After: long enough to fail every refresh behind these reads, short
+    // enough that the recovery below need not wait it out in real time.
+    fake.with(|fixture| {
+        fixture
+            .rate_limit_many
+            .insert("conversations.replies".to_owned(), (1, usize::MAX));
+    });
+    let replies = fake.calls("conversations.replies");
+
+    for _ in 0..5 {
+        let body = ok(&state, &thread_path, WRITE_TOKEN).await;
+        assert!(
+            body["refresh_failed"].is_string(),
+            "the stale copy says so: {body}"
+        );
+        settled(&state).await;
+    }
+    assert_eq!(
+        fake.calls("conversations.replies"),
+        replies + 1,
+        "five page reads started one upstream thread read, not five"
+    );
+    quiet(
+        &state,
+        &RefreshKey::timeline(
+            ChannelId(SLACK_CH.to_owned()),
+            TimelineView::Thread,
+            Some(&root),
+            50,
+        ),
+    )
+    .await;
+
+    // The limit lifts and a reply arrives upstream; past the back-off the next scheduled
+    // refresh lands it, and the read after it shows it.
+    fake.with(|fixture| {
+        fixture.rate_limit_many.remove("conversations.replies");
+        slack_fake::add_reply(
+            fixture,
+            SLACK_CH,
+            &root,
+            &slack_fake::ts(90, 0),
+            "late reply",
+        );
+    });
+    state
+        .refresh_schedule
+        .age(vibe_talk::cache_first::REFRESH_BACKOFF_MAX);
+    assert!(
+        state.refresh_schedule.is_due(&RefreshKey::view(
+            ChannelId(SLACK_CH.to_owned()),
+            TimelineView::Thread,
+            Some(&root),
+        )),
+        "the back-off has passed"
+    );
+    let before_recovery = fake.calls("conversations.replies");
+    let probe = ok(&state, &thread_path, WRITE_TOKEN).await;
+    assert!(probe["messages"].is_array(), "probe read: {probe}");
+    // Successive polls, each past the schedule's back-off (aged, as time passing would age
+    // it): while the provider's budget still holds the route after its last rate limit
+    // (`slack::budget::LIMITING_WINDOW`) a refresh fails without sending, and the next poll's
+    // refresh is the one that lands the reply — no reload anywhere.
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    let body = loop {
+        state
+            .refresh_schedule
+            .age(vibe_talk::cache_first::REFRESH_BACKOFF_MAX);
+        let _ = ok(&state, &thread_path, WRITE_TOKEN).await;
+        settled(&state).await;
+        let body = ok(&state, &thread_path, WRITE_TOKEN).await;
+        if texts(&body).iter().any(|text| text == "late reply") {
+            break body;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the thread never recovered: {body}"
+        );
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    };
+    assert!(
+        fake.calls("conversations.replies") > before_recovery,
+        "a scheduled refresh read upstream again"
+    );
+    let _ = body;
+}
+
 #[tokio::test]
 async fn slack_s_all_the_cache_holds_is_answered_at_once_and_the_read_behind_it_lands_for_the_next()
 {
@@ -2732,7 +2835,12 @@ async fn an_answer_from_the_cache_is_dated_by_the_last_upstream_read_that_answer
 
     // It answers again: the catch-up behind lands for the next read from that cursor, and the
     // read after it, from the cache again, is as new as that catch-up, which listed nothing.
+    // `#1227 poll-storm-stale-thread`: the failed refreshes backed the view's schedule off, so
+    // the recovery read comes once that has passed (aged here, as the minutes would age it).
     d.chat.fail_timelines(None);
+    d.state
+        .refresh_schedule
+        .age(vibe_talk::cache_first::REFRESH_BACKOFF_MAX);
     ok(&d.state, &poll(&after), WRITE_TOKEN).await;
     landed(&d.state, &forward, Some(&after)).await;
     let body = ok(&d.state, &poll(&after), WRITE_TOKEN).await;

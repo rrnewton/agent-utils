@@ -1110,10 +1110,10 @@ function mutationAwaitsRead(): boolean {
 // Whether the server can no longer continue from a cursor (`isCursorRefusal`) is web/src/core/sync's.
 
 /**
- * `#617 cold-load-first-paint`. After a page the server answered from its own copy, the next reads
- * come soon, one after the other, rather than at the next poll (`STAND_IN_RETRY_MS`): how many have
- * been spent, and whether the next poll should be one, are web/src/core/sync's (`createStandInRetries`,
- * `#624 voice-page-modularity`).
+ * After a page the server answered from its own copy, the next read comes at the normal poll
+ * cadence: whether a stand-in answer ever shortens that wait is web/src/core/sync's
+ * (`createStandInRetries`, `#624 voice-page-modularity`); since `#1227 poll-storm-stale-thread`
+ * it never does — the server refreshes on its own schedule and pushes what it brings.
  *
  * @type {import("./src/core/sync/index.ts").StandInRetries}
  */
