@@ -1,13 +1,14 @@
 ---
 title: 'wrkslots-lock-scope: gather salvage and census before the configuration lock'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
 - wrkslots
 - lock-scope
 created_at: 2026-11-10T07:01:50.445436710+00:00
-updated_at: 2026-11-10T07:01:50.445436710+00:00
+updated_at: 2026-11-10T15:04:16.944495946+00:00
+closed_at: 2026-11-10T15:04:16.944495655+00:00
 ---
 
 # Description
