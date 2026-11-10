@@ -5514,6 +5514,19 @@ const TUNING_BANDS = {
   MAX_READING_CH: [80, 240, "the widest; past a couple of hundred characters a line is unreadable"],
   DEFAULT_READING_CH: [45, 120,
     "what an unconfigured reader gets, and it has to be a width that is actually offered"],
+  MIN_TWO_COLUMN_SPLIT: [20, 40,
+    "the least of the window the left column may be dragged to (#1186 two-column-splitter): past " +
+    "two fifths the column it leaves is too narrow to read, and the drag's own floor is in pixels"],
+  MAX_TWO_COLUMN_SPLIT: [60, 80,
+    "the most of the window the left column may be dragged to (#1186 two-column-splitter): past " +
+    "four fifths the right column is too narrow to read, and the drag's own ceiling is in pixels"],
+  DEFAULT_TWO_COLUMN_SPLIT: [40, 60,
+    "half and half until the reader drags the separator (#1186 two-column-splitter), and it has " +
+    "to be a split the drag is allowed to reach"],
+  MIN_COLUMN_PX: [200, 450,
+    "the narrowest either column may be dragged to (#1186 two-column-splitter): under a couple " +
+    "of hundred pixels no column holds a readable line, and past half the narrowest two-column " +
+    "window the two floors together leave nothing to drag"],
   SUSPENSION_GRACE_MS: [500, 5000,
     "below about half a second it misses the close iOS delivers on the way back; above a few " +
     "seconds it excuses genuine failures the reader watched happen"],

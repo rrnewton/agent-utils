@@ -117,6 +117,29 @@ function clampReadingWidth(value: unknown): number {
 }
 
 /**
+ * `#1186 two-column-splitter`. Where the separator between the desk's two columns stands, as a
+ * PERCENTAGE of the main screen's width taken by the left column. Fifty until the reader drags
+ * it; the ends keep each column at least 300px wide in the narrowest window that shows two
+ * columns at all (1000px), and the drag clamps to 300px a side at the window's actual width.
+ */
+const MIN_TWO_COLUMN_SPLIT = 30;
+const MAX_TWO_COLUMN_SPLIT = 70;
+const DEFAULT_TWO_COLUMN_SPLIT = 50;
+
+/** A split this page will actually apply, read as `clampReadingWidth` reads its width. */
+function clampTwoColumnSplit(value: unknown): number {
+  const text = typeof value === "string" ? value.trim() : value;
+  if (text === "" || text === null || text === undefined) {
+    return DEFAULT_TWO_COLUMN_SPLIT;
+  }
+  const pct = Number(text);
+  if (!Number.isFinite(pct)) {
+    return DEFAULT_TWO_COLUMN_SPLIT;
+  }
+  return Math.min(MAX_TWO_COLUMN_SPLIT, Math.max(MIN_TWO_COLUMN_SPLIT, Math.round(pct)));
+}
+
+/**
  * How fast a message is read, as a PERCENTAGE, or null for "however the agent speaks".
  *
  * The bounds match the server's own clamp: below half the words stop being words, above double the
@@ -137,22 +160,26 @@ export {
   DEFAULT_MSG_SCALE,
   DEFAULT_QUOTE_READ_PERCENT,
   DEFAULT_READING_CH,
+  DEFAULT_TWO_COLUMN_SPLIT,
   MAX_CARD_MAX_LINES,
   MAX_COLLAPSED_LINES,
   MAX_MSG_SCALE,
   MAX_QUOTE_READ_PERCENT,
   MAX_READING_CH,
   MAX_READ_SPEED,
+  MAX_TWO_COLUMN_SPLIT,
   MIN_CARD_MAX_LINES,
   MIN_COLLAPSED_LINES,
   MIN_MSG_SCALE,
   MIN_QUOTE_READ_PERCENT,
   MIN_READING_CH,
   MIN_READ_SPEED,
+  MIN_TWO_COLUMN_SPLIT,
   clampCardMaxLines,
   clampCollapsedLines,
   clampMsgScale,
   clampQuoteReadPercent,
   clampReadSpeed,
   clampReadingWidth,
+  clampTwoColumnSplit,
 };

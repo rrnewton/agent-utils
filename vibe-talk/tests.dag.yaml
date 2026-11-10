@@ -2050,6 +2050,26 @@ steps:
   # anchor across arrivals and resizes and typing again lands whole; on the desktop the same without a
   # keyboard, unfocused keys navigating; and hover crossings and rests between the two columns scroll
   # neither. Measured on 2026-11-09: about 25s wall.
+  # `#1186 two-column-splitter` in the browser engine, at 1280x800: the separator between the two
+  # columns dragged with the mouse narrows and widens them while each column's first on-screen row
+  # stays the same row at the same height, stops with neither column under 300px past either edge,
+  # double-clicks back to half and half, moves a point per arrow key from its focus with
+  # aria-valuenow saying where it stands, and survives a reload on the device.
+  - group: check
+    job: two-column-splitter-browser
+    desc: dragging the two columns' separator resizes them with neither column's anchor row moving, clamps at 300px a column, resets on double-click, moves by arrow keys, and persists across a reload, in current Chromium at 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/two_column_splitter_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 25
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   - group: check
     job: typing-scroll-browser
     desc: typing at the foot keeps the whole composer in view across arrivals, keyboard resizes and late row growth, reading scrollback holds, and hover scrolls neither column, in current Chromium at 412x915, 360x800 and 1280x800

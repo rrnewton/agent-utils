@@ -1552,6 +1552,28 @@ const twoColumns = createTwoColumns({
 });
 const { sideColumnUp, threadListOnScreen, sideThreads, sideShowing, COLUMNS_TOO_NARROW, inThisColumn, columnSteps, eachColumn, inOtherColumn, followInOtherColumn, threadListOffered, columnsOffered, renderColumnToggle, sideHasBox, toggleHasBox, renderColumns, moveLayout, leftColumnPlace, keepLeftColumnPlace, sameLeftPlace, setLayout, noteListBefore, oneColumnBeforeList, columnsFromKeyboard, toggleColumns, chooseView, chooseOneColumn, showOneColumnView, recordViewChoice, leftColumnToMain, enterColumns, leaveColumns, showOneColumnLeft, enterThreadList, renderSideMode, renderSideColumn, sideThreadChoice } = twoColumns;
 
+/**
+ * The separator between the two columns, dragged to change their widths: web/src/view/channel's
+ * now (`createColumnSplitter`, `#1186 two-column-splitter`). Kept on the device with the other
+ * client settings; applied here, before anything is drawn, as the stored settings are.
+ *
+ * @type {import("./src/view/channel/index.ts").ColumnSplitter}
+ */
+const columnSplitter = createColumnSplitter({
+  lookup: (id) => leftEl(id),
+  keep: (pct) => deviceSettings().keep(DEVICE_SETTINGS.twoColumnSplit, pct),
+  clampSplit: (value) => clampTwoColumnSplit(value),
+  defaultSplit: DEFAULT_TWO_COLUMN_SPLIT,
+  columnsOn: () => layoutShown.columns(),
+  mainColumn: () => columns.main,
+  sideColumn: () => columns.side,
+  inColumn: (column, act) => inColumn(/** @type {any} */ (column), act),
+  readerPlace: () => readerPlace(),
+  keepReaderPlace: (place) => keepReaderPlace(/** @type {any} */ (place)),
+  scheduleColumnLinks: () => scheduleColumnLinks(),
+});
+columnSplitter.apply(deviceSettings().get(DEVICE_SETTINGS.twoColumnSplit));
+
 /** The right column's cards are web/src/view/channel's now (`createSideCards`, `#624`). */
 const sideCards = createSideCards({
   leftEl: (id) => leftEl(id),
@@ -10973,6 +10995,17 @@ application.track(mountScreenControls({
   gripMove: (event) => readingWidthControl.gripMove(event),
   gripUp: () => readingWidthControl.gripUp(),
   gripKey: (event) => readingWidthControl.gripKey(event),
+}));
+// The two columns' separator: its drag, its keys and its double-click reset (`#1186
+// two-column-splitter`). One owner in web/src/view/channel/splitter.ts (`#624
+// voice-page-modularity`), mounted here, in the page's order.
+application.track(mountColumnSplitterControls({
+  lookup: (id) => leftEl(id),
+  down: (event) => columnSplitter.down(event),
+  move: (event) => columnSplitter.move(event),
+  up: () => columnSplitter.up(),
+  key: (event) => columnSplitter.key(event),
+  doubleClick: () => columnSplitter.doubleClick(),
 }));
 
 // The page's last document-level listeners (`#54 resume-recovery`): the page

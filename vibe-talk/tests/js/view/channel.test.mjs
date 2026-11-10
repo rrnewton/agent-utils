@@ -2570,3 +2570,61 @@ test("`#1144 scrollback-typing-jump`: the scroll trace wraps, rings and restores
     "what was traced stays for the report, and nothing joins it");
   assert.equal(main.scrollTop, 999, "the write itself still landed");
 });
+
+test("`#1186 two-column-splitter`: the separator drags, clamps, keeps each column's place, and resets, from the module alone", () => {
+  const { createColumnSplitter } = CHANNEL_VIEW;
+  const clampSplit = (value) => {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.min(70, Math.max(30, Math.round(n))) : 50;
+  };
+  const attrs = new Map();
+  const separator = {
+    setAttribute: (name, value) => attrs.set(name, String(value)),
+    setPointerCapture: () => {},
+    getBoundingClientRect: () => ({ left: 0, width: 1000 }),
+  };
+  const vars = new Map();
+  const screenMain = {
+    style: { setProperty: (name, value) => vars.set(name, value) },
+    getBoundingClientRect: () => ({ left: 0, width: 1000 }),
+  };
+  const kept = [];
+  const places = { main: { seen: [{ ids: ["m1"], top: 100 }] }, side: { seen: [{ ids: ["s1"], top: 200 }] } };
+  const restored = [];
+  let working = "main";
+  const splitter = createColumnSplitter({
+    lookup: (id) => (id === "column-splitter" ? separator : screenMain),
+    keep: (value) => kept.push(value),
+    clampSplit,
+    defaultSplit: 50,
+    columnsOn: () => true,
+    mainColumn: () => "main",
+    sideColumn: () => "side",
+    inColumn: (column, act) => { const before = working; working = column; try { return act(); } finally { working = before; } },
+    readerPlace: () => places[working],
+    keepReaderPlace: (place) => { restored.push([working, place]); return true; },
+    scheduleColumnLinks: () => {},
+  });
+  assert.equal(splitter.apply(140), 70, "apply did not clamp to the widest split");
+  assert.equal(vars.get("--two-column-split"), "70%");
+  assert.equal(attrs.get("aria-valuenow"), "70");
+  splitter.apply(50);
+  // A drag to 300px of a 1000px screen: the percentage floor (30) and the pixel floor agree.
+  splitter.down({ pointerId: 1, preventDefault: () => {} });
+  restored.length = 0;
+  splitter.move({ clientX: 300 });
+  assert.equal(splitter.split(), 30);
+  assert.deepStrictEqual(restored, [["main", places.main], ["side", places.side]],
+    "the drag did not put each column's reader back on the place it read before the width changed");
+  // Past the right edge the left column stops at its widest, never wider.
+  splitter.move({ clientX: 990 });
+  assert.equal(splitter.split(), 70);
+  splitter.up();
+  assert.deepStrictEqual(kept, [70], "the split was not kept once, where the drag stopped");
+  // The keys move it a point at a time and keep as they go; double-click is half and half again.
+  splitter.key({ key: "ArrowLeft", preventDefault: () => {} });
+  assert.equal(splitter.split(), 69);
+  splitter.doubleClick();
+  assert.equal(splitter.split(), 50);
+  assert.equal(kept[kept.length - 1], 50);
+});

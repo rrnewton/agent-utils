@@ -101,6 +101,7 @@ export interface ElementById {
   "collapsed-lines-smaller": HTMLButtonElement;
   "collapsed-lines-state": HTMLParagraphElement;
   "column-links": HTMLElement;
+  "column-splitter": HTMLDivElement;
   "column-reply": HTMLDivElement;
   "column-toggle": HTMLButtonElement;
   "combine-messages": HTMLInputElement;

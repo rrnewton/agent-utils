@@ -10,12 +10,14 @@ import {
   DEFAULT_COLLAPSED_LINES,
   DEFAULT_MSG_SCALE,
   DEFAULT_READING_CH,
+  DEFAULT_TWO_COLUMN_SPLIT,
   clampCardMaxLines,
   clampQuoteReadPercent,
   clampCollapsedLines,
   clampMsgScale,
   clampReadSpeed,
   clampReadingWidth,
+  clampTwoColumnSplit,
 } from "./bounds.ts";
 
 /** One setting kept on the device. */
@@ -158,6 +160,12 @@ export const DEVICE_SETTINGS = Object.freeze({
     key: "vibe-talk.voice.width",
     read: (raw: string | null) => clampReadingWidth(raw === null ? DEFAULT_READING_CH : raw),
     write: (ch: number) => String(ch),
+  } satisfies DeviceSetting<number>,
+  /** `#1186 two-column-splitter`. The two columns' split, a percentage, clamped (`clampTwoColumnSplit`). */
+  twoColumnSplit: {
+    key: "vibe-talk.voice.two-column-split",
+    read: (raw: string | null) => clampTwoColumnSplit(raw === null ? DEFAULT_TWO_COLUMN_SPLIT : raw),
+    write: (pct: number) => String(pct),
   } satisfies DeviceSetting<number>,
   /** `#425 collapsed-lines`. The lines a fold shows, clamped. Synced. */
   collapsedLines: {

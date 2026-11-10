@@ -136,6 +136,8 @@ export { createReadingColumn } from "./readingcolumn.ts";
 export { createSentRead } from "./sentread.ts";
 export { createThreadEntry, freshEntryState } from "./threadentry.ts";
 export { createTwoColumns } from "./twocolumns.ts";
+export { createColumnSplitter, mountColumnSplitterControls } from "./splitter.ts";
+export type { ColumnSplitter, ColumnSplitterControls, ColumnSplitterControlsDependencies, ColumnSplitterDependencies, SplitterPlace } from "./splitter.ts";
 export { createSideCards } from "./sidecards.ts";
 export { createFilterPlace, freshFilterState } from "./filterplace.ts";
 export { createLiveState } from "./livestate.ts";

@@ -60,6 +60,15 @@ test("every number this page is tuned by stays inside a band that says what woul
       sourceConstant("DEFAULT_READING_CH") <= sourceConstant("MAX_READING_CH"),
     "the default reading width is not one the reader is allowed to choose"
   );
+  assert.ok(
+    sourceConstant("MIN_TWO_COLUMN_SPLIT") < sourceConstant("MAX_TWO_COLUMN_SPLIT"),
+    "the least split the reader may drag to is not less than the most"
+  );
+  assert.ok(
+    sourceConstant("DEFAULT_TWO_COLUMN_SPLIT") >= sourceConstant("MIN_TWO_COLUMN_SPLIT") &&
+      sourceConstant("DEFAULT_TWO_COLUMN_SPLIT") <= sourceConstant("MAX_TWO_COLUMN_SPLIT"),
+    "the default split is not one the reader is allowed to drag to"
+  );
 });
 
 test("...and the table covers EVERY constant, so a new one cannot escape by being new", () => {
