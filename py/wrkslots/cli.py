@@ -6043,6 +6043,17 @@ def _pregather_salvage_facts(
                     prepared=facts,
                     archive_root=archive_root,
                 )
+                # Re-derive as the locked salvage will, so any index
+                # refresh that derivation causes is already reflected in
+                # the fingerprint the locked reuse compares against.
+                _salvage_candidate(
+                    config,
+                    record,
+                    checkout,
+                    vcs,
+                    path_override=path,
+                    salvage_unlisted_modules=True,
+                )
                 fingerprint = _salvage_fingerprint_or_none(
                     config, checkout, path, vcs, source=None, mirror=None
                 )
