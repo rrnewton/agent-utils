@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use crate::git::{Combined, Git};
 use crate::model::{
     now, Discharge, HeldCandidate, HeldChange, Item, ItemStatus, KeptValidation, Obligation, Plan,
-    Ruling,
+    PlannedBatch, Ruling,
 };
 use crate::ops::{self, repo};
 use crate::plan::short;
@@ -591,6 +591,24 @@ enum BatchOutcome {
     /// landed, the withdrawn changes leave the window (their recorded
     /// withdrawal is applied when the run ends), and the run goes on.
     Withdrawn(String),
+}
+
+/// The plan index a published job claims under (#1008, #1196
+/// front-starve): the planned batch it exactly is, or, for a batch flight,
+/// the planned batch it is a speculative prefix of. Prefix flights of a
+/// multi-change batch otherwise record no index and claim behind every
+/// indexed job, however early their flight sits.
+fn plan_index_for(batches: &[PlannedBatch], job: &Job) -> Option<usize> {
+    if let Some(batch) = batches.iter().find(|batch| batch.prs == job.prs) {
+        return Some(batch.index);
+    }
+    if job.purpose != "batch" {
+        return None;
+    }
+    batches
+        .iter()
+        .find(|batch| batch.prs.len() >= job.prs.len() && batch.prs[..job.prs.len()] == job.prs[..])
+        .map(|batch| batch.index)
 }
 
 /// Worktree slots for concurrent validations, reused between candidates.
@@ -4436,16 +4454,13 @@ impl<'a> Runner<'a> {
         let base = &job.base;
         // Claim order (#1008): the job records whether any of its changes is
         // prioritized, and its batch's plan index, so a claim leases in plan
-        // order instead of publication order. No planned batch matches a
-        // remainder or a prefix probe exactly: those keep age order.
+        // order instead of publication order. A speculative prefix flight
+        // of a multi-change batch claims under that batch's index (#1196
+        // front-starve); remainders and prefix probes keep age order.
         let (prioritized, plan_index) = {
             let report = lock(&self.report);
             let plan = &report.plan;
-            let plan_index = plan
-                .batches
-                .iter()
-                .find(|batch| batch.prs == job.prs)
-                .map(|batch| batch.index);
+            let plan_index = plan_index_for(&plan.batches, job);
             let prioritized = job.prs.iter().any(|pr| {
                 plan.items
                     .iter()
@@ -5237,6 +5252,32 @@ impl<'a> Runner<'a> {
     /// eligible only as a plain green standing on the current base, with
     /// no dependency still in flight or pending and no plan conflict
     /// with the stale roots it skips.
+    /// Whether `flight` never started: it was published for donors and its
+    /// job still sits queued, so no validation was spent on it (never
+    /// claimed, or claimed and given back unvalidated; #1196 front-starve).
+    /// Only a donor flight can be unstarted; a local validation starts
+    /// with its flight. An unreadable job record reads as started
+    /// (blocking is the safe direction).
+    fn flight_unstarted(&self, flight: &Flight) -> bool {
+        let Some(donors) = &self.donors else {
+            return false;
+        };
+        let job_id = {
+            let published = lock(&donors.published);
+            published
+                .iter()
+                .find(|(_, commit)| commit == &flight.candidate.tip)
+                .map(|(id, _)| id.clone())
+        };
+        let Some(job_id) = job_id else {
+            return false;
+        };
+        donors
+            .store
+            .get(&job_id)
+            .is_ok_and(|job| job.state == crate::donor::JobState::Queued)
+    }
+
     fn next_decidable_index(
         &self,
         flights: &VecDeque<Flight>,
@@ -5255,6 +5296,13 @@ impl<'a> Runner<'a> {
             }
             if flight.result.is_none() {
                 if flight.rooted && flight.candidate.parent != base {
+                    continue;
+                }
+                // An unstarted front (its donor job was never claimed, so
+                // no validation was spent on it) blocks nothing (#1196
+                // front-starve): a green disjoint root behind it may land
+                // first, and the front just rebuilds on the new base.
+                if self.flight_unstarted(flight) {
                     continue;
                 }
                 return None;
@@ -11067,6 +11115,50 @@ mod unit {
         // referenced; `green` in the JSON is derived from `results`.
         assert!(json.contains("\"outcome\":\"fail\""), "{json}");
         assert!(json.contains("\"validation_id\":3"), "{json}");
+    }
+
+    #[test]
+    fn a_prefix_flight_claims_under_its_planned_batch() {
+        // #1196 front-starve: speculative prefix flights of one planned
+        // batch claim under that batch's index; exact batches match
+        // directly, and non-batch jobs keep no index (age order).
+        let batches = vec![
+            PlannedBatch {
+                index: 0,
+                prs: vec![10, 11, 12],
+                note: String::new(),
+            },
+            PlannedBatch {
+                index: 1,
+                prs: vec![13],
+                note: String::new(),
+            },
+        ];
+        let job = |purpose: &'static str, prs: Vec<i64>| Job {
+            purpose,
+            prs,
+            commit: "c".repeat(40),
+            parent: "b".repeat(40),
+            base: "b".repeat(40),
+            speculation: None,
+            selection: Selection::All,
+            policy: "all".to_owned(),
+            extra: BTreeSet::new(),
+            peripheral: false,
+            rooted: false,
+        };
+        assert_eq!(plan_index_for(&batches, &job("batch", vec![10])), Some(0));
+        assert_eq!(
+            plan_index_for(&batches, &job("batch", vec![10, 11])),
+            Some(0)
+        );
+        assert_eq!(
+            plan_index_for(&batches, &job("batch", vec![10, 11, 12])),
+            Some(0)
+        );
+        assert_eq!(plan_index_for(&batches, &job("batch", vec![13])), Some(1));
+        assert_eq!(plan_index_for(&batches, &job("probe", vec![10])), None);
+        assert_eq!(plan_index_for(&batches, &job("batch", vec![99])), None);
     }
 
     #[test]
