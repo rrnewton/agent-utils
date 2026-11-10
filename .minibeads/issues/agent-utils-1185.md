@@ -1,11 +1,12 @@
 ---
 title: 'chip-height-snap: resting inside the slack is snapped to the foot as chips resize'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: mu-scroll
 created_at: 2026-11-10T03:08:53.221144610+00:00
-updated_at: 2026-11-10T03:08:53.221144610+00:00
+updated_at: 2026-11-10T07:53:41.133902651+00:00
+closed_at: 2026-11-10T07:53:41.047796049+00:00
 ---
 
 # Description
@@ -34,3 +35,7 @@ Tests: a browser case in the typing-scroll walk (desktop): resting a few pixels 
 - The scroll-tools and read-steer observers never write the scroll position while the follow state is off.
 - Browser walk covers the resting case at desktop width; unit pins keep covering the follow state's transitions.
 - Validation: page-only selection (path-selected gate) green.
+
+# Notes
+
+Landed as df3a0210 (stack 29be52f7, 5abd4f57, df3a0210) on github/main, gate green 153 steps (owner tier, path-selected), deployed 2026-11-10 2:37 AM ET and passed its 15-min health watch (coordb). Closed on that confirmation. #1144 stays open for the owner's scroll-trace verdict.
