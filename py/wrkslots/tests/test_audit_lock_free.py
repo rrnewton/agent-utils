@@ -523,3 +523,123 @@ def test_status_leaves_no_context_behind_for_its_caller(tmp_path: Path) -> None:
     # the finished status's list.
     assert wrkslots_cli._TEARING_DOWN_PIDNS.get() is None
     assert wrkslots_cli._VERBOSE_DIAGNOSTICS.get() is False
+
+
+def _liveness_hook(
+    monkeypatch: pytest.MonkeyPatch, during: Callable[[int, list[str]], None]
+) -> list[list[str]]:
+    """Run ``during`` inside each liveness query, i.e. in a reader's measuring phase."""
+
+    original = wrkslots_cli._owner_liveness_states
+    calls: list[list[str]] = []
+
+    def liveness(config: object, records: object) -> object:
+        slots = sorted(record.slot for record in records)  # type: ignore[attr-defined]
+        calls.append(slots)
+        during(len(calls), slots)
+        return original(config, records)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(wrkslots_cli, "_owner_liveness_states", liveness)
+    return calls
+
+
+def _set_task(root: Path, task: str) -> None:
+    document = _read_active(root)
+    cast(list[dict[str, object]], document["slots"])[0]["task"] = task
+    document["revision"] = cast(int, document["revision"]) + 1
+    _write_active(root, document)
+
+
+def _writer_lock_free(root: Path) -> bool:
+    try:
+        with wrkslots_cli._locked(root / "worktrees" / "ACTIVE", exclusive=True, wait_seconds=0):
+            return True
+    except wrkslots_cli.Refusal:
+        return False
+
+
+@pytest.mark.parametrize("command", ["status", "doctor"])
+def test_reader_remeasures_a_row_changed_while_it_measured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    root = _fixture(tmp_path / "case")
+    _add_slot_b(root)
+    free: list[bool] = []
+
+    def during(call: int, slots: list[str]) -> None:
+        # The measuring phase holds no registry lock: a writer gets in and changes one row.
+        free.append(_writer_lock_free(root))
+        if call == 1:
+            _set_task(root, "changed while measuring")
+
+    calls = _liveness_hook(monkeypatch, during)
+    payload = json.loads(_cli(root, command, "--format", "json"))
+    rows = {str(row["slot"]): row for row in payload["active"]}
+    # Published from the registry as it is now, not a mix of the two instants.
+    assert rows["slot-a"]["task"] == "changed while measuring", rows["slot-a"]
+    # The repeat asks liveness again only for the row that changed.
+    assert calls == [["slot-a", "slot-b"], ["slot-a"]], calls
+    assert free == [True, True], free
+
+
+@pytest.mark.parametrize("command", ["status", "doctor"])
+def test_reader_sees_an_event_written_while_it_measured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    root = _fixture(tmp_path / "case")
+    _add_slot_b(root)
+    _add_events(root, 1)
+
+    def during(call: int, slots: list[str]) -> None:
+        if call == 1:
+            # Only the event log changes: the row itself is untouched.
+            _cli(root, "hold", "--reason", "placed while measuring", "slot-a")
+
+    calls = _liveness_hook(monkeypatch, during)
+    payload = json.loads(_cli(root, command, "--format", "json"))
+    rows = {str(row["slot"]): row for row in payload["active"]}
+    assert rows["slot-a"]["hold_reason"] == "placed while measuring", rows["slot-a"]
+    # Nothing a liveness answer depends on changed, so it is not asked again.
+    assert calls == [["slot-a", "slot-b"]], calls
+
+
+@pytest.mark.parametrize("command", ["status", "doctor"])
+def test_reader_measures_under_the_lock_when_the_registry_keeps_changing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+) -> None:
+    root = _fixture(tmp_path / "case")
+    _add_slot_b(root)
+    free: list[bool] = []
+
+    def during(call: int, slots: list[str]) -> None:
+        # A well-behaved writer: it changes the row whenever it can take the lock.
+        allowed = _writer_lock_free(root)
+        free.append(allowed)
+        if allowed:
+            _set_task(root, f"change {call}")
+
+    calls = _liveness_hook(monkeypatch, during)
+    payload = json.loads(_cli(root, command, "--format", "json"))
+    rows = {str(row["slot"]): row for row in payload["active"]}
+    retries = wrkslots_cli._PHASED_READ_RETRIES
+    # One measurement, the retries, then the last one under the lock.
+    assert len(calls) == retries + 2, calls
+    assert free == [True] * (retries + 1) + [False], free
+    assert rows["slot-a"]["task"] == f"change {retries + 1}", rows["slot-a"]
+
+
+def test_registry_read_identity_sees_content_not_metadata(tmp_path: Path) -> None:
+    root = _fixture(tmp_path / "case")
+    config = wrkslots_cli._load_config(str(root), None)
+    before = wrkslots_cli._registry_read_identity(config)
+    active = _active(root)
+    status = active.stat()
+    document = _read_active(root)
+    cast(list[dict[str, object]], document["slots"])[0]["task"] = "same length!"[: len("do work")]
+    active.write_text(json.dumps(document))
+    os.utime(active, ns=(status.st_atime_ns, status.st_mtime_ns))
+    assert wrkslots_cli._registry_read_identity(config) != before
+    # Lock files, which every reader opens, do not count.
+    (root / "worktrees" / "ACTIVE.global.intent.lock").write_text("")
+    after = wrkslots_cli._registry_read_identity(config)
+    assert wrkslots_cli._registry_read_identity(config) == after

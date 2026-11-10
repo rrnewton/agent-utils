@@ -41896,84 +41896,227 @@ def _status_record(
     return value
 
 
-def _slot_findings(
-    config: Config,
-    states: Sequence[ActiveState],
-    hold_results: Mapping[tuple[str, str], _HoldResult],
-) -> list[dict[str, object]]:
-    """Every storage and operational diagnosis, without authorizing mutation."""
+# Readers in phases (#1172). status and doctor held the shared registry lock for their whole run,
+# about 33 s at a consumer's 237 rows: liveness commands, Git probes of every checkout and release
+# replay all ran under it, so every mutation waited that long. They now take a short locked
+# snapshot of what the registry says, measure outside the lock, and confirm under a second short
+# lock that the registry is exactly what the snapshot read. A report is published only from a
+# measurement whose snapshot was still current, so it shows the registry at one instant; when the
+# registry changed, the snapshot is retaken under that same lock and the measurement repeated,
+# reusing the per-row observations whose rows did not change. After _PHASED_READ_RETRIES repeats
+# the last measurement runs under the lock, as the whole command used to.
+_PHASED_READ_RETRIES = 2
 
-    findings = [
-        item.to_obj()
-        for item in _registry_storage_inconsistencies(
-            config, states, tolerate_unavailable_repositories=True
-        )
-    ]
 
-    def note(kind: str, slot: str | None, machine: str | None, detail: str) -> None:
-        findings.append(
-            {
-                "kind": kind,
-                "scope": "operational",
-                "slot": slot,
-                "slot_type": None,
-                "machine": machine,
-                "checkout": None,
-                "detail": detail,
-                "remedy": "inspect the named condition; diagnosis alone authorizes no mutation",
-            }
-        )
+def _registry_read_identity(config: Config) -> tuple[object, ...]:
+    """Content identity of everything a registry reader reports from.
 
-    releases = _owner_release_states(config, states)
-    for state in states:
-        for record in state.slots:
-            hold_result = hold_results[(record.machine, record.slot)]
-            if hold_result.error is not None:
-                note("invalid-hold", record.slot, state.machine, hold_result.error)
-            process_state, process_detail = _process_state(record.owner)
-            if process_state == "dead":
-                note(
-                    "dead-owner", record.slot, state.machine,
-                    f"recorded owner is not running ({process_detail}); the slot "
-                    "is held by a row whose owner has exited",
+    Every regular control file except lock files is read and hashed -- ACTIVE and ARCHIVED shards,
+    journals, handoff and hold records, and any partial write left beside them -- and so are
+    the quarantine directory's journals and every slot image record. An append-only event
+    directory is identified by its complete-event count (the registry-wide sequence), the last
+    event's digest, which chains every earlier event, and any partial event write. Contents,
+    not file times or inode numbers, so a replaced file whose metadata happens to match still
+    reads as changed.
+    """
+
+    def digest(path: Path) -> str:
+        try:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError as exc:
+            return f"unreadable: {exc.strerror}"
+
+    parts: list[object] = []
+    try:
+        entries = sorted(os.scandir(config.control), key=lambda entry: entry.name)
+    except OSError as exc:
+        raise Refusal(f"cannot list control directory {config.control}: {exc}") from exc
+    for entry in entries:
+        name = entry.name
+        if name.endswith(".lock"):
+            continue
+        path = Path(entry.path)
+        if entry.is_symlink():
+            parts.append((name, "symlink", os.readlink(path)))
+        elif name.startswith("EVENTS.") and entry.is_dir():
+            try:
+                names = sorted(os.listdir(path))
+            except OSError as exc:
+                parts.append((name, f"unreadable: {exc.strerror}"))
+                continue
+            complete_pattern = re.compile(r"[0-9]{20}\.json")
+            complete = [item for item in names if complete_pattern.fullmatch(item)]
+            partial = tuple(item for item in names if not complete_pattern.fullmatch(item))
+            last = complete[-1] if complete else None
+            parts.append(
+                (name, len(complete), last, None if last is None else digest(path / last), partial)
+            )
+        elif name == _quarantine_directory(config).name and entry.is_dir():
+            parts.append(
+                (name, tuple((item.name, digest(item)) for item in sorted(path.glob("*.journal"))))
+            )
+        elif name == slotimage.IMAGES_DIRECTORY and entry.is_dir():
+            parts.append(
+                (
+                    name,
+                    tuple(
+                        (item.relative_to(path).as_posix(), digest(item))
+                        for item in sorted(path.glob(f"*/*/{slotimage.RECORD_NAME}"))
+                    ),
                 )
-            released = releases.get((record.machine, record.slot))
-            if released is not None:
-                release, void_reason = released
-                if void_reason is None:
-                    note(
-                        "owner-released", record.slot, state.machine,
-                        f"{_owner_release_summary(release)} (event "
-                        f"{release.sequence}, generation {release.generation}); "
-                        "remove no longer waits for the owner's exit or the "
-                        "heartbeat time-to-live, and still requires the handoff "
-                        "read and an unused slot",
-                    )
-                else:
-                    note(
-                        "owner-release-void", record.slot, state.machine,
-                        f"release at {release.recorded_at} (event "
-                        f"{release.sequence}) no longer applies: {void_reason}",
-                    )
+            )
+        elif entry.is_file(follow_symlinks=False):
+            parts.append((name, digest(path)))
+    return tuple(parts)
 
-    findings.extend(_identity_drift_findings(config, states))
-    findings.extend(_image_attachment_findings(config))
-    findings.extend(_image_lock_findings(config, states))
 
+def _storage_subject_key(states: Sequence[ActiveState]) -> str:
+    """What _registry_storage_inconsistencies reads from the rows: their slots and checkouts."""
+
+    subject = sorted(
+        (
+            record.machine,
+            record.slot,
+            record.slot_type,
+            record.layout,
+            [(item.name, item.path, item.repository) for item in record.checkouts],
+        )
+        for state in states
+        for record in state.slots
+    )
+    return hashlib.sha256(json.dumps(subject).encode("utf-8")).hexdigest()
+
+
+@dataclasses.dataclass
+class _PhasedReadCache:
+    """Observations a repeated measurement may reuse: each is keyed by exactly what it read."""
+
+    storage: dict[str, tuple[StorageInconsistency, ...]] = dataclasses.field(
+        default_factory=dict
+    )
+    drift: dict[str, list[dict[str, object]]] = dataclasses.field(default_factory=dict)
+    image_locks: dict[str, list[dict[str, object]]] = dataclasses.field(default_factory=dict)
+    liveness: dict[tuple[str, str, int, str], tuple[str, str]] = dataclasses.field(
+        default_factory=dict
+    )
+
+    def storage_inconsistencies(
+        self, config: Config, states: Sequence[ActiveState]
+    ) -> tuple[StorageInconsistency, ...]:
+        key = _storage_subject_key(states)
+        if key not in self.storage:
+            self.storage[key] = _registry_storage_inconsistencies(
+                config, states, tolerate_unavailable_repositories=True
+            )
+        return self.storage[key]
+
+    def identity_drift(
+        self, config: Config, states: Sequence[ActiveState]
+    ) -> list[dict[str, object]]:
+        key = _storage_subject_key(states)
+        if key not in self.drift:
+            self.drift[key] = _identity_drift_findings(config, states)
+        return [dict(item) for item in self.drift[key]]
+
+    def image_lock_findings(
+        self, config: Config, states: Sequence[ActiveState]
+    ) -> list[dict[str, object]]:
+        key = _storage_subject_key(states)
+        if key not in self.image_locks:
+            self.image_locks[key] = _image_lock_findings(config, states)
+        return [dict(item) for item in self.image_locks[key]]
+
+    def owner_liveness(
+        self, config: Config, records: Sequence[ActiveRecord]
+    ) -> dict[tuple[str, str, int], tuple[str, str]]:
+        keyed = {
+            (record.machine, record.slot, record.generation, _record_sha256(record)): record
+            for record in records
+        }
+        missing = [record for key, record in keyed.items() if key not in self.liveness]
+        if missing:
+            answered = _owner_liveness_states(config, missing)
+            for record in missing:
+                self.liveness[
+                    (record.machine, record.slot, record.generation, _record_sha256(record))
+                ] = answered[(record.machine, record.slot, record.generation)]
+        return {key[:3]: self.liveness[key] for key in keyed}
+
+
+_PhasedSnapshot = TypeVar("_PhasedSnapshot")
+_PhasedResult = TypeVar("_PhasedResult")
+
+
+def _phased_registry_read(
+    config: Config,
+    wait_seconds: float,
+    snapshot: Callable[[], _PhasedSnapshot],
+    measure: Callable[[_PhasedSnapshot], _PhasedResult],
+) -> tuple[_PhasedSnapshot, _PhasedResult]:
+    """Snapshot under the shared lock, measure outside it, publish only a current measurement."""
+
+    subject = config.control / "ACTIVE"
+    with _locked(subject, exclusive=False, wait_seconds=wait_seconds):
+        taken = snapshot()
+        identity = _registry_read_identity(config)
+    retries = 0
+    while True:
+        result = measure(taken)
+        with _locked(subject, exclusive=False, wait_seconds=wait_seconds):
+            if _registry_read_identity(config) == identity:
+                return taken, result
+            taken = snapshot()
+            identity = _registry_read_identity(config)
+            if retries >= _PHASED_READ_RETRIES:
+                return taken, measure(taken)
+        retries += 1
+
+
+def _operational_finding(
+    kind: str, slot: str | None, machine: str | None, detail: str
+) -> dict[str, object]:
+    return {
+        "kind": kind,
+        "scope": "operational",
+        "slot": slot,
+        "slot_type": None,
+        "machine": machine,
+        "checkout": None,
+        "detail": detail,
+        "remedy": "inspect the named condition; diagnosis alone authorizes no mutation",
+    }
+
+
+def _slot_findings_registry_tail(
+    config: Config, states: Sequence[ActiveState]
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """The findings doctor reads from the mount table and from control files, in report order.
+
+    Image attachments come first and the control-file findings last; the image-lock findings
+    go between them in the report. These stay under the registry lock: an in-progress write's
+    temporary file or journal is an interrupted one only while no writer can hold the lock.
+    """
+
+    attachments = _image_attachment_findings(config)
+    findings: list[dict[str, object]] = []
     for path in _outstanding_journals(config):
-        note("unfinished-journal", None, None, f"recovery required: {path.name}")
+        findings.append(
+            _operational_finding("unfinished-journal", None, None, f"recovery required: {path.name}")
+        )
 
     for row in _quarantined_journal_rows(config):
         age_seconds = row["age_seconds"]
         age = f"{age_seconds}s" if isinstance(age_seconds, int) else "unknown"
         slot_value = row["slot"]
         machine_value = row["machine"]
-        note(
-            "quarantined-journal",
-            slot_value if isinstance(slot_value, str) else None,
-            machine_value if isinstance(machine_value, str) else None,
-            f"quarantined journal {row['journal']} retained for inspection "
-            f"(age {age}); report-only in v1, hand restore is in the user guide",
+        findings.append(
+            _operational_finding(
+                "quarantined-journal",
+                slot_value if isinstance(slot_value, str) else None,
+                machine_value if isinstance(machine_value, str) else None,
+                f"quarantined journal {row['journal']} retained for inspection "
+                f"(age {age}); report-only in v1, hand restore is in the user guide",
+            )
         )
 
     # `status` refuses outright on a partial atomic update. Diagnosis reports
@@ -41988,20 +42131,116 @@ def _slot_findings(
         if event_directory.is_dir() and not event_directory.is_symlink():
             leftovers += sorted(event_directory.glob("*.json.tmp.*"))
     for path in leftovers:
-        note(
-            "partial-atomic-update", None, None,
-            f"interrupted write left {path.name}; preserve it and run "
-            "'wrkslots recover'",
+        findings.append(
+            _operational_finding(
+                "partial-atomic-update", None, None,
+                f"interrupted write left {path.name}; preserve it and run "
+                "'wrkslots recover'",
+            )
         )
 
     cap = config.max_active_slots
     mine = [r for s in states if s.machine == config.machine for r in s.slots]
     if cap is not None and len(mine) > cap:
-        note(
-            "cap-breach", None, config.machine,
-            f"{len(mine)} active slot(s) against max_active_slots={cap} "
-            f"(excess {len(mine) - cap})",
+        findings.append(
+            _operational_finding(
+                "cap-breach", None, config.machine,
+                f"{len(mine)} active slot(s) against max_active_slots={cap} "
+                f"(excess {len(mine) - cap})",
+            )
         )
+    return attachments, findings
+
+
+def _slot_findings(
+    config: Config,
+    states: Sequence[ActiveState],
+    hold_results: Mapping[tuple[str, str], _HoldResult],
+    *,
+    storage: Sequence[StorageInconsistency] | None = None,
+    releases: Mapping[tuple[str, str], tuple[_OwnerRelease, str | None]] | None = None,
+    drift: Sequence[Mapping[str, object]] | None = None,
+    image_locks: Sequence[Mapping[str, object]] | None = None,
+    registry_tail: tuple[
+        Sequence[Mapping[str, object]], Sequence[Mapping[str, object]]
+    ]
+    | None = None,
+) -> list[dict[str, object]]:
+    """Every storage and operational diagnosis, without authorizing mutation.
+
+    A phased doctor passes the parts it has already measured; any part left out is read here.
+    """
+
+    findings = [
+        item.to_obj()
+        for item in (
+            _registry_storage_inconsistencies(
+                config, states, tolerate_unavailable_repositories=True
+            )
+            if storage is None
+            else storage
+        )
+    ]
+    if releases is None:
+        releases = _owner_release_states(config, states)
+    for state in states:
+        for record in state.slots:
+            hold_result = hold_results[(record.machine, record.slot)]
+            if hold_result.error is not None:
+                findings.append(
+                    _operational_finding(
+                        "invalid-hold", record.slot, state.machine, hold_result.error
+                    )
+                )
+            process_state, process_detail = _process_state(record.owner)
+            if process_state == "dead":
+                findings.append(
+                    _operational_finding(
+                        "dead-owner", record.slot, state.machine,
+                        f"recorded owner is not running ({process_detail}); the slot "
+                        "is held by a row whose owner has exited",
+                    )
+                )
+            released = releases.get((record.machine, record.slot))
+            if released is not None:
+                release, void_reason = released
+                if void_reason is None:
+                    findings.append(
+                        _operational_finding(
+                            "owner-released", record.slot, state.machine,
+                            f"{_owner_release_summary(release)} (event "
+                            f"{release.sequence}, generation {release.generation}); "
+                            "remove no longer waits for the owner's exit or the "
+                            "heartbeat time-to-live, and still requires the handoff "
+                            "read and an unused slot",
+                        )
+                    )
+                else:
+                    findings.append(
+                        _operational_finding(
+                            "owner-release-void", record.slot, state.machine,
+                            f"release at {release.recorded_at} (event "
+                            f"{release.sequence}) no longer applies: {void_reason}",
+                        )
+                    )
+
+    findings.extend(
+        _identity_drift_findings(config, states)
+        if drift is None
+        else [dict(item) for item in drift]
+    )
+    attachments, control_findings = (
+        _slot_findings_registry_tail(config, states)
+        if registry_tail is None
+        else registry_tail
+    )
+    findings.extend(dict(item) for item in attachments)
+    findings.extend(
+        _image_lock_findings(config, states)
+        if image_locks is None
+        else [dict(item) for item in image_locks]
+    )
+    findings.extend(dict(item) for item in control_findings)
     return findings
 
 
@@ -42252,9 +42491,12 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             config, require_repository=False, announce=False
         )
     )
-    with _locked(
-        config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock
-    ):
+    cache = _PhasedReadCache()
+
+    def snapshot() -> tuple[
+        list[ActiveState],
+        tuple[list[dict[str, object]], list[dict[str, object]]],
+    ]:
         # Read beside an outstanding recover-absent-validate-rows batch, as
         # status and create do: its rows are archived before they leave
         # ACTIVE, and they stay in both until the batch finishes or is
@@ -42267,14 +42509,34 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
                 config, require_repository=False, announce=False
             )
         )
+        return all_states, _slot_findings_registry_tail(config, all_states)
+
+    def measure(
+        taken: tuple[
+            list[ActiveState],
+            tuple[list[dict[str, object]], list[dict[str, object]]],
+        ],
+    ) -> tuple[list[ActiveState], list[dict[str, object]], list[dict[str, object]]]:
+        # Outside the lock (#1172): holds and releases come from the snapshot's
+        # event chain, the rest observes processes, disks and Git.
+        all_states, registry_tail = taken
         states = (
             all_states
             if args.all_machines
             else [state for state in all_states if state.machine == config.machine]
         )
         hold_results = _load_record_holds(config, all_states)
-        all_findings = _slot_findings(config, all_states, hold_results)
-        doctor_releases = _owner_release_states(config, states)
+        releases = _owner_release_states(config, all_states)
+        all_findings = _slot_findings(
+            config,
+            all_states,
+            hold_results,
+            storage=cache.storage_inconsistencies(config, all_states),
+            releases=releases,
+            drift=cache.identity_drift(config, all_states),
+            image_locks=cache.image_lock_findings(config, all_states),
+            registry_tail=registry_tail,
+        )
         findings = (
             all_findings
             if args.all_machines
@@ -42285,20 +42547,25 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             ]
         )
         doctor_records = [record for state in states for record in state.slots]
-        doctor_liveness = _owner_liveness_states(config, doctor_records)
+        doctor_liveness = cache.owner_liveness(config, doctor_records)
         rows = [
             _status_record(
                 config,
                 record,
                 hold_result=hold_results[(record.machine, record.slot)],
                 tolerate_hold_error=True,
-                owner_release=doctor_releases.get((record.machine, record.slot)),
+                owner_release=releases.get((record.machine, record.slot)),
                 liveness=doctor_liveness[
                     (record.machine, record.slot, record.generation)
                 ],
             )
             for record in doctor_records
         ]
+        return states, findings, rows
+
+    _taken, (states, findings, rows) = _phased_registry_read(
+        config, args.wait_lock, snapshot, measure
+    )
     cap = config.max_active_slots
     wt_scope = (
         f"skipped: {config.worktrees_image_skipped}"
@@ -42381,9 +42648,11 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
             config, require_repository=False, announce=False
         )
     )
-    with _locked(
-        config.control / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock
-    ):
+    cache = _PhasedReadCache()
+
+    def snapshot() -> tuple[
+        list[ActiveState], list[str], tuple[StorageInconsistency, ...]
+    ]:
         _refuse_partial_state(config, allow_validate_batch_seals=True)
         # validate-run reads status after admission (scorecard handoff and its
         # sweep), so a run admitted beside an interrupted absent-row batch
@@ -42393,8 +42662,29 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
                 config, require_repository=False, announce=False
             )
         )
-        storage_inconsistencies = _registry_storage_inconsistencies(
-            config, all_states, tolerate_unavailable_repositories=True
+        ordinary_journals = _outstanding_journals(config)
+        seal_journals = _validate_batch_seal_journals(config)
+        journals = [
+            path.name for path in (*ordinary_journals, *seal_journals)
+        ]
+        return (
+            all_states,
+            journals,
+            _journal_inconsistencies(config, ordinary_journals),
+        )
+
+    def measure(
+        taken: tuple[list[ActiveState], list[str], tuple[StorageInconsistency, ...]],
+    ) -> tuple[
+        list[ActiveState], tuple[StorageInconsistency, ...], list[dict[str, object]]
+    ]:
+        # Outside the lock (#1172): holds and releases come from the snapshot's
+        # event chain, the rest observes processes, disks and Git.
+        all_states, _journals, journal_inconsistencies = taken
+        tearing_down.clear()
+        storage_inconsistencies = (
+            *cache.storage_inconsistencies(config, all_states),
+            *journal_inconsistencies,
         )
         states = (
             all_states
@@ -42403,24 +42693,13 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
         )
         hold_results = _load_record_holds(config, states)
         status_releases = _owner_release_states(config, states)
-        ordinary_journals = _outstanding_journals(config)
-        seal_journals = _validate_batch_seal_journals(config)
-        journals = [
-            path.name for path in (*ordinary_journals, *seal_journals)
-        ]
-        storage_inconsistencies = (
-            *storage_inconsistencies,
-            *_journal_inconsistencies(
-                config, ordinary_journals
-            ),
-        )
         visible_records = [
             record
             for state in states
             for record in state.slots
             if args.slot is None or record.slot == args.slot
         ]
-        liveness_states = _owner_liveness_states(config, visible_records)
+        liveness_states = cache.owner_liveness(config, visible_records)
         records = [
             _status_record(
                 config,
@@ -42438,6 +42717,11 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
             )
             for record in visible_records
         ]
+        return states, storage_inconsistencies, records
+
+    (_states, journals, _items), (states, storage_inconsistencies, records) = (
+        _phased_registry_read(config, args.wait_lock, snapshot, measure)
+    )
     if tearing_down and not _VERBOSE_DIAGNOSTICS.get():
         print(
             f"wrkslots: {len(tearing_down)} tearing-down PID namespaces ignored",

@@ -2994,6 +2994,14 @@ append-only event history once before they take the lock, which is most of the r
 registry with tens of thousands of events; under the lock they then only confirm that each
 event file they verified is unchanged, and verify whatever arrived meanwhile.
 
+`status` and `doctor` hold the lock only to read the registry. They release it while they ask
+the liveness command, inspect Git worktrees and disks, and read processes, then take it again
+briefly to confirm that the registry is exactly what they read: every control file's contents
+and each machine's event count and last event. If it changed, they read it again under that
+lock and repeat the measurement, asking again only about rows that changed; after two repeats
+the last measurement runs under the lock. A report therefore always shows the registry at one
+instant, as when the whole command held the lock.
+
 ## Recovery and compatibility views
 
 Every mutation appends a numbered, hash-linked JSON event before refreshing the readable ACTIVE,
