@@ -119,13 +119,82 @@ fi
 # wrkslots Rust readers routing (#562 early flip, soak phase): with no
 # explicit engine override of any kind, dispatch through the soak
 # launcher in readers-only mode when opted in per process
-# (WRKSLOTS_RUST_READERS=1) or per host (an `enabled = true` line in
-# ${WRKSLOTS_RUST_READERS_FILE:-~/.local/etc/agent-utils/wrkslots-rust-readers},
-# a per-host file that is not synced between hosts). Code default is
-# OFF: neither opt-in, nothing changes. WRKSLOTS_ENGINE=python (or
-# WRKSLOTS_RUST_READERS=0) opts back out. Routed calls are logged by
-# the soak launcher (WRKSLOTS_SOAK_LOG, default
-# ~/.local/state/wrkslots-soak/soak.log).
+# (WRKSLOTS_RUST_READERS=1) or for a listed project by a per-host
+# scoped file (${WRKSLOTS_RUST_READERS_FILE:-~/.local/etc/agent-utils/
+# wrkslots-rust-readers}, a file that is not synced between hosts):
+#
+#   readers = scoped
+#   project = /absolute/project/root
+#
+# The legacy bare `enabled = true` line is ignored on purpose: an older
+# resolver that only knows that spelling must stay off rather than route
+# every project on the host. Code default is OFF: neither opt-in,
+# nothing changes. WRKSLOTS_ENGINE=python (or WRKSLOTS_RUST_READERS=0)
+# opts back out. Routed calls are logged by the soak launcher
+# (WRKSLOTS_SOAK_LOG, default ~/.local/state/wrkslots-soak/soak.log).
+_wrkslots_readers_config_value() {
+    local file="$1" key="$2" line value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^[[:space:]]*\"?${key}\"?[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]]; then
+            printf '%s' "${BASH_REMATCH[1]}"
+            return 0
+        fi
+        if [[ "$line" =~ ^[[:space:]]*\"?${key}\"?[[:space:]]*:[[:space:]]*([^#\ ,}]+) ]]; then
+            value="${BASH_REMATCH[1]}"
+            value="${value%\"}"
+            value="${value#\"}"
+            printf '%s' "$value"
+            return 0
+        fi
+    done < "$file"
+    return 1
+}
+
+_wrkslots_readers_authoritative_root() {
+    local root="$1" config="$1/.wrkslots.yml" worktrees_value layout_value control pattern
+    [[ -L "$config" ]] && return 0
+    worktrees_value="$(_wrkslots_readers_config_value "$config" worktrees_dir 2>/dev/null)" || return 0
+    layout_value="$(_wrkslots_readers_config_value "$config" layout 2>/dev/null)" || layout_value="nested"
+    if [[ -z "$worktrees_value" || "$worktrees_value" == /* || "$worktrees_value" == "." \
+        || "$worktrees_value" == ".." || "$worktrees_value" == ../* \
+        || "$worktrees_value" == */.. || "$worktrees_value" == */../* \
+        || ( "$layout_value" != "nested" && "$layout_value" != "flat" ) ]]; then
+        return 0
+    fi
+    control="$(readlink -m -- "$root/$worktrees_value")"
+    [[ "$layout_value" == "flat" ]] && control="$(dirname -- "$control")"
+    [[ -L "$control/wrkslots" ]] && return 0
+    for pattern in 'ACTIVE.*.json' 'ARCHIVED.*.json' 'ACTIVE.*.journal' \
+                   'CREATE.*.journal' 'FINISH.*.journal' \
+                   'VALIDATE-BATCH-SEAL.*.journal' 'EVENTS.*'; do
+        compgen -G "$control/$pattern" >/dev/null && return 0
+    done
+    return 1
+}
+
+_wrkslots_readers_project_root() {
+    local explicit="${1:-}" candidate fallback=""
+    if [[ -n "$explicit" ]]; then
+        if [[ -d "$explicit" && ! -L "$explicit" ]]; then
+            (cd -- "$explicit" && pwd -P)
+        fi
+        return
+    fi
+    candidate="$(pwd -P)"
+    while :; do
+        if [[ -e "$candidate/.wrkslots.yml" || -L "$candidate/.wrkslots.yml" ]]; then
+            fallback="$candidate"
+            if _wrkslots_readers_authoritative_root "$candidate"; then
+                printf '%s' "$candidate"
+                return
+            fi
+        fi
+        [[ "$candidate" == "/" ]] && break
+        candidate="$(dirname -- "$candidate")"
+    done
+    printf '%s' "$fallback"
+}
+
 if [[ "$TOOL" == "wrkslots" && -z "${WRKSLOTS_ENGINE:-}" && -z "$ENGINE_VAR" ]]; then
     WRKSLOTS_READERS=""
     case "${WRKSLOTS_RUST_READERS:-}" in
@@ -133,8 +202,67 @@ if [[ "$TOOL" == "wrkslots" && -z "${WRKSLOTS_ENGINE:-}" && -z "$ENGINE_VAR" ]];
         0|false) WRKSLOTS_READERS="" ;;
         *)
             READERS_FILE="${WRKSLOTS_RUST_READERS_FILE:-$HOME/.local/etc/agent-utils/wrkslots-rust-readers}"
-            if [[ -f "$READERS_FILE" ]] && grep -Eq '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*true[[:space:]]*$' "$READERS_FILE"; then
-                WRKSLOTS_READERS="1"
+            if [[ -f "$READERS_FILE" ]] \
+                && grep -Eq '^[[:space:]]*readers[[:space:]]*=[[:space:]]*scoped([[:space:]]*(#.*)?)?$' "$READERS_FILE"; then
+                # Parse only the leading wrkslots globals, mirroring the
+                # Python CLI, to learn the command and explicit root.
+                READERS_ARGS=("$@")
+                READERS_INDEX=0
+                READERS_EXPLICIT_ROOT=""
+                while (( READERS_INDEX < ${#READERS_ARGS[@]} )); do
+                    case "${READERS_ARGS[READERS_INDEX]}" in
+                        --project-root)
+                            if (( READERS_INDEX + 1 >= ${#READERS_ARGS[@]} )); then
+                                break
+                            fi
+                            READERS_EXPLICIT_ROOT="${READERS_ARGS[READERS_INDEX + 1]}"
+                            READERS_INDEX=$((READERS_INDEX + 2))
+                            ;;
+                        --project-root=*)
+                            READERS_EXPLICIT_ROOT="${READERS_ARGS[READERS_INDEX]#--project-root=}"
+                            READERS_INDEX=$((READERS_INDEX + 1))
+                            ;;
+                        --machine|--wait-lock)
+                            if (( READERS_INDEX + 1 >= ${#READERS_ARGS[@]} )); then
+                                break
+                            fi
+                            READERS_INDEX=$((READERS_INDEX + 2))
+                            ;;
+                        --machine=*|--wait-lock=*|--allow-existing-unregistered-worktrees)
+                            READERS_INDEX=$((READERS_INDEX + 1))
+                            ;;
+                        *) break ;;
+                    esac
+                done
+                READERS_COMMAND="${READERS_ARGS[READERS_INDEX]:-}"
+                case "$READERS_COMMAND" in
+                    status|doctor|unpushed|shell-command|quickstart)
+                        READERS_PROJECT_ROOT="$(_wrkslots_readers_project_root "$READERS_EXPLICIT_ROOT")"
+                        READERS_LISTED=""
+                        if [[ -n "$READERS_PROJECT_ROOT" ]]; then
+                            while IFS= read -r READERS_LINE || [[ -n "$READERS_LINE" ]]; do
+                                if [[ "$READERS_LINE" =~ ^[[:space:]]*project[[:space:]]*=[[:space:]]*(.*)[[:space:]]*$ ]]; then
+                                    READERS_LISTED_PATH="${BASH_REMATCH[1]}"
+                                    if [[ "$READERS_LISTED_PATH" == \"*\" && "$READERS_LISTED_PATH" == *\" ]] \
+                                        || [[ "$READERS_LISTED_PATH" == \'*\' && "$READERS_LISTED_PATH" == *\' ]]; then
+                                        READERS_LISTED_PATH="${READERS_LISTED_PATH:1:-1}"
+                                    fi
+                                    if [[ "$READERS_LISTED_PATH" == /* && "$(readlink -m -- "$READERS_LISTED_PATH")" == "$READERS_PROJECT_ROOT" ]]; then
+                                        READERS_LISTED="1"
+                                        break
+                                    fi
+                                fi
+                            done < "$READERS_FILE"
+                        fi
+                        if [[ -n "$READERS_LISTED" ]]; then
+                            WRKSLOTS_READERS="1"
+                        elif [[ -n "$READERS_PROJECT_ROOT" ]]; then
+                            echo "[wrkslots] readers soak skipped: project $READERS_PROJECT_ROOT is not listed in scoped host opt-in; running Python" >&2
+                        else
+                            echo "[wrkslots] readers soak skipped: project root not found for scoped host opt-in; running Python" >&2
+                        fi
+                        ;;
+                esac
             fi
             ;;
     esac

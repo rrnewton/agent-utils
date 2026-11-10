@@ -1,6 +1,6 @@
 ---
 title: "gate-soak-scoped-host-optin: scope the per-host Rust readers opt-in to named projects"
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-10T02:14:51.000000000+00:00
@@ -55,3 +55,15 @@ isolated by the #1170 environment guard.
 Approved by the lead coordinator on 2026-11-09 before the reader soak is
 restarted on devbig014. The first listed project is
 `/home/newton/work/dev-agent-utils`.
+
+## Resolution
+
+[watermelon-full-preview] The host opt-in is now scoped in
+`common/bin/engine-resolver`: the legacy bare `enabled = true` spelling is
+ignored, while `readers = scoped` applies only to a request whose resolved
+project root exactly matches a listed absolute `project =` path. The resolver
+uses an explicit leading `--project-root` or the same authoritative upward
+`.wrkslots.yml` discovery policy as the Python loader, logs one Python-choice
+line for an unlisted or undiscovered reader project, and keeps explicit
+environment opt-in and opt-out semantics. Resolver tests cover listed,
+discovered, unlisted, legacy-file, explicit-env, and opt-out paths.

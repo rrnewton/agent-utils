@@ -53,7 +53,10 @@ def _build_sandbox(tmp_path: Path) -> Path:
 
 
 def _run(
-    root: Path, extra_env: dict[str, str] | None = None, *args: str
+    root: Path,
+    extra_env: dict[str, str] | None = None,
+    *args: str,
+    cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = {
         key: value
@@ -75,7 +78,7 @@ def _run(
     env.update(extra_env or {})
     return subprocess.run(
         [str(root / "common" / "bin" / TOOL), *args],
-        cwd=root,
+        cwd=cwd or root,
         capture_output=True,
         text=True,
         env=env,
@@ -147,6 +150,71 @@ def test_readers_env_optin_dispatches_to_soak(tmp_path: Path) -> None:
 
 def test_readers_host_file_optin_dispatches_to_soak(tmp_path: Path) -> None:
     root = _build_sandbox(tmp_path)
+    project = tmp_path / "listed-project"
+    project.mkdir()
+    host_file = tmp_path / "wrkslots-rust-readers"
+    host_file.write_text(
+        f"readers = scoped\nproject = {project}\n"
+    )
+    result = _run(
+        root,
+        {"WRKSLOTS_RUST_READERS_FILE": str(host_file)},
+        "--project-root", str(project), "doctor",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"SOAK readers=1 args=--project-root {project} doctor\n"
+
+
+def test_readers_scoped_discovered_project_dispatches_to_soak(tmp_path: Path) -> None:
+    root = _build_sandbox(tmp_path)
+    project = tmp_path / "listed-project"
+    nested = project / "slots" / "slot-a"
+    nested.mkdir(parents=True)
+    (project / ".wrkslots.yml").write_text("schema: 2\n")
+    control = project / "worktrees"
+    control.mkdir()
+    (control / "ACTIVE.node-a.json").write_text("{}\n")
+    host_file = tmp_path / "wrkslots-rust-readers"
+    host_file.write_text(
+        f'readers = scoped\nproject = "{project}"\n'
+    )
+    result = _run(
+        root,
+        {"WRKSLOTS_RUST_READERS_FILE": str(host_file)},
+        "status",
+        cwd=nested,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "SOAK readers=1 args=status\n"
+
+
+def test_readers_scoped_unlisted_project_stays_python_and_logs_why(
+    tmp_path: Path,
+) -> None:
+    root = _build_sandbox(tmp_path)
+    listed = tmp_path / "listed-project"
+    listed.mkdir()
+    unlisted = tmp_path / "other-project"
+    unlisted.mkdir()
+    host_file = tmp_path / "wrkslots-rust-readers"
+    host_file.write_text(
+        f"readers = scoped\nproject = {listed}\n"
+    )
+    result = _run(
+        root,
+        {"WRKSLOTS_RUST_READERS_FILE": str(host_file)},
+        "--project-root", str(unlisted), "doctor",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"PY-{TOOL}\n"
+    assert (
+        f"project {unlisted} is not listed in scoped host opt-in; running Python"
+        in result.stderr
+    )
+
+
+def test_readers_legacy_host_file_is_ignored(tmp_path: Path) -> None:
+    root = _build_sandbox(tmp_path)
     host_file = tmp_path / "wrkslots-rust-readers"
     host_file.write_text("enabled = true\n")
     result = _run(
@@ -155,7 +223,8 @@ def test_readers_host_file_optin_dispatches_to_soak(tmp_path: Path) -> None:
         "doctor",
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "SOAK readers=1 args=doctor\n"
+    assert result.stdout == f"PY-{TOOL}\n"
+    assert "readers soak skipped" not in result.stderr
 
 
 def test_readers_missing_soak_launcher_falls_through_to_python(
@@ -164,11 +233,15 @@ def test_readers_missing_soak_launcher_falls_through_to_python(
     root = _build_sandbox(tmp_path)
     (root / "common" / "bin" / "wrkslots-soak").unlink()
     host_file = tmp_path / "wrkslots-rust-readers"
-    host_file.write_text("enabled = true\n")
+    project = tmp_path / "listed-project"
+    project.mkdir()
+    host_file.write_text(
+        f"readers = scoped\nproject = {project}\n"
+    )
     result = _run(
         root,
         {"WRKSLOTS_RUST_READERS_FILE": str(host_file)},
-        "status",
+        "--project-root", str(project), "status",
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout == f"PY-{TOOL}\n"
