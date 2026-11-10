@@ -155,8 +155,11 @@ def number(found: Json, *path: str) -> float:
 
 
 def whole_composer(reader: Reader, found: Json, when: str) -> None:
-    reader.check(found["composer"] is not None and number(found, "composer", "top") >= -1
-                 and number(found, "composer", "bottom") <= number(found, "viewport") + 1,
+    # The box whole above the visible foot, its composer not clipped at the top: a row parked
+    # under the box (#1135) stands below the keys at rest by design, so the box is the measure.
+    reader.check(found["box"] is not None and number(found, "box", "top") >= -1
+                 and number(found, "box", "bottom") <= number(found, "viewport") + 1
+                 and found["composer"] is not None and number(found, "composer", "top") >= -1,
                  f"{when}: the composer is not whole on screen: {found}")
 
 
@@ -200,10 +203,11 @@ def foot_walk(reader: Reader) -> None:
     up = reader.height - KEYBOARD_PX  # type: ignore[attr-defined]
     found = keyboard(reader, up, "the keyboard did not come up")
     whole_composer(reader, found, "keyboard up")
+    rest_gap = number(found, "gap")
     page.keyboard.type("a long reply being typed while the channel moves ", delay=20)
     arrive(reader, "An agent message arriving while the owner types at the foot.")
     found = place(reader)
-    reader.check(number(found, "gap") <= 25, f"an arrival while typing left the reader above the foot: {found}")
+    reader.check(number(found, "gap") <= rest_gap + 17, f"an arrival while typing left the reader above the foot: {found}")
     whole_composer(reader, found, "an arrival while typing")
     page.keyboard.type("and more words ", delay=20)
     found = keyboard(reader, up - 48, "the keyboard's strip did not grow")
@@ -211,10 +215,10 @@ def foot_walk(reader: Reader) -> None:
     page.keyboard.type("still typing ", delay=20)
     found = keyboard(reader, up, "the keyboard's strip did not shrink back")
     whole_composer(reader, found, "the strip shrunk while typing")
-    reader.check(number(found, "gap") <= 25, f"the strip's comings and goings left the reader above the foot: {found}")
+    reader.check(number(found, "gap") <= rest_gap + 17, f"the strip's comings and goings left the reader above the foot: {found}")
     grow_last_row(reader)
     found = place(reader)
-    reader.check(number(found, "gap") <= 25,
+    reader.check(number(found, "gap") <= rest_gap + 17,
                  f"a row grown late at the foot sank the composer and stopped the following (gap {number(found, 'gap'):.0f}px): {found}")
     whole_composer(reader, found, "a row grown late while typing")
     page.keyboard.type("x", delay=20)
@@ -222,7 +226,7 @@ def foot_walk(reader: Reader) -> None:
     whole_composer(reader, place(reader), "the key after the growth")
     arrive(reader, "An arrival after the late growth, while typing at the foot.")
     found = place(reader)
-    reader.check(number(found, "gap") <= 25, f"the arrival after the growth was not followed: {found}")
+    reader.check(number(found, "gap") <= rest_gap + 17, f"the arrival after the growth was not followed: {found}")
     reader.notes.append("typing at the foot: arrivals, strip resizes and a row grown 180px late all followed, "
                         "the whole composer on screen throughout")
 

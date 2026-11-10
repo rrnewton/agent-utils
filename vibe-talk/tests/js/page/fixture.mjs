@@ -5165,6 +5165,12 @@ const TUNING_BANDS = {
   SERVER_CACHE_NO_AGE_LIMIT: [65535, 65535,
     "the max_days the server sends for a full history with no age limit (u16::MAX in src/config.rs); " +
     "another value would call a real limit none, or say the server keeps 65535 days"],
+  // `#1144 scrollback-typing-jump` (part 2b). The scroll trace's ring and its caps.
+  SCROLL_TRACE_MAX_ENTRIES: [100, 5000, "scroll writes and scrolls kept for the trace's report"],
+  SCROLL_TRACE_WINDOW_MS: [10000, 300000, "how far back the scroll trace keeps, in ms"],
+  ID_CHARS: [32, 512, "chars of an element or focus id kept in one trace entry"],
+  ANCHOR_ID_CHARS: [64, 1024, "chars of the reading anchor's id kept in one trace entry"],
+  STACK_CHARS: [128, 4096, "chars of one write's stack kept in one trace entry"],
   KEYBOARD_MIN_PX: [100, 220,
     "the least height an on-screen keyboard takes from the viewport before the page hides both bars for it: " +
     "lower takes a browser's toolbar sliding away, or a hardware keyboard's accessory strip, for a keyboard " +

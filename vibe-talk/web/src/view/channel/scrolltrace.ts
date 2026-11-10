@@ -11,7 +11,7 @@
 /** The most scrolls one trace holds. */
 export const SCROLL_TRACE_MAX_ENTRIES = 600;
 /** How far back, in milliseconds from the newest scroll, one trace holds. */
-export const SCROLL_TRACE_WINDOW_MS = 60_000;
+export const SCROLL_TRACE_WINDOW_MS = 60000;
 
 /** The two lists whose places are traced. */
 const TRACE_AREAS: readonly string[] = ["scroll-area", "side-scroll"];

@@ -2484,6 +2484,7 @@ test("`#624 voice-page-modularity`: removals and the placing wait, from the modu
   canon.removed.set("m1", 1);
   assert.equal(owner.removedUpstream("m1"), true, "a removed message was not said removed upstream");
   assert.equal(owner.removedUpstream("other"), false, "a message nobody removed was said removed upstream");
+});
 
 test("`#1144 scrollback-typing-jump`: the scroll trace wraps, rings and restores, from the module alone", () => {
   const { createScrollTrace, SCROLL_TRACE_MAX_ENTRIES } = CHANNEL_VIEW;
