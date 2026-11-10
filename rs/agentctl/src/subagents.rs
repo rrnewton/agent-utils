@@ -22735,10 +22735,10 @@ fi
     mod control;
     /// Offline retirement of an exact adopted generation with no runtime mutation.
     mod dead_adoption;
-    /// `/goal` commands typed raw and proved by the harness's answer.
-    mod goal_command;
     /// Launch and live effort options, and their per-harness refusal.
     mod effort;
+    /// `/goal` commands typed raw and proved by the harness's answer.
+    mod goal_command;
     /// Takeover and handback of a headless agent: one writer per session.
     mod headless_takeover;
     /// Herdr readiness and adopted Muse process ownership compatibility.

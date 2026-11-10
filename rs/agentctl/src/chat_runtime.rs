@@ -6866,10 +6866,9 @@ impl BridgeState {
             .map(str::to_owned)
             .or_else(|| {
                 let profile = record["profile"].as_str()?;
-                let document: serde_json::Value = serde_json::from_slice(
-                    &std::fs::read(registry.join("profiles.json")).ok()?,
-                )
-                .ok()?;
+                let document: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(registry.join("profiles.json")).ok()?)
+                        .ok()?;
                 document["profiles"][profile]["reasoning_effort"]
                     .as_str()
                     .map(str::to_owned)
