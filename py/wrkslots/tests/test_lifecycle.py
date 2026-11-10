@@ -12291,6 +12291,81 @@ def test_abort_create_removes_a_clean_initialized_submodule(tmp_path: Path) -> N
     assert str(target) not in git(repository, "worktree", "list", "--porcelain").stdout
 
 
+def _advance_leaf_remote(tmp_path: Path, leaf: Path) -> str:
+    """Move the leaf remote's main past the gitlink, as later upstream work does.
+
+    The slot's nested leaf then holds what a clone made after that push
+    holds: a local main equal to origin/main, outside the detached HEAD.
+    """
+    leaf_source = tmp_path / "leaf-source"
+    (leaf_source / "leaf.txt").write_text("leaf upstream\n", encoding="utf-8")
+    git(leaf_source, "commit", "-am", "leaf upstream")
+    git(leaf_source, "push", "origin", "main")
+    git(leaf, "fetch", "origin")
+    git(leaf, "branch", "-f", "main", "origin/main")
+    tip = git(leaf, "rev-parse", "main").stdout.strip()
+    assert tip != git(leaf, "rev-parse", "HEAD").stdout.strip()
+    return tip
+
+
+def test_abort_create_accepts_a_clone_made_branch_that_matches_its_remote(
+    tmp_path: Path,
+) -> None:
+    # #1177: the default branch git clone made in a nested submodule sits
+    # past the gitlink but on origin/main, so it is preserved, not unique.
+    project, journal, leaf = _interrupted_create_with_populated_submodules(tmp_path)
+    _advance_leaf_remote(tmp_path, leaf)
+    target = checkout(project)
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode == 0, aborted.stderr
+    assert active_slots(project) == []
+    assert not journal.exists()
+    assert not target.exists()
+
+
+def test_abort_create_refuses_a_submodule_branch_with_a_commit_on_no_remote(
+    tmp_path: Path,
+) -> None:
+    # #1177: a branch carrying a commit absent from every remote still
+    # refuses, naming the branch and the commit, beside a clone-made one.
+    project, journal, leaf = _interrupted_create_with_populated_submodules(tmp_path)
+    _advance_leaf_remote(tmp_path, leaf)
+    tree = git(leaf, "rev-parse", "HEAD^{tree}").stdout.strip()
+    local = git(
+        leaf, "commit-tree", tree, "-p", "HEAD", "-m", "local only"
+    ).stdout.strip()
+    git(leaf, "branch", "local-work", local)
+    target = checkout(project)
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode != 0
+    assert "local branch local-work" in aborted.stderr
+    assert local in aborted.stderr
+    assert "preserve it for inspection" in aborted.stderr
+    assert journal.is_file()
+    assert target.is_dir()
+    assert git(leaf, "rev-parse", "local-work").stdout.strip() == local
+
+
 def test_recover_repopulates_an_unpopulated_submodule_checkout(tmp_path: Path) -> None:
     """#881: recover repopulates a wholesale-unpopulated checkout, then verifies."""
     project, _journal, leaf = _interrupted_create_with_populated_submodules(tmp_path)

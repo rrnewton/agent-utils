@@ -49876,8 +49876,9 @@ def _verify_initialized_submodules_for_abort(vcs: _GitVcs, checkout: Path) -> bo
     Returns False when no submodule is initialized.  Each initialized
     submodule must sit at its recorded gitlink with a clean status
     (ignored files included), no unfinished operation, no stash, and no
-    local branch carrying commits outside its HEAD; anything else is
-    preserved for inspection, never removed.
+    local branch carrying commits outside both its HEAD and its
+    remote-tracking refs (#1177); anything else is preserved for
+    inspection, never removed.
     """
 
     declared = _declared_initialized_submodules(checkout)
@@ -49938,15 +49939,25 @@ def _verify_initialized_submodules_for_abort(vcs: _GitVcs, checkout: Path) -> bo
             )
         branches = vcs._run(
             repository,
-            ["for-each-ref", "--format=%(objectname)", "refs/heads"],
+            ["for-each-ref", "--format=%(objectname) %(refname:strip=2)", "refs/heads"],
         ).stdout
-        for branch_head in branches.splitlines():
-            branch_head = branch_head.strip()
-            if branch_head and not vcs.is_ancestor(repository, branch_head, head):
+        for line in branches.splitlines():
+            branch_head, _separator, branch = line.strip().partition(" ")
+            if not branch_head or vcs.is_ancestor(repository, branch_head, head):
+                continue
+            # git clone makes the remote's default branch during
+            # `submodule update --init`; it may sit past the gitlink, but
+            # a branch whose every commit a remote-tracking ref already
+            # holds loses nothing when the submodule goes (#1177).
+            unique = vcs._run(
+                repository,
+                ["rev-list", "--count", branch_head, "--not", "--remotes"],
+            ).stdout.strip()
+            if unique != "0":
                 raise Refusal(
                     f"cannot abort checkout with {label} whose local branch "
-                    f"carries {branch_head} outside its HEAD; preserve it "
-                    "for inspection"
+                    f"{branch} carries {branch_head} outside its HEAD and every "
+                    "remote-tracking ref; preserve it for inspection"
                 )
     return True
 

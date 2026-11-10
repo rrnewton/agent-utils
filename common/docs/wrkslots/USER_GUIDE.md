@@ -231,8 +231,11 @@ row, and create recovery also checks it before provisioning any worktree or runn
 missing, replaced, or retargeted link refuses publication and leaves the journal for inspection.
 When the scope has really ended, discard the unpublished operation instead:
 `recover --slot SLOT --abort-create` removes a create's unchanged provisional worktrees, and
-`recover --abort-import` discards an import journal, which never changed any files. For example,
-after placing the owner inside `agent-slot01.scope`:
+`recover --abort-import` discards an import journal, which never changed any files. An abort also
+removes initialized submodules, so each must be clean at its recorded commit; a submodule's local
+branch may point elsewhere only when its remote-tracking refs already hold every commit on it, as
+the default branch `git clone` makes does. Any other branch refuses the abort and is named. For
+example, after placing the owner inside `agent-slot01.scope`:
 
 ```sh
 TASK_SCOPE_UNIT=agent-slot01.scope

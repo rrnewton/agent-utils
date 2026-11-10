@@ -1,11 +1,12 @@
 ---
 title: "abort-create-clone-branches: recover --abort-create refuses submodule branches that git clone made and that match the remote"
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-createlock
 created_at: 2026-11-10T01:40:00.000000000+00:00
-updated_at: 2026-11-10T01:40:00.000000000+00:00
+updated_at: 2026-11-10T02:21:15.000000000+00:00
+closed_at: 2026-11-10T02:21:15.000000000+00:00
 ---
 
 # Description
@@ -42,3 +43,19 @@ in both editions if the Rust edition has this path.
 
 Reported by a consumer harness (2026-11-09; its CREATE journal and per-branch facts were kept on that host).
 Requested by the lead coordinator for mu-createlock after #1124 (same area: create journals and recovery).
+
+## Resolution
+
+Delivered by mu-createlock (opus 5.5), Python edition only: the Rust edition
+does not implement `recover --abort-create` (its recover serves only
+`--abort-import`), so there is no differential case. The initialized-submodule
+check before an abort now treats a local branch outside the submodule's HEAD
+as preserved when `git rev-list --count <branch> --not --remotes` is 0, at
+every submodule depth. A branch with any commit absent from every
+remote-tracking ref still refuses, and the refusal now names the branch as
+well as the commit. Tests: an interrupted create whose nested leaf's
+clone-made main sits past the gitlink on origin/main aborts (and fails
+before the fix with the reported refusal); a leaf branch carrying a commit on
+no remote, beside that clone-made main, still refuses naming the branch and
+commit and leaves the journal and slot for inspection. The user guide's
+abort paragraph states the rule.
