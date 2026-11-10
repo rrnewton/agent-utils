@@ -1,11 +1,12 @@
 ---
 title: 'fold-latency-behaviour-verdict: the fold check judges behaviour, and its millisecond budgets are an opt-in benchmark'
-status: open
+status: closed
 priority: 2
 issue_type: task
 assignee: mu-foldlat
 created_at: 2026-11-10T21:05:00+00:00
-updated_at: 2026-11-10T21:05:00+00:00
+updated_at: 2026-11-10T21:20:00+00:00
+closed_at: 2026-11-10T21:20:00+00:00
 ---
 
 # Description
@@ -42,3 +43,16 @@ outside the gate, and the fresh majority re-walk is removed: one walk, judged on
 Owner redirect 2026-11-10 (real-time-sensitive tests out of gating until robust). The keyboard
 and keyboard-hides-bar checks were proved the same way (20 of 20 in the saturated scope, their
 behaviour mutations red) and need no change.
+
+## Resolution
+
+[muse watermelon] `vibe-talk/tests/fold_latency_browser.py` now judges behaviour alone in gating:
+eight Shift+O presses draw eight folds as one line, eight `e` presses draw eight Done marks, and
+hiding a row restyles only what it touches. Handler times are still printed per press with the
+host's load, and the former millisecond budgets are enforced only by `--benchmark`, an opt-in
+measurement outside the gate; the fresh majority re-walk is removed. Proved on 2026-11-10 by 20 of
+20 runs inside a CPU-quota scope (CPUQuota=400% on four cores, saturated by burners, killed
+after), three passes at loadavg about 180, a variant page with its fold bookkeeping removed
+failing the check, and the busy-work variant failing only under `--benchmark`. The sibling
+keyboard and keyboard-hides-bar checks passed the same saturated-scope series 20 of 20 each with
+their behaviour mutations red, and stay enabled unchanged.

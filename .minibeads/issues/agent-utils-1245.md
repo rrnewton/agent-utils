@@ -1,11 +1,12 @@
 ---
 title: 'keyboard-browser-cpu-deflake: the keyboard browser check hits its CPU budget under gate load'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-foldlat
 created_at: 2026-11-10T19:33:47+00:00
-updated_at: 2026-11-10T19:33:47+00:00
+updated_at: 2026-11-10T21:20:00+00:00
+closed_at: 2026-11-10T21:20:00+00:00
 ---
 
 # Description
@@ -29,3 +30,11 @@ This is the third load-shaped browser check after #1231 fold-latency-deflake and
 # Notes
 
 Lead request 2026-11-10. Owner: mu-foldlat (after #1243).
+
+## Resolution
+
+[muse watermelon] Closed as superseded by #1248 fold-latency-behaviour-verdict. The owner's
+redirect (2026-11-10) took real-time-sensitive tests out of gating until they are robust, so the
+CPU-guard tuning prepared for this issue was dropped unlanded. The keyboard check's assertions
+were already behavioural; it was proved robust as it stands (20 of 20 inside a CPU-quota scope
+saturated by burners, a dead-key-dispatch variant red) and stays enabled unchanged.

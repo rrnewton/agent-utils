@@ -2036,14 +2036,13 @@ steps:
       est_duration_s: 30
 
   # `#532 shift-o-latency` in the browser engine: twenty threads of long replies unpacked in the Threads view;
-  # eight Shift+O and eight e, each drawn in the frame after its key, each handler held to 28 ms of main-thread
-  # work at the median (its CPU time, corrected by a layout reference bracketed around each press, #998,
-  # #1231), every press printed with the host's load at that press, a failing size re-walked fresh to a
-  # majority of three attempts, and hiding one row restyling a few elements rather than the page (a #429 rule on a touch screen
-  # restyled about 5,000). Measured on 2026-10-26: about 20s wall.
+  # eight Shift+O folds and eight e Done marks, each drawn folded or Done, and hiding one row restyling a
+  # few elements rather than the page (a #429 rule on a touch screen restyled about 5,000). The verdict is
+  # that behaviour only; handler times are printed, and the old millisecond budgets are an opt-in
+  # `--benchmark` outside the gate. Measured on 2026-10-26: about 20s wall.
   - group: check
     job: fold-latency-browser
-    desc: Shift+O and e in an unpacked Threads view each draw in the frame after the key within a 28 ms main-thread work budget, and hiding a row restyles only what it touches (#532), in current Chromium at 393x852 and 1280x800
+    desc: Shift+O folds and e marks Done in an unpacked Threads view, each drawn as promised, and hiding a row restyles only what it touches (#532), in current Chromium at 393x852 and 1280x800
     labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/fold_latency_browser.py
     jobs_flag: ""
