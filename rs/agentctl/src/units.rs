@@ -169,23 +169,23 @@ pub fn rendered_headless(
     }
     let agentctl = unit_path("agentctl", &options.agentctl)?;
     let registry = unit_path("registry", &options.registry)?;
-    // Write the resolved real binary, not a launcher script (#1221).
-    let resolved_claude = match unit.claude.as_deref() {
-        Some(path) => {
-            Some(crate::headless::claude::resolve_harness_binary_for_unit(path).map_err(fail)?)
-        }
-        None => None,
-    };
-    let claude = match resolved_claude.as_deref() {
+    // Write the launcher path as given (#1221 follow-up): it stays in the
+    // spawn path so its environment setup runs, and the wrapper pins the
+    // post-exec identity. The resolved real binary is a comment only.
+    let claude = match unit.claude.as_deref() {
         Some(path) => format!(" --claude-bin {}", unit_path("claude", path)?),
         None => String::new(),
     };
-    let claude_note = match (unit.claude.as_deref(), resolved_claude.as_deref()) {
-        (Some(given), Some(resolved)) if given != resolved => format!(
-            "# --claude-bin resolved from {} to the real harness binary by install-units (#1221).\n",
-            given.display()
-        ),
-        _ => String::new(),
+    let claude_note = match unit.claude.as_deref() {
+        Some(given) => match crate::headless::claude::real_binary_of_launcher(given) {
+            Some(resolved) => format!(
+                "# --claude-bin {} is kept as given; it execs {}, the real harness binary. The launcher stays in the spawn path so its environment setup runs; the wrapper pins the post-exec identity (#1221).\n",
+                given.display(),
+                resolved.display()
+            ),
+            None => String::new(),
+        },
+        None => String::new(),
     };
     let environment: String = unit
         .environment
@@ -510,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn headless_unit_resolves_a_launcher_to_the_real_binary() {
+    fn headless_unit_keeps_the_launcher_and_names_the_real_binary_in_a_comment() {
         use std::os::unix::fs::PermissionsExt;
         let dest = scratch("headless-resolve");
         let real = fs::canonicalize("/bin/true").unwrap();
@@ -527,11 +527,16 @@ mod tests {
             environment: Vec::new(),
         };
         let (_, contents) = rendered_headless(&options(&dest), "coordinator", &unit).unwrap();
+        // The launcher stays in ExecStart so its env setup runs; the real
+        // binary appears only in the comment.
         assert!(
-            contents.contains(&format!("--claude-bin {}\n", real.display())),
+            contents.contains(&format!("--claude-bin {}\n", launcher.display())),
             "{contents}"
         );
-        assert!(contents.contains("resolved from"), "{contents}");
+        assert!(
+            contents.contains(&format!("it execs {}", real.display())),
+            "{contents}"
+        );
         let _ = fs::remove_dir_all(&dest);
     }
 

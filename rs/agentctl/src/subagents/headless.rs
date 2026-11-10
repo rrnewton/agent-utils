@@ -434,9 +434,12 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let mut config =
             wrapper::WrapperConfig::new(agent_name, &directory, Path::new(&record.cwd), &session);
         if let Some(bin) = claude_bin {
-            // Spawn the real binary, not a launcher script (#1221).
-            let resolved = claude::resolve_harness_binary(bin).map_err(fail)?;
-            config.command = vec![resolved.path.display().to_string()];
+            // Spawn the launcher as given (#1221 follow-up): canonicalising
+            // a symlink to the launcher script is fine, but never resolve
+            // past it, so its environment setup runs. The wrapper pins the
+            // post-exec identity after it execs the real binary.
+            let launcher = claude::canonical_launcher_path(bin).map_err(fail)?;
+            config.command = vec![launcher.display().to_string()];
         }
         config.arguments = record.arguments.clone();
         if let Some(lines) = tool_preview_lines {

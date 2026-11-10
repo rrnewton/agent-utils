@@ -2207,7 +2207,18 @@ pub fn run(config: WrapperConfig, terminate: Arc<AtomicBool>, hooks: &dyn Hooks)
                 break code;
             }
         }
-        if wrapper.pin_pending && wrapper.pin_last_attempt.elapsed() >= Duration::from_millis(250) {
+        // Watch the pinned identity for the harness's whole life, not only
+        // while a pin is pending: on a hot machine a multi-exec launcher
+        // chain can settle later than the bounded spawn retry, and a later
+        // exec must replace the pin, never leave a wrong one (#1221).
+        if wrapper.harness.is_some()
+            && wrapper.pin_last_attempt.elapsed()
+                >= if wrapper.pin_pending {
+                    Duration::from_millis(250)
+                } else {
+                    Duration::from_secs(1)
+                }
+        {
             wrapper.retry_pin(hooks);
         }
         wrapper.check_ack_deadline()?;

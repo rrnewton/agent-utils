@@ -317,3 +317,114 @@ fn stop_of_a_headless_agent_never_asks_the_wrapper_to_stop_when_that_would_end_t
     assert_eq!(manager.load("lead").unwrap().lifecycle, "running");
     reap(vec![sibling]);
 }
+
+#[test]
+fn run_headless_spawns_the_launcher_as_given_and_pins_the_post_exec_identity() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let manager = headless_agent(&fixture);
+    // A fake harness that announces init, then reads input until EOF.
+    let fake = fixture.root.join("fake_harness.py");
+    fs::write(
+        &fake,
+        "import json, sys\n\
+         sys.stdout.write(json.dumps({\"type\": \"system\", \"subtype\": \"init\", \"claude_code_version\": \"9.9.9\", \"model\": \"fake\", \"permissionMode\": \"dontAsk\", \"session_id\": \"s\", \"tools\": [\"Bash\"]}) + \"\\n\")\n\
+         sys.stdout.flush()\n\
+         for _line in sys.stdin:\n    pass\n",
+    )
+    .unwrap();
+    // A launcher like the host's: an export, a brief sleep, then exec.
+    let launcher = fixture.root.join("claude-launcher");
+    fs::write(
+        &launcher,
+        format!(
+            "#!/bin/sh\nexport MCP_TIMEOUT=60000\nsleep 0.3\nexec python3 {} \"$@\"\n",
+            fake.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+    // A previous run's identity must not survive this spawn.
+    let mut stale_child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let stale = agent_queue::identity::observe(u64::from(stale_child.id()))
+        .unwrap()
+        .identity;
+    stale_child.kill().unwrap();
+    stale_child.wait().unwrap();
+    let mut record = manager.load("lead").unwrap();
+    record.harness_identity = Some(stale.clone());
+    manager.save(&record).unwrap();
+
+    let terminate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = terminate.clone();
+    // No assertion inside the scope before the flag is set and the wrapper
+    // thread joined: a panic there would leave the scope waiting on a
+    // wrapper that runs forever, masking the real failure as a hang.
+    // Liveness and environ are captured while the harness lives, inside
+    // the scope but without asserting there.
+    let (code, pinned, last, live, environ, harness_pid) = std::thread::scope(|scope| {
+        let run = scope
+            .spawn(|| manager.run_headless("lead", Some(&launcher), None, None, terminate.clone()));
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut pinned = None;
+        let mut last = None;
+        let mut live = None;
+        let mut environ = Vec::new();
+        let mut harness_pid = None;
+        while std::time::Instant::now() < deadline {
+            let current = manager.load("lead").unwrap().harness_identity;
+            if let Some(identity) = &current {
+                if *identity != stale {
+                    live = Some(agent_queue::identity::liveness(identity));
+                    if live == Some(agent_queue::identity::ProcessLiveness::Alive) {
+                        environ =
+                            fs::read(format!("/proc/{}/environ", identity.pid)).unwrap_or_default();
+                        if let Ok(directory) = manager.directory("lead") {
+                            harness_pid = fs::read(directory.join("harness.json"))
+                                .ok()
+                                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                                .and_then(|doc| doc["identity"]["pid"].as_u64());
+                        }
+                        if harness_pid == Some(identity.pid) {
+                            pinned = Some(identity.clone());
+                            break;
+                        }
+                    }
+                }
+            }
+            last = current;
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        (
+            run.join().unwrap(),
+            pinned,
+            last,
+            live,
+            environ,
+            harness_pid,
+        )
+    });
+    let code = code.unwrap();
+    assert_eq!(code, 0);
+    let pinned = pinned.unwrap_or_else(|| {
+        panic!("post-exec identity was not pinned live; last: {last:?}, last liveness: {live:?}")
+    });
+    assert_eq!(
+        live,
+        Some(agent_queue::identity::ProcessLiveness::Alive),
+        "pinned identity {pinned:?} must be the live post-exec harness"
+    );
+    // The launcher's export reached the harness, and the pin names it.
+    assert!(
+        environ
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == b"MCP_TIMEOUT=60000"),
+        "launcher export must reach the harness"
+    );
+    // Captured while the harness lived: stopping the wrapper clears it.
+    assert_eq!(harness_pid, Some(pinned.pid));
+}

@@ -701,8 +701,10 @@ impl Fixture {
     fn use_exec_launcher(&mut self) {
         use std::os::unix::fs::PermissionsExt;
         let launcher = self.root.join("launcher.sh");
+        // Like the host's platform launcher: an export the harness must
+        // inherit, then a brief sleep, then exec the real harness.
         let script = format!(
-            "#!/bin/sh\nsleep 0.3\nexec {} \"$@\"\n",
+            "#!/bin/sh\nexport MCP_TIMEOUT=60000\nsleep 0.3\nexec {} \"$@\"\n",
             self.config.command.join(" ")
         );
         fs::write(&launcher, script).unwrap();
@@ -782,6 +784,14 @@ fn an_execing_launcher_pins_the_post_exec_harness_on_start_and_wrapper_restart()
     });
     let pinned = pinned_identity(&hooks.record).unwrap();
     assert_ne!(pinned, stale);
+    // The launcher stayed in the spawn path: its export reached the harness.
+    let environ = fs::read(format!("/proc/{first_pid}/environ")).unwrap();
+    assert!(
+        environ
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == b"MCP_TIMEOUT=60000"),
+        "launcher export must reach the harness"
+    );
     let fresh = agent_queue::identity::observe(u64::from(first_pid)).unwrap();
     assert_eq!(pinned, fresh.identity, "pin must be the post-exec identity");
     assert_eq!(

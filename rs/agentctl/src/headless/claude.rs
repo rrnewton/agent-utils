@@ -1044,12 +1044,14 @@ fn launcher_exec_target(script: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Resolve a `--claude-bin` to the real harness binary (#1221): follow
-/// symlinks, and when the target is a launcher script, use the binary it
-/// `exec`s. A bare name is found on `PATH` first. Errors name a remedy.
-pub fn resolve_harness_binary(given: &Path) -> Result<ResolvedHarnessBinary, String> {
+/// The `--claude-bin` to spawn, as given (#1221 follow-up): a bare name is
+/// found on `PATH`, and symlinks are canonicalised — to the launcher script
+/// itself when that is the target, never past a launcher to the real binary
+/// it `exec`s, so the launcher's environment setup (for example its
+/// `MCP_TIMEOUT` export) still runs. The wrapper pins the post-exec identity
+/// after the launcher execs.
+pub fn canonical_launcher_path(given: &Path) -> Result<PathBuf, String> {
     let candidate: PathBuf = if given.components().count() == 1 {
-        // A bare name: find it on PATH, as the shell would.
         let name = given.to_string_lossy().into_owned();
         std::env::var_os("PATH")
             .and_then(|paths| {
@@ -1059,18 +1061,26 @@ pub fn resolve_harness_binary(given: &Path) -> Result<ResolvedHarnessBinary, Str
             })
             .ok_or_else(|| {
                 format!(
-                    "--claude-bin {name:?} was not found on PATH; pass the absolute path of the real Claude Code binary"
+                    "--claude-bin {name:?} was not found on PATH; pass the absolute path of the Claude Code launcher or binary"
                 )
             })?
     } else {
         given.to_path_buf()
     };
-    let canonical = std::fs::canonicalize(&candidate).map_err(|error| {
+    std::fs::canonicalize(&candidate).map_err(|error| {
         format!(
-            "--claude-bin {} cannot be resolved: {error}; pass the absolute path of the real Claude Code binary",
+            "--claude-bin {} cannot be resolved: {error}; pass the absolute path of the Claude Code launcher or binary",
             candidate.display()
         )
-    })?;
+    })
+}
+
+/// Resolve a `--claude-bin` past any launcher to the real harness binary
+/// (#1221). This is for reporting only — a unit comment naming what a
+/// launcher execs — never for the spawn path, which keeps the launcher so
+/// its environment setup runs. A bare name is found on `PATH` first.
+pub fn resolve_harness_binary(given: &Path) -> Result<ResolvedHarnessBinary, String> {
+    let canonical = canonical_launcher_path(given)?;
     if is_script(&canonical) {
         if let Some(target) = launcher_exec_target(&canonical) {
             return Ok(ResolvedHarnessBinary {
@@ -1085,21 +1095,23 @@ pub fn resolve_harness_binary(given: &Path) -> Result<ResolvedHarnessBinary, Str
         ));
     }
     Ok(ResolvedHarnessBinary {
-        given: (canonical != candidate).then(|| given.to_path_buf()),
+        given: (canonical.as_path() != given).then(|| given.to_path_buf()),
         path: canonical,
         via_launcher_script: false,
     })
 }
 
-/// Lenient resolution for unit rendering: resolve when the file exists on
-/// this host, keep a not-yet-existing path as given (rendering stays pure
-/// for fixtures), and refuse only a launcher script that exists but whose
-/// real binary cannot be found.
-pub fn resolve_harness_binary_for_unit(given: &Path) -> Result<PathBuf, String> {
-    if !given.exists() && given.components().count() > 1 {
-        return Ok(given.to_path_buf());
-    }
-    Ok(resolve_harness_binary(given)?.path)
+/// The real binary a `--claude-bin` launcher execs, for a unit comment
+/// only (#1221 follow-up): `None` when the given path is itself that binary,
+/// does not exist here, or its exec target cannot be found. Never refuses:
+/// the launcher stays in the spawn path either way.
+#[must_use]
+pub fn real_binary_of_launcher(given: &Path) -> Option<PathBuf> {
+    let resolved = resolve_harness_binary(given).ok()?;
+    let canonical_given = canonical_launcher_path(given).ok()?;
+    (resolved.path != canonical_given || resolved.via_launcher_script)
+        .then_some(resolved.path)
+        .filter(|path| path.as_path() != given)
 }
 
 /// The wrapper's declared contract, printed by `agentctl capabilities`.
@@ -1158,6 +1170,14 @@ mod tests {
         let resolved = resolve_harness_binary(&launcher).unwrap();
         assert_eq!(resolved.path, real);
         assert!(resolved.via_launcher_script);
+        // The spawn path never resolves past the launcher (#1221 follow-up):
+        // canonicalising the symlink gives the script itself, not the binary.
+        assert_eq!(
+            canonical_launcher_path(&launcher).unwrap(),
+            std::fs::canonicalize(&launcher).unwrap()
+        );
+        assert_eq!(canonical_launcher_path(&link).unwrap(), real);
+        assert_eq!(real_binary_of_launcher(&launcher), Some(real.clone()));
         // Variable-form launcher, as the host's 685-byte launcher writes it.
         let var_launcher = dir.join("claude-var");
         std::fs::write(

@@ -610,6 +610,7 @@ pub fn observe_stable(pid: u64, timeout: std::time::Duration) -> Result<LiveProc
     let deadline = std::time::Instant::now() + timeout;
     let mut previous: Option<LiveProcess> = None;
     let mut stable: Option<LiveProcess> = None;
+    let mut stable_since: Option<std::time::Instant> = None;
     let mut last_error: Option<Error> = None;
     loop {
         match observe(pid) {
@@ -617,7 +618,18 @@ pub fn observe_stable(pid: u64, timeout: std::time::Duration) -> Result<LiveProc
                 let agreed = previous
                     .as_ref()
                     .is_some_and(|prev| prev.identity == live.identity);
-                if agreed && !executable_is_interpreter(&live.executable_path) {
+                if !agreed {
+                    stable_since = Some(std::time::Instant::now());
+                }
+                // One pair of agreeing observations can still catch a
+                // transient stage of a multi-exec launcher chain: require
+                // the same identity continuously for a short window.
+                if agreed
+                    && !executable_is_interpreter(&live.executable_path)
+                    && stable_since.is_some_and(|since| {
+                        since.elapsed() >= std::time::Duration::from_millis(200)
+                    })
+                {
                     return Ok(live);
                 }
                 if agreed {
@@ -634,6 +646,7 @@ pub fn observe_stable(pid: u64, timeout: std::time::Duration) -> Result<LiveProc
                 // An exec in flight makes one observation incoherent; that is
                 // the race this retry exists for, not a final failure.
                 previous = None;
+                stable_since = None;
                 last_error = Some(error);
             }
         }
