@@ -41,6 +41,13 @@ pub(crate) struct LaunchProfile {
     pub(crate) record_edges: Option<bool>,
     /// `true` records the agent as pinned (a persistent lane) at `start` (#917 chat-bang-commands).
     pub(crate) pinned: Option<bool>,
+    /// `true` boxes the agent to its wrkslots slot at `start` (#1205 lane-write-sandbox):
+    /// the slot is derived from `--cwd` inside `worktrees/slots/<name>`, and a `root`
+    /// project isolation is coerced to `userns` for harnesses with no root relay.
+    /// Default off: no profile boxes unless it opts in.
+    pub(crate) write_sandbox: bool,
+    /// Isolation for the write-sandbox box; `None` uses the project's configured isolation.
+    pub(crate) slot_isolation: Option<String>,
 }
 
 /// The roles a launch profile may give its agents (#897 chat-latency-stamps).
@@ -58,6 +65,8 @@ pub(crate) struct PublicProfile {
     reasoning_effort: Option<String>,
     argv_count: usize,
     environment: Vec<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    write_sandbox: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     agentcloud: Option<CloudLaunch>,
     /// Agentcloud profiles are launchable only by this edition; the other edition lists them too.
@@ -73,6 +82,7 @@ impl LaunchProfile {
             mode: self.mode.clone(),
             model: self.model.clone(),
             reasoning_effort: self.reasoning_effort.clone(),
+            write_sandbox: self.write_sandbox,
             argv_count: self.argv.len(),
             environment: self
                 .environment
@@ -219,6 +229,10 @@ struct RawProfile {
     record_edges: Option<bool>,
     #[serde(default)]
     pinned: Option<bool>,
+    #[serde(default)]
+    write_sandbox: Option<bool>,
+    #[serde(default)]
+    slot_isolation: Option<String>,
     /// The agent's role, one of [`ROLES`], and its protocol, one of [`PROTOCOLS`]: checked here,
     /// and read from the file by the chat bridge's latency stamps (#897).
     #[serde(default)]
@@ -1062,6 +1076,18 @@ fn validate(name: String, mut raw: RawProfile) -> Result<LaunchProfile, AgentErr
             }
         }
     }
+    if let Some(value) = raw.slot_isolation.as_deref() {
+        if !matches!(value, "userns" | "cgroup" | "root") {
+            return Err(fail(format!(
+                "profile {name:?} slot_isolation must be userns, cgroup, or root, not {value:?}"
+            )));
+        }
+    }
+    if raw.write_sandbox == Some(true) && raw.harness == "agentcloud" {
+        return Err(fail(format!(
+            "profile {name:?} write_sandbox does not apply to agentcloud agents"
+        )));
+    }
     Ok(LaunchProfile {
         name,
         harness: raw.harness,
@@ -1073,6 +1099,8 @@ fn validate(name: String, mut raw: RawProfile) -> Result<LaunchProfile, AgentErr
         cloud: raw.agentcloud,
         record_edges: raw.record_edges,
         pinned: raw.pinned,
+        write_sandbox: raw.write_sandbox.unwrap_or(false),
+        slot_isolation: raw.slot_isolation,
     })
 }
 
@@ -2144,6 +2172,35 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[test]
+    fn write_sandbox_is_opt_in_and_validates_isolation() {
+        // #1205 lane-write-sandbox: default off, Muse may opt in.
+        let plain = parse(serde_json::json!({"harness": "muse", "mode": "interactive"}))
+            .expect("plain muse profile");
+        assert!(!plain.write_sandbox);
+        assert_eq!(plain.slot_isolation, None);
+        let boxed = parse(serde_json::json!({
+            "harness": "muse", "mode": "interactive",
+            "write_sandbox": true, "slot_isolation": "userns"
+        }))
+        .expect("opted-in muse profile");
+        assert!(boxed.write_sandbox);
+        assert_eq!(boxed.slot_isolation.as_deref(), Some("userns"));
+        let message = parse(serde_json::json!({
+            "harness": "muse", "mode": "interactive",
+            "write_sandbox": true, "slot_isolation": "bogus"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("slot_isolation must be"), "{message}");
+        let message = parse(serde_json::json!({
+            "harness": "agentcloud", "mode": "interactive", "write_sandbox": true
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("write_sandbox"), "{message}");
     }
 
     #[test]

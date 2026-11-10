@@ -18,3 +18,9 @@ SURVEY (2026-11-10, this lane, read-only). (1) The box already exists: py/wrkslo
 # Acceptance Criteria
 
 Phase 1: this issue records survey, writable-set design, agentctl-for-all-harnesses plan, per-project tmp+TTL+reaper, experiments guideline, rollout and denied-write logging; temp-data skill draft sent for owner review; no live lane or profile changed. Phase 2 (separate owner approval): opt-in trial on one lane proving EROFS outside the writable set and clean harness operation inside it.
+
+# Notes
+
+## Phase 2 (agentctl side, opt-in)
+
+Implemented behind profile flag `write_sandbox` (default off; no live lane enabled): profiles accept `write_sandbox`/`slot_isolation`; a start with such a profile and `--cwd` inside `worktrees/slots/<name>` boxes to that slot for claude, codex and Muse; a `root` project isolation coerces to `userns` for Muse (explicit root still refused). wrkslots binds the gate-admission directory writable when $GATE_ADMISSION_DIR is explicitly exported and exists, and $WRKSLOTS_DENY_LOG=1 wraps the boxed command in strace failed-file-syscall logging (log-only, no strace = untraced). Per-project tmp TTL/reaper, the 2 GB guideline and the trial lane wait for owner-confirmed figures.

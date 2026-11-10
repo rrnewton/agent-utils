@@ -1782,6 +1782,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 box_writable: Some(scope.to_owned()),
                 box_cwd: Some(cwd.clone()),
                 executable: slot_executable,
+                write_sandbox: false,
             })
         } else {
             None

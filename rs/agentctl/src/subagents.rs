@@ -6048,6 +6048,41 @@ pub struct SlotLaunch {
     pub box_writable: Option<String>,
     /// With `project_box`: the box's working directory (the agent's `--cwd`).
     pub box_cwd: Option<PathBuf>,
+    /// The launch came from a profile's opt-in `write_sandbox` (#1205): a `root`
+    /// effective isolation is coerced to `userns` for a harness with no root relay.
+    pub write_sandbox: bool,
+}
+
+/// The slot a `--cwd` inside a flat slot directory names: the directory itself
+/// when its parent is named `slots` (`<project>/worktrees/slots/<name>`).
+pub(crate) fn slot_from_cwd(cwd: &Path) -> Option<String> {
+    let parent = cwd.parent()?.file_name()?.to_str()?;
+    if parent != "slots" {
+        return None;
+    }
+    cwd.file_name()?.to_str().map(str::to_owned)
+}
+
+/// The isolation a boxed launch may use, given the effective isolation the slot
+/// manager reported. Muse has no root relay, so an opt-in `write_sandbox`
+/// launch whose project config says `root` runs under `userns` instead; an
+/// explicit root request for Muse is still refused, as before.
+pub(crate) fn resolve_box_isolation(
+    harness: &str,
+    effective: &str,
+    explicit_root: bool,
+    write_sandbox: bool,
+) -> Result<String> {
+    if effective == "root" && !RELAY_HARNESSES.contains(&harness) {
+        if write_sandbox && !explicit_root {
+            return Ok("userns".to_owned());
+        }
+        return Err(fail(format!(
+            "--slot with root isolation supports {}, not {harness:?}",
+            RELAY_HARNESSES.join(", ")
+        )));
+    }
+    Ok(effective.to_owned())
 }
 
 /// What a coordinator box may write besides the usual paths (`wrkslots box --writable`).
@@ -9636,6 +9671,23 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                 }
                 let launch = &launch;
                 let (line, slot_path, isolation) = slot_shell_command(launch, &project, &[])?;
+                // #1205: an opt-in write-sandbox Muse launch whose project config
+                // says root runs under userns (Muse has no root relay).
+                let (line, isolation) = match resolve_box_isolation(
+                    &options.harness,
+                    &isolation,
+                    launch.isolation.as_deref() == Some("root"),
+                    launch.write_sandbox,
+                ) {
+                    Ok(resolved) if resolved != isolation => {
+                        let mut coerced = launch.clone();
+                        coerced.isolation = Some(resolved.clone());
+                        let (line, _path, _iso) = slot_shell_command(&coerced, &project, &[])?;
+                        (line, resolved)
+                    }
+                    Ok(resolved) => (line, resolved),
+                    Err(error) => return Err(error),
+                };
                 let slot_path = fs::canonicalize(&slot_path).map_err(|_| {
                     fail(format!(
                         "slot directory is not a directory: {}",
@@ -17955,6 +18007,31 @@ fi
         assert_eq!(
             argv.lines().skip(1).collect::<Vec<_>>(),
             ["shell-command", "s2", "--format", "json"]
+        );
+    }
+
+    #[test]
+    fn write_sandbox_slot_is_derived_from_cwd_and_muse_root_coerces() {
+        // #1205 lane-write-sandbox: the opt-in profile flag boxes Muse too.
+        assert_eq!(
+            slot_from_cwd(Path::new("/p/worktrees/slots/sandbox")).as_deref(),
+            Some("sandbox")
+        );
+        assert_eq!(slot_from_cwd(Path::new("/p/worktrees/sandbox")), None);
+        assert_eq!(slot_from_cwd(Path::new("/p")), None);
+        assert_eq!(
+            resolve_box_isolation("muse", "root", false, true).unwrap(),
+            "userns"
+        );
+        assert!(resolve_box_isolation("muse", "root", true, true).is_err());
+        assert!(resolve_box_isolation("muse", "root", false, false).is_err());
+        assert_eq!(
+            resolve_box_isolation("claude", "root", false, true).unwrap(),
+            "root"
+        );
+        assert_eq!(
+            resolve_box_isolation("muse", "userns", false, false).unwrap(),
+            "userns"
         );
     }
 

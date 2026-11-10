@@ -4054,6 +4054,8 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 environment,
                 cloud,
                 profile_pinned,
+                profile_write_sandbox,
+                profile_slot_isolation,
             ) = if let Some(profile_name) = value.profile.as_deref() {
                 let mut overlaps = Vec::new();
                 if value.mode.is_some() {
@@ -4101,6 +4103,8 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     profile.environment.clone(),
                     profile.cloud.clone(),
                     profile.pinned,
+                    profile.write_sandbox,
+                    profile.slot_isolation.clone(),
                 )
             } else {
                 let harness = value.harness.unwrap_or_else(|| "codex".to_owned());
@@ -4140,6 +4144,8 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     value.harness_args,
                     value.environment,
                     cloud,
+                    None,
+                    false,
                     None,
                 )
             };
@@ -4206,15 +4212,37 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         project: value.box_project.clone(),
                         project_box: true,
                         box_writable: value.box_writable.clone(),
+                        write_sandbox: profile_write_sandbox,
+                        ..SlotLaunch::default()
+                    })
+                } else if let Some(slot) = value.slot.clone() {
+                    Some(SlotLaunch {
+                        slot,
+                        isolation: value
+                            .slot_isolation
+                            .clone()
+                            .or_else(|| profile_slot_isolation.clone()),
+                        project: value.slot_project.clone(),
+                        write_sandbox: profile_write_sandbox,
+                        ..SlotLaunch::default()
+                    })
+                } else if profile_write_sandbox {
+                    // #1205: the profile opted in and no --slot was given (a
+                    // profile forbids it): box to the slot --cwd sits in.
+                    let slot = crate::subagents::slot_from_cwd(&value.cwd).ok_or_else(|| {
+                        Failure::Usage(format!(
+                            "profile {:?} has write_sandbox: pass --cwd inside a slot (worktrees/slots/<name>) or drop the flag",
+                            value.profile.as_deref().unwrap_or_default()
+                        ))
+                    })?;
+                    Some(SlotLaunch {
+                        slot,
+                        isolation: profile_slot_isolation.clone(),
+                        write_sandbox: true,
                         ..SlotLaunch::default()
                     })
                 } else {
-                    value.slot.clone().map(|slot| SlotLaunch {
-                        slot,
-                        isolation: value.slot_isolation.clone(),
-                        project: value.slot_project.clone(),
-                        ..SlotLaunch::default()
-                    })
+                    None
                 };
                 let options = StartOptions {
                     workspace_id: value.workspace_id,

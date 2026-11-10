@@ -1077,6 +1077,12 @@ def build_spec(
         path = Path(expand_path(item, str(home), user))
         if path.exists():
             add(path, path)
+    # Gate admission (#1205): a gate launcher that exports $GATE_ADMISSION_DIR
+    # gets that queue bound writable; unexported, the box's fresh /tmp stays
+    # untouched and no host /tmp path leaks into the view.
+    gate = gate_admission_dir()
+    if gate is not None and gate.exists():
+        add(gate, gate)
     entries = home_entries(settings, home)
     read_only = [] if view.coordinator else [str(view.control_directory)]
     runtime = spec_directory()
@@ -1117,6 +1123,51 @@ def build_spec(
         "cwd": str(cwd),
         **policy,
     }
+
+
+def gate_admission_dir(environ: Mapping[str, str] | None = None) -> Path | None:
+    """The gate-admission directory to bind writable, when explicitly exported.
+
+    Only an explicitly set $GATE_ADMISSION_DIR counts (#1205): defaulting to
+    the gate's usual /tmp path would bind a host /tmp subdir into every box,
+    breaking the fresh-/tmp contract. A gate launcher exports the variable;
+    the gate itself resolves the same variable, defaulting on its side.
+    """
+
+    env = os.environ if environ is None else environ
+    value = env.get("GATE_ADMISSION_DIR")
+    return Path(value) if value else None
+
+
+def deny_log_command(
+    command: Sequence[str],
+    log_path: Path,
+    *,
+    enabled: bool,
+    strace: str | None,
+) -> list[str]:
+    """Wrap ``command`` for log-only denied-write tracing (#1205).
+
+    With $WRKSLOTS_DENY_LOG set and strace present, failed file syscalls
+    (EROFS among them) are appended to ``log_path``; tracing never blocks or
+    alters the command. Without strace the command runs untraced.
+    """
+
+    if not enabled or strace is None or not command:
+        return list(command)
+    return [
+        strace,
+        "-f",
+        "-qq",
+        "-e",
+        "trace=%file",
+        "-e",
+        "status=failed",
+        "-o",
+        str(log_path),
+        "--",
+        *command,
+    ]
 
 
 def git_config_mask_paths(aliases: Sequence[Path]) -> list[str]:
@@ -1614,6 +1665,14 @@ def _limit_propagation(roots: Sequence[str]) -> None:
 # ------------------------------------------------------------- userns helper
 
 
+def _traced(spec: Mapping[str, object], command: Sequence[str], environ: Mapping[str, str]) -> list[str]:
+    """Apply log-only denied-write tracing when $WRKSLOTS_DENY_LOG is set."""
+
+    enabled = environ.get("WRKSLOTS_DENY_LOG", "").lower() in ("1", "true", "yes")
+    log_path = Path(str(spec.get("home_layer", "/tmp"))) / "wrkslots-deny.log"
+    return deny_log_command(command, log_path, enabled=enabled, strace=shutil.which("strace"))
+
+
 def enter_userns(spec: Mapping[str, object], command: Sequence[str]) -> None:
     """Enter a new user + mount namespace, build the view, exec ``command``."""
 
@@ -1623,6 +1682,7 @@ def enter_userns(spec: Mapping[str, object], command: Sequence[str]) -> None:
     _write("/proc/self/uid_map", f"{uid} {uid} 1\n")
     _write("/proc/self/gid_map", f"{gid} {gid} 1\n")
     build_view(spec)
+    command = _traced(spec, command, os.environ)
     os.execvp(command[0], list(command))
 
 
@@ -1785,6 +1845,7 @@ def enter_root(spec_file: str) -> None:
     os.umask(int(str(document.get("umask", 0o022))))
     _check(_libc().unshare(_CLONE_NEWNS), "unshare mount namespace")
     build_view(view)
+    command = _traced(view, command, environment)
     _set_capabilities([])
     if os.getuid() != uid or os.geteuid() != uid or os.getgid() != gid:
         raise SandboxError("privilege drop did not take effect")
