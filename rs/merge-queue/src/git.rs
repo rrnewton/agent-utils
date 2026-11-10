@@ -611,6 +611,167 @@ impl Git {
         self.run(&["log", "-1", "--format=%B", commit])
     }
 
+    /// The stable patch-id (`git patch-id --stable`) of a unified diff: the
+    /// empty string when the diff carries no patch (an empty commit).
+    pub fn patch_id(&self, diff: &[u8]) -> Result<String, String> {
+        let mut command = self.command(&["patch-id", "--stable"]);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("could not run git patch-id: {error}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(diff)
+                .map_err(|error| format!("could not feed git patch-id: {error}"))?;
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("could not run git patch-id: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "git patch-id failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_owned())
+    }
+
+    /// A commit's patch as bytes (`git show` with no message).
+    fn commit_diff(&self, commit: &str) -> Result<Vec<u8>, String> {
+        let output = self.output(
+            self.command(&["show", "--format=", commit]),
+            "git show",
+            &[0],
+        )?;
+        Ok(output.stdout)
+    }
+
+    /// A commit's stable patch-id; empty for an empty commit.
+    pub fn commit_patch_id(&self, commit: &str) -> Result<String, String> {
+        self.patch_id(&self.commit_diff(commit)?)
+    }
+
+    /// The stable patch-id of the whole `from..to` diff (a squash candidate).
+    fn range_patch_id(&self, from: &str, to: &str) -> Result<String, String> {
+        let output = self.output(self.command(&["diff", from, to]), "git diff", &[0])?;
+        self.patch_id(&output.stdout)
+    }
+
+    /// Map each of `originals` (oldest first) to the landed commit that
+    /// carries its patch in `landed_parent..landed_tip`, matching by
+    /// patch-id because a rebase rewrites the SHAs.
+    ///
+    /// A group of consecutive originals whose combined patch is one landed
+    /// commit's patch landed squashed into that commit. An original with no
+    /// match did not land as its own commit; its note says why as far as the
+    /// patches show it.
+    pub fn map_commits(
+        &self,
+        originals: &[String],
+        landed_parent: &str,
+        landed_tip: &str,
+    ) -> Result<Vec<crate::model::CommitLanding>, String> {
+        let landed = self.own_commits(landed_tip, &[landed_parent])?;
+        let mut landed_patches: Vec<String> = Vec::with_capacity(landed.len());
+        for commit in &landed {
+            landed_patches.push(self.commit_patch_id(commit)?);
+        }
+        let mut used = vec![false; landed.len()];
+        let mut result: Vec<crate::model::CommitLanding> = Vec::with_capacity(originals.len());
+        for original in originals {
+            if let Some(index) = landed.iter().position(|commit| commit == original) {
+                if !used[index] {
+                    used[index] = true;
+                    result.push(crate::model::CommitLanding {
+                        original: original.clone(),
+                        landed: Some(original.clone()),
+                        note: String::new(),
+                    });
+                    continue;
+                }
+            }
+            let patch = self.commit_patch_id(original)?;
+            let matched = if patch.is_empty() {
+                None
+            } else {
+                landed_patches
+                    .iter()
+                    .enumerate()
+                    .find(|(index, candidate)| !used[*index] && **candidate == patch)
+                    .map(|(index, _)| index)
+            };
+            match matched {
+                Some(index) => {
+                    used[index] = true;
+                    result.push(crate::model::CommitLanding {
+                        original: original.clone(),
+                        landed: Some(landed[index].clone()),
+                        note: String::new(),
+                    });
+                }
+                None => result.push(crate::model::CommitLanding {
+                    original: original.clone(),
+                    landed: None,
+                    note: if patch.is_empty() {
+                        "dropped: empty once rebased (its patch is already on the base)".to_owned()
+                    } else {
+                        "dropped: no landed commit carries its patch".to_owned()
+                    },
+                }),
+            }
+        }
+        // Squash pass: a run of still-unmatched originals whose combined
+        // patch is exactly one unused landed commit's patch landed together
+        // in that commit.
+        let mut index = 0;
+        while index < result.len() {
+            if result[index].landed.is_some() {
+                index += 1;
+                continue;
+            }
+            let mut end = index;
+            let mut squashed_into: Option<usize> = None;
+            while end < result.len() && result[end].landed.is_none() {
+                if end > index {
+                    if let Ok(parent) = self.rev_parse(&format!("{}^", originals[index])) {
+                        if let Ok(group_patch) = self.range_patch_id(&parent, &originals[end]) {
+                            if !group_patch.is_empty() {
+                                if let Some(found) = landed_patches
+                                    .iter()
+                                    .enumerate()
+                                    .find(|(i, candidate)| !used[*i] && **candidate == group_patch)
+                                    .map(|(i, _)| i)
+                                {
+                                    squashed_into = Some(found);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                end += 1;
+            }
+            if let Some(found) = squashed_into {
+                used[found] = true;
+                for entry in &mut result[index..=end] {
+                    entry.landed = Some(landed[found].clone());
+                    entry.note = "squashed".to_owned();
+                }
+                index = end + 1;
+            } else {
+                index += 1;
+            }
+        }
+        Ok(result)
+    }
+
     /// Author and message metadata for replaying a commit.
     fn commit_meta(&self, commit: &str) -> Result<(String, String, String, String), String> {
         let raw = self.run(&["log", "-1", "--format=%an%x00%ae%x00%aI%x00%B", commit])?;
@@ -1564,6 +1725,69 @@ mod unit {
         );
         let base = git.rev_parse("main").unwrap();
         assert_eq!(git.range(&base, &a).unwrap(), [a.clone()].into());
+    }
+
+    /// Two commits on a branch from `base`, returned oldest first with the head.
+    fn two_commits(tmp: &TempDir, git: &Git) -> (Vec<String>, String) {
+        git.run(&["checkout", "-q", "-b", "feature", "main"])
+            .unwrap();
+        write(&tmp.0, "a.txt", "a\n");
+        git_add_commit(&tmp.0);
+        let first = git.rev_parse("HEAD").unwrap();
+        write(&tmp.0, "b.txt", "b\n");
+        git_add_commit(&tmp.0);
+        let second = git.rev_parse("HEAD").unwrap();
+        git.run(&["checkout", "-q", "main"]).unwrap();
+        (vec![first, second.clone()], second)
+    }
+
+    #[test]
+    fn map_commits_matches_a_rebase_by_patch_id() {
+        let tmp = TempDir::new("git-map-rebase");
+        let git = init(&tmp.0);
+        let (originals, _head) = two_commits(&tmp, &git);
+        // The base moves, then the commits are replayed onto it: new SHAs.
+        write(&tmp.0, "base.txt", "moved\n");
+        git_add_commit(&tmp.0);
+        let parent = git.rev_parse("main").unwrap();
+        let Combined::Clean(first) = git.cherry_pick(&parent, &originals[0]).unwrap() else {
+            panic!("first commit should replay");
+        };
+        let Combined::Clean(tip) = git.cherry_pick(&first, &originals[1]).unwrap() else {
+            panic!("second commit should replay");
+        };
+        assert_ne!(first, originals[0]);
+        let map = git.map_commits(&originals, &parent, &tip).unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map[0].landed.as_deref(), Some(first.as_str()));
+        assert_eq!(map[1].landed.as_deref(), Some(tip.as_str()));
+        assert!(map.iter().all(|entry| entry.note.is_empty()));
+    }
+
+    #[test]
+    fn map_commits_names_a_squash_and_a_drop() {
+        let tmp = TempDir::new("git-map-squash");
+        let git = init(&tmp.0);
+        let (originals, head) = two_commits(&tmp, &git);
+        let parent = git.rev_parse("main").unwrap();
+        // One landed commit carrying both originals' combined patch.
+        let tree = git.tree_of(&head).unwrap();
+        let squashed = git.commit_on(&tree, &parent, "squashed").unwrap();
+        let map = git.map_commits(&originals, &parent, &squashed).unwrap();
+        assert!(
+            map.iter()
+                .all(|entry| entry.landed.as_deref() == Some(squashed.as_str())
+                    && entry.note == "squashed"),
+            "{map:?}"
+        );
+        // Only the first commit lands: the second is reported dropped.
+        let Combined::Clean(only) = git.cherry_pick(&parent, &originals[0]).unwrap() else {
+            panic!("first commit should replay");
+        };
+        let map = git.map_commits(&originals, &parent, &only).unwrap();
+        assert_eq!(map[0].landed.as_deref(), Some(only.as_str()));
+        assert_eq!(map[1].landed, None);
+        assert!(map[1].note.starts_with("dropped:"), "{map:?}");
     }
 
     #[test]

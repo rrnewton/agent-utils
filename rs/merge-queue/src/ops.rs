@@ -492,6 +492,8 @@ fn submit_resolved(
             .map_or_else(Vec::new, |old| old.deciding_failed.clone()),
         status: ItemStatus::Queued,
         landed_as: String::new(),
+        landed_map: Vec::new(),
+        landed_batch: String::new(),
         history: existing.map(|old| old.history).unwrap_or_default(),
     };
     let mut detail = match &item.claim {

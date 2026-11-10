@@ -739,7 +739,10 @@ pub fn close_postponed(state: &State, config: &Config) -> Result<(), String> {
             continue;
         }
         closes += 1;
-        match hosting.close(item.pr, &close_comment(&item.landed_as)) {
+        match hosting.close(
+            item.pr,
+            &close_comment(&item.landed_as, &item.landed_batch, &item.landed_map),
+        ) {
             Ok(()) => {
                 note_close(state, item.pr, "closed")?;
                 clear_close_retry(state, item.pr);
@@ -837,9 +840,62 @@ pub fn record_closed(state: &State, _lock: &Lock) -> Result<Vec<i64>, String> {
     Ok(recorded)
 }
 
+/// First 8 characters of a commit ID (the mapping's spelling).
+fn short8(sha: &str) -> &str {
+    &sha[..sha.len().min(8)]
+}
+
 /// The comment left on a pull request closed after landing.
-pub fn close_comment(landed: &str) -> String {
-    format!("Landed by merge-queue in {landed} (the exact validated commit; see the queue's run report).")
+///
+/// With a commit map (#1171 mq-close-comment) the comment proves what
+/// landed: the landing batch, every original commit mapped to its landed
+/// SHA (matched by patch-id, so a rebase's rewritten SHAs still pair up),
+/// and either "all N commits landed" or the commits that did not land as
+/// their own commits, each with its reason. Without one (a change landed
+/// before maps were recorded) the comment keeps its previous form.
+pub fn close_comment(landed: &str, batch: &str, map: &[crate::model::CommitLanding]) -> String {
+    if map.is_empty() {
+        return format!(
+            "Landed by merge-queue in {landed} (the exact validated commit; see the queue's run report)."
+        );
+    }
+    let pairs: Vec<String> = map
+        .iter()
+        .filter_map(|entry| {
+            entry.landed.as_ref().map(|landed| {
+                let suffix = if entry.note == "squashed" {
+                    " (squashed)"
+                } else {
+                    ""
+                };
+                format!(
+                    "{} -> {}{}",
+                    short8(&entry.original),
+                    short8(landed),
+                    suffix
+                )
+            })
+        })
+        .collect();
+    let missing: Vec<String> = map
+        .iter()
+        .filter(|entry| entry.landed.is_none())
+        .map(|entry| format!("{} ({})", short8(&entry.original), entry.note))
+        .collect();
+    let verdict = if missing.is_empty() {
+        format!("all {} commits landed ({})", map.len(), pairs.join(", "))
+    } else {
+        format!(
+            "{} of {} commits landed ({}); not landed as their own commits: {}",
+            pairs.len(),
+            map.len(),
+            pairs.join(", "),
+            missing.join(", ")
+        )
+    };
+    format!(
+        "Landed by merge-queue in batch {batch}: {verdict}. The landed tip is {landed}; see the queue's run report."
+    )
 }
 
 #[cfg(test)]
@@ -854,6 +910,95 @@ mod unit {
         assert_eq!(close_retry_delay(6), Duration::from_secs(1920));
         assert_eq!(close_retry_delay(7), Duration::from_secs(3600));
         assert_eq!(close_retry_delay(30), Duration::from_secs(3600));
+    }
+
+    fn landing(original: &str, landed: Option<&str>, note: &str) -> crate::model::CommitLanding {
+        crate::model::CommitLanding {
+            original: original.to_owned(),
+            landed: landed.map(str::to_owned),
+            note: note.to_owned(),
+        }
+    }
+
+    #[test]
+    fn close_comment_names_the_batch_and_maps_one_commit() {
+        let original = "7e3cbe79".to_owned() + &"a".repeat(32);
+        let landed = "718d6431".to_owned() + &"b".repeat(32);
+        let comment = close_comment(
+            &landed,
+            &format!("#5333 at {}", &landed[..10]),
+            &[landing(&original, Some(&landed), "")],
+        );
+        assert!(comment.contains("in batch #5333 at 718d6431b"), "{comment}");
+        assert!(comment.contains("all 1 commits landed"), "{comment}");
+        assert!(comment.contains("7e3cbe79 -> 718d6431"), "{comment}");
+        assert!(comment.contains(&landed), "{comment}");
+    }
+
+    #[test]
+    fn close_comment_maps_every_commit_of_a_multi_commit_change() {
+        let first = "7e3cbe79".to_owned() + &"a".repeat(32);
+        let second = "f9284ed9".to_owned() + &"c".repeat(32);
+        let first_landed = "718d6431".to_owned() + &"b".repeat(32);
+        let second_landed = "9d30d450".to_owned() + &"d".repeat(32);
+        let comment = close_comment(
+            &second_landed,
+            &format!("#5333 at {}", &second_landed[..10]),
+            &[
+                landing(&first, Some(&first_landed), ""),
+                landing(&second, Some(&second_landed), ""),
+            ],
+        );
+        assert!(comment.contains("all 2 commits landed"), "{comment}");
+        assert!(
+            comment.contains("7e3cbe79 -> 718d6431, f9284ed9 -> 9d30d450"),
+            "{comment}"
+        );
+    }
+
+    #[test]
+    fn close_comment_says_what_a_squash_and_a_drop_did() {
+        let kept = "11111111".to_owned() + &"a".repeat(32);
+        let squashed_a = "22222222".to_owned() + &"a".repeat(32);
+        let squashed_b = "33333333".to_owned() + &"a".repeat(32);
+        let dropped = "44444444".to_owned() + &"a".repeat(32);
+        let kept_landed = "55555555".to_owned() + &"b".repeat(32);
+        let squash_landed = "66666666".to_owned() + &"b".repeat(32);
+        let comment = close_comment(
+            &squash_landed,
+            &format!("#5333 at {}", &squash_landed[..10]),
+            &[
+                landing(&kept, Some(&kept_landed), ""),
+                landing(&squashed_a, Some(&squash_landed), "squashed"),
+                landing(&squashed_b, Some(&squash_landed), "squashed"),
+                landing(
+                    &dropped,
+                    None,
+                    "dropped: no landed commit carries its patch",
+                ),
+            ],
+        );
+        assert!(comment.contains("3 of 4 commits landed"), "{comment}");
+        assert!(comment.contains("11111111 -> 55555555"), "{comment}");
+        assert!(
+            comment.contains("22222222 -> 66666666 (squashed)"),
+            "{comment}"
+        );
+        assert!(
+            comment.contains("44444444 (dropped: no landed commit carries its patch)"),
+            "{comment}"
+        );
+    }
+
+    #[test]
+    fn close_comment_without_a_map_keeps_its_previous_form() {
+        let landed = "718d6431".to_owned() + &"b".repeat(32);
+        assert_eq!(
+            close_comment(&landed, "", &[]),
+            format!(
+                "Landed by merge-queue in {landed} (the exact validated commit; see the queue's run report)."
+            )
+        );
     }
 
     #[test]

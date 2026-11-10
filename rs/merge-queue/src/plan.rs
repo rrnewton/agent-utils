@@ -1254,6 +1254,8 @@ mod unit {
             deciding_failed: vec![],
             status: ItemStatus::Queued,
             landed_as: String::new(),
+            landed_map: Vec::new(),
+            landed_batch: String::new(),
             history: vec![],
         }
     }

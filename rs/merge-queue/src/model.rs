@@ -265,6 +265,17 @@ pub struct Item {
     /// Base-branch commit that contains this change, once landed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub landed_as: String,
+    /// How each original commit of this change landed, oldest first, computed
+    /// at landing by matching patch-ids between the submitted head and the
+    /// landed range (a rebase rewrites the SHAs). Empty for changes landed
+    /// before this was recorded; the closing comment then keeps its old form.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub landed_map: Vec<CommitLanding>,
+    /// The landing batch this change landed in (its changes and tip), named
+    /// in the closing comment. Empty for changes landed before this was
+    /// recorded.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub landed_batch: String,
     /// History, oldest first.
     #[serde(default)]
     pub history: Vec<Event>,
@@ -272,6 +283,24 @@ pub struct Item {
 
 fn is_zero_u32(value: &u32) -> bool {
     *value == 0
+}
+
+/// One original commit of a landed change and how it landed.
+///
+/// `landed` is the base-branch commit that carries the original's patch, or
+/// `None` when no landed commit carries it on its own. `note` says why for
+/// the `None` case and for a squashed landing (`squashed`); it is empty for
+/// an ordinary one-to-one landing.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CommitLanding {
+    /// The commit as submitted (on the change's head).
+    pub original: String,
+    /// The commit that carries its patch on the base branch, when one does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed: Option<String>,
+    /// Why there is no one-to-one landed commit, or `squashed`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
 }
 
 /// The candidate a GREEN_FLAKY hold validated (see [`Item::held_candidate`]).

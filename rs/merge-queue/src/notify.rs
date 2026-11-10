@@ -742,6 +742,8 @@ mod unit {
             notify_delivery: NotifyDelivery::default(),
             status,
             landed_as: "b".repeat(40),
+            landed_map: Vec::new(),
+            landed_batch: String::new(),
             history: vec![],
         }
     }

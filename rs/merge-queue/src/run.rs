@@ -8616,6 +8616,42 @@ impl<'a> Runner<'a> {
             ),
         );
         let run_id = lock(&self.report).run.clone();
+        // How each change's original commits landed, for the closing
+        // comment (#1171 mq-close-comment): matched by patch-id between the
+        // submitted head and the range this landing added, because a rebase
+        // rewrites the SHAs. Best-effort: a failure leaves the map empty and
+        // the comment keeps its old form; it never fails a landing.
+        let landed_maps: BTreeMap<i64, Vec<crate::model::CommitLanding>> = if self.simulating() {
+            BTreeMap::new()
+        } else {
+            let items = lock(&self.items).clone();
+            let mut maps = BTreeMap::new();
+            for pr in prs {
+                let Some(item) = items.get(pr) else { continue };
+                let mut exclude: Vec<&str> = vec![old_base.as_str()];
+                for other in prs {
+                    if other != pr {
+                        if let Some(other_item) = items.get(other) {
+                            exclude.push(other_item.head.as_str());
+                        }
+                    }
+                }
+                let mapped = self
+                    .git
+                    .own_commits(&item.head, &exclude)
+                    .and_then(|originals| self.git.map_commits(&originals, &old_base, tip));
+                match mapped {
+                    Ok(map) => {
+                        maps.insert(*pr, map);
+                    }
+                    Err(error) => {
+                        eprintln!("merge-queue: commit map for #{pr} unavailable: {error}");
+                    }
+                }
+            }
+            maps
+        };
+        let landed_batch = format!("{} at {}", list(prs), short(tip));
         if !self.simulating() {
             {
                 let mut items = lock(&self.items);
@@ -8623,6 +8659,10 @@ impl<'a> Runner<'a> {
                     if let Some(item) = items.get_mut(pr) {
                         item.status = ItemStatus::Landed;
                         item.landed_as = tip.to_owned();
+                        if let Some(map) = landed_maps.get(pr) {
+                            item.landed_map = map.clone();
+                        }
+                        item.landed_batch = landed_batch.clone();
                         item.next_retry_at.clear();
                         item.last_refusal.clear();
                         item.deciding_report = self.run_dir.join("report.md").display().to_string();
