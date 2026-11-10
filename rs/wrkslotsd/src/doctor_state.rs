@@ -259,6 +259,20 @@ pub(crate) fn doctor_cli(
     all_machines: bool,
     human: bool,
 ) -> Result<String> {
+    // Published only from a read the registry did not change under
+    // (#1200 rust-status-consistency).
+    let (cfg, _selected) = load_cfg(root, machine_override)?;
+    crate::global_state::consistent_read(&cfg.control, || {
+        doctor_cli_once(root, machine_override, all_machines, human)
+    })
+}
+
+fn doctor_cli_once(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    all_machines: bool,
+    human: bool,
+) -> Result<String> {
     let (cfg, selected) = load_cfg(root, machine_override)?;
     let config = load_config(root, machine_override)?;
     let cap = config

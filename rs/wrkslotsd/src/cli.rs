@@ -2011,6 +2011,7 @@ pub fn run() -> u8 {
                     gate,
                     format == "human",
                     all_machines,
+                    jobs,
                 )
             } {
                 Ok((text, code)) => {
@@ -2093,6 +2094,7 @@ pub fn run() -> u8 {
                         plan_total_seconds: cache_plan_total_seconds,
                     },
                     all_machines,
+                    None,
                 ) {
                     Ok(value) => {
                         println!(

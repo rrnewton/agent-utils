@@ -5472,6 +5472,53 @@ pub(crate) fn validation_liveness(
     })
 }
 
+/// The Python audit's default pool width (`_AUDIT_DEFAULT_JOBS`).
+const AUDIT_DEFAULT_JOBS: usize = 4;
+
+/// The audit's pool width: `--jobs`, or the smaller of
+/// AUDIT_DEFAULT_JOBS and the CPUs this process may run on.
+fn audit_jobs(jobs: Option<i64>) -> Result<usize> {
+    match jobs {
+        Some(count) if count < 1 => Err("--jobs must be at least 1".to_string()),
+        Some(count) => Ok(usize::try_from(count).unwrap_or(usize::MAX)),
+        None => Ok(std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .min(AUDIT_DEFAULT_JOBS)),
+    }
+}
+
+/// Run `judge` for every index below `count` on at most `jobs` threads,
+/// returning the results in index order.
+fn judge_in_pool<T: Send>(count: usize, jobs: usize, judge: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let workers = jobs.min(count);
+    if workers <= 1 {
+        return (0..count).map(&judge).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut results: Vec<(usize, T)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if index >= count {
+                            return done;
+                        }
+                        done.push((index, judge(index)));
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("audit worker panicked"))
+            .collect()
+    });
+    results.sort_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_index, result)| result).collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn audit_record(
     root: Option<&Path>,
@@ -5484,7 +5531,7 @@ fn audit_record(
     sealed_generation: Option<i64>,
     validation_paths: &[PathBuf],
     measurement: &CacheMeasurement,
-    process_census: &mut Option<std::result::Result<ProcessSnapshot, String>>,
+    process_census: &std::sync::OnceLock<std::result::Result<ProcessSnapshot, String>>,
     census_targets: &[PathBuf],
 ) -> Result<(Value, bool)> {
     let slot = record
@@ -5701,14 +5748,11 @@ fn audit_record(
         && !slot_absent
     {
         // One shared census for the whole audit, captured only when
-        // a row can use it (single attempt, fail-closed like Python).
-        if process_census.is_none() {
-            *process_census = Some(capture_process_snapshot(
-                std::process::id() as i64,
-                census_targets,
-            ));
-        }
-        match process_census.as_ref().expect("census captured") {
+        // a row can use it (single attempt, fail-closed like Python);
+        // rows judged in parallel wait for the one capture.
+        match process_census
+            .get_or_init(|| capture_process_snapshot(std::process::id() as i64, census_targets))
+        {
             Err(error) => {
                 reasons.push(format!("process/path census failed: {error}"));
                 process_census_unknown = true;
@@ -6033,7 +6077,9 @@ pub(crate) fn parse_audit(
     machine_override: Option<&str>,
     census: CensusRequest,
     all_machines: bool,
+    jobs: Option<i64>,
 ) -> Result<Value> {
+    let jobs = audit_jobs(jobs)?;
     if census.work_limit < 1 {
         return Err("--cache-work-limit must be positive".to_string());
     }
@@ -6441,7 +6487,8 @@ pub(crate) fn parse_audit(
             .collect::<String>()
     };
     let census_measurements = cache_census(&cfg, &census_subjects, &census, &registry_revision)?;
-    let mut process_census: Option<std::result::Result<ProcessSnapshot, String>> = None;
+    let process_census: std::sync::OnceLock<std::result::Result<ProcessSnapshot, String>> =
+        std::sync::OnceLock::new();
     // Every registered slot directory, as the Python audit passes them
     // all to its one shared census.
     let census_targets: Vec<PathBuf> = records
@@ -6455,9 +6502,11 @@ pub(crate) fn parse_audit(
             slot_directory(&cfg, slot, slot_type).ok()
         })
         .collect();
-    let mut rows: Vec<Value> = Vec::new();
-    let mut running_agent_count: i64 = 0;
-    for (index, record) in records.iter().enumerate() {
+    // Registered rows are judged by a bounded pool (#1200
+    // rust-status-consistency), as the Python audit does; rows keep
+    // their registry order and the first refusal in that order wins.
+    let judge = |index: usize| {
+        let record = &records[index];
         let machine = record
             .get("machine")
             .and_then(Value::as_str)
@@ -6468,7 +6517,7 @@ pub(crate) fn parse_audit(
             .unwrap_or_default();
         let sealed = seal_by_slot.get(&(machine.to_string(), slot.to_string()));
         let events = events_by_machine.get(machine).cloned().unwrap_or_default();
-        let (row, running) = audit_record(
+        audit_record(
             root,
             &cfg,
             &config,
@@ -6479,9 +6528,24 @@ pub(crate) fn parse_audit(
             sealed.map(|(generation, _path)| *generation),
             &validation_paths,
             &census_measurements[index],
-            &mut process_census,
+            &process_census,
             &census_targets,
-        )?;
+        )
+    };
+    let judged = judge_in_pool(records.len(), jobs, judge);
+    let mut rows: Vec<Value> = Vec::new();
+    let mut running_agent_count: i64 = 0;
+    for (record, verdict) in records.iter().zip(judged) {
+        let machine = record
+            .get("machine")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let slot = record
+            .get("slot")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let sealed = seal_by_slot.get(&(machine.to_string(), slot.to_string()));
+        let (row, running) = verdict?;
         running_agent_count += i64::from(running);
         if let Some((generation, _path)) = sealed {
             represented_seals.insert((machine.to_string(), slot.to_string(), *generation));
@@ -7310,6 +7374,7 @@ fn non_slot_entry_bytes(path: &Path) -> Option<u64> {
 /// one verdict line per slot, and the coordinator gate block with
 /// `--gate`).  Exit code is 0 without `--gate`; with it, 1 when any
 /// slot needs attention and 2 when any slot's state is unknown.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn audit_cli(
     root: Option<&Path>,
     machine_override: Option<&str>,
@@ -7317,8 +7382,9 @@ pub(crate) fn audit_cli(
     gate: bool,
     human: bool,
     all_machines: bool,
+    jobs: Option<i64>,
 ) -> Result<(String, i32)> {
-    let payload = parse_audit(root, machine_override, census, all_machines)?;
+    let payload = parse_audit(root, machine_override, census, all_machines, jobs)?;
     let text = |key: &str| {
         payload
             .get(key)

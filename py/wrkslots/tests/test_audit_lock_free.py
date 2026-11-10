@@ -770,3 +770,41 @@ def test_other_edition_accepts_the_same_jobs_option(tmp_path: Path) -> None:
     refused = run("0")
     assert refused.returncode != 0
     assert "--jobs must be at least 1" in refused.stderr
+
+
+def _comparable_rust_audit(root: Path, tmp_path: Path, jobs: int) -> tuple[dict[str, object], float]:
+    started = time.perf_counter()
+    result = subprocess.run(
+        [
+            str(rust_wrkslotsd()), "audit-text", "--root", str(root),
+            "--cache-census-state", str(tmp_path / f"rust-census-{jobs}.json"),
+            "--format", "json", "--jobs", str(jobs),
+        ],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
+    )
+    elapsed = time.perf_counter() - started
+    assert result.returncode == 0, result.stderr
+    payload: dict[str, object] = json.loads(result.stdout)
+    payload.pop("metrics", None)
+    payload.pop("disk")  # free space moves between the two runs
+    for row in cast(list[dict[str, object]], payload["slots"]):
+        row.pop("heartbeat_age_seconds", None)
+        row["reasons"] = [
+            re.sub(r"\b\d+s\b", "Ns", str(reason))
+            for reason in cast(list[object], row["reasons"])
+        ]
+    return payload, elapsed
+
+
+def test_other_edition_pools_rows_with_the_same_report(tmp_path: Path) -> None:
+    """#1200 rust-status-consistency: Rust audit --jobs 4 reports exactly what --jobs 1 does."""
+    root = _verdict_mix_fixture(tmp_path / "case")
+    serial, serial_seconds = _comparable_rust_audit(root, tmp_path, 1)
+    pooled, pooled_seconds = _comparable_rust_audit(root, tmp_path, 4)
+    assert pooled == serial
+    verdicts = {
+        str(row["slot"]): row["verdict"]
+        for row in cast(list[dict[str, object]], serial["slots"])
+    }
+    assert {"BLOCKED", "HELD"} <= set(verdicts.values()), verdicts
+    print(f"rust audit: --jobs 1 {serial_seconds:.2f}s, --jobs 4 {pooled_seconds:.2f}s")

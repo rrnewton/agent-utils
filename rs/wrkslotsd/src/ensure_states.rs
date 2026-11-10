@@ -60,6 +60,25 @@ pub(crate) fn flock_wait(
     }
 }
 
+/// As `flock_wait`, for a shared lock (#1200: the readers' last,
+/// locked measurement), which no exclusive writer holds at the same time.
+pub(crate) fn flock_wait_shared(
+    file: &std::fs::File,
+    deadline: std::time::Instant,
+) -> std::result::Result<(), rustix::io::Errno> {
+    loop {
+        match rustix::fs::flock(file, rustix::fs::FlockOperation::NonBlockingLockShared) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(error);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+}
+
 pub(crate) struct Flock {
     _file: std::fs::File,
 }
@@ -93,6 +112,46 @@ pub(crate) fn acquire_lock(path: &Path, subject: &Path) -> Result<Flock> {
     }
     let deadline = std::time::Instant::now() + lock_wait();
     match flock_wait(&file, deadline) {
+        Ok(()) => Ok(Flock { _file: file }),
+        Err(_) => Err(format!(
+            "state lock is busy for {}; retry after the current command exits",
+            subject.display()
+        )),
+    }
+}
+
+/// As `acquire_lock`, for a shared lock on `path` (#1200): readers may
+/// hold it together, and no writer holds it while they do. It waits as
+/// long as `acquire_lock` (`WRKSLOTS_WAIT_LOCK`).
+pub(crate) fn acquire_shared_lock(path: &Path, subject: &Path) -> Result<Flock> {
+    if let Some(parent) = path.parent() {
+        if parent
+            .symlink_metadata()
+            .map(|meta| meta.file_type().is_symlink() || !meta.is_dir())
+            .unwrap_or(true)
+        {
+            return Err(format!("unsafe lock parent: {}", parent.display()));
+        }
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("cannot open state lock {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect state lock {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "state lock is not a regular file: {}",
+            path.display()
+        ));
+    }
+    let deadline = std::time::Instant::now() + lock_wait();
+    match flock_wait_shared(&file, deadline) {
         Ok(()) => Ok(Flock { _file: file }),
         Err(_) => Err(format!(
             "state lock is busy for {}; retry after the current command exits",

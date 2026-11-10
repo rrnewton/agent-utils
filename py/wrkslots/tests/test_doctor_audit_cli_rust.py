@@ -19,6 +19,7 @@ from typing import cast
 from wrkslots.tests.test_doctor_state_rust import _fixture, _root
 
 from wrkslots.tests.rust_binary import rust_wrkslotsd
+from wrkslots.tests.test_status_cli_rust import change_mid_read_env
 
 
 AU_ROOT = Path(__file__).resolve().parents[3]
@@ -375,3 +376,25 @@ def test_both_editions_find_the_harness_root_from_a_slot_through_symlinks(
         )
         assert result.returncode == 0, (command[0], result.stderr)
         assert json.loads(result.stdout)["project_root"] == str(root.resolve()), command[0]
+
+
+def test_doctor_publishes_the_registry_after_a_change_mid_read_like_python(
+    tmp_path: Path,
+) -> None:
+    """#1200 rust-status-consistency: a report never mixes two instants of the registry."""
+    root = _root(tmp_path)
+    _fixture(root)
+    rust_result = subprocess.run(
+        [str(rust_wrkslotsd()), "doctor-text", "--root", str(root), "--format", "json"],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
+        env=change_mid_read_env(root, tmp_path),
+    )
+    python_result = _python(root, "doctor", "--format", "json")
+    assert rust_result.returncode == python_result.returncode, (
+        rust_result.stderr, python_result.stderr,
+    )
+    rust_document = cast(dict[str, object], json.loads(rust_result.stdout))
+    first = cast(list[dict[str, object]], rust_document["active"])[0]
+    assert first["task"] == "changed while measuring", first
+    python_document = cast(dict[str, object], json.loads(python_result.stdout))
+    assert _normalized(rust_document) == _normalized(python_document)

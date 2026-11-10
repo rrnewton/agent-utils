@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import cast
 
@@ -82,3 +83,48 @@ def test_status_human_form_matches_python(tmp_path: Path) -> None:
         return lines
 
     assert scrub(rust_result.stdout) == scrub(python_result.stdout)
+
+
+#: Rewrites the first registered row's task, as a writer landing mid-read would (#1200).
+CHANGE_FIRST_TASK = """
+import json, sys
+from pathlib import Path
+shard = Path(sys.argv[1])
+document = json.loads(shard.read_text())
+document["slots"][0]["task"] = "changed while measuring"
+document["revision"] += 1
+shard.write_text(json.dumps(document))
+"""
+
+
+def change_mid_read_env(root: Path, tmp_path: Path) -> dict[str, str]:
+    """The environment that lands CHANGE_FIRST_TASK after a Rust reader's first measurement."""
+    script = tmp_path / "change-first-task.py"
+    script.write_text(CHANGE_FIRST_TASK)
+    shard = root / "worktrees" / "ACTIVE.node-a.json"
+    return {
+        **os.environ,
+        "WRKSLOTS_TEST_REGISTRY_CHANGE": f"{sys.executable} {script} {shard}",
+    }
+
+
+def test_status_publishes_the_registry_after_a_change_mid_read_like_python(
+    tmp_path: Path,
+) -> None:
+    """#1200 rust-status-consistency: a report never mixes two instants of the registry."""
+    root = _root(tmp_path)
+    _fixture(root)
+    rust_result = subprocess.run(
+        [str(rust_wrkslotsd()), "status-text", "--root", str(root), "--format", "json"],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
+        env=change_mid_read_env(root, tmp_path),
+    )
+    assert rust_result.returncode == 0, rust_result.stderr
+    rust_document = cast(dict[str, object], json.loads(rust_result.stdout))
+    first = cast(list[dict[str, object]], rust_document["active"])[0]
+    assert first["task"] == "changed while measuring", first
+    # Re-measured from the registry as it is now: the report Python makes of it.
+    python_result = _python(root, "--format", "json")
+    assert python_result.returncode == 0, python_result.stderr
+    python_document = cast(dict[str, object], json.loads(python_result.stdout))
+    assert _normalized(rust_document) == _normalized(python_document)

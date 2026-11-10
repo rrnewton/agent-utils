@@ -7,8 +7,10 @@
 //! then apply the cross-machine uniqueness and active-versus-archived
 //! overlap rules. Snapshot mode only: a machine with a non-empty event
 //! log derives its state, and derivation stays with `rebuild`.
-//! Read-only; the lock-based overlap re-read the Python reader performs
-//! is not reproduced, so an overlap is reported from the first read.
+//! Read-only. The status and doctor readers publish only a read whose
+//! registry content identity did not change across it
+//! (`consistent_read`, #1200 rust-status-consistency), as the Python
+//! readers' phased read does (#1172).
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -656,4 +658,232 @@ pub(crate) fn parse_global(root: Option<&Path>) -> Result<Value> {
         "machines": machines.iter().collect::<Vec<_>>(),
         "states": states,
     }))
+}
+
+/// How many times a reader repeats a measurement whose registry changed
+/// under it before it measures under the shared registry lock, as the
+/// Python readers' `_PHASED_READ_RETRIES` (#1172).
+const PHASED_READ_RETRIES: usize = 2;
+
+fn content_digest(path: &Path) -> String {
+    use sha2::Digest as _;
+    match std::fs::read(path) {
+        Ok(bytes) => sha2::Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        Err(error) => format!("unreadable: {error}"),
+    }
+}
+
+fn sorted_names(directory: &Path) -> std::io::Result<Vec<String>> {
+    let mut names: Vec<String> = std::fs::read_dir(directory)?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<_>>()?;
+    names.sort();
+    Ok(names)
+}
+
+fn is_complete_event(name: &str) -> bool {
+    name.len() == 25
+        && name.ends_with(".json")
+        && name.as_bytes()[..20].iter().all(u8::is_ascii_digit)
+}
+
+/// Content identity of everything a registry reader reports from, as
+/// the Python `_registry_read_identity` (#1172): every regular control
+/// file except lock files is hashed, and so are the quarantine
+/// directory's journals and every slot image record; an append-only
+/// event directory is identified by its complete-event count, the last
+/// event's digest (which chains every earlier event) and any partial
+/// event write. Contents, not file times or inode numbers.
+pub(crate) fn registry_read_identity(control: &Path) -> Result<Vec<Value>> {
+    let names = sorted_names(control).map_err(|error| {
+        format!(
+            "cannot list control directory {}: {error}",
+            control.display()
+        )
+    })?;
+    let mut parts: Vec<Value> = Vec::new();
+    for name in names {
+        if name.ends_with(".lock") {
+            continue;
+        }
+        let path = control.join(&name);
+        let Ok(metadata) = path.symlink_metadata() else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            let target = std::fs::read_link(&path)
+                .map(|target| target.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            parts.push(json!([name, "symlink", target]));
+        } else if name.starts_with("EVENTS.") && metadata.is_dir() {
+            match sorted_names(&path) {
+                Ok(events) => {
+                    let (complete, partial): (Vec<String>, Vec<String>) =
+                        events.into_iter().partition(|item| is_complete_event(item));
+                    let last = complete.last();
+                    parts.push(json!([
+                        name,
+                        complete.len(),
+                        last,
+                        last.map(|last| content_digest(&path.join(last))),
+                        partial,
+                    ]));
+                }
+                Err(error) => parts.push(json!([name, format!("unreadable: {error}")])),
+            }
+        } else if name == "quarantine" && metadata.is_dir() {
+            let journals: Vec<Value> = sorted_names(&path)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|item| !item.starts_with('.') && item.ends_with(".journal"))
+                .map(|item| json!([item, content_digest(&path.join(&item))]))
+                .collect();
+            parts.push(json!([name, journals]));
+        } else if name == crate::image_record::IMAGES_DIRECTORY && metadata.is_dir() {
+            let mut records: Vec<Value> = Vec::new();
+            for outer in sorted_names(&path).unwrap_or_default() {
+                if outer.starts_with('.') || !path.join(&outer).is_dir() {
+                    continue;
+                }
+                for inner in sorted_names(&path.join(&outer)).unwrap_or_default() {
+                    let record = path
+                        .join(&outer)
+                        .join(&inner)
+                        .join(crate::image_record::RECORD_NAME);
+                    if inner.starts_with('.') || !record.exists() {
+                        continue;
+                    }
+                    records.push(json!([
+                        format!("{outer}/{inner}/{}", crate::image_record::RECORD_NAME),
+                        content_digest(&record),
+                    ]));
+                }
+            }
+            parts.push(json!([name, records]));
+        } else if metadata.is_file() {
+            parts.push(json!([name, content_digest(&path)]));
+        }
+    }
+    Ok(parts)
+}
+
+/// Run a registry reader so that it reports the registry at one instant
+/// (#1200 rust-status-consistency), as the Python readers' phased read
+/// does (#1172). `measure` runs lock-free between two reads of the
+/// registry content identity, and its result (a report or a refusal) is
+/// published only when the identity did not change across it. Otherwise
+/// it is measured again, and after PHASED_READ_RETRIES repeats the last
+/// measurement runs under the shared registry lock, which no writer can
+/// hold at the same time. The Python reader re-measures only the rows
+/// that changed; this repeats the whole read, with the same report.
+pub(crate) fn consistent_read<T>(
+    control: &Path,
+    mut measure: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    for attempt in 0..=PHASED_READ_RETRIES {
+        let before = registry_read_identity(control)?;
+        let measured = measure();
+        if attempt == 0 {
+            change_registry_for_test();
+        }
+        if registry_read_identity(control)? == before {
+            return measured;
+        }
+    }
+    let _lock = crate::ensure_states::acquire_shared_lock(
+        &control.join("ACTIVE.global.lock"),
+        &control.join("ACTIVE"),
+    )?;
+    measure()
+}
+
+/// Test seam (#1200): run `WRKSLOTS_TEST_REGISTRY_CHANGE` once, after a
+/// reader's first measurement and before it checks the registry
+/// identity, so a differential can land a mutation mid-read.
+fn change_registry_for_test() {
+    if let Some(command) = std::env::var_os("WRKSLOTS_TEST_REGISTRY_CHANGE") {
+        let _ = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+}
+
+#[cfg(test)]
+mod read_identity_tests {
+    use super::*;
+
+    fn control(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wrkslots-identity-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("EVENTS.host")).unwrap();
+        std::fs::create_dir_all(dir.join("slot-images/agent/a")).unwrap();
+        std::fs::create_dir_all(dir.join("quarantine")).unwrap();
+        std::fs::write(dir.join("ACTIVE.host.json"), b"{}").unwrap();
+        std::fs::write(dir.join("ACTIVE.global.lock"), b"").unwrap();
+        std::fs::write(dir.join("EVENTS.host/00000000000000000001.json"), b"1").unwrap();
+        std::fs::write(dir.join("slot-images/agent/a/IMAGE.json"), b"{}").unwrap();
+        std::fs::write(dir.join("quarantine/x.journal"), b"j").unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_identity_sees_every_reported_content_but_not_locks() {
+        let dir = control("contents");
+        let base = registry_read_identity(&dir).unwrap();
+        assert_eq!(registry_read_identity(&dir).unwrap(), base);
+        // A lock file's content is not reported from.
+        std::fs::write(dir.join("ACTIVE.global.lock"), b"held").unwrap();
+        assert_eq!(registry_read_identity(&dir).unwrap(), base);
+        for (path, content) in [
+            ("ACTIVE.host.json", &b"{\"slots\": []}"[..]),
+            ("EVENTS.host/00000000000000000002.json", b"2"),
+            ("EVENTS.host/00000000000000000003.json.tmp", b"partial"),
+            ("slot-images/agent/a/IMAGE.json", b"{\"size\": 1}"),
+            ("quarantine/x.journal", b"changed"),
+        ] {
+            let before = registry_read_identity(&dir).unwrap();
+            std::fs::write(dir.join(path), content).unwrap();
+            assert_ne!(registry_read_identity(&dir).unwrap(), before, "{path}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_read_that_saw_a_change_is_measured_again() {
+        let dir = control("phased");
+        let mut calls = 0;
+        let report = consistent_read(&dir, || {
+            calls += 1;
+            if calls == 1 {
+                // A writer lands while the first measurement runs.
+                std::fs::write(dir.join("ACTIVE.host.json"), b"{\"slots\": [1]}").unwrap();
+                return Ok("mixed");
+            }
+            Ok("current")
+        })
+        .unwrap();
+        assert_eq!((report, calls), ("current", 2));
+        // A registry that changes on every measurement is read once more
+        // under the shared lock, after the bounded repeats.
+        let mut calls = 0;
+        let report = consistent_read(&dir, || {
+            calls += 1;
+            std::fs::write(dir.join("ACTIVE.host.json"), format!("{{\"n\": {calls}}}")).unwrap();
+            Ok(calls)
+        })
+        .unwrap();
+        assert_eq!(report, PHASED_READ_RETRIES + 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
