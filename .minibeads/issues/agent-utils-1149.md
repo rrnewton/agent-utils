@@ -1,6 +1,6 @@
 ---
 title: 'worktrees-image-migrate-original-kept: migrate leaves the original under the bind, nothing reclaims it, and a later remove breaks'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-09T17:35:00.000000000+00:00
@@ -38,3 +38,9 @@ only path, kind and size): compare content or hashes, mode, HEAD and Git status,
 # Notes
 
 Order of the worktrees-image set: #1147 (records race), #1148 (silent mount failure), #1149 (migrate original), then #1150 (migrate liveness) and #1151 (help and small items). Rust parity follows in the Rust worktrees-image handlers.
+
+## Resolution
+
+Covered by f7477253 (#1162): `migrate-layout --to direct` already reclaims the host original beneath each bind under the layout census, and direct-layout migrate reclaims its plain original; those parts needed no new work.
+
+Delivered here for the existing host-to-image `wrkslots migrate`: (1) binds-layout migrate now reclaims the original at migrate time — after the compare passes it renames the verified original to a `.<slot>.premigrate-<random>` sibling, binds the subvolume at the slot path, re-proves the displaced tree unused with the one-slot census (holds, registered liveness, process-use census), and deletes it, so nothing remains under the bind; a crash between rename and bind leaves the original at the named sibling to rename back. (2) `_remove_slot_directory` unmounts without dropping the record and refuses before `delete_slot_subvolume` when anything sits beneath the bind, re-establishing the bind with record and subvolume intact (test). (3) The migrate compare now covers mode, symlink target and a SHA-256 content hash per file, plus each checkout's HEAD and `git status` (read with `--no-optional-locks` so a copied linked worktree never writes the shared index); a same-size content-only difference refuses with the original kept (tests). Hard-link preservation in the copy was split out by coordinator decision and is not filed yet. Rust parity: mirror the signature fields, Git-state compare, reclaim order, and the remove guard in the Rust worktrees-image handlers (filed with the landing PUSH).

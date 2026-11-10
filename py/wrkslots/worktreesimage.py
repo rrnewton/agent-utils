@@ -529,26 +529,94 @@ def delete_slot_subvolume(path: Path) -> None:
     _run(["btrfs", "subvolume", "delete", str(path)], sudo=True)
 
 
-def listing_signature(root: Path) -> list[tuple[str, str, int]]:
-    """Sorted (relative path, kind, size) for every migratable entry.
+def _content_hash(path: Path) -> str:
+    import hashlib
 
-    Special files (FIFOs, sockets, devices — runtime residue in build
-    caches) are skipped: they cannot be copied and are never slot
-    content, so migration neither copies nor compares them.
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def listing_signature(root: Path) -> list[tuple[str, str, int, int, str]]:
+    """Sorted (path, kind, size, mode, proof) for every migratable entry.
+
+    Proof is the link target for a symlink and the SHA-256 of the
+    contents for a file, so the migrate compare catches a same-size
+    content difference, a mode change, and a retargeted link — not
+    just a different listing. Special files (FIFOs, sockets, devices
+    — runtime residue in build caches) are skipped: they cannot be
+    copied and are never slot content, so migration neither copies
+    nor compares them.
     """
 
-    signature: list[tuple[str, str, int]] = []
+    import stat as stat_module
+
+    signature: list[tuple[str, str, int, int, str]] = []
     for current, dirs, files in os.walk(root):
         for name in dirs + files:
             entry = Path(current) / name
             relative = entry.relative_to(root).as_posix()
             if entry.is_symlink():
-                signature.append((relative, "link", len(os.readlink(entry))))
+                mode = stat_module.S_IMODE(entry.lstat().st_mode)
+                signature.append((relative, "link", 0, mode, os.readlink(entry)))
             elif entry.is_dir():
-                signature.append((relative, "dir", 0))
+                mode = stat_module.S_IMODE(entry.stat().st_mode)
+                signature.append((relative, "dir", 0, mode, ""))
             elif entry.is_file():
-                signature.append((relative, "file", entry.stat().st_size))
+                info = entry.stat()
+                signature.append(
+                    (
+                        relative,
+                        "file",
+                        info.st_size,
+                        stat_module.S_IMODE(info.st_mode),
+                        _content_hash(entry),
+                    )
+                )
     return sorted(signature)
+
+
+def git_state_signature(root: Path) -> list[tuple[str, str, str]]:
+    """Sorted (checkout, HEAD, status) for each Git checkout under root.
+
+    A directory holding a ``.git`` entry (directory or worktree
+    pointer file) contributes its ``HEAD`` and porcelain status, so
+    the migrate compare also proves the copy is the same checkout in
+    the same state, not merely the same bytes. A checkout Git cannot
+    read contributes its error text, which must then match too.
+    """
+
+    states: list[tuple[str, str, str]] = []
+    for current, dirs, _files in os.walk(root):
+        directory = Path(current)
+        if ".git" not in dirs and not (directory / ".git").is_file():
+            continue
+        relative = directory.relative_to(root).as_posix()
+        values: list[str] = []
+        for argv in (
+            ["rev-parse", "HEAD"],
+            ["status", "--porcelain=v1", "--untracked-files=no"],
+        ):
+            # --no-optional-locks: a copied linked worktree shares its
+            # administrative directory with the original, and a status
+            # refresh must never write the shared index from here.
+            result = subprocess.run(
+                ["git", "--no-optional-locks", "-C", str(directory), *argv],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            values.append(
+                result.stdout.strip()
+                if result.returncode == 0
+                else f"unreadable: {(result.stderr or result.stdout).strip()}"
+            )
+        states.append((relative, values[0], values[1]))
+        if ".git" in dirs:
+            dirs.remove(".git")
+    return sorted(states)
 
 
 def _skip_special(directory: str, names: list[str]) -> list[str]:
@@ -833,6 +901,16 @@ def relocate_bind(control: Path, mount_dir: Path, slot: str, source: Path, desti
         return records
 
     _update_bind_records(control, relocate)
+
+
+def forget_bind(control: Path, slot: str) -> None:
+    """Drop a slot's bind record only; mounts are the caller's business."""
+
+    def drop(records: dict[str, BindRecord]) -> dict[str, BindRecord]:
+        records.pop(slot, None)
+        return records
+
+    _update_bind_records(control, drop)
 
 
 def umount_point(path: Path) -> None:

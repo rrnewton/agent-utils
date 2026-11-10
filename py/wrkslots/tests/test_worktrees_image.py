@@ -156,7 +156,7 @@ def test_special_files_are_not_migratable(tmp_path: Path) -> None:
     (tmp_path / "keep.txt").write_text("x", encoding="utf-8")
     os.mkfifo(tmp_path / "pipe")
     signature = worktreesimage.listing_signature(tmp_path)
-    assert signature == [("keep.txt", "file", 1)]
+    assert [(row[0], row[1], row[2]) for row in signature] == [("keep.txt", "file", 1)]
     assert worktreesimage._skip_special(str(tmp_path), ["keep.txt", "pipe"]) == ["pipe"]
 
 
@@ -550,8 +550,9 @@ def test_listing_signature_and_quota(tmp_path: Path) -> None:
     (tmp_path / "sub").mkdir()
     (tmp_path / "sub" / "b.txt").write_text("x", encoding="utf-8")
     signature = worktreesimage.listing_signature(tmp_path)
-    assert ("a.txt", "file", 5) in signature
-    assert ("sub", "dir", 0) in signature
+    triples = {(row[0], row[1], row[2]) for row in signature}
+    assert ("a.txt", "file", 5) in triples
+    assert ("sub", "dir", 0) in triples
     assert not worktreesimage.process_inside(tmp_path / "nowhere")
     settings = worktreesimage.settings_from_obj(
         {"path": "w.img", "size_bytes": 2 * GIB, "slot_quota_bytes": 7}
@@ -1043,6 +1044,123 @@ def test_image_status_reports_the_worktrees_image_when_configured(
     payload = json_module.loads(capsys.readouterr().out)
     assert payload["worktrees_image"]["state"] == "not-mounted"
     assert payload["worktrees_image"]["mount_at"] == "worktrees_dir"
+
+
+def test_signature_catches_content_mode_and_link_differences(tmp_path: Path) -> None:
+    left, right = tmp_path / "left", tmp_path / "right"
+    for root, text in ((left, "aaaa"), (right, "bbbb")):  # same size
+        root.mkdir()
+        (root / "f.txt").write_text(text, encoding="utf-8")
+    assert worktreesimage.listing_signature(left) != worktreesimage.listing_signature(right)
+    (right / "f.txt").write_text("aaaa", encoding="utf-8")
+    assert worktreesimage.listing_signature(left) == worktreesimage.listing_signature(right)
+    os.chmod(right / "f.txt", 0o600)
+    assert worktreesimage.listing_signature(left) != worktreesimage.listing_signature(right)
+    os.chmod(right / "f.txt", 0o644)
+    os.symlink("f.txt", left / "link")
+    os.symlink("other", right / "link")
+    assert worktreesimage.listing_signature(left) != worktreesimage.listing_signature(right)
+
+
+def test_git_signature_catches_head_and_status_differences(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if shutil.which("git") is None:
+        pytest.skip("needs git")
+    for key in ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"):
+        monkeypatch.setenv(key, "sig-test")
+    for key in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
+        monkeypatch.setenv(key, "sig-test@example.invalid")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    (repo / "f.txt").write_text("one\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "one"], cwd=repo, check=True)
+    slot = tmp_path / "slot"
+    subprocess.run(
+        ["git", "worktree", "add", str(slot), "-b", "b1"],
+        cwd=repo, check=True, capture_output=True,
+    )
+    copied = tmp_path / "copied"
+    shutil.copytree(slot, copied, symlinks=True)
+    assert worktreesimage.git_state_signature(slot) == worktreesimage.git_state_signature(copied)
+    (copied / "f.txt").write_text("changed\n", encoding="utf-8")
+    assert worktreesimage.git_state_signature(slot) != worktreesimage.git_state_signature(copied)
+
+
+class _FakeBtrfs:
+    """Fake privileged commands over real directories (create/mount/delete)."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def run(
+        self, argv: list[str], *, sudo: bool = False
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append(list(argv))
+        if argv[:3] == ["btrfs", "subvolume", "create"]:
+            Path(argv[3]).mkdir(parents=True, exist_ok=True)
+        elif argv[:3] == ["btrfs", "subvolume", "delete"]:
+            shutil.rmtree(argv[3])
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+def test_remove_refuses_before_deleting_when_content_sits_beneath(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path, worktreesimage.MOUNTED)
+    control = config.control
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "s1").mkdir(parents=True)
+    slot_path = config.worktrees / "s1"
+    slot_path.mkdir(parents=True)
+    (slot_path / "stale-original.txt").write_text("kept\n", encoding="utf-8")
+    worktreesimage.save_bind_records(
+        control,
+        {"s1": worktreesimage.BindRecord(subvolume="s1", target=str(slot_path))},
+    )
+    fake = _FakeBtrfs()
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    monkeypatch.setattr(worktreesimage, "mount_id_at", lambda point: 9)
+    with pytest.raises(OSError, match="beneath the worktrees-image bind"):
+        cli._remove_slot_directory(config, slot_path)
+    # Nothing deleted, record intact, bind re-established.
+    assert (mount_dir / "s1").is_dir()
+    assert worktreesimage.load_binds(control) == {"s1": "s1"}
+    assert (slot_path / "stale-original.txt").is_file()
+    assert [call[0] for call in fake.calls] == ["umount", "mount"]
+
+
+def test_binds_migrate_reclaims_the_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import argparse
+
+    from wrkslots import imagecmd
+
+    root = _image_project(tmp_path)
+    fake = _FakeBtrfs()
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    monkeypatch.setattr(worktreesimage, "mount_id_at", lambda point: 9)
+    monkeypatch.setattr(worktreesimage, "ensure_image_mounted", lambda *a: None)
+    monkeypatch.setattr(worktreesimage, "ensure_binds", lambda *a: [])
+    monkeypatch.setattr(
+        worktreesimage, "current_state", lambda *a: worktreesimage.MOUNTED
+    )
+    config = cli._load_config(str(root), "image-host")
+    slot_path = config.worktrees / "s1"
+    slot_path.mkdir(parents=True, exist_ok=True)
+    (slot_path / "work.txt").write_text("work\n", encoding="utf-8")
+    args = argparse.Namespace(
+        project_root=str(root), machine="image-host", slot="s1", slot_type="agent"
+    )
+    assert imagecmd._cmd_migrate(args) == 0
+    assert "(original reclaimed)" in capsys.readouterr().out
+    mount_dir = worktreesimage.image_mount_dir(config.control)
+    assert (mount_dir / "s1" / "work.txt").read_text(encoding="utf-8") == "work\n"
+    assert list(config.worktrees.glob(".s1.premigrate-*")) == []
+    assert worktreesimage.load_binds(config.control) == {"s1": "s1"}
 
 
 # --- #1162 worktrees-image-at-slots-dir: direct layout, quota modes, locks ---

@@ -4840,12 +4840,27 @@ def _remove_slot_directory(config: Config, path: Path) -> None:
     if image is None:
         bind_slot = _worktrees_bind_slot(config, path)
         if bind_slot is not None:
+            mount_dir = worktreesimage.image_mount_dir(config.control)
             try:
                 records = worktreesimage.load_bind_records(config.control)
-                worktreesimage.unbind_slot(config.control, bind_slot, path)
+                # Unmount first WITHOUT dropping the record, and look
+                # underneath before anything is deleted (#1149): a
+                # pre-reclaim migrate left the host original beneath
+                # the bind, and deleting the subvolume first would
+                # destroy the real slot and expose the stale copy.
+                worktreesimage.umount_point(path)
+                if next(path.iterdir(), None) is not None:
+                    worktreesimage.bind_slot(config.control, mount_dir, bind_slot, path)
+                    raise OSError(
+                        errno.ENOTEMPTY,
+                        f"content sits beneath the worktrees-image bind at {path} "
+                        "(a host original an older migrate kept); the bind was "
+                        "re-established and nothing was deleted - reclaim the "
+                        "original or switch layout before removing the slot",
+                    )
+                worktreesimage.forget_bind(config.control, bind_slot)
                 worktreesimage.delete_slot_subvolume(
-                    worktreesimage.image_mount_dir(config.control)
-                    / records[bind_slot].subvolume
+                    mount_dir / records[bind_slot].subvolume
                 )
             except worktreesimage.WorktreesImageError as exc:
                 raise OSError(errno.ENOTEMPTY, str(exc)) from exc

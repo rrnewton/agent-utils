@@ -254,9 +254,11 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
         help="move one slot into the project worktrees image (same path)",
         description=(
             "Copy one idle slot into a btrfs subvolume inside the mounted project "
-            "worktrees image, verify the copy file by file, and swap it in at the "
-            "same path. The registry record and slot path do not change. Refuses "
-            "while any process works inside the slot."
+            "worktrees image, verify the copy file by file (contents, modes, link "
+            "targets, and each checkout's HEAD and status), swap it in at the "
+            "same path, and reclaim the verified original. The registry record "
+            "and slot path do not change. Refuses for a held slot, a slot whose "
+            "owner is not proven dead, or while any process uses the slot."
         ),
         formatter_class=formatter,
     )
@@ -891,6 +893,62 @@ def _lock_slot_checkouts(config: "cli.Config", slot: str, slot_type: str) -> Non
         )
 
 
+def _slot_record(
+    config: "cli.Config", slot: str, slot_type: str
+) -> "cli.ActiveRecord | None":
+    from wrkslots import cli
+
+    try:
+        state = cli._load_active(config)
+    except (cli.Refusal, cli.StateError, OSError):
+        return None
+    return next(
+        (item for item in state.slots if item.slot == slot and item.slot_type == slot_type),
+        None,
+    )
+
+
+def _assert_migratable(
+    config: "cli.Config", slot: str, slot_type: str, slot_path: Path
+) -> None:
+    """The migrate-layout census bar for one slot (#1149/#1150 pieces).
+
+    A registered slot must have no hold, an owner the registered
+    liveness authority proves dead (or none), and no process the
+    process-use census finds in it. An unregistered directory has no
+    row to prove those from; the census still runs by path.
+    """
+
+    from wrkslots import cli
+
+    record = _slot_record(config, slot, slot_type)
+    if record is not None:
+        state = cli._load_active(config)
+        hold = cli._load_record_holds(config, [state]).get((record.machine, record.slot))
+        if hold is None or hold.error is not None or hold.value is not None:
+            detail = hold.error if hold is not None and hold.error else "slot is held"
+            raise _refuse(f"slot {slot}: {detail}; unhold it before migrate")
+        owner_state, owner_detail = cli._owner_liveness_states(config, [record])[
+            (record.machine, record.slot, record.generation)
+        ]
+        if owner_state != "dead":
+            raise _refuse(
+                f"slot {slot}: owner is not proven dead ({owner_state}: "
+                f"{owner_detail}); stop its agent before migrate"
+            )
+    try:
+        cli._assert_slot_unused(
+            slot_path,
+            cli._record_for_slot_use_check(
+                record, validate_complete=False, allow_live_validate_owner=False
+            )
+            if record is not None
+            else None,
+        )
+    except cli.Refusal as exc:
+        raise _refuse(f"slot {slot} is in use; migrate only a stopped slot: {exc}") from exc
+
+
 def _cmd_migrate(args: argparse.Namespace) -> int:
     from wrkslots import cli
 
@@ -909,13 +967,14 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
         _lock_slot_checkouts(config, args.slot, args.slot_type)
         print(f"{args.slot} is already bound from the worktrees image")
         return 0
-    if worktreesimage.process_inside(slot_path):
-        raise _refuse(f"a process is working inside {slot_path}; migrate only a stopped slot")
+    _assert_migratable(config, args.slot, args.slot_type, slot_path)
     before = worktreesimage.listing_signature(slot_path)
+    before_git = worktreesimage.git_state_signature(slot_path)
     mount_dir = worktreesimage.image_mount_dir(config.control)
     subvolume = mount_dir / args.slot
     if subvolume.exists():
         raise _refuse(f"image subvolume already exists: {subvolume}; inspect it first")
+    displaced = slot_path.parent / f".{args.slot}.premigrate-{secrets.token_hex(8)}"
     try:
         worktreesimage.create_slot_subvolume(subvolume, settings.slot_quota_bytes)
         try:
@@ -932,16 +991,46 @@ def _cmd_migrate(args: argparse.Namespace) -> int:
             # untouched either way.
             worktreesimage.delete_slot_subvolume(subvolume)
             raise
-        if worktreesimage.listing_signature(subvolume) != before:
+        if (
+            worktreesimage.listing_signature(subvolume) != before
+            or worktreesimage.git_state_signature(subvolume) != before_git
+        ):
+            worktreesimage.delete_slot_subvolume(subvolume)
             raise _refuse("migrated copy does not match the slot file by file; original kept")
-        # Bind at the original real path: the path, registry record and
-        # agent cwd never change; the original stays beneath the bind
-        # until a separate, approved deletion.
-        worktreesimage.bind_slot(config.control, mount_dir, args.slot, slot_path)
+        # Reclaim (#1149): move the verified original aside, bind the
+        # subvolume at the original real path (path, registry record
+        # and agent cwd never change), re-prove the displaced tree
+        # unused, then delete it — nothing stays beneath the bind.
+        # A crash between the rename and the bind leaves the original
+        # at the named sibling; rename it back and rerun migrate.
+        os.rename(slot_path, displaced)
+        try:
+            worktreesimage.bind_slot(config.control, mount_dir, args.slot, slot_path)
+        except BaseException:
+            if slot_path.is_dir() and next(slot_path.iterdir(), None) is None:
+                slot_path.rmdir()
+            os.rename(displaced, slot_path)
+            worktreesimage.delete_slot_subvolume(subvolume)
+            raise
     except worktreesimage.WorktreesImageError as exc:
         raise _refuse(str(exc)) from exc
+    try:
+        _assert_migratable(config, args.slot, args.slot_type, displaced)
+    except Exception as exc:
+        raise _refuse(
+            f"migrated {args.slot} into the worktrees image, bound at {slot_path}, but "
+            f"the verified original at {displaced} could not be proven unused for "
+            f"reclaim: {exc}; delete it once inspected"
+        ) from exc
+    try:
+        shutil.rmtree(displaced)
+    except OSError as exc:
+        raise _refuse(
+            f"migrated {args.slot} into the worktrees image, bound at {slot_path}, but "
+            f"the verified original remains at {displaced}: {exc}; delete it once inspected"
+        ) from exc
     _lock_slot_checkouts(config, args.slot, args.slot_type)
-    print(f"migrated {args.slot} into the worktrees image, bound at {slot_path} (original kept beneath)")
+    print(f"migrated {args.slot} into the worktrees image, bound at {slot_path} (original reclaimed)")
     return 0
 
 
@@ -963,9 +1052,9 @@ def _cmd_migrate_direct(
         _lock_slot_checkouts(config, args.slot, args.slot_type)
         print(f"{args.slot} is already a subvolume in the worktrees image")
         return 0
-    if worktreesimage.process_inside(slot_path):
-        raise _refuse(f"a process is working inside {slot_path}; migrate only a stopped slot")
+    _assert_migratable(config, args.slot, args.slot_type, slot_path)
     before = worktreesimage.listing_signature(slot_path)
+    before_git = worktreesimage.git_state_signature(slot_path)
     staging = slot_path.parent / f".{args.slot}.migrating-{secrets.token_hex(8)}"
     displaced = slot_path.parent / f".{args.slot}.premigrate-{secrets.token_hex(8)}"
     try:
@@ -981,7 +1070,10 @@ def _cmd_migrate_direct(
         except BaseException:
             worktreesimage.delete_slot_subvolume(staging)
             raise
-        if worktreesimage.listing_signature(staging) != before:
+        if (
+            worktreesimage.listing_signature(staging) != before
+            or worktreesimage.git_state_signature(staging) != before_git
+        ):
             worktreesimage.delete_slot_subvolume(staging)
             raise _refuse("migrated copy does not match the slot file by file; original kept")
     except worktreesimage.WorktreesImageError as exc:
