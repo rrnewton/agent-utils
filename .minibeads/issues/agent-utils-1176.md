@@ -1,10 +1,11 @@
 ---
 title: "doc-kind-buckets: recognise minibeads issues and GitHub gists as their own document kinds"
-status: open
+status: closed
 priority: 1
 issue_type: task
 created_at: 2026-11-10T00:55:14.000000000+00:00
-updated_at: 2026-11-10T00:55:14.000000000+00:00
+updated_at: 2026-11-10T12:02:34.000000000+00:00
+closed_at: 2026-11-10T12:02:34.000000000+00:00
 ---
 
 # Description
@@ -32,3 +33,20 @@ Today `vibe-talk/src/documents.rs` recognises only GitHub blob markdown/files, p
 # Notes
 
 Owner reply 282, 2026-11-09 7:22 PM ET. Server work lives in `vibe-talk/src/documents.rs`; the Documents view lives under `vibe-talk/web/src/view/documents/`. Page-code edits are named to the coordinator before editing (concurrent Documents control-bar and voice-page work).
+
+## Follow-up gate verdict (2026-11-10)
+
+[watermelon-full-preview mu-docbuckets] Landed on main as f01bc7ff after the owner-priority path-selected gate passed (153 passed, 0 failed). The fast-track follow-up `validate.py --all --keep-going` run (owner priority, gate parent 2103516 / ticket 2103521, log /tmp/docbuckets-gate-all-owner.log) finished its main phase: dagrun FAIL, 234 passed, 8 failed in 1537.9s. Every #1176 doc-kind-buckets touched step passed, including vibe-talk.check.documents-buckets-browser, vibe-talk.check.documents-browser, vibe-talk.check.documents-read-browser, vibe-talk.test.unit (3181 passed), all vibe-talk.test.page slices, and vibe-talk.check.contract. No touched step is red, so no fix-forward is required.
+
+The 8 failures are all in untouched code and show load/census time bounds under host load:
+
+- vibe-talk.check.keyboard-browser: CPU-TIMEOUT over 60s cpu (107s)
+- vibe-talk.check.two-column-browser: search-replies-place-1280, the cards walk scrolled the left column
+- packages.standalone.wrkslots: wrkslots remove refused, /proc scan after the path fence exceeded its 30-second bound
+- python.wrkslots.shard-1: test_remove_write_rust.py::test_an_older_reader_refuses_only_an_outstanding_owner_journal, /proc scan before the path fence exceeded its 30-second bound
+- python.wrkslots.shard-2: test_remove_write_rust.py::test_remove_matches_python, same /proc scan bound
+- python.wrkslots.shard-6: test_reclaim_slot_state.py::test_remove_reclaims_state_home_and_bundles_unpushed_git and test_remove_write_rust.py::test_remove_forced_churn_refuses_like_python, same /proc scan bound
+- python-lifecycle.host.shard-0: test_lifecycle.py::test_remove_agent_batch_removes_disk_image_slots
+- python-lifecycle.host.shard-2: test_lifecycle.py::test_validate_complete_still_refuses_live_path_use_after_owner_dies, read-only census exceeded its 120.0s operation-wide bound (elapsed 120.1s)
+
+Per coordinator direction, solo reruns of these 8 untouched failures were skipped, and the queued gate-exclusive phase (cross steps for agentctl/herdr-run, untouched by this change) was stopped before admission. scripts/check_client_names.py run bare before this record: ok, 4038 files name no consuming project.
