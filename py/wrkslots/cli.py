@@ -69996,24 +69996,46 @@ def _cmd_recover_absent_validate_rows(args: argparse.Namespace) -> int:
             coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
         else:
             coordinator = None
-        # The privileged process census runs before the lock (#1194):
+        # The privileged process census also runs before the lock (#1194):
         # processes never take this lock, so holding it during the census
         # never protected against a process starting in a row later; the
         # census judges the moment it runs and its refusals are unchanged.
-        # Under the lock the rows are fingerprint-checked and the storage,
-        # owner and retained-handle checks still run; only the host census
-        # is skipped when this pre-census covered the same rows.
-        census_prechecked = False
+        # An early census before the lock, on snapshot-only records (a full
+        # plan would parse the event history a second time, over the
+        # bounded-pass budget). It only refuses earlier: the locked recovery
+        # re-runs the census and every other check unchanged, so no refusal
+        # is weakened and no event pass is added.
         if args.apply:
             try:
-                pre_planned = _plan_absent_validate_rows(config, requested)
-                if pre_planned:
-                    _assert_absent_validate_rows_safe(
-                        config, [record for _item, record, _entry in pre_planned]
+                snapshot = _load_active_snapshot(config)
+                by_slot = {record.slot: record for record in snapshot.slots}
+                pre_records = [
+                    by_slot[item.slot]
+                    for item in requested
+                    if item.machine == config.machine
+                    and item.slot in by_slot
+                    and by_slot[item.slot].generation == item.generation
+                ]
+                if len(pre_records) == len(requested) and pre_records:
+                    # Paths only: the storage validation (and its worktree
+                    # listings) still runs under the lock, within its
+                    # bounded-pass budget.
+                    pre_rows = tuple(
+                        (
+                            record,
+                            tuple(
+                                _stored_path(
+                                    config, checkout.path, "checkout path"
+                                )
+                                for checkout in record.checkouts
+                            ),
+                        )
+                        for record in pre_records
                     )
-                    census_prechecked = True
+                    _assert_absent_validate_processes_unrelated(pre_rows)
             except Exception:
-                census_prechecked = False
+                pass
+        census_prechecked = False
         with _mutation_locks(config, args.wait_lock):
             _refuse_partial_state(config)
             journals = _outstanding_journals(config)
