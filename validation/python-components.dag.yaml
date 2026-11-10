@@ -486,10 +486,14 @@ steps:
       # ~1.9 GiB. 4.25 GiB x mem_cap_factor 1.25 caps it at 5.31 GiB, above 4.1 GiB + 25%.
       rss_baseline_bytes: 4563402752
 
+  # Shard count 4 (was 2): at 2 shards each ran ~700 s median in gate logs
+  # (2026-11-10 measurement, #1253 validate-10min), so one shard alone
+  # exceeded a 10-minute wall. The family-weighted assignment in
+  # run_pytest_shard balances the four; their union is the old selection.
   - group: wrkviz
     job: shard-0
-    desc: wrkviz Python tests, shard 1 of 2
-    cmd: python3 scripts/run_component_tests.py --component wrkviz --shard 0/2 -- -q
+    desc: wrkviz Python tests, shard 1 of 4
+    cmd: python3 scripts/run_component_tests.py --component wrkviz --shard 0/4 -- -q
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-pytest-shards, component-wrkviz]
     timeout: 14400
@@ -498,8 +502,28 @@ steps:
 
   - group: wrkviz
     job: shard-1
-    desc: wrkviz Python tests, shard 2 of 2
-    cmd: python3 scripts/run_component_tests.py --component wrkviz --shard 1/2 -- -q
+    desc: wrkviz Python tests, shard 2 of 4
+    cmd: python3 scripts/run_component_tests.py --component wrkviz --shard 1/4 -- -q
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, validation-pytest-shards, component-wrkviz]
+    timeout: 14400
+    cpu_timeout: 1800
+    hint: *python_test_hint
+
+  - group: wrkviz
+    job: shard-2
+    desc: wrkviz Python tests, shard 3 of 4
+    cmd: python3 scripts/run_component_tests.py --component wrkviz --shard 2/4 -- -q
+    jobs_flag: ""
+    labels: [validation-workspace, validation-python-component-tests, validation-pytest-shards, component-wrkviz]
+    timeout: 14400
+    cpu_timeout: 1800
+    hint: *python_test_hint
+
+  - group: wrkviz
+    job: shard-3
+    desc: wrkviz Python tests, shard 4 of 4
+    cmd: python3 scripts/run_component_tests.py --component wrkviz --shard 3/4 -- -q
     jobs_flag: ""
     labels: [validation-workspace, validation-python-component-tests, validation-pytest-shards, component-wrkviz]
     timeout: 14400
