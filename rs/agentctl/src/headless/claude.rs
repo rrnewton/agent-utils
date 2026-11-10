@@ -965,6 +965,143 @@ pub fn transcript_received(path: &Path, uuid: &str) -> bool {
     false
 }
 
+/// A `--claude-bin` resolved to the real harness binary (#1221).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedHarnessBinary {
+    /// Canonical path of the binary to spawn.
+    pub path: PathBuf,
+    /// The path as given, when it differed (a symlink or a launcher script).
+    pub given: Option<PathBuf>,
+    /// Whether `given` was a launcher script whose `exec` target was used.
+    pub via_launcher_script: bool,
+}
+
+fn is_elf(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic).is_ok() && magic == [0x7f, b'E', b'L', b'F']
+}
+
+fn is_script(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut file) = File::open(path) else {
+        return false;
+    };
+    let mut head = [0u8; 2];
+    file.read_exact(&mut head).is_ok() && &head == b"#!"
+}
+
+/// The `exec` target of a launcher script: the first `exec /abs/path ...`
+/// line, canonicalised, when that target is itself an ELF binary.
+fn launcher_exec_target(script: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(script).ok()?;
+    // Simple `VAR="/abs/path"` assignments a launcher uses for its target.
+    let mut vars: Vec<(String, String)> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some((name, value)) = line.split_once('=') {
+            let name = name.trim();
+            if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                let value = value.trim().trim_matches(|c| c == '"' || c == '\'');
+                if value.starts_with('/') {
+                    vars.push((name.to_owned(), value.to_owned()));
+                }
+            }
+        }
+    }
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("exec ") else {
+            continue;
+        };
+        let raw = rest
+            .split(|c: char| c.is_whitespace())
+            .next()?
+            .trim_matches(|c| c == '"' || c == '\'');
+        let target: Option<String> = if raw.starts_with('/') {
+            Some(raw.to_owned())
+        } else if let Some(var) = raw
+            .strip_prefix('$')
+            .map(|v| v.trim_matches(|c| c == '{' || c == '}'))
+        {
+            vars.iter()
+                .rev()
+                .find(|(name, _)| name == var)
+                .map(|(_, value)| value.clone())
+        } else {
+            None
+        };
+        let target = target?;
+        if let Ok(canonical) = std::fs::canonicalize(Path::new(&target)) {
+            if is_elf(&canonical) {
+                return Some(canonical);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a `--claude-bin` to the real harness binary (#1221): follow
+/// symlinks, and when the target is a launcher script, use the binary it
+/// `exec`s. A bare name is found on `PATH` first. Errors name a remedy.
+pub fn resolve_harness_binary(given: &Path) -> Result<ResolvedHarnessBinary, String> {
+    let candidate: PathBuf = if given.components().count() == 1 {
+        // A bare name: find it on PATH, as the shell would.
+        let name = given.to_string_lossy().into_owned();
+        std::env::var_os("PATH")
+            .and_then(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|dir| dir.join(&name))
+                    .find(|path| path.is_file())
+            })
+            .ok_or_else(|| {
+                format!(
+                    "--claude-bin {name:?} was not found on PATH; pass the absolute path of the real Claude Code binary"
+                )
+            })?
+    } else {
+        given.to_path_buf()
+    };
+    let canonical = std::fs::canonicalize(&candidate).map_err(|error| {
+        format!(
+            "--claude-bin {} cannot be resolved: {error}; pass the absolute path of the real Claude Code binary",
+            candidate.display()
+        )
+    })?;
+    if is_script(&canonical) {
+        if let Some(target) = launcher_exec_target(&canonical) {
+            return Ok(ResolvedHarnessBinary {
+                given: Some(given.to_path_buf()),
+                path: target,
+                via_launcher_script: true,
+            });
+        }
+        return Err(format!(
+            "--claude-bin {} is a launcher script and the real binary it execs could not be found; pass the real Claude Code binary directly (for example the target of its exec line) instead of the launcher",
+            given.display()
+        ));
+    }
+    Ok(ResolvedHarnessBinary {
+        given: (canonical != candidate).then(|| given.to_path_buf()),
+        path: canonical,
+        via_launcher_script: false,
+    })
+}
+
+/// Lenient resolution for unit rendering: resolve when the file exists on
+/// this host, keep a not-yet-existing path as given (rendering stays pure
+/// for fixtures), and refuse only a launcher script that exists but whose
+/// real binary cannot be found.
+pub fn resolve_harness_binary_for_unit(given: &Path) -> Result<PathBuf, String> {
+    if !given.exists() && given.components().count() > 1 {
+        return Ok(given.to_path_buf());
+    }
+    Ok(resolve_harness_binary(given)?.path)
+}
+
 /// The wrapper's declared contract, printed by `agentctl capabilities`.
 #[must_use]
 pub fn capabilities() -> Value {
@@ -990,6 +1127,59 @@ pub fn capabilities() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_harness_binary_follows_symlinks_and_launcher_scripts() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "agentctl-resolve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = std::fs::canonicalize("/bin/true").unwrap();
+        // Symlink to the real binary.
+        let link = dir.join("claude-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let resolved = resolve_harness_binary(&link).unwrap();
+        assert_eq!(resolved.path, real);
+        assert!(!resolved.via_launcher_script);
+        // Direct exec launcher.
+        let launcher = dir.join("claude");
+        std::fs::write(
+            &launcher,
+            format!("#!/bin/sh\nexec {} \"$@\"\n", real.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let resolved = resolve_harness_binary(&launcher).unwrap();
+        assert_eq!(resolved.path, real);
+        assert!(resolved.via_launcher_script);
+        // Variable-form launcher, as the host's 685-byte launcher writes it.
+        let var_launcher = dir.join("claude-var");
+        std::fs::write(
+            &var_launcher,
+            format!(
+                "#!/bin/bash\nNATIVE_BINARY=\"{}\"\nexec \"$NATIVE_BINARY\" \"$@\"\n",
+                real.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&var_launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(resolve_harness_binary(&var_launcher).unwrap().path, real);
+        // A script with no resolvable exec target is refused with a remedy.
+        let bad = dir.join("claude-bad");
+        std::fs::write(&bad, "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = resolve_harness_binary(&bad).unwrap_err();
+        assert!(error.contains("real Claude Code binary"), "{error}");
+        // A missing path is refused with a remedy.
+        assert!(resolve_harness_binary(&dir.join("nope")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn lifecycle_init_text_tools_and_result_translate() {

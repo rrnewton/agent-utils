@@ -169,9 +169,23 @@ pub fn rendered_headless(
     }
     let agentctl = unit_path("agentctl", &options.agentctl)?;
     let registry = unit_path("registry", &options.registry)?;
-    let claude = match unit.claude.as_deref() {
+    // Write the resolved real binary, not a launcher script (#1221).
+    let resolved_claude = match unit.claude.as_deref() {
+        Some(path) => {
+            Some(crate::headless::claude::resolve_harness_binary_for_unit(path).map_err(fail)?)
+        }
+        None => None,
+    };
+    let claude = match resolved_claude.as_deref() {
         Some(path) => format!(" --claude-bin {}", unit_path("claude", path)?),
         None => String::new(),
+    };
+    let claude_note = match (unit.claude.as_deref(), resolved_claude.as_deref()) {
+        (Some(given), Some(resolved)) if given != resolved => format!(
+            "# --claude-bin resolved from {} to the real harness binary by install-units (#1221).\n",
+            given.display()
+        ),
+        _ => String::new(),
     };
     let environment: String = unit
         .environment
@@ -185,7 +199,8 @@ pub fn rendered_headless(
             .replace("@REGISTRY@", &registry)
             .replace("@ENVIRONMENT@", &environment)
             .replace("@CLAUDE_BIN@", &claude)
-            .replace("@NAME@", name),
+            .replace("@NAME@", name)
+            .replace("[Unit]", &format!("{claude_note}[Unit]")),
     ))
 }
 
@@ -495,10 +510,36 @@ mod tests {
     }
 
     #[test]
+    fn headless_unit_resolves_a_launcher_to_the_real_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let dest = scratch("headless-resolve");
+        let real = fs::canonicalize("/bin/true").unwrap();
+        let launcher = dest.join("claude");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(
+            &launcher,
+            format!("#!/bin/sh\nexec {} \"$@\"\n", real.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+        let unit = HeadlessUnit {
+            claude: Some(launcher.clone()),
+            environment: Vec::new(),
+        };
+        let (_, contents) = rendered_headless(&options(&dest), "coordinator", &unit).unwrap();
+        assert!(
+            contents.contains(&format!("--claude-bin {}\n", real.display())),
+            "{contents}"
+        );
+        assert!(contents.contains("resolved from"), "{contents}");
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
     fn headless_unit_runs_the_wrapper_and_is_written_alone() {
         let dest = scratch("headless");
         let unit = HeadlessUnit {
-            claude: Some(PathBuf::from("/usr/local/bin/claude")),
+            claude: Some(PathBuf::from("/home/owner/bin/claude")),
             environment: vec![
                 ("PATH".to_owned(), "/home/owner/bin:/usr/bin".to_owned()),
                 ("BAD".to_owned(), "a\"b".to_owned()),
@@ -508,7 +549,7 @@ mod tests {
         let (name, contents) = rendered_headless(&options(&dest), "coordinator", &unit).unwrap();
         assert_eq!(name, PathBuf::from("agentctl-headless-coordinator.service"));
         assert!(contents.contains(
-            "ExecStart=/opt/agentctl/bin/agentctl --registry /home/owner/project/.agentctl run-headless coordinator --claude-bin /usr/local/bin/claude\n"
+            "ExecStart=/opt/agentctl/bin/agentctl --registry /home/owner/project/.agentctl run-headless coordinator --claude-bin /home/owner/bin/claude\n"
         ), "{contents}");
         assert!(
             contents.contains("Environment=\"PATH=/home/owner/bin:/usr/bin\"\n"),

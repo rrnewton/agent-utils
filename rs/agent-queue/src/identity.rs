@@ -559,6 +559,100 @@ pub fn observe(_pid: u64) -> Result<LiveProcess> {
     ))
 }
 
+/// Whether `path` (a `/proc/PID/exe` target) is a script interpreter rather
+/// than the harness binary itself: a shell or language runtime that a short
+/// launcher runs before it `exec`s the real binary (#1221).
+#[must_use]
+pub fn executable_is_interpreter(path: &Path) -> bool {
+    let Some(name) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_ascii_lowercase())
+    else {
+        return false;
+    };
+    let name = name
+        .strip_suffix(" (deleted)")
+        .unwrap_or(&name)
+        .trim()
+        .to_owned();
+    matches!(
+        name.as_str(),
+        "sh" | "bash"
+            | "dash"
+            | "ash"
+            | "zsh"
+            | "ksh"
+            | "mksh"
+            | "csh"
+            | "tcsh"
+            | "perl"
+            | "ruby"
+            | "node"
+            | "nodejs"
+            | "env"
+            | "busybox"
+    ) || name.starts_with("python")
+        || name.starts_with("perl")
+}
+
+/// Observe `pid` until its identity is stable and post-exec, bounded by
+/// `timeout` (#1221 headless-identity-exec-race).
+///
+/// Polls [`observe`] with a short paced interval. Returns as soon as two
+/// consecutive observations agree and the executable is not an interpreter.
+/// At the deadline it returns the last pair of agreeing observations even
+/// when the executable is still an interpreter (a script harness whose final
+/// image is its interpreter), so a caller can pin provisionally and re-pin
+/// on the harness's init event or a later re-observation. It errors when no
+/// two observations ever agreed or the process could not be observed.
+pub fn observe_stable(pid: u64, timeout: std::time::Duration) -> Result<LiveProcess> {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut previous: Option<LiveProcess> = None;
+    let mut stable: Option<LiveProcess> = None;
+    let mut last_error: Option<Error> = None;
+    loop {
+        match observe(pid) {
+            Ok(live) => {
+                let agreed = previous
+                    .as_ref()
+                    .is_some_and(|prev| prev.identity == live.identity);
+                if agreed && !executable_is_interpreter(&live.executable_path) {
+                    return Ok(live);
+                }
+                if agreed {
+                    // Keep the newest agreeing observation as the deadline fallback.
+                    stable = Some(LiveProcess {
+                        identity: live.identity.clone(),
+                        process_group_id: live.process_group_id,
+                        executable_path: live.executable_path.clone(),
+                    });
+                }
+                previous = Some(live);
+            }
+            Err(error) => {
+                // An exec in flight makes one observation incoherent; that is
+                // the race this retry exists for, not a final failure.
+                previous = None;
+                last_error = Some(error);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if let Some(live) = stable {
+        return Ok(live);
+    }
+    Err(last_error.unwrap_or_else(|| {
+        Error::process(format!(
+            "custom process {pid} identity did not stabilise within {} ms",
+            timeout.as_millis()
+        ))
+    }))
+}
+
 /// One link of a process's ancestry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ancestor {
@@ -1017,6 +1111,39 @@ mod tests {
         let mut reused = me.clone();
         reused.starttime_ticks += 1;
         assert!(!ancestry.contains(&reused));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn observe_stable_waits_through_an_execing_launcher() {
+        // A launcher that sleeps briefly, then execs a real binary: the
+        // stable post-exec identity must name that binary, not the shell.
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        assert!(executable_is_interpreter(Path::new("/bin/sh")));
+        assert!(executable_is_interpreter(Path::new("/usr/bin/python3.12")));
+        assert!(!executable_is_interpreter(Path::new("/usr/bin/sleep")));
+        let child = Reap(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", "sleep 0.3; exec /bin/sleep 30"])
+                .spawn()
+                .unwrap(),
+        );
+        let pid = u64::from(child.0.id());
+        let live = observe_stable(pid, std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(live.identity.pid, pid);
+        assert!(
+            live.executable_path.ends_with("sleep"),
+            "{}",
+            live.executable_path.display()
+        );
+        assert!(!executable_is_interpreter(&live.executable_path));
+        assert_eq!(liveness(&live.identity), ProcessLiveness::Alive);
     }
 
     #[cfg(target_os = "linux")]

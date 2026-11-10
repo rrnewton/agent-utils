@@ -722,6 +722,56 @@ mod tests {
     }
 
     #[test]
+    fn post_exec_record_identity_is_live_and_proves_the_sender() {
+        // The identity a headless record must end with after an exec'ing
+        // launcher (#1221): observed stably from the live harness process.
+        // This process stands in for that harness.
+        let me = agent_queue::identity::observe_stable(
+            u64::from(std::process::id()),
+            std::time::Duration::from_secs(2),
+        )
+        .expect("stable identity")
+        .identity;
+        let dir = std::env::temp_dir().join(format!(
+            "agent-teams-post-exec-{}-{}",
+            std::process::id(),
+            me.starttime_ticks
+        ));
+        let agent_dir = dir.join("agents").join("coordinator");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        let record = serde_json::json!({
+            "name": "coordinator", "harness_identity": me,
+            "managed_by": null,
+        });
+        std::fs::write(
+            agent_dir.join("agent.json"),
+            serde_json::to_string(&record).expect("record json"),
+        )
+        .expect("record file");
+        std::fs::write(dir.join("coordinator.json"), "{\"name\": \"coordinator\"}")
+            .expect("designation file");
+        let (identity, _) = agent_record(&dir, "coordinator").expect("record");
+        assert_eq!(identity, me);
+        // Liveness and sender proof both accept the post-exec identity.
+        assert!(identity_alive(&identity));
+        assert!(ancestry_contains(&identity));
+        assert_eq!(
+            coordinator_liveness(&Designation::Registry, Some(&dir)),
+            CoordinatorLiveness::Live
+        );
+        assert_eq!(
+            sender_standing(&Designation::Registry, Some(&dir)),
+            SenderStanding::Coordinator
+        );
+        // The pre-exec / stale image of the same PID would not pass: the
+        // executable no longer matches, so liveness is not Alive.
+        let mut stale = me.clone();
+        stale.executable_inode += 1;
+        assert!(!identity_alive(&stale));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn partial_identity_parses_and_matches_ancestry() {
         let me = identity_of(u64::from(std::process::id())).expect("self identity");
         let partial = parse_identity(&serde_json::json!({

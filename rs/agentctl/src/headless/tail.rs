@@ -871,6 +871,55 @@ fn turn_of(segments: &[events::Segment], target: u64) -> io::Result<Option<Vec<E
     Ok(Some(window))
 }
 
+/// Identity of the record/log `tail` is following, by token and directory
+/// identity rather than segment numbers (#1221): a replaced record under the
+/// same name gets a new token and usually a fresh events directory, even
+/// when its new generation numbers are lower than the old cursor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LogIdentity {
+    token: Option<String>,
+    agent_dir: Option<(u64, u64)>,
+    events_dir: Option<(u64, u64)>,
+}
+
+fn dir_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+fn log_identity(dir: &Path) -> LogIdentity {
+    let agent_dir_path = dir.parent();
+    let token = agent_dir_path.and_then(|parent| {
+        let text = std::fs::read_to_string(parent.join("agent.json")).ok()?;
+        let value: Value = serde_json::from_str(&text).ok()?;
+        value
+            .get("token")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    });
+    LogIdentity {
+        token,
+        agent_dir: agent_dir_path.and_then(dir_identity),
+        events_dir: dir_identity(dir),
+    }
+}
+
+fn identity_replaced(old: &LogIdentity, new: &LogIdentity) -> bool {
+    let token_changed = matches!(
+        (&old.token, &new.token),
+        (Some(before), Some(after)) if before != after
+    );
+    let dir_changed = matches!(
+        (&old.events_dir, &new.events_dir),
+        (Some(before), Some(after)) if before != after
+    ) || matches!(
+        (&old.agent_dir, &new.agent_dir),
+        (Some(before), Some(after)) if before != after
+    );
+    token_changed || dir_changed
+}
+
 /// Run `tail` over the log in `dir`, writing to `out`. With `follow`, poll until `stop` returns
 /// true. Returns `false` when `--at` named an event that does not exist. Only the segments the
 /// selection needs are read: `--since` starts at the segment holding it, `--last` at the newest
@@ -952,10 +1001,55 @@ pub fn run(
     for event in selected {
         printer.event(event)?;
     }
+    let mut identity = log_identity(dir);
+    let mut since = options.since;
     while options.follow && !stop() {
         std::thread::sleep(options.poll);
+        // A record replacement under the same name (new token / new agent or
+        // events directory, or a fresh log entirely before the cursor) must
+        // not leave this tail frozen on the old log (#1221).
+        let current = log_identity(dir);
+        let now_segments = events::segments(dir).unwrap_or_default();
+        let generation_regressed = !now_segments.is_empty()
+            && now_segments
+                .iter()
+                .all(|segment| segment.key() < (follower.cursor_generation(), u64::MAX))
+            && follower.cursor_generation() > 0
+            && now_segments.iter().map(|s| s.generation).max().unwrap_or(0)
+                < follower.cursor_generation();
+        if identity_replaced(&identity, &current) || generation_regressed {
+            let old_generation = follower.cursor_generation();
+            let new_generation = events::segments(dir)
+                .ok()
+                .and_then(|segments| segments.iter().map(|s| s.generation).max())
+                .unwrap_or(0);
+            if options.json {
+                writeln!(
+                    printer.out,
+                    "{}",
+                    serde_json::json!({"record_replaced": {"from_generation": old_generation, "to_generation": new_generation}})
+                )?;
+            } else {
+                writeln!(
+                    printer.out,
+                    "restarted (record replaced): generation {old_generation} -> {new_generation}"
+                )?;
+            }
+            printer.out.flush()?;
+            follower.reset(dir);
+            printer.last_seq = None;
+            printer.senders.clear();
+            since = None;
+            if current.token.is_some() || current.events_dir.is_some() {
+                identity = current;
+            }
+        } else if current.token.is_some() || current.events_dir.is_some() {
+            // Keep the last known identity; a transiently missing record
+            // (archived mid-replacement) does not itself trigger a reset.
+            identity = current;
+        }
         for event in follower.poll()? {
-            if options.since.is_none_or(|since| event.seq > since) {
+            if since.is_none_or(|since| event.seq > since) {
                 printer.event(&event)?;
             }
         }
@@ -1032,6 +1126,85 @@ mod tests {
         let mut buffer = Vec::new();
         let found = run(dir, options, &mut buffer, &|| true).unwrap();
         (found, String::from_utf8(buffer).unwrap())
+    }
+
+    #[test]
+    fn follow_survives_a_record_replacement() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let dir = scratch("replaced");
+        let root = dir.parent().unwrap().to_path_buf();
+        fs::write(
+            root.join("agent.json"),
+            r#"{"token": "t-old", "adapter": "harness-wrapper"}"#,
+        )
+        .unwrap();
+        // Two generations, so the follower's cursor sits past anything a
+        // fresh replacement log (generation 1, seq 1) will hold.
+        for text in ["old one", "old two"] {
+            let mut writer = EventWriter::open(&dir, "coordinator").unwrap();
+            writer
+                .append("assistant.text", None, json!({"text": text}))
+                .unwrap();
+            drop(writer);
+        }
+        let out_path = std::env::temp_dir().join(format!(
+            "agentctl-tail-out-{}-{}",
+            std::process::id(),
+            events::now_millis()
+        ));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread_dir = dir.clone();
+        let thread_out = out_path.clone();
+        let handle = std::thread::spawn(move || {
+            let mut file = fs::File::create(&thread_out).unwrap();
+            let options = TailOptions {
+                follow: true,
+                poll: Duration::from_millis(10),
+                ..TailOptions::default()
+            };
+            run(&thread_dir, &options, &mut file, &move || {
+                thread_stop.load(Ordering::SeqCst)
+            })
+        });
+        let read_out = || fs::read_to_string(&out_path).unwrap_or_default();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !read_out().contains("old two") {
+            assert!(std::time::Instant::now() < deadline, "old log not followed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Replace the record under the same name: new token, fresh log.
+        fs::remove_dir_all(&root).unwrap();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            root.join("agent.json"),
+            r#"{"token": "t-new", "adapter": "harness-wrapper"}"#,
+        )
+        .unwrap();
+        let mut writer = EventWriter::open(&dir, "coordinator").unwrap();
+        writer
+            .append(
+                "assistant.text",
+                None,
+                json!({"text": "new answer after replacement"}),
+            )
+            .unwrap();
+        drop(writer);
+        while !(read_out().contains("restarted (record replaced)")
+            && read_out().contains("new answer after replacement"))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tail did not follow the replacement log: {}",
+                read_out()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::SeqCst);
+        assert!(handle.join().unwrap().unwrap());
+        let _ = fs::remove_file(&out_path);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

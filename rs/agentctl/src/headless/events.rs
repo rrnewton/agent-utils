@@ -362,12 +362,36 @@ impl Follower {
         Ok(follower)
     }
 
+    /// The generation the follower's cursor sits in.
+    #[must_use]
+    pub fn cursor_generation(&self) -> u64 {
+        self.key.0
+    }
+
+    /// Restart from the beginning of `dir`'s current log (a replaced record's
+    /// fresh log, #1221).
+    pub fn reset(&mut self, dir: &Path) {
+        self.dir = dir.to_path_buf();
+        self.key = (0, 0);
+        self.offset = 0;
+    }
+
     /// The events written since the previous call, oldest first. A segment is finished once a
     /// newer one exists, since only one writer runs at a time and it writes in order; one
     /// pruned before it was read is skipped (the reader sees the hole in `seq`).
     pub fn poll(&mut self) -> io::Result<Vec<Event>> {
         let mut events = Vec::new();
-        for segment in segments(&self.dir)? {
+        let current = segments(&self.dir)?;
+        // A replaced record's fresh log can sit entirely before the cursor
+        // (generation 1 after generation 2): restart from its start (#1221).
+        if !current.is_empty()
+            && current.iter().all(|segment| segment.key() < self.key)
+            && self.key != (0, 0)
+        {
+            self.key = (0, 0);
+            self.offset = 0;
+        }
+        for segment in current {
             if segment.key() < self.key {
                 continue;
             }

@@ -1,6 +1,6 @@
 ---
 title: 'headless-identity-exec-race: a headless restart pins the launcher process, not the harness'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-10T16:20:57+00:00
@@ -30,14 +30,20 @@ Either way the hook runs once and is never retried, and the wrapper's `harness.j
 - After spawn, re-observe the harness until its identity is stable: either retry with a short bounded backoff until two observations agree and the executable is no longer an interpreter, or pin on the harness's first stream-json `system`/init event, by which time the exec is done.
 - Record the post-exec identity in both the record and `harness.json`. If pinning still fails after the bounded retry, keep retrying in the background rather than leaving the previous run's identity in place; a stale identity from an earlier run must never survive a new spawn. At minimum, clear it.
 - Resolve `--claude-bin` to the real binary in `install-units --headless` and in `run-headless` (follow symlinks; when the target is a launcher script, note it in the unit comment or refuse with a remedy), so the spawned process is the harness itself.
-- Tests: a fake launcher that sleeps briefly and then execs a fake harness. The record must end with the harness's identity after a first start, after a restart (the stale identity of the previous run must be replaced), and after an unexpected harness exit and restart. `agent-teams` liveness and sender proof must accept the new identity.
+- `agentctl tail NAME --follow` must survive a record replacement, not only wrapper restarts: when the agent directory or record token changes under the same name (new token, new generation, or events/index replaced), tail prints a one-line `restarted (record replaced)` marker, resets its cursor, and follows the new log from its start. Detect replacement by the record token/instance or generation, not segment numbers, which a fresh log can sit entirely behind.
+- Tests: a fake launcher that sleeps briefly and then execs a fake harness. The record must end with the harness's identity after a first start, after a restart (the stale identity of the previous run must be replaced), and after an unexpected harness exit and restart. `agent-teams` liveness and sender proof must accept the new identity. A tail test: follow, replace the record, then append to the new log, and the new events must appear.
 
 # Acceptance Criteria
 
 - Restarting a headless wrapper whose `--claude-bin` is an exec'ing launcher leaves the record naming the live post-exec harness, with no operator action.
 - No path leaves a previous run's `harness_identity` in the record after a new harness spawns.
 - `install-units --headless` writes the resolved harness binary.
+- `agentctl tail NAME --follow` following an agent whose record is replaced under the same name prints a `restarted (record replaced)` marker and then the new log's events.
 
 # Notes
 
 Coordinate with #1216 agentctl-effort-option, which changes the run-headless harness argv for --effort; whichever lands second rebases.
+
+## Resolution
+
+[watermelon-full-preview] Delivered: `observe_stable` in agent-queue re-observes a spawned harness with a bounded, paced retry until two observations agree and the executable is no longer an interpreter, with a stable-interpreter fallback pinned provisionally. `RecordIdentity::harness_spawned` clears the previous run's `harness_identity` before observing, and the wrapper clears `harness.json` the same way, re-pins on the first stream-json init event, and keeps retrying an unfinished or provisional pin in its main loop, so no stale identity survives a new spawn. `resolve_harness_binary` follows symlinks and a launcher script's `exec` target (including the variable form) in both `run-headless` and `install-units --headless`, refusing an unresolvable script with a remedy and noting a resolved-from path in the unit. `tail --follow` watches the record token and agent/events directory identity plus generation regression, prints `restarted (record replaced): generation N -> M`, resets its cursor, and follows the new log from its start. Tests cover a fake exec'ing launcher on first start, wrapper restart, and unexpected-exit restart, the identity/agent-teams liveness and sender proof, binary resolution, the resolved unit, and tail record replacement.

@@ -680,6 +680,178 @@ fn a_harness_that_dies_inside_a_turn_is_restarted_and_the_agent_told() {
     fixture.stop(handle);
 }
 
+/// Hooks that pin like `RecordIdentity` (#1221): clear the old pin first,
+/// then record the stable post-exec identity in a record file.
+#[derive(Debug)]
+struct PinHooks {
+    record: PathBuf,
+}
+
+impl Hooks for PinHooks {
+    fn harness_spawned(&self, pid: u32) -> std::result::Result<(), String> {
+        let _ = fs::remove_file(&self.record);
+        let live = agent_queue::identity::observe_stable(u64::from(pid), Duration::from_secs(2))
+            .map_err(|error| error.to_string())?;
+        atomic_json(&self.record, &json!({"identity": live.identity}))
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl Fixture {
+    fn use_exec_launcher(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let launcher = self.root.join("launcher.sh");
+        let script = format!(
+            "#!/bin/sh\nsleep 0.3\nexec {} \"$@\"\n",
+            self.config.command.join(" ")
+        );
+        fs::write(&launcher, script).unwrap();
+        fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755)).unwrap();
+        self.config.command = vec![launcher.display().to_string()];
+    }
+
+    fn start_pinned(&self, hooks: &Arc<PinHooks>) -> thread::JoinHandle<Result<i32>> {
+        let hooks = Arc::clone(hooks);
+        let config = self.config.clone();
+        let handle = thread::spawn(move || run(config, Arc::new(AtomicBool::new(false)), &*hooks));
+        self.wait("socket", || {
+            control::socket_path(&self.agent_directory).exists()
+        });
+        self.wait("idle", || {
+            self.has_event("status", |data| data["status"] == "idle")
+        });
+        handle
+    }
+}
+
+fn pinned_identity(path: &Path) -> Option<agent_queue::identity::ProcessIdentity> {
+    let document: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    serde_json::from_value(document.get("identity")?.clone()).ok()
+}
+
+fn spawned_pid(fixture: &Fixture, nth: usize) -> u32 {
+    fixture
+        .events()
+        .iter()
+        .filter(|event| event.kind == "lifecycle.harness_spawned")
+        .nth(nth)
+        .and_then(|event| event.data["pid"].as_u64())
+        .map(|pid| pid as u32)
+        .expect("harness_spawned event")
+}
+
+fn dead_identity() -> agent_queue::identity::ProcessIdentity {
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let identity = agent_queue::identity::observe(u64::from(child.id()))
+        .unwrap()
+        .identity;
+    child.kill().unwrap();
+    child.wait().unwrap();
+    identity
+}
+
+#[test]
+fn an_execing_launcher_pins_the_post_exec_harness_on_start_and_wrapper_restart() {
+    let mut fixture = Fixture::new("launcher", "normal");
+    fixture.use_exec_launcher();
+    let stale = dead_identity();
+    // A previous run's identity in both places a new spawn must replace.
+    atomic_json(
+        &fixture.agent_directory.join(HARNESS_FILE),
+        &json!({"schema": "agentctl-headless-harness/v1", "identity": stale}),
+    )
+    .unwrap();
+    let hooks = Arc::new(PinHooks {
+        record: fixture.root.join("record-pin.json"),
+    });
+    atomic_json(&hooks.record, &json!({"identity": stale})).unwrap();
+
+    let handle = fixture.start_pinned(&hooks);
+    fixture.enqueue("m1", "hello there", json!({}));
+    fixture.wait("m1 processed", || {
+        fixture.state("m1") == Some(queue::MessageState::Processed)
+    });
+    let first_pid = spawned_pid(&fixture, 0);
+    fixture.wait("post-exec pin", || {
+        pinned_identity(&hooks.record).is_some_and(|identity| identity.pid == u64::from(first_pid))
+            && pinned_identity(&fixture.agent_directory.join(HARNESS_FILE))
+                .is_some_and(|identity| identity.pid == u64::from(first_pid))
+    });
+    let pinned = pinned_identity(&hooks.record).unwrap();
+    assert_ne!(pinned, stale);
+    let fresh = agent_queue::identity::observe(u64::from(first_pid)).unwrap();
+    assert_eq!(pinned, fresh.identity, "pin must be the post-exec identity");
+    assert_eq!(
+        agent_queue::identity::liveness(&pinned),
+        agent_queue::identity::ProcessLiveness::Alive
+    );
+    let harness_file = pinned_identity(&fixture.agent_directory.join(HARNESS_FILE)).unwrap();
+    assert_eq!(harness_file.pid, u64::from(first_pid));
+    fixture.stop(handle);
+
+    // Wrapper restart: the first run's identity must be replaced, not kept.
+    let handle = fixture.start_pinned(&hooks);
+    fixture.enqueue("m2", "again", json!({}));
+    fixture.wait("m2 processed", || {
+        fixture.state("m2") == Some(queue::MessageState::Processed)
+    });
+    let second_pid = spawned_pid(&fixture, 1);
+    assert_ne!(second_pid, first_pid);
+    fixture.wait("restart pin", || {
+        pinned_identity(&hooks.record).is_some_and(|identity| identity.pid == u64::from(second_pid))
+            && pinned_identity(&fixture.agent_directory.join(HARNESS_FILE))
+                .is_some_and(|identity| identity.pid == u64::from(second_pid))
+    });
+    let pinned = pinned_identity(&hooks.record).unwrap();
+    assert_eq!(
+        agent_queue::identity::liveness(&pinned),
+        agent_queue::identity::ProcessLiveness::Alive
+    );
+    assert_eq!(
+        pinned_identity(&fixture.agent_directory.join(HARNESS_FILE))
+            .unwrap()
+            .pid,
+        u64::from(second_pid)
+    );
+    fixture.stop(handle);
+}
+
+#[test]
+fn an_execing_launcher_repins_after_an_unexpected_harness_exit() {
+    let mut fixture = Fixture::new("launcher-crash", "crash");
+    fixture.use_exec_launcher();
+    fixture.config.max_restarts = 1;
+    let hooks = Arc::new(PinHooks {
+        record: fixture.root.join("record-pin.json"),
+    });
+    let handle = fixture.start_pinned(&hooks);
+    let first_pid = spawned_pid(&fixture, 0);
+    fixture.enqueue("doomed", "anything", json!({}));
+    fixture.wait("harness restarted", || {
+        fixture
+            .events()
+            .iter()
+            .filter(|event| event.kind == "lifecycle.harness_spawned")
+            .count()
+            == 2
+    });
+    let second_pid = spawned_pid(&fixture, 1);
+    assert_ne!(second_pid, first_pid);
+    fixture.wait("repinned after crash", || {
+        pinned_identity(&hooks.record).is_some_and(|identity| identity.pid == u64::from(second_pid))
+            && pinned_identity(&fixture.agent_directory.join(HARNESS_FILE))
+                .is_some_and(|identity| identity.pid == u64::from(second_pid))
+    });
+    assert_eq!(
+        agent_queue::identity::liveness(&pinned_identity(&hooks.record).unwrap()),
+        agent_queue::identity::ProcessLiveness::Alive
+    );
+    fixture.stop(handle);
+}
+
 #[test]
 fn a_live_harness_of_an_earlier_wrapper_blocks_a_new_one() {
     let fixture = Fixture::new("orphan", "normal");

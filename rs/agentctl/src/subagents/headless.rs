@@ -89,8 +89,29 @@ struct RecordIdentity<'m, 'a, A: ManagedApi + ?Sized> {
 
 impl<A: ManagedApi + ?Sized> wrapper::Hooks for RecordIdentity<'_, '_, A> {
     fn harness_spawned(&self, pid: u32) -> std::result::Result<(), String> {
-        let observed = agent_queue::identity::observe(u64::from(pid))
-            .map_err(|error| format!("observe harness process {pid}: {error}"))?;
+        // No previous run's identity survives a new spawn (#1221): clear it
+        // first, then re-observe until stable and post-exec. A failed
+        // observation leaves the record cleared, never stale, and the
+        // wrapper keeps retrying in the background / on init.
+        self.with_record(|record| {
+            record.harness_identity = None;
+            Ok(())
+        })?;
+        let observed =
+            agent_queue::identity::observe_stable(u64::from(pid), Duration::from_secs(2))
+                .map_err(|error| format!("observe harness process {pid}: {error}"))?;
+        self.with_record(|record| {
+            record.harness_identity = Some(observed.identity.clone());
+            Ok(())
+        })
+    }
+}
+
+impl<'m, 'a, A: ManagedApi + ?Sized> RecordIdentity<'m, 'a, A> {
+    fn with_record(
+        &self,
+        update: impl FnOnce(&mut super::AgentRecord) -> std::result::Result<(), String>,
+    ) -> std::result::Result<(), String> {
         // A stop holds the lifecycle lock while it waits for this wrapper; never wait long.
         let _lock = self
             .manager
@@ -106,7 +127,7 @@ impl<A: ManagedApi + ?Sized> wrapper::Hooks for RecordIdentity<'_, '_, A> {
         if record.token != self.token {
             return Err("the record was replaced; not recording the harness".to_owned());
         }
-        record.harness_identity = Some(observed.identity);
+        update(&mut record)?;
         self.manager
             .save(&record)
             .map_err(|error| error.to_string())
@@ -413,7 +434,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let mut config =
             wrapper::WrapperConfig::new(agent_name, &directory, Path::new(&record.cwd), &session);
         if let Some(bin) = claude_bin {
-            config.command = vec![bin.display().to_string()];
+            // Spawn the real binary, not a launcher script (#1221).
+            let resolved = claude::resolve_harness_binary(bin).map_err(fail)?;
+            config.command = vec![resolved.path.display().to_string()];
         }
         config.arguments = record.arguments.clone();
         if let Some(lines) = tool_preview_lines {

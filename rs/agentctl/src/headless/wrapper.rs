@@ -145,6 +145,12 @@ pub trait Hooks {
     /// A harness process started with this PID; an error is logged and does not stop the
     /// wrapper.
     fn harness_spawned(&self, pid: u32) -> std::result::Result<(), String>;
+    /// The harness emitted its first stream-json init event, so any launcher
+    /// `exec` is done: re-pin the now post-exec identity (#1221). The default
+    /// re-runs the spawn pin.
+    fn harness_initialized(&self, pid: u32) -> std::result::Result<(), String> {
+        self.harness_spawned(pid)
+    }
 }
 
 /// Hooks that record nothing.
@@ -314,6 +320,18 @@ struct Wrapper {
     /// When the harness last finished a turn or started; the clock for an input that was
     /// queued but never started.
     idle_since: Instant,
+    /// Harness PID whose post-exec identity still needs pinning (#1221).
+    pin_pid: Option<u32>,
+    /// Last identity pinned for `pin_pid`, when one was observed.
+    pin_identity: Option<agent_queue::identity::ProcessIdentity>,
+    /// Whether pinning is unfinished (failed, or only a provisional
+    /// interpreter identity): the main loop keeps retrying it.
+    pin_pending: bool,
+    /// Whether the last hooks pin attempt failed and must be retried even
+    /// when the observed identity has not changed.
+    pin_hook_failed: bool,
+    /// When pinning was last attempted, to pace retries.
+    pin_last_attempt: Instant,
 }
 
 impl Wrapper {
@@ -407,7 +425,11 @@ impl Wrapper {
                 }
             })
             .map_err(|error| io_fail("start harness writer", error))?;
-        self.record_harness(pid);
+        // A new spawn must never keep a previous run's identity: both files
+        // are cleared inside the pin attempt, then re-observed post-exec.
+        self.pin_pid = Some(pid);
+        self.pin_identity = self.record_harness(pid);
+        self.pin_last_attempt = Instant::now();
         let digest = format!(
             "{:x}",
             Sha256::digest(self.config.command.join("\0") + "\0" + &argv.join("\0"))
@@ -417,15 +439,77 @@ impl Wrapper {
             None,
             json!({"pid": pid, "resume": resume, "argv_sha256": digest}),
         )?;
-        if let Err(message) = hooks.harness_spawned(pid) {
-            self.emit(
-                "error",
-                None,
-                json!({"class": "record_harness_identity", "message": message}),
-            )?;
+        match hooks.harness_spawned(pid) {
+            Ok(()) => {
+                self.pin_hook_failed = false;
+                // A provisional interpreter pin stays pending: the loop re-pins post-exec.
+                self.pin_pending =
+                    agent_queue::identity::observe(u64::from(pid)).is_ok_and(|live| {
+                        agent_queue::identity::executable_is_interpreter(&live.executable_path)
+                    });
+            }
+            Err(message) => {
+                self.pin_pending = true;
+                self.pin_hook_failed = true;
+                self.emit(
+                    "error",
+                    None,
+                    json!({"class": "record_harness_identity", "message": message}),
+                )?;
+            }
         }
         self.rescan = true;
         Ok(())
+    }
+
+    /// Retry an unfinished post-exec pin (#1221): re-observe the harness and,
+    /// when its identity changed or was never pinned, rewrite `harness.json`
+    /// and ask the hooks to re-pin the record. Paced by the caller.
+    fn retry_pin(&mut self, hooks: &dyn Hooks) {
+        let Some(pid) = self.pin_pid else { return };
+        if self.harness.as_ref().is_none_or(|h| h.child.id() != pid) {
+            return;
+        }
+        self.pin_last_attempt = Instant::now();
+        let Ok(live) = agent_queue::identity::observe(u64::from(pid)) else {
+            return;
+        };
+        let changed = self
+            .pin_identity
+            .as_ref()
+            .is_none_or(|pinned| *pinned != live.identity);
+        let interpreter = agent_queue::identity::executable_is_interpreter(&live.executable_path);
+        if !changed && !self.pin_hook_failed {
+            // Already pinned at this identity; keep watching while it is
+            // only a provisional interpreter image.
+            self.pin_pending = interpreter;
+            return;
+        }
+        if changed {
+            self.pin_identity = self.record_harness(pid);
+        }
+        match hooks.harness_spawned(pid) {
+            Ok(()) => {
+                self.pin_hook_failed = false;
+                self.pin_pending = interpreter;
+                if changed {
+                    let _ = self.emit(
+                        "lifecycle.harness_identity",
+                        None,
+                        json!({"pid": pid, "provisional": interpreter}),
+                    );
+                }
+            }
+            Err(message) => {
+                self.pin_pending = true;
+                self.pin_hook_failed = true;
+                let _ = self.emit(
+                    "error",
+                    None,
+                    json!({"class": "record_harness_identity", "message": message}),
+                );
+            }
+        }
     }
 
     /// Settle `inflight/` items before the first drain: proven by the transcript, returned to
@@ -753,7 +837,7 @@ impl Wrapper {
         self.set_status("busy")
     }
 
-    fn harness_line(&mut self, line: &str) -> Result<()> {
+    fn harness_line(&mut self, line: &str, hooks: &dyn Hooks) -> Result<()> {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             return Ok(());
         };
@@ -780,6 +864,34 @@ impl Wrapper {
                             json!({"harness": "claude", "version": version, "model": model,
                                    "permission_mode": permission_mode, "session": session, "tools": tools}),
                         )?;
+                        // By init the launcher exec is done: re-pin post-exec (#1221).
+                        if let Some(pid) = self.harness.as_ref().map(|h| h.child.id()) {
+                            self.pin_pid = Some(pid);
+                            self.pin_identity = self.record_harness(pid);
+                            self.pin_last_attempt = Instant::now();
+                            match hooks.harness_initialized(pid) {
+                                Ok(()) => {
+                                    self.pin_hook_failed = false;
+                                    self.pin_pending = agent_queue::identity::observe(u64::from(
+                                        pid,
+                                    ))
+                                    .is_ok_and(|live| {
+                                        agent_queue::identity::executable_is_interpreter(
+                                            &live.executable_path,
+                                        )
+                                    });
+                                }
+                                Err(message) => {
+                                    self.pin_pending = true;
+                                    self.pin_hook_failed = true;
+                                    self.emit(
+                                        "error",
+                                        None,
+                                        json!({"class": "record_harness_identity", "message": message}),
+                                    )?;
+                                }
+                            }
+                        }
                     }
                     if !self.busy {
                         self.begin_turn("self", None)?;
@@ -1434,6 +1546,10 @@ impl Wrapper {
         // session open; nothing of the group may outlive the harness record.
         let group = harness.child.id();
         drop(harness);
+        self.pin_pid = None;
+        self.pin_identity = None;
+        self.pin_pending = false;
+        self.pin_hook_failed = false;
         end_process_group(group, Duration::from_secs(5));
         let leftovers = own_session_writers(
             &self.config.session,
@@ -1512,8 +1628,9 @@ impl Wrapper {
 
     /// Remember the running harness's kernel identity, so a later wrapper refuses to start a
     /// second harness while this one lives (for example after this wrapper was killed).
-    fn record_harness(&mut self, pid: u32) {
-        record_harness_file(&self.config.agent_directory, pid);
+    /// Clears any previous run's file first and re-observes post-exec (#1221).
+    fn record_harness(&mut self, pid: u32) -> Option<agent_queue::identity::ProcessIdentity> {
+        record_harness_file_stable(&self.config.agent_directory, pid)
     }
 
     fn clear_harness_record(&self) {
@@ -1853,15 +1970,25 @@ pub fn own_session_writers(session: &str, agent_directory: &Path, own: &str) -> 
 /// wrapper starts a second harness while it lives. Also used by a takeover for its interactive
 /// harness.
 pub fn record_harness_file(agent_directory: &Path, pid: u32) {
-    let identity = agent_queue::identity::observe(u64::from(pid))
-        .ok()
-        .and_then(|live| serde_json::to_value(live.identity).ok());
-    if let Some(identity) = identity {
-        let _ = atomic_json(
-            &agent_directory.join(HARNESS_FILE),
-            &json!({"schema": "agentctl-headless-harness/v1", "identity": identity}),
-        );
-    }
+    let _ = record_harness_file_stable(agent_directory, pid);
+}
+
+/// Like [`record_harness_file`], but first clears any previous run's file and
+/// re-observes until the identity is stable and post-exec (#1221), returning
+/// the pinned identity. No previous identity survives a failed observation.
+pub fn record_harness_file_stable(
+    agent_directory: &Path,
+    pid: u32,
+) -> Option<agent_queue::identity::ProcessIdentity> {
+    clear_harness_file(agent_directory);
+    let live =
+        agent_queue::identity::observe_stable(u64::from(pid), Duration::from_secs(2)).ok()?;
+    let identity = serde_json::to_value(live.identity.clone()).ok()?;
+    let _ = atomic_json(
+        &agent_directory.join(HARNESS_FILE),
+        &json!({"schema": "agentctl-headless-harness/v1", "identity": identity}),
+    );
+    Some(live.identity)
 }
 
 /// Forget the harness recorded by [`record_harness_file`].
@@ -2018,6 +2145,11 @@ pub fn run(config: WrapperConfig, terminate: Arc<AtomicBool>, hooks: &dyn Hooks)
         restart_at: None,
         restart_notice: false,
         idle_since: Instant::now(),
+        pin_pid: None,
+        pin_identity: None,
+        pin_pending: false,
+        pin_hook_failed: false,
+        pin_last_attempt: Instant::now(),
         config,
     };
     let settings_digest = settings_digest(&wrapper.config.arguments);
@@ -2052,7 +2184,7 @@ pub fn run(config: WrapperConfig, terminate: Arc<AtomicBool>, hooks: &dyn Hooks)
                     .as_ref()
                     .is_some_and(|harness| harness.instance == instance)
                 {
-                    wrapper.harness_line(&line)?;
+                    wrapper.harness_line(&line, hooks)?;
                 }
             }
             Ok(Message::Eof(instance)) => {
@@ -2074,6 +2206,9 @@ pub fn run(config: WrapperConfig, terminate: Arc<AtomicBool>, hooks: &dyn Hooks)
             if let Some(code) = wrapper.harness_exited()? {
                 break code;
             }
+        }
+        if wrapper.pin_pending && wrapper.pin_last_attempt.elapsed() >= Duration::from_millis(250) {
+            wrapper.retry_pin(hooks);
         }
         wrapper.check_ack_deadline()?;
         wrapper.check_approval_deadlines()?;
