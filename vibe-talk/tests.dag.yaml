@@ -1648,6 +1648,30 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1210 ui-stability-no-async-shift` in the browser engine, at 393x852 by touch and 1280x800: a reader
+  # parked mid-Main with a draft held, sampled at every frame for 60 s of background updates (channel
+  # messages, thread replies, edits above and below, reactions above, on the anchor and on a folded card,
+  # read state by re-read, the Newest recount, the 45 s poll; collapsed summaries off, the owner's
+  # setting), each update reported separately so a mover is named, plus a near-foot slack coda and a
+  # closing control with anchoring off proving the watch sees a shift. REPORT-ONLY until part D lands
+  # (--strict asserts; TODO(#1210) flip when green). First runs 2026-11-10, summaries off: anchor within
+  # 0.4px everywhere; near-foot thread-reply snap 18px at both sizes; desk thread card resort shift 0.068.
+  # Summaries on (--summaries on): summaries landing shifted 0.22-0.24 at both sizes.
+  - group: check
+    job: scroll-soak-browser
+    desc: a reader parked mid-Main is sampled every frame for 60 s of background updates (live messages and replies, edits above and below, reactions incl. a folded card, read state, the Newest recount and the poll; summaries off), each update's anchor movement and layout shift reported separately beside the recorded baseline, plus a near-foot slack coda, in current Chromium at 393x852 and 1280x800 (report-only until #1210 part D; --strict asserts)
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/scroll_soak_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 720
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 200
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#338 column-overscroll` in the browser engine, at 1280x800 and 1920x1080 in two columns with a mouse:
   # the right column's cards open at their foot with no room past it; the wheel, rested and turned at the
   # foot, goes on into blank room until the last card's top is at half the column's height; the mouse
