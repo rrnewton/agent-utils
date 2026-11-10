@@ -18,14 +18,6 @@ is long enough to scroll several viewports, and at 393x852 (touch) and again
 at 1280x800 (mouse) the Outline button opens the pop-up, an entry tap/click
 jumps to its heading, the HERE mark follows scrolling, and the title links
 to the document's original source in a new tab.
-
-They also cover `#1236 documents-reader-layout`: the seeded paste carries
-headings, a wrapped bullet list and a table, and with the reader open at
-both sizes the column is bounded and centred on the desk and full-width on
-the phone, the reading-width grip has no box over the text, table body
-rows alternate grounds, `h1`/`h2` carry a bottom rule, and the hamburger
-menu offers no "Expand all" in this view — while back in the channel,
-where a seeded long message folds, the grip and the item are offered again.
 """
 
 import json
@@ -51,41 +43,12 @@ _FILLER = (
     "document below scrolls for several viewports and each heading can be "
     "brought to the top of the scroller in turn.\n\n"
 )
-# The reader-layout matter (`#1236 documents-reader-layout`): bullets long
-# enough to wrap onto a second line of the reader, and a table with enough
-# body rows to alternate grounds twice over.
-_LAYOUT_LIST = (
-    "- the first check ran the whole suite from a clean tree, and this line "
-    "is long enough to wrap onto the next line of the reader at either size\n"
-    "- the second check kept its items close together, so the list reads as "
-    "one block with the air around it rather than inside it\n"
-    "- the third check signed the run off\n"
-)
-_LAYOUT_TABLE = (
-    "| Step | Result | Note |\n"
-    "| --- | --- | --- |\n"
-    "| Build | green | first body row |\n"
-    "| Test | green | second body row |\n"
-    "| Ship | green | third body row |\n"
-    "| Watch | green | fourth body row |\n"
-)
 PASTE_BODY = (
-    "# Demo deployment report\n\nThe **nightly** run finished green.\n\n"
-    + _LAYOUT_LIST + "\n" + _LAYOUT_TABLE
-    + "\n## Setup\n\n" + _FILLER * 8
+    "# Demo deployment report\n\nThe **nightly** run finished green.\n\n- one\n- two\n"
+    "\n## Setup\n\n" + _FILLER * 8
     + "### Setup details\n\n" + _FILLER * 8
     + "## Finish\n\n" + _FILLER * 10
     + "The final line.\n"
-)
-# A channel message past the fold (`#1236`): in the channel it gives
-# "Expand all" work to do, which is what makes its absence from the menu
-# in the Documents view a check rather than the menu's resting state.
-LONG_MESSAGE = (
-    "A long status note for the fold: the nightly run rebuilt every target "
-    "from a clean tree, ran each suite in turn, compared the results with "
-    "the run before it, and wrote the whole account down where the next "
-    "reader can find it without opening a single log by hand. Nothing in "
-    "it is a link, so it registers no document."
 )
 OUTLINE_TEXTS = ["Demo deployment report", "Setup", "Setup details", "Finish"]
 
@@ -169,109 +132,6 @@ def wait_here_is(page: Page, label: str) -> None:
     )
 
 
-def check_reader_layout(page: Page, *, desktop: bool) -> None:
-    """The open reader's layout at this size (`#1236 documents-reader-layout`).
-
-    On the desk the column is bounded and centred in the scroller; on the
-    phone it takes the screen. At both sizes the grip has no box here and
-    no point over the text column hits it, table body rows alternate
-    grounds, `h1`/`h2` carry their rule, and the list keeps its air around
-    it rather than between its items.
-    """
-    layout = page.evaluate(
-        """() => {
-          const body = document.getElementById('doc-body');
-          const area = document.getElementById('scroll-area');
-          const grip = document.getElementById('width-grip');
-          const r = body.getBoundingClientRect();
-          const a = area.getBoundingClientRect();
-          const rows = [...body.querySelectorAll('tbody tr')];
-          let gripHit = false;
-          for (const fx of [0.1, 0.3, 0.5, 0.7, 0.9]) {
-            for (const fy of [0.3, 0.5, 0.7]) {
-              const hit = document.elementFromPoint(
-                r.left + r.width * fx, innerHeight * fy);
-              if (hit === grip || (hit !== null && grip.contains(hit))) gripHit = true;
-            }
-          }
-          const rule = (el) => {
-            const s = getComputedStyle(el);
-            return s.borderBottomStyle !== 'none'
-              && parseFloat(s.borderBottomWidth) > 0;
-          };
-          return {
-            bodyLeft: r.left, bodyRight: r.right, bodyWidth: r.width,
-            areaLeft: a.left, areaClientWidth: area.clientWidth,
-            innerWidth,
-            gripRects: grip.getClientRects().length,
-            gripDisplay: getComputedStyle(grip).display,
-            gripHit,
-            rowBgs: rows.map((row) => getComputedStyle(row).backgroundColor),
-            h1Rule: rule(body.querySelector('h1')),
-            h2Rule: rule(body.querySelector('h2')),
-            listMarginTop: parseFloat(
-              getComputedStyle(body.querySelector('ul')).marginTop),
-            itemMarginTop: parseFloat(
-              getComputedStyle(body.querySelector('li')).marginTop),
-          };
-        }""")
-    if desktop:
-        check(layout["bodyWidth"] < layout["innerWidth"] - 200
-              and 480 < layout["bodyWidth"] < 1000,
-              f"the desktop reader column is not bounded: {layout}")
-        left_gap = layout["bodyLeft"] - layout["areaLeft"]
-        right_gap = (layout["areaLeft"] + layout["areaClientWidth"]
-                     - layout["bodyRight"])
-        check(abs(left_gap - right_gap) <= 24,
-              f"the desktop reader column is not centred: "
-              f"left {left_gap}, right {right_gap}")
-    else:
-        check(layout["bodyWidth"] > layout["innerWidth"] - 64,
-              f"the phone reader does not take the screen: {layout}")
-    check(layout["gripRects"] == 0 and layout["gripDisplay"] == "none",
-          f"the width grip has a box over the reader: {layout}")
-    check(layout["gripHit"] is False,
-          "a point over the text column hits the width grip")
-    check(len(layout["rowBgs"]) >= 3
-          and layout["rowBgs"][0] != layout["rowBgs"][1]
-          and layout["rowBgs"][1] != layout["rowBgs"][2],
-          f"table body rows do not alternate grounds: {layout['rowBgs']}")
-    check(layout["h1Rule"] is True and layout["h2Rule"] is True,
-          "h1/h2 carry no bottom rule in the reader")
-    check(layout["listMarginTop"] >= 8 and layout["itemMarginTop"] <= 6,
-          f"the list's air is not around it with dense items: {layout}")
-
-
-def check_action_menu(page: Page, *, desktop: bool, expand_visible: bool) -> None:
-    """Open the hamburger menu by real input and hold "Expand all" to account.
-
-    Both the `hidden` state the menu counts and what is actually on screen
-    must agree (`#1236 documents-reader-layout`); the menu is closed again
-    by the same input that opened it.
-    """
-    opener = page.locator("#action-menu-open")
-    opener.wait_for(state="visible", timeout=20_000)
-    if desktop:
-        opener.click()
-    else:
-        opener.tap()
-    page.wait_for_selector("#action-menu", state="visible", timeout=20_000)
-    hidden = page.evaluate(
-        "() => document.getElementById('expand-all').hidden")
-    check(hidden is (not expand_visible),
-          f"Expand all's hidden is {hidden}, "
-          f"not {not expand_visible}, with the menu open here")
-    check(page.locator("#expand-all").is_visible() is expand_visible,
-          f"the open menu's Expand all is not "
-          f"{'shown' if expand_visible else 'away'} as it should be here")
-    if desktop:
-        opener.click()
-    else:
-        opener.tap()
-    page.wait_for_function(
-        "() => document.getElementById('action-menu').hidden", timeout=20_000)
-
-
 def free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -342,10 +202,6 @@ def main() -> int:
                  {"text": "Report: https://paste.example/demo-doc and the "
                           "[guide](https://github.com/octo/widgets/blob/main/docs/guide.md) "
                           "plus https://github.com/octo/widgets/blob/main/docs/broken.md"})
-            # The fold "Expand all" exists for (`#1236`): a long message with
-            # no document in it, so the document count below is untouched.
-            call(base, "POST", f"/api/v1/channels/{CHANNEL}/reply", WRITE_TOKEN,
-                 {"text": LONG_MESSAGE})
             docs = []
             deadline = time.time() + 30
             while time.time() < deadline:
@@ -394,12 +250,6 @@ def main() -> int:
                 check(title_link.get_attribute("target") == "_blank", "the title link opens in place")
                 check("noopener" in (title_link.get_attribute("rel") or ""),
                       "the title link keeps an opener")
-
-                # The reader's layout on the phone, and its menu (`#1236
-                # documents-reader-layout`): full width, no grip over the
-                # text, zebra rows, heading rules, and no "Expand all".
-                check_reader_layout(page, desktop=False)
-                check_action_menu(page, desktop=False, expand_visible=False)
 
                 # The old top-of-reader TOC is gone: the outline lives in its pop-up,
                 # closed until the Outline button opens it.
@@ -579,12 +429,6 @@ def main() -> int:
                 check(dpage.locator("#doc-title a").get_attribute("href")
                       == "https://paste.example/demo-doc",
                       "the desktop title does not link to the source")
-                # The reader's layout on the desk, and its menu (`#1236
-                # documents-reader-layout`): a bounded, centred column, no
-                # grip over the text, zebra rows, heading rules, and no
-                # "Expand all".
-                check_reader_layout(dpage, desktop=True)
-                check_action_menu(dpage, desktop=True, expand_visible=False)
                 dpage.click("#doc-outline-open")
                 dpage.wait_for_function(
                     "() => !document.getElementById('doc-outline-pop').hidden", timeout=20_000)
@@ -638,32 +482,10 @@ def main() -> int:
                 # what matters is being back in the app, in Documents.
                 dpage.wait_for_function(
                     "() => !document.getElementById('pane-docs').hidden", timeout=20_000)
-
-                # The message view is unchanged (`#1236`): on to the channel
-                # (Documents -> Voice -> Channel), where the seeded long
-                # message folds — the grip stands on the column again and
-                # the menu offers "Expand all" again.
-                dpage.click("#view-switch")
-                dpage.click("#view-switch")
-                dpage.wait_for_function(
-                    "() => !document.getElementById('pane-discord').hidden", timeout=20_000)
-                dpage.wait_for_function(
-                    "() => !document.getElementById('expand-all').hidden", timeout=20_000)
-                grip_back = dpage.evaluate(
-                    """() => {
-                      const grip = document.getElementById('width-grip');
-                      return {
-                        rects: grip.getClientRects().length,
-                        display: getComputedStyle(grip).display,
-                      };
-                    }""")
-                check(grip_back["rects"] > 0 and grip_back["display"] != "none",
-                      f"the width grip did not return with the channel: {grip_back}")
-                check_action_menu(dpage, desktop=True, expand_visible=True)
                 dctx.close()
                 browser.close()
             print("documents browser check: real-server list, touch fetch, reader, outline pop-up, "
-                  "source link, fetch error, in-document links, and reader layout all seen")
+                  "source link, fetch error, and in-document links all seen")
             return 0
         finally:
             server.terminate()

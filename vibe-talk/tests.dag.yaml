@@ -1131,6 +1131,24 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1236 documents-reader-layout` against the real server binary: the reader's
+  # measure and dress at phone and desk, split from documents-browser so it gates
+  # in parallel with `#1235 documents-list-continuation`.
+  - group: check
+    job: documents-layout-browser
+    desc: the Documents reader layout (bounded centred column, grip gate, zebra rows, heading rules, menu gating), against the real server (fake chat upstream) in current Chromium at 393x852 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/documents_layout_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 90
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#355 provider-grouped-channels` in the browser engine at 1280x800 and a 375x812 phone: with two chat
   # services the bar's channel picker holds one <optgroup> per service in configuration order, Alt+Down
   # and Alt+Up through CDP step across the groups in the order shown, a reload restores the channel
