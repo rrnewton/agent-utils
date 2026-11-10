@@ -21524,40 +21524,195 @@ def _too_long_link_within(path: Path, exc: OSError, slot_root: Path | None) -> b
     return holder is not None
 
 
+#: Errnos a /proc/PID read fails with once that process has exited (#1173
+#: census-vanished-process): ENOENT once its entry is gone, ESRCH when it exits
+#: between the lookup and the read.  A process that exited uses nothing, so a
+#: census skips the read; EACCES, EPERM and every other errno still refuse.
+_PROCESS_GONE_ERRNOS = frozenset({errno.ENOENT, errno.ESRCH})
+
+
+def _note_process_gone(pid_dir: Path, gone: Sequence[tuple[Path, OSError]]) -> None:
+    """Note in the census diagnostics that ``pid_dir`` exited while it was read.
+
+    ``gone`` holds the reads that showed nothing because the process exited.
+    ESRCH always means it did; ENOENT alone may only be an absent entry (a
+    kernel thread's exe, a closed descriptor), so without ESRCH the note
+    needs `_process_has_exited` too.  The note goes to stderr only when
+    ``WRKSLOTS_CENSUS_DIAGNOSTICS=1``, so ordinary output never changes; the
+    other edition prints the same line.
+    """
+
+    if not gone or os.environ.get("WRKSLOTS_CENSUS_DIAGNOSTICS") != "1":
+        return
+    exited = [item for item in gone if item[1].errno == errno.ESRCH]
+    if not exited:
+        if not _process_has_exited(pid_dir):
+            return
+        exited = list(gone)
+    path, exc = exited[0]
+    name = errno.errorcode.get(exc.errno or 0, str(exc.errno))
+    print(
+        f"census: {_walked_process_label(pid_dir)} exited during the census "
+        f"({path}: {name}); skipped",
+        file=sys.stderr,
+    )
+
+
+#: The kernel's PF_EXITING task flag: set as do_exit starts, before it
+#: releases the task's mappings, descriptors, working directory and root.
+_PF_EXITING = 0x00000004
+#: How long a census waits for a process in do_exit, whose entry it may not
+#: read, to become a zombie or vanish (#1173).  The other edition uses the same.
+_CENSUS_EXIT_WAIT_SECONDS = 0.2
+_CENSUS_EXIT_POLL_SECONDS = 0.01
+
+
+def _process_has_exited(pid_dir: Path) -> bool:
+    """Whether ``pid_dir``'s process has exited: its stat is gone, or it is a zombie.
+
+    By the zombie state do_exit has released the process's descriptors,
+    mappings, working directory and root, so it uses nothing.  A zombie
+    leader whose threads still run is walked through those threads, never
+    here.
+    """
+
+    try:
+        raw = (pid_dir / "stat").read_bytes()
+    except OSError as exc:
+        return exc.errno in _PROCESS_GONE_ERRNOS
+    parsed = _parse_proc_stat(raw)
+    return parsed is not None and parsed.state in _ZOMBIE_STATES
+
+
+def _unreadable_entry_exited(pid_dir: Path, path: Path, exc: OSError) -> bool:
+    """Whether an entry this user may not read belongs to a process that exited.
+
+    Once do_exit drops a process's mappings, /proc makes its fd directory
+    root-owned, so an exiting process's descriptors read EACCES even to its
+    own user, yet do_exit releases the descriptors only afterwards.  So an
+    exited process (gone, or a zombie) counts as gone at once; one still in
+    do_exit (PF_EXITING) is polled for `_CENSUS_EXIT_WAIT_SECONDS` and counts
+    as gone only if it exits meanwhile; any other process does not (#1173).
+    A process stuck in do_exit may still hold the descriptors: it stays
+    indeterminate, and the census refuses.
+    """
+
+    # One read decides: a second could find the process reaped meanwhile.
+    try:
+        raw = (pid_dir / "stat").read_bytes()
+    except OSError as stat_error:
+        return stat_error.errno in _PROCESS_GONE_ERRNOS
+    parsed = _parse_proc_stat(raw)
+    if parsed is not None and parsed.state in _ZOMBIE_STATES:
+        return True
+    if parsed is None or not parsed.flags & _PF_EXITING:
+        return False
+    deadline = time.monotonic() + _CENSUS_EXIT_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        time.sleep(_CENSUS_EXIT_POLL_SECONDS)
+        if _process_has_exited(pid_dir):
+            return True
+    if os.environ.get("WRKSLOTS_CENSUS_DIAGNOSTICS") == "1":
+        name = errno.errorcode.get(exc.errno or 0, str(exc.errno))
+        print(
+            f"census: {_walked_process_label(pid_dir)} still exiting after "
+            f"{int(_CENSUS_EXIT_WAIT_SECONDS * 1000)} ms ({path}: {name}); indeterminate",
+            file=sys.stderr,
+        )
+    return False
+
+
 def _link_target(
-    path: Path, slot_device: int | None = None, slot_root: Path | None = None
+    path: Path,
+    slot_device: int | None = None,
+    slot_root: Path | None = None,
+    *,
+    gone: list[tuple[Path, OSError]] | None = None,
 ) -> Path | None:
+    """Return where the /proc link ``path`` points, or None without evidence.
+
+    A link whose process exited (ENOENT or ESRCH) is no evidence, and is added
+    to ``gone`` when given; an unreadable one refuses (#1173).
+    """
+
     try:
         raw = os.readlink(path)
-    except FileNotFoundError:
-        return None
-    except PermissionError as exc:
-        raise Refusal(
-            f"process use is indeterminate because {path} is unreadable: {exc}"
-        ) from exc
     except OSError as exc:
-        if exc.errno == errno.EINVAL:
-            return None
-        # Same device proof as _readable_link_target (#618): stat
-        # follows the descriptor, and another filesystem device is
-        # proven outside the slot.
-        if slot_device is not None:
-            try:
-                observed = os.stat(path)
-            except OSError:
-                observed = None
-            if observed is not None and observed.st_dev != slot_device:
-                return None
-        within = _too_long_link_within(path, exc, slot_root)
-        if within is not None:
-            return slot_root if within else None
-        raise Refusal(f"process use is indeterminate because {path} failed: {exc}") from exc
+        if exc.errno not in _PROCESS_GONE_ERRNOS:
+            return _undecided_link_target(path, exc, slot_device, slot_root)
+        if gone is not None:
+            gone.append((path, exc))
+        return None
     if raw.endswith(" (deleted)"):
         raw = raw[: -len(" (deleted)")]
     target = Path(raw)
     if not target.is_absolute():
         target = path.parent / target
     return Path(os.path.normpath(str(target)))
+
+
+def _undecided_link_target(
+    path: Path, exc: OSError, slot_device: int | None, slot_root: Path | None
+) -> Path | None:
+    """Decide a /proc link readlink(2) failed on for another reason than exit."""
+
+    if isinstance(exc, PermissionError):
+        raise Refusal(
+            f"process use is indeterminate because {path} is unreadable: {exc}"
+        ) from exc
+    if exc.errno == errno.EINVAL:
+        return None
+    # Same device proof as _readable_link_target (#618): stat
+    # follows the descriptor, and another filesystem device is
+    # proven outside the slot.
+    if slot_device is not None:
+        try:
+            observed = os.stat(path)
+        except OSError:
+            observed = None
+        if observed is not None and observed.st_dev != slot_device:
+            return None
+    within = _too_long_link_within(path, exc, slot_root)
+    if within is not None:
+        return slot_root if within else None
+    raise Refusal(f"process use is indeterminate because {path} failed: {exc}") from exc
+
+
+_Unread = TypeVar("_Unread")
+
+
+def _unread_process_entry(
+    pid_dir: Path,
+    path: Path,
+    exc: OSError,
+    gone: list[tuple[Path, OSError]],
+    unreadable_is_no_evidence: bool,
+    empty: _Unread,
+) -> _Unread:
+    """Classify a failed read of one /proc/PID entry: ``empty``, or a refusal.
+
+    A process that exited (ENOENT or ESRCH, or an unreadable entry of a
+    process that `_unreadable_entry_exited`) shows nothing, and the read is
+    added to ``gone`` (#1173).  An unreadable entry of a live process refuses unless
+    the caller skips unreadable entries as lsof does; every other errno
+    refuses.
+    """
+
+    if exc.errno in _PROCESS_GONE_ERRNOS:
+        gone.append((path, exc))
+        return empty
+    if isinstance(exc, PermissionError):
+        if unreadable_is_no_evidence:
+            return empty
+        if _unreadable_entry_exited(pid_dir, path, exc):
+            gone.append((path, exc))
+            return empty
+        raise Refusal(
+            f"process use is indeterminate because {path} is unreadable: {exc}"
+        ) from exc
+    raise Refusal(
+        f"process use is indeterminate because {path} cannot be read: {exc}"
+    ) from exc
 
 
 def _process_uses_slot(
@@ -21571,8 +21726,11 @@ def _process_uses_slot(
 
     With ``unreadable_is_no_evidence``, each link, descriptor directory or
     maps file this user may not read is skipped, as lsof run as this user
-    skips it, and the uses already found are kept.  Other failures still
-    refuse, and the mount table is always read.
+    skips it, and the uses already found are kept.  A read that finds the
+    process exited (ENOENT or ESRCH, or EACCES or EPERM once
+    `_unreadable_entry_exited`) is no evidence and is noted in the census
+    diagnostics (#1173).  Other failures still refuse, and the mount table is
+    always read.
     """
 
     try:
@@ -21580,13 +21738,22 @@ def _process_uses_slot(
     except OSError:
         slot_device = None
 
+    # Reads that found the process exited (#1173 census-vanished-process):
+    # each is no evidence, and the walk goes on to the census's end.
+    gone: list[tuple[Path, OSError]] = []
+
     def link_target(path: Path) -> Path | None:
         try:
-            return _link_target(path, slot_device, slot_path)
+            return _link_target(path, slot_device, slot_path, gone=gone)
         except Refusal as exc:
-            if unreadable_is_no_evidence and isinstance(exc.__cause__, PermissionError):
+            if not isinstance(exc.__cause__, PermissionError):
+                raise
+            if unreadable_is_no_evidence:
                 return None
-            raise
+            if not _unreadable_entry_exited(pid_dir, path, exc.__cause__):
+                raise
+            gone.append((path, exc.__cause__))
+            return None
 
     uses: list[str] = []
     for name in ("cwd", "root", "exe"):
@@ -21596,18 +21763,10 @@ def _process_uses_slot(
     fd_dir = pid_dir / "fd"
     try:
         descriptors = list(fd_dir.iterdir())
-    except FileNotFoundError:
-        descriptors = []
-    except PermissionError as exc:
-        if not unreadable_is_no_evidence:
-            raise Refusal(
-                f"process use is indeterminate because {fd_dir} is unreadable: {exc}"
-            ) from exc
-        descriptors = []
     except OSError as exc:
-        raise Refusal(
-            f"process use is indeterminate because {fd_dir} cannot be read: {exc}"
-        ) from exc
+        descriptors = _unread_process_entry(
+            pid_dir, fd_dir, exc, gone, unreadable_is_no_evidence, []
+        )
     for descriptor in descriptors:
         target = link_target(descriptor)
         if target is not None and _path_is_within(target, slot_path):
@@ -21616,18 +21775,11 @@ def _process_uses_slot(
     maps_path = pid_dir / "maps"
     try:
         maps = maps_path.read_text(encoding="utf-8", errors="surrogateescape")
-    except FileNotFoundError:
-        maps = ""
-    except PermissionError as exc:
-        if not unreadable_is_no_evidence:
-            raise Refusal(
-                f"process use is indeterminate because {maps_path} is unreadable: {exc}"
-            ) from exc
-        maps = ""
     except OSError as exc:
-        raise Refusal(
-            f"process use is indeterminate because {maps_path} cannot be read: {exc}"
-        ) from exc
+        maps = _unread_process_entry(
+            pid_dir, maps_path, exc, gone, unreadable_is_no_evidence, ""
+        )
+    _note_process_gone(pid_dir, gone)
     slot_text = str(slot_path)
     for line in maps.splitlines():
         if slot_text in line:
@@ -21843,6 +21995,39 @@ def _process_uids(pid_dir: Path) -> tuple[int, int, int, int] | None:
             except ValueError:
                 break
     raise Refusal(f"process ownership is indeterminate for {pid_dir.name}")
+
+
+def _census_process_uids(pid_dir: Path) -> tuple[int, int, int, int] | None:
+    """`_process_uids` for a census: None once the process has exited (#1173).
+
+    `_process_uids` refuses a second ESRCH, because a liveness question must
+    not take a failed reopen as proof of exit.  A census asks only what live
+    processes use, and one that exited uses nothing, so it is skipped and noted.
+    """
+
+    try:
+        return _process_uids(pid_dir)
+    except Refusal as exc:
+        cause = exc.__cause__
+        if isinstance(cause, OSError) and cause.errno in _PROCESS_GONE_ERRNOS:
+            _note_process_gone(pid_dir, [(pid_dir / "status", cause)])
+            return None
+        raise
+
+
+def _census_process_cgroup(pid_dir: Path) -> str | None:
+    """`_read_process_cgroup` for a census: None once the process has exited (#1173)."""
+
+    try:
+        return _read_process_cgroup(pid_dir)
+    except Refusal as exc:
+        cause = exc.__cause__
+        if isinstance(cause, OSError) and cause.errno in _PROCESS_GONE_ERRNOS:
+            gone = [(pid_dir / "cgroup", cause)]
+            if cause.errno == errno.ESRCH or _process_has_exited(pid_dir):
+                _note_process_gone(pid_dir, gone)
+                return None
+        raise
 
 
 def _process_uid(pid_dir: Path) -> int | None:
@@ -22691,7 +22876,7 @@ def _observe_slot_use_once(
                 generation = None
             start_ticks = None if generation is None else generation.start_ticks
         try:
-            uids = _process_uids(pid_dir)
+            uids = _census_process_uids(pid_dir)
         except Refusal:
             if reported_use is None:
                 raise
@@ -22701,7 +22886,7 @@ def _observe_slot_use_once(
             continue
         if owner_cgroup_is_evidence and record is not None and record.owner is not None:
             try:
-                cgroup = _read_process_cgroup(pid_dir)
+                cgroup = _census_process_cgroup(pid_dir)
             except Refusal as exc:
                 cgroup_refusal = Refusal(
                     f"recorded cgroup use is indeterminate for PID {pid}: {exc}"
@@ -22709,6 +22894,8 @@ def _observe_slot_use_once(
                 if reported_use is None:
                     raise cgroup_refusal from exc
                 reported_use_recheckable = False
+                continue
+            if cgroup is None:
                 continue
             if cgroup == record.owner.cgroup_path:
                 cgroup_refusal = Refusal(
@@ -47530,7 +47717,11 @@ def _capture_agent_remove_batch_census(
 
 
 def _readable_link_target(
-    path: Path, slot_device: int | None = None, slot_root: Path | None = None
+    path: Path,
+    slot_device: int | None = None,
+    slot_root: Path | None = None,
+    *,
+    gone: list[tuple[Path, OSError]] | None = None,
 ) -> str | None:
     """Return an absolute link target, or None when absent or unreadable.
 
@@ -47543,12 +47734,15 @@ def _readable_link_target(
     filesystem device is proven to lie outside the slot, whose slots are
     separate filesystem images.  A same-device target stays
     indeterminate: a very long path inside the slot fails readlink the
-    same way, so treating it as unused would fail open (#618).
+    same way, so treating it as unused would fail open (#618).  A link whose
+    process exited is added to ``gone`` when given (#1173).
     """
 
     try:
         raw = os.readlink(path)
     except OSError as exc:
+        if exc.errno in _PROCESS_GONE_ERRNOS and gone is not None:
+            gone.append((path, exc))
         if exc.errno in (
             errno.ENOENT, errno.ESRCH, errno.EINVAL, errno.EACCES, errno.EPERM,
         ):
@@ -47629,9 +47823,10 @@ def _agent_batch_fresh_use(
             except Refusal:
                 generation = None
             start_ticks = None if generation is None else generation.start_ticks
-        if _process_uids(pid_dir) is None:
+        if _census_process_uids(pid_dir) is None:
             continue
         uses: list[str] = []
+        gone: list[tuple[Path, OSError]] = []
         if owner_cgroup is not None:
             try:
                 cgroup = _read_process_cgroup(pid_dir)
@@ -47648,7 +47843,9 @@ def _agent_batch_fresh_use(
         uses.extend(mount_verdicts.uses(pid_dir))
         if not uses:
             for name in ("cwd", "root", "exe"):
-                target = _readable_link_target(pid_dir / name, slot_device, slot_path)
+                target = _readable_link_target(
+                    pid_dir / name, slot_device, slot_path, gone=gone
+                )
                 if within(target):
                     uses.append(f"{name}={target}")
                     break
@@ -47663,9 +47860,13 @@ def _agent_batch_fresh_use(
                     raise Refusal(
                         f"process use is indeterminate because {fd_dir} cannot be read: {exc}"
                     ) from exc
+                if exc.errno in _PROCESS_GONE_ERRNOS:
+                    gone.append((fd_dir, exc))
                 descriptors = []
             for descriptor in descriptors:
-                target = _readable_link_target(fd_dir / descriptor, slot_device, slot_path)
+                target = _readable_link_target(
+                    fd_dir / descriptor, slot_device, slot_path, gone=gone
+                )
                 if within(target):
                     uses.append(f"fd/{descriptor}={target}")
                     break
@@ -47680,6 +47881,8 @@ def _agent_batch_fresh_use(
                     raise Refusal(
                         f"process use is indeterminate because {maps_path} cannot be read: {exc}"
                     ) from exc
+                if exc.errno in _PROCESS_GONE_ERRNOS:
+                    gone.append((maps_path, exc))
                 maps = b""
             if slot_bytes in maps:
                 for line in maps.split(b"\n"):
@@ -47694,6 +47897,7 @@ def _agent_batch_fresh_use(
                     if within(os.path.normpath(mapped) if mapped.startswith("/") else None):
                         uses.append(f"map={mapped}")
                         break
+        _note_process_gone(pid_dir, gone)
         if uses:
             refusal = Refusal(
                 f"live {_walked_process_label(pid_dir)} uses slot {slot_path}: "
@@ -48027,7 +48231,7 @@ def _agent_batch_fenced_use(
             except Refusal:
                 generation = None
             start_ticks = None if generation is None else generation.start_ticks
-        if _process_uids(pid_dir) is None:
+        if _census_process_uids(pid_dir) is None:
             continue
         if owner_cgroup is not None:
             try:
@@ -48044,6 +48248,13 @@ def _agent_batch_fenced_use(
                 )
         uses = mount_verdicts.uses(pid_dir)
         current = pid_dir
+        # Reads that found the process exited (#1173), for the diagnostics.
+        gone: list[tuple[Path, OSError]] = []
+
+        def skipped(exc: OSError) -> bool:
+            if exc.errno in _PROCESS_GONE_ERRNOS:
+                gone.append((current, exc))
+            return exc.errno in _FENCED_SCAN_SKIPPED_ERRNOS
         try:
             for name in ("cwd", "root", "exe"):
                 if uses:
@@ -48057,13 +48268,13 @@ def _agent_batch_fenced_use(
                     elif in_tree(str(current)):
                         uses.append(f"{name}={raw}{identity_match}")
                 except OSError as exc:
-                    if exc.errno not in _FENCED_SCAN_SKIPPED_ERRNOS:
+                    if not skipped(exc):
                         raise
             current = pid_dir / "fd"
             try:
                 descriptors = [] if uses else os.listdir(current)
             except OSError as exc:
-                if exc.errno not in _FENCED_SCAN_SKIPPED_ERRNOS:
+                if not skipped(exc):
                     raise
                 descriptors = []
             for descriptor in descriptors:
@@ -48071,7 +48282,7 @@ def _agent_batch_fenced_use(
                 try:
                     raw = os.readlink(current)
                 except OSError as exc:
-                    if exc.errno not in _FENCED_SCAN_SKIPPED_ERRNOS:
+                    if not skipped(exc):
                         raise
                     continue
                 if raw.startswith("socket:[") and raw.endswith("]"):
@@ -48091,15 +48302,16 @@ def _agent_batch_fenced_use(
                         uses.append(f"fd/{descriptor}={raw}{identity_match}")
                         break
                 except OSError as exc:
-                    if exc.errno not in _FENCED_SCAN_SKIPPED_ERRNOS:
+                    if not skipped(exc):
                         raise
             current = pid_dir / "maps"
             try:
                 maps = b"" if uses else current.read_bytes()
             except OSError as exc:
-                if exc.errno not in _FENCED_SCAN_SKIPPED_ERRNOS:
+                if not skipped(exc):
                     raise
                 maps = b""
+            _note_process_gone(pid_dir, gone)
         except OSError as exc:
             return _UndecidedFencedUse(f"{current}: {exc}")
         seen: set[bytes] = set()
@@ -63166,8 +63378,9 @@ def _zombie_leader_thread_dirs(pid_dir: Path) -> tuple[Path, ...]:
         return ()
     try:
         status = _read_process_status(pid_dir)
-    except FileNotFoundError:
-        # A leader is reaped only after its last thread: the group is gone.
+    except (FileNotFoundError, ProcessLookupError):
+        # A leader is reaped only after its last thread: the group is gone
+        # (ESRCH: reaped between the lookup and the read, #1173).
         return ()
     except (OSError, UnicodeError) as exc:
         raise Refusal(

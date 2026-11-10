@@ -43,6 +43,7 @@ use crate::hold_write::{
     acquire_mutation_locks, active_document, current_hold, refuse_target_storage, validate_global,
 };
 use crate::journals_state::parse_journals;
+use crate::proc_reads;
 use crate::status_state::{process_state, read_process_identity, Identity};
 
 type Result<T> = std::result::Result<T, String>;
@@ -547,16 +548,22 @@ pub(crate) struct ProcessSnapshot {
     processes: Vec<ProcessLinks>,
 }
 
-fn observe_link(link: &Path) -> LinkObservation {
+/// Read one /proc link. A link whose process exited (ENOENT or ESRCH)
+/// is no evidence and is added to `gone` (#1173 census-vanished-process).
+fn observe_link(link: &Path, gone: &mut Vec<(PathBuf, std::io::Error)>) -> LinkObservation {
     use std::os::unix::fs::MetadataExt as _;
-    match std::fs::read_link(link) {
+    match proc_reads::read_link(link) {
         Ok(target) => {
             let shown = target.to_string_lossy().into_owned();
             LinkObservation::Target(PathBuf::from(shown.trim_end_matches(" (deleted)")))
         }
         Err(error) => {
+            if proc_reads::is_gone(&error) {
+                gone.push((link.to_path_buf(), error));
+                return LinkObservation::NoEvidence;
+            }
             // Errnos the Python census treats as no evidence.
-            if matches!(error.raw_os_error(), Some(1 | 2 | 3 | 13 | 22)) {
+            if matches!(error.raw_os_error(), Some(1 | 13 | 22)) {
                 return LinkObservation::NoEvidence;
             }
             LinkObservation::Undecided {
@@ -594,7 +601,7 @@ fn observation_points_into(
 
 #[cfg(test)]
 fn link_points_into(link: &Path, slot_path: &Path, slot_device: u64) -> Result<bool> {
-    observation_points_into(&observe_link(link), slot_path, slot_device)
+    observation_points_into(&observe_link(link, &mut Vec::new()), slot_path, slot_device)
 }
 
 /// Most listings of /proc one snapshot takes before it refuses
@@ -691,18 +698,27 @@ fn read_process_links(pid: i64, leader: Option<i64>) -> ProcessLinks {
         Some(leader) => PathBuf::from(format!("/proc/{leader}/task/{pid}")),
     };
     let mut links: Vec<(&'static str, LinkObservation)> = Vec::new();
+    // Reads that found the process exited, for the census diagnostics.
+    let mut gone: Vec<(PathBuf, std::io::Error)> = Vec::new();
     for (label, link) in [
         ("working directory", base.join("cwd")),
         ("executable", base.join("exe")),
     ] {
-        links.push((label, observe_link(&link)));
+        links.push((label, observe_link(&link, &mut gone)));
     }
-    if let Ok(fds) = std::fs::read_dir(base.join("fd")) {
-        for fd in fds.flatten() {
-            links.push(("descriptor", observe_link(&fd.path())));
+    let fd_dir = base.join("fd");
+    match proc_reads::read_dir(&fd_dir) {
+        Ok(fds) => {
+            for fd in fds.flatten() {
+                links.push(("descriptor", observe_link(&fd.path(), &mut gone)));
+            }
         }
+        Err(error) if proc_reads::is_gone(&error) => gone.push((fd_dir, error)),
+        Err(_) => {}
     }
-    ProcessLinks { pid, leader, links }
+    let process = ProcessLinks { pid, leader, links };
+    proc_reads::note_process_gone(&process.holder(), &base, &gone);
+    process
 }
 
 /// What one snapshot has read so far, across its listings of /proc.
@@ -2759,6 +2775,139 @@ mod link_tests {
         child.kill().unwrap();
         child.wait().unwrap();
         std::fs::remove_dir_all(&base).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod census_gone_tests {
+    //! #1173 census-vanished-process: a snapshot read that finds the
+    //! process exited is no evidence, and the snapshot completes.
+    use super::{assert_slot_unused_snapshot, capture_process_snapshot};
+    use crate::proc_reads::test_support::{holding_fd, in_cwd, proc_path, stop, Slot};
+    use crate::proc_reads::{inject, reset};
+
+    const ENOENT: i32 = 2;
+    const ESRCH: i32 = 3;
+
+    fn snapshot_with(
+        child: &std::process::Child,
+        slot: &Slot,
+        entries: &[&str],
+        errno: i32,
+    ) -> (Result<(), String>, Vec<String>) {
+        reset();
+        for entry in entries {
+            inject(&proc_path(child, entry), errno);
+        }
+        let verdict =
+            capture_process_snapshot(std::process::id() as i64, std::slice::from_ref(&slot.slot))
+                .and_then(|snapshot| assert_slot_unused_snapshot(&snapshot, &slot.slot));
+        let prefix = format!("census: process {} ", child.id());
+        let notes = reset()
+            .into_iter()
+            .filter(|note| note.starts_with(&prefix))
+            .collect();
+        (verdict, notes)
+    }
+
+    #[test]
+    fn a_process_gone_on_each_read_is_skipped_and_noted() {
+        let slot = Slot::new("snapshot");
+        let children = [
+            (in_cwd(&slot), vec!["cwd"]),
+            (holding_fd(&slot), vec!["fd/3"]),
+            (holding_fd(&slot), vec!["fd"]),
+        ];
+        for (child, entries) in &children {
+            let (verdict, notes) = snapshot_with(child, &slot, &[], ESRCH);
+            let error = verdict.unwrap_err();
+            assert!(error.contains("uses slot"), "{entries:?}: {error}");
+            assert!(notes.is_empty(), "{notes:?}");
+        }
+        for (child, entries) in &children {
+            for errno in [ENOENT, ESRCH] {
+                reset();
+                // Every other child's use is hidden too, so the slot is
+                // unused exactly when this child's gone reads are skipped.
+                for (other, other_entries) in &children {
+                    for entry in other_entries {
+                        inject(&proc_path(other, entry), errno);
+                    }
+                }
+                let verdict = capture_process_snapshot(
+                    std::process::id() as i64,
+                    std::slice::from_ref(&slot.slot),
+                )
+                .and_then(|snapshot| assert_slot_unused_snapshot(&snapshot, &slot.slot));
+                let prefix = format!("census: process {} ", child.id());
+                let notes: Vec<String> = reset()
+                    .into_iter()
+                    .filter(|note| note.starts_with(&prefix))
+                    .collect();
+                assert_eq!(verdict, Ok(()), "{entries:?} errno {errno}");
+                if errno == ESRCH {
+                    assert_eq!(
+                        notes,
+                        [format!(
+                            "census: process {} exited during the census ({}: ESRCH); skipped",
+                            child.id(),
+                            proc_path(child, entries[0]).display()
+                        )]
+                    );
+                } else {
+                    assert!(notes.is_empty(), "{notes:?}");
+                }
+            }
+        }
+        // A gone executable read still completes, with the other evidence.
+        let (child, _entries) = &children[0];
+        for errno in [ENOENT, ESRCH] {
+            let (verdict, _notes) = snapshot_with(child, &slot, &["exe"], errno);
+            assert!(verdict.unwrap_err().contains("uses slot"));
+        }
+        for (child, _entries) in children {
+            stop(child);
+        }
+    }
+
+    #[test]
+    fn processes_exiting_during_the_snapshot_never_refuse_or_hide_a_user() {
+        let slot = Slot::new("snapshot-churn");
+        let unused = Slot::new("snapshot-churn-unused");
+        let user = in_cwd(&slot);
+        let running = std::sync::atomic::AtomicBool::new(true);
+        std::thread::scope(|scope| {
+            // Bounded churn: a gate runs this beside other steps under a
+            // CPU limit, so the children are few and paced.
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    for _ in 0..100 {
+                        if !running.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        let mut child = std::process::Command::new("true")
+                            .current_dir(&slot.slot)
+                            .spawn()
+                            .unwrap();
+                        child.wait().unwrap();
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                });
+            }
+            for _ in 0..5 {
+                let snapshot = capture_process_snapshot(
+                    std::process::id() as i64,
+                    &[slot.slot.clone(), unused.slot.clone()],
+                )
+                .unwrap();
+                assert_eq!(assert_slot_unused_snapshot(&snapshot, &unused.slot), Ok(()));
+                let error = assert_slot_unused_snapshot(&snapshot, &slot.slot).unwrap_err();
+                assert!(error.contains("uses slot"), "{error}");
+            }
+            running.store(false, std::sync::atomic::Ordering::Relaxed);
+        });
+        let _ = reset();
+        stop(user);
     }
 }
 

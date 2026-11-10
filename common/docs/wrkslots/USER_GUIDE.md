@@ -639,6 +639,18 @@ be dead, and the full process-use scan must find no cwd, executable, root, descr
 cgroup, or mount use. If the liveness source is degraded or stale, return `2`; unknown ownership is
 not a free slot.
 
+A process that exits while the scan reads it uses nothing, so the scan skips it and goes on: a read
+of its `/proc` entry that fails with `ENOENT` or `ESRCH` is no evidence. So is one that fails with
+`EACCES` or `EPERM` once the process is gone or a zombie: an exiting process's descriptors become
+unreadable before it has released them, so a process still exiting is given up to 200 ms to finish.
+An entry the scan may not read of a process that is still running, or still exiting after that,
+makes the answer indeterminate, and the command refuses. To see which processes a scan skipped
+this way, set `WRKSLOTS_CENSUS_DIAGNOSTICS=1`: each time the scan skips one, it names it on
+standard error as `census: process PID exited during the census (/proc/PID/ENTRY: ERRNO); skipped`,
+and a process still exiting after the wait as
+`census: process PID still exiting after 200 ms (/proc/PID/ENTRY: ERRNO); indeterminate`. The
+variable changes nothing else, and without it the scan prints nothing about skipped processes.
+
 Large registries should configure `init --liveness-batch-command PATH`. Audit then invokes that
 project-owned command once, with a `wrkslots-liveness-batch-request/v1` JSON object on standard
 input. Every request subject contains the agent and the complete environment that the

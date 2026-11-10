@@ -10,6 +10,7 @@ import selectors
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
@@ -1476,3 +1477,303 @@ def test_a_link_that_is_unreadable_rather_than_released_is_still_refused(
     # cli reads links through the os module, so patching os.readlink reaches it.
     monkeypatch.setattr(os, "readlink", readlink)
     assert not cli._process_is_exiting_namespace_init(pid_dir)
+
+
+# #1173 census-vanished-process: a /proc read that finds its process exited
+# (ENOENT, ESRCH) is no evidence and the census completes; EACCES of a live
+# process still refuses.  The children and the injected reads mirror the
+# other edition's census_gone_tests, which assert the same diagnostics.
+
+
+@dataclasses.dataclass
+class _GoneSlot:
+    slot: Path
+    outside: Path
+
+
+@pytest.fixture
+def gone_slot(tmp_path: Path) -> _GoneSlot:
+    (tmp_path / "slot").mkdir()
+    (tmp_path / "outside").mkdir()
+    return _GoneSlot((tmp_path / "slot").resolve(), (tmp_path / "outside").resolve())
+
+
+def _settled(child: subprocess.Popen[bytes], entry: str, target: Path) -> subprocess.Popen[bytes]:
+    link = Path(f"/proc/{child.pid}/{entry}")
+    for _ in range(500):
+        with contextlib.suppress(OSError):
+            if os.readlink(link) == str(target):
+                return child
+        time.sleep(0.01)
+    child.kill()
+    raise AssertionError(f"{link} never pointed at {target}")
+
+
+def _in_cwd(slot: _GoneSlot) -> subprocess.Popen[bytes]:
+    child = subprocess.Popen(["sleep", "600"], cwd=slot.slot, stdin=subprocess.DEVNULL)
+    return _settled(child, "cwd", slot.slot)
+
+
+def _holding_fd(slot: _GoneSlot) -> subprocess.Popen[bytes]:
+    held = slot.slot / "held"
+    held.write_bytes(b"x")
+    child = subprocess.Popen(
+        ["sh", "-c", 'exec sleep 600 3<"$0"', str(held)],
+        cwd=slot.outside, stdin=subprocess.DEVNULL,
+    )
+    return _settled(child, "fd/3", held)
+
+
+def _running_from(slot: _GoneSlot) -> subprocess.Popen[bytes]:
+    program = slot.slot / "sleep"
+    program.write_bytes(Path("/bin/sleep").read_bytes())
+    program.chmod(0o755)
+    child = subprocess.Popen([str(program), "600"], cwd=slot.outside, stdin=subprocess.DEVNULL)
+    return _settled(child, "exe", program)
+
+
+def _inject(monkeypatch: pytest.MonkeyPatch, failing: dict[Path, int]) -> None:
+    """Fail the census's reads of exactly these /proc paths with these errnos."""
+
+    def fail(path: os.PathLike[str] | str) -> None:
+        number = failing.get(Path(path))
+        if number is not None:
+            exc_type = {errno.ENOENT: FileNotFoundError, errno.ESRCH: ProcessLookupError,
+                        errno.EACCES: PermissionError}.get(number, OSError)
+            raise exc_type(number, os.strerror(number), str(path))
+
+    original_readlink = os.readlink
+    original_iterdir = Path.iterdir
+    original_read_text = Path.read_text
+
+    def readlink(path: os.PathLike[str] | str, *args: object, **kwargs: object) -> str:
+        fail(path)
+        return original_readlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    def iterdir(path: Path) -> Iterator[Path]:
+        fail(path)
+        return original_iterdir(path)
+
+    def read_text(path: Path, *args: object, **kwargs: object) -> str:
+        fail(path)
+        return original_read_text(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "readlink", readlink)
+    monkeypatch.setattr(Path, "iterdir", iterdir)
+    monkeypatch.setattr(Path, "read_text", read_text)
+
+
+def _uses_with(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    child: subprocess.Popen[bytes], slot: _GoneSlot, entries: Sequence[str], number: int,
+) -> tuple[list[str], list[str]]:
+    pid_dir = Path(f"/proc/{child.pid}")
+    with monkeypatch.context() as patch:
+        patch.setenv("WRKSLOTS_CENSUS_DIAGNOSTICS", "1")
+        _inject(patch, {pid_dir / entry: number for entry in entries})
+        capsys.readouterr()
+        uses = cli._process_uses_slot(pid_dir, slot.slot)
+    return uses, capsys.readouterr().err.splitlines()
+
+
+def test_census_skips_and_notes_a_process_gone_on_each_read(
+    gone_slot: _GoneSlot, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    children = [
+        (_in_cwd(gone_slot), ["cwd"]),
+        (_holding_fd(gone_slot), ["fd/3"]),
+        (_holding_fd(gone_slot), ["fd"]),
+        (_running_from(gone_slot), ["exe", "maps"]),
+    ]
+    try:
+        for child, entries in children:
+            uses, notes = _uses_with(monkeypatch, capsys, child, gone_slot, [], errno.ESRCH)
+            assert uses, f"{entries} must be a use uninjected"
+            assert notes == []
+            for number in (errno.ENOENT, errno.ESRCH):
+                uses, notes = _uses_with(monkeypatch, capsys, child, gone_slot, entries, number)
+                assert uses == [], (entries, number)
+                if number == errno.ESRCH:
+                    assert notes == [
+                        f"census: process {child.pid} exited during the census "
+                        f"(/proc/{child.pid}/{entries[0]}: ESRCH); skipped"
+                    ]
+                else:
+                    # Its stat is still there: an absent entry, not an exit.
+                    assert notes == []
+        # root has no positive case without privilege; a gone root read still
+        # completes the census with the other evidence.
+        for number in (errno.ENOENT, errno.ESRCH):
+            uses, _notes = _uses_with(monkeypatch, capsys, children[0][0], gone_slot, ["root"], number)
+            assert len(uses) == 1
+    finally:
+        for child, _entries in children:
+            child.kill()
+            child.wait()
+
+
+@pytest.mark.parametrize("entry", ["cwd", "root", "exe", "fd", "fd/3", "maps"])
+def test_census_still_refuses_an_unreadable_read_of_a_live_process(
+    gone_slot: _GoneSlot, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    entry: str,
+) -> None:
+    child = _holding_fd(gone_slot)
+    try:
+        with pytest.raises(cli.Refusal) as refused:
+            _uses_with(monkeypatch, capsys, child, gone_slot, [entry], errno.EACCES)
+        assert "process use is indeterminate because" in str(refused.value)
+        assert f"/proc/{child.pid}/{entry} is unreadable" in str(refused.value)
+        assert capsys.readouterr().err == ""
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_census_counts_an_unreaped_zombie_as_gone(
+    gone_slot: _GoneSlot, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    child = subprocess.Popen(["true"], cwd=gone_slot.slot)
+    pid_dir = Path(f"/proc/{child.pid}")
+    try:
+        while not cli._process_has_exited(pid_dir):
+            time.sleep(0.005)
+        uses, notes = _uses_with(monkeypatch, capsys, child, gone_slot, [], errno.ESRCH)
+        assert uses == []
+        assert notes == [
+            f"census: process {child.pid} exited during the census "
+            f"(/proc/{child.pid}/cwd: ENOENT); skipped"
+        ]
+    finally:
+        child.wait()
+
+
+def test_census_status_read_skips_a_gone_process(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    pid_dir = Path("/proc/123")
+    monkeypatch.setenv("WRKSLOTS_CENSUS_DIAGNOSTICS", "1")
+    scripted_status(
+        monkeypatch, pid_dir,
+        [ProcessLookupError(errno.ESRCH, "old inode"),
+         ProcessLookupError(errno.ESRCH, "fresh inode also exited")],
+    )
+    assert cli._census_process_uids(pid_dir) is None
+    assert capsys.readouterr().err.splitlines() == [
+        "census: process 123 exited during the census (/proc/123/status: ESRCH); skipped"
+    ]
+
+
+def test_census_cgroup_read_skips_only_a_gone_process(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv("WRKSLOTS_CENSUS_DIAGNOSTICS", "1")
+    pid_dir = Path("/proc/123")
+    with monkeypatch.context() as patch:
+        _inject(patch, {pid_dir / "cgroup": errno.ESRCH})
+        assert cli._census_process_cgroup(pid_dir) is None
+    assert capsys.readouterr().err.splitlines() == [
+        "census: process 123 exited during the census (/proc/123/cgroup: ESRCH); skipped"
+    ]
+    # A live process's unreadable or failing cgroup still refuses.
+    live = Path(f"/proc/{os.getpid()}")
+    for number in (errno.EACCES, errno.EIO, errno.ENOENT):
+        with monkeypatch.context() as patch:
+            _inject(patch, {live / "cgroup": number})
+            with pytest.raises(cli.Refusal, match="cannot read process cgroup"):
+                cli._census_process_cgroup(live)
+
+
+def test_census_of_processes_exiting_meanwhile_never_refuses(gone_slot: _GoneSlot) -> None:
+    for _ in range(200):
+        child = subprocess.Popen(["true"], cwd=gone_slot.slot)
+        pid_dir = Path(f"/proc/{child.pid}")
+        reaper = threading.Thread(target=child.wait)
+        reaper.start()
+        try:
+            for _ in range(20):
+                cli._process_uses_slot(pid_dir, gone_slot.slot)
+                cli._census_process_uids(pid_dir)
+        finally:
+            reaper.join()
+
+
+def _exiting_stat(stat: bytes) -> bytes:
+    """``stat`` with State D and PF_EXITING set: a task stuck in do_exit."""
+    closing = stat.rfind(b") ")
+    fields = stat[closing + 2:].split()
+    fields[0] = b"D"
+    fields[6] = str(int(fields[6]) | cli._PF_EXITING).encode()
+    return stat[:closing] + b") " + b" ".join(fields) + b"\n"
+
+
+def _stat_says_exiting(
+    monkeypatch: pytest.MonkeyPatch, pid_dir: Path, *, until_exit: bool,
+) -> None:
+    """Make the census read ``pid_dir`` as in do_exit (until it really exits)."""
+    original = Path.read_bytes
+    exiting = _exiting_stat(original(pid_dir / "stat"))
+
+    def read_bytes(path: Path) -> bytes:
+        if path != pid_dir / "stat":
+            return original(path)
+        if until_exit:
+            real = original(path)
+            parsed = cli._parse_proc_stat(real)
+            if parsed is not None and parsed.state in cli._ZOMBIE_STATES:
+                return real
+        return exiting
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+
+
+def test_census_unreadable_entry_of_a_process_that_exits_within_the_wait_is_gone(
+    gone_slot: _GoneSlot, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Not in do_exit: an unreadable entry of a live process refuses at once.
+    live = _holding_fd(gone_slot)
+    try:
+        started = time.monotonic()
+        with pytest.raises(cli.Refusal, match="is unreadable"):
+            _uses_with(monkeypatch, capsys, live, gone_slot, ["fd"], errno.EACCES)
+        assert time.monotonic() - started < cli._CENSUS_EXIT_WAIT_SECONDS
+        assert capsys.readouterr().err == ""
+    finally:
+        live.kill()
+        live.wait()
+    # In do_exit (its stat says so until it really is a zombie): it counts as
+    # gone once it exits within the wait.
+    child = subprocess.Popen(["sleep", "0.02"], cwd=gone_slot.outside)
+    pid_dir = Path(f"/proc/{child.pid}")
+    try:
+        with monkeypatch.context() as patch:
+            _stat_says_exiting(patch, pid_dir, until_exit=True)
+            uses, notes = _uses_with(patch, capsys, child, gone_slot, ["fd"], errno.EACCES)
+        assert uses == []
+        assert notes == [
+            f"census: process {child.pid} exited during the census "
+            f"({pid_dir / 'fd'}: EACCES); skipped"
+        ]
+    finally:
+        child.wait()
+
+
+def test_census_unreadable_entry_of_a_process_still_exiting_after_the_wait_refuses(
+    gone_slot: _GoneSlot, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    child = _in_cwd(gone_slot)
+    pid_dir = Path(f"/proc/{child.pid}")
+    try:
+        with monkeypatch.context() as patch:
+            _stat_says_exiting(patch, pid_dir, until_exit=False)
+            started = time.monotonic()
+            with pytest.raises(cli.Refusal) as refused:
+                _uses_with(patch, capsys, child, gone_slot, ["fd"], errno.EACCES)
+            assert time.monotonic() - started >= cli._CENSUS_EXIT_WAIT_SECONDS
+        assert f"{pid_dir / 'fd'} is unreadable" in str(refused.value)
+        assert capsys.readouterr().err.splitlines() == [
+            f"census: process {child.pid} still exiting after 200 ms "
+            f"({pid_dir / 'fd'}: EACCES); indeterminate"
+        ]
+    finally:
+        child.kill()
+        child.wait()

@@ -1024,6 +1024,9 @@ def test_an_unreadable_entry_after_a_found_use_keeps_the_use(tmp_path: Path) -> 
     (entries / "root").symlink_to("/")
     (entries / "fd").mkdir()
     (entries / "maps").write_bytes(f"00400000-00401000 r--p 0 00:01 1 {slot}/held\n".encode())
+    # A live process's stat: without one the entries read as an exited
+    # process, whose unreadable entries are no evidence (#1173).
+    (entries / "stat").write_bytes(Path("/proc/self/stat").read_bytes())
     (entries / "fd").chmod(0)
     (entries / "maps").chmod(0)
     try:
