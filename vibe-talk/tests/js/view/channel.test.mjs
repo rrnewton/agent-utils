@@ -2633,3 +2633,24 @@ test("`#1186 two-column-splitter`: the separator drags, clamps, keeps each colum
   assert.equal(splitter.split(), 50);
   assert.equal(kept[kept.length - 1], 50);
 });
+
+test("`#624 voice-page-modularity`: a column's older-pages record and the channel seam, from the module alone", () => {
+  const { createOlderPages, freshOlderPages } = CHANNEL_VIEW;
+  const a = freshOlderPages(); const b = freshOlderPages();
+  a.cursor = "x";
+  assert.equal(b.cursor, null, "a fresh column shared its older pages");
+  assert.deepStrictEqual(freshOlderPages(), { moreAbove: false, cursor: null, inFlight: false, step: null, deferred: false });
+  const seen = [];
+  const summary = { replaceChildren: (...kids) => seen.push(kids) };
+  const owner = createOlderPages({
+    activeColumn: () => ({ older: a }),
+    el: () => summary,
+    transcript: () => ({ seam: (label, detail) => ({ label, detail }) }),
+  });
+  assert.equal(owner.olderPages(), a, "olderPages was not the column's own record");
+  owner.renderChannelSeam("12 messages");
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0][0].label, "12 messages");
+  assert.match(seen[0][0].detail, /Older messages load as you scroll up/);
+  assert.equal(typeof owner.plainReach.gapFrom, "function");
+});

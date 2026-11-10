@@ -163,7 +163,7 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
   same("inColumn(columns.side, () => { olderPages().cursor = 'side-cursor'; olderPages().moreAbove = true; })");
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.older.cursor, columns.side.older.moreAbove, olderPages().cursor])")),
     ["side-cursor", true, null]);
-  assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshOlderPages())")),
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(page.preludeBinding("freshOlderPages")())),
     { moreAbove: false, cursor: null, inFlight: false, step: null, deferred: false });
   // The same for its reply arrows.
   assert.equal(same("inColumn(columns.side, () => replyArrows()) === columns.side.arrows && replyArrows() === columns.main.arrows"), true);
