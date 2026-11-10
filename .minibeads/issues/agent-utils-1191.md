@@ -1,10 +1,11 @@
 ---
 title: "binding-deadline-test-flake: a 0.2-second deadline in the blocked-open cancellation test fails under load"
-status: open
+status: closed
 priority: 2
 issue_type: bug
+assignee: cl-census
 created_at: 2026-11-10T05:10:00.000000000+00:00
-updated_at: 2026-11-10T05:10:00.000000000+00:00
+updated_at: 2026-11-10T10:40:00.000000000+00:00
 ---
 
 # Description
@@ -39,3 +40,21 @@ Keep the existing assertions: the refusal text, the bounded elapsed time, no lea
 
 Filed for the lead coordinator (2026-11-09) from cl-census's gate 7 for #1173. For cl-census after #1173, #1174
 and #1175, or whoever takes the census-load flake family (#1084/#1102/#1188).
+
+## Resolution
+
+Fixed by giving every sub-second deadline in `test_census_binding_deadline.py` a start signal (cl-census, opus 5.5).
+`_StartGatedClock` patches `time.monotonic` with a clock that stands still at the moment it was armed until the
+delayed open has logged its start (the log line the child writes before it sleeps), then runs with the real clock;
+a 60 s cap keeps a binding that never starts from hanging the test. A deadline taken from it can therefore pass only
+while the open is blocked, however late a loaded host schedules the child. It covers the blocked-open test, the
+twelve-roots, unbound-subjects (re-armed per turn), costly-peer (re-armed for the second turn), cleanup-failure and
+uncancellable-child tests. Elapsed bounds are now measured from the logged start (the log also records
+`time.perf_counter()`): the allowance plus the 1 s reap allowance plus 2 s of scheduling slack, asserted below the
+open's delay, which is 10 s in the two cancellation tests. The refusal text, descriptor and reaping assertions are
+unchanged.
+
+Sabotage: with the worker cleanup's `os.kill(pid, signal.SIGKILL)` replaced by `pass` (reverted), the blocked-open
+test fails with "DID NOT RAISE ChildProcessError": the child is never reaped. Unloaded: 20/20 runs of the file
+(13 tests each). Under load: landed only after 20/20 runs of the file under synthetic CPU load (nproc + 64 busy
+loops on a 316-core host, in a user scope, by day with the gate queue empty); the counts are in the landing report.

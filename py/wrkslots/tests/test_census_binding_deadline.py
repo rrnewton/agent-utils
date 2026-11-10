@@ -63,12 +63,63 @@ def _delay_checkout_opens(
             # have been closed before the binding work starts.
             with log.open("a", encoding="utf-8") as output:
                 output.write(
-                    json.dumps({"path": raw, "started": time.monotonic()}) + "\n"
+                    json.dumps(
+                        {
+                            "path": raw,
+                            "started": time.monotonic(),
+                            "real": time.perf_counter(),
+                        }
+                    )
+                    + "\n"
                 )
             time.sleep(seconds)
         return original_open(path, flags, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(os, "open", delayed_open)
+
+
+class _StartGatedClock:
+    """A monotonic clock that stands still until a delayed open has started (#1191).
+
+    Until ``log`` holds ``lines`` entries, every reading returns the moment the clock was
+    armed, so a deadline taken from it cannot pass before the binding child under test is
+    blocked in its open, however late a loaded host schedules that child; from then on the
+    clock runs with the real one, and the deadline passes while the open is blocked. A
+    sub-second wall deadline alone expired before the child started (2026-11-09, load
+    90-170). After ``cap`` real seconds it runs regardless, so a binding that never starts
+    fails the test instead of hanging it. A forked child inherits the clock with the patch.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, log: Path, *, cap: float = 60) -> None:
+        self._real = time.monotonic
+        self._log = log
+        self._cap = cap
+        self._armed = self._real()
+        self._lines = 1
+        monkeypatch.setattr(time, "monotonic", self.monotonic)
+
+    def arm(self, lines: int) -> None:
+        """Stand still again until the log holds ``lines`` entries."""
+        self._armed = self._real()
+        self._lines = lines
+
+    def started(self) -> bool:
+        try:
+            return len(self._log.read_text(encoding="utf-8").splitlines()) >= self._lines
+        except FileNotFoundError:
+            return False
+
+    def monotonic(self) -> float:
+        now = self._real()
+        if now - self._armed >= self._cap or self.started():
+            return now
+        return self._armed
+
+
+def _seconds_since_open_started(log: Path, index: int = 0) -> float:
+    """Real seconds since the ``index``-th delayed open logged its start."""
+    entry = json.loads(log.read_text(encoding="utf-8").splitlines()[index])
+    return time.perf_counter() - float(entry["real"])
 
 
 def _child_pids(monkeypatch: pytest.MonkeyPatch) -> list[int]:
@@ -159,7 +210,7 @@ def test_twelve_real_roots_stop_binding_at_the_default_five_second_deadline(
         return original_identity(config, cache, deadline=deadline)
 
     monkeypatch.setattr(cli, "_audit_cache_root_identity", observed_identity)
-    started = time.perf_counter()
+    _StartGatedClock(monkeypatch, log)
 
     # The default is asserted above; a short explicit allowance proves the
     # same shared-deadline and no-late-start behavior without waiting five
@@ -168,10 +219,10 @@ def test_twelve_real_roots_stop_binding_at_the_default_five_second_deadline(
         fixture, wall_seconds=0.5, errors={"refused": "original refusal"}
     )
 
-    elapsed = time.perf_counter() - started
-    # The short work allowance, at most the existing one-second reap
-    # allowance, plus half a second of process scheduling/serialization.
-    assert elapsed <= 2.0, elapsed
+    elapsed = _seconds_since_open_started(log)
+    # From the first open's start: the short work allowance, at most the
+    # existing one-second reap allowance, plus scheduling on a loaded host.
+    assert elapsed <= 0.5 + cli._READ_ONLY_COMMAND_REAP_SECONDS + 2.0, elapsed
     assert 0 < len(calls) < 12
     assert all(began < deadline for began, deadline in calls)
     deadlines = {deadline for _began, deadline in calls}
@@ -196,10 +247,11 @@ def test_one_blocked_open_is_cancelled_before_its_sleep_finishes(
 ) -> None:
     fixture = _fixture(tmp_path, {"subject": (1,)})
     log = tmp_path / "blocked-open.jsonl"
-    _delay_checkout_opens(monkeypatch, fixture, 3, log)
+    delay = 10
+    _delay_checkout_opens(monkeypatch, fixture, delay, log)
     children = _child_pids(monkeypatch)
     before_fds = _open_descriptors()
-    started = time.perf_counter()
+    _StartGatedClock(monkeypatch, log)
 
     with pytest.raises(cli.Refusal, match="root binding exceeded the fixed wall"):
         cli._audit_cache_root_identity(
@@ -208,8 +260,10 @@ def test_one_blocked_open_is_cancelled_before_its_sleep_finishes(
             deadline=time.monotonic() + 0.2,
         )
 
-    elapsed = time.perf_counter() - started
-    assert elapsed <= 1.7, elapsed
+    # Cancelled long before the open's sleep would have finished: the
+    # allowance and the reap allowance, plus scheduling on a loaded host.
+    elapsed = _seconds_since_open_started(log)
+    assert elapsed <= 0.2 + cli._READ_ONLY_COMMAND_REAP_SECONDS + 2.0 < delay, elapsed
     assert len(log.read_text().splitlines()) == 1
     assert set(os.listdir("/proc/self/fd")) == before_fds
     _assert_reaped(children)
@@ -221,7 +275,9 @@ def test_unbound_subjects_remain_unavailable_on_repeated_deadline_exhaustion(
     fixture = _fixture(tmp_path, {"first": (1,), "later": (1,), "empty": ()})
     log = tmp_path / "repeated-open.jsonl"
     _delay_checkout_opens(monkeypatch, fixture, 3, log)
-    for selected in ("first", "later"):
+    clock = _StartGatedClock(monkeypatch, log)
+    for turn, selected in enumerate(("first", "later")):
+        clock.arm(turn + 1)
         measured, counters = _measure(fixture, wall_seconds=0.15)
         assert measured["empty"] == cli._AuditCacheMeasurement(0, "complete")
         assert counters["work_consumed"] == 0
@@ -241,19 +297,18 @@ def test_costly_binding_peer_does_not_prevent_cheap_subject_next_turn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fixture = _fixture(tmp_path, {"aa-costly": (1,), "zz-cheap": (1,)})
-    _delay_checkout_opens(
-        monkeypatch,
-        fixture,
-        3,
-        tmp_path / "costly-open.jsonl",
-        only_subject="aa-costly",
-    )
+    log = tmp_path / "costly-open.jsonl"
+    _delay_checkout_opens(monkeypatch, fixture, 3, log, only_subject="aa-costly")
+    # Each turn's allowance runs out only once the costly binding has started,
+    # so the cheap subject's work never races the host's speed.
+    clock = _StartGatedClock(monkeypatch, log)
     first, _counters = _measure(fixture, wall_seconds=0.3)
     assert first["aa-costly"].status == "error"
     assert first["aa-costly"].bytes is None
     assert first["zz-cheap"].status in {"partial", "error"}
     assert first["zz-cheap"].bytes is None
 
+    clock.arm(2)
     second, counters = _measure(fixture, wall_seconds=0.3)
 
     assert second["zz-cheap"].status == "complete"
@@ -453,7 +508,8 @@ def test_cleanup_failure_still_closes_all_parent_descriptors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fixture = _fixture(tmp_path, {"subject": (1,)})
-    _delay_checkout_opens(monkeypatch, fixture, 3, tmp_path / "cleanup-open.jsonl")
+    log = tmp_path / "cleanup-open.jsonl"
+    _delay_checkout_opens(monkeypatch, fixture, 3, log)
     children = _child_pids(monkeypatch)
     original_kill = os.kill
 
@@ -465,6 +521,7 @@ def test_cleanup_failure_still_closes_all_parent_descriptors(
 
     monkeypatch.setattr(os, "kill", failed_kill)
     before = _open_descriptors()
+    _StartGatedClock(monkeypatch, log)
     try:
         with pytest.raises(OSError, match="injected cancellation failure"):
             cli._audit_cache_root_identity(
@@ -483,14 +540,16 @@ def test_uncancellable_child_has_a_bounded_reap_wait(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fixture = _fixture(tmp_path, {"subject": (1,)})
-    _delay_checkout_opens(monkeypatch, fixture, 3, tmp_path / "unreaped-open.jsonl")
+    log = tmp_path / "unreaped-open.jsonl"
+    delay = 10
+    _delay_checkout_opens(monkeypatch, fixture, delay, log)
     children = _child_pids(monkeypatch)
     original_kill = os.kill
     before = _open_descriptors()
     # Model SIGKILL not promptly ending a kernel-blocked child. The test's own
     # finally uses the real signal after checking the bounded cleanup result.
     monkeypatch.setattr(os, "kill", lambda _pid, _sig: None)
-    started = time.perf_counter()
+    _StartGatedClock(monkeypatch, log)
     try:
         with pytest.raises(cli.Refusal, match="root binding exceeded the fixed wall"):
             cli._audit_cache_root_identity(
@@ -498,7 +557,10 @@ def test_uncancellable_child_has_a_bounded_reap_wait(
                 fixture.planned["subject"][0],
                 deadline=time.monotonic() + 0.15,
             )
-        assert time.perf_counter() - started <= 1.65
+        # The allowance and the bounded reap wait, plus scheduling on a
+        # loaded host; well before the uncancelled open would finish.
+        elapsed = _seconds_since_open_started(log)
+        assert elapsed <= 0.15 + cli._READ_ONLY_COMMAND_REAP_SECONDS + 2.0 < delay, elapsed
         assert set(os.listdir("/proc/self/fd")) == before
         assert children
         for pid in children:
