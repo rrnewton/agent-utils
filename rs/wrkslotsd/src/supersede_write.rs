@@ -77,7 +77,8 @@ fn within(candidate: &Path, parent: &Path) -> bool {
 /// Where the /proc link `path` of the process at `base` points, or None
 /// without evidence, as the Python census decides: a link whose process
 /// exited (ENOENT or ESRCH, or EACCES or EPERM once
-/// `proc_reads::unreadable_entry_exited`; added to `gone`) or that is no
+/// `proc_reads::unreadable_entry_state` finds it exited under the
+/// pass's shared `wait`; added to `gone`) or that is no
 /// link (EINVAL) is no evidence; one that stat proves lies on another
 /// filesystem device than the slot is not in it; an unreadable link of a
 /// live process and every other failure refuse (#1173
@@ -87,6 +88,7 @@ fn link_target(
     path: &Path,
     slot_device: Option<u64>,
     gone: &mut Vec<(PathBuf, std::io::Error)>,
+    wait: &proc_reads::ExitWait,
 ) -> Result<Option<PathBuf>> {
     use std::os::unix::fs::MetadataExt as _;
     let raw = match proc_reads::read_link(path) {
@@ -96,13 +98,14 @@ fn link_target(
             return Ok(None);
         }
         Err(error) if matches!(error.raw_os_error(), Some(1 | 13)) => {
-            if proc_reads::unreadable_entry_exited(&holder(base), base, path, &error) {
+            let holder = holder(base);
+            let state = proc_reads::unreadable_entry_state(&holder, base, path, &error, wait);
+            if state == proc_reads::UnreadableEntry::Exited {
                 gone.push((path.to_path_buf(), error));
                 return Ok(None);
             }
-            return Err(format!(
-                "process use is indeterminate because {} is unreadable: {error}",
-                path.display()
+            return Err(proc_reads::unreadable_refusal(
+                &holder, path, &error, &state,
             ));
         }
         Err(error) if error.raw_os_error() == Some(22) => return Ok(None),
@@ -137,25 +140,29 @@ fn holder(base: &Path) -> String {
 
 /// A failed read of one /proc/PID entry of the process at `base`: no
 /// evidence once the process exited (ENOENT or ESRCH, or an unreadable
-/// entry once `proc_reads::unreadable_entry_exited`; added to `gone`),
+/// entry once `proc_reads::unreadable_entry_state` finds it exited under
+/// the pass's shared `wait`; added to `gone`),
 /// otherwise a refusal (#1173).
 fn unread_process_entry(
     base: &Path,
     path: &Path,
     error: std::io::Error,
     gone: &mut Vec<(PathBuf, std::io::Error)>,
+    wait: &proc_reads::ExitWait,
 ) -> Result<()> {
-    let unreadable = error.kind() == std::io::ErrorKind::PermissionDenied;
-    if proc_reads::is_gone(&error)
-        || (unreadable && proc_reads::unreadable_entry_exited(&holder(base), base, path, &error))
-    {
+    if proc_reads::is_gone(&error) {
         gone.push((path.to_path_buf(), error));
         return Ok(());
     }
-    if unreadable {
-        return Err(format!(
-            "process use is indeterminate because {} is unreadable: {error}",
-            path.display()
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        let holder = holder(base);
+        let state = proc_reads::unreadable_entry_state(&holder, base, path, &error, wait);
+        if state == proc_reads::UnreadableEntry::Exited {
+            gone.push((path.to_path_buf(), error));
+            return Ok(());
+        }
+        return Err(proc_reads::unreadable_refusal(
+            &holder, path, &error, &state,
         ));
     }
     Err(format!(
@@ -164,7 +171,13 @@ fn unread_process_entry(
     ))
 }
 
-fn process_uses_slot(pid: i64, slot_path: &Path) -> Result<Vec<String>> {
+/// The reads of every process one census pass makes share `wait`, so
+/// their exits share one deadline (#1174).
+fn process_uses_slot(
+    pid: i64,
+    slot_path: &Path,
+    wait: &proc_reads::ExitWait,
+) -> Result<Vec<String>> {
     use std::os::unix::fs::MetadataExt as _;
     let pid_dir = PathBuf::from(format!("/proc/{pid}"));
     let slot_device = std::fs::metadata(slot_path)
@@ -174,7 +187,9 @@ fn process_uses_slot(pid: i64, slot_path: &Path) -> Result<Vec<String>> {
     let mut gone: Vec<(PathBuf, std::io::Error)> = Vec::new();
     let mut uses: Vec<String> = Vec::new();
     for name in ["cwd", "root", "exe"] {
-        if let Some(target) = link_target(&pid_dir, &pid_dir.join(name), slot_device, &mut gone)? {
+        if let Some(target) =
+            link_target(&pid_dir, &pid_dir.join(name), slot_device, &mut gone, wait)?
+        {
             if within(&target, slot_path) {
                 uses.push(format!("{name}={}", target.display()));
             }
@@ -184,7 +199,8 @@ fn process_uses_slot(pid: i64, slot_path: &Path) -> Result<Vec<String>> {
     match proc_reads::read_dir(&fd_dir) {
         Ok(entries) => {
             for entry in entries.flatten() {
-                if let Some(target) = link_target(&pid_dir, &entry.path(), slot_device, &mut gone)?
+                if let Some(target) =
+                    link_target(&pid_dir, &entry.path(), slot_device, &mut gone, wait)?
                 {
                     if within(&target, slot_path) {
                         uses.push(format!(
@@ -197,13 +213,13 @@ fn process_uses_slot(pid: i64, slot_path: &Path) -> Result<Vec<String>> {
                 }
             }
         }
-        Err(error) => unread_process_entry(&pid_dir, &fd_dir, error, &mut gone)?,
+        Err(error) => unread_process_entry(&pid_dir, &fd_dir, error, &mut gone, wait)?,
     }
     let maps_path = pid_dir.join("maps");
     let maps = match proc_reads::read_to_string(&maps_path) {
         Ok(maps) => maps,
         Err(error) => {
-            unread_process_entry(&pid_dir, &maps_path, error, &mut gone)?;
+            unread_process_entry(&pid_dir, &maps_path, error, &mut gone, wait)?;
             String::new()
         }
     };
@@ -350,8 +366,9 @@ pub(crate) fn supersede_handoff(
     };
     let slot_dir = slot_directory(&cfg, slot, "agent")?;
     let mut slot_use: Option<String> = None;
+    let wait = proc_reads::ExitWait::new();
     for pid in descendant_pids(successor.pid)? {
-        let found = process_uses_slot(pid, &slot_dir)?;
+        let found = process_uses_slot(pid, &slot_dir, &wait)?;
         if let Some(first) = found.into_iter().next() {
             slot_use = Some(format!("pid {pid}: {first}"));
             break;
@@ -465,7 +482,11 @@ mod census_gone_tests {
         for entry in entries {
             inject(&proc_path(child, entry), errno);
         }
-        let found = process_uses_slot(child.id() as i64, &slot.slot);
+        let found = process_uses_slot(
+            child.id() as i64,
+            &slot.slot,
+            &crate::proc_reads::ExitWait::new(),
+        );
         (found, reset())
     }
 
@@ -553,7 +574,12 @@ mod census_gone_tests {
         }
         reset();
         assert_eq!(
-            process_uses_slot(child.id() as i64, &slot.slot).unwrap(),
+            process_uses_slot(
+                child.id() as i64,
+                &slot.slot,
+                &crate::proc_reads::ExitWait::new()
+            )
+            .unwrap(),
             Vec::<String>::new()
         );
         assert_eq!(
@@ -576,7 +602,11 @@ mod census_gone_tests {
         reset();
         inject(&proc_path(&live, "fd"), EACCES);
         let started = std::time::Instant::now();
-        let found = process_uses_slot(live.id() as i64, &slot.slot);
+        let found = process_uses_slot(
+            live.id() as i64,
+            &slot.slot,
+            &crate::proc_reads::ExitWait::new(),
+        );
         let notes = reset();
         assert!(found.unwrap_err().contains("is unreadable"));
         assert!(started.elapsed() < crate::proc_reads::CENSUS_EXIT_WAIT);
@@ -596,7 +626,11 @@ mod census_gone_tests {
         reset();
         inject(&fd_dir, EACCES);
         crate::proc_reads::replace_until_exit(&base.join("stat"), &exiting_stat(&stat));
-        let found = process_uses_slot(child.id() as i64, &slot.slot);
+        let found = process_uses_slot(
+            child.id() as i64,
+            &slot.slot,
+            &crate::proc_reads::ExitWait::new(),
+        );
         let notes = reset();
         child.wait().unwrap();
         assert_eq!(found.unwrap(), Vec::<String>::new());
@@ -621,20 +655,30 @@ mod census_gone_tests {
         inject(&fd_dir, EACCES);
         crate::proc_reads::replace(&base.join("stat"), &exiting_stat(&stat));
         let started = std::time::Instant::now();
-        let error = process_uses_slot(child.id() as i64, &slot.slot).unwrap_err();
+        let error = process_uses_slot(
+            child.id() as i64,
+            &slot.slot,
+            &crate::proc_reads::ExitWait::new(),
+        )
+        .unwrap_err();
         let notes = reset();
         assert!(started.elapsed() >= crate::proc_reads::CENSUS_EXIT_WAIT);
         assert!(
             error.contains(&format!("{} is unreadable", fd_dir.display())),
             "{error}"
         );
-        assert_eq!(
-            notes,
-            [format!(
-                "census: process {} still exiting after 200 ms ({}: EACCES); indeterminate",
-                child.id(),
-                fd_dir.display()
-            )]
+        assert!(
+            error.contains(&format!(
+                "; process {} is still exiting (PF_EXITING, its memory already released) after a ",
+                child.id()
+            )),
+            "{error}"
+        );
+        let prefix = format!("census: process {} still exiting after ", child.id());
+        let suffix = format!(" ms ({}: EACCES); indeterminate", fd_dir.display());
+        assert!(
+            notes.len() == 1 && notes[0].starts_with(&prefix) && notes[0].ends_with(&suffix),
+            "{notes:?}"
         );
         stop(child);
     }
@@ -665,7 +709,7 @@ mod census_gone_tests {
             std::thread::scope(|scope| {
                 scope.spawn(|| child.wait().unwrap());
                 for _ in 0..20 {
-                    process_uses_slot(pid, &slot.slot)
+                    process_uses_slot(pid, &slot.slot, &crate::proc_reads::ExitWait::new())
                         .unwrap_or_else(|error| panic!("exiting PID {pid}: {error}"));
                 }
             });

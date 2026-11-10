@@ -550,7 +550,7 @@ pub(crate) struct ProcessSnapshot {
 
 /// Read one /proc link. A link whose process exited (ENOENT or ESRCH)
 /// is no evidence and is added to `gone` (#1173 census-vanished-process).
-fn observe_link(link: &Path, gone: &mut Vec<(PathBuf, std::io::Error)>) -> LinkObservation {
+fn observe_link(link: &Path, reader: &mut EntryReader<'_>) -> LinkObservation {
     use std::os::unix::fs::MetadataExt as _;
     match proc_reads::read_link(link) {
         Ok(target) => {
@@ -559,11 +559,14 @@ fn observe_link(link: &Path, gone: &mut Vec<(PathBuf, std::io::Error)>) -> LinkO
         }
         Err(error) => {
             if proc_reads::is_gone(&error) {
-                gone.push((link.to_path_buf(), error));
+                reader.gone.push((link.to_path_buf(), error));
                 return LinkObservation::NoEvidence;
             }
-            // Errnos the Python census treats as no evidence.
-            if matches!(error.raw_os_error(), Some(1 | 13 | 22)) {
+            if matches!(error.raw_os_error(), Some(1 | 13)) {
+                return reader.unreadable(link, error);
+            }
+            // Not a link: no evidence, as in the Python census.
+            if error.raw_os_error() == Some(22) {
                 return LinkObservation::NoEvidence;
             }
             LinkObservation::Undecided {
@@ -601,7 +604,64 @@ fn observation_points_into(
 
 #[cfg(test)]
 fn link_points_into(link: &Path, slot_path: &Path, slot_device: u64) -> Result<bool> {
-    observation_points_into(&observe_link(link, &mut Vec::new()), slot_path, slot_device)
+    let wait = proc_reads::ExitWait::new();
+    let mut reader = EntryReader::new("test link", link, &wait);
+    observation_points_into(&observe_link(link, &mut reader), slot_path, slot_device)
+}
+
+/// One process's census reads: where they are taken, the reads that
+/// found it exited (for the census diagnostics), and how an entry this
+/// user may not read is answered.
+struct EntryReader<'a> {
+    holder: String,
+    base: &'a Path,
+    owned: Option<bool>,
+    gone: Vec<(PathBuf, std::io::Error)>,
+    wait: &'a proc_reads::ExitWait,
+}
+
+impl<'a> EntryReader<'a> {
+    fn new(holder: &str, base: &'a Path, wait: &'a proc_reads::ExitWait) -> Self {
+        EntryReader {
+            holder: holder.to_string(),
+            base,
+            owned: None,
+            gone: Vec::new(),
+            wait,
+        }
+    }
+
+    /// An entry (link, fd directory or maps) failing with EACCES or
+    /// EPERM (#1174, the lead's ruling). A process of this user's uid is
+    /// refused to it only once do_exit dropped its mappings, so it is
+    /// followed as #1173 follows it: gone or a zombie, at once or within
+    /// the snapshot's shared exit wait, uses nothing; still exiting after
+    /// that is indeterminate and refuses. A protected (non-dumpable or setuid)
+    /// process that is not exiting, or another user's process, is no
+    /// evidence, as Python's remove census (lsof's rule) takes it.
+    /// Python's audit census reads such a process as root (sudo -n), which
+    /// this snapshot cannot: a documented gap.
+    fn unreadable(&mut self, path: &Path, error: std::io::Error) -> LinkObservation {
+        let owned = *self
+            .owned
+            .get_or_insert_with(|| proc_reads::owned_by_invoker(self.base));
+        if !owned {
+            return LinkObservation::NoEvidence;
+        }
+        let state =
+            proc_reads::unreadable_entry_state(&self.holder, self.base, path, &error, self.wait);
+        match state {
+            proc_reads::UnreadableEntry::Exited => {
+                self.gone.push((path.to_path_buf(), error));
+                LinkObservation::NoEvidence
+            }
+            proc_reads::UnreadableEntry::Running => LinkObservation::NoEvidence,
+            proc_reads::UnreadableEntry::StillExiting { .. } => LinkObservation::Undecided {
+                error: proc_reads::unreadable_refusal(&self.holder, path, &error, &state),
+                device: None,
+            },
+        }
+    }
 }
 
 /// Most listings of /proc one snapshot takes before it refuses
@@ -692,38 +752,116 @@ fn list_proc() -> Result<Vec<String>> {
     Ok(names)
 }
 
-fn read_process_links(pid: i64, leader: Option<i64>) -> ProcessLinks {
+/// Read one process (or a surviving thread of `leader`). Every process
+/// one snapshot reads shares its `wait`, so their exits share one
+/// deadline (#1174).
+fn read_process_links(pid: i64, leader: Option<i64>, wait: &proc_reads::ExitWait) -> ProcessLinks {
     let base = match leader {
         None => PathBuf::from("/proc").join(pid.to_string()),
         Some(leader) => PathBuf::from(format!("/proc/{leader}/task/{pid}")),
     };
+    let holder = ProcessLinks {
+        pid,
+        leader,
+        links: Vec::new(),
+    }
+    .holder();
+    let mut reader = EntryReader::new(&holder, &base, wait);
     let mut links: Vec<(&'static str, LinkObservation)> = Vec::new();
-    // Reads that found the process exited, for the census diagnostics.
-    let mut gone: Vec<(PathBuf, std::io::Error)> = Vec::new();
     for (label, link) in [
         ("working directory", base.join("cwd")),
+        ("root directory", base.join("root")),
         ("executable", base.join("exe")),
     ] {
-        links.push((label, observe_link(&link, &mut gone)));
+        links.push((label, observe_link(&link, &mut reader)));
     }
     let fd_dir = base.join("fd");
     match proc_reads::read_dir(&fd_dir) {
         Ok(fds) => {
             for fd in fds.flatten() {
-                links.push(("descriptor", observe_link(&fd.path(), &mut gone)));
+                links.push(("descriptor", observe_link(&fd.path(), &mut reader)));
             }
         }
-        Err(error) if proc_reads::is_gone(&error) => gone.push((fd_dir, error)),
+        Err(error) if proc_reads::is_gone(&error) => reader.gone.push((fd_dir, error)),
+        Err(error) if matches!(error.raw_os_error(), Some(1 | 13)) => {
+            links.push(("descriptor", reader.unreadable(&fd_dir, error)));
+        }
         Err(_) => {}
     }
+    // Mapped files, as the Python census reads them (#1174
+    // rust-remove-census-root-maps): a file mapped from the slot, even one
+    // deleted since or whose descriptor was closed, uses it.
+    let maps_path = base.join("maps");
+    match proc_reads::read_bytes(&maps_path) {
+        Ok(maps) => {
+            for mapped in mapped_paths(&maps) {
+                links.push(("mapping", LinkObservation::Target(mapped)));
+            }
+        }
+        Err(error) if proc_reads::is_gone(&error) => reader.gone.push((maps_path, error)),
+        Err(error) if matches!(error.raw_os_error(), Some(1 | 13)) => {
+            links.push(("mapping", reader.unreadable(&maps_path, error)));
+        }
+        Err(error) => links.push((
+            "mapping",
+            LinkObservation::Undecided {
+                error: format!(
+                    "process use is indeterminate because {} cannot be read: {error}",
+                    maps_path.display()
+                ),
+                device: None,
+            },
+        )),
+    }
+    let gone = std::mem::take(&mut reader.gone);
     let process = ProcessLinks { pid, leader, links };
-    proc_reads::note_process_gone(&process.holder(), &base, &gone);
+    proc_reads::note_process_gone(&holder, &base, &gone);
     process
+}
+
+/// The distinct absolute file paths in one /proc/PID/maps table, each
+/// without the kernel's " (deleted)" suffix. A line has five fields and
+/// then the path, which may hold spaces; split as the Python census does.
+fn mapped_paths(maps: &[u8]) -> std::collections::BTreeSet<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut paths = std::collections::BTreeSet::new();
+    for line in maps.split(|byte| *byte == b'\n') {
+        let mut rest = line;
+        let mut fields = 0;
+        while fields < 5 {
+            let start = rest
+                .iter()
+                .position(|byte| !byte.is_ascii_whitespace())
+                .unwrap_or(rest.len());
+            rest = &rest[start..];
+            let end = rest
+                .iter()
+                .position(u8::is_ascii_whitespace)
+                .unwrap_or(rest.len());
+            if end == 0 {
+                break;
+            }
+            rest = &rest[end..];
+            fields += 1;
+        }
+        let start = rest
+            .iter()
+            .position(|byte| !byte.is_ascii_whitespace())
+            .unwrap_or(rest.len());
+        let path = rest[start..].trim_ascii_end();
+        if fields < 5 || !path.starts_with(b"/") {
+            continue;
+        }
+        let path = path.strip_suffix(b" (deleted)").unwrap_or(path);
+        paths.insert(PathBuf::from(std::ffi::OsStr::from_bytes(path)));
+    }
+    paths
 }
 
 /// What one snapshot has read so far, across its listings of /proc.
 struct SnapshotReads<'a> {
     targets: &'a [PathBuf],
+    exit_wait: proc_reads::ExitWait,
     devices: Vec<Option<u64>>,
     settled: Vec<bool>,
     read: std::collections::HashMap<i64, u64>,
@@ -772,12 +910,14 @@ impl SnapshotReads<'_> {
             if self.read.get(&tid) == Some(&start) {
                 continue;
             }
-            self.admit(read_process_links(tid, Some(leader)), start);
+            let thread = read_process_links(tid, Some(leader), &self.exit_wait);
+            self.admit(thread, start);
         }
         let base = PathBuf::from("/proc").join(leader.to_string());
         if let Some((start, state)) = process_stat(&base) {
             if !is_terminal_state(state) && self.read.get(&leader) != Some(&start) {
-                self.admit(read_process_links(leader, None), start);
+                let process = read_process_links(leader, None, &self.exit_wait);
+                self.admit(process, start);
             }
         }
         Ok(())
@@ -820,6 +960,7 @@ pub(crate) fn capture_process_snapshot(
         .collect();
     let mut reads = SnapshotReads {
         targets,
+        exit_wait: proc_reads::ExitWait::new(),
         devices,
         settled: vec![false; targets.len()],
         read: std::collections::HashMap::new(),
@@ -866,7 +1007,8 @@ pub(crate) fn capture_process_snapshot(
             if reads.read.get(&pid) == Some(&start) {
                 continue;
             }
-            reads.admit(read_process_links(pid, None), start);
+            let process = read_process_links(pid, None, &reads.exit_wait);
+            reads.admit(process, start);
             // A leader that exited while it was read showed nothing; its
             // threads still hold what it held, so they are read now, in
             // this listing, not left to one that may never come.
@@ -2779,15 +2921,41 @@ mod link_tests {
 }
 
 #[cfg(test)]
+mod mapped_paths_tests {
+    use super::mapped_paths;
+    use std::path::PathBuf;
+
+    #[test]
+    fn mapped_paths_keep_absolute_files_without_the_deleted_suffix() {
+        let maps = b"00400000-00452000 r-xp 00000000 08:02 173521 /usr/bin/dbus-daemon\n\
+00651000-00652000 r--p 00051000 08:02 173521 /usr/bin/dbus-daemon\n\
+7f00-7f01 r--s 00000000 00:2c 42   /slot/a dir/held (deleted)\n\
+7ffd-7ffe rw-p 00000000 00:00 0                          [stack]\n\
+7ffe-7fff rw-p 00000000 00:00 0\n";
+        let found: Vec<PathBuf> = mapped_paths(maps).into_iter().collect();
+        assert_eq!(
+            found,
+            [
+                PathBuf::from("/slot/a dir/held"),
+                PathBuf::from("/usr/bin/dbus-daemon")
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
 mod census_gone_tests {
     //! #1173 census-vanished-process: a snapshot read that finds the
     //! process exited is no evidence, and the snapshot completes.
     use super::{assert_slot_unused_snapshot, capture_process_snapshot};
-    use crate::proc_reads::test_support::{holding_fd, in_cwd, proc_path, stop, Slot};
+    use crate::proc_reads::test_support::{
+        holding_fd, in_cwd, mapping_only, proc_path, stop, Slot,
+    };
     use crate::proc_reads::{inject, reset};
 
     const ENOENT: i32 = 2;
     const ESRCH: i32 = 3;
+    const EACCES: i32 = 13;
 
     fn snapshot_with(
         child: &std::process::Child,
@@ -2868,6 +3036,114 @@ mod census_gone_tests {
         for (child, _entries) in children {
             stop(child);
         }
+    }
+
+    /// `stat` with State D and PF_EXITING set: a task stuck in do_exit.
+    fn exiting_stat(stat: &[u8]) -> Vec<u8> {
+        let text = String::from_utf8_lossy(stat).into_owned();
+        let closing = text.rfind(") ").unwrap();
+        let mut fields: Vec<String> = text[closing + 2..]
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        fields[0] = "D".to_string();
+        let flags: u64 = fields[6].parse().unwrap();
+        fields[6] = (flags | 0x4).to_string();
+        format!("{}) {}\n", &text[..closing], fields.join(" ")).into_bytes()
+    }
+
+    fn snapshot_verdict(slot: &Slot) -> Result<(), String> {
+        capture_process_snapshot(std::process::id() as i64, std::slice::from_ref(&slot.slot))
+            .and_then(|snapshot| assert_slot_unused_snapshot(&snapshot, &slot.slot))
+    }
+
+    #[test]
+    fn a_mapping_is_a_use_and_unreadable_maps_follow_the_owner_rule() {
+        // #1174: the slot's only user maps a file from it.
+        let slot = Slot::new("snapshot-maps");
+        let child = mapping_only(&slot, "600");
+        let base = std::path::PathBuf::from(format!("/proc/{}", child.id()));
+        let maps = base.join("maps");
+        reset();
+        let error = snapshot_verdict(&slot).unwrap_err();
+        assert!(
+            error.contains("uses slot") && error.contains("(mapping)"),
+            "{error}"
+        );
+
+        // Our own process, still in do_exit past the wait: indeterminate.
+        reset();
+        inject(&maps, EACCES);
+        crate::proc_reads::replace(
+            &base.join("stat"),
+            &exiting_stat(&std::fs::read(base.join("stat")).unwrap()),
+        );
+        let started = std::time::Instant::now();
+        let error = snapshot_verdict(&slot).unwrap_err();
+        let notes = reset();
+        assert!(started.elapsed() >= crate::proc_reads::CENSUS_EXIT_WAIT);
+        assert!(
+            error.contains(&format!("{} is unreadable", maps.display())),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!(
+                "; process {} is still exiting (PF_EXITING, its memory already released) after a ",
+                child.id()
+            )),
+            "{error}"
+        );
+        let prefix = format!("census: process {} still exiting after ", child.id());
+        let suffix = format!(" ms ({}: EACCES); indeterminate", maps.display());
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.starts_with(&prefix) && note.ends_with(&suffix)),
+            "{notes:?}"
+        );
+
+        // A protected process that is not exiting (non-dumpable, setuid):
+        // no evidence, as Python's remove census takes it. Python's audit
+        // reads such a process as root; this snapshot cannot (documented
+        // gap), so today the slot reads as unused.
+        reset();
+        inject(&maps, EACCES);
+        assert_eq!(snapshot_verdict(&slot), Ok(()));
+        let _ = reset();
+        stop(child);
+
+        // Our own process in do_exit that exits within the wait: gone. Read
+        // through the per-process reader, so whole-host snapshot time does
+        // not decide whether it is still running when its maps are read.
+        let mut child = mapping_only(&slot, "0.1");
+        let base = std::path::PathBuf::from(format!("/proc/{}", child.id()));
+        let maps = base.join("maps");
+        reset();
+        inject(&maps, EACCES);
+        crate::proc_reads::replace_until_exit(
+            &base.join("stat"),
+            &exiting_stat(&std::fs::read(base.join("stat")).unwrap()),
+        );
+        let process =
+            super::read_process_links(child.id() as i64, None, &crate::proc_reads::ExitWait::new());
+        let notes = reset();
+        child.wait().unwrap();
+        assert!(
+            !process
+                .links
+                .iter()
+                .any(|(label, observation)| *label == "mapping"
+                    && !matches!(observation, super::LinkObservation::NoEvidence)),
+            "an exited process's unreadable maps is no evidence"
+        );
+        assert!(
+            notes.contains(&format!(
+                "census: process {} exited during the census ({}: EACCES); skipped",
+                child.id(),
+                maps.display()
+            )),
+            "{notes:?}"
+        );
     }
 
     #[test]

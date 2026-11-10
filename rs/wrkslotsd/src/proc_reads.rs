@@ -6,12 +6,13 @@
 //! ESRCH when the process exits between the lookup and the read. A process
 //! that exited uses nothing, so a census takes that read as no evidence
 //! and goes on. EACCES and EPERM count the same only once the process has
-//! exited (`unreadable_entry_exited`); on a live process they, and every
+//! exited (`unreadable_entry_state`); on a live process they, and every
 //! other errno, keep their meaning. The Python census classifies the same
 //! way and prints the same diagnostics.
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 const ENOENT: i32 = 2;
 const ESRCH: i32 = 3;
@@ -36,6 +37,10 @@ pub(crate) fn read_to_string(path: &Path) -> io::Result<String> {
     std::fs::read_to_string(path)
 }
 
+pub(crate) fn read_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    read(path)
+}
+
 fn read(path: &Path) -> io::Result<Vec<u8>> {
     injected(path)?;
     #[cfg(test)]
@@ -49,10 +54,59 @@ fn read(path: &Path) -> io::Result<Vec<u8>> {
 /// releases the task's mappings, descriptors, working directory and root.
 const PF_EXITING: u64 = 0x0000_0004;
 
-/// How long a census waits for a process in do_exit, whose entry it may
-/// not read, to become a zombie or vanish. The other edition uses the same.
-pub(crate) const CENSUS_EXIT_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
-const CENSUS_EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+/// How long one census pass waits, in all, for the processes in do_exit
+/// whose entries it may not read to become zombies or vanish (#1173,
+/// #1174). Every such process in the pass shares the one deadline
+/// (`ExitWait`), so ten exiting compilers cost no more than one. Unmapping
+/// a large process's memory, which do_exit does after its entries turn
+/// unreadable and before it closes its descriptors, took over 200 ms on a
+/// loaded gate host. The other edition uses the same.
+pub(crate) const CENSUS_EXIT_WAIT: Duration = Duration::from_secs(2);
+/// The first recheck of an exiting process comes this soon, and each
+/// later one twice as late, up to CENSUS_EXIT_POLL: an ordinary exit
+/// costs a few milliseconds.
+const CENSUS_EXIT_FIRST_POLL: Duration = Duration::from_millis(5);
+const CENSUS_EXIT_POLL: Duration = Duration::from_millis(50);
+
+/// One census pass's shared wait for processes in do_exit (#1174). The
+/// deadline starts with the first exiting process the pass meets and
+/// bounds every later one: a process met after it has passed gets one
+/// more stat read and no wait.
+pub(crate) struct ExitWait {
+    deadline: std::cell::Cell<Option<Instant>>,
+}
+
+impl ExitWait {
+    pub(crate) fn new() -> Self {
+        ExitWait {
+            deadline: std::cell::Cell::new(None),
+        }
+    }
+
+    /// Whether the process read at `base` exits before the pass's
+    /// deadline; if not, how long it was waited for.
+    fn wait_for_exit(&self, base: &Path) -> Result<(), Duration> {
+        let started = Instant::now();
+        let deadline = self.deadline.get().unwrap_or(started + CENSUS_EXIT_WAIT);
+        self.deadline.set(Some(deadline));
+        let mut poll = CENSUS_EXIT_FIRST_POLL;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            std::thread::sleep(poll.min(deadline - now));
+            if has_exited(base) {
+                return Ok(());
+            }
+            poll = (poll * 2).min(CENSUS_EXIT_POLL);
+        }
+        if has_exited(base) {
+            return Ok(());
+        }
+        Err(started.elapsed())
+    }
+}
 
 /// The scheduler state and flags in `base`/stat, or None once it is gone
 /// or unparseable; the error says whether it is gone.
@@ -84,43 +138,94 @@ pub(crate) fn has_exited(base: &Path) -> bool {
     }
 }
 
-/// Whether an entry (`path`, failing with `error`) this user may not read
-/// belongs to a process that exited. Once do_exit drops a process's
-/// mappings, /proc makes its fd directory root-owned, so an exiting
-/// process's descriptors read EACCES even to its own user, yet do_exit
-/// releases the descriptors only afterwards. So an exited process (gone,
-/// or a zombie) counts as gone at once; one still in do_exit (PF_EXITING)
-/// is polled for CENSUS_EXIT_WAIT and counts as gone only if it exits
-/// meanwhile; any other process does not. A process stuck in do_exit may
-/// still hold the descriptors: it stays indeterminate, and the census
-/// refuses.
-pub(crate) fn unreadable_entry_exited(
+/// What a process whose entry (`path`, failing with `error`) this user
+/// may not read is doing. Once do_exit drops a process's mappings, /proc
+/// makes its fd directory root-owned, so an exiting process's descriptors
+/// read EACCES even to its own user, yet do_exit releases the descriptors
+/// only afterwards. So an exited process (gone, or a zombie) counts as
+/// gone at once; one still in do_exit (PF_EXITING) is rechecked under the
+/// pass's shared `wait` and counts as gone only if it exits meanwhile; any
+/// other process does not. A process stuck in do_exit may still hold the
+/// descriptors: it stays indeterminate, and the census refuses. Its
+/// memory is gone for good, so the entry never turns readable again; only
+/// its exit ends the wait early.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum UnreadableEntry {
+    /// Gone or a zombie, at once or within the pass's wait: it uses nothing.
+    Exited,
+    /// Still in do_exit when the pass's wait ended, after being waited for
+    /// this long: it may hold what it held.
+    StillExiting { waited: Duration },
+    /// Not exiting: a protected (non-dumpable or setuid) process.
+    Running,
+}
+
+pub(crate) fn unreadable_entry_state(
     holder: &str,
     base: &Path,
     path: &Path,
     error: &io::Error,
-) -> bool {
+    wait: &ExitWait,
+) -> UnreadableEntry {
     // One read decides: a second could find the process reaped meanwhile.
     match stat_state(base) {
-        Err(stat_error) => return is_gone(&stat_error),
-        Ok(Some((state, _flags))) if matches!(state.as_str(), "Z" | "X") => return true,
-        Ok(Some((_state, flags))) if flags & PF_EXITING != 0 => {}
-        Ok(_) => return false,
-    }
-    let deadline = std::time::Instant::now() + CENSUS_EXIT_WAIT;
-    while std::time::Instant::now() < deadline {
-        std::thread::sleep(CENSUS_EXIT_POLL);
-        if has_exited(base) {
-            return true;
+        Err(stat_error) if is_gone(&stat_error) => return UnreadableEntry::Exited,
+        Err(_) => return UnreadableEntry::Running,
+        Ok(Some((state, _flags))) if matches!(state.as_str(), "Z" | "X") => {
+            return UnreadableEntry::Exited
         }
+        Ok(Some((_state, flags))) if flags & PF_EXITING != 0 => {}
+        Ok(_) => return UnreadableEntry::Running,
     }
+    let Err(waited) = wait.wait_for_exit(base) else {
+        return UnreadableEntry::Exited;
+    };
     diagnose(format!(
         "census: {holder} still exiting after {} ms ({}: {}); indeterminate",
-        CENSUS_EXIT_WAIT.as_millis(),
+        waited.as_millis(),
         path.display(),
         errno_name(error)
     ));
-    false
+    UnreadableEntry::StillExiting { waited }
+}
+
+/// The refusal for an entry (`path`, failing with `error`) of `holder`
+/// this user may not read, when `state` is not Exited. For a process
+/// given up on in do_exit it names the process, its state and how long it
+/// was waited for, so the wait can be measured on a loaded host.
+pub(crate) fn unreadable_refusal(
+    holder: &str,
+    path: &Path,
+    error: &io::Error,
+    state: &UnreadableEntry,
+) -> String {
+    let mut message = format!(
+        "process use is indeterminate because {} is unreadable: {error}",
+        path.display()
+    );
+    if let UnreadableEntry::StillExiting { waited } = state {
+        message.push_str(&format!(
+            "; {holder} is still exiting (PF_EXITING, its memory already released) after a {} ms wait (this census waits {} ms in all for exiting processes)",
+            waited.as_millis(),
+            CENSUS_EXIT_WAIT.as_millis()
+        ));
+    }
+    message
+}
+
+/// Whether the process read at `base` runs under this user's real uid
+/// (the Uid line of its status). A process that cannot be read is not.
+pub(crate) fn owned_by_invoker(base: &Path) -> bool {
+    let Ok(status) = read(&base.join("status")) else {
+        return false;
+    };
+    let me = rustix::process::getuid().as_raw();
+    String::from_utf8_lossy(&status)
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|uids| uids.split_whitespace().next())
+        .and_then(|real| real.parse::<u32>().ok())
+        == Some(me)
 }
 
 fn errno_name(error: &io::Error) -> String {
@@ -173,20 +278,37 @@ thread_local! {
     static INJECTED: std::cell::RefCell<Vec<(PathBuf, i32)>> =
         const { std::cell::RefCell::new(Vec::new()) };
     static NOTES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
-    static REPLACED: std::cell::RefCell<Vec<(PathBuf, Vec<u8>, bool)>> =
+    static REPLACED: std::cell::RefCell<Vec<(PathBuf, Vec<u8>, Until)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How long a replaced read lasts.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum Until {
+    Reset,
+    RealExit,
+    /// This many more reads.
+    Reads(usize),
 }
 
 #[cfg(test)]
 fn replaced(path: &Path) -> Option<Vec<u8>> {
-    let (content, until_exit) = REPLACED.with(|replaced| {
-        replaced
-            .borrow()
-            .iter()
-            .find(|(target, _content, _until_exit)| target == path)
-            .map(|(_target, content, until_exit)| (content.clone(), *until_exit))
+    let (content, until) = REPLACED.with(|replaced| {
+        let mut replaced = replaced.borrow_mut();
+        let (_target, content, until) = replaced
+            .iter_mut()
+            .find(|(target, _content, _until)| target == path)?;
+        let current = *until;
+        if let Until::Reads(left) = until {
+            if *left == 0 {
+                return None;
+            }
+            *left -= 1;
+        }
+        Some((content.clone(), current))
     })?;
-    if until_exit {
+    if let Until::RealExit = until {
         // The real stat wins once it shows the process exited.
         let real = std::fs::read(path).ok()?;
         let text = String::from_utf8_lossy(&real);
@@ -200,25 +322,33 @@ fn replaced(path: &Path) -> Option<Vec<u8>> {
     Some(content)
 }
 
-/// Test seam: census reads of `path` on this thread return `content`.
 #[cfg(test)]
-pub(crate) fn replace(path: &Path, content: &[u8]) {
+fn push_replacement(path: &Path, content: &[u8], until: Until) {
     REPLACED.with(|replaced| {
         replaced
             .borrow_mut()
-            .push((path.to_path_buf(), content.to_vec(), false))
+            .push((path.to_path_buf(), content.to_vec(), until))
     });
+}
+
+/// Test seam: census reads of `path` on this thread return `content`.
+#[cfg(test)]
+pub(crate) fn replace(path: &Path, content: &[u8]) {
+    push_replacement(path, content, Until::Reset);
 }
 
 /// Test seam: as `replace`, until the real stat at `path` shows the
 /// process exited (gone, or a zombie).
 #[cfg(test)]
 pub(crate) fn replace_until_exit(path: &Path, content: &[u8]) {
-    REPLACED.with(|replaced| {
-        replaced
-            .borrow_mut()
-            .push((path.to_path_buf(), content.to_vec(), true))
-    });
+    push_replacement(path, content, Until::RealExit);
+}
+
+/// Test seam: as `replace`, for the next `reads` reads only; then the
+/// real file is read.
+#[cfg(test)]
+pub(crate) fn replace_for(path: &Path, content: &[u8], reads: usize) {
+    push_replacement(path, content, Until::Reads(reads));
 }
 
 #[cfg(test)]
@@ -344,6 +474,48 @@ pub(crate) mod test_support {
         child
     }
 
+    /// A child, outside the slot, whose only use of it is a libc mapping
+    /// of a slot file whose descriptor it closed; it exits after
+    /// `seconds`. Returns once it printed "ready".
+    pub(crate) fn mapping_only(slot: &Slot, seconds: &str) -> Child {
+        use std::io::BufRead as _;
+        let held = slot.slot.join("mapped");
+        std::fs::write(&held, vec![b'x'; 4096]).unwrap();
+        let script = "import ctypes, os, sys, time\n\
+libc = ctypes.CDLL(None, use_errno=True)\n\
+libc.mmap.restype = ctypes.c_void_p\n\
+libc.mmap.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long)\n\
+fd = os.open(sys.argv[1], os.O_RDONLY)\n\
+assert libc.mmap(None, 4096, 1, 2, fd, 0) not in (None, ctypes.c_void_p(-1).value)\n\
+os.close(fd)\n\
+print('ready', flush=True)\n\
+time.sleep(float(sys.argv[2]))\n";
+        // The interpreter itself: a `python3` on PATH may be a launcher
+        // that forks it, and the census must meet the mapping PID.
+        let interpreter = Command::new("python3")
+            .arg("-c")
+            .arg("import sys; print(sys.executable)")
+            .output()
+            .unwrap();
+        let interpreter = String::from_utf8(interpreter.stdout).unwrap();
+        let mut child = Command::new(interpreter.trim())
+            .arg("-c")
+            .arg(script)
+            .arg(&held)
+            .arg(seconds)
+            .current_dir(&slot.outside)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "ready");
+        child
+    }
+
     fn settle(child: &Child, entry: &str, target: &Path) {
         let link = proc_path(child, entry);
         for _ in 0..500 {
@@ -362,5 +534,96 @@ pub(crate) mod test_support {
     pub(crate) fn stop(mut child: Child) {
         let _ = child.kill();
         let _ = child.wait();
+    }
+}
+
+#[cfg(test)]
+mod exit_wait_tests {
+    use super::*;
+
+    const EACCES: i32 = 13;
+
+    /// A stat line for a fake process stuck in do_exit (State D, PF_EXITING).
+    fn exiting_stat(pid: u32) -> Vec<u8> {
+        format!(
+            "{pid} (cc1plus) D 1 1 1 0 -1 {} 0 0 0 0 0 0 0 0 20 0 1 0 100 0 0\n",
+            PF_EXITING | 0x40
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn the_wait_ends_as_soon_as_the_process_exits() {
+        // A fake /proc/PID: in do_exit for the deciding read and the first
+        // recheck, then gone (its real stat does not exist).
+        let base = PathBuf::from("/nonexistent-proc/4242");
+        let _ = reset();
+        replace_for(&base.join("stat"), &exiting_stat(4242), 2);
+        let wait = ExitWait::new();
+        let error = io::Error::from_raw_os_error(EACCES);
+        let started = Instant::now();
+        let state = unreadable_entry_state("process 4242", &base, &base.join("fd"), &error, &wait);
+        let elapsed = started.elapsed();
+        assert_eq!(reset(), Vec::<String>::new());
+        assert_eq!(state, UnreadableEntry::Exited);
+        // Two short rechecks (5 and 10 ms), nowhere near the whole wait.
+        assert!(elapsed < CENSUS_EXIT_WAIT / 4, "{elapsed:?}");
+    }
+
+    #[test]
+    fn exiting_processes_share_one_deadline() {
+        let bases: Vec<PathBuf> = (0..10)
+            .map(|index| PathBuf::from(format!("/nonexistent-proc/{}", 5000 + index)))
+            .collect();
+        let _ = reset();
+        for (index, base) in bases.iter().enumerate() {
+            replace(&base.join("stat"), &exiting_stat(5000 + index as u32));
+        }
+        let wait = ExitWait::new();
+        let error = io::Error::from_raw_os_error(EACCES);
+        let started = Instant::now();
+        let states: Vec<UnreadableEntry> = bases
+            .iter()
+            .enumerate()
+            .map(|(index, base)| {
+                unreadable_entry_state(
+                    &format!("process {}", 5000 + index),
+                    base,
+                    &base.join("fd"),
+                    &error,
+                    &wait,
+                )
+            })
+            .collect();
+        let elapsed = started.elapsed();
+        let notes = reset();
+        // One wait in all, not ten.
+        assert!(elapsed >= CENSUS_EXIT_WAIT, "{elapsed:?}");
+        assert!(elapsed < CENSUS_EXIT_WAIT * 2, "{elapsed:?}");
+        assert_eq!(notes.len(), 10, "{notes:?}");
+        let UnreadableEntry::StillExiting { waited } = states[0] else {
+            panic!("{:?}", states[0]);
+        };
+        assert!(waited >= CENSUS_EXIT_WAIT, "{waited:?}");
+        for state in &states[1..] {
+            let UnreadableEntry::StillExiting { waited } = state else {
+                panic!("{state:?}");
+            };
+            assert!(*waited < CENSUS_EXIT_WAIT / 4, "{waited:?}");
+        }
+        let refusal = unreadable_refusal(
+            "process 5003",
+            &bases[3].join("fd"),
+            &error,
+            &UnreadableEntry::StillExiting {
+                waited: Duration::from_millis(0),
+            },
+        );
+        assert_eq!(
+            refusal,
+            format!(
+                "process use is indeterminate because /nonexistent-proc/5003/fd is unreadable: {error}; process 5003 is still exiting (PF_EXITING, its memory already released) after a 0 ms wait (this census waits 2000 ms in all for exiting processes)"
+            )
+        );
     }
 }

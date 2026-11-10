@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import errno
+import re
 import os
 import selectors
 import signal
@@ -1770,10 +1771,163 @@ def test_census_unreadable_entry_of_a_process_still_exiting_after_the_wait_refus
                 _uses_with(patch, capsys, child, gone_slot, ["fd"], errno.EACCES)
             assert time.monotonic() - started >= cli._CENSUS_EXIT_WAIT_SECONDS
         assert f"{pid_dir / 'fd'} is unreadable" in str(refused.value)
-        assert capsys.readouterr().err.splitlines() == [
-            f"census: process {child.pid} still exiting after 200 ms "
-            f"({pid_dir / 'fd'}: EACCES); indeterminate"
-        ]
+        assert re.search(
+            rf"; process {child.pid} is still exiting \(PF_EXITING, its memory already "
+            r"released\) after a \d+ ms wait \(this census waits 2000 ms in all",
+            str(refused.value),
+        )
+        [note] = capsys.readouterr().err.splitlines()
+        assert re.fullmatch(
+            rf"census: process {child.pid} still exiting after \d+ ms "
+            rf"\({re.escape(str(pid_dir / 'fd'))}: EACCES\); indeterminate",
+            note,
+        )
     finally:
         child.kill()
+        child.wait()
+
+
+class _FakeClock:
+    """A monotonic clock that moves only when the census sleeps."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def _fake_exiting_process(root: Path, pid: int) -> Path:
+    """A /proc/PID stand-in under ``root`` whose stat says it is in do_exit."""
+    pid_dir = root / str(pid)
+    pid_dir.mkdir(parents=True)
+    (pid_dir / "stat").write_bytes(_exiting_stat(Path("/proc/self/stat").read_bytes()))
+    return pid_dir
+
+
+def _zombie_stat(stat: bytes) -> bytes:
+    closing = stat.rfind(b") ")
+    fields = stat[closing + 2:].split()
+    fields[0] = b"Z"
+    return stat[:closing] + b") " + b" ".join(fields) + b"\n"
+
+
+def test_census_exit_wait_ends_as_soon_as_the_process_exits(tmp_path: Path) -> None:
+    """An ordinary exit costs one short recheck, not the whole wait (#1174)."""
+    pid_dir = _fake_exiting_process(tmp_path, 4242)
+    fake = _FakeClock()
+
+    def sleep_then_exit(seconds: float) -> None:
+        fake.sleep(seconds)
+        stat = pid_dir / "stat"
+        stat.write_bytes(_zombie_stat(stat.read_bytes()))
+
+    exit_wait = cli._CensusExitWait(clock=fake.clock, sleep=sleep_then_exit)
+    denied = PermissionError(errno.EACCES, "Permission denied")
+    assert cli._unreadable_entry_exited(pid_dir, pid_dir / "fd", denied, exit_wait)
+    assert fake.sleeps == [cli._CENSUS_EXIT_FIRST_POLL_SECONDS]
+    assert exit_wait.still_exiting == {}
+
+
+def test_census_exiting_processes_share_one_deadline(tmp_path: Path) -> None:
+    """Ten processes stuck in do_exit cost one wait in all, then refuse (#1174)."""
+    pid_dirs = [_fake_exiting_process(tmp_path, 5000 + index) for index in range(10)]
+    fake = _FakeClock()
+    exit_wait = cli._CensusExitWait(clock=fake.clock, sleep=fake.sleep)
+    denied = PermissionError(errno.EACCES, "Permission denied")
+    for pid_dir in pid_dirs:
+        assert not cli._unreadable_entry_exited(pid_dir, pid_dir / "fd", denied, exit_wait)
+    assert fake.now == pytest.approx(cli._CENSUS_EXIT_WAIT_SECONDS)
+    # Rechecks back off from the first poll to the steady one.
+    assert fake.sleeps[:2] == [cli._CENSUS_EXIT_FIRST_POLL_SECONDS] + [
+        2 * cli._CENSUS_EXIT_FIRST_POLL_SECONDS
+    ]
+    assert max(fake.sleeps) == cli._CENSUS_EXIT_POLL_SECONDS
+    assert exit_wait.still_exiting == {
+        pid_dir: (2000 if index == 0 else 0) for index, pid_dir in enumerate(pid_dirs)
+    }
+    refusal = cli._unreadable_entry_refusal(
+        pid_dirs[3], pid_dirs[3] / "fd", denied, exit_wait
+    )
+    assert str(refusal) == (
+        f"process use is indeterminate because {pid_dirs[3] / 'fd'} is unreadable: "
+        f"{denied}; process 5003 is still exiting (PF_EXITING, its memory already "
+        "released) after a 0 ms wait (this census waits 2000 ms in all for exiting "
+        "processes)"
+    )
+
+
+_MAP_ONLY_CHILD = """
+import ctypes, os, sys, time
+libc = ctypes.CDLL(None, use_errno=True)
+libc.mmap.restype = ctypes.c_void_p
+libc.mmap.argtypes = (
+    ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long,
+)
+fd = os.open(sys.argv[1], os.O_RDONLY)
+assert libc.mmap(None, 4096, 1, 2, fd, 0) not in (None, ctypes.c_void_p(-1).value)
+os.close(fd)
+print("ready", flush=True)
+time.sleep(float(sys.argv[2]))
+"""
+
+
+def _mapping_only(slot: _GoneSlot, seconds: str) -> subprocess.Popen[bytes]:
+    """A child outside the slot whose only use of it is a libc mapping (#1174)."""
+    held = slot.slot / "mapped"
+    held.write_bytes(b"x" * 4096)
+    child = subprocess.Popen(
+        [sys.executable, "-c", _MAP_ONLY_CHILD, str(held), seconds],
+        cwd=slot.outside, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+    )
+    assert child.stdout is not None and child.stdout.readline().strip() == b"ready"
+    return child
+
+
+def test_census_unreadable_maps_follow_the_exit_and_lsof_rules(
+    gone_slot: _GoneSlot, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Paired with the other edition's snapshot case for #1174 (same child, same faults)."""
+    child = _mapping_only(gone_slot, "600")
+    pid_dir = Path(f"/proc/{child.pid}")
+    maps = pid_dir / "maps"
+    try:
+        assert cli._process_uses_slot(pid_dir, gone_slot.slot) == [
+            f"map={gone_slot.slot / 'mapped'}"
+        ]
+        # Still in do_exit past the wait: indeterminate.
+        with monkeypatch.context() as patch:
+            _stat_says_exiting(patch, pid_dir, until_exit=False)
+            started = time.monotonic()
+            with pytest.raises(cli.Refusal, match=f"{maps} is unreadable"):
+                _uses_with(patch, capsys, child, gone_slot, ["maps"], errno.EACCES)
+            assert time.monotonic() - started >= cli._CENSUS_EXIT_WAIT_SECONDS
+        # A protected process that is not exiting, under the remove census's
+        # lsof rule: no evidence.
+        with monkeypatch.context() as patch:
+            _inject(patch, {maps: errno.EACCES})
+            assert cli._process_uses_slot(
+                pid_dir, gone_slot.slot, unreadable_is_no_evidence=True
+            ) == []
+    finally:
+        child.kill()
+        child.wait()
+    # In do_exit and exiting within the wait: gone.
+    child = _mapping_only(gone_slot, "0.05")
+    pid_dir = Path(f"/proc/{child.pid}")
+    try:
+        with monkeypatch.context() as patch:
+            _stat_says_exiting(patch, pid_dir, until_exit=True)
+            uses, notes = _uses_with(patch, capsys, child, gone_slot, ["maps"], errno.EACCES)
+        assert uses == []
+        assert notes == [
+            f"census: process {child.pid} exited during the census "
+            f"({pid_dir / 'maps'}: EACCES); skipped"
+        ]
+    finally:
         child.wait()

@@ -775,6 +775,88 @@ def test_remove_forced_churn_refuses_like_python(
             assert f"live process {pid} uses slot" in detail, (edition, detail)
 
 
+# #1174 rust-remove-census-root-maps: a process whose ONLY use of the slot is
+# its root directory (a chroot, in an unprivileged user namespace), or a file
+# mapped from it whose descriptor it closed and which it then deleted.  Each
+# prints "ready" once it holds nothing else in the slot.
+_CHROOT_ONLY_CHILD = """
+import os, sys, time
+slot, outside = sys.argv[1], sys.argv[2]
+away = os.open(outside, os.O_RDONLY)
+os.chroot(slot)
+os.fchdir(away)
+os.close(away)
+print("ready", flush=True)
+time.sleep(600)
+"""
+_MAP_ONLY_CHILD = """
+import ctypes, os, sys, time
+held, outside = sys.argv[1], sys.argv[2]
+libc = ctypes.CDLL(None, use_errno=True)
+libc.mmap.restype = ctypes.c_void_p
+libc.mmap.argtypes = (
+    ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long,
+)
+# libc's mmap, not Python's, which keeps a duplicate descriptor.
+fd = os.open(held, os.O_RDONLY)
+address = libc.mmap(None, 4096, 1, 2, fd, 0)
+assert address not in (None, ctypes.c_void_p(-1).value), ctypes.get_errno()
+os.close(fd)
+os.unlink(held)
+os.chdir(outside)
+print("ready", flush=True)
+time.sleep(600)
+"""
+
+
+def _slot_only_user(kind: str, root: Path, outside: Path) -> subprocess.Popen[str]:
+    checkout = root / "worktrees" / "slot-a" / "repo"
+    if kind == "root":
+        argv = ["unshare", "-r", sys.executable, "-c", _CHROOT_ONLY_CHILD,
+                str(checkout), str(outside)]
+    else:
+        held = checkout / "mapped-then-deleted"
+        held.write_bytes(b"x" * 4096)
+        argv = [sys.executable, "-c", _MAP_ONLY_CHILD, str(held), str(outside)]
+    user = subprocess.Popen(
+        argv, cwd=outside, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, text=True
+    )
+    assert user.stdout is not None
+    if user.stdout.readline().strip() != "ready":
+        user.kill()
+        user.wait()
+        pytest.skip(f"cannot hold the slot only through its {kind} here")
+    return user
+
+
+@pytest.mark.parametrize("kind", ["root", "map"])
+def test_remove_refuses_a_slot_used_only_by_root_or_mapping_like_python(
+    tmp_path: Path, kind: str
+) -> None:
+    """#1174: a chroot root or a mapped (even deleted) file in the slot vetoes removal in both editions."""
+
+    with _own_fs(tmp_path) as base:
+        for edition in ("python", "rust"):
+            root = _fixture(base / edition)
+            outside = base / f"{edition}-outside"
+            outside.mkdir()
+            user = _slot_only_user(kind, root, outside)
+            try:
+                if edition == "python":
+                    with pytest.raises(wrkslots_cli.Refusal) as refused:
+                        _python_remove(root)
+                    detail = str(refused.value)
+                else:
+                    result = _rust_remove(root)
+                    assert result.returncode == 1, (edition, result.stdout, result.stderr)
+                    detail = result.stderr
+            finally:
+                user.kill()
+                user.wait()
+            assert f"live process {user.pid} uses slot" in detail, (edition, detail)
+            assert (root / "worktrees" / "slot-a" / "repo").is_dir(), edition
+
+
 def _liveness_evidence(root: Path) -> list[dict[str, object]]:
     directory = root / "worktrees" / "EVENTS.node-a"
     found: list[dict[str, object]] = []

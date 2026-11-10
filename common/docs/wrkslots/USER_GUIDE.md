@@ -642,14 +642,26 @@ not a free slot.
 A process that exits while the scan reads it uses nothing, so the scan skips it and goes on: a read
 of its `/proc` entry that fails with `ENOENT` or `ESRCH` is no evidence. So is one that fails with
 `EACCES` or `EPERM` once the process is gone or a zombie: an exiting process's descriptors become
-unreadable before it has released them, so a process still exiting is given up to 200 ms to finish.
-An entry the scan may not read of a process that is still running, or still exiting after that,
-makes the answer indeterminate, and the command refuses. To see which processes a scan skipped
+unreadable before it has released them, so a process still exiting is rechecked until it finishes,
+for at most 2 seconds per scan in all: every exiting process the scan meets shares that one wait, and
+an ordinary exit is seen within a few milliseconds. An entry the scan may not read of a process that
+is still running, or still exiting after that, makes the answer indeterminate, and the command
+refuses, naming the process and how long it was waited for. To see which processes a scan skipped
 this way, set `WRKSLOTS_CENSUS_DIAGNOSTICS=1`: each time the scan skips one, it names it on
 standard error as `census: process PID exited during the census (/proc/PID/ENTRY: ERRNO); skipped`,
 and a process still exiting after the wait as
-`census: process PID still exiting after 200 ms (/proc/PID/ENTRY: ERRNO); indeterminate`. The
+`census: process PID still exiting after N ms (/proc/PID/ENTRY: ERRNO); indeterminate`. The
 variable changes nothing else, and without it the scan prints nothing about skipped processes.
+
+The scan reads each process's working directory, root, executable, descriptors and mapped files. An
+entry the invoking user may not read is answered by whose process it is. A process of the invoking
+user's own uid is refused to it only while exiting, so the wait above applies: gone or a zombie
+in time is no evidence, still exiting is indeterminate. A protected process that is not exiting (one
+that made itself non-dumpable, such as a user session manager or keyring, or a setuid helper) and
+another user's process are no evidence to `remove`, as lsof run as the invoking user skips them.
+Known gap (#1192): the `wrkslotsd` `remove` and `audit` take such a protected or foreign process's
+unreadable maps or links as no evidence, while `wrkslots audit` reads them through its root census
+(`sudo -n`) and refuses when that census is not available.
 
 Large registries should configure `init --liveness-batch-command PATH`. Audit then invokes that
 project-owned command once, with a `wrkslots-liveness-batch-request/v1` JSON object on standard

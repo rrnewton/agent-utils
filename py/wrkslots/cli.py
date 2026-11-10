@@ -21658,10 +21658,56 @@ def _note_process_gone(pid_dir: Path, gone: Sequence[tuple[Path, OSError]]) -> N
 #: The kernel's PF_EXITING task flag: set as do_exit starts, before it
 #: releases the task's mappings, descriptors, working directory and root.
 _PF_EXITING = 0x00000004
-#: How long a census waits for a process in do_exit, whose entry it may not
-#: read, to become a zombie or vanish (#1173).  The other edition uses the same.
-_CENSUS_EXIT_WAIT_SECONDS = 0.2
-_CENSUS_EXIT_POLL_SECONDS = 0.01
+#: How long one census pass waits, in all, for the processes in do_exit whose
+#: entries it may not read to become zombies or vanish (#1173, #1174).  Every
+#: such process in the pass shares the one deadline, so ten exiting compilers
+#: cost no more than one.  Unmapping a large process's memory, which do_exit
+#: does after its entries turn unreadable and before it closes its
+#: descriptors, took over 200 ms on a loaded gate host.  The other edition
+#: uses the same.
+_CENSUS_EXIT_WAIT_SECONDS = 2.0
+#: The first recheck of an exiting process comes this soon, and each later one
+#: twice as late, up to `_CENSUS_EXIT_POLL_SECONDS`: an ordinary exit costs a
+#: few milliseconds.
+_CENSUS_EXIT_FIRST_POLL_SECONDS = 0.005
+_CENSUS_EXIT_POLL_SECONDS = 0.05
+
+
+class _CensusExitWait:
+    """One census pass's shared wait for processes in do_exit (#1174).
+
+    The deadline starts with the first exiting process the pass meets and
+    bounds every later one: a process met after it has passed gets one more
+    stat read and no wait.  ``still_exiting`` keeps, for each process given up
+    on, how many milliseconds it was waited for, for the refusal.
+    """
+
+    def __init__(
+        self,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self.clock = clock
+        self.sleep = sleep
+        self.deadline: float | None = None
+        self.still_exiting: dict[Path, int] = {}
+
+    def wait_for_exit(self, pid_dir: Path) -> bool:
+        """Whether ``pid_dir``'s process exits before the pass's deadline."""
+
+        started = self.clock()
+        if self.deadline is None:
+            self.deadline = started + _CENSUS_EXIT_WAIT_SECONDS
+        poll = _CENSUS_EXIT_FIRST_POLL_SECONDS
+        while (now := self.clock()) < self.deadline:
+            self.sleep(min(poll, self.deadline - now))
+            if _process_has_exited(pid_dir):
+                return True
+            poll = min(poll * 2, _CENSUS_EXIT_POLL_SECONDS)
+        if _process_has_exited(pid_dir):
+            return True
+        self.still_exiting[pid_dir] = round((self.clock() - started) * 1000)
+        return False
 
 
 def _process_has_exited(pid_dir: Path) -> bool:
@@ -21681,17 +21727,21 @@ def _process_has_exited(pid_dir: Path) -> bool:
     return parsed is not None and parsed.state in _ZOMBIE_STATES
 
 
-def _unreadable_entry_exited(pid_dir: Path, path: Path, exc: OSError) -> bool:
+def _unreadable_entry_exited(
+    pid_dir: Path, path: Path, exc: OSError, exit_wait: _CensusExitWait
+) -> bool:
     """Whether an entry this user may not read belongs to a process that exited.
 
     Once do_exit drops a process's mappings, /proc makes its fd directory
     root-owned, so an exiting process's descriptors read EACCES even to its
     own user, yet do_exit releases the descriptors only afterwards.  So an
     exited process (gone, or a zombie) counts as gone at once; one still in
-    do_exit (PF_EXITING) is polled for `_CENSUS_EXIT_WAIT_SECONDS` and counts
-    as gone only if it exits meanwhile; any other process does not (#1173).
-    A process stuck in do_exit may still hold the descriptors: it stays
-    indeterminate, and the census refuses.
+    do_exit (PF_EXITING) is rechecked under the pass's shared ``exit_wait``
+    and counts as gone only if it exits meanwhile; any other process does not
+    (#1173, #1174).  A process stuck in do_exit may still hold the
+    descriptors: it stays indeterminate, and the census refuses.  Its memory
+    is gone for good, so the entry never turns readable again; only its exit
+    ends the wait early.
     """
 
     # One read decides: a second could find the process reaped meanwhile.
@@ -21704,19 +21754,36 @@ def _unreadable_entry_exited(pid_dir: Path, path: Path, exc: OSError) -> bool:
         return True
     if parsed is None or not parsed.flags & _PF_EXITING:
         return False
-    deadline = time.monotonic() + _CENSUS_EXIT_WAIT_SECONDS
-    while time.monotonic() < deadline:
-        time.sleep(_CENSUS_EXIT_POLL_SECONDS)
-        if _process_has_exited(pid_dir):
-            return True
+    if exit_wait.wait_for_exit(pid_dir):
+        return True
     if os.environ.get("WRKSLOTS_CENSUS_DIAGNOSTICS") == "1":
         name = errno.errorcode.get(exc.errno or 0, str(exc.errno))
         print(
             f"census: {_walked_process_label(pid_dir)} still exiting after "
-            f"{int(_CENSUS_EXIT_WAIT_SECONDS * 1000)} ms ({path}: {name}); indeterminate",
+            f"{exit_wait.still_exiting[pid_dir]} ms ({path}: {name}); indeterminate",
             file=sys.stderr,
         )
     return False
+
+
+def _unreadable_entry_refusal(
+    pid_dir: Path, path: Path, exc: OSError, exit_wait: _CensusExitWait
+) -> Refusal:
+    """The refusal for an entry this user may not read of a process that has not exited.
+
+    For a process given up on in do_exit it names the process, its state and
+    how long it was waited for, so the wait can be measured on a loaded host.
+    """
+
+    message = f"process use is indeterminate because {path} is unreadable: {exc}"
+    waited = exit_wait.still_exiting.get(pid_dir)
+    if waited is not None:
+        message += (
+            f"; {_walked_process_label(pid_dir)} is still exiting (PF_EXITING, its "
+            f"memory already released) after a {waited} ms wait (this census waits "
+            f"{int(_CENSUS_EXIT_WAIT_SECONDS * 1000)} ms in all for exiting processes)"
+        )
+    return Refusal(message)
 
 
 def _link_target(
@@ -21785,6 +21852,7 @@ def _unread_process_entry(
     gone: list[tuple[Path, OSError]],
     unreadable_is_no_evidence: bool,
     empty: _Unread,
+    exit_wait: _CensusExitWait,
 ) -> _Unread:
     """Classify a failed read of one /proc/PID entry: ``empty``, or a refusal.
 
@@ -21801,12 +21869,10 @@ def _unread_process_entry(
     if isinstance(exc, PermissionError):
         if unreadable_is_no_evidence:
             return empty
-        if _unreadable_entry_exited(pid_dir, path, exc):
+        if _unreadable_entry_exited(pid_dir, path, exc, exit_wait):
             gone.append((path, exc))
             return empty
-        raise Refusal(
-            f"process use is indeterminate because {path} is unreadable: {exc}"
-        ) from exc
+        raise _unreadable_entry_refusal(pid_dir, path, exc, exit_wait) from exc
     raise Refusal(
         f"process use is indeterminate because {path} cannot be read: {exc}"
     ) from exc
@@ -21818,6 +21884,7 @@ def _process_uses_slot(
     *,
     mount_verdicts: _MountTableVerdicts | None = None,
     unreadable_is_no_evidence: bool = False,
+    exit_wait: _CensusExitWait | None = None,
 ) -> list[str]:
     """Return how ``pid_dir`` uses ``slot_path``: links, descriptors, maps, mounts.
 
@@ -21827,8 +21894,12 @@ def _process_uses_slot(
     process exited (ENOENT or ESRCH, or EACCES or EPERM once
     `_unreadable_entry_exited`) is no evidence and is noted in the census
     diagnostics (#1173).  Other failures still refuse, and the mount table is
-    always read.
+    always read.  A census that reads many processes passes its one
+    ``exit_wait``, so their exits share one deadline (#1174).
     """
+
+    if exit_wait is None:
+        exit_wait = _CensusExitWait()
 
     try:
         slot_device: int | None = os.stat(slot_path).st_dev
@@ -21847,8 +21918,10 @@ def _process_uses_slot(
                 raise
             if unreadable_is_no_evidence:
                 return None
-            if not _unreadable_entry_exited(pid_dir, path, exc.__cause__):
-                raise
+            if not _unreadable_entry_exited(pid_dir, path, exc.__cause__, exit_wait):
+                raise _unreadable_entry_refusal(
+                    pid_dir, path, exc.__cause__, exit_wait
+                ) from exc.__cause__
             gone.append((path, exc.__cause__))
             return None
 
@@ -21862,7 +21935,7 @@ def _process_uses_slot(
         descriptors = list(fd_dir.iterdir())
     except OSError as exc:
         descriptors = _unread_process_entry(
-            pid_dir, fd_dir, exc, gone, unreadable_is_no_evidence, []
+            pid_dir, fd_dir, exc, gone, unreadable_is_no_evidence, [], exit_wait
         )
     for descriptor in descriptors:
         target = link_target(descriptor)
@@ -21874,7 +21947,7 @@ def _process_uses_slot(
         maps = maps_path.read_text(encoding="utf-8", errors="surrogateescape")
     except OSError as exc:
         maps = _unread_process_entry(
-            pid_dir, maps_path, exc, gone, unreadable_is_no_evidence, ""
+            pid_dir, maps_path, exc, gone, unreadable_is_no_evidence, "", exit_wait
         )
     _note_process_gone(pid_dir, gone)
     slot_text = str(slot_path)
@@ -22917,6 +22990,8 @@ def _observe_slot_use_once(
             invoking_ancestry.add(ancestor)
             ancestor = _read_process_parent(ancestor)
     mount_verdicts = _MountTableVerdicts(slot_path)
+    # One deadline for every exiting process this scan meets (#1174).
+    exit_wait = _CensusExitWait()
     indeterminate_use: Refusal | None = None
     reported_use: _LiveUseObservation | None = None
     reported_use_recheckable = True
@@ -23031,6 +23106,7 @@ def _observe_slot_use_once(
                     slot_path,
                     mount_verdicts=mount_verdicts,
                     unreadable_is_no_evidence=direct_use_proven_absent,
+                    exit_wait=exit_wait,
                 )
         except Refusal as exc:
             if indeterminate_use is None:
@@ -32536,8 +32612,9 @@ def _cmd_supersede_handoff(args: argparse.Namespace) -> int:
             )
         slot_dir = _slot_directory(config, record.slot, record.slot_type)
         use: str | None = None
+        exit_wait = _CensusExitWait()
         for pid in _descendant_pids(successor.pid):
-            found = _process_uses_slot(Path("/proc") / str(pid), slot_dir)
+            found = _process_uses_slot(Path("/proc") / str(pid), slot_dir, exit_wait=exit_wait)
             if found:
                 use = f"pid {pid}: {found[0]}"
                 break
