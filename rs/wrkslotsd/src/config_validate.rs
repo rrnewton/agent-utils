@@ -1403,8 +1403,8 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
         Some(value) => json!(as_int(value, "configuration.max_active_slots", 0)?),
     };
     let eden_cap = match raw.get("eden_host_cap") {
-        None | Some(Value::Null) => json!(3),
-        Some(value) => json!(as_int(value, "configuration.eden_host_cap", 1)?),
+        None | Some(Value::Null) => None,
+        Some(value) => Some(json!(as_int(value, "configuration.eden_host_cap", 1)?)),
     };
     let cache_globs = match raw.get("cache_globs") {
         None => Vec::new(),
@@ -1553,7 +1553,7 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
             }
         }
     }
-    Ok(json!({
+    let mut payload = json!({
         "cache_globs": cache_globs,
         "config_path": path.to_string_lossy(),
         "control": control.to_string_lossy(),
@@ -1570,7 +1570,6 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
         "liveness_command": liveness.to_string_lossy(),
         "machine": machine,
         "max_active_slots": cap,
-        "eden_host_cap": eden_cap,
         "post_provision_hooks": hooks,
         "post_provision_hook_slot_types": hook_slot_types,
         "reclaimable_ignored_paths": reclaimable,
@@ -1583,7 +1582,14 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
         "worktrees": worktrees.to_string_lossy(),
         "worktrees_image": wt_value,
         "worktrees_image_skipped": wt_skipped,
-    }))
+    });
+    if let Some(value) = eden_cap {
+        payload
+            .as_object_mut()
+            .expect("config payload object")
+            .insert("eden_host_cap".to_owned(), value);
+    }
+    Ok(payload)
 }
 
 #[cfg(test)]
