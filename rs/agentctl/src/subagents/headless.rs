@@ -956,6 +956,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn enqueue_for(
         &self,
         record: &AgentRecord,
