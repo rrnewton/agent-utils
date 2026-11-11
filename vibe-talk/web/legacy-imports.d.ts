@@ -206,6 +206,7 @@ declare const createServiceWords: LegacyImports["createServiceWords"];
 declare const createReadingModeActs: LegacyImports["createReadingModeActs"];
 declare const createOpenInView: LegacyImports["createOpenInView"];
 declare const createPageGuards: LegacyImports["createPageGuards"];
+declare const createScrollTraceControls: LegacyImports["createScrollTraceControls"];
 declare const createHeldDone: LegacyImports["createHeldDone"];
 declare const createReadState: LegacyImports["createReadState"];
 declare const createPendingSends: LegacyImports["createPendingSends"];
@@ -217,6 +218,7 @@ declare const createChannelDirectoryView: LegacyImports["createChannelDirectoryV
 declare const createDeploymentWords: LegacyImports["createDeploymentWords"];
 declare const createChannelSelection: LegacyImports["createChannelSelection"];
 declare const freshOlderPages: LegacyImports["freshOlderPages"];
+declare const freshPinsView: LegacyImports["freshPinsView"];
 declare const createFilterPlace: LegacyImports["createFilterPlace"];
 declare const createLiveState: LegacyImports["createLiveState"];
 declare const createDoneAct: LegacyImports["createDoneAct"];

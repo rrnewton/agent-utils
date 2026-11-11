@@ -352,6 +352,17 @@ export function freshTimelineRows(): TimelineRowsRecord {
  * `channelDrafts` holds.
  *
  */
+/** A column's pinned-only view record: only pinned rows, and what was last drawn. */
+export interface PinsViewRecord {
+  only: boolean;
+  drawn: string;
+}
+
+/** A fresh pinned-only view record (`#624 voice-page-modularity`). */
+export function freshPinsView(): PinsViewRecord {
+  return { only: false, drawn: "" };
+}
+
 export function freshComposerState(): ComposerRecord {
   return { key: "" };
 }

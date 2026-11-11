@@ -185,7 +185,7 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
   // And its Pinned filter.
   same("inColumn(columns.side, () => { pinsView().only = true; })");
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.pins.only, pinsView().only])")), [true, false]);
-  assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshPinsView())")), { only: false, drawn: "" });
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(page.preludeBinding("freshPinsView")())), { only: false, drawn: "" });
   // And its scroll tools' pass.
   same("inColumn(columns.side, () => { scrollTools().held += 1; })");
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.tools.held, scrollTools().held])")), [1, 0]);

@@ -2341,9 +2341,9 @@ const {
 } = scrollKeeping;
 
 /** The invitation only makes sense while there is nothing else in the transcript. */
-function renderEmptyState() {
+const renderEmptyState = () => {
   el("empty-state").hidden = el("transcript").children.length > 0;
-}
+};
 
 /** Saying a message's day on the status line: web/src/view/channel's now (`createDayTap`, `#624`). */
 const dayTap = createDayTap({ setStatus: (text) => setStatus(text) });
@@ -5711,9 +5711,6 @@ const rowDrawing = createRowDrawing();
 
 const currentChannelId = () => String(selectedChannelId() || "");
 
-function freshPinsView() {
-  return { only: false, drawn: "" };
-}
 
 const pinnedMessagesOwner = createPinnedMessages({
   byId: el,
@@ -7127,9 +7124,7 @@ const resumePreference = mountResumePreference({
   renderControls: () => voiceCall().renderControls(),
 });
 
-function renderResumeState() {
-  resumePreference.render();
-}
+const renderResumeState = () => resumePreference.render();
 
 // --- the live channel stream -------------------------------------------------------------------
 //
@@ -8638,19 +8633,18 @@ const { storedKeyboardDebug, applyKeyboardDebug } = keyboardDebug;
 // server's log (`POST /api/v1/scroll-trace`). Off by default, kept on this device alone, and nothing is
 // sent until Send is pressed or the trace itself sends its minute over a shift nobody made (`#1208`).
 
-/**
- * The first row the reader could see in `area`, named for the trace: its first message's id, and how
- * far below the list's top it stands.
- *
- * @param {HTMLElement} area
- * @returns {import("./src/view/channel/index.ts").ScrollTraceAnchor | null}
- */
-function scrollTraceAnchor(area) {
-  const row = scrollAnchor(area);
-  if (!row) return null;
-  const ids = idsOf(row);
-  return { id: ids[0] || row.id || "", offset: row.getBoundingClientRect().top - area.getBoundingClientRect().top };
-}
+/** The trace's anchor, its stored choice and sending what it holds: web/src/view/channel/scrolltrace.ts (`createScrollTraceControls`, #624). */
+const scrollTraceControls = createScrollTraceControls({
+  scrollAnchor,
+  idsOf,
+  storedTrace: () => deviceSettings().get(DEVICE_SETTINGS.scrollTrace),
+  keepTrace: (on) => deviceSettings().keep(DEVICE_SETTINGS.scrollTrace, on),
+  el,
+  scrollTrace: () => scrollTrace,
+  api: (path, options) => /** @type {any} */ (api(path, options)),
+  setStatus,
+});
+const { scrollTraceAnchor, storedScrollTrace, applyScrollTrace, sendScrollTrace } = scrollTraceControls;
 
 const scrollTrace = createScrollTrace({
   lookup: (id) => leftEl(id),
@@ -8678,36 +8672,8 @@ const scrollTrace = createScrollTrace({
   autoSend: (text) => { void sendScrollTrace(text); },
 });
 
-/** What was stored. ABSENT MEANS OFF. */
-function storedScrollTrace() {
-  // A browser refusing storage reads as off (`DEVICE_SETTINGS.scrollTrace.refused`).
-  return deviceSettings().get(DEVICE_SETTINGS.scrollTrace);
-}
 
-/** The reader's choice, kept on this device, its switch set to match. @param {boolean} on */
-function applyScrollTrace(on) {
-  try {
-    deviceSettings().keep(DEVICE_SETTINGS.scrollTrace, on);
-  } catch (_error) {
-    // A browser that refuses storage still traces for this session.
-  }
-  el("scroll-trace").checked = on;
-  if (on) scrollTrace.start();
-  else scrollTrace.stop();
-}
 
-/** Post the minute the trace holds to the server's log, and say on the status line how it went. */
-async function sendScrollTrace(text) {
-  try {
-    // `report` says the trace as one JSON text; `api` carries a body it writes as JSON itself, as it
-    // carries the call-end record's. The trace itself calls this with its minute when a shift or a
-    // selection loss it saw was nobody's act (`#1208`).
-    await api("/api/v1/scroll-trace", { method: "POST", body: JSON.parse(text || scrollTrace.report()) });
-    setStatus("Scroll trace sent.");
-  } catch (_error) {
-    setStatus("Scroll trace could not be sent.");
-  }
-}
 
 el("scroll-trace").addEventListener("change", () => applyScrollTrace(el("scroll-trace").checked));
 el("scroll-trace-send").addEventListener("click", () => {

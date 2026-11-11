@@ -484,3 +484,73 @@ export function createScrollTrace(deps: ScrollTraceDependencies): ScrollTrace {
     },
   };
 }
+
+/** What the trace's anchor, stored choice and sending ask of the page. */
+export interface ScrollTraceControlsDependencies {
+  scrollAnchor(area: HTMLElement): Element | null;
+  idsOf(row: Element): readonly string[];
+  storedTrace(): boolean;
+  keepTrace(on: boolean): void;
+  el(id: "scroll-trace"): HTMLInputElement;
+  scrollTrace(): ScrollTrace;
+  api(path: string, options: { method: string; body: unknown }): Promise<unknown>;
+  setStatus(text: string): void;
+}
+
+/** The trace's anchor, its stored choice, and sending what it holds. */
+export interface ScrollTraceControls {
+  scrollTraceAnchor(area: HTMLElement): ScrollTraceAnchor | null;
+  storedScrollTrace(): boolean;
+  applyScrollTrace(on: boolean): void;
+  sendScrollTrace(text?: string): Promise<void>;
+}
+
+/** The trace's controls over `deps` (`#624 voice-page-modularity`). */
+export function createScrollTraceControls(deps: ScrollTraceControlsDependencies): ScrollTraceControls {
+  /**
+   * The first row the reader could see in `area`, named for the trace: its first message's id, and how
+   * far below the list's top it stands.
+   *
+   * @param {HTMLElement} area
+   * @returns {import("./src/view/channel/index.ts").ScrollTraceAnchor | null}
+   */
+  function scrollTraceAnchor(area: HTMLElement): ScrollTraceAnchor | null {
+    const row = deps.scrollAnchor(area);
+    if (!row) return null;
+    const ids = deps.idsOf(row);
+    return { id: ids[0] || row.id || "", offset: row.getBoundingClientRect().top - area.getBoundingClientRect().top };
+  }
+
+  /** What was stored. ABSENT MEANS OFF. */
+  function storedScrollTrace(): boolean {
+    // A browser refusing storage reads as off (`DEVICE_SETTINGS.deps.scrollTrace().refused`).
+    return deps.storedTrace();
+  }
+
+  /** The reader's choice, kept on this device, its switch set to match. */
+  function applyScrollTrace(on: boolean): void {
+    try {
+      deps.keepTrace(on);
+    } catch (_error) {
+      // A browser that refuses storage still traces for this session.
+    }
+    deps.el("scroll-trace").checked = on;
+    if (on) deps.scrollTrace().start();
+    else deps.scrollTrace().stop();
+  }
+
+  /** Post the minute the trace holds to the server's log, and say on the status line how it went. */
+  async function sendScrollTrace(text?: string): Promise<void> {
+    try {
+      // `report` says the trace as one JSON text; `api` carries a body it writes as JSON itself, as it
+      // carries the call-end record's. The trace itself calls this with its minute when a shift or a
+      // selection loss it saw was nobody's act (`#1208`).
+      await deps.api("/api/v1/scroll-trace", { method: "POST", body: JSON.parse(text || deps.scrollTrace().report()) });
+      deps.setStatus("Scroll trace sent.");
+    } catch (_error) {
+      deps.setStatus("Scroll trace could not be sent.");
+    }
+  }
+
+  return { scrollTraceAnchor, storedScrollTrace, applyScrollTrace, sendScrollTrace };
+}

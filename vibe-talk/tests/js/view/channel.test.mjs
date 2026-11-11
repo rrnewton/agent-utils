@@ -3409,3 +3409,31 @@ test("`#624 voice-page-modularity`: the cards filtered, their read runs folded, 
   assert.equal(owner.sideListState(0, 0, 0), "No threads in this channel yet.");
   assert.equal(owner.sideListState(2, 0, 0), "No threads match that search — all of this channel is loaded.");
 });
+
+test("`#624 voice-page-modularity`: the scroll trace's anchor, stored choice and sending, from the module alone", async () => {
+  const { createScrollTraceControls } = CHANNEL_VIEW;
+  const record = [];
+  const row = { id: "r1", getBoundingClientRect: () => ({ top: 130 }) };
+  const area = { getBoundingClientRect: () => ({ top: 100 }) };
+  const box = { checked: false };
+  const controls = createScrollTraceControls({
+    scrollAnchor: () => row,
+    idsOf: () => ["m9"],
+    storedTrace: () => true,
+    keepTrace: (on) => record.push(`keep=${on}`),
+    el: () => box,
+    scrollTrace: () => ({
+      start: () => record.push("start"),
+      stop: () => record.push("stop"),
+      report: () => "{\"v\":1}",
+    }),
+    api: async (path, options) => record.push(`post ${path} ${options.method}`),
+    setStatus: (text) => record.push(text),
+  });
+  assert.deepStrictEqual(controls.scrollTraceAnchor(area), { id: "m9", offset: 30 });
+  assert.equal(controls.storedScrollTrace(), true);
+  controls.applyScrollTrace(true);
+  await controls.sendScrollTrace();
+  assert.deepStrictEqual(record, ["keep=true", "start", "post /api/v1/scroll-trace POST", "Scroll trace sent."]);
+  assert.equal(box.checked, true);
+});
