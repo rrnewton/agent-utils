@@ -1,6 +1,6 @@
 ---
 title: 'documents-search: search only fetched documents from the Documents view'
-status: open
+status: closed
 priority: 1
 issue_type: task
 assignee: mu-docsearch
@@ -8,7 +8,8 @@ labels:
 - vibe-talk
 - documents
 created_at: 2026-11-10T23:15:00-05:00
-updated_at: 2026-11-10T23:15:00-05:00
+updated_at: 2026-11-11T00:46:00-05:00
+closed_at: 2026-11-11T00:46:00-05:00
 ---
 
 # Description
@@ -63,3 +64,5 @@ Frozen by the parallel modularity lane: `scrollkeep.ts`, `folding.ts`,
 - Browser test at phone (393x852) and desktop (1280x800): search, a result,
   and the reader opens at the highlighted match.
 - Focused tests pass; the owner-tier path-selected gate passes.
+
+Landed: server piece 316d1c4d, page piece 6f7f1c8b on main (owner-tier gate PASS, 158 jobs). [watermelon-full-preview]
