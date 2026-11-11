@@ -1233,18 +1233,19 @@ async function readCollapseTall(script = SCRIPT) {
   return { page, row, head, top: row.getBoundingClientRect().top };
 }
 
-test("Shift+E ON A MESSAGE TALLER THAN THE SCREEN, read part way through, brings its head to the top (#280, #295)", async () => {
+test("Shift+E ON A MESSAGE TALLER THAN THE SCREEN, read part way through, centers it in the room (#1215(c), #280, #295)", async () => {
   const { page, row, head, top } = await readCollapseTall();
   assert.equal(row.getAttribute("data-collapsed"), "true");
-  assert.equal(top, head, "the collapsed message's head is not at the top of the list");
+  const center = (row.getBoundingClientRect().top + row.getBoundingClientRect().bottom) / 2;
+  assert.ok(Math.abs(center - (head + SCROLL_VIEWPORT_PX) / 2) <= 1, `the collapsed message is not centered: center ${center}, room ${(head + SCROLL_VIEWPORT_PX) / 2}`);
   assert.equal(channelRow(page, "10").getBoundingClientRect().top, row.getBoundingClientRect().bottom,
     "the message after it is not right below it");
-  // The control: its foot held, though the foot is below the screen. The list runs back up past
-  // everything the reader had read, and the folded message is nowhere near the top.
+  // The control: its head held to the top instead of centered. The folded message sits at the
+  // head, not in the middle of the room, so the check above can tell centering from holding.
   const control = await readCollapseTall(await brokenModule([{ file: "src/view/channel/scrollkeep.ts",
-    find: "} else if (box.bottom <= foot + 1) {", replace: "} else if (true) {" }]));
-  assert.notEqual(control.top, head,
-    "the negative control also brought the folded message to the top, so the check above proves nothing");
+    find: "preservingScrollCentered(area, row, head, foot, mutate);", replace: "preservingScrollAt(area, row, head, mutate);" }]));
+  assert.equal(control.top, head,
+    "the negative control did not hold the folded message at the top, so the check above proves nothing");
 });
 
 test("Shift+E on a short message, which has no fold, marks it and says only that (#295)", async () => {

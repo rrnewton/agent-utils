@@ -78,8 +78,8 @@ export interface FoldKeys<Pane> {
    *
    * The anchor is the scroll owner's per-act choice (`#1251 scroll-single-owner`, `#1215
    * collapse-anchor-below`): the row itself while its head is on screen, the next row when its
-   * head is already above the viewport, its head brought to the top when it is taller than the
-   * screen, and the foot for a reader on the newest line.
+   * head is already above the viewport, the collapsed row centered when it is taller than
+   * the screen, and the foot for a reader on the newest line.
    */
   foldForRead(pane: Pane, row: HTMLElement): boolean;
   /**

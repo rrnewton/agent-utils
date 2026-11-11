@@ -109,8 +109,8 @@ export interface ScrollKeeping {
    * Collapse or expand `row` in `area` under the per-act anchor choice (`#1251
    * scroll-single-owner`, `#1215 collapse-anchor-below`): a reader following the foot stays on
    * it; while the row's top is on screen the row itself is held; with its top above the
-   * viewport the next drawn row is held and the history above absorbs the change; a row taller
-   * than the room brings its head to the scroller's top, as it always has.
+   * viewport the next drawn row is held and the history above absorbs the change; with
+   * neither on screen (inside a row taller than the room) the collapsed row is centered.
    */
   preservingCollapse(area: HTMLElement, row: HTMLElement, head: number, foot: number, mutate: () => void): void;
   /**
@@ -336,8 +336,22 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
       if (next) preservingScrollAt(area, next, next.getBoundingClientRect().top, mutate);
       else preservingScrollAt(area, row, box.top, mutate);
     } else {
-      preservingScrollAt(area, row, head, mutate);
+      preservingScrollCentered(area, row, head, foot, mutate);
     }
+  }
+
+  /** Center `row` in `area`'s room across `mutate`, the selection kept as in `preservingScroll`. */
+  function preservingScrollCentered(area: HTMLElement, row: HTMLElement, head: number, foot: number, mutate: () => void): void {
+    const selection = deps.selectionIn ? deps.selectionIn(area) : null;
+    mutate();
+    if (!row.parentNode) {
+      deps.renderJumpNewest();
+    } else {
+      const rect = row.getBoundingClientRect();
+      area.scrollTop += rect.top + (rect.bottom - rect.top) / 2 - (head + foot) / 2;
+      deps.renderJumpNewest();
+    }
+    if (selection && deps.restoreSelectionIn) deps.restoreSelectionIn(area, selection);
   }
 
   function restoreScroll(mark: ScrollMark): void {

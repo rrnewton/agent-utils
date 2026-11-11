@@ -644,11 +644,11 @@ test("`#1251 scroll-single-owner` + `#1215 collapse-anchor-below`: a collapse ho
   tops.set("c", [40, 120]);
   keep.preservingCollapse(area, b, 0, 200, () => { tops.set("b", [-80, -20]); tops.set("c", [-20, 60]); });
   assert.equal(area.scrollTop, 240, "a collapse with its head off screen did not hold the next row");
-  // Taller than the room: its head comes to the scroller's top, as it always has.
+  // Taller than the room (neither its top nor the next row on screen): centered (`#1215`(c)).
   area.scrollTop = 300;
   tops.set("b", [-80, 500]);
   keep.preservingCollapse(area, b, 0, 200, () => tops.set("b", [-80, 60]));
-  assert.equal(area.scrollTop, 220, "a row taller than the screen did not bring its head to the top");
+  assert.equal(area.scrollTop, 190, "a row taller than the screen was not centered in the room");
   // Following the foot: the foot is held, whatever the row.
   area.scrollTop = 300;
   bottom = true;

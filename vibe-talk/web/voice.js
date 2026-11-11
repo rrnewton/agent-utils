@@ -2413,6 +2413,7 @@ const folding = createFolding({
   eachColumn,
   readerActed,
   preservingScroll,
+  preservingCollapse,
   threadHue: (id) => Number(threadHue(String(id))),
   threadOf,
   rowMessages,

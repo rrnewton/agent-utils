@@ -1405,12 +1405,12 @@ test("`#624 voice-page-modularity`: Shift+E's fold keeps the reader's place, and
       // The owner's per-act choice, modelled on this fixture's geometry (`#1251`, `#1215`):
       // at the foot or with the head on screen the act is simply held; with the head above the
       // viewport the next row abuts the foot here, so holding it moves by the foot's shift; a
-      // row taller than the screen brings its head to the top.
+      // row taller than the screen is centered in the room.
       const was = row2.getBoundingClientRect();
       if (state.bottom || was.top >= head - 1) { log.push("hold"); act(); return; }
       act();
       const now = row2.getBoundingClientRect();
-      area2.scrollTop += was.bottom <= foot ? now.bottom - was.bottom : now.top - head;
+      area2.scrollTop += was.bottom <= foot ? now.bottom - was.bottom : (now.top + now.bottom) / 2 - (head + foot) / 2;
     },
     renderScrollTools: () => log.push("tools"),
     rowForAct: (...args) => { if (args.length !== 1) log.push(`rowForAct ${args.length} args`); return state.acted; },
@@ -1449,7 +1449,7 @@ test("`#624 voice-page-modularity`: Shift+E's fold keeps the reader's place, and
   area.scrollTop = 500;
   state.rect = { top: 40, bottom: 900 };
   state.after = { top: 40, bottom: 60 };
-  assert.deepStrictEqual([run(() => keys.foldForRead(pane, tall)), area.scrollTop], [[true, "fold 2 true", "tools"], 440], "a row taller than the screen did not bring its head to the top");
+  assert.deepStrictEqual([run(() => keys.foldForRead(pane, tall)), area.scrollTop], [[true, "fold 2 true", "tools"], 150], "a row taller than the screen was not centered in the room");
   folds.clear();
   state.bottom = true;
   assert.deepStrictEqual(run(() => keys.foldForRead(pane, tall)), [true, "hold", "fold 2 true", "tools"], "a reader on the newest line was not kept there");

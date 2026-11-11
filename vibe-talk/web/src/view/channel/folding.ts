@@ -81,6 +81,8 @@ export interface FoldingDependencies {
   eachColumn(fn: () => void): void;
   readerActed(): void;
   preservingScroll(fn: () => void): void;
+  /** Collapse or expand `row` in `area` under the scroll owner's per-act anchor choice (`#1215`). */
+  preservingCollapse(area: HTMLElement, row: HTMLElement, head: number, foot: number, fn: () => void): void;
   threadHue(thread: string): number;
   threadOf(message: unknown): string | null;
   rowMessages(li: Element): unknown[];
@@ -252,7 +254,8 @@ export function createFolding(deps: FoldingDependencies): Folding {
     setFolded(entry, !(entry.id !== null && expandedIds.has(entry.id)));
     fold.addEventListener("click", deps.inThisColumn(() => {
       deps.readerActed();
-      deps.preservingScroll(() => setFolded(entry, !isFolded(entry)));
+      const pane = deps.side() ? deps.sidePane() : deps.channelPane();
+      deps.preservingCollapse(pane.scroller(), entry.li, pane.head(), pane.foot(), () => setFolded(entry, !isFolded(entry)));
       renderScrollTools();
     }));
     meta.append(fold);
