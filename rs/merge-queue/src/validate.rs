@@ -631,15 +631,22 @@ impl Ran {
         if self.cancelled || self.refused || self.is_empty_red() {
             return ProbeObservation::Unknown;
         }
-        if self.exit == Some(4)
-            && !self.results.results.is_empty()
+        // A probe in which every selected test passed is not a red base
+        // (#1283 probe-candidate-only, #1273 probe-no-counted-tests):
+        // an unqualified receipt (exit 4, no counted tests) or any other
+        // non-zero exit with only passes is inconclusive, never Fail.
+        if !self.results.results.is_empty()
             && self
                 .results
                 .results
                 .values()
                 .all(|outcome| *outcome == Outcome::Pass)
         {
-            return ProbeObservation::Unknown;
+            return if self.exit == Some(0) {
+                ProbeObservation::Pass
+            } else {
+                ProbeObservation::Unknown
+            };
         }
         if self.reproduces() {
             return ProbeObservation::Fail;

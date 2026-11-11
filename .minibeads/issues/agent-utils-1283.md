@@ -1,6 +1,6 @@
 ---
 title: 'probe-candidate-only: skip the culprit probe when every failing test is absent from the base'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-11-11T10:05:00.000000000+00:00
