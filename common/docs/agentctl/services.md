@@ -312,7 +312,11 @@ takes that registry's designated coordinator (its restore.json
 phases reach its own coordinator with no file in its registry.
 Other-daemon rows are report-only even when their binary reports no
 commit, so a report where every agentctl service is current exits 0 or
-74. A legacy bridge run as `chat run --state DIR` is discovered as a
+74. A candidate that does not descend from a unit's running commit is
+a downgrade: an apply run moves nothing, exits 75 and names each ahead
+unit with its running commit (a report also exits 75), so a stale
+`--from` checkout can never refresh a unit backwards; point it at
+current main, for example the local mirror. A legacy bridge run as `chat run --state DIR` is discovered as a
 bridge. Before a bridge restart, turnover warns the agent behind it to
 use `agentctl chat reply --file` during the window, since an inline
 reply marker emitted while the bridge is down may not be captured; the
@@ -344,7 +348,11 @@ takes that registry's designated coordinator (its restore.json
 phases reach its own coordinator with no file in its registry.
 Other-daemon rows are report-only even when their binary reports no
 commit, so a report where every agentctl service is current exits 0 or
-74. A legacy bridge run as `chat run --state DIR` is discovered as a
+74. A candidate that does not descend from a unit's running commit is
+a downgrade: an apply run moves nothing, exits 75 and names each ahead
+unit with its running commit (a report also exits 75), so a stale
+`--from` checkout can never refresh a unit backwards; point it at
+current main, for example the local mirror. A legacy bridge run as `chat run --state DIR` is discovered as a
 bridge. Before a bridge restart, turnover warns the agent behind it to
 use `agentctl chat reply --file` during the window, since an inline
 reply marker emitted while the bridge is down may not be captured; the

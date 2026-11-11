@@ -1443,6 +1443,53 @@ fn turnover_notify_routes_to_each_registry_designated_coordinator() {
 }
 
 #[test]
+fn turnover_refuses_a_candidate_behind_a_running_commit() {
+    // #1289: a stale source must not move any unit backwards.
+    let world = world();
+    let (checkout, old, new) = turnover_checkout(&world._temporary.0);
+    // The world's units run the NEW commit; the candidate is its ancestor.
+    world
+        .fake
+        .commits
+        .borrow_mut()
+        .insert(PathBuf::from("/state/bin/agentctl-old"), new.clone());
+    let mut options = turnover_options(&world, checkout);
+    options.revision = old.clone();
+    let report = turnover(&world.fake, &Tables, &options).unwrap();
+    assert_eq!(report.exit_code, 75, "{}", report.text);
+    assert!(
+        report.text.contains("refusing a downgrade"),
+        "{}",
+        report.text
+    );
+    let rows = report.document["services"].as_array().unwrap();
+    assert!(
+        rows.iter().any(|row| row["decision"] == "ahead"),
+        "{}",
+        report.text
+    );
+    // Apply mode refuses the same way and moves nothing.
+    options.report_only = false;
+    options.notify = Some(vec!["/bin/notify".to_owned()]);
+    let calls_before = world.fake.calls.borrow().len();
+    let report = turnover(&world.fake, &Tables, &options).unwrap();
+    assert_eq!(report.exit_code, 75, "{}", report.text);
+    assert_eq!(
+        world.fake.calls.borrow().len(),
+        calls_before,
+        "{}",
+        report.text
+    );
+    let calls = world.fake.notify_calls.borrow();
+    assert!(
+        calls.iter().any(|(_, environment)| environment
+            .iter()
+            .any(|(name, value)| name == "TURNOVER_VERDICT" && value == "exit-75")),
+        "{calls:?}"
+    );
+}
+
+#[test]
 fn turnover_report_other_daemon_without_commit_is_report_only() {
     // #1220: an other-daemon row with no commit must not force exit 75
     // when every agentctl service is current.

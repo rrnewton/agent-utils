@@ -822,13 +822,31 @@ pub fn turnover(
         .iter()
         .map(|(unit, error)| format!("{unit}: runs agentctl but cannot be read: {error}"))
         .collect();
+    // #1289 turnover-downgrade-guard: a candidate that does not descend
+    // from a running commit would move that unit backwards. Pinned rows
+    // already had their decision replaced, so they are exempt.
+    let ahead: Vec<String> = rows
+        .iter()
+        .chain(global_row.iter())
+        .filter(|row| row.decision == Decision::Ahead)
+        .map(|row| format!("{} running {}", row.unit, sha8(row.running.as_deref())))
+        .collect();
+    let downgrade_refused = !ahead.is_empty();
+    if downgrade_refused {
+        notes.push(format!(
+            "refusing a downgrade: candidate {} does not descend from {}; point --from/--revision at current main (for example the local mirror) and rerun",
+            sha8(Some(&candidate)),
+            ahead.join(", ")
+        ));
+    }
     let mut refresh_documents: Vec<Value> = Vec::new();
     let mut refresh_text = String::new();
     let mut exit_code = 0_i32;
-    let any_refresh = rows.iter().any(|row| row.decision == Decision::Refresh)
-        || global_row
-            .as_ref()
-            .is_some_and(|row| row.decision == Decision::Refresh);
+    let any_refresh = !downgrade_refused
+        && (rows.iter().any(|row| row.decision == Decision::Refresh)
+            || global_row
+                .as_ref()
+                .is_some_and(|row| row.decision == Decision::Refresh));
 
     if options.dry_run && !options.report_only {
         // The ordered plan: bridges last per registry, global last of all.
@@ -1000,8 +1018,13 @@ pub fn turnover(
         }
     }
 
+    if !options.report_only && !options.dry_run && downgrade_refused {
+        exit_code = 75;
+    }
+
     if options.report_only {
         let errors = !unreadable.is_empty()
+            || downgrade_refused
             || rows.iter().any(|row| row.decision == Decision::Unknown)
             || global_row
                 .as_ref()
