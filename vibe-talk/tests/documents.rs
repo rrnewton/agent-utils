@@ -1010,3 +1010,85 @@ async fn document_speech_prepare_keeps_clamped_speed_and_trimmed_voice() {
     assert_eq!(status, StatusCode::OK);
     assert!(!audio.is_empty(), "no audio came back");
 }
+
+#[tokio::test]
+async fn search_finds_only_fetched_documents_by_title_and_body() {
+    let (app, github) = harness();
+    const OTHER_KEY: &str = "github:octo/widgets@main:docs/other.md";
+    github.put(OTHER_KEY, "# Other Notes\n\nzebraword lives here\n", "v1");
+    // Before any fetch, nothing is searched.
+    let (status, body) = call(
+        &app,
+        "GET",
+        "/api/v1/documents/search?q=body",
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["searched"], 0);
+    assert_eq!(body["hits"].as_array().map(Vec::len), Some(0));
+
+    cache_report(&app).await;
+    // Body match.
+    let (status, body) = call(
+        &app,
+        "GET",
+        "/api/v1/documents/search?q=body",
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["searched"], 1, "one fetched document searched: {body}");
+    assert_eq!(body["hits"][0]["key"], KEY);
+    assert_eq!(body["hits"][0]["title_match"], false);
+    assert!(body["hits"][0]["snippet"]
+        .as_str()
+        .is_some_and(|s| s.contains("body")));
+    // Title match, case-insensitively, in the shared language.
+    let (_, body) = call(
+        &app,
+        "GET",
+        "/api/v1/documents/search?q=%22real%20title%22",
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(body["hits"][0]["key"], KEY);
+    assert_eq!(body["hits"][0]["title_match"], true);
+    // No message leakage: "report" is the mentioning messages' link label and
+    // the row's file name, but neither the fetched title nor its body.
+    let (_, body) = call(
+        &app,
+        "GET",
+        "/api/v1/documents/search?q=report",
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(body["hits"].as_array().map(Vec::len), Some(0), "{body}");
+    // No unfetched leakage: the other document holds "zebraword" but is not fetched.
+    let (_, body) = call(
+        &app,
+        "GET",
+        "/api/v1/documents/search?q=zebraword",
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(body["hits"].as_array().map(Vec::len), Some(0), "{body}");
+    assert_eq!(body["searched"], 1);
+    // An empty query is refused, and a hit needs the read token like the list.
+    let (status, _) = call(
+        &app,
+        "GET",
+        "/api/v1/documents/search?q=",
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = call(&app, "GET", "/api/v1/documents/search?q=body", None, None).await;
+    assert_ne!(status, StatusCode::OK);
+}

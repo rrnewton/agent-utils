@@ -189,6 +189,8 @@ fn routes(state: AppState) -> Router {
         // `#628 documents-index-server`. READ to list/read/check, WRITE to fetch
         // (fetching spends credentials). No MCP tool.
         .route("/api/v1/documents", get(api::list_documents))
+        // `#1266 documents-search`: fetched documents only, READ scope.
+        .route("/api/v1/documents/search", get(api::search_documents))
         .route("/api/v1/documents/fetch", post(api::fetch_document))
         .route(
             "/api/v1/documents/fetch-recent",

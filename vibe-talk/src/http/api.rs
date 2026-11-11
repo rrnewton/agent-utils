@@ -7480,6 +7480,52 @@ pub async fn get_document(
     .into_response())
 }
 
+/// Query of `GET /api/v1/documents/search`.
+#[derive(Deserialize)]
+pub struct DocumentSearchQuery {
+    /// The query, in the shared search language.
+    pub q: Option<String>,
+    /// At most this many hits (default 20, at most 50).
+    pub limit: Option<usize>,
+}
+
+/// `GET /api/v1/documents/search?q=...` — search the FETCHED documents only
+/// (`#1266 documents-search`): the message search's language and matching
+/// (`crate::search_query`) over each cached copy's title plus body. READ
+/// scope, as the list. The answer's `searched` counts the fetched copies
+/// examined, so the bounded cache's reach is stated, never silent.
+pub async fn search_documents(
+    State(state): State<AppState>,
+    _scope: ReadScope,
+    Query(query): Query<DocumentSearchQuery>,
+) -> Result<Response, ApiError> {
+    let text = query.q.unwrap_or_default();
+    if text.chars().count() > crate::server_search::MAX_QUERY_CHARS {
+        return Err(ApiError::bad_request("query too long"));
+    }
+    let parsed = crate::search_query::parse(&text);
+    if parsed.is_empty() {
+        return Err(ApiError::bad_request("give a search query"));
+    }
+    let found = state
+        .documents
+        .search_documents(&parsed, query.limit.unwrap_or(20));
+    Ok(Json(serde_json::json!({
+        "hits": found.hits.iter().map(|hit| serde_json::json!({
+            "key": hit.key,
+            "title": hit.title,
+            "kind": hit.kind.as_str(),
+            "fetched_ms": hit.fetched_ms,
+            "title_match": hit.title_match,
+            "snippet": hit.snippet,
+            "snippet_start": hit.snippet_start,
+        })).collect::<Vec<_>>(),
+        "searched": found.searched,
+        "untrusted_content_notice": crate::untrusted::NOTICE,
+    }))
+    .into_response())
+}
+
 /// Body of the document fetch routes.
 #[derive(Deserialize)]
 pub struct FetchDocumentBody {

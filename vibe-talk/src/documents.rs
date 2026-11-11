@@ -2057,6 +2057,65 @@ impl Service {
         fetched
     }
 
+    /// Every fetched copy the cache holds, in no promised order.
+    #[must_use]
+    pub fn cached_all(&self) -> Vec<Fetched> {
+        self.cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .docs
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Search the FETCHED documents only (`#1266 documents-search`): the
+    /// shared message-search language ([`crate::search_query`]) matched over
+    /// each cached copy's title plus body. Unfetched index entries and message
+    /// text are never searched. `searched` says how many fetched copies were
+    /// examined, so a bounded-cache eviction is visible, never silent.
+    #[must_use]
+    pub fn search_documents(&self, query: &crate::search_query::Query, limit: usize) -> DocSearch {
+        let limit = limit.clamp(1, 50);
+        let terms = query.positive_terms();
+        let day_start = |day: crate::search_query::Day| day.start_ms_at_offset(0);
+        let mut hits: Vec<DocSearchHit> = Vec::new();
+        let all = self.cached_all();
+        let searched = all.len();
+        for doc in all {
+            let haystack = format!("{}\n{}", doc.title, doc.content);
+            let subject = crate::search_query::Subject::new(
+                &haystack,
+                "",
+                "",
+                doc.fetched_ms,
+                false,
+                doc.content.contains("http://") || doc.content.contains("https://"),
+            );
+            if !query.matches(&subject, &day_start) {
+                continue;
+            }
+            let (snippet, snippet_start) = snippet_of(&doc.content, &terms);
+            let folded_title = crate::search_query::fold(&doc.title);
+            hits.push(DocSearchHit {
+                title_match: terms.iter().any(|t| folded_title.contains(t.as_str())),
+                key: doc.key,
+                title: doc.title,
+                kind: doc.kind,
+                fetched_ms: doc.fetched_ms,
+                snippet,
+                snippet_start,
+            });
+        }
+        hits.sort_by(|a, b| {
+            b.fetched_ms
+                .cmp(&a.fetched_ms)
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        hits.truncate(limit);
+        DocSearch { hits, searched }
+    }
+
     /// Whether the source now holds a newer version than the cached one.
     /// Best effort: an unfetched document, or one whose source cannot say,
     /// reports no update.
@@ -2087,6 +2146,68 @@ impl Service {
             latest_version: latest,
         })
     }
+}
+
+/// One hit of [`Service::search_documents`] (`#1266 documents-search`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DocSearchHit {
+    /// Document key.
+    pub key: String,
+    /// Real title of the fetched copy.
+    pub title: String,
+    /// What kind of document it is.
+    pub kind: DocKind,
+    /// When the cached copy was fetched, in Unix milliseconds.
+    pub fetched_ms: i64,
+    /// Whether a matched term is in the title (else the body matched).
+    pub title_match: bool,
+    /// An excerpt of the body around the first matched term (the body's head
+    /// when only the title matched).
+    pub snippet: String,
+    /// Byte offset of `snippet` in the body.
+    pub snippet_start: usize,
+}
+
+/// The answer of [`Service::search_documents`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DocSearch {
+    /// Matching fetched documents, most recently fetched first.
+    pub hits: Vec<DocSearchHit>,
+    /// How many fetched documents were searched.
+    pub searched: usize,
+}
+
+/// The excerpt of `content` around the earliest of `terms`: `(text, start)`.
+/// The body's head when no term is in the body (a title-only match).
+fn snippet_of(content: &str, terms: &[String]) -> (String, usize) {
+    let lower = content.to_lowercase();
+    let mut best: Option<(usize, usize)> = None;
+    for term in terms {
+        if term.is_empty() {
+            continue;
+        }
+        if let Some(at) = lower.find(term.as_str()) {
+            if best.is_none_or(|(old, _)| at < old) {
+                best = Some((at, term.len()));
+            }
+        }
+    }
+    let Some((at, _)) = best else {
+        let end = content
+            .char_indices()
+            .nth(180)
+            .map_or(content.len(), |(i, _)| i);
+        return (content[..end].to_owned(), 0);
+    };
+    let mut start = at.saturating_sub(60);
+    while start > 0 && !content.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (at + 140).min(content.len());
+    while end < content.len() && !content.is_char_boundary(end) {
+        end += 1;
+    }
+    (content[start..end].to_owned(), start)
 }
 
 /// The answer of a freshness check.
