@@ -12,7 +12,7 @@ export type { DocViewName, ViewSelector, ViewSelectorDependencies } from "./sele
 export type { DocumentMention, DocumentRow, DocumentsListAnswer } from "./types.ts";
 
 import { createListening } from "../dom/index.ts";
-import { createDocumentsList } from "./list.ts";
+import { createDocumentsList, FOLLOW_SLACK_PX } from "./list.ts";
 import type { DocumentsListPlace } from "./list.ts";
 import { createDocumentsReader, openDocumentNotice } from "./reader.ts";
 import type { OpenDocument } from "./reader.ts";
@@ -103,16 +103,13 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     }
   }
 
-  /** How close to the bottom counts as parked there, in px (the list's own slack). */
-  const LIST_FOLLOW_SLACK_PX = 24;
-
   /** The list's place now, where the list is the pane on screen; else null. */
   function listPlaceNow(): DocumentsListPlace | null {
     try {
       if (deps.byId("pane-docs").hidden || deps.byId("docs-list-view").hidden) return null;
       const scroller = deps.byId("scroll-area");
       const top = typeof scroller.scrollTop === "number" && Number.isFinite(scroller.scrollTop) ? scroller.scrollTop : 0;
-      const follow = top + scroller.clientHeight >= scroller.scrollHeight - LIST_FOLLOW_SLACK_PX;
+      const follow = top + scroller.clientHeight >= scroller.scrollHeight - FOLLOW_SLACK_PX;
       return { top, follow };
     } catch {
       return null;

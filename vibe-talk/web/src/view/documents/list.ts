@@ -154,7 +154,7 @@ const REFRESH_PULL_PX = 64;
 /** How close to the true bottom counts as parked there for the pull, in px (the channel's slack). */
 const PULL_EDGE_SLACK_PX = 2;
 /** How close to the bottom counts as following the newest across a refresh, in px. */
-const FOLLOW_SLACK_PX = 24;
+export const FOLLOW_SLACK_PX = 24;
 /** How near the top scrolling pages older documents in, in px. */
 const OLDER_TRIGGER_PX = 500;
 
