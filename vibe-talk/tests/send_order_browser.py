@@ -36,6 +36,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import socket
 import subprocess
 import tempfile
@@ -58,6 +59,25 @@ READ_TOKEN = "send-order-browser-read-token-0000000000"
 WRITE_TOKEN = "send-order-browser-write-token-111111111"
 FAILURE = "Google Chat message send failed"
 Json = dict[str, object]
+# The most a state wait below waits for the state it expects (`#1250 vibe-talk-timing-robust`, the
+# STATE_S precedent of the read-aloud checks). Every wait polls drawn or bridge-recorded state, so
+# a pass takes as long as the page and bridge do on a hot host and this only bounds a failure.
+STATE_S = 30.0
+# Records the retry countdown as the page draws it, in the page: every distinct number of seconds
+# the first outbox row shows, in the order drawn. The check once sampled the row's text from this
+# process and demanded "Retrying in 3 s." at that instant, so a starved sample a second late read
+# 2 or 1 and failed a page behaving exactly as drawn (`#1250`); the recorded sequence is judged
+# instead — its first value is the backoff the page drew, however late this process reads it.
+COUNTDOWN_RECORDER_JS = """() => {
+  window.__retryCountdowns = [];
+  setInterval(() => {
+    const row = document.querySelector('#outgoing-log li.outgoing-message');
+    const drawn = row ? /Retrying in (\\d+) s\\./.exec(row.innerText || '') : null;
+    const seconds = drawn ? Number(drawn[1]) : null;
+    const seen = window.__retryCountdowns;
+    if (seconds !== null && seen[seen.length - 1] !== seconds) seen.push(seconds);
+  }, 20);
+}"""
 
 
 @dataclass
@@ -331,7 +351,7 @@ def main() -> int:
         assert isinstance(found, list)
         return [(str(item[0]), str(item[1])) for item in found if isinstance(item, list)]
 
-    def until(page: Page, what: str, done: Callable[[], bool], seconds: float = 15.0) -> None:
+    def until(page: Page, what: str, done: Callable[[], bool], seconds: float = STATE_S) -> None:
         """Wait, while the browser runs, until `done()` holds."""
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
@@ -371,15 +391,20 @@ def main() -> int:
                 if not page.is_visible("#channel-compose-text"):
                     page.click("#view-switch")
                 page.wait_for_selector("#channel-compose-text", state="visible", timeout=10_000)
+                page.evaluate(COUNTDOWN_RECORDER_JS)
 
                 # 1. A fails at once; B waits behind it; A goes again and lands; then B.
                 bridge.fail_once.add("A")
                 send(page, "A is the first thing I wrote")
                 until(page, "A did not fail and wait to go again",
                       lambda: [state for state, _ in rows(page)] == ["retrying"])
-                retrying = rows(page)[0][1]
-                check("Google Chat could not answer: Google Chat message send failed." in retrying
-                      and "Retrying in 3 s." in retrying, f"A's row does not say why it waits, or how long: {retrying!r}")
+                until(page, "A's row never said why it waits, or how long",
+                      lambda: bool(drawn := rows(page))
+                      and "Google Chat could not answer: Google Chat message send failed." in drawn[0][1]
+                      and re.search(r"Retrying in \d+ s\.", drawn[0][1]) is not None)
+                countdowns: object = page.evaluate("() => window.__retryCountdowns")
+                check(isinstance(countdowns, list) and countdowns[:1] == [3],
+                      f"A's drawn countdown began {countdowns!r}, not at the 3 s backoff it says it waits")
                 send(page, "B is what I wrote next")
                 until(page, "B was not shown waiting behind A",
                       lambda: [state for state, _ in rows(page)] == ["retrying", "queued"])
