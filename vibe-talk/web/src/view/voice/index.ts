@@ -18,3 +18,4 @@ export { mountCallComposer } from "./callcomposer.ts";
 export type { CallComposer, CallComposerDependencies, CannedPromptEntry } from "./callcomposer.ts";
 export { createWatchFrame } from "./watchframe.ts";
 export type { WatchAllLike, WatchCall, WatchFrame, WatchFrameDependencies, WatchFrameOwner } from "./watchframe.ts";
+export * from "./readingacts.ts";

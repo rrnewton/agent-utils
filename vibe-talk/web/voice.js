@@ -8279,12 +8279,19 @@ application.track(mountPageListeners({
   saveUnsettledTurns: () => voiceCall().saveUnsettledTurns(),
 }));
 
-/** Take the pace popover down. Safe to call when it is already down. */
-function closeSpeedPopover() {
-  el("speed-popover").hidden = true;
-  el("read-speed").setAttribute("aria-expanded", "false");
-  scheduleBackSync();
-}
+/** The pace popover down and read-aloud reading mode on and off: web/src/view/voice/readingacts.ts (`createReadingModeActs`, #624). */
+const readingActsOwner = createReadingModeActs({
+  el,
+  scheduleBackSync,
+  readAloudOwner,
+  clearError,
+  showError,
+  guardQuietly,
+  setStatus,
+  renderControls: () => voiceCall().renderControls(),
+  renderChannelRows,
+});
+const { closeSpeedPopover, leaveReadingMode, setReadingMode } = readingActsOwner;
 
 // The reading preferences' switches: the read-aloud pace's popover, Your own messages, and the switches that shape
 // how messages are drawn and sent. One owner in web/src/view/settings/preferenceswitches.ts (`#624
@@ -8351,58 +8358,7 @@ application.track(mountReadControls({
   leaveReadingMode: () => leaveReadingMode(),
 }));
 
-/**
- * `#442 read-strip-order`. Stop: the read ends AND reading mode is left, in one tap, by the path
- * the Read button has always left it by. After #434 made Read the Pause of a read in progress, the
- * only ways out were a tap on the row being read or the media keys' stop, which a reader holding a
- * phone in a car does not find. The button pressed goes as the mode does, so focus goes to Read.
- */
-function leaveReadingMode() {
-  const from = document.activeElement;
-  if (readAloudOwner().readingMode) setReadingMode(false);
-  else readAloudOwner().stopReading();
-  if (from && from === el("read-aloud-stop")) {
-    const read = el("read-aloud");
-    if (!read.hidden && typeof read.focus === "function") read.focus();
-  }
-}
 
-/** Turn reading mode on or off. The one path in and out of it, whichever control asked. */
-function setReadingMode(on) {
-  readAloudOwner().readingMode = on;
-  // Turning it OFF stops what is playing. Leaving audio running under a reader who has just said
-  // "not this any more" is the kind of thing that gets a tab muted and never opened again.
-  if (!readAloudOwner().readingMode) {
-    readAloudOwner().stopReading();
-  }
-  readAloudOwner().setReadState(readAloudOwner().readingMode ? "ready" : "idle");
-  if (readAloudOwner().readingMode) {
-    // A failed conversation banner belongs to the call that produced it. Leaving it over the
-    // independent device-speech mode makes a working Read control look broken; if device speech
-    // itself is unavailable, replace it immediately with that actionable reason.
-    clearError();
-    const speechProblem = readAloudOwner().readAloudPlayback === "browser" ? readAloudOwner().browserSpeechProblem() : "";
-    if (speechProblem) {
-      readAloudOwner().setReadState("failed");
-      showError(speechProblem);
-    }
-    // AHEAD OF THE TAP. This is the request that makes every later tap cheap, and it is issued the
-    // moment the mode is entered rather than when a message is chosen, because the reader is
-    // already looking at the text and has not decided yet which line they want.
-    guardQuietly(readAloudOwner().prepareSpeech)();
-  } else {
-    readAloudOwner().forgetPreparedSpeech();
-  }
-  setStatus(
-    readAloudOwner().readingMode
-      ? readAloudOwner().readAloudPlayback === "browser"
-        ? readAloudOwner().browserSpeechProblem() || `${readAloudOwner().readAloudLabel}: tap a message to hear it, and it archives when it finishes.`
-        : "reading mode: tap a message to hear it, and it archives when it finishes."
-      : "reading mode off."
-  );
-  voiceCall().renderControls();
-  renderChannelRows();
-}
 // The call's controls: Talk, Hang up, the speaker, clearing the view, forgetting the stored conversations, and a
 // failed start tried again. One owner in web/src/view/voice/callcontrols.ts (`#624 voice-page-modularity`), mounted
 // here, in the page's order; its `unmount` waits for the ordered boot's teardown.

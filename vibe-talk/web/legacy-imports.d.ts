@@ -203,6 +203,7 @@ declare const createStartsRead: LegacyImports["createStartsRead"];
 declare const createChannelHead: LegacyImports["createChannelHead"];
 declare const createSearchOpenControl: LegacyImports["createSearchOpenControl"];
 declare const createServiceWords: LegacyImports["createServiceWords"];
+declare const createReadingModeActs: LegacyImports["createReadingModeActs"];
 declare const createHeldDone: LegacyImports["createHeldDone"];
 declare const createReadState: LegacyImports["createReadState"];
 declare const createPendingSends: LegacyImports["createPendingSends"];

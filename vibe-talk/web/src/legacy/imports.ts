@@ -119,7 +119,7 @@ import { decode, decodeTagged, is, roots } from "../contract/index.ts";
  */
 export const VibeTalkContract = Object.freeze({ roots, is, decode, decodeTagged });
 
-export { createAutoplay, createReadAloud, createReadingJump, createVoiceCall, createVoiceTranscript, createWatchFrame, mountCallComposer, mountCallControls, mountPageButtons, mountReadControls } from "../view/voice/index.ts";
+export { createAutoplay, createReadAloud, createReadingJump, createVoiceCall, createVoiceTranscript, createWatchFrame, mountCallComposer, mountCallControls, mountPageButtons, mountReadControls, createReadingModeActs } from "../view/voice/index.ts";
 
 export {
   CANNED_PROMPTS,

@@ -3697,8 +3697,9 @@ test("`#304 back-gesture-in-app`: THE READING-PACE POPOVER is an entry, with clo
     assert.equal(silent.gesture.left, true, "the control whose pace button pushes nothing did not leave the app");
     assert.equal(silent.gesture.open, true);
   }
-  const quiet = await paceWalk(false, brokenScript('  el("read-speed").setAttribute("aria-expanded", "false");\n  scheduleBackSync();\n',
-    '  el("read-speed").setAttribute("aria-expanded", "false");\n'));
+  const quiet = await paceWalk(false, await brokenModule([{ file: "src/view/voice/readingacts.ts",
+    find: '    deps.el("read-speed").setAttribute("aria-expanded", "false");\n    deps.scheduleBackSync();\n',
+    replace: '    deps.el("read-speed").setAttribute("aria-expanded", "false");\n' }]));
   assert.deepStrictEqual(quiet.escaped.asked, [], "the control that closes the popover silently went back through its entry");
 });
 
