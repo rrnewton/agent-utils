@@ -322,6 +322,14 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
   }
 
   function preservingCollapse(area: HTMLElement, row: HTMLElement, head: number, foot: number, mutate: () => void): void {
+    // A live held anchor (a filter hold, a search walk, a landed jump on another row) owns
+    // the reader's place over this act's own choice, as `captureScroll` has it: the act's
+    // readerActed is what ends such a hold, and it has not run here.
+    const jump = deps.jumpAnchorRow ? deps.jumpAnchorRow() : null;
+    if (deps.heldFilterRow() || (deps.searchWalk && deps.searchWalk()) || (jump && jump !== row)) {
+      preservingScroll(mutate);
+      return;
+    }
     if (deps.atBottom(area, deps.restSlackPx)) {
       mutate();
       area.scrollTop = area.scrollHeight;

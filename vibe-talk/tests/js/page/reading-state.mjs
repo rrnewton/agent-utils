@@ -5060,13 +5060,13 @@ test("`#243 filter-keeps-selection`: the reader's own act ends what the change h
   }
   // The press alone ends the hold, the fold's own act aside...
   const pressed = await run(await brokenModule([{ file: "src/view/channel/folding.ts",
-    find: "      deps.readerActed();\n      deps.preservingScroll(() => setFolded(entry, !isFolded(entry)));",
-    replace: "      deps.preservingScroll(() => setFolded(entry, !isFolded(entry)));" }]), true);
+    find: "      deps.readerActed();\n      const pane = deps.side() ? deps.sidePane() : deps.channelPane();\n      deps.preservingCollapse(pane.scroller(), entry.li, pane.head(), pane.foot(), () => setFolded(entry, !isFolded(entry)));",
+    replace: "      const pane = deps.side() ? deps.sidePane() : deps.channelPane();\n      deps.preservingCollapse(pane.scroller(), entry.li, pane.head(), pane.foot(), () => setFolded(entry, !isFolded(entry)));" }]), true);
   keptAt(pressed.page, "28", pressed.before, "the message whose fold the reader pressed and opened");
   // THE CONTROL: with neither, the message the reader opened is pushed up by the held pin.
   const held = await run(await brokenModule([{ file: "src/view/channel/folding.ts",
-    find: "      deps.readerActed();\n      deps.preservingScroll(() => setFolded(entry, !isFolded(entry)));",
-    replace: "      deps.preservingScroll(() => setFolded(entry, !isFolded(entry)));" }]), false);
+    find: "      deps.readerActed();\n      const pane = deps.side() ? deps.sidePane() : deps.channelPane();\n      deps.preservingCollapse(pane.scroller(), entry.li, pane.head(), pane.foot(), () => setFolded(entry, !isFolded(entry)));",
+    replace: "      const pane = deps.side() ? deps.sidePane() : deps.channelPane();\n      deps.preservingCollapse(pane.scroller(), entry.li, pane.head(), pane.foot(), () => setFolded(entry, !isFolded(entry)));" }]), false);
   assert.ok(yOf(held.page, "28") < held.before - 1, "the test cannot see the held pin move the message opened");
 });
 

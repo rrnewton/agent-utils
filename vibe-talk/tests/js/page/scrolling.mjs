@@ -105,13 +105,13 @@ test("COLLAPSING A MESSAGE ABOVE THE VIEWPORT LEAVES THE READER LOOKING AT THE S
   // able to SEE the difference, so it has to be shown seeing it.
   const control = await run(
     await brokenModule([{ file: "src/view/channel/scrollkeep.ts",
-      find: "    area.scrollTop += (mark.anchor as Element).getBoundingClientRect().top - mark.top;",
-      replace: "    void mark;" }])
+      find: "      area.scrollTop += held.getBoundingClientRect().top - targetTop;",
+      replace: "      void held;" }])
   );
   assert.notEqual(
     control.moved,
     0,
-    "with the scroll restore deleted the view still did not move, so this fixture cannot tell " +
+    "with the per-act hold deleted the view still did not move, so this fixture cannot tell " +
       "an anchored page from an unanchored one"
   );
 });

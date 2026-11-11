@@ -2086,7 +2086,7 @@ test("`#431 voice-transcript-expand`: opening the newest card by a tap keeps the
   assert.equal(anchor.getBoundingClientRect().top, before, "opening the card moved the line being read");
   assert.equal(tapped.getBoundingClientRect().top, tappedBefore, "opening the card moved the card");
 
-  const control = await run(await brokenModule([{ file: "src/view/channel/folding.ts", find: "      deps.preservingScroll(() => setFolded(entry, !isFolded(entry)));", replace: "      setFolded(entry, !isFolded(entry));" }]));
+  const control = await run(await brokenModule([{ file: "src/view/channel/folding.ts", find: "      const pane = deps.side() ? deps.sidePane() : deps.channelPane();\n      deps.preservingCollapse(pane.scroller(), entry.li, pane.head(), pane.foot(), () => setFolded(entry, !isFolded(entry)));", replace: "      setFolded(entry, !isFolded(entry));" }]));
   assert.ok(!atBottomOf(control.area), "with the fold's scroll keeper removed the reader still stayed on the newest line, so this proves nothing");
 });
 
