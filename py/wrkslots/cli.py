@@ -5996,6 +5996,247 @@ def _journal_fingerprint(config: Config) -> tuple[tuple[str, int, int], ...]:
     return tuple(sorted(entries))
 
 
+# A single-record mutation (adopt, create) used to run the whole-fleet validation -- every
+# shard, the archive, the event chains, every slot's storage -- inside its exclusive locks,
+# and the configuration lock is the same exclusive flock on the project root that a consumer's
+# run-population lock takes. Measured 2026-11-10 on a shared host (185 slots, 78,892 event
+# files, 2 s samples of /proc/locks): two plain adopts held it 430 s and 236 s, an agent create
+# 57 s, and validation setups behind them were refused as "configuration lock is busy" (#1274).
+#
+# Such a command now validates before it takes any lock, and under the locks it compares only
+# the registry identity taken before that validation, then re-checks the one record it
+# touches. An unchanged identity proves that no wrkslots writer committed anything in between,
+# so every fact the validation read still holds; a changed one sends the command back to
+# validate again, a bounded number of times, instead of validating while it holds the lock.
+
+#: Lock-free validation rounds a single-record mutation runs before it refuses as busy. A
+#: round is repeated only when another writer changed the registry between the start of the
+#: round and the identity check under the configuration lock (#1274).
+REGISTRY_VALIDATION_ATTEMPTS = 5
+
+#: Top-level control-directory names that a global validation reads, besides the event logs:
+#: the ACTIVE and ARCHIVED shards, every mutation journal, holds, handoff sidecars, and the
+#: partial-update leftovers of each. An allowlist, never "every file but the locks": the control
+#: directory can also hold storage that is not registry state at all, such as a project
+#: worktrees image hundreds of GiB in size whose times change with every slot write.
+_REGISTRY_IDENTITY_PREFIXES = (
+    "ACTIVE.",
+    "ARCHIVED.",
+    "CREATE.",
+    "FINISH.",
+    "HANDOFF.",
+    "HOLD.",
+    "VALIDATE-BATCH-SEAL.",
+)
+
+#: (mode, device, inode, size, mtime_ns, ctime_ns) of one registry file; None when it vanished
+#: between the directory listing and its lstat.
+_RegistryEntryIdentity = tuple[int, int, int, int, int, int]
+
+
+@dataclasses.dataclass(frozen=True)
+class _RegistryIdentity:
+    """Cheap identity of every registry file a global validation reads (#1274).
+
+    One lstat per file, never a content read: the names listed by
+    ``_REGISTRY_IDENTITY_PREFIXES`` and every file in every ``EVENTS.*`` log (78,892 files
+    took about 0.2 s on the measured host). Every wrkslots mutation changes at least one of
+    them -- it appends an event, replaces a shard, or writes or removes a journal -- and an
+    atomic replacement always brings a new inode, so an equal identity proves that no wrkslots
+    writer committed anything between the two readings. Lock files are left out (opening one
+    creates it), and so is storage outside the registry: slot directories and Git
+    registrations never took this lock, and the commands re-check them for the record they
+    touch.
+    """
+
+    config_sha256: str | None
+    entries: tuple[tuple[str, _RegistryEntryIdentity | None], ...]
+
+    def changed_names(self, other: _RegistryIdentity) -> list[str]:
+        """Entry names that differ between two identities, including added and removed ones."""
+
+        mine = dict(self.entries)
+        theirs = dict(other.entries)
+        return sorted(
+            name
+            for name in mine.keys() | theirs.keys()
+            if name not in mine or name not in theirs or mine[name] != theirs[name]
+        )
+
+
+def _registry_entry_identity(entry: os.DirEntry[str]) -> _RegistryEntryIdentity | None:
+    try:
+        status = entry.stat(follow_symlinks=False)
+    except OSError:
+        return None
+    return (
+        status.st_mode,
+        status.st_dev,
+        status.st_ino,
+        status.st_size,
+        status.st_mtime_ns,
+        status.st_ctime_ns,
+    )
+
+
+def _registry_identity(config: Config) -> _RegistryIdentity:
+    """Take the registry identity a prevalidated mutation compares under its locks (#1274)."""
+
+    entries: list[tuple[str, _RegistryEntryIdentity | None]] = []
+    try:
+        with os.scandir(config.control) as listing:
+            top = sorted(listing, key=lambda entry: entry.name)
+    except OSError as exc:
+        raise Refusal(f"cannot list registry directory {config.control}: {exc}") from exc
+    for entry in top:
+        name = entry.name
+        if name.startswith("EVENTS.") and entry.is_dir(follow_symlinks=False):
+            try:
+                with os.scandir(entry.path) as listing:
+                    children = sorted(listing, key=lambda child: child.name)
+            except OSError as exc:
+                raise Refusal(f"cannot list event log {entry.path}: {exc}") from exc
+            entries.extend(
+                (f"{name}/{child.name}", _registry_entry_identity(child)) for child in children
+            )
+            continue
+        if name.endswith(".lock") or not name.startswith(
+            (*_REGISTRY_IDENTITY_PREFIXES, "EVENTS.")
+        ):
+            continue
+        entries.append((name, _registry_entry_identity(entry)))
+    return _RegistryIdentity(_file_sha256(config.config_path), tuple(entries))
+
+
+def _describe_registry_change(before: _RegistryIdentity, after: _RegistryIdentity) -> str:
+    """Name what changed between two identities, counting event files per log."""
+
+    changes = [] if before.config_sha256 == after.config_sha256 else ["the configuration"]
+    event_files: dict[str, int] = {}
+    for name in before.changed_names(after):
+        log, separator, _file = name.partition("/")
+        if separator:
+            event_files[log] = event_files.get(log, 0) + 1
+        else:
+            changes.append(name)
+    changes.extend(f"{count} file(s) in {log}" for log, count in sorted(event_files.items()))
+    if not changes:
+        return "nothing"
+    shown = ", ".join(changes[:6])
+    return shown if len(changes) <= 6 else f"{shown} (+{len(changes) - 6} more)"
+
+
+class _RegistryBusy(_LockBusy):
+    """Every lock-free validation round of a mutation was overtaken by another writer."""
+
+
+_PreparedFacts = TypeVar("_PreparedFacts")
+_CommitResult = TypeVar("_CommitResult")
+
+
+def _run_prevalidated_mutation(
+    config: Config,
+    wait_seconds: float,
+    command: str,
+    prepare: Callable[[], _PreparedFacts | None],
+    commit: Callable[[_RegistryIdentity | None, _PreparedFacts | None], _CommitResult],
+) -> _CommitResult:
+    """Validate without any lock, then commit under the mutation locks (#1274).
+
+    Each round takes the registry identity, then runs ``prepare``: the global validation and
+    every other fleet-wide read, holding no lock (a read that meets a retirement half-written
+    waits on the shared lock and reads again, as every lock-free reader does). Then it takes
+    the exclusive mutation locks and compares the identity; only when it is unchanged does
+    ``commit(identity, facts)`` run, so every registry fact ``prepare`` gathered still holds.
+    A changed identity releases the locks and starts a new round; after
+    ``REGISTRY_VALIDATION_ATTEMPTS`` rounds the command refuses as busy and writes nothing.
+
+    ``prepare`` returns None when an interrupted mutation's journal is outstanding: the
+    journal recovery that ``_assert_no_journal`` performs needs the exclusive lock, so if the
+    registry is still unchanged under it, ``commit(None, None)`` runs the command's original
+    validation there, exactly as before #1274. A journal a live writer holds disappears when
+    that writer finishes, which changes the identity, so the next round validates lock-free
+    again.
+
+    A refusal raised by ``prepare`` is reported only when the registry held still for that
+    round: one raised while another writer changed it judged a state that no longer exists,
+    and the next round judges the current one (the final round reports it either way).
+
+    ``wait_seconds`` bounds the time spent waiting for the locks over all rounds together; the
+    clock starts at the first wait.
+    """
+
+    lock_deadline: float | None = None
+    change = "nothing"
+    for attempt in range(1, REGISTRY_VALIDATION_ATTEMPTS + 1):
+        identity = _registry_identity(config)
+        try:
+            facts = prepare()
+        except Refusal:
+            if attempt == REGISTRY_VALIDATION_ATTEMPTS:
+                raise
+            current = _registry_identity(config)
+            if current == identity:
+                raise
+            change = _describe_registry_change(identity, current)
+            continue
+        if lock_deadline is None:
+            lock_deadline = time.monotonic() + wait_seconds
+        with _mutation_locks(config, _remaining_lock_wait(lock_deadline)):
+            current = _registry_identity(config)
+            if current == identity:
+                if facts is None:
+                    return commit(None, None)
+                return commit(identity, facts)
+            change = _describe_registry_change(identity, current)
+    raise _RegistryBusy(
+        f"registry is busy: another wrkslots mutation changed it during each of the "
+        f"{REGISTRY_VALIDATION_ATTEMPTS} lock-free validations this {command} ran (last "
+        f"change: {change}). state: REFUSED -- nothing was written, as when the "
+        "configuration lock is busy",
+        remedy=f"retry 'wrkslots {command}' after the other wrkslots mutations exit",
+    )
+
+
+def _assert_registry_change_limited_to_slot(
+    config: Config,
+    reference: _RegistryIdentity | None,
+    before: Mapping[tuple[str, str, str], object],
+    slot: str,
+) -> None:
+    """The post-write check of a mutation: no registry row but ``slot``'s changed.
+
+    ``reference`` is the identity a prevalidated mutation verified under its locks (#1274).
+    Under those locks no other wrkslots writer can commit, and the mutation writes only this
+    machine's ACTIVE and ARCHIVED shards and event log. When those are the only registry
+    entries that differ from the reference, this machine's rows are re-derived from its log
+    (memoized, so only the events written since are read and verified) and every other row
+    is the validated ``before`` row. Any other difference, and every caller without a
+    reference, gets the full re-validation the command always ran.
+    """
+
+    if reference is not None:
+        current = _registry_identity(config)
+        local = {f"ACTIVE.{config.machine}.json", f"ARCHIVED.{config.machine}.json"}
+        events = f"EVENTS.{config.machine}/"
+        if reference.config_sha256 == current.config_sha256 and all(
+            name in local or name.startswith(events)
+            for name in reference.changed_names(current)
+        ):
+            # One replay for both of this machine's views: each load after an append walks the
+            # whole log once, file by file, to confirm the memoized events are unchanged.
+            derived = _states_from_events(config, config.machine)
+            local_active, local_archive = (
+                (_load_active(config), _load_archive(config)) if derived is None else derived
+            )
+            after = {key: value for key, value in before.items() if key[1] != config.machine}
+            after.update(_global_rows((local_active,), (local_archive,)))
+            _assert_only_slot_changed(before, after, slot)
+            return
+    after_states, after_archives = _validate_global_state(config)
+    _assert_only_slot_changed(before, _global_rows(after_states, after_archives), slot)
+
+
 def _pregather_salvage_facts(
     config: Config, slot: str, archive_root: Path | None = None
 ) -> None:
@@ -30854,6 +31095,37 @@ def _cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+@dataclasses.dataclass(frozen=True)
+class _CreatePrevalidated:
+    """What a create's lock-free validation established (#1274).
+
+    ``repositories`` are the source repositories the plan will name, in plan order, as
+    ``_create_plan_repositories`` derives them; ``storage_inconsistencies`` is the
+    fleet-wide storage report computed with them, which a create only prints.
+    """
+
+    states: tuple[ActiveState, ...]
+    archives: tuple[ArchiveState, ...]
+    repositories: tuple[Path, ...]
+    storage_inconsistencies: tuple[StorageInconsistency, ...]
+
+
+def _create_plan_repositories(config: Config, args: argparse.Namespace) -> tuple[Path, ...]:
+    """The source repositories ``_create_plan`` will name, in its order, without its Git work.
+
+    The plan itself (branch checks, the remote fetch, the start point) stays under the
+    configuration lock; the lock-free storage report needs only these paths. Under the lock
+    the plan's own repositories are compared with them, and a difference recomputes the
+    report there.
+    """
+
+    repositories = _assignments(args.repo, "repository")
+    return tuple(
+        _stored_repository_path(config, _repository_path(config, raw)[0])[1]
+        for _name, raw in sorted(repositories.items())
+    )
+
+
 def _create_plan(config: Config, args: argparse.Namespace, vcs: _GitVcs) -> tuple[PlannedCheckout, ...]:
     repositories = _assignments(args.repo, "repository")
     remotes = _assignments(args.remote, "remote")
@@ -31946,7 +32218,28 @@ def _cmd_create(args: argparse.Namespace) -> int:
     coordinator_lease = _read_process_identity(args.coordinator_pid)
     _assert_create_owner_authorized(owner, coordinator_lease)
     vcs = _GitVcs()
-    with _mutation_locks(config, args.wait_lock):
+
+    def prepare() -> _CreatePrevalidated | None:
+        # Lock-free (#1274). An outstanding journal -- an interrupted mutation's, a live
+        # writer's, or a validation batch's seal -- needs the recovery and classification
+        # that only the locked path performs, so that round defers to it.
+        if _outstanding_journals(config) or _validate_batch_seal_journals(config):
+            return None
+        states, archives = _validate_global_state(config)
+        _assert_agent_and_slot_free(config, args.slot, args.agent, args.slot_type)
+        repositories = _create_plan_repositories(config, args)
+        return _CreatePrevalidated(
+            states=tuple(states),
+            archives=tuple(archives),
+            repositories=repositories,
+            storage_inconsistencies=_registry_storage_inconsistencies(
+                config, states, additional_repositories=repositories
+            ),
+        )
+
+    def commit(
+        reference: _RegistryIdentity | None, prepared: _CreatePrevalidated | None
+    ) -> tuple[ActiveRecord, tuple[StorageInconsistency, ...]]:
         _assert_create_processes(
             owner, coordinator_lease, stage="before create mutation"
         )
@@ -31956,37 +32249,47 @@ def _cmd_create(args: argparse.Namespace) -> int:
         # outage. The disjointness check below still rejects reuse or overlap
         # with every sealed path before this create writes anything.
         _refuse_partial_state(config, allow_validate_batch_seals=True)
-        _recover_orphaned_validate_batch_seal(config)
-        _recover_dead_actor_journals(config)
-        states, archives, absent_batch_paths, absent_batch_slots = (
-            _validate_global_state_beside_absent_batch(config)
-        )
-        _assert_not_in_absent_batch(args.slot, absent_batch_slots)
-        paired_finish_path = _validate_batch_paired_finish_path(config)
-        cleanup_exclusions = (
-            frozenset({paired_finish_path})
-            if paired_finish_path is not None
-            else frozenset()
-        ) | absent_batch_paths
-        interrupted_creates = _classify_create_journals(
-            config,
-            states,
-            archives,
-            excluded_paths=cleanup_exclusions,
-            requested_slot=args.slot,
-            requested_slot_type=args.slot_type,
-        )
-        _assert_interrupted_creates_unrelated(
-            config,
-            interrupted_creates,
-            slot=args.slot,
-            agent=args.agent,
-            slot_type=args.slot_type,
-        )
+        interrupted_creates: tuple[_CreateJournalClassification, ...] = ()
+        paired_finish_path: Path | None = None
+        cleanup_exclusions: frozenset[Path] = frozenset()
+        if prepared is None:
+            _recover_orphaned_validate_batch_seal(config)
+            _recover_dead_actor_journals(config)
+            states, archives, absent_batch_paths, absent_batch_slots = (
+                _validate_global_state_beside_absent_batch(config)
+            )
+            _assert_not_in_absent_batch(args.slot, absent_batch_slots)
+            paired_finish_path = _validate_batch_paired_finish_path(config)
+            cleanup_exclusions = (
+                frozenset({paired_finish_path})
+                if paired_finish_path is not None
+                else frozenset()
+            ) | absent_batch_paths
+            interrupted_creates = _classify_create_journals(
+                config,
+                states,
+                archives,
+                excluded_paths=cleanup_exclusions,
+                requested_slot=args.slot,
+                requested_slot_type=args.slot_type,
+            )
+            _assert_interrupted_creates_unrelated(
+                config,
+                interrupted_creates,
+                slot=args.slot,
+                agent=args.agent,
+                slot_type=args.slot_type,
+            )
+        else:
+            # Validated lock-free and still current (#1274): no journal, seal or interrupted
+            # batch was outstanding then, so none is recovered, excluded or classified now,
+            # and the slot and agent were free.
+            states, archives = list(prepared.states), list(prepared.archives)
         before = _global_rows(states, archives)
         _ensure_state_shard(config)
         state = _load_active(config)
-        _assert_agent_and_slot_free(config, args.slot, args.agent, args.slot_type)
+        if prepared is None:
+            _assert_agent_and_slot_free(config, args.slot, args.agent, args.slot_type)
         _assert_create_disk_space(config, args.override_disk_floor)
         slot_path = _slot_directory(config, args.slot, args.slot_type)
         if slot_path.exists() or slot_path.is_symlink():
@@ -32010,32 +32313,37 @@ def _cmd_create(args: argparse.Namespace) -> int:
             _stored_repository_path(config, item.repository)[1] for item in plan
         )
         _assert_git_identity_supported(config, plan_repositories, vcs)
-        storage_inconsistencies = _registry_storage_inconsistencies(
-            config, states, additional_repositories=plan_repositories
+        storage_inconsistencies = (
+            prepared.storage_inconsistencies
+            if prepared is not None and prepared.repositories == plan_repositories
+            else _registry_storage_inconsistencies(
+                config, states, additional_repositories=plan_repositories
+            )
         )
         _assert_create_target_clear(
             config, states, args.slot, args.slot_type, plan, vcs
         )
-        interrupted_creates = _classify_create_journals(
-            config,
-            states,
-            archives,
-            excluded_paths=cleanup_exclusions,
-            requested_slot=args.slot,
-            requested_slot_type=args.slot_type,
-        )
-        if _validate_batch_paired_finish_path(config) != paired_finish_path:
-            raise Refusal(
-                "private validation finish changed while create was prepared"
+        if prepared is None:
+            interrupted_creates = _classify_create_journals(
+                config,
+                states,
+                archives,
+                excluded_paths=cleanup_exclusions,
+                requested_slot=args.slot,
+                requested_slot_type=args.slot_type,
             )
-        _assert_interrupted_creates_unrelated(
-            config,
-            interrupted_creates,
-            slot=args.slot,
-            agent=args.agent,
-            slot_type=args.slot_type,
-            plan=plan,
-        )
+            if _validate_batch_paired_finish_path(config) != paired_finish_path:
+                raise Refusal(
+                    "private validation finish changed while create was prepared"
+                )
+            _assert_interrupted_creates_unrelated(
+                config,
+                interrupted_creates,
+                slot=args.slot,
+                agent=args.agent,
+                slot_type=args.slot_type,
+                plan=plan,
+            )
         _warn_retained_storage_inconsistencies(storage_inconsistencies)
         slot_path.parent.mkdir(parents=True, exist_ok=True)
         created_at = _utc_now()
@@ -32232,14 +32540,22 @@ def _cmd_create(args: argparse.Namespace) -> int:
             event_writer=event_writer,
             journal_path=journal_path,
         )
-        after_states, after_archives, _paths, _slots = (
-            _validate_global_state_beside_absent_batch(config, announce=False)
-        )
-        _assert_only_slot_changed(
-            before,
-            _global_rows(after_states, after_archives),
-            args.slot,
-        )
+        if prepared is None:
+            after_states, after_archives, _paths, _slots = (
+                _validate_global_state_beside_absent_batch(config, announce=False)
+            )
+            _assert_only_slot_changed(
+                before,
+                _global_rows(after_states, after_archives),
+                args.slot,
+            )
+        else:
+            _assert_registry_change_limited_to_slot(config, reference, before, args.slot)
+        return record, storage_inconsistencies
+
+    record, storage_inconsistencies = _run_prevalidated_mutation(
+        config, args.wait_lock, "create", prepare, commit
+    )
     # The slot is registered and every checkout is materialized, including the
     # post-provision hooks' submodules; installers run outside the lock and
     # cannot undo or fail the creation.
@@ -33237,12 +33553,31 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
     _validate_agent_name(args.agent)
     owner = _capture_caller_process(args.owner_pid, "owner")
     task_scope = _task_scope_from_args(args, owner)
-    with _mutation_locks(config, args.wait_lock):
-        _refuse_partial_state(config)
-        _assert_no_journal(config)
+
+    def validate() -> dict[tuple[str, str, str], object]:
+        """The fleet-wide validation; returns the global rows it validated."""
+
         states, archives = _validate_global_state(config)
         _assert_command_registry_storage(config, states, args)
-        before = _global_rows(states, archives)
+        return _global_rows(states, archives)
+
+    def prepare() -> dict[tuple[str, str, str], object] | None:
+        # Lock-free (#1274). An outstanding journal needs the recovery that only the locked
+        # path performs, so that round defers to it.
+        if _outstanding_journals(config):
+            return None
+        return validate()
+
+    def commit(
+        reference: _RegistryIdentity | None,
+        prepared: dict[tuple[str, str, str], object] | None,
+    ) -> ActiveRecord | None:
+        _refuse_partial_state(config)
+        if prepared is None:
+            _assert_no_journal(config)
+            before = validate()
+        else:
+            before = prepared
         state = _load_active(config)
         record = _find_record(state, args.slot)
         _expected_generation(record, args.expected_generation)
@@ -33257,13 +33592,18 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
                 f"already adopted slot={record.slot} agent={record.agent} "
                 f"generation={record.generation}"
             )
-            return 0
+            return None
         if record.owner is not None and record.owner != owner:
             state_name, detail = _process_state(record.owner)
             raise Refusal(
                 f"slot {record.slot} already has a {state_name} historical owner: {detail}; "
                 "ordinary adopt cannot replace it"
             )
+        if reference is not None:
+            # The registry is exactly as validated, but this slot's storage is not registry
+            # state, so it is re-checked here, for this one record, as the locked
+            # validation used to check it.
+            _assert_target_record_storage_consistent(config, (state,), record)
         confirmed_owner = _read_process_identity(owner.pid)
         if confirmed_owner != owner:
             raise Refusal("owner process generation changed during adopt")
@@ -33284,12 +33624,12 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
             slot=adopted.slot,
             evidence={"owner": _identity_to_obj(owner)},
         )
-        after_states, after_archives = _validate_global_state(config)
-        _assert_only_slot_changed(
-            before,
-            _global_rows(after_states, after_archives),
-            args.slot,
-        )
+        _assert_registry_change_limited_to_slot(config, reference, before, args.slot)
+        return adopted
+
+    adopted = _run_prevalidated_mutation(config, args.wait_lock, "adopt", prepare, commit)
+    if adopted is None:
+        return 0
     print(
         f"adopted slot={adopted.slot} agent={adopted.agent} generation={adopted.generation} "
         f"owner_pid={owner.pid}"

@@ -442,6 +442,7 @@
         "py/wrkslots/tests/test_owner_transfer.py",
         "py/wrkslots/tests/test_ownerless_clone.py",
         "py/wrkslots/tests/test_pair_state_rust.py",
+        "py/wrkslots/tests/test_prevalidated_mutation.py",
         "py/wrkslots/tests/test_proc_status.py",
         "py/wrkslots/tests/test_quarantine_journal_rust.py",
         "py/wrkslots/tests/test_read_handoff_write_rust.py",

@@ -41,7 +41,8 @@ from typing import NoReturn, cast
 import pytest
 
 
-PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+# Annotated: orphan_retire_cases reads it across an import cycle, which mypy may check first.
+PACKAGE_ROOT: Path = Path(__file__).resolve().parents[1]
 PY_ROOT = PACKAGE_ROOT.parent
 WRKSLOTS = PACKAGE_ROOT / "__main__.py"
 COMPATIBILITY_COMMAND = PY_ROOT / "wrkslots.py"
