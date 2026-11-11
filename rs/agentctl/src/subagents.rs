@@ -13740,10 +13740,19 @@ its drain would also type, so it was not queued",
             || fs::canonicalize(&info.cwd)
                 .ok()
                 .is_some_and(|cwd| Some(cwd) == fs::canonicalize(&record.cwd).ok());
+        // A pane another agent name now claims is a replacement
+        // harness, not this failed launch: never close it (the
+        // herdr-agent differential's failed-launch-replacement case).
+        let claimed_elsewhere = self
+            .client
+            .agent_names()?
+            .iter()
+            .any(|(name, owner)| owner == pane && name != &record.name);
         Ok(info.pane_id == pane
             && Some(&info.workspace_id) == record.workspace_id.as_ref()
             && cwd_matches
             && info.agent.as_deref() == Some(&record.harness)
+            && !claimed_elsewhere
             && (record.custom_process_identity.is_none()
                 || self.client.pane_is_idle_shell(pane)?))
     }

@@ -805,6 +805,44 @@ fn stop_closes_a_launch_failed_pane_whose_name_was_never_applied() {
 }
 
 #[test]
+fn stop_refuses_a_launch_failed_pane_claimed_by_a_replacement_name() {
+    // The differential's replacement case: the recorded pane now
+    // belongs to another agent name, so stop must not close it.
+    let fixture = Fixture::new();
+    fixture.start(None);
+    let mut record = fixture.manager().load("worker").unwrap();
+    record.lifecycle = "launch_failed".to_owned();
+    record.error = Some("timed out waiting for agent startup".to_owned());
+    record.pane_reported_by_agentctl = true;
+    let pane = record.pane_id.clone().unwrap();
+    fixture.manager().save(&record).unwrap();
+    fixture
+        .client
+        .agent_get_missing
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    fixture
+        .client
+        .custom_alive
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    fixture
+        .client
+        .herdr_names
+        .lock()
+        .unwrap()
+        .insert("replacement".to_owned(), pane.clone());
+    let error = fixture.manager().stop("worker").unwrap_err().to_string();
+    assert!(
+        error.contains("not found") || error.contains("unavailable"),
+        "{error}"
+    );
+    assert!(
+        fixture.client.closed.lock().unwrap().is_empty(),
+        "the replacement pane must not be closed"
+    );
+    assert!(fixture.manager().load("worker").is_ok());
+}
+
+#[test]
 fn deliver_while_working_queues_behind_a_working_claude_behind_a_root_slot_relay() {
     let (fixture, _) = relay_worker_of("claude");
     *fixture.client.relay_verdict.lock().unwrap() =
