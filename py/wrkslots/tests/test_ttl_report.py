@@ -72,7 +72,7 @@ def test_thresholds_must_not_decrease() -> None:
 
 def _report(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *extra: str
-) -> tuple[int, str]:
+) -> tuple[int, cli.Config]:
     config = _config(tmp_path)
     state = cli.ActiveState(
         machine="testhost",

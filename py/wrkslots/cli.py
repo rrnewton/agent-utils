@@ -24375,6 +24375,27 @@ def _ttl_stage(
     return "current"
 
 
+class _TtlCheckoutRow(TypedDict):
+    name: str
+    branch: str
+    remote: str
+    rescue_ref: str
+    bundle: str
+
+
+class _TtlReportRow(TypedDict):
+    slot: str
+    agent: str
+    stage: str
+    next_action: str
+    heartbeat_at: str
+    heartbeat_ttl_seconds: int
+    expired_at: str
+    overdue_seconds: int
+    teardown_at: str
+    checkouts: list[_TtlCheckoutRow]
+
+
 def _ttl_report_rows(
     config: Config,
     state: ActiveState,
@@ -24383,14 +24404,14 @@ def _ttl_report_rows(
     *,
     only_overdue: bool = False,
     slot: str | None = None,
-) -> list[dict[str, object]]:
+) -> list[_TtlReportRow]:
     """One dry-run row per slot: stage, rescue refs, bundle, teardown time.
 
     Read-only planning for #1293: it names what rescue and teardown would
     do without running Git, writing a bundle, or touching any slot.
     """
     rescue_date = now.astimezone(dt.timezone.utc).strftime("%Y%m%d")
-    rows: list[dict[str, object]] = []
+    rows: list[_TtlReportRow] = []
     for record in sorted(state.slots, key=lambda item: item.slot):
         if slot is not None and record.slot != slot:
             continue
@@ -24435,7 +24456,7 @@ def _ttl_report_rows(
 
 
 def _ttl_health_lines(
-    rows: list[dict[str, object]], thresholds: TtlThresholds
+    rows: list[_TtlReportRow], thresholds: TtlThresholds
 ) -> list[str]:
     """Tick-hub HEALTH lines for the ladder (#1293 slice 2).
 
@@ -24505,7 +24526,7 @@ def _cmd_ttl_report(args: argparse.Namespace) -> int:
                 f"expired_at={row['expired_at']} teardown_at={row['teardown_at']} "
                 f"next={row['next_action']}"
             )
-            for checkout in row["checkouts"]:  # type: ignore[union-attr]
+            for checkout in row["checkouts"]:
                 print(
                     f"  rescue {checkout['name']} {checkout['rescue_ref']} "
                     f"bundle {checkout['bundle']}"
