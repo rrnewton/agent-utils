@@ -1,6 +1,6 @@
 ---
 title: 'doc-back-side-thread-hidden: Back from a side-column document restores the side thread'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: mu-docread2
@@ -32,3 +32,7 @@ The coordinator assigned this number from the devbig014 block and directed a fix
 # Notes
 
 Coordinator-assigned from the devbig014 ledger block after the #1326 doc-link-bare-url probe observation. Filed by mu-docread2 before implementation; the fix lands alone as landing D. Related: #1326 doc-link-bare-url (the investigation that surfaced this), #1327 doc-reader-kind-header, #1328 doc-heading-size, #1330 doc-read-highlight.
+
+## Resolution
+
+[watermelon-full-preview] Landed in 3a44b437. Root cause: jumpToDocumentLink opened the document in the tapped column, so in the right column showView("docs") hid #side-pane instead of the channel pane, and Back (left column) never restored it. The document jump now opens in the main column, like the message jump already did, with the return spot still taken in the tapped column. Proof: in_app_links browser walk desk step (side thread's document opened, Back restored the thread visibly; failing before with the side pane display:none and 0 boxes), phone walk unchanged; owner gate green (150 passed). Unverified: browser-gesture Back was not separately walked (same return path).

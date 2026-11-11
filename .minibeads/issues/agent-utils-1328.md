@@ -1,6 +1,6 @@
 ---
 title: 'doc-heading-size: bigger h1 to h3 headings in the document reader'
-status: open
+status: closed
 priority: 0
 issue_type: task
 assignee: mu-docread2
@@ -32,3 +32,7 @@ Document reader headings (h1 to h3) currently read too close to body size to sca
 # Notes
 
 Owner reply 384, fast-track. Filed by mu-docread2 before implementation; lands with #1327 doc-reader-kind-header as landing B. Siblings filed together: #1326 doc-link-bare-url, #1327 doc-reader-kind-header, #1330 doc-read-highlight.
+
+## Resolution
+
+[watermelon-full-preview] Landed in 3c7eb1b1 with #1327 doc-reader-kind-header. Reader #doc-body h1/h2/h3 are now 1.8/1.5/1.3em at weight 650, line-height 1.25 (a document scale above the message column's 1.25/1.16/1.08em, whose weight and line-height they keep); before, reader h1 fell to the shell's global 1.1rem, below its own h2. Proof: documents_layout browser walk holds heading order and size floors at 393x852 and 1280x800; owner gate green, combined tree re-verified after rebase.

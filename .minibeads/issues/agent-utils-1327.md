@@ -1,6 +1,6 @@
 ---
 title: 'doc-reader-kind-header: the document reader header shows the document type and repo'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 assignee: mu-docread2
@@ -33,3 +33,7 @@ Today the reader header does not say what kind of document is open, so a minibea
 # Notes
 
 Owner reply 383, fast-track. Filed by mu-docread2 before implementation; lands with #1328 doc-heading-size as landing B. Siblings filed together: #1326 doc-link-bare-url, #1328 doc-heading-size, #1330 doc-read-highlight.
+
+## Resolution
+
+[watermelon-full-preview] Landed in 3c7eb1b1 with #1328 doc-heading-size. The reader header now names the open document's kind via pure documentKindLabel in reader.ts: Minibeads issue #<n> with status for github_issue (.minibeads/issues files, never "GitHub issue"), GitHub markdown, GitHub file, Gist, Paste, Google Doc, each with owner/repo only from a strict github.com URL; unknown kinds label nothing, and every open clears the label first so no stale kind survives. Proof: exhaustive documents.test.mjs cases plus documents_buckets and documents_layout browser walks at 393x852 and 1280x800; owner gate green, combined tree re-verified after rebase. Unverified in a browser walk: Gist, GitHub file, and Google Doc labels (unit-tested only; no existing walk seeds those kinds).

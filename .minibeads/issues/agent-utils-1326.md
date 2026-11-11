@@ -1,6 +1,6 @@
 ---
 title: 'doc-link-bare-url: a bare GitHub markdown URL in a thread reply opens in document view'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: mu-docread2
@@ -34,3 +34,7 @@ Repro (Slack thread C0CC755QYSK, thread ts 1794413584.924419, reply message 1794
 # Notes
 
 Owner reply 382, fast-track. Filed by mu-docread2 before implementation; the fix lands alone as landing A. Siblings filed together: #1327 doc-reader-kind-header, #1328 doc-heading-size, #1330 doc-read-highlight.
+
+## Resolution
+
+[watermelon-full-preview] Landed in 14bdac82. The owner's exact failure did not reproduce on current code: the live reply renders both links dot-free with correct data-doc keys, both documents fetch 200, page wiring opens them in every harness, and the 2026-11-11 access log shows the owner's clicks that session never reached reader.open (no document GET for either key). The likely cause is a long-lived tab across that morning's releases; this is unverified (no client error reporting exists to confirm it), and the owner is asked to retest after the deploy — a recurrence is a new issue. One proven defect on the traced path is fixed: the sanitizer now allows data-doc (like data-msg), so mark_restated no longer strips document marks and headed bodies keep their heading. The exact shape is pinned by render tests (Slack bullet, bare URL plus sentence dot, parenthesised control) and the page links suite (plain tap opens the reader, Ctrl/Cmd still leaves). Gate evidence: full gate 160 passed with sole red approval-card-phone-help-browser (untouched), which passes solo on the exact tree.

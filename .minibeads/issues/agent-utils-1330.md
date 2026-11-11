@@ -1,6 +1,6 @@
 ---
 title: 'doc-read-highlight: highlight the block being read in the document reader and keep it in view'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 assignee: mu-docread2
@@ -33,3 +33,7 @@ Since #1039 documents-read-parity (landed 5484c9bd and 85501d44), the reader rea
 # Notes
 
 Owner reply 385, fast-track. Filed by mu-docread2 before implementation; the fix lands alone as landing C. Siblings filed together: #1326 doc-link-bare-url, #1327 doc-reader-kind-header, #1328 doc-heading-size.
+
+## Resolution
+
+[watermelon-full-preview] Landed in 125c0bf2. The shared read-aloud owner now reports a document read's block (onReadingBlock on its payload, fired at the same boundaries as the message light and cleared on stop/finish/failure); the reader lights that block in #doc-body with the message light's data-reading-block attribute and dress, and follows it into view. Blocks are found words-first in document order with the owner's drawn-element index as fallback; out of range lights nothing. Proof: documents_read browser walk at 393x852 and 1280x800 (lit, moved by Next/media/jump/Prev, followed, cleared) on device and cloud voices, message read walks unchanged; full re-gate after the reader.ts conflict resolution over #1327 was green (161 passed). Limits: cloud pieces inside one drawn block light the whole block (as messages do), and sentence-level light for documents remains off by existing design.
