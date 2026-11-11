@@ -1486,6 +1486,11 @@ pub async fn voice_session(
     );
     let mut session: VoiceSession = session?;
     session.agent_prompt = agent_prompt;
+    // `#1303 voice-transcript-share`. Every call gets a server-minted conversation id,
+    // beside the relay ticket this same call mints below: a backend that names no
+    // conversation (the relayed `vibe-talk-v1` bridge) must still have every turn filed
+    // under one stable id, on every device.
+    session.conversation_id = Some(crate::conversation::mint_conversation_id());
     // `#553 voice-ws-relay-auth`. A relayed bridge is opened through this server, on a ticket that
     // stands in for the bearer token a browser cannot put on a WebSocket.
     if session.protocol == "vibe-talk-v1" && state.config.conversation.relay_upstream.is_some() {

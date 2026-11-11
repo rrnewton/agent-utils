@@ -50,6 +50,37 @@ pub struct VoiceSession {
     /// its sessions carry none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_prompt: Option<crate::contract::SessionPrompt>,
+    /// The conversation this call's transcript belongs to, minted by THIS server per
+    /// voice-session call (`#1303 voice-transcript-share`).
+    ///
+    /// A backend that names its own conversation (a hosted vendor's initiation frame) still
+    /// wins on the page; a backend that names none — the deployment-managed `vibe-talk-v1`
+    /// bridge behind the relay — leaves the page inventing a local id, and a page whose
+    /// recording had failed once then filed nothing for the rest of its life. A server-minted
+    /// id is stable for the call, known before the socket opens, and the same on every device
+    /// that later reads the stored record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+}
+
+/// Mint one conversation id for one call: `call-` plus 128 bits from the system CSPRNG,
+/// base64url-unpadded, so it passes [`crate::store::ConversationId::parse`] as it stands.
+/// `#1303 voice-transcript-share`.
+///
+/// # Panics
+///
+/// Panics when the system CSPRNG is unavailable, as the ticket mint does: an id must not
+/// fall back to something guessable or repeatable.
+#[must_use]
+pub fn mint_conversation_id() -> String {
+    use base64::Engine as _;
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes)
+        .expect("the system CSPRNG must be available to mint a conversation id");
+    format!(
+        "call-{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    )
 }
 
 /// Why a voice session could not be opened.
@@ -137,6 +168,7 @@ impl ConversationalVoiceProvider for ElevenLabsConversationProvider {
             input_sample_rate: 16_000,
             output_sample_rate: 16_000,
             agent_prompt: None,
+            conversation_id: None,
         })
     }
 }
@@ -185,6 +217,7 @@ impl ConversationalVoiceProvider for WebSocketConversationProvider {
             input_sample_rate: 24_000,
             output_sample_rate: 24_000,
             agent_prompt: None,
+            conversation_id: None,
         })
     }
 }
@@ -244,6 +277,7 @@ impl ConversationalVoiceProvider for S2sConversationProvider {
             input_sample_rate: 24_000,
             output_sample_rate: 24_000,
             agent_prompt: None,
+            conversation_id: None,
         })
     }
 }
@@ -322,6 +356,20 @@ mod tests {
             explicit_send_only: true,
             ..ConversationConfig::default()
         }
+    }
+
+    /// `#1303 voice-transcript-share`. A minted id is fit to file turns under at once:
+    /// it parses as a conversation id, and two calls never share one.
+    #[test]
+    fn a_minted_conversation_id_parses_and_never_repeats() {
+        let first = mint_conversation_id();
+        let second = mint_conversation_id();
+        assert!(first.starts_with("call-"), "{first}");
+        assert!(
+            crate::store::ConversationId::parse(&first).is_ok(),
+            "{first}"
+        );
+        assert_ne!(first, second, "two calls, two conversations");
     }
 
     /// `#209 voice-socket-open`. The misconfiguration that kept every call on one host from

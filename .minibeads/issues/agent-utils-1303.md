@@ -1,12 +1,13 @@
 ---
 title: 'voice-transcript-share: persist every voice call server-side and share one transcript across devices'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - vibe-talk
 created_at: 2026-11-11T15:08:15+00:00
 updated_at: 2026-11-11T15:08:15+00:00
+closed_at: 2026-11-11T15:08:15+00:00
 ---
 
 # Description
@@ -33,3 +34,11 @@ Liaison evidence from the vibe-talk server log on the serving host (2026-11-10 a
 # Notes
 
 P0 owner tier, FAST-TRACK. Owner reply 362. Filed by mu-xdevtx before implementation; the fix lands separately on mu-xdevtx/transcript-share.
+
+## Resolution
+
+[watermelon-full-preview] Root cause confirmed from the serving host's log (`~/.local/state/vibe-talk-slack/app.log`): 2026-11-10/11 shows 14 voice-socket calls and 3 turn POSTs, including a real 25 s call (1,041 client frames) on 2026-11-10 with zero POSTs. The relayed `vibe-talk-v1` stack does mint a page-local id at socket open, so the missing-id suspect alone does not explain it: in `web/src/view/voice/transcript.ts`, `recordTurn` set `recordingBroken = true` on ANY failed POST and both record paths then silently dropped every later turn for the rest of the page's life — one transient failure in a long-lived PWA page disabled recording on every later call until reload.
+
+Delivered in the closing commit: (1) the server mints `conversation_id` on every `GET /api/v1/voice-session` (`conversation::mint_conversation_id`, beside the relay ticket), the contract is regenerated, and the page files `vibe-talk-v1` turns under the server-minted id, falling back to a local id only with an older server; a hosted vendor's own id still wins. (2) No permanent not-recording state: a transient POST (no answer, or 5xx) is retried at once, the turn is kept and flushed in order ahead of the next turn and at call end; `recordingBroken` now only names an in-progress outage. (3) Cross-device pickup: `refreshStoredConversation` fetches the newest stored page on visibility/focus, appending only turns this page has not seen (identity: conversation, server stamp, speaker, text), so two devices share one transcript without duplicates. Live push through an event stream was not cheap — no transcript event stream exists — so pickup is on open/focus, as the criteria allow.
+
+Tests: Rust unit test for minting, `voice_relay` integration test (two calls mint distinct ids; a turn filed under a minted id reads back), contract tests, and three page tests (transient-failure retry and in-order flush; server-minted id filing; cross-device pickup without duplication, driven through two pages on one store — the two-context browser walk's equivalent at the page layer; a real-browser two-context walk was not run). Unverified: no live call on the deployed server was made from this lane; the coordinator deploys and the owner's next call is the live proof.

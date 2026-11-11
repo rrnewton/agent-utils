@@ -1432,6 +1432,76 @@ test("`#270 voice-transcript-markers`: a call whose words a broken store would n
     "the next call was sent an older call's recap, not the one above it");
 });
 
+test("`#1303 voice-transcript-share`: a transient store failure is retried and never stops recording for the page's life", async () => {
+  const page = newPage();
+  const socket = await recordingCall(page, "conv_retry");
+  // The store is down for one turn, then answers again.
+  page.storeStatus = 503;
+  socket.onmessage({ data: JSON.stringify({ type: "agent_response", agent_response_event: { agent_response: "said while the store was down" } }) });
+  await watchTurns(page);
+  assert.match(page.el("storage-state").textContent, /Not recording yet/);
+  page.storeStatus = null;
+  socket.onmessage({ data: JSON.stringify({ type: "agent_response", agent_response_event: { agent_response: "said after it came back" } }) });
+  await watchTurns(page);
+  const stored = [...page.storedTurns.get("conv_retry") || []].map((turn) => turn.text);
+  assert.ok(stored.includes("said while the store was down"), `the turn from the outage was never filed: ${stored}`);
+  assert.ok(stored.includes("said after it came back"), `recording stayed off after a transient failure: ${stored}`);
+  assert.ok(
+    stored.indexOf("said while the store was down") < stored.indexOf("said after it came back"),
+    `the kept turn was filed out of order: ${stored}`
+  );
+});
+
+test("`#1303 voice-transcript-share`: a vibe-talk-v1 call files its turns under the conversation id the server minted", async () => {
+  const page = newPage();
+  page.transcriptRecordsSupported = true;
+  await signIn(page);
+  page.setFetch(async () => json(200, {
+    websocket_url: "wss://example.invalid/private-voice",
+    protocol: "vibe-talk-v1",
+    provider: "Voice bridge",
+    input_sample_rate: 24000,
+    output_sample_rate: 24000,
+    conversation_id: "call-fromserver00000001",
+  }));
+  await page.el("talk").click();
+  await page.settle();
+  const socket = page.sockets.at(-1);
+  socket.onopen();
+  socket.onmessage({ data: JSON.stringify({ type: "session_started", greeting: false }) });
+  await page.settle();
+  speech(socket, "user", 1, "hello from the phone", true);
+  turnDone(socket, 1);
+  await watchTurns(page);
+  const stored = [...page.storedTurns.get("call-fromserver00000001") || []].map((turn) => turn.text);
+  assert.ok(stored.includes("hello from the phone"), `nothing was filed under the server-minted id: ${[...page.storedTurns.keys()]}`);
+});
+
+test("`#1303 voice-transcript-share`: an open page picks up turns recorded on another device when it is opened again", async () => {
+  const phone = newPage();
+  const socket = await recordingCall(phone, "conv_shared");
+  socket.onmessage({ data: JSON.stringify({ type: "agent_response", agent_response_event: { agent_response: "said on the phone" } }) });
+  await watchTurns(phone);
+
+  const desktop = await reloadOf(phone);
+  assert.match(desktop.renderedText(), /said on the phone/);
+
+  // The phone records more while the desktop page stays open.
+  const held = desktop.storedTurns.get("conv_shared");
+  held.push({ speaker: "agent", text: "said later on the phone", at_ms: desktop.storeStamp("conv_shared", "agent") });
+  await desktop.setVisibility("hidden");
+  await desktop.setVisibility("visible");
+  await desktop.settle();
+  assert.match(desktop.renderedText(), /said later on the phone/, "the open page never picked up the other device's turn");
+  // And never twice.
+  await desktop.setVisibility("hidden");
+  await desktop.setVisibility("visible");
+  await desktop.settle();
+  const drawn = desktop.el("transcript").children.filter((li) =>
+    li.descendants().some((node) => node.className === "body" && node.textContent === "said later on the phone"));
+  assert.equal(drawn.length, 1, "the picked-up turn was drawn twice");
+});
+
 test("`#270 voice-transcript-markers`: the line above a call says what recap it was sent, beside how the call before ended", async () => {
   const resume = sourceStringTable("RESUME_SEAM_DETAILS");
   const page = newPage();

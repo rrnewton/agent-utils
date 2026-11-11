@@ -1952,6 +1952,7 @@
   ],
   "VoiceSession": [
     {
+      "conversation_id": "call-mintedbysession00001",
       "input_sample_rate": 16000,
       "output_sample_rate": 24000,
       "protocol": "vibe-talk-v1",

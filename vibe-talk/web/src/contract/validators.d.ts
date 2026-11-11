@@ -2649,6 +2649,18 @@ export interface VoiceSession {
    */
   agent_prompt?: SessionPrompt | null;
   /**
+   * The conversation this call's transcript belongs to, minted by THIS server per
+   * voice-session call (`#1303 voice-transcript-share`).
+   *
+   * A backend that names its own conversation (a hosted vendor's initiation frame) still
+   * wins on the page; a backend that names none — the deployment-managed `vibe-talk-v1`
+   * bridge behind the relay — leaves the page inventing a local id, and a page whose
+   * recording had failed once then filed nothing for the rest of its life. A server-minted
+   * id is stable for the call, known before the socket opens, and the same on every device
+   * that later reads the stored record.
+   */
+  conversation_id?: string | null;
+  /**
    * Microphone PCM sample rate expected by the provider.
    */
   input_sample_rate: number;

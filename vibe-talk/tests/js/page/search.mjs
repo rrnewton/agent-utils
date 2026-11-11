@@ -473,11 +473,11 @@ test("A STORE THAT IS DOWN NEVER INTERRUPTS THE CALL", async () => {
 
   assert.equal(state(page), "live", "a failing store hung up the call");
   assert.equal(page.el("error").hidden, true, `the store raised an error panel: ${page.el("error").textContent}`);
-  assert.equal(
-    page.storeCalls.filter((c) => c.startsWith("POST")).length,
-    1,
-    `the page kept retrying a store it already knows is broken: ${page.storeCalls.join(", ")}`
-  );
+  // `#1303 voice-transcript-share`: retrying is the point — one failure must not lose the
+  // rest of the call — but it is bounded per turn, never a request per frame for ever.
+  const posts = page.storeCalls.filter((c) => c.startsWith("POST")).length;
+  assert.ok(posts > 1, `a transient failure was never retried: ${page.storeCalls.join(", ")}`);
+  assert.ok(posts <= 20, `the page retried a broken store without bound: ${page.storeCalls.join(", ")}`);
   assert.match(
     page.el("storage-state").textContent,
     /Not recording/,

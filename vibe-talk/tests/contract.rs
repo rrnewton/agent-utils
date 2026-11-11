@@ -500,6 +500,7 @@ fn samples() -> Value {
                 input_sample_rate: 16_000,
                 output_sample_rate: 24_000,
                 agent_prompt: None,
+                conversation_id: Some("call-mintedbysession00001".into()),
             }),
             to(&VoiceSession {
                 websocket_url: "wss://voice.example/session".into(),
@@ -509,6 +510,7 @@ fn samples() -> Value {
                 input_sample_rate: 16_000,
                 output_sample_rate: 24_000,
                 agent_prompt: None,
+                conversation_id: None,
             }),
             // `#272 voice-agent-instructions`: a hosted agent handed the owner's words each of the
             // three ways, with what its configuration said present and absent.
@@ -526,6 +528,7 @@ fn samples() -> Value {
                     instructions_applied: true,
                     override_allowed: Some(true),
                 }),
+                conversation_id: None,
             }),
             to(&VoiceSession {
                 websocket_url: "wss://voice.example/session".into(),
@@ -541,6 +544,7 @@ fn samples() -> Value {
                     instructions_applied: true,
                     override_allowed: None,
                 }),
+                conversation_id: None,
             }),
             to(&VoiceSession {
                 websocket_url: "wss://voice.example/session".into(),
@@ -556,6 +560,7 @@ fn samples() -> Value {
                     instructions_applied: false,
                     override_allowed: Some(false),
                 }),
+                conversation_id: None,
             }),
         ],
         "PendingPostResponse": [

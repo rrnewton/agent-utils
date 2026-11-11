@@ -3440,6 +3440,13 @@
           ],
           "description": "The owner's words for the agent, for the page to hand over as the socket opens. `#272\nvoice-agent-instructions`.\n\nFilled in by `GET /api/v1/voice-session` on every session of a hosted agent the page\nconfigures, whatever the owner has saved — `not_sent` when none of his words can reach it —\nso the page always learns what the call was given; a provider never sets it. A\ndeployment-managed bridge reads the same words from `GET /api/v1/voice-agent` instead, and\nits sessions carry none."
         },
+        "conversation_id": {
+          "description": "The conversation this call's transcript belongs to, minted by THIS server per\nvoice-session call (`#1303 voice-transcript-share`).\n\nA backend that names its own conversation (a hosted vendor's initiation frame) still\nwins on the page; a backend that names none — the deployment-managed `vibe-talk-v1`\nbridge behind the relay — leaves the page inventing a local id, and a page whose\nrecording had failed once then filed nothing for the rest of its life. A server-minted\nid is stable for the call, known before the socket opens, and the same on every device\nthat later reads the stored record.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "input_sample_rate": {
           "description": "Microphone PCM sample rate expected by the provider.",
           "format": "uint32",

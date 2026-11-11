@@ -6117,6 +6117,12 @@ const TUNING_BANDS = {
     "how long a reconnect waits for the call's turns to reach the server before it reads the record " +
     "it hands the new session: shorter builds the record without the turn just said; longer holds " +
     "the reconnect, and the reader's call, on a slow store"],
+  // `#1303 voice-transcript-share`. Attempts at one transcript record before it is kept for
+  // the next flush: one is the old latch that lost whole calls to a single transient failure;
+  // a great many would hammer a store that is down once per turn for a whole call.
+  RECORD_ATTEMPTS: [2, 10,
+    "attempts at one transcript record before it is kept and retried ahead of the next turn: " +
+    "fewer loses turns to one transient failure; more multiplies requests against a down store"],
   // `#396 thread-color-memory`.
   THREAD_HUES_VERSION: [1, 1,
     "the stored thread colours' shape. Changing it recolours every thread on every device, which " +

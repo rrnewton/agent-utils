@@ -1864,6 +1864,7 @@ async function openConversation(options: {chat?: boolean} | undefined) {
   session.inputRate = minted.input_sample_rate || 16000;
   session.outputRate = minted.output_sample_rate || 16000;
   voicePromptForCall = minted.agent_prompt || null; // `#272 voice-agent-instructions`
+  session.serverConversationId = minted.conversation_id || null; // `#1303 voice-transcript-share`
   session.lastTranscriptKey = null;
   session.liveTurns = new Map();
   session.noTextRows = new Map();
@@ -2052,7 +2053,7 @@ function wireCallSocket(socket: WebSocket, socketUrl: string, resume: Resume | n
       deps.conversationOpen = true;
       deps.startPostWatch();
       beginCallRelay();
-      session.conversationId = deps.conversationIdFrom(null);
+      session.conversationId = session.serverConversationId || deps.conversationIdFrom(null);
       if (resume) {
         // `#331 resume-on-websocket`. The record goes at `session_started`, and only to a session
         // that lists `replay`, so what this call was handed is settled there
@@ -3299,9 +3300,8 @@ function listenForTextAfterHangUp(socket: WebSocket, conversationId: string | nu
 
 /** File one turn in `conversationId`, as `recordTurn` does for the call in progress. */
 function fileTurnIn(conversationId: string | null, speaker: string, text: string) {
-  if (deps.recordingBroken || !conversationId || !text) return;
+  if (!conversationId || !text) return;
   deps.recordQueue = deps.recordQueue.then(() => {
-    if (deps.recordingBroken) return undefined;
     return deps.api(`/api/v1/conversations/${conversationId}/turns`, {
       method: "POST",
       body: { speaker, text },

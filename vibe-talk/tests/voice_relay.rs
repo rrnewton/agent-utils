@@ -193,6 +193,53 @@ async fn a_page_opens_the_relay_once_on_its_ticket_and_keeps_its_tools() {
     refused_with(open(&ws(&base, &path), None).await, 401);
 }
 
+/// `#1303 voice-transcript-share`. Every voice-session call mints a fresh conversation
+/// id, and a turn filed under it is there for another device to read back.
+#[tokio::test]
+async fn every_call_mints_a_conversation_id_and_turns_persist_under_it() {
+    let (upstream, _seen) = bridge().await;
+    let base = server(&upstream).await;
+    let client = reqwest::Client::new();
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let body: Value = client
+            .get(format!("{base}/api/v1/voice-session"))
+            .bearer_auth(WRITE_TOKEN)
+            .send()
+            .await
+            .expect("asks")
+            .json()
+            .await
+            .expect("json");
+        let id = body["conversation_id"]
+            .as_str()
+            .expect("a minted conversation id")
+            .to_owned();
+        assert!(id.starts_with("call-"), "{id}");
+        ids.push(id);
+    }
+    assert_ne!(ids[0], ids[1], "two calls, two conversations");
+    let id = &ids[0];
+    let posted = client
+        .post(format!("{base}/api/v1/conversations/{id}/turns"))
+        .bearer_auth(WRITE_TOKEN)
+        .json(&serde_json::json!({"speaker": "you", "text": "shared across devices"}))
+        .send()
+        .await
+        .expect("posts a turn");
+    assert_eq!(posted.status().as_u16(), 200, "a turn under the minted id");
+    let read: Value = client
+        .get(format!("{base}/api/v1/conversations/{id}"))
+        .bearer_auth(WRITE_TOKEN)
+        .send()
+        .await
+        .expect("reads it back")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(read["turns"][0]["text"], "shared across devices");
+}
+
 #[tokio::test]
 async fn a_server_opens_it_with_the_voice_token_but_never_gets_tools() {
     let (upstream, mut seen) = bridge().await;

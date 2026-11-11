@@ -34,6 +34,8 @@ export interface CallSession {
   outputRate: number;
   lastTranscriptKey: string | null;
   conversationId: string | null;
+  /** The server-minted conversation id for this call (`#1303 voice-transcript-share`), when the voice-session answer carried one. */
+  serverConversationId?: string | null;
   chat: boolean;
   vendorSentAudioInChat: boolean;
   v1Ready: boolean;

@@ -123,13 +123,23 @@ import { unsayableDraft } from "../../present/call/index.ts";
 export function createVoiceTranscript<Column extends object>(deps: VoiceTranscriptDependencies<Column>) {
 
 
-// Recording is FIRE-AND-FORGET and gives up after the first failure.
+// Recording is FIRE-AND-FORGET, and a failure is retried, never latched.
 //
 // A store that is down must not be able to interrupt a conversation: the owner is driving, the
-// agent is talking, and an error panel per turn would be worse than losing the record. So one
-// failure disables recording for the rest of the page's life and says so ONCE, in Settings,
-// where it can be read afterwards. It never reaches `teardown()` and never ends a call.
+// agent is talking, and an error panel per turn would be worse than losing the record. So a
+// failure is said ONCE, in Settings, where it can be read afterwards, the turn is kept, and
+// recording tries again — at once, and again ahead of the next turn. `#1303
+// voice-transcript-share`: the old rule, one failure disables recording for the rest of the
+// page's life, is what left most calls with nothing stored at all: a long-lived PWA page
+// failed once and then filed nothing, on any call, until it happened to be reloaded. It
+// never reaches `teardown()` and never ends a call.
 let recordingBroken: boolean = false;
+
+/** How many times one record is attempted before it is kept for the next flush. */
+const RECORD_ATTEMPTS = 3;
+
+/** Records a transient failure could not file yet, in the order they were said. */
+let unrecorded: Array<{ conversationId: string; record: Record<string, unknown> }> = [];
 
 
 /**
@@ -297,6 +307,8 @@ function noteConversationEnded(cause: string = "ended") {
     return;
   }
   conversationOpen = false;
+  // `#1303 voice-transcript-share`. A call that ends mid-outage still files what it kept.
+  recordQueue = recordQueue.then(() => flushUnrecorded());
   // The call that just ended is what the NEXT one resumes from. Read here rather than in
   // `teardown`, which clears the session — and only when a conversation was really open, so a
   // failed mint cannot point the next call at a conversation that has no turns. Nor can a call
@@ -2568,6 +2580,75 @@ function flushRecordsAfterLive() {
 }
 
 
+/** One POST of one record. */
+function postOnce(conversationId: string, record: Record<string, unknown>) {
+  return deps.api(`/api/v1/conversations/${conversationId}/turns`, { method: "POST", body: record });
+}
+
+/** Whether a failed POST may succeed later: no answer at all, or a server-side failure. */
+function transientFailure(error: ApiRequestError): boolean {
+  const status = Number(error.status) || 0;
+  return status === 0 || status >= 500;
+}
+
+/**
+ * Post one record, retrying a transient failure at once. A final refusal (any other 4xx)
+ * and a transient failure that outlasts the attempts both throw, for the caller to tell
+ * apart by status.
+ */
+async function postWithRetry(conversationId: string, record: Record<string, unknown>) {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < RECORD_ATTEMPTS; attempt += 1) {
+    try {
+      const answer = await postOnce(conversationId, record);
+      if (recordingBroken) {
+        recordingBroken = false;
+        setStorageState("Recording again: the store answered, and what it missed is being filed.");
+      }
+      if (answer && answer.turn) noteStored(conversationId, answer.turn);
+      return answer;
+    } catch (caught) {
+      lastError = caught;
+      if (!transientFailure(caught as ApiRequestError)) throw caught;
+    }
+  }
+  throw lastError;
+}
+
+/** Say, once per outage, that recording is behind — and that it has not given up. */
+function noteRecordingBehind(error: ApiRequestError) {
+  if (!recordingBroken) {
+    setStorageState(
+      `Not recording yet: ${error.message}. The lines are kept and recording keeps trying; ` +
+        `what is already stored is untouched.`
+    );
+  }
+  recordingBroken = true;
+}
+
+/** File what an outage left behind, oldest first; what still fails stays for the next flush. */
+async function flushUnrecorded(): Promise<void> {
+  if (unrecorded.length === 0) return;
+  const held = unrecorded;
+  unrecorded = [];
+  for (const entry of held) {
+    try {
+      const answer = await postOnce(entry.conversationId, entry.record);
+      if (answer && answer.turn) noteStored(entry.conversationId, answer.turn);
+    } catch (caught) {
+      if (transientFailure(caught as ApiRequestError)) unrecorded.push(entry);
+    }
+  }
+  if (unrecorded.length === 0 && recordingBroken) recordingBroken = false;
+}
+
+/** Keep one record a transient failure could not file, bounded so a dead store cannot grow it for ever. */
+function keepUnrecorded(conversationId: string, record: Record<string, unknown>) {
+  unrecorded.push({ conversationId, record });
+  if (unrecorded.length > 500) unrecorded.splice(0, unrecorded.length - 500);
+}
+
+
 /**
  * Post one transcript record — a send, a marker — in the queue the turns go through. Resolves to
  * `{turn}` as stored, `{refused: code}` for a refusal that is final, or null when nothing was kept.
@@ -2582,7 +2663,7 @@ function flushRecordsAfterLive() {
 function recordRecord(conversationId: string | null, body: Record<string, unknown>) {
   if (!transcriptRecordsSupported || !conversationId) return Promise.resolve(null);
   // A conversation's first record is its start marker, a send or a draft not sent included.
-  if (!recordingBroken) fileStartMarker(conversationId);
+  fileStartMarker(conversationId);
   return postRecord(conversationId, body);
 }
 
@@ -2596,10 +2677,10 @@ function recordRecord(conversationId: string | null, body: Record<string, unknow
  */
 function postRecord(conversationId: string, body: Record<string, unknown> | (() => Record<string, unknown>)) {
   const done = recordQueue.then(async () => {
-    if (recordingBroken) return null;
+    await flushUnrecorded();
+    const record = typeof body === "function" ? body() : body;
     try {
-      const record = typeof body === "function" ? body() : body;
-      const answer = await deps.api(`/api/v1/conversations/${conversationId}/turns`, { method: "POST", body: record });
+      const answer = await postWithRetry(conversationId, record);
       return answer && answer.turn ? { turn: answer.turn } : null;
     } catch (caught) {
   const error = caught as ApiRequestError;
@@ -2609,11 +2690,10 @@ function postRecord(conversationId: string, body: Record<string, unknown> | (() 
         setStorageState(`A record of this call was not kept: ${error.message}.`);
         return { refused: String(error.code || status) };
       }
-      recordingBroken = true;
-      setStorageState(
-        `Not recording: ${error.message}. What is already stored is untouched; the lines on ` +
-          `screen are only on screen.`
-      );
+      // A transient failure keeps the record and says so once; the next record flushes it.
+      // `#1303 voice-transcript-share`: never a permanent not-recording state.
+      keepUnrecorded(conversationId, record);
+      noteRecordingBehind(error);
       return null;
     }
   });
@@ -4022,7 +4102,8 @@ function setStorageState(text: string) {
  * Record one turn, without letting the store interfere with the call.
  *
  * Deliberately not awaited by its callers and deliberately silent on the call screen: the owner
- * is in a car. The FIRST failure disables recording and is reported once, in Settings.
+ * is in a car. A failure is reported once, in Settings, retried, and never disables recording
+ * (`#1303 voice-transcript-share`).
  *
  * ONE AT A TIME, IN THE ORDER THEY WERE SAID. Every turn joins `recordQueue` and the next POST is
  * not issued until the previous one has answered. Firing them off in parallel looks harmless and
@@ -4128,12 +4209,7 @@ function pageTurnInFlight() {
  *   spoken yes to the card (`#269 approval-card-inline`)
  */
 function recordTurn(who: string, text: string, options: {answerOf?: YesHold | null} = {}): void  {
-  if (recordingBroken || !deps.session.conversationId || !text) {
-    // `#270 voice-transcript-markers`. Something said in this call that a broken store will not keep
-    // still makes it the conversation the next call carries on from. Its recap then says it could
-    // not be had, rather than an older call's recap going out under a line that says "the
-    // conversation above".
-    if (recordingBroken && deps.session.conversationId && text) deps.session.recordedAny = true;
+  if (!deps.session.conversationId || !text) {
     return;
   }
   // A `note` is the page's own line — that a turn played with no text, `#330` — never the agent's.
@@ -4144,12 +4220,10 @@ function recordTurn(who: string, text: string, options: {answerOf?: YesHold | nu
   const hold = options.answerOf || null;
   // `#270 voice-transcript-markers`. A conversation's first record is its start marker.
   fileStartMarker(conversationId);
-  recordQueue = recordQueue.then(() => {
-    // Checked here rather than only at call time: a turn queued before the store failed must not
-    // be posted after it, or one dead store costs one request per turn for the rest of the call.
-    if (recordingBroken) {
-      return undefined;
-    }
+  recordQueue = recordQueue.then(async () => {
+    // What an outage left behind goes first, in the order it was said. `#1303
+    // voice-transcript-share`: a failure no longer stops the queue at all.
+    await flushUnrecorded();
     /** @type {{speaker: string, text: string, answer?: number}} */
     const body: {speaker: string, text: string, answer?: number} = { speaker, text };
     // `#270 voice-transcript-markers`. A spoken yes the page acted on is filed as the answer to the
@@ -4161,16 +4235,20 @@ function recordTurn(who: string, text: string, options: {answerOf?: YesHold | nu
       (hold.state === "accepted" || hold.state === "committing" || hold.state === "sent")) {
       body.answer = hold.serial;
     }
-    return deps.api(`/api/v1/conversations/${conversationId}/turns`, {
-      method: "POST",
-      body,
-    }).catch((error) => {
-      recordingBroken = true;
-      setStorageState(
-        `Not recording: ${error.message}. What is already stored is untouched; the lines on ` +
-          `screen are only on screen.`
-      );
-    });
+    try {
+      await postWithRetry(conversationId, body);
+    } catch (caught) {
+      const error = caught as ApiRequestError;
+      if (transientFailure(error)) {
+        // Kept, and flushed ahead of the next turn; this call is still the one the next
+        // call resumes from (`#270 voice-transcript-markers`).
+        keepUnrecorded(conversationId, body);
+        deps.session.recordedAny = true;
+        noteRecordingBehind(error);
+      } else {
+        setStorageState(`A record of this call was not kept: ${error.message}.`);
+      }
+    }
   });
 }
 
@@ -4271,6 +4349,7 @@ function restoredRun(turns: TranscriptTurn[], trailingSeam: boolean, moreAbove: 
     : null);
   let previous = null;
   for (const turn of turns) {
+    noteStored(turn.conversation_id, turn);
     if (previous !== null && turn.conversation_id !== previous) {
       rule(previous, startOf(turn));
     } else if (previous === null && moreAbove && startOf(turn)) {
@@ -4377,12 +4456,89 @@ function forgetTranscriptWalk() {
 let restoredStoredConversation = false;
 
 
+/** Stored turns this page already has on screen or has filed itself, by server identity. `#1303 voice-transcript-share`. */
+const seenStoredKeys: Set<string> = new Set();
+
+/** A stored turn's identity across devices: its conversation, server stamp, speaker and words. */
+function storedKey(conversationId: string, turn: { at_ms?: number; speaker?: string; text?: string }): string {
+  return `${conversationId}:${turn.at_ms ?? ""}:${turn.speaker ?? ""}:${turn.text ?? ""}`;
+}
+
+/** Remember one stored turn, so a refresh from another device never draws it twice. */
+function noteStored(conversationId: string, turn: { at_ms?: number; speaker?: string; text?: string }): void {
+  seenStoredKeys.add(storedKey(conversationId, turn));
+}
+
+let transcriptRefreshInFlight = false;
+
+/**
+ * Pick up turns another device recorded while this page was open. `#1303
+ * voice-transcript-share`: two devices, one transcript.
+ *
+ * The first read is still {@link loadStoredConversation}'s; this is every later one. It
+ * asks for the newest page only, keeps the turns this page has not seen, and appends
+ * them in the order they were said. It runs when the page is opened again — it becomes
+ * visible, or takes focus — which is when the owner looks at the other device. A failure
+ * is silent here: the record on screen is untouched, and Settings keeps the last word
+ * the first read said.
+ *
+ * @returns how many turns arrived
+ */
+async function refreshStoredConversation(): Promise<number> {
+  if (!restoredStoredConversation) {
+    await loadStoredConversation();
+    return 0;
+  }
+  if (deps.tokenScope === "read" || transcriptRefreshInFlight) return 0;
+  transcriptRefreshInFlight = true;
+  try {
+    const payload = await deps.api(`/api/v1/transcript?limit=${TRANSCRIPT_PAGE_LIMIT}${recordsQuery()}`);
+    const turns = oldestFirst<TranscriptTurn>(payload);
+    const fresh = turns.filter((turn) => !seenStoredKeys.has(storedKey(turn.conversation_id, turn)));
+    if (fresh.length === 0) return 0;
+    const pinned = deps.atBottom(deps.el("scroll-area"));
+    deps.el("transcript").append(...restoredRun(fresh, false));
+    deps.renderEmptyState();
+    deps.renderScrollTools();
+    deps.followIfPinned(pinned, fresh.length);
+    return fresh.length;
+  } catch (_caught) {
+    return 0;
+  } finally {
+    transcriptRefreshInFlight = false;
+  }
+}
+
+
 /** What Settings says about the stored record when the saved token is read-scope. */
 const READ_SCOPE_STORAGE_STATE =
   "Stored conversations need the write-scope token; this one may read channels only.";
 
 
+let refreshListenersArmed = false;
+
+/**
+ * Arm the cross-device pickup on the first explicit read of the record, never at
+ * construction (`#624 voice-page-modularity` keeps construction free of effects).
+ * `#1303 voice-transcript-share`.
+ */
+function armRefreshOnOpen(): void {
+  if (refreshListenersArmed) return;
+  refreshListenersArmed = true;
+  if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden && deps.currentView === "voice") void refreshStoredConversation();
+    });
+  }
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+    window.addEventListener("focus", () => {
+      if (deps.currentView === "voice") void refreshStoredConversation();
+    });
+  }
+}
+
 async function loadStoredConversation() {
+  armRefreshOnOpen();
   if (restoredStoredConversation) {
     return;
   }
@@ -4621,6 +4777,7 @@ get heardTyped() { return heardTyped; }, set heardTyped(value: typeof heardTyped
 reportHeard,
 recordTurn,
 loadStoredConversation,
+refreshStoredConversation,
 loadOlderTurns,
 maybeLoadOlderTurns,
 forgetConversations
