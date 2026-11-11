@@ -223,10 +223,12 @@ class Drill:
             "profiles": {
                 "fakework": {
                     "harness": "muse", "mode": "interactive",
+                    "reasoning_effort": "high",
                     "env": {"FAKE_HARNESS_LOG_DIR": str(self.log_dir)},
                 },
                 "profwork": {
                     "harness": "muse", "mode": "interactive",
+                    "reasoning_effort": "xhigh",
                     "env": {
                         "FAKE_HARNESS_LOG_DIR": str(self.log_dir),
                         "DRILL_PROFILE_VALUE": PROFILE_VALUE,
@@ -662,10 +664,11 @@ def test_restore_drill_happy_path_fresh_pane_slot_and_rerun(tmp_path: Path) -> N
             "slotlane", "fakework", sessions["slotlane"], slot="slot01",
         )
         drill.designate_coordinator()
-        # Profile env is tab-creation env: present in the first launch.
-        assert f"DRILL_PROFILE_VALUE={PROFILE_VALUE}" in drill.launches(
-            sessions["prof"],
-        )[0]
+        # Profile env is tab-creation env: present in the first launch,
+        # with the profile's declared reasoning effort carried on argv.
+        prof_first = drill.launches(sessions["prof"])[0]
+        assert f"DRILL_PROFILE_VALUE={PROFILE_VALUE}" in prof_first
+        assert "reasoning-effort" in prof_first and "xhigh" in prof_first
         old_panes = {
             name: cast(str, drill.record(name)["pane_id"]) for name in sessions
         }
@@ -706,9 +709,11 @@ def test_restore_drill_happy_path_fresh_pane_slot_and_rerun(tmp_path: Path) -> N
             assert new_panes[name] != old_panes[name], name
             assert _ps_comm(drill.harness_pid(name)) == FAKE_NAME, name
             assert len(drill.launches(session)) == 2, name
-        # Profile and launch environment both survive the revive.
+        # Profile and launch environment both survive the revive, and the
+        # declared reasoning effort is carried through it.
         prof_after = drill.launches(sessions["prof"])[1]
         assert f"DRILL_PROFILE_VALUE={PROFILE_VALUE}" in prof_after
+        assert "reasoning-effort" in prof_after and "xhigh" in prof_after
         assert f"BASH_ENV={drill.env_file}" in prof_after
         assert f"PATH={drill.tools_dir}:" in prof_after
         # The slot is owned by the new harness pid, read through wrkslots.
