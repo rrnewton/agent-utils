@@ -111,7 +111,7 @@ test("`#624 voice-page-modularity`: a focused field with the visual viewport a k
     lookup: (id) => els[id] || { id, getClientRects: () => [] },
     el: (id) => els[id],
     viewport: () => viewport, innerHeight: () => 800, scrollY: () => 0, root: () => root,
-    activeElement: () => focus, virtualKeyboard: () => undefined, computedStyle: () => null, closeSpeedPopover: () => {}, nudge: (area, delta) => { area.scrollTop += delta; },
+    activeElement: () => focus, virtualKeyboard: () => undefined, computedStyle: () => null, closeSpeedPopover: () => {}, nudge: (area, delta) => { area.scrollTop += delta; }, atFoot: () => false, toFoot: (area) => { area.scrollTop = area.scrollHeight; },
   });
   keyboard.noteKeyboard();
   assert.equal(attrs.get("data-keyboard"), undefined, "nothing focused, nothing up");
@@ -148,6 +148,8 @@ test("`#1144 scrollback-typing-jump`: typed at the foot, the jump is made whole 
     "channel-compose-state": { id: "channel-compose-state", getClientRects: () => [] },
     "channel-compose-text": field,
   };
+  let footHeld = true;
+  const footTakes = [];
   const timers = [];
   const keyboard = createOnScreenKeyboard({
     clock: { setTimeout: (run, ms) => { timers.push({ run, ms }); return timers.length; }, clearTimeout: (h) => { timers[h - 1] = null; } },
@@ -156,7 +158,7 @@ test("`#1144 scrollback-typing-jump`: typed at the foot, the jump is made whole 
     viewport: () => ({ height: 579, scale: 1, offsetTop: 300 }), innerHeight: () => 915, scrollY: () => 0, root: () => root,
     activeElement: () => field, virtualKeyboard: () => undefined,
     computedStyle: (node) => (node === composer ? { getPropertyValue: (name) => (name === "--keyboard-fit" ? "on" : "") } : null),
-    closeSpeedPopover: () => {}, nudge: (area, delta) => { area.scrollTop += delta; },
+    closeSpeedPopover: () => {}, nudge: (area, delta) => { area.scrollTop += delta; }, atFoot: (one) => one === area && footHeld, toFoot: (one) => { footTakes.push(one.id); one.scrollTop = one.scrollHeight; },
   });
   keyboard.noteKeyboard();
   assert.equal(area.scrollTop, 100, "the fit as the keyboard came up left the foot on the keys");
@@ -172,6 +174,52 @@ test("`#1144 scrollback-typing-jump`: typed at the foot, the jump is made whole 
   assert.equal(area.scrollTop, 100, "the whole foot is back on the keyboard's top");
   keyboard.noteComposerInput({ id: "side-compose-text" });
   assert.equal(timers.filter((one) => one && one.ms === 0).length, 1, "another box's key completes nothing here");
+});
+
+test("`#1251 scroll-single-owner`: the keyboard going down takes a reader at the foot back to it, through the owner", () => {
+  const { createOnScreenKeyboard } = VIEW_COMPOSER;
+  const root = { clientWidth: 412, clientHeight: 915, setAttribute: () => {}, getAttribute: () => null, style: { setProperty: () => {} } };
+  const area = { id: "scroll-area", scrollTop: 40, scrollHeight: 500, getBoundingClientRect: () => ({ top: 0, bottom: 900 }) };
+  const composer = { id: "channel-composer", parentNode: area,
+    getBoundingClientRect: () => ({ top: 793, bottom: 931 + (100 - area.scrollTop) }) };
+  const field = { tagName: "TEXTAREA", id: "channel-compose-text", type: "textarea", isContentEditable: false,
+    getClientRects: () => [{}], getBoundingClientRect: () => ({ top: 793, bottom: 879 + (100 - area.scrollTop) }) };
+  const els = {
+    "read-speed-box": { id: "read-speed-box" }, "speed-popover": { hidden: true }, "keyboard-debug": { checked: false },
+    "keyboard-debug-readout": { hidden: true, style: {} },
+    "channel-composer": composer, "scroll-area": area, "side-scroll": { id: "side-scroll" },
+    "channel-send": { id: "channel-send", getClientRects: () => [] },
+    "channel-compose-state": { id: "channel-compose-state", getClientRects: () => [] },
+    "channel-compose-text": field,
+  };
+  let view = { height: 579, scale: 1, offsetTop: 300 };
+  let focus = field;
+  let footHeld = true;
+  const footTakes = [];
+  const keyboard = createOnScreenKeyboard({
+    clock: { setTimeout: () => 0, clearTimeout: () => {} },
+    lookup: (id) => els[id] || { id, getClientRects: () => [] },
+    el: (id) => els[id],
+    viewport: () => view, innerHeight: () => 915, scrollY: () => 0, root: () => root,
+    activeElement: () => focus, virtualKeyboard: () => undefined,
+    computedStyle: (node) => (node === composer ? { getPropertyValue: (name) => (name === "--keyboard-fit" ? "on" : "") } : null),
+    closeSpeedPopover: () => {}, nudge: (one, delta) => { one.scrollTop += delta; },
+    atFoot: (one) => one === area && footHeld, toFoot: (one) => { footTakes.push(one.id); one.scrollTop = one.scrollHeight; },
+  });
+  keyboard.noteKeyboard();
+  view = { height: 915, scale: 1, offsetTop: 0 };
+  keyboard.noteKeyboard();
+  assert.deepStrictEqual(footTakes, ["scroll-area"], "the keyboard going down did not take the reader back to the foot");
+  assert.equal(area.scrollTop, 500, "the reader was not put at the foot the list regained");
+  // A reader who had scrolled away from the foot is left where they are.
+  footHeld = false;
+  footTakes.length = 0;
+  area.scrollTop = 40;
+  view = { height: 579, scale: 1, offsetTop: 300 };
+  keyboard.noteKeyboard();
+  view = { height: 915, scale: 1, offsetTop: 0 };
+  keyboard.noteKeyboard();
+  assert.deepStrictEqual(footTakes, [], "the keyboard going down moved a reader who had scrolled away");
 });
 
 test("`#821 voice-page-read-aloud-react`: dictation writes unsure then settled words after what the box held, says it listens, and falls back to the keyboard's microphone", () => {

@@ -61,6 +61,9 @@ export interface OnScreenKeyboardDependencies {
   closeSpeedPopover(): void;
   /** Move `area` by a measured delta through the scroll owner (`#1251`). */
   nudge(area: HTMLElement, delta: number): void;
+  /** Whether `area` rests at its foot (the page's `atBottom`), and taking it there through the owner (`#1251`). */
+  atFoot(area: HTMLElement): boolean;
+  toFoot(area: HTMLElement): void;
 }
 
 /** The keyboard's commands. */
@@ -165,6 +168,11 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
     const fit = shown && field && KEYBOARD_FIT_PARTS[field.id] ? field : null;
     const height = viewport ? Number(viewport.height) || 0 : deps.innerHeight() || 0;
     if (fit !== onScreenKeyboard.fitted) {
+      // `#1251 scroll-single-owner`: as the keyboard goes down the list regains the fitted
+      // room; a reader who was at its foot is taken back to it by the owner, as native
+      // scroll anchoring used to do silently. Noted before the room is cleared.
+      const fittedArea = onScreenKeyboard.fittedArea;
+      const wasAtFoot = fit === null && fittedArea !== null && deps.atFoot(fittedArea);
       onScreenKeyboard.fitted = fit;
       onScreenKeyboard.settling = false;
       if (fit) startKeyboardFit(fit, height);
@@ -172,6 +180,7 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
         onScreenKeyboard.fittedArea = null;
         onScreenKeyboard.fittedRoom = 0;
         renderKeyboardInset(0);
+        if (wasAtFoot && fittedArea !== null) deps.toFoot(fittedArea);
       }
     } else if (fit && Math.abs(height - onScreenKeyboard.fittedHeight) >= 1) {
       // The room follows the keyboard's size whatever the reader is doing: without it the box could sit
