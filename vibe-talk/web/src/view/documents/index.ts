@@ -325,6 +325,19 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
         (error: unknown) => deps.onStatus?.(error instanceof Error ? error.message : String(error)),
       ).finally(() => setBusy(false));
     };
+    // A counted fetch (`#1307 doc-fetch-visible-viewport`): the button reads
+    // "Fetching done/total" as each document lands, then returns to "Fetch".
+    const reportFetching = (
+      run: (progress: (done: number, total: number) => unknown) => Promise<number>,
+    ): void => {
+      setBusy(true);
+      run((doneCount, total) => {
+        if (total > 0) button.textContent = `Fetching ${doneCount}/${total}`;
+      }).then(
+        (n) => deps.onStatus?.(`Fetched ${n} document${n === 1 ? "" : "s"}.`),
+        (error: unknown) => deps.onStatus?.(error instanceof Error ? error.message : String(error)),
+      ).finally(() => setBusy(false));
+    };
     listening.listen(button, "click", () => {
       const open = menu.hidden;
       menu.hidden = !open;
@@ -341,7 +354,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
           button.setAttribute("aria-expanded", "false");
           clearArmed = false;
         }
-        if (act === "visible") report(list.fetchVisible(), (n) => `Fetched ${n} document${n === 1 ? "" : "s"}.`);
+        if (act === "visible") reportFetching((progress) => list.fetchVisible(progress));
         else if (act === "since") since.hidden = false;
         else if (act === "refresh") {
           setBusy(true, "Refreshing…");
@@ -392,10 +405,8 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
       const days = Number((deps.byId("docs-since-days") as HTMLInputElement).value) || 0;
       const hours = Number((deps.byId("docs-since-hours") as HTMLInputElement).value) || 0;
       since.hidden = true;
-      report(
-        list.fetchSince(Date.now() - ((days * 24 + hours) * 3_600_000)),
-        (n) => `Fetched ${n} document${n === 1 ? "" : "s"}.`,
-      );
+      reportFetching((progress) =>
+        list.fetchSince(Date.now() - ((days * 24 + hours) * 3_600_000), progress));
     });
   }
 

@@ -487,9 +487,10 @@ async function withList(answer, run) {
     "documents-list": listEl, "scroll-area": scroller, "pane-docs": paneDocs, "docs-list-view": listView,
   })[id];
   const paths = [];
+  const calls = [];
   const statuses = [];
   const list = mod.createDocumentsList({
-    api: async (path) => { paths.push(path); return answer(path); },
+    api: async (path, options) => { paths.push(path); calls.push({ path, options }); return answer(path, options); },
     byId,
     onOpen: () => {},
     onStatus: (text) => statuses.push(text),
@@ -508,7 +509,7 @@ async function withList(answer, run) {
     .filter((kid) => String(kid.className).includes("doc-card"))
     .map((kid) => kid.getAttribute("data-key"));
   try {
-    await run({ list, listEl, scroller, paths, statuses, fire, keys });
+    await run({ list, listEl, scroller, paths, calls, statuses, fire, keys });
   } finally {
     if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
     list.unmount();
@@ -581,6 +582,177 @@ test("documents list: drag up parked at the bottom refreshes; other drags do not
     drag(500, 400);
     await flush([]);
     assert.equal(reads(), before + 1, "drag up from mid-list refreshed");
+  });
+});
+
+// ---- 3c. Fetch visible (#1307 doc-fetch-visible-viewport) --------------------------------------
+//
+// "Fetch visible" fetches the unfetched rows whose rendered cards intersect the shared
+// scroller's visible band — not every loaded row — newest first, at most four in flight,
+// patching each row from its fetch answer as it lands (no list re-read at the end), with
+// (done, total) progress per completion. Deferred fetch answers drive the concurrency:
+// no timers, no sleeps, no wall-clock budgets (owner rule 346).
+
+function unfetchedRow(key, ms) {
+  return { ...docRow(key, ms), fetched: false, fetched_ms: null };
+}
+
+function cardMap(listEl) {
+  return new Map(listEl.children
+    .filter((kid) => String(kid.className).includes("doc-card"))
+    .map((kid) => [kid.getAttribute("data-key"), kid]));
+}
+
+function putRect(el, top, bottom) {
+  el.getBoundingClientRect = () => ({ top, bottom, left: 0, right: 100, width: 100, height: bottom - top });
+}
+
+// Microtask turns only: deferred fetches settle with no timer involved.
+async function settle(turns = 60) {
+  for (let i = 0; i < turns; i += 1) await Promise.resolve();
+}
+
+function fetchAnswerFor(key) {
+  return { fetched: [{ key, title: `${key} fetched title`, version: "v2", fetched_ms: 9999 }] };
+}
+
+const LIST_READS = (paths) => paths.filter((path) => path.startsWith("/api/v1/documents?")).length;
+
+test("documents list: Fetch visible fetches only unfetched rows whose cards intersect the scroller band (#1307)", async () => {
+  const rows = [
+    unfetchedRow("above", 100), unfetchedRow("top", 200), unfetchedRow("partial", 300),
+    unfetchedRow("below", 400), docRow("held", 500),
+  ];
+  const posted = [];
+  await withList((_path, options) => {
+    if (options?.method === "POST") { posted.push(options.body.key); return fetchAnswerFor(options.body.key); }
+    return { documents: rows, total: rows.length };
+  }, async ({ list, listEl, scroller }) => {
+    await list.refresh();
+    putRect(scroller, 0, 100);
+    const cards = cardMap(listEl);
+    putRect(cards.get("above"), -120, -10);
+    putRect(cards.get("top"), 0, 50);
+    putRect(cards.get("partial"), 80, 140);
+    putRect(cards.get("below"), 200, 260);
+    putRect(cards.get("held"), 10, 60);
+    const arrived = await list.fetchVisible();
+    assert.equal(arrived, 2, "Fetch visible did not arrive exactly the on-screen unfetched rows");
+    assert.deepEqual([...posted].sort(), ["partial", "top"],
+      "Fetch visible fetched a row outside the band, or the already-fetched one inside it");
+    assert.deepEqual(posted, ["partial", "top"], "the on-screen attempts were not newest first");
+  });
+});
+
+test("documents list: Fetch visible attempts newest first and reports progress per completion (#1307)", async () => {
+  // No geometry is stubbed here: fake cards carry no rects, so the drawn rows count as on
+  // screen (the degrade rule), and every unfetched row is a target.
+  const rows = ["k1", "k2", "k3", "k4", "k5", "k6"].map((key, i) => unfetchedRow(key, (i + 1) * 100));
+  const attempted = [];
+  await withList((_path, options) => {
+    if (options?.method === "POST") { attempted.push(options.body.key); return fetchAnswerFor(options.body.key); }
+    return { documents: rows, total: rows.length };
+  }, async ({ list }) => {
+    await list.refresh();
+    const progress = [];
+    const arrived = await list.fetchVisible((done, total) => progress.push([done, total]));
+    assert.equal(arrived, 6);
+    assert.deepEqual(attempted, ["k6", "k5", "k4", "k3", "k2", "k1"], "attempts are not newest first");
+    assert.deepEqual(progress, [[0, 6], [1, 6], [2, 6], [3, 6], [4, 6], [5, 6], [6, 6]],
+      "progress does not run (0,total) then one step per completion to (total,total)");
+  });
+});
+
+test("documents list: Fetch visible keeps at most four fetches in flight, and more than one (#1307)", async () => {
+  const rows = Array.from({ length: 8 }, (_one, i) => unfetchedRow(`c${i + 1}`, (i + 1) * 100));
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const pending = new Map();
+  const started = [];
+  await withList((_path, options) => {
+    if (options?.method === "POST") {
+      const key = options.body.key;
+      started.push(key);
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      return new Promise((resolve) => {
+        pending.set(key, () => { inFlight -= 1; resolve(fetchAnswerFor(key)); });
+      });
+    }
+    return { documents: rows, total: rows.length };
+  }, async ({ list }) => {
+    await list.refresh();
+    const run = list.fetchVisible();
+    try {
+      await settle();
+      assert.equal(inFlight, 4, `the pool did not fill to four in flight (saw ${inFlight})`);
+      const first = started[0];
+      pending.get(first)();
+      pending.delete(first);
+      await settle();
+      assert.equal(started.length, 5, "one completion did not admit exactly one more fetch");
+      assert.equal(inFlight, 4, "the pool did not refill to four after a completion");
+    } finally {
+      // Drain whatever remains so the run ends whatever the assertions above said.
+      for (let guard = 0; guard < 20 && pending.size > 0; guard += 1) {
+        for (const [key, release] of [...pending]) { pending.delete(key); release(); }
+        await settle();
+      }
+    }
+    assert.equal(await run, 8, "not every target arrived");
+    assert.ok(maxInFlight <= 4 && maxInFlight > 1, `the pool peaked at ${maxInFlight} in flight`);
+  });
+});
+
+test("documents list: fetched rows patch in place from the fetch answer, with no list re-read (#1307)", async () => {
+  const rows = [unfetchedRow("one", 100), unfetchedRow("two", 200)];
+  const pending = new Map();
+  await withList((_path, options) => {
+    if (options?.method === "POST") {
+      const key = options.body.key;
+      return new Promise((resolve) => pending.set(key, () => resolve(fetchAnswerFor(key))));
+    }
+    return { documents: rows, total: rows.length };
+  }, async ({ list, listEl, paths }) => {
+    await list.refresh();
+    const readsBefore = LIST_READS(paths);
+    const run = list.fetchVisible();
+    await settle();
+    // Land only the newest: its card flips at once, the other stays unfetched.
+    pending.get("two")();
+    pending.delete("two");
+    await settle();
+    let cards = cardMap(listEl);
+    assert.ok(!String(cards.get("two").className).includes("doc-unfetched"), "the landed card is still dimmed");
+    assert.ok(cards.get("two").textContent.includes("two fetched title"),
+      "the landed card does not show the title its fetch answer carried");
+    assert.ok(String(cards.get("one").className).includes("doc-unfetched"), "the unlanded card flipped early");
+    assert.equal(LIST_READS(paths), readsBefore, "a list re-read happened while fetches were landing");
+    pending.get("one")();
+    pending.delete("one");
+    assert.equal(await run, 2);
+    await settle();
+    cards = cardMap(listEl);
+    assert.ok(cards.get("one").textContent.includes("one fetched title"), "the second card did not patch in place");
+    assert.equal(LIST_READS(paths), readsBefore, "Fetch visible ended with a full list re-read");
+  });
+});
+
+test("documents list: fetchSince still scopes by cutoff and reports progress (#1307)", async () => {
+  const rows = [unfetchedRow("old", 100), unfetchedRow("edge", 250), unfetchedRow("new", 300), docRow("held", 400)];
+  const attempted = [];
+  await withList((_path, options) => {
+    if (options?.method === "POST") { attempted.push(options.body.key); return fetchAnswerFor(options.body.key); }
+    return { documents: rows, total: rows.length };
+  }, async ({ list, paths }) => {
+    await list.refresh();
+    const readsBefore = LIST_READS(paths);
+    const progress = [];
+    const arrived = await list.fetchSince(250, (done, total) => progress.push([done, total]));
+    assert.equal(arrived, 2);
+    assert.deepEqual(attempted, ["new", "edge"], "fetchSince did not fetch exactly the at-or-after-cutoff unfetched rows, newest first");
+    assert.deepEqual(progress, [[0, 2], [1, 2], [2, 2]]);
+    assert.equal(LIST_READS(paths), readsBefore, "fetchSince ended with a full list re-read");
   });
 });
 

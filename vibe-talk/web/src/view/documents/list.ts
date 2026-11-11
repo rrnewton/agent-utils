@@ -38,10 +38,10 @@ export interface DocumentsList {
    * scroller's current place by the same rule.
    */
   refresh(place?: DocumentsListPlace): Promise<void>;
-  /** Fetch the unfetched among the rows just drawn; how many arrived. */
-  fetchVisible(): Promise<number>;
+  /** Fetch the unfetched rows whose cards are on screen, newest first; how many arrived. */
+  fetchVisible(progress?: (done: number, total: number) => unknown): Promise<number>;
   /** Fetch unfetched rows last mentioned at or after `cutoffMs`. */
-  fetchSince(cutoffMs: number): Promise<number>;
+  fetchSince(cutoffMs: number, progress?: (done: number, total: number) => unknown): Promise<number>;
   /** Fetch the most recent unfetched documents, then redraw. */
   fetchRecent(): Promise<number>;
   /** Check fetched rows for newer versions, updating them; progress by key. */
@@ -71,6 +71,32 @@ const FETCH_PATH = "/api/v1/documents/fetch";
 const FETCH_RECENT_PATH = "/api/v1/documents/fetch-recent";
 const FRESHNESS_PATH = (key: string) => `/api/v1/documents/${encodeURIComponent(key)}/freshness`;
 const FETCH_RECENT_LIMIT = 10;
+
+/** How many documents a bulk fetch holds in flight at once (`#1307 doc-fetch-visible-viewport`). */
+const FETCH_CONCURRENCY = 4;
+
+/** One fetched entry of `POST /documents/fetch`'s answer, as far as patching a row reads it. */
+interface FetchedEntryPatch {
+  title: string | null;
+  version: string | null;
+  fetched_ms: number | null;
+}
+
+/** The patch `answer` carries for `key`, or null where it carries none readable. */
+function fetchedPatchOf(answer: unknown, key: string): FetchedEntryPatch | null {
+  const fetched = (answer as { fetched?: unknown } | null)?.fetched;
+  if (!Array.isArray(fetched)) return null;
+  for (const entry of fetched) {
+    const one = entry as { key?: unknown; title?: unknown; version?: unknown; fetched_ms?: unknown } | null;
+    if (!one || one.key !== key) continue;
+    return {
+      title: typeof one.title === "string" ? one.title : null,
+      version: typeof one.version === "string" ? one.version : null,
+      fetched_ms: typeof one.fetched_ms === "number" && Number.isFinite(one.fetched_ms) ? one.fetched_ms : null,
+    };
+  }
+  return null;
+}
 
 /** The type-filter buckets of `#1176 doc-kind-buckets`: gists sit with pastes. */
 export type DocumentBucket = "markdown" | "pastes" | "issues" | "other";
@@ -284,6 +310,106 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
       if (state.hidden && !showingHidden) return false;
       if (starredOnly && !state.starred) return false;
       return true;
+    });
+  }
+
+  /** The vertical span `element` reports, or null where it reports none readable. */
+  function rectOf(element: unknown): { top: number; bottom: number } | null {
+    try {
+      const host = element as { getBoundingClientRect?: () => { top?: unknown; bottom?: unknown } } | null | undefined;
+      if (!host || typeof host.getBoundingClientRect !== "function") return null;
+      const rect = host.getBoundingClientRect();
+      if (!rect || typeof rect.top !== "number" || typeof rect.bottom !== "number") return null;
+      if (!Number.isFinite(rect.top) || !Number.isFinite(rect.bottom)) return null;
+      return { top: rect.top, bottom: rect.bottom };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The band of the shared scroller the reader can see, in viewport coordinates: the
+   * scroller's own span where it can be measured, else the viewport's, else null.
+   */
+  function visibleBand(): { top: number; bottom: number } | null {
+    const scroller = scrollerOrNull();
+    if (scroller) {
+      const rect = rectOf(scroller);
+      if (rect && rect.bottom > rect.top) return rect;
+    }
+    const height = (globalThis as { innerHeight?: unknown }).innerHeight;
+    if (typeof height === "number" && Number.isFinite(height) && height > 0) {
+      return { top: 0, bottom: height };
+    }
+    return null;
+  }
+
+  /** The rendered `.doc-card` elements, each with the document key it names. */
+  function cardElements(): readonly { key: string; element: unknown }[] {
+    let list: HTMLElement | null = null;
+    try {
+      list = deps.byId(LIST_ID) ?? null;
+    } catch {
+      return [];
+    }
+    if (!list) return [];
+    const keyOf = (element: unknown): string | null => {
+      const host = element as { getAttribute?: (name: string) => unknown } | null | undefined;
+      if (!host || typeof host.getAttribute !== "function") return null;
+      const key = host.getAttribute("data-key");
+      return typeof key === "string" && key !== "" ? key : null;
+    };
+    const host = list as unknown as {
+      querySelectorAll?: (selector: string) => Iterable<unknown>;
+      children?: ArrayLike<unknown>;
+    };
+    if (typeof host.querySelectorAll === "function") {
+      try {
+        const found = [...host.querySelectorAll(".doc-card")]
+          .map((element) => ({ key: keyOf(element), element }))
+          .filter((card): card is { key: string; element: unknown } => card.key !== null);
+        if (found.length > 0) return found;
+      } catch {
+        // Fall through to the children below.
+      }
+    }
+    const kids = host.children;
+    if (!kids) return [];
+    const found: { key: string; element: unknown }[] = [];
+    for (const kid of Array.from(kids)) {
+      const className = String((kid as { className?: unknown } | null)?.className ?? "");
+      if (!className.split(/\s+/).includes("doc-card")) continue;
+      const key = keyOf(kid);
+      if (key !== null) found.push({ key, element: kid });
+    }
+    return found;
+  }
+
+  /**
+   * The unfetched rows "Fetch visible" reaches (`#1307 doc-fetch-visible-viewport`):
+   * drawn, non-busy rows whose rendered cards intersect the scroller's visible band.
+   * Degrade rule: where no drawn card reports usable geometry — no
+   * `getBoundingClientRect`, or all-zero rects, as the fake-DOM tests draw them — the
+   * screen cannot scope the fetch, so every drawn unfetched row counts as on screen
+   * rather than none of them fetching. The same holds where no band can be measured.
+   */
+  function rowsOnScreen(): readonly DocumentRow[] {
+    const drawn = visibleRows().filter((row) => !row.fetched && !busy.has(row.key));
+    if (drawn.length === 0) return drawn;
+    const cards = cardElements();
+    if (cards.length === 0) return drawn;
+    const rects = new Map<string, { top: number; bottom: number } | null>();
+    for (const card of cards) rects.set(card.key, rectOf(card.element));
+    const usable = (
+      rect: { top: number; bottom: number } | null | undefined,
+    ): rect is { top: number; bottom: number } =>
+      rect !== null && rect !== undefined && !(rect.top === 0 && rect.bottom === 0);
+    if (!drawn.some((row) => usable(rects.get(row.key)))) return drawn;
+    const band = visibleBand();
+    if (!band) return drawn;
+    return drawn.filter((row) => {
+      const rect = rects.get(row.key);
+      return usable(rect) && rect.bottom > band.top && rect.top < band.bottom;
     });
   }
 
@@ -685,16 +811,38 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     });
   }
 
-  async function fetchRow(row: DocumentRow): Promise<boolean> {
+  /**
+   * Fetch one row, saying what landed: the answer's patch for it, `null` where the fetch
+   * landed without a readable entry, or `false` where it failed — the failure recorded
+   * on the row and said, as a single fetch always has.
+   */
+  async function fetchRowEntry(row: DocumentRow): Promise<FetchedEntryPatch | null | false> {
     try {
-      await deps.api(FETCH_PATH, { method: "POST", body: { key: row.key } });
-      return true;
+      const answer = await deps.api(FETCH_PATH, { method: "POST", body: { key: row.key } });
+      return fetchedPatchOf(answer, row.key);
     } catch (error) {
       const words = error instanceof Error ? error.message : String(error);
       errors.set(row.key, `Could not fetch it. ${words}`);
       deps.onStatus?.(`Could not fetch ${row.file_name}. ${words}`);
       return false;
     }
+  }
+
+  async function fetchRow(row: DocumentRow): Promise<boolean> {
+    return (await fetchRowEntry(row)) !== false;
+  }
+
+  /** Mark `key` fetched in the drawn rows, from its fetch answer's patch where one landed. */
+  function patchFetched(key: string, patch: FetchedEntryPatch | null): void {
+    rowsNow = rowsNow.map((row) => (row.key === key
+      ? {
+          ...row,
+          fetched: true,
+          title: patch?.title ?? row.title,
+          version: patch ? patch.version : row.version,
+          fetched_ms: patch ? patch.fetched_ms : row.fetched_ms,
+        }
+      : row));
   }
 
   async function fetchOnly(row: DocumentRow): Promise<void> {
@@ -744,24 +892,60 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     }
   }
 
-  async function fetchMany(targets: readonly DocumentRow[]): Promise<number> {
+  /**
+   * Fetch `targets` newest first with at most `FETCH_CONCURRENCY` in flight (`#1307`).
+   * Each row patches into `rowsNow` from its own fetch answer and redraws as it lands,
+   * so cards flip one by one and no list re-read follows the run. `progress` hears
+   * (done, total) at the start and as each fetch completes, landed or failed.
+   */
+  async function fetchMany(
+    targets: readonly DocumentRow[],
+    progress?: (done: number, total: number) => unknown,
+  ): Promise<number> {
+    const pending = targets
+      .filter((row) => !row.fetched && !busy.has(row.key))
+      .sort((a, b) => (b.last_mentioned_ms ?? 0) - (a.last_mentioned_ms ?? 0));
+    const total = pending.length;
     let arrived = 0;
-    for (const row of targets) {
-      if (row.fetched || busy.has(row.key)) continue;
-      busy.add(row.key);
-      render(rowsNow);
-      if (await fetchRow(row)) arrived += 1;
-      busy.delete(row.key);
+    let done = 0;
+    let next = 0;
+    progress?.(0, total);
+    async function worker(): Promise<void> {
+      while (true) {
+        const at = next;
+        next += 1;
+        if (at >= total) return;
+        const row = pending[at]!;
+        if (busy.has(row.key)) {
+          done += 1;
+          progress?.(done, total);
+          continue;
+        }
+        busy.add(row.key);
+        errors.delete(row.key);
+        render(rowsNow);
+        const entry = await fetchRowEntry(row);
+        busy.delete(row.key);
+        if (entry !== false) {
+          patchFetched(row.key, entry);
+          arrived += 1;
+        }
+        done += 1;
+        progress?.(done, total);
+        render(rowsNow);
+      }
     }
-    await refresh();
+    await Promise.all(
+      Array.from({ length: Math.min(FETCH_CONCURRENCY, total) }, () => worker()),
+    );
     return arrived;
   }
 
   return {
     refresh,
-    fetchVisible: () => fetchMany(visibleRows()),
-    fetchSince: (cutoffMs: number) =>
-      fetchMany(visibleRows().filter((row) => (row.last_mentioned_ms ?? 0) >= cutoffMs)),
+    fetchVisible: (progress) => fetchMany(rowsOnScreen(), progress),
+    fetchSince: (cutoffMs: number, progress) =>
+      fetchMany(visibleRows().filter((row) => (row.last_mentioned_ms ?? 0) >= cutoffMs), progress),
     async fetchRecent(): Promise<number> {
       const answer = (await deps.api(FETCH_RECENT_PATH, {
         method: "POST",
