@@ -207,6 +207,7 @@ declare const createReadingModeActs: LegacyImports["createReadingModeActs"];
 declare const createOpenInView: LegacyImports["createOpenInView"];
 declare const createPageGuards: LegacyImports["createPageGuards"];
 declare const createScrollTraceControls: LegacyImports["createScrollTraceControls"];
+declare const createFreshness: LegacyImports["createFreshness"];
 declare const createHeldDone: LegacyImports["createHeldDone"];
 declare const createReadState: LegacyImports["createReadState"];
 declare const createPendingSends: LegacyImports["createPendingSends"];

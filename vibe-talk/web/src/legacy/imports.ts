@@ -109,6 +109,7 @@ export { PULL_WAIT_MS, REPLY_LANDING_GAP_PX, anchorOfRow, authorPasses, createCa
   createSearchOpenControl,
   createServiceWords,
   createOpenInView,
+  createFreshness,
   } from "../view/channel/index.ts";
 
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";

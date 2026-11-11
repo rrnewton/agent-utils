@@ -3938,84 +3938,35 @@ const channelScope = createChannelScope({
 });
 const { syncCanonDismissed, saveChannelScope, hydrateChannelScope, hydrateFromCache, clearChannelScreen, screenBelongsToToken, forgetMessages, noteChannelReadFailure, reconcileChannelSnapshot } = channelScope;
 
-function setChannelFreshness(state) {
-  loadState().freshness = state;
-  renderChannelFreshness();
-}
-
-/**
- * Over the top of the list rather than in it: a sentence at the head of the history scrolls away
- * with it, and the reader is usually at the bottom, which is exactly where "these are old" has to
- * be visible. Hidden while the pull-to-refresh pill is in the same place — a pull at the top. A
- * pull up from the newest line puts that pill at the foot of the list, and this one stays.
- */
-function renderChannelFreshness() {
-  // The pill floats over the left column and speaks for it. `#229 desktop-two-column`: the right
-  // column's freshness is its own, said on a line of that column (`#231 two-column-polish`).
-  if (columnWork.side()) {
-    renderSideFreshness();
-    return;
-  }
-  const pill = el("channel-freshness");
-  const gesture = el("pull-refresh");
-  const at = stamp(loadState().freshAt);
-  const refreshing = loadState().refreshing;
-  // CURRENT IS SAID TOO, not left blank: a blank pill reads the same as a page that never managed
-  // to refresh, which is what a reader opening the app in the car could not tell apart.
-  const current = loadState().freshAt
-    ? `${liveFollow.attached() && providerFacts.liveDelivery() !== "off" ? "Live · updated" : "Updated"} ${at}` +
-      (refreshing ? " · refreshing…" : "")
-    : "";
-  const text = staleWords(loadState().freshness, loadState().freshAt, refreshing, "messages", () => chatServiceOf(selectedChannelId())) || current;
-  pill.textContent = text;
-  pill.setAttribute("data-state", loadState().freshness);
-  // It gives way to a pull at the TOP, which draws in the same place (a pull up at the foot leaves
-  // "Offline" or "Refresh failed" standing, `#188 pull-refresh-bottom`), and — since `#197
-  // floating-search` put the search glass on the same line — to the open search bar, which grows
-  // along that line across the top of the list.
-  pill.hidden = text === "" || screens.view() !== "discord" ||
-    (!gesture.hidden && gesture.getAttribute("data-edge") !== "end") || searchField.open();
-  // No room is reserved or released here (#1210): the pane carries `data-freshness` statically,
-  // so the list's top edge stands at the floating line's foot for as long as the pane is shown
-  // and the scroller never resizes as freshness appears, clears, or is reworded.
-}
+/** How old what is on screen is, said over the list: web/src/view/channel/freshness.ts (`createFreshness`, #624). */
+const freshnessOwner = createFreshness({
+  loadState,
+  side: () => columnWork.side(),
+  el,
+  leftEl,
+  stamp,
+  liveAttached: () => liveFollow.attached(),
+  liveDelivery: () => providerFacts.liveDelivery(),
+  staleWords,
+  chatServiceOf,
+  selectedChannelId,
+  view: () => screens.view(),
+  searchOpen: () => searchField.open(),
+  columnsShown: () => layoutShown.columns(),
+  sideColumn: () => columns.side,
+  mainColumn: () => columns.main,
+  inColumn,
+  sideColumnUp,
+  threadListFailure: (channel) => threadList.threadListFailure(channel),
+  threadListLandedAt: (channel) => threadList.threadListLandedAt(channel),
+  setTextIfChanged,
+  holdingReader,
+  keepingCardPlace: (act) => keepingCardPlace(act),
+});
+const { setChannelFreshness, renderChannelFreshness, renderSideFreshness } = freshnessOwner;
 
 
-/**
- * The right column's line saying how old its rows are: drawn only when it changed, and only when
- * they are not current. `#231 two-column-polish`. A thread says what its own reads have said, as
- * the pill says Main's; the cards say what the thread list's reads have said, by the newest that
- * landed — else by the left column's, whose store the cards are drawn from — and nothing once one
- * lands again.
- */
-function renderSideFreshness() {
-  const line = leftEl("side-freshness");
-  let state = "fresh";
-  let text = "";
-  if (layoutShown.columns() && columns.side.mode === "thread") {
-    [state, text] = inColumn(columns.side, () =>
-      [loadState().freshness, staleWords(loadState().freshness, loadState().freshAt, loadState().refreshing, "messages", () => chatServiceOf(selectedChannelId()))]);
-  } else if (sideColumnUp()) {
-    const channel = String(selectedChannelId());
-    state = threadList.threadListFailure(channel) || "fresh";
-    const at = threadList.threadListLandedAt(channel) || inColumn(columns.main, () => loadState().freshAt);
-    // With no time to give, the state alone, rather than a time nothing was read at.
-    text = state === "fresh" ? "" : at ? staleWords(state, at, false, "threads", () => chatServiceOf(selectedChannelId()))
-      : state === "offline" ? "Offline" : "Refresh failed";
-  }
-  setTextIfChanged(line, text);
-  if (line.getAttribute("data-state") !== state) line.setAttribute("data-state", state);
-  const hide = text === "";
-  if (line.hidden === hide) return;
-  // The line's height comes out of the list's below it, which browser scroll anchoring does not
-  // hold: a reader of the thread keeps the line they are on, or the newest line (`holdingReader`).
-  const toggle = () => {
-    line.hidden = hide;
-  };
-  if (layoutShown.columns() && columns.side.mode === "thread") inColumn(columns.side, () => holdingReader(toggle));
-  // `#261 two-column-connectors`: and a reader of the cards keeps theirs, the foot above all.
-  else keepingCardPlace(toggle);
-}
+
 
 // The record itself — read back from this window's storage and the device's, checked on the way back
 // and the old version brought forward (UI_STATE_KEY, UI_STATE_VERSION, UI_STATE_CHANNELS,
