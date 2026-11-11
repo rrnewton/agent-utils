@@ -825,7 +825,15 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
     if (replyState.docked) {
       leaveDockedReply(String(target.id), { sent: true });
       // `#467 inline-send-in-place`. Its row takes the place the box has just left.
-      deps.renderOutgoingEverywhere();
+      // `#1251 scroll-single-owner`: that redraw draws every row in the undocked state
+      // (the docked margins go, and bodies rewrap taller), which moves the reader's row
+      // by everything that regrew above it — held by the owner, as the browser's scroll
+      // anchoring used to hold it silently.
+      deps.inColumn(replyState.column, () => {
+        const mark = deps.captureScroll();
+        deps.renderOutgoingEverywhere();
+        deps.restoreScroll(mark);
+      });
     }
     await completion;
   }
