@@ -569,8 +569,21 @@ impl Ran {
     /// Honest probe observation: `Missing`/`Skip`-only (or empty) results
     /// are `Unknown`, never a pass. An empty red (no recorded test result)
     /// observed nothing, so it is `Unknown` too: it can name no culprit.
+    /// An exit-4 run whose selected tests all passed is also `Unknown`
+    /// (#1273 probe-no-counted-tests): its receipt could not qualify
+    /// (no counted tests), which is inconclusive, never a red base.
     pub fn probe_observation(&self) -> ProbeObservation {
         if self.cancelled || self.refused || self.is_empty_red() {
+            return ProbeObservation::Unknown;
+        }
+        if self.exit == Some(4)
+            && !self.results.results.is_empty()
+            && self
+                .results
+                .results
+                .values()
+                .all(|outcome| *outcome == Outcome::Pass)
+        {
             return ProbeObservation::Unknown;
         }
         if self.reproduces() {
@@ -2082,6 +2095,18 @@ mod unit {
         ));
         assert!(!gh_paced_refusal("COULD_NOT_RUN: slots full"));
         assert!(!gh_paced_refusal(""));
+    }
+
+    #[test]
+    fn an_exit_4_probe_with_every_selected_test_passed_is_inconclusive() {
+        // #1273 probe-no-counted-tests: the receipt cannot qualify (no
+        // counted tests), so the run exits 4 with every selected test
+        // passed. As a probe that is inconclusive, never a red base.
+        let passed = ran_with(&[("check.lint_checks", Outcome::Pass)], Some(4), &[]);
+        assert_eq!(passed.probe_observation(), ProbeObservation::Unknown);
+        // A counted failure at exit 4 still reproduces.
+        let failed = ran_with(&[("check.lint_checks", Outcome::Fail)], Some(4), &[]);
+        assert_eq!(failed.probe_observation(), ProbeObservation::Fail);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 ---
 title: 'probe-no-counted-tests: a base probe with no counted tests must not read as a red base'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-11-11T06:00:00.000000000+00:00
