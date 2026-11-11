@@ -209,6 +209,28 @@ reach nobody. Reply with that command, once per reply, and confirm with
 `agentctl chat sent`. The bridge told your parent coordinator once that the
 owner is talking to you directly; work the thread as your own.
 
+## Find a prior discussion
+
+When the owner asks where something was discussed, or to link the prior messages about a
+topic ("find where we discussed X", "link the prior messages about Y"), search the
+conversation with the vibe-talk CLI and link the hits — do not reconstruct the exchange
+from memory:
+
+```sh
+vibe-talk search "deploy freeze"
+vibe-talk search "runner offline" --channel "lead team" --since 2026-10-30 --limit 20
+```
+
+Run it where the server runs, with the server's `--config` and environment (the READ token
+and addresses come from that configuration; never print the token). Each hit line carries
+the message's permalink in its own service and its vibe-talk deep link; quote those links
+in the reply. The lines after the hits say how far back each channel was searched: search
+covers only what the server's cache holds, a recent window until full-history retention
+lands, so when a channel's reach is partial, say so in the reply ("searched back to …;
+older discussion is outside the cached window") rather than presenting the hits as the
+whole history. `--json` gives the same hits structured. Full reference:
+`vibe-talk search --help`.
+
 ## Do not
 
 - Do not use another chat tool or the provider's API to answer a bridged

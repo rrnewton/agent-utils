@@ -1624,6 +1624,12 @@ mod read_scope_writes_nothing {
                 "find_message",
                 vec![json!({"channel_id": READ_CHANNEL, "query": "message 6 about lunch"})],
             ),
+            // `#1338 vibe-talk-search-cli`: search is a read, and this session proves it
+            // leaves the cache unchanged like every other read here.
+            (
+                "search",
+                vec![json!({"channel_id": READ_CHANNEL, "query": "message"})],
+            ),
             (
                 "read_message",
                 vec![json!({"channel_id": READ_CHANNEL, "message_id": message})],

@@ -2286,7 +2286,7 @@
           "type": "integer"
         },
         "reason": {
-          "description": "Why the server's copy was not searched: `no_cache`, `serve_off` (the operator has not let\nthe server answer from its copy), `not_kept`, `unverified` (the provider's account is not\nchecked yet), `suspended`, `in_doubt` (access to the channel is in doubt, or an erase of\nit is waiting) or `read_scope` (the read token is never answered from the server's copy).\nA string rather than a closed set, so a reason added later does not make an older page\nrefuse the answer.",
+          "description": "Why the server's copy was not searched: `no_cache`, `serve_off` (the operator has not let\nthe server answer from its copy), `not_kept`, `unverified` (the provider's account is not\nchecked yet), `suspended`, or `in_doubt` (access to the channel is in doubt, or an erase of\nit is waiting). Older answers could also carry `read_scope`; since `#1338\nvibe-talk-search-cli` both tokens search, so it is no longer sent.\nA string rather than a closed set, so a reason added later does not make an older page\nrefuse the answer.",
           "type": [
             "string",
             "null"

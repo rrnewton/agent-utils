@@ -145,6 +145,17 @@ and landing evidence (the exact tested commit and the validation result) on the 
 in the commit body. Compose multi-line text in a file with a quoted heredoc (`<<'EOF'`) and pass
 it with `--body-file` or `--from-file`; then read back what was stored.
 
+## Find a prior discussion
+
+When the owner asks where something was discussed, or to link the prior messages about a
+topic ("find where we discussed X", "link the prior messages about Y"), have the answer
+come from `vibe-talk search` (run where the server runs, with its `--config`; READ token,
+never printed), not from memory: each hit line carries the message's permalink in its own
+service and its vibe-talk deep link, and the coverage lines after the hits say how far
+back each channel was searched. Search covers only the server's cached window until
+full-history retention lands, so the report to the owner says when results are limited to
+that window. The same rule is in the agentctl-chat skill for chat requests.
+
 ## Reporting to the owner
 
 - You alone speak to the owner on the owner's channel (chat bridge, voice, or terminal). Workers

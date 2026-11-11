@@ -39,6 +39,7 @@ USAGE:
               [--startup-probe-wait SECONDS]
     vibe-talk pair-link [--config PATH] [--config-overlay PATH]... [--base-url URL] [--ttl SECONDS]
     vibe-talk recap [--config PATH] [--hours N | --since WHEN] [--channel NAME] [--json]
+    vibe-talk search \"<query>\" [--channel NAME] [--since DATE] [--limit N] [--json]
     vibe-talk cache-stats PATH
 
 COMMANDS:
@@ -50,6 +51,10 @@ COMMANDS:
                           grouped by thread, each message tagged DONE or UNREAD (what the owner
                           has marked read), for an agent catching the owner up. Uses the READ
                           token. See `vibe-talk recap --help`
+    search \"<query>\"      search the chat history the running server holds and print one line
+                          per hit (ET time, author, snippet, permalink, vibe-talk deep link),
+                          newest first, with a line per channel saying how far back it was
+                          searched. Uses the READ token. See `vibe-talk search --help`
     cache-stats PATH      print, as JSON, what the message cache file at PATH holds and what its
                           storage costs: bytes on disk, per table and index, and per message; and
                           for each channel its messages, replies, text bytes, the span of days
@@ -360,6 +365,7 @@ async fn main() -> anyhow::Result<()> {
     match argv.next().as_deref() {
         Some("pair-link") => return pair_link(argv).await,
         Some("recap") => return recap(argv).await,
+        Some("search") => return search(argv).await,
         Some("cache-stats") => return cache_stats(argv),
         _ => {}
     }
@@ -1258,6 +1264,25 @@ async fn recap(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
         return Ok(());
     };
     println!("{}", vibe_talk::recap::run(options).await?);
+    Ok(())
+}
+
+/// `vibe-talk search`. `#1338 vibe-talk-search-cli`.
+///
+/// Standard output carries the hits and nothing else; diagnostics go to standard error.
+async fn search(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(log_in_colour(&std::io::stderr()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .init();
+    let Some(options) = vibe_talk::search_cli::parse(args)? else {
+        return Ok(());
+    };
+    println!("{}", vibe_talk::search_cli::run(options).await?);
     Ok(())
 }
 

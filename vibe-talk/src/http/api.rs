@@ -2318,8 +2318,9 @@ impl SearchQuery {
 }
 
 /// `GET /api/v1/channels/{channel_id}/search` — search what the server's own copy of one channel
-/// holds. Read scope; the read token's answer says the copy was not searched (`read_scope`), as
-/// it is never answered from the copy. `#605 server-side-search`.
+/// holds. Read scope: both tokens search (`#1338 vibe-talk-search-cli`); a read caller's hits are
+/// rendered without recording heading tags, so the search changes no server state. `#605
+/// server-side-search`.
 pub async fn search_channel(
     State(state): State<AppState>,
     ReadScope(caller): ReadScope,

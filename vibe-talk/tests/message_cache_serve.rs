@@ -1323,10 +1323,17 @@ async fn a_search_of_the_servers_copy_keeps_the_serving_rules_and_says_which_ref
     assert!(hit_texts(&body).is_empty());
 
     d.state.message_cache.set_serve(true);
-    // The read token is never answered from the copy.
+    // `#1338 vibe-talk-search-cli`: search is a read, so the read token is answered from the
+    // copy exactly as the write token is — and the search records no heading tags doing it.
+    let headings_before = d.state.headings.authors();
     let body = ok(&d.state, &search_path(READ_CHANNEL, "message"), READ_TOKEN).await;
-    assert_eq!(reason(&body).as_deref(), Some("read_scope"), "{body}");
-    assert!(hit_texts(&body).is_empty());
+    assert_eq!(body["scopes"][0]["state"], "searched", "{body}");
+    assert_eq!(hit_texts(&body).len(), 12, "{body}");
+    assert_eq!(
+        d.state.headings.authors(),
+        headings_before,
+        "a read-scope search left the heading record untouched"
+    );
 
     // A channel in doubt is not searched.
     let cache = d.state.message_cache.cache().expect("installed");

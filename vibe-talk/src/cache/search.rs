@@ -349,7 +349,8 @@ pub enum SearchRefusal {
     AccountMismatch,
     /// Access to the channel is in doubt, or an erase of it is waiting.
     Blocked,
-    /// The caller holds the read token, which is never answered from the server's copy.
+    /// The caller held the read token. Historical: since `#1338 vibe-talk-search-cli` both
+    /// scopes search, so nothing returns this; the code stays so an older answer still reads.
     ReadScope,
 }
 

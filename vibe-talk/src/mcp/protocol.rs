@@ -697,6 +697,9 @@ async fn run_named(
         "read_page" => run_page(state, scope, args).await.map_err(ToolError::from),
         "count_messages" => run_count(state, scope, args).await.map_err(ToolError::from),
         "find_message" => run_find(state, scope, args).await.map_err(ToolError::from),
+        "search" => run_search(state, scope, args)
+            .await
+            .map_err(ToolError::from),
         "read_message" => run_read(state, scope, args).await.map_err(ToolError::from),
         // `#1040 documents-voice-agent`: cache-only, so no scope reaches a fetcher.
         "fetch_document" => run_fetch_document(state, args),
@@ -1857,6 +1860,75 @@ async fn run_find(state: &AppState, caller: Scope, args: &Value) -> Result<Strin
             untrusted::read_field(Some(read.contains(&alternative.message.id))),
             untrusted::continued(&alternative.message.content)
         ));
+    }
+    Ok(format!("{header}{}", untrusted::fenced(&body)))
+}
+
+/// `search` (`#1338 vibe-talk-search-cli`): the server's own copy, searched with the shared
+/// language, hits newest first with their permalinks; the scope lines say how far back each
+/// channel was searched, so a silent window is never handed over as the whole history.
+async fn run_search(state: &AppState, caller: Scope, args: &Value) -> Result<String, OpError> {
+    let query = arg_str(args, "query").unwrap_or_default();
+    let channels = match arg_id(args, "channel_id") {
+        Some(channel_id) => vec![ops::allowed_channel(state, &channel_id).await?],
+        None => ops::channels(state).await,
+    };
+    let limit = arg_u16(args, "limit").map(usize::from);
+    let answer = crate::server_search::search(
+        state,
+        caller,
+        channels,
+        &crate::server_search::Ask {
+            q: query.clone(),
+            tz: None,
+            below_ms: None,
+            limit,
+        },
+    )
+    .await?;
+    let owner = crate::owner::Owner::of(state);
+    let mut body = String::new();
+    for hit in &answer.hits {
+        body.push_str(&format!(
+            "[HIT | {} | {} | exact {} | {} {}{} | {}] {}\n",
+            hit.id.as_str(),
+            hit.spoken(),
+            hit.timestamp,
+            untrusted::one_line(&owner.speaker(&hit.author, hit.author_id.as_str())),
+            hit.author_id.mention(),
+            untrusted::thread_field(hit.reply_thread()),
+            hit.upstream_url.as_deref().unwrap_or("no permalink"),
+            untrusted::continued(&hit.content)
+        ));
+    }
+    let mut header = format!(
+        "Search for \"{query}\": {} hit(s), newest first.\n",
+        answer.hits.len()
+    );
+    for scope in &answer.scopes {
+        if scope.state != "searched" {
+            header.push_str(&format!(
+                "Not searched: {} ({}).\n",
+                scope.channel.display_name(),
+                scope.reason.unwrap_or("not_searched")
+            ));
+        } else if !scope.whole {
+            header.push_str(&format!(
+                "Searched {} back to {} (cached window only{}).\n",
+                scope.channel.display_name(),
+                scope
+                    .searched_back_to_ms
+                    .map_or_else(|| "the oldest held".to_owned(), crate::clock::iso_from_ms),
+                if scope.expanding {
+                    ", still gathering"
+                } else {
+                    ""
+                }
+            ));
+        }
+    }
+    if answer.hits.is_empty() {
+        header.push_str("No hits in the window searched; absence here is not absence ever.\n");
     }
     Ok(format!("{header}{}", untrusted::fenced(&body)))
 }

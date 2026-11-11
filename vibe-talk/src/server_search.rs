@@ -8,12 +8,20 @@
 //! either finds it or neither does.
 //!
 //! **Only what the cache may hand out.** A search hands rows out of the cache, so it keeps the
-//! gates a served read keeps ([`crate::cache::Sink::search`]): the write scope (a read token is
-//! never answered from the cache, as `ops::may_serve` says), serving on, the channel on the
+//! gates a served read keeps ([`crate::cache::Sink::search`]): serving on, the channel on the
 //! cache's list, its provider's account checked against the file and not suspended, and nothing
 //! in doubt. A channel that fails one is not searched, and its scope says why, by code; the answer
 //! is still a 200, so the page can say exactly what was and was not searched. Rows not seen since
 //! an offer for the channel was dropped, and texts only a push brought, are withheld.
+//!
+//! **Both scopes search** (`#1338 vibe-talk-search-cli`). Search is a read: a READ token already
+//! reads these same messages through the channel endpoints, so searching them widens no access.
+//! The one write in the old path — rendering a hit recorded its paren tag in the shared heading
+//! record, confirming it for later readers — is split out: a WRITE caller renders with
+//! [`crate::render::fill_page`] exactly as before, a READ caller with
+//! [`crate::render::fill_page_readonly`], which finds headings only from tags already confirmed
+//! and leaves the record untouched. Everything else in the path (the cache search itself, the
+//! stamp, the noise marking) touches only the answer's own copies.
 //!
 //! **What it does not promise: freshness.** A served page rests on a read of the newest end made
 //! seconds ago; a search reaches back through stretches the server last listed hours or days ago
@@ -105,9 +113,6 @@ pub async fn search(
         let zone = zone.clone();
         let id = channel.id.clone();
         async move {
-            if caller != Scope::Write {
-                return Err(SearchRefusal::ReadScope);
-            }
             tokio::task::spawn_blocking(move || {
                 let day_start_ms = |day: Day| {
                     zone.day_start_ms(day.year, day.month, day.day)
@@ -152,7 +157,7 @@ pub async fn search(
     }
     let mut hits = Vec::new();
     for (index, messages) in by_channel {
-        hits.extend(prepare(state, &channels[index], messages).await);
+        hits.extend(prepare(state, caller, &channels[index], messages).await);
     }
     hits.sort_by_key(|message| std::cmp::Reverse(message.created_ms()));
     Ok(SearchResponse {
@@ -195,7 +200,15 @@ fn merge(
 }
 
 /// Stamp, mark and render one channel's hits as a timeline page's messages are.
-async fn prepare(state: &AppState, channel: &ChannelInfo, messages: Vec<Message>) -> Vec<Message> {
+///
+/// A WRITE caller renders exactly as a timeline page does. A READ caller renders without
+/// recording paren tags (`#1338 vibe-talk-search-cli`): the search changes no server state.
+async fn prepare(
+    state: &AppState,
+    caller: Scope,
+    channel: &ChannelInfo,
+    messages: Vec<Message>,
+) -> Vec<Message> {
     let mut page = crate::threads::TimelinePage {
         messages,
         ..crate::threads::TimelinePage::default()
@@ -204,7 +217,11 @@ async fn prepare(state: &AppState, channel: &ChannelInfo, messages: Vec<Message>
     crate::noise::filter_for(state, &channel.id)
         .await
         .mark(&mut page.messages);
-    crate::render::fill_page(&state.config, &state.headings, channel, &mut page);
+    if caller == Scope::Write {
+        crate::render::fill_page(&state.config, &state.headings, channel, &mut page);
+    } else {
+        crate::render::fill_page_readonly(&state.config, &state.headings, channel, &mut page);
+    }
     page.messages
 }
 

@@ -510,11 +510,37 @@ pub fn fill(
     channel: &ChannelInfo,
     messages: &mut [Message],
 ) {
+    fill_impl(config, headings, channel, messages, true);
+}
+
+/// [`fill`] without the recording: headings are found only from tags already confirmed, and
+/// `headings` is left exactly as it was. For a caller that must not change server state (a
+/// READ-scope search, `#1338 vibe-talk-search-cli`): recording confirms a tag from the second
+/// message that carries it, which is a write, so a read renders from what is already known.
+pub fn fill_readonly(
+    config: &Config,
+    headings: &HeadingTags,
+    channel: &ChannelInfo,
+    messages: &mut [Message],
+) {
+    fill_impl(config, headings, channel, messages, false);
+}
+
+fn fill_impl(
+    config: &Config,
+    headings: &HeadingTags,
+    channel: &ChannelInfo,
+    messages: &mut [Message],
+    record: bool,
+) {
     let markup = markup_for(config, channel);
-    for message in messages.iter() {
-        if let Some(tag) = crate::heading::paren_candidate(&message.content, message.author_is_bot)
-        {
-            headings.record(&channel.id, &message.author_id, &message.id, tag);
+    if record {
+        for message in messages.iter() {
+            if let Some(tag) =
+                crate::heading::paren_candidate(&message.content, message.author_is_bot)
+            {
+                headings.record(&channel.id, &message.author_id, &message.id, tag);
+            }
         }
     }
     for message in messages {
@@ -540,6 +566,21 @@ pub fn fill_page(
     for summary in page.threads.iter_mut().chain(page.thread.iter_mut()) {
         if let Some(root) = &mut summary.root {
             fill(config, headings, channel, std::slice::from_mut(root));
+        }
+    }
+}
+
+/// [`fill_page`] without the recording, as [`fill_readonly`] is to [`fill`].
+pub fn fill_page_readonly(
+    config: &Config,
+    headings: &HeadingTags,
+    channel: &ChannelInfo,
+    page: &mut crate::threads::TimelinePage,
+) {
+    fill_readonly(config, headings, channel, &mut page.messages);
+    for summary in page.threads.iter_mut().chain(page.thread.iter_mut()) {
+        if let Some(root) = &mut summary.root {
+            fill_readonly(config, headings, channel, std::slice::from_mut(root));
         }
     }
 }
@@ -3484,6 +3525,44 @@ mod tests {
 
     fn html(text: &str) -> String {
         to_html(text, Markup::Discord)
+    }
+
+    #[test]
+    fn fill_readonly_records_no_heading_tag_where_fill_does() {
+        // `#1338 vibe-talk-search-cli`: the READ-scope search renders through
+        // `fill_readonly`, which must leave the shared heading record untouched;
+        // the write path (`fill`) still confirms a tag from its second message.
+        let (state, _discord, _voice) =
+            crate::testing::state_from_toml(&crate::testing::config_toml());
+        let channel = crate::model::ChannelInfo {
+            id: crate::model::ChannelId("C1".to_owned()),
+            label: "c1".to_owned(),
+            writable: false,
+            alias: None,
+            added: false,
+            provider: None,
+            write_source: None,
+        };
+        let tagged = || {
+            vec![
+                crate::cache::fixtures::message("1", "ada", "(deploy) first", 1_000),
+                crate::cache::fixtures::message("2", "ada", "(deploy) second", 2_000),
+            ]
+        };
+        let mut read = tagged();
+        super::fill_readonly(&state.config, &state.headings, &channel, &mut read);
+        assert_eq!(
+            state.headings.authors(),
+            0,
+            "a readonly fill recorded a heading tag"
+        );
+        let mut written = tagged();
+        super::fill(&state.config, &state.headings, &channel, &mut written);
+        assert_eq!(
+            state.headings.authors(),
+            1,
+            "the write path no longer records heading tags"
+        );
     }
 
     #[test]

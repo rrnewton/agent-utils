@@ -5428,6 +5428,30 @@ What a line never contains:
 A refused request is logged as loudly as an accepted one, including a request to a path that does
 not exist — a client pointed at the wrong URL is exactly the case this log exists to catch.
 
+## Searching the history: `vibe-talk search`
+
+An agent asked "find where we discussed X" or "link the prior messages about Y" searches the
+conversation instead of reconstructing it:
+
+```sh
+vibe-talk search "deploy freeze"
+vibe-talk search "runner offline" --channel "lead team" --since 2026-10-30 --limit 20
+vibe-talk search "from:ada has:link" --json
+```
+
+Run it where the server runs, with the server's `--config` and environment, exactly like
+`pair-link`: it reads the READ token from the same configuration (or `--token-file`; never
+printed), reaches the server on its bind address, and prints one line per hit, newest first —
+ET time, author, snippet, the message's permalink in its own service, and its vibe-talk deep
+link, built on the configured `[server] public_url` (or `--base-url`). The query is the server
+search language (terms, phrases, `from:`/`in:`/`before:`/`after:`/`has:`), the same as the
+page's search; `--since` folds in as its `after:` term. Search is a read: the READ token
+searches exactly what it already reads through the channel endpoints, and the search changes
+no server state. After the hits, one line per channel says how far back it was searched, or
+why it was not searched: only the server's cached window is searched (a recent window until
+full-history retention lands), so no hits means no match in that window, not no match ever.
+See `vibe-talk search --help` for every option.
+
 ## Catching up: `vibe-talk recap`
 
 The owner marks messages Done as reading progress. After a day away, an agent asked "what did I

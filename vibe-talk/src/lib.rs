@@ -105,6 +105,7 @@ pub mod reply_pointers;
 pub mod reply_read;
 pub mod retrieval;
 pub mod scroll_trace;
+pub mod search_cli;
 pub mod search_query;
 pub mod send_approval;
 pub mod send_intent;

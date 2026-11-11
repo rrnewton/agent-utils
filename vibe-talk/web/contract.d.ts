@@ -1950,8 +1950,9 @@ declare namespace VibeTalk {
     /**
      * Why the server's copy was not searched: `no_cache`, `serve_off` (the operator has not let
      * the server answer from its copy), `not_kept`, `unverified` (the provider's account is not
-     * checked yet), `suspended`, `in_doubt` (access to the channel is in doubt, or an erase of
-     * it is waiting) or `read_scope` (the read token is never answered from the server's copy).
+     * checked yet), `suspended`, or `in_doubt` (access to the channel is in doubt, or an erase of
+     * it is waiting). Older answers could also carry `read_scope`; since `#1338
+     * vibe-talk-search-cli` both tokens search, so it is no longer sent.
      * A string rather than a closed set, so a reason added later does not make an older page
      * refuse the answer.
      */

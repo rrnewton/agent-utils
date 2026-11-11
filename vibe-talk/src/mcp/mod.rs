@@ -394,6 +394,35 @@ pub fn tool_manifest_with_services(
             listed: true,
         },
         ToolDescriptor {
+            name: "search",
+            description: "Search the messages this server holds, in the search language (terms, \
+                          phrases, from:/in:/before:/after:/has:), newest first, and return the \
+                          hits with their permalinks. USE THIS to find where something was \
+                          discussed or to link prior messages: it searches the server's own copy \
+                          of every channel (or one channel with channel_id), further back than a \
+                          page holds. The answer says how far back each channel was searched: \
+                          only the cached window is searched, so no hits means no match in that \
+                          window, not no match ever — say so rather than presenting silence as \
+                          the whole history. `#1338 vibe-talk-search-cli`; the shell twin is \
+                          `vibe-talk search`."
+                .to_owned(),
+            method: "GET",
+            path: "/api/v1/search",
+            approval: ApprovalMode::Automatic,
+            arguments: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "channel_id": channel_arg,
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200 }
+                },
+                "required": ["query"]
+            }),
+            mutates: false,
+            mcp_exposed: true,
+            listed: true,
+        },
+        ToolDescriptor {
             name: "read_message",
             description: "Read one known message in full, by its id. For a reply in a thread, \
                           also pass the thread id its line gave (| thread <thread id>) as \

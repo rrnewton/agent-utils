@@ -868,6 +868,7 @@ async fn the_read_scope_tool_list_is_unchanged() {
             "read_page",
             "count_messages",
             "find_message",
+            "search",
             "read_message",
             "fetch_document",
             "fetch_document_section",

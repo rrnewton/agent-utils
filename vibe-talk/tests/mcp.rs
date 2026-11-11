@@ -887,6 +887,7 @@ async fn a_full_handshake_then_list_then_call_works_over_the_endpoint() {
             "read_page",
             "count_messages",
             "find_message",
+            "search",
             "read_message",
             "fetch_document",
             "fetch_document_section",
