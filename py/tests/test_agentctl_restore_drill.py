@@ -116,6 +116,8 @@ def _require_prerequisites() -> tuple[Path, Path]:
         pytest.skip("restore drill needs a C compiler (cc) for its fake harness")
     if shutil.which("git") is None:
         pytest.skip("restore drill needs git for its scratch slot project")
+    if shutil.which("openssl") is None:
+        pytest.skip("restore drill needs openssl for a parseable scratch certificate")
     if not WRKSLOTS_BIN.is_file():
         pytest.skip(f"restore drill needs the wrkslots launcher at {WRKSLOTS_BIN}")
     try:
@@ -125,6 +127,21 @@ def _require_prerequisites() -> tuple[Path, Path]:
     if boot == PREVIOUS_BOOT:
         pytest.skip("restore drill previous-boot plant collides with the host boot id")
     return Path(herdr), Path(compiler)
+
+
+def _certificate_pem(directory: Path) -> bytes:
+    """A real self-signed PEM certificate: restore parses notAfter (#1137)."""
+    key = directory / "cert-key.pem"
+    cert = directory / "cert-generated.pem"
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", str(key), "-out", str(cert), "-days", "3650",
+            "-subj", "/CN=restore-drill",
+        ],
+        check=True, capture_output=True, timeout=120,
+    )
+    return cert.read_bytes()
 
 
 def _build_fake_harness(directory: Path, compiler: Path) -> Path:
@@ -238,7 +255,8 @@ class Drill:
             json.dumps(restore), encoding="utf-8",
         )
         (self.registry / "restore.json").chmod(0o600)
-        self.certificate.write_text("drill certificate\n", encoding="utf-8")
+        self.cert_pem = _certificate_pem(self.root)
+        self.certificate.write_bytes(self.cert_pem)
 
     def _prepare_slot_project(self, slot_representation: str) -> None:
         remote = self.root / "remote.git"
@@ -644,9 +662,7 @@ def test_restore_drill_happy_path_reused_pane_slot_and_rerun(tmp_path: Path) -> 
             assert pane in restored, (name, restored)
         drill.certificate.unlink()
         timer = threading.Timer(
-            2.0, lambda: drill.certificate.write_text(
-                "drill certificate\n", encoding="utf-8",
-            ),
+            2.0, lambda: drill.certificate.write_bytes(drill.cert_pem),
         )
         timer.start()
         try:
