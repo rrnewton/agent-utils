@@ -185,8 +185,12 @@ def test_only_the_release_build_step_builds_the_release_binary() -> None:
 def test_timing_browser_steps_hold_every_browser_slot() -> None:
     config = dag_from_path(REPO_ROOT / "validation.dag.yaml")
     by_tag = config.by_tag()
-    tag = "vibe-talk.check.read-aloud-blocks-browser"
+    tag = "vibe-talk.check.fold-latency-browser"
     assert by_tag[tag].hint.resources.get("browser") == config.resource_caps["browser"], tag
+    # Since #1250, read-aloud-blocks judges behaviour and only prints its audio-clock gaps,
+    # so it no longer owns every browser slot; keep that from drifting back by accident.
+    blocks = "vibe-talk.check.read-aloud-blocks-browser"
+    assert by_tag[blocks].hint.resources.get("browser") == 1, blocks
 
 
 def test_screenshot_shards_cover_every_profile_once() -> None:

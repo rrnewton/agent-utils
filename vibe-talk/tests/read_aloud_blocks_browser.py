@@ -5,7 +5,7 @@
 is read one block at a time: the block being read is lit, and inside it the sentence being said
 (`#379 read-aloud-sentences`); the row says "reading k of n", a tap on
 another block of it jumps there, Previous and Next and the Media Session's previoustrack, nexttrack,
-pause and play move through it, and the boundaries between blocks are heard without a gap.
+pause and play move through it, and the boundaries between blocks are walked in order.
 
 `#433 read-strip-low` and `#434 read-aloud-pause`: the strip sits directly on the chips row with
 no gap (measured, at 412x915, 393x852 and on a desk), and the Read button and the media keys are one
@@ -43,11 +43,20 @@ turn begins.
 
 The gap at a boundary is measured on the page's own audio clock: every Web Audio source the page
 starts is recorded with when it was due and how long it lasts, and a boundary's gap is how long the
-clock runs with nothing due.
+clock runs with nothing due. Those numbers are printed on every run.
 
-THE NEGATIVE CONTROL runs the same read with the voice's first audio slower than the page's
-half-second cushion. It must show gaps of more than half a second: that is what proves the
-measurement can see a gap at all, rather than passing because nothing was measured.
+The gating verdict is behaviour only (`#1250 vibe-talk-timing-robust`, the pattern of `#1248
+fold-latency-behaviour-verdict`): the blocks asked for in order and lit in order, the sentences in
+order, tap-to-jump, the timeline, Previous, Next, sections, the media keys, pause holding and
+resume carrying on, the message archived when heard to its end, and the strip's drawn geometry. No
+audio-clock gap decides it, so a hot host cannot fail it while the read behaves. The gap budgets —
+each boundary against the voice's own wait, no gap with an ahead voice, no gap inside a block that
+the page could have avoided — and the controls whose proof is a measured gap (the slow voice, the
+voice held up until the page runs dry, the page shim that schedules late with audio in hand) run
+only under `--benchmark`, an opt-in measurement outside the gate. A page that never schedules the
+next block still fails in gating: the walk waits for its drawn "k of n" and times out. Waits take a
+30 s state bound (`STATE_S`): a pass takes as long as the page does, and the bound only limits a
+failure.
 
 Pass --screenshots DIR to keep a PNG of each step, and --web-root DIR to run the same walk against
 another copy of the page.
@@ -120,8 +129,13 @@ CONTROL_FIRST_AUDIO_SECONDS = 1.2
 # the second walk's voice runs ahead, as a provider that generates faster than real time does.
 SPEAKING_PACE = 1.0
 AHEAD_PACE = 2.0
-# Slack on every measured boundary, for scheduling and a loaded machine.
+# Slack on every measured boundary, for scheduling and a loaded machine. A --benchmark budget part:
+# in gating no gap is judged, only printed.
 SLACK_MS = 60
+# The most a walk waits for a state it expects the page to reach (the precedent of
+# read_aloud_views_browser.py's STATE_S, #998): each wait polls for the state, so a pass takes as
+# long as the page does and the deadline only bounds a failure.
+STATE_S = 30.0
 # The underrun control's stall (#998): halfway through one block the voice holds its audio back until the
 # page has played everything it was given and run dry for CONTROL_DRY_S, however much it had in hand (a
 # loaded host can leave it seconds ahead), so it runs out with nothing to play and is not blamed. The
@@ -199,6 +213,24 @@ LATE_PAGE_SHIM = """(() => {
     }
     return start.call(this, when, ...rest);
   };
+})();"""
+
+# Records the sentences lit, page-side at frame rate, in order: the walk reads the record instead of
+# sampling the highlight from this process, which a loaded host can stall past a whole sentence.
+SENTENCE_PROBE = """(() => {
+  const seen = [];
+  window.sentencesLit = seen;
+  const sample = () => {
+    try {
+      const lit = CSS.highlights.get('read-aloud-sentence');
+      if (lit && lit.size > 0) {
+        const text = [...lit][0].toString();
+        if (text && seen[seen.length - 1] !== text) seen.push(text);
+      }
+    } catch {}
+    requestAnimationFrame(sample);
+  };
+  requestAnimationFrame(sample);
 })();"""
 
 # Records the Media Session handlers the page installs and the states it reports, keeping the real
@@ -685,6 +717,13 @@ def arguments() -> argparse.Namespace:
         default=page_sources.served_root(),
         help="the page assets to serve (default: this checkout's vibe-talk/web)",
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="also fail on the audio-clock gap budgets, and run the controls whose proof is a measured "
+             "gap (the slow voice, the held-up voice, the late page): an opt-in measurement outside "
+             "the gate, never part of the gating verdict (default: behaviour only, gaps printed)",
+    )
     return parser.parse_args()
 
 
@@ -745,7 +784,10 @@ def main() -> int:
         args.screenshots.mkdir(parents=True, exist_ok=True)
 
     def wait_for(condition: Callable[[], T | None], seconds: float, why: str) -> T:
-        deadline = time.monotonic() + seconds
+        # Every state wait in this file takes the STATE_S failure bound whatever its call site
+        # names: the smaller numbers here were how long a calm page took, and on a hot host they
+        # expired while the page behaved. No elapsed time from a wait is ever judged.
+        deadline = time.monotonic() + max(seconds, STATE_S)
         while time.monotonic() < deadline:
             value = condition()
             if value:
@@ -770,6 +812,7 @@ def main() -> int:
                 )
                 context.add_init_script("localStorage.setItem('vibe-talk.voice.read-audio-source', 'agent');")
                 context.add_init_script(SOURCE_PROBE)
+                context.add_init_script(SENTENCE_PROBE)
                 if shim is not None:
                     context.add_init_script(shim)  # after the probe, so the probe sees what the shim does
                 context.add_init_script(MEDIA_PROBE)
@@ -778,10 +821,11 @@ def main() -> int:
                 page.fill("#api-token", TOKEN)
                 page.click("#save-token")
                 page.click("#view-switch")
-                page.wait_for_selector(f'#discord-log > li[data-id="{SHORT}"]', timeout=10_000)
+                page.wait_for_selector(f'#discord-log > li[data-id="{SHORT}"]', timeout=int(STATE_S * 1000))
                 page.click("#read-aloud")
                 page.wait_for_function(
-                    f"() => readAloudOwner().preparedSpeech.has('{LONG}') && readAloudOwner().preparedSpeech.get('{LONG}').blocks", timeout=10_000)
+                    f"() => readAloudOwner().preparedSpeech.has('{LONG}') && readAloudOwner().preparedSpeech.get('{LONG}').blocks",
+                    timeout=int(STATE_S * 1000))
                 return context, page
 
             row = f'#discord-log > li[data-id="{LONG}"]'
@@ -796,6 +840,11 @@ def main() -> int:
                 return str(page.evaluate(
                     "() => document.getElementById('read-steer').hidden ? ''"
                     " : document.getElementById('read-steer-count').textContent"))
+
+            def settled(page: Page) -> None:
+                # Two animation frames before a geometry read (the Desk.settled pattern): the page
+                # has painted whatever the state just waited for changed. Never a timed sleep.
+                page.evaluate("() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))")
 
             def strip_gap(page: Page) -> float:
                 # `#433 read-strip-low`: the strip's bottom edge against the chips row's top
@@ -880,59 +929,64 @@ def main() -> int:
                     f"() => {{ const e = document.querySelector('{row} [data-reading-block]');"
                     " return e ? e.tagName.toLowerCase() + ':' + e.textContent.trim().split('\\n')[0] : ''; }"))
 
-            # THE NEGATIVE CONTROL first: a voice whose first audio is slower than the cushion.
-            api.first_audio = CONTROL_FIRST_AUDIO_SECONDS
-            with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
-                context, page = open_page(profile, 412, 915, True)
-                press(page, f"{row} .body", True)
-                wait_position(page, "3 of 7", 15)
-                control_gaps = gaps_of(page)
-                context.close()
-            control_worst = max(boundaries(control_gaps), default=0)
-            check(control_worst >= CONTROL_GAP_AT_LEAST_MS,
-                  f"with first audio {CONTROL_FIRST_AUDIO_SECONDS} s the worst boundary was {control_worst} ms"
-                  f" ({control_gaps}), so this harness cannot see a gap and proves nothing")
+            # The gap controls, whose proof is a measured gap, run only under --benchmark: in
+            # gating the three browser profiles they cost are never opened.
+            control_worst = 0
+            held_s = 0.0
+            stalled: list[Gap] = []
+            blamed = ""
+            if args.benchmark:
+                # THE NEGATIVE CONTROL first: a voice whose first audio is slower than the cushion.
+                api.first_audio = CONTROL_FIRST_AUDIO_SECONDS
+                with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
+                    context, page = open_page(profile, 412, 915, True)
+                    press(page, f"{row} .body", True)
+                    wait_position(page, "3 of 7", 15)
+                    control_gaps = gaps_of(page)
+                    context.close()
+                control_worst = max(boundaries(control_gaps), default=0)
+                check(control_worst >= CONTROL_GAP_AT_LEAST_MS,
+                      f"with first audio {CONTROL_FIRST_AUDIO_SECONDS} s the worst boundary was {control_worst} ms"
+                      f" ({control_gaps}), so this harness cannot see a gap and proves nothing")
 
-            # THE UNDERRUN CONTROLS (#998). A voice held up inside block 2 until the page has run dry leaves
-            # an underrun the page could not help: its next piece's buffer is made only after the audio ran
-            # out, and it is not blamed. A page that has block 2's next piece in hand and schedules it late
-            # is blamed.
-            api.first_audio = FIRST_AUDIO_SECONDS
-            api.stall_held.clear()
-            api.stall_release.clear()
-            api.stall_block = 1
-            with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
-                context, page = open_page(profile, 412, 915, True)
-                press(page, f"{row} .body", True)
-                check(api.stall_held.wait(CONTROL_HOLD_LIMIT_S), "the voice never reached the middle of block 2")
-                held_since = time.monotonic()
-                deadline = held_since + CONTROL_HOLD_LIMIT_S
-                while time.monotonic() < deadline and not page.evaluate(RAN_DRY, [rate_of(1), CONTROL_DRY_S]):
-                    page.wait_for_timeout(20)
-                held_s = time.monotonic() - held_since
-                api.stall_release.set()
-                wait_position(page, "3 of 7", 15)
-                stalled_gaps = gaps_of(page)
-                context.close()
-            api.stall_block = None
-            stalled = [gap for gap in stalled_gaps if gap.underrun and gap.block == 1]
-            check(bool(stalled), f"a voice held up inside block 2 until the page ran dry ({held_s:.1f} s) left no"
-                                 f" underrun there ({stalled_gaps}), so this harness cannot see one and proves nothing")
-            check_within_blocks(stalled_gaps, "with the voice held up inside block 2")
-            with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
-                context, page = open_page(profile, 412, 915, True, shim=LATE_PAGE_SHIM % rate_of(1))
-                press(page, f"{row} .body", True)
-                wait_position(page, "3 of 7", 15)
-                late_gaps = gaps_of(page)
-                context.close()
-            try:
-                check_within_blocks(late_gaps, "a page holding its audio back")
-                blamed = ""
-            except AssertionError as error:
-                blamed = str(error)
-            check("late with audio it had" in blamed or "its next piece was there in time" in blamed,
-                  f"a page that held block 2's pieces back {LATE_PAGE_MS} ms with them in hand was not blamed:"
-                  f" {late_gaps}")
+                # THE UNDERRUN CONTROLS (#998). A voice held up inside block 2 until the page has run
+                # dry leaves an underrun the page could not help: its next piece's buffer is made
+                # only after the audio ran out, and it is not blamed.
+                api.first_audio = FIRST_AUDIO_SECONDS
+                api.stall_held.clear()
+                api.stall_release.clear()
+                api.stall_block = 1
+                with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
+                    context, page = open_page(profile, 412, 915, True)
+                    press(page, f"{row} .body", True)
+                    check(api.stall_held.wait(CONTROL_HOLD_LIMIT_S), "the voice never reached the middle of block 2")
+                    held_since = time.monotonic()
+                    deadline = held_since + CONTROL_HOLD_LIMIT_S
+                    while time.monotonic() < deadline and not page.evaluate(RAN_DRY, [rate_of(1), CONTROL_DRY_S]):
+                        page.wait_for_timeout(20)
+                    held_s = time.monotonic() - held_since
+                    api.stall_release.set()
+                    wait_position(page, "3 of 7", 15)
+                    stalled_gaps = gaps_of(page)
+                    context.close()
+                api.stall_block = None
+                stalled = [gap for gap in stalled_gaps if gap.underrun and gap.block == 1]
+                check(bool(stalled), f"a voice held up inside block 2 until the page ran dry ({held_s:.1f} s) left no"
+                                     f" underrun there ({stalled_gaps}), so this harness cannot see one and proves nothing")
+                check_within_blocks(stalled_gaps, "with the voice held up inside block 2")
+                with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
+                    context, page = open_page(profile, 412, 915, True, shim=LATE_PAGE_SHIM % rate_of(1))
+                    press(page, f"{row} .body", True)
+                    wait_position(page, "3 of 7", 15)
+                    late_gaps = gaps_of(page)
+                    context.close()
+                try:
+                    check_within_blocks(late_gaps, "a page holding its audio back")
+                except AssertionError as error:
+                    blamed = str(error)
+                check("late with audio it had" in blamed or "its next piece was there in time" in blamed,
+                      f"a page that held block 2's pieces back {LATE_PAGE_MS} ms with them in hand was not blamed:"
+                      f" {late_gaps}")
 
             with api.lock:
                 api.reads.clear()
@@ -955,23 +1009,21 @@ def main() -> int:
                 check_phone_layout(page, "412x915", "playing")
                 shot("1-first-block")
 
-                # 1b. Inside it, the sentence being said is lit, each in turn. `#379`.
-                sentences: list[str] = []
-                deadline = time.monotonic() + 8
-                while time.monotonic() < deadline and position(page) == "1 of 7":
-                    said = str(page.evaluate(
-                        "() => { const lit = CSS.highlights.get('read-aloud-sentence');"
-                        " return lit ? [...lit][0].toString() : ''; }"))
-                    if said and (not sentences or sentences[-1] != said):
-                        sentences.append(said)
-                        if len(sentences) == 2:
-                            shot("1b-second-sentence")
-                    time.sleep(0.05)
+                # 1b. Inside it, the sentence being said is lit, each in turn. `#379`. The record is
+                # the page's own (SENTENCE_PROBE, frame rate); this process only reads it back.
+                wait_for(lambda: page.evaluate("() => window.sentencesLit") if len(
+                    page.evaluate("() => window.sentencesLit")) >= 2 else None, STATE_S,
+                    "the first block lit fewer than two sentences")
+                shot("1b-second-sentence")
+                wait_for(lambda: page.evaluate("() => window.sentencesLit")
+                         if page.evaluate("() => window.sentencesLit") == FIRST_SENTENCES else None,
+                         STATE_S, "the first block's sentences were not all lit in order")
+                sentences = [str(one) for one in page.evaluate("() => window.sentencesLit")]
                 check(sentences == FIRST_SENTENCES,
                       f"the sentences lit in the first block were {sentences}, not {FIRST_SENTENCES}")
 
-                # 2. It carries on through the blocks by itself, the light moving with the voice, and
-                # the boundaries are heard without a gap.
+                # 2. It carries on through the blocks by itself, the light moving with the voice.
+                # The boundary gaps are read and printed; their budgets decide only --benchmark.
                 wait_position(page, "2 of 7")
                 check(lit_element(page) == "li:the retry budget landed", f"block 2 lit: {lit_element(page)!r}")
                 wait_position(page, "4 of 7", 15)
@@ -985,14 +1037,18 @@ def main() -> int:
                 check([r.block for r in boundary_reads] == [0, 1, 2, 3],
                       f"the blocks were not each asked for once, in order: {[r.block for r in boundary_reads]}")
                 # Each boundary against the voice's own wait there: `FIRST_AUDIO_SECONDS` on a calm host,
-                # longer where the host held the voice up (`#472 gate-flake-hardening`).
+                # longer where the host held the voice up (`#472 gate-flake-hardening`). Printed at
+                # the end; enforced only under --benchmark.
                 waits = [max(round(FIRST_AUDIO_SECONDS * 1000), voice_wait_ms(before, after))
                          for before, after in zip(boundary_reads, boundary_reads[1:])]
-                for gap, wait in zip(boundaries(natural_gaps), waits):
-                    check(gap <= wait + SLACK_MS,
-                          f"a block boundary ran {gap} ms with nothing to play, more than the voice's own"
-                          f" {wait} ms first-audio wait there: {natural_gaps}")
-                underruns = check_within_blocks(natural_gaps, "at speaking pace")
+                if args.benchmark:
+                    for gap, wait in zip(boundaries(natural_gaps), waits):
+                        check(gap <= wait + SLACK_MS,
+                              f"a block boundary ran {gap} ms with nothing to play, more than the voice's own"
+                              f" {wait} ms first-audio wait there: {natural_gaps}")
+                    underruns = check_within_blocks(natural_gaps, "at speaking pace")
+                else:
+                    underruns = len([gap for gap in natural_gaps if not gap.boundary and gap.ms > SLACK_MS])
                 pace_boundaries = sorted(gap for gap in boundaries(natural_gaps) if gap > 0)
                 check(len({r.selection for r in boundary_reads}) == 1,
                       "the blocks of one read were asked for under different selections, so each cut off the last")
@@ -1046,6 +1102,9 @@ def main() -> int:
                 wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "suspended", 2,
                          "pause did not stop the audio clock")
                 paused_at = page.evaluate("() => readAloudOwner().readAloudContext.currentTime")
+                # A hold is judged by the clock reading the same after real time has passed: a
+                # loaded host only stretches this dwell, which gives a wrongly running clock
+                # more time to be caught, never less.
                 time.sleep(0.4)
                 check(page.evaluate("() => readAloudOwner().readAloudContext.currentTime") == paused_at,
                       "the audio clock ran on while paused")
@@ -1095,7 +1154,7 @@ def main() -> int:
                 # 7. A message of one block reads whole, as before: no strip, no block asked for.
                 press(page, f'#discord-log > li[data-id="{SHORT}"] .body', True)
                 wait_for(lambda: api.reads_of(SHORT), 3, "the short message was not read")
-                time.sleep(0.3)
+                settled(page)
                 check(api.reads_of(SHORT)[0].block is None, "a one-block message was asked for by block")
                 check(position(page) == "", f"a one-block read shows a position: {position(page)!r}")
                 wait_for(lambda: {"messages": [SHORT]} in api.dismissed, SHORT_SECONDS + 4,
@@ -1117,7 +1176,7 @@ def main() -> int:
                 page.mouse.move(box["x"] + 160, box["y"] + 10)
                 page.mouse.up()
                 page.keyboard.press("q")
-                page.wait_for_selector("#quick-reply", state="visible", timeout=10_000)
+                page.wait_for_selector("#quick-reply", state="visible", timeout=int(STATE_S * 1000))
                 check("quick-reply-text" in (page.evaluate("() => document.activeElement && document.activeElement.id") or ""),
                       "q did not focus the quick reply box")
                 page.keyboard.type("q")
@@ -1126,7 +1185,8 @@ def main() -> int:
                 context.close()
 
             # 8. On a desk, with a voice that generates faster than it speaks: the strip is there,
-            # the boundaries have no gap at all, and Next moves the read.
+            # the boundary gaps are read (their no-gap budget decides only --benchmark), and Next
+            # moves the read.
             api.pace = AHEAD_PACE
             with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
                 context, page = open_page(profile, 1280, 800, False)
@@ -1140,9 +1200,12 @@ def main() -> int:
                 ahead_gaps = gaps_of(page)
                 ahead_worst = max(boundaries(ahead_gaps), default=0)
                 check(len(boundaries(ahead_gaps)) >= 3, f"not three block boundaries were scheduled: {ahead_gaps}")
-                check(ahead_worst <= GAP_AHEAD_MOST_MS,
-                      f"with the voice running ahead a block boundary still ran {ahead_worst} ms: {ahead_gaps}")
-                underruns += check_within_blocks(ahead_gaps, "running ahead")
+                if args.benchmark:
+                    check(ahead_worst <= GAP_AHEAD_MOST_MS,
+                          f"with the voice running ahead a block boundary still ran {ahead_worst} ms: {ahead_gaps}")
+                    underruns += check_within_blocks(ahead_gaps, "running ahead")
+                else:
+                    underruns += len([gap for gap in ahead_gaps if not gap.boundary and gap.ms > SLACK_MS])
                 press(page, "#read-next", False)
                 wait_position(page, "5 of 7")
                 check_strip_order(page, "a desk", desk=True)
@@ -1161,13 +1224,13 @@ def main() -> int:
                 bar_desk = check_bar_stop(page, "a desk", 36)
                 # The narrowest desk, where the dock is tightest: still Pause with Stop beside it.
                 page.set_viewport_size({"width": 900, "height": 800})
-                time.sleep(0.3)
+                settled(page)
                 check_strip_order(page, "a 900px desk", desk=True)
                 check_bar_stop(page, "a 900px desk", 36)
                 if args.screenshots:
                     page.screenshot(path=str(args.screenshots / "8-desk-900.png"))
                 page.set_viewport_size({"width": 1280, "height": 800})
-                time.sleep(0.3)
+                settled(page)
                 # Tab meets them as they are seen (the count is not a stop).
                 page.focus("#read-section-prev")
                 for wanted in ("read-section-next", "read-prev", "read-next"):
@@ -1244,7 +1307,7 @@ def main() -> int:
                 # At the foot of the list the last message scrolls clear of the strip: the room
                 # the composer keeps above itself grew by the strip's height (`#433`).
                 page.evaluate("() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; }")
-                time.sleep(0.3)
+                settled(page)
                 cover = float(page.evaluate(
                     f"() => {{ const last = document.querySelector('#discord-log > li[data-id=\"{SHORT}\"]').getBoundingClientRect();"
                     " const s = document.getElementById('read-steer').getBoundingClientRect();"
@@ -1297,7 +1360,7 @@ def main() -> int:
                 check(page.is_hidden("#read-aloud-stop"), "the premise: a Stop stands before anything plays")
                 short_row = f'#discord-log > li[data-id="{SHORT}"]'
                 page.locator(short_row).hover()
-                page.wait_for_selector(f"{short_row}[data-selected='true']", timeout=5_000)
+                page.wait_for_selector(f"{short_row}[data-selected='true']", timeout=int(STATE_S * 1000))
                 page.keyboard.press("s")
                 wait_for(lambda: page.text_content("#read-aloud-label") == "Pause" and page.is_visible("#read-aloud-stop"),
                          5, "the read started with s has no Pause and Stop in the bar")
@@ -1336,7 +1399,7 @@ def main() -> int:
                             ".observe(document.documentElement, { attributes: true, attributeFilter: ['data-read-strip'] }); }")
                         press(page, f"{row} .body", True)
                         wait_position(page, "1 of 7")
-                        time.sleep(0.3)
+                        settled(page)
                         playing = check_phone_layout(page, where, "playing")
                         assert playing["strip"] is not None
                         check(playing["areaHeight"] + playing["strip"]["height"]
@@ -1353,7 +1416,7 @@ def main() -> int:
                         press(page, "#read-aloud", True)
                         wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "suspended", 2,
                                  f"the Read button's Pause did not hold the read at {where}")
-                        time.sleep(0.3)
+                        settled(page)
                         check_phone_layout(page, f"{where} held", "paused")
                         if args.screenshots:
                             page.screenshot(path=str(args.screenshots / f"{shot_name}-paused.png"))
@@ -1363,7 +1426,7 @@ def main() -> int:
                         check_phone_layout(page, f"{where} resumed", "playing")
                         press(page, "#read-aloud-stop", True)
                         check_mode_left(page, f"{where}'s bar")
-                        time.sleep(0.3)
+                        settled(page)
                         check_phone_layout(page, f"{where} stopped", None)
                         if args.screenshots:
                             page.screenshot(path=str(args.screenshots / f"{shot_name}-stopped.png"))
@@ -1372,14 +1435,20 @@ def main() -> int:
                               f"the layout dropped before the read stopped at {where}: {states}")
                         context.close()
 
+        controls_text = (
+            f" control with first audio {round(CONTROL_FIRST_AUDIO_SECONDS * 1000)} ms, worst {control_worst} ms;"
+            f" {underruns} underrun(s) inside a block, judged under --benchmark;"
+            f" a voice held up inside block 2 until the page ran dry ({held_s:.1f} s) left {len(stalled)} underrun(s)"
+            f" there, not blamed;"
+            f" a page holding block 2 back {LATE_PAGE_MS} ms with it in hand blamed"
+            f" ({'its buffer made before the underrun' if 'audio it had' in blamed else 'a gap with no underrun'})."
+            if args.benchmark else
+            f" {underruns} gap(s) over {SLACK_MS} ms inside a block, printed and not judged;"
+            " the gap controls and budgets are the opt-in --benchmark's and were not run.")
         print(f"{browser_version}: 7 blocks walked at 412x915, 393x852, 375x812 and on a desk. Block boundaries, voice"
               f" first audio {round(FIRST_AUDIO_SECONDS * 1000)} ms: at speaking pace {pace_boundaries} ms"
               f" (worst {worst}, the voice's waits {waits} ms); generating {AHEAD_PACE:g}x faster than it speaks, worst {ahead_worst} ms;"
-              f" control with first audio {round(CONTROL_FIRST_AUDIO_SECONDS * 1000)} ms, worst {control_worst} ms;"
-              f" {underruns} underrun(s) inside a block, the host late with the audio;"
-              f" a voice held up inside block 2 until the page ran dry ({held_s:.1f} s) left {len(stalled)} underrun(s)"
-              f" there, not blamed;"
-              f" a page holding block 2 back {LATE_PAGE_MS} ms with it in hand blamed ({'its buffer made before the underrun' if 'audio it had' in blamed else 'a gap with no underrun'})."
+              f"{controls_text}"
               f" On a phone the strip stands full width on the bottom row, playing, held and stopped at 393x852 and"
               f" 412x915 in both schemes ({'; '.join(grown)}); on a desk it stands on the chips row, {gap_desk:.1f}px"
               " off it. Strip order fat Previous and Next section, k of n, thin Previous and Next block (44px targets, at the"

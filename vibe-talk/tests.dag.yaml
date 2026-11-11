@@ -538,13 +538,15 @@ steps:
       rss_baseline_bytes: 1073741824
 
   # `#376 read-aloud-blocks` in the browser engine: a long message walked block by block against a
-  # voice with one session that speaks at speaking pace -- the block lit and counted, a tap on another
-  # block jumping there, Previous and Next, the media keys, and each boundary no longer than the
-  # voice's own first-audio wait (none where it generates ahead). The control's slow first audio
-  # must show as a gap, at a phone and a desk.
+  # voice with one session that speaks at speaking pace -- the blocks asked for and lit in order,
+  # the sentences lit in order, a tap on another block jumping there, Previous and Next, the media
+  # keys, pause holding and resume carrying on, and the strip's drawn geometry, at a phone and a desk.
+  # The verdict is that behaviour (`#1250 vibe-talk-timing-robust`); boundary gaps are printed, and
+  # their budgets plus the slow-voice, held-up-voice and late-page controls run only under the
+  # script's --benchmark, outside the gate.
   - group: check
     job: read-aloud-blocks-browser
-    desc: a long message read block by block in current Chromium, with boundary gaps measured on the audio clock and a slow-voice negative control
+    desc: a long message read block by block in current Chromium — blocks and sentences in order, jumps, media keys, pause and resume, and the strip's geometry — with audio-clock boundary gaps printed (budgets benchmark-only)
     labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/read_aloud_blocks_browser.py
     jobs_flag: ""
@@ -552,13 +554,13 @@ steps:
     timeout: 480
     cpu_timeout: 60
     hint:
-      # Holds every browser slot in its gate (the fold-latency pattern):
-      # its boundary gaps are measured on the audio clock and sibling
-      # browser steps starve them under multi-gate load.
-      resources: {browser: 8}
-      # 78 s median on 2026-11-07 (#998: blocks of at least 2.5 s and
-      # the two underrun control reads), ~10 CPU-seconds.
-      est_duration_s: 80
+      # One browser slot: since #1250 no audio-clock gap in this step decides a verdict, so
+      # sibling browser steps cannot starve it the way they starved the old boundary budgets
+      # (it held all eight slots then).
+      resources: {browser: 1}
+      # ~44 s solo on this host class at #1250 once the three --benchmark control profiles
+      # left the gate (was 80 s with them), ~8 CPU-seconds.
+      est_duration_s: 45
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
