@@ -134,7 +134,7 @@ Unlanded work that is still wanted gets an issue naming the archived branch, so
 moving the branch loses nothing. Preservation snapshots belong outside
 `refs/heads/` entirely (wrkslots writes them under `refs/rescue/`). The
 2026-10-14 cleanup is recorded in
-`ai_docs/transient/2026-10-14-branch-triage/REPORT.md`.
+`ai_docs/reports/research/2026-10-14-branch-triage/REPORT.md`.
 
 ## Repository Boundary
 
@@ -302,13 +302,17 @@ live under `ai_docs/` in dated files or dated directories, in one of two places:
   issues and active lanes cite as their governing plan. A plan here is kept up
   to date as the work it describes changes; when part of it lands, the plan is
   updated or the landed part is marked, not left to go stale.
-- `ai_docs/transient/` holds **disposable research and one-off proposals**:
-  investigations, audits, comparisons, and design notes written for a single
-  decision. They record what was found at a date; they are not maintained.
+- `ai_docs/reports/` holds **owner-requested studies, audits and surveys**
+  (`reports/research/` for investigations, `reports/measurements/` for
+  benchmark and timing results), `ai_docs/reference/` holds durable recipes
+  and how-it-works notes, and `ai_docs/archived/` (including
+  `archived/transient/`) holds finished episodes that are not maintained.
 
-A document starts in `ai_docs/transient/`. Move it to `ai_docs/plans/` (keeping
-its name, with a one-line redirect stub left at the old path) when it becomes
-the plan that live issues or lanes work from. When a plan is fully implemented
+File a new document directly into its cluster (see `ai_docs/AGENTS.md` for the
+full layout). Move it to `ai_docs/plans/` (keeping its name, with a one-line
+redirect stub left at the old path) when it becomes the plan that live issues
+or lanes work from; `ai_docs/transient/` now holds only such redirect stubs.
+When a plan is fully implemented
 and verified, write the settled user-facing explanation in `common/docs/` and
 remove or clearly supersede the plan. Do not present an unimplemented interface
 as a shipped tool.

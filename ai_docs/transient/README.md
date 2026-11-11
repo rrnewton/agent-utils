@@ -1,15 +1,7 @@
-# Transient working documents
+# Redirect stubs
 
-Use dated files or directories here for working designs, proposals, and research
-that has not become settled documentation. For example,
-`2026-09-17-agentctl/` contains the session-control design discussion and its
-public-source comparison.
-
-These documents record work in progress. They do not establish available
-commands or accepted architecture. A document that becomes the maintained
-plan live issues or lanes work from moves to
-[`ai_docs/plans/`](../plans/README.md), keeping its name, with a one-line
-redirect stub left at its old path here. When work is implemented and verified,
-write the settled user-facing explanation in `common/docs/` and remove or clearly
-supersede the corresponding draft. Keep private organizational research outside
-this public repository.
+This directory holds only one-line redirect stubs for documents that moved
+into the `ai_docs/` layout described in [`ai_docs/AGENTS.md`](../AGENTS.md)
+(`plans/`, `reports/`, `reference/`, `archived/`, `superseded/`), so links
+posted earlier keep working. Add no new documents here; file new work in its
+cluster and leave a stub here only when moving an existing document.
