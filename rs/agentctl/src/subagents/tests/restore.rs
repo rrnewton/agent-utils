@@ -564,6 +564,7 @@ fn watch_types_a_queued_prompt_and_reports_a_stale_one() {
             queue_stale: Duration::from_secs(600),
         },
         &mut Default::default(),
+        &mut Default::default(),
     );
     let queue = findings.iter().find(|row| row["check"] == "queue").unwrap();
     assert_eq!(queue["subject"], "lane", "{findings:?}");
@@ -594,6 +595,7 @@ fn watch_types_a_queued_prompt_and_reports_a_stale_one() {
             state_dir: None,
             queue_stale: Duration::ZERO,
         },
+        &mut Default::default(),
         &mut Default::default(),
     );
     let queue = findings.iter().find(|row| row["check"] == "queue").unwrap();
@@ -775,11 +777,13 @@ fn watch_restarts_a_timer_that_never_fires_and_starts_its_service_when_needed() 
                 unknown: Default::default(),
                 unit: "observer.timer".to_owned(),
                 max_age_seconds: 1800,
+                repair_stopped: false,
             },
             TimerWatch {
                 unknown: Default::default(),
                 unit: "tick.timer".to_owned(),
                 max_age_seconds: 1800,
+                repair_stopped: false,
             },
         ],
         ..config(&fixture, None)
@@ -800,6 +804,7 @@ fn watch_restarts_a_timer_that_never_fires_and_starts_its_service_when_needed() 
             state_dir: Some(fixture.root.join("watch")),
             queue_stale: Duration::from_secs(600),
         },
+        &mut Default::default(),
         &mut Default::default(),
     );
     let timers = findings
@@ -822,12 +827,14 @@ fn watch_restarts_a_timer_that_never_fires_and_starts_its_service_when_needed() 
         .any(|row| row["check"] == "herdr" && row["ok"] == true));
 }
 
-/// One `watch_once` pass over `config` sharing a timer-repair cooldown map (#961).
+/// One `watch_once` pass over `config` sharing a timer-repair cooldown map (#961)
+/// and a stopped-timer report set (#1277).
 fn timer_pass(
     fixture: &Fixture,
     host: &ScriptedHost,
     config: &RestoreConfig,
     repaired: &mut std::collections::BTreeMap<String, f64>,
+    stopped_noted: &mut std::collections::BTreeSet<String>,
 ) -> Vec<Value> {
     watch_once(
         &fixture.client,
@@ -843,6 +850,7 @@ fn timer_pass(
             queue_stale: Duration::from_secs(600),
         },
         repaired,
+        stopped_noted,
     )
 }
 
@@ -890,6 +898,7 @@ fn watch_leaves_a_monotonic_timer_alone_when_its_service_ran_recently() {
         &fixture,
         &host,
         &timer_config(&fixture, "observer.timer"),
+        &mut Default::default(),
         &mut Default::default(),
     );
     let timer = timer_row(&findings);
@@ -946,7 +955,13 @@ fn watch_starts_a_stale_monotonic_timers_service_once_then_holds_the_cooldown() 
     );
     let config = timer_config(&fixture, "observer.timer");
     let mut repaired = Default::default();
-    let findings = timer_pass(&fixture, &host, &config, &mut repaired);
+    let findings = timer_pass(
+        &fixture,
+        &host,
+        &config,
+        &mut repaired,
+        &mut Default::default(),
+    );
     let timer = timer_row(&findings);
     assert_eq!(timer["ok"], true, "{findings:?}");
     assert_eq!(
@@ -983,7 +998,13 @@ fn watch_starts_a_stale_monotonic_timers_service_once_then_holds_the_cooldown() 
         "",
     );
     host.answer("show observer.service", 0, stale_service, "");
-    let findings = timer_pass(&fixture, &host, &config, &mut repaired);
+    let findings = timer_pass(
+        &fixture,
+        &host,
+        &config,
+        &mut repaired,
+        &mut Default::default(),
+    );
     let timer = timer_row(&findings);
     assert_eq!(timer["ok"], false, "{findings:?}");
     assert_eq!(timer["cooldown"], true, "{timer}");
@@ -1057,6 +1078,7 @@ fn watch_starts_a_never_run_timers_service_exactly_once() {
         &host,
         &timer_config(&fixture, "observer.timer"),
         &mut Default::default(),
+        &mut Default::default(),
     );
     let timer = timer_row(&findings);
     assert_eq!(timer["ok"], true, "{findings:?}");
@@ -1126,6 +1148,7 @@ fn watch_still_repairs_a_stale_calendar_timer() {
         &host,
         &timer_config(&fixture, "observer.timer"),
         &mut Default::default(),
+        &mut Default::default(),
     );
     let timer = timer_row(&findings);
     assert_eq!(timer["ok"], true, "{findings:?}");
@@ -1175,6 +1198,7 @@ fn watch_reports_a_failed_service_without_repairing_a_stale_timer() {
         &host,
         &timer_config(&fixture, "observer.timer"),
         &mut Default::default(),
+        &mut Default::default(),
     );
     let timer = timer_row(&findings);
     assert_eq!(timer["ok"], false, "{findings:?}");
@@ -1212,6 +1236,7 @@ fn watch_reports_a_failed_unit_it_cannot_start() {
             state_dir: None,
             queue_stale: Duration::from_secs(600),
         },
+        &mut Default::default(),
         &mut Default::default(),
     );
     let unit = findings.iter().find(|row| row["check"] == "unit").unwrap();
@@ -1391,6 +1416,7 @@ fn watch_reports_a_timer_whose_service_fails_on_every_run_without_restarting_it(
             unknown: Default::default(),
             unit: "observer.timer".to_owned(),
             max_age_seconds: 1800,
+            repair_stopped: false,
         }],
         ..config(&fixture, None)
     };
@@ -1407,6 +1433,7 @@ fn watch_reports_a_timer_whose_service_fails_on_every_run_without_restarting_it(
             state_dir: None,
             queue_stale: Duration::from_secs(600),
         },
+        &mut Default::default(),
         &mut Default::default(),
     );
     let timer = findings.iter().find(|row| row["check"] == "timer").unwrap();
@@ -2299,6 +2326,7 @@ fn slot_image_finding(fixture: &Fixture, host: &ScriptedHost) -> Value {
             queue_stale: Duration::from_secs(600),
         },
         &mut Default::default(),
+        &mut Default::default(),
     );
     findings
         .into_iter()
@@ -2440,6 +2468,7 @@ fn watch_pass(fixture: &Fixture, host: &ScriptedHost, config: &RestoreConfig) ->
             queue_stale: Duration::from_secs(600),
         },
         &mut Default::default(),
+        &mut Default::default(),
     )
 }
 
@@ -2450,6 +2479,7 @@ fn timer_config(fixture: &Fixture, unit: &str) -> RestoreConfig {
             unknown: Default::default(),
             unit: unit.to_owned(),
             max_age_seconds: 1800,
+            repair_stopped: false,
         }],
         ..config(fixture, None)
     }
@@ -2718,6 +2748,120 @@ fn watch_believes_a_not_found_timer_only_when_list_timers_agrees() {
     assert_eq!(
         timer["detail"],
         "timer is not loaded (LoadState=not-found) and systemctl --user list-timers --all does not list it"
+    );
+}
+
+/// One stopped-timer pass's worth of systemctl answers (#1277).
+fn script_stopped_timer(host: &ScriptedHost) {
+    host.answer(
+        "show audit.timer --timestamp=unix -p ActiveState",
+        0,
+        "ActiveState=inactive\nNextElapseUSecRealtime=\nNextElapseUSecMonotonic=\nLastTriggerUSec=@1999990000\n",
+        "",
+    );
+    host.answer(
+        "show audit.timer --timestamp=unix -p LoadState",
+        0,
+        "LoadState=loaded\nActiveState=inactive\n",
+        "",
+    );
+    host.answer(
+        "show audit.timer --timestamp=unix -p UnitFileState",
+        0,
+        "UnitFileState=enabled\n",
+        "",
+    );
+}
+
+#[test]
+fn watch_never_starts_a_stopped_timer_and_reports_the_stop_once() {
+    // #1277: an operator stopped this timer on purpose. The watch must not start
+    // it, and must report the stop once per episode, not on every pass.
+    let fixture = Fixture::new();
+    let host = ScriptedHost::new();
+    script_stopped_timer(&host);
+    script_stopped_timer(&host);
+    let config = timer_config(&fixture, "audit.timer");
+    let mut repaired = Default::default();
+    let mut noted = Default::default();
+    let findings = timer_pass(&fixture, &host, &config, &mut repaired, &mut noted);
+    let timer = timer_row(&findings);
+    assert_eq!(timer["ok"], false, "{findings:?}");
+    assert_eq!(
+        timer["detail"],
+        "timer is inactive (UnitFileState=enabled); stopped by operator, not started"
+    );
+    assert_eq!(timer["operator_stopped"], true);
+    assert_eq!(timer["cooldown"], Value::Null);
+    assert_eq!(timer["repair"], Value::Null);
+    let findings = timer_pass(&fixture, &host, &config, &mut repaired, &mut noted);
+    let timer = timer_row(&findings);
+    assert_eq!(timer["ok"], false, "{findings:?}");
+    assert_eq!(timer["operator_stopped"], true);
+    assert_eq!(timer["cooldown"], true, "the stop is reported at most once");
+    assert!(!changed_anything(&host), "{:?}", host.commands());
+}
+
+#[test]
+fn watch_restarts_a_stopped_timer_only_when_its_entry_opts_in() {
+    // #1277: with `repair_stopped` set, an inactive timer takes the old
+    // schedule-broken restart path.
+    let fixture = Fixture::new();
+    let host = ScriptedHost::new();
+    host.answer(
+        "show audit.timer --timestamp=unix -p ActiveState",
+        0,
+        "ActiveState=inactive\nNextElapseUSecRealtime=\nNextElapseUSecMonotonic=\nLastTriggerUSec=@1999990000\n",
+        "",
+    );
+    host.answer(
+        "show audit.timer --timestamp=unix -p LoadState",
+        0,
+        "LoadState=loaded\nActiveState=inactive\n",
+        "",
+    );
+    host.answer(
+        "show audit.timer --timestamp=unix -p ActiveState",
+        0,
+        "ActiveState=active\nNextElapseUSecRealtime=\nNextElapseUSecMonotonic=1d 2h\nLastTriggerUSec=@1999999990\n",
+        "",
+    );
+    host.answer(
+        "show audit.timer --timestamp=unix -p Triggers",
+        0,
+        "Triggers=audit.service\n",
+        "",
+    );
+    host.answer(
+        "show audit.service",
+        0,
+        "ActiveState=inactive\nResult=success\nExecMainStatus=0\n",
+        "",
+    );
+    let config = RestoreConfig {
+        units: Vec::new(),
+        timers: vec![TimerWatch {
+            unknown: Default::default(),
+            unit: "audit.timer".to_owned(),
+            max_age_seconds: 1800,
+            repair_stopped: true,
+        }],
+        ..config(&fixture, None)
+    };
+    let findings = timer_pass(
+        &fixture,
+        &host,
+        &config,
+        &mut Default::default(),
+        &mut Default::default(),
+    );
+    let timer = timer_row(&findings);
+    assert_eq!(timer["ok"], true, "{findings:?}");
+    assert!(
+        host.commands()
+            .contains(&"systemctl --user restart audit.timer".to_owned()),
+        "{:?}",
+        host.commands()
     );
 }
 

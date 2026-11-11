@@ -211,6 +211,11 @@ pub struct TimerWatch {
     pub unit: String,
     /// Alarm when the timer last fired longer ago than this many seconds.
     pub max_age_seconds: u64,
+    /// Restart this timer even when an operator has stopped it (default false:
+    /// an inactive timer is a deliberate stop, reported once and never started
+    /// by the watch; #1277 watch-honour-stopped-timer).
+    #[serde(default)]
+    pub repair_stopped: bool,
     /// Keys a newer agentctl added, kept when this record is written back (#809
     /// chat-bridge-json-forward-compat).
     #[serde(flatten)]
@@ -2956,14 +2961,17 @@ type Check = std::result::Result<Option<String>, String>;
 
 /// Whether a timer problem is its schedule itself or only its freshness clock.
 ///
-/// A broken schedule (inactive, not loaded, no next elapse) is repaired by restarting the
+/// A broken schedule (not loaded, no next elapse) is repaired by restarting the
 /// timer. A merely stale timer is repaired by starting its service once: restarting a timer
 /// whose trigger counts from its service's last run resets that trigger, so the timer never
-/// elapses on its own and the watch would restart it on every pass (#961).
+/// elapses on its own and the watch would restart it on every pass (#961). A timer an
+/// operator stopped is never repaired at all: it is reported once per stop episode
+/// (#1277), unless its entry sets `repair_stopped`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TimerProblemKind {
     ScheduleBroken,
     Stale,
+    StoppedByOperator,
 }
 
 /// A timer problem the service manager confirmed, with the repair it calls for.
@@ -3016,12 +3024,29 @@ fn timer_problem(host: &dyn Host, timer: &TimerWatch) -> TimerCheck {
     )?;
     let active = state["ActiveState"].as_str();
     if active != "active" {
-        return Ok(
-            confirm_inactive_timer(host, timer, active)?.map(|detail| TimerProblem {
-                detail,
-                kind: TimerProblemKind::ScheduleBroken,
-            }),
-        );
+        let confirmed = confirm_inactive_timer(host, timer, active)?;
+        // An operator's `systemctl stop` leaves a loaded timer inactive, and restarting
+        // it would undo that stop on every pass (#1277). Only an entry that opted into
+        // repair, a timer in a failed state, or one that is not loaded at all takes the
+        // schedule-broken path; a plain stop is reported, never started.
+        if confirmed.active == "inactive" && confirmed.loaded && !timer.repair_stopped {
+            let unit_file = show(host, &timer.unit, &["UnitFileState"])?["UnitFileState"].clone();
+            return Ok(Some(TimerProblem {
+                detail: format!(
+                    "timer is inactive (UnitFileState={}); stopped by operator, not started",
+                    if unit_file.is_empty() {
+                        "unknown"
+                    } else {
+                        unit_file.as_str()
+                    }
+                ),
+                kind: TimerProblemKind::StoppedByOperator,
+            }));
+        }
+        return Ok(Some(TimerProblem {
+            detail: confirmed.detail,
+            kind: TimerProblemKind::ScheduleBroken,
+        }));
     }
     let scheduled = |key: &str| {
         state
@@ -3097,12 +3122,23 @@ fn timer_problem(host: &dyn Host, timer: &TimerWatch) -> TimerCheck {
     }))
 }
 
+/// A confirmed inactive timer: what the service manager said on the second look.
+struct ConfirmedInactive {
+    detail: String,
+    loaded: bool,
+    active: String,
+}
+
 /// Look again, after a pause, before calling a timer inactive or unknown.
 ///
 /// A reloading service manager can briefly answer for a timer it has not loaded yet, so the state
 /// must hold [`SYSTEMCTL_RETRY_DELAY`] later, and a timer the manager calls not loaded must also be
 /// missing from `list-timers --all`.
-fn confirm_inactive_timer(host: &dyn Host, timer: &TimerWatch, first: &str) -> Check {
+fn confirm_inactive_timer(
+    host: &dyn Host,
+    timer: &TimerWatch,
+    first: &str,
+) -> std::result::Result<ConfirmedInactive, String> {
     host.sleep(SYSTEMCTL_RETRY_DELAY);
     let state = show(host, &timer.unit, &["LoadState", "ActiveState"])?;
     let (load, active) = (state["LoadState"].as_str(), state["ActiveState"].as_str());
@@ -3114,7 +3150,11 @@ fn confirm_inactive_timer(host: &dyn Host, timer: &TimerWatch, first: &str) -> C
         ));
     }
     if load == "loaded" {
-        return Ok(Some(format!("timer is {active}")));
+        return Ok(ConfirmedInactive {
+            detail: format!("timer is {active}"),
+            loaded: true,
+            active: active.to_owned(),
+        });
     }
     let command = "systemctl --user list-timers --all";
     let listed = host.run(
@@ -3143,10 +3183,14 @@ fn confirm_inactive_timer(host: &dyn Host, timer: &TimerWatch, first: &str) -> C
             timer.unit
         ));
     }
-    Ok(Some(format!(
-        "timer is not loaded (LoadState={}) and {command} does not list it",
-        if load.is_empty() { "unknown" } else { load }
-    )))
+    Ok(ConfirmedInactive {
+        detail: format!(
+            "timer is not loaded (LoadState={}) and {command} does not list it",
+            if load.is_empty() { "unknown" } else { load }
+        ),
+        loaded: false,
+        active: active.to_owned(),
+    })
 }
 
 /// Why the service a timer triggers failed on its last run.
@@ -3187,6 +3231,7 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
     config: &RestoreConfig,
     options: &WatchOptions,
     timer_repaired_at: &mut BTreeMap<String, f64>,
+    timer_stopped_noted: &mut std::collections::BTreeSet<String>,
 ) -> Vec<Value> {
     let mut findings = Vec::new();
     let duties = &config.duties;
@@ -3296,6 +3341,8 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
                     continue;
                 }
                 Ok(None) => {
+                    // Seen keeping its schedule: any stop episode for it has ended.
+                    timer_stopped_noted.remove(&timer.unit);
                     findings.push(match service_failure(host, timer) {
                         Err(reason) => unchecked("timer", &timer.unit, reason, Value::Null),
                         Ok(Some(failure)) => {
@@ -3323,6 +3370,25 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
                 ));
                 continue;
             }
+            // A timer an operator stopped is never started (#1277): report it once per
+            // stop episode, then carry the cooldown suppression until it is seen active
+            // again, so neither stderr nor the coordinator alert repeats.
+            if problem.kind == TimerProblemKind::StoppedByOperator {
+                let mut row = finding(
+                    "timer",
+                    &timer.unit,
+                    false,
+                    problem.detail.clone(),
+                    Value::Null,
+                );
+                row["operator_stopped"] = json!(true);
+                if !timer_stopped_noted.insert(timer.unit.clone()) {
+                    row["cooldown"] = json!(true);
+                }
+                findings.push(row);
+                continue;
+            }
+            timer_stopped_noted.remove(&timer.unit);
             // One repair per timer per max_age window (#961): after a start, the service's
             // success timestamp has a full window to move before the timer is kicked again, and
             // a timer that has never run gets exactly one start, not one per pass.
@@ -3363,6 +3429,8 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
                         repair.push(format!("systemctl --user restart {}", timer.unit));
                     }
                 },
+                // Handled above: a stopped timer is reported, never started (#1277).
+                TimerProblemKind::StoppedByOperator => {}
             }
             let mut remaining = timer_problem(host, timer);
             if problem.kind == TimerProblemKind::ScheduleBroken && matches!(remaining, Ok(Some(_)))
@@ -3578,6 +3646,9 @@ fn alert<A: ManagedApi + ?Sized>(
     let due = findings
         .iter()
         .filter(|row| row["ok"] == false)
+        // A stopped timer's later passes in the same episode are not new reports
+        // (#1277): only its first, un-cooldowned row may alert.
+        .filter(|row| row["operator_stopped"] != true || row["cooldown"] != true)
         .filter(|row| {
             let key = format!(
                 "{}:{}",
@@ -3907,6 +3978,13 @@ pub fn watch<A: ManagedApi + ?Sized>(
         .and_then(read_report)
         .and_then(|previous| serde_json::from_value(previous["timer_repaired_at"].clone()).ok())
         .unwrap_or_default();
+    // Timers already reported as stopped by the operator in this stop episode
+    // (#1277): persisted so a watch restart does not report the same stop again.
+    let mut timer_stopped_noted: std::collections::BTreeSet<String> = path
+        .as_deref()
+        .and_then(read_report)
+        .and_then(|previous| serde_json::from_value(previous["timer_stopped_noted"].clone()).ok())
+        .unwrap_or_default();
     // Units whose cooldown finding has already gone to stderr this episode (#961): a
     // cooldown is logged once when it starts, not on every pass it spans.
     let mut cooldown_noted: std::collections::BTreeSet<String> = Default::default();
@@ -3927,6 +4005,7 @@ pub fn watch<A: ManagedApi + ?Sized>(
             config,
             &pass_options,
             &mut timer_repaired_at,
+            &mut timer_stopped_noted,
         );
         // Workspace hygiene and canonical tab order:
         // close unclaimed bare shells idle past the grace period, and keep
@@ -3970,6 +4049,11 @@ pub fn watch<A: ManagedApi + ?Sized>(
             {
                 continue;
             }
+            // The first stopped-by-operator row is the episode's one report (#1277);
+            // noting it here keeps its later cooldown rows off stderr too.
+            if row["operator_stopped"] == true {
+                cooldown_noted.insert(row["subject"].as_str().unwrap_or("").to_owned());
+            }
             eprintln!("agentctl watch: {}", line(row));
         }
         // What the watch itself could not check: its own health, not the subject's.
@@ -3992,6 +4076,7 @@ pub fn watch<A: ManagedApi + ?Sized>(
             "notice": notice,
             "alerted": alerted,
             "timer_repaired_at": timer_repaired_at,
+            "timer_stopped_noted": timer_stopped_noted,
             "bare_shell_since": bare_since,
             "closed_bare_shells": closed_bare_shells,
         });

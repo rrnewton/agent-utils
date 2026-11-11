@@ -1,10 +1,11 @@
 ---
 title: 'watch-honour-stopped-timer: watch restarts a timer an operator deliberately stopped'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-11T08:23:34+00:00
-updated_at: 2026-11-11T08:23:34+00:00
+updated_at: 2026-11-11T08:33:15+00:00
+closed_at: 2026-11-11T08:33:15+00:00
 ---
 
 # Description
@@ -33,3 +34,7 @@ Live evidence on the reporting host, 2026-11-11 around 03:21 AM ET: the watched 
 # Notes
 
 Reported 2026-11-11 under the same-hour rule for agentctl defects. Builds on #961 agentctl-watch-timer-repair-loop (freshness by the service's last success, one repair per window) and sits beside #1145 repair-notify-pair (per-duty switches): honouring a stop is per-timer here, not a duty switch, because the stop is a fact about the unit, not about the daemon.
+
+## Resolution
+
+[watermelon-full-preview] Fixed in `rs/agentctl/src/restore.rs`: a confirmed inactive, loaded timer is `TimerProblemKind::StoppedByOperator` — reported once per stop episode as "stopped by operator, not started" (the row names the `UnitFileState`), with later passes in the episode carrying the cooldown suppression and no coordinator re-alert; the episode set is persisted in health.json as `timer_stopped_noted` and ends when the timer is seen keeping its schedule. A timer entry may set `repair_stopped: true` to opt back into the restart repair. Not-loaded and failed timers keep the schedule-broken path, and a failed service on an active timer is still only reported. Two new ScriptedHost tests cover the stopped timer (no start call, one report) and the opt-in restart; the restore suite passes 66/66.
