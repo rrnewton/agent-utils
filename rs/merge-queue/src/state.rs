@@ -210,7 +210,15 @@ pub struct ValidatorConfig {
     /// like a failed check.
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub pre_claim_timeout_secs: u64,
+    /// Wall limit in seconds of one host probe (`MQ_PROBE=1`); 0 means
+    /// [`DEFAULT_PROBE_TIMEOUT_SECS`] (#1271 probe-timeout-bound). A
+    /// consumer whose probe is slow sets this above its probe duration.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub probe_timeout_secs: u64,
 }
+
+/// Default wall limit of one host probe.
+pub const DEFAULT_PROBE_TIMEOUT_SECS: u64 = 60;
 
 /// Default wall limit of a suspect-flake rerun.
 pub const DEFAULT_SUSPECT_FLAKE_TIMEOUT_SECS: u64 = 1800;
@@ -636,6 +644,15 @@ impl ValidatorConfig {
     /// Resolved base backoff in seconds (stored verbatim; 0 = no delay).
     pub fn refusal_backoff(&self) -> u64 {
         self.refusal_backoff_secs
+    }
+
+    /// Resolved wall limit of one host probe (#1271 probe-timeout-bound).
+    pub fn probe_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(if self.probe_timeout_secs == 0 {
+            DEFAULT_PROBE_TIMEOUT_SECS
+        } else {
+            self.probe_timeout_secs
+        })
     }
 
     /// Resolved wall limit of a suspect-flake rerun.

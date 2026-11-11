@@ -1,6 +1,6 @@
 ---
 title: 'probe-timeout-bound: the donor kills its health probe at a fixed 60 s, so a slow host probe never clears the fault'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-11-11T05:00:00.000000000+00:00

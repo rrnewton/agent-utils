@@ -3315,20 +3315,31 @@ impl Worker<'_> {
         let Ok(mut child) = command.spawn() else {
             return (false, String::new());
         };
+        let bound = cfg.probe_timeout();
         let started = std::time::Instant::now();
+        let mut killed = false;
         let passed = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status.success(),
-                Ok(None) if started.elapsed() <= std::time::Duration::from_secs(60) => {
+                Ok(None) if started.elapsed() <= bound => {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 _ => {
                     let _ = child.kill();
+                    killed = true;
                     break false;
                 }
             }
         };
-        let output = std::fs::read_to_string(&output_path).unwrap_or_default();
+        let mut output = std::fs::read_to_string(&output_path).unwrap_or_default();
+        if killed {
+            // Name the timeout so a killed probe is distinguishable from
+            // a not-ready verdict (#1271 probe-timeout-bound).
+            output.push_str(&format!(
+                "\nprobe killed at the {} s bound",
+                bound.as_secs()
+            ));
+        }
         let _ = std::fs::remove_file(&output_path);
         (passed, output)
     }
@@ -4809,6 +4820,35 @@ mod unit {
         };
         assert!(worker.probe_host_validator(&probe_cfg(run)));
         assert_eq!(std::fs::read_to_string(&count).unwrap().trim(), "2");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_probe_slower_than_the_default_bound_passes_with_a_raised_one() {
+        // #1271 probe-timeout-bound: the probe needs 2 s; killed at a 1 s
+        // bound (named as a timeout), it passes with the bound raised.
+        let work = temp("probe-timeout");
+        let (options, route) = probe_worker(&work);
+        let worker = Worker {
+            options: &options,
+            route: &route,
+            host: "h1".to_owned(),
+            slots: Mutex::new(vec![0]),
+            host_pause: Mutex::new(None),
+            probe_passed: AtomicBool::new(false),
+            next_host_delay: Mutex::new(std::time::Duration::from_secs(60)),
+            last_validator: Mutex::new(None),
+            next_fault_probe: Mutex::new(std::time::Instant::now()),
+            fault_probe_current: Mutex::new(std::time::Duration::from_secs(60)),
+            paced_refusals: Mutex::new(0),
+        };
+        let mut cfg = probe_cfg("sleep 2; exit 0".to_owned());
+        cfg.probe_timeout_secs = 1;
+        let (passed, output) = worker.probe_once(&cfg);
+        assert!(!passed);
+        assert!(output.contains("probe killed at the 1 s bound"), "{output}");
+        cfg.probe_timeout_secs = 5;
+        assert!(worker.probe_host_validator(&cfg));
         let _ = std::fs::remove_dir_all(&work);
     }
 

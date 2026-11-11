@@ -2343,6 +2343,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     require_tool_identity_lines,
                     pre_claim_check: String::new(),
                     pre_claim_timeout_secs: 0,
+                    probe_timeout_secs: 0,
                 },
                 value_ordering,
                 disjoint_root_min_red_percent,
