@@ -1651,6 +1651,8 @@ refuses.
 Two opt-in `remove` flags (also accepted by `remove-agent-batch` and `retire-pending`) reclaim
 dead-owner agent slots that the checks above otherwise refuse forever, by keeping the work in a
 verified local bundle first. Both are off by default; without them those slots keep their refusals.
+A third, `--archive-private-history`, covers a submodule that its source no longer declares; it is
+described after them.
 
 `--archive-drifted-checkouts` covers a checkout that is on another branch than the recorded one, on
 a detached HEAD, or whose remote URL changed ("branch changed ... update the recorded checkout",
@@ -1732,6 +1734,55 @@ tree instead of any `.gitattributes` in the worktree, committed or not, and they
 file again rather than reuse a blob that conversion made when it was staged.
 `.git/info/attributes` cannot be switched off that way, so a repository with rules there refuses
 (a nested repository with one refuses salvage).
+
+### Unpushed private history in a submodule its source no longer declares
+
+When the primary repository no longer initialises a submodule that the slot's checkout still holds,
+the slot's copy is judged by its own recorded remote: a published HEAD is recorded as
+`remote-verified`, an unpublished one is kept in a verified local bundle, and uncommitted changes in
+it refuse ("submodule NAME has uncommitted changes and its source no longer declares it"). Its own
+repository is the only copy of everything else it holds, and removal deletes that repository, so
+none of its own refs count as kept. Removal asks the recorded remote which branches and tags it
+advertises now (`git ls-remote` with the recorded URL, your global Git configuration ignored). A
+commit counts as kept when one of those reaches it. An advertised commit already in the submodule
+counts directly, and so does an annotated tag whose exact tag object is there, through the commit
+it names. When commits remain, the advertised tips missing locally are fetched, commits only, into
+an empty temporary store inside the slot, and anything they bring counts too. A local mirror
+outside the slot still counts as well. Only the recorded remote is asked; a commit that only some
+other repository (an upstream the remote was forked from) holds is not counted.
+
+Whatever remains is unpushed private history: commits on local branches or tags, in the stash,
+in reflogs, or named by nothing. Removal refuses and counts it, for example:
+
+```text
+unpushed private history in submodule product/component/leaf: 2 commits on 2 refs not on any
+remote (refs/heads/side, refs/tags/local-tag). Its source no longer declares it, so removal would
+delete the only copy. remedy: keep that history in a verified local bundle in the salvage archive,
+never pushed, by rerunning 'wrkslots remove slot01' with the same options plus
+--archive-private-history; or publish it by hand and rerun remove
+```
+
+If the remote could not be asked, the refusal says so, and nothing counted as kept. To keep the
+history, rerun the same command with `--archive-private-history` (also accepted by
+`remove-agent-batch` and `retire-pending`). The private tips become extra parents of the
+submodule's salvage commit, and that commit goes, with its complete history, into a self-contained
+bundle under the control directory's `wrkslots-salvage/` (or `--salvage-archive-root`). The bundle
+is read back with a fresh bare clone, the exact ref, and a full fsck, as for every local archive.
+Its receipt records `archive_reason: private-history-kept`, and the warning line names the kept refs
+and commits. Nothing is pushed: removal never pushes this history on its own. Uncommitted changes
+in such a submodule still refuse with or without the flag.
+
+To restore the kept history, fetch the archive ref that the receipt (`archive_bundle`,
+`archive_ref`) names from the bundle into any clone of the submodule's repository. The salvage
+commit's parents after the first are the kept tips, and its message lists them as `kept:` lines:
+
+```sh
+git fetch "$ARCHIVE_BUNDLE" "$ARCHIVE_REF:refs/heads/wrkslots-restored"
+git log -1 --format=%B wrkslots-restored      # the kept: lines
+git branch side <commit>                      # recreate a ref the refusal named
+```
+
+An annotated tag is kept as the commit it names, not as its tag object.
 
 For `recover-absent-agent-row(s)`, only the digest of a checkout's remote URL was recorded. A source
 repository whose remote has since moved between the GitHub spellings above for the same owner and

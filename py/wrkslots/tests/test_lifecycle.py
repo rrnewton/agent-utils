@@ -61839,6 +61839,192 @@ def test_mount_namespace_reprobe_refusal_names_the_window(tmp_path: Path) -> Non
         wrkslots._mount_namespace_reprobed(pid_dir, generation)
 
 
+_PRIVATE_HISTORY_REMEDY = (
+    "remedy: keep that history in a verified local bundle in the salvage archive, never "
+    "pushed, by rerunning 'wrkslots remove slot01' with the same options plus "
+    "--archive-private-history"
+)
+
+
+def _leaf_private_branch_and_tag(leaf: Path) -> tuple[str, str]:
+    """Two commits only the leaf's own repository holds: one on a branch, one on a tag."""
+    base = git(leaf, "rev-parse", "HEAD").stdout.strip()
+    git(leaf, "checkout", "-q", "-b", "side")
+    branch_commit = commit_local(leaf, "side.txt", "side\n", "side only")
+    git(leaf, "checkout", "-q", "--detach", base)
+    tag_commit = commit_local(leaf, "tagged.txt", "tagged\n", "tagged only")
+    git(leaf, "tag", "-a", "-m", "local only", "local-tag")
+    git(leaf, "checkout", "-q", "--detach", base)
+    return branch_commit, tag_commit
+
+
+def test_remove_keeps_nothing_extra_for_history_under_remote_advertised_tags(
+    tmp_path: Path,
+) -> None:
+    """#1255: commits only tags hold, which the remote advertises too, need no salvage."""
+    project, tree, _component, leaf = _slot_with_primary_dropped_leaf(tmp_path)
+    source = tmp_path / "leaf-source"
+    base = git(source, "rev-parse", "HEAD").stdout.strip()
+    git(source, "checkout", "-q", "--detach")
+    lightweight = commit_local(source, "release1.txt", "one\n", "release one")
+    git(source, "tag", "release-1")
+    annotated = commit_local(source, "release2.txt", "two\n", "release two")
+    git(source, "tag", "-a", "-m", "release two", "release-2")
+    git(source, "checkout", "-q", "main")
+    git(source, "push", "-q", "origin", "release-1", "release-2")
+    git(leaf, "fetch", "-q", "origin", "--tags")
+    # Two commits beyond HEAD, held only by tags: no branch has them.
+    assert git(leaf, "rev-list", "--count", "--tags", "--not", base).stdout.strip() == "2"
+    assert git(leaf, "branch", "-a", "--contains", lightweight).stdout == ""
+    assert git(leaf, "for-each-ref", "--contains", annotated, "--format=%(refname)").stdout == (
+        "refs/tags/release-2\n"
+    )
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    receipt = _drift_receipts(project)["product/component/leaf"]
+    assert receipt["disposition"] == "already-published"
+    assert receipt["evidence"] == "remote-verified"
+
+
+def test_remove_refuses_unpushed_private_history_with_counts(tmp_path: Path) -> None:
+    """#1255: a clean leaf with local-only commits names them, never uncommitted changes."""
+    project, tree, _component, leaf = _slot_with_primary_dropped_leaf(tmp_path)
+    branch_commit, tag_commit = _leaf_private_branch_and_tag(leaf)
+
+    removed = remove(project)
+
+    assert removed.returncode == 3, removed.stdout + removed.stderr
+    assert (
+        "unpushed private history in submodule product/component/leaf: 2 commits on 2 refs "
+        "not on any remote (refs/heads/side, refs/tags/local-tag). Its source no longer "
+        "declares it, so removal would delete the only copy. " + _PRIVATE_HISTORY_REMEDY
+    ) in removed.stderr
+    assert "uncommitted" not in removed.stderr
+    assert tree.is_dir()
+    assert git(leaf, "rev-parse", "side").stdout.strip() == branch_commit
+    assert git(leaf, "rev-parse", "local-tag^{commit}").stdout.strip() == tag_commit
+
+
+@pytest.mark.parametrize("holder", ("reflog", "nothing"))
+def test_remove_refuses_private_history_no_ref_names(tmp_path: Path, holder: str) -> None:
+    """#1255: a commit only a reflog entry, or no name at all, holds is counted too."""
+    project, tree, _component, leaf = _slot_with_primary_dropped_leaf(tmp_path)
+    base = git(leaf, "rev-parse", "HEAD").stdout.strip()
+    git(leaf, "checkout", "-q", "-b", "gone")
+    dropped = commit_local(leaf, "gone.txt", "gone\n", "branch deleted")
+    git(leaf, "checkout", "-q", "--detach", base)
+    git(leaf, "branch", "-q", "-D", "gone")
+    if holder == "nothing":
+        git(leaf, "reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all")
+        assert git(leaf, "reflog").stdout == ""
+
+    removed = remove(project)
+
+    assert removed.returncode == 3, removed.stdout + removed.stderr
+    assert (
+        "unpushed private history in submodule product/component/leaf: 1 commit not on any "
+        "remote, which only reflog entries or no name at all hold."
+    ) in removed.stderr
+    assert "uncommitted" not in removed.stderr
+    assert git(leaf, "cat-file", "-t", dropped).stdout.strip() == "commit"
+
+
+def test_archive_private_history_keeps_it_in_a_verified_bundle(tmp_path: Path) -> None:
+    """#1255: the documented salvage step bundles the history, pushes nothing, removes."""
+    project, tree, _component, leaf = _slot_with_primary_dropped_leaf(tmp_path)
+    branch_commit, tag_commit = _leaf_private_branch_and_tag(leaf)
+    leaf_remote = tmp_path / "leaf.git"
+    remote_before = remote_refs(leaf_remote)
+    assert remove(project).returncode == 3
+
+    removed = _remove_archiving(project, "--archive-private-history")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    assert remote_refs(leaf_remote) == remote_before
+    receipt = _drift_receipts(project)["product/component/leaf"]
+    assert receipt["disposition"] == "archived-local"
+    assert receipt["archive_reason"] == "private-history-kept"
+    assert "--archive-private-history keeps the unpushed private history" in removed.stderr
+    assert "refs/heads/side " + branch_commit[:12] in removed.stderr
+    restored = tmp_path / "restored-private.git"
+    git(tmp_path, "clone", "-q", "--bare", str(receipt["archive_bundle"]), str(restored))
+    salvage = str(receipt["salvage_commit"])
+    for commit in (branch_commit, tag_commit):
+        assert git(restored, "merge-base", "--is-ancestor", commit, salvage, check=False).returncode == 0
+    parents = git(restored, "rev-list", "--parents", "-n", "1", salvage).stdout.split()[2:]
+    assert sorted(parents) == sorted((branch_commit, tag_commit))
+
+
+def test_archive_private_history_still_refuses_uncommitted_submodule_work(
+    tmp_path: Path,
+) -> None:
+    """#1255: real uncommitted work keeps its own refusal, with or without the flag."""
+    project, tree, _component, leaf = _slot_with_primary_dropped_leaf(tmp_path)
+    _leaf_private_branch_and_tag(leaf)
+    (leaf / "leaf.txt").write_text("uncommitted\n", encoding="utf-8")
+
+    removed = _remove_archiving(project, "--archive-private-history")
+
+    assert removed.returncode == 3, removed.stdout + removed.stderr
+    assert (
+        "submodule product/component/leaf has uncommitted changes and its source no longer "
+        "declares it; preserve the slot and commit or publish that work by hand"
+    ) in removed.stderr
+    assert "unpushed private history" not in removed.stderr
+    assert tree.is_dir()
+    assert (leaf / "leaf.txt").read_text(encoding="utf-8") == "uncommitted\n"
+
+
+def test_remove_counts_history_a_remote_tip_missing_locally_reaches(tmp_path: Path) -> None:
+    """#1255: a commit the remote's newer branch tip holds is kept, via a commits-only fetch."""
+    project, tree, _component, leaf = _slot_with_primary_dropped_leaf(tmp_path)
+    source = tmp_path / "leaf-source"
+    git(source, "checkout", "-q", "-b", "feature")
+    published = commit_local(source, "feature.txt", "one\n", "feature one")
+    git(source, "push", "-q", "origin", "feature")
+    git(leaf, "fetch", "-q", "origin", "feature")
+    git(leaf, "branch", "-q", "side", "origin/feature")
+    git(leaf, "update-ref", "-d", "refs/remotes/origin/feature")
+    newer = commit_local(source, "feature2.txt", "two\n", "feature two")
+    git(source, "push", "-q", "origin", "feature")
+    # The slot holds the published commit only on its own branch, and lacks
+    # the remote's newer tip, which is the only advertised ref reaching it.
+    assert git(leaf, "cat-file", "-e", newer, check=False).returncode != 0
+    assert git(leaf, "rev-parse", "side").stdout.strip() == published
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    assert _drift_receipts(project)["product/component/leaf"]["disposition"] == (
+        "already-published"
+    )
+
+
+def test_remove_no_longer_drops_a_local_side_branch(tmp_path: Path) -> None:
+    """#1255: removal used to delete this commit with an already-published receipt."""
+    project, tree, _component, leaf = _slot_with_primary_dropped_leaf(tmp_path)
+    base = git(leaf, "rev-parse", "HEAD").stdout.strip()
+    git(leaf, "checkout", "-q", "-b", "side")
+    side = commit_local(leaf, "side.txt", "side\n", "side only")
+    git(leaf, "checkout", "-q", "--detach", base)
+
+    removed = remove(project)
+
+    assert removed.returncode == 3, removed.stdout + removed.stderr
+    assert (
+        "unpushed private history in submodule product/component/leaf: 1 commit on 1 ref "
+        "not on any remote (refs/heads/side)."
+    ) in removed.stderr
+    assert tree.is_dir()
+    assert git(leaf, "rev-parse", "side").stdout.strip() == side
+    assert len(active_slots(project)) == 1
+
+
 def test_remove_skips_an_uninitialised_nested_submodule(tmp_path: Path) -> None:
     project, tree, component, _leaf = _slot_with_primary_dropped_leaf(tmp_path)
     git(

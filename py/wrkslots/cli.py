@@ -18649,14 +18649,52 @@ class _GitVcs:
     ) -> list[str]:
         """Fetch the commits of ``missing`` into an empty store; return those containing ``head``.
 
-        Every commit walked was sent by the remote, as in
-        _assert_remote_sends_history: the store starts empty, has no
-        alternates, and GIT_NO_LAZY_FETCH makes a missing commit an error
-        rather than another download. Trees and blobs are not requested.
-        The temporary repository is made inside ``git_directory``, the
-        checkout's own Git directory, which removal deletes with the slot,
-        so even a remote that ignores the filter writes nothing to the
-        system temporary directory.
+        See _fetched_proof_store.
+        """
+
+        names = sorted(missing)
+        with self._fetched_proof_store(common, git_directory, authority, missing) as (
+            isolated,
+            lazy_off,
+            proof_root,
+        ):
+            if head not in self._present_commits(isolated, {head}, lazy_off):
+                return []
+            result = self._run(
+                isolated,
+                ["for-each-ref", "--format=%(refname)", "--contains", head, proof_root],
+                env_overrides=lazy_off,
+            )
+        containing: list[str] = []
+        for line in result.stdout.splitlines():
+            if not line:
+                continue
+            suffix = line.removeprefix(proof_root)
+            if suffix == line or not suffix.isdigit() or int(suffix) >= len(names):
+                raise Refusal(f"Git returned an unexpected containment ref: {line}")
+            containing.append(names[int(suffix)])
+        return containing
+
+    @contextlib.contextmanager
+    def _fetched_proof_store(
+        self,
+        common: Path,
+        git_directory: Path,
+        authority: _RemoteAuthority,
+        missing: Mapping[str, str],
+    ) -> Iterator[tuple[Path, Mapping[str, str], str]]:
+        """Fetch the commits of ``missing`` into an empty store and yield it.
+
+        Yields the temporary repository, the environment that reads only its
+        own objects with lazy fetching off, and the root of its refs, one per
+        name of ``missing`` in sorted order.  Every commit walked was sent by
+        the remote, as in _assert_remote_sends_history: the store starts
+        empty, has no alternates, and GIT_NO_LAZY_FETCH makes a missing commit
+        an error rather than another download. Trees and blobs are not
+        requested. The temporary repository is made inside ``git_directory``,
+        the checkout's own Git directory, which removal deletes with the slot,
+        so even a remote that ignores the filter writes nothing to the system
+        temporary directory.
         """
 
         names = sorted(missing)
@@ -18724,23 +18762,159 @@ class _GitVcs:
                 raise Refusal(
                     "Git fetched a different ref inventory than the remote advertised"
                 )
-            lazy_off = {**object_env, "GIT_NO_LAZY_FETCH": "1"}
-            if head not in self._present_commits(isolated, {head}, lazy_off):
-                return []
-            result = self._run(
-                isolated,
-                ["for-each-ref", "--format=%(refname)", "--contains", head, proof_root],
-                env_overrides=lazy_off,
+            yield isolated, {**object_env, "GIT_NO_LAZY_FETCH": "1"}, proof_root
+
+    def remote_advertised_covering(
+        self,
+        checkout: Path,
+        remote: str,
+        tips: Sequence[str],
+        authority: _RemoteAuthority,
+        *,
+        network_authority: _RemoteAuthority | None = None,
+    ) -> frozenset[str]:
+        """Return local commits the remote's advertised branches and tags reach now.
+
+        The durability proof for a submodule the primary no longer declares
+        (#1255), whose own repository removal deletes: a commit that a branch
+        or tag the remote lists at this moment reaches survives removal.  The
+        answer holds each advertised tip that is already a commit in the
+        checkout's object store, an annotated tag through the commit it
+        names when the tag object itself is present (object names are content
+        hashes, so a present object is the advertised one), and each of
+        ``tips`` that those do not reach but that a commits-only fetch of the
+        advertised tips missing locally brings into an empty store
+        (_fetched_proof_store).  Only refs/heads/* and refs/tags/* count; a
+        local refs/remotes/* or tag ref may name what the remote has since
+        deleted.  The answer shares remote_heads_containing's memo, under a
+        key no other question uses.
+        """
+
+        _validate_remote(remote)
+        if any(not SHA_RE.fullmatch(tip) for tip in tips):
+            raise Refusal("cannot search the remote for an invalid commit")
+        self.assert_remote_authority(checkout, remote, authority)
+        target = authority if network_authority is None else network_authority
+        expected_digest = hashlib.sha256(target.url.encode("utf-8")).hexdigest()
+        if target.sha256 != expected_digest:
+            raise StateError("remote authority URL and digest disagree")
+        if target.url.startswith("-"):
+            raise Refusal(
+                f"remote {remote!r} URL cannot begin with '-' for isolated transport"
             )
-        containing: list[str] = []
-        for line in result.stdout.splitlines():
-            if not line:
-                continue
-            suffix = line.removeprefix(proof_root)
-            if suffix == line or not suffix.isdigit() or int(suffix) >= len(names):
-                raise Refusal(f"Git returned an unexpected containment ref: {line}")
-            containing.append(names[int(suffix)])
-        return containing
+        common = self.common_directory(checkout)
+        objects = common / "objects"
+        memo = _REMOTE_CONTAINMENT_MEMO.get()
+        # A URL holds no NUL, so this key never meets another question's.
+        key = (
+            str(objects.resolve()),
+            "covering\0" + target.url,
+            hashlib.sha256("".join(f"{tip}\n" for tip in sorted(tips)).encode()).hexdigest(),
+            False,
+        )
+        if memo is not None:
+            cached = memo.get(key)
+            if (
+                cached is not None
+                and time.monotonic() - cached.observed_at
+                <= _REMOTE_CONTAINMENT_EVIDENCE_MAX_AGE_SECONDS
+            ):
+                if cached.refusal is not None:
+                    raise cached.refusal
+                return frozenset(cached.refs)
+        try:
+            covering = self._remote_advertised_covering_uncached(
+                checkout, target, common, tips
+            )
+        except Refusal as exc:
+            if memo is not None:
+                memo[key] = _RemoteContainmentEvidence((), time.monotonic(), exc)
+            raise
+        if memo is not None:
+            memo[key] = _RemoteContainmentEvidence(tuple(sorted(covering)), time.monotonic())
+        return covering
+
+    def _remote_advertised_covering_uncached(
+        self,
+        checkout: Path,
+        target: _RemoteAuthority,
+        common: Path,
+        tips: Sequence[str],
+    ) -> frozenset[str]:
+        """Ask the remote at ``target``; see remote_advertised_covering."""
+
+        prefixes = ("refs/heads/", "refs/tags/")
+        objects = common / "objects"
+        with self._isolated_repository(objects) as (isolated, object_env):
+            advertised = {
+                ref: tip
+                for ref, tip in self._ls_remote_inventory(
+                    isolated,
+                    target.url,
+                    refs=tuple(f"{prefix}*" for prefix in prefixes),
+                    env_overrides=object_env,
+                    timeout_seconds=_REMOTE_CONTAINMENT_LIST_SECONDS,
+                ).items()
+                if ref.startswith(prefixes)
+            }
+            peeled = self._present_peeled_commits(
+                isolated, set(advertised.values()), object_env
+            )
+            covering = set(peeled.values())
+            # A tip the present advertised commits reach is not listed by
+            # this walk; with none present, every tip remains.
+            remaining = (
+                set(tips)
+                & set(
+                    self._run(
+                        isolated,
+                        ["rev-list", "--stdin"],
+                        input_text="".join(f"{tip}\n" for tip in sorted(tips))
+                        + "".join(f"^{item}\n" for item in sorted(covering)),
+                        env_overrides={**object_env, "GIT_NO_LAZY_FETCH": "1"},
+                    ).stdout.split()
+                )
+                if covering
+                else set(tips)
+            )
+        missing = {ref: tip for ref, tip in advertised.items() if tip not in peeled}
+        if remaining and missing:
+            with self._fetched_proof_store(
+                common, self._private_git_directory(checkout), target, missing
+            ) as (fetched, lazy_off, _proof_root):
+                covering |= self._present_commits(fetched, remaining, lazy_off)
+        return frozenset(covering)
+
+    def _present_peeled_commits(
+        self,
+        isolated: Path,
+        candidates: AbstractSet[str],
+        object_env: Mapping[str, str],
+    ) -> dict[str, str]:
+        """Map each of ``candidates`` present in the store to the commit it is or names.
+
+        A commit maps to itself and an annotated tag to the commit it peels
+        to; an absent object, or a tag of a tree or blob, is left out.
+        """
+
+        if not candidates:
+            return {}
+        names = sorted(candidates)
+        result = self._run(
+            isolated,
+            ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            input_text="".join(f"{name}^{{commit}}\n" for name in names),
+            env_overrides={**object_env, "GIT_NO_LAZY_FETCH": "1"},
+        )
+        lines = result.stdout.splitlines()
+        if len(lines) != len(names):
+            raise Refusal("Git answered a different number of objects than it was asked")
+        peeled: dict[str, str] = {}
+        for name, line in zip(names, lines):
+            fields = line.split()
+            if len(fields) == 2 and fields[1] == "commit" and SHA_RE.fullmatch(fields[0]):
+                peeled[name] = fields[0]
+        return peeled
 
     def ref_exists(self, checkout: Path, ref: str) -> bool:
         _validate_full_ref(ref, "remote ref")
@@ -24272,6 +24446,23 @@ def _archive_salvage_locally(
             if drift is not None
             else "its superproject checkout differs from its recorded branch or remote"
         ) + ", so nothing was pushed"
+    elif archive_reason == _PRIVATE_HISTORY_ARCHIVE_REASON:
+        history = facts.private_history
+        reason = (
+            "--archive-private-history keeps the unpushed private history of a "
+            "submodule its source no longer declares"
+            + (
+                ""
+                if history is None
+                else f" ({_counted(history.commits, 'commit')}"
+                + "".join(
+                    f"{', ' if index else ': '}{refname} {commit[:12]}"
+                    for index, (refname, commit) in enumerate(history.refs)
+                )
+                + ")"
+            )
+            + ", so nothing was pushed"
+        )
     elif remote_failure is None:
         reason = f"remote {checkout.remote} is not in salvage_push_remotes"
     else:
@@ -24408,6 +24599,13 @@ class _SalvageCandidate:
     # gitlinks that point at other commits, each such (path, commit); None
     # when anything else differs (#1153).  See _published_gitlinks_proof.
     gitlinks: tuple[tuple[str, str], ...] | None = None
+    # Set only by private-state salvage (_salvage_candidate_uncached's
+    # keep_private_state): whether the checkout holds uncommitted work (its
+    # status, or what its own index stages, differs from HEAD), as opposed
+    # to only the unpushed private history in ``private_history`` (#1255).
+    # None means the same as ``dirty``.
+    uncommitted_work: bool | None = None
+    private_history: _PrivateHistory | None = None
 
     @property
     def aliased(self) -> bool:
@@ -24416,6 +24614,32 @@ class _SalvageCandidate:
             self.network_authority is not None
             and self.network_authority != self.remote_authority
         )
+
+    @property
+    def has_uncommitted_work(self) -> bool:
+        """Whether salvage would keep worktree or index state, not only history."""
+        return self.dirty if self.uncommitted_work is None else self.uncommitted_work
+
+
+@dataclasses.dataclass(frozen=True)
+class _PrivateHistory:
+    """The commits only a slot submodule's own repository holds (#1255).
+
+    ``tips`` are kept as extra parents of the salvage commit.  ``commits``
+    counts every commit they reach that no durable repository's ref and no
+    branch or tag the recorded remote advertises reaches; ``refs`` maps
+    each local ref whose tip (an annotated tag through the commit it names)
+    is one of those commits to that commit; ``unreferenced`` counts those
+    commits that no such ref reaches, which only a reflog entry, a
+    pseudoref or no name at all holds.  ``remote_unchecked`` is why the
+    recorded remote could not be asked, when it could not.
+    """
+
+    tips: tuple[str, ...]
+    commits: int
+    refs: tuple[tuple[str, str], ...]
+    unreferenced: int
+    remote_unchecked: str | None = None
 
 
 def _shallow_history_refusal(facts: _SalvageCandidate) -> Refusal:
@@ -25098,24 +25322,34 @@ def _worktree_private_orphan_tips(vcs: _GitVcs, path: Path, kept: str) -> tuple[
     return _commit_tips(vcs, path, positives, negatives)
 
 
-def _submodule_private_tips(
+def _submodule_private_history(
     vcs: _GitVcs,
     path: Path,
     kept: str,
     durable: Sequence[Path],
-) -> tuple[str, ...]:
-    """Return the tips of commits that only a slot submodule's own repository holds.
+    *,
+    remote_cover: Callable[[tuple[str, ...]], tuple[frozenset[str], str | None]]
+    | None = None,
+) -> _PrivateHistory | None:
+    """Return the commits that only a slot submodule's own repository holds, if any.
 
     A linked worktree's submodule repositories live in the worktree's own Git
     directory, so removal deletes every ref, stash entry and reflog they hold,
     remote-tracking refs and tags included (those may also be stale or
-    local), and every commit object no ref names.  This lists the tips of the
-    commits that any of them reaches (both object names of every reflog entry,
-    every pseudoref, every commit object) and that neither ``kept`` nor any ref
-    of a ``durable`` repository, which removal keeps (the source submodule
+    local), and every commit object no ref names.  This finds the commits
+    that any of them reaches (both object names of every reflog entry, every
+    pseudoref, every commit object) and that neither ``kept`` nor any ref of a
+    ``durable`` repository, which removal keeps (the source submodule
     repository, and the submodule's remote when that is a local repository
     outside the slot), reaches.  Ancestry is decided with those repositories'
     objects as alternates, so every durable ref resolves.
+
+    ``remote_cover`` (a submodule the primary no longer declares, which has no
+    durable source repository, #1255) is then asked about the tips that
+    remain; the commits it returns, those the recorded remote's advertised
+    branches and tags reach, count as kept too, and so does everything they
+    reach.  It also returns why the remote could not be asked, if it could not;
+    every tip then stays private.
     """
 
     _assert_files_ref_storage(vcs, path)
@@ -25175,12 +25409,62 @@ def _submodule_private_tips(
         if ":" in str(objects):
             raise Refusal(f"repository object directory path contains ':': {objects}")
         alternates.append(str(objects))
-    return _commit_tips(
-        vcs,
-        path,
-        positives,
-        negatives,
-        env_overrides={"GIT_ALTERNATE_OBJECT_DIRECTORIES": ":".join(alternates)},
+    # With no durable repository there is no alternate to name.
+    environment = (
+        {"GIT_ALTERNATE_OBJECT_DIRECTORIES": ":".join(alternates)} if alternates else None
+    )
+    tips = _commit_tips(vcs, path, positives, negatives, env_overrides=environment)
+    unchecked: str | None = None
+    if tips and remote_cover is not None:
+        covering, unchecked = remote_cover(tips)
+        if covering:
+            negatives |= covering
+            tips = _commit_tips(vcs, path, positives, negatives, env_overrides=environment)
+    if not tips:
+        return None
+    return _private_history_summary(vcs, path, tips, negatives, environment, unchecked)
+
+
+def _private_history_summary(
+    vcs: _GitVcs,
+    path: Path,
+    tips: tuple[str, ...],
+    negatives: AbstractSet[str],
+    environment: Mapping[str, str] | None,
+    unchecked: str | None,
+) -> _PrivateHistory:
+    """Count and name what ``tips`` hold beyond ``negatives``; see _PrivateHistory."""
+
+    def walk(starts: Iterable[str]) -> set[str]:
+        return set(
+            vcs._run(
+                path,
+                ["rev-list", "--stdin"],
+                input_text="".join(f"{item}\n" for item in sorted(starts))
+                + "".join(f"^{item}\n" for item in sorted(negatives)),
+                env_overrides=environment,
+            ).stdout.split()
+        )
+
+    private = walk(tips)
+    refs: list[tuple[str, str]] = []
+    for line in vcs._run(
+        path, ["for-each-ref", "--format=%(objectname) %(*objectname) %(refname)"]
+    ).stdout.splitlines():
+        fields = line.split(" ", 2)
+        if len(fields) != 3:
+            continue
+        direct, peeled, refname = fields
+        commit = peeled or direct
+        if commit in private:
+            refs.append((refname, commit))
+    named = walk({commit for _refname, commit in refs}) if refs else set()
+    return _PrivateHistory(
+        tips=tips,
+        commits=len(private),
+        refs=tuple(sorted(refs)),
+        unreferenced=len(private - named),
+        remote_unchecked=unchecked,
     )
 
 
@@ -25194,12 +25478,16 @@ def _durable_submodule_repositories(
 ) -> tuple[Path, ...]:
     """Return the repositories whose refs prove a slot submodule's commits survive removal.
 
-    Always the source submodule repository.  Also the submodule's remote when
-    its URL is an absolute path to an existing local repository that lies
-    neither in the slot nor in the Git directory of any of the slot's
-    checkouts (where a linked worktree keeps its submodule repositories), so
-    removal cannot delete it; a local mirror of the source's modules is the
-    usual case.  A network remote is never read: nothing here contacts one.
+    The source submodule repository, unless removal deletes it: a submodule
+    the primary no longer declares has its own module repository as its
+    recorded repository (#910), and that lies in the Git directory of one of
+    the slot's checkouts, so its refs prove nothing (#1255).  Also the
+    submodule's remote when its URL is an absolute path to an existing local
+    repository that lies neither in the slot nor in the Git directory of any
+    of the slot's checkouts (where a linked worktree keeps its submodule
+    repositories), so removal cannot delete it; a local mirror of the
+    source's modules is the usual case.  A network remote is never read:
+    nothing here contacts one.
     """
 
     _relative, source = _stored_repository_path(config, submodule.repository)
@@ -25258,6 +25546,11 @@ def _durable_submodule_repositories(
                 vcs._run(checkout_path, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
             ).resolve()
         )
+    resolved_source = source.resolve(strict=False)
+    if any(
+        resolved_source == root or resolved_source.is_relative_to(root) for root in removed
+    ):
+        durable.remove(source)
     for url in dict.fromkeys(urls):
         mirror = _absolute_local_remote_directory(
             path, _RemoteAuthority(url=url, sha256=hashlib.sha256(url.encode()).hexdigest())
@@ -25377,7 +25670,7 @@ def _salvage_candidate_uncached(
     (_index_state_trees), and the tips of every commit that removal would
     leave unreachable: for a checkout its worktree-private history
     (_worktree_private_orphan_tips), for a submodule everything its own
-    repository holds beyond its source repository (_submodule_private_tips).
+    repository holds beyond its source repository (_submodule_private_history).
     Every commit is made with a fixed identity, date and message, so rechecks
     derive the same salvage commit while that state is unchanged, and any
     change to it refuses.
@@ -25456,15 +25749,28 @@ def _salvage_candidate_uncached(
                 f"exit\n\nsource-head: {facts.head}\n",
             )
         )
+    # What the index holds beyond HEAD is uncommitted work, as a changed
+    # status is; the private history below is not (#1255).
+    uncommitted = facts.dirty or bool(extra)
+    history: _PrivateHistory | None = None
     if allow_detached:
-        tips = _submodule_private_tips(
+        history = _submodule_private_history(
             vcs,
             path,
             facts.commit,
             _durable_submodule_repositories(
                 vcs, config, record, checkout, path, facts.remote_authority
             ),
+            # A submodule the primary no longer declares has no durable
+            # source repository; what its recorded remote advertises is
+            # what survives removal.
+            remote_cover=(
+                functools.partial(_remote_private_cover, vcs, path, checkout, facts)
+                if _checkout_is_self_sourced(config, checkout, path, vcs)
+                else None
+            ),
         )
+        tips = () if history is None else history.tips
     else:
         tips = _worktree_private_orphan_tips(vcs, path, facts.commit)
     extra.extend(tip for tip in tips if tip not in extra)
@@ -25482,7 +25788,43 @@ def _salvage_candidate_uncached(
         f"exit\n\nsource-head: {facts.head}\n"
         + "".join(f"kept: {item}\n" for item in extra),
     )
-    return dataclasses.replace(facts, commit=commit, dirty=True)
+    return dataclasses.replace(
+        facts,
+        commit=commit,
+        dirty=True,
+        uncommitted_work=uncommitted,
+        private_history=history,
+    )
+
+
+def _remote_private_cover(
+    vcs: _GitVcs,
+    path: Path,
+    checkout: Checkout,
+    facts: _SalvageCandidate,
+    tips: tuple[str, ...],
+) -> tuple[frozenset[str], str | None]:
+    """Ask a submodule's recorded remote which of its commits it holds (#1255).
+
+    Returns the commits its advertised branches and tags reach (see
+    _GitVcs.remote_advertised_covering), or nothing and why when the remote
+    could not be asked: then every commit stays private, which refuses
+    removal or keeps them in a bundle, never deletes them.
+    """
+
+    try:
+        return (
+            vcs.remote_advertised_covering(
+                path,
+                checkout.remote,
+                tips,
+                facts.remote_authority,
+                network_authority=facts.network_authority,
+            ),
+            None,
+        )
+    except Refusal as exc:
+        return frozenset(), str(exc)
 
 
 def _salvage_candidate_facts(
@@ -26502,6 +26844,9 @@ _CHECKOUT_DRIFT_ARCHIVE_REASON = "recorded-checkout-drift"
 # A #1153 publication proof or shared bundle that no longer held when checked
 # again before deletion; the checkout was then kept in a bundle of its own.
 _PUBLICATION_LOST_ARCHIVE_REASON = "publication-proof-lost"
+# A submodule the primary no longer declares whose unpushed private history
+# remove --archive-private-history kept in a local bundle (#1255).
+_PRIVATE_HISTORY_ARCHIVE_REASON = "private-history-kept"
 _CHECKOUT_DRIFT_KEYS = frozenset(
     {
         "recorded_branch",
@@ -26658,12 +27003,13 @@ def _salvage_one_checkout(
     never_push: bool = False,
     gitlink_sources: Mapping[str, tuple[Checkout, Path, _SalvageCandidate]] | None = None,
     tag_proof: bool = False,
+    never_push_reason: str = _CHECKOUT_DRIFT_ARCHIVE_REASON,
 ) -> dict[str, object]:
     """Preserve one checkout's unpublished state before its slot is removed.
 
     ``never_push`` (a submodule of a drifted checkout, see _CheckoutDrift)
     keeps anything not already published in a verified local bundle instead
-    of pushing it to a salvage remote.
+    of pushing it to a salvage remote, recorded with ``never_push_reason``.
 
     Two more proofs count a checkout as already published (#1153), each
     named in the receipt's ``publication_proof`` and checked again before
@@ -26774,7 +27120,7 @@ def _salvage_one_checkout(
             archive_root or _default_salvage_archive_root(config),
             None,
             vcs,
-            archive_reason=_CHECKOUT_DRIFT_ARCHIVE_REASON if never_push else None,
+            archive_reason=never_push_reason if never_push else None,
             shared=True,
         )
     salvage_name = checkout.name.replace("/", "-")
@@ -26896,6 +27242,54 @@ def _published_gitlinks_proof(
     return proofs
 
 
+_PRIVATE_HISTORY_REFS_SHOWN = 5
+
+
+def _counted(count: int, noun: str) -> str:
+    return f"{count} {noun}" + ("" if count == 1 else "s")
+
+
+def _private_history_refusal(
+    slot: str, checkout: Checkout, history: _PrivateHistory
+) -> Refusal:
+    """The refusal for a self-sourced submodule holding only unpushed private history.
+
+    Names what removal would delete, counted in commits and refs, a few of
+    those refs, and the explicit step that keeps them (#1255).
+    """
+
+    shown = ", ".join(refname for refname, _commit in history.refs[:_PRIVATE_HISTORY_REFS_SHOWN])
+    more = len(history.refs) - _PRIVATE_HISTORY_REFS_SHOWN
+    if history.refs:
+        found = (
+            f"{_counted(history.commits, 'commit')} on {_counted(len(history.refs), 'ref')} "
+            f"not on any remote ({shown}" + (f" and {more} more" if more > 0 else "") + ")"
+        )
+        if history.unreferenced:
+            found += (
+                f"; {history.unreferenced} of those commits only a reflog entry or no "
+                "name at all holds"
+            )
+    else:
+        found = (
+            f"{_counted(history.commits, 'commit')} not on any remote, which only reflog "
+            "entries or no name at all hold"
+        )
+    unchecked = (
+        ""
+        if history.remote_unchecked is None
+        else f" (remote {checkout.remote} could not be asked, so none of its branches or "
+        f"tags counted: {history.remote_unchecked})"
+    )
+    return Refusal(
+        f"unpushed private history in submodule {checkout.name}: {found}{unchecked}. "
+        "Its source no longer declares it, so removal would delete the only copy. "
+        "remedy: keep that history in a verified local bundle in the salvage archive, "
+        f"never pushed, by rerunning 'wrkslots remove {slot}' with the same options plus "
+        "--archive-private-history; or publish it by hand and rerun remove"
+    )
+
+
 def _drifted_checkout_refusal(
     checkout: Checkout, drift: _CheckoutDrift, reason: str
 ) -> Refusal:
@@ -26925,6 +27319,7 @@ def _salvage_agent_slot(
     archive_drifted: bool = False,
     drift_refusal: str | None = None,
     owner_proven_dead: bool = False,
+    archive_private_history: bool = False,
 ) -> tuple[dict[str, object], ...]:
     """Salvage every checkout and initialized submodule of an agent slot.
 
@@ -26937,6 +27332,12 @@ def _salvage_agent_slot(
     removal may not do that (its owner is not proven dead), and a drifted
     checkout then refuses with it. Without ``archive_drifted`` every drifted
     checkout refuses exactly as before.
+
+    A submodule the primary no longer declares (self-sourced, #910) that
+    holds unpushed private history and no uncommitted work refuses with
+    _private_history_refusal, unless ``archive_private_history`` (remove
+    --archive-private-history) keeps that history in a verified local
+    bundle (#1255); uncommitted work in one always refuses.
     """
 
     _set_item_phase("salvage")
@@ -27051,11 +27452,18 @@ def _salvage_agent_slot(
             # A clean self-sourced submodule is remote-verified or bundled
             # (#871); uncommitted work in one has no source checkout left
             # to judge it against, so it is refused, as before.
-            raise Refusal(
-                f"submodule {checkout.name} has uncommitted changes and its "
-                "source no longer declares it; preserve the slot and commit "
-                "or publish that work by hand"
-            )
+            if facts.has_uncommitted_work or facts.private_history is None:
+                raise Refusal(
+                    f"submodule {checkout.name} has uncommitted changes and its "
+                    "source no longer declares it; preserve the slot and commit "
+                    "or publish that work by hand"
+                )
+            # Only unpushed private history (#1255): kept in a verified
+            # local bundle when the operator asked for that, never pushed.
+            if not archive_private_history:
+                raise _private_history_refusal(
+                    record.slot, checkout, facts.private_history
+                )
         pregathered = _PREGATHERED_SALVAGE_RECEIPTS.get()
         if (
             pregathered is not None
@@ -27089,6 +27497,12 @@ def _salvage_agent_slot(
                     if source_path != path and source_path.is_relative_to(path)
                 },
                 tag_proof=detached,
+                never_push_reason=(
+                    _PRIVATE_HISTORY_ARCHIVE_REASON
+                    if checkout.name in self_sourced_names
+                    and facts.private_history is not None
+                    else _CHECKOUT_DRIFT_ARCHIVE_REASON
+                ),
             )
         )
     return tuple(receipts)
@@ -27326,7 +27740,15 @@ def _assert_salvage_still_matches(
                 verify_repository_membership=not allow_detached,
                 allow_shallow=allow_detached,
                 accept_drift=drifted and not allow_detached,
-                keep_private_state=drifted,
+                # As _salvage_agent_slot derived them: a submodule the
+                # primary no longer declares keeps its private state too, so
+                # a salvage commit that kept its private history is derived
+                # again exactly (#1255).
+                keep_private_state=drifted
+                or (
+                    allow_detached
+                    and _checkout_is_self_sourced(config, checkout, path, vcs)
+                ),
                 salvage_unlisted_modules=(
                     not allow_detached and checkout.name in unlisted_parents
                 ),
@@ -46738,6 +47160,7 @@ def _prefetch_remote_containment(
     salvage_archive_root: Path | None = None,
     *,
     archive_drifted: bool = False,
+    archive_private_history: bool = False,
 ) -> None:
     """Do removal's slow salvage work for ``slot`` before the registry lock is taken.
 
@@ -46758,6 +47181,9 @@ def _prefetch_remote_containment(
     With ``archive_drifted`` a drifted checkout's bundle is made and
     verified here too, without contacting any remote (see _CheckoutDrift),
     and its submodules' bundles are made instead of being left for a push.
+    No bundle is made for a submodule the primary no longer declares that
+    removal will refuse (uncommitted work, or unpushed private history
+    without ``archive_private_history``; see _salvage_agent_slot).
     """
 
     try:
@@ -46778,6 +47204,8 @@ def _prefetch_remote_containment(
         vcs = _GitVcs()
         # (checkout, path, facts, drifted, never_push, detached)
         prepared: list[tuple[Checkout, Path, _SalvageCandidate, bool, bool, bool]] = []
+        # Listed submodules the primary no longer declares (#910, #1255).
+        self_sourced_names: set[str] = set()
         for checkout in record.checkouts:
             path = _stored_path(config, checkout.path, "checkout path")
             drifted = (
@@ -46787,18 +47215,17 @@ def _prefetch_remote_containment(
             candidates: list[tuple[Checkout, Path, bool, bool, bool]] = [
                 (checkout, path, False, drifted, False)
             ]
-            candidates.extend(
-                (
-                    submodule,
-                    submodule_path,
-                    True,
-                    False,
-                    _checkout_is_self_sourced(config, submodule, submodule_path, vcs),
+            for submodule, submodule_path in _submodule_salvage_checkouts(
+                config, checkout, vcs
+            ):
+                self_sourced = _checkout_is_self_sourced(
+                    config, submodule, submodule_path, vcs
                 )
-                for submodule, submodule_path in _submodule_salvage_checkouts(
-                    config, checkout, vcs
+                if self_sourced:
+                    self_sourced_names.add(submodule.name)
+                candidates.append(
+                    (submodule, submodule_path, True, False, self_sourced)
                 )
-            )
             # A proven-dead owner's unlisted and nested module repositories
             # are bundled by the removal under the lock; making and
             # fsck-verifying those bundles here, before the lock, keeps a
@@ -46856,6 +47283,17 @@ def _prefetch_remote_containment(
         if detached and not drifted
     ]
     for candidate, candidate_path, facts, drifted, never_push, detached in prepared:
+        if (
+            candidate.name in self_sourced_names
+            and facts.dirty
+            and (
+                facts.has_uncommitted_work
+                or facts.private_history is None
+                or not archive_private_history
+            )
+        ):
+            # Refused under the lock (_salvage_agent_slot); nothing to keep.
+            continue
         try:
             if drifted:
                 # No remote is asked: a drifted checkout is always archived.
@@ -47145,6 +47583,7 @@ def _cmd_remove_in_scope(
             args.slot,
             salvage_archive_root,
             archive_drifted=bool(getattr(args, "archive_drifted_checkouts", False)),
+            archive_private_history=bool(getattr(args, "archive_private_history", False)),
         )
     wait_deadline = getattr(args, "_wait_deadline", None)
     lock_scope = (
@@ -47786,6 +48225,9 @@ def _cmd_remove_in_scope(
                 archive_drifted=archive_drifted,
                 drift_refusal=drift_refusal,
                 owner_proven_dead=owner_proven_dead,
+                archive_private_history=bool(
+                    getattr(args, "archive_private_history", False)
+                ),
             )
             evidence = tuple(
                 f"checkout {item['checkout']}: {item['disposition']} commit "
@@ -74325,6 +74767,21 @@ def _cmd_config_convert(args: argparse.Namespace) -> int:
     return 0
 
 
+_ARCHIVE_PRIVATE_HISTORY_HELP = (
+    "for an agent slot with a submodule its source no longer declares (the slot's copy is "
+    "judged by its own recorded remote), do not refuse that submodule for unpushed private "
+    "history: commits that only its own repository holds (on local branches or tags, in "
+    "the stash or reflogs, or named by nothing) and that no branch or tag its recorded "
+    "remote advertises now, and no local mirror outside the slot, reaches. Removal deletes "
+    "that repository, so without this option it refuses and names the commits and refs "
+    "it would delete. With it, their tips become extra parents of the submodule's salvage "
+    "commit, which is kept with its complete history in a self-contained Git bundle that "
+    "is read back (fresh bare clone, exact ref, full fsck) under the control directory's "
+    "wrkslots-salvage/ (or --salvage-archive-root); the removal record names the bundle. "
+    "Nothing is pushed. Uncommitted changes in such a submodule still refuse. Restore with "
+    "'git fetch BUNDLE ARCHIVE_REF:refs/heads/restored'; the salvage commit's parents after "
+    "the first are the kept tips (default: off, private history refuses)"
+)
 _ARCHIVE_DRIFTED_CHECKOUTS_HELP = (
     "for an agent slot whose recorded owner is proven dead (exact process identity gone "
     "and the registered liveness command answering dead), do not refuse a checkout that "
@@ -75781,6 +76238,11 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="as for remove, for every target: " + _ARCHIVE_NESTED_CACHE_REPOSITORIES_HELP,
     )
     retire_pending.add_argument(
+        "--archive-private-history",
+        action="store_true",
+        help="as for remove, for every target: " + _ARCHIVE_PRIVATE_HISTORY_HELP,
+    )
+    retire_pending.add_argument(
         "--format",
         choices=("human", "json"),
         default="human",
@@ -76173,6 +76635,11 @@ usage or audit gate unknown, 3 fail-closed refusal.
         action="store_true",
         help=_ARCHIVE_NESTED_CACHE_REPOSITORIES_HELP,
     )
+    remove.add_argument(
+        "--archive-private-history",
+        action="store_true",
+        help=_ARCHIVE_PRIVATE_HISTORY_HELP,
+    )
     remove.set_defaults(handler=_cmd_remove)
 
     remove_validate_batch = subparsers.add_parser(
@@ -76345,6 +76812,11 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "as for remove, for every slot of the batch: "
             + _ARCHIVE_NESTED_CACHE_REPOSITORIES_HELP
         ),
+    )
+    remove_agent_batch.add_argument(
+        "--archive-private-history",
+        action="store_true",
+        help="as for remove, for every slot of the batch: " + _ARCHIVE_PRIVATE_HISTORY_HELP,
     )
     remove_agent_batch.add_argument(
         "--format", choices=("human", "json"), default="human"
