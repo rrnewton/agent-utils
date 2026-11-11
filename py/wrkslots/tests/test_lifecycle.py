@@ -47541,6 +47541,26 @@ def test_recover_ownerless_agent_worktree_salvages_dirty_tree_without_owner(
     assert git(remote, "show", f"{salvage_commit}:uncommitted.txt").stdout == "preserve me\n"
 
 
+def test_recover_ownerless_agent_worktree_refuses_ignored_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    target, head, remote_digest = prepare_ownerless_agent_worktree(project, repository)
+    git(target, "config", "user.email", "test@example.invalid")
+    (target / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+    git(target, "add", ".gitignore")
+    git(target, "commit", "-q", "-m", "ignore evidence")
+    head = git(target, "rev-parse", "HEAD").stdout.strip()
+    evidence = target / "ignored" / "evidence" / "note.bin"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_bytes(b"evidence-bytes\n")
+    allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+
+    assert run_ownerless_agent_recovery(project, target, head, remote_digest, apply=True) != 0
+    assert evidence.exists()
+    assert target.exists()
+
+
 def test_generic_recover_resumes_ownerless_agent_remove_through_host_context(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

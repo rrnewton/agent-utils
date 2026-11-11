@@ -67546,6 +67546,27 @@ def _ownerless_agent_facts(
             f"{', '.join(sorted(unprotected))}; salvage never publishes handoffs, so "
             "preserve each one outside the worktree before retrying"
         )
+    # Salvage never keeps gitignored files, and the removal below is
+    # forced, so ignored evidence outside the regenerable caches would
+    # be deleted silently (#1302): refuse, as ordinary removal does.
+    ignored: dict[str, tuple[_IgnoredFile, ...]] = {}
+    for checkout_name, nested in repositories:
+        files = _ignored_files_outside_caches(
+            config, dataclasses.replace(checkout, name=checkout_name), nested, vcs
+        )
+        if files:
+            ignored[checkout_name] = files
+    if ignored:
+        segments = "; ".join(
+            f"checkout {name}: "
+            + ", ".join(f"{item.path} ({item.size} bytes)" for item in files)
+            for name, files in sorted(ignored.items())
+        )
+        raise Refusal(
+            "ownerless agent worktree holds gitignored file(s) outside the known "
+            f"regenerable caches that recovery would delete: {segments}; preserve "
+            "each one outside the worktree before retrying recovery"
+        )
     _assert_slot_unused(path)
     _assert_unregistered_path_systemd_unrelated(path)
     return checkout

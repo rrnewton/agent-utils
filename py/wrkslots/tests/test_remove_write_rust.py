@@ -22,6 +22,7 @@ import json
 import os
 import subprocess
 import sys
+import tarfile
 import time
 from pathlib import Path
 from typing import cast
@@ -805,6 +806,117 @@ def test_remove_ignored_cache_target_still_removes_in_both_editions(tmp_path: Pa
             records = cast(list[dict[str, object]], archived["records"])
             salvage = cast(list[dict[str, object]], records[0]["salvage"])
             assert "ignored_files" not in salvage[0]
+
+
+def _evidence_fixture(tmp_path: Path) -> Path:
+    """A fixture slot with ``ignored/evidence/note.bin`` gitignored (#1302)."""
+
+    root = _fixture(tmp_path)
+    checkout = root / "worktrees" / "slot-a" / "repo"
+    (checkout / ".gitignore").write_text("ignored/\n")
+    _git(checkout, "add", ".gitignore")
+    _git(checkout, "commit", "-q", "-m", "ignore evidence")
+    _git(checkout, "push", "-q", "origin", "HEAD:suite/work")
+    evidence = checkout / "ignored" / "evidence" / "note.bin"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_bytes(b"evidence-bytes\n")
+    return root
+
+
+def _archived_salvage(root: Path) -> list[dict[str, object]]:
+    archived: dict[str, object] = json.loads(
+        (root / "worktrees" / "ARCHIVED.node-a.json").read_text()
+    )
+    records = cast(list[dict[str, object]], archived["records"])
+    assert len(records) == 1
+    return cast(list[dict[str, object]], records[0]["salvage"])
+
+
+def test_remove_refuses_ignored_evidence_by_default(tmp_path: Path) -> None:
+    root = _evidence_fixture(tmp_path / "case")
+    evidence = root / "worktrees" / "slot-a" / "repo" / "ignored" / "evidence" / "note.bin"
+    with pytest.raises(wrkslots_cli.Refusal) as caught:
+        _python_remove(root)
+    message = str(caught.value)
+    assert "ignored/evidence/note.bin" in message
+    assert "--archive-ignored" in message
+    assert "--discard-ignored" in message
+    assert evidence.exists()
+    assert (root / "worktrees" / "slot-a").exists()
+
+
+def test_remove_archives_ignored_evidence_when_asked(tmp_path: Path) -> None:
+    root = _evidence_fixture(tmp_path / "case")
+    expected_sha256 = hashlib.sha256(b"evidence-bytes\n").hexdigest()
+    assert _python_remove(root, archive_ignored=True) == 0
+    assert not (root / "worktrees" / "slot-a").exists()
+
+    salvage = _archived_salvage(root)
+    assert len(salvage) == 1
+    assert salvage[0]["ignored_files"] == [
+        {
+            "path": "ignored/evidence/note.bin",
+            "bytes": len(b"evidence-bytes\n"),
+            "sha256": expected_sha256,
+            "disposition": "archived",
+        }
+    ]
+    archive = salvage[0]["ignored_archive"]
+    assert isinstance(archive, dict)
+    tar_path = root / "worktrees" / str(archive["path"])
+    assert tar_path.is_file()
+    observed = tar_path.read_bytes()
+    assert hashlib.sha256(observed).hexdigest() == archive["sha256"]
+    assert len(observed) == archive["bytes"]
+    with tarfile.open(fileobj=io.BytesIO(observed), mode="r:") as bundle:
+        members = bundle.getmembers()
+        assert [member.name for member in members] == ["repo/ignored/evidence/note.bin"]
+        extracted = bundle.extractfile(members[0])
+        assert extracted is not None
+        assert extracted.read() == b"evidence-bytes\n"
+
+
+def test_remove_discards_ignored_evidence_when_asked(tmp_path: Path) -> None:
+    root = _evidence_fixture(tmp_path / "case")
+    expected_sha256 = hashlib.sha256(b"evidence-bytes\n").hexdigest()
+    assert _python_remove(root, discard_ignored=True) == 0
+    assert not (root / "worktrees" / "slot-a").exists()
+
+    salvage = _archived_salvage(root)
+    assert len(salvage) == 1
+    assert salvage[0]["ignored_files"] == [
+        {
+            "path": "ignored/evidence/note.bin",
+            "bytes": len(b"evidence-bytes\n"),
+            "sha256": expected_sha256,
+            "disposition": "discarded",
+        }
+    ]
+    assert "ignored_archive" not in salvage[0]
+    assert not list(root.rglob("ignored-*.tar"))
+
+
+def test_remove_never_blocks_on_cache_only_ignored_content(tmp_path: Path) -> None:
+    root = _fixture(tmp_path / "case")
+    checkout = root / "worktrees" / "slot-a" / "repo"
+    (checkout / ".gitignore").write_text("target/\nnode_modules/\n")
+    _git(checkout, "add", ".gitignore")
+    _git(checkout, "commit", "-q", "-m", "ignore caches")
+    _git(checkout, "push", "-q", "origin", "HEAD:suite/work")
+    (checkout / "target" / "debug").mkdir(parents=True)
+    (checkout / "target" / "debug" / "build.bin").write_bytes(b"cache\n")
+    (checkout / "node_modules" / "pkg").mkdir(parents=True)
+    (checkout / "node_modules" / "pkg" / "index.js").write_text("cache\n")
+    # node_modules is a cache only once the project configures it, the
+    # same definition clean-caches uses; target is covered by default.
+    config_path = root / ".wrkslots.yml"
+    config_path.write_text(
+        config_path.read_text() + "cache_globs:\n  - node_modules\n"
+    )
+    assert _python_remove(root) == 0
+    assert not (root / "worktrees" / "slot-a").exists()
+    salvage = _archived_salvage(root)
+    assert "ignored_files" not in salvage[0]
 
 
 @pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
