@@ -1,6 +1,6 @@
 ---
 title: 'collapse-anchor-below: collapsing a message whose top is off screen keeps the next message fixed'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 assignee: mu-renderloop
@@ -38,3 +38,7 @@ Part of the one-scroll-owner design under #1210: the anchor choice for a collaps
 # Notes
 
 Owner reply 307, 2026-11-10 10:00 AM ET. Follow-up to #1210 ui-stability-no-async-shift; the tracker was searched and no existing issue covers it. Parked until the stability work lands. Mentioned in the redraw-model design note as the collapse anchor choice for the one scroll owner.
+
+## Resolution
+
+[watermelon-full-preview] Delivered in the #1215 landing on top of the scroll owner (#1251): `preservingCollapse` in scrollkeep makes the per-act choice — the collapsed row while its top is on screen, the next drawn row when its top is above the viewport, and the collapsed row centered when neither is on screen (a giant taller than the room, replacing head-to-top) — and a collapse yields to a live held anchor (filter hold, search walk, landed jump) until the reader's own act ends it. Both fold acts (Shift+E and the fold control's tap) route through it. Proof: `vibe-talk/tests/collapse_anchor_browser.py` at 393x852 and 1280x800 — top held 0.0px, next held 0.4px, centered 0.2px off — gated as `vibe-talk.check.collapse-anchor-browser`; the owner-priority gate was green (last line `validate: OK`). The soak stays report-only green with the change, as its values did not regress in that gate.
