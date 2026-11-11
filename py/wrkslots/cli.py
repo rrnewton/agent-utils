@@ -42533,7 +42533,7 @@ def _audit_slot_root_listing(
 
 
 def _cmd_audit(args: argparse.Namespace) -> int:
-    _apply_scan_memory_limit(args)
+    restore_memory_limit = _apply_scan_memory_limit(args)
     _bound_event_retention()
     try:
         return _cmd_audit_scan(args)
@@ -42563,6 +42563,8 @@ def _cmd_audit(args: argparse.Namespace) -> int:
         else:
             print(f"PARTIAL: {detail}")
         return 2
+    finally:
+        restore_memory_limit()
 
 
 def _cmd_audit_scan(args: argparse.Namespace) -> int:
@@ -43639,11 +43641,18 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
 
 
 def _cmd_unpushed(args: argparse.Namespace) -> int:
+    restore_memory_limit = _apply_scan_memory_limit(args)
+    try:
+        return _cmd_unpushed_scan(args)
+    finally:
+        restore_memory_limit()
+
+
+def _cmd_unpushed_scan(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     if args.slot is not None:
         _validate_name(args.slot, "slot")
     deadline = _scan_deadline(args)
-    _apply_scan_memory_limit(args)
     _bound_event_retention()
     _prewarm_registry_read(lambda: _validate_global_state(config))
     # Snapshot under a short shared lock, scan outside it (#1247). This
@@ -43854,12 +43863,16 @@ def _check_scan_deadline(deadline: float, snapshot: object = None) -> None:
 _SCAN_MEMORY_LIMIT_DEFAULT_GIB = 4.0
 
 
-def _apply_scan_memory_limit(args: argparse.Namespace) -> None:
+def _apply_scan_memory_limit(args: argparse.Namespace) -> Callable[[], None]:
     """Cap this process's address space for a read-only scan (best effort).
 
-    A platform or sandbox that refuses the limit leaves the scan unbounded
-    apart from its wall bound; the refusal is noted, never fatal, because a
-    reader must not fail for an environment it cannot control.
+    Returns a callable that restores the previous soft limit; the caller
+    must run it when the scan ends, on every path, because these handlers
+    also run in-process (tests, embeddings), where a lowered RLIMIT_AS
+    would leak into whatever runs next in the same process. A platform or
+    sandbox that refuses the limit leaves the scan unbounded apart from its
+    wall bound; the refusal is noted, never fatal, because a reader must
+    not fail for an environment it cannot control.
     """
 
     gib = getattr(args, "scan_memory_limit", None)
@@ -43868,10 +43881,10 @@ def _apply_scan_memory_limit(args: argparse.Namespace) -> None:
     if not (math.isfinite(gib) and gib >= 0):
         raise Refusal("--scan-memory-limit must be a finite non-negative number of GiB")
     if gib == 0:
-        return
+        return lambda: None
     limit = int(gib * (1 << 30))
     try:
-        _soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
         if hard != resource.RLIM_INFINITY and hard < limit:
             limit = hard
         resource.setrlimit(resource.RLIMIT_AS, (limit, hard))
@@ -43880,6 +43893,15 @@ def _apply_scan_memory_limit(args: argparse.Namespace) -> None:
             f"wrkslots: cannot apply --scan-memory-limit: {exc}",
             file=sys.stderr,
         )
+        return lambda: None
+
+    def restore() -> None:
+        try:
+            resource.setrlimit(resource.RLIMIT_AS, (soft, hard))
+        except (OSError, ValueError):
+            pass
+
+    return restore
 
 
 def _registry_read_identity(config: Config) -> tuple[object, ...]:
@@ -44510,6 +44532,14 @@ def _image_attachment_findings(config: Config) -> list[dict[str, object]]:
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
+    restore_memory_limit = _apply_scan_memory_limit(args)
+    try:
+        return _cmd_doctor_scan(args)
+    finally:
+        restore_memory_limit()
+
+
+def _cmd_doctor_scan(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     _prewarm_registry_read(
         lambda: _validate_global_state_beside_absent_batch(
@@ -44517,7 +44547,6 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         )
     )
     deadline = _scan_deadline(args)
-    _apply_scan_memory_limit(args)
     _bound_event_retention()
     cache = _PhasedReadCache(deadline=deadline)
 
@@ -44711,8 +44740,13 @@ def _cmd_status(args: argparse.Namespace) -> int:
     # _TEARING_DOWN_PIDNS for itself, and an in-process caller (tests, a reader
     # run twice by one process) must not inherit them afterwards, or later
     # process observations would be collected into a finished status's list
-    # instead of reported.
-    return contextvars.copy_context().run(_cmd_status_in_context, args)
+    # instead of reported. The memory limit likewise applies inside the
+    # copy and is restored here, so an in-process caller keeps its own.
+    restore_memory_limit = _apply_scan_memory_limit(args)
+    try:
+        return contextvars.copy_context().run(_cmd_status_in_context, args)
+    finally:
+        restore_memory_limit()
 
 
 def _cmd_status_in_context(args: argparse.Namespace) -> int:
@@ -44726,7 +44760,6 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
         )
     )
     deadline = _scan_deadline(args)
-    _apply_scan_memory_limit(args)
     _bound_event_retention()
     cache = _PhasedReadCache(deadline=deadline)
 

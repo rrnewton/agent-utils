@@ -355,6 +355,23 @@ def test_status_memory_bound_reports_partial_and_exits_nonzero(
     assert "memory" in payload["scan_timeout"]
 
 
+def test_in_process_audit_restores_the_callers_memory_limit(
+    tmp_path: Path,
+) -> None:
+    root = _registry(tmp_path / "case", 1)
+    import resource as _resource
+
+    before = _resource.getrlimit(_resource.RLIMIT_AS)
+    args = wrkslots_cli._build_parser().parse_args(
+        ["--project-root", str(root), "audit", "--format", "json"]
+    )
+    stream = io.StringIO()
+    with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(io.StringIO()):
+        wrkslots_cli._cmd_audit(args)
+    # The scan ran under its own cap; the caller's limit is untouched after.
+    assert _resource.getrlimit(_resource.RLIMIT_AS) == before
+
+
 def test_scan_memory_limit_applies_an_address_space_cap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -369,12 +386,14 @@ def test_scan_memory_limit_applies_an_address_space_cap(
         "setrlimit",
         lambda which, limits: applied.append((which, limits)),
     )
-    wrkslots_cli._apply_scan_memory_limit(
+    restore = wrkslots_cli._apply_scan_memory_limit(
         argparse.Namespace(scan_memory_limit=2.0)
     )
     assert applied == [
         (resource.RLIMIT_AS, (2 * (1 << 30), resource.RLIM_INFINITY))
     ]
+    restore()
+    assert applied[-1] == (resource.RLIMIT_AS, (0, resource.RLIM_INFINITY))
     applied.clear()
     wrkslots_cli._apply_scan_memory_limit(
         argparse.Namespace(scan_memory_limit=0.0)
