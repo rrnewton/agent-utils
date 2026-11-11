@@ -4349,28 +4349,6 @@ function renderSideFreshness() {
   else keepingCardPlace(toggle);
 }
 
-/**
- * The page drew a snapshot for one channel and mode; `/client-config` may describe another.
- *
- * `#189 restore-ui-state`. The view is decided again rather than reset to Main, so a channel the
- * saved shell called threadless whose provider has threads after all opens in All — here, once —
- * unless the reader chose a view. Nothing is read here: with the channel on screen, what asked for
- * sign-in reads the view now up next — a reopen's owed read, or the poll of a page that opened
- * offline — and a read of its own would be a second one.
- */
-function reconcileChannelSnapshot(before) {
-  if (before.key === channelContextKey() && before.threading === providerFacts.threading()) return;
-  clearChannelScreen();
-  openChannelView();
-  threadPresence.forget();
-  hydrateChannelScope();
-  restoreChannelComposer();
-  voiceCall().renderControls();
-  // Threads or none, as sign-in says: one column or two decided again. `#229 desktop-two-column`.
-  renderColumns();
-  saveUiState();
-}
-
 // The record itself — read back from this window's storage and the device's, checked on the way back
 // and the old version brought forward (UI_STATE_KEY, UI_STATE_VERSION, UI_STATE_CHANNELS,
 // UI_STATE_CHARS, REOPENED_VIEWS) — the view chosen in each recent channel, whether what the page
