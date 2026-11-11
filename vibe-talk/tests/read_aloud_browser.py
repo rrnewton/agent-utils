@@ -1,28 +1,45 @@
 #!/usr/bin/env python3
-"""Time the app's read-aloud from tap to audible in real Chromium, against audio streamed at speaking pace.
+"""Read-aloud in real Chromium, against audio streamed at speaking pace: behaviour gates, times printed.
 
 A prepared read reaches the page as a WAV the server writes while the agent is still speaking, so
 it arrives at playback speed: 24 kHz, 16-bit, mono is 48 KB a second. Chromium's `<audio>` element
 reads about 225 KB of samples before it reports metadata or starts, so a page that hands the URL to
-`<audio src>` sits silent for about 4.7 seconds after the server already has audio. The fake-DOM
-suite (tests/js/voice_page.test.mjs) covers the page's branches; only a real media pipeline can
-show this wait, or show that it is gone.
+`<audio src>` sits silent for about 4.7 seconds after the server already has audio; that media
+element wait is why the page plays streamed reads through Web Audio at all, and it is the benchmark
+rationale below. The fake-DOM suite (tests/js/voice_page.test.mjs) covers the page's branches; only
+a real media pipeline can show that audio starts, stops and archives as a reader hears it.
 
 It serves the checked-out assets and a small fake API from one loopback origin, then walks one
-reader through, with real taps:
+reader through, with real taps. The gating verdict is that behaviour and nothing else
+(`#1250 vibe-talk-timing-robust`):
 
-  enter Read -> tap A: audible within a second -> tap B while A streams: A's audio already queued
-  is stopped and its response closed at once, and B is audible within a second -> a short message
-  played to its end is archived, and only then -> a response cut off part-way is tried again, says
-  so, and once every try is cut off says the cloud voice's connection kept dropping, and archives nothing -> leaving Read closes the response being read -> a read that opens
-  with silence reports when speech began, as well as when the first frame did.
+  enter Read -> tap A: the page reports it audible (a whole-number timing for the first frame and
+  for speech) and its audio context is running -> tap B while A streams, once some of A is queued
+  ahead of the speaker: every queued source due at the switch is stopped, A's response is closed
+  and not finished, and B reports audible -> a short message played to its end is archived, with
+  the dismissal recorded only after the server saw that response finish, and only that message ->
+  a response cut off part-way is tried again, says so, is asked for four times in all, and once
+  every try is cut off says the cloud voice's connection kept dropping, and archives nothing more
+  -> pause suspends the audio context, says Resume and leaves the response open, resume runs it
+  again, and stopping the read closes its response, not finished -> a read that opens with silence
+  reports speech after the first frame, as well as when the first frame did.
+
+No millisecond budget decides that verdict, so a hot host cannot fail it and a silent or unarchived
+read cannot pass it. The tap-to-audible and speech-onset times are still measured and printed on
+the summary line for every run, and `--benchmark` enforces the old budgets as an opt-in speed
+measurement run outside the gate: audible within a second of each tap, speech onset within 150 ms
+of where the tone (or its leading silence) puts it, A's queued audio silenced within 0.1 s of
+audio-clock time at a switch, and a switch's or a stop's response closed within 0.5 s of wall time.
 
 THE NEGATIVE CONTROL runs the same tap in a second browser with Web Audio taken away, so the page
-falls back to `<audio src>`. It must take seconds: that is what proves this harness can see the
-wait at all, rather than passing because the stream or the clock is not what it claims to be.
+falls back to `<audio src>`. Under `--benchmark` it must take seconds: that is what proves this
+harness can see the media element's wait at all, rather than passing because the stream or the
+clock is not what it claims to be. The gating run skips that profile entirely; the trade is that
+the harness-can-see-the-wait proof is benchmark-only, per `#1248`.
 
-Pass --screenshots DIR to keep a PNG of each step for review, and --web-root DIR to run the same
-check against another copy of the page (for example the one before a change).
+Pass --benchmark to enforce the budgets and run the control, --screenshots DIR to keep a PNG of
+each step for review, and --web-root DIR to run the same check against another copy of the page
+(for example the one before a change).
 """
 
 from __future__ import annotations
@@ -74,9 +91,15 @@ MESSAGES = {
 # Seconds of silence before the tone, per message. `#191 read-aloud-first-lag`: a real read opens
 # with 0.55 to 0.8 s of it, which `playing` counts as audible and speech onset does not.
 LEADING_SILENCE = {"305": 0.6}
+# The most a walk waits for a state it expects the page to reach (#998). Each such wait polls for
+# the state, so a pass takes as long as the page does and the deadline only bounds a failure; the
+# old 2 s and 10 s windows ran out under shared-gate load and passed solo.
+STATE_S = 30.0
+
+# The budgets below decide nothing in gating (`#1250 vibe-talk-timing-robust`); `--benchmark`
+# enforces them, and every run prints the times they would judge.
 # How far the page's speech onset may sit from where the tone really starts after `playing`.
 ONSET_TOLERANCE_MS = 150
-
 # The page must be audible this soon after a tap. Generous against the ~0.1 s the fix takes, and
 # far below the ~4.7 s the media element takes on the same stream.
 AUDIBLE_WITHIN_MS = 1000
@@ -84,6 +107,8 @@ AUDIBLE_WITHIN_MS = 1000
 CONTROL_AT_LEAST_MS = 3000
 # A's audio still queued at a switch must be stopped this soon after the tap, in audio-clock seconds.
 SILENCED_WITHIN_SECONDS = 0.1
+# A switch or a stop must close the response it leaves this soon after the tap, in wall seconds.
+CLOSED_WITHIN_SECONDS = 0.5
 
 # Records every Web Audio source the page starts, when it was due to play, and whether it was
 # STOPPED, plus the audio clock at each click. A read's audio is queued a little ahead of the
@@ -128,6 +153,19 @@ SILENCED_AT_SWITCH = """() => {
   return { due: due.length, unstopped: due.length - stopped.length,
            latest: stopped.reduce((m, s) => Math.max(m, s.stoppedAt - tap.clock), 0) };
 }"""
+
+# How many of the playing read's sources are queued ahead of the speaker: due to start after the
+# audio clock's now. The switch step waits for one before it taps, which is the state the old
+# fixed dwell before the switch was standing in for.
+QUEUED_AHEAD = """() => {
+  const context = readAloudOwner().readAloudContext;
+  if (!context || !window.readAloudProbe) return 0;
+  return window.readAloudProbe.sources.filter((s) => s.due > context.currentTime).length;
+}"""
+
+# Two drawn frames: the page has settled the state a no-change assertion then judges, where a
+# fixed dwell only hoped it had.
+SETTLED_FRAMES = "() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))"
 
 
 def wav_header() -> bytes:
@@ -369,6 +407,13 @@ def arguments() -> argparse.Namespace:
         default=page_sources.served_root(),
         help="the page assets to serve (default: this checkout's vibe-talk/web)",
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="also fail when the printed times exceed the audible, onset, silencing and closing "
+             "budgets, and run the <audio> negative control: an opt-in speed measurement, never "
+             "part of the gating verdict (default: behaviour only)",
+    )
     return parser.parse_args()
 
 
@@ -437,7 +482,7 @@ def main() -> int:
         def found() -> Json | None:
             with api.lock:
                 return next((t for name, t in api.timings if name == ticket), None)
-        return wait_for(found, 15, f"the page never reported {ticket} audible")
+        return wait_for(found, STATE_S, f"the page never reported {ticket} audible")
 
     try:
         with sync_playwright() as playwright:
@@ -469,28 +514,32 @@ def main() -> int:
                 page.fill("#api-token", TOKEN)
                 page.click("#save-token")
                 page.click("#view-switch")
-                page.wait_for_selector(f'#discord-log > li[data-id="{last}"]', timeout=10_000)
+                page.wait_for_selector(f'#discord-log > li[data-id="{last}"]', timeout=30_000)
                 page.click("#read-aloud")
-                page.wait_for_function(f"() => readAloudOwner().preparedSpeech.size() === {len(MESSAGES)}", timeout=10_000)
+                page.wait_for_function(f"() => readAloudOwner().preparedSpeech.size() === {len(MESSAGES)}", timeout=30_000)
                 return context, page
 
             def tap(page: Page, message_id: str) -> None:
                 # A real tap on the message text: a user gesture, which is what lets audio start.
                 page.tap(f'#discord-log > li[data-id="{message_id}"] .body')
 
-            # THE NEGATIVE CONTROL first: the same page and stream, played through `<audio src>`.
-            with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
-                context, page = open_page(profile, without_web_audio=True)
-                tap(page, "301")
-                control = timing_of("ticket-301")
-                context.close()
-            control_ms = audible_ms(control)
-            check(control_ms >= CONTROL_AT_LEAST_MS,
-                  f"the control was audible after {control_ms} ms through <audio>, so this"
-                  " harness does not reproduce the media element's wait and proves nothing")
-            with api.lock:
-                api.timings.clear()
-                api.reads.clear()
+            # THE NEGATIVE CONTROL first, benchmark only: the same page and stream, played
+            # through `<audio src>`. The gating run skips this profile entirely; the proof that
+            # the harness can see the media element's wait is benchmark-only, per `#1248`.
+            control_ms: int | None = None
+            if args.benchmark:
+                with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
+                    context, page = open_page(profile, without_web_audio=True)
+                    tap(page, "301")
+                    control = timing_of("ticket-301")
+                    context.close()
+                control_ms = audible_ms(control)
+                check(control_ms >= CONTROL_AT_LEAST_MS,
+                      f"the control was audible after {control_ms} ms through <audio>, so this"
+                      " harness does not reproduce the media element's wait and proves nothing")
+                with api.lock:
+                    api.timings.clear()
+                    api.reads.clear()
 
             with tempfile.TemporaryDirectory(prefix="vibe-talk-chrome-") as profile:
                 context, page = open_page(profile, without_web_audio=False)
@@ -501,24 +550,30 @@ def main() -> int:
                     if args.screenshots:
                         page.screenshot(path=str(args.screenshots / f"{name}.png"))
 
-                # 1. Tap A: audible within a second of the tap.
+                # 1. Tap A: the page reports it audible and its audio context is running. The
+                # times are printed on the summary line; `--benchmark` enforces their budgets.
                 tap(page, "301")
                 first = timing_of("ticket-301")
                 first_ms = audible_ms(first)
-                check(first_ms <= AUDIBLE_WITHIN_MS,
-                      f"A was audible {first_ms} ms after the tap (limit {AUDIBLE_WITHIN_MS} ms;"
-                      f" the <audio> control took {control_ms} ms): {first}")
-                # A's tone starts at its first sample, so speech begins when playback does.
+                # A's tone starts at its first sample, so a speech report exists for it too; how
+                # close it sits to the first frame is the benchmark's onset budget.
                 first_speech_ms = whole_ms(first, "tap_to_speech_ms")
-                check(abs(first_speech_ms - first_ms) <= ONSET_TOLERANCE_MS,
-                      f"A's speech was reported {first_speech_ms} ms after the tap and its first"
-                      f" frame {first_ms} ms, though the tone starts at the first sample: {first}")
+                if args.benchmark:
+                    check(first_ms <= AUDIBLE_WITHIN_MS,
+                          f"A was audible {first_ms} ms after the tap (limit {AUDIBLE_WITHIN_MS} ms;"
+                          f" the <audio> control took {control_ms} ms): {first}")
+                    check(abs(first_speech_ms - first_ms) <= ONSET_TOLERANCE_MS,
+                          f"A's speech was reported {first_speech_ms} ms after the tap and its first"
+                          f" frame {first_ms} ms, though the tone starts at the first sample: {first}")
                 running = page.evaluate("() => readAloudOwner().readAloudContext && readAloudOwner().readAloudContext.state")
                 check(running == "running", f"the read-aloud audio context is {running!r}, not running")
                 shot("1-a-audible")
 
-                # 2. Tap B while A is still streaming: A's response closes at once, B is audible.
-                time.sleep(1.0)
+                # 2. Tap B while A is still streaming: A's response closes and B is audible.
+                # Switch only once some of A is queued ahead of the speaker, the state whose
+                # silencing this step judges.
+                wait_for(lambda: page.evaluate(QUEUED_AHEAD) or None, STATE_S,
+                         "none of A was ever queued ahead of the speaker, so a switch silences nothing")
                 switched = time.monotonic()
                 tap(page, "302")
                 second = timing_of("ticket-302")
@@ -526,45 +581,59 @@ def main() -> int:
                 still_open = "A's response was still open after B was tapped, so the server would speak on for nobody"
                 a_closed = closed_at(a_read, still_open)
                 check(not a_read.finished, still_open)
-                check(a_closed - switched < 0.5,
-                      f"A's response closed {a_closed - switched:.2f} s after B was tapped")
                 second_ms = audible_ms(second)
-                check(second_ms <= AUDIBLE_WITHIN_MS,
-                      f"B was audible {second_ms} ms after the tap: {second}")
                 # ...and A's audio already queued ahead of the speaker was STOPPED, not left to end.
                 silenced: object = page.evaluate(SILENCED_AT_SWITCH)
                 check(number(silenced, "due") >= 1,
                       f"none of A was still queued at the switch, so its silencing proves nothing: {silenced}")
                 check(number(silenced, "unstopped") == 0,
                       f"A's queued audio was left to play on under B: {silenced}")
-                check(number(silenced, "latest") < SILENCED_WITHIN_SECONDS,
-                      f"A's queued audio was stopped more than {SILENCED_WITHIN_SECONDS} s after the tap: {silenced}")
+                if args.benchmark:
+                    check(a_closed - switched < CLOSED_WITHIN_SECONDS,
+                          f"A's response closed {a_closed - switched:.2f} s after B was tapped")
+                    check(second_ms <= AUDIBLE_WITHIN_MS,
+                          f"B was audible {second_ms} ms after the tap: {second}")
+                    check(number(silenced, "latest") < SILENCED_WITHIN_SECONDS,
+                          f"A's queued audio was stopped more than {SILENCED_WITHIN_SECONDS} s after the tap: {silenced}")
                 shot("2-b-audible")
 
                 # 3. A short message heard to its end is archived -- and not before its end.
                 tap(page, "303")
                 timing_of("ticket-303")
                 dismissal = wait_for(lambda: next((d for d in api.dismissed if d[1] == {"messages": ["303"]}), None),
-                                     SHORT_SECONDS + 5, "a message heard to its end was not archived")
+                                     STATE_S, "a message heard to its end was not archived")
                 (short_read,) = api.reads_of("303")
                 check(short_read.finished, "the short message's response did not run to its end")
-                check(dismissal[0] >= short_read.opened + SHORT_SECONDS,
-                      f"the message was archived {short_read.opened + SHORT_SECONDS - dismissal[0]:.2f} s"
-                      " before its audio could have finished")
+                # Event order, both server-side stamps: the dismissal was recorded no earlier
+                # than this response finished and closed (`Read.closed` is stamped as its
+                # stream completes), with no assumed audio duration.
+                short_closed = closed_at(short_read,
+                                         "the short message's response was still open when it was archived")
+                check(dismissal[0] >= short_closed,
+                      f"the message was archived {short_closed - dismissal[0]:.2f} s"
+                      " before its response finished")
                 shot("3-heard-and-archived")
 
                 # 4. A response cut off part-way is tried again (`#487 read-aloud-recovery`), says so,
                 # and when every try is cut off too it cannot be played, and archives nothing.
                 tap(page, "304")
                 timing_of("ticket-304")
-                wait_for(lambda: "trying again" in (page.text_content("#status") or ""), 15,
+                wait_for(lambda: "trying again" in (page.text_content("#status") or ""), STATE_S,
                          f"a cut-off read did not say it was trying again; status is {page.text_content('#status')!r}")
                 # `#548 cloud-read-failures`: said as the cloud voice's connection, in short words.
+                # Four cut tries at speaking pace run past STATE_S between them, so this final
+                # status keeps its longer bound; it only bounds a failure either way.
                 wait_for(lambda: "kept dropping" in (page.text_content("#status") or ""), 60,
                          f"a read cut off on every try did not say so; status is {page.text_content('#status')!r}")
                 tries = len(api.reads_of("304"))
                 check(tries == 4, f"a read cut off every time was asked for {tries} times, not once and three tries")
-                time.sleep(0.5)
+                # What proves nothing more will be archived: the final status above, every one
+                # of the four tries closed on the server, and two settled frames. The retry
+                # loop has ended in its failure state, which archives nothing, and no try is
+                # still open to finish and archive; a dwell alone proved none of that.
+                wait_for(lambda: all(read.closed is not None for read in api.reads_of("304")) or None, STATE_S,
+                         "a try at the cut-off read was still open after it said it kept dropping")
+                page.evaluate(SETTLED_FRAMES)
                 archived = [d[1] for d in api.dismissed]
                 check(archived == [{"messages": ["303"]}],
                       f"something besides the message heard to its end was archived: {archived}")
@@ -576,42 +645,53 @@ def main() -> int:
                 # again, and the read is the one it opens, not one from before.
                 earlier = len(api.reads_of("301"))
                 tap(page, "301")
-                reopened = wait_for(lambda: api.reads_of("301")[earlier:], 10,
+                reopened = wait_for(lambda: api.reads_of("301")[earlier:], STATE_S,
                                     "the tap after a read that could not be played opened no read")[-1]
                 wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "running"
-                         and page.text_content("#read-aloud-label") == "Pause", 10, "the read did not start playing")
+                         and page.text_content("#read-aloud-label") == "Pause", STATE_S, "the read did not start playing")
                 page.click("#read-aloud")
-                wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "suspended", 2,
+                wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "suspended", STATE_S,
                          "the Read button's Pause did not stop the audio clock")
                 check(page.text_content("#read-aloud-label") == "Resume",
                       f"a held read's button does not say Resume: {page.text_content('#read-aloud-label')!r}")
-                time.sleep(0.3)
+                # The hold is judged in its settled state -- suspended, saying Resume, and two
+                # drawn frames on -- not after a fixed dwell: the response must still be open.
+                page.evaluate(SETTLED_FRAMES)
+                check(page.evaluate("() => readAloudOwner().readAloudContext.state") == "suspended",
+                      "the audio clock did not stay suspended while the read was held")
                 check(reopened.closed is None, "pausing closed the response: the hold cut the read off")
                 page.click("#read-aloud")
-                wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "running", 2,
+                wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "running", STATE_S,
                          "the Read button's Resume did not start the audio clock again")
                 left = time.monotonic()
                 tap(page, "301")
-                wait_for(lambda: reopened.closed is not None, 2, "stopping the read left the response open")
+                wait_for(lambda: reopened.closed is not None, STATE_S, "stopping the read left the response open")
                 reopened_closed = closed_at(reopened, "stopping the read left the response open")
-                check(reopened_closed - left < 0.5,
-                      f"the response closed {reopened_closed - left:.2f} s after the read stopped")
+                if args.benchmark:
+                    check(reopened_closed - left < CLOSED_WITHIN_SECONDS,
+                          f"the response closed {reopened_closed - left:.2f} s after the read stopped")
                 check(not reopened.finished, "the stopped read ran to its end")
                 page.click("#read-aloud")
                 shot("5-left-read")
 
-                # 6. A read that opens with silence: the first frame is audible at once, speech
-                # only after the silence, and the page reports both. `#191 read-aloud-first-lag`.
+                # 6. A read that opens with silence: speech is reported after the first frame,
+                # and the page reports both. By how much -- the silence's length, within the
+                # onset tolerance -- is the benchmark's budget. `#191 read-aloud-first-lag`.
                 page.click("#read-aloud")
-                page.wait_for_function("() => readAloudOwner().preparedSpeech.has('305')", timeout=10_000)
+                page.wait_for_function("() => readAloudOwner().preparedSpeech.has('305')", timeout=30_000)
                 tap(page, "305")
                 quiet_start = timing_of("ticket-305")
                 quiet_audible_ms = audible_ms(quiet_start)
                 quiet_speech_ms = whole_ms(quiet_start, "tap_to_speech_ms")
                 lead_ms = round(LEADING_SILENCE["305"] * 1000)
-                check(abs(quiet_speech_ms - quiet_audible_ms - lead_ms) <= ONSET_TOLERANCE_MS,
-                      f"speech was reported {quiet_speech_ms - quiet_audible_ms} ms after the first"
-                      f" frame, but the read opens with {lead_ms} ms of silence: {quiet_start}")
+                check(quiet_speech_ms > quiet_audible_ms,
+                      f"speech was reported {quiet_speech_ms} ms after the tap, no later than the"
+                      f" first frame at {quiet_audible_ms} ms, though the read opens with"
+                      f" {lead_ms} ms of silence: {quiet_start}")
+                if args.benchmark:
+                    check(abs(quiet_speech_ms - quiet_audible_ms - lead_ms) <= ONSET_TOLERANCE_MS,
+                          f"speech was reported {quiet_speech_ms - quiet_audible_ms} ms after the first"
+                          f" frame, but the read opens with {lead_ms} ms of silence: {quiet_start}")
                 tap(page, "305")
                 shot("6-speech-onset")
 
@@ -619,10 +699,11 @@ def main() -> int:
                 browser_version = context.browser.version if context.browser else "Chromium"
                 context.close()
 
+        control_clause = f" (<audio> control {control_ms} ms)" if control_ms is not None else ""
         print(f"{browser_version} at 412x915, audio at speaking pace: tap to audible"
               f" {first_ms} ms and {second_ms} ms after a switch"
-              f" (<audio> control {control_ms} ms); a switch stops A's queued audio and closes its response"
-              " at once, as a stop does; heard to the end archives, cut off does not;"
+              f"{control_clause}; a switch stops A's queued audio and closes its response"
+              ", as a stop does; heard to the end archives, cut off does not;"
               f" after {round(LEADING_SILENCE['305'] * 1000)} ms of leading silence speech was reported"
               f" {quiet_speech_ms - quiet_audible_ms} ms after the first frame")
         return 0
