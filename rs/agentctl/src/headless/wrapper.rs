@@ -1382,7 +1382,23 @@ impl Wrapper {
         match enqueued {
             Ok(queue_id) => {
                 self.rescan = true;
-                Ok(json!({"ok": true, "queue_id": queue_id}))
+                // Name the new item's place, so a console can show
+                // `position N of M; running turn Xs old` instead of a
+                // bare queue id the owner cannot act on.
+                let pending = queue::pending_in_queue_order(&self.directories).unwrap_or_default();
+                let queue_depth = pending.len();
+                let queue_position = pending
+                    .iter()
+                    .position(|path| {
+                        path.file_stem()
+                            .is_some_and(|stem| stem.to_string_lossy() == queue_id)
+                    })
+                    .map_or(queue_depth, |index| index + 1);
+                let running_turn_age_seconds =
+                    self.turn_started.map(|started| started.elapsed().as_secs());
+                Ok(json!({"ok": true, "queue_id": queue_id,
+                    "queue_position": queue_position, "queue_depth": queue_depth,
+                    "running_turn_age_seconds": running_turn_age_seconds}))
             }
             Err(error) => Ok(json!({"ok": false, "class": "queue", "error": error.to_string()})),
         }

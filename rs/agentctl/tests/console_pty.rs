@@ -59,6 +59,10 @@ while True:
     out({"type": "system", "subtype": "init", "claude_code_version": "9.9.9", "model": "fake",
          "permissionMode": "dontAsk", "session_id": session, "tools": ["Bash"]})
     out({"type": "assistant", "parent_tool_use_id": None, "message": {"content": [
+        {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "echo tool-marker"}}]}})
+    out({"type": "user", "parent_tool_use_id": None, "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": "tool ran"}]}})
+    out({"type": "assistant", "parent_tool_use_id": None, "message": {"content": [
         {"type": "text", "text": "echo: " + text}]}})
     out({"type": "result", "subtype": "success", "duration_ms": 5,
          "usage": {"input_tokens": 1, "output_tokens": 2}, "permission_denials": []})
@@ -222,37 +226,100 @@ impl Console {
     fn alive(&self) -> bool {
         Path::new(&format!("/proc/{}", self.pid)).exists()
     }
+
+    /// The final screen a terminal would show: interpret CR, LF and
+    /// the console's clear-line / cursor-right sequences, so text that
+    /// was written and then erased does not count as shown.
+    fn screen_lines(&self) -> Vec<String> {
+        let mut lines: Vec<Vec<char>> = vec![Vec::new()];
+        let (mut row, mut col) = (0_usize, 0_usize);
+        let bytes = self.output.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                0x1b if index + 1 < bytes.len() && bytes[index + 1] == b'[' => {
+                    let mut end = index + 2;
+                    while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
+                        end += 1;
+                    }
+                    if end >= bytes.len() {
+                        break;
+                    }
+                    let params = &self.output[index + 2..end];
+                    match bytes[end] {
+                        b'K' => {
+                            if row < lines.len() {
+                                lines[row].truncate(col);
+                            }
+                        }
+                        b'C' => {
+                            col += params.parse::<usize>().unwrap_or(1);
+                        }
+                        _ => {}
+                    }
+                    index = end + 1;
+                }
+                0x1b => {
+                    index += 2;
+                }
+                b'\r' => {
+                    col = 0;
+                    index += 1;
+                }
+                b'\n' => {
+                    row += 1;
+                    col = 0;
+                    if row >= lines.len() {
+                        lines.push(Vec::new());
+                    }
+                    index += 1;
+                }
+                _ => {
+                    let text = &self.output[index..];
+                    let Some(ch) = text.chars().next() else { break };
+                    if !ch.is_control() {
+                        if row >= lines.len() {
+                            lines.push(Vec::new());
+                        }
+                        if col >= lines[row].len() {
+                            lines[row].resize(col, ' ');
+                            lines[row].push(ch);
+                        } else {
+                            lines[row][col] = ch;
+                        }
+                        col += 1;
+                    }
+                    index += ch.len_utf8();
+                }
+            }
+        }
+        lines
+            .iter()
+            .map(|line| line.iter().collect::<String>())
+            .collect()
+    }
+
+    fn screen_contains(&self, needle: &str) -> bool {
+        self.screen_lines().iter().any(|line| line.contains(needle))
+    }
+
+    fn wait_for_screen(&mut self, what: &str, needle: &str) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !self.screen_contains(needle) {
+            self.pump();
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what} ({needle:?}) on the console screen:\n{}\n--- raw ---\n{}",
+                self.screen_lines().join("\n"),
+                self.output
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
-#[test]
-fn console_delivers_typed_lines_as_plain_turns() {
-    let Some(fixture) = Fixture::new() else {
-        eprintln!("python3 not installed; skipping");
-        return;
-    };
-    let work = fixture.work.display().to_string();
-    let started = fixture.agentctl(&[
-        "start",
-        "worker",
-        "--mode",
-        "headless",
-        "--harness",
-        "claude",
-        "--effort",
-        "high",
-        "--cwd",
-        &work,
-    ]);
-    assert!(
-        started.status.success(),
-        "start failed: {}",
-        String::from_utf8_lossy(&started.stderr)
-    );
-    fixture.wait_for("control socket", || {
-        fixture.registry.join("agents/worker/control.sock").exists()
-    });
-
-    // Open the pty and launch the console orphaned onto its slave side.
+/// Launch `agentctl console worker` orphaned onto a fresh pty.
+fn launch_console(fixture: &Fixture) -> Console {
     let (mut master_fd, mut slave_fd) = (-1, -1);
     let opened = unsafe {
         libc::openpty(
@@ -311,19 +378,139 @@ fn console_delivers_typed_lines_as_plain_turns() {
         .trim()
         .parse()
         .unwrap();
-    let mut console = Console {
+    Console {
         master,
         output: String::new(),
         pid,
+    }
+}
+
+#[test]
+fn console_shows_a_follower_error_instead_of_silence() {
+    let Some(fixture) = Fixture::new() else {
+        eprintln!("python3 not installed; skipping");
+        return;
     };
-    console.wait_for("banner", "agentctl console worker");
+    let work = fixture.work.display().to_string();
+    let started = fixture.agentctl(&[
+        "start",
+        "worker",
+        "--mode",
+        "headless",
+        "--harness",
+        "claude",
+        "--effort",
+        "high",
+        "--cwd",
+        &work,
+    ]);
+    assert!(
+        started.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    fixture.wait_for("control socket", || {
+        fixture.registry.join("agents/worker/control.sock").exists()
+    });
+    // Find the event log directory wherever the registry layout puts it.
+    fn find_events(dir: &Path) -> Option<PathBuf> {
+        if dir.file_name().is_some_and(|name| name == "events") && dir.is_dir() {
+            return Some(dir.to_path_buf());
+        }
+        for entry in fs::read_dir(dir).ok()? {
+            let path = entry.ok()?.path();
+            if path.is_dir() {
+                if let Some(found) = find_events(&path) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    let events = find_events(&fixture.registry).expect("event log directory");
+    // Make the follower fail while the agent record stays intact: the
+    // event log path is a file, not a directory, so reading its
+    // segments errors at follower start.
+    fs::remove_dir_all(&events).unwrap();
+    fs::write(&events, b"not a directory").unwrap();
+    let mut console = launch_console(&fixture);
+    console.wait_for_screen("follower error shown", "console follower failed");
+    console.wait_for_screen(
+        "follower death announced",
+        "transcript is no longer updating",
+    );
+    console.type_line(b"/quit\r");
+    fixture.wait_for("console exit", || !console.alive());
+}
+
+#[test]
+fn console_delivers_typed_lines_as_plain_turns() {
+    let Some(fixture) = Fixture::new() else {
+        eprintln!("python3 not installed; skipping");
+        return;
+    };
+    let work = fixture.work.display().to_string();
+    let started = fixture.agentctl(&[
+        "start",
+        "worker",
+        "--mode",
+        "headless",
+        "--harness",
+        "claude",
+        "--effort",
+        "high",
+        "--cwd",
+        &work,
+    ]);
+    assert!(
+        started.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    fixture.wait_for("control socket", || {
+        fixture.registry.join("agents/worker/control.sock").exists()
+    });
+
+    let mut console = launch_console(&fixture);
+    console.wait_for_screen("banner on screen", "agentctl console worker");
 
     // A typed line arrives byte for byte: no sender header anywhere.
     console.type_line(b"run `date`\r");
-    console.wait_for("queue ack", "queued ");
+    console.wait_for_screen("queue ack on screen", "queued ");
+    console.wait_for_screen("queue position on screen", "position 1");
     fixture.wait_for("harness input", || fixture.texts().len() == 1);
     assert_eq!(fixture.texts(), ["run `date`"]);
     console.wait_for("console origin in the log", "console:alice");
+    // The turn's assistant text and tool line must be on the final
+    // screen (written and not erased by the input-line redraw), and
+    // must survive a later redraw while typing a draft.
+    console.wait_for_screen("assistant text on screen", "echo: run");
+    console.wait_for_screen("tool line on screen", "echo tool-marker");
+    console.type_line(b"draft");
+    console.wait_for_screen("draft on the input line", "draft");
+    assert!(
+        console.screen_contains("echo: run"),
+        "assistant text erased by redraw:\n{}",
+        console.screen_lines().join("\n")
+    );
+    assert!(
+        console.screen_contains("echo tool-marker"),
+        "tool line erased by redraw:\n{}",
+        console.screen_lines().join("\n")
+    );
+    console.type_line(&[0x15]);
+
+    // /help and an unknown /command are handled locally, never queued.
+    console.type_line(b"/help\r");
+    console.wait_for_screen("/help lists /interrupt", "/interrupt");
+    console.wait_for_screen("/help lists /quit", "/quit");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(fixture.texts().len(), 1, "/help reached the harness");
+    console.type_line(b"/bogus\r");
+    console.wait_for_screen("unknown command refused", "unknown command");
+    console.wait_for_screen("unknown command hints /help", "/help");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(fixture.texts().len(), 1, "/bogus reached the harness");
 
     // A bracketed paste is one message, newlines kept.
     console.type_line(b"\x1b[200~first line\nsecond line\x1b[201~");

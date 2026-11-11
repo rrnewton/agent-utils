@@ -13,7 +13,12 @@
 //! the wrapper to interrupt the running turn; a single Ctrl-C only
 //! hints and never leaves. Ctrl-D, `/quit`, or a signal leaves the
 //! console, every exit prints the disconnected notice, and leaving
-//! never touches the agent.
+//! never touches the agent. `/help` is answered locally, and any other
+//! `/command` is refused locally with a `/help` hint: neither is ever
+//! queued as a turn. A queued line names its queue position and the
+//! running turn's age. The follower's rendered lines are emitted whole
+//! above the input line, and a follower failure is printed in the
+//! console rather than swallowed.
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -58,30 +63,43 @@ impl Shared {
     }
 }
 
-/// The follower's writer: each write replaces the input row, prints the
-/// rendered events (raw mode needs CRLF), and redraws the input line.
+/// The follower's writer: it buffers until a whole rendered line has
+/// arrived, then prints that line above the input line in one locked
+/// section (raw mode needs CRLF) and redraws the input line.
+///
+/// Buffering is the whole point: `tail`'s printer writes each line
+/// with `writeln!`, which reaches a writer as separate `write` calls
+/// for the line text and for the trailing newline. Emitting (and
+/// redrawing over) a partial line erases the text just written, so a
+/// console that redrew on every `write` showed only blank lines.
 struct ConsoleWriter {
     shared: Arc<Shared>,
+    pending: Vec<u8>,
+}
+
+impl ConsoleWriter {
+    fn emit_pending(&mut self, text: &[u8]) {
+        let text = String::from_utf8_lossy(text);
+        let text = text.strip_suffix('\r').unwrap_or(&text);
+        self.shared.print_line(text);
+    }
 }
 
 impl Write for ConsoleWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let mut out = self.shared.out.lock().expect("stdout lock poisoned");
-        out.write_all(b"\r\x1b[K")?;
-        let mut start = 0;
-        for (index, byte) in bytes.iter().enumerate() {
-            if *byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r') {
-                out.write_all(&bytes[start..index])?;
-                out.write_all(b"\r\n")?;
-                start = index + 1;
-            }
+        self.pending.extend_from_slice(bytes);
+        while let Some(index) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=index).collect();
+            self.emit_pending(&line[..line.len() - 1]);
         }
-        out.write_all(&bytes[start..])?;
-        self.shared.redraw(&mut out)?;
         Ok(bytes.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        if !self.pending.is_empty() {
+            let pending = std::mem::take(&mut self.pending);
+            self.emit_pending(&pending);
+        }
         self.shared
             .out
             .lock()
@@ -465,6 +483,26 @@ fn submit<A: ManagedApi + ?Sized>(
         send_interrupt(socket, shared);
         return false;
     }
+    if line == "/help" {
+        for help in [
+            "console commands (handled here, never sent to the agent):",
+            "  /help       show this help",
+            "  /interrupt  interrupt the running turn",
+            "  /quit       leave the console (the agent keeps running)",
+            "  approve aN / deny aN [reason]  answer an approval",
+            "keys: Enter sends a plain turn; Ctrl-C twice on an empty line interrupts the turn; Ctrl-D on an empty line leaves",
+        ] {
+            shared.print_line(help);
+        }
+        return false;
+    }
+    if line.starts_with('/') {
+        shared.print_line(&format!(
+            "unknown command {}; type /help for the console commands",
+            line.split_whitespace().next().unwrap_or("/")
+        ));
+        return false;
+    }
     if let Some(reply) = parse_reply(&line) {
         let Some(id) = reply.id else {
             shared.print_line("name the approval: approve aN or deny aN [reason]");
@@ -486,10 +524,22 @@ fn submit<A: ManagedApi + ?Sized>(
     let body = json!({"op": "console.input", "text": line, "user": user, "tty": tty});
     match hcontrol::request(socket, &body, CONTROL_WAIT) {
         Ok(answer) if answer["ok"] == json!(true) => {
-            shared.print_line(&format!(
-                "queued {}",
-                answer["queue_id"].as_str().unwrap_or("?")
-            ));
+            let queue_id = answer["queue_id"].as_str().unwrap_or("?");
+            match (
+                answer["queue_position"].as_u64(),
+                answer["queue_depth"].as_u64(),
+            ) {
+                (Some(position), Some(depth)) => {
+                    let age = match answer["running_turn_age_seconds"].as_u64() {
+                        Some(seconds) => format!("running turn {seconds}s old"),
+                        None => "no turn running".to_owned(),
+                    };
+                    shared.print_line(&format!(
+                        "queued {queue_id} (position {position} of {depth}; {age})"
+                    ));
+                }
+                _ => shared.print_line(&format!("queued {queue_id}")),
+            }
         }
         Ok(answer) => {
             restore_buffer(shared, &line);
@@ -570,22 +620,34 @@ pub fn run<A: ManagedApi + ?Sized>(
     });
     options.follow = true;
     options.console = true;
+    // The banner goes first, so the transcript that follows cannot be
+    // mistaken for it and the owner sees the commands before any event.
+    shared.print_line(&format!(
+        "agentctl console {name}: Enter sends a plain turn; /help lists the console commands; /interrupt or Ctrl-C twice interrupts the turn; Ctrl-D or /quit leaves; approve aN / deny aN [reason] answers an approval"
+    ));
     let follower_shared = shared.clone();
     let follower_quit = quit.clone();
     let follower = std::thread::Builder::new()
         .name("console-follow".to_owned())
         .spawn(move || {
             let mut writer = ConsoleWriter {
-                shared: follower_shared,
+                shared: follower_shared.clone(),
+                pending: Vec::new(),
             };
-            let _ = tail::run(&events, &options, &mut writer, &|| {
+            // Never swallow the follower's fate: its failure (or an
+            // unexpected stop) is printed in the console itself.
+            match tail::run(&events, &options, &mut writer, &|| {
                 follower_quit.load(Ordering::Relaxed)
-            });
+            }) {
+                Ok(_) if follower_quit.load(Ordering::Relaxed) => {}
+                Ok(_) => follower_shared
+                    .print_line("console follower stopped; the transcript is no longer updating"),
+                Err(error) => follower_shared.print_line(&format!(
+                    "console follower failed: {error}; the transcript is no longer updating"
+                )),
+            }
         })
         .map_err(|error| error.to_string())?;
-    shared.print_line(&format!(
-        "agentctl console {name}: Enter sends a plain turn; /interrupt or Ctrl-C twice interrupts the turn; Ctrl-D or /quit leaves; approve aN / deny aN [reason] answers an approval"
-    ));
     let mut socket_seen = socket.exists();
     let mut ticks: u32 = 0;
     let mut chunk = [0_u8; 4096];

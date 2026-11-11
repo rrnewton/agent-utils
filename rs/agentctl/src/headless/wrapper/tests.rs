@@ -417,6 +417,13 @@ fn console_input_queues_a_plain_turn_with_its_origin() {
     )
     .unwrap();
     assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(answer["queue_position"], 1, "{answer}");
+    assert!(answer["queue_depth"].as_u64().unwrap_or(0) >= 1, "{answer}");
+    assert!(
+        answer["running_turn_age_seconds"].is_null()
+            || answer["running_turn_age_seconds"].is_number(),
+        "{answer}"
+    );
     let queue_id = answer["queue_id"].as_str().unwrap().to_owned();
     fixture.wait("console input processed", || {
         fixture.state(&queue_id) == Some(queue::MessageState::Processed)
