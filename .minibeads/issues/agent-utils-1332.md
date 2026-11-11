@@ -1,6 +1,6 @@
 ---
 title: 'proc-scan-bound: the remove census bound is a fixed 30 s on hosts of any size'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -34,3 +34,7 @@ Cause: `_AGENT_REMOVE_BATCH_SCAN_SECONDS = 30.0` in `py/wrkslots/cli.py` is one 
 # Notes
 
 Reported 2026-11-11 (owner Slack 6228 via a coordinator; gate evidence from two other lanes the same day). Direction from the owner the same day: where recorded owner evidence (pidfd, cgroup membership, recorded start time) can decide liveness, prefer it over a host-wide walk; that fuller design is a separate follow-up, and this issue keeps the narrow bound fix. Blocks #1287 retire-lock-narrow landing, whose touched tests are census-bound-sensitive under gate load.
+
+## Resolution
+
+[watermelon-full-preview] Landed as 289cd3a8 on github/main (owner gate 1794420575532722886-1b08d65c; its only red was the untouched vibe-talk.check.bridge-gutter-browser). The bound resolves environment, then configuration, then the host-scaled default; the scaling rule is pinned by `py/wrkslots/tests/test_proc_scan_bound.py` from a stubbed process count. The fuller recorded-owner liveness design (pidfd, cgroup, start time) stays a follow-up.
