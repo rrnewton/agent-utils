@@ -110,6 +110,10 @@ pub const DEFAULT_LEASE_SECS: u64 = 120;
 /// escalates by default (see `Store::note_probe_pass`).
 pub const DEFAULT_HOST_FAULT_ESCALATE_AFTER: usize = 5;
 
+/// Default seconds since a donor's last claim poll after which it counts
+/// as stale for the claim-timeout suspension (#1258 stale-donor).
+pub const DEFAULT_STALE_DONOR_SECS: u64 = 900;
+
 /// Where a job is.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -543,6 +547,10 @@ pub struct Store {
     /// Consecutive probe-pass/launch-refuse cycles after which a host fault escalates:
     /// a probe pass alone no longer clears it, only an admitted validation does.
     pub host_fault_escalate_after: usize,
+    /// Seconds since a donor's last claim poll after which it counts as
+    /// stale (not eligible-healthy) for the claim-timeout suspension
+    /// (#1258 stale-donor).
+    pub stale_donor_secs: u64,
     /// Repository in which tool identities can be resolved to git objects for the
     /// descendant check (receipt acceptance), when the queue host has one. `None`
     /// keeps receipt tool checks exact.
@@ -1107,6 +1115,7 @@ impl Store {
             current_tools: None,
             compare_only: std::collections::BTreeSet::new(),
             host_fault_escalate_after: DEFAULT_HOST_FAULT_ESCALATE_AFTER,
+            stale_donor_secs: DEFAULT_STALE_DONOR_SECS,
             tool_repo: None,
         }
     }
@@ -2603,10 +2612,26 @@ impl Store {
                 }) && !job.declined_by.iter().any(|declined| declined == *name)
             })
             .collect();
+        // A donor whose last claim poll is older than the stale bound is
+        // not eligible-healthy (#1258 stale-donor): it is not polling at
+        // all (for example paused by its own disk guard), so it must not
+        // defeat the suspension. A donor that resumes polling notes a
+        // fresh cap and counts again. Donors with no cap note count as
+        // seen now only if they faulted (already excluded by the fault
+        // check below); otherwise their staleness is unknown and they
+        // stay eligible-healthy.
+        let caps = self.donor_caps();
+        let now_unix = unix_now();
+        let stale = |name: &str| {
+            caps.get(name).is_some_and(|seen| {
+                now_unix.saturating_sub(seen["seen_unix"].as_u64().unwrap_or(0))
+                    > self.stale_donor_secs
+            })
+        };
         !eligible.is_empty()
             && eligible
                 .iter()
-                .all(|name| faults.contains_key(name.as_str()))
+                .all(|name| faults.contains_key(name.as_str()) || stale(name))
     }
 
     /// Probe-pass/launch-refuse flap counts by donor (`host-flap.json`): how
@@ -5187,6 +5212,55 @@ mod unit {
         store.record_host_fault("d1", "wedged");
         let waiting = store.read(&claimed.id).unwrap();
         assert!(!store.every_eligible_donor_faulted(&waiting));
+    }
+
+    #[test]
+    fn a_stale_donor_does_not_defeat_the_claim_timeout_suspension() {
+        // #1258 stale-donor: d1 is host-faulted; d2 is known from an
+        // admitted receipt but its last claim poll is past the stale
+        // bound, so the suspension holds. When d2 polls again it counts
+        // as eligible-healthy and the timeout applies once more.
+        let mut store = Store::new(&temp("stale-donor"));
+        store.stale_donor_secs = 900;
+        publish(&store, "c1");
+        let claimed = store.claim("d2", "h2", 1).unwrap().expect("a job");
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        store
+            .report(&claimed.id, &token, receipt(&claimed, "d2"))
+            .unwrap();
+        publish(&store, "c2");
+        let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        store
+            .report(
+                &claimed.id,
+                &token,
+                refused_receipt(
+                    &claimed,
+                    "d1",
+                    "MQ_COULD_NOT_RUN_SCOPE: host wedged\nCOULD_NOT_RUN",
+                ),
+            )
+            .unwrap_err();
+        store.record_host_fault("d1", "wedged");
+        let waiting = store.read(&claimed.id).unwrap();
+        let now_unix = unix_now();
+        store
+            .note_donor_cap("d2", 1, now_unix.saturating_sub(901))
+            .unwrap();
+        assert!(
+            store.every_eligible_donor_faulted(&waiting),
+            "a stale donor must not defeat the suspension"
+        );
+        store.note_donor_cap("d2", 1, now_unix).unwrap();
+        // The cap note only refreshes on change or after the refresh
+        // interval; a fresh poll at the same cap needs a changed cap to
+        // be recorded, so note a different cap to model the new poll.
+        store.note_donor_cap("d2", 2, now_unix).unwrap();
+        assert!(
+            !store.every_eligible_donor_faulted(&waiting),
+            "a donor polling again counts as eligible-healthy"
+        );
     }
 
     #[test]

@@ -1491,6 +1491,7 @@ impl<'a> Runner<'a> {
             store.lease_secs = config.donors.lease();
             store.could_not_run_limit = config.donors.could_not_run_limit();
             store.host_fault_escalate_after = config.donors.host_fault_escalate_after();
+            store.stale_donor_secs = config.donors.stale_donor_secs();
             if offload == crate::state::Offload::Decide {
                 store.compare_only = config.donors.compare_only.iter().cloned().collect();
             }

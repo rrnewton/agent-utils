@@ -304,6 +304,11 @@ pub struct DonorsConfig {
     /// and the fault then stays until an admitted validation, a probe pass
     /// alone no longer clears it (0 = 5).
     pub host_fault_escalate_after: u32,
+    /// Seconds since a donor's last claim poll after which it counts as
+    /// stale (not eligible-healthy) for the claim-timeout suspension
+    /// (0 = 900; #1258 stale-donor).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub stale_donor_secs: u64,
 }
 
 impl DonorsConfig {
@@ -354,6 +359,15 @@ impl DonorsConfig {
             crate::donor::DEFAULT_HOST_FAULT_ESCALATE_AFTER
         } else {
             self.host_fault_escalate_after as usize
+        }
+    }
+
+    /// Resolved stale-donor bound for the claim-timeout suspension.
+    pub fn stale_donor_secs(&self) -> u64 {
+        if self.stale_donor_secs == 0 {
+            crate::donor::DEFAULT_STALE_DONOR_SECS
+        } else {
+            self.stale_donor_secs
         }
     }
 

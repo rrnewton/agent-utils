@@ -570,6 +570,7 @@ fn donor_store(state: &State, config: &Config) -> crate::donor::Store {
     store.lease_secs = config.donors.lease();
     store.could_not_run_limit = config.donors.could_not_run_limit();
     store.host_fault_escalate_after = config.donors.host_fault_escalate_after();
+    store.stale_donor_secs = config.donors.stale_donor_secs();
     if crate::state::Offload::parse(config.validator.offload.as_str())
         == Ok(crate::state::Offload::Decide)
     {

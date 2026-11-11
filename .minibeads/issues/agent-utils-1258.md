@@ -1,6 +1,6 @@
 ---
 title: 'stale-donor: a donor that stopped polling must not defeat the claim-timeout suspension'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-10T23:55:00.000000000+00:00
