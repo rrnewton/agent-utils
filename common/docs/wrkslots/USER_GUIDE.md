@@ -660,7 +660,7 @@ the rungs are warn (at expiry), alarm (after 1 day), stop (after 2 days), and de
 after rescue (after 3 days); each `--*-after-seconds` flag moves its rung. For every slot it prints
 the rung, the dated rescue ref each checkout would get (`refs/heads/rescue/<slot>/<YYYYMMDD>/<branch>`),
 the fallback bundle under the control directory (`ttl-rescue/<slot>.bundle`), and the teardown time.
-`--format health` prints the same rows as tick-hub `HEALTH:` lines for a scheduled tick to consume.
+`--format health` prints the same rows as `HEALTH:` lines for a scheduled tick to consume.
 It runs no Git, writes nothing, and removes nothing; `--now ISO8601` judges the ladder at a fixed
 time instead of the current UTC time. Example: `wrkslots ttl-report --only-overdue --format json`.
 
