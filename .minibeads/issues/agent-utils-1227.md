@@ -64,7 +64,7 @@ Against a fake provider:
 - Cosmetic, unrelated, no fix wanted here: one settled send can log `send_timing` twice (the posting task logs it, and the two-phase send's detached task logs it again after its own settle note). One upstream post either way.
 - Coordinates with the lanes holding the page trace/selection work, the redraw/reads work, and the voice-page code move: file map shared before editing shared files.
 
-# Resolution
+## Resolution
 
 [watermelon-full-preview] Landed on `github/main` as 75671087 (gate green on the path-selected run; issue filed as b090972b). Deployed 2026-11-10 5:37 PM ET and `[message_cache] serve` restored to `true` at 5:38 PM ET. Live verification from the app log: polls bounded at the normal cadence per channel (13-21 per 10 minutes across four channels, against 232-375 on two channels in the storm), behind-read failures down about 25x and only on the server schedule with back-off, no 3 s loop, live ingestion recovering between shared-bucket rate-limit bursts.
 
