@@ -14,13 +14,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// The help text every `!help` (and every unrecognised `!` command) posts.
-pub(crate) const HELP_TEXT: &str = "Owner commands (handled by the bridge, never sent to an agent):\n\
-!help — this list\n\
-!who — the sub-agents of this coordinator: the managed-by tree, Pinned (persistent lanes) first, then Ephemeral\n\
-!who NAME — one agent in detail\n\
-!@NAME <message> — open a new thread bound to NAME and send it <message>; later messages in that thread go to NAME\n\
-!end — in a bound thread, end the binding; later messages there go to the coordinator\n\
-Talk to the coordinator by writing normally.";
+pub(crate) const HELP_TEXT: &str = "**Owner commands** (handled by the bridge, never sent to an agent):\n\
+- `!help` — this list\n\
+- `!who` — the sub-agents of this coordinator: the managed-by tree, Pinned (persistent lanes) first, then Ephemeral\n\
+- `!who NAME` — one agent in detail\n\
+- `!@NAME <message>` — open a new thread bound to NAME and send it <message>; later messages in that thread go to NAME\n\
+- `!end` — in a bound thread, end the binding; later messages there go to the coordinator\n\
+\n\
+Talk to the coordinator by writing normally.\n\
+No command handy? Just ask your coordinator in plain words (e.g. \"open a thread with liteinst\") and it will open the thread for you.";
 
 /// The outbound operation ID for one bridge-posted `!` answer: deterministic from the
 /// command message, so a provider replay reuses it and the helper dedupes the post.
@@ -365,7 +367,6 @@ pub(crate) fn render_who(snapshot: &BangSnapshot) -> String {
     fn walk(
         name: &str,
         depth: usize,
-        snapshot: &BangSnapshot,
         by_name: &BTreeMap<&str, &BangAgent>,
         children: &BTreeMap<String, Vec<String>>,
         seen: &mut BTreeSet<String>,
@@ -377,37 +378,19 @@ pub(crate) fn render_who(snapshot: &BangSnapshot) -> String {
         }
         *shown += 1;
         if let Some(agent) = by_name.get(name) {
-            let manager = match &agent.parent {
-                Some(parent)
-                    if depth == 0 || snapshot.coordinator.as_deref() != Some(parent.as_str()) =>
-                {
-                    format!(" — managed by {parent}")
-                }
-                _ => String::new(),
-            };
-            let _ = snapshot;
+            // Nested bullets carry the managed-by tree (#1339): no suffix.
             lines.push(format!(
-                "{}{} — {}/{} — {}{}",
+                "{}- {} — {}/{} — {}",
                 "  ".repeat(depth),
                 agent.name,
                 agent.harness,
                 agent.model,
-                agent.lifecycle,
-                manager
+                agent.lifecycle
             ));
         }
         if let Some(kids) = children.get(name) {
             for kid in kids {
-                walk(
-                    kid,
-                    depth + 1,
-                    snapshot,
-                    by_name,
-                    children,
-                    seen,
-                    lines,
-                    shown,
-                );
+                walk(kid, depth + 1, by_name, children, seen, lines, shown);
             }
         }
     }
@@ -432,7 +415,6 @@ pub(crate) fn render_who(snapshot: &BangSnapshot) -> String {
         walk(
             &root.name,
             0,
-            snapshot,
             &by_name,
             &children,
             &mut seen,
@@ -458,7 +440,7 @@ pub(crate) fn render_who(snapshot: &BangSnapshot) -> String {
         }
         shown += 1;
         let line = format!(
-            "{} — {}/{} — {} — managed by {}",
+            "- {} — {}/{} — {} — managed by {}",
             agent.name,
             agent.harness,
             agent.model,
@@ -471,18 +453,18 @@ pub(crate) fn render_who(snapshot: &BangSnapshot) -> String {
             ephemeral_lines.push(line);
         }
     }
-    out.push_str("Pinned (persistent lanes):\n");
+    out.push_str("\n**Pinned (persistent lanes):**\n");
     if pinned_lines.is_empty() {
-        out.push_str("  (none)\n");
+        out.push_str("- (none)\n");
     } else {
         for line in &pinned_lines {
             out.push_str(line);
             out.push('\n');
         }
     }
-    out.push_str("Ephemeral:\n");
+    out.push_str("\n**Ephemeral:**\n");
     if ephemeral_lines.is_empty() {
-        out.push_str("  (none)\n");
+        out.push_str("- (none)\n");
     } else {
         for line in &ephemeral_lines {
             out.push_str(line);
@@ -491,11 +473,11 @@ pub(crate) fn render_who(snapshot: &BangSnapshot) -> String {
     }
     if snapshot.agents.len() > MAX_WHO_AGENTS {
         out.push_str(&format!(
-            "… and {} more — !who NAME for one agent\n",
+            "\n… and {} more — !who NAME for one agent\n",
             snapshot.agents.len() - MAX_WHO_AGENTS
         ));
     }
-    out.push_str("Details: !who NAME · Help: !help");
+    out.push_str("\nDetails: !who NAME · Help: !help");
     out
 }
 
@@ -516,37 +498,39 @@ pub(crate) fn render_who_one(snapshot: &BangSnapshot, name: &str) -> String {
         return out;
     };
     let mut out = format!(
-        "{} — {}/{} — {}\n",
+        "**{}** — {}/{} — {}\n",
         agent.name, agent.harness, agent.model, agent.lifecycle
     );
     out.push_str(&format!(
-        "pinned: {} ({})\n",
+        "- pinned: {} ({})\n",
         if agent.pinned { "yes" } else { "no" },
         agent.pinned_source
     ));
     if let Some((manager, _)) = &agent.managed_by {
-        out.push_str(&format!("managed by: {manager}\n"));
+        out.push_str(&format!("- managed by: {manager}\n"));
     } else if let Some(parent) = &agent.parent {
-        out.push_str(&format!("managed by: {parent} (designated coordinator)\n"));
+        out.push_str(&format!(
+            "- managed by: {parent} (designated coordinator)\n"
+        ));
     } else {
-        out.push_str("managed by: (none recorded)\n");
+        out.push_str("- managed by: (none recorded)\n");
     }
     if let Some(creator) = &agent.created_by {
-        out.push_str(&format!("created by: {creator}\n"));
+        out.push_str(&format!("- created by: {creator}\n"));
     }
     if let Some(profile) = &agent.profile {
-        out.push_str(&format!("profile: {profile}\n"));
+        out.push_str(&format!("- profile: {profile}\n"));
     }
     if let Some(cwd) = &agent.cwd {
-        out.push_str(&format!("cwd: {cwd}\n"));
+        out.push_str(&format!("- cwd: {cwd}\n"));
     }
     if let Some(pane) = &agent.pane_id {
-        out.push_str(&format!("pane: {pane}\n"));
+        out.push_str(&format!("- pane: {pane}\n"));
     }
     if let Some(created) = agent.created_at {
-        out.push_str(&format!("created_at: {created}\n"));
+        out.push_str(&format!("- created_at: {created}\n"));
     }
-    out.push_str(&format!("host: {}\n", snapshot.host));
+    out.push_str(&format!("- host: {}\n", snapshot.host));
     out.push_str(&format!(
         "Inspect: agentctl read {} · agentctl status {}",
         agent.name, agent.name
@@ -619,6 +603,55 @@ mod tests {
         assert_eq!(parse_bang("!@Bad Name hi"), Some(Bang::Help));
         assert_eq!(parse_bang("!end"), Some(Bang::End));
         assert_eq!(parse_bang("!end now"), Some(Bang::Help));
+    }
+
+    #[test]
+    fn who_answers_render_as_markdown() {
+        let agent = |name: &str, parent: Option<&str>, pinned: bool| BangAgent {
+            name: name.to_owned(),
+            token: format!("t-{name}"),
+            lifecycle: "running".to_owned(),
+            harness: "claude".to_owned(),
+            model: "opus".to_owned(),
+            profile: None,
+            cwd: None,
+            pane_id: None,
+            created_at: None,
+            managed_by: parent.map(|p| (p.to_owned(), format!("t-{p}"))),
+            created_by: None,
+            former_tokens: Vec::new(),
+            pinned,
+            pinned_source: "test".to_owned(),
+            pinned_explicit: None,
+            parent: parent.map(str::to_owned),
+        };
+        let snapshot = BangSnapshot {
+            coordinator: Some("coordb".to_owned()),
+            host: "devbig014".to_owned(),
+            agents: vec![
+                agent("coordb", None, true),
+                agent("lieutenant", Some("coordb"), true),
+                agent("worker", Some("lieutenant"), false),
+            ],
+        };
+        let who = render_who(&snapshot);
+        assert!(who.contains("**Pinned (persistent lanes):**"), "{who}");
+        assert!(who.contains("**Ephemeral:**"), "{who}");
+        assert!(who.contains("- coordb — claude/opus — running"), "{who}");
+        assert!(
+            who.contains("  - lieutenant — claude/opus — running"),
+            "{who}"
+        );
+        assert!(
+            who.contains("    - worker — claude/opus — running"),
+            "{who}"
+        );
+        assert!(!who.contains("managed by lieutenant"), "{who}");
+        let one = render_who_one(&snapshot, "worker");
+        assert!(one.contains("**worker** — claude/opus — running"), "{one}");
+        assert!(one.contains("- managed by: lieutenant"), "{one}");
+        assert!(HELP_TEXT.contains("**Owner commands**"));
+        assert!(HELP_TEXT.contains("- `!who`"));
     }
 
     #[test]
