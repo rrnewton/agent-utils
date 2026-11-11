@@ -1,6 +1,6 @@
 ---
 title: 'donor-probe-pacing-bound: a pacing warning must not fault a donor host, and a restored pause must keep the configured probe bound with killed probes reaped'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-11-11T13:00:00.000000000+00:00
@@ -33,3 +33,7 @@ In `rs/merge-queue`:
 # Notes
 
 P0 under the same-hour rule for merge-queue bugs. Reported 2026-11-11.
+
+## Resolution
+
+[watermelon-full-preview] Delivered in this branch. `gh_paced_refusal` counts only a `GH-PACED REFUSED` line or a `WARNING` on a run carrying `COULD_NOT_RUN`; the donor probe path no longer treats a bare `WARNING` as paced. `restored_host_pause` takes a live-config fallback and `probe_once` resolves its bound via `probe_timeout_with_live` (snapshot bound wins, else live, else default). A killed probe runs in its own process group and is reaped with `bounded::kill_group`. Tests cover the warning-then-success transcript/probe, the snapshot-without-key live bound, and a `/proc` zombie count after a timeout kill.
