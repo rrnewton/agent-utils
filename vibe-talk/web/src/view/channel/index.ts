@@ -268,3 +268,6 @@ export { createNoiseActs } from "./noiseacts.ts";
 export type { NoiseActs, NoiseActsDependencies } from "./noiseacts.ts";
 export { mountTextSelection } from "./textselection.ts";
 export type { KeptTextSelection, TextSelection, TextSelectionDependencies } from "./textselection.ts";
+export * from "./searchopen.ts";
+export * from "./servicewords.ts";
+export * from "./channelhead.ts";

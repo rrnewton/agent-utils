@@ -1974,9 +1974,7 @@ const CHANNEL_DRAFT_REFUSED = "This browser could not save the draft. Keep this 
 const undoStamps = createUndoStamps();
 
 /** The next undo stamp: later acts stamp higher (web/src/view/shell `createUndoStamps`). */
-function nextUndoAt() {
-  return undoStamps.next();
-}
+const nextUndoAt = undoStamps.next;
 
 function showView(name) {
   // `#277 reply-in-column`. The call's view is one list, with no column for a reply to be open in.
@@ -2697,54 +2695,28 @@ const {
 // A filter changed: the reader's message stays where it is on the screen, by web/src/view/channel's
 // filter-kept place (`createFilterPlace`, `#624 voice-page-modularity`).
 
-function setSearchOpen(open) {
-  if (!open) {
-    keepingFilterPlace(() => showSearchOpen(false));
-    return;
-  }
-  showSearchOpen(true);
-}
-
-/** `setSearchOpen`, without holding the reader's place. */
-function showSearchOpen(open) {
-  // `#262 search-load-older`. Closed over a filter choosing rows, Hide read comes back (`hidingRead`).
-  const wasHidingRead = hidingRead();
-  searchField.setOpen(open);
-  if (!open) {
-    searchField.setQuery("");
-    // `#249 search-highlight`. And its marks, at once.
-    searchField.setMarked("");
-    markSearchSoon();
-    el("search-field").value = "";
-    // `#206 pin-message`. The Pinned filter lives in this bar, and goes with it for the reason the
-    // query does: a filter left on behind a control that is no longer on screen is the state this
-    // feature must never be in. `#211 link-filter`: so does Links. Placed once, for the whole of
-    // closing, by `keepingFilterPlace`.
-    setLinksOnly(false);
-    setPinnedOnly(false);
-    // `#251 author-filter`. And whose messages.
-    setAuthorFilter("everyone");
-  }
-  el("search-toggle").setAttribute("aria-pressed", open ? "true" : "false");
-  // `#197 floating-search`. The open bar floats over the top of the list, and web/voice.css keys
-  // two things off this: the bar's own shape, and the room the list makes for it at its head so
-  // the first match is never underneath. That room is added ABOVE a reader who may have scrolled
-  // down, which is exactly the change `holdingReader` exists for.
-  holdingReader(() => {
-    if (open) el("screen-main").setAttribute("data-searching", "");
-    else el("screen-main").removeAttribute("data-searching");
-  });
-  renderControlBar();
-  // The pill shares the line the bar grows along, and gives way to it.
-  renderChannelFreshness();
-  // Both columns: there is one search bar. `#229 desktop-two-column`.
-  if (hidingRead() !== wasHidingRead) eachColumn(renderCachedTimeline);
-  eachColumn(renderScrollTools);
-  if (sideColumnUp()) refilterSideCards();
-  if (open) {
-    el("search-field").focus();
-  }
-}
+// The search bar opened and closed: web/src/view/channel/searchopen.ts
+// (`createSearchOpenControl`, #624). Closing clears the query and filters inside
+// the filter-kept place, as before.
+const searchOpenControl = createSearchOpenControl({
+  keepingFilterPlace,
+  searchField,
+  markSearchSoon,
+  el,
+  setLinksOnly: (on) => setLinksOnly(on),
+  setPinnedOnly: (on) => setPinnedOnly(on),
+  setAuthorFilter: (author) => setAuthorFilter(author),
+  hidingRead: () => hidingRead(),
+  holdingReader,
+  renderControlBar: () => renderControlBar(),
+  renderChannelFreshness: () => renderChannelFreshness(),
+  eachColumn,
+  renderCachedTimeline: () => renderCachedTimeline(),
+  renderScrollTools: () => renderScrollTools(),
+  sideColumnUp,
+  refilterSideCards: () => refilterSideCards(),
+});
+const { setSearchOpen, showSearchOpen } = searchOpenControl;
 
 // The links in what is on screen, whose messages, and the kinds of link are
 // web/src/view/channel's now (`createRowLinks`, `#624 voice-page-modularity`): a row's links
@@ -3416,19 +3388,15 @@ const readOrder = createReadOrder();
 // most of what a slow service does — as "slow to answer". A network failure and a refusal are
 // already sentences, and keep them.
 
-// `SLOW_WORDS`, `providerWords`, `isSlowFailure` and `readableFailure` are web/src/core/api's
-// (`#624 voice-page-modularity`).
-
-/** The chat service a channel is read through, as a noun phrase for a sentence. */
-function chatServiceOf(channel) {
-  const provider = providerOfChannel(channel);
-  return (provider && typeof provider.name === "string" && provider.name.trim()) || chatServiceName();
-}
-
-/** {@link readableFailure} for the channel on screen. */
-function readableChannelFailure(error) {
-  return readableFailure(error, chatServiceOf(selectedChannelId()));
-}
+// Words for a slow service and a failed channel read: web/src/view/channel/servicewords.ts
+// (`createServiceWords`, #624), over core/api's `readableFailure`.
+const serviceWordsOwner = createServiceWords({
+  readableFailure,
+  providerOfChannel,
+  selectedChannelId,
+  chatServiceName,
+});
+const { chatServiceOf, readableChannelFailure } = serviceWordsOwner;
 voiceTranscript().initializeHeardPage(Math.random().toString(36).slice(2, 10));
 
 
@@ -7462,7 +7430,7 @@ const sendTakeBack = createSendTakeBack({
   renderDraftMarkers, idsOf, rowMessages, heldMessage, heldThreadRecord, openReply,
   dismissed: dismissedSends, dismissedView: dismissedSendsView, undo: sendUndo, nextUndoAt,
   persist: () => persistOutgoingMessages(), renderOutgoing: () => renderOutgoingEverywhere(),
-  channelLabel, view: () => screens.view(),
+  channelLabel: (id) => channelLabel(id), view: () => screens.view(),
 });
 const { edit: editOutgoingMessage, dismiss: dismissOutgoingMessage, endUndo: endSendUndo, renderUndo: renderSendUndo, putBack: putBackDismissedSend, forget: forgetDismissedSends, load: loadDismissedSends } = sendTakeBack;
 /**
@@ -7566,15 +7534,20 @@ const { draftHeld, draftLive, draftsHere } = draftQueries;
 // near `startCapture`. They are declared once now, where the long note about the send path already
 // lived; the relay below calls exactly the same function it was already getting.
 
-/**
- * The name the channel picker shows for a snowflake, or the snowflake itself for one no longer on
- * the list (an outbox entry may outlive its channel). From the list, not the picker's children:
- * those are service groups once there are several. `#355 provider-grouped-channels`.
- */
-function channelLabel(channelId) {
-  const channel = knownChannel(channelId);
-  return channel ? channelName(channel) : String(channelId);
-}
+/** A channel's picker name and the seam at its head restated: web/src/view/channel/channelhead.ts (`createChannelHead`, #624). */
+const channelHeadOwner = createChannelHead({
+  knownChannel,
+  channelName,
+  el,
+  readModes: () => readModes,
+  renderChannelSeam,
+  todoSummary,
+  channelSummary,
+  olderPager: () => olderPager,
+  olderPages: () => olderPages(),
+  selectedChannelId,
+});
+const { channelLabel, restateChannelSeam } = channelHeadOwner;
 
 // --- the stream of every channel, while a call is open ------------------------------------------
 //
@@ -7736,29 +7709,6 @@ const channelHistoryBox = mountChannelHistory({
   clearTimeout: (timer) => clearTimeout(timer),
 });
 
-/**
- * Rewrite the line at the head of the channel, which is already on screen saying the old name.
- *
- * From what is on the screen rather than by re-reading: a rename is not a reason to spend a
- * request, and a seam left standing with the previous name is the most confident possible way of
- * being wrong. It does nothing before the first read, when there is no seam to correct.
- */
-function restateChannelSeam() {
-  if (el("channel-summary").children.length === 0) {
-    return;
-  }
-  if (readModes.hiding()) {
-    renderChannelSeam(todoSummary());
-    return;
-  }
-  renderChannelSeam(
-    channelSummary(
-      el("discord-log").children.length,
-      olderPager.loadedIsWhole(olderPages().moreAbove),
-      channelName(knownChannel(selectedChannelId()))
-    )
-  );
-}
 
 // --- sign-in ---------------------------------------------------------------------------------
 
