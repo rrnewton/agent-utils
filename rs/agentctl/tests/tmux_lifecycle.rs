@@ -93,7 +93,7 @@ impl Fixture {
         let registry = root.join("registry");
         let spawn_command = format!(
             "AGENTCTL_CLAUDE_BIN={} {} --registry {} --term-backend tmux --tmux-socket {} \
-             start child --cwd {} --harness claude --startup-timeout 30 >> {} 2>&1",
+             start child --cwd {} --harness claude --effort high --startup-timeout 30 >> {} 2>&1",
             fake.display(),
             env!("CARGO_BIN_EXE_agentctl"),
             registry.display(),
