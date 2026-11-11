@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-1155-c0efd7f7289",
+    "issue_id": "agent-utils-1155",
+    "author": "mu-roles",
+    "body": "[watermelon-full-preview] Landed on main as 9784f5bc (library-only v1: py/wrkviz/roles.py + 20 tests + components.json registration; the wrkviz roles CLI was removed before landing because the Python/Rust CLI-help differentials require parity v1 does not have). Hand-checked precision on 76 sessions and the token survey are in the harness report ai_docs/2026-11-09-role-cost-survey.md (coordinator P/R 0.56/0.56, implementor 0.87/0.46, reviewer 0.81/0.87; liaison never predicted). Landing note: wrkslots test_reclaim_slot_state x2 red on 60 s remove budget under load; untouched; quarantine class #1267; landed per owner reply 346 (coordb).",
+    "created_at": "2026-11-11T10:05:10.491889298Z",
+    "updated_at": "2026-11-11T10:05:10.491889298Z"
+  }
+]

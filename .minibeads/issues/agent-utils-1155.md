@@ -1,10 +1,11 @@
 ---
 title: 'wrkviz-role-classifier: label each agent session coordinator, implementor or reviewer with a confidence'
-status: open
+status: closed
 priority: 2
 issue_type: task
 created_at: 2026-11-09T16:53:23.683078166+00:00
-updated_at: 2026-11-09T16:53:23.683078166+00:00
+updated_at: 2026-11-11T10:05:10.496971672+00:00
+closed_at: 2026-11-11T10:05:10.496971522+00:00
 ---
 
 # Description
