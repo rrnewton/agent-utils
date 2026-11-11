@@ -120,7 +120,55 @@ fn py_json_value(value: &Value, indent: usize) -> String {
 /// The JSON rendering of `image status`, in the Python dict's
 /// insertion order (top level and per-report), which a sorted map
 /// would not reproduce.
-fn render_status_json_ordered(new_slot_representation: &str, reports: &[Value]) -> String {
+fn render_wt_report(report: &Value) -> String {
+    let keys = [
+        "image_file",
+        "mount_point",
+        "mount_at",
+        "configured_size_bytes",
+        "state",
+        "image_exists",
+        "quota_mode",
+        "configured_quota_mode",
+        "binds",
+        "apparent_bytes",
+        "allocated_bytes",
+    ];
+    let parts: Vec<String> = keys
+        .iter()
+        .filter_map(|key| {
+            report.get(key).map(|value| {
+                let rendered = match value {
+                    Value::Object(map) => {
+                        if map.is_empty() {
+                            return "{}".to_string();
+                        }
+                        let inner: Vec<String> = map
+                            .iter()
+                            .map(|(name, item)| {
+                                format!(
+                                    "      {}: {}",
+                                    py_json_string(name),
+                                    py_json_value(item, 3)
+                                )
+                            })
+                            .collect();
+                        format!("{{\n{}\n    }}", inner.join(",\n"))
+                    }
+                    other => py_json_value(other, 2),
+                };
+                format!("    {}: {}", py_json_string(key), rendered)
+            })
+        })
+        .collect();
+    format!("{{\n{}\n  }}", parts.join(",\n"))
+}
+
+fn render_status_json_ordered(
+    new_slot_representation: &str,
+    reports: &[Value],
+    wt_report: Option<&Value>,
+) -> String {
     let image_parts: Vec<String> = reports
         .iter()
         .map(|report| {
@@ -160,14 +208,19 @@ fn render_status_json_ordered(new_slot_representation: &str, reports: &[Value]) 
             )
         })
         .collect();
+    let wt_part = match wt_report {
+        Some(report) => format!(",\n  \"worktrees_image\": {}", render_wt_report(report)),
+        None => String::new(),
+    };
     format!(
-        "{{\n  \"new_slot_representation\": {},\n  \"images\": [{}]\n}}\n",
+        "{{\n  \"new_slot_representation\": {},\n  \"images\": [{}]{}\n}}\n",
         py_json_string(new_slot_representation),
         if image_parts.is_empty() {
             String::new()
         } else {
             format!("\n{}\n  ", image_parts.join(",\n"))
-        }
+        },
+        wt_part
     )
 }
 
@@ -185,6 +238,31 @@ pub(crate) fn image_status(
     _entries: &[MountEntry],
     facts: &MountFactsFn<'_>,
     _runner: &dyn PrivilegedRunner,
+) -> HandlerOutcome {
+    image_status_wt(
+        control,
+        slot_path,
+        new_slot_representation,
+        format,
+        _entries,
+        facts,
+        _runner,
+        None,
+    )
+}
+
+/// `image status` with the conditional worktrees-image report
+/// (#1279): present only when the section applies on this host.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn image_status_wt(
+    control: &Path,
+    slot_path: &dyn Fn(&str, &str) -> PathBuf,
+    new_slot_representation: &str,
+    format: &str,
+    _entries: &[MountEntry],
+    facts: &MountFactsFn<'_>,
+    _runner: &dyn PrivilegedRunner,
+    wt_report: Option<&Value>,
 ) -> HandlerOutcome {
     let images: Vec<ImageRecord> = match all_images(control, slot_path) {
         Ok(images) => images,
@@ -215,13 +293,34 @@ pub(crate) fn image_status(
     if format == "json" {
         return HandlerOutcome {
             exit: 0,
-            stdout: render_status_json_ordered(new_slot_representation, &reports),
+            stdout: render_status_json_ordered(new_slot_representation, &reports, wt_report),
             stderr: String::new(),
         };
     }
+    let mut human = crate::image_status::render_status_human(new_slot_representation, &reports);
+    if let Some(report) = wt_report {
+        let line = format!(
+            "worktrees image: {} at {} (mount_at={})\n",
+            report
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            report
+                .get("mount_point")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            report
+                .get("mount_at")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        if let Some(end) = human.find('\n') {
+            human.insert_str(end + 1, &line);
+        }
+    }
     HandlerOutcome {
         exit: 0,
-        stdout: crate::image_status::render_status_human(new_slot_representation, &reports),
+        stdout: human,
         stderr: String::new(),
     }
 }
@@ -1117,6 +1216,63 @@ sys.stdout.write(f"{rc}\n{out.getvalue()}---STDERR---\n{err.getvalue()}")
                 "case {case} format {fmt}"
             );
         }
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn status_with_worktrees_field() {
+        let wt = serde_json::json!({
+            "image_file": "/proj/wt.img",
+            "mount_point": "/proj/.slots-image",
+            "mount_at": "binds",
+            "configured_size_bytes": 2147483648i64,
+            "state": "missing",
+            "image_exists": false,
+            "quota_mode": "unknown",
+            "configured_quota_mode": "simple",
+            "binds": {}
+        });
+        let root = std::env::temp_dir().join(format!("wrkslotsd-wt-field-{}", std::process::id()));
+        let control = root.join("control");
+        std::fs::create_dir_all(&control).expect("control");
+        let facts = |_: &Path, _: &Path| (None, None);
+        let human = image_status_wt(
+            &control,
+            &|_t, slot| root.join(slot),
+            "worktree",
+            "human",
+            &[],
+            &facts,
+            &NoRunner,
+            Some(&wt),
+        );
+        assert!(
+            human
+                .stdout
+                .contains("worktrees image: missing at /proj/.slots-image (mount_at=binds)\n"),
+            "{}",
+            human.stdout
+        );
+        let json = image_status_wt(
+            &control,
+            &|_t, slot| root.join(slot),
+            "worktree",
+            "json",
+            &[],
+            &facts,
+            &NoRunner,
+            Some(&wt),
+        );
+        assert!(
+            json.stdout.contains("\"worktrees_image\": {"),
+            "{}",
+            json.stdout
+        );
+        assert!(
+            json.stdout.contains("\"mount_at\": \"binds\""),
+            "{}",
+            json.stdout
+        );
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 

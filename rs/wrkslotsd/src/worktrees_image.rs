@@ -805,23 +805,57 @@ pub(crate) fn status_report(
     ctx: &WtCtx<'_>,
     settings: &WorktreesImageSettings,
 ) -> serde_json::Value {
+    status_report_with_quota(ctx, settings, None)
+}
+
+/// `status_report` with the active quota mode injected (the
+/// caller reads it from the mounted file system at dispatch).
+pub(crate) fn status_report_with_quota(
+    ctx: &WtCtx<'_>,
+    settings: &WorktreesImageSettings,
+    active_quota_mode: Option<&str>,
+) -> serde_json::Value {
     use std::os::unix::fs::MetadataExt as _;
     let image_file = settings.image_file(ctx.root);
-    let mount_dir = image_mount_dir(ctx.control);
+    // Python status_report: beside the slots directory for binds,
+    // the slots directory itself when direct.
+    let mount_dir = if settings.direct() {
+        ctx.worktrees.to_path_buf()
+    } else {
+        ctx.worktrees
+            .parent()
+            .map(|parent| parent.join(IMAGE_MOUNT_NAME))
+            .unwrap_or_default()
+    };
     let (exists, empty) = dir_facts(&mount_dir);
     let state = classify_mount(&mount_dir, ctx.entries, exists, empty);
     let mut report = serde_json::Map::new();
     report.insert("image_file".into(), json!(image_file.to_string_lossy()));
     report.insert("mount_point".into(), json!(mount_dir.to_string_lossy()));
+    report.insert("mount_at".into(), json!(settings.mount_at));
     report.insert("configured_size_bytes".into(), json!(settings.size_bytes));
     report.insert("state".into(), json!(state));
     let is_file = image_file.is_file();
     report.insert("image_exists".into(), json!(is_file));
-    let binds: serde_json::Map<String, Value> = load_bind_records(ctx.control)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(slot, record)| (slot, json!(record.subvolume)))
-        .collect();
+    report.insert(
+        "quota_mode".into(),
+        json!(if state == MOUNTED {
+            active_quota_mode.unwrap_or("unknown")
+        } else {
+            "unknown"
+        }),
+    );
+    report.insert("configured_quota_mode".into(), json!(settings.quota_mode));
+    let binds: serde_json::Map<String, Value> = if settings.direct() {
+        serde_json::Map::new()
+    } else {
+        let binds_root = ctx.worktrees.parent().unwrap_or(ctx.worktrees);
+        load_bind_records(binds_root)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(slot, record)| (slot, json!(record.subvolume)))
+            .collect()
+    };
     report.insert("binds".into(), Value::Object(binds));
     if is_file {
         if let Ok(meta) = std::fs::metadata(&image_file) {
@@ -908,9 +942,12 @@ fn render_report_json(report: &Value) -> String {
     let keys = [
         "image_file",
         "mount_point",
+        "mount_at",
         "configured_size_bytes",
         "state",
         "image_exists",
+        "quota_mode",
+        "configured_quota_mode",
         "binds",
         "apparent_bytes",
         "allocated_bytes",
@@ -1585,7 +1622,7 @@ mod tests {
         assert_eq!(wt_status(&ctx, None, "human").exit, 3);
 
         // Status on a sparse temp image, unmounted (empty mount dir).
-        std::fs::create_dir_all(image_mount_dir(&control)).expect("mount dir");
+        std::fs::create_dir_all(root.join(IMAGE_MOUNT_NAME)).expect("mount dir");
         std::fs::File::create(settings.image_file(&root))
             .expect("img")
             .set_len(2 * 1_073_741_824)

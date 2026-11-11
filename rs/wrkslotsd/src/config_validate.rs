@@ -1509,6 +1509,45 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
             )
         }
     };
+    // #1279: when the worktrees image applies but is not mounted,
+    // warn once per project root per process, on stderr only, as
+    // the Python loader does after its mount attempt. The Rust
+    // loader never mounts, so the reason is the classified state.
+    if wt_value.is_object() {
+        let direct = wt_value.get("mount_at").and_then(Value::as_str) == Some("worktrees_dir");
+        let mount_dir = if direct {
+            worktrees.clone()
+        } else {
+            worktrees
+                .parent()
+                .map(|parent| parent.join(crate::worktrees_image::IMAGE_MOUNT_NAME))
+                .unwrap_or_default()
+        };
+        let entries = std::fs::read_to_string("/proc/self/mountinfo")
+            .map(|text| crate::image_mounts::parse_mountinfo(&text))
+            .unwrap_or_default();
+        let exists = mount_dir.is_dir();
+        let empty = if exists {
+            std::fs::read_dir(&mount_dir)
+                .map(|mut it| it.next().is_none())
+                .unwrap_or(false)
+        } else {
+            true
+        };
+        let state = crate::worktrees_image::classify_mount(&mount_dir, &entries, exists, empty);
+        if state != crate::worktrees_image::MOUNTED {
+            use std::sync::OnceLock;
+            static WARNED: OnceLock<Mutex<std::collections::BTreeSet<PathBuf>>> = OnceLock::new();
+            let warned = WARNED.get_or_init(|| Mutex::new(std::collections::BTreeSet::new()));
+            let first = warned
+                .lock()
+                .map(|mut set| set.insert(root.clone()))
+                .unwrap_or(false);
+            if first {
+                eprintln!("wrkslots: WARNING: worktrees image not mounted: {state}");
+            }
+        }
+    }
     Ok(json!({
         "cache_globs": cache_globs,
         "config_path": path.to_string_lossy(),
