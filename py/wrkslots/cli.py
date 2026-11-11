@@ -34578,8 +34578,17 @@ def _cmd_create(args: argparse.Namespace) -> int:
         journals_outstanding = bool(
             _outstanding_journals(config) or _validate_batch_seal_journals(config)
         )
-        states, archives = _validate_global_state(config)
-        if not journals_outstanding:
+        if journals_outstanding:
+            # The plain fleet validation refuses on an interrupted absent
+            # batch's own overlap; the locked path classifies it instead.
+            # The lock-free report reads the same beside-batch states the
+            # locked classification allows, so this round never raises the
+            # overlap refusal the classification must name itself.
+            states, archives, _paths, _slots = (
+                _validate_global_state_beside_absent_batch(config, announce=False)
+            )
+        else:
+            states, archives = _validate_global_state(config)
             _assert_agent_and_slot_free(config, args.slot, args.agent, args.slot_type)
         repositories = _create_plan_repositories(config, args)
         return _CreatePrevalidated(
