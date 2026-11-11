@@ -26,6 +26,13 @@ _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _SECRET_NAME = re.compile(r"(?:TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|API_KEY|PRIVATE_KEY)", re.I)
 _SECRET_OPTION = re.compile(r"^--?(?:api[-_]?key|token|secret|password|passwd|credential)(?:=|$)", re.I)
 _EFFORTS = frozenset(("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"))
+#: Per-harness levels, mirroring ``effort_levels`` in the Rust edition. Codex runs
+#: through ultra: Codex validates the level against the chosen model itself.
+_EFFORT_LEVELS = {
+    "claude": ("low", "medium", "high", "xhigh", "max"),
+    "muse": ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"),
+    "codex": ("minimal", "low", "medium", "high", "xhigh", "max", "ultra"),
+}
 _HARNESSES = frozenset(("codex", "claude", "muse", "agy", "agentcloud"))
 #: Agentcloud profiles are listed and validated here but only the Rust edition launches them.
 AGENTCLOUD_HARNESS = "agentcloud"
@@ -835,6 +842,12 @@ def reasoning_arguments(harness: str, effort: str | None) -> tuple[str, ...]:
         return ()
     if effort not in _EFFORTS:
         raise AgentDeliveryError(f"unsupported reasoning effort {effort!r}")
+    levels = _EFFORT_LEVELS.get(harness)
+    if levels is not None and effort not in levels:
+        raise AgentDeliveryError(
+            f"reasoning effort {effort!r} is not supported for harness {harness!r}; "
+            f"accepted levels: {', '.join(levels)}"
+        )
     if harness == "codex":
         return ("--config", f"model_reasoning_effort={effort}")
     if harness == "claude":

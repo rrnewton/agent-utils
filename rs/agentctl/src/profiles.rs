@@ -1619,14 +1619,15 @@ fn registry_policy(registry: &Path) -> Result<Option<BTreeMap<String, Value>>, A
 /// Effort levels each harness accepts (#1216 agentctl-effort-option), or `None` when the
 /// harness has no structured effort mapping. Claude Code's `--effort` takes low through
 /// max; Muse takes none through ultra (ultra behind its env gate); Codex's
-/// `model_reasoning_effort` takes minimal through xhigh.
+/// `model_reasoning_effort` takes minimal through ultra — Codex validates the level
+/// against the chosen model itself, so agentctl does not narrow the list further.
 pub(crate) fn effort_levels(harness: &str) -> Option<&'static [&'static str]> {
     match harness {
         "claude" => Some(&["low", "medium", "high", "xhigh", "max"]),
         "muse" => Some(&[
             "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
         ]),
-        "codex" => Some(&["minimal", "low", "medium", "high", "xhigh"]),
+        "codex" => Some(&["minimal", "low", "medium", "high", "xhigh", "max", "ultra"]),
         _ => None,
     }
 }

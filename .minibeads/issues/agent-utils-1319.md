@@ -1,6 +1,6 @@
 ---
 title: 'codex-effort-ultra: agentctl refuses max and ultra effort for Codex lanes that Codex itself accepts'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -34,3 +34,7 @@ Builds from before #1216 start the same profile without complaint. So once the d
 # Notes
 
 Reported by a consumer's coordinator, whose lander could not start a Codex lane on the newer services snapshot. P1: the next scheduled turnover would otherwise break every Codex ultra relaunch on that host.
+
+## Resolution
+
+[watermelon-full-preview] Codex now accepts minimal through ultra in both editions: `effort_levels` in the Rust edition and `_EFFORT_LEVELS` in the Python edition (applied in `reasoning_arguments`, mirroring the Rust launch path) both list `minimal, low, medium, high, xhigh, max, ultra` for Codex, and the Rust doc comment records that Codex validates the level against the chosen model itself. The three Rust CLI help strings naming the Codex list agree. Checked against the current CLIs on this host: `claude --help` declares `--effort` as low, medium, high, xhigh, max and `muse --help` declares `--reasoning-effort` as none, minimal, low, medium, high, xhigh, max, ultra, so those tables are unchanged; Muse ultra keeps its `MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT=on` gate handling. Tests in `rs/agentctl/src/subagents/tests/effort.rs` cover a Codex max and a Codex ultra start passing `--config model_reasoning_effort=<level>` (record and launch spec) and a still-refused unknown level; `py/tests/test_agentctl_sessions.py` covers the Python parity.

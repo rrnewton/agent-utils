@@ -278,7 +278,7 @@ enum Commands {
     RunHeadless(RunHeadless),
     /// Record a new reasoning effort for a live agent (#1216 agentctl-effort-option): headless agents apply it from the next wrapper launch, TUI agents at a safe point or on restart --resume; a mid-turn agent is never interrupted without --urgent
     #[command(
-        after_help = "Examples:\n  agentctl set-effort coordinator high\n  agentctl set-effort coordinator medium --urgent\n\nThe level is validated against the agent's harness (Claude Code: low, medium, high, xhigh, max; Muse: none, minimal, low, medium, high, xhigh, max, ultra; Codex: minimal, low, medium, high, xhigh) and recorded in the agent record at once, overriding its profile. Headless agents apply it when their wrapper next launches (restart the unit or the wrapper to apply now); TUI agents apply it at a safe point through the harness control where one exists, otherwise on restart --resume. Without --urgent a mid-turn agent is left alone and the change is reported as recorded, not yet effective. Prints {name, effort, previous_effort, applies}."
+        after_help = "Examples:\n  agentctl set-effort coordinator high\n  agentctl set-effort coordinator medium --urgent\n\nThe level is validated against the agent's harness (Claude Code: low, medium, high, xhigh, max; Muse: none, minimal, low, medium, high, xhigh, max, ultra; Codex: minimal, low, medium, high, xhigh, max, ultra) and recorded in the agent record at once, overriding its profile. Headless agents apply it when their wrapper next launches (restart the unit or the wrapper to apply now); TUI agents apply it at a safe point through the harness control where one exists, otherwise on restart --resume. Without --urgent a mid-turn agent is left alone and the change is reported as recorded, not yet effective. Prints {name, effort, previous_effort, applies}."
     )]
     SetEffort(SetEffort),
     /// Interrupt a headless agent's running turn; queued inputs stay queued and run next
@@ -953,7 +953,7 @@ fn answer_prompt<A: crate::subagents::ManagedApi + ?Sized>(
 struct SetEffort {
     #[command(flatten)]
     agent: Named,
-    /// New reasoning effort level, validated against the agent's harness (Claude Code: low, medium, high, xhigh, max; Muse: none, minimal, low, medium, high, xhigh, max, ultra; Codex: minimal, low, medium, high, xhigh)
+    /// New reasoning effort level, validated against the agent's harness (Claude Code: low, medium, high, xhigh, max; Muse: none, minimal, low, medium, high, xhigh, max, ultra; Codex: minimal, low, medium, high, xhigh, max, ultra)
     #[arg(value_name = "LEVEL")]
     level: String,
     /// Allow the change to take effect even while the agent is mid-turn (the running turn itself is never killed; the new level applies from the next turn or launch)
@@ -1452,7 +1452,7 @@ struct Start {
     /// Model identifier passed unchanged to the Codex or Claude harness
     #[arg(long)]
     model: Option<String>,
-    /// Structured harness reasoning effort (alias: --effort); per-harness levels — Claude Code: low, medium, high, xhigh, max; Muse: none, minimal, low, medium, high, xhigh, max, ultra; Codex: minimal, low, medium, high, xhigh (default: the profile's reasoning_effort, else the harness default)
+    /// Structured harness reasoning effort (alias: --effort); per-harness levels — Claude Code: low, medium, high, xhigh, max; Muse: none, minimal, low, medium, high, xhigh, max, ultra; Codex: minimal, low, medium, high, xhigh, max, ultra (default: the profile's reasoning_effort, else the harness default)
     #[arg(long, alias = "effort")]
     reasoning_effort: Option<String>,
     /// Existing native conversation ID for local interactive Claude, Codex, or Muse; can combine

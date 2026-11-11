@@ -23,7 +23,7 @@ from agentctl.errors import (
 )
 from agentctl.profiles import (
     configuration_root,
-    load_configuration, load_profiles, validate_muse_headless_arguments,
+    load_configuration, load_profiles, reasoning_arguments, validate_muse_headless_arguments,
     validate_raw_harness_arguments, validate_structured_harness_argument_conflicts,
     workspace_for_registry,
 )
@@ -478,6 +478,21 @@ def test_headless_muse_reserves_session_prompt_and_precedence_options(
     assert fake.environments == []
     assert calls == []
     assert not (tmp_path / "registry").exists()
+
+
+def test_reasoning_arguments_match_the_rust_effort_levels() -> None:
+    for level in ("max", "ultra"):
+        assert reasoning_arguments("codex", level) == (
+            "--config", f"model_reasoning_effort={level}",
+        )
+    assert reasoning_arguments("claude", "max") == ("--effort", "max")
+    assert reasoning_arguments("muse", "ultra") == ("--reasoning-effort", "ultra")
+    with pytest.raises(AgentDeliveryError, match="accepted levels"):
+        reasoning_arguments("claude", "ultra")
+    with pytest.raises(AgentDeliveryError, match="accepted levels"):
+        reasoning_arguments("codex", "none")
+    with pytest.raises(AgentDeliveryError, match="unsupported reasoning effort"):
+        reasoning_arguments("codex", "bogus")
 
 
 def test_headless_muse_accepts_compiled_effort_and_repeatable_literal_options() -> None:

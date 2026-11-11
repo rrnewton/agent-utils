@@ -11,9 +11,68 @@ fn effort_levels_are_checked_per_harness() {
     assert!(refused.to_string().contains("accepted levels"), "{refused}");
     assert!(crate::profiles::validate_effort("muse", "ultra").is_ok());
     assert!(crate::profiles::validate_effort("codex", "xhigh").is_ok());
-    assert!(crate::profiles::validate_effort("codex", "max").is_err());
+    assert!(crate::profiles::validate_effort("codex", "max").is_ok());
+    assert!(crate::profiles::validate_effort("codex", "ultra").is_ok());
+    assert!(crate::profiles::validate_effort("codex", "none").is_err());
+    assert!(crate::profiles::validate_effort("codex", "bogus").is_err());
     assert!(crate::profiles::validate_effort("claude", "bogus").is_err());
     assert!(crate::profiles::validate_effort("unknown", "high").is_err());
+}
+
+#[test]
+fn codex_max_and_ultra_start_with_their_config_argument() {
+    for level in ["max", "ultra"] {
+        let fixture = Fixture::new();
+        let status = fixture
+            .manager()
+            .start_with_reasoning_effort(
+                "worker",
+                &fixture.root,
+                level,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(status["reasoning_effort"], level);
+        let expected = format!("model_reasoning_effort={level}");
+        assert!(
+            status["arguments"]
+                .as_array()
+                .unwrap()
+                .windows(2)
+                .any(|pair| pair[0] == "--config" && pair[1] == expected),
+            "{status}"
+        );
+        let record = fixture.manager().load("worker").unwrap();
+        assert_eq!(record.reasoning_effort.as_deref(), Some(level));
+        assert!(record.launch_spec.as_ref().is_some_and(|spec| {
+            spec["argv"]
+                .as_array()
+                .unwrap()
+                .windows(2)
+                .any(|pair| pair[0] == "--config" && pair[1] == expected)
+        }));
+    }
+    // A level no harness knows is still refused, before any launch.
+    let fixture = Fixture::new();
+    let error = fixture
+        .manager()
+        .start_with_reasoning_effort(
+            "worker",
+            &fixture.root,
+            "bogus",
+            StartOptions {
+                workspace_id: Some("workspace".to_owned()),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("unsupported reasoning effort"),
+        "{error}"
+    );
 }
 
 #[test]
