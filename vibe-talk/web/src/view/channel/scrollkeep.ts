@@ -13,6 +13,8 @@ export interface ScrollMark {
   readonly pinned: boolean;
   readonly anchor: Element | null;
   readonly top: number;
+  /** The anchor row's message id, where it has one: a redraw that replaces the row is re-found by it. */
+  readonly anchorId?: string | null;
 }
 
 /** A walk for the search whose control holds still while it reads, as far as keeping the reader reads it. */
@@ -232,6 +234,7 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
       pinned: deps.atBottom(area, deps.restSlackPx),
       anchor,
       top: anchor ? anchor.getBoundingClientRect().top : 0,
+      anchorId: anchor ? anchor.getAttribute("data-id") : null,
     };
   }
 
@@ -306,8 +309,13 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
       deps.scrollToNewest();
       return;
     }
-    // A list that was replaced while we were away has taken the anchor with it, and there is nothing
-    // left to measure against; leaving the position alone beats jumping somewhere arbitrary.
+    // A redraw that replaced the anchor's row has taken the held node with it: the row is
+    // re-found by its message id in the list as drawn now, and held by the new node. Only a
+    // mark whose row is gone altogether leaves the position alone, as before.
+    if (mark.anchor && !mark.anchor.parentNode && mark.anchorId) {
+      const refound = [...visibleList().children].find((one) => one.getAttribute("data-id") === mark.anchorId);
+      if (refound) mark = { ...mark, anchor: refound as Element };
+    }
     if (!mark.anchor || !mark.anchor.parentNode) {
       deps.renderJumpNewest();
       return;

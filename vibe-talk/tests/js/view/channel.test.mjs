@@ -656,6 +656,36 @@ test("`#1251 scroll-single-owner` + `#1215 collapse-anchor-below`: a collapse ho
   assert.equal(area.scrollTop, 900, "a reader following the foot was not kept on it");
 });
 
+test("`#1251 scroll-single-owner`: a redraw that replaces the anchor row is held by the row re-found by id", () => {
+  const { createScrollKeeping } = CHANNEL_VIEW;
+  let shift = 0;
+  const row = (id, top) => ({
+    id, parentNode: null, getAttribute: (name) => (name === "data-id" ? id : null),
+    getBoundingClientRect: () => ({ top: top + shift, bottom: top + shift + 40 }),
+  });
+  const oldRows = [row("a", -80), row("b", -40), row("c", 0), row("d", 40)];
+  const list = { id: "discord-log", children: oldRows };
+  for (const one of oldRows) one.parentNode = list;
+  const area = { scrollTop: 300, getBoundingClientRect: () => ({ top: 0 }) };
+  const els = { "discord-log": list, "pinned-log": { id: "pinned-log", children: [] }, "scroll-area": area, "load-older": { hidden: true, getBoundingClientRect: () => ({ top: 0 }) }, transcript: { children: [] } };
+  const keep = createScrollKeeping({
+    el: (id) => els[id], onMain: () => true, currentView: () => "discord", channelView: () => "main", pinnedOnly: () => false,
+    heldFilterRow: () => null, searchWalk: () => null, atBottom: () => false,
+    scrollToNewest: () => {}, renderJumpNewest: () => {}, setJumpNewest: () => {},
+  });
+  // The redraw replaces every row (the held node detached) and the content above the anchor
+  // grows by 25px in the replacement: the reader is corrected by the re-found row, not left
+  // where the shorter interim list clamped the scroll.
+  keep.preservingScroll(() => {
+    shift = 25;
+    const fresh = [row("a", -80), row("b", -40), row("c", 0), row("d", 40)];
+    for (const one of oldRows) one.parentNode = null;
+    for (const one of fresh) one.parentNode = list;
+    list.children = fresh;
+  });
+  assert.equal(area.scrollTop, 325, "a replaced anchor row was not re-found by id and held");
+});
+
 test("`#1057 newest-count-chip`: the rows below the reading position, from the last row wholly on screen", () => {
   const { rowsBelowReadingPosition } = CHANNEL_VIEW;
   const row = (top, bottom) => ({ getBoundingClientRect: () => ({ top, bottom }) });
