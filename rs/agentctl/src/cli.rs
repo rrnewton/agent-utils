@@ -4541,7 +4541,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         "none, minimal, low, medium, high, xhigh, max, ultra".to_owned()
                     });
                 return Err(Failure::Usage(format!(
-                    "no reasoning effort declared for harness {harness:?}: declare reasoning_effort in the launch profile or pass --effort LEVEL (accepted levels: {levels})"
+                    "no reasoning effort declared for harness {harness:?} (mode {mode}): declare reasoning_effort in the launch profile or pass --effort LEVEL (accepted levels: {levels})"
                 )));
             }
             if mode == "headless" && harness == "claude" && value.profile.is_none() {
@@ -6779,7 +6779,14 @@ mod tests {
                 &directory.join("profiles.json"),
                 &json!({
                     "schema": "agentctl-profiles/v1",
-                    "profiles": {"reviewer": {"harness": harness, "mode": mode, "reasoning_effort": "high"}},
+                    // The agentcloud case declares an effort so it reaches the resume
+                    // refusal; the headless case declares none, so the effort refusal
+                    // (which names the mode) is what stops it.
+                    "profiles": {"reviewer": if mode == "interactive" {
+                        json!({"harness": harness, "mode": mode, "reasoning_effort": "high"})
+                    } else {
+                        json!({"harness": harness, "mode": mode})
+                    }},
                 }),
             )
             .unwrap();
