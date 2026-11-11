@@ -536,10 +536,24 @@ class Drill:
         if while_down is not None:
             while_down()
         self.start_server()
+        # Let auto-restored presentations settle before restore proofs read
+        # them: under validation load a pane still settling reads as an
+        # owned presentation changed during the proof and refuses a lane
+        # that standalone runs revive. Poll until the pane set is stable.
         restored: dict[str, str] = {}
-        for pane in self.panes():
-            restored[cast(str, pane["pane_id"])] = cast(str, pane.get("cwd", ""))
-            assert pane.get("agent") is None, pane
+        deadline = time.monotonic() + 60
+        while True:
+            current: dict[str, str] = {}
+            for pane in self.panes():
+                current[cast(str, pane["pane_id"])] = cast(
+                    str, pane.get("cwd", ""),
+                )
+                assert pane.get("agent") is None, pane
+            if current == restored and current:
+                break
+            restored = current
+            assert time.monotonic() < deadline, restored
+            time.sleep(1.0)
         return restored
 
     def restore_teams(
