@@ -2239,57 +2239,37 @@ fn retire_handoff_sidecar(
 }
 
 /// Remove and archive the named slot.
-pub(crate) fn remove_slot(
+
+/// One removal validated and planned with no mutation locks held (#1287).
+struct PreparedRemove {
+    record: Value,
+    events: Vec<Value>,
+    salvage: Vec<Value>,
+    answer_state: String,
+    answer_detail: String,
+    release_present: bool,
+    owner_state: String,
+    heartbeat_age: i64,
+    agent: String,
+    latest_read: Option<Value>,
+}
+
+/// Lock-free candidate validation for `remove_slot` (#1287): the fleet
+/// validation, the state-home reclaim preparation, the storage and
+/// handoff gates, the salvage gates and the process-use census all run
+/// here, before the mutation locks are taken. The locked commit only
+/// re-checks that this slot's record and the event tip are unchanged.
+fn prepare_remove(
     root: Option<&Path>,
-    machine_override: Option<&str>,
+    cfg: &Cfg,
+    selected: &str,
+    config: &Value,
     slot: &str,
-    coordinator_pid: i64,
     expected_generation: i64,
-) -> Result<Value> {
-    require_fixture()?;
-    let host_context = [
-        "WRKSLOTS_REMOVE_RUNNER_PID",
-        "WRKSLOTS_REMOVE_COORDINATOR_START_TICKS",
-        "WRKSLOTS_REMOVE_PROOF_FD",
-    ]
-    .iter()
-    .filter(|name| std::env::var_os(name).is_some())
-    .count();
-    if host_context == 3 {
-        return Err("host-context removal stays with the Python edition for now".to_string());
-    }
-    if host_context != 0 {
-        return Err(
-            "host-context removal requires runner PID, coordinator generation, and proof FD"
-                .to_string(),
-        );
-    }
-    let (cfg, selected) = load_cfg(root, machine_override)?;
-    let config = load_config(root, machine_override)?;
-    crate::freeze::assert_not_frozen(&cfg, &config, "remove")?;
-    validate_name(&selected, "machine")?;
-    validate_name(slot, "slot")?;
-    let coordinator = read_process_identity(coordinator_pid)?;
-    assert_caller(&coordinator, "coordinator")?;
-    let locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
-    refuse_partial_state(&cfg.control)?;
-    let journals = parse_journals(root)?;
-    if let Some(first) = journals
-        .get("journals")
-        .and_then(Value::as_array)
-        .and_then(|names| names.first())
-        .and_then(Value::as_str)
-    {
-        return Err(format!(
-            "interrupted mutation recorded in {}; run 'wrkslots recover' first",
-            cfg.control.join(first).display()
-        ));
-    }
-    validate_global(root, &cfg)?;
-    let active = active_document(root, &cfg, &selected)?;
-    // The archive document is (re)read at completion time, after the
-    // out-of-lock deletion (#894); reading it here would go stale.
-    let archives_path = cfg.control.join(format!("ARCHIVED.{selected}.json"));
+    coordinator_pid: i64,
+) -> Result<PreparedRemove> {
+    validate_global(root, cfg)?;
+    let active = active_document(root, cfg, selected)?;
     let record = active
         .get("slots")
         .and_then(Value::as_array)
@@ -2300,10 +2280,7 @@ pub(crate) fn remove_slot(
         })
         .cloned()
         .ok_or_else(|| format!("slot '{slot}' is not active on machine {selected}"))?;
-    let generation = record
-        .get("generation")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
+    let generation = record.get("generation").and_then(Value::as_i64).unwrap_or(0);
     if generation != expected_generation {
         return Err(format!(
             "stale generation for slot {slot}: expected {expected_generation}, current {generation}"
@@ -2320,26 +2297,14 @@ pub(crate) fn remove_slot(
         ));
     }
     crate::reclaim_state::prepare_reclaim(&cfg.control, &slot_type, slot)?;
-    // Re-verify the coordinator generation under the mutation locks.
-    let coordinator_now = read_process_identity(coordinator_pid).map_err(|_| {
-        format!("coordinator PID {coordinator_pid} exited before the locked removal boundary")
-    })?;
-    if coordinator_now != coordinator {
-        return Err(format!(
-            "coordinator PID {coordinator_pid} generation changed before the locked removal boundary"
-        ));
-    }
-    assert_caller(&coordinator, "coordinator")?;
     refuse_target_storage(root, slot)?;
-    let events = load_event_chain(&cfg.control.join(format!("EVENTS.{selected}")), &selected)?;
+    let events = load_event_chain(&cfg.control.join(format!("EVENTS.{selected}")), selected)?;
     {
-        let hold = current_hold(root, &cfg, &selected, slot)?;
+        let hold = current_hold(root, cfg, selected, slot)?;
         if !hold.is_null() {
             return Err(format!(
                 "slot {slot} is held: {}",
-                hold.get("reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
+                hold.get("reason").and_then(Value::as_str).unwrap_or_default()
             ));
         }
     }
@@ -2352,19 +2317,10 @@ pub(crate) fn remove_slot(
         Some(identity_of(&owner_value))
     };
     let (owner_state, owner_detail) = process_state(owner_identity.as_ref());
-    let owner_gone = owner_absent || owner_state == "dead";
-    let release = release_in_effect(&cfg, &record, &events)?;
-    let agent = record
-        .get("agent")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let answer = liveness_answer(&cfg, &config, &record)?;
+    let _ = owner_detail;
+    let release = release_in_effect(cfg, &record, &events)?;
+    let answer = liveness_answer(cfg, config, &record)?;
     if release.is_none() {
-        // Both authorities must agree the owner is gone: the exact
-        // recorded process generation dead (or no owner recorded) AND
-        // the registered liveness answer "dead", with the heartbeat
-        // TTL expired. Every other combination refuses.
         if owner_state == "live" {
             return Err(
                 "owner consent and attested removal stay with the Python edition for now"
@@ -2384,11 +2340,6 @@ pub(crate) fn remove_slot(
                         .to_string(),
                 );
             }
-            // #993: a verdict resting on unattributed panes vetoes
-            // removal only if a live process references this slot.
-            // The held-reference census (assert_slot_unused, below)
-            // and the argv/environ naming scan here are that scoped
-            // proof; every other guard still runs unchanged.
             let lower_detail = answer.detail.to_lowercase();
             let pane_scoped = answer.state == "unverifiable"
                 && lower_detail.contains("pane")
@@ -2399,7 +2350,7 @@ pub(crate) fn remove_slot(
                     answer.state, answer.detail
                 ));
             }
-            let pane_slot_path = slot_directory(&cfg, slot, &slot_type)?;
+            let pane_slot_path = slot_directory(cfg, slot, &slot_type)?;
             if let Some((pid, kind, token)) = process_naming_slot(&pane_slot_path) {
                 return Err(format!(
                     "the unattributed pane may be using slot {slot}: live process {pid} names the slot in its {kind}: {token}; stop it and retry"
@@ -2417,13 +2368,9 @@ pub(crate) fn remove_slot(
             ));
         }
     }
-    let _ = owner_gone;
-    let _ = agent;
-    let slot_path = slot_directory(&cfg, slot, &slot_type)?;
-    assert_slot_contents(&cfg, &record)?;
-    // Handoff artifact gates: no uncommitted handoff, and a present
-    // artifact must have been read with matching provenance.
-    let sidecar = load_sidecar_artifact(&cfg, &selected, slot, &slot_type, generation)?;
+    let slot_path = slot_directory(cfg, slot, &slot_type)?;
+    assert_slot_contents(cfg, &record)?;
+    let sidecar = load_sidecar_artifact(cfg, selected, slot, &slot_type, generation)?;
     let legacy_handoff = slot_path.join("HANDOFF.md");
     if legacy_handoff.exists() || legacy_handoff.is_symlink() {
         return Err(
@@ -2465,7 +2412,6 @@ pub(crate) fn remove_slot(
         }
         (None, None) => {}
     }
-    // Salvage gate: every checkout already published and clean.
     let mut salvage: Vec<Value> = Vec::new();
     for checkout in record
         .get("checkouts")
@@ -2477,24 +2423,160 @@ pub(crate) fn remove_slot(
             .get("repository")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let (_stored, repository) = stored_repository_path(&cfg, repository_raw)?;
-        salvage.push(salvage_gate(&cfg, &config, &checkout, &repository)?);
+        let (_stored, repository) = stored_repository_path(cfg, repository_raw)?;
+        salvage.push(salvage_gate(cfg, config, &checkout, &repository)?);
     }
-    if let Some(checkouts) = record.get("checkouts").and_then(Value::as_array) {
-        for checkout in checkouts {
-            let moved = salvage
-                .iter()
-                .find(|item| {
-                    item.get("checkout").and_then(Value::as_str)
-                        == checkout.get("name").and_then(Value::as_str)
-                })
-                .cloned()
-                .unwrap_or(Value::Null);
-            let _ = moved;
-        }
-    }
-    // Use check and registry consistency before any event is written.
     assert_slot_unused(&slot_path, coordinator_pid)?;
+    let agent = record
+        .get("agent")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Ok(PreparedRemove {
+        record,
+        events,
+        salvage,
+        answer_state: answer.state,
+        answer_detail: answer.detail,
+        release_present: release.is_some(),
+        owner_state,
+        heartbeat_age,
+        agent,
+        latest_read,
+    })
+}
+
+pub(crate) fn remove_slot(
+    root: Option<&Path>,
+    machine_override: Option<&str>,
+    slot: &str,
+    coordinator_pid: i64,
+    expected_generation: i64,
+) -> Result<Value> {
+    require_fixture()?;
+    let host_context = [
+        "WRKSLOTS_REMOVE_RUNNER_PID",
+        "WRKSLOTS_REMOVE_COORDINATOR_START_TICKS",
+        "WRKSLOTS_REMOVE_PROOF_FD",
+    ]
+    .iter()
+    .filter(|name| std::env::var_os(name).is_some())
+    .count();
+    if host_context == 3 {
+        return Err("host-context removal stays with the Python edition for now".to_string());
+    }
+    if host_context != 0 {
+        return Err(
+            "host-context removal requires runner PID, coordinator generation, and proof FD"
+                .to_string(),
+        );
+    }
+    let (cfg, selected) = load_cfg(root, machine_override)?;
+    let config = load_config(root, machine_override)?;
+    crate::freeze::assert_not_frozen(&cfg, &config, "remove")?;
+    validate_name(&selected, "machine")?;
+    validate_name(slot, "slot")?;
+    let coordinator = read_process_identity(coordinator_pid)?;
+    assert_caller(&coordinator, "coordinator")?;
+    // Validate and plan with no lock held (#1287); the locked section
+    // below only re-checks this slot's record and commits it.
+    let prepared = prepare_remove(
+        root,
+        &cfg,
+        &selected,
+        &config,
+        slot,
+        expected_generation,
+        coordinator_pid,
+    )?;
+    let locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
+    refuse_partial_state(&cfg.control)?;
+    let journals = parse_journals(root)?;
+    if let Some(first) = journals
+        .get("journals")
+        .and_then(Value::as_array)
+        .and_then(|names| names.first())
+        .and_then(Value::as_str)
+    {
+        return Err(format!(
+            "interrupted mutation recorded in {}; run 'wrkslots recover' first",
+            cfg.control.join(first).display()
+        ));
+    }
+    let active = active_document(root, &cfg, &selected)?;
+    // The archive document is (re)read at completion time, after the
+    // out-of-lock deletion (#894); reading it here would go stale.
+    let archives_path = cfg.control.join(format!("ARCHIVED.{selected}.json"));
+    let record = active
+        .get("slots")
+        .and_then(Value::as_array)
+        .and_then(|slots| {
+            slots
+                .iter()
+                .find(|item| item.get("slot").and_then(Value::as_str) == Some(slot))
+        })
+        .cloned()
+        .ok_or_else(|| format!("slot '{slot}' is not active on machine {selected}"))?;
+    if record != prepared.record {
+        return Err(format!(
+            "slot {slot} changed between the lock-free validation and the registry lock; preserve it and retry"
+        ));
+    }
+    let generation = record
+        .get("generation")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    if generation != expected_generation {
+        return Err(format!(
+            "stale generation for slot {slot}: expected {expected_generation}, current {generation}"
+        ));
+    }
+    let slot_type = record
+        .get("slot_type")
+        .and_then(Value::as_str)
+        .unwrap_or("agent")
+        .to_string();
+    if slot_type != "agent" {
+        return Err(format!(
+            "remove for slot type '{slot_type}' stays with the Python edition for now"
+        ));
+    }
+    // Re-verify the coordinator generation under the mutation locks.
+    let coordinator_now = read_process_identity(coordinator_pid).map_err(|_| {
+        format!("coordinator PID {coordinator_pid} exited before the locked removal boundary")
+    })?;
+    if coordinator_now != coordinator {
+        return Err(format!(
+            "coordinator PID {coordinator_pid} generation changed before the locked removal boundary"
+        ));
+    }
+    assert_caller(&coordinator, "coordinator")?;
+    // Locked commit (#1287): the slot's record was re-checked above and
+    // its event chain must not have grown since the lock-free validation.
+    if load_event_chain(&cfg.control.join(format!("EVENTS.{selected}")), &selected)?.len()
+        != prepared.events.len()
+    {
+        return Err(format!(
+            "slot {slot} changed between the lock-free validation and the registry lock; preserve it and retry"
+        ));
+    }
+    let heartbeat_age = prepared.heartbeat_age;
+    let owner_state = prepared.owner_state;
+    let release: Option<Value> = if prepared.release_present {
+        Some(Value::Null)
+    } else {
+        None
+    };
+    let answer = Liveness {
+        state: prepared.answer_state,
+        detail: prepared.answer_detail,
+    };
+    let slot_path = slot_directory(&cfg, slot, &slot_type)?;
+    // Salvage gate: every checkout already published and clean (gathered
+    // lock-free in prepare_remove; the refresh below re-verifies it).
+    let salvage = prepared.salvage;
+    let agent = prepared.agent;
+    let latest_read = prepared.latest_read;
     ensure_event_log(root, &cfg, &selected)?;
     // The dead liveness line, recorded inside this registry-lock hold before
     // salvage, as the Python edition records it (#994).

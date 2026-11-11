@@ -32955,6 +32955,10 @@ class _CreatePrevalidated:
     archives: tuple[ArchiveState, ...]
     repositories: tuple[Path, ...]
     storage_inconsistencies: tuple[StorageInconsistency, ...]
+    # True when a journal was outstanding at validation time: the locked
+    # path still classifies it, but reuses this lock-free storage report
+    # instead of recomputing the fleet scan under the lock (#1287).
+    journals_outstanding: bool = False
 
 
 def _create_plan_repositories(config: Config, args: argparse.Namespace) -> tuple[Path, ...]:
@@ -34565,13 +34569,18 @@ def _cmd_create(args: argparse.Namespace) -> int:
     vcs = _GitVcs()
 
     def prepare() -> _CreatePrevalidated | None:
-        # Lock-free (#1276). An outstanding journal -- an interrupted mutation's, a live
-        # writer's, or a validation batch's seal -- needs the recovery and classification
-        # that only the locked path performs, so that round defers to it.
-        if _outstanding_journals(config) or _validate_batch_seal_journals(config):
-            return None
+        # Lock-free (#1276, #1287). An outstanding journal -- an interrupted
+        # mutation's, a live writer's, or a validation batch's seal -- needs
+        # the recovery and classification that only the locked path
+        # performs, so that round defers to it; the fleet storage report is
+        # still computed here, with no lock held, and the locked path
+        # reuses it instead of rescanning the fleet under the lock.
+        journals_outstanding = bool(
+            _outstanding_journals(config) or _validate_batch_seal_journals(config)
+        )
         states, archives = _validate_global_state(config)
-        _assert_agent_and_slot_free(config, args.slot, args.agent, args.slot_type)
+        if not journals_outstanding:
+            _assert_agent_and_slot_free(config, args.slot, args.agent, args.slot_type)
         repositories = _create_plan_repositories(config, args)
         return _CreatePrevalidated(
             states=tuple(states),
@@ -34580,6 +34589,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             storage_inconsistencies=_registry_storage_inconsistencies(
                 config, states, additional_repositories=repositories
             ),
+            journals_outstanding=journals_outstanding,
         )
 
     def commit(
@@ -34597,7 +34607,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
         interrupted_creates: tuple[_CreateJournalClassification, ...] = ()
         paired_finish_path: Path | None = None
         cleanup_exclusions: frozenset[Path] = frozenset()
-        if prepared is None:
+        locked_classification = prepared is None or prepared.journals_outstanding
+        if locked_classification:
             _recover_orphaned_validate_batch_seal(config)
             _recover_dead_actor_journals(config)
             states, archives, absent_batch_paths, absent_batch_slots = (
@@ -34629,11 +34640,12 @@ def _cmd_create(args: argparse.Namespace) -> int:
             # Validated lock-free and still current (#1276): no journal, seal or interrupted
             # batch was outstanding then, so none is recovered, excluded or classified now,
             # and the slot and agent were free.
+            assert prepared is not None
             states, archives = list(prepared.states), list(prepared.archives)
         before = _global_rows(states, archives)
         local = (
             None
-            if reference is None
+            if reference is None or locked_classification
             else _verified_local_log(config, reference, states, archives)
         )
         if local is None:
@@ -34646,7 +34658,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             _atomic_write_json(_active_path(config), _active_to_obj(local.active))
             _atomic_write_json(_archive_path(config), _archive_to_obj(local.archive))
             state = local.active
-        if prepared is None:
+        if locked_classification:
             _assert_agent_and_slot_free(config, args.slot, args.agent, args.slot_type)
         _assert_create_disk_space(config, args.override_disk_floor)
         slot_path = _slot_directory(config, args.slot, args.slot_type)
@@ -34728,7 +34740,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         _assert_create_target_clear(
             config, states, args.slot, args.slot_type, plan, vcs
         )
-        if prepared is None:
+        if locked_classification:
             interrupted_creates = _classify_create_journals(
                 config,
                 states,
@@ -34957,7 +34969,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             event_writer=event_writer,
             journal_path=journal_path,
         )
-        if prepared is None:
+        if locked_classification:
             after_states, after_archives, _paths, _slots = (
                 _validate_global_state_beside_absent_batch(config, announce=False)
             )
@@ -38159,11 +38171,34 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
         remove_args = argparse.Namespace(**remove_values)
         try:
             _cmd_remove(remove_args, emit=False)
+        except _PreparedRemovalRefused as exc:
+            # Refused by the lock-free validation (#1287): nothing was
+            # written for this candidate, so it is retained with that
+            # reason and the batch goes on, without re-validating under
+            # the lock to classify it.
+            retained.append(
+                {**identity, "outcome": "retained", "reason": str(exc)}
+            )
         except _TargetStorageDrift as exc:
             # One target's own storage is broken; the registry is not. The
             # target needs recovery, and the batch goes on only when the
             # registry shows that this attempt changed nothing.
             reason = str(exc) + (f"; remedy: {exc.remedy}" if exc.remedy else "")
+            if getattr(exc, "_lock_free_prepare", False):
+                # Raised by the lock-free validation (#1287): the slot is
+                # unchanged by construction, so no confirmation under the
+                # lock is needed before the batch goes on.
+                could_not_determine.append(
+                    _could_not_determine_row(
+                        identity,
+                        (
+                            f"{reason}; the slot is unchanged, so the batch "
+                            "continued with its next candidate"
+                        ),
+                        "target-storage-drift",
+                    )
+                )
+                continue
             try:
                 _confirm_unchanged_after_target_storage_drift(
                     config, candidate, exc, deadline
@@ -49478,6 +49513,7 @@ def _begin_or_resume_path_fence(
     finish: _FinishContext,
     *,
     journal_path: Path,
+    event_writer: _EventWriter | None = None,
 ) -> tuple[dict[str, object], Path]:
     original = _slot_directory(config, record.slot, record.slot_type)
     fenced = _finish_fenced_slot(config, record, journal)
@@ -49505,6 +49541,7 @@ def _begin_or_resume_path_fence(
             record,
             vcs,
             finish,
+            check_use=not finish.prepared_lock_free,
         )
         if current_checkouts != record.checkouts:
             raise Refusal(
@@ -49576,7 +49613,7 @@ def _begin_or_resume_path_fence(
     # duplicate progress event the other edition does not write.
     if journal.get("phase") != "fenced":
         journal["phase"] = "fenced"
-        _write_journal(config, journal, journal_path=journal_path)
+        _write_journal(config, journal, journal_path=journal_path, event_writer=event_writer)
     if newly_fenced:
         _interrupt_for_test("after-path-fence")
     return journal, fenced
@@ -50517,9 +50554,12 @@ def _begin_finish(
     journal_path: Path,
     defer_private_census: bool = False,
     defer_deletion: bool = False,
+    event_writer: _EventWriter | None = None,
+    previous_state: ActiveState | None = None,
 ) -> _PreparedPrivateFinish | _PreparedDeferredFinish | None:
     vcs = _GitVcs()
-    _load_archive(config, require_repository=False)
+    if not finish.prepared_lock_free:
+        _load_archive(config, require_repository=False)
     _assert_not_held(config, record)
     # The path fence below always runs _reclaim_preconditions again, use
     # check included, before it renames the slot (_begin_or_resume_path_fence),
@@ -50547,26 +50587,29 @@ def _begin_finish(
             else {"stale_copy_discard_sequence": finish.stale_copy_discard_sequence}
         ),
         require_repository=False,
+        event_writer=event_writer,
+        previous=previous_state,
     )
-    boundary_states, _boundary_archives = _validate_global_state(
-        config, require_repository=False
-    )
-    boundary_state = next(
-        (item for item in boundary_states if item.machine == config.machine), None
-    )
-    if boundary_state is None:
-        raise StateError(
-            f"slot {final_record.slot} lost its machine {config.machine} from the "
-            "registry before its destructive boundary"
+    if not finish.prepared_lock_free:
+        boundary_states, _boundary_archives = _validate_global_state(
+            config, require_repository=False
         )
-    boundary_record = _find_record(boundary_state, final_record.slot)
-    if _record_to_obj(boundary_record) != _record_to_obj(final_record):
-        raise StateError(
-            f"slot {final_record.slot} changed before its destructive boundary"
+        boundary_state = next(
+            (item for item in boundary_states if item.machine == config.machine), None
         )
-    _assert_target_record_storage_consistent(
-        config, boundary_states, boundary_record
-    )
+        if boundary_state is None:
+            raise StateError(
+                f"slot {final_record.slot} lost its machine {config.machine} from the "
+                "registry before its destructive boundary"
+            )
+        boundary_record = _find_record(boundary_state, final_record.slot)
+        if _record_to_obj(boundary_record) != _record_to_obj(final_record):
+            raise StateError(
+                f"slot {final_record.slot} changed before its destructive boundary"
+            )
+        _assert_target_record_storage_consistent(
+            config, boundary_states, boundary_record
+        )
     finished_at = _utc_now()
     journal = _finish_journal_payload(
         config,
@@ -50576,7 +50619,7 @@ def _begin_finish(
         phase="prepared",
         finish=finish,
     )
-    _write_journal(config, journal, journal_path=journal_path)
+    _write_journal(config, journal, journal_path=journal_path, event_writer=event_writer)
     _interrupt_for_test("after-finish-journal")
     if defer_private_census or defer_deletion:
         if defer_private_census and finish.private_cleanup is None:
@@ -50589,6 +50632,7 @@ def _begin_finish(
                 vcs,
                 finish,
                 journal_path=journal_path,
+                event_writer=event_writer,
             )
         except Refusal:
             canonical = _slot_directory(
@@ -50914,6 +50958,750 @@ def _cmd_finish(args: argparse.Namespace) -> int:
     )
     print(f"continuation={continuation}")
     return 0
+
+
+@dataclasses.dataclass(frozen=True)
+class _RemovalAdmission:
+    """One removal's owner, heartbeat and liveness judgement (#1287).
+
+    Computed identically by the locked removal and by retire-pending's
+    lock-free preparation; the locked commit of a prepared removal trusts
+    it only while the slot's fingerprint still matches.
+    """
+
+    age: float
+    expired: bool
+    owner_state: str
+    detail: str
+    live_validate_owner: bool
+    owner_consent: _OwnerConsent | None
+    owner_release: _OwnerRelease | None
+    consent_liveness: tuple[str, str] | None
+    attested_stop: _AttestedStop | None
+    attested_never_started: _AttestedStop | None
+    dead_liveness_detail: str | None
+    owner_unrecorded: bool
+
+
+def _removal_admission(
+    config: Config,
+    record: ActiveRecord,
+    *,
+    coordinator: ProcessIdentity,
+    retirement_candidate: _RetirementCandidate | None,
+    attest_agent: str | None,
+    never_started_agent: str | None,
+    attest_note: str | None,
+    validate_complete: bool,
+    coordinator_authorized: bool,
+    include_owner_consented: bool,
+    handoff_writer: ProcessIdentity | None,
+    agent_batch: _AgentRemoveBatchContext | None,
+    unlocked_refusal: Refusal | None,
+) -> _RemovalAdmission:
+    _assert_not_held(config, record)
+    age, expired = _heartbeat_diagnosis(record)
+    owner_state, detail = _process_state(record.owner)
+    live_validate_owner = bool(
+        validate_complete
+        and owner_state == "live"
+        and record.owner == coordinator
+    )
+    owner_consent: _OwnerConsent | None = None
+    owner_release: _OwnerRelease | None = None
+    owner_unrecorded = _owner_record_is_absent(record)
+    # An explicit release by the exact owner process generation is the
+    # owner's own decision to give this generation back, so it is honoured
+    # by an explicit remove and by a retire-pending batch alike. It stands
+    # in for the owner's death and the heartbeat time-to-live only; the
+    # handoff read, the direct-use check, salvage and holds still apply.
+    if (
+        record.slot_type == "agent"
+        and owner_state in ("live", "dead")
+        and not validate_complete
+        and not owner_unrecorded
+    ):
+        owner_release = _owner_release_in_effect(
+            config, record, _load_events(config, record.machine)
+        )
+    # An explicit remove names one slot, so running it is the coordinator's
+    # decision for that slot. A retire-pending batch selects slots itself
+    # and a scheduler may pass --coordinator-authorized for it, so it may
+    # use owner consent only when the caller opted in for the batch.
+    # Otherwise a live owner keeps the original refusal and is retained.
+    owner_consent_allowed = retirement_candidate is None or include_owner_consented
+    if (
+        owner_release is None
+        and owner_consent_allowed
+        and record.slot_type == "agent"
+        and owner_state == "live"
+        and not validate_complete
+        and not _owner_record_is_absent(record)
+    ):
+        owner_consent = _owner_consented_release(
+            config,
+            record,
+            detail,
+            events=_load_events(config, record.machine),
+            coordinator_authorized=coordinator_authorized,
+            expired=expired,
+            age=age,
+        )
+    consent_liveness: tuple[str, str] | None = None
+    attested_stop: _AttestedStop | None = None
+    attested_never_started: _AttestedStop | None = None
+    dead_liveness_detail: str | None = None
+    if live_validate_owner:
+        if handoff_writer is None:
+            _assert_caller_process(coordinator, "validate owner")
+    elif owner_consent is not None or owner_release is not None:
+        # The registered liveness authority answers "is the owner still
+        # running?", and for a consenting or releasing owner the answer may
+        # be yes by construction. Record its answer as evidence; do not
+        # gate on it.
+        consent_liveness = _registered_liveness_state(config, record)
+    elif record.slot_type == "agent":
+        answer = _registered_liveness_answer(config, record)
+        if answer.state == "dead":
+            dead_liveness_detail = answer.detail
+        if answer.state != "dead":
+            # Only the authority's exact "no record of this agent" can be
+            # stood in for, and only for an owner generation proven dead.
+            # A registered agent the authority cannot verify (an active
+            # record that was never stopped, an incomplete rename) keeps
+            # refusing: it may still be running. A verdict resting on
+            # unattributed panes is scoped to this slot instead (#993).
+            attestable = (
+                answer.unregistered
+                and owner_state == "dead"
+                and not owner_unrecorded
+            )
+            # A name the session tooling cannot use can never be judged at all, so
+            # neither the ordinary gate nor the attested stop can ever pass. Only the
+            # negative space in wrkslots' own records can prove such a slot free: no
+            # owner recorded now, none ever recorded for this generation, and the
+            # authority answering unverifiable rather than alive.
+            never_started_proven = (
+                answer.state == "unverifiable"
+                and record.owner is None
+                and not _agent_name_usable(record.agent)
+                and _slot_never_had_owner(
+                    record, _load_events(config, record.machine)
+                )
+            )
+            if never_started_agent is not None:
+                if not never_started_proven:
+                    raise Refusal(
+                        f"cannot remove {record.slot}: "
+                        "--attest-agent-never-started applies only when no owner "
+                        "was ever recorded for this slot generation, the recorded "
+                        f"agent name {record.agent!r} is one the session tooling "
+                        "cannot use, and the registered liveness authority answers "
+                        "unverifiable rather than alive. state: REFUSED -- no "
+                        "checkout was salvaged or removed"
+                    )
+                assert attest_note is not None
+                attested_never_started = _AttestedStop(
+                    note=attest_note, liveness_detail=answer.detail
+                )
+                consent_liveness = (answer.state, answer.detail)
+            elif not attestable:
+                if attest_agent is None and never_started_proven:
+                    raise Refusal(
+                        f"cannot remove {record.slot}: its recorded agent name "
+                        f"{record.agent!r} is one the session tooling cannot use, "
+                        "so the registered liveness authority can never judge "
+                        f"it ({answer.detail}). state: REFUSED -- no checkout "
+                        "was salvaged or removed. remedy: no owner was ever "
+                        "recorded for this slot generation, so if the coordinator "
+                        "knows no agent was ever started in it, rerun this one "
+                        "explicit remove with --coordinator-authorized "
+                        f"--attest-agent-never-started {record.agent} "
+                        "--attest-note TEXT stating that basis; the attestation "
+                        "is recorded in the event log, and the heartbeat "
+                        "time-to-live, process-use, Git and salvage checks "
+                        "still run"
+                    )
+                if (
+                    answer.state == "unverifiable"
+                    and "pane" in answer.detail.lower()
+                    and "archived-record-pane" not in answer.detail.lower()
+                ):
+                    # #993 (criteria 1-2): a verdict that rests on panes
+                    # the authority cannot attribute to any registered
+                    # agent vetoes this removal only if a live process
+                    # actually references this slot. The slot-scoped
+                    # census is the same proof the absent-row extension
+                    # (28f01ef0) uses; every other storage-side guard
+                    # (owner generation, time-to-live, handoff, direct
+                    # use, salvage) still runs unchanged below.
+                    _assert_pane_verdict_slot_unused(
+                        config, record, agent_batch, unlocked_refusal
+                    )
+                    if attest_agent is not None:
+                        print(
+                            "NOTE: --attest-agent-stopped was not needed: the "
+                            "unattributed-pane verdict does not reference this "
+                            "slot, so no attestation was recorded",
+                            file=sys.stderr,
+                        )
+                    consent_liveness = (answer.state, answer.detail)
+                else:
+                    _refuse_registered_liveness(answer.state, answer.detail)
+            elif attest_agent is None:
+                _refuse_registered_liveness(
+                    answer.state, answer.detail, attest_agent=record.agent
+                )
+            else:
+                assert attest_note is not None
+                attested_stop = _AttestedStop(
+                    note=attest_note, liveness_detail=answer.detail
+                )
+                consent_liveness = (answer.state, answer.detail)
+        elif attest_agent is not None:
+            print(
+                "NOTE: --attest-agent-stopped was not needed: the registered "
+                "liveness authority reports the agent dead; no attestation was "
+                "recorded",
+                file=sys.stderr,
+            )
+        elif never_started_agent is not None:
+            print(
+                "NOTE: --attest-agent-never-started was not needed: the "
+                "registered liveness authority reports the agent dead; no "
+                "attestation was recorded",
+                file=sys.stderr,
+            )
+    else:
+        _assert_owner_liveness(config, record)
+    # A release stops this generation's heartbeat (heartbeat refuses while
+    # it is in effect) and is bound to the heartbeat stamp, so any renewal
+    # voids it. Waiting for the time-to-live would only re-prove what the
+    # exact owner already declared.
+    if not expired and not validate_complete and owner_release is None:
+        remaining = max(1, record.heartbeat_ttl_seconds - int(age))
+        raise Refusal(
+            f"slot {record.slot} heartbeat is {int(age)}s old and its "
+            f"{record.heartbeat_ttl_seconds}s time-to-live has not expired. state: "
+            "REFUSED -- no checkout was salvaged or removed. remedy: wait at least "
+            f"{remaining}s without renewal before retrying remove; if the owner is still "
+            "working, have it run 'wrkslots heartbeat' instead"
+        )
+    # An absent or degenerate owner record no longer blocks removal. The
+    # heartbeat has already expired above, and every guard that actually
+    # protects work still runs below: the handoff read, the direct-use
+    # check, and salvage before delete. See _owner_record_is_absent.
+    if (
+        owner_state != "dead"
+        and not live_validate_owner
+        and not owner_unrecorded
+        and owner_consent is None
+        and owner_release is None
+    ):
+        raise Refusal(
+            f"remove requires a proven-dead recorded owner; owner is {owner_state}: {detail}. "
+            "state: REFUSED -- no checkout was salvaged or removed. remedy: wait for the "
+            "exact owner process to exit and for the time-to-live to remain expired; if "
+            "process evidence is unavailable, repair that evidence rather than treating the "
+            "slot as free"
+        )
+    return _RemovalAdmission(
+        age=age,
+        expired=expired,
+        owner_state=owner_state,
+        detail=detail,
+        live_validate_owner=live_validate_owner,
+        owner_consent=owner_consent,
+        owner_release=owner_release,
+        consent_liveness=consent_liveness,
+        attested_stop=attested_stop,
+        attested_never_started=attested_never_started,
+        dead_liveness_detail=dead_liveness_detail,
+        owner_unrecorded=owner_unrecorded,
+    )
+
+
+def _removal_basis(
+    admission: _RemovalAdmission,
+    record: ActiveRecord,
+    *,
+    coordinator: ProcessIdentity,
+    coordinator_authorized: bool,
+) -> tuple[str, Mapping[str, object]] | None:
+    """The durable basis record a removal writes before salvage (#1287).
+
+    Recorded before any salvage or deletion so the removal is
+    attributable from the append-only history alone, and so an
+    interrupted removal can re-derive the same basis on recovery.
+    """
+
+    if admission.owner_consent is not None:
+        assert admission.consent_liveness is not None
+        return OWNER_CONSENT_ACTION, _owner_consent_evidence(
+            record,
+            admission.owner_consent,
+            coordinator=coordinator,
+            coordinator_authorized=coordinator_authorized,
+            age=admission.age,
+            registered_liveness=admission.consent_liveness,
+        )
+    if admission.owner_release is not None:
+        assert admission.consent_liveness is not None
+        return OWNER_RELEASE_ACTION, _owner_release_evidence(
+            record,
+            admission.owner_release,
+            coordinator=coordinator,
+            coordinator_authorized=coordinator_authorized,
+            owner_state=admission.owner_state,
+            age=admission.age,
+            registered_liveness=admission.consent_liveness,
+        )
+    if admission.attested_stop is not None:
+        return ATTESTED_STOP_ACTION, _attested_stop_evidence(
+            record,
+            admission.attested_stop,
+            coordinator=coordinator,
+            owner_detail=admission.detail,
+            age=admission.age,
+        )
+    if admission.attested_never_started is not None:
+        return NEVER_STARTED_ACTION, _never_started_evidence(
+            record,
+            admission.attested_never_started,
+            coordinator=coordinator,
+            owner_detail=admission.detail,
+            age=admission.age,
+        )
+    if admission.dead_liveness_detail is not None:
+        return REGISTERED_LIVENESS_ACTION, _registered_liveness_evidence(
+            record, admission.dead_liveness_detail
+        )
+    return None
+
+
+def _removal_salvage(
+    config: Config,
+    record: ActiveRecord,
+    admission: _RemovalAdmission,
+    *,
+    salvage_archive_root: Path | None,
+    archive_drifted: bool,
+    archive_private_history: bool,
+) -> tuple[tuple[dict[str, object], ...], tuple[str, ...]]:
+    """Salvage one slot and describe it, lock-free or locked alike (#1287)."""
+
+    if record.slot_type == "validate":
+        return (), (
+            "slot type validate: authored work is excluded by construction, so salvage was not run",
+        )
+    if not record.checkouts and record.import_source is not None:
+        return (), (
+            "historical agent slot contains no checkout and its exact contents were "
+            "verified before deletion, so there was no checkout to salvage",
+        )
+    # Drift is archived only when the owner is proven dead: its exact
+    # process identity is gone (or no owner was ever recorded) and the
+    # registered liveness command answered dead. Without a release that
+    # command was required above; with a release it was only recorded,
+    # so its answer is required here. An owner that is still alive, or
+    # consented while alive, can restore its own checkout first.
+    owner_proven_dead = (
+        (
+            admission.owner_release is None
+            and admission.attested_stop is None
+            and admission.attested_never_started is None
+            and (admission.owner_state == "dead" or admission.owner_unrecorded)
+        )
+        or (
+            admission.owner_release is not None
+            and admission.owner_state == "dead"
+            and admission.consent_liveness is not None
+            and admission.consent_liveness[0] == "dead"
+        )
+    )
+    drift_refusal = (
+        None
+        if owner_proven_dead
+        and admission.owner_consent is None
+        and not admission.live_validate_owner
+        else (
+            "--archive-drifted-checkouts archives drift only when the "
+            "recorded owner is proven dead by its exact process identity "
+            "and by the registered liveness command; the owner here is "
+            f"{admission.owner_state}"
+            + (
+                ""
+                if admission.consent_liveness is None
+                else f" and registered liveness says {admission.consent_liveness[0]}"
+            )
+            + (
+                ", so have it restore its recorded branch and remote first"
+                if admission.attested_stop is None
+                and admission.attested_never_started is None
+                else "; a coordinator's attestation that an unregistered agent "
+                "stopped is not the authority's 'dead', so restore the recorded "
+                "branch and remote first, or remove without "
+                "--archive-drifted-checkouts"
+                if admission.attested_never_started is None
+                else "; a coordinator's attestation that no agent was ever "
+                "started is not the authority's 'dead', so restore the "
+                "recorded branch and remote first, or remove without "
+                "--archive-drifted-checkouts"
+            )
+        )
+    )
+    salvage = _salvage_agent_slot(
+        config,
+        record,
+        _GitVcs(),
+        archive_root=salvage_archive_root,
+        archive_drifted=archive_drifted,
+        drift_refusal=drift_refusal,
+        owner_proven_dead=owner_proven_dead,
+        archive_private_history=archive_private_history,
+    )
+    evidence = tuple(
+        f"checkout {item['checkout']}: {item['disposition']} commit "
+        f"{item['salvage_commit']}"
+        + (
+            f" at {item['remote_ref']}"
+            if item.get("remote_ref") is not None
+            else (
+                f" in {item['archive_bundle']}"
+                if item["disposition"] == "archived-local"
+                else " on an existing remote ref"
+            )
+        )
+        for item in salvage
+    )
+    return salvage, evidence
+
+
+def _reclaim_evidence_write(
+    record: ActiveRecord,
+    admission: _RemovalAdmission,
+    *,
+    coordinator: ProcessIdentity,
+    coordinator_authorized: bool,
+    salvage: tuple[dict[str, object], ...],
+    evidence: tuple[str, ...],
+    stale_image: slotimage.SlotImage | None,
+    stale_holders: tuple[_StaleCopyHolders, ...],
+) -> tuple[ActiveRecord, dict[str, object]] | None:
+    """The synthesized handoff a removal records when finish never did."""
+
+    if record.handoff is not None:
+        return None
+    continuation = (
+        f"wrkslots remove {record.slot} --coordinator-pid <current-coordinator-pid> "
+        f"--expected-generation {record.generation}"
+    )
+    updated = dataclasses.replace(
+        record,
+        handoff=Handoff(
+            recorded_at=_utc_now(),
+            validation=evidence,
+            limitations=(),
+            continuation=continuation,
+        ),
+    )
+    payload: dict[str, object] = {
+        "actor": _identity_to_obj(coordinator),
+        "coordinator_authorized": coordinator_authorized,
+        "owner_state": admission.owner_state,
+        "heartbeat_age_seconds": int(admission.age),
+        "salvage": list(salvage),
+        **(
+            {}
+            if admission.owner_consent is None
+            else {
+                "basis": OWNER_CONSENT_BASIS,
+                "handoff_sha256": admission.owner_consent.sha256,
+            }
+        ),
+        **(
+            {}
+            if admission.owner_release is None
+            else {
+                "basis": OWNER_RELEASE_BASIS,
+                "release_sequence": admission.owner_release.sequence,
+                "handoff_sha256": admission.owner_release.sha256,
+            }
+        ),
+        **(
+            {}
+            if admission.attested_stop is None
+            else {
+                "basis": ATTESTED_STOP_BASIS,
+                "attestation_note": admission.attested_stop.note,
+            }
+        ),
+        **(
+            {}
+            if admission.attested_never_started is None
+            else {
+                "basis": NEVER_STARTED_BASIS,
+                "attestation_note": admission.attested_never_started.note,
+            }
+        ),
+        **(
+            {}
+            if stale_image is None
+            else {"image_copies": [item.to_obj() for item in stale_holders]}
+        ),
+    }
+    return updated, payload
+
+
+class _PreparedRemovalRefused(Refusal):
+    """A retire-pending candidate refused by lock-free validation (#1287).
+
+    Nothing was written for this candidate (no attempt event, no salvage
+    of the slot itself beyond additive bundles), so the batch reports it
+    retained with this reason without re-validating under the lock.
+    """
+
+
+@dataclasses.dataclass
+class _PreparedRemoval:
+    """One retire-pending candidate validated and planned lock-free (#1287)."""
+
+    state: ActiveState
+    record: ActiveRecord
+    identity: _RegistryIdentity
+    fingerprint: _LockScopeFingerprint
+    journals: tuple[tuple[str, int, int], ...]
+    writer: _EventWriter
+    admission: _RemovalAdmission
+    salvage: tuple[dict[str, object], ...]
+    evidence_record: ActiveRecord | None
+    evidence_payload: dict[str, object] | None
+
+
+def _assert_prepared_removal_current(
+    config: Config, prepared: _PreparedRemoval
+) -> None:
+    """Refuse a prepared removal whose slot changed since its validation (#1287).
+
+    Compares only cheap identities under the lock: the registry identity
+    (one lstat per registry file), the journal fingerprint, and this
+    slot's lock-scope fingerprint (one rev-parse per checkout). A change
+    defers this slot by name; the batch goes on to its next candidate.
+    """
+
+    slot = prepared.record.slot
+    if (
+        _registry_identity(config) != prepared.identity
+        or _journal_fingerprint(config) != prepared.journals
+    ):
+        raise _RetirementDeferred(
+            f"slot {slot} changed between the lock-free validation and the "
+            "configuration lock; nothing was written for it from the stale "
+            "validation"
+        )
+    try:
+        current = _find_record(
+            _load_active_snapshot(config, require_repository=False), slot
+        )
+    except Refusal as exc:
+        raise _RetirementDeferred(
+            f"slot {slot} changed between the lock-free validation and the "
+            "configuration lock; nothing was written for it from the stale "
+            "validation"
+        ) from exc
+    if _record_to_obj(current) != _record_to_obj(prepared.record) or (
+        _lock_scope_fingerprint(config, current, _GitVcs()) != prepared.fingerprint
+    ):
+        raise _RetirementDeferred(
+            f"slot {slot} changed between the lock-free validation and the "
+            "configuration lock; nothing was written for it from the stale "
+            "validation"
+        )
+
+
+def _prepare_retirement_removal(
+    config: Config,
+    args: argparse.Namespace,
+    *,
+    coordinator: ProcessIdentity,
+    runner: ProcessIdentity,
+    handoff_writer: ProcessIdentity | None,
+    proof_fd: int | None,
+    agent_batch: _AgentRemoveBatchContext | None,
+    single_refusal: Refusal | None,
+    unlocked_refusal: Refusal | None,
+    live_use_recheck: _LiveUseRecheckBudget,
+    salvage_archive_root: Path | None,
+) -> _PreparedRemoval | None:
+    """Validate and plan one retire-pending candidate with no lock held (#1287).
+
+    Mirrors the locked removal's checks in their order, minus its writes:
+    the attempt event, the basis records and the finish journal are
+    committed later, under the lock, only while the registry identity and
+    this slot's fingerprint still match. Returns None when the locked
+    path must run instead (an outstanding journal, a missing event log,
+    or a grouped batch member). A refusal raised here is wrapped as
+    _PreparedRemovalRefused: nothing was written, so the batch retains
+    the candidate with that reason and goes on.
+    """
+
+    retirement_candidate = getattr(args, "_retirement_candidate", None)
+    if retirement_candidate is None or not isinstance(
+        retirement_candidate, _RetirementCandidate
+    ):
+        return None
+    if agent_batch is not None and agent_batch.group is not None:
+        return None
+    if _outstanding_journals(config):
+        return None
+    try:
+        states, _archives = _validate_global_state(
+            config, require_repository=False
+        )
+        state = _load_active(config, require_repository=False)
+        record = _find_record(state, args.slot)
+        _expected_generation(record, args.expected_generation)
+        if record.slot_type != "agent":
+            return None
+        if (
+            agent_batch is not None
+            and single_refusal is None
+            and unlocked_refusal is None
+        ):
+            _assert_unlocked_record_current(config, agent_batch, record)
+        _prepare_state_home_reclaim(
+            config, record.slot_type, record.slot, _GitVcs()
+        )
+        expected_identity = (
+            retirement_candidate.machine,
+            retirement_candidate.slot,
+            retirement_candidate.generation,
+        )
+        if expected_identity != (record.machine, record.slot, record.generation):
+            raise _RetirementDeferred(
+                "retirement candidate generation changed before its guarded attempt"
+            )
+        latest = _latest_handoff_read(record, _load_events(config, record.machine))
+        if latest is None or (
+            latest.sha256,
+            latest.retirement_enqueued,
+            latest.sequence,
+        ) != (
+            retirement_candidate.sha256,
+            True,
+            retirement_candidate.event_sequence,
+        ):
+            raise _RetirementDeferred(
+                "retirement candidate was superseded before its guarded attempt"
+            )
+        _assert_target_record_storage_consistent(
+            config, states, record, before_any_change=True
+        )
+        _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
+        if salvage_archive_root is not None and record.slot_type != "agent":
+            raise Refusal(
+                "--salvage-archive-root applies only to agent slots that require Git salvage"
+            )
+        if agent_batch is not None and record.slot_type != "agent":
+            raise Refusal(
+                "remove-agent-batch accepts only agent slots; use remove-validate-batch "
+                "for validation slots"
+            )
+        admission = _removal_admission(
+            config,
+            record,
+            coordinator=coordinator,
+            retirement_candidate=retirement_candidate,
+            attest_agent=None,
+            never_started_agent=None,
+            attest_note=None,
+            validate_complete=False,
+            coordinator_authorized=bool(args.coordinator_authorized),
+            include_owner_consented=(
+                getattr(args, "include_owner_consented", False) is True
+            ),
+            handoff_writer=handoff_writer,
+            agent_batch=agent_batch,
+            unlocked_refusal=unlocked_refusal,
+        )
+        slot_path = _assert_slot_contents(config, record)
+        _assert_no_uncommitted_handoffs(config, record, slot_path, _GitVcs())
+        _assert_handoff_read(config, record, slot_path)
+        if single_refusal is not None:
+            raise single_refusal
+        if unlocked_refusal is not None:
+            raise unlocked_refusal
+        if agent_batch is not None:
+            agent_batch.census.assert_slot_unused(
+                slot_path, None, ignore_current_process=False
+            )
+        _assert_slot_unused(
+            slot_path,
+            _record_for_slot_use_check(
+                record,
+                validate_complete=False,
+                allow_live_validate_owner=False,
+                owner_consented=(
+                    admission.owner_consent is not None
+                    or admission.owner_release is not None
+                ),
+            ),
+            use_lsof=True,
+            ignore_invoking_ancestry=False,
+            census=None,
+            live_use_recheck=live_use_recheck,
+            **_agent_batch_use_check(agent_batch, slot_path),
+        )
+        if not _event_files(_event_directory(config, record.machine)):
+            return None
+        salvage, evidence = _removal_salvage(
+            config,
+            record,
+            admission,
+            salvage_archive_root=salvage_archive_root,
+            archive_drifted=bool(getattr(args, "archive_drifted_checkouts", False)),
+            archive_private_history=bool(
+                getattr(args, "archive_private_history", False)
+            ),
+        )
+        evidence_write = _reclaim_evidence_write(
+            record,
+            admission,
+            coordinator=coordinator,
+            coordinator_authorized=bool(args.coordinator_authorized),
+            salvage=salvage,
+            evidence=evidence,
+            stale_image=None,
+            stale_holders=(),
+        )
+        sequence, tip = _chain_tip(config, record.machine)
+        writer = _EventWriter(
+            directory=_event_write_directory(config, record.machine),
+            machine=record.machine,
+            sequence=sequence,
+            previous_sha256="0" * 64 if tip is None else tip,
+        )
+        return _PreparedRemoval(
+            state=state,
+            record=record,
+            identity=_registry_identity(config),
+            fingerprint=_lock_scope_fingerprint(config, record, _GitVcs()),
+            journals=_journal_fingerprint(config),
+            writer=writer,
+            admission=admission,
+            salvage=salvage,
+            evidence_record=None if evidence_write is None else evidence_write[0],
+            evidence_payload=None if evidence_write is None else evidence_write[1],
+        )
+    except (_LockBusy, _RetirementDeferred):
+        raise
+    except _TargetStorageDrift as exc:
+        exc._lock_free_prepare = True  # type: ignore[attr-defined]
+        raise
+    except Refusal as exc:
+        raise _PreparedRemovalRefused(str(exc)) from exc
+
+
 
 
 def _cmd_remove(
@@ -51405,6 +52193,30 @@ def _cmd_remove_in_scope(
             archive_drifted=bool(getattr(args, "archive_drifted_checkouts", False)),
             archive_private_history=bool(getattr(args, "archive_private_history", False)),
         )
+    prepared_removal: _PreparedRemoval | None = None
+    if (
+        getattr(args, "_retirement_candidate", None) is not None
+        and private_cleanup is None
+        and validation_removal_proof is None
+        and not bool(args.validate_complete)
+        and proof_manifest is None
+        and attest_agent is None
+        and never_started_agent is None
+        and not discard_stale
+    ):
+        prepared_removal = _prepare_retirement_removal(
+            config,
+            args,
+            coordinator=coordinator,
+            runner=runner,
+            handoff_writer=handoff_writer,
+            proof_fd=proof_fd,
+            agent_batch=agent_batch,
+            single_refusal=single_refusal,
+            unlocked_refusal=unlocked_refusal,
+            live_use_recheck=live_use_recheck,
+            salvage_archive_root=salvage_archive_root,
+        )
     wait_deadline = getattr(args, "_wait_deadline", None)
     lock_scope = (
         _mutation_locks(config, args.wait_lock)
@@ -51415,82 +52227,22 @@ def _cmd_remove_in_scope(
     prepared_deferred_finish: _PreparedDeferredFinish | None = None
     finish_context: _FinishContext | None = None
     with lock_scope, _agent_batch_item_deadline(agent_batch):
-        _refuse_partial_state(
-            config,
-            allow_validate_batch_seals=private_cleanup is not None,
-        )
-        if not scoped_validation_finish:
-            _assert_no_journal(
-                config,
-                allowed=(
-                    frozenset()
-                    if agent_batch is None
-                    else frozenset(agent_batch.group_journals)
-                ),
-            )
-        states, archives = _validate_global_state(
-            config, require_repository=False
-        )
-        before = _global_rows(states, archives)
-        state = _load_active(config, require_repository=False)
-        record = _find_record(state, args.slot)
-        _expected_generation(record, args.expected_generation)
-        if (
-            agent_batch is not None
-            and single_refusal is None
-            and unlocked_refusal is None
-        ):
-            _assert_unlocked_record_current(config, agent_batch, record)
-        _prepare_state_home_reclaim(
-            config, record.slot_type, record.slot, _GitVcs()
-        )
-        if attest_agent is not None and (
-            record.slot_type != "agent" or record.agent != attest_agent
-        ):
-            raise Refusal(
-                f"--attest-agent-stopped names agent {attest_agent}, but slot "
-                f"{record.slot} is a {record.slot_type} slot recorded for agent "
-                f"{record.agent}. state: REFUSED -- no checkout was salvaged or removed"
-            )
-        if never_started_agent is not None and (
-            record.slot_type != "agent" or record.agent != never_started_agent
-        ):
-            raise Refusal(
-                f"--attest-agent-never-started names agent {never_started_agent}, but "
-                f"slot {record.slot} is a {record.slot_type} slot recorded for agent "
-                f"{record.agent}. state: REFUSED -- no checkout was salvaged or removed"
-            )
-        retirement_candidate = getattr(args, "_retirement_candidate", None)
-        if retirement_candidate is not None:
-            if not isinstance(retirement_candidate, _RetirementCandidate):
-                raise StateError("retirement queue candidate has an invalid type")
-            expected_identity = (
-                retirement_candidate.machine,
-                retirement_candidate.slot,
-                retirement_candidate.generation,
-            )
-            if expected_identity != (record.machine, record.slot, record.generation):
-                raise _RetirementDeferred(
-                    "retirement candidate generation changed before its guarded attempt"
-                )
-            latest = _latest_handoff_read(
-                record, _load_events(config, record.machine)
-            )
-            if latest is None or (
-                latest.sha256,
-                latest.retirement_enqueued,
-                latest.sequence,
-            ) != (
-                retirement_candidate.sha256,
-                True,
-                retirement_candidate.event_sequence,
-            ):
-                raise _RetirementDeferred(
-                    "retirement candidate was superseded before its guarded attempt"
-                )
-            _write_event_file(
-                config,
-                record.machine,
+        if prepared_removal is not None:
+            # One record commit (#1287): re-check this slot's identity,
+            # then write only its attempt, basis and finish-journal
+            # records. All validation, census and salvage ran lock-free
+            # in _prepare_retirement_removal; the deletion and its
+            # deciding census run after this lock is released.
+            _refuse_partial_state(config)
+            _assert_prepared_removal_current(config, prepared_removal)
+            _assert_no_journal(config)
+            retirement_candidate = getattr(args, "_retirement_candidate", None)
+            assert isinstance(retirement_candidate, _RetirementCandidate)
+            record = prepared_removal.record
+            state = prepared_removal.state
+            writer = prepared_removal.writer
+            admission = prepared_removal.admission
+            writer.append(
                 "retirement-attempted",
                 {
                     "slot": record.slot,
@@ -51501,701 +52253,507 @@ def _cmd_remove_in_scope(
                 },
             )
             _interrupt_for_test("after-retirement-attempt")
-        if private_cleanup is not None:
-            _assert_validate_batch_seal_target(
-                config,
+            basis = _removal_basis(
+                admission,
                 record,
-                private_cleanup.target.original_mode,
-                private_cleanup.target.identity,
-            )
-        _assert_target_record_storage_consistent(
-            config, states, record, before_any_change=True
-        )
-        _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
-        if args.validate_complete and record.slot_type != "validate":
-            raise Refusal(
-                "--validate-complete applies only to a slot created with --slot-type validate. "
-                "state: REFUSED -- no checkout was salvaged or removed. remedy: omit the flag "
-                "and satisfy the ordinary agent-slot reclaim conditions"
-            )
-        if salvage_archive_root is not None and record.slot_type != "agent":
-            raise Refusal(
-                "--salvage-archive-root applies only to agent slots that require Git salvage"
-            )
-        if agent_batch is not None and record.slot_type != "agent":
-            raise Refusal(
-                "remove-agent-batch accepts only agent slots; use remove-validate-batch "
-                "for validation slots"
-            )
-        create_rows: tuple[_CreateJournalClassification, ...] = ()
-        if scoped_validation_finish:
-            create_rows = _classify_disjoint_create_journals_for_record(
-                config, states, archives, record
-            )
-        _assert_not_held(config, record)
-        age, expired = _heartbeat_diagnosis(record)
-        owner_state, detail = _process_state(record.owner)
-        live_validate_owner = bool(
-            args.validate_complete
-            and owner_state == "live"
-            and record.owner == coordinator
-        )
-        owner_consent: _OwnerConsent | None = None
-        owner_release: _OwnerRelease | None = None
-        owner_unrecorded = _owner_record_is_absent(record)
-        # An explicit release by the exact owner process generation is the
-        # owner's own decision to give this generation back, so it is honoured
-        # by an explicit remove and by a retire-pending batch alike. It stands
-        # in for the owner's death and the heartbeat time-to-live only; the
-        # handoff read, the direct-use check, salvage and holds still apply.
-        if (
-            record.slot_type == "agent"
-            and owner_state in ("live", "dead")
-            and not args.validate_complete
-            and not owner_unrecorded
-        ):
-            owner_release = _owner_release_in_effect(
-                config, record, _load_events(config, record.machine)
-            )
-        # An explicit remove names one slot, so running it is the coordinator's
-        # decision for that slot. A retire-pending batch selects slots itself
-        # and a scheduler may pass --coordinator-authorized for it, so it may
-        # use owner consent only when the caller opted in for the batch.
-        # Otherwise a live owner keeps the original refusal and is retained.
-        owner_consent_allowed = retirement_candidate is None or (
-            getattr(args, "include_owner_consented", False) is True
-        )
-        if (
-            owner_release is None
-            and owner_consent_allowed
-            and record.slot_type == "agent"
-            and owner_state == "live"
-            and not args.validate_complete
-            and not _owner_record_is_absent(record)
-        ):
-            owner_consent = _owner_consented_release(
-                config,
-                record,
-                detail,
-                events=_load_events(config, record.machine),
+                coordinator=coordinator,
                 coordinator_authorized=bool(args.coordinator_authorized),
-                expired=expired,
-                age=age,
             )
-        consent_liveness: tuple[str, str] | None = None
-        attested_stop: _AttestedStop | None = None
-        attested_never_started: _AttestedStop | None = None
-        dead_liveness_detail: str | None = None
-        if live_validate_owner:
-            if handoff_writer is None:
-                _assert_caller_process(coordinator, "validate owner")
-        elif owner_consent is not None or owner_release is not None:
-            # The registered liveness authority answers "is the owner still
-            # running?", and for a consenting or releasing owner the answer may
-            # be yes by construction. Record its answer as evidence; do not
-            # gate on it.
-            consent_liveness = _registered_liveness_state(config, record)
-        elif record.slot_type == "agent":
-            answer = _registered_liveness_answer(config, record)
-            if answer.state == "dead":
-                dead_liveness_detail = answer.detail
-            if answer.state != "dead":
-                # Only the authority's exact "no record of this agent" can be
-                # stood in for, and only for an owner generation proven dead.
-                # A registered agent the authority cannot verify (an active
-                # record that was never stopped, an incomplete rename) keeps
-                # refusing: it may still be running. A verdict resting on
-                # unattributed panes is scoped to this slot instead (#993).
-                attestable = (
-                    answer.unregistered
-                    and owner_state == "dead"
-                    and not owner_unrecorded
+            if basis is not None:
+                basis_action, basis_evidence = basis
+                advanced = _replace_record(state, record)
+                _write_active_state(
+                    config,
+                    advanced,
+                    action=basis_action,
+                    slot=record.slot,
+                    evidence=basis_evidence,
+                    require_repository=False,
+                    event_writer=writer,
+                    previous=state,
                 )
-                # A name the session tooling cannot use can never be judged at all, so
-                # neither the ordinary gate nor the attested stop can ever pass. Only the
-                # negative space in wrkslots' own records can prove such a slot free: no
-                # owner recorded now, none ever recorded for this generation, and the
-                # authority answering unverifiable rather than alive.
-                never_started_proven = (
-                    answer.state == "unverifiable"
-                    and record.owner is None
-                    and not _agent_name_usable(record.agent)
-                    and _slot_never_had_owner(
-                        record, _load_events(config, record.machine)
+                state = advanced
+            writer.append(
+                "reclaim-started",
+                {
+                    "slot": record.slot,
+                    "generation": record.generation,
+                    "actor": _identity_to_obj(coordinator),
+                    "runner": _identity_to_obj(runner),
+                    "handoff_writer": (
+                        None
+                        if handoff_writer is None
+                        else _identity_to_obj(handoff_writer)
+                    ),
+                    "coordinator_authorized": bool(args.coordinator_authorized),
+                    "owner_state": admission.owner_state,
+                    "registered_liveness": (
+                        "dead"
+                        if admission.consent_liveness is None
+                        else admission.consent_liveness[0]
+                    ),
+                    "heartbeat_age_seconds": int(admission.age),
+                    "heartbeat_ttl_seconds": record.heartbeat_ttl_seconds,
+                    "validate_complete": False,
+                    "live_validate_owner": admission.live_validate_owner,
+                    "salvage_archive_root": (
+                        None
+                        if salvage_archive_root is None
+                        else str(salvage_archive_root)
+                    ),
+                },
+            )
+            if prepared_removal.evidence_record is not None:
+                record = prepared_removal.evidence_record
+                advanced = _replace_record(state, record)
+                _write_active_state(
+                    config,
+                    advanced,
+                    action="reclaim-evidence-recorded",
+                    slot=record.slot,
+                    evidence=prepared_removal.evidence_payload or {},
+                    require_repository=False,
+                    event_writer=writer,
+                    previous=state,
+                )
+                state = advanced
+            finish_context = _FinishContext(
+                mode="remove",
+                actor="coordinator",
+                archive_nested=(
+                    record.slot_type == "agent"
+                    and bool(
+                        getattr(args, "archive_nested_cache_repositories", False)
                     )
-                )
-                if never_started_agent is not None:
-                    if not never_started_proven:
-                        raise Refusal(
-                            f"cannot remove {record.slot}: "
-                            "--attest-agent-never-started applies only when no owner "
-                            "was ever recorded for this slot generation, the recorded "
-                            f"agent name {record.agent!r} is one the session tooling "
-                            "cannot use, and the registered liveness authority answers "
-                            "unverifiable rather than alive. state: REFUSED -- no "
-                            "checkout was salvaged or removed"
-                        )
-                    assert attest_note is not None
-                    attested_never_started = _AttestedStop(
-                        note=attest_note, liveness_detail=answer.detail
-                    )
-                    consent_liveness = (answer.state, answer.detail)
-                elif not attestable:
-                    if attest_agent is None and never_started_proven:
-                        raise Refusal(
-                            f"cannot remove {record.slot}: its recorded agent name "
-                            f"{record.agent!r} is one the session tooling cannot use, "
-                            "so the registered liveness authority can never judge "
-                            f"it ({answer.detail}). state: REFUSED -- no checkout "
-                            "was salvaged or removed. remedy: no owner was ever "
-                            "recorded for this slot generation, so if the coordinator "
-                            "knows no agent was ever started in it, rerun this one "
-                            "explicit remove with --coordinator-authorized "
-                            f"--attest-agent-never-started {record.agent} "
-                            "--attest-note TEXT stating that basis; the attestation "
-                            "is recorded in the event log, and the heartbeat "
-                            "time-to-live, process-use, Git and salvage checks "
-                            "still run"
-                        )
-                    if (
-                        answer.state == "unverifiable"
-                        and "pane" in answer.detail.lower()
-                        and "archived-record-pane" not in answer.detail.lower()
-                    ):
-                        # #993 (criteria 1-2): a verdict that rests on panes
-                        # the authority cannot attribute to any registered
-                        # agent vetoes this removal only if a live process
-                        # actually references this slot. The slot-scoped
-                        # census is the same proof the absent-row extension
-                        # (28f01ef0) uses; every other storage-side guard
-                        # (owner generation, time-to-live, handoff, direct
-                        # use, salvage) still runs unchanged below.
-                        _assert_pane_verdict_slot_unused(
-                            config, record, agent_batch, unlocked_refusal
-                        )
-                        if attest_agent is not None:
-                            print(
-                                "NOTE: --attest-agent-stopped was not needed: the "
-                                "unattributed-pane verdict does not reference this "
-                                "slot, so no attestation was recorded",
-                                file=sys.stderr,
-                            )
-                        consent_liveness = (answer.state, answer.detail)
-                    else:
-                        _refuse_registered_liveness(answer.state, answer.detail)
-                elif attest_agent is None:
-                    _refuse_registered_liveness(
-                        answer.state, answer.detail, attest_agent=record.agent
-                    )
-                else:
-                    assert attest_note is not None
-                    attested_stop = _AttestedStop(
-                        note=attest_note, liveness_detail=answer.detail
-                    )
-                    consent_liveness = (answer.state, answer.detail)
-            elif attest_agent is not None:
-                print(
-                    "NOTE: --attest-agent-stopped was not needed: the registered "
-                    "liveness authority reports the agent dead; no attestation was "
-                    "recorded",
-                    file=sys.stderr,
-                )
-            elif never_started_agent is not None:
-                print(
-                    "NOTE: --attest-agent-never-started was not needed: the "
-                    "registered liveness authority reports the agent dead; no "
-                    "attestation was recorded",
-                    file=sys.stderr,
-                )
-        else:
-            _assert_owner_liveness(config, record)
-        # A release stops this generation's heartbeat (heartbeat refuses while
-        # it is in effect) and is bound to the heartbeat stamp, so any renewal
-        # voids it. Waiting for the time-to-live would only re-prove what the
-        # exact owner already declared.
-        if not expired and not args.validate_complete and owner_release is None:
-            remaining = max(1, record.heartbeat_ttl_seconds - int(age))
-            raise Refusal(
-                f"slot {record.slot} heartbeat is {int(age)}s old and its "
-                f"{record.heartbeat_ttl_seconds}s time-to-live has not expired. state: "
-                "REFUSED -- no checkout was salvaged or removed. remedy: wait at least "
-                f"{remaining}s without renewal before retrying remove; if the owner is still "
-                "working, have it run 'wrkslots heartbeat' instead"
+                ),
+                salvage=prepared_removal.salvage,
+                validate_complete=False,
+                allow_live_validate_owner=admission.live_validate_owner,
+                private_cleanup=None,
+                validation_removal_proof=None,
+                live_use_recheck=live_use_recheck,
+                owner_consented=admission.owner_consent is not None
+                or admission.owner_release is not None,
+                agent_batch=agent_batch,
+                stale_copy_discard_sequence=None,
+                prepared_lock_free=True,
             )
-        # An absent or degenerate owner record no longer blocks removal. The
-        # heartbeat has already expired above, and every guard that actually
-        # protects work still runs below: the handoff read, the direct-use
-        # check, and salvage before delete. See _owner_record_is_absent.
-        if (
-            owner_state != "dead"
-            and not live_validate_owner
-            and not owner_unrecorded
-            and owner_consent is None
-            and owner_release is None
-        ):
-            raise Refusal(
-                f"remove requires a proven-dead recorded owner; owner is {owner_state}: {detail}. "
-                "state: REFUSED -- no checkout was salvaged or removed. remedy: wait for the "
-                "exact owner process to exit and for the time-to-live to remain expired; if "
-                "process evidence is unavailable, repair that evidence rather than treating the "
-                "slot as free"
-            )
-        if stale_image is not None:
-            if record.slot_type != "agent":
-                raise Refusal(
-                    "--discard-stale-image-copy applies only to an agent slot. state: "
-                    "REFUSED -- no checkout was salvaged or removed"
-                )
-            if _stale_image_copies(config, stale_image) != tuple(
-                sorted(
-                    (Path(item.mount_point), item.device, item.name) for item in stale_holders
-                )
-            ):
-                raise Refusal(
-                    f"the stale attachments of slot {record.slot}'s image changed before the "
-                    "registry lock was taken; nothing was salvaged or removed; retry"
-                )
-            print(
-                f"WARNING: discarding the stale image copies of slot {record.slot} "
-                f"({', '.join(item.name for item in stale_holders)}): anything written only "
-                "through them is not salvaged; salvage reads this host's own file system",
-                file=sys.stderr,
-            )
-            _enable_stale_copy_discard(config, stale_image)
-        slot_path = _assert_slot_contents(config, record)
-        _assert_no_uncommitted_handoffs(config, record, slot_path, _GitVcs())
-        _assert_handoff_read(config, record, slot_path)
-        if private_cleanup is not None:
-            if private_cleanup.target.path != slot_path:
-                raise StateError("private cleanup context does not match its slot path")
-            if (
-                _private_cleanup_fence_identity(config, slot_path)
-                != private_cleanup.target.identity
-            ):
-                raise Refusal(
-                    f"private cleanup path identity changed after its shared census: "
-                    f"{slot_path}"
-                )
-        if single_refusal is not None:
-            raise single_refusal
-        if unlocked_refusal is not None:
-            raise unlocked_refusal
-        if single_item and agent_batch is not None:
-            # However long the registry-lock wait made this scan, it decides no
-            # deletion: the scan after the fence does (#956, #1108).
-            # The batch's checks skip the invoking process, which opens the
-            # slot while it removes it.  When lsof ran, before the lock, it had
-            # not yet opened it, so a descriptor, mapping or directory lsof
-            # reported for it was inherited and is a use, which the ordinary
-            # lsof check refused as it refuses any other.
-            agent_batch.census.assert_slot_unused(
-                slot_path, None, ignore_current_process=False
-            )
-        _assert_slot_unused(
-            slot_path,
-            _record_for_slot_use_check(
+            prepared_finish = _begin_finish(
+                config,
+                state,
                 record,
-                validate_complete=bool(args.validate_complete),
-                allow_live_validate_owner=live_validate_owner,
-                owner_consented=owner_consent is not None or owner_release is not None,
-            ),
-            use_lsof=not live_validate_owner,
-            ignore_invoking_ancestry=live_validate_owner,
-            census=None if private_cleanup is None else private_cleanup.shared_census,
-            live_use_recheck=live_use_recheck,
-            **_agent_batch_use_check(agent_batch, slot_path),
-        )
-        if scoped_validation_finish:
-            boundary_states, boundary_archives = _validate_global_state(
+                finish_context,
+                journal_path=_journal_path(config),
+                defer_deletion=True,
+                event_writer=writer,
+                previous_state=state,
+            )
+            if not isinstance(prepared_finish, _PreparedDeferredFinish):
+                raise StateError("prepared retirement removal did not defer its deletion")
+            prepared_deferred_finish = prepared_finish
+        else:
+            _refuse_partial_state(
+                config,
+                allow_validate_batch_seals=private_cleanup is not None,
+            )
+            if not scoped_validation_finish:
+                _assert_no_journal(
+                    config,
+                    allowed=(
+                        frozenset()
+                        if agent_batch is None
+                        else frozenset(agent_batch.group_journals)
+                    ),
+                )
+            states, archives = _validate_global_state(
                 config, require_repository=False
             )
-            boundary_state = next(
-                item for item in boundary_states if item.machine == config.machine
+            before = _global_rows(states, archives)
+            state = _load_active(config, require_repository=False)
+            record = _find_record(state, args.slot)
+            _expected_generation(record, args.expected_generation)
+            if (
+                agent_batch is not None
+                and single_refusal is None
+                and unlocked_refusal is None
+            ):
+                _assert_unlocked_record_current(config, agent_batch, record)
+            _prepare_state_home_reclaim(
+                config, record.slot_type, record.slot, _GitVcs()
             )
-            boundary_record = _find_record(boundary_state, record.slot)
-            if _record_to_obj(boundary_record) != _record_to_obj(record):
+            if attest_agent is not None and (
+                record.slot_type != "agent" or record.agent != attest_agent
+            ):
                 raise Refusal(
-                    f"slot {record.slot} changed while interrupted creates were classified"
+                    f"--attest-agent-stopped names agent {attest_agent}, but slot "
+                    f"{record.slot} is a {record.slot_type} slot recorded for agent "
+                    f"{record.agent}. state: REFUSED -- no checkout was salvaged or removed"
+                )
+            if never_started_agent is not None and (
+                record.slot_type != "agent" or record.agent != never_started_agent
+            ):
+                raise Refusal(
+                    f"--attest-agent-never-started names agent {never_started_agent}, but "
+                    f"slot {record.slot} is a {record.slot_type} slot recorded for agent "
+                    f"{record.agent}. state: REFUSED -- no checkout was salvaged or removed"
+                )
+            retirement_candidate = getattr(args, "_retirement_candidate", None)
+            if retirement_candidate is not None:
+                if not isinstance(retirement_candidate, _RetirementCandidate):
+                    raise StateError("retirement queue candidate has an invalid type")
+                expected_identity = (
+                    retirement_candidate.machine,
+                    retirement_candidate.slot,
+                    retirement_candidate.generation,
+                )
+                if expected_identity != (record.machine, record.slot, record.generation):
+                    raise _RetirementDeferred(
+                        "retirement candidate generation changed before its guarded attempt"
+                    )
+                latest = _latest_handoff_read(
+                    record, _load_events(config, record.machine)
+                )
+                if latest is None or (
+                    latest.sha256,
+                    latest.retirement_enqueued,
+                    latest.sequence,
+                ) != (
+                    retirement_candidate.sha256,
+                    True,
+                    retirement_candidate.event_sequence,
+                ):
+                    raise _RetirementDeferred(
+                        "retirement candidate was superseded before its guarded attempt"
+                    )
+                _write_event_file(
+                    config,
+                    record.machine,
+                    "retirement-attempted",
+                    {
+                        "slot": record.slot,
+                        "generation": record.generation,
+                        "sha256": retirement_candidate.sha256,
+                        "handoff_read_sequence": retirement_candidate.event_sequence,
+                        "reason": "selected by bounded retirement queue",
+                    },
+                )
+                _interrupt_for_test("after-retirement-attempt")
+            if private_cleanup is not None:
+                _assert_validate_batch_seal_target(
+                    config,
+                    record,
+                    private_cleanup.target.original_mode,
+                    private_cleanup.target.identity,
                 )
             _assert_target_record_storage_consistent(
-                config, boundary_states, boundary_record
+                config, states, record, before_any_change=True
             )
-            _recheck_disjoint_create_journals_for_record(
+            _assert_remove_processes(coordinator, runner, handoff_writer, proof_fd)
+            if args.validate_complete and record.slot_type != "validate":
+                raise Refusal(
+                    "--validate-complete applies only to a slot created with --slot-type validate. "
+                    "state: REFUSED -- no checkout was salvaged or removed. remedy: omit the flag "
+                    "and satisfy the ordinary agent-slot reclaim conditions"
+                )
+            if salvage_archive_root is not None and record.slot_type != "agent":
+                raise Refusal(
+                    "--salvage-archive-root applies only to agent slots that require Git salvage"
+                )
+            if agent_batch is not None and record.slot_type != "agent":
+                raise Refusal(
+                    "remove-agent-batch accepts only agent slots; use remove-validate-batch "
+                    "for validation slots"
+                )
+            create_rows: tuple[_CreateJournalClassification, ...] = ()
+            if scoped_validation_finish:
+                create_rows = _classify_disjoint_create_journals_for_record(
+                    config, states, archives, record
+                )
+            admission = _removal_admission(
                 config,
-                create_rows,
-                boundary_states,
-                boundary_archives,
-                boundary_record,
+                record,
+                coordinator=coordinator,
+                retirement_candidate=retirement_candidate,
+                attest_agent=attest_agent,
+                never_started_agent=never_started_agent,
+                attest_note=attest_note,
+                validate_complete=bool(args.validate_complete),
+                coordinator_authorized=bool(args.coordinator_authorized),
+                include_owner_consented=(
+                    getattr(args, "include_owner_consented", False) is True
+                ),
+                handoff_writer=handoff_writer,
+                agent_batch=agent_batch,
+                unlocked_refusal=unlocked_refusal,
             )
-        _ensure_event_log(
-            config, record.machine, require_repository=False
-        )
-        if stale_image is not None:
-            # Durable before any salvage or deletion, beside whatever basis
-            # admitted the removal. Its sequence is written into the evidence
-            # of the event recorded just before this removal's finish journal,
-            # so recovery honours it only for this removal
-            # (_recorded_stale_copy_discard), and only for these devices.
-            state = _replace_record(state, record)
-            stale_copy_discard_sequence = _as_int(
+            age, expired = admission.age, admission.expired
+            owner_state, detail = admission.owner_state, admission.detail
+            live_validate_owner = admission.live_validate_owner
+            owner_consent, owner_release = admission.owner_consent, admission.owner_release
+            consent_liveness = admission.consent_liveness
+            attested_stop = admission.attested_stop
+            attested_never_started = admission.attested_never_started
+            dead_liveness_detail = admission.dead_liveness_detail
+            if stale_image is not None:
+                if record.slot_type != "agent":
+                    raise Refusal(
+                        "--discard-stale-image-copy applies only to an agent slot. state: "
+                        "REFUSED -- no checkout was salvaged or removed"
+                    )
+                if _stale_image_copies(config, stale_image) != tuple(
+                    sorted(
+                        (Path(item.mount_point), item.device, item.name) for item in stale_holders
+                    )
+                ):
+                    raise Refusal(
+                        f"the stale attachments of slot {record.slot}'s image changed before the "
+                        "registry lock was taken; nothing was salvaged or removed; retry"
+                    )
+                print(
+                    f"WARNING: discarding the stale image copies of slot {record.slot} "
+                    f"({', '.join(item.name for item in stale_holders)}): anything written only "
+                    "through them is not salvaged; salvage reads this host's own file system",
+                    file=sys.stderr,
+                )
+                _enable_stale_copy_discard(config, stale_image)
+            slot_path = _assert_slot_contents(config, record)
+            _assert_no_uncommitted_handoffs(config, record, slot_path, _GitVcs())
+            _assert_handoff_read(config, record, slot_path)
+            if private_cleanup is not None:
+                if private_cleanup.target.path != slot_path:
+                    raise StateError("private cleanup context does not match its slot path")
+                if (
+                    _private_cleanup_fence_identity(config, slot_path)
+                    != private_cleanup.target.identity
+                ):
+                    raise Refusal(
+                        f"private cleanup path identity changed after its shared census: "
+                        f"{slot_path}"
+                    )
+            if single_refusal is not None:
+                raise single_refusal
+            if unlocked_refusal is not None:
+                raise unlocked_refusal
+            if single_item and agent_batch is not None:
+                # However long the registry-lock wait made this scan, it decides no
+                # deletion: the scan after the fence does (#956, #1108).
+                # The batch's checks skip the invoking process, which opens the
+                # slot while it removes it.  When lsof ran, before the lock, it had
+                # not yet opened it, so a descriptor, mapping or directory lsof
+                # reported for it was inherited and is a use, which the ordinary
+                # lsof check refused as it refuses any other.
+                agent_batch.census.assert_slot_unused(
+                    slot_path, None, ignore_current_process=False
+                )
+            _assert_slot_unused(
+                slot_path,
+                _record_for_slot_use_check(
+                    record,
+                    validate_complete=bool(args.validate_complete),
+                    allow_live_validate_owner=live_validate_owner,
+                    owner_consented=admission.owner_consent is not None
+                or admission.owner_release is not None,
+                ),
+                use_lsof=not live_validate_owner,
+                ignore_invoking_ancestry=live_validate_owner,
+                census=None if private_cleanup is None else private_cleanup.shared_census,
+                live_use_recheck=live_use_recheck,
+                **_agent_batch_use_check(agent_batch, slot_path),
+            )
+            if scoped_validation_finish:
+                boundary_states, boundary_archives = _validate_global_state(
+                    config, require_repository=False
+                )
+                boundary_state = next(
+                    item for item in boundary_states if item.machine == config.machine
+                )
+                boundary_record = _find_record(boundary_state, record.slot)
+                if _record_to_obj(boundary_record) != _record_to_obj(record):
+                    raise Refusal(
+                        f"slot {record.slot} changed while interrupted creates were classified"
+                    )
+                _assert_target_record_storage_consistent(
+                    config, boundary_states, boundary_record
+                )
+                _recheck_disjoint_create_journals_for_record(
+                    config,
+                    create_rows,
+                    boundary_states,
+                    boundary_archives,
+                    boundary_record,
+                )
+            _ensure_event_log(
+                config, record.machine, require_repository=False
+            )
+            if stale_image is not None:
+                # Durable before any salvage or deletion, beside whatever basis
+                # admitted the removal. Its sequence is written into the evidence
+                # of the event recorded just before this removal's finish journal,
+                # so recovery honours it only for this removal
+                # (_recorded_stale_copy_discard), and only for these devices.
+                state = _replace_record(state, record)
+                stale_copy_discard_sequence = _as_int(
+                    _write_active_state(
+                        config,
+                        state,
+                        action=STALE_COPY_DISCARD_ACTION,
+                        slot=record.slot,
+                        evidence={
+                            "generation": record.generation,
+                            "actor": _identity_to_obj(coordinator),
+                            "coordinator_authorized": True,
+                            "image": str(stale_image.slot_image),
+                            "image_copies": [item.to_obj() for item in stale_holders],
+                        },
+                        require_repository=False,
+                    )["sequence"],
+                    "stale image copy discard event sequence",
+                    minimum=1,
+                )
+            basis = _removal_basis(
+                admission,
+                record,
+                coordinator=coordinator,
+                coordinator_authorized=bool(args.coordinator_authorized),
+            )
+            if basis is not None:
+                basis_action, basis_evidence = basis
+                state = _replace_record(state, record)
                 _write_active_state(
                     config,
                     state,
-                    action=STALE_COPY_DISCARD_ACTION,
+                    action=basis_action,
                     slot=record.slot,
-                    evidence={
-                        "generation": record.generation,
-                        "actor": _identity_to_obj(coordinator),
-                        "coordinator_authorized": True,
-                        "image": str(stale_image.slot_image),
-                        "image_copies": [item.to_obj() for item in stale_holders],
-                    },
+                    evidence=basis_evidence,
                     require_repository=False,
-                )["sequence"],
-                "stale image copy discard event sequence",
-                minimum=1,
-            )
-        if owner_consent is not None:
-            # Record the basis BEFORE any salvage or deletion so the removal
-            # is attributable from the append-only history alone, and so an
-            # interrupted removal can re-derive the same consent on recovery.
-            assert consent_liveness is not None
-            state = _replace_record(state, record)
-            _write_active_state(
-                config,
-                state,
-                action=OWNER_CONSENT_ACTION,
-                slot=record.slot,
-                evidence=_owner_consent_evidence(
-                    record,
-                    owner_consent,
-                    coordinator=coordinator,
-                    coordinator_authorized=bool(args.coordinator_authorized),
-                    age=age,
-                    registered_liveness=consent_liveness,
-                ),
-                require_repository=False,
-            )
-        elif owner_release is not None:
-            # Same reason as for consent: the basis is durable before any
-            # salvage or deletion, and recovery resumes only this exact release.
-            assert consent_liveness is not None
-            state = _replace_record(state, record)
-            _write_active_state(
-                config,
-                state,
-                action=OWNER_RELEASE_ACTION,
-                slot=record.slot,
-                evidence=_owner_release_evidence(
-                    record,
-                    owner_release,
-                    coordinator=coordinator,
-                    coordinator_authorized=bool(args.coordinator_authorized),
-                    owner_state=owner_state,
-                    age=age,
-                    registered_liveness=consent_liveness,
-                ),
-                require_repository=False,
-            )
-        elif attested_stop is not None:
-            # Same reason as for consent: the coordinator's attestation is
-            # durable before any salvage or deletion, and recovery resumes
-            # only this exact attestation.
-            state = _replace_record(state, record)
-            _write_active_state(
-                config,
-                state,
-                action=ATTESTED_STOP_ACTION,
-                slot=record.slot,
-                evidence=_attested_stop_evidence(
-                    record,
-                    attested_stop,
-                    coordinator=coordinator,
-                    owner_detail=detail,
-                    age=age,
-                ),
-                require_repository=False,
-            )
-        elif attested_never_started is not None:
-            # Same reason as for the attested stop: durable before salvage,
-            # and recovery resumes only this exact attestation.
-            state = _replace_record(state, record)
-            _write_active_state(
-                config,
-                state,
-                action=NEVER_STARTED_ACTION,
-                slot=record.slot,
-                evidence=_never_started_evidence(
-                    record,
-                    attested_never_started,
-                    coordinator=coordinator,
-                    owner_detail=detail,
-                    age=age,
-                ),
-                require_repository=False,
-            )
-        elif dead_liveness_detail is not None:
-            # Inside this same registry-lock hold, before salvage, like the
-            # records above: no extra lock round trip (#994, #1108).
-            state = _replace_record(state, record)
-            _write_active_state(
-                config,
-                state,
-                action=REGISTERED_LIVENESS_ACTION,
-                slot=record.slot,
-                evidence=_registered_liveness_evidence(record, dead_liveness_detail),
-                require_repository=False,
-            )
-        _write_event_file(
-            config,
-            record.machine,
-            "reclaim-started",
-            {
-                "slot": record.slot,
-                "generation": record.generation,
-                "actor": _identity_to_obj(coordinator),
-                "runner": _identity_to_obj(runner),
-                "handoff_writer": (
-                    None
-                    if handoff_writer is None
-                    else _identity_to_obj(handoff_writer)
-                ),
-                "coordinator_authorized": bool(args.coordinator_authorized),
-                "owner_state": owner_state,
-                "registered_liveness": (
-                    "dead" if consent_liveness is None else consent_liveness[0]
-                ),
-                "heartbeat_age_seconds": int(age),
-                "heartbeat_ttl_seconds": record.heartbeat_ttl_seconds,
-                "validate_complete": bool(args.validate_complete),
-                "live_validate_owner": live_validate_owner,
-                "salvage_archive_root": (
-                    None if salvage_archive_root is None else str(salvage_archive_root)
-                ),
-            },
-        )
-        salvage: tuple[dict[str, object], ...]
-        evidence: tuple[str, ...]
-        if record.slot_type == "validate":
-            salvage = ()
-            evidence = (
-                "slot type validate: authored work is excluded by construction, so salvage was not run",
-            )
-        elif not record.checkouts and record.import_source is not None:
-            salvage = ()
-            evidence = (
-                "historical agent slot contains no checkout and its exact contents were "
-                "verified before deletion, so there was no checkout to salvage",
-            )
-        else:
-            archive_drifted = bool(getattr(args, "archive_drifted_checkouts", False))
-            # Drift is archived only when the owner is proven dead: its exact
-            # process identity is gone (or no owner was ever recorded) and the
-            # registered liveness command answered dead. Without a release that
-            # command was required above; with a release it was only recorded,
-            # so its answer is required here. An owner that is still alive, or
-            # consented while alive, can restore its own checkout first.
-            owner_proven_dead = (
-                (
-                    owner_release is None
-                    and attested_stop is None
-                    and attested_never_started is None
-                    and (owner_state == "dead" or owner_unrecorded)
                 )
-                or (
-                    owner_release is not None
-                    and owner_state == "dead"
-                    and consent_liveness is not None
-                    and consent_liveness[0] == "dead"
-                )
+            _write_event_file(
+                config,
+                record.machine,
+                "reclaim-started",
+                {
+                    "slot": record.slot,
+                    "generation": record.generation,
+                    "actor": _identity_to_obj(coordinator),
+                    "runner": _identity_to_obj(runner),
+                    "handoff_writer": (
+                        None
+                        if handoff_writer is None
+                        else _identity_to_obj(handoff_writer)
+                    ),
+                    "coordinator_authorized": bool(args.coordinator_authorized),
+                    "owner_state": owner_state,
+                    "registered_liveness": (
+                        "dead"
+                        if admission.consent_liveness is None
+                        else admission.consent_liveness[0]
+                    ),
+                    "heartbeat_age_seconds": int(age),
+                    "heartbeat_ttl_seconds": record.heartbeat_ttl_seconds,
+                    "validate_complete": bool(args.validate_complete),
+                    "live_validate_owner": admission.live_validate_owner,
+                    "salvage_archive_root": (
+                        None if salvage_archive_root is None else str(salvage_archive_root)
+                    ),
+                },
             )
-            drift_refusal = (
-                None
-                if owner_proven_dead and owner_consent is None and not live_validate_owner
-                else (
-                    "--archive-drifted-checkouts archives drift only when the "
-                    "recorded owner is proven dead by its exact process identity "
-                    "and by the registered liveness command; the owner here is "
-                    f"{owner_state}"
-                    + (
-                        ""
-                        if consent_liveness is None
-                        else f" and registered liveness says {consent_liveness[0]}"
-                    )
-                    + (
-                        ", so have it restore its recorded branch and remote first"
-                        if attested_stop is None and attested_never_started is None
-                        else "; a coordinator's attestation that an unregistered agent "
-                        "stopped is not the authority's 'dead', so restore the recorded "
-                        "branch and remote first, or remove without "
-                        "--archive-drifted-checkouts"
-                        if attested_never_started is None
-                        else "; a coordinator's attestation that no agent was ever "
-                        "started is not the authority's 'dead', so restore the "
-                        "recorded branch and remote first, or remove without "
-                        "--archive-drifted-checkouts"
-                    )
-                )
-            )
-            salvage = _salvage_agent_slot(
+            salvage, evidence = _removal_salvage(
                 config,
                 record,
-                _GitVcs(),
-                archive_root=salvage_archive_root,
-                archive_drifted=archive_drifted,
-                drift_refusal=drift_refusal,
-                owner_proven_dead=owner_proven_dead,
+                admission,
+                salvage_archive_root=salvage_archive_root,
+                archive_drifted=bool(getattr(args, "archive_drifted_checkouts", False)),
                 archive_private_history=bool(
                     getattr(args, "archive_private_history", False)
                 ),
             )
-            evidence = tuple(
-                f"checkout {item['checkout']}: {item['disposition']} commit "
-                f"{item['salvage_commit']}"
-                + (
-                    f" at {item['remote_ref']}"
-                    if item.get("remote_ref") is not None
-                    else (
-                        f" bundled locally in {item['archive_bundle']}"
-                        if item["disposition"] == "archived-local"
-                        else " on an existing remote ref"
-                    )
-                )
-                for item in salvage
-            )
-        if record.handoff is None:
-            continuation = (
-                f"wrkslots remove {record.slot} --coordinator-pid <current-coordinator-pid> "
-                f"--expected-generation {record.generation}"
-            )
-            record = dataclasses.replace(
+            evidence_write = _reclaim_evidence_write(
                 record,
-                handoff=Handoff(
-                    recorded_at=_utc_now(),
-                    validation=evidence,
-                    limitations=(),
-                    continuation=continuation,
-                ),
+                admission,
+                coordinator=coordinator,
+                coordinator_authorized=bool(args.coordinator_authorized),
+                salvage=salvage,
+                evidence=evidence,
+                stale_image=stale_image,
+                stale_holders=stale_holders,
             )
-            state = _replace_record(state, record)
-            _write_active_state(
+            if evidence_write is not None:
+                record, evidence_payload = evidence_write
+                state = _replace_record(state, record)
+                _write_active_state(
+                    config,
+                    state,
+                    action="reclaim-evidence-recorded",
+                    slot=record.slot,
+                    evidence=evidence_payload,
+                    require_repository=False,
+                )
+            finish_context = _FinishContext(
+                mode="remove",
+                actor="coordinator",
+                archive_nested=(
+                    record.slot_type == "agent"
+                    and bool(getattr(args, "archive_nested_cache_repositories", False))
+                ),
+                salvage=salvage,
+                validate_complete=bool(args.validate_complete),
+                allow_live_validate_owner=admission.live_validate_owner,
+                private_cleanup=private_cleanup,
+                validation_removal_proof=validation_removal_proof,
+                live_use_recheck=live_use_recheck,
+                owner_consented=owner_consent is not None or owner_release is not None,
+                agent_batch=agent_batch,
+                stale_copy_discard_sequence=stale_copy_discard_sequence,
+            )
+            # An ordinary removal fences and journals under the lock, deletes
+            # the fenced tree with the lock released, and re-takes the lock only
+            # to record completion (#894).  The private-cleanup and scoped
+            # validation finishes keep their own out-of-lock shapes.
+            defer_deletion = (
+                private_cleanup is None
+                and not scoped_validation_finish
+                and validation_removal_proof is None
+            )
+            prepared_finish = _begin_finish(
                 config,
                 state,
-                action="reclaim-evidence-recorded",
-                slot=record.slot,
-                evidence={
-                    "actor": _identity_to_obj(coordinator),
-                    "coordinator_authorized": bool(args.coordinator_authorized),
-                    "owner_state": owner_state,
-                    "heartbeat_age_seconds": int(age),
-                    "salvage": list(salvage),
-                    **(
-                        {}
-                        if owner_consent is None
-                        else {
-                            "basis": OWNER_CONSENT_BASIS,
-                            "handoff_sha256": owner_consent.sha256,
-                        }
-                    ),
-                    **(
-                        {}
-                        if owner_release is None
-                        else {
-                            "basis": OWNER_RELEASE_BASIS,
-                            "release_sequence": owner_release.sequence,
-                            "handoff_sha256": owner_release.sha256,
-                        }
-                    ),
-                    **(
-                        {}
-                        if attested_stop is None
-                        else {
-                            "basis": ATTESTED_STOP_BASIS,
-                            "attestation_note": attested_stop.note,
-                        }
-                    ),
-                    **(
-                        {}
-                        if attested_never_started is None
-                        else {
-                            "basis": NEVER_STARTED_BASIS,
-                            "attestation_note": attested_never_started.note,
-                        }
-                    ),
-                    **(
-                        {}
-                        if stale_image is None
-                        else {"image_copies": [item.to_obj() for item in stale_holders]}
-                    ),
-                },
-                require_repository=False,
+                record,
+                finish_context,
+                journal_path=(
+                    _finish_journal_path(config, record.slot)
+                    if scoped_validation_finish
+                    or (agent_batch is not None and agent_batch.group is not None)
+                    else _journal_path(config)
+                ),
+                defer_private_census=private_cleanup is not None,
+                defer_deletion=defer_deletion,
             )
-        finish_context = _FinishContext(
-            mode="remove",
-            actor="coordinator",
-            archive_nested=(
-                record.slot_type == "agent"
-                and bool(getattr(args, "archive_nested_cache_repositories", False))
-            ),
-            salvage=salvage,
-            validate_complete=bool(args.validate_complete),
-            allow_live_validate_owner=live_validate_owner,
-            private_cleanup=private_cleanup,
-            validation_removal_proof=validation_removal_proof,
-            live_use_recheck=live_use_recheck,
-            owner_consented=owner_consent is not None or owner_release is not None,
-            agent_batch=agent_batch,
-            stale_copy_discard_sequence=stale_copy_discard_sequence,
-        )
-        # An ordinary removal fences and journals under the lock, deletes
-        # the fenced tree with the lock released, and re-takes the lock only
-        # to record completion (#894).  The private-cleanup and scoped
-        # validation finishes keep their own out-of-lock shapes.
-        defer_deletion = (
-            private_cleanup is None
-            and not scoped_validation_finish
-            and validation_removal_proof is None
-        )
-        prepared_finish = _begin_finish(
-            config,
-            state,
-            record,
-            finish_context,
-            journal_path=(
-                _finish_journal_path(config, record.slot)
-                if scoped_validation_finish
-                or (agent_batch is not None and agent_batch.group is not None)
-                else _journal_path(config)
-            ),
-            defer_private_census=private_cleanup is not None,
-            defer_deletion=defer_deletion,
-        )
-        if isinstance(prepared_finish, _PreparedPrivateFinish):
-            prepared_private_finish = prepared_finish
-        elif isinstance(prepared_finish, _PreparedDeferredFinish):
-            prepared_deferred_finish = prepared_finish
-        if prepared_deferred_finish is not None:
-            # Completion revalidates this slot's record itself; other slots
-            # may change while the deletion runs unlocked.
-            pass
-        elif prepared_private_finish is None:
-            after_states, after_archives = _validate_global_state(
-                config, require_repository=False
-            )
-            _assert_only_slot_changed(
-                before,
-                _global_rows(after_states, after_archives),
-                args.slot,
-            )
-        else:
-            after_states, after_archives = _validate_global_state_for_finish_recovery(
-                config, prepared_private_finish.journal
-            )
-            _assert_only_slot_changed(
-                before,
-                _global_rows(after_states, after_archives),
-                args.slot,
-            )
+            if isinstance(prepared_finish, _PreparedPrivateFinish):
+                prepared_private_finish = prepared_finish
+            elif isinstance(prepared_finish, _PreparedDeferredFinish):
+                prepared_deferred_finish = prepared_finish
+            if prepared_deferred_finish is not None:
+                # Completion revalidates this slot's record itself; other slots
+                # may change while the deletion runs unlocked.
+                pass
+            elif prepared_private_finish is None:
+                after_states, after_archives = _validate_global_state(
+                    config, require_repository=False
+                )
+                _assert_only_slot_changed(
+                    before,
+                    _global_rows(after_states, after_archives),
+                    args.slot,
+                )
+            else:
+                after_states, after_archives = _validate_global_state_for_finish_recovery(
+                    config, prepared_private_finish.journal
+                )
+                _assert_only_slot_changed(
+                    before,
+                    _global_rows(after_states, after_archives),
+                    args.slot,
+                )
     if prepared_private_finish is not None:
         assert private_cleanup is not None
         assert finish_context is not None
@@ -74538,6 +75096,10 @@ class _FinishContext:
     # written just before the finish journal, which binds the decision to
     # that journal for recovery (_recorded_stale_copy_discard).
     stale_copy_discard_sequence: int | None = None
+    # Set only by a retire-pending removal validated lock-free (#1287):
+    # its census and fleet validation already ran, so the fence skips its
+    # own use check; the post-fence census outside the lock still decides.
+    prepared_lock_free: bool = False
 
 
 @dataclasses.dataclass(frozen=True)

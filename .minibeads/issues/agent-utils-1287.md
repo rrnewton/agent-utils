@@ -25,6 +25,7 @@ Give `retire-pending` the #1276 adopt-lock-narrow treatment:
 - Do the slow work — `git worktree remove`, fence and use checks, storage deletion, and salvage publication — outside the project-root flock, or under a per-slot lock that is not the project-root flock. Every existing safety check still runs; the census and salvage facts gathered lock-free are trusted under the lock only while their cheap fingerprints still match, and are re-derived there when they do not.
 - If a re-check under the lock finds the slot changed, refuse that slot by name and go on to the next candidate; the batch neither blocks on it nor retries it inside the same run.
 - Mirror the same narrowing in the Rust edition's removal write path (`rs/wrkslotsd/src/remove_write.rs`), which holds its mutation locks across the same validation, census, and salvage work, keeping parity. The Rust `retire-pending` command itself is not ported yet and stays with the Python edition.
+- `wrkslots create` shares the fleet storage scan under the lock on one path: after #1276 a plain create computes the report lock-free and reuses it, but a create beside an outstanding journal deferred to the original locked path, which recomputed the fleet-wide storage report while holding the flock (measured on a shared host: two back-to-back creates held it 2 min 9 s and 2 min 35 s, printing dozens of retained storage inconsistencies). The journal classification still needs the lock; the storage report does not, so every round computes it lock-free and the locked path reuses it. Create gets its own counted lock-hold test for this path.
 
 # Acceptance Criteria
 
@@ -33,6 +34,7 @@ Give `retire-pending` the #1276 adopt-lock-narrow treatment:
 - A slot whose registry identity changes between the lock-free gather and the locked re-check is refused by name, and the batch continues with its next candidate (tested).
 - Every safety refusal of the ordinary removal still refuses through `retire-pending`: hold, handoff read, heartbeat and owner liveness, process use, salvage and unpushed work, and target storage consistency.
 - The Python and Rust removal paths keep parity: the same lock-held operation counts hold for the Rust writer's fixture tests.
+- A `create` beside an outstanding journal runs no fleet storage scan while holding the flock (counted, `py/wrkslots/tests/test_create_lock_scope.py`); its journal classification still runs under the lock as before.
 - The existing lifecycle, lock-scope, prevalidated-mutation, and Rust differential suites pass, apart from the pre-existing #1267 quarantine class.
 
 # Notes
