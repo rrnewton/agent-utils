@@ -63,7 +63,21 @@ fn a_failure_that_passes_on_a_same_commit_rerun_lands_as_flaky() {
     // mq-singleton-eject).
     let validations = r["validations"].as_array().unwrap();
     assert_eq!(validations.len(), 3, "{r}");
-    assert_eq!(validations[0]["commit"], validations[1]["commit"]);
+    // Probe order in the report is completion order, so match by commit:
+    // one probe reruns the batch commit, one probes the base itself.
+    let batch_commit = validations[0]["commit"].as_str().unwrap();
+    assert!(
+        validations[1..]
+            .iter()
+            .any(|v| v["purpose"] == "probe" && v["commit"] == batch_commit),
+        "{r}"
+    );
+    assert!(
+        validations[1..]
+            .iter()
+            .any(|v| v["purpose"] == "probe" && v["commit"] != batch_commit),
+        "{r}"
+    );
     assert_eq!(
         std::fs::read_to_string(&reruns).unwrap().trim(),
         "run-1 tests x"
