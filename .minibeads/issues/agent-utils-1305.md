@@ -1,12 +1,13 @@
 ---
 title: 'probe-reap-test: a killed probe test counts only its own children, not the whole test process'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - merge-queue
 created_at: 2026-11-11T15:20:41+00:00
-updated_at: 2026-11-11T15:20:41+00:00
+updated_at: 2026-11-11T17:43:53+00:00
+closed_at: 2026-11-11T17:43:53+00:00
 ---
 
 # Description
@@ -43,3 +44,7 @@ Impact: the c9ccf970 deploy build failed at 10:10 AM ET on 2026-11-11; the deplo
 # Notes
 
 Blocks merge-queue deploys. Follows #1294 donor-probe-pacing-bound, which added the test and the process-group kill it verifies. Filed by mu-zombie before implementation; the fix lands separately on mu-zombie/probe-reap-test.
+
+## Resolution
+
+[watermelon-full-preview] Fixed in the test only; no production code changed. The probe command now records its own pid (echo $$ > probe.pid; exec sleep 30), and after probe_once returns the test asserts that pid is gone or not in Z state in /proc, and that no live process remains in its process group. The process-wide zombie_children() count is removed, so sibling tests' transient zombies can no longer fail it. Verified: cargo test --release --locked -p merge-queue, full suite at default threads, 10 runs in a row green on the busy host.

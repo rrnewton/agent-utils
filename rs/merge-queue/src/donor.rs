@@ -5067,8 +5067,11 @@ mod unit {
     #[test]
     fn a_killed_probe_leaves_no_zombie_children() {
         // #1294 donor-probe-pacing-bound: a probe killed at its bound
-        // is reaped (child and process group waited on). Count zombie
-        // children via /proc; never timing.
+        // is reaped (child and process group waited on). #1305
+        // probe-reap-test: assert on this probe's own process only,
+        // via /proc; never timing, and never a process-wide zombie
+        // count (libtest runs every test as a thread of one process,
+        // so sibling tests' transient zombies are not this probe's).
         let work = temp("probe-reap");
         let (options, route) = probe_worker(&work);
         let worker = Worker {
@@ -5084,36 +5087,73 @@ mod unit {
             fault_probe_current: Mutex::new(std::time::Duration::from_secs(60)),
             paced_refusals: Mutex::new(0),
         };
-        let mut cfg = probe_cfg("sleep 30".to_owned());
+        // The probe records its own pid, then execs so that pid is
+        // the long-lived process probe_once must kill and reap.
+        let pid_path = work.join("probe.pid");
+        let mut cfg = probe_cfg(format!("echo $$ > {}; exec sleep 30", pid_path.display()));
         cfg.probe_timeout_secs = 1;
         let (passed, output) = worker.probe_once(&cfg);
         assert!(!passed);
         assert!(output.contains("probe killed at the 1 s bound"), "{output}");
-        assert_eq!(zombie_children(), 0, "a killed probe must be reaped");
+        let probe_pid: u32 = std::fs::read_to_string(&pid_path)
+            .expect("the probe must record its pid")
+            .trim()
+            .parse()
+            .expect("the recorded probe pid must parse");
+        // Gone is reaped; present in Z state is a zombie left behind.
+        assert_ne!(
+            process_state(probe_pid).as_deref(),
+            Some("Z"),
+            "a killed probe must be reaped, not left a zombie"
+        );
+        // probe_once kills the probe's whole process group (the probe
+        // is its group leader, so pgid == pid): no member may survive.
+        assert!(
+            live_processes_in_group(probe_pid).is_empty(),
+            "no process in the killed probe's group may survive: {:?}",
+            live_processes_in_group(probe_pid)
+        );
         let _ = std::fs::remove_dir_all(&work);
     }
 
-    /// Zombie (`Z` state) children of this process, counted via /proc.
-    fn zombie_children() -> usize {
-        let me = std::process::id().to_string();
-        let mut zombies = 0;
+    /// State letter of one process via /proc, or None when it is gone.
+    fn process_state(pid: u32) -> Option<String> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // stat: pid (comm) state ...; comm may hold spaces.
+        let close = stat.rfind(')')?;
+        stat[close + 2..]
+            .split_whitespace()
+            .next()
+            .map(str::to_owned)
+    }
+
+    /// Live (non-zombie) processes in process group `pgid`, via /proc.
+    fn live_processes_in_group(pgid: u32) -> Vec<u32> {
+        let mut live = Vec::new();
         let Ok(entries) = std::fs::read_dir("/proc") else {
-            return 0;
+            return live;
         };
         for entry in entries.flatten() {
             let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
                 continue;
             };
-            // stat: pid (comm) state ppid ...; comm may hold spaces.
+            // stat: pid (comm) state ppid pgrp ...; comm may hold spaces.
             let Some(close) = stat.rfind(')') else {
                 continue;
             };
             let fields: Vec<&str> = stat[close + 2..].split_whitespace().collect();
-            if fields.len() >= 2 && fields[0] == "Z" && fields[1] == me {
-                zombies += 1;
+            // fields: state, ppid, pgrp. A zombie is dead, not surviving.
+            if fields.len() >= 3 && fields[0] != "Z" && fields[2] == pgid.to_string() {
+                if let Some(pid) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse::<u32>().ok())
+                {
+                    live.push(pid);
+                }
             }
         }
-        zombies
+        live
     }
 
     #[test]
