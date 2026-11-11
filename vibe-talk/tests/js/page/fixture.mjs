@@ -280,10 +280,6 @@ const PAGE_ELEMENTS = new Map(
       // same reason: "the summary chip starts OFF" is a claim about the page as served, and a
       // fixture that dropped the attribute would answer null and make it untestable.
       pressed: (/\baria-pressed="([^"]+)"/.exec(m[2]) || [])[1],
-      // `#1210 ui-stability-no-async-shift`. Whether the markup reserves the freshness pill's
-      // room statically: "the room is held from the first paint" is a claim about the page as
-      // served, and a fixture that dropped the attribute would make it untestable.
-      freshness: /(?:^|\s)data-freshness(?=[\s=>/]|$)/.test(m[2]),
       // `#224 keyboard-shortcuts`. An input's `type`, which is how the page tells a field the reader
       // types in from a checkbox or a slider; undefined where the markup gives none.
       type: (/(?:^|\s)type="([^"]+)"/.exec(m[2]) || [])[1],
@@ -2046,9 +2042,6 @@ function newPage(store = new Map(), script = SCRIPT, arrange = null) {
     }
     if (markup.pressed !== undefined) {
       element.setAttribute("aria-pressed", markup.pressed);
-    }
-    if (markup.freshness) {
-      element.setAttribute("data-freshness", "");
     }
     elements.set(id, element);
   }

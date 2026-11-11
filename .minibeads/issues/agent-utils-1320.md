@@ -1,6 +1,6 @@
 ---
 title: 'no-freshness-band: the channel list reserves no header band; the freshness pill floats over the list'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
@@ -32,3 +32,7 @@ Cause: 5de62d18 (#1210 ui-stability-no-async-shift, D1) made `#pane-discord` car
 # Notes
 
 Related: #1210 ui-stability-no-async-shift, #32 freshness-pill-overlap, #1251 single scroll owner.
+
+## Resolution
+
+[watermelon-full-preview] Removed the reserved band: the `#screen-main:not([data-searching]) > #scroll-area:has(> #pane-discord[data-freshness])` margin rule in `web/styles/voice/09-to-do-view.css` is deleted and `#pane-discord` no longer carries static `data-freshness` in `web/voice.html`, so with search closed the first message sits at the top of the scroll area and the freshness pill floats over the list on its zero-height anchor — showing, clearing or rewording it takes no layout room, so #1210's no-shift holds with nothing held statically. Search still opens only behind the floating magnifier, and only the open bar makes room at the head. `freshness.ts` comments updated to match; no scroll writes added (landings still measure the pill as drawn via `floatingClearance`). New no-band test in the existing `tests/js/page/search.mjs` (with `sync.mjs`/`rows.mjs` assertions updated from the old reservation), and the Chromium walks `live_pill_browser.py`/`offline_cache_browser.py` updated to the floating-pill contract (the latter also samples the reply bridge's line along its segment, after a one-device-pixel corner sample missed a drawn line at the new head position). Verified: focused page tests, the #1210 `scroll_soak_browser.py` (exit 0), `live_pill_browser.py`, all three `offline_cache_browser.py` profiles, and desktop 1280x800 + phone screenshots inspected — no band, pill floating, magnifier floating.

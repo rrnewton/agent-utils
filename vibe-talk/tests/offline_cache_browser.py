@@ -18,12 +18,11 @@ one reader through:
   the reloads, a refresh also fails and recovers in place, on the channel's own poll, under a reader
   at the top, in the middle and at the newest line.
 
-While the freshness pill is up — refreshing, offline, failed — it must cover neither the view tabs
-nor the list's header seam or first row, and #scroll-area's place must be the same with it as without
-it (`#32 freshness-pill-overlap`): since `#324 live-pill-covers-row` the list's top edge moves down to
-the floating line's foot while the pill is up, so nothing scrolls under it, and nothing outside the
-list's own cell moves. As the pill's room and the error panel above the list come and
-go, a scrolled reader's line stays where it is on the screen, and a reader at the newest line stays
+While the freshness pill is up — refreshing, offline, failed — it must cover none of the view tabs,
+and #scroll-area's place must be the same with it as without it: since `#1320 no-freshness-band`
+the list reserves no band for it at all, its top edge stays at the top of its cell, and the pill
+floats over the head of the list as an overlay that takes no layout room (`#1210`). As the error
+panel above the list comes and goes, a scrolled reader's line stays where it is on the screen, and a reader at the newest line stays
 there (`#33 error-banner-scroll-shift`).
 
 On a touchscreen, a real finger parked at the newest line and drawn up past the end of the list
@@ -853,10 +852,11 @@ PLACE_JS = """async (where) => {
 }"""
 
 # Everything that can be covered, measured at the head of the list, with the view tabs and without
-# them. `problems` is empty when the pill covers none of the tabs, the header seams or the first row,
-# fits on its one line, and sits over the list's place with the list's top edge at the floating line's foot
-# (`#324 live-pill-covers-row`); `area` is #scroll-area's place — its box and the room its top edge moved
-# down by — and `bare` the same without the pill.
+# them. `problems` is empty when the pill covers none of the tabs, fits on its one line, and floats
+# over the list with NO band reserved at its head: the list's top edge is at the top of its cell
+# (`#1320 no-freshness-band`, reversing `#324 live-pill-covers-row`'s reserved room at the owner's
+# word); `area` is #scroll-area's place and `bare` the same with the pill hidden — identical, because
+# an overlay takes no layout room (`#1210`).
 # Scrolling to the top is free only because FakeApi answers has_more: False; with more history it
 # would page older rows in and spend a read the "one newest-page read" check counts.
 GEOMETRY_JS = """() => {""" + f"""
@@ -869,8 +869,8 @@ GEOMETRY_JS = """() => {""" + f"""
     const pill = document.getElementById('channel-freshness');
     const tabs = document.getElementById('channel-view-tabs');
     const problems = [];
-    // `#324 live-pill-covers-row`. The list's place: its box, and above it the room its top edge was
-    // moved down by, which the pill and the glass stand in.
+    // `#1320 no-freshness-band`. The list's place: its box at the top of its cell, with no room
+    // moved down for the pill or the glass, which float over it instead.
     const room = () => parseFloat(getComputedStyle(area).marginTop) || 0;
     const place = () => {
         const a = box(area), m = room();
@@ -889,9 +889,7 @@ GEOMETRY_JS = """() => {""" + f"""
         }
         if (meets(p, g)) found.push(`${layout}: the glass overlaps the pill "${pill.textContent}"`);
         if (g.top < list.top || g.left < list.left || g.right > list.right) found.push(`${layout}: the glass is not over the list`);
-        // ...and clear of the head of the list, which makes room for it as it does for the pill.
-        const head = [...document.querySelectorAll('#pane-discord .seam, #discord-log > li')].find(shown);
-        if (head && box(head).top < g.bottom - 0.5) found.push(`${layout}: the glass reaches ${(g.bottom - box(head).top).toFixed(1)}px over the head of the list`);
+        // The head of the list makes no room for it (`#1320`): it floats over the first rows.
         // The 48px target: beside and below the disc, outside it but inside the square, is the glass.
         const cx = (g.left + g.right) / 2, cy = mid(g);
         for (const [dx, dy] of [[-22, 0], [20, 0], [0, 22]]) {
@@ -905,21 +903,26 @@ GEOMETRY_JS = """() => {""" + f"""
     };
     const covering = (layout) => {
         const p = box(pill), list = place();
-        // Nothing scrolls under the pill or the glass: the list's top edge is the lower of their feet.
-        const glass = document.getElementById('search-toggle');
-        const foot = Math.max(p.bottom, shown(glass) ? box(glass).bottom : p.bottom);
-        if (Math.abs(box(area).top - foot) > 1) {
-            problems.push(`${layout}: the list's top edge is at ${box(area).top.toFixed(1)}px, not at the floating line's foot at ${foot.toFixed(1)}px`);
+        // No band at the head (`#1320`): the list's top edge is the top of its own cell (its box
+        // less any margin, which must be none), and the pill floats over the list below that edge.
+        if (room() > 0.5) {
+            problems.push(`${layout}: the list's top edge is pushed ${room().toFixed(1)}px down by a reserved band`);
+        }
+        if (Math.abs(box(area).top - list.top) > 1) {
+            problems.push(`${layout}: the list's top edge is at ${box(area).top.toFixed(1)}px, not at the top of its cell at ${list.top.toFixed(1)}px`);
+        }
+        if (p.top < box(area).top - 0.5) {
+            problems.push(`${layout}: the pill is not floating over the list`);
         }
         if (shown(tabs) && meets(p, box(tabs))) problems.push(`${layout}: it covers the Main/Threads/All tabs`);
         const seams = [...document.querySelectorAll('#pane-discord .seam')].filter(shown);
         if (seams.length === 0) problems.push(`${layout}: there is no header seam to measure against`);
-        seams.forEach((seam) => {
-            if (meets(p, box(seam))) problems.push(`${layout}: it covers the seam "${seam.textContent.trim()}"`);
-        });
         const first = document.querySelector('#discord-log > li');
         if (!shown(first)) problems.push(`${layout}: there is no first row to measure against`);
-        else if (meets(p, box(first))) problems.push(`${layout}: it covers the first row`);
+        // The head of the list (its summary seam, above the first row by design) sits at the top
+        // of the scroll area, under the floating pill: no reserved band above it.
+        const head = seams.find(shown) || first;
+        if (head && box(head).top > box(area).top + 24) problems.push(`${layout}: the head of the list starts ${box(head).top.toFixed(1)}px down, below a reserved band at the head of the list`);
         if (pill.scrollWidth > pill.clientWidth + 1) problems.push(`${layout}: it is cut short: ${pill.textContent}`);
         // ...and to the fraction of a pixel, which the check above rounds away: a flex line that
         // took a quarter of a pixel off the pill ellipsised the whole of its time (`#197
@@ -955,22 +958,20 @@ GEOMETRY_JS = """() => {""" + f"""
         covering('without tabs');
         tabs.hidden = tabsHidden;
     }
-    // To a tenth of a pixel; and without the client height, which is the list's own inside and is
-    // meant to give up the room.
+    // To a tenth of a pixel: the list's cell (its box, with no band above it) and its own inside.
     const size = () => {
         const a = box(area), m = room();
         return [a.top - m, a.left, a.width, a.height + m, area.clientWidth]
             .map((n) => (Math.round(n * 10) / 10 + 0).toFixed(1)).join(',');
     };
-    // The same box with the pill and its room taken away, in the same state, so that a banner
-    // appearing for its own reasons is not mistaken for the pill resizing the list.
-    const measured = size(), pane = document.getElementById('pane-discord');
-    const wasHidden = pill.hidden, reserved = pane.hasAttribute('data-freshness');
+    // The same box with the pill taken away, in the same state, so that a banner appearing for
+    // its own reasons is not mistaken for the pill resizing the list. The pill is an overlay
+    // (`#1320`), so hiding it alone must leave the box exactly as it was (`#1210`).
+    const measured = size();
+    const wasHidden = pill.hidden;
     pill.hidden = true;
-    pane.removeAttribute('data-freshness');
     const bare = size();
     pill.hidden = wasHidden;
-    if (reserved) pane.setAttribute('data-freshness', '');
     // `gchat-thread-selector`: the tabs left the list for the bar's thread picker.
     const picker = document.getElementById('thread-select');
     if (shown(tabs)) problems.push('the Main/Threads/All tabs are back over the list');
@@ -1639,7 +1640,10 @@ COALESCE_LOOK_JS = """async ({png, check, id, parent, stack}) => {""" + FLOAT_HE
             if (one === id) {
                 if (!ink(spine, (above.bottom + c.top) / 2)) problems.push(`the spine is not drawn across the gap above ${one}`);
                 if (!ink(spine, (b.top + level) / 2)) problems.push(`the spine is not drawn down to ${one}`);
-                if (!ink((b.left + stroke + c.left) / 2, level)) problems.push(`${one}'s line into its box is not drawn`);
+                // Along the segment, not at its midpoint alone: the midpoint falls on the corner's
+                // curve, where one device pixel of rounding after a layout shift (`#1320` moved the
+                // list's head) samples the stroke's antialiased edge and misses a drawn line.
+                if (inkIn(b.left + stroke, level - 1, c.left, level + 1).length === 0) problems.push(`${one}'s line into its box is not drawn`);
                 if (last && c.bottom - level > 8 && ink(spine, c.bottom - 3)) problems.push('the spine runs on past the last line');
                 if (i === 0) {
                     const x = row.querySelector(':scope > .reply-ungather');
@@ -2551,9 +2555,9 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 return {key: float(found[key]) for key in ("row", "gap", "top", "bottom", "banner")}
 
             def geometry(state: str, name: str) -> str:
-                # At the head of the list, where the header is: a pill over the header is `#32
-                # freshness-pill-overlap`, and one over whatever row is passing further down is `#324
-                # live-pill-covers-row`, which tests/live_pill_browser.py walks.
+                # At the head of the list: the pill floats over it with no band reserved
+                # (`#1320 no-freshness-band`); tests/live_pill_browser.py walks the same
+                # floating line at every scroll position.
                 found = page.evaluate(GEOMETRY_JS)
                 shot(name)
                 problems = [str(problem) for problem in found["problems"]]

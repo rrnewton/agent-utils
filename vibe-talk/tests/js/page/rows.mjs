@@ -744,12 +744,12 @@ test("the glass is DRAWN larger than the pill, with a larger glyph, and HIT at 4
     /--freshness-top:\s*calc\(var\(--search-bar\) \/ 2 \+ 0\.1rem - var\(--freshness-box\) \/ 2\)/,
     "the line is not placed by the bar, so the larger bar hangs over what is above the list"
   );
-  // ...and the head of the list makes room for whichever of the pill and the glass reaches lower:
-  // its top edge, since `#324 live-pill-covers-row`, so the room does not scroll away.
-  assert.match(
-    cssBlock("#screen-main:not([data-searching]) > #scroll-area:has(> #pane-discord[data-freshness]:not([hidden]))"),
-    /margin-top:\s*calc\(var\(--float-line\) \+ max\(var\(--freshness-box\), var\(--search-disc\)\) \/ 2\)/,
-    "the room at the head of the list is the pill's alone, so the larger glass sits on the first row"
+  // ...and the head of the list makes NO room for either while search is closed
+  // (`#1320 no-freshness-band`): the pill and the glass float over the first row as an overlay.
+  assert.equal(
+    cssRules(CSS, "#screen-main:not([data-searching]) > #scroll-area:has(> #pane-discord[data-freshness]:not([hidden]))").length,
+    0,
+    "the head of the list still reserves a band for the pill and the glass"
   );
 });
 

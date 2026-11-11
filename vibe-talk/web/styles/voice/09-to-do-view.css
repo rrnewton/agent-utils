@@ -540,14 +540,11 @@
    of the scroller, not of the pane: pinned to the pane it sat over the Main/Threads/All tabs and
    hid one.
 
-   `#32 freshness-pill-overlap`. Over the scroller's top it covered the list's own header instead —
-   the channel summary, the first thing a cold start shows. So while there is a freshness to state,
-   the list reserves the pill's height at its head (`data-freshness` on #pane-discord, below) and
-   the header starts under it. Nothing outside the list's own cell moves; `renderChannelFreshness`
-   holds a scrolled reader's place while it changes. One line, ellipsised, so that the reservation
-   is exact: a pill that wrapped to two on a narrow phone would outgrow it. Since `#324
-   live-pill-covers-row` the room is the list's top edge moved down rather than padding inside it,
-   which scrolled away and left the pill over whatever row was passing.
+   `#32 freshness-pill-overlap` once made the list reserve room for it at its head, and `#324
+   live-pill-covers-row` later moved that room to the list's top edge; `#1320 no-freshness-band`
+   removes the reservation entirely (see the note at the foot of this section): the pill floats
+   over the list as an overlay, one line, ellipsised, taking no layout room, so its appearing,
+   clearing or rewording moves nothing (`#1210`).
 
    `#197 floating-search`. The anchor is a zero-height LINE through the pill's middle, and the
    search glass sits on it too, at the right-hand end: the owner asked for the glass "on the same
@@ -634,35 +631,20 @@
   opacity: 0.85;
 }
 
-/* The pill's bottom edge, measured from the top of the list's cell; #scroll-area's own top padding is
-   then the gap between it and the header. The 2px is the pill's border.
+/* `#1320 no-freshness-band`. NO room is reserved at the head of the list for the pill or the
+   glass while search is closed: the owner asked why a persistent header band had taken vertical
+   space when the "Showing messages from HH:MM" chip "is designed as a floating chip anyway".
+   So there is deliberately no rule here moving #scroll-area down. The pill and the glass float
+   over the list on their zero-height line (`#channel-freshness-anchor`, above), the first
+   message sits at the top of the scroll area, and rows pass under the floating line as they
+   scroll — landings still account for it by measuring the pill and glass as drawn
+   (`floatingClearance`), so a jumped-to row is not put under them.
 
-   `#211 link-filter`. Or the glass's bottom edge, which is lower now that the glass is the larger
-   of the two things centred on the line: the room is made for whichever reaches further, so the
-   head of the list is clear of both.
-
-   `#324 live-pill-covers-row`. The room was padding at the head of #pane-discord, inside the
-   scroller, and room at the head scrolls away: on a 412px phone "Live · updated" stood over the
-   first row on screen whenever the list was not at its very top — over a thread's date rule when
-   entering it landed on the root, with a clipped strip of the header showing between the thread's
-   card and the pill, and over an unread chip in Main. With a live channel the pill is nearly always
-   up, so that was most of the time. So, as the author filter hanging under the open bar on a narrow
-   phone already does (`#251 author-filter`, below), the list's top edge moves down to the line's
-   foot and the room at its head is given back by as much: at any scroll position every row is where
-   it was, and the list scrolls as far, but nothing is drawn under the pill or the glass. The fade
-   under the header shortens to the scroller's own top padding, so the first row is never faded.
-   Only while the channel's pane is the one shown, and not while the search bar is open, which the
-   pill gives way to and which makes its own room.
-
-   `#1210 ui-stability-no-async-shift`. The pane carries `data-freshness` statically (voice.html),
-   so this room is held for as long as the pane is shown — before the first read says anything,
-   and across every rewording after it. The scroller's geometry is therefore constant; no script
-   reserves or releases the room, and nothing resizes the list when freshness changes. */
-#screen-main:not([data-searching]) > #scroll-area:has(> #pane-discord[data-freshness]:not([hidden])) {
-  margin-top: calc(var(--float-line) + max(var(--freshness-box), var(--search-disc)) / 2);
-  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 0.35rem);
-  mask-image: linear-gradient(to bottom, transparent 0, #000 0.35rem);
-}
+   `#1210 ui-stability-no-async-shift` still holds, by the opposite means from the band it first
+   used: the anchor is zero-height and the pill is an overlay that takes no layout room, so
+   showing, clearing or rewording it changes no geometry at all — nothing reserves or releases
+   room, in script or in this sheet. Only the OPEN search bar makes room at the head (below),
+   because it is a working bar, not a chip; closed, it is the glass alone on the same line. */
 
 /* `#197 floating-search`. The glass: a disc at the right-hand end of the line, in the pill's own
    panel, edge and shadow, so the two read as one band and neither as the louder. Positioned rather
@@ -907,8 +889,8 @@
 }
 
 /* ...and the list makes room for the bar at its head while it is open, so the first match is never
-   under it. The pill is not on screen while the bar is, so its room gives way to this rather than
-   stacking under it (`#324 live-pill-covers-row`: the pill's room is not made while searching). */
+   under it. This is the only room the head of the list ever makes (`#1320`): the pill is not on
+   screen while the bar is, and closed there is no band at all. */
 #screen-main[data-searching] #scroll-area {
   padding-top: calc(var(--float-line) + var(--search-bar) / 2 + 0.35rem);
 }

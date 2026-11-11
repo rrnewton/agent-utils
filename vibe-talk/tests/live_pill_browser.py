@@ -1,33 +1,30 @@
 #!/usr/bin/env python3
-"""The "Live · updated" pill over the head of the channel's list, in real Chromium at a 412x915 phone.
+"""The "Live · updated" pill floating over the head of the channel's list, in real Chromium at a phone.
 
-`#324 live-pill-covers-row`. Found by a read-only exercise of a Slack deployment on 2026-10-14: on a
-phone the floating pill covered the top row. In a thread it hid the date rule, with a clipped strip of
-the list's header showing between the thread's card and the pill; in Main it covered an unread chip.
-The pill's room was padding at the head of the list, inside the scroller, and room at the head scrolls
-away: whenever the list was not at its very top, the pill and the search glass beside it stood over
-whatever row was passing, and on a live channel the pill is nearly always up. Now the list's top edge
-moves down to the floating line's foot, so nothing is ever drawn or tapped under either, and a landing
-puts a row by where it starts, the date rule it draws above its tile included. The fake-DOM suite
-(tests/js/voice_page.test.mjs) pins the landing and the rule's selector; it lays nothing out, so it
-cannot say what Chromium draws under the pill. This does.
+`#1320 no-freshness-band`. The owner, 2026-11-11: a persistent header band had taken vertical space
+for a chip that "is designed as a floating chip anyway" — since `#1210` made `data-freshness` static,
+the rule that moved the list's top edge down to the floating line's foot (`#324 live-pill-covers-row`)
+applied whenever the pane was shown. Now NO band is reserved while search is closed: the list's top
+edge is at the top of its cell, the first message sits at the top of the scroll area, and the pill and
+the search glass float over the list as an overlay that takes no layout room, so showing, clearing or
+rewording the pill still moves nothing (`#1210`). A landing still puts a row by where it starts, below
+the pill as drawn (`floatingClearance`), the date rule it draws above its tile included. The fake-DOM
+suite (tests/js/voice_page.test.mjs) pins the rule's absence; it lays nothing out, so it cannot say
+where Chromium puts the list's edge. This does.
 
 It serves the checked-out page and the fake API of tests/two_column_browser.py -- a channel taller than
 the window with three threads -- from one loopback origin, at a 412x915 phone with touch, in the dark
 scheme and the light one, the live stream attached so the pill says "Live · updated":
 
-  Main, the list scrolled so the summed-up thread's "8 unread" chip stands on the pill's line -> the
-  chip is not under the pill: a tap where it was finds nothing of the list, and the list's top edge is
-  at the floating line's foot, below the pill and the glass -> the list scrolled through nine places
-  from its top to its foot -> at every one, a tap anywhere on the pill's line, beside the pill and the
-  glass, finds nothing of the list, and every pixel there is the screen's own background, nothing of a
-  row showing through -> the root of the long question's thread tapped in All: its thread, landed on
-  its root, whose date rule is wholly below the floating line and inside the list, with nothing of the
-  list showing between the thread's card and the pill -> the thread scrolled through nine places,
-  checked as Main was.
+  Main at its top -> the first row is at the top of the scroll area and the pill floats over the
+  list -> the list scrolled through nine places from its top to its foot -> at every one, the list's
+  top edge is still at the top of its cell (no band), the pill is still floating over the list, and
+  hiding and showing the pill moves neither the list nor the row under it -> the root of the long
+  question's thread tapped in All: its thread, landed on its root, whose date rule is wholly below
+  the floating line as drawn -> the thread scrolled through nine places, checked as Main was.
 
-THE CONTROLS: the pill's room put back as it was, padding at the head of the list (a style sheet laid
-over the page's): the same walk then finds the list under the pill, in Main and in the thread, so the
+THE CONTROLS: the old band put back (a style sheet laid over the page's, moving the list's top edge
+down by the floating line's foot): the same walk then reports a reserved band at most places, so the
 checks above can see the defect they guard against.
 
 No page error at any step. Pass --screenshots DIR to keep a PNG of each state for review; --web-root
@@ -37,7 +34,6 @@ DIR to run the same walk against another copy of the page.
 from __future__ import annotations
 
 import argparse
-import base64
 import os
 import tempfile
 import threading
@@ -47,7 +43,6 @@ from typing import TYPE_CHECKING
 
 import offline_cache_browser as fixture
 from offline_cache_browser import TOKEN, Json, check, handler_for
-from thread_card_focus_browser import PIXELS_JS
 from two_column_browser import REPLICA, THREAD_ROWS, ColumnsApi, Desk
 import page_sources
 
@@ -65,74 +60,32 @@ CHIP_ROOT = "202"
 THREAD_ROOT = "209"
 # Places each list is scrolled through, its top and its foot included.
 PLACES = 9
-# How far a pixel on the pill's line may be from the screen's background, per channel.
-PIXEL_TOLERANCE = 4
-# Room left around the pill and the glass when their line is sampled, for their shadow.
-SHADOW_PX = 10
 
-# The pill's room as it was before `#324`: padding at the head of the list, inside the scroller, and
-# the list's top edge left at the top of its cell.
+# The band as it was before `#1320`: the list's top edge moved down to the floating line's foot,
+# with the shorter fade that went with it.
 OLD_ROOM_CSS = """
 #screen-main > #scroll-area {
-  margin-top: 0 !important;
-  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 1.1rem) !important;
-  mask-image: linear-gradient(to bottom, transparent 0, #000 1.1rem) !important;
-}
-#pane-discord[data-freshness] {
-  padding-top: calc(var(--float-line) + max(var(--freshness-box), var(--search-disc)) / 2) !important;
+  margin-top: calc(var(--float-line) + max(var(--freshness-box), var(--search-disc)) / 2) !important;
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 0.35rem) !important;
+  mask-image: linear-gradient(to bottom, transparent 0, #000 0.35rem) !important;
 }
 """
 
-# The floating line and what is under it: the pill and the glass, the list's box and the top of its
-# cell (its box less the room its top edge was moved down by), the screen's own background, and, at
-# points across the line and the band above it, beside the pill and the glass, what a tap there finds
-# when that is part of the channel's list.
+# The floating line and what stands on it: the pill and the glass, the list's box and the top of
+# its cell (its box less any margin its top edge was moved down by — none since `#1320`), and how
+# far the list can scroll.
 LINE_JS = """() => {
     const box = (e) => { const r = e.getBoundingClientRect();
         return {top: r.top, bottom: r.bottom, left: r.left, right: r.right}; };
     const area = document.getElementById('scroll-area');
-    const pane = document.getElementById('pane-discord');
     const pill = document.getElementById('channel-freshness');
     const glass = document.getElementById('search-toggle');
     const list = box(area);
     const cell = list.top - (parseFloat(getComputedStyle(area).marginTop) || 0);
     const p = box(pill), g = box(glass);
     const foot = Math.max(p.bottom, g.bottom);
-    let painted = document.getElementById('screen-main');
-    while (painted && /^(transparent|rgba\\(0, 0, 0, 0\\))$/.test(getComputedStyle(painted).backgroundColor)) {
-        painted = painted.parentElement;
-    }
-    const background = (painted ? getComputedStyle(painted).backgroundColor : 'rgb(255, 255, 255)')
-        .match(/[\\d.]+/g).slice(0, 3).map(Number);
-    const away = (x, y, b, pad) => x < b.left - pad || x > b.right + pad || y < b.top - pad || y > b.bottom + pad;
-    const name = (e) => e.id ? `#${e.id}` : `${e.tagName.toLowerCase()}.${String(e.className).split(' ')[0]}`;
-    const hits = [], samples = [];
-    const rows = [...new Set([cell + 1, (cell + p.top) / 2, p.top + 3, (p.top + p.bottom) / 2, p.bottom - 3, foot - 1])]
-        .filter((y) => y > cell && y < foot);
-    for (const y of rows) {
-        for (let x = 2; x < window.innerWidth - 1; x += 12) {
-            if (!away(x, y, g, 6)) continue;
-            const hit = document.elementFromPoint(x, y);
-            if (hit && pane.contains(hit)) {
-                const row = hit.closest('#discord-log > li');
-                hits.push(`${name(hit)}${row ? ` of row ${row.getAttribute('data-id')}` : ''} at (${x}, ${y.toFixed(0)})`);
-            }
-            if (away(x, y, p, SHADOW) && away(x, y, g, SHADOW)) samples.push([x, y]);
-        }
-    }
-    return {text: pill.textContent, hidden: pill.hidden, list, cell, pill: p, glass: g, foot, background,
-            hits, samples, scrollTop: area.scrollTop, scrollMax: area.scrollHeight - area.clientHeight};
-}""".replace("SHADOW", str(SHADOW_PX))
-
-# Where the unread chip of row `id` is, and what a tap at its middle finds.
-CHIP_JS = """(id) => {
-    const chip = document.querySelector(`#discord-log > li[data-id="${id}"] > .thread-unread`);
-    if (!chip || chip.getClientRects().length === 0) return null;
-    const r = chip.getBoundingClientRect();
-    const x = (r.left + r.right) / 2, y = (r.top + r.bottom) / 2;
-    const hit = document.elementFromPoint(x, y);
-    return {top: r.top, bottom: r.bottom, left: r.left, right: r.right, x, y, text: chip.textContent.trim(),
-            hit: !!hit && chip.contains(hit)};
+    return {text: pill.textContent, hidden: pill.hidden, list, cell, pill: p, glass: g, foot,
+            scrollTop: area.scrollTop, scrollMax: area.scrollHeight - area.clientHeight};
 }"""
 
 # The first row of the list on screen that draws a date rule, its rule and its tile.
@@ -242,13 +195,6 @@ def edge(found: Json, part: str, side: str) -> float:
     return float(value[side])
 
 
-def pixels(desk: Desk, points: list[list[float]]) -> list[list[float]]:
-    """The colour at each CSS-pixel point of a screenshot of the viewport."""
-    png = base64.b64encode(desk.page.screenshot()).decode("ascii")
-    found: list[list[float]] = desk.page.evaluate(PIXELS_JS, {"png": png, "points": points})
-    return found
-
-
 def tap(desk: Desk, selector: str) -> None:
     box = desk.page.locator(selector).first.bounding_box()
     desk.check(box is not None, f"{selector} is not drawn")
@@ -257,27 +203,21 @@ def tap(desk: Desk, selector: str) -> None:
 
 
 def line_problems(desk: Desk, where: str) -> list[str]:
-    """What the list puts under the floating line here: a tap that finds part of it, a pixel that is not
-    the screen's own background, or the list's top edge above the line's foot. Empty when nothing is."""
+    """A reserved band here, or a pill that is not floating over the list. Empty when neither is:
+    the list's top edge is at the top of its cell and the pill stands over the list (`#1320`)."""
     found = line(desk)
     problems: list[str] = []
     if found["hidden"]:
         return [f"{where}: the pill is not shown"]
-    top, foot = edge(found, "list", "top"), number(found, "foot")
-    if top < foot - 0.5:
-        problems.append(f"{where}: the list's top edge is at {top:.1f}px, above the floating line's foot at {foot:.1f}px")
-    hits = found["hits"]
-    assert isinstance(hits, list)
-    problems.extend(f"{where}: a tap on the pill's line finds {hit}" for hit in hits[:4])
-    samples = found["samples"]
-    background = found["background"]
-    assert isinstance(samples, list) and isinstance(background, list)
-    off = [(point, colour) for point, colour in zip(samples, pixels(desk, samples))
-           if any(abs(float(c) - float(b)) > PIXEL_TOLERANCE for c, b in zip(colour, background))]
-    if off:
-        point, colour = off[0]
-        problems.append(f"{where}: {len(off)} of {len(samples)} pixels on the pill's line are not the screen's "
-                        f"background {background}, such as {colour} at {point}")
+    top, cell = edge(found, "list", "top"), number(found, "cell")
+    if top > cell + 0.5:
+        problems.append(f"{where}: the list's top edge is at {top:.1f}px, {top - cell:.1f}px below the top of "
+                        f"its cell at {cell:.1f}px: a reserved band")
+    pill_top, pill_bottom = edge(found, "pill", "top"), edge(found, "pill", "bottom")
+    list_bottom = edge(found, "list", "bottom")
+    if pill_top < top - 0.5 or pill_bottom > list_bottom + 0.5:
+        problems.append(f"{where}: the pill at {pill_top:.1f}-{pill_bottom:.1f}px is not floating over "
+                        f"the list at {top:.1f}-{list_bottom:.1f}px")
     return problems
 
 
@@ -296,27 +236,45 @@ def scroll_walk(desk: Desk, what: str) -> list[str]:
     return problems
 
 
-def chip_on_the_line(desk: Desk) -> list[str]:
-    """Main scrolled so the summed-up thread's unread chip stands on the pill's line: what covers it."""
+def head_at_top(desk: Desk) -> list[str]:
+    """Main at its very top: the first row at the head of the scroll area, the pill floating over it,
+    and hiding and showing the pill moving neither the list nor that row (`#1320`, `#1210`)."""
     page = desk.page
-    chip = page.evaluate(CHIP_JS, CHIP_ROOT)
-    desk.check(isinstance(chip, dict), f"fixture: row {CHIP_ROOT} shows no unread chip in Main")
-    assert isinstance(chip, dict)
-    found = line(desk)
-    middle = (edge(found, "pill", "top") + edge(found, "pill", "bottom")) / 2
-    page.evaluate(f"() => {{ document.getElementById('scroll-area').scrollTop += {float(chip['y']) - middle}; }}")
+    page.evaluate("() => { document.getElementById('scroll-area').scrollTop = 0; }")
     desk.settled()
-    chip = page.evaluate(CHIP_JS, CHIP_ROOT)
-    assert isinstance(chip, dict)
+    problems = line_problems(desk, "Main at its top")
     found = line(desk)
-    pill = found["pill"]
-    assert isinstance(pill, dict)
-    desk.check(float(chip["left"]) < float(pill["right"]) and float(chip["right"]) > float(pill["left"]),
-               f"fixture: the chip {chip} is not under the pill {pill} across the screen")
-    problems: list[str] = []
-    if chip["hit"]:
-        problems.append(f"the \"{chip['text']}\" chip is under the pill, and a tap through the pill reaches it")
-    problems.extend(line_problems(desk, "Main with the unread chip on the pill's line"))
+    top = edge(found, "list", "top")
+    # The head of the pane (its summary seam, then its first row), not the first row alone: the
+    # summary is an entry at the head of the view and sits above the first message by design.
+    first = page.evaluate("""() => {
+        const head = [...document.querySelectorAll('#pane-discord .seam, #discord-log > li')]
+            .find((e) => e.getClientRects().length > 0);
+        return head ? head.getBoundingClientRect().top : null;
+    }""")
+    desk.check(isinstance(first, (int, float)), "fixture: Main draws nothing at the head of the list")
+    if isinstance(first, (int, float)) and float(first) > top + 24:
+        problems.append(f"Main at its top: the head of the list starts at {float(first):.1f}px, "
+                        f"{float(first) - top:.1f}px below the scroll area's top: a reserved band")
+    # The pill takes no layout room: its coming and going leaves the list and the row where they were.
+    before = page.evaluate("""() => {
+        const area = document.getElementById('scroll-area');
+        const row = document.querySelector('#discord-log > li');
+        const a = area.getBoundingClientRect();
+        return [a.top, a.height, row ? row.getBoundingClientRect().top : 0, area.scrollTop];
+    }""")
+    page.evaluate("() => { document.getElementById('channel-freshness').hidden = true; }")
+    desk.settled()
+    after = page.evaluate("""() => {
+        const area = document.getElementById('scroll-area');
+        const row = document.querySelector('#discord-log > li');
+        const a = area.getBoundingClientRect();
+        return [a.top, a.height, row ? row.getBoundingClientRect().top : 0, area.scrollTop];
+    }""")
+    page.evaluate("() => { document.getElementById('channel-freshness').hidden = false; }")
+    desk.settled()
+    if before != after:
+        problems.append(f"Main at its top: hiding the pill moved the list from {before} to {after}")
     return problems
 
 
@@ -354,7 +312,7 @@ def open_thread(desk: Desk) -> None:
 
 
 def with_old_room(desk: Desk, steps: list[str]) -> list[str]:
-    """Run each named check with the pill's room put back as padding inside the scroller."""
+    """Run each named check with the old reserved band put back over the page's own sheet."""
     page = desk.page
     page.evaluate("(css) => { const s = document.createElement('style'); s.id = 'old-room'; s.textContent = css;"
                   " document.head.append(s); }", OLD_ROOM_CSS)
@@ -362,7 +320,7 @@ def with_old_room(desk: Desk, steps: list[str]) -> list[str]:
     problems: list[str] = []
     try:
         for step in steps:
-            problems.extend(chip_on_the_line(desk) if step == "chip" else scroll_walk(desk, step))
+            problems.extend(head_at_top(desk) if step == "head" else scroll_walk(desk, step))
     finally:
         page.evaluate("() => document.getElementById('old-room').remove()")
         desk.settled()
@@ -373,27 +331,26 @@ def pill_walk(desk: Desk) -> None:
     page = desk.page
     open_channel(desk)
 
-    # Main, the unread chip on the pill's line, then the whole list.
+    # Main at its head, then the whole list.
     page.select_option("#thread-select", "main")
     desk.wait_for(f"() => !!document.querySelector(\"#discord-log > li[data-id='{CHIP_ROOT}'] > .thread-unread\")",
                   "Main did not draw the thread's unread chip")
     desk.settled()
-    problems = chip_on_the_line(desk)
-    desk.shot("1-main-chip")
+    problems = head_at_top(desk)
+    desk.shot("1-main-head")
     desk.check(not problems, f"Main: {problems}")
     problems = scroll_walk(desk, "Main")
     desk.check(not problems, f"Main: {problems}")
     found = line(desk)
-    desk.notes.append(f"Main: the list starts at the floating line's foot ({edge(found, 'list', 'top'):.1f}px), the "
-                      f"unread chip on the pill's line is clipped rather than covered, and at {PLACES} places nothing "
-                      "of the list is under the pill or the glass")
-    control = with_old_room(desk, ["chip", "Main"])
-    desk.check(any("chip is under the pill" in problem for problem in control),
-               "THE CONTROL: with the old room the chip was not under the pill, so the check above proves nothing")
-    desk.check(sum("scrolled to" in problem for problem in control) >= PLACES // 2,
-               f"THE CONTROL: with the old room the list was under the pill at too few places: {control[:3]}")
+    desk.notes.append(f"Main: the list starts at the top of its cell ({edge(found, 'list', 'top'):.1f}px) with no "
+                      f"reserved band, the pill floats over it, and at {PLACES} places hiding it moves nothing")
+    control = with_old_room(desk, ["head", "Main"])
+    desk.check(any("reserved band" in problem for problem in control),
+               "THE CONTROL: with the old band the head was not flagged, so the check above proves nothing")
+    desk.check(sum("reserved band" in problem for problem in control) >= PLACES // 2,
+               f"THE CONTROL: with the old band too few places were flagged: {control[:3]}")
 
-    # A thread, landed on its root: the date rule clear, nothing of the list between the card and the pill.
+    # A thread, landed on its root: its date rule below the pill as drawn, over a list with no band.
     page.select_option("#thread-select", "flat")
     desk.wait_for("() => document.querySelectorAll('#discord-log > li[data-id]').length === 24", "All did not come back")
     desk.settled()
@@ -416,12 +373,12 @@ def pill_walk(desk: Desk) -> None:
     problems = scroll_walk(desk, "thread")
     desk.check(not problems, f"thread: {problems}")
     desk.notes.append(f"a thread landed with its root's date rule at {float(rule['top']):.1f}px, below the floating "
-                      f"line's foot at {foot:.1f}px, nothing of the list between the card and the pill, and nothing "
-                      f"under the line at {PLACES} places")
+                      f"line's foot at {foot:.1f}px, over a list whose top edge is at the top of its cell, at "
+                      f"{PLACES} places")
     control = with_old_room(desk, ["thread"])
-    desk.check(sum("scrolled to" in problem for problem in control) >= PLACES // 2,
-               f"THE CONTROL: with the old room the thread was under the pill at too few places: {control[:3]}")
-    desk.notes.append(f"with the old room the same checks found the list under the pill ({len(control)} findings in the "
+    desk.check(sum("reserved band" in problem for problem in control) >= PLACES // 2,
+               f"THE CONTROL: with the old band too few places were flagged: {control[:3]}")
+    desk.notes.append(f"with the old band the same checks flagged a reserved band ({len(control)} findings in the "
                       "thread alone)")
 
 

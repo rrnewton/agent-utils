@@ -1,8 +1,9 @@
 // How old what is on screen is, said over the list and on the right column's line
 // (`#624 voice-page-modularity`, moved from the legacy script as a pure move, cleared
-// by name with the scroll owner). Words, order and the room (none: `#1210` — the pane
-// carries the space statically) are as they were in the script. The load state, the
-// words for stale, and the place-keeping are the page's, handed in.
+// by name with the scroll owner). Words and order are as they were in the script, and
+// the room is none (`#1320`: the pill floats over the list and reserves no band, so
+// `#1210`'s no-shift holds with nothing held statically). The load state, the words
+// for stale, and the place-keeping are the page's, handed in.
 
 /** The load state, as freshness reads it. */
 export interface FreshnessLoadState {
@@ -83,9 +84,10 @@ export function createFreshness(deps: FreshnessDependencies): Freshness {
     // along that line across the top of the list.
     pill.hidden = text === "" || deps.view() !== "discord" ||
       (!gesture.hidden && gesture.getAttribute("data-edge") !== "end") || deps.searchOpen();
-    // No room is reserved or released here (#1210): the pane carries `data-freshness` statically,
-    // so the list's top edge stands at the floating line's foot for as long as the pane is shown
-    // and the scroller never resizes as freshness appears, clears, or is reworded.
+    // No room is reserved or released here, or anywhere (#1320, keeping #1210): the pill floats
+    // over the list on a zero-height anchor and takes no layout room, so the scroller never
+    // resizes and no row moves as freshness appears, clears, or is reworded. Callers that land
+    // a row measure the pill as drawn (`floatingClearance`), which is unchanged.
   }
 
   /**

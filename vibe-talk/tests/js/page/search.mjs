@@ -313,9 +313,9 @@ test("THE GLASS GROWS INTO A BAR OVER THE LIST, THE PILL GIVES WAY, AND CLOSING 
   assert.equal(page.el("search-field").hidden, false, "the field did not open");
   assert.equal(pill.hidden, true, "the open bar is drawn over the pill");
   assert.equal(page.el("topbar").hidden, true, "opening the search spent a header row after all");
-  // The pill's ROOM stays reserved while the pill steps aside, as it does for a pull: it is keyed
-  // to there being something to say, and the bar's own room replaces it in the stylesheet.
-  assert.equal(page.el("pane-discord").hasAttribute("data-freshness"), true);
+  // No room is reserved for the pill while it steps aside, or at any other time (`#1320`): the
+  // bar makes its own room while open, and closed there is no band for the pill to return to.
+  assert.equal(page.el("pane-discord").hasAttribute("data-freshness"), false);
 
   await page.el("search-field").setValue("stalled");
   assert.equal(unfiltered(page, "discord-log").length, 1, "the floating field does not filter");
@@ -336,18 +336,52 @@ test("THE GLASS GROWS INTO A BAR OVER THE LIST, THE PILL GIVES WAY, AND CLOSING 
   assert.equal(pill.hidden, false, "Escape left the pill hidden");
 });
 
-test("the open bar makes room for itself at the head of the list, in place of the pill's", () => {
+test("with search closed the list head reserves no band, with or without freshness showing", async () => {
+  // `#1320 no-freshness-band`. The owner: the freshness chip "is designed as a floating chip
+  // anyway", yet since `#1210` made `data-freshness` static the list kept a permanent header
+  // band for it. Now no band is reserved while search is closed: the pill floats over the list
+  // on its zero-height anchor, the first message sits at the top of the scroll area, and
+  // showing, clearing or rewording the pill still moves nothing because it takes no layout room.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [
+    message({ id: "1", content: "the first message at the head" }),
+    message({ id: "2", content: "a different subject" }),
+  ]);
+  assert.equal(page.el("screen-main").hasAttribute("data-searching"), false, "search ships open");
+  assert.equal(page.el("channel-freshness").hidden, false, "freshness is not showing");
+  // No rule moves the scroll area down for the pill, and no static reservation marks the pane.
+  assert.equal(
+    cssRules(CSS, "#screen-main:not([data-searching]) > #scroll-area:has(> #pane-discord[data-freshness]:not([hidden]))").length,
+    0,
+    "the list head still reserves a band for the freshness pill while search is closed"
+  );
+  for (const block of cssRules(CSS, "#scroll-area")) {
+    assert.doesNotMatch(block, /margin-top\s*:/, "the scroll area is pushed down from the top of its cell");
+  }
+  assert.equal(page.el("pane-discord").hasAttribute("data-freshness"), false,
+    "the pane still carries the static freshness reservation");
+  // The pill's line itself takes no room, so the first row is at the scroll area's head whether
+  // the pill is showing or cleared.
+  assert.match(cssBlock("#channel-freshness-anchor"), /height:\s*0/);
+  const firstRow = () => page.el("discord-log").children[0];
+  const headTop = () => firstRow().getBoundingClientRect().top;
+  const withPill = headTop();
+  page.el("channel-freshness").hidden = true;
+  assert.equal(headTop(), withPill, "clearing the freshness pill moved the first message");
+});
+
+test("the open bar makes room for itself at the head of the list, the only room the head ever makes", () => {
   // The bar floats, so without room reserved under it the first match — the one a filter leaves
-  // at the very top — would be underneath it. The room is padding inside the scroller, as
-  // `#32 freshness-pill-overlap` first made room for the pill, and it REPLACES the pill's room rather
-  // than stacking under it: the pill is not on screen while the bar is. Since `#324
-  // live-pill-covers-row` the pill's room is the list's top edge, and is made only while not searching.
+  // at the very top — would be underneath it. The room is padding inside the scroller, made only
+  // while the bar is open: since `#1320 no-freshness-band` the closed state reserves no band for
+  // the pill at all, so this replaces nothing and stacks under nothing.
   assert.match(
     cssBlock("#screen-main[data-searching] #scroll-area"),
     /padding-top:\s*calc\(var\(--float-line\) \+ var\(--search-bar\) \/ 2 \+ 0\.35rem\)/,
     "the list does not make room for the open bar"
   );
-  assert.equal(cssRules(CSS, "#screen-main:not([data-searching]) > #scroll-area:has(> #pane-discord[data-freshness]:not([hidden]))").length, 1, "the pill's room is not one rule");
+  assert.equal(cssRules(CSS, "#screen-main:not([data-searching]) > #scroll-area:has(> #pane-discord[data-freshness]:not([hidden]))").length, 0, "the pill's old band rule is still reserving room");
   assert.equal(cssRules(CSS, "#pane-discord[data-freshness]").length, 0,
     "the pill's room is padding inside the scroller again, which scrolls away");
   // ...and the bar is a panel of its own, so the count is not printed onto a message underneath.

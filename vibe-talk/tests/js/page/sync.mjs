@@ -568,36 +568,35 @@ test("a refresh the SERVER fails is reported as a failure, not as being offline"
   assert.equal(freshness(page).hidden, true, "two pills stacked in one place");
 });
 
-// `#32 freshness-pill-overlap`. The pill floats over the head of the list, so the pane makes room
-// for it there for exactly as long as it has something to say — and keeps that room while the pill
-// gives way to a pull, because the list jumping mid-gesture is worse than the pill's absence.
-test("the channel pane reserves the freshness pill's room for as long as it has something to say", async () => {
+// `#1320 no-freshness-band` (was `#32 freshness-pill-overlap`'s reservation). The pill floats
+// over the head of the list and the pane reserves NO room for it at any time — not while it has
+// something to say, and not while it gives way to a pull — so the list never shifts as the pill
+// changes between current, failed, and current again (`#1210`).
+test("the channel pane reserves no room for the freshness pill, whatever it has to say", async () => {
   const page = newPage();
   await signIn(page);
   await showDiscord(page, [message({ id: "721", content: "on screen" })]);
   const reserved = () => page.el("pane-discord").hasAttribute("data-freshness");
   const failing = errorResponse(502, "discord_error", "the provider is down");
-  // The pill has something to say from the first read on, so its room is held from then: the
-  // list never shifts as the pill changes between current, failed, and current again.
   assertCurrent(page, "a freshly read channel did not say it is current");
-  assert.equal(reserved(), true, "the current-state pill sits over the list's header");
+  assert.equal(reserved(), false, "the current-state pill reserved a band at the list's head");
   page.channelPage = failing;
   await reReadChannel(page);
   assert.equal(freshness(page).hidden, false);
-  assert.equal(reserved(), true, "the failed-refresh pill sits over the list's header");
+  assert.equal(reserved(), false, "the failed-refresh pill reserved a band at the list's head");
   page.channelPage = async () =>
     json(200, { channel: CHANNEL, messages: [message({ id: "721", content: "on screen" })], has_more: false });
   await reReadChannel(page);
   assertCurrent(page, "a recovered channel did not say it is current again");
-  assert.equal(reserved(), true, "a recovered channel moved the list by dropping the pill's room");
+  assert.equal(reserved(), false, "a recovered channel reserved a band at the list's head");
   page.channelPage = failing;
   await reReadChannel(page);
-  assert.equal(reserved(), true);
+  assert.equal(reserved(), false);
   page.el("pull-refresh").hidden = false;
   await page.el("view-switch").click();
   await page.el("view-switch").click();
   assert.equal(freshness(page).hidden, true);
-  assert.equal(reserved(), true, "giving way to the pull moved the list under the finger");
+  assert.equal(reserved(), false, "giving way to the pull reserved a band at the list's head");
 });
 
 test("each scope keeps at most MESSAGE_CACHE_ROWS rows, and a reload walks back from the oldest kept", async () => {

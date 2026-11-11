@@ -228,9 +228,9 @@
             that just succeeded: saved on this device and refreshing, or kept after a refresh that
             failed. It floats over the top of the list — outside the scroller, so it never scrolls
             away, and below the view tabs, so it never covers one. A zero-height anchor, so its
-            appearing resizes nothing; the channel pane reserves its height at the head of the
-            list instead, so it never covers the header either. It is a status and not an alert:
-            it is spoken once when it changes, never interrupts.
+            appearing resizes nothing, and since `#1320 no-freshness-band` the list reserves no
+            band for it either: it floats over the head of the list as a chip. It is a status and
+            not an alert: it is spoken once when it changes, never interrupts.
 
             `#197 floating-search`. The anchor is now the LINE everything floating over the top of
             the list is centred on, and the search glass shares it: the owner asked for the glass
@@ -550,10 +550,11 @@
               </div>
             </div>
 
-            <!-- `data-freshness` is static (#1210): the floating line's room at the list's head is
-                 reserved for as long as this pane is shown, so the scroller's geometry never
-                 changes when freshness appears, clears, or is reworded. -->
-            <div id="pane-discord" data-freshness hidden>
+            <!-- No freshness room is reserved at this pane's head (#1320 no-freshness-band):
+                 the freshness pill floats over the list on its zero-height anchor and takes no
+                 layout room, so the scroller's geometry never changes when freshness appears,
+                 clears, or is reworded (#1210). -->
+            <div id="pane-discord" hidden>
               <!--
                 NOTHING LIVES ABOVE THE MESSAGES ANY MORE, and that is the whole point.
                 `#83 channel-selector-in-bar` already found this once: a control placed here is
