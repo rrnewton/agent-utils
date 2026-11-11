@@ -469,14 +469,13 @@ def columns_walk(desk: Desk) -> None:
     desk.check(min(row["width"] for row in agents) > found["readingWidth"] + 1,
                f"the agent's tiles are no wider than one column's reading width ({found['readingWidth']:.0f}px)")
 
-    # The glass: at the left column's top right, by the divider, over no row, with no strip kept for it.
+    # The glass: at the left column's top right, by the divider, floating over the list with no
+    # strip kept for it (`#1320 no-freshness-band`: it may stand over the row at the head, as the
+    # freshness pill does; what is kept for it is nothing).
     glass = found["glass"]
     desk.check(divider - 24 <= glass["right"] <= divider, f"the glass is not at the divider: {glass} {divider}")
-    # What of a row is drawn: the list clips what is scrolled above its top edge.
-    over = [row["id"] for row in main if max(row["top"], left["top"]) < glass["bottom"] and row["bottom"] > glass["top"]
-            and row["left"] < glass["right"] and row["right"] > glass["left"]]
-    desk.check(not over, f"the glass covers rows {over}")
-    desk.check(glass["bottom"] <= left["top"] + 1, f"the glass is not on the line over the list: {glass} {left}")
+    desk.check(glass["top"] >= left["top"] - 1 and glass["bottom"] > left["top"],
+               f"the glass is not floating over the list: {glass} {left}")
     desk.check(gap < glass["width"], "a strip as wide as the glass is left between the rows and the divider")
 
     # The right column: its heading and its empty list's line span it.
@@ -489,7 +488,7 @@ def columns_walk(desk: Desk) -> None:
     desk.shot("two-columns")
     desk.notes.append(f"two {column:.0f}px columns: the owner's rows {min(row['width'] for row in mine):.0f}px, "
                       f"the agent's tiles {min(row['width'] for row in agents):.0f}px, "
-                      f"{gap:.0f}px from the divider, the glass over no row")
+                      f"{gap:.0f}px from the divider, the glass floating over the list")
 
     # One column at the same desk keeps its reading width.
     page.click("#column-toggle")

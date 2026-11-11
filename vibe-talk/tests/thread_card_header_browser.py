@@ -727,13 +727,18 @@ def check_fixed(desk: Desk, found: Json, where: str) -> None:
     """The owner: "the card should NOT scroll away when I scroll down, but should be the fixed header
     object." The thread scrolled both ways: the card stays where it stands."""
     box = part(found, "box")
-    for by in (-200, 200):
+    # Down first, then back up, each move judged against the position before it: since
+    # `#1320 no-freshness-band` the thread lands at its very top (scrollTop within a few px of
+    # 0), where a first move up proves nothing, and a return to the start is not a move either.
+    previous = number(part(found, "list"), "scrollTop")
+    for by in (200, -200):
         desk.page.evaluate(f"() => {{ document.getElementById('scroll-area').scrollTop += {by}; }}")
         desk.settled()
         now = wide(desk)
         moved = part(now, "box")
-        desk.check(abs(number(part(now, "list"), "scrollTop") - number(part(found, "list"), "scrollTop")) > 20 or by > 0,
+        desk.check(abs(number(part(now, "list"), "scrollTop") - previous) > 20,
                    f"{where}: the thread did not scroll, so this proves nothing")
+        previous = number(part(now, "list"), "scrollTop")
         desk.check(all(abs(number(moved, key) - number(box, key)) <= 0.5 for key in ("top", "left", "height")),
                    f"{where}: the card moved with the thread: {moved} from {box}")
 

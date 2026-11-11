@@ -1385,7 +1385,7 @@ steps:
   # across that column. Measured on 2026-10-19: about 8s wall.
   - group: check
     job: desktop-layout-browser
-    desc: Settings' head one quiet row (two on a phone) in reading and Tab order, and in two columns every row but the owner's across its column with the glass over none, in current Chromium at 1280x800, 1920x1080, 2560x1080 and 393x852
+    desc: Settings' head one quiet row (two on a phone) in reading and Tab order, and in two columns every row but the owner's across its column with the glass floating over the list, in current Chromium at 1280x800, 1920x1080, 2560x1080 and 393x852
     labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/desktop_layout_browser.py
     jobs_flag: ""
@@ -1568,7 +1568,7 @@ steps:
   # about 22s wall.
   - group: check
     job: live-pill-browser
-    desc: the live pill and the search glass stand over no row, chip or date rule of the channel's list, in Main and in a thread, at any scroll position and as a thread lands, in current Chromium at a 412x915 phone in both schemes
+    desc: the live pill and the search glass float over the channel's list with no reserved band at its head, in Main and in a thread, at any scroll position and as a thread lands, in current Chromium at a 412x915 phone in both schemes
     labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/live_pill_browser.py
     jobs_flag: ""
