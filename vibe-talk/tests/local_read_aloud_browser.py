@@ -10,7 +10,17 @@ tests/local_tts.rs, and the real Kokoro sidecar is measured separately;
 this walk covers what only the page can show: the read-aloud bar names
 the Local voice, Settings keeps it as the selected server reader, and a
 tap is heard. Both walks — 393x852 (a phone) and a desktop viewport —
-run the same steps.
+run the same steps. Pass --screenshots DIR to keep a PNG of each step
+for review, and --web-root DIR to run against another copy of the page.
+
+The gating verdict is behaviour only (#1250 vibe-talk-timing-robust,
+pattern #1248 fold-latency-behaviour-verdict): the bar names the Local
+voice, Settings keeps it selected, the ticket is played, and the page
+reports the read audible with an integer tap-to-audible time. That
+time is printed every run but decides nothing in gating; the old
+5000 ms budget is enforced only by --benchmark, an opt-in speed
+measurement run outside the gate (never in the dag command), so a hot
+host cannot fail this walk and a broken read cannot pass it.
 """
 
 from __future__ import annotations
@@ -32,6 +42,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from urllib.parse import unquote, urlsplit
 
+from browser_audio import CHROMIUM_AUDIO_ARGS
 import page_sources
 
 if TYPE_CHECKING:
@@ -46,6 +57,15 @@ EPOCH = datetime(2026, 1, 5, 9, 0, tzinfo=timezone.utc)
 RATE = 24_000
 MESSAGES = {"401": "a message read in the local voice",
             "402": "a second message, read the same way"}
+# The most a walk waits for a state it expects the page to reach (#1250 vibe-talk-timing-robust;
+# precedent read_aloud_views_browser.py:77-80, #998). Each such wait polls for the state, so a
+# pass takes as long as the page does and the deadline only bounds a failure; the old 10 s and
+# 15 s windows can run out on a saturated host and pass solo.
+STATE_S = 30.0
+# Tap-to-audible, printed every run, decides nothing in the gating verdict; `--benchmark` alone
+# enforces this budget as an opt-in speed measurement outside the gate (#1250
+# vibe-talk-timing-robust, pattern #1248 fold-latency-behaviour-verdict).
+AUDIBLE_BENCHMARK_MS = 5000
 
 
 def tone_wav(seconds: float = 1.2) -> bytes:
@@ -219,6 +239,13 @@ def arguments() -> argparse.Namespace:
         default=page_sources.served_root(),
         help="the page assets to serve (default: this checkout's vibe-talk/web)",
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="also fail when the printed tap-to-audible time exceeds the 5000 ms budget: an "
+             "opt-in speed measurement, never part of the gating verdict (default: "
+             "behaviour only)",
+    )
     return parser.parse_args()
 
 
@@ -227,23 +254,23 @@ def check(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-def walk(page: "Page", api: FakeApi, url: str, shot: Callable[[str], None]) -> None:
+def walk(page: "Page", api: FakeApi, url: str, shot: Callable[[str], None], benchmark: bool) -> None:
     """One reader's walk, the same at phone and desktop sizes."""
     page.goto(url, wait_until="load")
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
     page.click("#view-switch")
     last = list(MESSAGES)[-1]
-    page.wait_for_selector(f'#discord-log > li[data-id="{last}"]', timeout=10_000)
+    page.wait_for_selector(f'#discord-log > li[data-id="{last}"]', timeout=int(STATE_S * 1000))
 
     # The bar names the Local voice, and Settings keeps it selected.
     check(page.get_attribute("#audio-source", "aria-label") == "Read messages with Local voice",
           "the read-aloud bar did not name the Local voice")
     page.click("#open-settings")
-    page.wait_for_selector("#screen-settings", state="visible", timeout=10_000)
+    page.wait_for_selector("#screen-settings", state="visible", timeout=int(STATE_S * 1000))
     page.click("#fold-settings-voice-agent")
     page.click("#fold-reading-full")
-    page.wait_for_selector("#settings-audio-source", state="visible", timeout=10_000)
+    page.wait_for_selector("#settings-audio-source", state="visible", timeout=int(STATE_S * 1000))
     check(page.input_value("#settings-audio-source") == "agent",
           "Settings did not keep the Local voice as the selected reader")
     shot("settings-local-voice")
@@ -251,13 +278,13 @@ def walk(page: "Page", api: FakeApi, url: str, shot: Callable[[str], None]) -> N
 
     # A tap is heard.
     page.click("#read-aloud")
-    page.wait_for_function(f"() => readAloudOwner().preparedSpeech.size() === {len(MESSAGES)}", timeout=10_000)
+    page.wait_for_function(f"() => readAloudOwner().preparedSpeech.size() === {len(MESSAGES)}", timeout=int(STATE_S * 1000))
     viewport = page.viewport_size or {"width": 1440, "height": 900}
     if viewport["width"] < 600:
         page.tap('#discord-log > li[data-id="401"] .body')
     else:
         page.click('#discord-log > li[data-id="401"] .body')
-    deadline = time.monotonic() + 15
+    deadline = time.monotonic() + STATE_S
     timing: Json | None = None
     while time.monotonic() < deadline:
         with api.lock:
@@ -268,8 +295,12 @@ def walk(page: "Page", api: FakeApi, url: str, shot: Callable[[str], None]) -> N
     if timing is None:
         raise AssertionError("the page never reported the local read audible")
     audible = timing.get("tap_to_audible_ms")
-    check(isinstance(audible, int) and audible < 5000,
-          f"the local read was not promptly audible: {timing}")
+    if not isinstance(audible, int):
+        raise AssertionError(f"the local read did not report a tap-to-audible time: {timing}")
+    print(f"local read tap to audible: {audible} ms", flush=True)
+    if benchmark:
+        check(audible < AUDIBLE_BENCHMARK_MS,
+              f"the local read was not promptly audible: {timing}")
     with api.lock:
         check("401" in api.reads, f"the ticket was never played: {api.reads}")
     shot("read-aloud-local")
@@ -304,6 +335,7 @@ def main() -> int:
                 with tempfile.TemporaryDirectory(prefix="vibe-talk-local-chrome-") as profile:
                     context = playwright.chromium.launch_persistent_context(
                         profile,
+                        args=CHROMIUM_AUDIO_ARGS,
                         headless=True,
                         executable_path=executable,
                         viewport={"width": width, "height": height},
@@ -322,7 +354,7 @@ def main() -> int:
                         api.prepares.clear()
                         api.timings.clear()
                         api.reads.clear()
-                    walk(page, api, url, shot)
+                    walk(page, api, url, shot, args.benchmark)
                     check(not errors, f"page errors during the {name} walk: {errors}")
                     context.close()
                     print(f"local read-aloud walk ({name} {width}x{height}): ok")

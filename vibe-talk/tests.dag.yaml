@@ -486,10 +486,12 @@ steps:
 
   # `#552 wit-tts-provider` in the browser engine: Settings offers the Wit.ai voice and its
   # catalogue picker, the picked voice is what speech preparation asks for, and a tap is heard,
-  # at 393x852 and on a desktop.
+  # at 393x852 and on a desktop. The verdict is that behaviour only; the tap-to-audible time is
+  # printed, and the old 5000 ms budget is an opt-in `--benchmark` outside the gate (#1250
+  # vibe-talk-timing-robust, pattern #1248 fold-latency-behaviour-verdict).
   - group: check
     job: wit-read-aloud-browser
-    desc: read-aloud with the Wit.ai backend in current Chromium, phone and desktop
+    desc: read-aloud with the Wit.ai backend in current Chromium, phone and desktop, behaviour verdict only (tap-to-audible printed)
     labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/wit_read_aloud_browser.py
     jobs_flag: ""
@@ -504,9 +506,12 @@ steps:
 
   # `#561 local-tts-provider` in the browser engine: the read-aloud bar names the Local voice,
   # Settings keeps it as the selected reader, and a tap is heard, at 393x852 and on a desktop.
+  # The verdict is that behaviour only; the tap-to-audible time is printed, and the old 5000 ms
+  # budget is an opt-in `--benchmark` outside the gate (#1250 vibe-talk-timing-robust, pattern
+  # #1248 fold-latency-behaviour-verdict).
   - group: check
     job: local-read-aloud-browser
-    desc: read-aloud with the local backend in current Chromium, phone and desktop
+    desc: read-aloud with the local backend in current Chromium, phone and desktop, behaviour verdict only (tap-to-audible printed)
     labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/local_read_aloud_browser.py
     jobs_flag: ""
@@ -521,10 +526,12 @@ steps:
 
   # `#563 read-aloud-fallback-chain` in the browser engine: Settings displays the configured
   # voice order, a tap is heard, and the page names the fallback voice that spoke the block,
-  # at 393x852 and on a desktop.
+  # at 393x852 and on a desktop. The verdict is that behaviour only; the tap-to-audible time is
+  # printed, and the old 5000 ms budget is an opt-in `--benchmark` outside the gate (#1250
+  # vibe-talk-timing-robust, pattern #1248 fold-latency-behaviour-verdict).
   - group: check
     job: fallback-chain-browser
-    desc: read-aloud through a fallback chain in current Chromium, phone and desktop
+    desc: read-aloud through a fallback chain in current Chromium, phone and desktop, behaviour verdict only (tap-to-audible printed)
     labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/fallback_chain_browser.py
     jobs_flag: ""

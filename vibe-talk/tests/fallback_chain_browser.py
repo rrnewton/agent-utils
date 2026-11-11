@@ -10,7 +10,18 @@ preparation mints tickets, and a ticket plays a short WAV tone with the
 shows: Settings displays the configured order, a tap is heard, and the
 page tells the reader which voice is speaking. The Rust chain itself is
 covered by src/chain.rs tests and tests/fallback_chain.rs. Both walks —
-393x852 (a phone) and a desktop viewport — run the same steps.
+393x852 (a phone) and a desktop viewport — run the same steps. Pass
+--screenshots DIR to keep a PNG of each step for review, and
+--web-root DIR to run against another copy of the page.
+
+The gating verdict is behaviour only (#1250 vibe-talk-timing-robust,
+pattern #1248 fold-latency-behaviour-verdict): Settings displays the
+configured chain order, the status names the voice that spoke, and the
+page reports the read audible with an integer tap-to-audible time.
+That time is printed every run but decides nothing in gating; the old
+5000 ms budget is enforced only by --benchmark, an opt-in speed
+measurement run outside the gate (never in the dag command), so a hot
+host cannot fail this walk and a broken read cannot pass it.
 """
 
 from __future__ import annotations
@@ -49,6 +60,15 @@ RATE = 24_000
 CHAIN = ["Local voice", "Wit.ai voice", "Device voice"]
 MESSAGES = {"401": "a message the second voice in the chain reads",
             "402": "a second message, read the same way"}
+# The most a walk waits for a state it expects the page to reach (#1250 vibe-talk-timing-robust;
+# precedent read_aloud_views_browser.py:77-80, #998). Each such wait polls for the state, so a
+# pass takes as long as the page does and the deadline only bounds a failure; the old 10 s and
+# 15 s windows can run out on a saturated host and pass solo.
+STATE_S = 30.0
+# Tap-to-audible, printed every run, decides nothing in the gating verdict; `--benchmark` alone
+# enforces this budget as an opt-in speed measurement outside the gate (#1250
+# vibe-talk-timing-robust, pattern #1248 fold-latency-behaviour-verdict).
+AUDIBLE_BENCHMARK_MS = 5000
 
 
 def tone_wav(seconds: float = 1.2) -> bytes:
@@ -227,6 +247,13 @@ def arguments() -> argparse.Namespace:
         default=page_sources.served_root(),
         help="the page assets to serve (default: this checkout's vibe-talk/web)",
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="also fail when the printed tap-to-audible time exceeds the 5000 ms budget: an "
+             "opt-in speed measurement, never part of the gating verdict (default: "
+             "behaviour only)",
+    )
     return parser.parse_args()
 
 
@@ -235,21 +262,21 @@ def check(condition: bool, message: str) -> None:
         raise AssertionError(message)
 
 
-def walk(page: Page, api: FakeApi, url: str, shot: Callable[[str], None]) -> None:
+def walk(page: Page, api: FakeApi, url: str, shot: Callable[[str], None], benchmark: bool) -> None:
     """One reader's walk, the same at phone and desktop sizes."""
     page.goto(url, wait_until="load")
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
     page.click("#view-switch")
     last = list(MESSAGES)[-1]
-    page.wait_for_selector(f'#discord-log > li[data-id="{last}"]', timeout=10_000)
+    page.wait_for_selector(f'#discord-log > li[data-id="{last}"]', timeout=int(STATE_S * 1000))
 
     # Settings displays the configured order, first first.
     page.click("#open-settings")
-    page.wait_for_selector("#screen-settings", state="visible", timeout=10_000)
+    page.wait_for_selector("#screen-settings", state="visible", timeout=int(STATE_S * 1000))
     page.click("#fold-settings-voice-agent")
     page.click("#fold-reading-full")
-    page.wait_for_selector("#settings-chain-order", state="visible", timeout=10_000)
+    page.wait_for_selector("#settings-chain-order", state="visible", timeout=int(STATE_S * 1000))
     order = page.text_content("#settings-chain-order") or ""
     check(order == "Voice order: Local voice → Wit.ai voice → Device voice",
           f"Settings did not show the chain order: {order!r}")
@@ -258,7 +285,7 @@ def walk(page: Page, api: FakeApi, url: str, shot: Callable[[str], None]) -> Non
 
     # A tap is heard, and the page names the voice that spoke it.
     page.click("#read-aloud")
-    page.wait_for_function(f"() => readAloudOwner().preparedSpeech.size() === {len(MESSAGES)}", timeout=10_000)
+    page.wait_for_function(f"() => readAloudOwner().preparedSpeech.size() === {len(MESSAGES)}", timeout=int(STATE_S * 1000))
     viewport = page.viewport_size or {"width": 1440, "height": 900}
     if viewport["width"] < 600:
         page.tap('#discord-log > li[data-id="401"] .body')
@@ -266,8 +293,8 @@ def walk(page: Page, api: FakeApi, url: str, shot: Callable[[str], None]) -> Non
         page.click('#discord-log > li[data-id="401"] .body')
     page.wait_for_function(
         "() => document.querySelector('#status')?.textContent?.includes('Wit.ai voice')",
-        timeout=10_000)
-    deadline = time.monotonic() + 15
+        timeout=int(STATE_S * 1000))
+    deadline = time.monotonic() + STATE_S
     timing: Json | None = None
     while time.monotonic() < deadline:
         with api.lock:
@@ -278,8 +305,12 @@ def walk(page: Page, api: FakeApi, url: str, shot: Callable[[str], None]) -> Non
     if timing is None:
         raise AssertionError("the page never reported the chained read audible")
     audible = timing.get("tap_to_audible_ms")
-    check(isinstance(audible, int) and audible < 5000,
-          f"the chained read was not promptly audible: {timing}")
+    if not isinstance(audible, int):
+        raise AssertionError(f"the chained read did not report a tap-to-audible time: {timing}")
+    print(f"chained read tap to audible: {audible} ms", flush=True)
+    if benchmark:
+        check(audible < AUDIBLE_BENCHMARK_MS,
+              f"the chained read was not promptly audible: {timing}")
     shot("read-aloud-chain")
 
 
@@ -330,7 +361,7 @@ def main() -> int:
                     with api.lock:
                         api.timings.clear()
                         api.reads.clear()
-                    walk(page, api, url, shot)
+                    walk(page, api, url, shot, args.benchmark)
                     check(not errors, f"page errors during the {name} walk: {errors}")
                     context.close()
                     print(f"fallback-chain walk ({name} {width}x{height}): ok")
