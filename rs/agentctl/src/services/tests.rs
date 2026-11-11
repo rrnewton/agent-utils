@@ -14,7 +14,10 @@ use super::discover::{discover, discover_all, Kind, OptionTables};
 use super::host::{Host, UnitState};
 use super::refresh::{definition, refresh, RefreshOptions, DROP_IN};
 use super::snapshot::{self, Snapshot};
-use super::turnover::{turnover, TurnoverOptions};
+use super::turnover::{
+    notify_message, scheduled_outcome, turnover, ScheduledOutcome, TurnoverOptions,
+    TIMER_NOTIFY_AGENT,
+};
 use super::unit::{quote_word, shell_words, split_words, ExecCommand, UnitText};
 
 const OLD: &str = "1111111111111111111111111111111111111111";
@@ -1384,6 +1387,123 @@ fn turnover_report_is_unchanged_when_only_unrelated_paths_moved() {
         report.text
     );
     assert_eq!(report.exit_code, 0, "{}", report.text);
+}
+
+#[test]
+fn turnover_scheduled_outcomes_map_every_exit_code() {
+    // #1220: 0 and 74 complete a scheduled run; 1, 4 and 75 fail it.
+    assert_eq!(scheduled_outcome(0), ScheduledOutcome::Success);
+    assert_eq!(scheduled_outcome(74), ScheduledOutcome::Success);
+    assert_eq!(scheduled_outcome(1), ScheduledOutcome::Failure);
+    assert_eq!(scheduled_outcome(4), ScheduledOutcome::Failure);
+    assert_eq!(scheduled_outcome(75), ScheduledOutcome::Failure);
+    assert_eq!(scheduled_outcome(2), ScheduledOutcome::Failure);
+    assert_eq!(TIMER_NOTIFY_AGENT, "turnover-timer");
+    let message = notify_message(|name| match name {
+        "TURNOVER_PHASE" => Some("unit-done".to_owned()),
+        "TURNOVER_REGISTRY" => Some("/r/.agentctl".to_owned()),
+        "TURNOVER_UNIT" => Some("bridge.service".to_owned()),
+        "TURNOVER_OLD_SHA" => Some(OLD.to_owned()),
+        "TURNOVER_NEW_SHA" => Some(NEW.to_owned()),
+        "TURNOVER_VERDICT" => Some("refreshed".to_owned()),
+        _ => None,
+    });
+    assert_eq!(
+        message,
+        format!("turnover unit-done: registry /r/.agentctl, unit bridge.service, {OLD} -> {NEW}, verdict refreshed\n")
+    );
+}
+
+#[test]
+fn turnover_report_other_daemon_without_commit_is_report_only() {
+    // #1220: an other-daemon row with no commit must not force exit 75
+    // when every agentctl service is current.
+    let world = world();
+    let (checkout, old, _new) = turnover_checkout(&world._temporary.0);
+    let mut options = turnover_options(&world, checkout);
+    options.revision = old.clone();
+    world
+        .fake
+        .commits
+        .borrow_mut()
+        .insert(PathBuf::from("/state/bin/agentctl-old"), old.clone());
+    world.fake.units.borrow_mut().insert(
+        "tick.service".to_owned(),
+        FakeUnit {
+            transient: false,
+            text: "[Service]\nExecStart=/state/bin/tick-hub run\n".to_owned(),
+            fragment: PathBuf::from("/home/u/.config/systemd/user/tick.service"),
+            loaded: "[Service]\nExecStart={ path=/state/bin/tick-hub ; argv[]=/state/bin/tick-hub run }\n".to_owned(),
+            active: "active".to_owned(),
+            pid: None,
+        },
+    );
+    let report = turnover(&world.fake, &Tables, &options).unwrap();
+    let rows = report.document["services"].as_array().unwrap();
+    let tick = rows
+        .iter()
+        .find(|row| row["unit"] == "tick.service")
+        .expect("tick row");
+    assert_eq!(tick["decision"], "report-only", "{}", report.text);
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+}
+
+#[test]
+fn turnover_failure_alerts_the_coordinator_through_notify() {
+    // #1220: an unknown agentctl unit exits 75, a scheduled failure, and
+    // the notify command observes a run-failed phase.
+    let world = world();
+    let (checkout, old, _new) = turnover_checkout(&world._temporary.0);
+    let mut options = turnover_options(&world, checkout);
+    options.revision = old.clone();
+    options.notify = Some(vec!["/bin/notify".to_owned()]);
+    world.fake.add_unit_file(
+        "mystery-watch.service",
+        "[Service]\nExecStart=/state/bin/agentctl-mystery --registry /tmp watch-agents\nWorkingDirectory=/tmp\n",
+    );
+    let report = turnover(&world.fake, &Tables, &options).unwrap();
+    assert_eq!(report.exit_code, 75, "{}", report.text);
+    let calls = world.fake.notify_calls.borrow();
+    assert!(
+        calls.iter().any(|(_, environment)| {
+            environment
+                .iter()
+                .any(|(name, value)| name == "TURNOVER_PHASE" && value == "run-failed")
+                && environment
+                    .iter()
+                    .any(|(name, value)| name == "TURNOVER_VERDICT" && value == "exit-75")
+        }),
+        "{calls:?}"
+    );
+}
+
+#[test]
+fn turnover_apply_tidies_an_empty_pin_directory() {
+    // #1220: a staged run leaves no empty pin directory behind.
+    let world = world();
+    let (checkout, old, _new) = turnover_checkout(&world._temporary.0);
+    let mut options = turnover_options(&world, checkout);
+    options.revision = old.clone();
+    options.report_only = false;
+    options.dry_run = true;
+    world
+        .fake
+        .commits
+        .borrow_mut()
+        .insert(PathBuf::from("/state/bin/agentctl-old"), old.clone());
+    let registry = world._temporary.0.join("team/.agentctl");
+    // Dry runs change nothing, so the directory is still there.
+    fs::create_dir_all(registry.join("turnover-pins")).unwrap();
+    turnover(&world.fake, &Tables, &options).unwrap();
+    assert!(registry.join("turnover-pins").is_dir());
+    options.dry_run = false;
+    options.report_only = true;
+    // Report mode is read-only too.
+    turnover(&world.fake, &Tables, &options).unwrap();
+    assert!(registry.join("turnover-pins").is_dir());
+    options.report_only = false;
+    turnover(&world.fake, &Tables, &options).unwrap();
+    assert!(!registry.join("turnover-pins").exists());
 }
 
 #[test]

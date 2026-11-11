@@ -75,7 +75,8 @@ builds older than layout 2 stop at this file; upgrade agentctl. Readers of renam
 /// The directory holding the registry's chat bridges, one entry each.
 pub const BRIDGES: &str = "bridges";
 /// Names no agent may take: each is a directory of the registry itself.
-pub const RESERVED_NAMES: [&str; 4] = ["archive", AGENTS, LOCKS, BRIDGES];
+/// `turnover-pins` holds services-turnover pin files (#1220), not an agent.
+pub const RESERVED_NAMES: [&str; 5] = ["archive", AGENTS, LOCKS, BRIDGES, "turnover-pins"];
 /// The registry-wide lock files, `REGISTRY/.<stem>.lock`, that are fixed items, not agents'
 /// layout-1 locks. Layout 1 shared `.coordinator.lock` between the designation and an agent
 /// named `coordinator`; it stays, as the designation lock.
@@ -588,6 +589,9 @@ mod tests {
         let registry = scratch("reserved");
         prepare(&registry).unwrap();
         fs::create_dir(registry.join("archive")).unwrap();
+        // #1220: a turnover pin directory is not an agent either.
+        fs::create_dir(registry.join("turnover-pins")).unwrap();
+        assert!(!is_agent_name("turnover-pins"));
         assert!(names(&registry).unwrap().is_empty());
         assert!(is_tripwire(&registry.join("agents/agent.json")));
         assert!(registry.join(".renames").join(RENAMES_TRIPWIRE).is_file());

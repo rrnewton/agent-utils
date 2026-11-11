@@ -69,6 +69,75 @@ pub struct TurnoverOptions {
     pub interrupted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
+/// The designed notify identity for timer-driven turnover runs (#1220):
+/// a valid agent name the sender header can name and be answered by, set
+/// as `AGENTCTL_AGENT` by the scheduled entry and by the notify wrapper.
+pub const TIMER_NOTIFY_AGENT: &str = "turnover-timer";
+
+/// How a scheduled (timer) service treats a turnover exit code (#1220).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScheduledOutcome {
+    /// The run completed: 0 (all current or refreshed) or 74 (report:
+    /// some behind or report-only, nothing failed).
+    Success,
+    /// The run failed and the coordinator is alerted: 1 (a refresh failed
+    /// and rolled back), 4 (a rollback failed), 75 (nothing could move,
+    /// or a report had errors or unknowns), and any other code.
+    Failure,
+}
+
+/// Map every turnover exit code to its scheduled-service outcome.
+#[must_use]
+pub fn scheduled_outcome(exit_code: i32) -> ScheduledOutcome {
+    match exit_code {
+        0 | 74 => ScheduledOutcome::Success,
+        _ => ScheduledOutcome::Failure,
+    }
+}
+
+/// The file-based notify message for one TURNOVER_* environment (#1220):
+/// phase, registry, unit, both commits and the verdict, one per line.
+#[must_use]
+pub fn notify_message(get: impl Fn(&str) -> Option<String>) -> String {
+    let value = |name: &str| get(name).unwrap_or_default();
+    format!(
+        "turnover {phase}: registry {registry}, unit {unit}, {old} -> {new}, verdict {verdict}\n",
+        phase = value("TURNOVER_PHASE"),
+        registry = value("TURNOVER_REGISTRY"),
+        unit = value("TURNOVER_UNIT"),
+        old = value("TURNOVER_OLD_SHA"),
+        new = value("TURNOVER_NEW_SHA"),
+        verdict = value("TURNOVER_VERDICT"),
+    )
+}
+
+/// Run as the timer's `--notify` command (`services turnover-notify`):
+/// format the TURNOVER_* environment into a file and send it with
+/// `agentctl send TO --file FILE` under the timer notify identity.
+/// Returns the send's exit code.
+pub fn run_turnover_notify(to: &str, agent: &str) -> Result<i32, String> {
+    let message = notify_message(|name| std::env::var(name).ok());
+    let file = std::env::temp_dir().join(format!(
+        "agentctl-turnover-notify-{}.txt",
+        std::process::id()
+    ));
+    write_private(&file, message.as_bytes(), 0o600)?;
+    let agentctl = std::env::current_exe().map_err(|error| error.to_string())?;
+    let status = std::process::Command::new(&agentctl)
+        .env("AGENTCTL_AGENT", agent)
+        .arg("send")
+        .arg(to)
+        .arg("--file")
+        .arg(&file)
+        .status()
+        .map_err(|error| format!("cannot run {} send: {error}", agentctl.display()));
+    let _ = fs::remove_file(&file);
+    match status {
+        Ok(status) => Ok(status.code().unwrap_or(1)),
+        Err(error) => Err(error),
+    }
+}
+
 /// One unit's turnover decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Decision {
@@ -224,6 +293,20 @@ fn read_pins(host: &dyn Host, registry: &Path, units: &[&str]) -> Result<Pins, S
         }
     }
     Ok(pins)
+}
+
+/// #1220: a pin directory that stays in the registry is private, and one
+/// whose last pin file was removed is removed, so a staged run leaves no
+/// empty pin directory behind for the agent scan to misread.
+fn tidy_pin_dir(registry: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = registry.join("turnover-pins");
+    let empty = fs::read_dir(&dir).is_ok_and(|mut entries| entries.next().is_none());
+    if empty {
+        let _ = fs::remove_dir(&dir);
+    } else if dir.is_dir() {
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    }
 }
 
 impl Pins {
@@ -512,6 +595,11 @@ pub fn turnover(
         pins.insert(registry.clone(), read_pins(host, registry, &units)?);
     }
     let global_pin = pin_reason(host, &options.root.join("global.pin"))?;
+    if !options.report_only && !options.dry_run {
+        for registry in &registries {
+            tidy_pin_dir(registry);
+        }
+    }
 
     let mut rows: Vec<Row> = Vec::new();
     for service in &services {
@@ -561,11 +649,14 @@ pub fn turnover(
         let paths = other_affecting_paths(&name);
         let (decision, changed, mut detail) =
             decide(options, &candidate, &paths, running.as_deref());
-        let decision = if decision == Decision::Refresh {
-            detail = "no snapshot carries this binary; rebuild it from the checkout".to_owned();
+        // #1220: no snapshot can carry this binary, so it is report-only
+        // whatever its binary reports — including no commit at all, which
+        // must not force every report to exit 75.
+        let decision = {
+            if decision == Decision::Refresh || decision == Decision::Unknown {
+                detail = "no snapshot carries this binary; rebuild it from the checkout".to_owned();
+            }
             Decision::ReportOnly
-        } else {
-            decision
         };
         rows.push(Row {
             kind_label: name,
@@ -801,6 +892,25 @@ pub fn turnover(
         } else {
             0
         };
+    }
+
+    // #1220: a failing scheduled outcome alerts the coordinator through
+    // the same notify mechanism, once per registry.
+    if !options.dry_run && scheduled_outcome(exit_code) == ScheduledOutcome::Failure {
+        for registry in &registries {
+            let command = notify_command(host, registry, options.notify.as_deref());
+            notify(
+                host,
+                command.as_deref(),
+                "run-failed",
+                registry,
+                "",
+                None,
+                &candidate,
+                &format!("exit-{exit_code}"),
+                &mut notes,
+            );
+        }
     }
 
     Ok(render(

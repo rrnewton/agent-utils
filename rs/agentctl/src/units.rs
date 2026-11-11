@@ -310,6 +310,37 @@ pub fn rendered_scheduled(
         rendered.push(' ');
         rendered.push_str(&scheduled_argument(argument)?);
     }
+    let after = if entry.after.is_empty() {
+        String::new()
+    } else {
+        format!("After={}\n", entry.after.join(" "))
+    };
+    let timeout = entry
+        .timeout_start_seconds
+        .map(|seconds| format!("TimeoutStartSec={seconds}\n"))
+        .unwrap_or_default();
+    let mut environment = String::new();
+    for (name, value) in &entry.environment {
+        environment.push_str(&environment_line(name, value).ok_or_else(|| {
+            fail(format!(
+                "scheduled {:?} environment {name} cannot be rendered",
+                entry.name
+            ))
+        })?);
+    }
+    let success_exit = if entry.success_exit_status.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "SuccessExitStatus={}\n",
+            entry
+                .success_exit_status
+                .iter()
+                .map(i32::to_string)
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    };
     let base = format!("agentctl-scheduled-{}", entry.name);
     Ok(vec![
         (
@@ -317,6 +348,10 @@ pub fn rendered_scheduled(
             SCHEDULED_SERVICE
                 .replace("@HOST@", &host)
                 .replace("@COMMAND@", &rendered)
+                .replace("@AFTER@", &after)
+                .replace("@TIMEOUT@", &timeout)
+                .replace("@ENVIRONMENT@", &environment)
+                .replace("@SUCCESS_EXIT@", &success_exit)
                 .replace("@NAME@", &entry.name),
         ),
         (
@@ -612,6 +647,10 @@ mod tests {
             name: name.to_owned(),
             on_calendar: on_calendar.to_owned(),
             command: command.iter().map(|item| item.to_string()).collect(),
+            timeout_start_seconds: None,
+            environment: Default::default(),
+            after: Vec::new(),
+            success_exit_status: Vec::new(),
         }
     }
 
@@ -655,6 +694,56 @@ mod tests {
         );
         assert!(timer.contains("Persistent=true\n"), "{timer}");
         assert!(timer.contains("WantedBy=timers.target\n"), "{timer}");
+        for (_, contents) in &files {
+            assert!(!contents.contains('@'), "{contents}");
+        }
+    }
+
+    #[test]
+    fn scheduled_turnover_entry_renders_timezone_timeout_environment_and_ordering() {
+        // #1220: the 05:30 ET daily turnover entry.
+        let mut entry = scheduled(
+            "turnover",
+            "*-*-* 05:30:00 America/New_York",
+            &["/home/owner/bin/agentctl", "services", "turnover"],
+        );
+        entry.timeout_start_seconds = Some(7200);
+        entry.environment = [
+            (
+                "PATH".to_owned(),
+                "/home/owner/bin:/usr/bin:/bin".to_owned(),
+            ),
+            ("HOME".to_owned(), "/home/owner".to_owned()),
+            ("AGENTCTL_AGENT".to_owned(), "turnover-timer".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        entry.after = vec!["au-mirror-sync.service".to_owned()];
+        entry.success_exit_status = vec![0, 74];
+        let files = rendered_scheduled(&entry, "host-one").unwrap();
+        let (service, timer) = (&files[0].1, &files[1].1);
+        assert!(
+            timer.contains("OnCalendar=*-*-* 05:30:00 America/New_York\n"),
+            "{timer}"
+        );
+        assert!(
+            service.contains("After=au-mirror-sync.service\n"),
+            "{service}"
+        );
+        assert!(service.contains("TimeoutStartSec=7200\n"), "{service}");
+        assert!(
+            service.contains("Environment=\"PATH=/home/owner/bin:/usr/bin:/bin\"\n"),
+            "{service}"
+        );
+        assert!(
+            service.contains("Environment=\"HOME=/home/owner\"\n"),
+            "{service}"
+        );
+        assert!(
+            service.contains("Environment=\"AGENTCTL_AGENT=turnover-timer\"\n"),
+            "{service}"
+        );
+        assert!(service.contains("SuccessExitStatus=0 74\n"), "{service}");
         for (_, contents) in &files {
             assert!(!contents.contains('@'), "{contents}");
         }

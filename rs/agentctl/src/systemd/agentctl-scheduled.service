@@ -6,7 +6,8 @@
 [Unit]
 Description=agentctl scheduled command @NAME@
 ConditionHost=@HOST@
-
+@AFTER@
 [Service]
 Type=oneshot
 ExecStart=@COMMAND@
+@TIMEOUT@@ENVIRONMENT@@SUCCESS_EXIT@

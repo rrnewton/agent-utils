@@ -445,7 +445,12 @@ fn read_arguments(args: &[String], tables: &dyn OptionTables) -> Reading {
         } else if let Some(long) = word.strip_prefix("--") {
             match long.split_once('=') {
                 Some((name, value)) => Some((name.to_owned(), Some(value.to_owned()))),
-                None if values.contains(long) => {
+                None if values.contains(long)
+                    || (long == "state"
+                        && path.len() == 2
+                        && path[0] == "chat"
+                        && path[1] == "run") =>
+                {
                     let value = args.get(index).cloned();
                     index += 1;
                     Some((long.to_owned(), value))
@@ -478,11 +483,20 @@ fn read_arguments(args: &[String], tables: &dyn OptionTables) -> Reading {
             None
         };
         if let Some((name, Some(value))) = option {
-            match tables.canonical(&name).as_str() {
-                "registry" => reading.registry = Some(value),
-                "bridge-state" => reading.bridge_state = Some(value),
-                "state-dir" => reading.state_dir = Some(value),
-                _ => {}
+            // #1220: legacy units run `chat run --state DIR`, where
+            // `--state` names the bridge state (the Python form of
+            // `--bridge-state`), not the registry. Only inside `chat run`
+            // does it mean that; before the subcommand it is the
+            // `--registry` alias.
+            if name == "state" && path.as_slice() == ["chat", "run"] {
+                reading.bridge_state = Some(value);
+            } else {
+                match tables.canonical(&name).as_str() {
+                    "registry" => reading.registry = Some(value),
+                    "bridge-state" => reading.bridge_state = Some(value),
+                    "state-dir" => reading.state_dir = Some(value),
+                    _ => {}
+                }
             }
         }
     }
@@ -596,6 +610,21 @@ mod tests {
         );
         assert_eq!(headless.kind, Some(Kind::Headless));
         assert_eq!(headless.agent.as_deref(), Some("coordinator"));
+    }
+
+    #[test]
+    fn chat_run_state_is_a_bridge_state_not_the_registry() {
+        // #1220: legacy `chat run --state DIR` units are bridges.
+        let reading = read_arguments(
+            &words("--registry /r chat run --state /s --offer-reply-command"),
+            &Tables,
+        );
+        assert_eq!(reading.kind, Some(Kind::Bridge));
+        assert_eq!(reading.registry.as_deref(), Some("/r"));
+        assert_eq!(reading.bridge_state.as_deref(), Some("/s"));
+        let equals = read_arguments(&words("chat run --state=/s2"), &Tables);
+        assert_eq!(equals.kind, Some(Kind::Bridge));
+        assert_eq!(equals.bridge_state.as_deref(), Some("/s2"));
     }
 
     #[test]

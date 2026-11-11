@@ -234,6 +234,22 @@ pub struct ScheduledUnit {
     pub on_calendar: String,
     /// The command the timer runs, as an argv whose first element is absolute.
     pub command: Vec<String>,
+    /// `TimeoutStartSec=` for the oneshot, in seconds: long enough for a cold
+    /// snapshot build plus per-unit health windows on a turnover entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_start_seconds: Option<u64>,
+    /// `Environment=` pairs the service needs, such as PATH, HOME and a
+    /// designed notify identity (`AGENTCTL_AGENT`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub environment: std::collections::BTreeMap<String, String>,
+    /// Units this service is ordered after (`After=`), such as the local
+    /// mirror sync job a turnover must not race.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after: Vec<String>,
+    /// Exit codes systemd counts as success (`SuccessExitStatus=`): a
+    /// turnover's 0 and 74 are both completed outcomes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub success_exit_status: Vec<i32>,
     /// Keys a newer agentctl added, kept when this record is written back (#809
     /// chat-bridge-json-forward-compat).
     #[serde(flatten)]
@@ -244,12 +260,14 @@ pub struct ScheduledUnit {
 /// letters, digits, and the punctuation calendar syntax uses, with no specifier,
 /// quote, or command separator.
 pub(crate) fn calendar_schedule(value: &str) -> bool {
+    // `_` and `+` appear in timezone names (`America/New_York`,
+    // `Etc/GMT+5`); `/` separates the area from the locality.
     !value.is_empty()
         && value.len() <= 128
         && value.trim() == value
         && value
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b" -,.:/*".contains(&byte))
+            .all(|byte| byte.is_ascii_alphanumeric() || b" -,.:/*_+".contains(&byte))
 }
 
 fn default_startup_delay() -> u64 {
@@ -617,6 +635,33 @@ impl RestoreConfig {
             {
                 return Err(invalid(
                     "scheduled command needs an absolute program and plain arguments",
+                ));
+            }
+            if entry
+                .timeout_start_seconds
+                .is_some_and(|seconds| seconds == 0 || seconds > 86_400)
+            {
+                return Err(invalid(
+                    "scheduled timeout_start_seconds is between 1 and 86400",
+                ));
+            }
+            if entry.after.iter().any(|unit| !unit_name(unit))
+                || entry
+                    .success_exit_status
+                    .iter()
+                    .any(|code| !(0..=255).contains(code))
+                || entry.environment.iter().any(|(name, value)| {
+                    name.is_empty()
+                        || !name
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                        || value
+                            .chars()
+                            .any(|c| c.is_control() || c == '"' || c == '\\')
+                })
+            {
+                return Err(invalid(
+                    "scheduled after, success_exit_status and environment must be plain unit names, exit codes 0-255, and NAME=value pairs systemd can carry",
                 ));
             }
         }
@@ -4334,6 +4379,22 @@ mod tests {
         assert_eq!(config.scheduled.len(), 1);
         assert_eq!(config.scheduled[0].name, "nightly-backup");
         assert_eq!(config.scheduled[0].command.len(), 2);
+        // #1220: a daily 05:30 in a named timezone, with the turnover
+        // entry's timeout, environment, ordering and success codes.
+        let config = load(
+            r##"{"schema": "agentctl-restore/v1", "scheduled": [{"name": "turnover", "on_calendar": "*-*-* 05:30:00 America/New_York", "command": ["/home/me/bin/agentctl", "services", "turnover"], "timeout_start_seconds": 7200, "environment": {"PATH": "/home/me/bin:/usr/bin:/bin", "HOME": "/home/me", "AGENTCTL_AGENT": "turnover-timer"}, "after": ["au-mirror-sync.service"], "success_exit_status": [0, 74]}]}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            config.scheduled[0].on_calendar,
+            "*-*-* 05:30:00 America/New_York"
+        );
+        assert_eq!(config.scheduled[0].timeout_start_seconds, Some(7200));
+        assert_eq!(config.scheduled[0].after, ["au-mirror-sync.service"]);
+        assert!(load(
+            r##"{"schema": "agentctl-restore/v1", "scheduled": [{"name": "a", "on_calendar": "daily", "command": ["/bin/true"], "timeout_start_seconds": 0}]}"##,
+        )
+        .is_err());
         for refused in [
             // A duplicate name would render one pair over another.
             r##"{"schema": "agentctl-restore/v1", "scheduled": [{"name": "a", "on_calendar": "daily", "command": ["/bin/true"]}, {"name": "a", "on_calendar": "hourly", "command": ["/bin/true"]}]}"##,
