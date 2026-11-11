@@ -6392,93 +6392,53 @@ const { threadListBack, openThreadFromList, leaveThreadList, cardAnchor, placeCa
  * facts (`markReplyMatch`). Nothing is read as the search is typed: a reply the page does not hold is
  * found once the cards' own walk further back has read it (`searchReplies`, `#262 search-load-older`).
  */
-function filterSideCards() {
-  // A filter choosing rows opens every run, and closing it folds them again: unpacked blocks' runs, and
-  // under Fold read the runs of read threads over the cards (`foldCardRuns`, `#432 read-mode-unify`).
-  // Noted whether or not the blocks are drawn again (`cardsDrawn.noteSuspended`).
-  if (cardsDrawn.noteSuspended(readRunsSuspended()) && (unpackOnScreen() || readModes.mode() === "fold")) {
-    cardsDrawn.forget();
-    renderSideCards();
-    return;
-  }
-  // `#606 server-side-search`. The shared language, message by message: a thread with any hit is
-  // chosen, by its card's own words or by a reply the page holds.
-  const node = searchField.open() ? searchParsed(searchField.query()).node : null;
-  const typed = node !== null;
-  const marking = searchField.open() ? searchParsed(searchField.marked()).terms : [];
-  const allRows = /** @type {HTMLElement[]} */ ([...leftEl("side-cards").children]);
-  const rows = allRows.filter((row) => row.hasAttribute("data-card"));
-  const replyHits = typed ? threadsWithHits(node) : null;
-  // `#439 search-unmatched-separators`. The runs among the cards the reader has opened: shown, as in
-  // the channel's lists, but never counted among the matches the bar names.
-  const openedCards = openedCardGaps(false);
-  let unread = 0;
-  let shown = 0;
-  /** @type {Map<string, boolean>} */
-  const cardShown = new Map();
-  for (const row of rows) {
-    const text = row.getAttribute("data-search") || "";
-    const fresh = !row.hasAttribute("data-thread-read");
-    const revealed = openedCards !== null && openedCards.threads.has(String(row.getAttribute("data-id")));
-    // `#432 read-mode-unify`. Hide read takes a read thread out with its unpacked rows, as it takes a read
-    // message out of Main; a card in a folded run is hidden behind the run's line. A card in a run
-    // the reader opened from its unmatched line (`#439`) stands through either, while the search stands.
-    const kept = (((!hidingRead() || fresh) && row.getAttribute("data-read-run") !== "member") || revealed);
-    const own = !typed || rowMatches(row, node, text);
-    const inReplies = !own && replyHits !== null && replyHits.has(String(row.getAttribute("data-id")));
-    const said = own || inReplies || revealed;
-    if (row.hidden === kept) row.hidden = !kept;
-    setClassWord(row, "search-hidden", !said);
-    markReplyMatch(row, inReplies);
-    // `#249 search-highlight`. And where, once the typing pauses (`searchField.marked()`): the card's own
-    // words, whatever its replies matched.
-    markSearchHits(row, own || inReplies ? marking : []);
-    if (fresh) unread += 1;
-    if (kept && (own || inReplies)) shown += 1;
-    cardShown.set(String(row.getAttribute("data-id")), kept && said);
-  }
-  // `#419 threads-view-main-messages`. Main's messages among the cards: the read mode chose them as they
-  // were drawn (`mainRowMessages`), a folded run hides its members behind its line, and the search finds
-  // them by their words.
-  for (const row of allRows) {
-    if (!row.hasAttribute("data-main-row")) continue;
-    const revealed = openedCards !== null && inOpenedGap(row, openedCards.ids);
-    const kept = row.getAttribute("data-read-run") !== "member" || revealed;
-    const matched = !typed || rowMatches(row, node, row.getAttribute("data-search") || "");
-    const said = matched || revealed;
-    if (row.hidden === kept) row.hidden = !kept;
-    setClassWord(row, "search-hidden", !said);
-    markSearchHits(row, matched ? marking : []);
-  }
-  // `#404 threads-unpack-all`. A card's unpacked block goes where its card goes, a row hidden in a
-  // collapsed run of read messages staying hidden behind its line (`#407 unpack-row-parity`).
-  for (const row of allRows) {
-    const thread = row.getAttribute("data-unpack-thread");
-    if (thread === null) continue;
-    const shownBlock = cardShown.get(thread) === true && row.getAttribute("data-read-run") !== "member";
-    // ...and a block whose card heads a folded run of read threads goes behind the run's line with it.
-    const folded = row.getAttribute("data-card-run") === "member";
-    if (row.hidden === (shownBlock && !folded)) row.hidden = !(shownBlock && !folded);
-    // `#606 server-side-search`. Unpacked under a search, a thread shows only its hits, its other
-    // messages folded into lines between them (`drawUnpackGaps`), until the reader opens one.
-    const hit = !typed || rowMatches(row, node, row.getAttribute("data-search")) ||
-      (openedCards !== null && inOpenedGap(row, openedCards.ids));
-    setClassWord(row, "search-hidden", !hit);
-    markSearchHits(row, typed && hit ? marking : []);
-  }
-  // `#281 view-keys`. A failed read of older threads is said over the cards it left as they were.
-  const state = [olderThreadsFailure(), sideListState(rows.length, unread, shown)].filter((part) => part !== "").join(" ");
-  setTextIfChanged(leftEl("side-list-state"), state);
-  if (leftEl("side-list-state").hidden !== (state === "")) leftEl("side-list-state").hidden = state === "";
-  cardsDrawn.setCount(rows.length, shown);
-  if (threadListOnScreen()) sayCardCount();
-  // `#262 search-load-older`. The way to their threads' older replies, as the search and All's reach say.
-  renderRepliesSearch();
-  // `#439 search-unmatched-separators`. A line in each run the search leaves among the cards.
-  drawCardGaps(leftEl("side-cards"));
-  // `#261 two-column-connectors`. The cards shown are what the links go to.
-  scheduleColumnLinks();
-}
+// The search over the cards, the runs of read threads over them, and the links between Main's
+// roots and their cards are web/src/view/channel's now (`createCardRuns`, `#624
+// voice-page-modularity`). The read mode is only ever read, through the handed-in question.
+const cardRuns = createCardRuns({
+  leftById: leftEl,
+  noteSuspendedRuns: () => cardsDrawn.noteSuspended(readRunsSuspended()),
+  unpackOnScreen: () => unpackOnScreen(),
+  readMode: () => readModes.mode(),
+  readRunsSuspended: () => readRunsSuspended(),
+  forgetCards: () => cardsDrawn.forget(),
+  renderSideCards: () => renderSideCards(),
+  searchOpen: () => searchField.open(),
+  searchNode: () => searchParsed(searchField.query()).node,
+  searchTerms: () => searchParsed(searchField.marked()).terms,
+  threadsWithHits: (node) => threadsWithHits(/** @type {any} */ (node)),
+  openedCardGaps: (create) => openedCardGaps(create),
+  hidingRead: () => hidingRead(),
+  rowMatches: (row, node, text) => rowMatches(row, /** @type {any} */ (node), text),
+  markReplyMatch: (row, inReplies) => markReplyMatch(row, inReplies),
+  markSearchHits: (row, terms) => markSearchHits(row, /** @type {any} */ (terms)),
+  olderThreadsFailure: () => olderThreadsFailure(),
+  allLoaded: () => allLoaded(),
+  setCardsCount: (cards, shown) => cardsDrawn.setCount(cards, shown),
+  threadListOnScreen: () => threadListOnScreen(),
+  sayCardCount: () => sayCardCount(),
+  renderRepliesSearch: () => renderRepliesSearch(),
+  drawCardGaps: (list) => drawCardGaps(list),
+  inOpenedGap: (row, ids) => inOpenedGap(row, /** @type {any} */ (ids)),
+  selectedChannelId: () => selectedChannelId(),
+  rowIsRead: (row) => rowIsRead(row),
+  readRunPlan: (items, key, isRead, ids) => /** @type {any} */ (readRunPlan(/** @type {any} */ (items), key, /** @type {any} */ (isRead), /** @type {any} */ (ids))),
+  readRunLine: (row) => readRunLine(row),
+  placeInReadRun: (row, role, count) => placeInReadRun(row, /** @type {any} */ (role), count),
+  keepingCardPlace: (change) => keepingCardPlace(change),
+  makeColumnLinksDeps: () => ({
+    onTwoColumns: () => layoutShown.columns() && screens.screen() === "main" && screens.view() === "discord",
+    sideMode: () => columns.side.mode,
+    mainList: () => channelPane.list(),
+    openThread: () => /** @type {any} */ (sideThreadChoice()),
+    activePane: () => activePane(),
+    sidePane: () => sidePane,
+    litCard: () => litCardOnRight(),
+    cardRow: (thread) => cardRowOnRight(thread),
+    hue: (thread) => Number(threadHue(thread)),
+  }),
+});
+const { columnLinks, cardRunKey, filterSideCards, sideListState, refilterSideCards, cardRunRows, foldCardRuns, columnLinksShown, scheduleColumnLinks, drawColumnLinks, noteLinkedSelection, glideBehavior } = cardRuns;
 
 // --- unmatched runs among the thread cards ------------------------------------------------------
 //
@@ -6506,33 +6466,9 @@ function filterSideCards() {
 
 
 
-/**
- * What the right column says over its cards, or "" while it shows some: none in the channel, none
- * unread under Hide read (`#432 read-mode-unify`; Unread only, `#259`, before it), or none the search
- * matches.
- *
- * @param {number} cards How many cards there are.
- * @param {number} unread How many of them have unread replies.
- * @param {number} shown How many the filters leave.
- */
-function sideListState(cards, unread, shown) {
-  if (cards === 0) return "No threads in this channel yet.";
-  if (shown > 0) return "";
-  if (hidingRead() && unread === 0) return "No unread threads.";
-  // `#262 search-load-older`. How far back the search has looked, where that is the whole channel: until
-  // then the way further back under this line says the day (`renderRepliesSearch`).
-  const whole = allLoaded() ? " — all of this channel is loaded" : "";
-  return `No threads match that search${whole}.`;
-}
-
 // `#432 read-mode-unify`. Unread only (`#259 thread-list-unread-filter`) was the cards' own filter, a
 // chip and a choice kept on this device. It is the read mode now, as for every list: Hide read leaves the
 // read threads out, Fold read folds them into runs (`foldCardRuns`), Show read shows them.
-
-/** `filterSideCards`, the reader's place in the cards kept: the search typed, opened or closed. */
-function refilterSideCards() {
-  keepingCardPlace(filterSideCards);
-}
 
 // --- unpack every thread under its card (#404 threads-unpack-all) ----------------------------------
 //
@@ -6749,68 +6685,9 @@ const { THREADS_MAIN_KEY, mainRowsChoice, threadOrders, mainRowsOnScreen, render
 // rows are in it), a tap or Enter opening it (`openReadRun`). A read thread outside a run keeps its
 // unpacked rows folded as a thread's are (`unpackBlock`).
 
-/** The key the cards' opened runs are kept under, by channel (`readRuns`). */
-const cardRunKey = () => `cards:${String(selectedChannelId())}`;
-
 // A card's DOM helpers (cardRootOf, threadCardId, cardGapGroups, markCardLayout, fillCardText, ...) are
 // web/src/view/channel/'s, and the Main runs among the cards (mainRunsAmong) web/src/present/rows/'s
-// (`#624 voice-page-modularity`).
-
-/** Whether an item of the cards is read: a card by its thread (`threadIsRead`), a Main row by its messages. */
-const cardRunRead = (row) => (row.hasAttribute("data-card") ? row.hasAttribute("data-thread-read") : rowIsRead(row));
-
-/** The items of the run whose line is on `head`, the line's item first: cards and Main rows, not unpacked rows. */
-function cardRunRows(head) {
-  const rows = [...(head.parentNode || leftEl("side-cards")).children];
-  const run = [head];
-  for (let at = rows.indexOf(head) + 1; at < rows.length; at += 1) {
-    const row = rows[at];
-    if (row.getAttribute("data-card-run") === "member") continue;
-    if (row.getAttribute("data-read-run") !== "member" || row.hasAttribute("data-unpack-thread")) break;
-    run.push(row);
-  }
-  return run;
-}
-
-/**
- * Fold the runs of read items over the cards in `list` under Fold read, and undo them otherwise: each run's
- * line on its first item, its other items hidden, and the rows unpacked under its cards marked as in the run
- * (`data-card-run`), over the folds of their own block, which come back when the run is opened.
- */
-function foldCardRuns(list) {
-  const rows = /** @type {HTMLElement[]} */ ([...list.children]);
-  const items = rows.filter((row) => row.hasAttribute("data-card") || row.hasAttribute("data-main-row"));
-  const placed = readModes.mode() === "fold" && !readRunsSuspended()
-    ? readRunPlan(items, cardRunKey(), cardRunRead, cardRunIds) : new Map();
-  const isItem = new Set(items);
-  /** @type {{row: HTMLElement, threads: number, messages: number} | null} */
-  let run = null;
-  const say = () => {
-    if (!run) return;
-    const line = readRunLine(run.row);
-    const words = cardRunText(run.threads, run.messages);
-    if (line.textContent !== words) line.textContent = words;
-    line.setAttribute("title", `Show ${words.replace(/^… /, "these ")}`);
-  };
-  for (const row of rows) {
-    if (isItem.has(row)) {
-      const role = (placed.get(row) || { role: null }).role;
-      if (role !== "member") {
-        say();
-        run = role === "head" ? { row, threads: 0, messages: 0 } : null;
-      }
-      placeInReadRun(row, role, 0);
-      if (run) {
-        if (row.hasAttribute("data-card")) run.threads += 1;
-        else run.messages += idsOf(row).length;
-      }
-      continue;
-    }
-    if (run) row.setAttribute("data-card-run", "member");
-    else if (row.hasAttribute("data-card-run")) row.removeAttribute("data-card-run");
-  }
-  say();
-}
+// (`#624 voice-page-modularity`). The runs of read threads over the cards are `createCardRuns`' (above).
 
 
 
@@ -7085,49 +6962,6 @@ const { flyThreadCard, endCardFlightPart, endCardFlight } = cardFlightOwner;
 // web/src/view/channel's (`createColumnLinks`, `#624 voice-page-modularity`), with what is drawn and
 // what it costs. The page tells it which columns show, the selection and the highlighted card; the
 // names below are the page's commands to it. Nothing here scrolls for the mouse (`#1144`).
-
-const columnLinks = createColumnLinks({
-  lookup: (id) => leftEl(id),
-  onTwoColumns: () => layoutShown.columns() && screens.screen() === "main" && screens.view() === "discord",
-  sideMode: () => columns.side.mode,
-  mainList: () => channelPane.list(),
-  openThread: () => /** @type {any} */ (sideThreadChoice()),
-  activePane: () => activePane(),
-  sidePane: () => sidePane,
-  litCard: () => litCardOnRight(),
-  cardRow: (thread) => cardRowOnRight(thread),
-  hue: (thread) => Number(threadHue(thread)),
-});
-
-/** Whether the links have a place: two columns, the channel on the main screen, and cards or a thread's card. */
-function columnLinksShown() {
-  return columnLinks.shown();
-}
-
-/** Ask for the links to be drawn again at the next animation frame. */
-function scheduleColumnLinks() {
-  columnLinks.schedule();
-}
-
-/** Draw the links as the page stands now (`flyThreadCard`'s frames, and the frame asked for). */
-function drawColumnLinks() {
-  columnLinks.draw();
-}
-
-/** The selection was drawn again (`drawSelection`): the links follow it. */
-function noteLinkedSelection() {
-  columnLinks.noteSelection();
-}
-
-/**
- * How a deliberate glide moves (a jump the reader asked for, never the links'): "smooth", or
- * "auto" where the stylesheet says so (`--column-glide`).
- *
- * @returns {ScrollBehavior}
- */
-function glideBehavior() {
-  return columnLinks.glideBehavior();
-}
 
 // --- keeping the channel view fresh -----------------------------------------------------------
 //

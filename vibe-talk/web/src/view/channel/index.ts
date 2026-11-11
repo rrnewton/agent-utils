@@ -224,6 +224,8 @@ export { createOfflineCache } from "./offlinecache.ts";
 export type { OfflineCacheDependencies } from "./offlinecache.ts";
 export { createReadRunLines } from "./readrunlines.ts";
 export type { ReadRunLines, ReadRunLinesDependencies } from "./readrunlines.ts";
+export { createCardRuns } from "./cardruns.ts";
+export type { CardRunPlace, CardRuns, CardRunsDependencies } from "./cardruns.ts";
 export { createSideThreadActs } from "./sidethread.ts";
 export type { SideFlight, SideThreadActs, SideThreadActsDependencies, SideThreadSummary } from "./sidethread.ts";
 export { createCardPlaceActs } from "./cardplaceacts.ts";

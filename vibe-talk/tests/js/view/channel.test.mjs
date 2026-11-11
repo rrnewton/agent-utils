@@ -3295,3 +3295,58 @@ test("`#624 voice-page-modularity`: the right column's thread — selected, clos
   assert.equal(held.has("c1"), false);
   assert.ok(log.includes("open-cards"), "closing did not show the cards");
 });
+
+test("`#624 voice-page-modularity`: the cards filtered, their read runs folded, and the links asked after — from the module alone", () => {
+  const { createCardRuns } = CHANNEL_VIEW;
+  const log = [];
+  const el = (attrs = {}, children = []) => {
+    const made = { attrs: new Map(Object.entries(attrs)), children, className: "", parentNode: null, hidden: false, textContent: "",
+      hasAttribute: (name) => made.attrs.has(name), getAttribute: (name) => (made.attrs.has(name) ? made.attrs.get(name) : null),
+      setAttribute: (name, value) => made.attrs.set(name, String(value)), removeAttribute: (name) => made.attrs.delete(name) };
+    for (const child of children) child.parentNode = made;
+    return made;
+  };
+  const readCard = el({ "data-card": "", "data-id": "t1", "data-thread-read": "", "data-search": "read one" });
+  const freshCard = el({ "data-card": "", "data-id": "t2", "data-search": "fresh two" });
+  const list = el({}, [readCard, freshCard]);
+  const stateNode = el({});
+  let mode = "fold";
+  const owner = createCardRuns({
+    leftById: (id) => (id === "side-cards" ? list : stateNode),
+    noteSuspendedRuns: () => false, unpackOnScreen: () => false, readMode: () => mode,
+    readRunsSuspended: () => false, forgetCards: () => {}, renderSideCards: () => {},
+    searchOpen: () => false, searchNode: () => null, searchTerms: () => [],
+    threadsWithHits: () => null, openedCardGaps: () => null, hidingRead: () => false,
+    rowMatches: () => true, markReplyMatch: () => {}, markSearchHits: () => {},
+    olderThreadsFailure: () => "", allLoaded: () => true,
+    setCardsCount: (cards, shown) => log.push(["count", cards, shown]),
+    threadListOnScreen: () => false, sayCardCount: () => {}, renderRepliesSearch: () => {},
+    drawCardGaps: () => {}, inOpenedGap: () => false,
+    selectedChannelId: () => "c1", rowIsRead: () => false,
+    readRunPlan: (items) => new Map([[items[0], { role: "head" }], [items[1], { role: "member" }]]),
+    readRunLine: (row) => { const line = el({}); line.parentNode = row; ownerLine = line; return line; },
+    placeInReadRun: (row, role) => log.push(["place", row.getAttribute("data-id"), role]),
+    keepingCardPlace: (change) => change(),
+    makeColumnLinksDeps: () => ({
+      onTwoColumns: () => false, sideMode: () => "list", mainList: () => null,
+      openThread: () => null, activePane: () => null, sidePane: () => ({}),
+      litCard: () => null, cardRow: () => null, hue: () => 0,
+    }),
+  });
+  let ownerLine = null;
+  // No search, no Hide read: both cards stand, and the count says so.
+  owner.filterSideCards();
+  assert.deepStrictEqual(log, [["count", 2, 2]]);
+  assert.equal(readCard.hidden, false);
+  // Under Fold read the run's member is placed behind its head's line.
+  log.length = 0;
+  owner.foldCardRuns(list);
+  assert.deepStrictEqual(log, [["place", "t1", "head"], ["place", "t2", "member"]]);
+  // Show read again: no places are given.
+  mode = "show";
+  owner.foldCardRuns(list);
+  assert.deepStrictEqual(log.slice(2), [["place", "t1", null], ["place", "t2", null]]);
+  // The list's word over no cards at all.
+  assert.equal(owner.sideListState(0, 0, 0), "No threads in this channel yet.");
+  assert.equal(owner.sideListState(2, 0, 0), "No threads match that search — all of this channel is loaded.");
+});
