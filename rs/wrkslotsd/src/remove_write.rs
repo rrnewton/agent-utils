@@ -2802,7 +2802,7 @@ pub(crate) fn remove_slot(
                 "both canonical and fenced slot paths exist for {slot}"
             ));
         }
-        fence_slot_path(&cfg, &slot, &slot_path, &fenced_path).map_err(|error| {
+        fence_slot_path(&cfg, slot, &slot_path, &fenced_path).map_err(|error| {
             format!(
                 "cannot establish path fence {} -> {}: {error}",
                 slot_path.display(),
