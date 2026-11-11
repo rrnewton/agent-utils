@@ -611,11 +611,13 @@ steps:
   # `#554 read-pause-reply-resume` in the browser engine: on a phone, a read paused mid-message, the
   # message answered from its Reply and sent, then resumed: the device voice (modelled on Chrome for
   # Android, whose pause stops and whose resume does nothing) goes on from the sentence it was paused in,
-  # and the agent's voice from its block.
+  # and the agent's voice from its block, judged by the held sentence and block and the steer steps after
+  # Resume (`#1250 vibe-talk-timing-robust`). Resume latencies are printed; their budget is an opt-in
+  # `--benchmark` outside the gate.
   - group: check
     job: read-pause-reply-browser
     desc: a read paused, the message replied to and sent, then resumed, by both voices in current Chromium at 393x852 touch, the read going on from where it was held; and in a paused read, at 393x852 by touch and 1280x800 by mouse, the Quoted reply chip and the strip's Quote reply topmost wherever the words are, the quick reply typed and dictated into and sent quoted; and React on a paused read (#821) at 360, 375 and 412 wide by touch and 1280x800, the held sentence lit and quoted, the arrows 52px with React at the row's far right, dictation by a stand-in recognition, the keyboard's microphone without one, and a one-block device-voice read
-    labels: [validation-vibe-talk, validation-vibe-talk-page, disabled-optin]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/read_pause_reply_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
