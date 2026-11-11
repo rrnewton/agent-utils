@@ -530,8 +530,17 @@ class Drill:
         scratch server stopped (no pane shell alive), for plants a live
         shell would block, such as unmounting a slot image.
         """
+        killed = {name: self.harness_pid(name) for name in names}
         for name in names:
             self.kill_harness(name)
+        # Wait until each stub is verifiably gone: under load a pid still
+        # exiting during the revive proof reads as an unparseable process
+        # stat and refuses a lane standalone runs revive.
+        deadline = time.monotonic() + 60
+        for name, pid in killed.items():
+            while _ps_comm(pid):
+                assert time.monotonic() < deadline, (name, pid)
+                time.sleep(0.2)
         self.stop_server()
         for name in names:
             self.plant_previous_boot(name)
