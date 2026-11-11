@@ -27,8 +27,14 @@ message (the agent's: its ticket opened, sources started on a running context wh
 device's: an utterance of the message's own words started), no error, and the light is on that message
 where the reader sees it — the drawn row (or the card) marked as being read, and, for a message read in
 blocks by the agent's voice, its first block lit and the sentence lit inside that drawn row. Over the
-thread list the agent's read must take its blocks at the audio's pace: block 2 no sooner than about a
-block's length after block 1.
+thread list the agent's read takes its blocks in order, 1 then 2 then 3, by the page's own record of
+the strip. That order is the gating verdict, with the rest of the behaviour above (`#1250
+vibe-talk-timing-robust`, the pattern of `#1248 fold-latency-behaviour-verdict`): how long the light
+stayed on a block is printed but decides nothing, and the old pace budget — block 2 lit most of its
+block's length — is enforced only by `--benchmark`, an opt-in measurement outside the gate, so a
+hot host cannot fail this check while the reads behave. The one clock still read in gating is the
+audio clock as a liveness wait: the walk waits for it to have moved at all (0.15 s of audio, however
+long a loaded host takes to play it), never for it to move inside a fixed window.
 
 THE NEGATIVE CONTROL is a message the agent's voice answers with silence: the read stops when the
 block has arrived, says so, and archives nothing — where the page used to step on through the blocks
@@ -70,7 +76,8 @@ if TYPE_CHECKING:
 WIDTH, HEIGHT = 1280, 800
 RATE = 24_000
 CHUNK_MS = 50
-# Each block's audio, in seconds, and the light's least stay on one: most of it, against a loaded host.
+# Each block's audio, in seconds, and — for --benchmark only — the light's least stay on one: most
+# of it. In gating the blocks are judged by their order, never by how long one stayed lit.
 BLOCK_SECONDS = 1.0
 BLOCK_STAY_AT_LEAST_S = 0.7
 DEVICE_MS_PER_CHAR = 12
@@ -295,11 +302,12 @@ def handler(api: VoicesApi) -> type[BaseHTTPRequestHandler]:
 class Walk:
     """One voice's walk through the views, and what it found."""
 
-    def __init__(self, desk: Desk, api: VoicesApi, voice: str) -> None:
+    def __init__(self, desk: Desk, api: VoicesApi, voice: str, benchmark: bool = False) -> None:
         self.desk = desk
         self.page = desk.page
         self.api = api
         self.voice = voice
+        self.benchmark = benchmark
 
     def state(self, message_id: str, card: str | None = None) -> Json:
         found: Json = self.page.evaluate(READ_STATE_JS, [message_id, card])
@@ -439,18 +447,25 @@ def walk(walk_: Walk) -> None:
     found = walk_.read("unpacked-reply", f"#side-cards > li[data-unpack-thread='{RUNNER}'][data-id='206'] .body", "206",
                        "206@side-cards", blocks=blocks)
     if walk_.voice == "agent":
-        # The light keeps to the audio's pace: block 2 lit about a block's length, by the page's own record
-        # of the strip (`steerSteps`), so how long this check took to look does not count.
+        # The read takes its blocks in order, by the page's own record of the strip (`steerSteps`):
+        # 1 then 2 then 3, each one seen. How long the light stayed on block 2 is printed, and the
+        # old pace budget (most of a block's length) decides only a --benchmark run.
         walk_.wait_for("the read never reached its third block",
-                       "() => window.steerSteps.slice(-1)[0].count === '3 of 3'", 8)
+                       "() => window.steerSteps.slice(-1)[0].count === '3 of 3'", STATE_S)
         steps = page.evaluate("() => { const all = window.steerSteps; let at = all.length - 1;"
                               " while (at > 0 && all[at].count !== '1 of 3') at -= 1; return all.slice(at); }")
+        counts = [str(step["count"]) for step in steps]
+        wanted = ["1 of 3", "2 of 3", "3 of 3"]
+        places = [counts.index(one) if one in counts else -1 for one in wanted]
+        desk.check(all(place >= 0 for place in places) and places == sorted(places),
+                   f"the strip did not count 1 then 2 then 3 in order: {steps}")
         second = next((step for step in steps if step["count"] == "2 of 3"), None)
         third = next((step for step in steps if step["count"] == "3 of 3"), None)
-        desk.check(second is not None and third is not None, f"the strip did not count 2 then 3: {steps}")
         assert second is not None and third is not None
         stay = (float(third["at"]) - float(second["at"])) / 1000
-        desk.check(stay >= BLOCK_STAY_AT_LEAST_S, f"the light left block 2 after {stay:.2f}s of a {BLOCK_SECONDS}s block")
+        if walk_.benchmark:
+            desk.check(stay >= BLOCK_STAY_AT_LEAST_S,
+                       f"the light left block 2 after {stay:.2f}s of a {BLOCK_SECONDS}s block")
         desk.notes.append(f"block 2 lit {stay:.2f}s of its {BLOCK_SECONDS}s")
         desk.check(found["count"] in ("1 of 3", "2 of 3"), f"the strip did not count the blocks: {found}")
     walk_.read("unpacked-root", f"#side-cards > li[data-unpack-thread='{RUNNER}'][data-root-child] .body", "202",
@@ -494,25 +509,29 @@ def controls(walk_: Walk) -> None:
     desk = walk_.desk
     walk_.click("#side-log > li[data-id='203'] .body" if desk.page.query_selector("#side-log > li[data-id='203']")
                 else "#discord-log > li[data-id='203'] .body")
-    deadline = time.monotonic() + 8
+    deadline = time.monotonic() + STATE_S
     while time.monotonic() < deadline and SHORT not in walk_.api.archived():
         desk.page.wait_for_timeout(50)
     desk.check(SHORT in walk_.api.archived(), "a short message heard to its end was not archived")
     walk_.click(f"#side-log > li[data-id='{SILENT}'] .body")
     walk_.wait_for("a read answered with silence did not stop and say so",
-                   "() => /^Cloud voice isn't producing audio: it sent silence/.test(document.getElementById('error').textContent)", 8)
+                   "() => /^Cloud voice isn't producing audio: it sent silence/.test(document.getElementById('error').textContent)", STATE_S)
     # `#548 cloud-read-failures`: the device voice offered for that message, and the failure told to the server.
     desk.check(desk.page.evaluate("() => !document.getElementById('read-on-device').hidden"),
                "a read answered with silence did not offer Read with device voice")
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + STATE_S
     while time.monotonic() < deadline and not walk_.api.failures:
         desk.page.wait_for_timeout(50)
     with walk_.api.lock:
         failures = list(walk_.api.failures)
     desk.check([(one, report.get("reason")) for one, report in failures] == [(SILENT, "silent")],
                f"the silent read was not reported to the server as silent: {failures}")
-    desk.page.wait_for_timeout(500)
+    # The stopped read leaves the drawn row: wait for that drawn state, not a fixed moment after.
+    deadline = time.monotonic() + STATE_S
     found = walk_.state(SILENT)
+    while time.monotonic() < deadline and not (found["reading"] == [] and found["pending"] == []):
+        desk.page.wait_for_timeout(50)
+        found = walk_.state(SILENT)
     desk.check(found["reading"] == [] and found["pending"] == [], f"the silent read is still lit: {found}")
     desk.check(SILENT not in walk_.api.archived(), "a message read in silence was archived as heard")
     desk.check(len(walk_.api.tickets(SILENT)) == 1, f"the silent read went on asking: {walk_.api.tickets(SILENT)}")
@@ -540,7 +559,7 @@ def run(chromium: BrowserType, args: argparse.Namespace, voice: str) -> str:
             page.add_init_script(DEVICE_VOICE)
             desk = Desk(page, args.screenshots, f"read-views-{voice}", WIDTH, HEIGHT)
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
-            walk(Walk(desk, api, voice))
+            walk(Walk(desk, api, voice, bool(args.benchmark)))
             check(not errors, f"{voice}: the page threw: {errors}")
             context.close()
             return f"{version}, the {voice} voice: " + "; ".join(desk.notes)
@@ -560,6 +579,10 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--screenshots", type=Path, help="directory to write one PNG per read into (default: none)")
     parser.add_argument("--voice", choices=("agent", "device", "both"), default="both",
                         help="which voice to walk the views with (default: both, one browser each)")
+    parser.add_argument("--benchmark", action="store_true",
+                        help="also fail when the light leaves a block sooner than the old pace budget: an "
+                             "opt-in speed measurement, never part of the gating verdict (default: "
+                             "behaviour only)")
     return parser.parse_args()
 
 

@@ -564,7 +564,9 @@ steps:
 
   # `#540 read-aloud-desktop` in the browser engine: a message read aloud from every view — Main, All,
   # the thread list's cards, unpacked rows and Main rows, one thread, two columns — by the agent's voice
-  # and the device's, each with a clock this check reads; the light on the drawn row; silence stops a read.
+  # and the device's; the light on the drawn row, the blocks counted in order; silence stops a read.
+  # The verdict is that behaviour (`#1250 vibe-talk-timing-robust`); the block's lit time is printed,
+  # and its old pace budget is an opt-in `--benchmark` outside the gate.
   - group: check
     job: read-aloud-views-browser
     desc: reading aloud from every view by both voices in current Chromium at 1280x800, audio started and the light on the message read, and a silent voice stopping the read unarchived
