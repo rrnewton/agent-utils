@@ -30,3 +30,5 @@ The failure strands the launch: the record is left `lifecycle=launch_failed` wit
 # Notes
 
 Filed 2026-11-10 from a same-hour defect report (owner rule: agentctl defects are reported and handled the same hour). Evidence kept with the reporter: two failed launch logs quoting the idle screen and the `osc_title_working` verdict, and the retained `launch_failed` record. Related: #921 codex-ready-detection (the post-timeout screen takeover this extends).
+
+Second-team evidence (2026-11-11, via coordb): at about 15:0xZ on devbig030, in a second team's registry, `agentctl start --profile codex-sol` for seats rev-a3-cx and rev-a3b-cx both returned rc 75, `timed out waiting for agent startup`. Codex v0.166 showed the "Daybreak is on for new turns" screen while Herdr held the idle title as WORKING (`osc_title_working`); the name was never applied, leaving orphan tab pane wJ:pVC and retained `launch_failed` records for both seats. The team's workaround was a hand-typed send into the pane.
