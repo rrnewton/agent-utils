@@ -1,13 +1,14 @@
 ---
 title: 'wrkslots-status-lock: a read-only status holds the global state lock across a long scan'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 - state-lock
 created_at: 2026-11-10T21:27:58+00:00
-updated_at: 2026-11-10T21:27:58+00:00
+updated_at: 2026-11-11T02:38:54+00:00
+closed_at: 2026-11-11T02:38:54+00:00
 ---
 
 # Description
@@ -47,3 +48,7 @@ Measured on the local registry (35 slots, 1,595 events, 75 Git worktree registra
 Fix: measurements never run under the lock (the latest snapshot's measurement is published unconfirmed after the retakes; it still describes one snapshot instant); `unpushed` snapshots under a short lock and scans outside it; every read-only scan takes `--scan-timeout` (default 180 s) and past the bound prints partial results marked PARTIAL (`"partial": true` in JSON) and exits 2; one liveness call is bounded at 15 s; handoff publication is a single pass parsing each historical record once. Tests count Git calls and record parses, never wall time.
 
 Memory (P0 follow-up, same day): a plain `status` on the 185-slot registry (78,892 events, 429 MB log) reached 640 GiB RSS and was OOM-killed. Root cause of the blowup (found by the consumer's lane, confirmed here): `_registry_read_identity` hashed every regular file in the control directory except `*.lock` with `read_bytes()`. On that registry the control directory holds the 640 GiB (apparent) btrfs worktrees image, so each identity call read the whole image into memory; `_phased_registry_read` calls it at least twice per run, the first time under the shared lock, which is also the 40-minute lock hold. The fix hashes only registry files (ACTIVE.*, ARCHIVED.*, *.journal, HOLD.*, HANDOFF.*, the event listing, quarantine journals, slot-image records) and never opens the configured worktrees image or any other unnamed file. Loading alone on a copy of that control state measured 78,892 events parsed in 29.7 s at 691 MB tracemalloc peak / 1.73 GiB RSS, before any Git or liveness work: the per-file memo and the kept verified chain retained the whole parsed history for the command's life, and retakes re-verified it (1.3 TB of reads). Amendment: retained parsed-event bytes are capped (256 MiB of event files; no whole chain over 5,000 events; past the cap the memo starts over and later loads re-read), a streaming verifier (`_iter_events`) folds record by record retaining nothing, and read-only scans cap their own address space with `--scan-memory-limit` (default 4 GiB, RLIMIT_AS), past which they report PARTIAL and exit 2. Full streaming folds were not folded into the replay path: the parse-once/fold-once memo contract is pinned by `test_event_memo.py` (one parse and one fold per event across a whole batch command), so retention is bounded by the cap plus the hard process limit instead. The same loader serves `adopt`/`create` under their mutation locks, so the cap also bounds their load retention there.
+
+## Resolution
+
+Landed on main as 2473d23b (mu-statuslock). Measurements never run under the registry lock; `unpushed` snapshots under a short lock and scans outside it; all four readers take `--scan-timeout` (180 s; audit 600 s) and `--scan-memory-limit` (4 GiB, RLIMIT_AS), reporting PARTIAL with exit 2 past either bound; one liveness call is bounded at 15 s; handoff publication is single-pass; retained parsed-event bytes are capped at 256 MiB with no whole chain over 5,000 events; `_registry_read_identity` hashes only registry files and never opens the worktrees image. Gate 3c37a169 ran the full contract on the combined tree: the only reds were two lifecycle census/fence tests that pass solo and touch none of the changed paths. Not verified on the consumer's live registry (never run there); the control-copy status peaks at 0.76 GiB RSS.
