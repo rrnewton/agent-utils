@@ -808,6 +808,142 @@ def test_remove_ignored_cache_target_still_removes_in_both_editions(tmp_path: Pa
             assert "ignored_files" not in salvage[0]
 
 
+def _add_foreign_worktree(root: Path) -> Path:
+    """A clean linked worktree of a second repository inside slot-a (#1400)."""
+
+    foreign = root.parent / "foreign-repo"
+    _repo(foreign)
+    _git(foreign, "remote", "add", "origin", str(foreign))
+    _git(foreign, "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*")
+    nested = root / "worktrees" / "slot-a" / "foreign"
+    _git(
+        foreign, "worktree", "add", "-q", "-b", "foreign/work", str(nested), "HEAD"
+    )
+    _git(nested, "push", "-q", "origin", "HEAD:foreign/work")
+    return nested
+
+
+def _bind_live_owner(root: Path) -> None:
+    active_path = root / "worktrees" / "ACTIVE.node-a.json"
+    doc: dict[str, object] = json.loads(active_path.read_text())
+    slots = cast(list[dict[str, object]], doc["slots"])
+    slots[0]["owner"] = _identity_obj(os.getpid())
+    slots[0]["coordinator_lease"] = _identity_obj(os.getpid())
+    active_path.write_text(json.dumps(doc))
+
+
+def _write_handoff(root: Path, source: Path) -> int:
+    return wrkslots_cli._cmd_write_handoff(
+        argparse.Namespace(
+            project_root=str(root), machine=None, slot="slot-a",
+            agent="agent-slot-a", owner_pid=os.getpid(), expected_generation=1,
+            from_file=str(source), wait_lock=0.0,
+        )
+    )
+
+
+def _adopt_checkout(root: Path, name: str, path: Path) -> int:
+    return wrkslots_cli._cmd_adopt_checkout(
+        argparse.Namespace(
+            project_root=str(root), machine=None, slot="slot-a",
+            repo=f"{name}={path}", coordinator_pid=os.getpid(),
+            expected_generation=1, wait_lock=0.0,
+        )
+    )
+
+
+def test_write_handoff_warns_and_records_foreign_checkout(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _fixture(tmp_path / "case")
+    nested = _add_foreign_worktree(root)
+    _bind_live_owner(root)
+    source = tmp_path / "handoff.md"
+    source.write_text("ready\n")
+    assert _write_handoff(root, source) == 0
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.err
+    assert str(nested) in captured.err
+    assert "foreign-repo" in captured.err
+    sidecars = list((root / "worktrees").glob("HANDOFF.*.slot-a.1.json"))
+    assert len(sidecars) == 1
+    sidecar: dict[str, object] = json.loads(sidecars[0].read_text())
+    foreign = cast(list[dict[str, object]], sidecar["foreign_checkouts"])
+    assert foreign[0]["path"] == "worktrees/slot-a/foreign"
+    assert "foreign-repo" in str(foreign[0]["repository"])
+
+
+def test_remove_refuses_foreign_checkout_naming_adopt(tmp_path: Path) -> None:
+    root = _fixture(tmp_path / "case")
+    _add_foreign_worktree(root)
+    with pytest.raises(Exception) as caught:
+        _python_remove(root)
+    message = str(caught.value)
+    assert "adopt-checkout" in message
+    assert "git worktree move" in message
+    assert (root / "worktrees" / "slot-a" / "foreign").exists()
+
+
+def test_adopt_checkout_refuses_dirty_foreign_worktree(tmp_path: Path) -> None:
+    root = _fixture(tmp_path / "case")
+    nested = _add_foreign_worktree(root)
+    (nested / "dirty.txt").write_text("uncommitted\n")
+    with pytest.raises(Exception, match="clean|dirty|uncommitted"):
+        _adopt_checkout(root, "foreign", nested)
+
+
+def test_adopt_checkout_refuses_non_linked_path(tmp_path: Path) -> None:
+    root = _fixture(tmp_path / "case")
+    plain = root / "worktrees" / "slot-a" / "plain"
+    plain.mkdir()
+    with pytest.raises(Exception, match="linked worktree"):
+        _adopt_checkout(root, "plain", plain)
+
+
+def test_adopt_checkout_refuses_unknown_repository(tmp_path: Path) -> None:
+    root = _fixture(tmp_path / "case")
+    nested = _add_foreign_worktree(root)
+    _git(nested, "remote", "remove", "origin")
+    with pytest.raises(Exception, match="unknown repository|remote"):
+        _adopt_checkout(root, "foreign", nested)
+
+
+def test_adopt_checkout_then_remove_salvages_it(tmp_path: Path) -> None:
+    root = _fixture(tmp_path / "case")
+    nested = _add_foreign_worktree(root)
+    assert _adopt_checkout(root, "foreign", nested) == 0
+    active: dict[str, object] = json.loads(
+        (root / "worktrees" / "ACTIVE.node-a.json").read_text()
+    )
+    records = cast(list[dict[str, object]], active["slots"])
+    checkouts = cast(list[dict[str, object]], records[0]["checkouts"])
+    assert [item["name"] for item in checkouts] == ["repo", "foreign"]
+
+    # #1302 applies to the adopted checkout like any declared one.
+    (nested / ".gitignore").write_text("ignored/\n")
+    _git(nested, "add", ".gitignore")
+    _git(nested, "commit", "-q", "-m", "ignore evidence")
+    _git(nested, "push", "-q", "origin", "HEAD:foreign/work")
+    evidence = nested / "ignored" / "note.bin"
+    evidence.parent.mkdir(parents=True)
+    evidence.write_bytes(b"foreign-evidence\n")
+    with pytest.raises(Exception, match="ignored/note.bin"):
+        _python_remove(root)
+    assert _python_remove(root, discard_ignored=True) == 0
+    assert not (root / "worktrees" / "slot-a").exists()
+    salvage = _archived_salvage(root)
+    by_name = {str(item["checkout"]): item for item in salvage}
+    assert set(by_name) == {"repo", "foreign"}
+    assert by_name["foreign"]["ignored_files"] == [
+        {
+            "path": "ignored/note.bin",
+            "bytes": len(b"foreign-evidence\n"),
+            "sha256": hashlib.sha256(b"foreign-evidence\n").hexdigest(),
+            "disposition": "discarded",
+        }
+    ]
+
+
 def _evidence_fixture(tmp_path: Path) -> Path:
     """A fixture slot with ``ignored/evidence/note.bin`` gitignored (#1302)."""
 
