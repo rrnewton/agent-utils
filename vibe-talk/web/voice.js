@@ -1024,10 +1024,9 @@ const documentsView = createDocumentsView({
 const discussView = createDiscussView({
   byId: (id) => el(id),
   api: (path, options) => api(path, options),
-  // No direct LLM summarizer, no Discuss: the summaries capability the boot
-  // already holds (`summaries_unavailable`, via summaryRows) until the server's
-  // `discuss_available` client-config field lands and this reads that instead.
-  discussAvailable: () => summaryRows.disabledByServer() === "",
+  // No direct LLM summarizer, no Discuss: client-config's `discuss_available`,
+  // held with the other server facts and read here only when drawn or pressed.
+  discussAvailable: () => serverFacts.discussAvailable(),
   selectedChannelId: () => String(selectedChannelId() ?? ""),
   selection: () => selection(),
   serviceName: (channel) => chatServiceOf(channel),
@@ -7702,7 +7701,7 @@ const { signIn, saveToken, forgetToken, setTokenState, noTokenSentence } = creat
   token: () => token(),
   signedOutByRename: () => signedOutByRename(),
   config: () => apiDecoded("ClientConfigResponse", "/api/v1/client-config"),
-  applyClientConfig: (config) => applyClientConfig(config),
+  applyClientConfig: (config) => { applyClientConfig(config); discussView.sync(); },
   forgetMessages: () => forgetMessages(),
   showError: (text) => showError(text),
   setStatus: (text) => setStatus(text),

@@ -6,12 +6,16 @@
 // never parsed out of the model's words. Construction does nothing: no element is looked
 // up and nothing is fetched until `mount` wires the controls and `openWith` is called.
 //
-// The wire types below are the minimal local reading of `POST
-// /api/v1/channels/{id}/catchup`; the generated contract types land with the server's
-// contract regeneration, after which these give way to them.
+// The answer's wire types are the generated contract's (`CatchupResponse` and its
+// parts); the panel narrows the decoded body to the fields it reads.
 
 import { createListening } from "../dom/index.ts";
 import type { MessageLinkRef } from "../../foundation/index.ts";
+import type {
+  CatchupFooterLink as WireFooterLink,
+  CatchupStamp as WireStamp,
+  CatchupWindow as WireWindow,
+} from "../../contract/index.ts";
 
 /** What one catch-up asks for: a thread, or the channel in `view` when `thread_id` is null. */
 export interface CatchupRequestBody {
@@ -20,29 +24,13 @@ export interface CatchupRequestBody {
 }
 
 /** The window the server read, as far as the panel reports it. */
-export interface CatchupWindow {
-  count: number;
-  unread_count: number;
-}
+export type CatchupWindow = Pick<WireWindow, "count" | "unread_count">;
 
 /** One covered message the footer links to. */
-export interface CatchupFooterLink {
-  id: string;
-  label: string;
-  thread_id: string | null;
-}
+export type CatchupFooterLink = WireFooterLink;
 
 /** The server's timing and size stamp; token counts are null unless really reported. */
-export interface CatchupStamp {
-  context_ms: number | null;
-  model_ms: number | null;
-  first_token_ms: number | null;
-  total_ms: number | null;
-  input_tokens: number | null;
-  output_tokens: number | null;
-  input_chars: number | null;
-  output_chars: number | null;
-}
+export type CatchupStamp = WireStamp;
 
 /** One catch-up answer, narrowed to the fields the panel reads. */
 export interface CatchupAnswer {
@@ -100,13 +88,15 @@ export interface DiscussPanel {
 export const DISCUSS_UNAVAILABLE_HINT = "Discuss needs a direct LLM summarizer ([summaries.llm])";
 
 /**
- * Whether a catch-up failure is the deployment refusing for want of a summarizer
- * (503 `summarizer_not_configured`), as opposed to one attempt going wrong: the
- * refusal will still be true on a retry, so none is offered.
+ * Whether a catch-up failure is the deployment refusing for want of a direct LLM
+ * summarizer (503 `discuss_not_available_on_this_backend`, or the summarizer's own
+ * `summarizer_not_configured`), as opposed to one attempt going wrong: the refusal
+ * will still be true on a retry, so none is offered.
  */
 export function isDiscussUnavailable(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
   const record = error as { status?: unknown; code?: unknown; message?: unknown };
+  if (record.code === "discuss_not_available_on_this_backend") return true;
   if (record.code === "summarizer_not_configured") return true;
   if (record.status === 503 && typeof record.message === "string" && record.message.includes("summarizer")) return true;
   return typeof record.message === "string" && record.message.includes("summarizer_not_configured");
@@ -151,14 +141,14 @@ export function asCatchupAnswer(value: unknown): CatchupAnswer {
     footer_links: links,
     text: typeof record.text === "string" ? record.text : "",
     stamp: rawStamp === null ? null : {
-      context_ms: numberOrNull(rawStamp.context_ms),
-      model_ms: numberOrNull(rawStamp.model_ms),
+      context_ms: numberOrNull(rawStamp.context_ms) ?? 0,
+      model_ms: numberOrNull(rawStamp.model_ms) ?? 0,
       first_token_ms: numberOrNull(rawStamp.first_token_ms),
-      total_ms: numberOrNull(rawStamp.total_ms),
+      total_ms: numberOrNull(rawStamp.total_ms) ?? 0,
       input_tokens: numberOrNull(rawStamp.input_tokens),
       output_tokens: numberOrNull(rawStamp.output_tokens),
-      input_chars: numberOrNull(rawStamp.input_chars),
-      output_chars: numberOrNull(rawStamp.output_chars),
+      input_chars: numberOrNull(rawStamp.input_chars) ?? 0,
+      output_chars: numberOrNull(rawStamp.output_chars) ?? 0,
     },
   };
 }
@@ -170,19 +160,14 @@ export function asCatchupAnswer(value: unknown): CatchupAnswer {
  */
 export function formatStampLine(stamp: CatchupStamp | null): string {
   if (stamp === null) return "";
-  const parts: string[] = [];
-  if (stamp.context_ms !== null) parts.push(`context ${Math.round(stamp.context_ms)} ms`);
-  if (stamp.model_ms !== null) parts.push(`model ${Math.round(stamp.model_ms)} ms`);
-  if (stamp.total_ms !== null) parts.push(`total ${Math.round(stamp.total_ms)} ms`);
-  const size = (tokens: number | null, chars: number | null): string | null => {
-    if (tokens !== null) return `${tokens} tokens`;
-    if (chars !== null) return `${chars} chars`;
-    return null;
-  };
-  const into = size(stamp.input_tokens, stamp.input_chars);
-  const out = size(stamp.output_tokens, stamp.output_chars);
-  if (into !== null) parts.push(`in ${into}`);
-  if (out !== null) parts.push(`out ${out}`);
+  const parts: string[] = [
+    `context ${Math.round(stamp.context_ms)} ms`,
+    `model ${Math.round(stamp.model_ms)} ms`,
+    `total ${Math.round(stamp.total_ms)} ms`,
+  ];
+  const size = (tokens: number | null, chars: number): string => tokens !== null ? `${tokens} tokens` : `${chars} chars`;
+  parts.push(`in ${size(stamp.input_tokens, stamp.input_chars)}`);
+  parts.push(`out ${size(stamp.output_tokens, stamp.output_chars)}`);
   return parts.join(" · ");
 }
 

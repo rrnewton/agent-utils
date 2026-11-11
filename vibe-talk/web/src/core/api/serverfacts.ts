@@ -15,6 +15,9 @@ export interface ServerFacts {
   /** Whether this server names threads (`thread_names_supported`): whether a summary may be on its way. */
   threadNames(): boolean;
   setThreadNames(on: boolean): void;
+  /** Whether Discuss can run here (`discuss_available`): a direct LLM summarizer is configured. */
+  discussAvailable(): boolean;
+  setDiscussAvailable(on: boolean): void;
   /** Whether `/client-config` has answered in this page. */
   configApplied(): boolean;
   /** `/client-config` has answered. */
@@ -29,6 +32,7 @@ export interface ServerFacts {
 export function createServerFacts(): ServerFacts {
   let tokenScope: "read" | "write" | null = null;
   let threadNamesSupported = false;
+  let discussSupported = false;
   let clientConfigApplied = false;
   let serverPageBuild = "";
 
@@ -40,6 +44,10 @@ export function createServerFacts(): ServerFacts {
     threadNames: () => threadNamesSupported,
     setThreadNames(on) {
       threadNamesSupported = on;
+    },
+    discussAvailable: () => discussSupported,
+    setDiscussAvailable(on) {
+      discussSupported = on;
     },
     configApplied: () => clientConfigApplied,
     markConfigApplied() {

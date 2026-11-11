@@ -42,9 +42,8 @@ export interface DiscussViewDependencies {
   selection(): DiscussSelection;
   /**
    * Whether this deployment has a direct LLM summarizer Discuss can use, read on
-   * every draw: absent means available. The server's `discuss_available` boot
-   * field is its source once it lands; until then the page wires the summaries
-   * capability it already holds.
+   * every draw: absent means available. The page wires client-config's
+   * `discuss_available`, held with the other server facts.
    */
   discussAvailable?(): boolean;
   /** The chat service `channelId` is read through, for jump refs; "discord" unwired. */

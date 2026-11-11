@@ -31,6 +31,7 @@ export interface ClientConfigLike {
   live_delivery?: unknown;
   upstream_read_mark_supported?: unknown;
   thread_names_supported?: boolean;
+  discuss_available?: boolean;
   providers?: unknown;
   self_author_id?: unknown;
   owner_author_id?: unknown;
@@ -78,7 +79,8 @@ export interface ClientConfigDependencies {
     setDiscoverySupported(on: boolean): void; channels(): { id: unknown }[];
   };
   serverFacts: {
-    setThreadNames(on: boolean): void; setTokenScope(scope: unknown): void;
+    setThreadNames(on: boolean): void; setDiscussAvailable(on: boolean): void;
+    setTokenScope(scope: unknown): void;
     tokenScope(): unknown; markConfigApplied(): void;
   };
   whoIsWho: {
@@ -158,6 +160,8 @@ export function createClientConfig(deps: ClientConfigDependencies): ClientConfig
     deps.channelDirectory.setCapability("broadcast", deps.providerFacts.broadcastSupported());
     // `#528 thread-card-markdown-and-cap`: whether a long first message's summary may be on its way.
     deps.serverFacts.setThreadNames(config.thread_names_supported === true);
+    // `catchup-side-agent`: whether Discuss has a direct LLM summarizer to ask.
+    deps.serverFacts.setDiscussAvailable(config.discuss_available === true);
     deps.learnProviders(config.providers);
     deps.whoIsWho.setDeploymentCodingAgents(config);
     // The selected backend owns its display name. An older server leaves it unspecified, so the
