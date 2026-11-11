@@ -2044,7 +2044,7 @@ function showView(name) {
   const returning = top !== null;
   if (returning) {
     const mark = name === "discord" ? viewMarks.get(name) : undefined;
-    if (mark) restoreScroll(mark);
+    if (mark && mark.anchor) restoreScroll(mark);
     else el("scroll-area").scrollTop = top;
   } else {
     scrollToNewest();
