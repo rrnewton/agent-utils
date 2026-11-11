@@ -361,13 +361,26 @@ fn console_delivers_typed_lines_as_plain_turns() {
         "/interrupt reached the harness as a message"
     );
 
-    // Ctrl-C interrupts first; only the second Ctrl-C leaves, and the
-    // agent is untouched and stoppable.
+    // A single empty-line Ctrl-C only hints; two inside the window
+    // interrupt; a stray Ctrl-C never leaves the console.
     console.type_line(&[0x03]);
-    console.wait_for("interrupt ack", "Ctrl-C again leaves");
-    assert!(console.alive(), "first Ctrl-C must not leave the console");
+    console.wait_for("ctrl-c hint", "press Ctrl-C again to interrupt");
+    assert!(
+        console.alive(),
+        "a single Ctrl-C must not leave the console"
+    );
     console.type_line(&[0x03]);
+    console.wait_for("double ctrl-c interrupt", "interrupt sent");
+    assert!(console.alive(), "Ctrl-C must never leave the console");
+
+    // /quit leaves, prints the disconnected notice, and the agent is
+    // untouched and stoppable.
+    console.type_line(b"/quit\r");
     fixture.wait_for("console exit", || !console.alive());
+    console.wait_for(
+        "disconnected notice",
+        "Disconnected from worker; the agent is still running",
+    );
     let status = fixture.agentctl(&["status", "worker"]);
     assert!(status.status.success(), "{status:?}");
 }

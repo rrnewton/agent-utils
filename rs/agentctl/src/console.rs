@@ -8,10 +8,12 @@
 //! request, and the wrapper — after proving the peer — queues it as a
 //! plain user turn, byte for byte, with its origin logged. Approval
 //! answers (`approve a7`, `deny a7 too broad`) go through the existing
-//! approval path and are never delivered as messages. `/interrupt` (or
-//! Ctrl-C on an empty line) asks the wrapper to interrupt the running
-//! turn; only a second Ctrl-C inside the double-press window, Ctrl-D,
-//! or a signal leaves the console, and leaving never touches the agent.
+//! approval path and are never delivered as messages. `/interrupt`, or
+//! Ctrl-C twice on an empty line inside the double-press window, asks
+//! the wrapper to interrupt the running turn; a single Ctrl-C only
+//! hints and never leaves. Ctrl-D, `/quit`, or a signal leaves the
+//! console, every exit prints the disconnected notice, and leaving
+//! never touches the agent.
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -96,16 +98,19 @@ enum Action {
     Changed,
     /// Enter: submit the buffer.
     Submit,
-    /// Ctrl-C on an empty line: interrupt the running turn. A second
-    /// Ctrl-C within [`DOUBLE_CTRL_C`] leaves the console instead.
+    /// Ctrl-C twice on an empty line within [`DOUBLE_CTRL_C`]:
+    /// interrupt the running turn.
     Interrupt,
-    /// Leave the console.
+    /// First empty-line Ctrl-C: show the interrupt hint. A stray
+    /// Ctrl-C never leaves the console.
+    Hint,
+    /// Leave the console (Ctrl-D on an empty line, or `/quit`).
     Quit,
 }
 
-/// How soon a second empty-line Ctrl-C must follow the first to mean
-/// "leave" rather than "interrupt again".
-const DOUBLE_CTRL_C: Duration = Duration::from_secs(3);
+/// How soon a second empty-line Ctrl-C must follow the first to
+/// interrupt the turn (thread 316).
+const DOUBLE_CTRL_C: Duration = Duration::from_secs(2);
 
 /// The input line: text as chars with a char cursor, an incremental
 /// escape-sequence parser, and bracketed-paste collection.
@@ -179,11 +184,15 @@ impl LineEditor {
             Escape::Bracket(_) => return self.feed_bracket(byte),
             Escape::Ground => {}
         }
+        if byte != 0x03 {
+            self.ctrl_c_at = None;
+        }
         match byte {
             0x03 => {
-                // Ctrl-C: clear a non-empty buffer; on an empty buffer
-                // interrupt the turn, and only a second Ctrl-C inside
-                // the double-press window leaves the console.
+                // Ctrl-C: clear a non-empty buffer. On an empty buffer
+                // the first press only hints; a second inside the
+                // double-press window interrupts the turn. Ctrl-C
+                // never leaves the console.
                 if self.text.is_empty() {
                     let now = std::time::Instant::now();
                     if self
@@ -191,10 +200,10 @@ impl LineEditor {
                         .is_some_and(|at| now.duration_since(at) <= DOUBLE_CTRL_C)
                     {
                         self.ctrl_c_at = None;
-                        Action::Quit
+                        Action::Interrupt
                     } else {
                         self.ctrl_c_at = Some(now);
-                        Action::Interrupt
+                        Action::Hint
                     }
                 } else {
                     self.ctrl_c_at = None;
@@ -432,6 +441,7 @@ fn authenticate() -> Result<(String, String), String> {
 /// one (never delivered as a message), otherwise one `console.input`
 /// request. The buffer is kept when nothing was queued, so a line is
 /// never lost to a stopped wrapper.
+/// Returns true when the line was `/quit`: leave the console.
 fn submit<A: ManagedApi + ?Sized>(
     manager: &ManagedAgents<'_, A>,
     socket: &Path,
@@ -439,36 +449,39 @@ fn submit<A: ManagedApi + ?Sized>(
     user: &str,
     tty: &str,
     shared: &Arc<Shared>,
-) {
+) -> bool {
     let line = {
         let mut editor = shared.editor.lock().expect("editor lock poisoned");
         editor.take_text()
     };
     let line = line.trim_end().to_owned();
     if line.is_empty() {
-        return;
+        return false;
+    }
+    if line == "/quit" {
+        return true;
     }
     if line == "/interrupt" {
         send_interrupt(socket, shared);
-        return;
+        return false;
     }
     if let Some(reply) = parse_reply(&line) {
         let Some(id) = reply.id else {
             shared.print_line("name the approval: approve aN or deny aN [reason]");
-            return;
+            return false;
         };
         match manager.headless_answer(name, Some(&id), reply.decision, reply.reason.as_deref()) {
             Ok(_) => shared.print_line(&format!("{} {id} recorded", reply.decision.as_str())),
             Err(error) => shared.print_line(&format!("approval not recorded: {error}")),
         }
-        return;
+        return false;
     }
     if line.len() > CONSOLE_INPUT_MAX_BYTES {
         restore_buffer(shared, &line);
         shared.print_line(&format!(
             "message too large (at most {CONSOLE_INPUT_MAX_BYTES} bytes); kept"
         ));
-        return;
+        return false;
     }
     let body = json!({"op": "console.input", "text": line, "user": user, "tty": tty});
     match hcontrol::request(socket, &body, CONTROL_WAIT) {
@@ -494,6 +507,7 @@ fn submit<A: ManagedApi + ?Sized>(
             shared.print_line(&format!("not queued: {detail}"));
         }
     }
+    false
 }
 
 /// Ask the wrapper to interrupt the running turn (the `/interrupt` line
@@ -501,7 +515,7 @@ fn submit<A: ManagedApi + ?Sized>(
 fn send_interrupt(socket: &Path, shared: &Arc<Shared>) {
     match hcontrol::request(socket, &json!({"op": "interrupt"}), CONTROL_WAIT) {
         Ok(answer) if answer["ok"] == json!(true) => {
-            shared.print_line("interrupt sent; Ctrl-C again leaves the console");
+            shared.print_line("interrupt sent");
         }
         Ok(answer) => shared.print_line(&format!(
             "not interrupted: {}",
@@ -570,7 +584,7 @@ pub fn run<A: ManagedApi + ?Sized>(
         })
         .map_err(|error| error.to_string())?;
     shared.print_line(&format!(
-        "agentctl console {name}: Enter sends a plain turn; /interrupt or Ctrl-C interrupts the turn (Ctrl-C twice leaves); approve aN / deny aN [reason] answers an approval"
+        "agentctl console {name}: Enter sends a plain turn; /interrupt or Ctrl-C twice interrupts the turn; Ctrl-D or /quit leaves; approve aN / deny aN [reason] answers an approval"
     ));
     let mut socket_seen = socket.exists();
     let mut ticks: u32 = 0;
@@ -629,14 +643,24 @@ pub fn run<A: ManagedApi + ?Sized>(
                     let mut out = shared.out.lock().expect("stdout lock poisoned");
                     let _ = shared.redraw(&mut out);
                 }
-                Action::Submit => submit(manager, &socket, name, &user, &tty, &shared),
+                Action::Submit => {
+                    if submit(manager, &socket, name, &user, &tty, &shared) {
+                        break 'input;
+                    }
+                }
                 Action::Interrupt => send_interrupt(&socket, &shared),
+                Action::Hint => {
+                    shared.print_line("press Ctrl-C again to interrupt");
+                }
                 Action::Quit => break 'input,
             }
         }
     }
     quit.store(true, Ordering::Relaxed);
     let _ = follower.join();
+    shared.print_line(&format!(
+        "Disconnected from {name}; the agent is still running"
+    ));
     Ok(0)
 }
 
@@ -672,13 +696,21 @@ mod tests {
         feed(&mut editor, b"draft");
         assert!(matches!(editor.feed(0x03), Action::Changed));
         assert!(editor.text.is_empty());
-        // Empty line: first Ctrl-C interrupts, the second one leaves.
+        // Empty line: first Ctrl-C only hints, the second interrupts;
+        // Ctrl-C never leaves the console.
+        assert!(matches!(editor.feed(0x03), Action::Hint));
         assert!(matches!(editor.feed(0x03), Action::Interrupt));
-        assert!(matches!(editor.feed(0x03), Action::Quit));
+        assert!(matches!(editor.feed(0x03), Action::Hint));
         feed(&mut editor, b"one");
         assert!(matches!(editor.feed(b'\n'), Action::Changed));
         feed(&mut editor, b"two");
         assert_eq!(editor.take_text(), "one\ntwo");
+    }
+
+    #[test]
+    fn ctrl_d_on_an_empty_line_quits() {
+        let mut editor = LineEditor::default();
+        assert!(matches!(editor.feed(0x04), Action::Quit));
     }
 
     #[test]

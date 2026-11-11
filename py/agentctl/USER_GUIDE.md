@@ -3068,12 +3068,15 @@ an ancestor), and only for local headless agents. Enter queues the line
 through the wrapper as a plain user turn — byte for byte as typed, with
 no sender framing — logged with its origin (`from console:USER`); a
 bracketed paste is one message, and `approve aN` / `deny aN [reason]`
-answer a waiting approval instead of being sent. `/interrupt` (or
-Ctrl-C on an empty line) asks the wrapper to interrupt the running
-turn; Ctrl-C clears a non-empty line, and only a second Ctrl-C on an
-empty line leaves. If the wrapper's socket goes away the console says
-so once and keeps the line. Leaving never touches the agent. `tail`
-stays the read-only follower for pipes, scripts, and extra views.
+answer a waiting approval instead of being sent. `/interrupt` (or Ctrl-C
+twice on an empty line within two seconds) asks the wrapper to
+interrupt the running turn; Ctrl-C clears a non-empty line, a single
+empty-line Ctrl-C only shows a hint, and Ctrl-C never leaves. Ctrl-D
+or `/quit` leaves, and every exit prints
+`Disconnected from NAME; the agent is still running`. If the
+wrapper's socket goes away the console says so once and keeps the
+line. Leaving never touches the agent. `tail` stays the read-only
+follower for pipes, scripts, and extra views.
 
 `start --mode headless --harness claude` registers an `adapter: harness-wrapper`,
 `mode: headless` record with a new session UUID (`--resume UUID` keeps an existing
