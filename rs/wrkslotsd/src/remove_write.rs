@@ -2238,8 +2238,6 @@ fn retire_handoff_sidecar(
     Ok(())
 }
 
-/// Remove and archive the named slot.
-
 /// One removal validated and planned with no mutation locks held (#1287).
 struct PreparedRemove {
     record: Value,
@@ -2446,6 +2444,7 @@ fn prepare_remove(
     })
 }
 
+/// Remove and archive the named slot.
 pub(crate) fn remove_slot(
     root: Option<&Path>,
     machine_override: Option<&str>,
