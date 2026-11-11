@@ -26,7 +26,7 @@ def test_teardown_after_successful_rescue_removes_checkout(tmp_path: Path) -> No
 
     assert receipt["removed"] is True
     assert not repo.exists()
-    (entry,) = receipt["rescue"]["rescued"]  # type: ignore[index]
+    (entry,) = receipt["rescue"]["rescued"]
     assert entry["pushed"] is True
     assert _remote_ref(remote, entry["rescue_ref"]) == entry["wip_commit"]
 
@@ -42,7 +42,7 @@ def test_failed_rescue_still_tears_down_after_the_bundle(tmp_path: Path) -> None
 
     assert receipt["removed"] is True
     assert not repo.exists()
-    bundle = Path(str(receipt["rescue"]["bundle"]))  # type: ignore[index]
+    bundle = Path(str(receipt["rescue"]["bundle"]))
     assert bundle.is_file()
     import subprocess
 

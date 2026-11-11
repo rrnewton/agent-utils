@@ -24455,6 +24455,29 @@ def _ttl_report_rows(
     return rows
 
 
+class _TtlRescueEntry(TypedDict):
+    worktree: str
+    branch: str
+    rescue_ref: str
+    pushed: bool
+    wip_commit: str | None
+
+
+class _TtlRescueReceipt(TypedDict):
+    slot: str
+    date: str
+    rescued: list[_TtlRescueEntry]
+    bundle: str | None
+    operations: int
+
+
+class _TtlTeardownReceipt(TypedDict):
+    slot: str
+    rescue: _TtlRescueReceipt
+    removed: bool
+    path: str
+
+
 def _ttl_rescue_ref(slot: str, date_str: str, name: str) -> str:
     return f"refs/heads/rescue/{slot}/{date_str}/{name}"
 
@@ -24466,7 +24489,7 @@ def _execute_ttl_rescue(
     date_str: str,
     remote: str,
     bundle_path: Path,
-) -> dict[str, object]:
+) -> _TtlRescueReceipt:
     """Deterministic code-based rescue for one checkout (#1293 slice 3).
 
     Every worktree of the checkout is rescued: uncommitted changes become
@@ -24487,7 +24510,7 @@ def _execute_ttl_rescue(
         for line in listing.splitlines()
         if line.startswith("worktree ")
     ] or [checkout_dir]
-    rescued: list[dict[str, object]] = []
+    rescued: list[_TtlRescueEntry] = []
     operations = 0
     for worktree in worktrees:
         dirty = bool(git(worktree, "status", "--porcelain").stdout.strip())
@@ -24559,7 +24582,7 @@ def _execute_ttl_teardown(
     date_str: str,
     remote: str,
     bundle_path: Path,
-) -> dict[str, object]:
+) -> _TtlTeardownReceipt:
     """Deterministic teardown for one past-T+3 d checkout (#1293 slice 4).
 
     Rescue runs first and never vetoes removal: whatever rescue could not

@@ -48,7 +48,7 @@ def test_dirty_branch_is_wip_committed_and_pushed_to_dated_rescue_ref(tmp_path: 
         bundle_path=tmp_path / "bundles" / "slot-a.bundle",
     )
 
-    (entry,) = receipt["rescued"]  # type: ignore[index]
+    (entry,) = receipt["rescued"]
     assert entry["rescue_ref"] == "refs/heads/rescue/slot-a/20261114/feat/x"
     assert entry["pushed"] is True
     assert entry["wip_commit"] == _git(repo, "rev-parse", "HEAD")
@@ -67,7 +67,7 @@ def test_detached_head_and_failed_push_fall_back_to_verified_bundle(tmp_path: Pa
         bundle_path=tmp_path / "bundles" / "slot-b.bundle",
     )
 
-    (entry,) = receipt["rescued"]  # type: ignore[index]
+    (entry,) = receipt["rescued"]
     assert entry["branch"] == f"detached-{_git(repo, 'rev-parse', '--short', 'HEAD')}"
     assert entry["pushed"] is False
     bundle = Path(str(receipt["bundle"]))
