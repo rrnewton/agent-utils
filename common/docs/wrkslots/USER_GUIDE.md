@@ -1815,6 +1815,36 @@ git branch side <commit>                      # recreate a ref the refusal named
 
 An annotated tag is kept as the commit it names, not as its tag object.
 
+### Removal records the refs it found
+
+Each salvage receipt of an agent-slot removal (`remove`, `remove-agent-batch`, `retire-pending`)
+carries a `ref_inventory` of the refs that removal is about to delete from that checkout. Removal
+gathers it after salvage and before the path fence. You find it in the finish journal, the
+slot-removed event and `records[].salvage[]` of `ARCHIVED.<machine>.json`. It is evidence only:
+nothing is fetched, and a failure to read the refs is recorded as `{"error": "..."}` instead of
+refusing removal.
+
+- `scope`: `repository` when the checkout's Git directory is its repository's common directory (a
+  submodule's own repository, or a clone). Removal deletes that whole repository, so every ref is
+  listed: branches, tags, the stash, remote-tracking refs and notes. `worktree` for a linked
+  worktree of a repository that stays; only its private refs (`refs/worktree/`, `refs/bisect/`,
+  `refs/rewritten/`) are listed, since its branches stay in the source repository.
+- `head`: the ref HEAD names, or null when HEAD is detached.
+- `count` and `sha256`: how many refs, and the SHA-256 of their lines `OBJECT REFNAME` (each ending
+  in a newline) in ref-name order.
+- `refs`: the `[REFNAME, OBJECT]` pairs, when there are at most 64. Otherwise `file` names a sidecar
+  `wrkslots-salvage/<machine>/<slot>/<generation>/ref-inventory/<checkout>.json` in the salvage
+  archive root, which holds the same fields and the full list.
+
+To audit a removal later, list each receipt's refs, then check that each object is on a remote or
+in the receipt's bundle:
+
+```sh
+jq -r '.records[] | select(.slot == "slot01") | .salvage[]
+  | "\(.checkout) \(.ref_inventory.scope) \(.ref_inventory.count)"' \
+  worktrees/ARCHIVED.<machine>.json
+```
+
 For `recover-absent-agent-row(s)`, only the digest of a checkout's remote URL was recorded. A source
 repository whose remote has since moved between the GitHub spellings above for the same owner and
 repository (for example from `git@github.com:` to `https://github.com/`) is accepted when the

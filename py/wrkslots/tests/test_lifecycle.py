@@ -62202,6 +62202,102 @@ def test_remove_agent_batch_reports_every_private_history_refusal(tmp_path: Path
     assert active_slot_names(project) == slots[:2]
 
 
+def _expected_ref_inventory(path: Path, *patterns: str) -> tuple[list[list[str]], str]:
+    """The [refname, object] pairs and digest #1256 records, read with plain Git."""
+    listed = git(path, "for-each-ref", "--format=%(objectname) %(refname)", *patterns).stdout
+    pairs = sorted(
+        [refname, obj] for obj, _space, refname in (line.partition(" ") for line in listed.splitlines())
+    )
+    text = "".join(f"{obj} {refname}\n" for refname, obj in pairs)
+    return pairs, hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def test_remove_records_the_ref_inventory_of_each_checkout_and_submodule(
+    tmp_path: Path,
+) -> None:
+    """#1256: every receipt lists the refs removal deletes, with their objects."""
+    project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)
+    leaf = component / "leaf"
+    _leaf_private_branch_and_tag(component)
+    git(component, "tag", "light-tag")
+    (component / "component.txt").write_text("stashed\n", encoding="utf-8")
+    git(component, "stash", "-q")
+    git(component, "update-ref", "refs/remotes/origin/gone", "side")
+    git(tree, "update-ref", "refs/worktree/mark", "HEAD")
+    component_pairs, component_digest = _expected_ref_inventory(component)
+    # A branch, two tags, the stash and a stale remote-tracking ref, plus
+    # the clone's own main and remote-tracking refs.
+    assert {
+        "refs/heads/side",
+        "refs/tags/local-tag",
+        "refs/tags/light-tag",
+        "refs/stash",
+        "refs/remotes/origin/gone",
+    } <= {refname for refname, _obj in component_pairs}
+    tree_pairs, tree_digest = _expected_ref_inventory(tree, "refs/worktree/")
+    assert tree_pairs == [["refs/worktree/mark", git(tree, "rev-parse", "HEAD").stdout.strip()]]
+    leaf_pairs, leaf_digest = _expected_ref_inventory(leaf)
+
+    removed = _remove_archiving(project, "--archive-private-history")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    receipts = _drift_receipts(project)
+    assert receipts["product"]["ref_inventory"] == {
+        "scope": "worktree",
+        "head": "refs/heads/codex/task",
+        "count": 1,
+        "sha256": tree_digest,
+        "refs": tree_pairs,
+    }
+    assert receipts["product/component"]["ref_inventory"] == {
+        "scope": "repository",
+        "head": None,
+        "count": len(component_pairs),
+        "sha256": component_digest,
+        "refs": component_pairs,
+    }
+    leaf_inventory = receipts["product/component/leaf"]["ref_inventory"]
+    assert isinstance(leaf_inventory, dict)
+    assert (leaf_inventory["scope"], leaf_inventory["refs"]) == ("repository", leaf_pairs)
+    assert leaf_inventory["sha256"] == leaf_digest
+
+
+def test_remove_writes_a_large_ref_inventory_to_a_sidecar(tmp_path: Path) -> None:
+    """#1256: more than 64 refs go to a sidecar file the record names and digests."""
+    project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)
+    head = git(component, "rev-parse", "HEAD").stdout.strip()
+    # One Git process makes all 70 tags.
+    subprocess.run(
+        ["git", "-C", str(component), "update-ref", "--stdin"],
+        input="".join(f"create refs/tags/bulk-{index:03d} {head}\n" for index in range(70)),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    pairs, digest = _expected_ref_inventory(component)
+    assert len(pairs) > 70
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    inventory = _drift_receipts(project)["product/component"]["ref_inventory"]
+    assert isinstance(inventory, dict)
+    assert "refs" not in inventory
+    assert (inventory["count"], inventory["sha256"]) == (len(pairs), digest)
+    sidecar = Path(str(inventory["file"]))
+    assert sidecar.parent == (
+        control_directory(project) / "wrkslots-salvage" / "testhost" / "slot01" / "1"
+        / "ref-inventory"
+    )
+    written = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert written["refs"] == pairs
+    assert (written["count"], written["sha256"], written["checkout"]) == (
+        len(pairs),
+        digest,
+        "product/component",
+    )
+
+
 def test_remove_skips_an_uninitialised_nested_submodule(tmp_path: Path) -> None:
     project, tree, component, _leaf = _slot_with_primary_dropped_leaf(tmp_path)
     git(

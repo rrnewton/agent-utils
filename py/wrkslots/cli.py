@@ -27628,7 +27628,126 @@ def _salvage_agent_slot(
                 ),
             )
         )
+    # Evidence of what refs removal is about to delete, for a later audit
+    # (#1256); gathered before the path fence, never a refusal.
+    candidates_by_name = {
+        checkout.name: (checkout, path) for checkout, path, *_rest in prepared
+    }
+    for receipt in receipts:
+        inventoried, inventoried_path = candidates_by_name[
+            _as_str(receipt.get("checkout"), "salvage receipt.checkout")
+        ]
+        receipt["ref_inventory"] = _ref_inventory(
+            config, record, inventoried, inventoried_path, vcs, archive_root
+        )
     return tuple(receipts)
+
+
+# A ref inventory with more refs than this is written to a sidecar file
+# (#1256), so the archive record stays readable.
+_REF_INVENTORY_INLINE_LIMIT = 64
+_REF_INVENTORY_SCHEMA = 1
+
+
+def _ref_inventory(
+    config: Config,
+    record: ActiveRecord,
+    checkout: Checkout,
+    path: Path,
+    vcs: _GitVcs,
+    archive_root: Path | None,
+) -> dict[str, object]:
+    """Record the refs removal is about to delete from one checkout (#1256).
+
+    ``scope`` is ``repository`` when the checkout's Git directory is its
+    repository's common directory (a submodule's own repository, or a
+    clone), which removal deletes whole, so every ref is listed: branches,
+    tags, the stash, remote-tracking refs and notes.  It is ``worktree`` for
+    a linked worktree of a repository that stays, whose private refs
+    (refs/worktree/, refs/bisect/, refs/rewritten/) and HEAD are all removal
+    deletes.  ``head`` is the ref HEAD names, or None when detached;
+    ``sha256`` digests the lines "OBJECT REFNAME\n" in ref-name order.  Up
+    to _REF_INVENTORY_INLINE_LIMIT refs are listed inline as [REFNAME,
+    OBJECT] pairs; more go to a sidecar file in the slot's salvage
+    directory under ``archive_root`` (by default the control directory),
+    written and read back here, whose path the inventory names.
+    Evidence only: nothing is fetched, and a failure is recorded as
+    ``error`` instead of refusing removal.
+    """
+
+    try:
+        git_directory = Path(
+            vcs._run(path, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
+        )
+        scope = (
+            "repository"
+            if git_directory.resolve() == vcs.common_directory(path).resolve()
+            else "worktree"
+        )
+        symbolic = vcs._run(path, ["symbolic-ref", "--quiet", "HEAD"], check=False)
+        if symbolic.returncode not in (0, 1):
+            raise Refusal("cannot read HEAD" + _git_failure_detail(symbolic))
+        head = symbolic.stdout.strip() or None
+        listing = vcs._run(
+            path,
+            [
+                "for-each-ref",
+                "--format=%(objectname) %(refname)",
+                *(() if scope == "repository" else _WORKTREE_PRIVATE_REF_PREFIXES),
+            ],
+        ).stdout
+        refs: list[tuple[str, str]] = []
+        for line in listing.splitlines():
+            obj, _space, refname = line.partition(" ")
+            if not SHA_RE.fullmatch(obj) or not refname:
+                raise Refusal(f"Git listed an unexpected ref line: {line!r}")
+            refs.append((refname, obj))
+        refs.sort()
+        text = "".join(f"{obj} {refname}\n" for refname, obj in refs)
+        inventory: dict[str, object] = {
+            "scope": scope,
+            "head": head,
+            "count": len(refs),
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        }
+        pairs = [[refname, obj] for refname, obj in refs]
+        if len(refs) <= _REF_INVENTORY_INLINE_LIMIT:
+            inventory["refs"] = pairs
+            return inventory
+        root = archive_root or _default_salvage_archive_root(config)
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", checkout.name).strip("-.") or "checkout"
+        name_digest = hashlib.sha256(checkout.name.encode("utf-8")).hexdigest()[:12]
+        directory = (
+            root
+            / _LOCAL_SALVAGE_DIRECTORY
+            / record.machine
+            / record.slot
+            / str(record.generation)
+            / "ref-inventory"
+        )
+        _prepare_local_salvage_directory(root, directory)
+        sidecar = directory / f"{safe_name}-{name_digest}.json"
+        payload = {
+            "schema": _REF_INVENTORY_SCHEMA,
+            "kind": "wrkslots-ref-inventory",
+            "machine": record.machine,
+            "slot": record.slot,
+            "generation": record.generation,
+            "checkout": checkout.name,
+            **inventory,
+            "refs": pairs,
+        }
+        _atomic_write_json(sidecar, payload)
+        written = _strict_json_object(
+            _read_bounded_regular_file(sidecar, "ref inventory", _JOURNAL_BYTES_LIMIT),
+            "ref inventory",
+        )
+        if not _json_equal(written, payload):
+            raise Refusal(f"ref inventory readback failed: {sidecar}")
+        inventory["file"] = str(sidecar)
+        return inventory
+    except (Refusal, OSError, UnicodeError, ValueError) as exc:
+        return {"error": str(exc)}
 
 
 def _salvage_ownerless_checkout(
@@ -28018,6 +28137,9 @@ def _replace_lost_salvage_receipt(
     names = [entry.get("checkout") for entry in entries]
     if names.count(checkout.name) != 1:
         raise StateError(f"finish journal names checkout {checkout.name} other than once")
+    if "ref_inventory" in receipt:
+        # The refs found before the fence still describe what is deleted (#1256).
+        replacement["ref_inventory"] = receipt["ref_inventory"]
     entries[names.index(checkout.name)] = replacement
     journal["salvage"] = entries
     _write_journal(config, journal, journal_path=journal_path)

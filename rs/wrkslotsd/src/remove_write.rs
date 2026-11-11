@@ -74,6 +74,21 @@ fn identity_of(value: &Value) -> Identity {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
+    let (code, stdout, stderr) = git_unchecked(repo, args)?;
+    if code != Some(0) {
+        return Err(format!(
+            "Git refused in {}: git {}: {}",
+            repo.display(),
+            args.join(" "),
+            stderr.trim()
+        ));
+    }
+    Ok(stdout)
+}
+
+/// Run Git as `git` does and return its exit code, stdout and stderr,
+/// whatever the exit code.
+fn git_unchecked(repo: &Path, args: &[&str]) -> Result<(Option<i32>, String, String)> {
     let mut command = Command::new("git");
     command
         .args([
@@ -99,15 +114,101 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
     let output = command
         .output()
         .map_err(|error| format!("cannot execute Git: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "Git refused in {}: git {}: {}",
-            repo.display(),
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+    Ok((
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    ))
+}
+
+/// More refs than this go to a sidecar file in the Python edition (#1256).
+const REF_INVENTORY_INLINE_LIMIT: usize = 64;
+
+/// The refs removal deletes from one checkout, as the Python edition's
+/// `_ref_inventory` records them (#1256): `scope` is `repository` when the
+/// checkout's Git directory is its common directory (every ref listed) and
+/// `worktree` for a linked worktree (only refs/worktree/, refs/bisect/ and
+/// refs/rewritten/); `head` is the ref HEAD names, or null when detached;
+/// `sha256` digests the lines "OBJECT REFNAME\n" in ref-name order. A Git
+/// failure is recorded as `error`, never a refusal; an inventory too large
+/// to list inline needs the sidecar file only the Python edition writes.
+fn ref_inventory(path: &Path, name: &str) -> Result<Value> {
+    match ref_inventory_fields(path) {
+        Ok(inventory) => {
+            let count = inventory
+                .get("count")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            if count > REF_INVENTORY_INLINE_LIMIT as u64 {
+                return Err(format!(
+                    "checkout {name} has {count} refs to inventory; the ref inventory sidecar stays with the Python edition for now"
+                ));
+            }
+            Ok(inventory)
+        }
+        Err(error) => Ok(json!({ "error": error })),
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn ref_inventory_fields(path: &Path) -> Result<Value> {
+    let git_directory = PathBuf::from(git(path, &["rev-parse", "--absolute-git-dir"])?.trim());
+    let common_raw = git(path, &["rev-parse", "--git-common-dir"])?;
+    let common = {
+        let raw = common_raw.trim();
+        if Path::new(raw).is_absolute() {
+            PathBuf::from(raw)
+        } else {
+            path.join(raw)
+        }
+    };
+    let resolve = |candidate: &Path| {
+        std::fs::canonicalize(candidate)
+            .map_err(|error| format!("cannot resolve {}: {error}", candidate.display()))
+    };
+    let scope = if resolve(&git_directory)? == resolve(&common)? {
+        "repository"
+    } else {
+        "worktree"
+    };
+    let (code, stdout, stderr) = git_unchecked(path, &["symbolic-ref", "--quiet", "HEAD"])?;
+    let head = match code {
+        Some(0) => Value::String(stdout.trim().to_string()),
+        Some(1) => Value::Null,
+        _ => return Err(format!("cannot read HEAD: {}", stderr.trim())),
+    };
+    let mut arguments = vec!["for-each-ref", "--format=%(objectname) %(refname)"];
+    if scope == "worktree" {
+        arguments.extend(["refs/worktree/", "refs/bisect/", "refs/rewritten/"]);
+    }
+    let listing = git(path, &arguments)?;
+    let mut refs: Vec<(String, String)> = Vec::new();
+    for line in listing.lines() {
+        let (object, refname) = line.split_once(' ').unwrap_or((line, ""));
+        // A full SHA-1 object name, as the Python edition's SHA_RE accepts.
+        let full_object = object.len() == 40
+            && object
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+        if !full_object || refname.is_empty() {
+            return Err(format!("Git listed an unexpected ref line: {line:?}"));
+        }
+        refs.push((refname.to_string(), object.to_string()));
+    }
+    refs.sort();
+    let text: String = refs
+        .iter()
+        .map(|(refname, object)| format!("{object} {refname}\n"))
+        .collect();
+    Ok(json!({
+        "scope": scope,
+        "head": head,
+        "count": refs.len(),
+        "sha256": format!("{:x}", Sha256::digest(text.as_bytes())),
+        "refs": refs
+            .iter()
+            .map(|(refname, object)| json!([refname, object]))
+            .collect::<Vec<Value>>(),
+    }))
 }
 
 fn heartbeat_expired(record: &Value) -> Result<(bool, bool, i64)> {
@@ -1491,6 +1592,7 @@ fn salvage_gate(cfg: &Cfg, config: &Value, checkout: &Value, repository: &Path) 
             .get("containing_remote_refs")
             .cloned()
             .unwrap_or(json!([])),
+        "ref_inventory": ref_inventory(&path, &name)?,
     }))
 }
 
