@@ -215,6 +215,27 @@ LATE_PAGE_SHIM = """(() => {
   };
 })();"""
 
+# Records every audio-context state change, page-side as it happens. A Resume is judged by the
+# recorded sequence (a running after the last suspended), never by sampling the current state from
+# this process: under gate load this process can stall past the whole resumed interval — the read
+# ends and the context is quieted back to suspended before the next sample — and a level sampled
+# then says Resume never ran when it did (the 393x852 gate failure at #1250).
+CONTEXT_STATE_PROBE = """(() => {
+  const states = [];
+  window.contextStates = states;
+  let hooked = null;
+  const hook = () => {
+    const context = window.readAloudProbe && window.readAloudProbe.context;
+    if (context && hooked !== context) {
+      hooked = context;
+      states.push(context.state);
+      context.addEventListener('statechange', () => states.push(context.state));
+    }
+    requestAnimationFrame(hook);
+  };
+  requestAnimationFrame(hook);
+})();"""
+
 # Records the sentences lit, page-side at frame rate, in order: the walk reads the record instead of
 # sampling the highlight from this process, which a loaded host can stall past a whole sentence.
 SENTENCE_PROBE = """(() => {
@@ -812,6 +833,7 @@ def main() -> int:
                 )
                 context.add_init_script("localStorage.setItem('vibe-talk.voice.read-audio-source', 'agent');")
                 context.add_init_script(SOURCE_PROBE)
+                context.add_init_script(CONTEXT_STATE_PROBE)
                 context.add_init_script(SENTENCE_PROBE)
                 if shim is not None:
                     context.add_init_script(shim)  # after the probe, so the probe sees what the shim does
@@ -920,6 +942,26 @@ def main() -> int:
             def wait_position(page: Page, wanted: str, seconds: float = 10) -> None:
                 wait_for(lambda: position(page) == wanted, seconds,
                          f"the read never reached {wanted}; it shows {position(page)!r}")
+
+            def wait_resumed(page: Page, why: str) -> None:
+                # A running recorded after the last suspended (CONTEXT_STATE_PROBE): the event
+                # itself, kept page-side, so a stall in this process cannot miss it the way it
+                # can miss the current-state level once the read has ended and quieted the
+                # context again. On failure the whole recorded sequence says which it was.
+                try:
+                    wait_for(lambda: page.evaluate(
+                        "() => { const states = window.contextStates || [];"
+                        " return states.lastIndexOf('running') > states.lastIndexOf('suspended'); }"),
+                        STATE_S, why)
+                except AssertionError:
+                    seen = page.evaluate(
+                        "() => ({ states: window.contextStates || [],"
+                        " state: (() => { try { return readAloudOwner().readAloudContext.state; }"
+                        " catch { return 'unreadable'; } })(),"
+                        " clock: (() => { try { return readAloudOwner().readAloudContext.currentTime; }"
+                        " catch { return -1; } })(),"
+                        " label: document.getElementById('read-aloud-label').textContent })")
+                    raise AssertionError(f"{why}: recorded context states and page state: {seen}") from None
 
             def author_line(page: Page) -> str:
                 return str(page.evaluate(f"() => document.querySelector('{row} .msg-author').textContent"))
@@ -1115,8 +1157,7 @@ def main() -> int:
                       f"a media pause left the Read button saying {page.text_content('#read-aloud-label')!r}")
                 shot("5b-paused")
                 press(page, "#read-aloud", True)
-                wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "running", 2,
-                         "the Read button did not resume a media pause")
+                wait_resumed(page, "the Read button did not resume a media pause")
                 check(position(page) == "6 of 7", f"resuming moved the read to {position(page)}")
                 # And the Read button holds and resumes the same read, from the same block.
                 press(page, "#read-aloud", True)
@@ -1125,8 +1166,7 @@ def main() -> int:
                 check(page.text_content("#read-aloud-label") == "Resume",
                       "the Read button's pause left it saying Pause")
                 press(page, "#read-aloud", True)
-                wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "running", 2,
-                         "the Read button's Resume did not start the audio clock again")
+                wait_resumed(page, "the Read button's Resume did not start the audio clock again")
                 page.evaluate("() => window.mediaProbe.handlers.play({action: 'play'})")
                 states: object = page.evaluate("() => window.mediaProbe.states")
                 check(isinstance(states, list) and "paused" in states and states[-1] == "playing",
@@ -1301,8 +1341,7 @@ def main() -> int:
                 if args.screenshots:
                     page.screenshot(path=str(args.screenshots / "9-phone-393-paused.png"))
                 press(page, "#read-aloud", True)
-                wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "running", 2,
-                         "the Read button's Resume did not resume the read at 393x852")
+                wait_resumed(page, "the Read button's Resume did not resume the read at 393x852")
                 check(position(page) == "2 of 7", f"the resume moved the read to {position(page)}")
                 # At the foot of the list the last message scrolls clear of the strip: the room
                 # the composer keeps above itself grew by the strip's height (`#433`).
@@ -1421,8 +1460,7 @@ def main() -> int:
                         if args.screenshots:
                             page.screenshot(path=str(args.screenshots / f"{shot_name}-paused.png"))
                         press(page, "#read-aloud", True)
-                        wait_for(lambda: page.evaluate("() => readAloudOwner().readAloudContext.state") == "running", 2,
-                                 f"the Read button's Resume did not resume the read at {where}")
+                        wait_resumed(page, f"the Read button's Resume did not resume the read at {where}")
                         check_phone_layout(page, f"{where} resumed", "playing")
                         press(page, "#read-aloud-stop", True)
                         check_mode_left(page, f"{where}'s bar")
