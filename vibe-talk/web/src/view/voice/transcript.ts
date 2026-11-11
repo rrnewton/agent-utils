@@ -144,9 +144,8 @@ function pinnedHere(area: HTMLElement): boolean {
   return false;
 }
 
-/** Follow as `pinnedHere` decided, and note where the follow left the reader. */
-function followHere(area: HTMLElement, pinned: boolean, unseen?: number, view?: string): void {
-  deps.followIfPinned(pinned, unseen, view);
+/** Note where a follow left the reader, for `pinnedHere`'s next answer. */
+function noteFollow(area: HTMLElement, pinned: boolean): void {
   if (pinned) {
     footing = true;
     footingTop = area.scrollTop;
@@ -230,7 +229,8 @@ function line(who: string, text: string, atMs?: number | undefined) {
   // A row arriving into a filtered list is filtered too. Without this, a live turn spoken while
   // the reader is searching lands on screen among the matches whether or not it is one.
   deps.applySearch();
-  followHere(area, pinned, 1);
+  deps.followIfPinned(pinned, 1);
+  noteFollow(area, pinned);
   return li;
 }
 
@@ -304,7 +304,8 @@ function transcriptSeam(label: string, detail: string, into: HTMLElement[] | nul
   // A seam explains the rows beside it, so while a filter is on it goes away with them. It
   // declares nothing to `searchable`, which is exactly how `applySearch` knows that.
   deps.applySearch();
-  followHere(area, pinned);
+  deps.followIfPinned(pinned);
+  noteFollow(area, pinned);
   return li;
 }
 
@@ -511,7 +512,8 @@ function setSeamRecap(li: Element, boundary: Boundary) {
   const area = deps.leftEl("scroll-area");
   const pinned = pinnedHere(area);
   fillBoundary(li, boundary);
-  followHere(area, pinned);
+  deps.followIfPinned(pinned);
+  noteFollow(area, pinned);
 }
 
 
@@ -615,7 +617,8 @@ function renderCallRecap() {
   // `#352 voice-reconnect-on-bridge-error`. Whether the session now running is one a reconnect opened.
   if (said && deps.session.recap!.reconnected) line.setAttribute("data-reconnected", "");
   else line.removeAttribute("data-reconnected");
-  followHere(area, pinned);
+  deps.followIfPinned(pinned);
+  noteFollow(area, pinned);
 }
 
 
@@ -2519,7 +2522,8 @@ function placeInConversation(li: HTMLElement, conversationId: string | null, tur
   else list.append(li);
   deps.renderEmptyState();
   deps.applySearch();
-  followHere(area, pinned, turns);
+  deps.followIfPinned(pinned, turns);
+  noteFollow(area, pinned);
   return li;
 }
 
@@ -3923,7 +3927,8 @@ function releaseYesHold(hold: YesHold | null, kept: boolean = false) {
   const pinned = pinnedHere(area);
   li.removeAttribute("data-absorbed");
   deps.applySearch();
-  followHere(area, pinned);
+  deps.followIfPinned(pinned);
+  noteFollow(area, pinned);
 }
 
 
