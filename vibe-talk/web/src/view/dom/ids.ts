@@ -417,6 +417,7 @@ export interface ElementById {
   "quick-reply-discard-no": HTMLButtonElement;
   "quick-reply-discard-text": HTMLParagraphElement;
   "quick-reply-discard-yes": HTMLButtonElement;
+  "quick-reply-dock": HTMLButtonElement;
   "quick-reply-mic": HTMLButtonElement;
   "quick-reply-quote": HTMLElement;
   "quick-reply-send": HTMLButtonElement;

@@ -71,6 +71,9 @@
 //     position under the current message and should be open and visible." With words in it, the box's
 //     quote and words become the message's reply draft and its reply opens in the stream under it, as
 //     Reply opens it (`putDownQuickReply`); with none, the box just closes.
+//   * DOCKED BACK. `#1315 floating-reply-dock`: the dock icon at the box's lower-left does the tap
+//     outside's move on purpose, and more: the inline reply opens focused, and a Post to main tick
+//     is carried with the draft, where a tap outside leaves it behind.
 //   * NEVER LOST. `#819 voice-page-quoted-reply-and-draft-chip`, after the owner lost a dictated reply: what
 //     is written in the box is kept on the device as it is written, not only as the box closes, so a reload
 //     or a crashed tab with the box open still has it; each write is told to the page (`noteDraft`), whose
@@ -191,7 +194,7 @@ export interface QuotingDependencies {
    * as `message`'s reply draft, its reply open and shown in the stream under `row`, the row the box was
    * opened on (or the row drawing that message now).
    */
-  toStream(row: QuotedRow, message: Message, text: string): void;
+  toStream(row: QuotedRow, message: Message, text: string, opts?: { toMain?: boolean; focus?: boolean }): void;
   /**
    * `#819 voice-page-quoted-reply-and-draft-chip`. Where quick replies closed unsent are kept, by message and
    * quoted words, on the device.
@@ -235,6 +238,8 @@ export interface Quoting {
   closeQuickReply(): void;
   /** A tap outside the box: what was written goes back under its message, open and shown; nothing written, it closes. */
   putDownQuickReply(): void;
+  /** `#1315 floating-reply-dock`. The dock icon: the draft, its quote and its Post to main choice go into the reply in the stream, focused; the box closes. */
+  dockQuickReply(): void;
   /** Send the quick reply, then close it. */
   sendQuickReply(): Promise<void>;
   /** `#819`. Something was written in the open box: kept now, on the device. */
@@ -593,6 +598,23 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     closeQuickReply();
   }
 
+  /**
+   * `#1315 floating-reply-dock`. The dock icon at the box's lower-left: the reader changed their
+   * mind about writing floating. The quote and what was written — nothing written yet, the quote
+   * alone — become the message's reply in the stream, its Post to main choice carried with it
+   * (a tap outside leaves that choice behind, above), the focus kept in the box that takes over,
+   * and the floating box closes holding nothing for those words.
+   */
+  function dockQuickReply(): void {
+    const open = quickReply;
+    if (!open) return;
+    const written = deps.byId("quick-reply-text").value;
+    const toMain = !deps.byId("quick-reply-to-main-row").hidden && deps.byId("quick-reply-to-main").checked;
+    deps.toStream(open.row, open.message, `${quoteBlock(open.quote)}${written}`, { toMain, focus: true });
+    deps.byId("quick-reply-text").value = "";
+    closeQuickReply();
+  }
+
   /** Send the quick reply: the quoted words and what was written, in the message's thread; then close it. */
   async function sendQuickReply(): Promise<void> {
     const open = quickReply;
@@ -666,7 +688,7 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     quoteSelectionNow,
     quickReplyHolds, quickReplyListMoved, quickReplyOpen: () => quickReply !== null,
     quickReplyOpenKey: () => (quickReply ? quickReply.key : null), placeQuickReply,
-    closeQuickReply, putDownQuickReply, sendQuickReply, noteQuickReplyInput, openQuickDraft, openSentenceReply,
+    closeQuickReply, putDownQuickReply, dockQuickReply, sendQuickReply, noteQuickReplyInput, openQuickDraft, openSentenceReply,
     quickDraftLive: (key) => Boolean((quickReplyDrafts.get(key) || "").trim()),
     quickDraftMessage: (key) => keyParts(key).id,
   };

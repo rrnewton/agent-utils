@@ -136,7 +136,7 @@ export interface ReplySession {
   pressDraftChip(): Promise<void>;
   cancelQuickReply(): void;
   answerQuickReplyDiscard(discard: boolean): void;
-  quickReplyToStream(row: HTMLElement, message: ReplyMessageLike, text: string): void;
+  quickReplyToStream(row: HTMLElement, message: ReplyMessageLike, text: string, opts?: { toMain?: boolean; focus?: boolean }): void;
   openReply(messages: ReplyMessageLike[], from?: HTMLElement | null, quote?: string, focus?: boolean): void;
   renderReplyDestination(): void;
   closeReply(how?: { restore?: boolean; refocus?: boolean }): void;
@@ -581,12 +581,13 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
    * their quote, become the message's reply draft, ahead of any draft it had (a blank line between), and its
    * reply opens in the stream under it, shown and open, as Reply opens it, in the column drawing it. Without
    * taking the focus: the tap was going somewhere, and the reader sees the box without being put in it.
+   * Docking (`#1315 floating-reply-dock`) asks for the focus, and for its Post to main choice (`opts`).
    *
    * @param {HTMLElement} row the row the box was opened on
    * @param {any} message
    * @param {string} text the quote and what was written
    */
-  function quickReplyToStream(row: HTMLElement, message: ReplyMessageLike, text: string): void {
+  function quickReplyToStream(row: HTMLElement, message: ReplyMessageLike, text: string, opts: { toMain?: boolean; focus?: boolean } = {}): void {
     const id = String(message.id);
     const prior = deps.replyDrafts.get(id) || "";
     deps.replyDrafts.set(id, prior.trim() ? `${text}\n\n${prior}` : text);
@@ -596,7 +597,16 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
     // The row the box was opened on, unless a redraw has replaced it since: then the one drawing the message.
     const drawn = row.parentNode && deps.rowShown(row) ? row : deps.paneRowFor(deps.channelPane, id) || deps.paneRowFor(deps.sidePane, id);
     const column = drawn && listPane(drawn) === deps.sidePane ? deps.columns.side : deps.columns.main;
-    deps.inColumn(column, () => openReply(drawn ? deps.rowMessages(drawn) : [message], drawn, "", false));
+    deps.inColumn(column, () => {
+      openReply(drawn ? deps.rowMessages(drawn) : [message], drawn, "", Boolean(opts.focus));
+      // `#1315 floating-reply-dock`. Docking carries the floating box's Post to main choice with
+      // the draft, where a tap outside's put-down leaves it behind: ticked here, after the open
+      // has unticked it as every open does, and the destination said again under the box.
+      if (opts.toMain && !deps.el("reply-to-main-row").hidden) {
+        deps.el("reply-to-main").checked = true;
+        renderReplyDestination();
+      }
+    });
   }
 
 

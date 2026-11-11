@@ -22,6 +22,8 @@ export interface QuickReplyListenersDependencies {
   answerQuickReplyDiscard(discard: boolean): unknown;
   /** Close the box, its words kept. */
   closeQuickReply(): unknown;
+  /** `#1315 floating-reply-dock`. The dock icon: the draft goes into the reply in the stream, focused. */
+  dockQuickReply(): unknown;
   /** Any other key in the box: the message boxes' own keys. */
   onBoxKey(event: KeyboardEvent): unknown;
   /** Watch what is pasted or dropped into the box. */
@@ -68,6 +70,7 @@ export function mountQuickReplyListeners(deps: QuickReplyListenersDependencies):
     listen<Event>(left(id), "mousedown", keepSelection);
     listen<Event>(left(id), "click", () => deps.pressSelectionChip());
   }
+  listen<Event>(el("quick-reply-dock"), "click", () => deps.dockQuickReply());
   listen<Event>(el("quick-reply-send"), "click", () => deps.sendQuickReply());
   listen<Event>(el("quick-reply-cancel"), "click", () => deps.cancelQuickReply());
   listen<Event>(el("quick-reply-discard-yes"), "click", () => deps.answerQuickReplyDiscard(true));

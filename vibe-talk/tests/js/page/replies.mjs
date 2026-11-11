@@ -4456,6 +4456,73 @@ test("`#727 vt-selection-quick-reply`: a tap outside puts what was written back 
   }
 });
 
+test("`#1315 floating-reply-dock`: the dock icon moves the draft into the reply in the stream, focused, the quote and Post to main with it", async () => {
+  for (const desk of [false, true]) {
+    const where = desk ? "at a desk" : "on a phone";
+    const page = await quickPage({ desk });
+    // The icon: at the box, named for a screen reader and pointed at alike, in the served markup
+    // (the fixture models no static aria-label; Chromium reads the real one in the browser walk).
+    const dock = page.el("quick-reply-dock");
+    assert.match(HTML_CODE, /<button id="quick-reply-dock"[^>]*title="Dock this reply under its message"[^>]*aria-label="Dock this reply under its message"/,
+      `${where}: the dock icon has no tooltip or accessible label`);
+    // Words written: they dock under their quote, focused, and nothing is sent.
+    await quickReplyTo(page, 3);
+    await page.el("quick-reply-text").setValue("half a thought");
+    await dock.click();
+    await page.settle();
+    assert.equal(page.el("quick-reply").hidden, true, `${where}: docking left the floating box up`);
+    assert.equal(page.el("column-reply").hidden, false, `${where}: docking opened no reply in the stream`);
+    assert.equal(page.el("reply-text").value, `> ${QUICK_SENTENCES[3]}\n\nhalf a thought`,
+      `${where}: the reply under the message is not the quote and what was written`);
+    assert.match(page.el("reply-target-meta").textContent, new RegExp(`id ${QUICK_LONG}$`),
+      `${where}: the draft went under another message`);
+    assert.equal(focused(page), page.el("reply-text"), `${where}: docking did not keep the focus in the reply`);
+    assert.equal(page.repliesPosted.length, 0, `${where}: docking sent the reply`);
+    // The floating box holds nothing for those words now: the draft is the reply's.
+    await putReplyDown(page);
+    await quickReplyTo(page, 3);
+    assert.equal(page.el("quick-reply-text").value, "", `${where}: the draft was kept in the floating box as well`);
+    await page.el("quick-reply-cancel").click();
+    // Nothing written yet, on a fresh page: the quote alone docks, focused, losing nothing.
+    const fresh = await quickPage({ desk });
+    await quickReplyTo(fresh, 3);
+    await fresh.el("quick-reply-dock").click();
+    await fresh.settle();
+    assert.equal(fresh.el("quick-reply").hidden, true, `${where}: docking an empty box left it up`);
+    assert.equal(fresh.el("reply-text").value, `> ${QUICK_SENTENCES[3]}\n\n`,
+      `${where}: docking an empty box lost the quote`);
+    assert.equal(focused(fresh), fresh.el("reply-text"), `${where}: docking an empty box did not focus the reply`);
+  }
+  // Post to main ticked in the floating box stays ticked in the stream, and Send honours it.
+  const page = newPage();
+  page.threadingSupported = true;
+  const data = threadData();
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await page.selectText(wordsIn(rowWithId(page, "202")), null, "thread answer");
+  await page.el("selection-chip").click();
+  await page.settle();
+  assert.equal(page.el("quick-reply-to-main-row").hidden, false, "no Post to main choice in the floating box");
+  page.el("quick-reply-to-main").checked = true;
+  await page.el("quick-reply-text").setValue("taking this point to main, docked");
+  await page.el("quick-reply-dock").click();
+  await page.settle();
+  assert.equal(page.el("quick-reply").hidden, true, "docking left the floating box up");
+  assert.equal(page.el("reply-text").value, "> thread answer\n\ntaking this point to main, docked",
+    "the docked reply is not the quote and what was written");
+  assert.equal(page.el("reply-to-main").checked, true, "docking lost the Post to main tick");
+  assert.match(page.el("reply-destination").textContent, /main channel as a new thread/,
+    "the docked reply does not say it posts to main");
+  assert.equal(focused(page), page.el("reply-text"), "docking did not keep the focus in the reply");
+  await page.el("reply-send").click();
+  await page.settle();
+  const posted = page.repliesPosted.at(-1).body;
+  assert.equal(posted.reply_to, "202");
+  assert.equal(posted.post_to_main, true, JSON.stringify(posted));
+  assert.equal("thread_id" in posted, false, JSON.stringify(posted));
+});
+
 test("`#727 vt-selection-quick-reply`: replies to several sentences in a row, each its own quote, the list never moving", async () => {
   const page = await quickPage();
   const area = page.el("scroll-area");

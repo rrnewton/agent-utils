@@ -5945,7 +5945,7 @@ const quoteOwner = createQuoting({
   readOnly: (channel) => knownChannel(channel)?.writable === false,
   replyMarksRead: (message, text) => replyMarksRead(message, text),
   queueOutgoingMessage: (send) => queueOutgoingMessage(send),
-  toStream: (row, message, text) => quickReplyToStream(row, message, text),
+  toStream: (row, message, text, opts) => quickReplyToStream(row, message, text, opts),
   drafts: quickDrafts,
   noteDraft: (key, channel, written) => noteDraft("quick", key, channel, written),
   // `#821 voice-page-read-aloud-react`. The microphone stops whenever the box closes: Send, Cancel, Esc, a tap
@@ -5965,7 +5965,7 @@ const quoteOwner = createQuoting({
 
 const {
   noteQuoteSelection, takeQuote, placeSelectionChip, pressSelectionChip, quickReplyHolds,
-  quickReplyListMoved, placeQuickReply, closeQuickReply, putDownQuickReply, sendQuickReply,
+  quickReplyListMoved, placeQuickReply, closeQuickReply, putDownQuickReply, dockQuickReply, sendQuickReply,
 } = quoteOwner;
 
 // --- a reply open in the stream -------------------------------------------------------------------
@@ -8125,6 +8125,7 @@ application.track(mountQuickReplyListeners({
   cancelQuickReply: () => cancelQuickReply(),
   answerQuickReplyDiscard: (discard) => answerQuickReplyDiscard(discard),
   closeQuickReply: () => closeQuickReply(),
+  dockQuickReply: () => dockQuickReply(),
   onBoxKey: (event) => onComposerKey(event, guardQuietly(sendQuickReply), el("quick-reply-text")),
   watchBoxInsertions: (box) => watchBoxInsertions(box),
   noteQuickReplyInput: () => quoteOwner.noteQuickReplyInput(),

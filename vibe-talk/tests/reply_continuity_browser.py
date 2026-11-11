@@ -56,6 +56,11 @@ message offers Post to main left of Send/Cancel, unticked -> press ticks it, the
 Send posts top-level answering it (post_to_main, no thread_id), the new root reaches the list
 carrying its reply arrow, and the arrow lands on the quoted message.
 
+`#1315 floating-reply-dock`. Last, at 1280x800, on the quick replies' channel: q on selected
+words, a draft in the floating box, and its lower-left dock icon -> the inline reply under the
+message holds the quote and the draft, focused, the floating box gone, and Send posts it; in
+the post-to-main walk the same dock keeps a ticked Post to main ticked.
+
 Pass --screenshots DIR to keep a PNG of the open reply for each case; --web-root DIR to run the
 same walk against another copy of the page.
 """
@@ -1119,6 +1124,77 @@ def quick_reply_walk(walk: Walk) -> None:
                       "fourth, written and tapped away from, open with its quote under the message")
 
 
+def dock_reply_walk(walk: Walk) -> None:
+    """`#1315 floating-reply-dock`. At a desk, from the foot of the list: q on selected words, a
+    draft with its quote, and the dock icon at the floating box's lower-left — named for a screen
+    reader and pointed at alike — turns it back into the inline reply under its message: the same
+    draft, focused, the floating box gone, and Send from there posts it to the message."""
+    page = walk.page
+    row_id = message_id(COUNT - 1)
+    page.fill("#api-token", TOKEN)
+    page.click("#save-token")
+    page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+    page.click("#view-switch")
+    walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {COUNT}",
+                  "dock: the channel did not open")
+    walk.settled()
+    page.evaluate("() => { const area = document.getElementById('scroll-area'); area.scrollTop = area.scrollHeight; }")
+    walk.settled()
+    page.evaluate(SELECTION_JS, [row_id, 31, 70, True])
+    walk.wait_for("() => !document.getElementById('selection-chip').hidden", "dock: no chip under the words")
+    page.keyboard.press("q")
+    walk.wait_for("() => !document.getElementById('quick-reply').hidden", "dock: q opened no floating box")
+    walk.wait_for("() => document.activeElement === document.getElementById('quick-reply-text')",
+                  "dock: the floating box did not take the focus")
+    walk.settled()
+    dock: object = page.evaluate("""() => {
+      const dock = document.getElementById('quick-reply-dock');
+      const box = document.getElementById('quick-reply').getBoundingClientRect();
+      const r = dock.getBoundingClientRect();
+      return {label: dock.getAttribute('aria-label'), title: dock.getAttribute('title'),
+        left: r.left, boxLeft: box.left,
+        cancelLeft: document.getElementById('quick-reply-cancel').getBoundingClientRect().left};
+    }""")
+    assert isinstance(dock, dict)
+    walk.check(dock.get("label") == "Dock this reply under its message"
+               and dock.get("title") == "Dock this reply under its message",
+               f"dock: the icon is unnamed: {dock}")
+    walk.check(abs(float(dock["left"]) - float(dock["boxLeft"])) <= 24
+               and float(dock["left"]) < float(dock["cancelLeft"]),
+               f"dock: the icon is not at the box's lower-left: {dock}")
+    page.fill("#quick-reply-text", "docked thought")
+    walk.press("#quick-reply-dock")
+    walk.wait_for("() => document.getElementById('quick-reply').hidden", "dock: the floating box stayed up")
+    walk.wait_for("() => !document.getElementById('column-reply').hidden",
+                  "dock: no reply open under the message")
+    walk.wait_for("() => document.activeElement === document.getElementById('reply-text')",
+                  "dock: the focus did not stay with the draft")
+    walk.settled()
+    docked: object = page.evaluate(PUT_DOWN_JS, row_id)
+    assert isinstance(docked, dict)
+    docked_text = str(docked.get("text", ""))
+    walk.check(docked_text.startswith("> ") and docked_text.endswith("\n\ndocked thought"),
+               f"dock: the reply under the message holds {docked_text!r}")
+    walk.check(docked.get("target") == row_id, f"dock: the reply is under another message: {docked}")
+    dock_box = docked.get("box")
+    walk.check(isinstance(dock_box, dict) and float(dock_box["top"]) >= num(docked["areaTop"]) - 0.5
+               and float(dock_box["bottom"]) <= num(docked["areaBottom"]) + 0.5,
+               f"dock: the reply's box is not on the screen: {docked}")
+    walk.check(isinstance(dock_box, dict) and float(dock_box["top"]) >= num(docked["rowTop"]),
+               f"dock: the reply's box is not under its message: {docked}")
+    walk.shot("dock-reply")
+    sent = len(walk.api.replies)
+    walk.press("#reply-send")
+    walk.wait_for("() => document.getElementById('column-reply').hidden",
+                  "dock: Send did not put the docked reply away")
+    posted = walk.posted_since(sent, "dock")
+    walk.check(len(posted) == 1 and posted[0].get("reply_to") == row_id
+               and str(posted[0].get("text", "")).endswith("\n\ndocked thought"),
+               f"dock: what left the browser was {posted}")
+    walk.notes.append("q and a quoted draft, docked by the icon at the floating box's lower-left "
+                      "into the focused reply under its message, and sent from there")
+
+
 # `#819 voice-page-quoted-reply-and-draft-chip`: what the Draft chip says, what is focused, and its words.
 DRAFT_JS = """() => {
   const chip = document.getElementById('draft-chip');
@@ -1496,6 +1572,40 @@ def post_to_main_walk(walk: Walk) -> None:
                "post-to-main: the tick came back ticked from the last send")
     walk.press("#reply-cancel")
     walk.wait_for(CLOSED, "post-to-main: Cancel did not put the reopened box away")
+    # `#1315 floating-reply-dock`: the same tick in the floating box, docked, stays ticked in the
+    # stream, the draft and its quote with it, and Send honours it from there.
+    page.evaluate(SELECTION_JS, [target, 4, 20, True])
+    walk.wait_for("() => !document.getElementById('selection-chip').hidden",
+                  "post-to-main, dock: no chip under the words")
+    page.keyboard.press("q")
+    walk.wait_for("() => !document.getElementById('quick-reply').hidden",
+                  "post-to-main, dock: q opened no floating box")
+    walk.wait_for("() => !document.getElementById('quick-reply-to-main-row').hidden",
+                  "post-to-main, dock: no Post to main choice in the floating box")
+    walk.press("#quick-reply-to-main-row")
+    walk.wait_for("() => document.getElementById('quick-reply-to-main').checked",
+                  "post-to-main, dock: a press did not tick the floating box")
+    page.fill("#quick-reply-text", "docked to main")
+    walk.press("#quick-reply-dock")
+    walk.wait_for("() => document.getElementById('quick-reply').hidden",
+                  "post-to-main, dock: the floating box stayed up")
+    walk.wait_for("() => !document.getElementById('column-reply').hidden",
+                  "post-to-main, dock: no reply open under the message")
+    walk.wait_for("() => document.getElementById('reply-to-main').checked",
+                  "post-to-main, dock: the tick did not survive docking")
+    walk.wait_for("() => document.activeElement === document.getElementById('reply-text')",
+                  "post-to-main, dock: the focus did not stay with the draft")
+    walk.settled()
+    docked_text = str(page.evaluate("() => document.getElementById('reply-text').value"))
+    walk.check(docked_text.startswith("> ") and docked_text.endswith("\n\ndocked to main"),
+               f"post-to-main, dock: the reply under the message holds {docked_text!r}")
+    sent = len(walk.api.replies)
+    walk.press("#reply-send")
+    walk.wait_for(CLOSED, "post-to-main, dock: Send did not put the box away")
+    posted = walk.posted_since(sent, "post-to-main, dock")
+    walk.check(len(posted) == 1 and posted[0].get("post_to_main") is True
+               and posted[0].get("reply_to") == target and "thread_id" not in posted[0],
+               f"post-to-main, dock: what left the browser was {posted}")
     walk.notes.append("Post to main ticked left of Send/Cancel; the send landed top-level "
                       "answering the in-thread message, and its arrow lands on it; "
                       "reopened, the tick is unticked again")
@@ -1575,12 +1685,14 @@ def main() -> int:
         ("412x915-drafts", 412, 915, True, "dark"),
         # `#1052 post-to-main`, on a channel holding one answered thread.
         ("1280x800-post-to-main", 1280, 800, False, "dark"),
+        # `#1315 floating-reply-dock`, on the quick replies' channel, at a desk.
+        ("1280x800-dock-reply", 1280, 800, False, "dark"),
     )
     report: list[str] = []
     with sync_playwright() as playwright:
         for label, width, height, phone, scheme in runs:
             api = (FakeApi(messages=layout_messages()) if label.endswith("quote-layout")
-                   else FakeApi(messages=quick_messages(), reply_author=OWNER) if label.endswith(("quick-reply", "drafts"))
+                   else FakeApi(messages=quick_messages(), reply_author=OWNER) if label.endswith(("quick-reply", "drafts", "dock-reply"))
                    else FakeApi(messages=threaded_messages()) if label.endswith("post-to-main")
                    else FakeApi(empty_threads=label.endswith("new-thread")))
             server, thread, url = serve(api, web_root)
@@ -1612,6 +1724,8 @@ def main() -> int:
                         drafts_walk(walk)
                     elif label.endswith("post-to-main"):
                         post_to_main_walk(walk)
+                    elif label.endswith("dock-reply"):
+                        dock_reply_walk(walk)
                     elif api.empty_threads:
                         new_thread_walk(walk)
                     elif scheme == "dark":

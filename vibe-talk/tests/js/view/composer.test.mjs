@@ -362,6 +362,7 @@ test("`#624 voice-page-modularity`: the quoted words' and the quick-reply box's 
       cancelQuickReply: () => log.push("cancel"),
       answerQuickReplyDiscard: (discard) => log.push(`discard ${discard}`),
       closeQuickReply: () => log.push("close"),
+      dockQuickReply: () => log.push("dock"),
       onBoxKey: (key) => { log.push(`box key ${key.key}`); return "composer"; },
       watchBoxInsertions: (box) => log.push(`watch ${box.name}`),
       noteQuickReplyInput: () => log.push("input"),
@@ -379,7 +380,7 @@ test("`#624 voice-page-modularity`: the quoted words' and the quick-reply box's 
     });
     assert.deepStrictEqual(log, ["listen document selectionchange",
       "listen left:selection-chip mousedown", "listen left:selection-chip click", "listen left:read-steer-quote mousedown", "listen left:read-steer-quote click",
-      "listen quick-reply-send click", "listen quick-reply-cancel click", "listen quick-reply-discard-yes click",
+      "listen quick-reply-dock click", "listen quick-reply-send click", "listen quick-reply-cancel click", "listen quick-reply-discard-yes click",
       "listen quick-reply-discard-yes keydown", "listen quick-reply-discard-no keydown", "listen quick-reply-discard-no click",
       "listen quick-reply-text keydown", "watch quick-reply-text", "listen quick-reply-text input", "listen quick-reply-text pointerdown",
       "listen quick-reply-mic mousedown", "listen quick-reply-mic click", "listen left:draft-chip click", "listen read-react click",
@@ -389,6 +390,7 @@ test("`#624 voice-page-modularity`: the quoted words' and the quick-reply box's 
     fire("document", "selectionchange", event({ n: 1 }));
     fire("left:selection-chip", "mousedown", event({ n: 2 }));
     fire("left:read-steer-quote", "click", event({ n: 3 }));
+    fire("quick-reply-dock", "click", event({ n: 4 }));
     fire("quick-reply-send", "click", event({ n: 4 }));
     fire("quick-reply-cancel", "click");
     fire("quick-reply-discard-yes", "click");
@@ -405,7 +407,7 @@ test("`#624 voice-page-modularity`: the quoted words' and the quick-reply box's 
     fire("quick-reply-mic", "click");
     fire("left:draft-chip", "click");
     fire("read-react", "click");
-    assert.deepStrictEqual(log, ["note selection 0", "prevent 2", "chip 0", "send 0", "cancel", "discard true", "discard false",
+    assert.deepStrictEqual(log, ["note selection 0", "prevent 2", "chip 0", "dock", "send 0", "cancel", "discard true", "discard false",
       "prevent Escape", "stop Escape", "close", "prevent Escape", "stop Escape", "close", "box key Enter", "input", "keyboard",
       "prevent 5", "stop dictation", "draft chip", "react"]);
     log.length = 0;
