@@ -124,6 +124,7 @@ export interface ElementById {
   "discuss-links": HTMLUListElement;
   "discuss-mark-read": HTMLButtonElement;
   "discuss-mark-unread": HTMLButtonElement;
+  "discuss-menu-open": HTMLButtonElement;
   "discuss-open": HTMLButtonElement;
   "discuss-panel": HTMLDivElement;
   "discuss-retry": HTMLButtonElement;

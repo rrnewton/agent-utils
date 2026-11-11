@@ -1470,7 +1470,7 @@ test("`#624 voice-page-modularity`: the list's tools reach the act each names, i
     "listen search-all-channels change", "listen search-further click", "listen load-older-turns click", "listen collapse-all click",
     "listen expand-all click", "listen todo-filter click", "listen clear-backlog click", "listen undo-dismiss click", "listen summarise click",
     "listen reader-toggle click", "listen autoplay-toggle click", "listen expand-all click", "listen collapse-all click", "listen summarise click",
-    "listen reader-toggle click", "listen autoplay-toggle click", "listen jump-newest click"], "a listener was added out of the page's order");
+    "listen reader-toggle click", "listen autoplay-toggle click", "listen discuss-menu-open click", "listen jump-newest click"], "a listener was added out of the page's order");
   log.length = 0;
   assert.deepStrictEqual(press("load-older"), ["older asked"], "the control did not answer what it started, which the page suite waits for");
   // Each control answers what its act started, which the page suite waits for.

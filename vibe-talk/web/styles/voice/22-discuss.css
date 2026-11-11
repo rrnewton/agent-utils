@@ -161,3 +161,13 @@ body:has(#control-bar[data-placement="top"]) #discuss-panel {
   color: #aab2c0;
   font-size: 0.75rem;
 }
+
+/* On a phone the bar's strip is priced to its edge — the channel's name keeps
+ * its room (the view picker's bargain in 18-control-bar.css) — so the bar
+ * button gives way there and Discuss is carried by the action menu's item
+ * instead. The panel itself is one, however it was opened. */
+@media not ((min-width: 900px) and (pointer: fine)) {
+  #discuss-open {
+    display: none;
+  }
+}

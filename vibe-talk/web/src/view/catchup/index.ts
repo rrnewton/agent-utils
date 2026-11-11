@@ -104,6 +104,21 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
       button.setAttribute("aria-label", DISCUSS_UNAVAILABLE_HINT);
       button.setAttribute("aria-expanded", "false");
     }
+    // The menu's Discuss (the phone's way in) says the same, in its own dress.
+    try {
+      const item = deps.byId("discuss-menu-open");
+      if (available()) {
+        item.removeAttribute("aria-disabled");
+        item.setAttribute("title", "Catch up on this channel or thread");
+        item.removeAttribute("aria-label");
+      } else {
+        item.setAttribute("aria-disabled", "true");
+        item.setAttribute("title", DISCUSS_UNAVAILABLE_HINT);
+        item.setAttribute("aria-label", DISCUSS_UNAVAILABLE_HINT);
+      }
+    } catch {
+      // A host without the menu item: the bar button already says it.
+    }
   }
 
   function catchupPost(channelId: string, body: CatchupRequestBody): Promise<unknown> {
@@ -176,6 +191,15 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
           // Unavailable: the click does nothing — no panel, no POST — and the
           // button's title and aria label already say why.
         });
+        // The action menu's Discuss: choosing it closes the menu (the list
+        // controls' standing act for its items) and opens the same panel.
+        try {
+          listening.listen(deps.byId("discuss-menu-open"), "click", () => {
+            if (available()) open();
+          });
+        } catch {
+          // A host without the menu item keeps the bar button's way in.
+        }
         drawAvailability();
         try {
           panel.setScopeLabel(scopeNow().label);

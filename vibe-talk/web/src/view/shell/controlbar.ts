@@ -100,6 +100,8 @@ export function createControlBar(deps: ControlBarDependencies): ControlBar {
     deps.el("action-menu-open").hidden = !main;
     deps.el("reader-toggle").hidden = deps.view() !== "discord";
     deps.el("autoplay-toggle").hidden = deps.view() !== "discord";
+    // `catchup-side-agent`. Discuss in the menu, on the channel's view as reading is.
+    deps.el("discuss-menu-open").hidden = deps.view() !== "discord";
     // `#1265 documents-star-hide`. Show hidden, on the Documents view only.
     deps.el("docs-show-hidden").hidden = deps.view() !== "docs";
     if (deps.actionMenuOpen()) deps.renderActionMenu();

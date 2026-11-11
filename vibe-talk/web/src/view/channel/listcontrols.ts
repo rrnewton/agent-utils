@@ -82,7 +82,7 @@ export function mountListControls(deps: ListControlsDependencies): ListControls 
   listen(el("autoplay-toggle"), "click", () => deps.setAutoplay(!deps.autoplayOn()));
   // `#820 voice-page-action-menu`. Those are the action menu's items: choosing one closes it, after the
   // item's own act (registered just above), and gives the keys back to its opener rather than to nothing.
-  for (const id of ["expand-all", "collapse-all", "summarise", "reader-toggle", "autoplay-toggle"]) {
+  for (const id of ["expand-all", "collapse-all", "summarise", "reader-toggle", "autoplay-toggle", "discuss-menu-open"]) {
     listen(el(id), "click", () => {
       const inside = deps.focusInActionMenu();
       deps.closeActionMenu();

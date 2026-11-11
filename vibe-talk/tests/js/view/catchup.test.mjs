@@ -71,7 +71,7 @@ function deferred() {
 }
 
 const IDS = [
-  "discuss-open", "discuss-panel", "discuss-scope", "discuss-close", "discuss-status",
+  "discuss-open", "discuss-menu-open", "discuss-panel", "discuss-scope", "discuss-close", "discuss-status",
   "discuss-answer", "discuss-footer", "discuss-covers", "discuss-links",
   "discuss-mark-read", "discuss-mark-unread", "discuss-unmarkable",
   "discuss-stamp", "discuss-retry",
@@ -394,5 +394,35 @@ test("catchup: a 503 summarizer refusal says the hint in the panel, with no retr
     assert.equal(fx.els["discuss-retry"].hidden, true, "a refusal offered a retry");
     // From then on the button is drawn unavailable too.
     assert.equal(fx.els["discuss-open"].getAttribute("aria-disabled"), "true");
+  } finally { fx.restore(); }
+});
+
+// ---- 7. the action menu's Discuss (the phone's way in) -----------------------------------------
+
+test("catchup: the menu item opens the same panel and posts the same body", async () => {
+  const fx = fixture();
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    click(fx.els["discuss-menu-open"]);
+    await flush();
+    assert.equal(fx.calls.posts.length, 1, "the menu item did not ask");
+    assert.equal(fx.els["discuss-panel"].hidden, false, "the menu item did not open the panel");
+    assert.equal(fx.els["discuss-answer"].textContent, "Two things happened.");
+  } finally { fx.restore(); }
+});
+
+test("catchup: unavailable draws the menu item disabled too, and its click posts nothing", async () => {
+  const fx = fixture();
+  try {
+    const view = createDiscussView({ ...fx.deps, discussAvailable: () => false });
+    view.mountControls();
+    const item = fx.els["discuss-menu-open"];
+    assert.equal(item.getAttribute("aria-disabled"), "true", "the menu item is not drawn disabled");
+    assert.equal(item.getAttribute("aria-label"), DISCUSS_UNAVAILABLE_HINT);
+    click(item);
+    await flush();
+    assert.deepEqual(fx.calls.posts, [], "an unavailable menu Discuss still posted");
+    assert.equal(fx.els["discuss-panel"].hidden, true);
   } finally { fx.restore(); }
 });

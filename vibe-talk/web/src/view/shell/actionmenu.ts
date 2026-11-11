@@ -8,7 +8,7 @@ import type { ElementById } from "../dom/index.ts";
 
 /** The menu's items, each shown only where it has work to do. */
 // `#880 voice-page-menu-placement`: and Hide reader, offered on the channel's view; `#886 voice-page-autoplay`, Autoplay.
-const ACTION_MENU_ITEMS = Object.freeze(["expand-all", "collapse-all", "summarise", "reader-toggle", "autoplay-toggle", "docs-show-hidden"] as const);
+const ACTION_MENU_ITEMS = Object.freeze(["expand-all", "collapse-all", "summarise", "reader-toggle", "autoplay-toggle", "docs-show-hidden", "discuss-menu-open"] as const);
 
 /** What the menu asks of the page. */
 export interface ActionMenuDependencies {

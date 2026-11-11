@@ -111,9 +111,22 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
         f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
     page.goto(base + "/", wait_until="load")
     page.wait_for_selector("#view-switch", state="visible", timeout=20_000)
-    if page.locator("#discuss-open").is_hidden():
+    # To the channel view, which carries Discuss: the switch rotates through
+    # the views, so press it until the channel picker (channel view only) is up.
+    for _ in range(3):
+        if not page.locator("#discord-channel").is_hidden():
+            break
         page.click("#view-switch")
-    page.wait_for_selector("#discuss-open", state="visible", timeout=20_000)
+        try:
+            page.wait_for_selector("#discord-channel", state="visible", timeout=5_000)
+            break
+        except Exception:
+            continue
+    page.wait_for_selector("#discord-channel", state="visible", timeout=20_000)
+    # A bar button on a desk, the action menu's item on a phone (the bar strip
+    # there belongs to the channel name).
+    if width >= 900:
+        page.wait_for_selector("#discuss-open", state="visible", timeout=20_000)
 
     scroller_before = page.evaluate("""() => {
       const area = document.getElementById('scroll-area');
@@ -121,7 +134,12 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
       return {top: rect.top, height: rect.height};
     }""")
 
-    page.click("#discuss-open")
+    if width < 900:
+        page.click("#action-menu-open")
+        page.wait_for_selector("#discuss-menu-open", state="visible", timeout=20_000)
+        page.click("#discuss-menu-open")
+    else:
+        page.click("#discuss-open")
     page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
     page.wait_for_function(
         "() => document.getElementById('discuss-answer').textContent.includes('Ada shipped')",
