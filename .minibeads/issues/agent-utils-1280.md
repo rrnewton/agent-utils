@@ -6,7 +6,7 @@ issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-11T08:50:27+00:00
-updated_at: 2026-11-11T08:59:33+00:00
+updated_at: 2026-11-11T09:00:30+00:00
 ---
 
 # Description
@@ -16,7 +16,7 @@ updated_at: 2026-11-11T08:59:33+00:00
 - (a) **Published salvage isn't recognised.** `remote_cover` (`_remote_advertised_covering_uncached`) asks ls-remote only for `refs/heads/*` and `refs/tags/*`. A commit already published under the remote's `refs/salvage/*` (where wrkslots itself publishes salvage) and fetched back as `refs/remotes/origin/salvage/*` is never cleared, so every removal keeps it again.
 - (b) **The all-objects sweep keeps ancient garbage.** Every commit object in the store (`cat-file --batch-all-objects`) is a root, so commits that git's own garbage rules would already prune are kept and bundled.
 - (c) **Stale remote-tracking tips.** Real counts from the slot (read-only): its module `origin` is the parent checkout, not a hosted remote. It has 2,994 `refs/remotes/origin/*` refs, 136 tags, one local head and 39,687 commit objects. Only 4 refs fall under `refs/remotes/origin/salvage`, and the remote advertises no `refs/salvage/*`, so (a) explains at most 4 of the 3,870. A follow-up count found 2,991 of the 2,994 tracking refs pointing exactly at the parent's same-named head (the parent has 3,186 heads); 3 differ by SHA and 2 are gone by name. So true staleness is tiny too.
-- (e) **Reflog endpoints, ruled out for this slot.** A read-only count found the slot's whole reflog tree holds 4 lines with no forced-update entries, while only 13,857 of its 39,687 commit objects are reachable. So the bulk is the dangling tips of about 25,830 unreachable commits, which is (b). The reflog rule below stays as a general safeguard. The scan roots both ends of every reflog entry, including the reflogs of `refs/remotes/*`, so a forced fetch of a rewritten branch could leave a kept tip there.
+- (e) **Reflog endpoints, ruled out for this slot.** A read-only count found the slot's whole reflog tree holds 4 lines with no forced-update entries, while only 13,857 of its 39,687 commit objects are reachable. So the bulk is the dangling tips of about 25,830 unreachable commits, which is (b). Confirmed: all 3,870 kept parents of the salvage commit are unreachable from every ref in the slot, and none is reachable. The reflog rule below stays as a general safeguard. The scan roots both ends of every reflog entry, including the reflogs of `refs/remotes/*`, so a forced fetch of a rewritten branch could leave a kept tip there.
 
 # Design
 
