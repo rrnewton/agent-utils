@@ -1,11 +1,12 @@
 ---
 title: 'documents-star-hide: star and hide documents, synced per document'
-status: open
+status: closed
 priority: 1
 issue_type: task
 assignee: mu-docstate
 created_at: 2026-11-11T04:15:00+00:00
-updated_at: 2026-11-11T04:15:00+00:00
+updated_at: 2026-11-11T07:07:31+00:00
+closed_at: 2026-11-11T07:07:31+00:00
 ---
 
 # Description
@@ -126,3 +127,11 @@ lives there, the documents list needs no server round-trip to
 filter, and the reader header shares the same storage the list
 reads. Starred chip chosen over starred-first sort because the
 chips already exist (#1176, moved to the bottom by #1263).
+
+[watermelon-full-preview] Closed: landed on github/main as 694bbc03
+(implementation) after dd225059 (issue). Owner gate 177a5423 green;
+combined tree with #1263/#1264/#1266 verified (documents JS 56/56,
+documents browser walk at 393x852 and 1280x800, typecheck). The
+browser walk's Undo and hamburger steps use click() rather than tap:
+a Playwright tap immediately after a raw CDP touch swipe produced no
+click in this harness, while the swipe itself is real CDP touch.
