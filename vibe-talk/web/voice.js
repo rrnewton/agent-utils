@@ -2960,6 +2960,8 @@ const composerBoxes = createComposerBoxes({
   replyScroller: () => replyPane().scroller(),
   atBottom: (area, slack) => (slack === undefined ? atBottom(area) : atBottom(area, slack)),
   followFoot: (area) => followFoot(area),
+  nudge: (area, delta) => scrollKeeping.nudge(area, delta),
+  toPosition: (area, top) => scrollKeeping.toPosition(area, top),
   keepBoxInView: (box, area) => keepBoxInView(box, area),
   activeElement: () => document.activeElement,
   bottomSlack: BOTTOM_SLACK_PX,
@@ -7046,7 +7048,7 @@ const olderWalks = mountOlderWalks({
   api, channelName, channelDirectoryChannels: () => channelDirectory.channels(),
   jumpToMessageLink, messageBody, markSearchHits, searchParsed, heldMessagesById,
   keepingCardPlace, walkCursorOwed: timelineView.walkCursorOwed, loadOlder: timelineView.loadOlder,
-  guardQuietly: (fn) => guardQuietly(fn), renderJumpNewest, applySearch, preservingScroll, setStatus,
+  guardQuietly: (fn) => guardQuietly(fn), renderJumpNewest, applySearch, preservingScroll, toPosition: (area, top) => scrollKeeping.toPosition(area, top), setStatus,
   columnWork, columns, sideShowing, inColumn, columnSteps: () => /** @type {any} */ (columnSteps()), filterChanges,
   replyJumpCurrent: () => replyJumpTicket.current(), idsOf, rowMessages, plainReach, replyTally, providerOfChannel, channelDirectoryName: () => channelDirectory.providerName(),
 });
@@ -8771,6 +8773,7 @@ const screenKeyboard = createOnScreenKeyboard({
   virtualKeyboard: () => navigator.virtualKeyboard,
   computedStyle: (node) => (typeof window.getComputedStyle === "function" ? window.getComputedStyle(node) : null),
   closeSpeedPopover: () => closeSpeedPopover(),
+  nudge: (area, delta) => scrollKeeping.nudge(area, delta),
 });
 const { noteKeyboard, noteKeyboardReader, settleOnScroll, showKeyboardDebug, renderKeyboardDebug } = screenKeyboard;
 screenKeyboardRoom = screenKeyboard;

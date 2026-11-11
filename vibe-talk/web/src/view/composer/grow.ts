@@ -24,6 +24,9 @@ export interface ComposerGrowDependencies {
   atBottom(area: HTMLElement, slack?: number): boolean;
   /** Put `area` back at its foot (`followFoot`). */
   followFoot(area: HTMLElement): void;
+  /** Move `area` by a measured delta, and put it back at a measured place, through the scroll owner (`#1251`). */
+  nudge(area: HTMLElement, delta: number): void;
+  toPosition(area: HTMLElement, top: number): void;
   /** Bring `box` into `area` whole (`keepBoxInView`). */
   keepBoxInView(box: HTMLElement, area: HTMLElement): void;
   /** The element with the focus. */
@@ -88,7 +91,7 @@ export function createComposerGrow(deps: ComposerGrowDependencies): ComposerGrow
       owner.render(on);
       for (const area of footed) deps.followFoot(area);
       if (ticked && !footed.includes(ticked.area)) {
-        ticked.area.scrollTop += ticked.grow.getBoundingClientRect().top - ticked.top;
+        deps.nudge(ticked.area, ticked.grow.getBoundingClientRect().top - ticked.top);
       }
     },
     render(on) {
@@ -117,7 +120,7 @@ export function createComposerGrow(deps: ComposerGrowDependencies): ComposerGrow
       const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(field) : null;
       const borders = style ? (parseFloat(style.borderTopWidth) || 0) + (parseFloat(style.borderBottomWidth) || 0) : 0;
       field.style.setProperty(COMPOSER_GROW_HEIGHT, `${Math.ceil((Number(field.scrollHeight) || 0) + borders)}px`);
-      area.scrollTop = place;
+      deps.toPosition(area, place);
     },
     fitAll() {
       for (const id of COMPOSER_GROW_BOXES) owner.fit(deps.lookup(id));

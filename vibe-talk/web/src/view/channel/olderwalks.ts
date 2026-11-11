@@ -78,6 +78,8 @@ export interface OlderWalksDependencies {
   renderJumpNewest(): void;
   applySearch(): void;
   preservingScroll(mutate: () => void): void;
+  /** Put `area` at a measured scroll position through the scroll owner (`#1251`). */
+  toPosition(area: HTMLElement, top: number): void;
   setStatus(text: string): void;
   walkCursorOwed(): boolean;
   loadOlder(signal?: CancelSignal): Promise<void> | null;
@@ -501,7 +503,7 @@ function searchOlder() {
   const chip = el("load-older");
   // The walk starts with its control in view: older matches arrive under it, and that is where the
   // reader should be looking — not far down a list of matches, nor still in the search field.
-  if (chip.getBoundingClientRect().top < area.getBoundingClientRect().top) area.scrollTop = 0;
+  if (chip.getBoundingClientRect().top < area.getBoundingClientRect().top) deps.toPosition(area, 0);
   const walk: SearchWalk = {
     key: searchKey(),
     context: channelContextKey(),

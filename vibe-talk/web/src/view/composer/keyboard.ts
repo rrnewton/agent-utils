@@ -59,6 +59,8 @@ export interface OnScreenKeyboardDependencies {
   computedStyle(node: Element): CSSStyleDeclaration | null;
   /** Close the pace popover, whose button the keyboard takes away (`closeSpeedPopover`). */
   closeSpeedPopover(): void;
+  /** Move `area` by a measured delta through the scroll owner (`#1251`). */
+  nudge(area: HTMLElement, delta: number): void;
 }
 
 /** The keyboard's commands. */
@@ -279,7 +281,7 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
     const keysTop = viewport ? (Number(viewport.offsetTop) || 0) + (Number(viewport.height) || 0) : deps.innerHeight() || 0;
     const target = Math.min(area.getBoundingClientRect().bottom, keysTop);
     const off = foot.getBoundingClientRect().bottom - target;
-    if (Math.abs(off) >= 1) area.scrollTop += off;
+    if (Math.abs(off) >= 1) deps.nudge(area, off);
     // For the readout: where the jump took the foot, and how far it has moved the list in all.
     const last = onScreenKeyboard.lastFit;
     const before = last && last.field === field.id && onScreenKeyboard.settling ? last.moved : 0;

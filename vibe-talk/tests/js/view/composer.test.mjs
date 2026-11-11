@@ -62,7 +62,7 @@ test("`#624 voice-page-modularity`: the boxes that grow, on stand-in elements, f
   let atFoot = false;
   const grow = createComposerGrow({
     lookup: element, listOf: (field) => element(field.id === "side-compose-text" ? "side-scroll" : "scroll-area"),
-    atBottom: () => atFoot, followFoot: (area) => record.followed.push(area.id),
+    atBottom: () => atFoot, followFoot: (area) => record.followed.push(area.id), nudge: (area, delta) => { area.scrollTop += delta; }, toPosition: (area, top) => { area.scrollTop = top; },
     keepBoxInView: (box, area) => record.kept_in_view.push([box.id, area.id]), activeElement: () => focused,
     bottomSlack: 24, fieldSizing: true, keep: (on) => { if (on === "refuse") throw new Error("refused"); record.kept.push(on); },
   });
@@ -111,7 +111,7 @@ test("`#624 voice-page-modularity`: a focused field with the visual viewport a k
     lookup: (id) => els[id] || { id, getClientRects: () => [] },
     el: (id) => els[id],
     viewport: () => viewport, innerHeight: () => 800, scrollY: () => 0, root: () => root,
-    activeElement: () => focus, virtualKeyboard: () => undefined, computedStyle: () => null, closeSpeedPopover: () => {},
+    activeElement: () => focus, virtualKeyboard: () => undefined, computedStyle: () => null, closeSpeedPopover: () => {}, nudge: (area, delta) => { area.scrollTop += delta; },
   });
   keyboard.noteKeyboard();
   assert.equal(attrs.get("data-keyboard"), undefined, "nothing focused, nothing up");
@@ -156,7 +156,7 @@ test("`#1144 scrollback-typing-jump`: typed at the foot, the jump is made whole 
     viewport: () => ({ height: 579, scale: 1, offsetTop: 300 }), innerHeight: () => 915, scrollY: () => 0, root: () => root,
     activeElement: () => field, virtualKeyboard: () => undefined,
     computedStyle: (node) => (node === composer ? { getPropertyValue: (name) => (name === "--keyboard-fit" ? "on" : "") } : null),
-    closeSpeedPopover: () => {},
+    closeSpeedPopover: () => {}, nudge: (area, delta) => { area.scrollTop += delta; },
   });
   keyboard.noteKeyboard();
   assert.equal(area.scrollTop, 100, "the fit as the keyboard came up left the foot on the keys");

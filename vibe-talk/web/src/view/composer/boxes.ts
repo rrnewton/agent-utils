@@ -23,6 +23,9 @@ export interface ComposerBoxesDependencies {
   replyScroller(): HTMLElement;
   atBottom(area: HTMLElement, slack?: number): boolean;
   followFoot(area: HTMLElement): void;
+  /** Move `area` by a measured delta, and put it back at a measured place, through the scroll owner (`#1251`). */
+  nudge(area: HTMLElement, delta: number): void;
+  toPosition(area: HTMLElement, top: number): void;
   keepBoxInView(box: HTMLElement, area: HTMLElement): void;
   activeElement(): Element | null;
   bottomSlack: number;
@@ -74,6 +77,8 @@ export function createComposerBoxes(deps: ComposerBoxesDependencies): ComposerBo
     listOf: (field) => growingBoxList(field as ComposerBox),
     atBottom: (area, slack) => (slack === undefined ? deps.atBottom(area) : deps.atBottom(area, slack)),
     followFoot: (area) => deps.followFoot(area),
+    nudge: (area, delta) => deps.nudge(area, delta),
+    toPosition: (area, top) => deps.toPosition(area, top),
     keepBoxInView: (box, area) => deps.keepBoxInView(box, area),
     activeElement: () => deps.activeElement(),
     bottomSlack: deps.bottomSlack,

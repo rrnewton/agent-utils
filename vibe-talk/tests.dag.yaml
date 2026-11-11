@@ -1754,6 +1754,22 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1251 scroll-single-owner`: every direct scroll write outside the loop owner (scrollkeep),
+  # grouped by adoption path; enforcing for the paths already adopted (P1 keepers/footroom,
+  # P7 composer/keyboard), report-only for the rest until each path moves.
+  - group: check
+    job: scroll-writer-guard
+    desc: direct scrollTop/scrollTo/scrollBy/scrollIntoView writes outside scrollkeep, enforcing for adopted paths P1 and P7
+    labels: [validation-vibe-talk]
+    cmd: cd vibe-talk && python3 tests/scroll_writer_guard.py --enforce P1 P7
+    jobs_flag: ""
+    timeout: 120
+    cpu_timeout: 30
+    hint:
+      est_duration_s: 5
+      classification: light
+      rss_baseline_bytes: 268435456
+
   # `#338 column-overscroll` in the browser engine, at 1280x800 and 1920x1080 in two columns with a mouse:
   # the right column's cards open at their foot with no room past it; the wheel, rested and turned at the
   # foot, goes on into blank room until the last card's top is at half the column's height; the mouse
