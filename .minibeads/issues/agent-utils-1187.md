@@ -1,6 +1,6 @@
 ---
 title: 'mq-singleton-eject: do not eject a singleton for a red that is the base'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-11-10T03:34:52.000000000+00:00
