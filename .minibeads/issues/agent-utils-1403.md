@@ -7,7 +7,7 @@ labels:
 - agentctl
 - validation
 created_at: 2026-11-11T18:41:49+00:00
-updated_at: 2026-11-11T18:41:49+00:00
+updated_at: 2026-11-11T18:43:17+00:00
 ---
 
 # Description
@@ -31,3 +31,12 @@ Under owner rule 346 (gating checks must be fast, high-signal and robust on a ho
 # Notes
 
 Owned by the restore-drill lane on devbig014 (#1133). Changes that don't touch restore-drill may land with a rotating drill failure as their only red while this is open, citing #1403, provided the failing test passes one local solo run. Numbered from devbig030's interim block (1400-1469).
+
+## The four rotating tests (from the lane's gate logs)
+
+1. `test_restore_drill_happy_path_fresh_pane_slot_and_rerun`: on stale bases, "no reasoning effort declared for harness muse" (fixed on main by 3e22cfc9, which declares effort in the drill profiles).
+2. `test_restore_drill_certificate_never_appears_gates_at_75`: failed in a solo shard rerun; no distinguishing assertion line was captured.
+3. `test_restore_drill_missing_slot_bind_refuses_only_that_lane`: "launch of slotlane failed: pane ... did not return to a wrkslots-boxed shell within 30s" (exit 75). A 30-second wall-clock budget, the kind owner rule 346 forbids; the same timeout hit the happy-path test in the same run.
+4. `test_restore_drill_one_unrestorable_lane_refused_at_74`: on stale bases, the same missing-effort line; on a current base, "restore-teams: coord refused cannot parse process stat for pid N; stuck refused recorded pane, workspace, or cwd changed".
+
+So two of the failures were from stale bases, already fixed on main. The load-sensitive parts on current main are the 30-second pane-return wait and the process-stat parse during restore-teams, which looks like a race with a process that is exiting (compare 3d17ec58, which waits for stub death before reboot proofs).
