@@ -351,12 +351,14 @@ class Drill:
         )
 
     def wrkslots(
-        self, *args: str, timeout: float = 240,
+        self, *args: str, timeout: float = 900,
     ) -> subprocess.CompletedProcess[str]:
+        # Slot/image work scans the live host; under validation load the
+        # 240 s default expires before the refusal under test is reached.
         return self.run([str(WRKSLOTS_BIN), *args], timeout=timeout)
 
     def wrkslots_project(
-        self, *args: str, timeout: float = 240,
+        self, *args: str, timeout: float = 900,
     ) -> subprocess.CompletedProcess[str]:
         return self.wrkslots(
             "--project-root", str(self.project), *args, timeout=timeout,
