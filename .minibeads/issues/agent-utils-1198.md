@@ -1,6 +1,6 @@
 ---
 title: "failure-lines: name the failing test or suite in the donor receipt and ejection report"
-status: open
+status: closed
 priority: 2
 issue_type: feature
 assignee: ac-mqclose
