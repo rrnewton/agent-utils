@@ -8,7 +8,10 @@ written to the agreed contract, not run in the panel slice: the catchup
 route is answered at the network edge with a contract-shaped body (the model
 is nobody's to run in a walk), and dismiss/restore are recorded and answered
 there too; everything else — the real server, sign-in, the channel, the bar —
-is the shipped page at a 393x852 phone (touch) and a 1280x800 desk.
+is the shipped page at a 393x852 phone (touch) and a 1280x800 desk. The
+walk server has no [summaries.llm], so client-config is answered with
+`discuss_available` added — the capability a real Discuss deployment
+reports; the disabled-button state without it is covered by unit tests.
 
 The walk: open the channel, tap Discuss, see "Reading…" give way to the
 summary with its covered-messages footer, Mark read sending exactly the
@@ -94,6 +97,13 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
         writes.append((route.request.url, route.request.post_data_json or {}))
         route.fulfill(status=200, content_type="application/json", body="{}")
 
+    def client_config(route: Route) -> None:
+        body = call(base, "GET", "/api/v1/client-config", WRITE_TOKEN)
+        body["discuss_available"] = True
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps(body))
+
+    page.route("**/api/v1/client-config", client_config)
     page.route(f"**/api/v1/channels/{CHANNEL}/catchup", catchup)
     page.route(f"**/api/v1/channels/{CHANNEL}/dismiss", dismiss)
     page.route(f"**/api/v1/channels/{CHANNEL}/restore", dismiss)
