@@ -2560,6 +2560,24 @@ impl<'a> Runner<'a> {
                     ),
                 );
                 self.discard(flights, rx, pending, "an accepted ruling lands first");
+                // discard() keeps disjoint roots, but a root built on
+                // the held batch's base without it can never land as
+                // built once it lands (#1272 held-dependent-after):
+                // remove every remaining flight the same way, cancel
+                // it (which retires its donor job), remember it for a
+                // late receipt (discarded, never ejecting), and
+                // requeue its changes to rebuild on the new base.
+                {
+                    let mut reasons: BTreeMap<u64, String> = BTreeMap::new();
+                    while let Some(flight) = flights.pop_front() {
+                        reasons.insert(flight.id, "an accepted ruling lands first".to_owned());
+                        flight.cancel.store(true, Ordering::Relaxed);
+                        if flight.probe_for.is_none() {
+                            pending.push_front(flight.candidate.prs.clone());
+                        }
+                    }
+                    lock(&self.dropped_flights).extend(reasons);
+                }
             }
             let note = format!(
                 "{} passes ({}) accepted by {}: {}; validated in run {} as v{}",
@@ -7403,6 +7421,22 @@ impl<'a> Runner<'a> {
                                 break;
                             }
                         };
+                        // A dependency that is still queued (held for a
+                        // ruling included) but neither in flight, pending,
+                        // nor landed must not be rooted around (#1272
+                        // held-dependent-after): wait for it instead of
+                        // validating this batch on the base without it.
+                        let dep_waiting = dep_tip.is_none()
+                            && wanted.iter().any(|dep| {
+                                !prs.contains(dep)
+                                    && lock(&self.items)
+                                        .get(dep)
+                                        .is_some_and(|item| item.status == ItemStatus::Queued)
+                            });
+                        if dep_waiting {
+                            pending.push_front(prs);
+                            break;
+                        }
                         if dep_tip.is_none() {
                             // No dependency in flight: if its batch is
                             // still pending (a discard requeue can scramble

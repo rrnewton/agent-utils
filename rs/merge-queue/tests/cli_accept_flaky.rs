@@ -554,6 +554,37 @@ fn wait_for(what: &str, timeout: Duration, mut check: impl FnMut() -> bool) {
     panic!("timed out waiting for {what}");
 }
 
+/// #1272 held-dependent-after: B (--after held A) is never validated on
+/// a candidate without A while A is held GREEN_FLAKY.
+#[test]
+fn a_dependent_of_a_held_change_is_not_validated_without_it() {
+    let (fx, count, flaky) = setup("held-dependent-after", &[]);
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a"]);
+    std::fs::write(&flaky, "a").unwrap();
+    let report = run(&fx);
+    assert!(landed(&report).is_empty(), "{report}");
+    assert_eq!(item(&fx, 1)["status"], "queued");
+    // B depends on A and stacks on its branch.
+    fx.branch_from("b", "a", &[("tests/b", "ok\n")]);
+    fx.mq_ok(&["submit", "2", "--head", "b", "--after", "1"]);
+    let before = validations(&count);
+    let report = run(&fx);
+    assert!(landed(&report).is_empty(), "{report}");
+    assert_eq!(item(&fx, 1)["status"], "queued", "{report}");
+    assert_eq!(item(&fx, 2)["status"], "queued", "{report}");
+    let validated_alone = report["validations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v["prs"] == serde_json::json!([2]));
+    assert!(
+        !validated_alone,
+        "change 2 validated without change 1: {report}"
+    );
+    let _ = before;
+}
+
 fn lines(path: &Path) -> Vec<String> {
     std::fs::read_to_string(path)
         .unwrap_or_default()
