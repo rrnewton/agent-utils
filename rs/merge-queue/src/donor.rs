@@ -2013,6 +2013,37 @@ impl Store {
             // contention must not cancel a candidate's job at the bound.
             // The donor's consecutive pacing count, the claim timeout,
             // and the item deferral bound still bound the loop.
+            // A validate-lock quarantine (#1295) outranks even pacing:
+            // it blocks every validation on the host until an attested
+            // recovery, so it records a host fault at once (the donor
+            // pauses claiming) instead of counting as transient.
+            if let Some(quarantine) = crate::validate::validate_quarantine(&receipt.log_tail)
+                .or_else(|| cause_field.and_then(crate::validate::validate_quarantine))
+            {
+                job.lease = None;
+                job.state = if job.candidate_gone.is_some() {
+                    JobState::Cancelled
+                } else {
+                    JobState::Queued
+                };
+                job.history.push(format!(
+                    "{}: {} on {} could not run the validation ({detail}); host fault (validate quarantine: {quarantine}), {}",
+                    now(),
+                    receipt.donor.name,
+                    receipt.donor.host,
+                    if job.state == JobState::Queued {
+                        "queued again"
+                    } else {
+                        "cancelled (the queue no longer wants the candidate)"
+                    }
+                ));
+                self.note_host_fault(&receipt.donor.name, quarantine);
+                self.write(&job)?;
+                return Err(format!(
+                    "host could not run (validate quarantine: {quarantine}); no verdict, \
+                     no strike, the donor is paused"
+                ));
+            }
             let paced_receipt = crate::validate::gh_paced_refusal(&receipt.log_tail)
                 || cause_field.is_some_and(crate::validate::gh_paced_refusal);
             if paced_receipt {
@@ -3990,8 +4021,14 @@ impl Worker<'_> {
                 // host for it would only hold the job and risk pausing a
                 // good donor; the queue's stale sweep settles the job.
                 let stale_job = crate::validate::stale_base_refusal(&log_text).is_some();
-                let host_scope =
-                    crate::validate::could_not_run_scope(&log_text).is_some_and(|(host, _)| host);
+                // A validate-lock quarantine (#1295) cannot be recovered
+                // by waiting: it is a host fault at once (pause claiming;
+                // the queue records the fault from the receipt), never a
+                // transient could-not-run, and outranks pacing.
+                let quarantine = crate::validate::validate_quarantine(&log_text).map(str::to_owned);
+                let host_scope = quarantine.is_some()
+                    || crate::validate::could_not_run_scope(&log_text)
+                        .is_some_and(|(host, _)| host);
                 // A pacing-guard refusal (#1193 ghpaced-transient) is
                 // shared-budget contention, not a host defect, and a probe
                 // cannot fix it: below the bound it is transient (no probe,
@@ -4014,7 +4051,9 @@ impl Worker<'_> {
                 // refusal `host` must not pause the donor when the cause
                 // was the pacer. Host-scoped pacing refusals are transient
                 // at any count; unscoped ones keep the bound below.
-                let paced_transient = paced && (host_scope || paced_count < GH_PACED_FAULT_AFTER);
+                let paced_transient = paced
+                    && quarantine.is_none()
+                    && (host_scope || paced_count < GH_PACED_FAULT_AFTER);
                 if paced_transient {
                     eprintln!(
                         "merge-queue donor {}: pacing-guard refusal ({paced_count} in a row, bound {GH_PACED_FAULT_AFTER}); transient, no host fault",
@@ -4026,11 +4065,13 @@ impl Worker<'_> {
                     && !paced_transient
                     && !self.probe_host_validator(&job.validator);
                 if (probe_failed || host_scope) && !paced_transient {
-                    let reason = crate::validate::could_not_run_scope(&log_text)
-                        .map(|(_, reason)| reason)
-                        .unwrap_or_else(|| {
-                            "validator refused (COULD_NOT_RUN) and the probe failed".to_owned()
-                        });
+                    let reason = quarantine.clone().unwrap_or_else(|| {
+                        crate::validate::could_not_run_scope(&log_text)
+                            .map(|(_, reason)| reason)
+                            .unwrap_or_else(|| {
+                                "validator refused (COULD_NOT_RUN) and the probe failed".to_owned()
+                            })
+                    });
                     let since = now();
                     eprintln!(
                         "merge-queue donor {}: host cannot validate: {reason}; pausing claims and probing",
@@ -4809,6 +4850,48 @@ mod unit {
         // The next job is taken normally by the same donor.
         publish(&store, "c2");
         assert!(store.claim("d1", "h1", 1).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_quarantine_refusal_is_a_host_fault_not_a_transient() {
+        // #1295 refusal-cause-cleanup-line: a FLEET-WIDE validate
+        // quarantine cannot be recovered by waiting, so it is a host
+        // fault (recorded on the store; the donor pauses claiming),
+        // never a transient could-not-run. The cause names the
+        // quarantine line, not the later RETIRE-RETAINED teardown.
+        let mut store = Store::new(&temp("quarantine-refusal"));
+        store.could_not_run_limit = 99;
+        publish(&store, "c1");
+        let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
+        let token = claimed.lease.as_ref().unwrap().token.clone();
+        let error = store
+            .report(
+                &claimed.id,
+                &token,
+                refused_receipt(
+                    &claimed,
+                    "d1",
+                    "validate-lock: cleanup quarantine: FLEET-WIDE validate quarantine: \
+                     every validate-lock acquisition is refused; this quarantine cannot \
+                     be recovered by waiting\nCOULD_NOT_RUN\nvalidate-run: RETIRE-RETAINED \
+                     run may still use slot s1",
+                ),
+            )
+            .unwrap_err();
+        assert!(error.contains("quarantine"), "{error}");
+        assert!(!error.contains("RETIRE-RETAINED"), "{error}");
+        let after = store.read(&claimed.id).unwrap();
+        assert_eq!(after.state, JobState::Queued, "{after:?}");
+        let history = after.history.join("\n");
+        assert!(
+            history.contains("FLEET-WIDE validate quarantine"),
+            "{history}"
+        );
+        assert!(!history.contains("RETIRE-RETAINED"), "{history}");
+        assert!(
+            !store.host_fault_list().is_empty(),
+            "a quarantine must record a host fault"
+        );
     }
 
     #[test]

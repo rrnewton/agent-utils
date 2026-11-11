@@ -134,15 +134,32 @@ pub fn gh_paced_refusal(log_text: &str) -> bool {
         || (log_text.contains("GH-PACED WARNING") && log_text.contains("COULD_NOT_RUN"))
 }
 
+/// The validate-lock quarantine line of a refusal's output, when one is
+/// present: a fleet-wide quarantine ("FLEET-WIDE validate quarantine:
+/// every validate-lock acquisition is refused ... cannot be recovered
+/// by waiting") blocks every validation on the host until an attested
+/// recovery, so it is a host fault, never a transient could-not-run
+/// (#1295). Matched on the line's own words, case-insensitively.
+pub fn validate_quarantine(log_text: &str) -> Option<&str> {
+    log_text
+        .lines()
+        .map(str::trim)
+        .find(|line| line.to_lowercase().contains("validate quarantine"))
+}
+
 /// The line of a refusal's log that names why it refused — its cause, in
 /// the order a reader would trust: the structured stale-base scope line,
-/// else the first line holding `REFUSED`, else the first scope line, else
-/// (for a validator that marks nothing) the last non-empty line. A
-/// wrapper's teardown lines (`validate-lock RELEASED`, a retained slot)
-/// print after the refusal and would otherwise bury the reason as the
-/// log's last line (#1059).
+/// else a validate-lock quarantine line, else the first line holding
+/// `REFUSED`, else the first scope line, else (for a validator that
+/// marks nothing) the last non-empty line. A wrapper's teardown lines
+/// (`validate-lock RELEASED`, a retained slot) print after the refusal
+/// and would otherwise bury the reason as the log's last line (#1059,
+/// #1295).
 pub fn refusal_cause(log_text: &str) -> Option<&str> {
     if let Some(line) = stale_base_refusal(log_text) {
+        return Some(line);
+    }
+    if let Some(line) = validate_quarantine(log_text) {
         return Some(line);
     }
     let lines: Vec<&str> = log_text.lines().map(str::trim).collect();
@@ -2061,6 +2078,24 @@ mod unit {
         );
         let refused = "REFUSED: no image\nvalidate-lock RELEASED\n";
         assert_eq!(refusal_cause(refused), Some("REFUSED: no image"));
+    }
+
+    #[test]
+    fn a_quarantine_cause_wins_over_a_later_teardown_line() {
+        // #1295 refusal-cause-cleanup-line: the real refusal is the
+        // lowercase validate-lock quarantine line; a RETIRE-RETAINED
+        // teardown line printed after it must not displace it.
+        let log = "validate-lock: cleanup quarantine: FLEET-WIDE validate quarantine: \
+                   every validate-lock acquisition is refused; this quarantine cannot \
+                   be recovered by waiting\nCOULD_NOT_RUN\n\
+                   validate-run: RETIRE-RETAINED validate-merge-queue-x: validation-run \
+                   authority reports the run may still use slot validate-fresh-y\n";
+        let cause = refusal_cause(log).expect("a cause");
+        assert!(cause.contains("FLEET-WIDE validate quarantine"), "{cause}");
+        assert!(!cause.contains("RETIRE-RETAINED"), "{cause}");
+        assert!(validate_quarantine(log).is_some_and(|line| line.contains("quarantine")));
+        assert_eq!(validate_quarantine("validate-lock RELEASED\n"), None);
+        assert_eq!(validate_quarantine(""), None);
     }
 
     #[test]
