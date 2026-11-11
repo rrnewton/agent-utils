@@ -6779,7 +6779,7 @@ mod tests {
                 &directory.join("profiles.json"),
                 &json!({
                     "schema": "agentctl-profiles/v1",
-                    "profiles": {"reviewer": {"harness": harness, "mode": mode}},
+                    "profiles": {"reviewer": {"harness": harness, "mode": mode, "reasoning_effort": "high"}},
                 }),
             )
             .unwrap();

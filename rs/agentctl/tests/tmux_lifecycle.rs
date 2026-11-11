@@ -305,6 +305,8 @@ fn tmux_backend_runs_the_full_agent_lifecycle() {
         &work,
         "--harness",
         "claude",
+        "--effort",
+        "high",
         "--startup-timeout",
         "30",
     ]);

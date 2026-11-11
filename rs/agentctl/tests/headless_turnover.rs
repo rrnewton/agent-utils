@@ -220,6 +220,8 @@ fn a_headless_agent_turns_over_to_a_fresh_session_that_reads_the_handoff_first()
         "headless",
         "--harness",
         "claude",
+        "--effort",
+        "high",
         "--cwd",
         &work,
     ]);
