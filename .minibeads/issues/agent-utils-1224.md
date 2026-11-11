@@ -1,10 +1,11 @@
 ---
 title: 'mention-jump-in-view: a mention jump lands its highlighted message in view and keeps it there'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-11-10T16:34:00+00:00
-updated_at: 2026-11-10T16:34:00+00:00
+updated_at: 2026-11-11T03:20:40.902680250+00:00
+closed_at: 2026-11-11T03:20:40.902680120+00:00
 ---
 
 # Description
