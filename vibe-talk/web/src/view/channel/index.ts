@@ -266,3 +266,5 @@ export { createRichHeaders } from "./richheaders.ts";
 export type { RichHeaders, RichHeadersDependencies, RichHeaderSettings } from "./richheaders.ts";
 export { createNoiseActs } from "./noiseacts.ts";
 export type { NoiseActs, NoiseActsDependencies } from "./noiseacts.ts";
+export { mountTextSelection } from "./textselection.ts";
+export type { KeptTextSelection, TextSelection, TextSelectionDependencies } from "./textselection.ts";

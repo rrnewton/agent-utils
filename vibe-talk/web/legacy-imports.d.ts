@@ -251,6 +251,7 @@ declare const mountReplyBox: LegacyImports["mountReplyBox"];
 declare const mountKeptSends: LegacyImports["mountKeptSends"];
 declare const mountReadingJumps: LegacyImports["mountReadingJumps"];
 declare const mountChannelViewControls: LegacyImports["mountChannelViewControls"];
+declare const mountTextSelection: LegacyImports["mountTextSelection"];
 declare const mountSideListControls: LegacyImports["mountSideListControls"];
 declare const mountSideControls: LegacyImports["mountSideControls"];
 declare const createLinkedMark: LegacyImports["createLinkedMark"];
