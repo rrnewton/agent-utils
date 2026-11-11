@@ -1367,9 +1367,16 @@ impl Wrapper {
             true,
             &Blocking,
             |identifier| {
-                json!({"id": identifier, "text": text, "queued_at": unix_seconds(),
-                       "delivery_attempts": 0, "from": from, "origin": origin,
-                       "priority": "normal", "deliver": "turn-boundary"})
+                // The console item is the one shared raw definition (#1223
+                // bridge-raw-headless): the owner's line reaches the harness
+                // byte for byte, marked `raw` like a bridge raw item for the
+                // same text, with the console origin riding along.
+                let mut item = crate::agent::enqueued_item(identifier, &text, true);
+                item["from"] = json!(from);
+                item["origin"] = origin.clone();
+                item["priority"] = json!("normal");
+                item["deliver"] = json!("turn-boundary");
+                item
             },
         );
         match enqueued {

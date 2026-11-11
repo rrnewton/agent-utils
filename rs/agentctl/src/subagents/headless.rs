@@ -325,6 +325,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
                 "normal",
                 "turn-boundary",
                 None,
+                false,
             )?),
             None => None,
         };
@@ -458,6 +459,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         wrapper::run(config, terminate, &hooks)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn enqueue_headless(
         &self,
         queue_root: &Path,
@@ -466,6 +468,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         priority: &str,
         deliver: &str,
         not_after: Option<u64>,
+        raw: bool,
     ) -> Result<String> {
         let from = std::env::var("AGENTCTL_AGENT")
             .ok()
@@ -478,6 +481,17 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             true,
             &agent_queue::fsio::Blocking,
             |identifier| {
+                // A raw item is the one shared definition (`agent::enqueued_item`, #1223
+                // bridge-raw-headless): marked `raw`, text exactly as given, no
+                // deferred-time opening. The headless routing fields ride along.
+                if raw {
+                    let mut item = crate::agent::enqueued_item(identifier, text, true);
+                    item["from"] = json!(from);
+                    item["priority"] = json!(priority);
+                    item["deliver"] = json!(deliver);
+                    item["not_after"] = json!(not_after);
+                    return item;
+                }
                 // A chat request prompt names its message's create time, as for a pane queue:
                 // open it with the delay as of queuing, so the stored text stays printable.
                 let mut item = json!({
@@ -669,7 +683,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let (queue_root, id) = {
             let _lock = self.lock(agent_name)?;
             let record = self.load(agent_name)?;
-            self.enqueue_for(&record, text, message_id, urgent, not_after)?
+            self.enqueue_for(&record, text, message_id, urgent, not_after, false)?
         };
         let blocked = self.wake(agent_name);
         let wait = if blocked.is_some() {
@@ -700,6 +714,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             message_id,
             options.deliver_while_working,
             options.not_after,
+            options.raw_prompt,
         )?;
         let blocked = self.wake(&record.name);
         // The caller holds the lifecycle lock that `stop` needs: never wait long under it.
@@ -737,6 +752,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             Some(message_id),
             options.deliver_while_working,
             options.not_after,
+            options.raw_prompt,
         )?;
         drop(lock);
         let blocked = self.wake_within(&record.name, CHAT_WAKE_TIMEOUT);
@@ -828,6 +844,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         message_id: Option<&str>,
         urgent: bool,
         not_after: Option<u64>,
+        raw: bool,
     ) -> Result<(PathBuf, String)> {
         if !record.is_headless() || record.lifecycle != "running" {
             return Err(fail(format!(
@@ -844,8 +861,15 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             ("normal", "turn-boundary")
         };
         let queue_root = self.queue(&record.name)?;
-        let id =
-            self.enqueue_headless(&queue_root, text, message_id, priority, deliver, not_after)?;
+        let id = self.enqueue_headless(
+            &queue_root,
+            text,
+            message_id,
+            priority,
+            deliver,
+            not_after,
+            raw,
+        )?;
         Ok((queue_root, id))
     }
 
@@ -892,6 +916,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             "normal",
             "turn-boundary",
             None,
+            false,
         )?;
         drop(lock);
         let blocked = self.wake(agent_name);

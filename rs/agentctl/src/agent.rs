@@ -1750,7 +1750,7 @@ fn enqueue_internal(
 /// The document `enqueue` writes for `text`. A raw prompt's document is the plain item
 /// marked `raw`, its text exactly as given: no deferred-time opening is made of words that
 /// must reach the composer verbatim (#1136 raw-message-bridge).
-fn enqueued_item(identifier: &str, text: &str, raw: bool) -> Value {
+pub(crate) fn enqueued_item(identifier: &str, text: &str, raw: bool) -> Value {
     if raw {
         let mut item = agent_queue::queue::plain_item(identifier, text);
         item["raw"] = json!(true);

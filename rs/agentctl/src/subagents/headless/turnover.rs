@@ -321,7 +321,15 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             // A fixed ID, so a rerun after a crash right after queueing does not queue it twice.
             let id = format!("turnover-{}", field(&journal, "nonce"));
             if agent_queue::queue::message_state(&queue_root, &id)?.is_none() {
-                self.enqueue_headless(&queue_root, &prompt, Some(&id), "urgent", "now", None)?;
+                self.enqueue_headless(
+                    &queue_root,
+                    &prompt,
+                    Some(&id),
+                    "urgent",
+                    "now",
+                    None,
+                    false,
+                )?;
             }
             journal.insert("prompt_id".to_owned(), json!(id));
             journal.insert("phase".to_owned(), json!("starting"));

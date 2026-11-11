@@ -428,3 +428,28 @@ fn run_headless_spawns_the_launcher_as_given_and_pins_the_post_exec_identity() {
     // Captured while the harness lived: stopping the wrapper clears it.
     assert_eq!(harness_pid, Some(pinned.pid));
 }
+
+#[test]
+fn a_raw_bridge_send_to_a_headless_agent_keeps_its_raw_mark() {
+    // #1223 bridge-raw-headless: the raw flag must survive the headless
+    // enqueue, as the one shared raw-item definition the console uses.
+    let fixture = Fixture::new();
+    let manager = headless_agent(&fixture);
+    let record = manager.load("lead").unwrap();
+    let options = DrainOptions {
+        raw_prompt: true,
+        ready_timeout: Duration::ZERO,
+        ..DrainOptions::default()
+    };
+    manager
+        .send_headless_record(&record, "/help", Some("raw-1"), &options)
+        .unwrap();
+    let queue = manager.queue("lead").unwrap();
+    let item = agent_queue::queue::load_message(&queue.join("inbox.v2/raw-1.json")).unwrap();
+    assert_eq!(item["raw"], true, "{item:?}");
+    assert_eq!(item["text"], "/help", "{item:?}");
+    assert!(item.get("opening").is_none(), "{item:?}");
+    let shared = crate::agent::enqueued_item("raw-1", "/help", true);
+    assert_eq!(item["raw"], shared["raw"]);
+    assert_eq!(item["text"], shared["text"]);
+}

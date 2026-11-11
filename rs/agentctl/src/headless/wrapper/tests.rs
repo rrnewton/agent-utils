@@ -423,8 +423,11 @@ fn console_input_queues_a_plain_turn_with_its_origin() {
     });
     let processed =
         queue::load_message(&fixture.queue().join(format!("processed/{queue_id}.json"))).unwrap();
-    // Byte for byte as typed: no sender header, no time opening.
+    // Byte for byte as typed: no sender header, no time opening. The
+    // shared raw definition (#1223): a console item and a bridge raw
+    // item for the same text are the same marked item.
     assert_eq!(processed["text"], "run `date`", "{processed:?}");
+    assert_eq!(processed["raw"], true, "{processed:?}");
     assert_eq!(processed["from"], "console:alice");
     assert_eq!(processed["origin"]["kind"], "console");
     assert_eq!(processed["origin"]["user"], "alice");

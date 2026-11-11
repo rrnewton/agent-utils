@@ -350,7 +350,22 @@ fn console_delivers_typed_lines_as_plain_turns() {
         fixture.texts()[2]
     );
 
-    // Ctrl-C leaves the console; the agent is untouched and stoppable.
+    // `/interrupt` interrupts through the control socket; it is never
+    // delivered as a message.
+    console.type_line(b"/interrupt\r");
+    console.wait_for("interrupt ack", "interrupt sent");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        fixture.texts().len(),
+        3,
+        "/interrupt reached the harness as a message"
+    );
+
+    // Ctrl-C interrupts first; only the second Ctrl-C leaves, and the
+    // agent is untouched and stoppable.
+    console.type_line(&[0x03]);
+    console.wait_for("interrupt ack", "Ctrl-C again leaves");
+    assert!(console.alive(), "first Ctrl-C must not leave the console");
     console.type_line(&[0x03]);
     fixture.wait_for("console exit", || !console.alive());
     let status = fixture.agentctl(&["status", "worker"]);
