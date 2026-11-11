@@ -1,8 +1,8 @@
 # channel-bars-layout: rethinking the channel view's two bottom bars (proposal)
 
 > **Update 2026-10-23 (`#455 vibe-talk-next-plan`).** Part of the master plan,
-> [`2026-10-23-vibe-talk-next/README.md`]((../../plans/2026-10-23-vibe-talk-next/README.md). Terms follow its
-> [terminology]((../../plans/2026-10-23-vibe-talk-next/TERMINOLOGY.md). This proposal is on its UI track,
+> [`2026-10-23-vibe-talk-next/README.md`](../../plans/2026-10-23-vibe-talk-next/README.md). Terms follow its
+> [terminology](../../plans/2026-10-23-vibe-talk-next/TERMINOLOGY.md). This proposal is on its UI track,
 > independent of the data model; its questions are group I of the consolidated list. Nothing here is
 > superseded.
 
@@ -274,7 +274,7 @@ the redesign picks keeps this policy. `#573 scrubber-full-width` implements it f
 The page states it on the root as `data-read-strip="playing"` or `"paused"` (absent with no strip;
 `renderReadLayout` in `web/voice.js`). The redesign should key its own hiding off that attribute
 rather than add a second state. The multi-track scrubber (the hierarchical navigator in
-[documents-view]((../../plans/2026-10-26-documents-view/README.md)) grows the strip upward from the same place.
+[documents-view](../../plans/2026-10-26-documents-view/README.md)) grows the strip upward from the same place.
 
 **How it maps onto each option.**
 

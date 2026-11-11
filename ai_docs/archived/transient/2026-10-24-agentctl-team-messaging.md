@@ -266,7 +266,7 @@ Gastown." agentctl already combines Herdr agent management and the chat bridge i
 adding team messaging to it as revision 1 proposed (`agentctl team ...`, `agentctl teams ...`)
 makes a fat multi-purpose binary. This section looks only at team messaging. The whole-suite
 factoring, including the chat bridge's split from agent management, is
-`#498 suite-a-la-carte` ([`2026-10-24-suite-a-la-carte.md`]((../../reports/research/2026-10-24-suite-a-la-carte.md));
+`#498 suite-a-la-carte` ([`2026-10-24-suite-a-la-carte.md`](../../reports/research/2026-10-24-suite-a-la-carte.md));
 4.7 says where this section agrees with it and where it goes further.
 
 ### 4.1 What team messaging actually needs from agentctl

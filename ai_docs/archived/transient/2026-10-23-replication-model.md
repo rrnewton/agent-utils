@@ -1,8 +1,8 @@
 # replication-model: what the page, the server and the provider each hold, and how it should merge
 
 > **Update 2026-10-23 (`#455 vibe-talk-next-plan`).** Part of the master plan,
-> [`2026-10-23-vibe-talk-next/README.md`]((../../plans/2026-10-23-vibe-talk-next/README.md). Terms follow its
-> [terminology]((../../plans/2026-10-23-vibe-talk-next/TERMINOLOGY.md). It maps this document's changes to
+> [`2026-10-23-vibe-talk-next/README.md`](../../plans/2026-10-23-vibe-talk-next/README.md). Terms follow its
+> [terminology](../../plans/2026-10-23-vibe-talk-next/TERMINOLOGY.md). It maps this document's changes to
 > milestones: C1 to C4 are the cl-dedupe lane (0.1.x); C5 to C9 and the §8 tests are 0.3.0 (Sync).
 > The questions are group E of its consolidated list. One plan change: C7's interim receipt fix for
 > R9 moves into the C4 lane.

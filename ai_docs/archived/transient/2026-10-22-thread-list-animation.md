@@ -1,8 +1,8 @@
 # thread-list-animation: a calmer Threads view — proposal
 
 > **Update 2026-10-23 (`#455 vibe-talk-next-plan`).** Part of the master plan,
-> [`2026-10-23-vibe-talk-next/README.md`]((../../plans/2026-10-23-vibe-talk-next/README.md). Terms follow its
-> [terminology]((../../plans/2026-10-23-vibe-talk-next/TERMINOLOGY.md). This proposal is on its UI track; its
+> [`2026-10-23-vibe-talk-next/README.md`](../../plans/2026-10-23-vibe-talk-next/README.md). Terms follow its
+> [terminology](../../plans/2026-10-23-vibe-talk-next/TERMINOLOGY.md). This proposal is on its UI track; its
 > questions are group I of the consolidated list. Its arrival motion is also what a thread promoted
 > by a reply (replication change C4) should use when it joins the Threads view. Nothing here is
 > superseded.

@@ -3,7 +3,7 @@
 [opus 5.5] `#547 car-mode-design`. A proposal for the owner, written 2026-10-26. Nothing in it is implemented except the bug
 fix in "Where we are". It follows `#554 read-pause-reply-resume`. It is meant to sit beside the bottom-bar
 proposal, [`2026-10-22-channel-bars-layout.md`](../2026-10-22-channel-bars-layout.md) (group I of
-[`2026-10-23-vibe-talk-next`]((../../../plans/2026-10-23-vibe-talk-next/README.md)).
+[`2026-10-23-vibe-talk-next`](../../../plans/2026-10-23-vibe-talk-next/README.md)).
 
 ## What the owner asked
 

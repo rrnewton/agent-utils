@@ -38,10 +38,10 @@ Claude. A chat application is another input/output surface.
 
 | Need | Current command | Current limitation |
 | --- | --- | --- |
-| Native Codex or Claude workers that a human can inspect directly | [`herdr-agent`]((../../../../common/docs/herdr-run/AGENT_USER_GUIDE.md) | Herdr hosts the interactive terminals. Native goal inspection depends on harness support. |
-| Resumable Codex or Antigravity turns, transcripts, and MCP access | [`herdr-subagents`]((../../../../common/docs/herdr-run/FOREIGN_USER_GUIDE.md) | Headless workers use Herdr or tmux; its interactive mode supports Codex on Herdr only. |
-| Google Chat access to one existing coordinator | [`herdr-chat`]((../../../../common/docs/herdr-run/CHAT_USER_GUIDE.md) | The coordinator must run in Herdr. The bridge submits terminal input and uses an explicit final-reply artifact. |
-| Execute a shell command in a Herdr pane and collect its output and exit status | [`herdr-run`]((../../../../common/docs/herdr-run/rendered/python/USER_GUIDE.md) | Separate shell-execution utility; it does not manage agent conversations. |
+| Native Codex or Claude workers that a human can inspect directly | [`herdr-agent`](../../../../common/docs/herdr-run/AGENT_USER_GUIDE.md) | Herdr hosts the interactive terminals. Native goal inspection depends on harness support. |
+| Resumable Codex or Antigravity turns, transcripts, and MCP access | [`herdr-subagents`](../../../../common/docs/herdr-run/FOREIGN_USER_GUIDE.md) | Headless workers use Herdr or tmux; its interactive mode supports Codex on Herdr only. |
+| Google Chat access to one existing coordinator | [`herdr-chat`](../../../../common/docs/herdr-run/CHAT_USER_GUIDE.md) | The coordinator must run in Herdr. The bridge submits terminal input and uses an explicit final-reply artifact. |
+| Execute a shell command in a Herdr pane and collect its output and exit status | [`herdr-run`](../../../../common/docs/herdr-run/rendered/python/USER_GUIDE.md) | Separate shell-execution utility; it does not manage agent conversations. |
 
 These workers currently run on the same host and share local state files with
 their controller. Chat provides remote human access to that host's coordinator;

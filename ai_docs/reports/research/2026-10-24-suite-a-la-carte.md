@@ -2,7 +2,7 @@
 
 Working design and audit, 2026-10-24. `#498 suite-a-la-carte`. Code references are to `main` at
 `2a9d8012` unless a line says otherwise. The team-messaging design it refers to is
-[`2026-10-24-agentctl-team-messaging.md`]((../../archived/transient/2026-10-24-agentctl-team-messaging.md)
+[`2026-10-24-agentctl-team-messaging.md`](../../archived/transient/2026-10-24-agentctl-team-messaging.md)
 (`#496 agentctl-team-messaging`). A separate lane is adding a section there on where team
 messaging lives; section 2.5 below is this audit's input to that decision.
 
@@ -292,7 +292,7 @@ marked **accidental** are ones a change could remove without changing the design
   - **By design:** Herdr. The bridge types into the pane and reads replies from it. The Claude
     Code Discord and Telegram plugins show the alternative: messages enter one harness as MCP
     notifications, with no supervisor or multiplexer
-    ([agentctl comparison]((../../../common/docs/agentctl/RELATED_WORK.md#claude-code-channels-chat-connects-to-the-harness)).
+    ([agentctl comparison](../../../common/docs/agentctl/RELATED_WORK.md#claude-code-channels-chat-connects-to-the-harness)).
     That path is harness-specific and would be a different product, not a factoring.
   - Python edition: Google Chat works through its public API, and Herdr is still required.
 
@@ -471,9 +471,9 @@ on its `PATH` explicitly. The check then documents each dependency it allows.
 ## 5. Composability compared with Gas Town and other systems
 
 Sources: Gas Town read at commit `c0b37bd5` (cloned 2026-10-24) for this section; the other
-systems as recorded, with pinned revisions, in [RELATED_WORK.md]((../../../RELATED_WORK.md),
-[the agentctl comparison]((../../../common/docs/agentctl/RELATED_WORK.md) and
-[the wrkslots comparison]((../../../common/docs/wrkslots/RELATED_WORK.md).
+systems as recorded, with pinned revisions, in [RELATED_WORK.md](../../../RELATED_WORK.md),
+[the agentctl comparison](../../../common/docs/agentctl/RELATED_WORK.md) and
+[the wrkslots comparison](../../../common/docs/wrkslots/RELATED_WORK.md).
 
 | System | Unit of installation | Smallest useful piece, and what it needs | Messaging between agents |
 |---|---|---|---|

@@ -1,8 +1,8 @@
 # Voice tool audit: what the voice agent is given, and three failures from the car
 
 > **Update 2026-10-23 (`#455 vibe-talk-next-plan`).** Part of the master plan,
-> [`2026-10-23-vibe-talk-next/README.md`]((../../plans/2026-10-23-vibe-talk-next/README.md). Terms follow its
-> [terminology]((../../plans/2026-10-23-vibe-talk-next/TERMINOLOGY.md). The voice agent's next steps (a start
+> [`2026-10-23-vibe-talk-next/README.md`](../../plans/2026-10-23-vibe-talk-next/README.md). Terms follow its
+> [terminology](../../plans/2026-10-23-vibe-talk-next/TERMINOLOGY.md). The voice agent's next steps (a start
 > briefing, summaries by tool, the research hand-off, the eval harness) are milestone 0.5.0. Nothing
 > here is superseded.
 

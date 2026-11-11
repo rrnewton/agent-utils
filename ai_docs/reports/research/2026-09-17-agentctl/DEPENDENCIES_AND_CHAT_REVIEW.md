@@ -33,7 +33,7 @@ Source entry points:
 - [agent_cli.py](../../../py/herdr_run/agent_cli.py)
 - [agent.py](../../../py/herdr_run/agent.py)
 - [subagents.py](../../../py/herdr_run/subagents.py)
-- [client.py]((../../../../py/herdr_run/client.py)
+- [client.py](../../../../py/herdr_run/client.py)
 - [foreign/lib.py](../../../py/herdr_run/foreign/lib.py)
 - [Rust agent module](../../../rs/herdr-run/src/agent.rs)
 
@@ -69,7 +69,7 @@ headless companions currently have only a Python implementation.
 
 ## Current Chat robustness: tested strengths
 
-The existing [Chat tests]((../../../../py/tests/test_herdr_chat.py) exercise the real
+The existing [Chat tests](../../../../py/tests/test_herdr_chat.py) exercise the real
 durable delivery queue with fake harness/provider boundaries. They cover input
 deduplication across bridge restart, stable reply request IDs after lost upstream
 acknowledgement, suppression of the bridge's own messages, sender authorization,

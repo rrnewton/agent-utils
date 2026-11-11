@@ -43,7 +43,7 @@ under `/tmp/dagrun-cargo-build-sweep.oOOOqVZc/targets/` and consumed about 1.5 G
 
 The measured source snapshot was commit `1bdc4e0f38149c807f27fe18fc00c4ada1725f4f`
 (tree `33f5eaae6c4b3c42dfe57b68eb79d4d8fc3ec9fb`). The benchmark graph is
-[`examples/08-dagrun-clean-build-sweep.yaml`]((../../../examples/08-dagrun-clean-build-sweep.yaml).
+[`examples/08-dagrun-clean-build-sweep.yaml`](../../../examples/08-dagrun-clean-build-sweep.yaml).
 Its `cargo-build` command type places `--jobs N` at the Cargo invocation and dagrun independently
 limits the whole step cgroup to N cores.
 

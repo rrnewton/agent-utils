@@ -941,7 +941,7 @@ Sources: `docs/overview.md`, `docs/glossary.md`, `internal/templates/roles/mayor
   their parent natively. They suit short delegated tasks; persistent, separately visible workers
   stay with agentctl.
 - **Codex app-server**: already compared in
-  [common/docs/agentctl/RELATED_WORK.md]((../../../../common/docs/agentctl/RELATED_WORK.md).
+  [common/docs/agentctl/RELATED_WORK.md](../../../../common/docs/agentctl/RELATED_WORK.md).
   Section 3.2 adds the verified `exec resume` behaviour and the schema's `turn/steer`.
 
 ### 16.3 Orchestrators
@@ -953,7 +953,7 @@ Sources: `docs/overview.md`, `docs/glossary.md`, `internal/templates/roles/mayor
   work runs", and the agent server "decides what runs". Taken: the split between deciding when to
   run (here, queue policy and the bridge) and running (here, the wrapper).
 - **CLI Agent Orchestrator, Happy, Claude Squad**: compared in
-  [common/docs/agentctl/RELATED_WORK.md]((../../../../common/docs/agentctl/RELATED_WORK.md). CLI
+  [common/docs/agentctl/RELATED_WORK.md](../../../../common/docs/agentctl/RELATED_WORK.md). CLI
   Agent Orchestrator marks a message delivered before the paste, the same choice as agentctl's
   `inflight/` barrier. Headless adds a receiver-side record that turns "possibly submitted" into
   a definite answer.

@@ -42,7 +42,7 @@ by a refusal to overwrite `processed/same-id.json`; that ID remained in both
 an ID across its entire lifecycle.
 
 Existing coverage:
-[`test_concurrent_explicit_message_id_is_created_exactly_once`]((../../../../py/tests/test_herdr_agent.py#L351)
+[`test_concurrent_explicit_message_id_is_created_exactly_once`](../../../../py/tests/test_herdr_agent.py#L351)
 uses the serialized `enqueue` entry point. It does not exercise this `send`
 interleaving. Generated message IDs make this less likely for ordinary managed
 sends, but the public library explicitly accepts caller-supplied IDs.
@@ -109,8 +109,8 @@ pane and returned the replacement token from the original `start` call.
 Keeping a durable generation token is insufficient unless the entire operation
 remains bound to it.
 
-Existing coverage: [initial briefs]((../../../../py/tests/test_herdr_subagents.py#L111)
-and [sequential name reuse]((../../../../py/tests/test_herdr_subagents.py#L197) are
+Existing coverage: [initial briefs](../../../../py/tests/test_herdr_subagents.py#L111)
+and [sequential name reuse](../../../../py/tests/test_herdr_subagents.py#L197) are
 covered separately; this interleaving is not.
 
 ### 5. A partially allocated managed tab can become impossible to stop through the manager
@@ -125,7 +125,7 @@ the tab's actual pane as changed ownership. The documented normal cleanup path
 cannot release the name.
 
 The fake-client check reproduced this with one failed discovery request. The
-existing [failed-launch cleanup test]((../../../../py/tests/test_herdr_subagents.py#L135)
+existing [failed-launch cleanup test](../../../../py/tests/test_herdr_subagents.py#L135)
 fails later, during harness startup, after both identities were recorded.
 
 ### 6. Managed stop can close a human pane added after its ownership check
@@ -138,7 +138,7 @@ membership, then captures output, writes state, and closes the whole tab at
 not serialize human changes made through Herdr.
 
 Adding a second pane during the fake output read resulted in successful closure
-of both panes. The [existing extra-pane test]((../../../../py/tests/test_herdr_subagents.py#L171)
+of both panes. The [existing extra-pane test](../../../../py/tests/test_herdr_subagents.py#L171)
 checks only a pane present before stop starts. This matters to any future
 promise of direct human interaction alongside automated lifecycle control.
 
@@ -222,17 +222,17 @@ not independently reproduced during this bounded audit.
   without consuming a retry attempt. The shared queue moves a request behind
   its durable inflight barrier before terminal submission; a process restart
   quarantines it instead of automatically injecting it again. Tests cover
-  [busy restart]((../../../../py/tests/test_herdr_agent.py#L667),
-  [crash after submission]((../../../../py/tests/test_herdr_agent.py#L621),
-  [crash immediately after the barrier]((../../../../py/tests/test_herdr_agent.py#L641),
-  and [distinct machine outcomes]((../../../../py/tests/test_herdr_agent.py#L694).
+  [busy restart](../../../../py/tests/test_herdr_agent.py#L667),
+  [crash after submission](../../../../py/tests/test_herdr_agent.py#L621),
+  [crash immediately after the barrier](../../../../py/tests/test_herdr_agent.py#L641),
+  and [distinct machine outcomes](../../../../py/tests/test_herdr_agent.py#L694).
 - **Different queue roots share a target lock.** Exact-pane and session-based
   addressing serialize on the resolved pane, and target assertions are checked
-  again while waiting. See [shared-target tests]((../../../../py/tests/test_herdr_agent.py#L206).
+  again while waiting. See [shared-target tests](../../../../py/tests/test_herdr_agent.py#L206).
 - **Known identity changes are refusals.** The managed API validates its name,
   pane, workspace, directory, and known native session. Tests cover
-  [session replacement]((../../../../py/tests/test_herdr_subagents.py#L171) and
-  [named-agent replacement]((../../../../py/tests/test_herdr_subagents.py#L291).
+  [session replacement](../../../../py/tests/test_herdr_subagents.py#L171) and
+  [named-agent replacement](../../../../py/tests/test_herdr_subagents.py#L291).
 - **Ordinary managed mutations use a stable lifecycle lock.** Send, drain,
   read, and stop share the lock outside the worker directory, so archiving and
   recreating that directory cannot replace a held lock inode. The startup-brief
