@@ -46,14 +46,14 @@ import sys
 from collections import Counter, defaultdict
 from datetime import datetime, time, timedelta
 from pathlib import Path
-from typing import Callable, TypedDict
+from typing import Callable, Optional, TypedDict
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
 DEFAULT_HISTORY = "/tmp/dev-agent-utils-gate-admission/history.jsonl"
 DEFAULT_LEDGER = "~/.local/state/agent-utils/gate-ledger.jsonl"
 Row = dict[str, object]
-InDay = Callable[[float | None], bool]
+InDay = Callable[[Optional[float]], bool]
 
 
 class Dist(TypedDict):
@@ -64,7 +64,7 @@ class Dist(TypedDict):
 
 
 Split = TypedDict("Split", {"tier": str, "class": str, "tickets": int, "wait": Dist,
-                            "run": Dist, "red_tickets": int, "red_rate": float | None})
+                            "run": Dist, "red_tickets": int, "red_rate": Optional[float]})
 
 
 class Overall(TypedDict):
@@ -78,8 +78,8 @@ class Overall(TypedDict):
 
 
 GatesBlock = TypedDict("GatesBlock", {"full_gates": int, "pass": int, "fail": int, "partial": int,
-                                      "red_gate_rate": float | None, "batch_gates": int,
-                                      "red_batch_rate": float | None})
+                                      "red_gate_rate": Optional[float], "batch_gates": int,
+                                      "red_batch_rate": Optional[float]})
 
 
 class TierHeads(TypedDict):
