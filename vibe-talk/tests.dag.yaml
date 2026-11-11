@@ -1687,8 +1687,10 @@ steps:
     cmd: cd vibe-talk && python3 tests/empty_messages_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
+    # Failure bounds, not a performance verdict (#1250): solo under dagrun accounting this takes
+    # 13.8 s CPU / 16.0 s wall, so keep over five times that CPU headroom under hot-host load.
     timeout: 480
-    cpu_timeout: 60
+    cpu_timeout: 120
     hint:
       resources: {browser: 1}
       est_duration_s: 20

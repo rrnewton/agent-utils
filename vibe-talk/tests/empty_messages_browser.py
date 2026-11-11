@@ -33,6 +33,8 @@ import os
 import re
 import tempfile
 import threading
+import time
+from collections.abc import Callable
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -43,6 +45,14 @@ import page_sources
 
 if TYPE_CHECKING:
     from playwright.sync_api import BrowserType, Page
+
+# The most a state wait below waits for the drawn state it expects (`#1250
+# vibe-talk-timing-robust`, the STATE_S precedent of the read-aloud checks). Every wait polls what
+# the page has drawn, so a pass takes as long as the page does on a hot host and this only bounds
+# a failure; the 5-10 s bounds it replaces were what a loaded gate could outrun, and the one-shot
+# reads of the drawn rows and counts after a two-frame settle could catch the list before the
+# switch's redraw landed.
+STATE_S = 30.0
 
 # (label, width, height, colour scheme, phone).
 SIZES = (
@@ -175,9 +185,23 @@ class Reader:
 
     def wait_for(self, condition: str, why: str, arg: object = None) -> None:
         try:
-            self.page.wait_for_function(condition, arg=arg, timeout=10_000)
+            self.page.wait_for_function(condition, arg=arg, timeout=int(STATE_S * 1000))
         except Exception as error:  # noqa: BLE001 - the walk's own words say what did not happen
             raise AssertionError(f"{self.label}: {why}") from error
+
+    def wait_drawn(self, why: Callable[[], str], holds: Callable[[], bool]) -> None:
+        """Until `holds` of what is drawn, STATE_S at most, then judged by the same read.
+
+        For the verdicts a `wait_for` on one row cannot pin — the whole drawn list, the heading's
+        count, the card's unread — which the page redraws together after the switch: poll the
+        drawn state itself rather than reading it once two frames after the wait (`#1250`). `why`
+        is said only on failure, from the state then drawn.
+        """
+        deadline = time.monotonic() + STATE_S
+        while not holds() and time.monotonic() < deadline:
+            self.page.wait_for_timeout(100)
+        if not holds():
+            self.check(False, why())
 
     def switch(self, on: bool) -> None:
         """Settings > Messages > Empty messages, set to `on`, and Settings closed."""
@@ -186,7 +210,7 @@ class Reader:
         for fold in ("fold-settings-messages", "fold-empty-messages"):
             if page.get_attribute(f"#{fold}", "aria-expanded") != "true":
                 page.click(f"#{fold}")
-        page.wait_for_selector("#hide-empty-messages", state="visible", timeout=5_000)
+        page.wait_for_selector("#hide-empty-messages", state="visible", timeout=int(STATE_S * 1000))
         groups = page.evaluate("""() => [...document.querySelectorAll('#fold-settings-messages-body .settings-group h3')]
             .map((h) => h.textContent.trim())""")
         # `#728 vt-quote-read-threshold` put Quoted replies under Your own messages, before these two.
@@ -246,7 +270,7 @@ def open_all(reader: Reader) -> None:
     page = reader.page
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
-    page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+    page.wait_for_selector("#search-toggle", state="visible", timeout=int(STATE_S * 1000))
     page.click("#view-switch")
     reader.wait_for("() => document.querySelector(\"#discord-log > li[data-id='209']\")", "the channel did not open in All")
     reader.settled()
@@ -254,30 +278,40 @@ def open_all(reader: Reader) -> None:
 
 def check_hidden(reader: Reader, where: str) -> None:
     """No empty message drawn; the file alone and the reaction alone drawn, saying what they say."""
-    found = reader.drawn()
-    ids = reader.ids()
-    reader.check(not [id_ for id_ in (*EMPTY, EMPTY_REPLY) if id_ in ids], f"{where}: an empty message is drawn: {ids}")
-    texts = found["texts"]
-    assert isinstance(texts, dict)
-    reader.check(FILE_ONLY in ids and "screenshot.png" in str(texts.get(FILE_ONLY, "")),
-                 f"{where}: the file posted with no words is not drawn naming it: {texts.get(FILE_ONLY)!r}")
-    reader.check(REACTION_ONLY in ids and "👍" in str(texts.get(REACTION_ONLY, "")),
-                 f"{where}: the message with only a reaction is not drawn with it: {texts.get(REACTION_ONLY)!r}")
+
+    def holds() -> bool:
+        found = reader.drawn()
+        ids = [str(each) for each in found["ids"]] if isinstance(found["ids"], list) else []
+        texts = found["texts"] if isinstance(found["texts"], dict) else {}
+        return (not [id_ for id_ in (*EMPTY, EMPTY_REPLY) if id_ in ids]
+                and FILE_ONLY in ids and "screenshot.png" in str(texts.get(FILE_ONLY, ""))
+                and REACTION_ONLY in ids and "👍" in str(texts.get(REACTION_ONLY, "")))
+
+    def why() -> str:
+        texts = reader.drawn()["texts"]
+        said = texts if isinstance(texts, dict) else {}
+        return (f"{where}: the drawn rows are {reader.ids()}, with the file {said.get(FILE_ONLY)!r} "
+                f"and the reaction {said.get(REACTION_ONLY)!r}")
+
+    reader.wait_drawn(why, holds)
 
 
 def check_shown(reader: Reader, where: str, replies: bool) -> None:
     """Every message drawn: the thread's empty reply too where the list holds replies (All, not Main)."""
-    ids = reader.ids()
-    reader.check(all(id_ in ids for id_ in (*EMPTY, *((EMPTY_REPLY,) if replies else ()), FILE_ONLY, REACTION_ONLY)),
-                 f"{where}: not every message is drawn: {ids}")
+    reader.wait_drawn(lambda: f"{where}: not every message is drawn: {reader.ids()}",
+                      lambda: all(id_ in reader.ids()
+                                  for id_ in (*EMPTY, *((EMPTY_REPLY,) if replies else ()), FILE_ONLY, REACTION_ONLY)))
 
 
 def check_count(reader: Reader, count: int, where: str) -> None:
     """The heading over the list counts the messages it draws, not the empty ones it leaves out."""
-    said_ = str(reader.page.text_content("#channel-summary") or "")
-    found = re.search(r"(\d+) messages?", said_)
-    reader.check(found is not None and int(found.group(1)) == count,
-                 f"{where}'s heading says {said_!r}, not the {count} messages drawn")
+
+    def holds() -> bool:
+        found = re.search(r"(\d+) messages?", str(reader.page.text_content("#channel-summary") or ""))
+        return found is not None and int(found.group(1)) == count
+
+    reader.wait_drawn(lambda: f"{where}'s heading says {str(reader.page.text_content('#channel-summary') or '')!r}, "
+                      f"not the {count} messages drawn", holds)
 
 
 def unread_on_card(reader: Reader) -> int:
