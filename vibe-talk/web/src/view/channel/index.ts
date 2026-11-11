@@ -271,3 +271,4 @@ export type { KeptTextSelection, TextSelection, TextSelectionDependencies } from
 export * from "./searchopen.ts";
 export * from "./servicewords.ts";
 export * from "./channelhead.ts";
+export * from "./openinview.ts";

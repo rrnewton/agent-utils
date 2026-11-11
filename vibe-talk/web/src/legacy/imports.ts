@@ -1,4 +1,4 @@
-export { createApplication, createKeyboardComposition, createServerAccess } from "../app/index.ts";
+export { createApplication, createKeyboardComposition, createServerAccess, createPageGuards } from "../app/index.ts";
 // What the legacy page script (web/voice.js) takes from the modules, and nothing else.
 //
 // `#624 voice-page-modularity`. The page's code moves out of web/voice.js into these modules a
@@ -108,6 +108,7 @@ export { LINK_KINDS_KEY, READ_MODES, READ_MODE_KEY, READ_MODE_SAID, THREADS_UNPA
 export { PULL_WAIT_MS, REPLY_LANDING_GAP_PX, anchorOfRow, authorPasses, createCardFlight, createCardPlaces, createColumnSplitter, createColumnReplies, createColumnWork, createColumnStateAccess, createColumns, createElementLookup, createFootRooms, createLayoutShown, createJumpAnchor, createLinkedMark, createPackSlides, screenMotionMs, createPullToRefresh, createQuoting, createReadingColumn, createReplyArrows, createSentRead, createReplyGathering, createReplySession, createChannelViews, createChannelScope, createChannelLoading, createDayTap, createMessageDetails, createNoiseActs, createRichHeaders, createStartsRead, createFilterPlace, createFreshRead, createHeldDone, createReadState, createPendingSends, createOlderPages, createOpeningView, createPlacing, createReplyCounts, createDoneAct, createLiveState, createSideCards, createThreadEntry, createTwoColumns, createRowDrawing, createRowGestures, createScrollKeeping, createUnderLists, createUnpackWatch, FOLLOW_REST_PX, fillCardText, freshenDayTitle, freshComposerState, freshEntryState, freshDoneState, freshLoadState, freshOlderPages, freshScrollPlace, freshScrollTools, freshSelection, freshTimelineRows, freshFilterState, freshGatherState, freshListState, freshReplyArrows, fromGatheredThread, idsOf, markCardLayout, messageTop, mountChannelViewControls, mountColumnSplitterControls, mountTextSelection, mountFilterChips, mountKeptSends, mountListControls, mountListGestures, mountListKeepers, mountListWatch, mountReadingJumps, mountReplyBox, mountSideControls, mountSideListControls, notNoiseButtonOf, quoteLabelFits, renderedText, rowIn, rowMessages, rowShown, rowTimeTabStop, sameCardPlace, shownRowFor, createChannelHead,
   createSearchOpenControl,
   createServiceWords,
+  createOpenInView,
   } from "../view/channel/index.ts";
 
 import { decode, decodeTagged, is, roots } from "../contract/index.ts";

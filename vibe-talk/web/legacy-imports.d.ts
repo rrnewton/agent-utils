@@ -204,6 +204,8 @@ declare const createChannelHead: LegacyImports["createChannelHead"];
 declare const createSearchOpenControl: LegacyImports["createSearchOpenControl"];
 declare const createServiceWords: LegacyImports["createServiceWords"];
 declare const createReadingModeActs: LegacyImports["createReadingModeActs"];
+declare const createOpenInView: LegacyImports["createOpenInView"];
+declare const createPageGuards: LegacyImports["createPageGuards"];
 declare const createHeldDone: LegacyImports["createHeldDone"];
 declare const createReadState: LegacyImports["createReadState"];
 declare const createPendingSends: LegacyImports["createPendingSends"];

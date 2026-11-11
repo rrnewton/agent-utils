@@ -398,6 +398,12 @@ const shellNotices = createShellNotices({
   detailChanged: (text) => connectionReadouts.detail(text),
 });
 const { setStatus, statusSays, dismissStatus, setState, showError, clearError, showDetail, addDetail, dismissBanner } = shellNotices;
+/** The page's quiet guards: web/src/app/guards.ts (`createPageGuards`, #624). */
+const pageGuards = createPageGuards({
+  showError,
+  readableChannelFailure: (error) => readableChannelFailure(error),
+});
+const { guardQuietly, refreshQuietly } = pageGuards;
 
 // The state dot (`setState`): one of idle, working, live, unresponsive, ended, suspended, error, which
 // web/voice.css colours. `suspended` is `#54 resume-recovery`: the socket died while the page was in the
@@ -934,52 +940,25 @@ const messagePreferences = mountMessagePreferences({
   storedOpenInView: () => storedOpenInView(),
 });
 
-/**
- * Draw again every body the switch decides the links of, from what is held, as for Empty messages: each
- * column's rows, the thread list's cards and the right column's.
- */
-function redrawMessageLinks() {
-  // The links are wired as each body is built, so the rows are drawn again from nothing:
-  // a kept row (`#1229 keyed-row-patching`) would keep the links the old switch gave it.
-  if (providerFacts.threading()) {
-    eachColumn(() => {
-      el("discord-log").replaceChildren();
-      renderCachedTimeline();
-    });
-    eachColumn(() => {
-      if (selection().view === "threads") el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
-    });
-    renderSideColumn();
-  } else {
-    eachColumn(() => regroupChannelRows(true));
-  }
-}
+/** Which view Open in channel lands in, and the links redrawn for it: web/src/view/channel/openinview.ts (`createOpenInView`, #624). */
+const openInViewOwner = createOpenInView({
+  threading: () => providerFacts.threading(),
+  eachColumn: (act) => eachColumn(act),
+  el,
+  renderCachedTimeline: () => renderCachedTimeline(),
+  view: () => selection().view,
+  threadCards: (threads) => threadCards(threads),
+  threads: () => timelineRows().threads,
+  renderSideColumn: () => renderSideColumn(),
+  regroupChannelRows: (redraw) => regroupChannelRows(redraw),
+  storedChoice: () => deviceSettings().get(DEVICE_SETTINGS.openInView),
+  keepChoice: (view) => deviceSettings().keep(DEVICE_SETTINGS.openInView, view),
+  renderChoice: () => messagePreferences.openInView.render(),
+});
+const { redrawMessageLinks, storedOpenInView, renderOpenInView, chooseOpenInView } = openInViewOwner;
 
-/**
- * The view a sent card's Open in channel lands in (`#580 open-in-chat-jump`): "flat", All, every
- * message in the order sent, unless the reader chose "main", the threads. ABSENT MEANS ALL, the
- * owner's choice: "I suggest that the all view with all chronological messages be the default".
- *
- * @returns {"flat" | "main"}
- */
-function storedOpenInView() {
-  return deviceSettings().get(DEVICE_SETTINGS.openInView);
-}
 
-/** Draw the choice as stored. Never writes it: an absent choice stays absent, so it syncs nothing. */
-function renderOpenInView() {
-  messagePreferences.openInView.render();
-}
 
-/** Keep the reader's choice, `view`, and draw it. */
-function chooseOpenInView(view) {
-  try {
-    deviceSettings().keep(DEVICE_SETTINGS.openInView, view);
-  } catch (_error) {
-    // A browser that refuses storage keeps the shipped default.
-  }
-  renderOpenInView();
-}
 
 // --- screens ----------------------------------------------------------------------------------
 //
@@ -1125,26 +1104,13 @@ const screenShowing = createScreenShowing({
   settleFocus: () => settleFocus(),
   scheduleBackSync: () => scheduleBackSync(),
 });
-const { showScreen } = screenShowing;
+const { showScreen, closeSettings } = screenShowing;
 
 // Where Back on Help goes — Settings, which is where Help is opened from, unless `?` opened it
 // (`keysFromKeyboard`) — and where Settings' way out goes are the screens' (`Screens.helpReturn`,
 // `Screens.beforeSettings`), put back as each screen is arrived at (`Screens.arrive`).
 
 
-/**
- * Leave Settings for the screen it was opened from: what its Back button does, and Escape.
- *
- * `#224 keyboard-shortcuts`. Every control on Settings keeps its value the moment it changes, so
- * leaving is the whole of "save and exit". The one thing done first is to let go of a field that
- * still holds the focus: a click on Back takes the focus from it, which is what fires its `change`,
- * and Escape must lose no more than that click does.
- */
-function closeSettings() {
-  const held = /** @type {HTMLElement | null} */ (document.activeElement);
-  if (held && !focusLost() && typeof held.blur === "function") held.blur();
-  showScreen(screens.beforeSettings());
-}
 
 // --- Settings, folded -----------------------------------------------------------------------------
 //
@@ -7398,7 +7364,7 @@ const outboxDispatch = createOutboxDispatch({
     : followsNewest(el("scroll-area")),
   noteSelfAuthor, noteStartsRead: (parts) => noteStartsRead(/** @type {any} */ (parts)), appendPart: (part) => appendToColumns(/** @type {any} */ (part)),
   scrollToNewest: (side) => { if (side) inColumn(columns.side, scrollToNewest); else scrollToNewest(); },
-  markSentRead: (entry) => guardQuietly(markSentRead)(entry),
+  markSentRead: (entry) => guardQuietly(/** @type {any} */ (markSentRead))(entry),
   reportColumnReply, columnReplies, quietly: (run) => guardQuietly(run)(),
 });
 const { queue: queueOutgoingMessage, retry: retryOutgoingMessage, schedule: scheduleOutgoingMessage, blocker: outgoingBlocker, credential: currentCredential, retriesItself, editable: editableSend, waitingItsTurn, resumeRetries: resumeOutgoingRetries, stop: stopOutgoingSends } = outboxDispatch;
@@ -9265,34 +9231,7 @@ application.track(mountListGestures({
   finishPackSlide: () => finishPackSlide(),
 }));
 
-/**
- * Like `guard`, but for things that are not a call: it reports, and it does NOT tear down a live
- * conversation. Reading the channel list must never be able to hang up on the owner.
- */
-function guardQuietly(fn) {
-  return (...args) =>
-    Promise.resolve(fn(...args)).catch((error) => {
-      showError(error.message);
-    });
-}
 
-/**
- * Like `guardQuietly`, for a re-read of the channel nobody asked for: the poll, the live feed's
- * catch-up. `#195 send-resilience`.
- *
- * Its failure is already said over the rows it is about, by the freshness pill — "Refresh failed ·
- * showing messages from 10:17". The banner on top of that was the same news a second time, in the
- * server's diagnostic words, back on every poll for as long as the service stayed slow, and it
- * read as though something the reader did had failed. The banner stays for what the reader asked
- * for, and for a failure with no rows on screen to carry it — reworded, never raw.
- */
-function refreshQuietly(fn) {
-  return (...args) =>
-    Promise.resolve(fn(...args)).catch((error) => {
-      if (error && error.shownInPill) return;
-      showError(readableChannelFailure(error));
-    });
-}
 
 // The boot, mounted and started in the page's order (`createApplication`, above): the mounts
 // were tracked as the wiring mounted them, and the start acts are the first drawing and sign-in.

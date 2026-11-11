@@ -16,7 +16,7 @@ const SCREEN_TITLES: Readonly<Record<string, string>> = Object.freeze({ settings
 /** What showing a screen asks of the page. */
 export interface ScreenShowingDependencies {
   /** Which screen is up, and a screen arrived at (`Screens.screen`, `Screens.arrive`). */
-  readonly screens: Pick<Screens, "screen" | "arrive">;
+  readonly screens: Pick<Screens, "screen" | "arrive" | "beforeSettings">;
   /** The page's element by id, in the column being worked on (`el`). */
   el(id: string): HTMLElement;
   /** Close the room past the right column's foot (`closeOverscroll`, `#338 column-overscroll`). */
@@ -63,10 +63,12 @@ export interface ScreenShowingDependencies {
   scheduleBackSync(): void;
 }
 
-/** Showing a screen's one command. */
+/** Showing a screen's commands. */
 export interface ScreenShowing {
   /** Show screen `name`, everything that goes with the change done around it, in order. */
   showScreen(name: string): void;
+  /** Leave Settings for the screen it was opened from. */
+  closeSettings(): void;
 }
 
 /** Showing as the page has it. */
@@ -178,7 +180,21 @@ export function createScreenShowing(deps: ScreenShowingDependencies): ScreenShow
     deps.scheduleBackSync();
   }
 
-  return { showScreen };
+  /**
+   * Leave Settings for the screen it was opened from: what its Back button does, and Escape.
+   *
+   * `#224 keyboard-shortcuts`. Every control on Settings keeps its value the moment it changes, so
+   * leaving is the whole of "save and exit". The one thing done first is to let go of a field that
+   * still holds the focus: a click on Back takes the focus from it, which is what fires its `change`,
+   * and Escape must lose no more than that click does.
+   */
+  function closeSettings(): void {
+    const held = document.activeElement as HTMLElement | null;
+    if (held && !deps.focusLost() && typeof held.blur === "function") held.blur();
+    showScreen(screens.beforeSettings());
+  }
+
+  return { showScreen, closeSettings };
 }
 
 // What the page and the tests use of it.
