@@ -134,6 +134,7 @@ def _status_args(root: Path, **overrides: object) -> argparse.Namespace:
         "slot": None,
         "verbose": False,
         "scan_timeout": 180.0,
+        "scan_memory_limit": 0.0,
     }
     values.update(overrides)
     return argparse.Namespace(**values)
@@ -234,6 +235,82 @@ def test_storage_scan_git_calls_grow_per_checkout_not_per_finding(
     # share the repository: growth is exactly the checkout growth.
     assert counts[3] == 3 + 2
     assert counts[7] == 7 + 2
+
+
+def test_event_retention_stays_flat_as_the_log_grows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _registry(tmp_path / "case", 1)
+    config = wrkslots_cli._load_config(str(root), None)
+    # Keep every written event settled, so the memo may keep it at once.
+    later = wrkslots_cli._EVENT_MEMO_STABLE_NS * 10
+    monkeypatch.setattr(
+        wrkslots_cli, "_event_memo_clock_ns", lambda: 10**18 + later
+    )
+    monkeypatch.setattr(wrkslots_cli, "_EVENT_MEMO_BYTES_LIMIT", 4096)
+    monkeypatch.setattr(wrkslots_cli, "_CHAIN_MEMO_EVENTS_LIMIT", 4)
+    retained: list[int] = []
+    total = 0
+    for batch in (30, 120):
+        for _ in range(batch):
+            wrkslots_cli._write_event_file(config, "node-a", "heartbeat", {})
+        total += batch
+        with wrkslots_cli._event_memo_scope() as memo:
+            events = wrkslots_cli._load_events(config, "node-a")
+            assert len(events) == total
+            retained.append(memo.file_bytes)
+            # No whole chain is kept past the event cap.
+            assert memo.chains == {}
+    # Retained parsed bytes never pass the cap, however long the log grows.
+    assert all(size <= 4096 for size in retained), retained
+    # The streaming verifier still sees every record, retaining none.
+    assert sum(1 for _ in wrkslots_cli._iter_events(config, "node-a")) == 150
+
+
+def test_status_memory_bound_reports_partial_and_exits_nonzero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _registry(tmp_path / "case", 2)
+
+    def exhausted(*args: object, **kwargs: object) -> object:
+        raise MemoryError
+
+    monkeypatch.setattr(wrkslots_cli, "_owner_liveness_states", exhausted)
+    stream = io.StringIO()
+    with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(io.StringIO()):
+        rc = wrkslots_cli._cmd_status(_status_args(root))
+    assert rc == 2
+    payload = json.loads(stream.getvalue())
+    assert payload["partial"] is True
+    assert "scan_memory_limit" not in payload  # detail lives in scan_timeout
+    assert "memory" in payload["scan_timeout"]
+
+
+def test_scan_memory_limit_applies_an_address_space_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    applied: list[tuple[int, tuple[int, int]]] = []
+    monkeypatch.setattr(
+        wrkslots_cli.resource,
+        "getrlimit",
+        lambda which: (0, wrkslots_cli.resource.RLIM_INFINITY),
+    )
+    monkeypatch.setattr(
+        wrkslots_cli.resource,
+        "setrlimit",
+        lambda which, limits: applied.append((which, limits)),
+    )
+    wrkslots_cli._apply_scan_memory_limit(
+        argparse.Namespace(scan_memory_limit=2.0)
+    )
+    assert applied == [
+        (wrkslots_cli.resource.RLIMIT_AS, (2 * (1 << 30), wrkslots_cli.resource.RLIM_INFINITY))
+    ]
+    applied.clear()
+    wrkslots_cli._apply_scan_memory_limit(
+        argparse.Namespace(scan_memory_limit=0.0)
+    )
+    assert applied == []
 
 
 def test_handoff_publication_parses_each_historical_record_once(

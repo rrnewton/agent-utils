@@ -3226,6 +3226,11 @@ Every read-only scan is wall-bounded: `--scan-timeout SECONDS` caps one `status`
 legitimate large audit spends judging rows). A scan that passes the bound prints the
 results it has as partial (a `PARTIAL:` line, or `"partial": true` in JSON) and exits 2
 instead of running on, so a slow registry degrades the report, never the lock.
+`--scan-memory-limit GIB` (default 4, 0 disables) likewise caps the scan process's
+address space; a scan that reaches it reports partial results the same way instead
+of growing until the host kills it. Parsed-event retention inside one command is
+capped too (256 MiB of event files, and no whole verified chain over 5,000 events),
+so a long event log costs re-reads on later loads, never unbounded memory.
 
 `audit` already snapshots the registry under a short lock and measures outside it. It judges
 up to `--jobs` registered rows at once (default: the smaller of 4 and the CPUs it may run on).

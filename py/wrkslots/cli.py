@@ -7795,6 +7795,15 @@ def _event_from_path(
 # the chain before it changes the directory.
 _EVENT_MEMO_STABLE_NS = 2_000_000_000
 _EVENT_MEMO_ENTRIES_LIMIT = 1 << 17
+#: Total parsed-event bytes the per-file memo and a kept chain may retain
+#: (#1247). The memo exists so one command parses each event once (a batch
+#: loads the log dozens of times); uncapped, it also kept the whole parsed
+#: history for the command's life, which is the growth behind the 640 GiB
+#: status kill. Past the cap the memo starts over: later loads re-read what
+#: they need, and retained bytes stay flat however long the log grows.
+_EVENT_MEMO_BYTES_LIMIT = 256 << 20
+#: A verified chain longer than this is not retained whole (#1247).
+_CHAIN_MEMO_EVENTS_LIMIT = 5000
 _REPLAY_MEMO_ENTRIES_LIMIT = 8
 _PENDING_MEMO_ENTRIES_LIMIT = 8
 _EPISODE_MEMO_ENTRIES_LIMIT = 64
@@ -7836,6 +7845,8 @@ class _EventMemo:
     chains: dict[tuple[str, str], _VerifiedEventChain] = dataclasses.field(
         default_factory=dict
     )
+    #: Sum of the file sizes of the events kept in ``files`` (#1247 cap).
+    file_bytes: int = 0
 
 
 _ACTIVE_EVENT_MEMO: list[_EventMemo] = []
@@ -7920,9 +7931,15 @@ def _verify_event_paths(
                 and identity[4] + _EVENT_MEMO_STABLE_NS <= observed_ns
                 and _event_file_identity(path) == identity
             ):
-                if len(memo) >= _EVENT_MEMO_ENTRIES_LIMIT:
+                memo_scope = _ACTIVE_EVENT_MEMO[-1]
+                if (
+                    len(memo) >= _EVENT_MEMO_ENTRIES_LIMIT
+                    or memo_scope.file_bytes + identity[2] > _EVENT_MEMO_BYTES_LIMIT
+                ):
                     memo.clear()
+                    memo_scope.file_bytes = 0
                 memo[key] = (identity, expected_sequence, previous, raw)
+                memo_scope.file_bytes += identity[2]
                 kept = identity
         previous = _as_str(raw["sha256"], "append-only event.sha256")
         events.append(raw)
@@ -7959,9 +7976,45 @@ def _load_events(config: Config, machine: str | None = None) -> tuple[dict[str, 
         [directory / name for name in names], selected
     )
     identities = tuple(identity for identity in trusted if identity is not None)
-    if len(identities) == len(names):
+    if (
+        len(identities) == len(names)
+        and len(names) <= _CHAIN_MEMO_EVENTS_LIMIT
+        and sum(item[2] for item in identities) <= _EVENT_MEMO_BYTES_LIMIT
+    ):
         chains[key] = _VerifiedEventChain(names, identities, events)
     return events
+
+
+def _iter_events(
+    config: Config, machine: str | None = None
+) -> Iterator[dict[str, object]]:
+    """Verify one chain record by record, retaining nothing (#1247).
+
+    Each event is parsed, chain-checked and yielded; the caller folds what
+    it needs and drops the rest, so a fold over a long log holds only its
+    derived state, never the parsed history.
+    """
+
+    selected = machine or config.machine
+    directory = _event_directory(config, selected)
+    previous = "0" * 64
+    for sequence, name in enumerate(_event_file_names(directory), start=1):
+        raw = _event_from_path(directory / name, selected, sequence, previous)
+        previous = _as_str(raw["sha256"], "append-only event.sha256")
+        yield raw
+
+
+def _chain_tip(config: Config, machine: str) -> tuple[int, str | None]:
+    """Event count and last digest of one chain, reading only its last file."""
+
+    directory = _event_directory(config, machine)
+    names = _event_file_names(directory)
+    if not names:
+        return 0, None
+    raw = _read_json(directory / names[-1], "append-only event")
+    return len(names), _as_str(
+        _as_mapping(raw, "append-only event")["sha256"], "append-only event.sha256"
+    )
 
 
 @dataclasses.dataclass
@@ -41884,12 +41937,17 @@ def _audit_slot_root_listing(
 
 
 def _cmd_audit(args: argparse.Namespace) -> int:
+    _apply_scan_memory_limit(args)
     try:
         return _cmd_audit_scan(args)
-    except _ScanTimeout as exc:
-        # Partial results (#1247): the scan stopped at its wall bound, so no
-        # verdicts are published; the marker keeps that from reading as clean.
-        detail = str(exc)
+    except (_ScanTimeout, MemoryError) as exc:
+        # Partial results (#1247): the scan stopped at its wall or memory
+        # bound, so no verdicts are published; the marker keeps that from
+        # reading as clean.
+        detail = str(exc) or (
+            "read-only scan exceeded its --scan-memory-limit bound; "
+            "rerun with a larger bound if a full scan is required"
+        )
         if getattr(args, "format", "human") == "json":
             print(
                 json.dumps(
@@ -42988,6 +43046,7 @@ def _cmd_unpushed(args: argparse.Namespace) -> int:
     if args.slot is not None:
         _validate_name(args.slot, "slot")
     deadline = _scan_deadline(args)
+    _apply_scan_memory_limit(args)
     _prewarm_registry_read(lambda: _validate_global_state(config))
     # Snapshot under a short shared lock, scan outside it (#1247). This
     # command used to hold the lock across every per-checkout Git probe and
@@ -43049,6 +43108,11 @@ def _cmd_unpushed(args: argparse.Namespace) -> int:
                 )
     except _ScanTimeout as exc:
         partial_detail = str(exc)
+    except MemoryError:
+        partial_detail = (
+            "read-only scan exceeded its --scan-memory-limit bound; "
+            "rerun with a larger bound if a full scan is required"
+        )
     payload: dict[str, object] = {"schema": SCHEMA, "slots": rows}
     if partial_detail is not None:
         payload["partial"] = True
@@ -43183,6 +43247,40 @@ def _check_scan_deadline(deadline: float, snapshot: object = None) -> None:
             "read-only scan exceeded its --scan-timeout bound; "
             "rerun with a larger bound if a full scan is required",
             snapshot,
+        )
+
+
+#: Default address-space self-limit for one read-only scan, in GiB (#1247).
+#: A scan that reaches it fails its next allocation and reports partial
+#: results instead of growing until the host OOM-kills it.
+_SCAN_MEMORY_LIMIT_DEFAULT_GIB = 4.0
+
+
+def _apply_scan_memory_limit(args: argparse.Namespace) -> None:
+    """Cap this process's address space for a read-only scan (best effort).
+
+    A platform or sandbox that refuses the limit leaves the scan unbounded
+    apart from its wall bound; the refusal is noted, never fatal, because a
+    reader must not fail for an environment it cannot control.
+    """
+
+    gib = getattr(args, "scan_memory_limit", None)
+    if gib is None:
+        gib = _SCAN_MEMORY_LIMIT_DEFAULT_GIB
+    if not (math.isfinite(gib) and gib >= 0):
+        raise Refusal("--scan-memory-limit must be a finite non-negative number of GiB")
+    if gib == 0:
+        return
+    limit = int(gib * (1 << 30))
+    try:
+        _soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        if hard != resource.RLIM_INFINITY and hard < limit:
+            limit = hard
+        resource.setrlimit(resource.RLIMIT_AS, (limit, hard))
+    except (OSError, ValueError) as exc:
+        print(
+            f"wrkslots: cannot apply --scan-memory-limit: {exc}",
+            file=sys.stderr,
         )
 
 
@@ -43801,6 +43899,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         )
     )
     deadline = _scan_deadline(args)
+    _apply_scan_memory_limit(args)
     cache = _PhasedReadCache(deadline=deadline)
 
     def snapshot() -> tuple[
@@ -43911,6 +44010,12 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
             for state in states
             for record in state.slots
         ]
+    except MemoryError:
+        partial_detail = (
+            "read-only scan exceeded its --scan-memory-limit bound; "
+            "rerun with a larger bound if a full scan is required"
+        )
+        states, findings, rows = [], [], []
     cap = config.max_active_slots
     wt_scope = (
         f"skipped: {config.worktrees_image_skipped}"
@@ -44002,6 +44107,7 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
         )
     )
     deadline = _scan_deadline(args)
+    _apply_scan_memory_limit(args)
     cache = _PhasedReadCache(deadline=deadline)
 
     def snapshot() -> tuple[
@@ -44112,6 +44218,13 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
             for record in state.slots
             if args.slot is None or record.slot == args.slot
         ]
+    except MemoryError:
+        # Memory bound hit (#1247): no snapshot survived to report from.
+        partial_detail = (
+            "read-only scan exceeded its --scan-memory-limit bound; "
+            "rerun with a larger bound if a full scan is required"
+        )
+        states, storage_inconsistencies, records, journals = [], (), [], []
     if tearing_down and not _VERBOSE_DIAGNOSTICS.get():
         print(
             f"wrkslots: {len(tearing_down)} tearing-down PID namespaces ignored",
@@ -75795,6 +75908,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
             f"(default: {_READ_SCAN_TIMEOUT_DEFAULT_SECONDS:g})"
         ),
     )
+    status.add_argument(
+        "--scan-memory-limit",
+        type=float,
+        default=_SCAN_MEMORY_LIMIT_DEFAULT_GIB,
+        metavar="GIB",
+        help=(
+            "address-space self-limit for the read-only scan in GiB; past it the "
+            "command prints partial results marked PARTIAL and exits 2; 0 disables it"
+        ),
+    )
     status.set_defaults(handler=_cmd_status)
 
     doctor = subparsers.add_parser(
@@ -75816,6 +75939,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "wall bound for the read-only scan in seconds; past it the command "
             "prints partial results marked PARTIAL and exits 2 "
             f"(default: {_READ_SCAN_TIMEOUT_DEFAULT_SECONDS:g})"
+        ),
+    )
+    doctor.add_argument(
+        "--scan-memory-limit",
+        type=float,
+        default=_SCAN_MEMORY_LIMIT_DEFAULT_GIB,
+        metavar="GIB",
+        help=(
+            "address-space self-limit for the read-only scan in GiB; past it the "
+            "command prints partial results marked PARTIAL and exits 2; 0 disables it"
         ),
     )
     doctor.set_defaults(handler=_cmd_doctor)
@@ -75919,6 +76052,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
             f"and exits 2 (default: {_AUDIT_SCAN_TIMEOUT_DEFAULT_SECONDS:g})"
         ),
     )
+    audit.add_argument(
+        "--scan-memory-limit",
+        type=float,
+        default=_SCAN_MEMORY_LIMIT_DEFAULT_GIB,
+        metavar="GIB",
+        help=(
+            "address-space self-limit for the read-only scan in GiB; past it the "
+            "command prints partial results marked PARTIAL and exits 2; 0 disables it"
+        ),
+    )
     audit.set_defaults(handler=_cmd_audit)
 
     unpushed = subparsers.add_parser(
@@ -75937,6 +76080,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "wall bound for the read-only scan in seconds; past it the command "
             "prints partial results marked PARTIAL and exits 2 "
             f"(default: {_READ_SCAN_TIMEOUT_DEFAULT_SECONDS:g})"
+        ),
+    )
+    unpushed.add_argument(
+        "--scan-memory-limit",
+        type=float,
+        default=_SCAN_MEMORY_LIMIT_DEFAULT_GIB,
+        metavar="GIB",
+        help=(
+            "address-space self-limit for the read-only scan in GiB; past it the "
+            "command prints partial results marked PARTIAL and exits 2; 0 disables it"
         ),
     )
     unpushed.set_defaults(handler=_cmd_unpushed)
