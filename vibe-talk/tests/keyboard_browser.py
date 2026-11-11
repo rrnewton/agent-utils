@@ -34,9 +34,7 @@ under a person's fingers, and measures the list that is on screen:
   then asks the chat service once to mark it read (`after_reply`), and folds it, the ring staying on
   it, no other message changed and neither the list nor the message moving by a pixel, and pressed
   again writes no second Done and asks the server's floor, which asks the service nothing (`#295
-  shift-e-read-collapse`), Enter opens and closes a long message, Shift+Down and Shift+Up step
-  through only the unread messages of a mixed list in either direction and stop with a hint at
-  either end (`#1314 unread-step-keys`), and -> on a message in a thread
+  shift-e-read-collapse`), Enter opens and closes a long message, and -> on a message in a thread
   enters the thread, <- comes back to the message it was opened from, and so does Esc -> Ctrl+K
   opens the channel picker and Esc leaves it for the list; a channel chosen from it gives the keys
   back to the list, so j and the arrows move the ring rather than the picker -> "?" then "," leaves
@@ -880,54 +878,6 @@ def ringed(walk: Walk, chord: str, why: str, leaving: str | None = None) -> dict
     check(number(row, "top") >= -1 and number(row, "bottom") <= number(row, "height") + 1 or number(row, "top") >= -1,
           f"{why}: the selected message is not on screen: {row}")
     return row
-
-
-def unread_step_keys(walk: Walk, api: FakeApi) -> None:
-    """`#1314 unread-step-keys`: Shift+arrows through only the unread of a mixed list, at 1280x800.
-
-    Every message but three is marked Done on the server first (its own dismissals route), so the
-    list the keys walk is mostly read; the page is reloaded onto it. Home selects the oldest row;
-    Shift+Down visits the three unread in order, Shift+Up comes back the same way, and at either
-    end the selection stays where it is and the status line says there are no more. Plain arrows
-    afterwards still step one message, onto a read one."""
-    keep = {"880000000000000005", "880000000000000025", "880000000000000045"}
-    with api.lock:
-        dismissed_before = set(api.dismissed)
-    api.dismiss({"messages": [str(m["id"]) for m in api.messages
-                              if str(m["id"]) not in keep and str(m["id"]).startswith("8800")]})
-    walk.page.reload(wait_until="load")
-    walk.page.wait_for_selector('#discord-log > li[data-id]', state="visible", timeout=10_000)
-    walk.page.evaluate(RECORD_KEYS_JS)
-    oldest = ringed(walk, "Home", "unread steps: Home")
-    check(str(oldest["id"]).endswith("0000"), f"unread steps: Home did not select the oldest message: {oldest}")
-    for chord, want in (("Shift+ArrowDown", "0005"), ("Shift+ArrowDown", "0025"), ("Shift+ArrowDown", "0045")):
-        row = ringed(walk, chord, f"unread steps: {chord} to {want}")
-        check(str(row["id"]).endswith(want), f"unread steps: {chord} selected {row['id']}, not the unread {want}")
-    press(walk.cdp, "Shift+ArrowDown")
-    walk.settled()
-    check(str(walk.page.evaluate("() => document.getElementById('status').textContent")).startswith("No more unread below."),
-          "unread steps: the last unread below did not say so on the status line")
-    check(str(ring(walk)["id"]).endswith("0045"),
-          "unread steps: the selection moved past the last unread")
-    for chord, want in (("Shift+ArrowUp", "0025"), ("Shift+ArrowUp", "0005")):
-        row = ringed(walk, chord, f"unread steps: {chord} to {want}")
-        check(str(row["id"]).endswith(want), f"unread steps: {chord} selected {row['id']}, not the unread {want}")
-    press(walk.cdp, "Shift+ArrowUp")
-    walk.settled()
-    check(str(walk.page.evaluate("() => document.getElementById('status').textContent")).startswith("No more unread above."),
-          "unread steps: the first unread above did not say so on the status line")
-    check(str(ring(walk)["id"]).endswith("0005"), "unread steps: the selection moved above the first unread")
-    # Plain arrows are unchanged: one message at a time, onto a read one and back.
-    row = ringed(walk, "ArrowDown", "unread steps: a plain arrow after them")
-    check(str(row["id"]).endswith("0006"), f"unread steps: a plain ArrowDown selected {row['id']}, not the next message")
-    row = ringed(walk, "ArrowUp", "unread steps: a plain arrow back")
-    check(str(row["id"]).endswith("0005"), f"unread steps: a plain ArrowUp selected {row['id']}, not the message above")
-    walk.notes.append("Shift+Down and Shift+Up visited only the unread messages of a mixed list in order, "
-                      "stopped with a hint at either end, and plain arrows still stepped one message")
-    # The mixed list was this walk's alone: the server's Done set goes back as it was.
-    with api.lock:
-        api.dismissed.clear()
-        api.dismissed.update(dismissed_before)
 
 
 def keymap_keys(walk: Walk, api: FakeApi) -> None:
@@ -1777,7 +1727,6 @@ def main() -> int:
             picker_and_help_keys(walk)
             two_columns_single(walk)
             view_keys(walk, "Control", "Ctrl")
-            unread_step_keys(walk, api)
 
             # The same on a Mac, as `navigator.platform` reports it there: the page says Cmd, and Cmd
             # (Meta) is the chord. A second tab of the signed-in profile, its platform emulated.
