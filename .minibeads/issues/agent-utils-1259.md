@@ -34,3 +34,4 @@ Out of scope: the `herdr-agent` and `agentctl` cross-language differentials (the
 # Notes
 
 Filed by the test-robustness audit lane (mu-testaudit). Related: #1267 wrkslots-load-robust (same quarantine mechanism), #1249 cross-differentials-robust (differentials, separate).
+- Hunt (mu-testaudit, 2026-11-10): my four gate logs name no failing agentctl case; `rust.agentctl.test` failed once (389s, exit 1) with no retained case detail. No case quarantined without a name and mechanism; next red must retain case names from the step detail.

@@ -534,6 +534,7 @@ def _cache_fixture(base: Path) -> Path:
     return root
 
 
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_audit_census_partial_then_complete_matches_python(tmp_path: Path) -> None:
     root = _cache_fixture(tmp_path)
     python_first = _python(root, tmp_path, work_limit=1)

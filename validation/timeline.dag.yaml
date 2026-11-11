@@ -4,11 +4,15 @@ resource_caps:
   # Real browsers, as many at once as vibe-talk/tests.dag.yaml allows its own: the composed graph
   # refuses two fragments that disagree on a cap.
   browser: 8
-  # The three steps below share py/tests/js/browser's output directory, and the functional suite
-  # serves its fixture on a fixed port, so they take turns with each other whatever the browser cap.
+  # The three steps below share py/tests/js/browser's output directory, so they take turns with
+  # each other whatever the browser cap. The functional suite serves its fixture on an ephemeral
+  # port (bind :0 via the config's free-port probe; AGENT_TIMELINE_E2E_PORT pins one explicitly).
   timeline-fixture: 1
 
 steps:
+  # Benchmark steps are labelled disabled-optin (#1252 timeline-benchmark-optin; owner reply
+  # 346): redraw budgets are timing measurements, so validate.py excludes them by default and
+  # --include-disabled runs them on demand.
   # The browser checks run Playwright from py/tests/js/browser/node_modules and drive the Chromium
   # build that Playwright version names, so they depend on the step that installs both rather than
   # on whoever last ran `npm install` there. The directory tracks no lockfile (see its README); its
@@ -82,7 +86,7 @@ steps:
       benchmark-site.test.cjs
     jobs_flag: ""
     deps: [setup.browser-deps]
-    labels: [validation-timeline, component-wrkviz]
+    labels: [validation-timeline, component-wrkviz, disabled-optin]
     timeout: 7200
     cpu_timeout: 900
     hint:
@@ -104,7 +108,7 @@ steps:
       printf '\n' && cat benchmark-report.txt
     jobs_flag: ""
     deps: [setup.browser-deps]
-    labels: [validation-timeline, component-wrkviz]
+    labels: [validation-timeline, component-wrkviz, disabled-optin]
     timeout: 7200
     cpu_timeout: 900
     hint:

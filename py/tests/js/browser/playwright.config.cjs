@@ -3,7 +3,18 @@
 const path = require("path");
 const { defineConfig } = require("@playwright/test");
 
-const port = Number(process.env.AGENT_TIMELINE_E2E_PORT || 41739);
+// No fixed port (#1252): derive the port from this checkout's path, so
+// parallel gates in different checkouts never collide on one fixed port,
+// while every process that loads this config in one run agrees on it.
+// Pin AGENT_TIMELINE_E2E_PORT to choose a specific port.
+const crypto = require("crypto");
+
+function derivedPort() {
+  const digest = crypto.createHash("sha256").update(__dirname).digest();
+  return 21000 + (digest.readUInt16BE(0) % 18000);
+}
+
+const port = Number(process.env.AGENT_TIMELINE_E2E_PORT || derivedPort());
 const baseURL = "http://127.0.0.1:" + port;
 
 module.exports = defineConfig({
