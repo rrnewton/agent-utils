@@ -329,22 +329,24 @@
   display: none;
 }
 /* With the bar in the header the drop-up opens downward instead, as the trays do. */
-#control-bar[data-placement="top"] .docs-menu {
+#control-bar[data-placement="top"] .docs-menu,
+#control-bar[data-placement="top"] .docs-since {
   top: calc(100% + 6px);
   bottom: auto;
 }
-/* The Fetch since… prompt (`#1308 doc-fetch-since-prompt`): a framed card fixed
-   to the viewport above the bar's right end, in the popovers' dress (the tab
-   row's opaque dock ground, edge and lift). It used to be a plain row at the
-   top of the list inside the scroller — off-screen wherever the list was
-   scrolled to its newest end, so choosing the menu item visibly did nothing.
-   Fixed here it is where the thumb already is, on a phone and a desk alike,
-   however far the list has scrolled; the bottom room clears the bar row, and
-   with the bar moved to the header the card stays at this same corner. */
+/* The Fetch since… prompt (`#1308 doc-fetch-since-prompt`): a framed card
+   above the bar's right end, in the popovers' dress (the tab row's opaque
+   dock ground, edge and lift). It used to be a plain row at the top of the
+   list inside the scroller — off-screen wherever the list was scrolled to
+   its newest end, so choosing the menu item visibly did nothing. Anchored
+   to the bar like its drop-up menu (never `fixed`: nothing on this page
+   escapes the scroller's containment that way) it is where the thumb
+   already is, on a phone and a desk alike, however far the list has
+   scrolled; with the bar in the header it opens downward, as the menu does. */
 .docs-since {
-  position: fixed;
-  right: calc(8px + env(safe-area-inset-right));
-  bottom: calc(5.5rem + env(safe-area-inset-bottom));
+  position: absolute;
+  bottom: calc(100% + 6px);
+  right: 8px;
   width: min(22rem, calc(100vw - 16px));
   z-index: var(--z-modal);
   display: flex;

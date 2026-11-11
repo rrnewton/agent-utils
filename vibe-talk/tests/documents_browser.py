@@ -215,8 +215,8 @@ def check_star_gold(label: str, off: dict[str, str], on: dict[str, str]) -> None
 def check_fetch_since_prompt(page: Page, width: int, height: int, use_touch: bool) -> None:
     """Fetch since… presents its since-when prompt in the viewport
     (`#1308 doc-fetch-since-prompt`): with the list scrolled to its newest
-    (bottom) end the card is fixed on screen, asks since when, holds the
-    focus, and Cancel puts it away."""
+    (bottom) end the card hangs on screen above the bar, asks since when,
+    holds the focus, and Cancel puts it away."""
     press = page.tap if use_touch else page.click
     page.evaluate(
         "() => { const root = document.getElementById('scroll-area');"
@@ -229,7 +229,7 @@ def check_fetch_since_prompt(page: Page, width: int, height: int, use_touch: boo
           "the prompt does not ask since when")
     position = page.evaluate(
         "() => getComputedStyle(document.getElementById('docs-since')).position")
-    check(position == "fixed", f"the prompt is not fixed to the viewport (position: {position})")
+    check(position == "absolute", f"the prompt is not anchored above the bar (position: {position})")
     box = page.locator("#docs-since").bounding_box()
     check(box is not None and box["x"] >= 0 and box["y"] >= 0
           and box["x"] + box["width"] <= width and box["y"] + box["height"] <= height,

@@ -358,8 +358,8 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
         if (act === "visible") reportFetching((progress) => list.fetchVisible(progress));
         else if (act === "since") {
           // Ask since when where the owner is looking (`#1308`): the prompt
-          // card is fixed to the viewport, and its first field takes the
-          // focus (its value selected, ready to overtype).
+          // card hangs above the bar, and its first field takes the focus
+          // (its value selected, ready to overtype).
           since.hidden = false;
           try {
             const days = deps.byId("docs-since-days") as HTMLInputElement;

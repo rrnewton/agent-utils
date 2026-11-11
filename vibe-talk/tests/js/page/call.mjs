@@ -3600,8 +3600,10 @@ test("THERE IS EXACTLY ONE COMPOSER FOR THE AGENT, AND IT IS IN THE CALL'S TRANS
   // Nothing typeable is left in the dock at all: the bar does not convert into a field any more.
   const dock = HTML.slice(HTML.indexOf('id="dock"'));
   const typeable = [...(dock.match(/<input[^>]*>/g) || []), ...(dock.match(/<textarea[^>]*>/g) || [])].filter(
-    // The pace box (`#567 pace-stepper`) takes a percent, not a message to anyone.
-    (tag) => !/type="(range|checkbox|radio|button)"/.test(tag) && !/id="read-speed-box"/.test(tag)
+    // The pace box (`#567 pace-stepper`) takes a percent, not a message to anyone. The
+    // Fetch-since days/hours (`#1308 doc-fetch-since-prompt`) take a span, not a message.
+    (tag) => !/type="(range|checkbox|radio|button)"/.test(tag) && !/id="read-speed-box"/.test(tag) &&
+      !/id="docs-since-(days|hours)"/.test(tag)
   );
   assert.deepStrictEqual(typeable, [], "the dock still holds a text field, so there are two composers");
   // The one that is left is in the call's pane, inside the scrolling element, after the turns.
