@@ -377,6 +377,26 @@ class Desk:
             self.page.wait_for_timeout(25)
         check(False, f"{self.label} {what}: only {int(self.page.evaluate(peek_js))} frames were sampled")
 
+    def scroll_to_middle(self, area_id: str) -> None:
+        """Park scroller `area_id` in the middle quarter of its range, re-aiming as it settles.
+
+        The midpoint recomputed each poll is a moving target while rows above still reshape
+        (scrollHeight grows and anchoring shifts scrollTop), so aim at the quarter band and
+        re-set only when outside it; the walk needs a middle-ish reader, not an exact pixel.
+        """
+        deadline = time.monotonic() + STATE_S
+        while time.monotonic() < deadline:
+            if bool(self.page.evaluate(
+                    f"() => {{ const a = document.getElementById('{area_id}');"
+                    " const range = a.scrollHeight - a.clientHeight;"
+                    " if (range <= 0) return false;"
+                    " const at = a.scrollTop / range;"
+                    " if (at >= 0.25 && at <= 0.75) return true;"
+                    " a.scrollTop = Math.round(range / 2); return false; }")):
+                return
+            self.page.wait_for_timeout(100)
+        check(False, f"{self.label}: the list never reached its middle")
+
     def wait_selected(self, list_id: str, row_id: str | None = None) -> None:
         """Wait until `list_id` has a selected row (the row `row_id`, when one is named)."""
         wanted = "true" if row_id is None else f"row.getAttribute('data-id') === '{row_id}'"
@@ -546,11 +566,7 @@ def one_column(desk: Desk) -> None:
     before = desk.state("discord-log")
     check(len(before) == POSTS + REPLIES and all(before.values()),
           f"{desk.label}: not every long message arrived folded: {before}")
-    page.evaluate("() => { const area = document.getElementById('scroll-area'); "
-                  "area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) / 2); }")
-    desk.wait_for("() => { const a = document.getElementById('scroll-area');"
-                  " return Math.abs(a.scrollTop - Math.round((a.scrollHeight - a.clientHeight) / 2)) <= 2; }",
-                  "the list never reached its middle")
+    desk.scroll_to_middle("scroll-area")
     page.evaluate("() => document.getElementById('scroll-area').focus()")
     for chord in ("ArrowDown", "j", "j"):
         desk.key(chord)
