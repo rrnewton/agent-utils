@@ -273,6 +273,12 @@ export interface PageNavigationDependencies<Column, ThreadLike, Pane> {
   headOfList(area: HTMLElement, row: HTMLElement): number;
   renderScrollTools(): void;
   revealRow(row: HTMLElement, center: boolean): void;
+  /**
+   * Note the row a jump just landed on as the scroll anchor (`#1224 mention-jump-in-view`):
+   * what arrives above it afterwards holds it, not the first row on screen. Optional where
+   * a host does not wire the anchor; the landing itself is unchanged there.
+   */
+  noteJumpAnchor?(row: HTMLElement, id: string): void;
   idsOf(row: HTMLElement): string[];
   // In-app links.
   inAppLinksOn(): boolean;
@@ -927,6 +933,12 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
     deps.openReadRun(row as HTMLElement);
     deps.setLinkedMark(String(deps.selectedChannelId()), String(id));
     deps.revealRow((deps.rowHolding(id) || row) as HTMLElement, center);
+    // `#1224 mention-jump-in-view`. The landed row is the reader's place now: what arrives
+    // above it after this (live turns, summaries, a page of older history) holds this row.
+    if (deps.noteJumpAnchor) {
+      const landed = (deps.rowHolding(id) || row) as HTMLElement;
+      deps.noteJumpAnchor(landed, String(id));
+    }
     deps.renderScrollTools();
     deps.setStatus("Here is the linked message.");
     return true;

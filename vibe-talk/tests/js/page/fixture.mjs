@@ -5193,6 +5193,10 @@ const TUNING_BANDS = {
   STACK_CHARS: [128, 4096, "chars of one write's stack kept in one trace entry"],
   SCROLL_TRACE_AUTO_SEND_MS: [10000, 300000, "the least while between the trace posting itself"],
   SCROLL_TRACE_INPUT_QUIET_MS: [100, 2000, "how long after the reader's last input a move is still theirs"],
+  // `#1224 mention-jump-in-view`. How often a landed row is checked while it can still be lost:
+  // under four a second checks chase every resize of a page still settling; far slower than
+  // frames a reader sees misses the loss until whatever pushed it has itself gone.
+  JUMP_LOST_CHECK_MS: [50, 1000, "ms between checks of a jumped-to row while it may still be lost"],
   FOLLOW_REST_PX: [4, 20, "px above the rows' foot that still counts as resting on it for follow"],
   KEYBOARD_MIN_PX: [100, 220,
     "the least height an on-screen keyboard takes from the viewport before the page hides both bars for it: " +

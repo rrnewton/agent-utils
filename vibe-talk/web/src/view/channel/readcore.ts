@@ -253,6 +253,8 @@ export interface TimelineViewDependencies {
   searchOffered(): boolean;
   pullToRefresh: { fingerDown(): boolean };
   heldFilterRow(): Element | null;
+  /** The row a jump just landed on, held as the place until the reader moves (`#1224`). Absent: unkept. */
+  jumpAnchorRow?(): Element | null;
   scrollAnchor(area: HTMLElement): Element | null;
   /** The reader's text selection in `area` and putting it back (`#1209`), as the scroll keeper's. */
   selectionIn?(area: HTMLElement): { id: string; start: number; end: number } | null;
@@ -426,6 +428,7 @@ export function createTimelineView(deps: TimelineViewDependencies): TimelineView
   const searchOffered = deps.searchOffered;
   const pullToRefresh = deps.pullToRefresh;
   const heldFilterRow = deps.heldFilterRow;
+  const jumpAnchorRow = deps.jumpAnchorRow;
   const scrollAnchor = deps.scrollAnchor;
   const followsNewest = deps.followsNewest;
   const visibleList = deps.visibleList;
@@ -1941,8 +1944,11 @@ function landedReadPosition(area: HTMLElement, keepPosition: boolean, sentAtNewe
 
 function channelReadPosition(area: HTMLElement): { wasAtNewest: boolean; previousTop: number; anchorId: string | null; anchorTop: number; around: { marks: { id: string; top: number }[]; near: ReturnType<typeof rowNeighbours> } | null } {
   // A message a filter change holds in place is the one kept, and the newest line is not followed.
-  // `#243 filter-keeps-selection`.
-  const anchor = screens.view() === "discord" ? heldFilterRow() || scrollAnchor(area) : null;
+  // `#243 filter-keeps-selection`. A jump's landed row ahead of it: the reader's latest explicit
+  // place, as `captureScroll` prefers it (`#1224 mention-jump-in-view`) — a read landing that
+  // rebuilds every row re-finds it by id in `heldRowAfter`, where holding the first row on
+  // screen instead would let changed rows between the two move the landed row off its place.
+  const anchor = screens.view() === "discord" ? (jumpAnchorRow ? jumpAnchorRow() : null) || heldFilterRow() || scrollAnchor(area) : null;
   const anchorIds = anchor ? idsOf(anchor) : [];
   return {
     wasAtNewest: screens.view() === "discord" && followsNewest(area),

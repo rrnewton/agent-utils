@@ -35,6 +35,8 @@ export interface ScrollKeepingDependencies {
   pinnedOnly(): boolean;
   /** The row a filter change holds in place, or null (`heldFilterRow`). */
   heldFilterRow(): HTMLElement | null;
+  /** The row a jump just landed on, held as the place until the reader moves (`#1224`). Absent: unkept. */
+  jumpAnchorRow?(): HTMLElement | null;
   /** The walk for the search in the column being worked on, or null. */
   searchWalk(): AnchoredWalk | null;
   /** Whether `area` is at its newest line (`atBottom`), within `slack` where one is named. */
@@ -185,6 +187,10 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
    */
   function captureScroll(): ScrollMark {
     const area = el("scroll-area");
+    // `#1224 mention-jump-in-view`. A jump's landed row is the reader's latest explicit place:
+    // what changes after it holds that row first, not the row that happens to stand at the top.
+    const landed = deps.jumpAnchorRow ? deps.jumpAnchorRow() : null;
+    if (landed) return { pinned: false, anchor: landed, top: landed.getBoundingClientRect().top };
     // `#243 filter-keeps-selection`. While a filter change holds a message in place, that message is
     // where the reader is, and the newest line is not followed: nothing but the reader moves it.
     const held = deps.heldFilterRow();

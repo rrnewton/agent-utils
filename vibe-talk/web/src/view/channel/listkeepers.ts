@@ -46,6 +46,10 @@ export interface ListKeepersDependencies<Column> extends SizeWatching {
   /** Whether a filter change holds a message in place, and the row it holds (`#243 filter-keeps-selection`). */
   keepFilterHold(): boolean;
   heldFilterRow(): HTMLElement | null;
+  /** Put a jump's landed row back where the jump put it, where one holds (`#1224`). Absent: unkept. */
+  keepJumpAnchor?(): boolean;
+  /** Whether a jump's landed row still holds, without placing it (`#1224`). Absent: never. */
+  jumpAnchorHolds?(): boolean;
   /** Whether a walk for the search holds the step back still, in the column the code is working in (`#262`). */
   searchWalkAnchored(): boolean;
   /** The call: whether the reader is writing to the agent, and keeping its box in view (`#241 voice-composer`). */
@@ -152,6 +156,9 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
         placeQuickReply();
         return;
       }
+      // `#1224 mention-jump-in-view`. A jump's landed row next: the reader's latest explicit
+      // place, ahead of a thread entry's or filter change's older hold and any foot following.
+      if (deps.keepJumpAnchor && deps.keepJumpAnchor()) return;
       // `#221 read-modes`. Except a reader just landed on a thread's first unread who has not moved
       // since: on a desk the entry itself wrapped the dock, by putting the thread's name in the picker,
       // and the message is kept at the head however near the end of the list it is.
@@ -262,7 +269,8 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
       if (!sideColumnUp() || screens.screen() !== "main" || screens.view() !== "discord") return false;
       if (columns.side.mode === "list") return !cardsDrawn.opening();
       return inColumn(columns.side, () => {
-        return !entryLandingHolds() && heldFilterRow() === null && !searchWalkAnchored();
+        return !entryLandingHolds() && heldFilterRow() === null && !searchWalkAnchored()
+          && !(deps.jumpAnchorHolds && deps.jumpAnchorHolds());
       });
     };
     listen(area, "scroll", () => note(), { passive: true });
@@ -320,7 +328,8 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
     }, { passive: true });
     mainFollowNow = () => footing !== null && footing.foot;
     const free = () => screens.screen() === "main" && screens.view() === "discord" && writingIn(area)
-      && !entryLandingHolds() && heldFilterRow() === null && !searchWalkAnchored() && !quickReplyHolds(area);
+      && !entryLandingHolds() && heldFilterRow() === null && !searchWalkAnchored() && !quickReplyHolds(area)
+      && !(deps.jumpAnchorHolds && deps.jumpAnchorHolds());
     const mainFootKeeper = watch(() => {
       const was = footing;
       const context = contextOf();

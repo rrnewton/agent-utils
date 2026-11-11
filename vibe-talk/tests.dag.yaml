@@ -1367,6 +1367,26 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1224 mention-jump-in-view`, in the browser engine: a Documents mention tapped in a channel of
+  # 120 long messages read ten at a time, its message mid-history. At 393x852 with touch and at
+  # 1280x800, in the owner's configuration (collapsed summaries off) late reads that replace rows
+  # above, a live arrival, a live reaction and an older page must leave the highlighted row where
+  # the jump put it; then Summaries on and off must too.
+  - group: check
+    job: mention-jump-browser
+    desc: a mention in the Documents list lands its highlighted message in view and keeps it there while late reads, a live arrival, a reaction, history paging and summaries land, in current Chromium at 393x852 with touch and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/mention_jump_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 360
+    cpu_timeout: 60
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 30
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#564 message-summary-toggle`, in the browser engine: the unpack walk's channel, one reply holding a
   # quote and a code block far wider than a phone, every summary failing. At 393x852, 412x915 and
   # 1280x800 the unpacked row says its failure in a small muted label and stays grey as Done, and

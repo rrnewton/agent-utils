@@ -251,6 +251,7 @@ declare const mountChannelViewControls: LegacyImports["mountChannelViewControls"
 declare const mountSideListControls: LegacyImports["mountSideListControls"];
 declare const mountSideControls: LegacyImports["mountSideControls"];
 declare const createLinkedMark: LegacyImports["createLinkedMark"];
+declare const createJumpAnchor: LegacyImports["createJumpAnchor"];
 declare const createCardFlight: LegacyImports["createCardFlight"];
 declare const createScrollKeeping: LegacyImports["createScrollKeeping"];
 declare const createPackSlides: LegacyImports["createPackSlides"];

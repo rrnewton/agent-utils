@@ -825,6 +825,7 @@ const shellNavigation = createPageNavigation({
   settleFocus: () => settleFocus(),
   replyOnScreen: () => replyOnScreen(),
   setLinkedMark: (channel, id) => linkedMark.set(channel, id),
+  noteJumpAnchor: (row, id) => jumpAnchor.note(/** @type {HTMLElement} */ (row), id),
   cardsCycle: () => cardsCycle(),
   rowShown: (row) => rowShown(/** @type {any} */ (row)),
   visibleList: () => visibleList(),
@@ -909,11 +910,32 @@ const linkedMark = createLinkedMark({
   // Put out by the reader, the address lets go of the message too, so a reload does not mark it again.
   // Only where the address still names that message: a link landing since has a place of its own there.
   dismissed: (linked) => {
+    // `#1224 mention-jump-in-view`. The reader put the mark out: the jump's hold on its row goes too.
+    jumpAnchor.clear();
     const focus = deepLinks.focus();
     if (!focus || String(focus.message) !== linked.id || String(focus.channel) !== linked.channel) return;
     deepLinks.setFocus(null);
     syncDeepLinkAddress();
   },
+});
+
+// `#1224 mention-jump-in-view`. The row a jump landed on, held as the scroll anchor while what
+// arrives after it changes height above it (web/src/view/channel `createJumpAnchor`): asked first
+// by the scroll keeping's capture once mu-stable's shared mark lands, placed again by the lists'
+// keepers, and the trace told through mu-scroll's `noteJumpLost` (`#1208`) where a landing is
+// pushed off screen inside its window with no hand in it.
+/** @type {import("./src/view/channel/index.ts").JumpAnchor} */
+const jumpAnchor = createJumpAnchor({
+  el: (id) => el(id),
+  contextKey: () => channelContextKey(),
+  rowById: (id) => rowHolding(id),
+  listPlaceTop: (area) => listPlaceTop(area),
+  now: () => performance.now(),
+  clock: {
+    setTimeout: (run, ms) => setTimeout(run, ms),
+    clearTimeout: (handle) => clearTimeout(/** @type {any} */ (handle)),
+  },
+  noteJumpLost: (id) => scrollTrace.noteJumpLost(id),
 });
 
 /**
@@ -2490,6 +2512,7 @@ const scrollKeeping = createScrollKeeping({
   channelView: () => selection().view,
   pinnedOnly: () => pinsView().only,
   heldFilterRow: () => heldFilterRow(),
+  jumpAnchorRow: () => jumpAnchor.row(),
   searchWalk: () => columnWork.active().searchWalk,
   atBottom: (area) => atBottom(area),
   scrollToNewest: () => scrollToNewest(),
@@ -7560,7 +7583,7 @@ const timelineView = createTimelineView({
   get noChannelWords() { return NO_CHANNEL_TO_READ; }, notePinsRevision, noteBookmark, plainReach, todoView,
   noiseRenderCount: () => noiseSettings.renderCount(), foldedOneIds, foldedOnes, readRuns, setReadMode,
   setJumpNewest, scrollToNewest, keepFilterHold, inThisColumn: (fn) => inThisColumn(fn), pinsView, searchOffered: () => searchOffered(),
-  pullToRefresh, heldFilterRow, scrollAnchor, followsNewest, visibleList, noiseSettings,
+  pullToRefresh, heldFilterRow, jumpAnchorRow: () => jumpAnchor.row(), scrollAnchor, followsNewest, visibleList, noiseSettings,
   selectionIn: (area) => textSelectionIn(area),
   restoreSelectionIn: (area, selection) => restoreTextSelectionIn(area, selection),
   combineOn: () => combineSwitch.on(), columns, sideShowing, openThreadRootId,
@@ -9855,6 +9878,8 @@ const listKeepersMount = mountListKeepers({
   placeEntryLanding: (row, first) => placeEntryLanding(row, first),
   keepFilterHold: () => keepFilterHold(),
   heldFilterRow: () => heldFilterRow(),
+  keepJumpAnchor: () => jumpAnchor.place(),
+  jumpAnchorHolds: () => jumpAnchor.row() !== null,
   searchWalkAnchored: () => {
     const walk = columnWork.active().searchWalk;
     return Boolean(walk && walk.anchored);
