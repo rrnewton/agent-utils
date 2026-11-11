@@ -313,7 +313,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
 
             # The mention: one mention, so the tap jumps straight to its message.
-            reader.tap("#documents-list .doc-card .doc-mentions", phone)
+            reader.tap("#documents-list .doc-card .doc-mentions-link", phone)
             reader.wait(
                 f"() => document.querySelector('#discord-log > li[data-id=\"{TARGET}\"]')"
                 f"?.getAttribute('data-linked') === 'true'",

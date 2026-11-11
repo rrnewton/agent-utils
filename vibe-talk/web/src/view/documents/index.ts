@@ -2,7 +2,7 @@
 // documents linked in chat, and the full-screen reader for one of them. Its
 // public interface; the page mounts it once and shows it as the `docs` view.
 
-export { createDocumentsList } from "./list.ts";
+export { createDocumentsList, dedupeDocumentRows, documentIdentity } from "./list.ts";
 export type { DocumentsList, DocumentsListDependencies, DocumentsListPlace } from "./list.ts";
 export { createDocumentsReader, currentOutlineIndex, openDocumentNotice } from "./reader.ts";
 export type { DocumentsReader, DocumentsReaderDependencies, OpenDocument } from "./reader.ts";

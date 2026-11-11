@@ -149,6 +149,81 @@ function byOldest(a: DocumentRow, b: DocumentRow): number {
   return (a.last_mentioned_ms ?? 0) - (b.last_mentioned_ms ?? 0);
 }
 
+/**
+ * The document a row names, ignoring which address named it (`#1263
+ * documents-list-cards`): a GitHub file linked at two refs (or by its blob
+ * and raw addresses, which mint one key) is one document, so its identity
+ * is owner/repo and path, never the ref. Other kinds are their key.
+ */
+export function documentIdentity(row: DocumentRow): string {
+  if (row.key.startsWith("github:")) {
+    const rest = row.key.slice("github:".length);
+    const slash = rest.indexOf("/");
+    const at = rest.indexOf("@", slash);
+    const colon = rest.indexOf(":", at);
+    if (slash > 0 && at > slash && colon > at) {
+      const owner = rest.slice(0, slash).toLowerCase();
+      const repo = rest.slice(slash + 1, at).toLowerCase();
+      return `github:${owner}/${repo}:${rest.slice(colon + 1)}`;
+    }
+  }
+  return row.key;
+}
+
+/**
+ * One row per document (`#1263 documents-list-cards`): exact-key repeats
+ * and same-document rows (two addresses for one file) collapse into one
+ * entry. The fetched copy, else the newest-mentioned, names the entry;
+ * mentions union by mentioning message, and the entry is fetched if any
+ * of its copies is.
+ */
+export function dedupeDocumentRows(rows: readonly DocumentRow[]): DocumentRow[] {
+  const groups = new Map<string, DocumentRow[]>();
+  for (const row of rows) {
+    const identity = documentIdentity(row);
+    const group = groups.get(identity);
+    if (group) group.push(row);
+    else groups.set(identity, [row]);
+  }
+  const out: DocumentRow[] = [];
+  for (const group of groups.values()) {
+    if (group.length === 1) {
+      out.push(group[0]!);
+      continue;
+    }
+    const ranked = [...group].sort((a, b) => {
+      if (a.fetched !== b.fetched) return a.fetched ? -1 : 1;
+      return (b.last_mentioned_ms ?? 0) - (a.last_mentioned_ms ?? 0);
+    });
+    const rep = ranked[0]!;
+    const byMessage = new Map<string, DocumentRow["mentions"][number]>();
+    for (const row of group) {
+      for (const mention of row.mentions ?? []) {
+        byMessage.set(`${mention.channel_id}\u001f${mention.message_id}`, mention);
+      }
+    }
+    const mentions = [...byMessage.values()].sort(
+      (a, b) => (a.posted_ms ?? 0) - (b.posted_ms ?? 0),
+    );
+    const mentioned = group.flatMap((row) => row.mentions ?? []);
+    const times = (pick: (row: DocumentRow) => number | null) =>
+      group.map(pick).filter((ms): ms is number => ms !== null);
+    const firsts = times((row) => row.first_mentioned_ms);
+    const lasts = times((row) => row.last_mentioned_ms);
+    const fetcheds = times((row) => row.fetched_ms);
+    out.push({
+      ...rep,
+      fetched: group.some((row) => row.fetched),
+      fetched_ms: fetcheds.length ? Math.max(...fetcheds) : rep.fetched_ms,
+      mentions,
+      mention_count: mentioned.length > 0 ? mentions.length : group.reduce((sum, row) => sum + row.mention_count, 0),
+      first_mentioned_ms: firsts.length ? Math.min(...firsts) : rep.first_mentioned_ms,
+      last_mentioned_ms: lasts.length ? Math.max(...lasts) : rep.last_mentioned_ms,
+    });
+  }
+  return out;
+}
+
 /** How far past the bottom a drag up must travel to refresh, in px: the channel pull's arm. */
 const REFRESH_PULL_PX = 64;
 /** How close to the true bottom counts as parked there for the pull, in px (the channel's slack). */
@@ -195,40 +270,52 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
       row.kind === "github_issue" && row.issue_number !== null && row.issue_number !== undefined
         ? `#${row.issue_number} ${displayTitle(row)}`
         : displayTitle(row);
-    const subtitle = document.createElement("span");
-    subtitle.className = "doc-subtitle";
+    // One meta line (`#1263 documents-list-cards`): file name, mentioned and
+    // fetched times, the mentions as plain linked text, and the kind label
+    // linking out — all on one line, the file name ellipsising first.
+    const meta = document.createElement("span");
+    meta.className = "doc-meta";
     const failed = errors.get(row.key);
-    if (isBusy) subtitle.textContent = "Fetching…";
-    else if (failed) subtitle.textContent = failed;
-    else if (row.moved_to) subtitle.textContent = `moved to ${row.moved_to}`;
+    if (isBusy) meta.textContent = "Fetching…";
+    else if (failed) meta.textContent = failed;
+    else if (row.moved_to) meta.textContent = `moved to ${row.moved_to}`;
     else {
-      subtitle.textContent = `${row.file_name} · ${mentionedAgo(row.last_mentioned_ms, Date.now())}`;
+      const file = document.createElement("span");
+      file.className = "doc-meta-file";
+      file.textContent = row.file_name;
+      file.title = row.file_name;
+      meta.appendChild(file);
+      meta.appendChild(document.createTextNode(` · ${mentionedAgo(row.last_mentioned_ms, Date.now())}`));
       if (row.kind === "github_issue" && row.issue_status) {
-        subtitle.textContent += ` · ${row.issue_status}`;
+        meta.appendChild(document.createTextNode(` · ${row.issue_status}`));
       }
       if (row.fetched && row.fetched_ms !== null) {
-        subtitle.textContent += ` · ${fetchedAgo(row.fetched_ms, Date.now())}`;
-        subtitle.title = new Date(row.fetched_ms).toLocaleString();
+        const fetched = document.createElement("span");
+        fetched.textContent = ` · ${fetchedAgo(row.fetched_ms, Date.now())}`;
+        fetched.title = new Date(row.fetched_ms).toLocaleString();
+        meta.appendChild(fetched);
       }
+      const mentions = document.createElement("button");
+      mentions.setAttribute("type", "button");
+      mentions.className = "doc-mentions-link";
+      mentions.textContent = `${row.mention_count} ${row.mention_count === 1 ? "mention" : "mentions"}`;
+      listening.listen(mentions, "click", (event: Event) => {
+        event.stopPropagation();
+        deps.onMentions?.(row);
+      });
+      meta.appendChild(document.createTextNode(" · "));
+      meta.appendChild(mentions);
+      const kindLink = document.createElement("a");
+      kindLink.className = "doc-kind";
+      kindLink.href = row.url;
+      kindLink.target = "_blank";
+      kindLink.rel = "noopener noreferrer";
+      kindLink.textContent = row.kind;
+      kindLink.addEventListener("click", (event) => event.stopPropagation());
+      meta.appendChild(document.createTextNode(" · "));
+      meta.appendChild(kindLink);
     }
-    const mentions = document.createElement("button");
-    mentions.setAttribute("type", "button");
-    mentions.className = "doc-mentions";
-    mentions.textContent = `${row.mention_count} ${row.mention_count === 1 ? "mention" : "mentions"}`;
-    listening.listen(mentions, "click", (event: Event) => {
-      event.stopPropagation();
-      deps.onMentions?.(row);
-    });
-    subtitle.appendChild(document.createTextNode(" · "));
-    subtitle.appendChild(mentions);
-    const kindLink = document.createElement("a");
-    kindLink.className = "doc-kind";
-    kindLink.href = row.url;
-    kindLink.target = "_blank";
-    kindLink.rel = "noopener noreferrer";
-    kindLink.textContent = row.kind;
-    kindLink.addEventListener("click", (event) => event.stopPropagation());
-    texts.append(title, subtitle, kindLink);
+    texts.append(title, meta);
     card.appendChild(texts);
 
     const download = document.createElement("button");
@@ -374,7 +461,7 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
   }
 
   function render(rows: readonly DocumentRow[]): void {
-    rowsNow = [...rows].sort(byOldest);
+    rowsNow = dedupeDocumentRows(rows).sort(byOldest);
     listening.unmount();
     const list = deps.byId(LIST_ID);
     wireOuter(list);
@@ -394,10 +481,14 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
       const note = document.createElement("p");
       note.className = "doc-empty";
       note.textContent = "No documents of this type.";
-      list.replaceChildren(head, bucketBar(), note);
+      list.replaceChildren(head, note, bucketBar());
       return;
     }
-    list.replaceChildren(head, bucketBar(), ...cards);
+    // The filter chips dock at the bottom (`#1263 documents-list-cards`):
+    // the list opens at its newest end, so the chips are the last row and
+    // stick above the bottom bar. One `.doc-buckets` bar (see bucketBar),
+    // so a later Starred chip joins this same element.
+    list.replaceChildren(head, ...cards, bucketBar());
     // Arrow keys walk the cards; Enter opens (above).
     listening.listen(list, "keydown", (event: KeyboardEvent) => {
       if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;

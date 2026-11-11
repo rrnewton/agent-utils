@@ -1440,6 +1440,82 @@ test("documents list: the bucket filter shows one type at a time", async () => {
   });
 });
 
+// ---- 6. one-line meta, bottom chips, dedupe (#1263 documents-list-cards) ---------------------
+
+test("documents list: dedupe collapses exact keys and same-document URLs, unioning mentions", () => {
+  const mod = requireModule(LIST, "src/view/documents/list.ts");
+  assert.equal(typeof mod.dedupeDocumentRows, "function", "list does not export dedupeDocumentRows");
+  const mention = (id, ms) => ({ channel_id: "c", message_id: id, thread_id: null, posted_ms: ms, author: "A", label: null });
+  const base = {
+    kind: "github_markdown", url: "https://github.com/o/r/blob/main/docs/proposal.md",
+    title: "Proposal", file_name: "proposal.md", fetched: false, fetched_ms: null,
+    moved_to: null, issue_number: null, issue_status: null,
+    first_mentioned_ms: 100, last_mentioned_ms: 100,
+  };
+  const rows = [
+    { ...base, key: "github:o/r@main:docs/proposal.md", mention_count: 1, mentions: [mention("m1", 100)] },
+    { ...base, key: "github:o/r@feature:docs/proposal.md", url: "https://github.com/o/r/blob/feature/docs/proposal.md",
+      fetched: true, fetched_ms: 500, mention_count: 2, mentions: [mention("m2", 200), mention("m1", 100)],
+      first_mentioned_ms: 100, last_mentioned_ms: 200 },
+    { ...base, key: "github:o/r@main:docs/proposal.md", mention_count: 1, mentions: [mention("m1", 100)] },
+    { ...base, key: "paste:p1", kind: "paste", file_name: "p1", title: "p1", mention_count: 1, mentions: [mention("m9", 50)], last_mentioned_ms: 50 },
+  ];
+  const out = mod.dedupeDocumentRows(rows);
+  assert.equal(out.length, 2, `expected 2 deduped rows, got ${out.length}: ${out.map((r) => r.key).join(", ")}`);
+  const merged = out.find((row) => row.file_name === "proposal.md");
+  assert.equal(merged.fetched, true, "the merged row keeps the fetched copy");
+  assert.equal(merged.mention_count, 2, "mentions are unioned by message, not summed blindly");
+  assert.deepEqual(merged.mentions.map((m) => m.message_id), ["m1", "m2"]);
+  assert.equal(merged.last_mentioned_ms, 200);
+});
+
+test("documents list: card meta is one line with a text mentions link; chips sit last", async () => {
+  const mentioned = [];
+  const rows = [
+    { ...docRow("alpha", Date.now() - 60_000), kind: "github_markdown", file_name: "alpha.md", mention_count: 3,
+      fetched: true, fetched_ms: Date.now(), mentions: [] },
+  ];
+  const mod = requireModule(LIST, "src/view/documents/list.ts");
+  const listEl = fakeElement("div");
+  const scroller = fakeElement("div");
+  scroller.scrollTop = 0; scroller.clientHeight = 100;
+  Object.defineProperty(scroller, "scrollHeight", { get: () => listEl.children.length * 300 });
+  const byId = (id) => ({ "documents-list": listEl, "scroll-area": scroller,
+    "pane-docs": fakeElement("div"), "docs-list-view": fakeElement("div") })[id];
+  const savedDocument = globalThis.document;
+  globalThis.document = { createElement: (tag) => fakeElement(tag),
+    createElementNS: (_ns, tag) => fakeElement(tag),
+    createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }), querySelector: () => null };
+  try {
+    const list = mod.createDocumentsList({ api: async () => ({ documents: rows, total: 1 }),
+      byId, onOpen: () => {}, onMentions: (row) => mentioned.push(row) });
+    await list.refresh();
+    const card = listEl.children.find((kid) => String(kid.className).includes("doc-card"));
+    assert.ok(card, "no card drawn");
+    const texts = card.children.find((kid) => String(kid.className).includes("doc-texts"));
+    const meta = texts.children.find((kid) => String(kid.className).includes("doc-meta"));
+    assert.ok(meta, "card has no single .doc-meta line");
+    assert.equal(texts.children.filter((kid) => String(kid.className).includes("doc-kind")).length, 0,
+      "the kind link still sits on its own row under the meta");
+    assert.ok(meta.textContent.includes("alpha.md"), "meta misses the filename");
+    assert.ok(meta.textContent.includes("mentioned"), "meta misses the mentioned time");
+    assert.ok(meta.textContent.includes("fetched"), "meta misses the fetched time");
+    assert.ok(meta.textContent.includes("3 mentions"), "meta misses the mention count");
+    assert.ok(meta.textContent.includes("github_markdown"), "meta misses the kind label");
+    const link = meta.children.find((kid) => String(kid.className).includes("doc-mentions-link"));
+    assert.ok(link, "mentions is not a text link in the meta line");
+    assert.equal(link.textContent, "3 mentions");
+    for (const listener of [...(link.listeners.click || [])]) listener({ stopPropagation() {} });
+    assert.equal(mentioned.length, 1, "the mentions link did not open the mentioning messages");
+    const last = listEl.children[listEl.children.length - 1];
+    assert.ok(String(last.className).includes("doc-buckets"),
+      "the filter chips are not the last row of the list (docked at the bottom)");
+    list.unmount();
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
+  }
+});
+
 test("issue header: front matter splits into a header over the body", () => {
   const mod = requireModule(ISSUEHEADER, "src/view/documents/issueheader.ts");
   assert.equal(typeof mod.splitIssueHeader, "function", "issueheader does not export splitIssueHeader");

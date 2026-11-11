@@ -131,12 +131,38 @@
 .doc-title {
   font-weight: 600;
 }
-.doc-subtitle {
+/* One meta line per card (`#1263 documents-list-cards`): file name,
+   mentioned/fetched times, mentions and the kind label, never wrapping.
+   The file name ellipsises first; the rest is flex-none. */
+.doc-meta {
+  display: flex;
+  align-items: baseline;
+  white-space: nowrap;
+  overflow: hidden;
   font-size: 0.85em;
   opacity: 0.8;
+  min-width: 0;
+}
+.doc-meta-file {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.doc-mentions-link {
+  flex: none;
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  text-decoration: underline;
+  cursor: pointer;
 }
 .doc-kind {
-  font-size: 0.8em;
+  flex: none;
+  font-size: 0.95em;
 }
 .doc-download {
   flex: none;
@@ -150,7 +176,7 @@
   font-size: 0.85em;
   opacity: 0.75;
 }
-.doc-mentions {
+.docs-mentions {
   display: flex;
   flex-direction: column;
   gap: 4px;
@@ -165,10 +191,6 @@
 .doc-mention-item {
   text-align: left;
   cursor: pointer;
-}
-.doc-mentions-link,
-.doc-mentions {
-  font-size: 0.85em;
 }
 
 /* The Fetch drop-up and its Fetch since… panel, above the bar at its right end. */
@@ -426,12 +448,18 @@ body:has(#control-bar[data-placement="top"]) #doc-outline-pop {
   scroll-margin-top: 8px;
 }
 
-/* Type filter buckets (`#1176 doc-kind-buckets`): a quiet row over the cards. */
+/* Type filter buckets (`#1176 doc-kind-buckets`), docked at the bottom of
+   the list (`#1263 documents-list-cards`): the last row of the list, which
+   opens at its bottom, so the chips sit above the bottom bar on open
+   without scrolling. (No sticky/fixed here: the scroller's containment
+   guard forbids positioned escapes from the list.) */
 .doc-buckets {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
   padding: 6px 10px;
+  background: var(--bg, Canvas);
+  border-top: 1px solid var(--edge);
 }
 .doc-bucket {
   border: 1px solid #3a4a61;

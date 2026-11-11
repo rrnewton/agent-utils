@@ -356,7 +356,7 @@ def main() -> int:
                 check(page.locator("#pane-docs").is_visible(), "Back from the reader left the Documents view")
 
                 # A mention jumps to its message; Back returns to the list.
-                mention = page.locator("#documents-list .doc-card", has_text="demo-doc").locator(".doc-mentions")
+                mention = page.locator("#documents-list .doc-card", has_text="demo-doc").locator(".doc-mentions-link")
                 mention.tap()
                 page.wait_for_function("() => !document.getElementById('pane-discord').hidden", timeout=20_000)
                 page.go_back()
