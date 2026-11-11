@@ -1,6 +1,6 @@
 ---
 title: 'muse-drawn-prompt-missed: a prompt fully drawn in the Muse editor is reported as not drawn, and Enter is never pressed'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
@@ -52,3 +52,13 @@ Builds and versions:
 # Notes
 
 The quoted screen has the notice's host, team and path names redacted; so its first line is shorter than captured; the wrapping of the other lines is as captured. Both affected panes were left untouched. Each lane will see the notice whenever it next submits.
+
+## Resolution
+
+[watermelon-full-preview] Cause: not the wrapping. The Muse drawn-prompt and staged-draft checks already read the editor region only (between the last two rules, above one status footer) and undo the wrapping, the `❯` prefix and the continuation indent; a fixture built from the screen above passes them, in both the Rust and Python editions. What went stale was the screen itself. `agentctl watch-agents` observes through a Herdr client that keeps each read-only answer for the whole pass (`HerdrClient::snapshotting`, #571 watch-agents-scale), and its queue drain types through that same client. A delivery's first pane read in a pass was therefore the only one Herdr was ever asked: after the drain pasted the notice, every poll for the drawn prompt was answered with the pre-paste screen (editor still empty), so the notice was stranded as `late_paste` and never submitted in that pass. Likewise, the stale-draft recovery pressed Enter on a drawn draft and then kept reading the pre-Enter screen, so a draft the lane had in fact submitted (its copy now in the transcript above an empty editor) read as still staged after 3 Enter key presses. A direct `agentctl send` uses a non-snapshotting client and was never affected, which is why only watcher-drained lanes stranded.
+
+Fix: any non-read invocation through a snapshotting client (typing text, pressing a key, reporting a status) now drops the pass's kept answers, so the next read asks Herdr again. Observation passes type nothing, so their caching is unchanged. The drawn/staged checks themselves are unchanged in behaviour and are now pinned by fixtures.
+
+Regression tests: a snapshotting-client test whose pane screen changes on Enter (the post-Enter read asks Herdr again; it returned the kept pre-Enter screen before the fix); a fake Muse editor that wraps staged text at 80 columns, through which the notice above is delivered idle and busy with exactly one paste and one Enter; editor-level fixtures (Rust and Python) for the wrapped drawn prompt (drawn whole, and vouched as a draft by its editor text), a really empty editor (no draw, so the late_paste refusal stands), and a submitted copy in the transcript above an empty editor (no draft, pane reads idle, not staged).
+
+Noted separately, not fixed here: one lane in the same minute got `cannot invoke Herdr: control command was cancelled`, a pass-deadline cancellation of a Herdr call, which types nothing and retries on a later pass.

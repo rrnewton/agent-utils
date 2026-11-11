@@ -281,6 +281,57 @@ def test_a_paste_muse_wraps_inside_a_word_or_a_path_is_still_the_exact_editor() 
         frame("❯ break/at/odd/\n  places"), "break/at/odd/placez")
 
 
+def test_the_issue_1323_wrapped_notice_is_the_exact_editor_and_a_submitted_copy_is_not() -> None:
+    # #1323 muse-drawn-prompt-missed: the notice as Muse drew it — wrapped long lines,
+    # `❯` on the first row, a two-space continuation indent, the status footer below.
+    rule = "─" * 160
+    footer = "  watermelon-full-preview · xhigh · /work/project · Launch overrides\n"
+    prompt = (
+        "[from coordinator via agentctl · reply: agentctl send coordinator]\n"
+        "coordinator -> all lanes on this host: the data disk is low and another "
+        "team's builds are frozen. Until further notice:\n"
+        "(1) Run at most ONE local validate or build at a time per lane, and never "
+        "in parallel nested worktrees.\n"
+        "(2) As soon as a validate or gate finishes (never mid-validate), delete the "
+        "regenerable build output it left in your slot or nested worktrees: cargo "
+        "target/ dirs (rs/target, vibe-talk/target, etc.) and page build trees. If "
+        "your next validate would rebuild them anyway, you may keep the ones in "
+        "your MAIN slot checkout, but delete extra nested-worktree copies.\n"
+        "No reply needed; just do it at your next safe point."
+    )
+    drawn = (
+        "◆ prior answer\n" + rule + "\n"
+        "❯ [from coordinator via agentctl · reply: agentctl send coordinator]\n"
+        "  coordinator -> all lanes on this host: the data disk is low and another "
+        "team's builds are frozen. Until further notice:\n"
+        "  (1) Run at most ONE local validate or build at a time per lane, and never "
+        "in parallel nested worktrees.\n"
+        "  (2) As soon as a validate or gate finishes (never mid-validate), delete the "
+        "regenerable build output it left in your slot or nested worktrees: cargo target/\n"
+        "  dirs (rs/target, vibe-talk/target, etc.) and page build trees. If your next "
+        "validate would rebuild them anyway, you may keep the ones in your MAIN slot\n"
+        "  checkout, but delete extra nested-worktree copies.\n"
+        "  No reply needed; just do it at your next safe point.\n"
+        + rule + "\n" + footer
+    )
+    assert muse_verified_process_paste_is_exact_composer(drawn, prompt)
+    assert client_module.muse_verified_process_paste_in_composer(drawn, prompt)
+    # A really empty editor holds none of it: the late_paste refusal stands.
+    empty = "◆ prior answer\n" + rule + "\n❯\n" + rule + "\n" + footer
+    assert not client_module.muse_verified_process_paste_in_composer(empty, prompt)
+    # The same prompt submitted — a user turn above an empty editor — is not a draft
+    # in the editor, and the pane does not read staged.
+    submitted = drawn.replace(
+        "◆ prior answer\n" + rule + "\n❯ ", "❯ ", 1,
+    ).replace(
+        "\n" + rule + "\n" + footer,
+        "\n\n◆ Noted. Standing by.\n\n" + rule + "\n❯\n" + rule + "\n" + footer,
+        1,
+    )
+    assert not client_module.muse_verified_process_paste_in_composer(submitted, prompt)
+    assert client_module.muse_verified_process_prompt_transcript_count(submitted, prompt) == 1
+
+
 def test_a_bare_slash_command_under_its_open_menu_is_the_staged_paste() -> None:
     # Measured live on Muse 1.4.16 (#1136 raw-message-bridge): a pasted bare slash
     # command opens the command menu under the editor line, so the editor is the

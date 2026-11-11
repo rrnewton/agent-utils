@@ -59,6 +59,10 @@ pub(super) struct MuseEditor {
     /// its first this-many characters, and the rest of it, and every key after it, waits in
     /// `held` until [`Self::release`].
     pub(super) stalled: Option<usize>,
+    /// Draw the staged text wrapped at this many columns, as a real Muse editor does:
+    /// `❯` on the first row and a two-space indent on every later row (#1323
+    /// muse-drawn-prompt-missed). `None` draws it as typed.
+    pub(super) wrap_columns: Option<usize>,
     /// Input a stalled Muse has not read yet, in the order it was typed.
     held: Vec<Held>,
 }
@@ -97,8 +101,47 @@ impl Default for MuseEditor {
             missed_enters: 0,
             stalled: None,
             held: Vec::new(),
+            wrap_columns: None,
         }
     }
+}
+
+/// `text` as a Muse editor of `columns` columns draws it: the first row after `❯`, every
+/// later row under a two-space indent, long lines wrapped at a word or, for a word longer
+/// than a row, at any character (#1323 muse-drawn-prompt-missed).
+fn wrapped_editor(text: &str, columns: usize) -> String {
+    let width = columns.saturating_sub(2).max(1);
+    let mut rows: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let mut rest = line;
+        loop {
+            if rest.chars().count() <= width {
+                rows.push(rest.to_owned());
+                break;
+            }
+            let head: String = rest.chars().take(width).collect();
+            let cut = head.rfind(' ').filter(|at| *at > 0).unwrap_or(head.len());
+            rows.push(head[..cut].to_owned());
+            rest = rest[cut..].trim_start_matches(' ');
+            if rest.is_empty() {
+                break;
+            }
+        }
+    }
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| {
+            if index == 0 {
+                format!("❯ {row}")
+            } else {
+                format!("  {row}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 impl MuseEditor {
@@ -142,6 +185,9 @@ impl MuseEditor {
             (Some(text), _) => format!("❯ [Pasted Content {} chars]", length(text)),
             (None, Some(text)) if self.garble => {
                 format!("❯ {}", text.chars().skip(1).collect::<String>())
+            }
+            (None, Some(text)) if self.wrap_columns.is_some() => {
+                wrapped_editor(text, self.wrap_columns.unwrap())
             }
             (None, Some(text)) => format!("❯ {text}"),
             (None, None) => "❯".to_owned(),

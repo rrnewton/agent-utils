@@ -1481,6 +1481,86 @@ mod tests {
     }
 
     #[test]
+    fn the_issue_1323_wrapped_notice_is_drawn_and_a_submitted_copy_is_no_draft() {
+        // #1323 muse-drawn-prompt-missed: the notice as Muse drew it in the editor —
+        // long lines wrapped, `❯` on the first row, a two-space continuation indent, the
+        // status footer below the bottom rule.
+        let divider = "─".repeat(160);
+        let prompt = "[from coordinator via agentctl · reply: agentctl send coordinator]\n\
+                      coordinator -> all lanes on this host: the data disk is low and another \
+                      team's builds are frozen. Until further notice:\n\
+                      (1) Run at most ONE local validate or build at a time per lane, and never \
+                      in parallel nested worktrees.\n\
+                      (2) As soon as a validate or gate finishes (never mid-validate), delete the \
+                      regenerable build output it left in your slot or nested worktrees: cargo \
+                      target/ dirs (rs/target, vibe-talk/target, etc.) and page build trees. If \
+                      your next validate would rebuild them anyway, you may keep the ones in \
+                      your MAIN slot checkout, but delete extra nested-worktree copies.\n\
+                      No reply needed; just do it at your next safe point.";
+        let footer = "  watermelon-full-preview · xhigh · /work/project · Launch overrides\n";
+        let drawn = format!(
+            "◆ prior answer\n{divider}\n\
+             ❯ [from coordinator via agentctl · reply: agentctl send coordinator]\n  \
+             coordinator -> all lanes on this host: the data disk is low and another team's \
+             builds are frozen. Until further notice:\n  \
+             (1) Run at most ONE local validate or build at a time per lane, and never in \
+             parallel nested worktrees.\n  \
+             (2) As soon as a validate or gate finishes (never mid-validate), delete the \
+             regenerable build output it left in your slot or nested worktrees: cargo target/\n  \
+             dirs (rs/target, vibe-talk/target, etc.) and page build trees. If your next \
+             validate would rebuild them anyway, you may keep the ones in your MAIN slot\n  \
+             checkout, but delete extra nested-worktree copies.\n  \
+             No reply needed; just do it at your next safe point.\n{divider}\n{footer}"
+        );
+        assert_eq!(
+            muse_verified_process_paste_drawn(&drawn, prompt),
+            MusePasteDrawn::Whole
+        );
+        assert!(muse_verified_process_paste_is_exact_composer(
+            &drawn, prompt
+        ));
+        // The draft the stale-draft check vouches for is the editor region only, unwrapped.
+        let draft = muse_verified_process_editor_draft(&drawn).expect("a draft");
+        let crate::stale_draft::Draft::Text(rows) = &draft else {
+            panic!("a literal draft, not a placeholder: {draft:?}");
+        };
+        assert!(crate::stale_draft::text_matches(rows, prompt));
+        // A really empty editor is still no draw at all: the late_paste refusal stands.
+        let empty = format!("◆ prior answer\n{divider}\n❯\n{divider}\n{footer}");
+        assert_eq!(
+            muse_verified_process_paste_drawn(&empty, prompt),
+            MusePasteDrawn::Nothing
+        );
+        assert!(muse_verified_process_editor_draft(&empty).is_none());
+        // The same prompt submitted — now a user turn in the transcript above an empty
+        // editor — is never a staged draft, and the pane reads idle, not staged.
+        let submitted = format!(
+            "❯ [from coordinator via agentctl · reply: agentctl send coordinator]\n  \
+             coordinator -> all lanes on this host: the data disk is low and another team's \
+             builds are frozen. Until further notice:\n  \
+             (1) Run at most ONE local validate or build at a time per lane, and never in \
+             parallel nested worktrees.\n  \
+             (2) As soon as a validate or gate finishes (never mid-validate), delete the \
+             regenerable build output it left in your slot or nested worktrees: cargo target/\n  \
+             dirs (rs/target, vibe-talk/target, etc.) and page build trees. If your next \
+             validate would rebuild them anyway, you may keep the ones in your MAIN slot\n  \
+             checkout, but delete extra nested-worktree copies.\n  \
+             No reply needed; just do it at your next safe point.\n\n\
+             ◆ Noted. Standing by.\n\n{divider}\n❯\n{divider}\n{footer}"
+        );
+        assert_eq!(
+            muse_verified_process_paste_drawn(&submitted, prompt),
+            MusePasteDrawn::Nothing
+        );
+        assert!(muse_verified_process_editor_draft(&submitted).is_none());
+        assert_eq!(
+            muse_verified_process_prompt_transcript_count(&submitted, prompt),
+            1
+        );
+        assert_eq!(muse_verified_pane_status("idle", &submitted), "idle");
+    }
+
+    #[test]
     fn a_long_brief_drawn_in_part_then_whole_is_classified_at_each_step() {
         // A real-sized coordinator brief: several KB over many lines, literal while Muse is
         // still taking it in, then its placeholder.

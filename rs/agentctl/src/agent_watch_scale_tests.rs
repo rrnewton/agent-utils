@@ -27,6 +27,8 @@ case "$1 $2" in
   "pane read")
     if [ "$5" = recent-unwrapped ] || [ "$5" = recent ]; then sleep "$(cat "$dir/recent-delay")"; fi
     cat "$dir/screens/$3.txt" ;;
+  "pane send-keys")
+    if [ -f "$dir/screens/$3.after" ]; then cat "$dir/screens/$3.after" > "$dir/screens/$3.txt"; fi ;;
   *) echo "fake herdr: unsupported $*" >&2; exit 2 ;;
 esac
 "#;
@@ -527,6 +529,48 @@ fn a_snapshot_answers_each_read_once_and_never_keeps_input() {
     client.begin_pass(None);
     client.panes(None).unwrap();
     assert_eq!(team.calls(), vec!["pane list".to_owned()]);
+}
+
+#[test]
+fn a_snapshot_read_after_typing_into_the_pane_asks_herdr_again() {
+    // #1323 muse-drawn-prompt-missed: watch-agents drains queues through the snapshotting
+    // client, so a delivery that types a paste (or presses Enter on a draft) and then polls
+    // the pane must not be answered from the pass snapshot: the snapshot holds the screen
+    // from before the input, which made a drawn prompt read as never drawn and a submitted
+    // draft read as still staged for the whole pass.
+    let members = vec![
+        member("coordinator", "running", Some("idle"), IDLE_SCREEN),
+        member("one", "running", Some("idle"), "draft drawn"),
+    ];
+    let team = Team::new("snapshot-input", &members, 3, 0.0);
+    let client = team.client();
+    client.begin_pass(None);
+    let pane = pane_of(1);
+    assert_eq!(
+        client.read(&pane, "visible", Some(200)).unwrap(),
+        "draft drawn"
+    );
+    assert_eq!(
+        client.read(&pane, "visible", Some(200)).unwrap(),
+        "draft drawn"
+    );
+    // Enter submits the draft: behind Herdr, the pane now shows an empty editor.
+    fs::write(
+        team.tools.join("screens").join(format!("{pane}.after")),
+        "editor empty",
+    )
+    .unwrap();
+    client.send_keys(&pane, "Enter").unwrap();
+    assert_eq!(
+        client.read(&pane, "visible", Some(200)).unwrap(),
+        "editor empty"
+    );
+    let reads = team
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("pane read"))
+        .count();
+    assert_eq!(reads, 2, "{:?}", team.calls());
 }
 
 /// #720 agentctl-muse-stale-draft: the production probe finds the owner's requests waiting in a

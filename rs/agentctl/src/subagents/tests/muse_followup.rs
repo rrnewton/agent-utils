@@ -548,6 +548,63 @@ fn a_later_send_to_an_input_stalled_pane_queues_untyped_and_both_land_once_muse_
     );
 }
 
+/// The #1323 notice, as Muse draws a paste of it: wrapped long lines, `❯` on the first
+/// row, a two-space continuation indent, the status footer below the bottom rule.
+const WRAPPED_NOTICE: &str = "[from coordinator via agentctl · reply: agentctl send coordinator]\n\
+                              coordinator -> all lanes on this host: the data disk is low and \
+                              another team's builds are frozen. Until further notice:\n\
+                              (1) Run at most ONE local validate or build at a time per lane, \
+                              and never in parallel nested worktrees.\n\
+                              (2) As soon as a validate or gate finishes (never mid-validate), \
+                              delete the regenerable build output it left in your slot or \
+                              nested worktrees: cargo target/ dirs (rs/target, vibe-talk/target, \
+                              etc.) and page build trees. If your next validate would rebuild \
+                              them anyway, you may keep the ones in your MAIN slot checkout, but \
+                              delete extra nested-worktree copies.\n\
+                              No reply needed; just do it at your next safe point.";
+
+#[test]
+fn a_wrapped_notice_drawn_in_the_editor_is_submitted_exactly_once_idle_and_busy() {
+    // #1323 muse-drawn-prompt-missed: the drawn check must undo the wrapping, the `❯`
+    // prefix and the continuation indent, for an idle and for a busy Muse alike, and
+    // press Enter once — never strand the prompt as not drawn.
+    for busy in [false, true] {
+        let fixture = Fixture::new();
+        let manager = start_busy_muse(&fixture, false);
+        {
+            let mut editor = fixture.client.muse_editor.lock().unwrap();
+            let editor = editor.as_mut().unwrap();
+            editor.busy = busy;
+            editor.wrap_columns = Some(80);
+        }
+        if !busy {
+            *fixture.client.status.lock().unwrap() = Some("done".to_owned());
+        }
+        let result = manager
+            .send_identified_with_runtime(
+                "worker",
+                WRAPPED_NOTICE,
+                held(),
+                "wrapped",
+                &Clock::default(),
+            )
+            .unwrap();
+        assert_eq!(result.delivered, ["wrapped"], "busy={busy}");
+        assert_eq!(keys(&fixture), ["Enter"], "busy={busy}");
+        assert_eq!(
+            fixture.client.literal_pastes.lock().unwrap().len(),
+            1,
+            "busy={busy}"
+        );
+        let queue = manager.queue("worker").unwrap();
+        assert!(
+            queue.join("processed/wrapped.json").is_file(),
+            "busy={busy}"
+        );
+        assert!(!queue.join("inbox/wrapped.json").exists(), "busy={busy}");
+    }
+}
+
 #[test]
 fn a_stranded_paste_that_never_draws_is_reported_lost_and_releases_the_queue() {
     let fixture = Fixture::new();

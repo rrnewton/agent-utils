@@ -1190,6 +1190,16 @@ impl PassSnapshot {
             .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
+    /// Drop every kept answer: an input or other effect through this client (typing into a
+    /// pane, pressing a key, reporting a status) can change what any of them would say, so
+    /// the next read must ask Herdr again (#1323 muse-drawn-prompt-missed).
+    fn invalidate(&self) {
+        self.answers
+            .lock()
+            .expect("snapshot answers lock poisoned")
+            .clear();
+    }
+
     fn forget(&self, args: &[String], slot: &SnapshotAnswer) {
         let mut answers = self.answers.lock().expect("snapshot answers lock poisoned");
         if answers
@@ -1315,6 +1325,12 @@ impl HerdrClient {
                 .iter()
                 .any(|[noun, verb]| args[0] == *noun && args[1] == *verb);
         if !query {
+            // Not a read the snapshot keeps: an effect. Whatever it does can change a
+            // pane's screen or status, so no kept answer may be served after it; a
+            // delivery that types through the watcher's client (its queue drain) would
+            // otherwise poll the screen from before its own paste all pass long and
+            // report a drawn prompt as never drawn (#1323 muse-drawn-prompt-missed).
+            snapshot.invalidate();
             return self.invoke_now(args, timeout, &bounded);
         }
         let slot = snapshot.slot(args);
