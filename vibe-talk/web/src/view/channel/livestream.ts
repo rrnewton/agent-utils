@@ -40,6 +40,8 @@ export interface LiveStreamDependencies {
   foldLiveMessage(message: Message, live?: boolean, replayed?: boolean, read?: unknown): Message;
   appendChannelRow(message: Message, live?: boolean, folded?: boolean): void;
   appendToColumns(message: Message, live?: boolean, replayed?: boolean): Message;
+  /** Run `act` with the reader held where they are, through the scroll owner (`#1251`). */
+  preservingScroll(act: () => void): void;
   renderOutgoingEverywhere(): void;
   noteServerThreadHuesIn(messages: readonly Message[]): void;
   threadOf(message: Message): string | null;
@@ -152,7 +154,9 @@ export function createLiveStream(deps: LiveStreamDependencies): LiveStream {
   const foldLiveMessage = deps.foldLiveMessage;
   const appendChannelRow = deps.appendChannelRow;
   const appendToColumns = deps.appendToColumns;
-  const renderOutgoingEverywhere = deps.renderOutgoingEverywhere;
+  // `#1251 scroll-single-owner`: every outgoing redraw is held by the owner, as the browser's
+  // scroll anchoring used to hold it silently.
+  const renderOutgoingEverywhere = (): void => deps.preservingScroll(() => deps.renderOutgoingEverywhere());
   const threadOf = deps.threadOf;
   const loadCanon = deps.loadCanon;
   const replayLedger = deps.replayLedger;
@@ -318,7 +322,7 @@ function receiveLiveMessage(message: Message, selfPosted: boolean, replayed: boo
       // line was a row short of it by then and was never followed: the message arrived out of sight
       // under them, and the jump offered to take them to it.
       const pinned = liveFollowers();
-      appendToColumns(message, true, replayed);
+      deps.preservingScroll(() => appendToColumns(message, true, replayed));
       followLiveArrival(pinned);
       followReplyStore();
     } else if (places) {

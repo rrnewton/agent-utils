@@ -224,3 +224,42 @@ test("`#624 voice-page-modularity`: the older walks mount and dispose without a 
   walks.dispose();
   walks.dispose();
 });
+
+test("`#1251 scroll-single-owner`: a landing held by the owner since capture is not restored over, and a reset base still is", () => {
+  const { createTimelineView } = READCORE;
+  // The held row's content stands at 600: captured at scroll 500 with its top at 100.
+  let rowTop = 100;
+  const row = {
+    getAttribute: (name) => (name === "data-context-id" ? "m1" : null),
+    getBoundingClientRect: () => ({ top: rowTop }),
+    parentNode: null,
+  };
+  const list = { id: "discord-log", children: [row] };
+  row.parentNode = list;
+  const area = { scrollTop: 500 };
+  const { deps } = fakeDeps({
+    el: (id) => (id === "discord-log" ? list : { id, children: [] }),
+    visibleList: () => list,
+    keepFilterHold: () => false,
+    followsNewest: () => false,
+    scrollToNewest: () => { area.scrollTop = 9999; },
+    setJumpNewest: () => {},
+    idsOf: () => ["m1"],
+    listState: () => ({ newestId: "m1", backlog: 0 }),
+  });
+  const view = createTimelineView(deps);
+  const how = { area, keepPosition: true, wasAtNewest: false, previousTop: 500, anchorId: "m1", anchorTop: 100 };
+  // The owner held the row since capture (its own correction for the same redraw): the row
+  // stands at its captured offset with the scroll elsewhere than the captured base, and
+  // restoring that base would undo the hold.
+  area.scrollTop = 643;
+  rowTop = 100;
+  view.settleAfterRead([{ id: "m1" }], how);
+  assert.equal(area.scrollTop, 643, "a landing restored its stale base over the owner's hold");
+  // The browser reset the scroll while the read was out (the row stands where the reset
+  // left it, not at its captured offset): the captured base is restored, as before.
+  area.scrollTop = 0;
+  rowTop = 600;
+  view.settleAfterRead([{ id: "m1" }], how);
+  assert.equal(area.scrollTop, 1000, "a reset base was not restored as before");
+});

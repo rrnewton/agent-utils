@@ -1876,8 +1876,15 @@ function settleAfterRead(messages: readonly Message[], how: { area: HTMLElement;
     // `#612 view-stability`: in the Threads list, not after a card a reply moved to the foot (`heldRowAfter`).
     const held = heldRowAfter(how);
     if (held && Number.isFinite(how.anchorTop)) {
-      how.area.scrollTop = how.previousTop;
-      how.area.scrollTop += held.row.getBoundingClientRect().top - held.top;
+      // `#1251 scroll-single-owner`: the held row already at its captured offset with the
+      // scroll elsewhere than the captured base means the owner held it since (its own
+      // correction for the same redraw); the captured base is stale and restoring it
+      // would undo that hold. Otherwise the captured base is restored, as before.
+      const nowTop = held.row.getBoundingClientRect().top;
+      if (Math.abs(nowTop - held.top) > 1 || how.area.scrollTop === how.previousTop) {
+        how.area.scrollTop = how.previousTop;
+        how.area.scrollTop += nowTop - held.top;
+      }
     } else if (how.heldPlaceAt !== undefined) {
       // As near as the read reaches: the top, when everything it brought is newer than the reader's
       // message — the walk back goes on from there — and otherwise the newest line.
