@@ -8,7 +8,9 @@
 # (WRKSLOTS_SOAK_LOG, default ~/.local/state/wrkslots-soak/soak.log).
 # Note: the Rust writers refuse live registries unless
 # WRKSLOTSD_FIXTURE_WRITER=1 is set for the soak; a Rust refusal is
-# final (logged edition=rust), never a silent Python rerun.
+# final (logged edition=rust), never a silent Python rerun. The one
+# pre-dispatch exception is image-mode create: it is not a covered Rust
+# command yet, so it is handed to Python before Rust runs.
 set -u
 
 SELF="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -27,7 +29,7 @@ log_invocation() {
 run_python() {
     local cmd="$1"; shift || true
     local start=$SECONDS
-    echo "[wrkslots] $cmd: python (not yet in Rust)" >&2
+    echo "[wrkslots] $cmd: python (${PYTHON_NOTE:-not yet in Rust})" >&2
     "${CI_HUB_PYTHON:-python3}" "$ROOT/py/bin/wrkslots" "$@"
     local rc=$?
     log_invocation "$cmd" python "$rc" "$((SECONDS - start))"
@@ -95,6 +97,47 @@ case "$CMD" in
         RUST_CMD="$CMD" ;;
     *) run_python "$CMD" "${ORIGINAL[@]}" ;;
 esac
+
+# Image-backed create is not a covered Rust command. Resolve its
+# representation before dispatch, using Rust's own normalized config for
+# the config case, and hand image mode to Python before Rust runs. Any
+# other Rust outcome stays final; this never reruns a started command.
+if [[ "$CMD" == "create" ]]; then
+    REQUESTED_REPRESENTATION="config"
+    PREVIOUS_ARG=""
+    for arg in "${REST[@]}"; do
+        if [[ "$PREVIOUS_ARG" == "--representation" ]]; then
+            REQUESTED_REPRESENTATION="$arg"
+        fi
+        case "$arg" in
+            --representation=*) REQUESTED_REPRESENTATION="${arg#*=}" ;;
+            --) break ;;
+        esac
+        PREVIOUS_ARG="$arg"
+    done
+    EFFECTIVE_REPRESENTATION="$REQUESTED_REPRESENTATION"
+    if [[ "$EFFECTIVE_REPRESENTATION" == "config" ]]; then
+        VALIDATE_ARGS=(validate-config)
+        if [[ -n "$PROJECT_ROOT" ]]; then
+            VALIDATE_ARGS+=(--root "$PROJECT_ROOT")
+        fi
+        if [[ -n "$MACHINE" ]]; then
+            VALIDATE_ARGS+=(--machine "$MACHINE")
+        fi
+        if CONFIG_JSON="$("$ROOT/rs/bin/wrkslotsd" "${VALIDATE_ARGS[@]}" 2>/dev/null)"; then
+            EFFECTIVE_REPRESENTATION="$(
+                printf '%s' "$CONFIG_JSON" \
+                    | "${CI_HUB_PYTHON:-python3}" -c \
+                        'import json,sys; print(json.load(sys.stdin).get("slot_representation", ""))' \
+                        2>/dev/null
+            )" || EFFECTIVE_REPRESENTATION=""
+        fi
+    fi
+    if [[ "$EFFECTIVE_REPRESENTATION" == "image" ]]; then
+        PYTHON_NOTE="image provisioning in Python"
+        run_python "$CMD" "${ORIGINAL[@]}"
+    fi
+fi
 
 # Refuse (to Python) anything the Rust command does not accept: compare
 # the caller's flags with the Rust command's own --help.

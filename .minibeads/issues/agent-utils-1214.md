@@ -1,6 +1,6 @@
 ---
 title: "wrkslots-soak-image-create-fallback: Rust soak refuses image-mode create without handing off to Python"
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-10T15:05:40.000000000+00:00
@@ -48,3 +48,13 @@ rerun in Python.
 
 Fold the fix into the current Rust-primary landing stack after the issue is
 reserved. The Python CLI is the working reference for image-backed create.
+
+## Resolution
+
+[watermelon-full-preview] The soak wrapper now resolves create's effective representation
+before dispatch—an explicit `--representation`, otherwise Rust's normalized
+`validate-config` output—and hands image mode to Python before Rust runs,
+with the stderr note `image provisioning in Python` and a Python soak-log
+line. Every other Rust outcome remains final and is never rerun. A wrapper
+test covers explicit-image and configured-image creates, including the exit
+code, stderr, and soak log.

@@ -44,6 +44,8 @@ case "$1" in
   unpushed-text)
     if [ "$2" = "--help" ]; then echo "Usage: --root --machine --slot --format"; exit 0; fi
     echo "RS unpushed-text $@" ;;
+  validate-config)
+    if [ -f ./validate-image ]; then echo '{"slot_representation": "image"}'; else echo '{"slot_representation": "worktree"}'; fi ;;
   create-text)
     if [ "$2" = "--help" ]; then echo "Usage: --root --machine --slot-type --coordinator-authorized --agent --task --purpose --owner-pid --coordinator-pid --repo --remote --remote-url --branch --start --override-disk-floor --task-scope-unit --task-scope-invocation-id --representation --format"; exit 0; fi
     echo "RS create-text $@" ;;
@@ -218,6 +220,22 @@ def test_create_both_formats_run_in_rust(tmp_path: Path) -> None:
     assert payload.returncode == 0, payload.stderr
     assert payload.stdout.startswith("RS create-text create-text slot01 --format json")
     assert "cmd=create edition=rust rc=0" in log.read_text()
+
+
+def test_create_image_mode_hands_off_to_python(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    explicit = _run(root, log, "create", "slot01", "--representation", "image")
+    assert explicit.returncode == 0, explicit.stderr
+    assert explicit.stdout.startswith("PY wrkslots create slot01 --representation image")
+    assert "image provisioning in Python" in explicit.stderr
+
+    (root / "validate-image").touch()
+    configured = _run(root, log, "create", "slot01")
+    assert configured.returncode == 0, configured.stderr
+    assert configured.stdout.startswith("PY wrkslots create slot01")
+    assert "image provisioning in Python" in configured.stderr
+    assert log.read_text().count("cmd=create edition=python rc=0") == 2
+    assert "cmd=create edition=rust" not in log.read_text()
 
 
 def test_freeze_runs_in_rust(tmp_path: Path) -> None:
