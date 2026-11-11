@@ -1,10 +1,10 @@
 ---
 title: 'per-kind-summarizer-model: choose the summarizer model per summary kind in vibe-talk and wrkviz'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-11-11T19:00:00.000000000+00:00
-updated_at: 2026-11-11T19:00:00.000000000+00:00
+updated_at: 2026-11-11T20:30:00.000000000+00:00
 ---
 
 # Description
@@ -41,3 +41,16 @@ wrkviz has one phase default plus one rollup default.
 
 Related: #1275 muse-ember-summarizer (the bake-off this mechanism serves),
 #1027 vibe-talk-spark-summarizer (gateway backend).
+
+## Resolution
+
+[watermelon-full-preview] Done and deployed. vibe-talk per-kind models landed
+as agent-utils `1c038e56` and wrkviz per-kind defaults/overrides as
+`686d4428`. #1324 has been deployed since 12:12 PM ET (2026-11-11):
+the coordinator applied the overlay (`message` and `thread_name` on
+`small-elk-internal`, default `muse-spark-1.4-internal`), confirmed live in
+app.log with answer_ms ~2 s. `side_agent` was switched to
+`small-elk-internal` at about 2:17 PM ET on the owner's speed call (after the
+A/B report recommended staying on Spark 1.4 for that kind; the owner chose
+speed). Rollback remains deleting the override lines. The full bake-off is in
+the harness report `ai_docs/reports/measurements/2026-11-11-small-elk-summarizer-ab.md`.
