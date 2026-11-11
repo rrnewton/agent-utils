@@ -1,6 +1,6 @@
 ---
 title: 'documents-scroll-landings: first open at the top, Back to the bottom'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-docscroll
@@ -84,3 +84,24 @@ mu-docscroll/documents-scroll. Related: #1047 documents-list-order,
 #1229 keyed-row-patching, #1251 scroll-single-owner, #624
 voice-page-modularity. Parallel Documents lanes (list cards, star/hide,
 search) coordinate through the coordinator.
+
+## Resolution
+
+Landed as e91bbae6 (the fix) on github/main, tip a9faed88. The Documents
+view records the list's place when a document opens from the list; a
+first open lands at the reader's top after its content renders, however
+late fetched, through the view's existing restore surface; Back and
+view-switch returns apply the recorded place through the list refresh
+after its rows render (the bottom where parked there, the exact offset
+where scrolled up). No new direct scroll writer (guard P4 inventory
+unchanged) and no frozen file touched; the fix does not rely on
+`#scroll-area`'s native anchoring, which `#1251` still owns.
+
+Evidence: 3 unit landings with slow gates (5 solo passes); the new
+slow-fetch browser walk at 393x852 and 1280x800 (5 solo passes); the
+existing documents browser walk solo; the owner-tier gate green
+(159 PASS, including the new documents-scroll-browser job). One
+gate-run failure in untouched approval-card code passed solo on the
+same tree (host load average above 130; the named load cause).
+
+[watermelon-full-preview] mu-docscroll.
