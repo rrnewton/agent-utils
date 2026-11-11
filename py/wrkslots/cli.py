@@ -24314,6 +24314,176 @@ def _heartbeat_diagnosis(record: ActiveRecord) -> tuple[float, bool]:
     return age, age > record.heartbeat_ttl_seconds
 
 
+# TTL escalation ladder (#1293): seconds past heartbeat-TTL expiry at which
+# each rung starts. The defaults are warn at expiry, alarm after 1 day,
+# stop after 2 days, deterministic teardown after 3 days.
+_TTL_WARN_AFTER_SECONDS = 0
+_TTL_ALARM_AFTER_SECONDS = 86_400
+_TTL_STOP_AFTER_SECONDS = 172_800
+_TTL_TEARDOWN_AFTER_SECONDS = 259_200
+_TTL_STAGE_ACTIONS = {
+    "current": "none",
+    "warn": "warn the owner agent and the coordinator",
+    "alarm": "tick-hub HEALTH alarm and daily refused-or-overdue report",
+    "stop": "stop the slot agent",
+    "teardown": "rescue, then deterministic teardown",
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class TtlThresholds:
+    """Seconds past TTL expiry at which each escalation rung starts."""
+
+    warn_after_seconds: int
+    alarm_after_seconds: int
+    stop_after_seconds: int
+    teardown_after_seconds: int
+
+
+def _ttl_thresholds(
+    warn_after_seconds: int,
+    alarm_after_seconds: int,
+    stop_after_seconds: int,
+    teardown_after_seconds: int,
+) -> TtlThresholds:
+    values = (
+        warn_after_seconds,
+        alarm_after_seconds,
+        stop_after_seconds,
+        teardown_after_seconds,
+    )
+    if any(value < 0 for value in values) or list(values) != sorted(values):
+        raise Refusal(
+            "TTL escalation thresholds must be non-negative and non-decreasing "
+            "(warn <= alarm <= stop <= teardown)"
+        )
+    return TtlThresholds(*values)
+
+
+def _ttl_stage(
+    expired_at: dt.datetime, now: dt.datetime, thresholds: TtlThresholds
+) -> str:
+    overdue = (now - expired_at).total_seconds()
+    if overdue >= thresholds.teardown_after_seconds:
+        return "teardown"
+    if overdue >= thresholds.stop_after_seconds:
+        return "stop"
+    if overdue >= thresholds.alarm_after_seconds:
+        return "alarm"
+    if overdue >= thresholds.warn_after_seconds:
+        return "warn"
+    return "current"
+
+
+def _ttl_report_rows(
+    config: Config,
+    state: ActiveState,
+    now: dt.datetime,
+    thresholds: TtlThresholds,
+    *,
+    only_overdue: bool = False,
+    slot: str | None = None,
+) -> list[dict[str, object]]:
+    """One dry-run row per slot: stage, rescue refs, bundle, teardown time.
+
+    Read-only planning for #1293: it names what rescue and teardown would
+    do without running Git, writing a bundle, or touching any slot.
+    """
+    rescue_date = now.astimezone(dt.timezone.utc).strftime("%Y%m%d")
+    rows: list[dict[str, object]] = []
+    for record in sorted(state.slots, key=lambda item: item.slot):
+        if slot is not None and record.slot != slot:
+            continue
+        heartbeat = _parse_timestamp(
+            record.heartbeat_at, f"slot {record.slot} heartbeat"
+        )
+        expired_at = heartbeat + dt.timedelta(seconds=record.heartbeat_ttl_seconds)
+        if only_overdue and now < expired_at:
+            continue
+        stage = _ttl_stage(expired_at, now, thresholds)
+        teardown_at = expired_at + dt.timedelta(
+            seconds=thresholds.teardown_after_seconds
+        )
+        bundle = str(config.control / "ttl-rescue" / f"{record.slot}.bundle")
+        rows.append(
+            {
+                "slot": record.slot,
+                "agent": record.agent,
+                "stage": stage,
+                "next_action": _TTL_STAGE_ACTIONS[stage],
+                "heartbeat_at": record.heartbeat_at,
+                "heartbeat_ttl_seconds": record.heartbeat_ttl_seconds,
+                "expired_at": expired_at.isoformat(),
+                "teardown_at": teardown_at.isoformat(),
+                "checkouts": [
+                    {
+                        "name": checkout.name,
+                        "branch": checkout.branch,
+                        "remote": checkout.remote,
+                        "rescue_ref": (
+                            f"refs/heads/rescue/{record.slot}/{rescue_date}/"
+                            f"{checkout.branch}"
+                        ),
+                        "bundle": bundle,
+                    }
+                    for checkout in record.checkouts
+                ],
+            }
+        )
+    return rows
+
+
+def _cmd_ttl_report(args: argparse.Namespace) -> int:
+    config = _load_config(args.project_root, args.machine)
+    thresholds = _ttl_thresholds(
+        args.warn_after_seconds,
+        args.alarm_after_seconds,
+        args.stop_after_seconds,
+        args.teardown_after_seconds,
+    )
+    now = (
+        _parse_timestamp(args.now, "--now")
+        if args.now is not None
+        else dt.datetime.now(dt.timezone.utc)
+    )
+    state = _load_active_snapshot(config, require_repository=False)
+    rows = _ttl_report_rows(
+        config, state, now, thresholds,
+        only_overdue=args.only_overdue, slot=args.slot,
+    )
+    if args.format == "json":
+        print(
+            json.dumps(
+                {
+                    "schema": SCHEMA,
+                    "now": now.isoformat(),
+                    "thresholds_seconds": {
+                        "warn": thresholds.warn_after_seconds,
+                        "alarm": thresholds.alarm_after_seconds,
+                        "stop": thresholds.stop_after_seconds,
+                        "teardown": thresholds.teardown_after_seconds,
+                    },
+                    "slots": rows,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
+        for row in rows:
+            print(
+                f"SLOT {row['slot']} agent={row['agent']} stage={row['stage']} "
+                f"expired_at={row['expired_at']} teardown_at={row['teardown_at']} "
+                f"next={row['next_action']}"
+            )
+            for checkout in row["checkouts"]:  # type: ignore[union-attr]
+                print(
+                    f"  rescue {checkout['name']} {checkout['rescue_ref']} "
+                    f"bundle {checkout['bundle']}"
+                )
+    return 0
+
+
 def _historical_slot_candidates(config: Config, slot: str, slot_type: str) -> list[Path]:
     """Every slot directory a historical record may legitimately name.
 
@@ -78290,6 +78460,66 @@ usage or audit gate unknown, 3 fail-closed refusal.
         ),
     )
     audit.set_defaults(handler=_cmd_audit)
+    ttl_report = subparsers.add_parser(
+        "ttl-report",
+        description=(
+            "read-only TTL escalation dry run (#1293): each slot's ladder stage, "
+            "planned rescue refs, fallback bundle and teardown time; acts on nothing"
+        ),
+        help="show the TTL escalation dry-run report (acts on nothing)",
+    )
+    ttl_report.add_argument(
+        "--format", choices=("human", "json"), default="human",
+        help="output format (default: human)",
+    )
+    ttl_report.add_argument(
+        "--now", metavar="ISO8601", default=None,
+        help=(
+            "timestamp to judge the ladder against, with a time zone "
+            "(default: the current UTC time); tests pass a fixed value"
+        ),
+    )
+    ttl_report.add_argument(
+        "--slot", metavar="NAME", default=None,
+        help="report only this slot (default: every slot on this machine)",
+    )
+    ttl_report.add_argument(
+        "--only-overdue", action="store_true",
+        help="report only slots past heartbeat-TTL expiry (default: all slots)",
+    )
+    ttl_report.add_argument(
+        "--warn-after-seconds", type=int, default=_TTL_WARN_AFTER_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "seconds past TTL expiry when the warn rung starts; the owner agent "
+            f"and coordinator are warned (default: {_TTL_WARN_AFTER_SECONDS})"
+        ),
+    )
+    ttl_report.add_argument(
+        "--alarm-after-seconds", type=int, default=_TTL_ALARM_AFTER_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "seconds past TTL expiry when the alarm rung starts; a tick-hub "
+            f"HEALTH line and daily report (default: {_TTL_ALARM_AFTER_SECONDS})"
+        ),
+    )
+    ttl_report.add_argument(
+        "--stop-after-seconds", type=int, default=_TTL_STOP_AFTER_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "seconds past TTL expiry when the slot agent is stopped "
+            f"(default: {_TTL_STOP_AFTER_SECONDS})"
+        ),
+    )
+    ttl_report.add_argument(
+        "--teardown-after-seconds", type=int, default=_TTL_TEARDOWN_AFTER_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "seconds past TTL expiry when deterministic teardown runs after "
+            f"rescue (default: {_TTL_TEARDOWN_AFTER_SECONDS})"
+        ),
+    )
+    ttl_report.set_defaults(handler=_cmd_ttl_report)
 
     unpushed = subparsers.add_parser(
         "unpushed",
