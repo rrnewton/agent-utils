@@ -1,4 +1,4 @@
-"""Single-record mutations validate the registry outside the exclusive lock (#1274 adopt-lock-narrow).
+"""Single-record mutations validate the registry outside the exclusive lock (#1276 adopt-lock-narrow).
 
 `adopt` and `create` used to run the whole-fleet validation -- every shard, the archive, the
 event chains, every slot's storage -- while they held the exclusive configuration lock, the

@@ -6001,7 +6001,7 @@ def _journal_fingerprint(config: Config) -> tuple[tuple[str, int, int], ...]:
 # and the configuration lock is the same exclusive flock on the project root that a consumer's
 # run-population lock takes. Measured 2026-11-10 on a shared host (185 slots, 78,892 event
 # files, 2 s samples of /proc/locks): two plain adopts held it 430 s and 236 s, an agent create
-# 57 s, and validation setups behind them were refused as "configuration lock is busy" (#1274).
+# 57 s, and validation setups behind them were refused as "configuration lock is busy" (#1276).
 #
 # Such a command now validates before it takes any lock, and under the locks it compares only
 # the registry identity taken before that validation, then re-checks the one record it
@@ -6013,7 +6013,7 @@ def _journal_fingerprint(config: Config) -> tuple[tuple[str, int, int], ...]:
 
 #: Lock-free validation rounds a single-record mutation runs before it refuses as busy. A
 #: round is repeated only when another writer changed the registry between the start of the
-#: round and the identity check under the configuration lock (#1274).
+#: round and the identity check under the configuration lock (#1276).
 REGISTRY_VALIDATION_ATTEMPTS = 5
 
 #: Top-level control-directory names that a global validation reads, besides the event logs,
@@ -6040,7 +6040,7 @@ _RegistryEntryIdentity = tuple[int, int, int, int, int, int]
 
 @dataclasses.dataclass(frozen=True)
 class _RegistryIdentity:
-    """Cheap identity of every registry file a global validation reads (#1274).
+    """Cheap identity of every registry file a global validation reads (#1276).
 
     One lstat per file, never a content read: the names listed by
     ``_REGISTRY_IDENTITY_PREFIXES``, every top-level journal, every file in every ``EVENTS.*``
@@ -6093,7 +6093,7 @@ def _registry_journal_name(name: str) -> bool:
 
 
 def _registry_identity(config: Config) -> _RegistryIdentity:
-    """Take the registry identity a prevalidated mutation compares under its locks (#1274)."""
+    """Take the registry identity a prevalidated mutation compares under its locks (#1276)."""
 
     def listed(path: str, label: str) -> list[os.DirEntry[str]]:
         try:
@@ -6173,7 +6173,7 @@ def _run_prevalidated_mutation(
     prepare: Callable[[], _PreparedFacts | None],
     commit: Callable[[_RegistryIdentity | None, _PreparedFacts | None], _CommitResult],
 ) -> _CommitResult:
-    """Validate without any lock, then commit under the mutation locks (#1274).
+    """Validate without any lock, then commit under the mutation locks (#1276).
 
     Each round takes the registry identity, then runs ``prepare``: the global validation and
     every other fleet-wide read, holding no lock (a read that meets a retirement half-written
@@ -6186,7 +6186,7 @@ def _run_prevalidated_mutation(
     ``prepare`` returns None when an interrupted mutation's journal is outstanding: the
     journal recovery that ``_assert_no_journal`` performs needs the exclusive lock, so if the
     registry is still unchanged under it, ``commit(None, None)`` runs the command's original
-    validation there, exactly as before #1274. A journal a live writer holds disappears when
+    validation there, exactly as before #1276. A journal a live writer holds disappears when
     that writer finishes, which changes the identity, so the next round validates lock-free
     again.
 
@@ -6232,7 +6232,7 @@ def _run_prevalidated_mutation(
 
 #: Event kinds a prevalidated adopt or create appends for its own slot. The post-write check
 #: accepts a run of only these, for only that slot, by reading just those events; any other
-#: shape gets the exact check (#1274).
+#: shape gets the exact check (#1276).
 _SLOT_MUTATION_EVENT_KINDS = frozenset(
     {"active-state-recorded", "operation-progress-recorded", "operation-completed"}
 )
@@ -6241,7 +6241,7 @@ _COMPLETE_EVENT_NAME = re.compile(r"[0-9]{20}\.json")
 
 @dataclasses.dataclass(frozen=True)
 class _VerifiedLocalLog:
-    """This machine's states and event-log tip as a lock-free validation verified them (#1274).
+    """This machine's states and event-log tip as a lock-free validation verified them (#1276).
 
     Valid only under the mutation locks of a prevalidated mutation whose registry identity
     matched: no writer has appended since, so the command advances this state and appends
@@ -6270,7 +6270,7 @@ def _verified_local_log(
     states: Sequence[ActiveState],
     archives: Sequence[ArchiveState],
 ) -> _VerifiedLocalLog | None:
-    """Read this machine's verified log tip under the mutation locks (#1274).
+    """Read this machine's verified log tip under the mutation locks (#1276).
 
     Call only once the registry identity equals ``reference``, the identity taken before the
     validation that produced ``states`` and ``archives``, and after ``_refuse_partial_state``.
@@ -6316,7 +6316,7 @@ def _appended_events_limited_to_slot(
 ) -> bool:
     """Do the events appended after the verified tip change no registry row but ``slot``'s?
 
-    True only for the run a prevalidated adopt or create appends (#1274). That run is new
+    True only for the run a prevalidated adopt or create appends (#1276). That run is new
     files directly after the tip, each verified on the chain from the tip's digest. Each is
     of a ``_SLOT_MUTATION_EVENT_KINDS`` kind and names ``slot``. Each active-state event
     advances the verified state by one revision, from ``slot``'s verified record to a record
@@ -6383,7 +6383,7 @@ def _assert_registry_change_limited_to_slot(
 ) -> None:
     """The post-write check of a mutation: no registry row but ``slot``'s changed.
 
-    ``reference`` is the identity a prevalidated mutation verified under its locks (#1274),
+    ``reference`` is the identity a prevalidated mutation verified under its locks (#1276),
     and ``local`` this machine's verified state and log tip. Under those locks no other
     wrkslots writer can commit, and the mutation writes only this machine's ACTIVE and
     ARCHIVED shards and event log, plus the slot's own image record for an image-backed
@@ -9071,7 +9071,7 @@ def _write_active_state(
 
     ``previous`` is the state ``state`` advances from. It is loaded from the log unless the
     caller passes it, which only a prevalidated mutation does, with the state it verified
-    under its locks (#1274). A writer positioned after an existing event shows the log
+    under its locks (#1276). A writer positioned after an existing event shows the log
     exists, so the log is not listed again to learn that.
     """
 
@@ -9228,7 +9228,7 @@ def _write_journal(
     journal_path: Path | None = None,
 ) -> None:
     if event_writer is None or not event_writer.sequence:
-        # A writer positioned after an existing event shows the log exists (#1274).
+        # A writer positioned after an existing event shows the log exists (#1276).
         _ensure_event_log(config)
     writer = event_writer or _event_writer(config, config.machine)
     selected_path = journal_path or _journal_path(config)
@@ -9252,7 +9252,7 @@ def _clear_journal(
     journal_path: Path | None = None,
 ) -> None:
     if event_writer is None or not event_writer.sequence:
-        # A writer positioned after an existing event shows the log exists (#1274).
+        # A writer positioned after an existing event shows the log exists (#1276).
         _ensure_event_log(config)
     writer = event_writer or _event_writer(config, config.machine)
     selected_path = journal_path or _journal_path(config)
@@ -31305,7 +31305,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 @dataclasses.dataclass(frozen=True)
 class _CreatePrevalidated:
-    """What a create's lock-free validation established (#1274).
+    """What a create's lock-free validation established (#1276).
 
     ``repositories`` are the source repositories the plan will name, in plan order, as
     ``_create_plan_repositories`` derives them; ``storage_inconsistencies`` is the
@@ -32428,7 +32428,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
     vcs = _GitVcs()
 
     def prepare() -> _CreatePrevalidated | None:
-        # Lock-free (#1274). An outstanding journal -- an interrupted mutation's, a live
+        # Lock-free (#1276). An outstanding journal -- an interrupted mutation's, a live
         # writer's, or a validation batch's seal -- needs the recovery and classification
         # that only the locked path performs, so that round defers to it.
         if _outstanding_journals(config) or _validate_batch_seal_journals(config):
@@ -32489,7 +32489,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 slot_type=args.slot_type,
             )
         else:
-            # Validated lock-free and still current (#1274): no journal, seal or interrupted
+            # Validated lock-free and still current (#1276): no journal, seal or interrupted
             # batch was outstanding then, so none is recovered, excluded or classified now,
             # and the slot and agent were free.
             states, archives = list(prepared.states), list(prepared.archives)
@@ -32504,7 +32504,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             state = _load_active(config)
         else:
             # What _ensure_state_shard does for a log that has events, from the states the
-            # lock-free validation derived from exactly these events (#1274): nothing under
+            # lock-free validation derived from exactly these events (#1276): nothing under
             # the lock loads the log.
             _atomic_write_json(_active_path(config), _active_to_obj(local.active))
             _atomic_write_json(_archive_path(config), _archive_to_obj(local.archive))
@@ -32582,7 +32582,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
         # the locks.  The shard above has already ensured the log exists,
         # so no append can bypass this writer through _ensure_event_log.
         # A prevalidated create starts it at the verified tip, without
-        # loading the chain at all (#1274).
+        # loading the chain at all (#1276).
         event_writer = (
             _event_writer(config, config.machine) if local is None else local.writer(config)
         )
@@ -33795,7 +33795,7 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
         return states, archives
 
     def prepare() -> tuple[list[ActiveState], list[ArchiveState]] | None:
-        # Lock-free (#1274). An outstanding journal needs the recovery that only the locked
+        # Lock-free (#1276). An outstanding journal needs the recovery that only the locked
         # path performs, so that round defers to it.
         if _outstanding_journals(config):
             return None
@@ -33812,7 +33812,7 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
         else:
             states, archives = prepared
         before = _global_rows(states, archives)
-        # Validated lock-free and still current (#1274): this machine's state and log tip come
+        # Validated lock-free and still current (#1276): this machine's state and log tip come
         # from that validation, so nothing under the lock loads the log.
         local = (
             None

@@ -1183,7 +1183,7 @@ def test_create_constructs_one_event_writer_for_all_its_appends(
     load inside the registry locks.  The created slot and its events are
     exactly what separate writers produced.  A prevalidated create starts
     its one writer at the tip its lock-free validation verified instead
-    (`_VerifiedLocalLog.writer`, #1274), so both constructions count.
+    (`_VerifiedLocalLog.writer`, #1276), so both constructions count.
     """
 
     project, _repository, _remote = make_project(tmp_path)
