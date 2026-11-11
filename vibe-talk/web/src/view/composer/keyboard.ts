@@ -61,8 +61,7 @@ export interface OnScreenKeyboardDependencies {
   closeSpeedPopover(): void;
   /** Move `area` by a measured delta through the scroll owner (`#1251`). */
   nudge(area: HTMLElement, delta: number): void;
-  /** Whether `area` rests at its foot (the page's `atBottom`), and taking it there through the owner (`#1251`). */
-  atFoot(area: HTMLElement): boolean;
+  /** Take `area` to its foot through the scroll owner (`#1251`). */
   toFoot(area: HTMLElement): void;
 }
 
@@ -172,7 +171,7 @@ export function createOnScreenKeyboard(deps: OnScreenKeyboardDependencies): OnSc
       // room; a reader who was at its foot is taken back to it by the owner, as native
       // scroll anchoring used to do silently. Noted before the room is cleared.
       const fittedArea = onScreenKeyboard.fittedArea;
-      const wasAtFoot = fit === null && fittedArea !== null && deps.atFoot(fittedArea);
+      const wasAtFoot = fit === null && fittedArea !== null && !onScreenKeyboard.readerMoved;
       onScreenKeyboard.fitted = fit;
       onScreenKeyboard.settling = false;
       if (fit) startKeyboardFit(fit, height);

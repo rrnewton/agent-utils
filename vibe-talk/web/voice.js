@@ -8774,7 +8774,6 @@ const screenKeyboard = createOnScreenKeyboard({
   computedStyle: (node) => (typeof window.getComputedStyle === "function" ? window.getComputedStyle(node) : null),
   closeSpeedPopover: () => closeSpeedPopover(),
   nudge: (area, delta) => scrollKeeping.nudge(area, delta),
-  atFoot: (area) => atBottom(area),
   toFoot: (area) => scrollKeeping.toFoot(area),
 });
 const { noteKeyboard, noteKeyboardReader, settleOnScroll, showKeyboardDebug, renderKeyboardDebug } = screenKeyboard;
