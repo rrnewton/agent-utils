@@ -1447,7 +1447,13 @@ def test_profile_resume_cli_preserves_policy_and_boxes_the_selected_native_launc
         "value": "selected-conversation", "source": "asserted",
     }
     assert result["native_session"] == record.native_session
-    assert result["lifecycle"] == "running" and captured.err == ""
+    # #1158: a Muse launch without the question kill flag warns on stderr.
+    expected_err = (
+        ""
+        if harness != "muse"
+        else f"agentctl: warning: worker: this launch {blocking_question_warning('muse', ())}\n"
+    )
+    assert result["lifecycle"] == "running" and captured.err == expected_err
 
 
 @pytest.mark.parametrize("harness", ["codex", "claude", "muse"])
@@ -1589,7 +1595,12 @@ def test_profile_resume_raw_only_selectors_remain_allowed_without_structured_res
         "--profile", "owner-policy",
     ]) == 0
     captured = capsys.readouterr()
-    assert captured.err == "" and fake.launched[0][3][-2:] == arguments
+    expected_err = (
+        ""
+        if harness != "muse"
+        else f"agentctl: warning: worker: this launch {blocking_question_warning('muse', ())}\n"
+    )
+    assert captured.err == expected_err and fake.launched[0][3][-2:] == arguments
     record = sessions.get("worker")
     assert record.resume is None and record.native_session == {
         "schema": "agentctl-native-session/v1", "agent": harness,
