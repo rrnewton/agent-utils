@@ -2621,7 +2621,7 @@ test("a desk's dock growing keeps a reader on the newest turn there, and moves n
   // the slack, so this is the defect and not a rounding — and everything else comes out the same,
   // the return from Settings included: what the page does there, it did before this.
   const control = await run(await brokenModule([{ file: "src/view/channel/listkeepers.ts",
-    find: "      if (grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) {\n        area.scrollTop = area.scrollHeight;\n      }\n",
+    find: "      if (grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) {\n        deps.toFoot(area);\n      }\n",
     replace: "" }]));
   assert.ok(GROWTH > BOTTOM_SLACK_PX, "the premise: a second row is more than the slack");
   assert.deepStrictEqual(control, { ...real, newest: false });
@@ -3793,8 +3793,8 @@ test("`#338 column-overscroll`: at a desk PgDn or Space at the foot of the right
   assert.deepStrictEqual(notFoot, { ...real, atNewest: false });
   // End and the chip landing where the room already is, rather than closing it: the reader stays in it.
   const kept = await run(await brokenModule([{ file: "src/view/channel/footroom.ts",
-    find: "    if (area === deps.side()) closeOverscroll();\n    area.scrollTop = area.scrollHeight;\n  }",
-    replace: "    area.scrollTop = area.scrollHeight;\n  }" }, { file: "src/view/shell/scrollkeys.ts",
+    find: "    if (area === deps.side()) closeOverscroll();\n    deps.toFoot(area);\n  }",
+    replace: "    deps.toFoot(area);\n  }" }, { file: "src/view/shell/scrollkeys.ts",
     find: "    if (deps.scrollArea() === deps.sideScroll()) deps.closeOverscroll();\n", replace: "" }], brokenScriptEach(
     ["    jumpNewest: inThisColumn(() => {\n      closeOverscroll();\n",
       "    jumpNewest: inThisColumn(() => {\n"],
