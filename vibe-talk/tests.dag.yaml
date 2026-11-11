@@ -1767,6 +1767,23 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1215 collapse-anchor-below`: the three collapse cases in real Chromium at phone and desk
+  # widths — the collapsed top held, the next row held, a giant collapsed row centered.
+  - group: check
+    job: collapse-anchor-browser
+    desc: collapsing a message with its top on screen, above it, and inside a giant, at 393x852 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/collapse_anchor_browser.py
+    jobs_flag: ""
+    deps: [setup.contract-tools]
+    timeout: 720
+    cpu_timeout: 90
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 120
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#1251 scroll-single-owner`: every direct scroll write outside the loop owner (scrollkeep),
   # grouped by adoption path; enforcing for the paths already adopted (P1 keepers/footroom,
   # P7 composer/keyboard), report-only for the rest until each path moves.
