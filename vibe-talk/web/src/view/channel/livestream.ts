@@ -156,7 +156,7 @@ export function createLiveStream(deps: LiveStreamDependencies): LiveStream {
   const appendToColumns = deps.appendToColumns;
   // `#1251 scroll-single-owner`: every outgoing redraw is held by the owner, as the browser's
   // scroll anchoring used to hold it silently.
-  const renderOutgoingEverywhere = (): void => deps.preservingScroll(() => deps.renderOutgoingEverywhere());
+  const renderOutgoingEverywhere = deps.renderOutgoingEverywhere;
   const threadOf = deps.threadOf;
   const loadCanon = deps.loadCanon;
   const replayLedger = deps.replayLedger;
@@ -322,7 +322,7 @@ function receiveLiveMessage(message: Message, selfPosted: boolean, replayed: boo
       // line was a row short of it by then and was never followed: the message arrived out of sight
       // under them, and the jump offered to take them to it.
       const pinned = liveFollowers();
-      deps.preservingScroll(() => appendToColumns(message, true, replayed));
+      appendToColumns(message, true, replayed);
       followLiveArrival(pinned);
       followReplyStore();
     } else if (places) {

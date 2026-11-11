@@ -4707,7 +4707,7 @@ const { noteSelfAuthor, messageChannel } = speakers;
 function renderChannelRows() {
   // `#1251 scroll-single-owner`: every Main-list redraw is held by the owner — except under a
   // quick-reply hold, whose own holder places the box (`placeQuickReply`).
-  if (quickReplyHolds(el("scroll-area")) || filterChanges.changing() || currentFilterHold() !== null) renderChannelRowsNow();
+  if (columnWork.side() || quickReplyHolds(el("scroll-area")) || filterChanges.changing() || currentFilterHold() !== null) renderChannelRowsNow();
   else scrollKeeping.holdingRows(() => renderChannelRowsNow());
 }
 
