@@ -24552,6 +24552,34 @@ def _execute_ttl_rescue(
     }
 
 
+def _execute_ttl_teardown(
+    checkout_dir: Path,
+    *,
+    slot: str,
+    date_str: str,
+    remote: str,
+    bundle_path: Path,
+) -> dict[str, object]:
+    """Deterministic teardown for one past-T+3 d checkout (#1293 slice 4).
+
+    Rescue runs first and never vetoes removal: whatever rescue could not
+    push is held by the verified bundle the rescue wrote, the outcome is
+    recorded in the receipt, and the checkout tree is then removed. The
+    only refusal is a caller error (no Git checkout at the path); a slot
+    that reached this rung has no refusal left. Real slot removal wires
+    this through the removal machinery and its lock pattern; this
+    executor is the fixture-proven core that wiring calls.
+    """
+    if not (checkout_dir / ".git").exists():
+        raise Refusal(f"ttl teardown needs a Git checkout at {checkout_dir}")
+    rescue = _execute_ttl_rescue(
+        checkout_dir, slot=slot, date_str=date_str,
+        remote=remote, bundle_path=bundle_path,
+    )
+    shutil.rmtree(checkout_dir)
+    return {"slot": slot, "rescue": rescue, "removed": True, "path": str(checkout_dir)}
+
+
 def _ttl_health_lines(
     rows: list[_TtlReportRow], thresholds: TtlThresholds
 ) -> list[str]:

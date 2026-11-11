@@ -482,6 +482,7 @@
         "py/wrkslots/tests/test_transfer_owner_write_rust.py",
         "py/wrkslots/tests/test_ttl_report.py",
         "py/wrkslots/tests/test_ttl_rescue.py",
+        "py/wrkslots/tests/test_ttl_teardown.py",
         "py/wrkslots/tests/test_unhold_write_rust.py",
         "py/wrkslots/tests/test_unpushed_state_rust.py",
         "py/wrkslots/tests/test_validate_batch_seal_ownership.py",
