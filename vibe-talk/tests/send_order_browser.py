@@ -27,7 +27,9 @@ The bridge records every post in the order it arrived, so "A then B" is what rea
 service, not what the page drew. It needs the release binary, which has web/ compiled into it:
 `cargo build --release` first (the `send-order-browser` make target does). Pass --server-bin to use
 another build, --port P to put the server on P and the bridge on P+1 (default: free ports), and
---screenshots DIR to keep a PNG of each waiting state.
+--screenshots DIR to keep a PNG of each waiting state. Pass --benchmark to also enforce the one
+timing reading (the drawn countdown began at 3 s); gating never does — the 3 s wait counts from
+the failed attempt's start, so on a hot host a correct page can draw a smaller number first.
 """
 
 from __future__ import annotations
@@ -64,10 +66,13 @@ Json = dict[str, object]
 # a pass takes as long as the page and bridge do on a hot host and this only bounds a failure.
 STATE_S = 30.0
 # Records the retry countdown as the page draws it, in the page: every distinct number of seconds
-# the first outbox row shows, in the order drawn. The check once sampled the row's text from this
-# process and demanded "Retrying in 3 s." at that instant, so a starved sample a second late read
-# 2 or 1 and failed a page behaving exactly as drawn (`#1250`); the recorded sequence is judged
-# instead — its first value is the backoff the page drew, however late this process reads it.
+# the first outbox row shows, in the order drawn. Gating judges only that the row names the cause
+# and draws a countdown at all: the product counts its 3 s wait from when the failed attempt
+# STARTED (`nextRetryAt` in the page's `core/outbox/retries.ts`), so on a hot host a page behaving
+# exactly as specified can legitimately draw "Retrying in 2 s." first — demanding a first drawn
+# value of 3 failed such a page in a real loaded gate (`#1250`). The exact wait stays pinned with
+# explicit timestamps by `tests/js/core/outbox.test.mjs` (no host clock); the recorded sequence
+# here feeds the opt-in `--benchmark`, which is where a first-drawn-3 reading belongs.
 COUNTDOWN_RECORDER_JS = """() => {
   window.__retryCountdowns = [];
   setInterval(() => {
@@ -256,6 +261,11 @@ def arguments() -> argparse.Namespace:
         help="Chrome/Chromium executable (default: Playwright's bundled Chromium)",
     )
     parser.add_argument("--screenshots", type=Path, help="keep a PNG of each waiting state in this directory")
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="also enforce the timing reading — A's drawn countdown began at 3 s (never in gating)",
+    )
     return parser.parse_args()
 
 
@@ -403,8 +413,9 @@ def main() -> int:
                       and "Google Chat could not answer: Google Chat message send failed." in drawn[0][1]
                       and re.search(r"Retrying in \d+ s\.", drawn[0][1]) is not None)
                 countdowns: object = page.evaluate("() => window.__retryCountdowns")
-                check(isinstance(countdowns, list) and countdowns[:1] == [3],
-                      f"A's drawn countdown began {countdowns!r}, not at the 3 s backoff it says it waits")
+                if args.benchmark:
+                    check(isinstance(countdowns, list) and countdowns[:1] == [3],
+                          f"[benchmark] A's drawn countdown began {countdowns!r}, not at the 3 s backoff")
                 send(page, "B is what I wrote next")
                 until(page, "B was not shown waiting behind A",
                       lambda: [state for state, _ in rows(page)] == ["retrying", "queued"])
@@ -500,7 +511,7 @@ def main() -> int:
                 version = context.browser.version if context.browser else "Chromium"
                 context.close()
         print(f"{version} at 412x915 against the real server and a mock Google Chat bridge: A failed at"
-              " once and waited 3 s, B waited behind it and the bridge never saw it, A went again under the"
+              " once and said when it would go again, B waited behind it and the bridge never saw it, A went again under the"
               " same nonce and landed, then B; C kept failing, D waited behind it across a real reload that"
               " sent nothing, and Retry on C landed C, then D; Dismiss on a failing E let F go; G, H and I"
               " reached a slow bridge one at a time, in order; and Q did not reach the bridge until P, whose"
