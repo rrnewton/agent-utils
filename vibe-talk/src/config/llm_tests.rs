@@ -55,6 +55,58 @@ fn an_anthropic_section_needs_only_a_key_file_and_takes_conservative_defaults() 
 }
 
 #[test]
+fn the_side_agent_model_comes_from_the_models_table_or_falls_back() {
+    // `catchup-side-agent` on `#1324 per-kind-summarizer-model`: the side agent asks
+    // [summaries.llm.models] side_agent when named, else `model`.
+    let named = load(
+        "[summaries.llm]\napi_key_file = \"/run/secrets/model-key\"\nmodel = \"small-model\"\n\
+         [summaries.llm.models]\nside_agent = \"big-model\"\n",
+    )
+    .expect("valid");
+    let llm = named.summaries.llm.expect("read");
+    assert_eq!(llm.models.side_agent.as_deref(), Some("big-model"));
+    assert_eq!(llm.model_for(SummaryKind::SideAgent), "big-model");
+    assert_eq!(
+        llm.model, "small-model",
+        "the summariser's own model is untouched"
+    );
+
+    let plain =
+        load("[summaries.llm]\napi_key_file = \"/run/secrets/model-key\"\n").expect("valid");
+    let llm = plain.summaries.llm.expect("read");
+    assert!(!llm.models.any());
+    assert_eq!(
+        llm.model_for(SummaryKind::SideAgent),
+        llm.model,
+        "no override: the section's model"
+    );
+}
+
+#[test]
+fn the_catchup_window_defaults_to_150_and_zero_is_refused() {
+    // `catchup-side-agent`.
+    assert_eq!(
+        load("").expect("valid").summaries.catchup_window_messages,
+        150
+    );
+    let named = Config::from_toml_and_env(
+        &format!("{BASE}catchup_window_messages = 25\n"),
+        &BTreeMap::new(),
+    )
+    .expect("valid");
+    assert_eq!(named.summaries.catchup_window_messages, 25);
+    let err = Config::from_toml_and_env(
+        &format!("{BASE}catchup_window_messages = 0\n"),
+        &BTreeMap::new(),
+    )
+    .expect_err("zero covers nothing");
+    assert!(
+        matches!(&err, ConfigError::Invalid { field, .. } if field == "summaries.catchup_window_messages"),
+        "{err}"
+    );
+}
+
+#[test]
 fn an_anthropic_section_without_a_key_file_is_refused_by_name() {
     let err = load("[summaries.llm]\ndialect = \"anthropic\"\n").expect_err("no key");
     assert!(

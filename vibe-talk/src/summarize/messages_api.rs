@@ -915,6 +915,18 @@ impl Summarizer for MessagesApiSummarizer {
         })
     }
 
+    async fn complete_prompt(&self, system: &str, prompt: &str) -> Result<String, SummaryError> {
+        // The whole answer, uncut: a Discuss reply is bullets, not one flattened sentence, so
+        // none of `plain_uncut`'s summary shaping applies. `catchup-side-agent`.
+        self.complete(
+            Priority::Interactive,
+            crate::config::SummaryKind::SideAgent,
+            system,
+            prompt,
+        )
+        .await
+    }
+
     async fn name_thread(&self, request: &ThreadRequest<'_>) -> Result<ThreadNaming, SummaryError> {
         // `#541 thread-summary-concise`: the style rides with the rule, outside the policy input.
         let system = format!(

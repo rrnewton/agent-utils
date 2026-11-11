@@ -64,6 +64,103 @@
       }
     }
   ],
+  "CatchupRequest": [
+    {
+      "thread_id": "thread-1",
+      "view": "main"
+    },
+    {
+      "thread_id": null,
+      "view": null
+    }
+  ],
+  "CatchupResponse": [
+    {
+      "backend": "meta-gateway",
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "footer_links": [
+        {
+          "id": "1010",
+          "label": "09:51 · Ada",
+          "thread_id": "thread-1"
+        }
+      ],
+      "markable_ids": [
+        "1010"
+      ],
+      "model": "some-model",
+      "stamp": {
+        "context_ms": 120,
+        "first_token_ms": 300,
+        "input_chars": 51234,
+        "input_tokens": 10000,
+        "model_ms": 3900,
+        "output_chars": 812,
+        "output_tokens": 200,
+        "total_ms": 4050
+      },
+      "text": "one point worth knowing",
+      "thread_id": "thread-1",
+      "unread_ids": [
+        "1010",
+        "1011"
+      ],
+      "view": "thread",
+      "window": {
+        "count": 12,
+        "from_id": "1000",
+        "noise_hidden": 1,
+        "read_count": 10,
+        "through_id": "1011",
+        "truncated": true,
+        "unread_count": 2
+      }
+    },
+    {
+      "backend": "messages-api",
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "footer_links": [],
+      "markable_ids": [],
+      "model": "some-model",
+      "stamp": {
+        "context_ms": 3,
+        "first_token_ms": null,
+        "input_chars": 40,
+        "input_tokens": null,
+        "model_ms": 10,
+        "output_chars": 0,
+        "output_tokens": null,
+        "total_ms": 13
+      },
+      "text": "",
+      "thread_id": null,
+      "unread_ids": [],
+      "view": "flat",
+      "window": {
+        "count": 0,
+        "from_id": null,
+        "noise_hidden": 0,
+        "read_count": 0,
+        "through_id": null,
+        "truncated": false,
+        "unread_count": 0
+      }
+    }
+  ],
   "ChannelHistoryState": [
     {
       "channel_id": "C0000MAIN1",
@@ -144,6 +241,7 @@
         "name": "voice",
         "settings_url": "https://voice.example/settings"
       },
+      "discuss_available": true,
       "hidden_channels": [
         {
           "added": false,

@@ -700,6 +700,10 @@ pub struct SummariesConfig {
     /// named, never what it is named, so it is not in the cache key. See
     /// [`crate::summarize::threads`].
     pub thread_naming_interval_seconds: u64,
+    /// How many of a channel's newest messages one Discuss (catch-up) read covers.
+    /// `catchup-side-agent`. It decides how much context the side agent is shown, never what a
+    /// one-message summary says, so it is not in the summary cache key.
+    pub catchup_window_messages: usize,
     /// A direct Messages API summariser, when `[summaries.llm]` is present. `#233 llm-summarizer`.
     ///
     /// When present it is THE summariser, and it is also the one that names threads; see
@@ -720,6 +724,7 @@ impl Default for SummariesConfig {
             reply_timeout_seconds: crate::summarize::agent::DEFAULT_REPLY_TIMEOUT_SECONDS,
             thread_naming_interval_seconds:
                 crate::summarize::threads::DEFAULT_NAMING_INTERVAL_SECONDS,
+            catchup_window_messages: DEFAULT_CATCHUP_WINDOW_MESSAGES,
             llm: None,
         }
     }
@@ -1006,6 +1011,10 @@ impl LlmConfig {
         )
     }
 }
+
+/// How many of a channel's newest messages one Discuss read covers when `[summaries]` names
+/// no `catchup_window_messages`. `catchup-side-agent`.
+pub const DEFAULT_CATCHUP_WINDOW_MESSAGES: usize = 150;
 
 /// The model `[summaries.llm]` asks when none is named: a small, fast model whose alias is
 /// valid on both the Anthropic API and Google Vertex.
@@ -2070,6 +2079,7 @@ struct FileSummaries {
     socket_idle_seconds: Option<u64>,
     reply_timeout_seconds: Option<u64>,
     thread_naming_interval_seconds: Option<u64>,
+    catchup_window_messages: Option<usize>,
     llm: Option<FileLlm>,
 }
 
@@ -3243,8 +3253,17 @@ fn summaries_config(
         thread_naming_interval_seconds: file
             .thread_naming_interval_seconds
             .unwrap_or(defaults.thread_naming_interval_seconds),
+        catchup_window_messages: file
+            .catchup_window_messages
+            .unwrap_or(defaults.catchup_window_messages),
         llm,
     };
+    if summaries.catchup_window_messages == 0 {
+        return Err(ConfigError::Invalid {
+            field: "summaries.catchup_window_messages".to_owned(),
+            detail: "must be at least 1, or a Discuss read covers no messages at all".to_owned(),
+        });
+    }
     if summaries.thread_naming_interval_seconds > MAX_THREAD_NAMING_INTERVAL_SECONDS {
         return Err(ConfigError::Invalid {
             field: "summaries.thread_naming_interval_seconds".to_owned(),

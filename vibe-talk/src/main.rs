@@ -805,6 +805,11 @@ async fn main() -> anyhow::Result<()> {
     let thread_names = Arc::new(vibe_talk::summarize::threads::ThreadNames::with_interval(
         std::time::Duration::from_secs(config.summaries.thread_naming_interval_seconds),
     ));
+    // `catchup-side-agent`: the Discuss side agent, beside the summariser and built from the
+    // same [summaries.llm] section retuned. Absent without one; the endpoint says so.
+    let catchup_summarizer = vibe_talk::summarize::catchup_summarizer_for(&config.summaries);
+    let catchup_model: Option<Arc<str>> =
+        vibe_talk::summarize::catchup_model(&config.summaries).map(Arc::from);
     let state = AppState {
         config: Arc::new(config),
         chat: Arc::clone(&chat),
@@ -843,6 +848,8 @@ async fn main() -> anyhow::Result<()> {
         send_intent: Arc::new(vibe_talk::send_intent::SendIntent::new()),
         reply_reads: Arc::new(vibe_talk::reply_read::ReplyReads::new()),
         live: Arc::clone(&live),
+        catchup_summarizer,
+        catchup_model,
         summarizer,
         summary_version: summary_version.into(),
         summary_counters: Arc::new(vibe_talk::summarize::counters::SummaryCounters::new()),

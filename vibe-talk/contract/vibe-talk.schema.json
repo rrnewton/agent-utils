@@ -117,6 +117,271 @@
       ],
       "type": "object"
     },
+    "CatchupFooterLink": {
+      "description": "One unread message a Discuss answer covers, for the panel's footer list.\n`catchup-side-agent`.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/MessageId",
+          "description": "The message."
+        },
+        "label": {
+          "description": "`\"HH:MM · author\"`, as the message itself carries it.",
+          "type": "string"
+        },
+        "thread_id": {
+          "description": "The thread the message belongs to, when it belongs to one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "thread_id"
+      ],
+      "type": "object"
+    },
+    "CatchupRequest": {
+      "description": "The body of `POST /api/v1/channels/{channel_id}/catchup`: one Discuss read.\n`catchup-side-agent`.",
+      "properties": {
+        "thread_id": {
+          "default": null,
+          "description": "The thread to cover, whole; absent or null covers the channel itself.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "view": {
+          "default": null,
+          "description": "Which channel view a channel read covers: `\"flat\"` (the default) or `\"main\"`.\nIgnored for a thread read. The window's size is server configuration, never the\ncaller's choice.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "thread_id",
+        "view"
+      ],
+      "type": "object"
+    },
+    "CatchupResponse": {
+      "description": "One Discuss answer: the model text, and exactly what it covers. `catchup-side-agent`.",
+      "properties": {
+        "backend": {
+          "description": "Which backend answered, said out loud so a page can never imply a model it did not get.",
+          "type": "string"
+        },
+        "channel": {
+          "$ref": "#/$defs/ChannelInfo",
+          "description": "The channel read, as configured here."
+        },
+        "footer_links": {
+          "description": "One link per unread message covered, oldest first.",
+          "items": {
+            "$ref": "#/$defs/CatchupFooterLink"
+          },
+          "type": "array"
+        },
+        "markable_ids": {
+          "description": "The subset of `unread_ids` a dismissal can name, for the footer's mark-read act.",
+          "items": {
+            "$ref": "#/$defs/MessageId"
+          },
+          "type": "array"
+        },
+        "model": {
+          "description": "The model it asked.",
+          "type": "string"
+        },
+        "stamp": {
+          "$ref": "#/$defs/CatchupStamp",
+          "description": "How the read spent its time."
+        },
+        "text": {
+          "description": "The model's answer, its cites checked against the ids it was shown. Model text only:\nthe footer is structured, above.",
+          "type": "string"
+        },
+        "thread_id": {
+          "description": "The thread covered, or null for a channel read.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "unread_ids": {
+          "description": "Exactly the unread ids the model was shown, oldest first.",
+          "items": {
+            "$ref": "#/$defs/MessageId"
+          },
+          "type": "array"
+        },
+        "view": {
+          "description": "The view covered: `\"flat\"` or `\"main\"` for a channel read.",
+          "type": "string"
+        },
+        "window": {
+          "$ref": "#/$defs/CatchupWindow",
+          "description": "What the read covered."
+        }
+      },
+      "required": [
+        "channel",
+        "thread_id",
+        "view",
+        "window",
+        "unread_ids",
+        "markable_ids",
+        "footer_links",
+        "text",
+        "backend",
+        "model",
+        "stamp"
+      ],
+      "type": "object"
+    },
+    "CatchupStamp": {
+      "description": "How one Discuss read spent its time, and on how much text. `catchup-side-agent`.\n\nToken counts and a first-token time are null unless a backend really reports them; they\nare never estimated.",
+      "properties": {
+        "context_ms": {
+          "description": "Fetching the window and building the context, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "first_token_ms": {
+          "description": "Time to the first token, when the backend streams and reports it.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "input_chars": {
+          "description": "Characters shown to the model: system prompt and context together.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "input_tokens": {
+          "description": "Input tokens, when the backend reports them.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "model_ms": {
+          "description": "The one model call, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output_chars": {
+          "description": "Characters in the answer.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output_tokens": {
+          "description": "Output tokens, when the backend reports them.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "total_ms": {
+          "description": "The whole request, in milliseconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "context_ms",
+        "model_ms",
+        "first_token_ms",
+        "total_ms",
+        "input_tokens",
+        "output_tokens",
+        "input_chars",
+        "output_chars"
+      ],
+      "type": "object"
+    },
+    "CatchupWindow": {
+      "description": "What one Discuss read covered. `catchup-side-agent`.",
+      "properties": {
+        "count": {
+          "description": "Messages in the window the model was shown.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "from_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessageId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The window's oldest message, when it has one."
+        },
+        "noise_hidden": {
+          "description": "Messages the owner's noise rules call read, hidden from the window and counted here.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "read_count": {
+          "description": "How many of them were read.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "through_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MessageId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The window's newest message, when it has one."
+        },
+        "truncated": {
+          "description": "Whether a walk bound cut the window short of what was asked for.",
+          "type": "boolean"
+        },
+        "unread_count": {
+          "description": "How many of them were unread.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "count",
+        "unread_count",
+        "read_count",
+        "from_id",
+        "through_id",
+        "truncated",
+        "noise_hidden"
+      ],
+      "type": "object"
+    },
     "ChannelHistoryState": {
       "description": "One channel's history in the message cache, and the owner's say over it: `GET`, `PUT\n/api/v1/channels/{id}/history`, and `POST` or `DELETE .../history/prioritize`. `#602\nhistory-settings-and-limits`.\n\nWhat Settings › Channels shows under History, and what search's \"Search further back\" reads\nwhile it waits. Times are milliseconds since the Unix epoch on the server's clock; `now_ms`\nis that clock as of the answer, so a page can say \"in 3 minutes\" without trusting its own.",
       "properties": {
@@ -399,6 +664,10 @@
         "conversational_voice": {
           "$ref": "#/$defs/VoiceDescription",
           "description": "Selected conversational voice provider, named by its implementation."
+        },
+        "discuss_available": {
+          "description": "Whether Discuss (the catch-up side agent) can answer on this deployment.\n`catchup-side-agent`.\n\nTrue exactly when a direct LLM summariser is configured (`[summaries.llm]`), which is\nwhen the server built a side agent. The page draws its Discuss button disabled\nwithout it — a deployment whose summaries come through its ElevenLabs agent is fully\nconfigured for summaries, and its button must not present as broken; the endpoint\nitself answers such a deployment `discuss_not_available_on_this_backend`. Absent,\nfrom an older server, means false.",
+          "type": "boolean"
         },
         "hidden_channels": {
           "description": "Channels from the configuration file the owner took off his list, in configuration order.\n`#199 removable-config-channels`.\n\nSettings lists them so each can be shown again; `channels` above already leaves them out.\nSent only to a write-scope caller, because showing one again takes that scope and a\nread-scope credential has no use for the names of channels the owner put away. Absent when\nnone are hidden, and from an older server, which could not hide one.",
@@ -3620,6 +3889,12 @@
     },
     {
       "$ref": "#/$defs/SearchResponse"
+    },
+    {
+      "$ref": "#/$defs/CatchupRequest"
+    },
+    {
+      "$ref": "#/$defs/CatchupResponse"
     }
   ],
   "description": "Generated from vibe-talk/src/contract.rs by `make -C vibe-talk contract`. Do not edit.",

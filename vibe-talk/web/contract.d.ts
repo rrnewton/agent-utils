@@ -98,6 +98,168 @@ declare namespace VibeTalk {
   }
 
   /**
+   * One unread message a Discuss answer covers, for the panel's footer list.
+   * `catchup-side-agent`.
+   */
+  interface CatchupFooterLink {
+    /**
+     * The message.
+     */
+    id: MessageId;
+    /**
+     * `"HH:MM · author"`, as the message itself carries it.
+     */
+    label: string;
+    /**
+     * The thread the message belongs to, when it belongs to one.
+     */
+    thread_id: string | null;
+  }
+
+  /**
+   * The body of `POST /api/v1/channels/{channel_id}/catchup`: one Discuss read.
+   * `catchup-side-agent`.
+   */
+  interface CatchupRequest {
+    /**
+     * The thread to cover, whole; absent or null covers the channel itself.
+     */
+    thread_id: string | null;
+    /**
+     * Which channel view a channel read covers: `"flat"` (the default) or `"main"`.
+     * Ignored for a thread read. The window's size is server configuration, never the
+     * caller's choice.
+     */
+    view: string | null;
+  }
+
+  /**
+   * One Discuss answer: the model text, and exactly what it covers. `catchup-side-agent`.
+   */
+  interface CatchupResponse {
+    /**
+     * Which backend answered, said out loud so a page can never imply a model it did not get.
+     */
+    backend: string;
+    /**
+     * The channel read, as configured here.
+     */
+    channel: ChannelInfo;
+    /**
+     * One link per unread message covered, oldest first.
+     */
+    footer_links: CatchupFooterLink[];
+    /**
+     * The subset of `unread_ids` a dismissal can name, for the footer's mark-read act.
+     */
+    markable_ids: MessageId[];
+    /**
+     * The model it asked.
+     */
+    model: string;
+    /**
+     * How the read spent its time.
+     */
+    stamp: CatchupStamp;
+    /**
+     * The model's answer, its cites checked against the ids it was shown. Model text only:
+     * the footer is structured, above.
+     */
+    text: string;
+    /**
+     * The thread covered, or null for a channel read.
+     */
+    thread_id: string | null;
+    /**
+     * Exactly the unread ids the model was shown, oldest first.
+     */
+    unread_ids: MessageId[];
+    /**
+     * The view covered: `"flat"` or `"main"` for a channel read.
+     */
+    view: string;
+    /**
+     * What the read covered.
+     */
+    window: CatchupWindow;
+  }
+
+  /**
+   * How one Discuss read spent its time, and on how much text. `catchup-side-agent`.
+   *
+   * Token counts and a first-token time are null unless a backend really reports them; they
+   * are never estimated.
+   */
+  interface CatchupStamp {
+    /**
+     * Fetching the window and building the context, in milliseconds.
+     */
+    context_ms: number;
+    /**
+     * Time to the first token, when the backend streams and reports it.
+     */
+    first_token_ms: number | null;
+    /**
+     * Characters shown to the model: system prompt and context together.
+     */
+    input_chars: number;
+    /**
+     * Input tokens, when the backend reports them.
+     */
+    input_tokens: number | null;
+    /**
+     * The one model call, in milliseconds.
+     */
+    model_ms: number;
+    /**
+     * Characters in the answer.
+     */
+    output_chars: number;
+    /**
+     * Output tokens, when the backend reports them.
+     */
+    output_tokens: number | null;
+    /**
+     * The whole request, in milliseconds.
+     */
+    total_ms: number;
+  }
+
+  /**
+   * What one Discuss read covered. `catchup-side-agent`.
+   */
+  interface CatchupWindow {
+    /**
+     * Messages in the window the model was shown.
+     */
+    count: number;
+    /**
+     * The window's oldest message, when it has one.
+     */
+    from_id: MessageId | null;
+    /**
+     * Messages the owner's noise rules call read, hidden from the window and counted here.
+     */
+    noise_hidden: number;
+    /**
+     * How many of them were read.
+     */
+    read_count: number;
+    /**
+     * The window's newest message, when it has one.
+     */
+    through_id: MessageId | null;
+    /**
+     * Whether a walk bound cut the window short of what was asked for.
+     */
+    truncated: boolean;
+    /**
+     * How many of them were unread.
+     */
+    unread_count: number;
+  }
+
+  /**
    * One channel's history in the message cache, and the owner's say over it: `GET`, `PUT
    * /api/v1/channels/{id}/history`, and `POST` or `DELETE .../history/prioritize`. `#602
    * history-settings-and-limits`.
@@ -339,6 +501,18 @@ declare namespace VibeTalk {
      * Selected conversational voice provider, named by its implementation.
      */
     conversational_voice: VoiceDescription;
+    /**
+     * Whether Discuss (the catch-up side agent) can answer on this deployment.
+     * `catchup-side-agent`.
+     *
+     * True exactly when a direct LLM summariser is configured (`[summaries.llm]`), which is
+     * when the server built a side agent. The page draws its Discuss button disabled
+     * without it — a deployment whose summaries come through its ElevenLabs agent is fully
+     * configured for summaries, and its button must not present as broken; the endpoint
+     * itself answers such a deployment `discuss_not_available_on_this_backend`. Absent,
+     * from an older server, means false.
+     */
+    discuss_available?: boolean;
     /**
      * Channels from the configuration file the owner took off his list, in configuration order.
      * `#199 removable-config-channels`.
@@ -2742,6 +2916,8 @@ declare namespace VibeTalk {
     ChannelHistoryState: ChannelHistoryState;
     HistoryModeRequest: HistoryModeRequest;
     SearchResponse: SearchResponse;
+    CatchupRequest: CatchupRequest;
+    CatchupResponse: CatchupResponse;
   }
 
   /** A contract type a peer may extend with new `type` tags. */

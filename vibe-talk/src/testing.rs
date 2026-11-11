@@ -419,6 +419,11 @@ fn state_pieces_with(
         reply_reads: Arc::new(crate::reply_read::ReplyReads::new()),
         spoken_names: Arc::new(crate::speakable::SharedNames::new()),
         live,
+        // As `main` builds it: a side agent only when the test's configuration has a
+        // [summaries.llm] section. A test of the Discuss endpoint that substitutes its own
+        // summariser sets these two fields on the state it gets back.
+        catchup_summarizer: crate::summarize::catchup_summarizer_for(&config_for_version),
+        catchup_model: crate::summarize::catchup_model(&config_for_version).map(Arc::from),
         summarizer: Arc::clone(&summarizer),
         // Taken from the summariser rather than named here, exactly as `main` takes it, so a test
         // that substitutes a different backend gets that backend's cache key rather than one this

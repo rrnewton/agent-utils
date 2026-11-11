@@ -6726,6 +6726,129 @@ pub fn reply_dismissals(
     })
 }
 
+// --- the Discuss window: what one catch-up read covers --------------------------------------
+//
+// `catchup-side-agent`. The fetch half of the endpoint, kept apart from the model call so the
+// windowing and the read partition are testable without a backend (or the context builder).
+
+/// One Discuss read's window, fetched and partitioned.
+#[derive(Clone, Debug)]
+pub struct CatchupFetch {
+    /// The channel read, as configured here.
+    pub channel: ChannelInfo,
+    /// The window's messages, oldest first, noise excluded.
+    pub messages: Vec<Message>,
+    /// Which of `messages` the owner has read (dismissed, or his own settled read).
+    pub read: std::collections::HashSet<MessageId>,
+    /// Whether a walk bound ([`MAX_RECAP_PAGES`], [`MAX_RECAP_MESSAGES`]) cut the window
+    /// short of what was asked for.
+    pub truncated: bool,
+    /// Messages the owner's noise rules call read, hidden from `messages` and counted here.
+    pub noise_hidden: usize,
+}
+
+/// Fetch the window one Discuss read covers: a channel's newest `window` messages in `view`
+/// ([`crate::threads::TimelineView::Flat`] or
+/// [`crate::threads::TimelineView::Main`]), or one whole thread when `thread_id` names one
+/// (`view` then selects nothing; the caller passes
+/// [`crate::threads::TimelineView::Thread`]).
+///
+/// The timeline is walked backwards from its newest page inside the recap bounds, so a
+/// window of any age answers and `truncated` says when a bound cut it. Noise is counted and
+/// left out, as in [`recap`]; the read set is [`dismissed_within`]'s, the same source of
+/// truth as the page.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] outside the allowlist, [`OpError::Chat`] when a timeline
+/// read fails, or [`OpError::Store`] when the read set cannot be read.
+pub async fn catchup_fetch(
+    state: &AppState,
+    caller: crate::auth::Scope,
+    channel_id: &str,
+    view: crate::threads::TimelineView,
+    thread_id: Option<&str>,
+    window: usize,
+) -> Result<CatchupFetch, OpError> {
+    use crate::threads::{TimelineRequest, TimelineView};
+    let channel = allowed(state, channel_id).await?;
+    let whole_thread = thread_id.is_some();
+    let target = if whole_thread {
+        MAX_RECAP_MESSAGES
+    } else {
+        window.max(1)
+    };
+    let mut held: Vec<Message> = Vec::new();
+    let mut before: Option<String> = None;
+    let mut truncated = false;
+    let mut finished = false;
+    for _ in 0..MAX_RECAP_PAGES {
+        let request = TimelineRequest {
+            view: if whole_thread {
+                TimelineView::Thread
+            } else {
+                view
+            },
+            thread_id: thread_id.map(str::to_owned),
+            before: before.clone(),
+            after: None,
+            limit: MAX_PAGE,
+        };
+        let (_, page) = timeline(state, caller, channel_id, &request).await?;
+        if page.messages.is_empty() {
+            finished = true;
+            break;
+        }
+        let has_more = page.has_more;
+        held.extend(page.messages);
+        if held.len() >= MAX_RECAP_MESSAGES {
+            truncated = has_more;
+            finished = true;
+            break;
+        }
+        if !whole_thread && held.len() >= target {
+            finished = true;
+            break;
+        }
+        if !has_more {
+            finished = true;
+            break;
+        }
+        match page.next_before {
+            Some(next) => before = Some(next),
+            None => {
+                truncated = true;
+                finished = true;
+                break;
+            }
+        }
+    }
+    // The page bound ended the walk short of the window (or of the thread's start): say so.
+    if !finished {
+        truncated = true;
+    }
+    // Pages arrive newest first, each oldest-first within itself; one sort puts the whole
+    // window oldest-first however the walk was paged, as in `recap`.
+    held.sort_by_key(|message| (message.created_ms().unwrap_or(i64::MAX), message.id.clone()));
+    held.dedup_by(|next, kept| next.id == kept.id);
+    let noise_hidden = held.iter().filter(|message| message.noise).count();
+    let mut messages: Vec<Message> = held.into_iter().filter(|message| !message.noise).collect();
+    if messages.len() > target {
+        messages = messages.split_off(messages.len() - target);
+    }
+    let read = dismissed_within(state, caller, &channel.id, &messages)
+        .await?
+        .into_iter()
+        .collect();
+    Ok(CatchupFetch {
+        channel,
+        messages,
+        read,
+        truncated,
+        noise_hidden,
+    })
+}
+
 // --- the recap: a window labelled with what the owner has read --------------------------------
 //
 // `#717 vt-unread-recap`. Read scope, and writes nothing: `own_read::settle` only answers *as

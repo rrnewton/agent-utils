@@ -649,6 +649,8 @@ enabled = true
 # threshold_chars = 400
 # target_chars = 160
 # context_messages = 3        # how many preceding messages ride along as context
+# catchup_window_messages = 150  # how many of a channel's newest messages one Discuss
+#                                  # (catch-up) read covers; not in the summary cache key
 #
 # The model to ask. NOTE: nothing reads this — the ElevenLabs agent runs whichever model it is
 # configured with, and [summaries.llm] below names its own `model` and never falls back to this
@@ -734,6 +736,19 @@ enabled = true
 # timeout_secs = 30                  # per request; also how long, in all, a summary waits for slots
 # requests_per_minute = 15           # client-side ceiling, summaries and thread names together
 # burst = 3                          # calls allowed back to back before that pace applies
+#
+# Discuss (the catch-up side agent) is a SECOND instance of whichever backend this section
+# builds, retuned for a whole window: medium reasoning on the gateway, a larger output
+# budget and deadline than the one-sentence defaults. It asks `model` above unless the
+# [summaries.llm.models] table's `side_agent` kind names another (the meta_gateway
+# example below shows that table's shape).
+#
+# The models table belongs to THIS section alone. A deployment whose summaries come from
+# its ElevenLabs agent (no [summaries.llm]) has no model id for it to select — which model
+# answers there is the agent's own configuration — so the table is inert for that backend,
+# and Discuss itself is unavailable there: the endpoint answers 503
+# `discuss_not_available_on_this_backend` saying so. Summaries and everything else the
+# agent serves are unaffected either way.
 #
 # Google Vertex:
 # [summaries.llm]

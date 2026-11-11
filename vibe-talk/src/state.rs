@@ -48,6 +48,15 @@ pub struct AppState {
     /// [`crate::summarize::Summarizer::describe`] is reported to the caller so a page can never
     /// imply a summary it did not get.
     pub summarizer: Arc<dyn Summarizer>,
+    /// The Discuss side agent's own backend instance, when `[summaries.llm]` is configured.
+    /// `catchup-side-agent`; see [`crate::summarize::catchup_summarizer_for`]. `None` is a
+    /// real state, not an error: a deployment summarising through its ElevenLabs agent has
+    /// no side agent, and the catch-up endpoint then refuses every call saying Discuss is
+    /// not available on that backend.
+    pub catchup_summarizer: Option<Arc<dyn Summarizer>>,
+    /// The model [`AppState::catchup_summarizer`] asks, named in its answer so a page can
+    /// never imply a model it did not get. `None` exactly when there is no side agent.
+    pub catchup_model: Option<Arc<str>>,
     /// The policy every cached summary is filed under. Computed once at startup from
     /// [`crate::summarize::policy_version`], because recomputing it per request is how the two
     /// halves of a cache key drift apart.

@@ -14,7 +14,8 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 use vibe_talk::contract::{
-    ApiErrorBody, BookmarkResponse, ClientConfigResponse, ClientSettings, CommittedPostResponse,
+    ApiErrorBody, BookmarkResponse, CatchupFooterLink, CatchupRequest, CatchupResponse,
+    CatchupStamp, CatchupWindow, ClientConfigResponse, ClientSettings, CommittedPostResponse,
     LiveDeleteEvent, LiveDelivery, LiveMessageEvent, LiveResetEvent, MessageCacheHistory,
     MessageCacheRequest, MessageCacheStatus, MessagesResponse, NoiseRules, PendingPost,
     PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled, ProviderDescription,
@@ -301,6 +302,7 @@ fn client_config(
         ],
         summaries_unavailable: (!full).then(|| "elevenlabs.api_key is not configured".into()),
         thread_names_supported: full,
+        discuss_available: full,
         token_scope: scope,
         noise_rules: full.then(|| NoiseRules {
             rules: vec!["Working…".into(), "Thinking*".into()],
@@ -1244,6 +1246,82 @@ fn samples() -> Value {
                 resume_below_ms: None,
                 upstream: "none",
                 untrusted_content_notice: "third-party text",
+            }),
+        ],
+        // `catchup-side-agent`: a thread read and a bare channel read; an answer covering
+        // unread messages beside one covering an empty window, so every optional field is
+        // seen present and omitted.
+        "CatchupRequest": [
+            to(&CatchupRequest {
+                thread_id: Some("thread-1".into()),
+                view: Some("main".into()),
+            }),
+            to(&CatchupRequest::default()),
+        ],
+        "CatchupResponse": [
+            to(&CatchupResponse {
+                channel: channel(),
+                thread_id: Some("thread-1".into()),
+                view: "thread".into(),
+                window: CatchupWindow {
+                    count: 12,
+                    unread_count: 2,
+                    read_count: 10,
+                    from_id: Some(MessageId("1000".into())),
+                    through_id: Some(MessageId("1011".into())),
+                    truncated: true,
+                    noise_hidden: 1,
+                },
+                unread_ids: vec![MessageId("1010".into()), MessageId("1011".into())],
+                markable_ids: vec![MessageId("1010".into())],
+                footer_links: vec![CatchupFooterLink {
+                    id: MessageId("1010".into()),
+                    label: "09:51 · Ada".into(),
+                    thread_id: Some("thread-1".into()),
+                }],
+                text: "one point worth knowing".into(),
+                backend: "meta-gateway".into(),
+                model: "some-model".into(),
+                stamp: CatchupStamp {
+                    context_ms: 120,
+                    model_ms: 3900,
+                    first_token_ms: Some(300),
+                    total_ms: 4050,
+                    input_tokens: Some(10_000),
+                    output_tokens: Some(200),
+                    input_chars: 51_234,
+                    output_chars: 812,
+                },
+            }),
+            to(&CatchupResponse {
+                channel: channel(),
+                thread_id: None,
+                view: "flat".into(),
+                window: CatchupWindow {
+                    count: 0,
+                    unread_count: 0,
+                    read_count: 0,
+                    from_id: None,
+                    through_id: None,
+                    truncated: false,
+                    noise_hidden: 0,
+                },
+                unread_ids: Vec::new(),
+                markable_ids: Vec::new(),
+                footer_links: Vec::new(),
+                text: String::new(),
+                backend: "messages-api".into(),
+                model: "some-model".into(),
+                stamp: CatchupStamp {
+                    context_ms: 3,
+                    model_ms: 10,
+                    first_token_ms: None,
+                    total_ms: 13,
+                    input_tokens: None,
+                    output_tokens: None,
+                    input_chars: 40,
+                    output_chars: 0,
+                },
             }),
         ],
         "VibeTalkV1ClientFrame": [

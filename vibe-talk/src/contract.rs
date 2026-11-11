@@ -236,6 +236,17 @@ pub struct ClientConfigResponse {
     /// read-scope caller (whose reads queue no naming), means false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub thread_names_supported: bool,
+    /// Whether Discuss (the catch-up side agent) can answer on this deployment.
+    /// `catchup-side-agent`.
+    ///
+    /// True exactly when a direct LLM summariser is configured (`[summaries.llm]`), which is
+    /// when the server built a side agent. The page draws its Discuss button disabled
+    /// without it — a deployment whose summaries come through its ElevenLabs agent is fully
+    /// configured for summaries, and its button must not present as broken; the endpoint
+    /// itself answers such a deployment `discuss_not_available_on_this_backend`. Absent,
+    /// from an older server, means false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub discuss_available: bool,
     /// The scope of the token that asked.
     ///
     /// The caller's own scope, so it discloses nothing it did not already hold. The page needs it
@@ -1465,6 +1476,103 @@ pub enum VibeTalkV1ClientFrame {
     },
 }
 
+/// The body of `POST /api/v1/channels/{channel_id}/catchup`: one Discuss read.
+/// `catchup-side-agent`.
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+pub struct CatchupRequest {
+    /// The thread to cover, whole; absent or null covers the channel itself.
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    /// Which channel view a channel read covers: `"flat"` (the default) or `"main"`.
+    /// Ignored for a thread read. The window's size is server configuration, never the
+    /// caller's choice.
+    #[serde(default)]
+    pub view: Option<String>,
+}
+
+/// What one Discuss read covered. `catchup-side-agent`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CatchupWindow {
+    /// Messages in the window the model was shown.
+    pub count: usize,
+    /// How many of them were unread.
+    pub unread_count: usize,
+    /// How many of them were read.
+    pub read_count: usize,
+    /// The window's oldest message, when it has one.
+    pub from_id: Option<MessageId>,
+    /// The window's newest message, when it has one.
+    pub through_id: Option<MessageId>,
+    /// Whether a walk bound cut the window short of what was asked for.
+    pub truncated: bool,
+    /// Messages the owner's noise rules call read, hidden from the window and counted here.
+    pub noise_hidden: usize,
+}
+
+/// One unread message a Discuss answer covers, for the panel's footer list.
+/// `catchup-side-agent`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CatchupFooterLink {
+    /// The message.
+    pub id: MessageId,
+    /// `"HH:MM · author"`, as the message itself carries it.
+    pub label: String,
+    /// The thread the message belongs to, when it belongs to one.
+    pub thread_id: Option<String>,
+}
+
+/// How one Discuss read spent its time, and on how much text. `catchup-side-agent`.
+///
+/// Token counts and a first-token time are null unless a backend really reports them; they
+/// are never estimated.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CatchupStamp {
+    /// Fetching the window and building the context, in milliseconds.
+    pub context_ms: u64,
+    /// The one model call, in milliseconds.
+    pub model_ms: u64,
+    /// Time to the first token, when the backend streams and reports it.
+    pub first_token_ms: Option<u64>,
+    /// The whole request, in milliseconds.
+    pub total_ms: u64,
+    /// Input tokens, when the backend reports them.
+    pub input_tokens: Option<u64>,
+    /// Output tokens, when the backend reports them.
+    pub output_tokens: Option<u64>,
+    /// Characters shown to the model: system prompt and context together.
+    pub input_chars: usize,
+    /// Characters in the answer.
+    pub output_chars: usize,
+}
+
+/// One Discuss answer: the model text, and exactly what it covers. `catchup-side-agent`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CatchupResponse {
+    /// The channel read, as configured here.
+    pub channel: ChannelInfo,
+    /// The thread covered, or null for a channel read.
+    pub thread_id: Option<String>,
+    /// The view covered: `"flat"` or `"main"` for a channel read.
+    pub view: String,
+    /// What the read covered.
+    pub window: CatchupWindow,
+    /// Exactly the unread ids the model was shown, oldest first.
+    pub unread_ids: Vec<MessageId>,
+    /// The subset of `unread_ids` a dismissal can name, for the footer's mark-read act.
+    pub markable_ids: Vec<MessageId>,
+    /// One link per unread message covered, oldest first.
+    pub footer_links: Vec<CatchupFooterLink>,
+    /// The model's answer, its cites checked against the ids it was shown. Model text only:
+    /// the footer is structured, above.
+    pub text: String,
+    /// Which backend answered, said out loud so a page can never imply a model it did not get.
+    pub backend: String,
+    /// The model it asked.
+    pub model: String,
+    /// How the read spent its time.
+    pub stamp: CatchupStamp,
+}
+
 /// Every root of the contract: each value that crosses a boundary on its own, by the name the
 /// generated code gives it.
 ///
@@ -1515,6 +1623,9 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         generator.subschema_for::<HistoryModeRequest>(),
         // `#605 server-side-search`. Appended, for the same reason.
         generator.subschema_for::<SearchResponse>(),
+        // `catchup-side-agent`. Appended, for the same reason.
+        generator.subschema_for::<CatchupRequest>(),
+        generator.subschema_for::<CatchupResponse>(),
     ]
 }
 

@@ -309,6 +309,8 @@ fn routes(state: AppState) -> Router {
         .route("/api/v1/channels/{channel_id}/count", get(api::count))
         // `#717 vt-unread-recap`. READ scope: a window grouped by thread with Done tags.
         .route("/api/v1/channels/{channel_id}/recap", get(api::recap))
+        // `catchup-side-agent`. WRITE scope: one Discuss read — it spends a model call.
+        .route("/api/v1/channels/{channel_id}/catchup", post(api::catchup))
         .route("/api/v1/channels/{channel_id}/digest", get(api::digest))
         .route("/api/v1/channels/{channel_id}/resolve", post(api::resolve))
         .route("/api/v1/channels/{channel_id}/reply", post(api::reply))

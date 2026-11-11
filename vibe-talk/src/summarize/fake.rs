@@ -41,6 +41,7 @@ struct State {
     sentence: Option<String>,
     names_threads: bool,
     threads: Vec<String>,
+    prompts: Vec<(String, String)>,
 }
 
 impl FakeSummarizer {
@@ -100,6 +101,13 @@ impl FakeSummarizer {
         self.lock().fail_next = Some(why.to_owned());
     }
 
+    /// Every `(system, prompt)` [`Summarizer::complete_prompt`] was handed, in order.
+    /// `catchup-side-agent`: the Discuss tests' seam — exactly what a model would be shown.
+    #[must_use]
+    pub fn prompt_calls(&self) -> Vec<(String, String)> {
+        self.lock().prompts.clone()
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state
             .lock()
@@ -149,6 +157,19 @@ impl Summarizer for FakeSummarizer {
             sentence: format!("thread summary #{n}"),
             cut_at: None,
         })
+    }
+
+    async fn complete_prompt(&self, system: &str, prompt: &str) -> Result<String, SummaryError> {
+        let mut state = self.lock();
+        if let Some(why) = state.fail_next.take() {
+            return Err(SummaryError::Transport(why));
+        }
+        state.prompts.push((system.to_owned(), prompt.to_owned()));
+        if let Some(reply) = &state.answer {
+            // Whole, as the shipped backends return a prompt answer: no flattening, no cap.
+            return Ok(reply.clone());
+        }
+        Ok(format!("catchup #{}", state.prompts.len()))
     }
 
     async fn summarize(&self, request: &SummaryRequest<'_>) -> Result<Summary, SummaryError> {

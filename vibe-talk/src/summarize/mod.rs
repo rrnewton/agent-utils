@@ -123,6 +123,61 @@ pub fn summarizer_for(
     ))
 }
 
+/// The side agent's output budget on the `meta_gateway` backend: a multi-bullet answer after
+/// medium reasoning, not one sentence. `catchup-side-agent`.
+pub const CATCHUP_MAX_TOKENS_GATEWAY: u32 = 8192;
+/// The side agent's output budget on the `messages_api` backend.
+pub const CATCHUP_MAX_TOKENS_MESSAGES: u32 = 4096;
+/// How long one side-agent call may take, in seconds: it reads a whole window, not one message.
+pub const CATCHUP_TIMEOUT_SECS: u64 = 60;
+
+/// Build the Discuss side agent's own backend instance, when `[summaries.llm]` is present.
+/// `catchup-side-agent`.
+///
+/// A second instance beside [`summarizer_for`]'s, from a clone of the same section retuned
+/// for a window rather than a sentence: the model
+/// [`crate::config::LlmConfig::model_for`] resolves for
+/// [`crate::config::SummaryKind::SideAgent`], medium reasoning on the gateway, and a larger output budget and deadline (never
+/// below what the operator configured). Its `policy_input` therefore differs from the
+/// summariser's, which is harmless: nothing it answers is filed under a summary cache key.
+/// It carries its OWN rate limiter — each backend constructor builds one from the section,
+/// and sharing one would take a constructor that accepts one; the same per-minute ceiling
+/// applies to each instance separately. `None` without `[summaries.llm]`: Discuss is a
+/// feature of the direct model backends, and a deployment summarising through its
+/// ElevenLabs agent gets the endpoint's named refusal saying so.
+#[must_use]
+pub fn catchup_summarizer_for(summaries: &SummariesConfig) -> Option<Arc<dyn Summarizer>> {
+    let mut llm = summaries.llm.clone()?;
+    llm.model = llm
+        .model_for(crate::config::SummaryKind::SideAgent)
+        .to_owned();
+    llm.max_tokens = llm.max_tokens.max(match llm.backend {
+        crate::config::LlmBackend::MetaGateway => CATCHUP_MAX_TOKENS_GATEWAY,
+        crate::config::LlmBackend::MessagesApi => CATCHUP_MAX_TOKENS_MESSAGES,
+    });
+    llm.timeout_secs = llm.timeout_secs.max(CATCHUP_TIMEOUT_SECS);
+    if llm.backend == crate::config::LlmBackend::MetaGateway {
+        llm.reasoning_effort = crate::config::ReasoningEffort::Medium;
+    }
+    Some(match llm.backend {
+        crate::config::LlmBackend::MessagesApi => {
+            Arc::new(messages_api::MessagesApiSummarizer::new(llm))
+        }
+        crate::config::LlmBackend::MetaGateway => {
+            Arc::new(meta_gateway::MetaGatewaySummarizer::new(llm))
+        }
+    })
+}
+
+/// The model the side agent built by [`catchup_summarizer_for`] asks, for the API answer.
+#[must_use]
+pub fn catchup_model(summaries: &SummariesConfig) -> Option<String> {
+    summaries
+        .llm
+        .as_ref()
+        .map(|llm| llm.model_for(crate::config::SummaryKind::SideAgent).to_owned())
+}
+
 /// The framing every summariser is given.
 ///
 /// Part of [`policy_version`], so editing this sentence invalidates every summary ever produced
@@ -369,6 +424,22 @@ pub trait Summarizer: Send + Sync {
         Err(SummaryError::NotConfigured("summaries.llm"))
     }
 
+    /// Answer one free-form prompt: the Discuss side agent's one call. `catchup-side-agent`.
+    ///
+    /// `system` is this server's own instruction and `prompt` is the fenced context
+    /// [`crate::catchup::build_context`] built; the answer comes back whole — no flattening
+    /// and no length cap of ours, unlike a summary. By default
+    /// [`SummaryError::NotConfigured`]: only the direct model backends can do this, and the
+    /// ElevenLabs agent backend keeps the default.
+    ///
+    /// # Errors
+    ///
+    /// [`SummaryError`] as for [`Summarizer::summarize`].
+    async fn complete_prompt(&self, system: &str, prompt: &str) -> Result<String, SummaryError> {
+        let _ = (system, prompt);
+        Err(SummaryError::NotConfigured("summaries.llm"))
+    }
+
     /// Summarise one message: the answer flattened and uncut up to the stored ceiling. See
     /// [`Summary`].
     ///
@@ -422,14 +493,16 @@ pub fn policy_version_of(prompt: &str, config: &SummariesConfig, backend: &str) 
 /// That is the prompt (with whatever the backend adds, [`Summarizer::policy_input`]), the backend,
 /// `model`, `target_chars`, `context_messages`, `max_per_socket`, `socket_idle_seconds`, and the
 /// `[summaries.llm]` wording inputs (dialect, model and output budget for `messages_api`; model,
-/// output budget and reasoning effort for `meta_gateway`). Four settings are deliberately NOT here:
+/// output budget and reasoning effort for `meta_gateway`). Five settings are deliberately NOT here:
 ///
 /// * `threshold_chars` decides WHICH messages are summarised, not what a summary says;
 /// * `reply_timeout_seconds` decides how long one is waited for;
 /// * the [`hard_cap_chars`] an answer is cut at decides how much of a stored answer is SHOWN, and
 ///   the answer is stored uncut ([`Summary`]);
 /// * `thread_naming_interval_seconds` decides WHEN a thread is named, not what it is named
-///   (remote-ops-audit W5).
+///   (remote-ops-audit W5);
+/// * `catchup_window_messages` decides how much of a channel one Discuss read covers, and
+///   nothing the side agent answers is filed as a summary (`catchup-side-agent`).
 ///
 /// [`policy_version_v1`] folded the first three in, under a rule of "every field", and paid for it
 /// with a full re-summarisation whenever one moved. A setting added to [`SummariesConfig`] later
@@ -651,6 +724,7 @@ mod tests {
             socket_idle_seconds: _,
             reply_timeout_seconds: _,
             thread_naming_interval_seconds: _,
+            catchup_window_messages: _,
             llm: _,
         } = config();
         vec![
@@ -679,6 +753,12 @@ mod tests {
                 "thread_naming_interval_seconds",
                 false,
                 moved(|c| c.thread_naming_interval_seconds += 1),
+            ),
+            // How much of a channel one Discuss read covers; no word of a summary.
+            (
+                "catchup_window_messages",
+                false,
+                moved(|c| c.catchup_window_messages += 1),
             ),
         ]
     }

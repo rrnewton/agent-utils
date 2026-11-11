@@ -267,6 +267,13 @@ fn inventory() -> Vec<Route> {
             Read,
             Query("?hours=2", "?hours=soon"),
         ),
+        // `catchup-side-agent`: one Discuss read spends a model call, so write scope.
+        route(
+            "POST",
+            "/api/v1/channels/{channel_id}/catchup",
+            Write,
+            Json(r#"{"thread_id":null,"view":"flat"}"#),
+        ),
         route(
             "POST",
             "/api/v1/channels/{channel_id}/resolve",

@@ -42,6 +42,9 @@ mod cache_bench;
 #[path = "cache_source.rs"]
 mod cache_source;
 
+#[path = "catchup.rs"]
+mod catchup;
+
 #[path = "channel_heads.rs"]
 mod channel_heads;
 

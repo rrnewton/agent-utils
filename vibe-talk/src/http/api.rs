@@ -1058,6 +1058,10 @@ pub async fn client_config(
         thread_names_supported: scope >= Scope::Write
             && state.summarizer.names_threads()
             && state.summarizer.unavailable_reason().is_none(),
+        // `catchup-side-agent`: whether a side agent was built at all, so the page can draw
+        // Discuss disabled on a deployment whose summaries come through its ElevenLabs agent
+        // instead of offering a button whose every click refuses.
+        discuss_available: state.catchup_summarizer.is_some(),
         token_scope: scope.into(),
         noise_rules: noise_rules_view(&state).await,
         voice_settings: Some(crate::send_approval::view(&state).await),
@@ -2473,6 +2477,171 @@ pub async fn recap(
     };
     let response = ops::recap(&state, caller, &channel_id, since_ms, until_ms).await?;
     Ok(no_store(Json(response)))
+}
+
+/// Discuss is not available on this deployment's summariser backend. `catchup-side-agent`.
+///
+/// A distinguishable 503, never the bare summariser-not-configured: a deployment whose
+/// summaries come from its ElevenLabs agent is fully configured for summaries, and the
+/// answer has to say that this ONE feature needs `[summaries.llm]` rather than imply the
+/// deployment is missing a summariser.
+fn discuss_not_available() -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "discuss_not_available_on_this_backend",
+        "Discuss needs the LLM summarizer backend ([summaries.llm]); the ElevenLabs agent \
+         backend that serves this deployment's summaries does not provide it",
+    )
+}
+
+/// `POST /api/v1/channels/{channel_id}/catchup` — one Discuss read: the side agent over the
+/// channel's newest window (or one whole thread), in one model call. `catchup-side-agent`.
+///
+/// WRITE scope: it spends a model call and settles the owner's own read state on the way, as
+/// every read through [`ops::dismissed_within`] does. Slice 1 is one-shot and stores
+/// nothing: no transcript, no follow-ups, no synced prompt override — the shipped default
+/// instruction, hard-wired.
+pub async fn catchup(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(channel_id): Path<String>,
+    Json(body): Json<crate::contract::CatchupRequest>,
+) -> Result<Response, ApiError> {
+    use crate::threads::TimelineView;
+    let began = std::time::Instant::now();
+    // The allowlist before the backend question, so an unknown channel is a 404 whatever is
+    // configured — the handler order every channel route here keeps.
+    if state.channel(&channel_id).is_none() {
+        return Err(OpError::UnknownChannel.into());
+    }
+    let Some(agent) = state.catchup_summarizer.clone() else {
+        return Err(discuss_not_available());
+    };
+    let thread_id = body
+        .thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let (view, view_name) = if thread_id.is_some() {
+        (TimelineView::Thread, "thread")
+    } else {
+        match body.view.as_deref() {
+            None | Some("flat") => (TimelineView::Flat, "flat"),
+            Some("main") => (TimelineView::Main, "main"),
+            Some(other) => {
+                return Err(ApiError::bad_request(format!(
+                    "view is \"flat\" (the default) or \"main\", not {other:?}"
+                )))
+            }
+        }
+    };
+    let context_began = std::time::Instant::now();
+    let fetched = crate::read_reason::ReadReason::SummaryWindow
+        .scope(ops::catchup_fetch(
+            &state,
+            Scope::Write,
+            &channel_id,
+            view,
+            thread_id,
+            state.config.summaries.catchup_window_messages,
+        ))
+        .await?;
+    let owner = crate::owner::Owner::of(&state);
+    let built = crate::catchup::build_context(&fetched.messages, &fetched.read, &owner);
+    let system = crate::catchup::effective_system_prompt(None);
+    let context_ms = u64::try_from(context_began.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let model_began = std::time::Instant::now();
+    let raw = agent
+        .complete_prompt(&system, &built.prompt)
+        .await
+        .map_err(|error| match error {
+            // A backend with no free-form prompt in the side-agent seat is the same
+            // deployment fact as no side agent at all, and gets the same clear answer.
+            crate::summarize::SummaryError::NotConfigured(_) => discuss_not_available(),
+            other => ApiError::from(OpError::Summarizer(other)),
+        })?;
+    let model_ms = u64::try_from(model_began.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let sent: std::collections::HashSet<MessageId> =
+        fetched.messages.iter().map(|m| m.id.clone()).collect();
+    let text = crate::catchup::validate_cites(&raw, &sent);
+    let by_id: std::collections::HashMap<&str, &Message> = fetched
+        .messages
+        .iter()
+        .map(|message| (message.id.as_str(), message))
+        .collect();
+    let footer_links = built
+        .unread_ids
+        .iter()
+        .filter_map(|id| by_id.get(id.as_str()).map(|message| (id, message)))
+        .map(|(id, message)| crate::contract::CatchupFooterLink {
+            id: id.clone(),
+            label: format!(
+                "{} · {}",
+                if message.spoken_time.is_empty() {
+                    message.timestamp.as_str()
+                } else {
+                    message.spoken_time.as_str()
+                },
+                message.author
+            ),
+            thread_id: message
+                .thread
+                .as_ref()
+                .map(|thread| thread.id.clone())
+                .or_else(|| thread_id.map(str::to_owned)),
+        })
+        .collect();
+    let stamp = crate::contract::CatchupStamp {
+        context_ms,
+        model_ms,
+        first_token_ms: None,
+        total_ms: u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
+        input_tokens: None,
+        output_tokens: None,
+        input_chars: system.chars().count() + built.prompt.chars().count(),
+        output_chars: text.chars().count(),
+    };
+    tracing::info!(
+        channel = %channel_id,
+        thread = thread_id.unwrap_or(""),
+        view = view_name,
+        context_ms = stamp.context_ms,
+        model_ms = stamp.model_ms,
+        total_ms = stamp.total_ms,
+        input_chars = stamp.input_chars,
+        output_chars = stamp.output_chars,
+        window = fetched.messages.len(),
+        unread = built.unread_ids.len(),
+        "discuss catch-up answered"
+    );
+    Ok(no_store(Json(crate::contract::CatchupResponse {
+        channel: fetched.channel,
+        thread_id: thread_id.map(str::to_owned),
+        view: view_name.to_owned(),
+        window: crate::contract::CatchupWindow {
+            count: fetched.messages.len(),
+            unread_count: built.unread_ids.len(),
+            read_count: fetched
+                .messages
+                .len()
+                .saturating_sub(built.unread_ids.len()),
+            from_id: fetched.messages.first().map(|message| message.id.clone()),
+            through_id: fetched.messages.last().map(|message| message.id.clone()),
+            truncated: fetched.truncated,
+            noise_hidden: fetched.noise_hidden,
+        },
+        unread_ids: built.unread_ids,
+        markable_ids: built.markable_ids,
+        footer_links,
+        text,
+        backend: agent.backend().to_owned(),
+        model: state
+            .catchup_model
+            .as_deref()
+            .unwrap_or_else(|| agent.backend())
+            .to_owned(),
+        stamp,
+    })))
 }
 
 /// Query parameters for a bounded count.
