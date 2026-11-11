@@ -333,7 +333,7 @@ def test_handoff_publication_parses_each_historical_record_once(
 
     def counting(value: object, label: str) -> object:
         calls["n"] += 1
-        return original_parse(value, label)  # type: ignore[arg-type]
+        return original_parse(value, label)
 
     monkeypatch.setattr(wrkslots_cli, "_record_from_obj", counting)
     publication = wrkslots_cli._handoff_write_publication(record, events)

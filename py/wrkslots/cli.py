@@ -43882,7 +43882,10 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         # Partial results from the last snapshot (#1247): only the findings
         # the snapshot itself carries; storage, drift and liveness unmeasured.
         partial_detail = str(exc)
-        snap_states, registry_tail = exc.snapshot  # type: ignore[misc]
+        snap_states, registry_tail = cast(
+            "tuple[list[ActiveState], tuple[list[dict[str, object]], list[dict[str, object]]]]",
+            exc.snapshot,
+        )
         states = (
             snap_states
             if args.all_machines
@@ -44081,7 +44084,10 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
         # Partial results from the last snapshot (#1247): rows are named, but
         # liveness and storage were not measured before the bound.
         partial_detail = str(exc)
-        snap_states, journals, journal_inconsistencies = exc.snapshot  # type: ignore[misc]
+        snap_states, journals, journal_inconsistencies = cast(
+            "tuple[list[ActiveState], list[str], tuple[StorageInconsistency, ...]]",
+            exc.snapshot,
+        )
         states = (
             snap_states
             if args.all_machines
