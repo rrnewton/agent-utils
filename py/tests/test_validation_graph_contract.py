@@ -1118,9 +1118,9 @@ def test_all_cross_filter_fails_closed() -> None:
 def test_all_list_names_skipped_cross_steps_and_cross_all_forces_them(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """#1190/#1249: `--all --list` on a page-only change names the three
+    """#1190/#1249: `--all --list` on a page-only change names the two
     still-disabled agentctl shards as skipped and plans none of them, while
-    the re-enabled herdr-agent and herdr-run differentials are planned;
+    the re-enabled differentials are planned;
     `--all --cross-all --list` still plans none of the disabled shards;
     only `--cross-differentials` plans those too."""
     validate = _validate_module()
@@ -1134,13 +1134,13 @@ def test_all_list_names_skipped_cross_steps_and_cross_all_forces_them(
     for tag in (
         "cross.agentctl.differential-0",
         "cross.agentctl.differential-1",
-        "cross.agentctl.differential-2",
     ):
         assert listed.count(tag) == 1, tag  # named once, as skipped
         assert f"STEP  {tag}" not in listed, tag
     for tag in (
         "cross.agentctl.herdr-agent-differential",
         "cross.herdr-run.differential",
+        "cross.agentctl.differential-2",
     ):
         assert f"STEP  {tag}" in listed, tag  # re-enabled in the main phase
     assert validate.main(["--all", "--cross-all", "--list"]) == 0
