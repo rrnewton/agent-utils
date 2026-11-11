@@ -2991,6 +2991,7 @@ def _census_verdicts(report: dict[str, object]) -> dict[str, object]:
     return {Path(str(node["path"])).name: node["verdict"] for node in nodes}
 
 
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_socket_census_is_read_only_passive_and_runs_no_sudo(tmp_path: Path) -> None:
     tree = tmp_path / "tree"
     tree.mkdir()

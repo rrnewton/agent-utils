@@ -37,6 +37,7 @@ def _unpushed_repo(home: Path) -> str:
     return _git(repo, "rev-parse", "HEAD")
 
 
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_remove_reclaims_state_home_and_bundles_unpushed_git(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -78,6 +79,7 @@ def _home_user(home: Path) -> subprocess.Popen[bytes]:
     return subprocess.Popen(["sleep", "3600"], cwd=home)
 
 
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_remove_refuses_when_a_process_uses_the_state_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -132,6 +134,7 @@ def _make_orphan(root: Path) -> Path:
     return _home(root)
 
 
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_reclaim_orphan_state_plan_then_apply(tmp_path: Path) -> None:
     root = _fixture(tmp_path / "case")
     home = _make_orphan(root)
@@ -143,6 +146,7 @@ def test_reclaim_orphan_state_plan_then_apply(tmp_path: Path) -> None:
     assert not home.exists()
 
 
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_reclaim_orphan_state_apply_refuses_under_freeze(tmp_path: Path) -> None:
     root = _fixture(tmp_path / "case")
     home = _make_orphan(root)

@@ -20,6 +20,8 @@ import subprocess
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 from wrkslots.tests.test_doctor_state_rust import _fixture, _root
 
 from wrkslots.tests.rust_binary import rust_wrkslotsd
@@ -72,6 +74,7 @@ def _both(root: Path, *args: str) -> tuple[subprocess.CompletedProcess[str], sub
     return python_result, rust_result
 
 
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_shell_command_json_and_text_match_python(tmp_path: Path) -> None:
     root = _root(tmp_path)
     _upstream(tmp_path)

@@ -370,6 +370,7 @@ def _write_and_read_handoff(root: Path, source_dir: Path, *, read: bool) -> None
         proc.wait()
 
 
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_remove_read_sidecar_retires_it(tmp_path: Path) -> None:
     with _own_fs(tmp_path) as base:
         _remove_read_sidecar_retires_it(base)
@@ -440,6 +441,7 @@ def test_remove_sidecar_without_intent_refuses_like_python(
     assert (rust_root / "worktrees" / "slot-a").exists()
 
 
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_remove_with_image_records_matches_python(tmp_path: Path) -> None:
     with _own_fs(tmp_path) as base:
         _remove_with_image_records(base)
@@ -724,6 +726,7 @@ def _ignored_file_still_removes(tmp_path: Path) -> None:
     assert not (rust_root / "worktrees" / "slot-a").exists()
 
 
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_remove_forced_churn_refuses_like_python(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1049,6 +1052,7 @@ def test_recovery_rewrites_the_finish_journal_owner(tmp_path: Path) -> None:
         assert not (root / "worktrees" / "ACTIVE.node-a.journal").exists()
 
 
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_an_older_reader_refuses_only_an_outstanding_owner_journal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

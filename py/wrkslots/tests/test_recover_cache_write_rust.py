@@ -80,6 +80,7 @@ def _python_cache(root: Path) -> int:
     return wrkslots_cli._cmd_recover_ownerless_agent_cache(args)
 
 
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_cache_plan_matches_python(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

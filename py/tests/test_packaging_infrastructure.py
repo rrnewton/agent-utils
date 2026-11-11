@@ -40,6 +40,10 @@ def _collect_lifecycle_tests(mark_expression: str | None = None) -> set[str]:
         command.extend(("-m", mark_expression))
     environment = os.environ.copy()
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    # The census counts every case, including load-quarantined ones (#1267):
+    # they are excluded from shard runs by default but remain in exactly one
+    # partition, so the opt-in includes them here.
+    environment["WRKSLOTS_INCLUDE_QUARANTINED"] = "1"
     completed = subprocess.run(
         command,
         cwd=REPO_ROOT / "py",

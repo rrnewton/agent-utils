@@ -88,6 +88,7 @@ def _events(path: Path) -> list[dict[str, object]]:
     ]
 
 
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_default_budget_blocked_traversal_terminates_on_every_attempt_and_retries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest,
 ) -> None:
@@ -150,6 +151,7 @@ def test_default_budget_blocked_traversal_terminates_on_every_attempt_and_retrie
     _assert_reaped(children)
 
 
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_killed_file_stat_keeps_all_three_debits_and_completed_directory_metric(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

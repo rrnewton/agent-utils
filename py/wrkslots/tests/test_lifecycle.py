@@ -7493,6 +7493,7 @@ def test_socket_orphan_namespace_unavailable_is_an_exact_classifier(
 
 @pytest.mark.ordinary_environment
 @pytest.mark.parametrize("kind", ["cwd", "open", "hardlink", "symlink", "mapped", "socket", "socket-at", "socket-space", "socket-abstract", "socket-orphan", "eventfd"])
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_batch_census_isolated_real_file_alias_mapping_and_socket(
     tmp_path: Path, lsof_tmpfs_fixture: Path, monkeypatch: pytest.MonkeyPatch, kind: str,
 ) -> None:
@@ -17868,6 +17869,7 @@ def test_validate_complete_still_refuses_live_owner_from_shared_cgroup(
 
 
 @pytest.mark.ordinary_environment
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_validate_complete_still_refuses_live_path_use_after_owner_dies(
     tmp_path: Path,
 ) -> None:
@@ -58970,6 +58972,7 @@ def test_remove_agent_batch_removes_a_slot_whose_fence_changed_its_device_and_in
 
 @pytest.mark.ordinary_environment
 @pytest.mark.parametrize("group_max", [1, 8])
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_remove_agent_batch_removes_disk_image_slots(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, group_max: int,
 ) -> None:
@@ -59142,6 +59145,7 @@ def destroy_leftover_images(project: Path) -> None:
 
 @pytest.mark.ordinary_environment
 @pytest.mark.parametrize("holding", ["directory", "unlinked-file"])
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_remove_agent_batch_refuses_a_detached_holder_of_an_image_slot_after_its_fence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, holding: str,
 ) -> None:

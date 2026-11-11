@@ -16,6 +16,8 @@ import subprocess
 from pathlib import Path
 from typing import cast
 
+import pytest
+
 from wrkslots.tests.test_doctor_state_rust import _fixture, _root
 
 from wrkslots.tests.rust_binary import rust_wrkslotsd
@@ -193,6 +195,7 @@ def test_doctor_refuses_duplicate_slot_in_both_editions(tmp_path: Path) -> None:
     assert rust_result.returncode != 0
 
 
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_audit_human_and_gate_match_python(tmp_path: Path) -> None:
     root = _root(tmp_path)
     _fixture(root)

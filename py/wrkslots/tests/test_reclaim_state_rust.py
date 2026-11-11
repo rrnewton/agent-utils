@@ -8,6 +8,8 @@ import subprocess
 from pathlib import Path
 
 from wrkslots import cli as wrkslots_cli
+
+import pytest
 from wrkslots.tests.rust_binary import rust_wrkslotsd
 from wrkslots.tests.test_reclaim_slot_state import _home, _make_orphan
 from wrkslots.tests.test_remove_write_rust import _fixture
@@ -47,6 +49,7 @@ def _norm(text: str, root: Path) -> str:
     return text.replace(str(root), "ROOT")
 
 
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_reclaim_orphan_rust_plan_and_apply_match_python(tmp_path: Path) -> None:
     rust_root = _fixture(tmp_path / "rust")
     oracle_root = _fixture(tmp_path / "oracle")

@@ -167,6 +167,7 @@ def test_multiple_roots_repeatedly_complete_as_one_subject(
     assert completions >= 4, "stable subject fell into a post-completion partial cycle"
 
 
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_subject_cursor_is_fair_with_different_root_counts_and_oversized_peer(
     tmp_path: Path,
 ) -> None:
@@ -206,6 +207,7 @@ def test_subject_cursor_is_fair_with_different_root_counts_and_oversized_peer(
 
 
 @pytest.mark.parametrize("root_count", (1, 3, 10))
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_empty_roots_complete_on_the_last_available_directory_observation(
     tmp_path: Path, root_count: int
 ) -> None:

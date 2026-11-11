@@ -34,3 +34,4 @@ updated_at: 2026-11-10T22:46:59+00:00
 # Notes
 
 Filed by the test-robustness audit lane (mu-testaudit). Related: #1250 vibe-talk-timing-robust (same disable mechanism), #1249 cross-differentials-robust.
+- Audit candidate (coordb): `python.wrkviz` shard-0 `test_serve_matches_python` / `test_serve_raw_requests_match_python` fail under load with "server banner did not arrive within 15.0s", a wall-clock startup budget (ac-mqclose gates). Make it wait on readiness with a generous timeout, or quarantine with an issue.

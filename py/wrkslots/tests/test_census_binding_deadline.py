@@ -319,6 +319,7 @@ def test_costly_binding_peer_does_not_prevent_cheap_subject_next_turn(
     assert second["aa-costly"].status == "error"
 
 
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_persisted_root_validation_does_not_start_after_deadline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

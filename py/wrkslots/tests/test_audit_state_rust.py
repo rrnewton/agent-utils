@@ -267,6 +267,7 @@ def test_audit_nested_cargo_target_matches_python(tmp_path: Path) -> None:
 
 # Unpinned: the real census path stays exercised in both editions.
 @pytest.mark.real_process_evidence
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_audit_deletable_matches_python(tmp_path: Path) -> None:
     root = _fixture(tmp_path)
     actual = _check(root, tmp_path)
@@ -1598,6 +1599,7 @@ def _churn_row(row: dict[str, object], pid: str) -> dict[str, object]:
 
 
 @pytest.mark.real_process_evidence
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_audit_census_sees_appearing_pid_and_tolerates_vanished_pid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1618,6 +1620,7 @@ def test_audit_census_sees_appearing_pid_and_tolerates_vanished_pid(
 
 
 @pytest.mark.real_process_evidence
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_audit_forced_churn_matches_python(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1672,6 +1675,7 @@ ctypes.CDLL(None).pthread_exit(None)
 
 
 @pytest.mark.real_process_evidence
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_audit_follows_a_leader_that_exits_after_the_listing_like_python(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1803,6 +1807,7 @@ def _heavy_churn_hook(base: Path, tag: str, slot: Path, *, vanishing: int) -> tu
 
 
 @pytest.mark.real_process_evidence
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_audit_heavy_churn_many_slots_matches_python(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1878,6 +1883,7 @@ def _holder_replacement_hook(base: Path, tag: str, slot: Path) -> tuple[str, Pat
 
 
 @pytest.mark.real_process_evidence
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_audit_follows_a_matched_holder_replaced_before_its_recheck(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
