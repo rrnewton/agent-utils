@@ -14,7 +14,9 @@ use crate::summarize_core::{run_process, BatchFailure, ClaudeResult, TIMED_OUT_E
 use crate::token_usage::TokenUsage;
 
 /// The model the muse backend uses for phase summaries, agent names and the project overview.
-pub const DEFAULT_MUSE_MODEL: &str = "muse-spark-1.3-internal";
+/// Spark 1.4 since #1275 muse-ember-summarizer (it matched or beat 1.3 on every summary kind);
+/// roll back by naming "muse-spark-1.3-internal" here, or per run with --model muse-spark-1.3-internal.
+pub const DEFAULT_MUSE_MODEL: &str = "muse-spark-1.4-internal";
 
 /// The model the muse backend uses for calendar rollups, which gain most from a larger model.
 pub const DEFAULT_MUSE_ROLLUP_MODEL: &str = "watermelon-full-preview";

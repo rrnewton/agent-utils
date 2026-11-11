@@ -2404,7 +2404,7 @@ A Spark-class reasoning model on a chat-completions gateway, at the default effo
 [summaries.llm]
 backend = "meta_gateway"
 base_url = "https://models.gateway.example/v1"
-model = "muse-spark-1.3-internal"
+model = "muse-spark-1.4-internal"               # the recommended Spark; "muse-spark-1.3-internal" rolls back (#1275)
 client_identity_file = "/path/to/identity.pem"
 ca_bundle_file = "/path/to/private-root.pem"
 reasoning_effort = "low"                         # the default; "minimal" is faster, "off" omits the field

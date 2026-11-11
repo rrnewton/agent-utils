@@ -201,6 +201,7 @@ pub const ZERO_RATED_BACKENDS: &[&str] = &["muse"];
 /// average). Any other model is assumed to take a minute.
 const DEFAULT_CALL_SECONDS: &[(&str, f64)] = &[
     ("muse-spark-1.3-internal", 50.0),
+    ("muse-spark-1.4-internal", 50.0),
     ("watermelon-full-preview", 190.0),
 ];
 const FALLBACK_CALL_SECONDS: f64 = 60.0;

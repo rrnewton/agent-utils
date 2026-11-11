@@ -185,6 +185,7 @@ ZERO_RATED_BACKENDS = frozenset({"muse"})
 #: average). Any other model is assumed to take a minute.
 DEFAULT_CALL_SECONDS: Mapping[str, float] = {
     "muse-spark-1.3-internal": 50.0,
+    "muse-spark-1.4-internal": 50.0,
     "watermelon-full-preview": 190.0,
 }
 FALLBACK_CALL_SECONDS = 60.0

@@ -18,7 +18,9 @@ from wrkviz.backend_process import TIMED_OUT_EXIT, BackendProcesses
 from wrkviz.token_usage import TokenUsage
 
 #: The model the muse backend uses for phase summaries, agent names and the project overview.
-DEFAULT_MUSE_MODEL = "muse-spark-1.3-internal"
+#: Spark 1.4 since #1275 muse-ember-summarizer (it matched or beat 1.3 on every summary kind);
+#: roll back by naming "muse-spark-1.3-internal" here, or per run with --model muse-spark-1.3-internal.
+DEFAULT_MUSE_MODEL = "muse-spark-1.4-internal"
 
 #: The model the muse backend uses for calendar rollups, which gain most from a larger model.
 DEFAULT_MUSE_ROLLUP_MODEL = "watermelon-full-preview"

@@ -3541,7 +3541,7 @@ options:
                         those CLIs; heuristic is deterministic and offline
   --model MODEL         backend model for phase summaries, agent names and the
                         project overview. Defaults: muse 'muse-
-                        spark-1.3-internal'; codex 'gpt-5.5' (or
+                        spark-1.4-internal'; codex 'gpt-5.5' (or
                         WRKVIZ_MODEL); required for claude
   --rollup-model ROLLUP_MODEL
                         backend model for calendar rollups (default: --model,
@@ -5210,7 +5210,7 @@ options:
                         those CLIs; heuristic is deterministic and offline
   --model MODEL         backend model for phase summaries, agent names and the
                         project overview. Defaults: muse 'muse-
-                        spark-1.3-internal'; codex 'gpt-5.5' (or
+                        spark-1.4-internal'; codex 'gpt-5.5' (or
                         WRKVIZ_MODEL); required for claude
   --rollup-model ROLLUP_MODEL
                         backend model for calendar rollups (default: --model,
@@ -5353,7 +5353,7 @@ options:
                         those CLIs; heuristic is deterministic and offline
   --model MODEL         backend model for phase summaries, agent names and the
                         project overview. Defaults: muse 'muse-
-                        spark-1.3-internal'; codex 'gpt-5.5' (or
+                        spark-1.4-internal'; codex 'gpt-5.5' (or
                         WRKVIZ_MODEL); required for claude
   --rollup-model ROLLUP_MODEL
                         backend model for calendar rollups (default: --model,
@@ -5515,7 +5515,7 @@ options:
                         those CLIs; heuristic is deterministic and offline
   --model MODEL         backend model for phase summaries, agent names and the
                         project overview. Defaults: muse 'muse-
-                        spark-1.3-internal'; codex 'gpt-5.5' (or
+                        spark-1.4-internal'; codex 'gpt-5.5' (or
                         WRKVIZ_MODEL); required for claude
   --rollup-model ROLLUP_MODEL
                         backend model for calendar rollups (default: --model,

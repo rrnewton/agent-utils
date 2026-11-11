@@ -154,7 +154,7 @@ def test_default_summary_model_is_supported_configuration(
     assert "instead of selecting another model or backend" in help_text
     # argparse may wrap a model name at its hyphens.
     help_text = help_text.replace("- ", "-")
-    assert "muse-spark-1.3-internal" in help_text
+    assert "muse-spark-1.4-internal" in help_text
     assert "watermelon-full-preview" in help_text
     assert "zero-rated" in help_text
 
@@ -162,9 +162,9 @@ def test_default_summary_model_is_supported_configuration(
 @pytest.mark.parametrize(
     ("backend", "model", "rollup", "expected"),
     [
-        ("muse", None, None, ("muse-spark-1.3-internal", "watermelon-full-preview")),
+        ("muse", None, None, ("muse-spark-1.4-internal", "watermelon-full-preview")),
         ("muse", "spark-x", None, ("spark-x", "spark-x")),
-        ("muse", None, "big-y", ("muse-spark-1.3-internal", "big-y")),
+        ("muse", None, "big-y", ("muse-spark-1.4-internal", "big-y")),
         ("codex", None, None, (timeline_cli.DEFAULT_MODEL, timeline_cli.DEFAULT_MODEL)),
         ("codex", "gpt-z", "gpt-r", ("gpt-z", "gpt-r")),
         ("claude", "claude-q", None, ("claude-q", "claude-q")),
@@ -211,7 +211,7 @@ def test_muse_backend_options_reach_pipeline(
     )
     timeline_cli._summary_call(ns)
     assert seen["backend"] == "muse"
-    assert seen["model"] == "muse-spark-1.3-internal"
+    assert seen["model"] == "muse-spark-1.4-internal"
     assert seen["rollup_model"] == "watermelon-full-preview"
     assert seen["muse_command"] == ("/opt/muse-wrapper",)
     assert seen["backend_timeout_seconds"] == 120.0

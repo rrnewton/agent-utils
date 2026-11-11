@@ -647,7 +647,7 @@ def test_summarize_muse_default_matches_python(tmp_path: Path, rust_wrkviz: Path
     calls = _both_with_env(tmp_path, rust_wrkviz, ["--muse-command", str(fake)])
     assert calls["rs"] == calls["py"]
     models = {str(call["model"]) for call in calls["py"]}
-    assert models == {"muse-spark-1.3-internal", "watermelon-full-preview"}
+    assert models == {"muse-spark-1.4-internal", "watermelon-full-preview"}
     assert any(call["windows"] == 1 for call in calls["py"])
     assert all(call["effort"] == "medium" for call in calls["py"])
 
