@@ -172,10 +172,10 @@ pub fn catchup_summarizer_for(summaries: &SummariesConfig) -> Option<Arc<dyn Sum
 /// The model the side agent built by [`catchup_summarizer_for`] asks, for the API answer.
 #[must_use]
 pub fn catchup_model(summaries: &SummariesConfig) -> Option<String> {
-    summaries
-        .llm
-        .as_ref()
-        .map(|llm| llm.model_for(crate::config::SummaryKind::SideAgent).to_owned())
+    summaries.llm.as_ref().map(|llm| {
+        llm.model_for(crate::config::SummaryKind::SideAgent)
+            .to_owned()
+    })
 }
 
 /// The framing every summariser is given.
