@@ -3210,13 +3210,15 @@ Mutations keep their hold short too. `adopt` and `create` validate the whole reg
 shard, the archive, the event history and every slot's storage -- before they take the lock.
 Under the lock they only confirm that no registry file changed since that validation began (one
 `lstat` per file: the shards, journals, holds, handoff records and every event file), re-check
-the one slot they change, and write. If another mutation committed in between, they release the
-lock and validate again; after five such rounds they refuse as busy ("registry is busy") and
-change nothing, as when the lock itself stays busy. `--wait-lock` bounds the waiting of all
-rounds together. While the journal of an interrupted or running mutation is outstanding they
-validate under the lock as before, because recovering or classifying that journal needs it.
-`create` still plans its checkouts (including the remote fetch), adds the worktrees and runs the
-post-provision hooks under the lock.
+the one slot they change, and write. They advance the state that validation derived and append
+after the event it verified last, so under the lock they read no event history: only that last
+event and the events they write themselves. If another mutation committed in between, they
+release the lock and validate again; after five such rounds they refuse as busy ("registry is
+busy") and change nothing, as when the lock itself stays busy. `--wait-lock` bounds the waiting
+of all rounds together. While the journal of an interrupted or running mutation is outstanding
+they validate under the lock as before, because recovering or classifying that journal needs
+it. `create` still plans its checkouts (including the remote fetch), adds the worktrees and
+runs the post-provision hooks under the lock.
 
 Readers keep their share of the lock short. `status`, `doctor`, `audit` and `unpushed` verify the
 append-only event history once before they take the lock, which is most of the reading on a

@@ -6,7 +6,9 @@ same flock on the project root that a consumer's run-population lock takes. Thes
 where that work runs now. They count the instrumented operations that run while the exclusive
 lock is held, never wall time: the fleet-wide validation runs before the lock, and under it run
 only the registry identity check, the touched record's own checks, the write, and a post-write
-check that reads only the events this command wrote. A writer that commits during the
+check that reads only the events this command wrote. Nothing under the lock loads or lists the
+event log: the state the command advances and the tip it appends after come from the verified
+validation, and the tip is the only earlier event read again. A writer that commits during the
 lock-free validation sends the command back to validate again; after a bounded number of
 overtaken rounds the command refuses as busy and writes nothing.
 """
@@ -14,6 +16,7 @@ overtaken rounds the command refuses as busy and writes nothing.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import fcntl
 import os
 import time
@@ -41,8 +44,9 @@ _Result = TypeVar("_Result")
 #: Instrumented operations. "validate" is the fleet validation, "fleet-storage" adopt's
 #: storage scan of every row, "storage-scan" the storage report (with the number of rows it
 #: was given), "slot-free" create's registry-wide slot and agent check, "journals" the
-#: outstanding-journal scan, "classify" create's journal classification, and "event-read" one
-#: event file read and hash-verified from disk rather than from the command's memo.
+#: outstanding-journal scan, "classify" create's journal classification, "event-read" one
+#: event file read and hash-verified from disk rather than from the command's memo, "log-load"
+#: one load of a whole event log (memoized or not), and "log-list" one listing of an event log.
 _INSTRUMENTED = {
     "_validate_global_state": "validate",
     "_assert_command_registry_storage": "fleet-storage",
@@ -50,6 +54,8 @@ _INSTRUMENTED = {
     "_outstanding_journals": "journals",
     "_classify_create_journals": "classify",
     "_event_from_path": "event-read",
+    "_load_events": "log-load",
+    "_event_file_names": "log-list",
 }
 
 
@@ -230,10 +236,13 @@ def test_adopt_runs_no_fleet_validation_while_holding_the_exclusive_lock(
     assert ledger.count("journals", held=True) == 0
     # Under the lock the only storage scan is the touched record's own.
     assert ledger.storage_rows_under_lock() == [1]
-    # One exclusive acquisition, and under it no event was read from disk but the one the
-    # adopt itself wrote.
+    # One exclusive acquisition. Under it the log was neither loaded nor listed, and the only
+    # events read from disk were the verified tip, which the new event follows, and the event
+    # the adopt itself wrote.
     assert ledger.exclusive_rounds == 1
-    assert ledger.count("event-read", held=True) <= written
+    assert ledger.count("log-load", held=True) == 0
+    assert ledger.count("log-list", held=True) == 0
+    assert ledger.count("event-read", held=True) == 1 + written
 
 
 def test_create_runs_no_fleet_validation_while_holding_the_exclusive_lock(
@@ -261,7 +270,11 @@ def test_create_runs_no_fleet_validation_while_holding_the_exclusive_lock(
     assert [rows for name, held, rows in ledger.calls if name == "storage-scan"] == [2]
     assert ledger.storage_rows_under_lock() == []
     assert ledger.exclusive_rounds == 1
-    assert ledger.count("event-read", held=True) <= written
+    # The journal writes, the active-state write and the journal's completion all append
+    # after the verified tip; under the lock the log was neither loaded nor listed.
+    assert ledger.count("log-load", held=True) == 0
+    assert ledger.count("log-list", held=True) == 0
+    assert ledger.count("event-read", held=True) == 1 + written
 
 
 @pytest.mark.parametrize("operation", ("adopt", "create"))
@@ -469,3 +482,83 @@ def test_post_write_check_rederives_local_rows_and_falls_back_for_anything_else(
     # Without a reference (the locked path) the full re-validation always runs.
     cli._assert_registry_change_limited_to_slot(config, None, before, "slot01")
     assert validations == ["validate", "validate"]
+
+
+def test_post_write_check_reads_only_the_events_appended_after_the_verified_tip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    for slot, agent, branch in (("slot01", "codex-1", "codex/task"), ("slot02", "codex-2", "codex/task2")):
+        made = create(project, slot=slot, agent=agent, branch=branch)
+        assert made.returncode == 0, made.stderr
+    config = cli._load_config(str(project), "testhost")
+    states, archives = cli._validate_global_state(config)
+    before = cli._global_rows(states, archives)
+    reference = cli._registry_identity(config)
+
+    # The verified tip is what loading the whole log yields: the same state and the same
+    # writer position, from the last event file alone.
+    local = cli._verified_local_log(config, reference, states, archives)
+    assert local is not None
+    assert local.sequence == _event_count(project)
+    assert local.active == cli._load_active(config)
+    assert local.archive == cli._load_archive(config)
+    loaded = cli._event_writer(config, "testhost")
+    positioned = local.writer(config)
+    assert (positioned.directory, positioned.sequence, positioned.previous_sha256) == (
+        loaded.directory,
+        loaded.sequence,
+        loaded.previous_sha256,
+    )
+    # Nothing validated for this machine, or no event file: the original path.
+    assert cli._verified_local_log(config, reference, [], archives) is None
+    empty = cli._RegistryIdentity(reference.config_sha256, ())
+    assert cli._verified_local_log(config, empty, states, archives) is None
+
+    beat = command(
+        project, "heartbeat", "slot01", "--agent", "codex-1", "--owner-pid", str(os.getpid()),
+        "--expected-generation", "1",
+    )
+    assert beat.returncode == 0, beat.stderr
+    appended = _event_count(project) - local.sequence
+    assert appended >= 1
+    loads: list[str] = []
+    reads: list[str] = []
+    load = cli._load_events
+    read = cli._event_from_path
+
+    def counted_load(
+        config: cli.Config, machine: str | None = None
+    ) -> tuple[dict[str, object], ...]:
+        loads.append(machine or config.machine)
+        return load(config, machine)
+
+    def counted_read(
+        path: Path,
+        machine: str,
+        expected_sequence: int,
+        previous: str,
+        *,
+        require_filename: bool = True,
+    ) -> dict[str, object]:
+        reads.append(path.name)
+        return read(path, machine, expected_sequence, previous, require_filename=require_filename)
+
+    monkeypatch.setattr(cli, "_load_events", counted_load)
+    monkeypatch.setattr(cli, "_event_from_path", counted_read)
+
+    # The heartbeat's events name slot01 and advance its record by one revision: reading
+    # just those events is the whole check.
+    cli._assert_registry_change_limited_to_slot(config, reference, before, "slot01", local)
+    assert loads == []
+    assert reads == [f"{sequence:020d}.json" for sequence in range(local.sequence + 1, local.sequence + appended + 1)]
+    # Checked for slot02, the same run names another slot, so the log is replayed and the
+    # exact check reports the changed row.
+    with pytest.raises(cli.StateError, match="changed an unrelated registry row"):
+        cli._assert_registry_change_limited_to_slot(config, reference, before, "slot02", local)
+    assert loads == ["testhost"]
+    # A run that does not start right after the verified tip is not accepted either.
+    shifted = dataclasses.replace(local, sequence=local.sequence - 1)
+    assert not cli._appended_events_limited_to_slot(
+        config, shifted, [f"{local.sequence + 1:020d}.json"], "slot01"
+    )

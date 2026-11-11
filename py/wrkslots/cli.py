@@ -6008,6 +6008,8 @@ def _journal_fingerprint(config: Config) -> tuple[tuple[str, int, int], ...]:
 # touches. An unchanged identity proves that no wrkslots writer committed anything in between,
 # so every fact the validation read still holds; a changed one sends the command back to
 # validate again, a bounded number of times, instead of validating while it holds the lock.
+# The command then advances the state that validation derived and appends after the event tip
+# it verified (_VerifiedLocalLog), so nothing under the locks loads or lists the event log.
 
 #: Lock-free validation rounds a single-record mutation runs before it refuses as busy. A
 #: round is repeated only when another writer changed the registry between the start of the
@@ -6198,31 +6200,183 @@ def _run_prevalidated_mutation(
     )
 
 
+#: Event kinds a prevalidated adopt or create appends for its own slot. The post-write check
+#: accepts a run of only these, for only that slot, by reading just those events; any other
+#: shape gets the exact check (#1274).
+_SLOT_MUTATION_EVENT_KINDS = frozenset(
+    {"active-state-recorded", "operation-progress-recorded", "operation-completed"}
+)
+_COMPLETE_EVENT_NAME = re.compile(r"[0-9]{20}\.json")
+
+
+@dataclasses.dataclass(frozen=True)
+class _VerifiedLocalLog:
+    """This machine's states and event-log tip as a lock-free validation verified them (#1274).
+
+    Valid only under the mutation locks of a prevalidated mutation whose registry identity
+    matched: no writer has appended since, so the command advances this state and appends
+    after this tip without loading the log again.
+    """
+
+    active: ActiveState
+    archive: ArchiveState
+    sequence: int
+    sha256: str
+
+    def writer(self, config: Config) -> _EventWriter:
+        """A writer that appends after the verified tip, where ``_event_writer`` would."""
+
+        return _EventWriter(
+            directory=_event_write_directory(config, self.active.machine),
+            machine=self.active.machine,
+            sequence=self.sequence,
+            previous_sha256=self.sha256,
+        )
+
+
+def _verified_local_log(
+    config: Config,
+    reference: _RegistryIdentity,
+    states: Sequence[ActiveState],
+    archives: Sequence[ArchiveState],
+) -> _VerifiedLocalLog | None:
+    """Read this machine's verified log tip under the mutation locks (#1274).
+
+    Call only once the registry identity equals ``reference``, the identity taken before the
+    validation that produced ``states`` and ``archives``, and after ``_refuse_partial_state``.
+    This machine's event files are then exactly the gapless chain that validation verified
+    and folded, so their count is the tip's sequence and the last of them holds the tip's
+    digest. Only that file is read. ``_event_writer`` and ``_load_active`` walk the whole log
+    instead, and on the measured registry each such walk under the lock read all 79,044 files
+    again once the #1247 memo cap was exceeded. Returns None when this machine has no event
+    file or no validated state; the caller then takes its original path.
+    """
+
+    prefix = f"EVENTS.{config.machine}/"
+    names = [
+        name[len(prefix) :] for name, _identity in reference.entries if name.startswith(prefix)
+    ]
+    active = next((item for item in states if item.machine == config.machine), None)
+    archive = next((item for item in archives if item.machine == config.machine), None)
+    if (
+        active is None
+        or archive is None
+        or not names
+        or names[-1] != f"{len(names):020d}.json"
+        or not all(_COMPLETE_EVENT_NAME.fullmatch(name) for name in names)
+    ):
+        return None
+    path = _event_write_directory(config, config.machine) / names[-1]
+    claimed = _as_mapping(_read_json(path, "append-only event"), "append-only event")
+    # The link to the event before it was verified with the whole chain; this re-checks the
+    # tip's own schema, machine, sequence and digest.
+    tip = _event_from_path(
+        path,
+        config.machine,
+        len(names),
+        _as_str(claimed.get("previous_sha256"), "append-only event.previous_sha256"),
+    )
+    return _VerifiedLocalLog(
+        active, archive, len(names), _as_str(tip["sha256"], "append-only event.sha256")
+    )
+
+
+def _appended_events_limited_to_slot(
+    config: Config, local: _VerifiedLocalLog, appended: Sequence[str], slot: str
+) -> bool:
+    """Do the events appended after the verified tip change no registry row but ``slot``'s?
+
+    True only for the run a prevalidated adopt or create appends (#1274). That run is new
+    files directly after the tip, each verified on the chain from the tip's digest. Each is
+    of a ``_SLOT_MUTATION_EVENT_KINDS`` kind and names ``slot``. Each active-state event
+    advances the verified state by one revision, from ``slot``'s verified record to a record
+    of ``slot`` on this machine whose paths check out. Only those files are read. Any other
+    shape returns False, and the caller replays this machine's log instead, which reports a
+    malformed event exactly as every load does.
+    """
+
+    machine = local.active.machine
+    first = local.sequence + 1
+    expected = [f"{sequence:020d}.json" for sequence in range(first, first + len(appended))]
+    if list(appended) != expected:
+        return False
+    directory = _event_directory(config, machine)
+    records = {record.slot: record for record in local.active.slots}
+    revision = local.active.revision
+    previous = local.sha256
+    for sequence, name in enumerate(appended, start=first):
+        event = _event_from_path(directory / name, machine, sequence, previous)
+        previous = _as_str(event["sha256"], "append-only event.sha256")
+        payload = _as_mapping(event["payload"], "append-only event.payload")
+        kind = event["kind"]
+        if kind not in _SLOT_MUTATION_EVENT_KINDS or payload.get("slot") != slot:
+            return False
+        if kind != "active-state-recorded":
+            continue
+        current = records.get(slot)
+        raw_record = payload.get("record")
+        if (
+            raw_record is None
+            or payload.get("previous_revision") != revision
+            or payload.get("revision") != revision + 1
+            or payload.get("previous_record_sha256")
+            != (None if current is None else _event_digest(_record_to_obj(current)))
+        ):
+            return False
+        record = _record_from_obj(raw_record, "append-only active-record event.record")
+        if record.slot != slot or record.machine != machine:
+            return False
+        if (
+            record.slot_type == "agent"
+            and record.import_source is None
+            and any(
+                other.slot != slot
+                and other.slot_type == "agent"
+                and other.import_source is None
+                and other.agent == record.agent
+                for other in records.values()
+            )
+        ):
+            return False
+        _assert_record_paths(config, record, require_repository=True)
+        records[slot] = record
+        revision += 1
+    return True
+
+
 def _assert_registry_change_limited_to_slot(
     config: Config,
     reference: _RegistryIdentity | None,
     before: Mapping[tuple[str, str, str], object],
     slot: str,
+    local: _VerifiedLocalLog | None = None,
 ) -> None:
     """The post-write check of a mutation: no registry row but ``slot``'s changed.
 
-    ``reference`` is the identity a prevalidated mutation verified under its locks (#1274).
-    Under those locks no other wrkslots writer can commit, and the mutation writes only this
-    machine's ACTIVE and ARCHIVED shards and event log. When those are the only registry
-    entries that differ from the reference, this machine's rows are re-derived from its log
-    (memoized, so only the events written since are read and verified) and every other row
+    ``reference`` is the identity a prevalidated mutation verified under its locks (#1274),
+    and ``local`` this machine's verified state and log tip. Under those locks no other
+    wrkslots writer can commit, and the mutation writes only this machine's ACTIVE and
+    ARCHIVED shards and event log. Suppose those are the only registry entries that differ
+    from the reference. If the events appended after ``local``'s tip are a run that
+    ``_appended_events_limited_to_slot`` accepts, reading those events is the whole check.
+    Otherwise this machine's rows are re-derived by replaying its log, and every other row
     is the validated ``before`` row. Any other difference, and every caller without a
     reference, gets the full re-validation the command always ran.
     """
 
     if reference is not None:
         current = _registry_identity(config)
-        local = {f"ACTIVE.{config.machine}.json", f"ARCHIVED.{config.machine}.json"}
+        local_shards = {f"ACTIVE.{config.machine}.json", f"ARCHIVED.{config.machine}.json"}
         events = f"EVENTS.{config.machine}/"
+        changed = reference.changed_names(current)
         if reference.config_sha256 == current.config_sha256 and all(
-            name in local or name.startswith(events)
-            for name in reference.changed_names(current)
+            name in local_shards or name.startswith(events) for name in changed
         ):
+            appended = [name[len(events) :] for name in changed if name.startswith(events)]
+            if local is not None and _appended_events_limited_to_slot(
+                config, local, appended, slot
+            ):
+                return
             # One replay for both of this machine's views: each load after an append walks the
             # whole log once, file by file, to confirm the memoized events are unchanged.
             derived = _states_from_events(config, config.machine)
@@ -8872,15 +9026,26 @@ def _write_active_state(
     evidence: Mapping[str, object] | None = None,
     require_repository: bool = True,
     event_writer: _EventWriter | None = None,
+    previous: ActiveState | None = None,
 ) -> dict[str, object]:
-    """Record one slot's active-state change and return the event that records it."""
+    """Record one slot's active-state change and return the event that records it.
 
-    _ensure_event_log(
-        config, state.machine, require_repository=require_repository
-    )
-    previous = _load_active(
-        config, state.machine, require_repository=require_repository
-    )
+    ``previous`` is the state ``state`` advances from. It is loaded from the log unless the
+    caller passes it, which only a prevalidated mutation does, with the state it verified
+    under its locks (#1274). A writer positioned after an existing event shows the log
+    exists, so the log is not listed again to learn that.
+    """
+
+    if event_writer is None or not event_writer.sequence:
+        _ensure_event_log(
+            config, state.machine, require_repository=require_repository
+        )
+    if previous is None:
+        previous = _load_active(
+            config, state.machine, require_repository=require_repository
+        )
+    elif previous.machine != state.machine:
+        raise StateError("active state can only advance from the same machine's state")
     if state.revision != previous.revision + 1:
         raise StateError(
             "active state revision must advance exactly once before it is recorded"
@@ -9023,7 +9188,9 @@ def _write_journal(
     event_writer: _EventWriter | None = None,
     journal_path: Path | None = None,
 ) -> None:
-    _ensure_event_log(config)
+    if event_writer is None or not event_writer.sequence:
+        # A writer positioned after an existing event shows the log exists (#1274).
+        _ensure_event_log(config)
     writer = event_writer or _event_writer(config, config.machine)
     selected_path = journal_path or _journal_path(config)
     writer.append(
@@ -9045,7 +9212,9 @@ def _clear_journal(
     event_writer: _EventWriter | None = None,
     journal_path: Path | None = None,
 ) -> None:
-    _ensure_event_log(config)
+    if event_writer is None or not event_writer.sequence:
+        # A writer positioned after an existing event shows the log exists (#1274).
+        _ensure_event_log(config)
     writer = event_writer or _event_writer(config, config.machine)
     selected_path = journal_path or _journal_path(config)
     writer.append(
@@ -32286,8 +32455,21 @@ def _cmd_create(args: argparse.Namespace) -> int:
             # and the slot and agent were free.
             states, archives = list(prepared.states), list(prepared.archives)
         before = _global_rows(states, archives)
-        _ensure_state_shard(config)
-        state = _load_active(config)
+        local = (
+            None
+            if reference is None
+            else _verified_local_log(config, reference, states, archives)
+        )
+        if local is None:
+            _ensure_state_shard(config)
+            state = _load_active(config)
+        else:
+            # What _ensure_state_shard does for a log that has events, from the states the
+            # lock-free validation derived from exactly these events (#1274): nothing under
+            # the lock loads the log.
+            _atomic_write_json(_active_path(config), _active_to_obj(local.active))
+            _atomic_write_json(_archive_path(config), _archive_to_obj(local.archive))
+            state = local.active
         if prepared is None:
             _assert_agent_and_slot_free(config, args.slot, args.agent, args.slot_type)
         _assert_create_disk_space(config, args.override_disk_floor)
@@ -32355,7 +32537,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
         # writer would load the whole chain just to learn its tip, inside
         # the locks.  The shard above has already ensured the log exists,
         # so no append can bypass this writer through _ensure_event_log.
-        event_writer = _event_writer(config, config.machine)
+        # A prevalidated create starts it at the verified tip, without
+        # loading the chain at all (#1274).
+        event_writer = (
+            _event_writer(config, config.machine) if local is None else local.writer(config)
+        )
         _write_journal(
             config,
             _create_journal_payload(
@@ -32532,6 +32718,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 "coordinator": _identity_to_obj(coordinator_lease),
             },
             event_writer=event_writer,
+            previous=None if local is None else local.active,
         )
         _interrupt_for_test("after-active-write")
         _clear_journal(
@@ -32550,7 +32737,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 args.slot,
             )
         else:
-            _assert_registry_change_limited_to_slot(config, reference, before, args.slot)
+            _assert_registry_change_limited_to_slot(
+                config, reference, before, args.slot, local
+            )
         return record, storage_inconsistencies
 
     record, storage_inconsistencies = _run_prevalidated_mutation(
@@ -33554,14 +33743,14 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
     owner = _capture_caller_process(args.owner_pid, "owner")
     task_scope = _task_scope_from_args(args, owner)
 
-    def validate() -> dict[tuple[str, str, str], object]:
-        """The fleet-wide validation; returns the global rows it validated."""
+    def validate() -> tuple[list[ActiveState], list[ArchiveState]]:
+        """The fleet-wide validation; returns the states it validated."""
 
         states, archives = _validate_global_state(config)
         _assert_command_registry_storage(config, states, args)
-        return _global_rows(states, archives)
+        return states, archives
 
-    def prepare() -> dict[tuple[str, str, str], object] | None:
+    def prepare() -> tuple[list[ActiveState], list[ArchiveState]] | None:
         # Lock-free (#1274). An outstanding journal needs the recovery that only the locked
         # path performs, so that round defers to it.
         if _outstanding_journals(config):
@@ -33570,15 +33759,23 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
 
     def commit(
         reference: _RegistryIdentity | None,
-        prepared: dict[tuple[str, str, str], object] | None,
+        prepared: tuple[list[ActiveState], list[ArchiveState]] | None,
     ) -> ActiveRecord | None:
         _refuse_partial_state(config)
         if prepared is None:
             _assert_no_journal(config)
-            before = validate()
+            states, archives = validate()
         else:
-            before = prepared
-        state = _load_active(config)
+            states, archives = prepared
+        before = _global_rows(states, archives)
+        # Validated lock-free and still current (#1274): this machine's state and log tip come
+        # from that validation, so nothing under the lock loads the log.
+        local = (
+            None
+            if reference is None
+            else _verified_local_log(config, reference, states, archives)
+        )
+        state = _load_active(config) if local is None else local.active
         record = _find_record(state, args.slot)
         _expected_generation(record, args.expected_generation)
         if record.agent != args.agent:
@@ -33623,8 +33820,10 @@ def _cmd_adopt(args: argparse.Namespace) -> int:
             action="owner-bound",
             slot=adopted.slot,
             evidence={"owner": _identity_to_obj(owner)},
+            event_writer=None if local is None else local.writer(config),
+            previous=None if local is None else local.active,
         )
-        _assert_registry_change_limited_to_slot(config, reference, before, args.slot)
+        _assert_registry_change_limited_to_slot(config, reference, before, args.slot, local)
         return adopted
 
     adopted = _run_prevalidated_mutation(config, args.wait_lock, "adopt", prepare, commit)
