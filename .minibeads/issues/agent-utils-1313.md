@@ -1,12 +1,13 @@
 ---
 title: 'chat-latency-headless-accepted: record when the headless wrapper accepts a request, so ingestion compares across paths'
-status: open
+status: closed
 priority: 2
 issue_type: feature
 labels:
 - agentctl
 created_at: 2026-11-11T16:01:51+00:00
 updated_at: 2026-11-11T16:01:51+00:00
+closed_at: 2026-11-11T16:01:51+00:00
 ---
 
 # Description
@@ -34,3 +35,26 @@ A 2026-11-11 comparison of a headless coordinator with terminal coordinators on 
 # Notes
 
 The lead re-runs the headless versus terminal comparison on 2026-11-18, with a week of #1216 agentctl-effort-option effort and model stamps.
+
+## Resolution
+
+[watermelon-full-preview] Delivered with this closing commit. A
+headless request now carries `accepted_at_millis`: when delivery is
+stamped for a headless target, the bridge reads the `queued_at` of
+the request's `chat-<key>` queue item (in whichever queue phase
+holds it) and records it beside `delivered_at_millis`; terminal
+targets and older records leave it absent, never zero. `chat
+latency` gains `admitted_to_accepted` (headless ingestion) and
+`accepted_to_delivered` ("accepted -> turn start (queue wait)") in
+the text report, the JSON stages and per-request fields, while the
+existing fields are kept, and the folded summaries and `--by`
+groupings carry both new stages (appended, so old summaries read
+unchanged). Tests use recorded timestamps: a headless fixture whose
+queue item records `queued_at` 1700.25 s stamps accepted 1700250 ms
+beside delivery, and the report-level stages split a headless
+request's 800 ms ingestion from its 8.2 s queue wait while a
+terminal request reports only admitted -> delivered. The Python
+edition has no chat latency path to refuse; the wrapper itself is
+unchanged - the stamp is read from its queue item. Unverified: no
+live headless coordinator was compared; the 2026-11-18 re-run is the
+lead's.

@@ -17,6 +17,10 @@ pub struct RequestTimes {
     pub admitted_at_millis: u64,
     /// When the acknowledgement reaction (the first) was confirmed added.
     pub acknowledged_at_millis: Option<u64>,
+    /// When a headless target's queue accepted the prompt (its queue
+    /// item's `queued_at`), before the model started it (#1313).
+    /// Absent for terminal targets and older records, never zero.
+    pub accepted_at_millis: Option<u64>,
     /// When the prompt was verified typed into the agent, or a headless model started it: the
     /// moment the receipt reaction (the second) is queued.
     pub delivered_at_millis: Option<u64>,
@@ -173,6 +177,7 @@ impl BridgeState {
                 thread_id: record.message.thread_id.clone(),
                 admitted_at_millis: record.admitted_at_millis,
                 acknowledged_at_millis: record.ack_completed_at_millis,
+                accepted_at_millis: record.accepted_at_millis,
                 delivered_at_millis: record.delivered_at_millis,
                 first_reply_sent_at_millis,
                 last_reply_sent_at_millis,

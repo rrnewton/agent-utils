@@ -3,6 +3,10 @@
 //! bridge's request and reply records are the source: posted (the provider's message time),
 //! admitted, acknowledged (the first reaction confirmed), delivered (the prompt verified typed, or
 //! a headless model started it, when the second reaction is queued), and the first reply sent.
+//! Ingestion is labelled per path (#1313): a terminal target's ingestion is
+//! admitted -> delivered (typed), while a headless target's splits at the
+//! moment its queue accepted the prompt (admitted -> accepted), with
+//! accepted -> delivered then showing the queue wait until the turn started.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -52,7 +56,7 @@ fn split(request: &RequestTimes) -> bool {
         .is_some_and(|timing| timing.split == "transcript")
 }
 
-const STAGES: [Stage; 7] = [
+const STAGES: [Stage; 9] = [
     Stage {
         name: "posted_to_admitted",
         label: "posted -> admitted",
@@ -125,6 +129,19 @@ const STAGES: [Stage; 7] = [
                 None => request.first_reply_sent_at_millis.map(|_| 0),
             }
         },
+    },
+    // #1313: only headless requests carry an accepted time, so these
+    // two stages count them alone; a terminal request's ingestion
+    // stays admitted -> delivered above.
+    Stage {
+        name: "admitted_to_accepted",
+        label: "admitted -> accepted (headless queue)",
+        interval: |request| between(Some(request.admitted_at_millis), request.accepted_at_millis),
+    },
+    Stage {
+        name: "accepted_to_delivered",
+        label: "accepted -> turn start (queue wait)",
+        interval: |request| between(request.accepted_at_millis, request.delivered_at_millis),
     },
 ];
 
@@ -292,12 +309,22 @@ mod tests {
     }
 
     fn request(posted: Option<u64>, delivered: Option<u64>, reply: Option<u64>) -> RequestTimes {
+        request_accepted(posted, None, delivered, reply)
+    }
+
+    fn request_accepted(
+        posted: Option<u64>,
+        accepted: Option<u64>,
+        delivered: Option<u64>,
+        reply: Option<u64>,
+    ) -> RequestTimes {
         RequestTimes {
             key: "k".repeat(64),
             thread_id: "spaces/example/threads/1".to_owned(),
             posted_at_millis: posted,
             admitted_at_millis: 1_000,
             acknowledged_at_millis: Some(1_500),
+            accepted_at_millis: accepted,
             delivered_at_millis: delivered,
             first_reply_sent_at_millis: reply,
             last_reply_sent_at_millis: reply,
@@ -325,9 +352,21 @@ mod tests {
                 Some(6_000),
                 Some(8_600),
                 None,
+                None,
+                None,
                 None
             ]
         );
+        // #1313: a headless request splits ingestion at queue
+        // acceptance; the queue wait is accepted -> turn start.
+        let headless = request_accepted(Some(400), Some(1_800), Some(10_000), Some(12_000));
+        let intervals: Vec<Option<u64>> = STAGES
+            .iter()
+            .map(|stage| (stage.interval)(&headless))
+            .collect();
+        assert_eq!(intervals[7], Some(800));
+        assert_eq!(intervals[8], Some(8_200));
+        assert_eq!(intervals[2], Some(9_000));
         let waiting = request(None, None, None);
         let intervals: Vec<Option<u64>> = STAGES
             .iter()
@@ -335,7 +374,7 @@ mod tests {
             .collect();
         assert_eq!(
             intervals,
-            vec![None, Some(500), None, None, None, None, None]
+            vec![None, Some(500), None, None, None, None, None, None, None]
         );
         // Without a provider time, the total starts at admission.
         let unposted = request(None, Some(2_000), Some(5_000));

@@ -2791,6 +2791,12 @@ struct RequestRecord {
     admitted_cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     delivery_started_at_millis: Option<u64>,
+    /// When a headless target's queue accepted the prompt: the `queued_at`
+    /// of its `chat-<key>` queue item, read when delivery is stamped
+    /// (#1313 chat-latency-headless-accepted). Absent for terminal
+    /// targets and for records written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted_at_millis: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     delivered_at_millis: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2953,6 +2959,7 @@ impl RequestRecord {
             admitted_delivery_id: None,
             admitted_cursor: None,
             delivery_started_at_millis: None,
+            accepted_at_millis: None,
             delivered_at_millis: None,
             ack_started_at_millis: None,
             ack_completed_at_millis: None,
@@ -6725,6 +6732,42 @@ impl BridgeState {
     /// coordinator designation. The role is `coordinator` for the designated coordinator, else
     /// the profile's `role`, else `worker`; the protocol is the profile's, else `unknown`. Every
     /// other field a source does not give is `unknown`. Never fails delivery.
+    /// When `agent`'s queue accepted request `key`: the `queued_at`
+    /// (Unix seconds, as a float) of its `chat-<key>` item in whichever
+    /// queue phase holds it now, in Unix milliseconds (#1313). `None`
+    /// when no registry is known or the item cannot be read: the stage
+    /// is then absent from the report, never zero.
+    fn queue_accepted_at(&self, agent: &str, key: &str) -> Option<u64> {
+        let registry = self.latency_registry.as_deref()?;
+        let directory = agent_queue::registry::directory(registry, agent).ok()?;
+        let directories = agent_queue::queue::QueueDirectories::new(&directory.join("queue"));
+        let item = format!("chat-{key}.json");
+        for lane in [
+            &directories.inbox,
+            &directories.inbox_v2,
+            &directories.inflight,
+            &directories.processed,
+            &directories.failed,
+            &directories.cancelled,
+        ] {
+            let path = lane.join(&item);
+            if path.is_file() {
+                // Read the item raw: only its queued_at is wanted, and
+                // an item a reader cannot parse counts as unread, so
+                // the stage stays absent rather than failing delivery.
+                if let Some(document) = std::fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                {
+                    if let Some(seconds) = document.get("queued_at").and_then(Value::as_f64) {
+                        return Some((seconds * 1000.0) as u64);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub(crate) fn delivery_stamp_for(&self, agent: &str) -> DeliveryStamp {
         use crate::chat_latency::UNKNOWN;
         let agent = agent.to_owned();
@@ -11512,6 +11555,16 @@ and the replies captured for them. The provider's own thread is the complete rec
             },
             think,
             tools,
+            // #1313: headless queue acceptance splits ingestion from
+            // the queue wait; absent (never zero) without an accepted
+            // time, as for terminal targets and older records.
+            record
+                .accepted_at_millis
+                .map(|accepted| accepted.saturating_sub(admitted)),
+            match (record.accepted_at_millis, delivered) {
+                (Some(accepted), Some(d)) => Some(d.saturating_sub(accepted)),
+                _ => None,
+            },
         ];
         let day = crate::chat_latency::et_date(admitted as f64 / 1_000.0);
         (day, durations)
@@ -11585,6 +11638,7 @@ and the replies captured for them. The provider's own thread is the complete rec
             "posted_at_millis": parse_rfc3339_millis(&record.message.created_at),
             "admitted_at_millis": record.admitted_at_millis,
             "acknowledged_at_millis": record.ack_completed_at_millis,
+            "accepted_at_millis": record.accepted_at_millis,
             "delivered_at_millis": record.delivered_at_millis,
             "first_reply_at_millis": self.first_reply_at(record),
             "stamp": record.stamp,
@@ -14611,6 +14665,18 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
             if record.stamp.is_none() {
                 let agent = record.agent_for(&self.config.agent_name);
                 record.stamp = Some(self.delivery_stamp_for(&agent));
+            }
+            // A headless target's queue accepted the prompt when its
+            // `chat-<key>` item was appended, long before the model
+            // started it: keep that queue wait out of ingestion (#1313).
+            if record.accepted_at_millis.is_none()
+                && record
+                    .stamp
+                    .as_ref()
+                    .is_some_and(|stamp| stamp.adapter == "headless")
+            {
+                let agent = record.agent_for(&self.config.agent_name);
+                record.accepted_at_millis = self.queue_accepted_at(&agent, &record.key);
             }
             // Still blocked up to delivery when the last error said so.
             let blocked_to_the_end = record
@@ -22502,6 +22568,45 @@ pub(crate) mod tests {
         assert_eq!(follow.new_request_keys.len(), 1);
         let record = state.read_request(&follow.new_request_keys[0]).unwrap();
         assert_eq!(record.target_agent.as_deref(), Some("worker"));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(registry).unwrap();
+    }
+
+    #[test]
+    fn headless_delivery_stamps_queue_acceptance_from_the_item() {
+        // #1313: a headless request carries the queue item's queued_at
+        // (recorded timestamps, not the wall clock) as accepted, beside
+        // the delivered (turn-start) time.
+        let registry = temporary("accepted-registry");
+        let agent_dir = registry.join("agents").join("coordinator");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::write(
+            agent_dir.join("agent.json"),
+            json!({"name":"coordinator","token":"t-c","lifecycle":"running","harness":"claude"})
+                .to_string(),
+        )
+        .unwrap();
+        let root = temporary("accepted-state");
+        let state = BridgeState::initialize(&root, config())
+            .unwrap()
+            .with_latency_profile(Some(registry.clone()), true);
+        let admission = state.admit_batch(&delivery(1, "c1", "r1")).unwrap();
+        let key = admission.new_request_keys[0].clone();
+        let queue = agent_dir.join("queue").join("processed");
+        fs::create_dir_all(&queue).unwrap();
+        fs::write(
+            queue.join(format!("chat-{key}.json")),
+            json!({"queued_at": 1700.25}).to_string(),
+        )
+        .unwrap();
+        state
+            .put_delivery_phase(&key, RequestPhase::Delivered, None)
+            .unwrap();
+        let record = state.read_request(&key).unwrap();
+        assert_eq!(record.accepted_at_millis, Some(1_700_250), "{record:?}");
+        assert!(record.delivered_at_millis.is_some());
+        let times = state.request_times().unwrap();
+        assert_eq!(times[0].accepted_at_millis, Some(1_700_250));
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(registry).unwrap();
     }

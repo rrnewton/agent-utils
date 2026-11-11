@@ -5,7 +5,7 @@
 //! summary file under `<bridge-state>/latency/`, keyed by the bridge,
 //! coordinator and the stamps it carried at delivery: model, effort,
 //! adapter, harness, launch profile, role, protocol, and whether it was
-//! admitted inside a jam. Summaries are bounded: eight stages over fixed
+//! admitted inside a jam. Summaries are bounded: ten stages over fixed
 //! log buckets, well under a kilobyte a day. Folding is exact-once live and
 //! in backfill because the request record itself carries `folded_at`.
 //!
@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 /// Stage names in order. The last two split `delivered_to_first_reply` where the target's
 /// transcript is followed (#897 chat-latency-stamps): until its first tool call (thinking, or
 /// waiting for its turn), and from then until the first reply (its tools and what follows).
-pub const STAGES: [&str; 8] = [
+pub const STAGES: [&str; 10] = [
     "posted_to_admitted",
     "admitted_to_ack",
     "ack_to_delivered",
@@ -31,6 +31,10 @@ pub const STAGES: [&str; 8] = [
     "admitted_to_delivered",
     "delivered_to_first_tool",
     "first_tool_to_first_reply",
+    // #1313: headless ingestion splits at queue acceptance, so it can
+    // be compared with a terminal target's admitted -> typed.
+    "admitted_to_accepted",
+    "accepted_to_delivered",
 ];
 
 /// Bucket upper bounds in milliseconds (log-spaced); the last bucket is

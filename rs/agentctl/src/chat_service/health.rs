@@ -1037,6 +1037,7 @@ mod tests {
             posted_at_millis: Some(NOW - 120_000),
             admitted_at_millis: NOW - 119_000,
             acknowledged_at_millis: Some(NOW - 118_000),
+            accepted_at_millis: None,
             delivered_at_millis: (phase == "delivered").then_some(NOW - 117_000),
             first_reply_sent_at_millis: (replies > 0).then_some(NOW - 100_000),
             last_reply_sent_at_millis: (replies > 0).then_some(NOW - 100_000),
