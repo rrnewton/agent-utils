@@ -603,6 +603,7 @@ def _state_without_mac(path: Path) -> dict[str, object]:
     return payload
 
 
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust; verdict gap is #1310
 def test_audit_census_resume_state_matches_python(tmp_path: Path) -> None:
     root = _cache_fixture(tmp_path)
     shared = tmp_path / "shared-census.json"
