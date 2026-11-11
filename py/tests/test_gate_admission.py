@@ -34,6 +34,13 @@ def _hermetic_gate_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv("GATE_PHASE_PRIORITY_CONFIG", str(tmp_path / "hostless-gate-phase-priority.toml"))
     monkeypatch.setenv("GATE_BLACKOUT_CONFIG", str(tmp_path / "hostless-gate.toml"))
     monkeypatch.delenv("GATE_INTERLEAVE_AFTER", raising=False)
+    # Tests run real gate.py subprocesses whose commands wait on files in
+    # tmp_path; with CPU containment on, each admitted command becomes a
+    # real systemd user scope, and a test that times out leaves its scope
+    # (and its wait loop) running on the host. Tests never create real
+    # scopes: the containment wrapper itself is covered in-process by
+    # test_contained_command_wraps_in_a_quota_scope.
+    monkeypatch.setenv("GATE_CPU_CONTAINMENT", "off")
 
 
 def _env(tmp_path: Path) -> dict[str, str]:
@@ -48,6 +55,9 @@ def _env(tmp_path: Path) -> dict[str, str]:
             "GATE_BLACKOUT_CONFIG": str(tmp_path / "gate.toml"),
             # A lane may run the suite under GATE_SLOTS=1; the tests assume the default.
             "GATE_SLOTS": "2",
+            # Admitted test commands never run in real systemd scopes (see
+            # the fixture): a timed-out test would leak the scope.
+            "GATE_CPU_CONTAINMENT": "off",
             # The real preflight runs validation steps; these tests give it a stand-in.
             "GATE_PREFLIGHT_COMMAND": "true"}
 
@@ -392,9 +402,25 @@ def test_blackout_help_documents_config_and_flag(tmp_path: Path) -> None:
     assert "--rerun" in result.stdout
 
 
+def _gate_scope_units() -> set[str]:
+    """Live agent-utils-gate-*.scope user units, or empty where systemctl
+    cannot list them (no user systemd on this host)."""
+    try:
+        done = subprocess.run(
+            ["systemctl", "--user", "list-units", "agent-utils-gate-*.scope",
+             "--all", "--no-legend"],
+            capture_output=True, text=True, timeout=30)
+    except OSError:
+        return set()
+    if done.returncode != 0:
+        return set()
+    return {line.split()[0] for line in done.stdout.splitlines() if line.split()}
+
+
 def test_a_rerun_ticket_jumps_ordinary_queued_gates(tmp_path: Path) -> None:
     """A --rerun ticket sorts ahead of every ordinary queued ticket and is
     granted as soon as the running gate finishes."""
+    scopes_before = _gate_scope_units()
     order = tmp_path / "order.txt"
 
     def note(tag: str) -> str:
@@ -421,6 +447,15 @@ def test_a_rerun_ticket_jumps_ordinary_queued_gates(tmp_path: Path) -> None:
         out, _ = proc.communicate(timeout=30)
         assert proc.returncode == 0, out
     assert order.read_text().split() == ["rerun", "ordinary"]
+    # No systemd scope this test created may survive it (they leaked on
+    # 2026-11-10/11 when the test timed out under load). Scope teardown
+    # can lag process exit, so poll briefly.
+    deadline = time.time() + 10
+    leaked = _gate_scope_units() - scopes_before
+    while leaked and time.time() < deadline:
+        time.sleep(0.25)
+        leaked = _gate_scope_units() - scopes_before
+    assert not leaked, f"test leaked gate scope(s): {sorted(leaked)}"
 
 
 def test_cpu_quota_comes_from_the_slots_file_with_a_default(tmp_path: Path) -> None:
