@@ -4375,8 +4375,8 @@ const threadList = createThreadList({
   defaultChannelView,
   chooseView,
   openThreadFromList: (id, summary) => openThreadFromList(id, summary),
-  selectSideThread,
-  closeSideThread,
+  selectSideThread: (id, summary) => selectSideThread(id, summary),
+  closeSideThread: () => closeSideThread(),
   setLayout,
   paintCard: (row, choice, tally) => paintThreadCard(row, choice, /** @type {any} */ (tally)),
   fetchTimeline: (path) => apiDecoded("TimelineResponse", path),
@@ -7036,144 +7036,67 @@ const { threadCardsDrawn, THREAD_CARD_FOLD_KEY, THREAD_CARD_LISTS, threadCardFol
 //     off screen, from one thread to another, on a reload — which has no card on screen to come from;
 //     nor back down when the thread closes.
 
-/**
- * How long the card at the top of a thread takes to move up from its card in the list, in ms: the
- * stylesheet's `--card-flight` on #screen-main, which is 0 for a reader whose system asks for less
- * motion, as `--column-glide` is "auto" then. 0 too where the stylesheet says nothing.
- */
-function cardFlightMs() {
-  const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(leftEl("screen-main")) : null;
-  const said = style ? String(style.getPropertyValue("--card-flight")).trim() : "";
-  const parsed = /^(\d+(?:\.\d+)?)(ms|s)$/.exec(said);
-  return parsed ? Number(parsed[1]) * (parsed[2] === "s" ? 1000 : 1) : 0;
-}
-
-/**
- * Where thread `id`'s card is in the cards on screen — on the right, or in the thread list — while any
- * of it shows: where the card at the top of its thread starts from. Else null.
- *
- * @param {string} id
- */
-function cardFlightStart(id) {
-  const row = cardRowOnRight(id);
-  if (!row || !rowShown(row) || !rowInView(sidePane, row)) return null;
-  return row.getBoundingClientRect();
-}
-
-/**
- * The card moving up while it is, moving it, and ending it by its animations or a timer: one owner in
- * web/src/view/channel/cardflight.ts (`#624 voice-page-modularity`). The page destructures its commands
- * under their old names.
- */
-const cardFlightOwner = createCardFlight({
-  clock: clockOnUse(),
-  ms: () => cardFlightMs(),
-  drawn: (node) => drawnOnPage(node),
-  linksShown: () => columnLinksShown(),
-  drawLinks: () => drawColumnLinks(),
-  scheduleLinks: () => scheduleColumnLinks(),
-  frame: (run) => {
-    if (typeof requestAnimationFrame !== "function") return false;
-    requestAnimationFrame(run);
-    return true;
-  },
-});
-const { flyThreadCard, endCardFlightPart, endCardFlight } = cardFlightOwner;
-
-/** Whether `node` and everything it is in are drawn: none of them `hidden`. */
-function drawnOnPage(node) {
-  for (let at = node; at; at = /** @type {HTMLElement} */ (at.parentNode)) if (at.hidden) return false;
-  return true;
-}
-
-/** The right column with no thread selected: its cards, and the thread list read behind them. */
-function showSideList() {
-  openSideCards();
-  // Not before sign-in has answered: the reopen's read reads the list behind the cards then.
-  if (serverFacts.configApplied()) guardQuietly(refreshThreadDirectory)();
-}
-
-/**
- * Select thread `id` on the right, from wherever the reader asked for it: its tag on a row, a count
- * of unread replies, a card, the view picker. Drawn at once from what the page holds and read
- * behind, landing on its first unread, exactly as a thread opens in one column.
- */
-function selectSideThread(id, summary = null) {
-  noteDeepLinkReaderMove();
-  const thread = String(id);
-  const channel = String(selectedChannelId());
-  if (!layoutShown.columns() || !channel) return undefined;
-  // Entered from its card, `enterCard` says so once this returns. `#277 thread-card-focus`.
-  columns.side.fromCards = false;
-  const known = summary || channelStore.current().threads.find((held) => String(held.id) === thread) || null;
-  sideThreads.set(channel, { id: thread, summary: known });
-  const was = columns.side.mode;
-  // `#298 thread-card-header`. Where its card is, while the cards show it, for the card at the top to
-  // move up from.
-  const from = was === "list" ? cardFlightStart(thread) : null;
-  if (was === "list") rememberCardPlace();
-  // `#410 inline-reply-editor`. A reply open under a row unpacked among the cards goes with them, its
-  // words kept as a draft: it is the left column's reply (`openReply`), drawn in a list now hidden.
-  if (replyState.docked && replyState.column !== columns.side && replyPane() === sidePane) putDockedReplyAway();
-  columns.side.mode = "thread";
-  renderSideMode();
-  const opened = inColumn(columns.side, () => {
-    if (was === "thread" && selection().view === "thread" && String(selection().threadId) === thread) {
-      // Shown again as it was put away, two columns coming back to it: drawn again where a Done or an
-      // Undo made meanwhile in one column left its rows behind its copy. `#306 done-stale-across-views`.
-      if (rowsMissDone()) renderCachedTimeline();
-      return undefined;
-    }
-    return changeChannelView("thread", thread, known);
-  });
-  flyThreadCard(leftEl("side-thread-card"), from, leftEl("side-pane"));
-  return opened;
-}
-
-/** The X: the thread goes, and the cards come back. Its rows are held, so selecting it again is instant. */
-function closeSideThread() {
-  // `#277 reply-in-column`. A reply open under the thread goes with it, its words kept as a draft.
-  if (replyState.column === columns.side) putDockedReplyAway();
-  // `#262 search-load-older`. The thread's walk for the search goes with it: nothing else it asks
-  // about changes when the cards come back.
-  endSearchWalk(columns.side);
-  const channel = String(selectedChannelId());
-  sideThreads.delete(channel);
-  if (columns.side.mode === "thread") {
-    inColumn(columns.side, () => {
-      dropReplyArrowTap();
-      putRepliesBack();
-      rememberChannelDraft();
-      rememberChannelContext();
-      ++loadState().generation;
-    });
-  }
-  showSideList();
-}
-
-/**
- * Forget what the right column shows, for another channel or another credential. `reopen`, for a
- * channel the reader changed to: show that channel's thread selected there earlier in this session,
- * or its cards and the thread list read behind them.
- */
-function resetSideColumn(reopen = false) {
-  // `#404 threads-unpack-all`. Unpack reads were the last channel's.
-  unpackReadQueue.forget();
-  unpackWatch.stop();
-  endSearchWalk(columns.side);
-  columns.side.searchNote = null;
-  // `#262 search-load-older`. And the cards' walk, and what the last one found: they were this channel's.
-  endRepliesWalk();
-  repliesWalks.forgetNote();
-  inColumn(columns.side, () => {
-    dropReplyArrowTap();
-    gatherState().gathered = null;
-    listState().rowsGathered = false;
-    ++loadState().generation;
-  });
-  // Made afresh, as when it was first used: only while it is not the column worked on, whose records
-  // are live.
-  if (columnWork.active() !== columns.side) {
+// The card moving up as its thread opens, and the right column's thread life, are
+// web/src/view/channel's now (`createSideThreadActs`, `#624 voice-page-modularity`): where the
+// card at the top starts from, selecting and closing the right column's thread, forgetting the
+// column, and reading it behind its rows. The flight owner is made by cardflight's factory,
+// handed in as a maker with the page's acts.
+const sideThreadActs = createSideThreadActs({
+  leftById: leftEl,
+  makeFlight: (ms, drawn) => createCardFlight({
+    clock: clockOnUse(),
+    ms,
+    drawn: (node) => drawn(/** @type {any} */ (node)),
+    linksShown: () => columnLinksShown(),
+    drawLinks: () => drawColumnLinks(),
+    scheduleLinks: () => scheduleColumnLinks(),
+    frame: (run) => {
+      if (typeof requestAnimationFrame !== "function") return false;
+      requestAnimationFrame(run);
+      return true;
+    },
+  }),
+  cardRowOnRight: (id) => cardRowOnRight(id),
+  rowShown: (row) => rowShown(/** @type {any} */ (row)),
+  rowInView: (pane, row) => rowInView(/** @type {any} */ (pane), row),
+  sidePane: () => sidePane,
+  openSideCards: () => openSideCards(),
+  configApplied: () => serverFacts.configApplied(),
+  guardQuietly: (run) => guardQuietly(run),
+  refreshThreadDirectory: () => refreshThreadDirectory(),
+  noteDeepLinkReaderMove: () => noteDeepLinkReaderMove(),
+  selectedChannelId: () => selectedChannelId(),
+  columnsShown: () => layoutShown.columns(),
+  threadSummary: (id) => channelStore.current().threads.find((held) => String(held.id) === String(id)) || null,
+  sideThreads: () => sideThreads,
+  sideMode: () => columns.side.mode,
+  setSideMode: (mode) => { columns.side.mode = /** @type {any} */ (mode); },
+  setSideFromCards: (on) => { columns.side.fromCards = on; },
+  replyDockedAway: () => Boolean(replyState.docked && replyState.column !== columns.side && replyPane() === sidePane),
+  replyInSide: () => replyState.column === columns.side,
+  putDockedReplyAway: () => putDockedReplyAway(),
+  renderSideMode: () => renderSideMode(),
+  inSideColumn: (act) => inColumn(columns.side, act),
+  selectionView: () => selection().view,
+  selectionThreadId: () => selection().threadId,
+  rowsMissDone: () => rowsMissDone(),
+  renderCachedTimeline: () => renderCachedTimeline(),
+  changeChannelView: (view, thread, known) => changeChannelView(/** @type {any} */ (view), thread, /** @type {any} */ (known)),
+  endSearchWalk: () => endSearchWalk(columns.side),
+  dropReplyArrowTap: () => dropReplyArrowTap(),
+  putRepliesBack: () => putRepliesBack(),
+  rememberChannelDraft: () => rememberChannelDraft(),
+  rememberChannelContext: () => rememberChannelContext(),
+  bumpLoadGeneration: () => { ++loadState().generation; },
+  clearGathered: () => { gatherState().gathered = null; listState().rowsGathered = false; },
+  forgetUnpackReads: () => unpackReadQueue.forget(),
+  stopUnpackWatch: () => unpackWatch.stop(),
+  endRepliesWalk: () => endRepliesWalk(),
+  forgetRepliesNote: () => repliesWalks.forgetNote(),
+  clearSideSearchNote: () => { columns.side.searchNote = null; },
+  rememberCardPlace: () => rememberCardPlace(),
+  activeIsSide: () => columnWork.active() === columns.side,
+  resetSideRecords: () => {
     columns.side.left = false;
     columns.side.older = freshOlderPages();
     columns.side.arrows = freshReplyArrows();
@@ -7189,91 +7112,19 @@ function resetSideColumn(reopen = false) {
     columns.side.done = freshDoneState();
     columns.side.place = freshScrollPlace();
     columns.side.gather = freshGatherState();
-  }
-  for (const id of ["side-log", "side-thread-list", "side-summary", "side-pinned-log", "side-outgoing-log"]) {
-    leftEl(id).replaceChildren();
-  }
-  leftEl("side-notice").hidden = true;
-  leftEl("side-older").hidden = true;
-  leftEl("side-loading").hidden = true;
-  cardsDrawn.forget();
-  leftEl("side-cards").replaceChildren();
-  if (!sideColumnUp() || !reopen) {
-    columns.side.mode = "list";
-    if (sideColumnUp()) openSideCards();
-    return;
-  }
-  // `#281 view-keys`. The thread list shows cards, whatever two columns had selected on the right.
-  if (layoutShown.threadList()) {
-    columns.side.mode = "list";
-    showSideList();
-    return;
-  }
-  const open = sideThreads.get(String(selectedChannelId()));
-  if (open) {
-    columns.side.mode = "list";
-    guardQuietly(() => selectSideThread(open.id, open.summary))();
-  } else {
-    showSideList();
-  }
-}
-
-/**
- * Read the right column's thread behind its rows, or the thread list behind its cards: the poll's
- * second read, and coming back to the page. Nothing while one column is up.
- *
- * `since` is `replayLedger.started()` as it stood when the refresh asking for this began, before its
- * read of Main. `#231 two-column-polish`. A read of the thread on the right that went on the wire
- * after that is this read already: a thread selected while the poll's read of Main was out queued its
- * read behind it, and that read ran before the poll got here. Reading it again brought nothing the
- * first had not, a second request for the same rows. See `answeredSince` for which reads count.
- *
- * @param {string} reason
- * @param {number | null} [since]
- */
-async function readSideColumn(reason, since = null) {
-  if (!sideColumnUp()) return;
-  if (columns.side.mode === "thread") {
-    await inColumn(columns.side, () => (since !== null && answeredSince(since, reason)
-      ? undefined : timelineView.loadDiscord({ keepPosition: true, reason, readAs: "side" })));
-  } else {
-    await refreshThreadDirectory();
-  }
-}
-
-/**
- * The newest timeline read each column sent and that has not failed before landing a page: the view
- * it was for (`channelContextKey`), its number among `replayLedger.started()`, and whether it read the
- * view in full rather than as what changed. `#231 two-column-polish`. One still on the wire counts,
- * as the read a refresh would send would only queue behind it; if it then fails, the right column's
- * line says so (`renderSideFreshness`) and the next poll reads the view again. A chain of what
- * changed that fails after its first page keeps its record, which no refresh begun before it can
- * act on: the chain ran queued behind that refresh's read of Main, and its failure is that read's.
- *
- * @type {Map<ColumnFields, {context: string, read: number, full: boolean}>}
- */
-const columnReadsSent = new Map();
-
-/**
- * Whether a read this column sent of the view it shows now, after read number `since`, answers for
- * a read for `reason`. Only one sent after: one that left BEFORE the refresh asking may have left
- * before what that refresh reads for — an edit the stream announced, say — had happened. And only
- * one that read as much as `reason` needs: a read in full answers anything, and a read of what
- * changed answers a reason only where that reason may be read so too (`forwardCursor`) — on a
- * channel whose changes carry additions alone, an edit's read is in full, and a delta read for the
- * poll would leave the edit unread.
- */
-function answeredSince(since, reason) {
-  const sent = columnReadsSent.get(columnWork.active());
-  return Boolean(sent) && sent.read > since && sent.context === channelContextKey() &&
-    (sent.full || timelineReader.forwardCursor(reason) !== null);
-}
-
-/** Whether a message belongs to the thread the right column is showing. */
-function inSideThread(message) {
-  if (!sideShowing()) return false;
-  return inColumn(columns.side, () => selection().view === "thread" && threadOf(message) === String(selection().threadId));
-}
+  },
+  forgetCards: () => cardsDrawn.forget(),
+  sideColumnUp: () => sideColumnUp(),
+  threadListShown: () => layoutShown.threadList(),
+  loadSideDiscord: (options) => timelineView.loadDiscord(/** @type {any} */ (options)),
+  channelContextKey: () => channelContextKey(),
+  activeColumn: () => columnWork.active(),
+  forwardCursor: (reason) => timelineReader.forwardCursor(reason),
+  sideShowing: () => sideShowing(),
+});
+const { columnReadsSent, cardFlightMs, cardFlightStart, drawnOnPage, showSideList, selectSideThread, closeSideThread, resetSideColumn, readSideColumn, answeredSince, inSideThread } = sideThreadActs;
+const cardFlightOwner = sideThreadActs.flight;
+const { flyThreadCard, endCardFlightPart, endCardFlight } = cardFlightOwner;
 
 // --- the links between Main's roots and their cards ------------------------------------------------
 //
@@ -7451,7 +7302,7 @@ const timelineView = createTimelineView({
   restoreSavedBookmark, noteServerThreadHuesIn, knownChannel, viewKey,
   reader: timelineReader, timelineDeltaPages: TIMELINE_DELTA_PAGES, isCursorRefusal,
   abandonedReads, channelReads, queueDiscordLoad: (options) => queueDiscordLoad(options), finishDiscordLoad: (column) => finishDiscordLoad(column),
-  replayLedger, columnReadsSent, landAbandonedTimelineRead: (payload, read) => landAbandonedTimelineRead(payload, /** @type {any} */ (read)),
+  replayLedger, columnReadsSent: /** @type {any} */ (columnReadsSent), landAbandonedTimelineRead: (payload, read) => landAbandonedTimelineRead(payload, /** @type {any} */ (read)),
   queuePlaceUnplaced, heldMessage: (id) => liveStream.heldMessage(id), removedUpstream: (id) => removedUpstream(id), prepareSpeech: () => readAloudOwner().prepareSpeech(), guardQuietly: (fn) => guardQuietly(fn),
   settleReplays: (read, answer) => settleReplays(read, answer), setStatus,
   liveSeen: (channel) => liveEvents.seen(channel), liveNews: (channel) => liveEvents.news(channel),

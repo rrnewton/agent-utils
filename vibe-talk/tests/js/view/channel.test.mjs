@@ -3135,3 +3135,56 @@ test("`#624 voice-page-modularity`: leaving the thread list and the card place �
   owner.openThreadFromList("t9", { id: "t9" });
   assert.deepStrictEqual(log.at(-1), ["choose", { view: "thread", thread: "t9", summary: { id: "t9" }, origin: "list" }]);
 });
+
+test("`#624 voice-page-modularity`: the right column's thread — selected, closed, read behind, and answered for — from the module alone", async () => {
+  const { createSideThreadActs } = CHANNEL_VIEW;
+  const log = [];
+  const held = new Map();
+  let mode = "list";
+  let view = "flat";
+  const el = () => ({ hidden: false, parentNode: null, replaceChildren: () => {}, getBoundingClientRect: () => ({ left: 1, top: 2 }) });
+  const owner = createSideThreadActs({
+    leftById: () => el(),
+    makeFlight: () => ({ flyThreadCard: (...args) => log.push(["fly", args[1]]), endCardFlightPart: () => {}, endCardFlight: () => {} }),
+    cardRowOnRight: () => null, rowShown: () => false, rowInView: () => false, sidePane: () => null,
+    openSideCards: () => log.push("open-cards"), configApplied: () => false,
+    guardQuietly: (run) => run, refreshThreadDirectory: async () => { log.push("directory"); },
+    noteDeepLinkReaderMove: () => {}, selectedChannelId: () => "c1", columnsShown: () => true,
+    threadSummary: () => null, sideThreads: () => held,
+    sideMode: () => mode, setSideMode: (next) => { mode = next; }, setSideFromCards: () => {},
+    replyDockedAway: () => false, replyInSide: () => false, putDockedReplyAway: () => log.push("dock-away"),
+    renderSideMode: () => log.push("side-mode"), inSideColumn: (act) => act(),
+    selectionView: () => view, selectionThreadId: () => "t1",
+    rowsMissDone: () => false, renderCachedTimeline: () => {},
+    changeChannelView: (...args) => { log.push(["change", ...args]); return "opened"; },
+    endSearchWalk: () => log.push("end-search"), dropReplyArrowTap: () => {}, putRepliesBack: () => {},
+    rememberChannelDraft: () => {}, rememberChannelContext: () => {}, bumpLoadGeneration: () => log.push("bump"),
+    clearGathered: () => {}, forgetUnpackReads: () => {}, stopUnpackWatch: () => {},
+    endRepliesWalk: () => {}, forgetRepliesNote: () => {}, clearSideSearchNote: () => {},
+    rememberCardPlace: () => log.push("remember-place"), activeIsSide: () => false,
+    resetSideRecords: () => log.push("reset-records"), forgetCards: () => {},
+    sideColumnUp: () => true, threadListShown: () => false,
+    loadSideDiscord: async (options) => { log.push(["load", options]); },
+    channelContextKey: () => "ctx", activeColumn: () => "side-col",
+    forwardCursor: () => null, sideShowing: () => true,
+  });
+  // Selecting draws it at once from what is held and remembers it for the channel.
+  assert.equal(owner.selectSideThread("t1"), "opened");
+  assert.equal(mode, "thread");
+  assert.deepStrictEqual(held.get("c1"), { id: "t1", summary: null });
+  assert.deepStrictEqual(log.filter((entry) => Array.isArray(entry) && entry[0] === "fly"), [["fly", null]]);
+  // A read since answers for nothing yet; one sent after, in full, answers for a later refresh.
+  assert.equal(owner.answeredSince(5, "poll"), false);
+  owner.columnReadsSent.set("side-col", { context: "ctx", read: 9, full: true });
+  assert.equal(owner.answeredSince(5, "poll"), true, "a fuller later read did not answer for this one");
+  assert.equal(owner.answeredSince(9, "poll"), false, "the same read answered for itself");
+  // Reading behind: the thread's read is sent, not the directory's.
+  log.length = 0;
+  await owner.readSideColumn("poll", null);
+  assert.deepStrictEqual(log, [["load", { keepPosition: true, reason: "poll", readAs: "side" }]]);
+  // Closing forgets the thread and shows the cards again.
+  view = "thread";
+  owner.closeSideThread();
+  assert.equal(held.has("c1"), false);
+  assert.ok(log.includes("open-cards"), "closing did not show the cards");
+});

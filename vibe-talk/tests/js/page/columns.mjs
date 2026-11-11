@@ -1108,7 +1108,8 @@ test("`#231 two-column-polish`: on a channel whose changes carry additions alone
   assert.ok(ids.includes("205"), "the live reply left the thread on the right");
   // The control: any read of the thread since counts, a read of what changed too. The edit's read is
   // then collapsed into one that could not carry it, and the edit is never shown.
-  const control = await edited(brokenScript("    (sent.full || timelineReader.forwardCursor(reason) !== null);", "    true;"));
+  const control = await edited(await brokenModule([{ file: "src/view/channel/sidethread.ts",
+    find: "      ((sent as { full: boolean }).full || deps.forwardCursor(reason) !== null);", replace: "      true;" }]));
   assert.deepStrictEqual(control.reads, ["main", "thread delta"],
     "the negative control still read the thread in full, so the check above proves nothing");
   assert.doesNotMatch(control.text, /corrected/);
@@ -3520,7 +3521,8 @@ test("`#298 thread-card-header`: the card moves up only from a card on screen â€
     assert.deepStrictEqual(await run(SCRIPT), { tag: [true, true], another: [false, false], away: [false, false] },
       "the card moved up from where no card showed, or not from where one did");
     // The control: asked whether the card shows nowhere, it moves from a card scrolled away.
-    const blind = await run(brokenScript(" || !rowInView(sidePane, row)) return null;", ") return null;"));
+    const blind = await run(await brokenModule([{ file: "src/view/channel/sidethread.ts",
+      find: " || !deps.rowInView(deps.sidePane(), row)) return null;", replace: ") return null;" }]));
     assert.deepStrictEqual(blind.away, [true, true], "the negative control did not move the card either, so the check above proves nothing");
     // Reduced motion, and a stylesheet that says nothing: never.
     for (const arrange of [(p) => p.preferReducedMotion(), null]) {

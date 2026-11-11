@@ -406,3 +406,4 @@ declare const createLitCards: LegacyImports["createLitCards"];
 declare const createThreadCardHead: LegacyImports["createThreadCardHead"];
 declare const createMainCards: LegacyImports["createMainCards"];
 declare const createCardPlaceActs: LegacyImports["createCardPlaceActs"];
+declare const createSideThreadActs: LegacyImports["createSideThreadActs"];

@@ -1931,8 +1931,9 @@ test("`#306 done-stale-across-views`: the right column's thread, put away with t
     "    if (!deps.sideShowing() && deps.activeColumn() !== deps.sideColumn() && deps.sideLeft()) {", "    if (false) {"));
   assert.equal(unfollowed.page.el("side-log").children.find((li) => li.getAttribute("data-id") === "202").getAttribute("data-archived"),
     "false", "without the right column's copy brought into line it showed the Done, so this test cannot see it");
-  const undrawn = await run(brokenScript("      if (rowsMissDone()) renderCachedTimeline();\n      return undefined;",
-    "      return undefined;"));
+  const undrawn = await run(await brokenModule([{ file: "src/view/channel/sidethread.ts",
+    find: "        if (deps.rowsMissDone()) deps.renderCachedTimeline();\n        return undefined;",
+    replace: "        return undefined;" }]));
   assert.equal(undrawn.page.el("side-log").children.find((li) => li.getAttribute("data-id") === "202").getAttribute("data-archived"),
     "false", "without the redraw as two columns come back it showed the Done, so this test cannot see it");
 });

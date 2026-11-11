@@ -202,3 +202,5 @@ export { createThreadCardHead } from "../view/channel/index.ts";
 export { createMainCards } from "../view/channel/index.ts";
 // leaving the thread list and the card-place acts (#624 mu-keyread)
 export { createCardPlaceActs } from "../view/channel/index.ts";
+// the card moving up and the right column's thread (#624 mu-keyread)
+export { createSideThreadActs } from "../view/channel/index.ts";
