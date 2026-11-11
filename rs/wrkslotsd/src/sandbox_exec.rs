@@ -10,6 +10,7 @@
 //! fake, and nothing here starts a scope, enters a namespace, or
 //! touches a cgroup.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -154,13 +155,154 @@ pub(crate) struct PlaceOnlyGiven {
 }
 
 fn run_refusal(message: &str) -> (i32, String, String) {
+    refusal_for(message, "run")
+}
+
+fn refusal_for(message: &str, command: &str) -> (i32, String, String) {
     (
         3,
         String::new(),
         format!(
-            "REFUSED: {message}\nREMEDY: run 'wrkslots run --help', correct the named condition, then rerun 'wrkslots run' with the required arguments\n"
+            "REFUSED: {message}\nREMEDY: run 'wrkslots {command} --help', correct the named condition, then rerun 'wrkslots {command}' with the required arguments\n"
         ),
     )
+}
+
+/// Quote one argv word the way Python `shlex.quote` does.
+pub(crate) fn shlex_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    let safe = value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'_' | b'@' | b'%' | b'+' | b'=' | b':' | b',' | b'.' | b'/' | b'-'
+            )
+    });
+    if safe {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+/// Host facts for `run_print`, injected so tests never probe
+/// the real systemd or cgroup state.
+pub(crate) struct RunPrintFacts {
+    pub(crate) home: PathBuf,
+    pub(crate) pid: u32,
+    pub(crate) cgroup_text: Option<String>,
+    pub(crate) systemd_run_available: bool,
+    pub(crate) spec: crate::sandbox_state::SpecFacts,
+    /// Interpreter and sandbox module the helper argv names
+    /// (the Rust binary's own helper at dispatch time).
+    pub(crate) helper_interpreter: String,
+    pub(crate) helper_module: String,
+    pub(crate) dont_write_bytecode: bool,
+}
+
+/// `wrkslots run|box --print` (#1317): print the boxed command
+/// without running it, mirroring Python `sandbox.run`'s
+/// `print_only` branch for all three isolations. The glue
+/// supplies the final view and a non-empty command (`$SHELL`
+/// substituted for an empty one, as `_cmd_run`/`_cmd_box` do).
+pub(crate) fn run_print(
+    view: &crate::sandbox_state::SlotView,
+    settings: &crate::sandbox_state::SandboxSettings,
+    command: &[String],
+    cwd: Option<&Path>,
+    facts: &RunPrintFacts,
+    command_name: &str,
+) -> (i32, String, String) {
+    use crate::sandbox_state::{build_spec, expand_home, slice_limit_properties, slice_name};
+    if !crate::sandbox_state::ISOLATIONS.contains(&settings.isolation.as_str()) {
+        return refusal_for(
+            &format!(
+                "isolation must be one of {}",
+                crate::sandbox_state::ISOLATIONS.join(", ")
+            ),
+            command_name,
+        );
+    }
+    if command.is_empty() {
+        return refusal_for("no command to run", command_name);
+    }
+    if !facts.systemd_run_available {
+        return refusal_for(
+            "systemd-run is not available; the sandbox needs a systemd user manager",
+            command_name,
+        );
+    }
+    let kind = if view.coordinator { "box" } else { "run" };
+    let unit = scope_unit_name(kind, &view.slot, facts.pid);
+    let slot_slice = slice_name(
+        &view.slot_type,
+        &view.slot,
+        None,
+        facts.cgroup_text.as_deref(),
+    );
+    let workdir: &Path = cwd.unwrap_or(&view.slot_path);
+    let spec = match build_spec(
+        view,
+        settings,
+        &facts.home,
+        workdir,
+        true,
+        "inherit",
+        &facts.spec,
+    ) {
+        Ok(spec) => spec,
+        Err(message) => return refusal_for(&message, command_name),
+    };
+    let mut out = format!(
+        "# isolation {}; scope {unit} in {slot_slice}\n",
+        settings.isolation
+    );
+    for line in slice_limit_properties(&settings.limits, None) {
+        out.push_str(&format!("# slice {slot_slice}: {line}\n"));
+    }
+    let home_text = facts.home.to_string_lossy();
+    for (key, value) in &settings.env {
+        out.push_str(&format!("# env {key}={}\n", expand_home(value, &home_text)));
+    }
+    match settings.isolation.as_str() {
+        "userns" => {
+            let spec_json = crate::sandbox_state::py_json_compact_sorted(&spec);
+            match userns_helper_argv(
+                &facts.helper_interpreter,
+                &facts.helper_module,
+                &spec_json,
+                command,
+            ) {
+                Ok(argv) => {
+                    let quoted: Vec<String> = argv.iter().map(|part| shlex_quote(part)).collect();
+                    out.push_str(&quoted.join(" \\\n  "));
+                    out.push('\n');
+                }
+                Err(message) => return refusal_for(&message, command_name),
+            }
+        }
+        "root" => {
+            let argv = root_helper_argv(
+                &facts.helper_interpreter,
+                &facts.helper_module,
+                "SPEC-FILE",
+                facts.dont_write_bytecode,
+            );
+            let quoted: Vec<String> = argv.iter().map(|part| shlex_quote(part)).collect();
+            out.push_str(&quoted.join(" "));
+            out.push('\n');
+            let payload = json!({"view": spec, "command": command});
+            out.push_str(&crate::sandbox_state::py_json_indented_sorted(&payload));
+            out.push('\n');
+        }
+        _ => {
+            let quoted: Vec<String> = command.iter().map(|part| shlex_quote(part)).collect();
+            out.push_str(&quoted.join(" "));
+            out.push('\n');
+        }
+    }
+    (0, out, String::new())
 }
 
 /// `wrkslots run --place-only` (#1304): apply the slot's slice
@@ -770,6 +912,183 @@ sys.stdout.write(f"{rc}\n{out.getvalue()}---STDERR---\n{err.getvalue()}")
             );
         }
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    const RUN_PRINT_DRIVER: &str = r####"import argparse, io, os, shutil, sys
+from contextlib import redirect_stdout, redirect_stderr
+from pathlib import Path
+sys.path.insert(0, os.environ["WRKSLOTS_PY_ROOT"])
+from wrkslots import cli, sandbox
+
+case, base = sys.argv[1], Path(sys.argv[2])
+os.environ.pop("GATE_ADMISSION_DIR", None)
+os.environ.pop("XDG_RUNTIME_DIR", None)
+os.environ["USER"] = "fixture-user"
+home = base / "home"
+os.environ["HOME"] = str(home)
+sandbox.parent_slice = lambda cgroup_file=None: None
+sandbox._interpreter = lambda: "/usr/bin/python3"
+os.getpid = lambda: 4242
+shutil.which = lambda name: (None if case == "no-systemd" else "/usr/bin/systemd-run")
+isolation = {"cgroup": "cgroup", "userns": "userns", "root": "root"}.get(case, "cgroup")
+coordinator = case == "box"
+settings = sandbox.settings_from_obj({"isolation": isolation, "env": {"TASK": "~/work"}, "limits": {"memory_max": "32G"}})
+view = sandbox.SlotView(
+    slot="box-a" if coordinator else "slot-a",
+    slot_type="box" if coordinator else "agent",
+    slot_path=base / "project" if coordinator else base / "slot-a",
+    state_directory=base / "state" / "slot-a",
+    git_directories=() if coordinator else (base / "gitcommon",),
+    control_directory=base / "control",
+    representation="worktrees",
+    project_root=base / "project",
+    coordinator=coordinator,
+    writable=(base / "project",) if coordinator else (),
+    propagate=(),
+)
+command = [] if case == "no-command" else ["/bin/echo", "hello world", "it's"]
+out, err = io.StringIO(), io.StringIO()
+try:
+    with redirect_stdout(out), redirect_stderr(err):
+        rc = sandbox.run(view, settings, command, print_only=True)
+except sandbox.SandboxError as exc:
+    exc = cli.Refusal(str(exc))
+    remedy = cli._refusal_remedy(argparse.Namespace(command="box" if coordinator else "run"), exc)
+    sys.stdout.write(f"3\n{out.getvalue()}---STDERR---\nREFUSED: {exc}\nREMEDY: {remedy}\n")
+    sys.exit(0)
+sys.stdout.write(f"{rc}\n{out.getvalue()}---STDERR---\n{err.getvalue()}")
+"####;
+
+    /// Oracle differential (#1317): Python `sandbox.run`
+    /// `print_only` vs `run_print` on the same fixture, byte for
+    /// byte for every isolation.
+    #[test]
+    fn run_print_matches_python_oracle() {
+        use crate::sandbox_state::{settings_from_obj, SlotView, SpecFacts};
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("repo root")
+            .to_path_buf();
+        let root = std::env::temp_dir().join(format!("wrkslotsd-run-print-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        for dir in [
+            home.join(".claude"),
+            home.join(".cache"),
+            root.join("slot-a"),
+            root.join("state/slot-a"),
+            root.join("gitcommon"),
+            root.join("control"),
+            root.join("project/ai_docs"),
+        ] {
+            std::fs::create_dir_all(&dir).expect("fixture dir");
+        }
+        std::fs::write(home.join("plain.txt"), "x").expect("file");
+        let driver_path = root.join("run_print_driver.py");
+        std::fs::write(&driver_path, RUN_PRINT_DRIVER).expect("driver");
+        let uid = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&root).expect("meta").uid()
+        };
+        let module = repo
+            .join("py/wrkslots/sandbox.py")
+            .canonicalize()
+            .expect("module path");
+        for (case, isolation, coordinator) in [
+            ("cgroup", "cgroup", false),
+            ("userns", "userns", false),
+            ("root", "root", false),
+            ("box", "cgroup", true),
+            ("no-command", "cgroup", false),
+            ("no-systemd", "cgroup", false),
+        ] {
+            let output = std::process::Command::new("python3")
+                .arg(&driver_path)
+                .arg(case)
+                .arg(&root)
+                .env("WRKSLOTS_PY_ROOT", repo.join("py"))
+                .output()
+                .expect("python oracle runs");
+            assert!(output.status.success(), "case {case}: {:?}", output.stderr);
+            let text = String::from_utf8(output.stdout).expect("utf8");
+            let (head, rest) = text.split_once('\n').expect("exit line");
+            let (stdout, stderr) = rest.split_once("---STDERR---\n").expect("marker");
+            let view = SlotView {
+                slot: if coordinator { "box-a" } else { "slot-a" }.to_string(),
+                slot_type: if coordinator { "box" } else { "agent" }.to_string(),
+                slot_path: if coordinator {
+                    root.join("project")
+                } else {
+                    root.join("slot-a")
+                },
+                state_directory: root.join("state/slot-a"),
+                git_directories: if coordinator {
+                    Vec::new()
+                } else {
+                    vec![root.join("gitcommon")]
+                },
+                control_directory: root.join("control"),
+                representation: "worktrees".to_string(),
+                project_root: Some(root.join("project")),
+                coordinator,
+                writable: if coordinator {
+                    vec![root.join("project")]
+                } else {
+                    Vec::new()
+                },
+                propagate: Vec::new(),
+            };
+            let settings = settings_from_obj(&json!({
+                "isolation": isolation,
+                "env": {"TASK": "~/work"},
+                "limits": {"memory_max": "32G"}
+            }))
+            .expect("settings");
+            let command: Vec<String> = if case == "no-command" {
+                Vec::new()
+            } else {
+                vec![
+                    "/bin/echo".to_string(),
+                    "hello world".to_string(),
+                    "it's".to_string(),
+                ]
+            };
+            let facts = RunPrintFacts {
+                home: home.clone(),
+                pid: 4242,
+                cgroup_text: Some("0::/user.slice/user@1000.service/app.scope\n".to_string()),
+                systemd_run_available: case != "no-systemd",
+                spec: SpecFacts {
+                    user: "fixture-user".to_string(),
+                    uid,
+                    mountinfo: None,
+                    gate_dir: None,
+                    xdg_runtime_dir: None,
+                },
+                helper_interpreter: "/usr/bin/python3".to_string(),
+                helper_module: module.to_string_lossy().into_owned(),
+                dont_write_bytecode: false,
+            };
+            let outcome = run_print(
+                &view,
+                &settings,
+                &command,
+                None,
+                &facts,
+                if coordinator { "box" } else { "run" },
+            );
+            assert_eq!(
+                outcome,
+                (
+                    head.trim().parse::<i32>().expect("exit"),
+                    stdout.to_string(),
+                    stderr.to_string()
+                ),
+                "case {case}"
+            );
+        }
+        std::fs::remove_dir_all(&root).expect("cleanup");
     }
 
     #[test]

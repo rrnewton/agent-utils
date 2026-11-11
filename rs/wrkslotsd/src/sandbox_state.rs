@@ -8,6 +8,8 @@
 //! runs `systemctl`, enters a namespace, or touches a cgroup; the
 //! exec half lives in a later writer step.
 
+use std::path::{Path, PathBuf};
+
 use serde_json::{json, Value};
 
 pub(crate) const DEFAULT_TASKS_MAX: i64 = 8192;
@@ -663,7 +665,7 @@ pub(crate) fn settings_to_obj(settings: &SandboxSettings) -> Value {
     })
 }
 
-fn py_json_string(text: &str) -> String {
+pub(crate) fn py_json_string(text: &str) -> String {
     // Python `json.dumps` default escaping (ensure_ascii=True).
     let mut out = String::from("\"");
     for ch in text.chars() {
@@ -733,6 +735,77 @@ fn render_value(value: &Value, indent: usize) -> String {
         Value::String(text) => py_json_string(text),
         other => other.to_string(),
     }
+}
+
+/// Python `json.dumps(value, sort_keys=True)`: one line, `", "`
+/// and `": "` separators.
+pub(crate) fn py_json_compact_sorted(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let parts: Vec<String> = keys
+                .iter()
+                .map(|key| {
+                    format!(
+                        "{}: {}",
+                        py_json_string(key),
+                        py_json_compact_sorted(&map[*key])
+                    )
+                })
+                .collect();
+            format!("{{{}}}", parts.join(", "))
+        }
+        Value::Array(items) => {
+            let parts: Vec<String> = items.iter().map(py_json_compact_sorted).collect();
+            format!("[{}]", parts.join(", "))
+        }
+        Value::String(text) => py_json_string(text),
+        other => other.to_string(),
+    }
+}
+
+/// Python `json.dumps(value, indent=2, sort_keys=True)`.
+pub(crate) fn py_json_indented_sorted(value: &Value) -> String {
+    fn render(value: &Value, indent: usize) -> String {
+        match value {
+            Value::Object(map) => {
+                if map.is_empty() {
+                    return "{}".to_string();
+                }
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                let pad = "  ".repeat(indent + 1);
+                let close = "  ".repeat(indent);
+                let parts: Vec<String> = keys
+                    .iter()
+                    .map(|key| {
+                        format!(
+                            "{pad}{}: {}",
+                            py_json_string(key),
+                            render(&map[*key], indent + 1)
+                        )
+                    })
+                    .collect();
+                format!("{{\n{}\n{close}}}", parts.join(",\n"))
+            }
+            Value::Array(items) => {
+                if items.is_empty() {
+                    return "[]".to_string();
+                }
+                let pad = "  ".repeat(indent + 1);
+                let close = "  ".repeat(indent);
+                let parts: Vec<String> = items
+                    .iter()
+                    .map(|item| format!("{pad}{}", render(item, indent + 1)))
+                    .collect();
+                format!("[\n{}\n{close}]", parts.join(",\n"))
+            }
+            Value::String(text) => py_json_string(text),
+            other => other.to_string(),
+        }
+    }
+    render(value, 0)
 }
 
 fn opt_string(value: &Option<String>) -> Value {
@@ -942,6 +1015,417 @@ pub(crate) fn merge_defaults(existing: &Value) -> Result<(Value, Vec<String>), S
     Ok((Value::Object(merged), added))
 }
 
+/// Everything about a slot the sandbox must make visible or
+/// writable, mirroring Python `SlotView`. The dispatch glue builds
+/// it (register record, representation, box scope); this module
+/// only describes the view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SlotView {
+    pub(crate) slot: String,
+    pub(crate) slot_type: String,
+    pub(crate) slot_path: PathBuf,
+    pub(crate) state_directory: PathBuf,
+    pub(crate) git_directories: Vec<PathBuf>,
+    pub(crate) control_directory: PathBuf,
+    pub(crate) representation: String,
+    pub(crate) project_root: Option<PathBuf>,
+    pub(crate) coordinator: bool,
+    pub(crate) writable: Vec<PathBuf>,
+    pub(crate) propagate: Vec<PathBuf>,
+}
+
+/// Host facts `build_spec` needs, injected so tests never read
+/// the real mount table or runtime directory.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SpecFacts {
+    /// `$USER`; empty means "the home directory's name".
+    pub(crate) user: String,
+    pub(crate) uid: u32,
+    /// `/proc/self/mountinfo` text; `None` means unreadable.
+    pub(crate) mountinfo: Option<String>,
+    /// Explicitly exported `$GATE_ADMISSION_DIR`, when set.
+    pub(crate) gate_dir: Option<PathBuf>,
+    /// `$XDG_RUNTIME_DIR`, when set.
+    pub(crate) xdg_runtime_dir: Option<PathBuf>,
+}
+
+fn unescape_mount(value: &str) -> String {
+    value
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+/// `path` plus other mount paths exposing the same directory,
+/// mirroring Python `path_aliases` over an injected mountinfo.
+pub(crate) fn path_aliases(path: &Path, mountinfo: Option<&str>) -> Vec<PathBuf> {
+    let aliases = vec![path.to_path_buf()];
+    let Some(text) = mountinfo else {
+        return aliases;
+    };
+    let mut rows: Vec<(String, String, PathBuf)> = Vec::new();
+    for line in text.lines() {
+        let head = line.split(" - ").next().unwrap_or("");
+        let fields: Vec<&str> = head.split_whitespace().collect();
+        if fields.len() >= 5 {
+            rows.push((
+                fields[2].to_string(),
+                unescape_mount(fields[3]),
+                PathBuf::from(unescape_mount(fields[4])),
+            ));
+        }
+    }
+    let home_rows: Vec<&(String, String, PathBuf)> =
+        rows.iter().filter(|row| row.2 == path).collect();
+    let Some((device, root, _)) = home_rows.last() else {
+        return aliases;
+    };
+    if root == "/" {
+        return aliases;
+    }
+    let mut aliases = aliases;
+    for (other_device, other_root, other_mount) in &rows {
+        if other_device != device || other_mount == path {
+            continue;
+        }
+        let trimmed = other_root.trim_end_matches('/');
+        if other_root == "/" || root.starts_with(&format!("{trimmed}/")) {
+            let relative = root[trimmed.len()..].trim_start_matches('/');
+            let alias = if relative.is_empty() {
+                other_mount.clone()
+            } else {
+                other_mount.join(relative)
+            };
+            if alias.is_dir() && !aliases.contains(&alias) {
+                aliases.push(alias);
+            }
+        }
+    }
+    aliases
+}
+
+/// The slot's persistent private layer over `$HOME`.
+pub(crate) fn home_layer(view: &SlotView) -> PathBuf {
+    view.state_directory.join("home")
+}
+
+pub(crate) fn expand_home(value: &str, home: &str) -> String {
+    if value == "~" {
+        return home.to_string();
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        return format!("{}/{rest}", home.trim_end_matches('/'));
+    }
+    value.to_string()
+}
+
+/// Expand a leading `~` and `$USER`/`${USER}`/`$HOME`/`${HOME}`,
+/// mirroring Python `expand_path`.
+pub(crate) fn expand_path(value: &str, home: &str, user: &str) -> String {
+    fn replace_dollar(text: &str, name: &str, replacement: &str) -> String {
+        let braced = format!("${{{name}}}");
+        let text = text.replace(&braced, replacement);
+        let chars: Vec<char> = text.chars().collect();
+        let name_chars: Vec<char> = name.chars().collect();
+        let mut out = String::new();
+        let mut index = 0;
+        while index < chars.len() {
+            let is_match = chars[index] == '$'
+                && chars[index + 1..].starts_with(&name_chars)
+                && chars
+                    .get(index + 1 + name_chars.len())
+                    .is_none_or(|next| !(next.is_ascii_alphanumeric() || *next == '_'));
+            if is_match {
+                out.push_str(replacement);
+                index += 1 + name_chars.len();
+            } else {
+                out.push(chars[index]);
+                index += 1;
+            }
+        }
+        out
+    }
+    let value = expand_home(value, home);
+    let value = replace_dollar(&value, "USER", user);
+    replace_dollar(&value, "HOME", home)
+}
+
+/// The real `$HOME` entries bound read-only over the layer, as
+/// (relative path, kind), mirroring Python `home_entries`.
+pub(crate) fn home_entries(
+    settings: &SandboxSettings,
+    home: &Path,
+) -> Result<Vec<(String, String)>, String> {
+    let candidates: Vec<String> = if settings.home == "ro" {
+        let mut skip: Vec<&str> = settings
+            .home_private
+            .iter()
+            .filter(|relative| !relative.contains('/'))
+            .map(String::as_str)
+            .collect();
+        skip.extend(settings.home_private_files.iter().map(String::as_str));
+        let mut names: Vec<String> = Vec::new();
+        let entries = std::fs::read_dir(home)
+            .map_err(|error| format!("cannot list $HOME {}: {error}", home.display()))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("cannot list $HOME {}: {error}", home.display()))?;
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        names
+            .into_iter()
+            .filter(|name| !skip.contains(&name.as_str()))
+            .collect()
+    } else {
+        settings.home_expose.clone()
+    };
+    let mut out = Vec::new();
+    for relative in candidates {
+        let path = home.join(&relative);
+        let is_link = path
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink());
+        if is_link {
+            if !relative.contains('/') {
+                out.push((relative, "link".to_string()));
+            } else if path.exists() {
+                out.push((
+                    relative,
+                    if path.is_dir() { "dir" } else { "file" }.to_string(),
+                ));
+            }
+        } else if path.is_dir() {
+            out.push((relative, "dir".to_string()));
+        } else if path.is_file() {
+            out.push((relative, "file".to_string()));
+        }
+    }
+    Ok(out)
+}
+
+/// The isolated Git policy's fixed locations, mirroring Python
+/// `git_config_mask_paths` (lexically normalised, de-duplicated).
+pub(crate) fn git_config_mask_paths(aliases: &[PathBuf]) -> Vec<String> {
+    fn normpath(path: &str) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        for part in path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other),
+            }
+        }
+        format!("/{}", parts.join("/"))
+    }
+    let mut paths: Vec<String> = Vec::new();
+    for base in aliases {
+        for relative in [".gitconfig", ".config/git"] {
+            paths.push(base.join(relative).to_string_lossy().into_owned());
+        }
+    }
+    paths.push("/etc/gitconfig".to_string());
+    let mut out: Vec<String> = Vec::new();
+    for path in paths {
+        let normalised = normpath(&path);
+        if !out.contains(&normalised) {
+            out.push(normalised);
+        }
+    }
+    out
+}
+
+fn ensure_spec_directory(directory: &Path, uid: u32) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    if !directory.exists() {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(directory)
+            .map_err(|error| {
+                format!(
+                    "cannot create the root launcher spec directory {}: {error}",
+                    directory.display()
+                )
+            })?;
+    }
+    let meta = std::fs::symlink_metadata(directory).map_err(|error| {
+        format!(
+            "cannot create the root launcher spec directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    if !meta.is_dir() || meta.uid() != uid || meta.permissions().mode() & 0o077 != 0 {
+        return Err(format!(
+            "root launcher spec directory {} must be a directory owned by uid {uid} with mode 0700; remove it and retry",
+            directory.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Describe the view the helper must build, as plain JSON,
+/// mirroring Python `build_spec`. Filesystem existence checks
+/// read the given tree; the only side effect is Python's own:
+/// creating the root-launcher spec directory when a runtime
+/// directory is present.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_spec(
+    view: &SlotView,
+    settings: &SandboxSettings,
+    home: &Path,
+    cwd: &Path,
+    slot_writable: bool,
+    git_config_policy: &str,
+    facts: &SpecFacts,
+) -> Result<Value, String> {
+    if home == Path::new("/") || !home.is_absolute() {
+        return Err(format!(
+            "refusing to box a command with HOME={}",
+            home.display()
+        ));
+    }
+    let user = if facts.user.is_empty() {
+        home.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    } else {
+        facts.user.clone()
+    };
+    let aliases = path_aliases(home, facts.mountinfo.as_deref());
+    let mut binds: Vec<[String; 2]> = Vec::new();
+    let mut add = |source: &Path, target: &Path| {
+        let pair = [
+            source.to_string_lossy().into_owned(),
+            target.to_string_lossy().into_owned(),
+        ];
+        if !binds.contains(&pair) {
+            binds.push(pair);
+        }
+    };
+    for relative in &settings.home_shared {
+        let path = home.join(relative);
+        if path.exists() {
+            add(&path, &path);
+        }
+    }
+    for relative in &settings.home_private {
+        if relative.contains('/') && (settings.home == "hidden" || home.join(relative).is_dir()) {
+            add(&home_layer(view).join(relative), &home.join(relative));
+        }
+    }
+    if slot_writable {
+        add(&view.slot_path, &view.slot_path);
+        for directory in view.git_directories.iter().chain(view.writable.iter()) {
+            add(directory, directory);
+        }
+    }
+    if let Some(root) = &view.project_root {
+        for relative in &settings.outputs {
+            let path = root.join(relative);
+            if path.is_dir() {
+                add(&path, &path);
+            }
+        }
+    }
+    let home_text = home.to_string_lossy();
+    for item in &settings.read_write {
+        let path = PathBuf::from(expand_path(item, &home_text, &user));
+        if path.exists() {
+            add(&path, &path);
+        }
+    }
+    if let Some(gate) = &facts.gate_dir {
+        if gate.exists() {
+            add(gate, gate);
+        }
+    }
+    let entries = home_entries(settings, home)?;
+    let mut read_only: Vec<String> = if view.coordinator {
+        Vec::new()
+    } else {
+        vec![view.control_directory.to_string_lossy().into_owned()]
+    };
+    if let Some(runtime) = &facts.xdg_runtime_dir {
+        if runtime.is_dir() {
+            let directory = runtime.join("wrkslots");
+            ensure_spec_directory(&directory, facts.uid)?;
+            read_only.push(directory.to_string_lossy().into_owned());
+        }
+    }
+    let mut masks: Vec<String> = Vec::new();
+    for base in &aliases {
+        for relative in &settings.home_hidden {
+            masks.push(base.join(relative).to_string_lossy().into_owned());
+        }
+    }
+    let private_state: [&str; 3] = if view.coordinator {
+        ["slot-state", "box-state", ""]
+    } else {
+        ["slot-images", "slot-state", "box-state"]
+    };
+    for name in private_state {
+        if !name.is_empty() {
+            masks.push(
+                view.control_directory
+                    .join(name)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    let mut git_masks: Vec<String> = Vec::new();
+    if git_config_policy == "isolated" {
+        git_masks = git_config_mask_paths(&aliases);
+        for path in &git_masks {
+            if !masks.contains(path) {
+                masks.push(path.clone());
+            }
+        }
+    } else if git_config_policy != "inherit" {
+        return Err(format!(
+            "--git-config-policy must be one of inherit, isolated, not '{git_config_policy}'"
+        ));
+    }
+    let mut spec = json!({
+        "home": home.to_string_lossy(),
+        "home_aliases": aliases[1..]
+            .iter()
+            .map(|alias| alias.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        "home_mode": settings.home,
+        "home_layer": home_layer(view).to_string_lossy(),
+        "home_binds": entries
+            .iter()
+            .filter(|(_, kind)| kind != "link")
+            .map(|(relative, _)| relative.clone())
+            .collect::<Vec<_>>(),
+        "read_only": read_only,
+        "binds": binds,
+        "masks": masks,
+        "tmp_size": settings.tmp_size,
+        "protect_system": settings.protect_system,
+        "propagate": view
+            .propagate
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        "cwd": cwd.to_string_lossy(),
+    });
+    if git_config_policy == "isolated" {
+        if let Some(map) = spec.as_object_mut() {
+            map.insert(
+                "git_config_policy".to_string(),
+                Value::String("isolated".to_string()),
+            );
+            map.insert("git_config_masks".to_string(), json!(git_masks));
+        }
+    }
+    Ok(spec)
+}
+
 #[cfg(test)]
 mod tests {
     const DRIVER: &str = r####"import argparse, io, json, os, sys
@@ -1101,5 +1585,231 @@ sys.stdout.write("0\n" + json.dumps(sandbox.settings_to_obj(settings), indent=2)
             assert_eq!(sandbox_show_config(raw.as_ref()), expected, "case {case}");
         }
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    const SPEC_DRIVER: &str = r####"import json, os, sys
+from pathlib import Path
+sys.path.insert(0, os.environ["WRKSLOTS_PY_ROOT"])
+from wrkslots import sandbox
+
+case, base = sys.argv[1], Path(sys.argv[2])
+os.environ.pop("GATE_ADMISSION_DIR", None)
+os.environ["USER"] = "fixture-user"
+root = base
+home = root / "home"
+if case in ("runtime", "bad-runtime"):
+    runtime = root / "runtime"
+    runtime.mkdir(parents=True, exist_ok=True)
+    if case == "bad-runtime":
+        (runtime / "wrkslots").mkdir(mode=0o755, exist_ok=True)
+    os.environ["XDG_RUNTIME_DIR"] = str(runtime)
+else:
+    os.environ.pop("XDG_RUNTIME_DIR", None)
+coordinator = case == "coordinator"
+view = sandbox.SlotView(
+    slot="box-a" if coordinator else "slot-a",
+    slot_type="box" if coordinator else "agent",
+    slot_path=root / "project" if coordinator else root / "slot-a",
+    state_directory=root / "state" / "slot-a",
+    git_directories=() if coordinator else (root / "gitcommon",),
+    control_directory=root / "control",
+    representation="worktrees",
+    project_root=root / "project",
+    coordinator=coordinator,
+    writable=(root / "project",) if coordinator else (),
+    propagate=(root / "control",) if coordinator else (),
+)
+raw = {"home": "hidden"} if case == "agent-hidden" else {}
+settings = sandbox.settings_from_obj(raw)
+policy = "isolated" if case == "agent-isolated" else "inherit"
+if case == "bad-policy":
+    policy = "bogus"
+try:
+    spec = sandbox.build_spec(view, settings, home, view.slot_path, slot_writable=(case != "agent-closed"), git_config_policy=policy)
+except sandbox.SandboxError as exc:
+    sys.stdout.write(f"ERR\n{exc}\n")
+    sys.exit(0)
+sys.stdout.write("OK\n" + json.dumps(spec, sort_keys=True) + "\n")
+"####;
+
+    fn spec_fixture(tag: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("wrkslotsd-spec-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        for dir in [
+            home.join(".claude"),
+            home.join(".cargo/registry"),
+            home.join(".config/muse"),
+            home.join(".cache"),
+            home.join("bin"),
+            home.join("docs"),
+            root.join("slot-a"),
+            root.join("state/slot-a"),
+            root.join("gitcommon"),
+            root.join("control"),
+            root.join("project/ai_docs"),
+        ] {
+            std::fs::create_dir_all(&dir).expect("fixture dir");
+        }
+        std::fs::write(home.join("plain.txt"), "x").expect("file");
+        std::fs::write(home.join(".claude.json"), "{}").expect("private file");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(home.join("plain.txt"), home.join("alink")).expect("link");
+        root
+    }
+
+    fn spec_view(root: &Path, coordinator: bool) -> SlotView {
+        SlotView {
+            slot: if coordinator { "box-a" } else { "slot-a" }.to_string(),
+            slot_type: if coordinator { "box" } else { "agent" }.to_string(),
+            slot_path: if coordinator {
+                root.join("project")
+            } else {
+                root.join("slot-a")
+            },
+            state_directory: root.join("state/slot-a"),
+            git_directories: if coordinator {
+                Vec::new()
+            } else {
+                vec![root.join("gitcommon")]
+            },
+            control_directory: root.join("control"),
+            representation: "worktrees".to_string(),
+            project_root: Some(root.join("project")),
+            coordinator,
+            writable: if coordinator {
+                vec![root.join("project")]
+            } else {
+                Vec::new()
+            },
+            propagate: if coordinator {
+                vec![root.join("control")]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    /// Oracle differential (#1317): Python `build_spec` vs the
+    /// Rust port on the same fixture `$HOME`, compared as
+    /// sorted-key JSON.
+    #[test]
+    fn build_spec_matches_python_oracle() {
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("repo root")
+            .to_path_buf();
+        let root = spec_fixture("oracle");
+        let driver_path = root.join("spec_driver.py");
+        std::fs::write(&driver_path, SPEC_DRIVER).expect("driver");
+        let uid = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&root).expect("meta").uid()
+        };
+        for (case, coordinator, hidden, closed, policy) in [
+            ("agent-ro", false, false, false, "inherit"),
+            ("agent-hidden", false, true, false, "inherit"),
+            ("agent-closed", false, false, true, "inherit"),
+            ("agent-isolated", false, false, false, "isolated"),
+            ("coordinator", true, false, false, "inherit"),
+            ("bad-policy", false, false, false, "bogus"),
+            ("runtime", false, false, false, "inherit"),
+            ("bad-runtime", false, false, false, "inherit"),
+        ] {
+            if case == "bad-runtime" {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::remove_dir_all(root.join("runtime"));
+                let dir = root.join("runtime/wrkslots");
+                std::fs::create_dir_all(&dir).expect("spec dir");
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+                    .expect("mode");
+            }
+            let output = std::process::Command::new("python3")
+                .arg(&driver_path)
+                .arg(case)
+                .arg(&root)
+                .env("WRKSLOTS_PY_ROOT", repo.join("py"))
+                .output()
+                .expect("python oracle runs");
+            assert!(output.status.success(), "case {case}: {:?}", output.stderr);
+            let text = String::from_utf8(output.stdout).expect("utf8");
+            let (head, rest) = text.split_once('\n').expect("marker");
+            let view = spec_view(&root, coordinator);
+            let settings = if hidden {
+                settings_from_obj(&json!({"home": "hidden"})).expect("settings")
+            } else {
+                SandboxSettings::default()
+            };
+            let facts = SpecFacts {
+                user: "fixture-user".to_string(),
+                uid,
+                mountinfo: None,
+                gate_dir: None,
+                xdg_runtime_dir: if case.starts_with("runtime") || case == "bad-runtime" {
+                    Some(root.join("runtime"))
+                } else {
+                    None
+                },
+            };
+            let ours = build_spec(
+                &view,
+                &settings,
+                &root.join("home"),
+                &view.slot_path.clone(),
+                !closed,
+                policy,
+                &facts,
+            );
+            if head == "ERR" {
+                let message = ours.expect_err("refusal");
+                assert_eq!(message, rest.trim_end(), "case {case}");
+            } else {
+                let spec = ours.expect("spec");
+                assert_eq!(
+                    py_json_compact_sorted(&spec),
+                    rest.trim_end(),
+                    "case {case}"
+                );
+            }
+        }
+        // HOME=/ refuses identically without an oracle round trip.
+        let view = spec_view(&root, false);
+        let facts = SpecFacts {
+            user: "fixture-user".to_string(),
+            uid,
+            ..Default::default()
+        };
+        let message = build_spec(
+            &view,
+            &SandboxSettings::default(),
+            Path::new("/"),
+            &view.slot_path.clone(),
+            true,
+            "inherit",
+            &facts,
+        )
+        .expect_err("root home refusal");
+        assert_eq!(message, "refusing to box a command with HOME=/");
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn aliases_and_expand_path_match_python() {
+        let home = Path::new("/data/home/user");
+        let mountinfo = "\
+1 2 0:1 / /data rw - ext4 /dev/sda rw\n\
+2 3 0:1 /home/user /data/home/user rw - ext4 /dev/sda rw\n\
+3 4 0:1 / /elsewhere rw - ext4 /dev/sda rw\n";
+        // /elsewhere exposes the same device root `/`, so the
+        // home directory appears below it.
+        let aliases = path_aliases(home, Some(mountinfo));
+        assert_eq!(aliases[0], home);
+        assert_eq!(
+            expand_path("~/x/$USER/${HOME}/$HOMELY", "/home/u", "bob"),
+            "/home/u/x/bob//home/u/$HOMELY"
+        );
+        assert_eq!(expand_path("~", "/home/u", "bob"), "/home/u");
     }
 }
