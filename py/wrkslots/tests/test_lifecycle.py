@@ -12401,6 +12401,191 @@ def test_abort_create_refuses_a_submodule_branch_with_a_commit_on_no_remote(
     assert git(leaf, "rev-parse", "local-work").stdout.strip() == local
 
 
+_PARTIAL_INIT_HOOK = (
+    "git -c protocol.file.allow=always submodule update --init --recursive"
+)
+
+
+def _interrupted_create_killed_mid_submodule_hook(
+    tmp_path: Path,
+) -> tuple[Path, Path, Path]:
+    """A create whose submodule hook died mid-init (#1337), journal at running.
+
+    Component and leaf are fully cloned, then their tracked files are
+    staged-deleted before checkout finished: the hook's partial-init
+    dirt, with every gitlink still at its recorded commit.
+    """
+
+    project, repository, _remote = make_project(
+        tmp_path, post_provision_hooks=(_PARTIAL_INIT_HOOK,)
+    )
+    add_recursive_submodules(tmp_path, project, repository)
+    interrupted = create(
+        project, env={"WRKSLOTS_TEST_INTERRUPT": "after-create-worktree"}
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    target = checkout(project)
+    git(
+        target,
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+        "component",
+    )
+    git(target / "component", "rm", "-q", "component.txt")
+    git(target / "component" / "leaf", "rm", "-q", "leaf.txt")
+    journal = create_journal_path(project)
+    config = wrkslots._load_config(str(project), "testhost")
+    raw = wrkslots._as_mapping(
+        json.loads(journal.read_text(encoding="utf-8")), "test create journal"
+    )
+    changed = dict(raw)
+    changed["hook_failure"] = {
+        "checkout": "product",
+        "hook_index": 0,
+        "command": _PARTIAL_INIT_HOOK,
+        "status": "running",
+    }
+    wrkslots._write_journal(config, changed, journal_path=journal)
+    return project, journal, target
+
+
+def test_abort_create_forgives_its_hooks_partial_submodule_init(
+    tmp_path: Path,
+) -> None:
+    # #1337: dirt that is only the running hook's partial submodule
+    # init aborts cleanly instead of blocking every later donor run.
+    project, journal, target = _interrupted_create_killed_mid_submodule_hook(tmp_path)
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode == 0, aborted.stderr
+    assert active_slots(project) == []
+    assert not journal.exists()
+    assert not target.exists()
+
+
+def test_abort_create_forgives_a_clone_left_at_its_default_commit(
+    tmp_path: Path,
+) -> None:
+    # #1337: the clone sits at its remote's default commit (not the
+    # gitlink) with only staged deletions: still the hook's partial init.
+    project, journal, target = _interrupted_create_killed_mid_submodule_hook(tmp_path)
+    component_source = tmp_path / "component-source"
+    (component_source / "later.txt").write_text("later\n", encoding="utf-8")
+    git(component_source, "add", "later.txt")
+    git(component_source, "commit", "-m", "later component work")
+    git(component_source, "push", "origin", "main")
+    component = target / "component"
+    git(component, "fetch", "origin")
+    git(component, "checkout", "-q", "origin/main")
+    git(component, "rm", "-q", "later.txt")
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode == 0, aborted.stderr
+    assert active_slots(project) == []
+    assert not journal.exists()
+    assert not target.exists()
+
+
+def test_abort_create_still_refuses_authored_dirt_beside_partial_init(
+    tmp_path: Path,
+) -> None:
+    # #1337: one authored file in the superproject keeps the refusal.
+    project, journal, target = _interrupted_create_killed_mid_submodule_hook(tmp_path)
+    (target / "seed.txt").write_text("authored\n", encoding="utf-8")
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode != 0
+    assert "source state is dirty" in aborted.stderr
+    assert "preserve it for inspection" in aborted.stderr
+    assert journal.is_file()
+    assert target.is_dir()
+
+
+def test_abort_create_still_refuses_a_moved_gitlink(tmp_path: Path) -> None:
+    # #1337: a gitlink recorded at another commit is authored movement.
+    project, journal, target = _interrupted_create_killed_mid_submodule_hook(tmp_path)
+    component = target / "component"
+    git(component, "reset", "--hard", "-q", "HEAD")
+    git(target / "component" / "leaf", "reset", "--hard", "-q", "HEAD")
+    tree = git(component, "rev-parse", "HEAD^{tree}").stdout.strip()
+    moved = git(
+        component, "commit-tree", tree, "-p", "HEAD", "-m", "moved"
+    ).stdout.strip()
+    git(component, "checkout", "-q", moved)
+    git(target, "add", "component")
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode != 0
+    assert "preserve it for inspection" in aborted.stderr
+    assert journal.is_file()
+    assert target.is_dir()
+
+
+def test_abort_create_still_refuses_modified_submodule_content(
+    tmp_path: Path,
+) -> None:
+    # #1337: edited (not deleted) content inside a submodule refuses.
+    project, journal, target = _interrupted_create_killed_mid_submodule_hook(tmp_path)
+    leaf = target / "component" / "leaf"
+    git(leaf, "reset", "--hard", "-q", "HEAD")
+    (leaf / "leaf.txt").write_text("edited\n", encoding="utf-8")
+
+    aborted = command(
+        project,
+        "recover",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--slot",
+        "slot01",
+        "--abort-create",
+    )
+
+    assert aborted.returncode != 0
+    assert "preserve it for inspection" in aborted.stderr
+    assert journal.is_file()
+    assert target.is_dir()
+
+
 def test_recover_repopulates_an_unpopulated_submodule_checkout(tmp_path: Path) -> None:
     """#881: recover repopulates a wholesale-unpopulated checkout, then verifies."""
     project, _journal, leaf = _interrupted_create_with_populated_submodules(tmp_path)

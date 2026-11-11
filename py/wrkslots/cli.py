@@ -57251,6 +57251,102 @@ def _verify_initialized_submodules_for_abort(vcs: _GitVcs, checkout: Path) -> bo
     return True
 
 
+def _submodule_partial_init(vcs: _GitVcs, submodule: Path) -> bool:
+    """Whether a populated submodule holds only a partial init (#1337).
+
+    A create hook killed inside `git submodule update --init` leaves a
+    clone at its default commit, never checked out: staged or unstaged
+    deletions of the clone's own files, and nothing else. No unfinished
+    operation, no stash, and no commit (on HEAD or any local branch)
+    outside its remote-tracking refs, so nothing authored is lost.
+    """
+
+    if not _submodule_worktree_populated(submodule):
+        return True
+    if vcs.operation_paths(submodule):
+        return False
+    stash = vcs._run(
+        submodule, ["show-ref", "--verify", "--quiet", "refs/stash"], check=False
+    )
+    if stash.returncode == 0:
+        return False
+    try:
+        head = vcs.head(submodule)
+    except Refusal:
+        return False
+    unique = vcs._run(
+        submodule, ["rev-list", "--count", head, "--not", "--remotes"]
+    ).stdout.strip()
+    if unique != "0":
+        return False
+    branches = vcs._run(
+        submodule,
+        ["for-each-ref", "--format=%(objectname)", "refs/heads"],
+    ).stdout
+    for branch_head in branches.splitlines():
+        branch_head = branch_head.strip()
+        if not branch_head:
+            continue
+        unique = vcs._run(
+            submodule, ["rev-list", "--count", branch_head, "--not", "--remotes"]
+        ).stdout.strip()
+        if unique != "0":
+            return False
+    status = vcs.status(submodule, (), include_ignored=True)
+    for line in status.splitlines():
+        if not line:
+            continue
+        if line.startswith(("? ", "! ")):
+            return False
+        parts = line.split(" ", 8)
+        if len(parts) != 9 or parts[0] != "1":
+            return False
+        xy, sub = parts[1], parts[2]
+        if sub.startswith("S"):
+            if parts[3:6] != ["160000", "160000", "160000"] or parts[6] != parts[7]:
+                return False
+            if not _submodule_partial_init(vcs, submodule / parts[8]):
+                return False
+        elif not (set(xy) <= {".", "D"} and "D" in xy):
+            return False
+    return True
+
+
+def _hook_partial_init_dirt(vcs: _GitVcs, destination: Path, status: str) -> bool:
+    """Whether checkout dirt is only the running hook's partial init (#1337).
+
+    Every status line must be a submodule whose gitlink is unchanged
+    (recorded commit in HEAD and index, mode 160000 throughout) with no
+    untracked content, and each such submodule must itself hold only a
+    partial init. Any other line is authored or unknown dirt.
+    """
+
+    lines = [line for line in status.splitlines() if line]
+    if not lines:
+        return True
+    gitlinks = set(vcs.submodule_paths(destination))
+    for line in lines:
+        parts = line.split(" ", 8)
+        if len(parts) != 9 or parts[0] != "1":
+            return False
+        sub, modes, head, index, path = (
+            parts[2],
+            parts[3:6],
+            parts[6],
+            parts[7],
+            parts[8],
+        )
+        if modes != ["160000", "160000", "160000"] or head != index:
+            return False
+        if len(sub) != 4 or sub[0] != "S" or sub[3] != ".":
+            return False
+        if path not in gitlinks:
+            return False
+        if not _submodule_partial_init(vcs, destination / path):
+            return False
+    return True
+
+
 def _abort_create(
     config: Config,
     journal_path: Path,
@@ -57264,6 +57360,17 @@ def _abort_create(
     slot_path = _slot_directory(config, slot, slot_type)
     vcs = _GitVcs()
     recorded_by_name = {checkout.name: checkout for checkout in recorded_created}
+    # #1337: only the checkout whose hook the journal holds at `running`
+    # may carry that hook's partial submodule init into an abort.
+    hook_checkout: str | None = None
+    if journal_payload is not None:
+        failure = journal_payload.get("hook_failure")
+        if (
+            isinstance(failure, Mapping)
+            and failure.get("status") == "running"
+            and isinstance(failure.get("checkout"), str)
+        ):
+            hook_checkout = failure["checkout"]
     if config.layout == "nested" and slot_path.exists():
         if not slot_path.is_dir() or slot_path.is_symlink():
             raise Refusal(f"cannot abort unsafe slot path: {slot_path}")
@@ -57288,6 +57395,7 @@ def _abort_create(
             Checkout | None,
             tuple[CacheDirectory, ...],
             _EmptySubmoduleAdministration | None,
+            bool,
             bool,
         ]
     ] = []
@@ -57329,7 +57437,12 @@ def _abort_create(
             status = vcs.status(
                 destination, _cache_globs_for(config, checkout.name)
             )
-            if status:
+            forgiven_partial = bool(
+                status
+                and hook_checkout == item.name
+                and _hook_partial_init_dirt(vcs, destination, status)
+            )
+            if status and not forgiven_partial:
                 first = status.splitlines()[0]
                 raise Refusal(
                     f"cannot abort changed checkout {item.name}: source state is dirty "
@@ -57337,14 +57450,18 @@ def _abort_create(
                 )
             present = True
             caches = _cache_directories_for_checkout(config, checkout)
-            verified_initialized = _verify_initialized_submodules_for_abort(
-                vcs, destination
-            )
-            submodule_administration = (
-                None
-                if verified_initialized
-                else _empty_submodule_administration(vcs, destination)
-            )
+            if forgiven_partial:
+                verified_initialized = False
+                submodule_administration = None
+            else:
+                verified_initialized = _verify_initialized_submodules_for_abort(
+                    vcs, destination
+                )
+                submodule_administration = (
+                    None
+                    if verified_initialized
+                    else _empty_submodule_administration(vcs, destination)
+                )
         elif destination.absolute() in vcs.listed_worktrees(repository):
             raise Refusal(
                 f"cannot abort missing checkout still registered by Git: {destination}"
@@ -57355,6 +57472,7 @@ def _abort_create(
             caches = ()
             submodule_administration = None
             verified_initialized = False
+            forgiven_partial = False
         if vcs.branch_exists(repository, item.branch):
             branch_head = vcs.verify_ref(
                 repository, f"refs/heads/{item.branch}", "created branch"
@@ -57375,6 +57493,7 @@ def _abort_create(
                 caches,
                 submodule_administration,
                 verified_initialized,
+                forgiven_partial,
             )
         )
     if slot_path.exists():
@@ -57389,6 +57508,7 @@ def _abort_create(
         caches,
         submodule_administration,
         verified_initialized,
+        forgiven_partial,
     ) in preflight:
         if present:
             assert checkout is not None
@@ -57411,13 +57531,19 @@ def _abort_create(
             status = vcs.status(
                 destination, _cache_globs_for(config, checkout.name)
             )
-            if status:
+            if status and not (
+                forgiven_partial
+                and hook_checkout == item.name
+                and _hook_partial_init_dirt(vcs, destination, status)
+            ):
                 first = status.splitlines()[0]
                 raise Refusal(
                     f"cannot abort changed checkout {item.name}: source state is dirty "
                     f"({first}); preserve it for inspection"
                 )
-            if verified_initialized:
+            if forgiven_partial:
+                current_submodule_administration = None
+            elif verified_initialized:
                 # Recheck the submodules still hold nothing to lose, then
                 # remove the worktree including them (#885).
                 _verify_initialized_submodules_for_abort(vcs, destination)
@@ -57437,7 +57563,11 @@ def _abort_create(
                 _prune_empty_submodule_administration(
                     vcs, destination, current_submodule_administration
                 )
-            vcs.remove_worktree(repository, destination, force=verified_initialized)
+            vcs.remove_worktree(
+                repository,
+                destination,
+                force=verified_initialized or forgiven_partial,
+            )
             _fsync_directory(slot_path.parent)
     for (
         item,
@@ -57449,6 +57579,7 @@ def _abort_create(
         _caches,
         _submodule_administration,
         _verified_initialized,
+        _forgiven_partial,
     ) in preflight:
         vcs.delete_branch_at(repository, item.branch, expected_head)
     if slot_path.exists():
