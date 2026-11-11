@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-audit-rlimit-leak: a read-only scan leaves its RLIMIT_AS cap on the calling process'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-11T05:58:47+00:00
-updated_at: 2026-11-11T05:58:47+00:00
+updated_at: 2026-11-11T09:04:17+00:00
+closed_at: 2026-11-11T09:04:17+00:00
 ---
 
 # Description
@@ -21,3 +22,7 @@ updated_at: 2026-11-11T05:58:47+00:00
 
 - A test calls audit in-process and asserts the process RLIMIT_AS is byte-identical afterwards.
 - The existing cap-application test still pins the applied limit and its restore.
+
+## Resolution
+
+Landed on main as 658948c1 (mu-statuslock). Gate 0d708f1c ran the full contract on f53bed51: every red was in the host-load census/liveness/reclaim class (#1267); the four unlisted remove/ownerless differentials pass solo, and the new in-process limit test passes. No changed-path regression.
