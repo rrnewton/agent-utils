@@ -1,55 +1,30 @@
 ---
-title: 'validate-10min: a ~10 minute validate on a hot host'
-status: open
+title: 'stale-donor: a donor that stopped polling must not defeat the claim-timeout suspension'
+status: closed
 priority: 1
-issue_type: task
-assignee: mu-gatefast
-created_at: 2026-11-10T22:00:00+00:00
-updated_at: 2026-11-10T22:00:00+00:00
+issue_type: bug
+created_at: 2026-11-10T23:55:00.000000000+00:00
+updated_at: 2026-11-10T23:55:00.000000000+00:00
 ---
 
 # Description
 
-[watermelon-full-preview] Owner reply 344 (2026-11-10): validate should be fast
-(~10 min) and concurrent; no gate needs the whole host. Measurement on
-2026-11-10 from gate logs and the ledger: wrkviz Python shards ran ~700 s
-median each at 2 shards, so one shard alone exceeded a 10-minute wall.
-Lifecycle namespace shards (~450-570 s), rust.merge-queue.test (~555 s) and
-wrkslots shards (~400 s) are the next critical-path steps.
-
-Also here (coordb, 2026-11-10): gate-phase priority must not let queued
-exclusive phases outrank owner-tier gates. Nine old-tree cross-differential
-exclusive phases starved owner gates because waiters from trees that
-predate the owner tier sort by the phase rerun mark alone.
+The claim timeout (3600 s) is suspended only while every eligible donor is host-faulted. In one run (20261110T020453Z era, report 2026-11-09 about 11:35 PM ET), one donor was paused by its own host-side disk guard and had not polled for about 6 hours (last seen 348 minutes earlier), yet still counted as eligible and healthy. When the only other verdict donor was host-faulted, the suspension did not apply and the queue cancelled five of six donor jobs with "no donor took it in time" (nothing ejected). A donor that is not polling at all is not healthy, so the exemption never fired.
 
 # Design
 
-- Split wrkviz Python tests from 2 shards to 4 (family-weighted assignment
-  in run_pytest_shard; the four shards' union is the old selection,
-  326+326+326+325 = 1303 tests).
-- gate.py: a queued, unstarted exclusive phase over only the five cross
-  differentials disabled by default (#1249 cross-differentials-robust,
-  owner reply 346) is stale — reaping drops it and records
-  `stale-disabled-phase` in history, and a fresh one is not queued. An
-  explicit --rerun, and a phase validate.py marks as a deliberate
-  `--cross-differentials` opt-in, are never stale. The owner tier keeps
-  sorting ahead of every unstarted phase; running gates are never
-  preempted.
-- Follow-up (not in the first landing): lifecycle shard splits, cargo
-  build caching across gates where safe, and re-measurement against the
-  10-minute target.
+In `rs/merge-queue/src/donor.rs` (`Store::every_eligible_donor_faulted` and the donor liveness records):
+
+- A donor whose last claim poll (`seen_unix`) is older than a configurable bound (default 15 minutes) is not counted as eligible-healthy for the suspension check.
+- A donor that reports a self-pause (for example its disk guard) registers as faulted/paused, so it no longer counts as eligible-healthy either.
+- A stale donor that resumes polling counts as eligible-healthy again.
 
 # Acceptance Criteria
 
-- wrkviz runs as 4 shards whose collected union equals the old 2 shards'.
-- A stale disabled phase ticket is reaped, an opt-in phase is not, and an
-  owner ticket is granted before an unstarted marked phase (focused tests
-  in py/tests/test_gate_admission.py).
-- Full gate passes on the landed tree; critical path re-measured and the
-  remaining minutes named here.
+- One live donor faulted plus one stale donor (no poll past the bound): the suspension holds and no jobs are cancelled.
+- A stale donor that resumes polling counts again for the suspension check.
+- `cargo test -p merge-queue` (all targets) passes, including the new cases.
 
 # Notes
 
-Provisional number 1258 (1250-1257 taken on main at filing); renumber at
-landing if taken. The earlier Part 2 commit renamed a neighbouring lane's
-issue file by mistake; that rename is reverted in this commit.
+Report read at the 2026-11-09 stale-donor write-up relayed to this lane (queue-side decision in `donor_validate`, suspension via `every_eligible_donor_faulted`). No existing tracker entry covers this (searched: donor issues are unrelated).
