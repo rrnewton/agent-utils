@@ -1197,8 +1197,15 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
    * it always did.
    */
   function jumpToDocumentLink(key: string, from?: Element | null): void {
+    // Opening is the left column's act, wherever the link was tapped
+    // (`#1336 doc-back-side-thread-hidden`), as `jumpToMessageLink`'s jump
+    // is: in the right column `showView`'s `el("pane-discord")` is
+    // `#side-pane`, so opening from a side thread there hid that thread
+    // instead of the channel's pane, and nothing put it back. The spot is
+    // taken first, in the tapped column; only the open moves.
+    const openIt = (): void => deps.inColumn(deps.mainColumn(), () => deps.openDocument(key));
     if (deps.screens().screen() !== "main" || deps.screens().view() !== "discord") {
-      deps.openDocument(key);
+      openIt();
       return;
     }
     const spot = documentLinkSpot(from ?? null);
@@ -1209,7 +1216,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
     linkJumps.take(jump);
     scheduleBackSync();
     try {
-      deps.openDocument(key);
+      openIt();
     } finally {
       // Landed, in the reader or on its failure: what is open now — the
       // document's levels — is the jump's, and a further document opened

@@ -30,6 +30,12 @@ At 1280x800 and at 393x852 with touch, the same walk:
 on the row and a "Linked message" note at its head, on screen, with a × a thumb can take; on the desk the
 mouse crossing another message selects it and the mark stays.
 
+`#1336 doc-back-side-thread-hidden`, on the desk only: in two columns, a document link (`data-doc`,
+the other mark `wireMessageLinks` takes in-app) in a reply of the side column's thread opens the
+reader, and the reader's Back restores that thread visibly — its pane drawn again, not left
+`display: none` with its rows in the DOM but no box. A phone has no side column to restore (one
+column, or the thread list), so this step is the desk's.
+
 No page error at any step. Pass --screenshots DIR to keep a PNG of each landing.
 """
 
@@ -42,10 +48,10 @@ import threading
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 
 import offline_cache_browser as fixture
-from offline_cache_browser import CHANNEL, TOKEN, Json, check, handler_for
+from offline_cache_browser import CHANNEL, SCOPES, TOKEN, Json, check, handler_for
 from two_column_browser import RUNNER, ColumnsApi, Desk
 import page_sources
 
@@ -71,8 +77,27 @@ def link_body(href: str, data: str, text: str) -> str:
     return f'<p>see <a href="{href}" data-msg="{data}" {LINK_ATTRS}>{text}</a> above</p>\n'
 
 
+DOC_KEY = "paste:side-doc"
+DOC_HREF = "https://paste.example/side-doc"
+DOC_ROW: Json = {
+    "key": DOC_KEY, "kind": "paste", "issue_number": None, "issue_status": None,
+    "url": DOC_HREF, "file_name": "side-doc", "title": "Side guide",
+    "fetched": True, "version": "1", "fetched_ms": 1_790_000_000_000, "moved_to": None,
+    "mention_count": 1, "first_mentioned_ms": 1_790_000_000_000, "last_mentioned_ms": 1_790_000_000_000,
+    "mentions": [{"channel_id": CHANNEL["id"], "message_id": "208", "thread_id": RUNNER,
+                  "posted_ms": 1_790_000_000_000, "author": "ci-bot", "label": "the side guide"}],
+}
+DOC_CONTENT = "# Side guide\n\nOpened from the side thread.\n\nMore words follow here.\n"
+
+
+def doc_link_body() -> str:
+    """A body as the server renders a link to a document: its `data-doc` mark (`#1073`)."""
+    return f'<p>read <a href="{DOC_HREF}" data-doc="{DOC_KEY}" {LINK_ATTRS}>the side guide</a> here</p>\n'
+
+
 class LinkedApi(ColumnsApi):
-    """The columns channel, two late messages linking to earlier ones as the server renders them."""
+    """The columns channel, two late messages linking to earlier ones as the server renders them,
+    and one runner reply (208) linking to a document, for the side column's walk (`#1336`)."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -83,6 +108,34 @@ class LinkedApi(ColumnsApi):
                 row["content_html"] = link_body(address("201"), mark("201"), "the plan")
             if row["id"] == "206":
                 row["content_html"] = link_body(address("201"), mark("201"), address("201"))
+            if row["id"] == "208":
+                row["content_html"] = doc_link_body()
+
+    def post(self, path: str, body: Json) -> tuple[int, Json]:
+        if path == "/api/v1/documents/fetch":
+            return 200, {"ok": True}
+        return super().post(path, body)
+
+
+def documents_handler(api: LinkedApi) -> type:
+    """The fake API's handler, plus the Documents list and the one document this walk reads."""
+    base = handler_for(api)
+
+    class Handler(base):  # type: ignore[valid-type, misc]
+        def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's API
+            path = unquote(urlsplit(self.path).path)
+            if path in ("/api/v1/documents", f"/api/v1/documents/{DOC_KEY}"):
+                if SCOPES.get(self.headers.get("Authorization") or "") is None:
+                    self.json(401, {"error": "unauthorized", "detail": "unknown token"})
+                elif path == "/api/v1/documents":
+                    self.json(200, {"documents": [DOC_ROW], "total": 1, "revision": 1})
+                else:
+                    self.json(200, {"document": {"title": "Side guide", "url": DOC_HREF, "kind": "paste"},
+                                    "content": DOC_CONTENT, "outline": ["Side guide"]})
+                return
+            super().do_GET()
+
+    return Handler
 
 
 # Where the reader is: the row's top in the window, the list's scroll, the thread heading, the picker,
@@ -144,6 +197,67 @@ class Link:
         self.href = str(found["href"])
         self.x = float(str(found["x"]))
         self.y = float(str(found["y"]))
+
+
+# The side thread's pane and its linking row, as laid out: `#1336`'s measure. `hidden` alone
+# would not say it — the check is the computed style and a real box inside the side scroller.
+SIDE_JS = """() => {
+    const side = document.getElementById('side-pane');
+    const style = getComputedStyle(side);
+    const row = document.querySelector('#side-log > li[data-id="208"]');
+    const area = document.getElementById('side-scroll');
+    const r = row ? row.getBoundingClientRect() : null;
+    const a = area ? area.getBoundingClientRect() : null;
+    return {
+        sideHidden: side.hidden, sideDisplay: style.display, sideVisibility: style.visibility,
+        sideRects: side.getClientRects().length,
+        discordHidden: document.getElementById('pane-discord').hidden,
+        docsHidden: document.getElementById('pane-docs').hidden,
+        rows: document.querySelectorAll('#side-log > li[data-id]').length,
+        linkedInside: Boolean(r && a && r.bottom > a.top && r.top < a.bottom
+            && r.right > a.left && r.left < a.right),
+        linkedRects: row ? row.getClientRects().length : 0,
+        linkedText: row ? row.textContent : '',
+        columns: document.getElementById('screen-main').getAttribute('data-columns'),
+        viewLabel: document.getElementById('view-switch-label').textContent,
+        status: document.getElementById('status').textContent,
+    };
+}"""
+
+# The document link in the side thread: its words, whether the app took it, and its middle.
+DOC_LINK_JS = """() => {
+    const a = document.querySelector('#side-log > li[data-id="208"] .md a[data-doc]');
+    if (!a) return null;
+    a.scrollIntoView({block: 'center'});
+    const r = a.getBoundingClientRect();
+    return {text: a.textContent, inApp: a.hasAttribute('data-in-app'), href: a.getAttribute('href'),
+            x: r.left + r.width / 2, y: r.top + r.height / 2};
+}"""
+
+
+class SideState:
+    """What `SIDE_JS` read, with the types each part has."""
+
+    def __init__(self, found: Json) -> None:
+        self.side_hidden = bool(found["sideHidden"])
+        self.side_display = str(found["sideDisplay"])
+        self.side_visibility = str(found["sideVisibility"])
+        self.side_rects = int(str(found["sideRects"]))
+        self.discord_hidden = bool(found["discordHidden"])
+        self.docs_hidden = bool(found["docsHidden"])
+        self.rows = int(str(found["rows"]))
+        self.linked_inside = bool(found["linkedInside"])
+        self.linked_rects = int(str(found["linkedRects"]))
+        self.linked_text = str(found["linkedText"])
+        self.columns = str(found["columns"])
+        self.view_label = str(found["viewLabel"])
+        self.status = str(found["status"])
+
+    def __repr__(self) -> str:
+        return (f"SideState(side_hidden={self.side_hidden}, display={self.side_display!r}, "
+                f"visibility={self.side_visibility!r}, rects={self.side_rects}, rows={self.rows}, "
+                f"linked_inside={self.linked_inside}, linked_rects={self.linked_rects}, "
+                f"columns={self.columns!r}, view={self.view_label!r}, status={self.status!r})")
 
 
 LANDED_JS = """(id) => document.querySelector(`#discord-log > li[data-id="${id}"]`)?.getAttribute('data-landed') === 'true'"""
@@ -230,7 +344,7 @@ def main() -> int:
 def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int, height: int, phone: bool) -> str:
     """One reader at one size, against a fresh fake API and a fresh browser profile."""
     api = LinkedApi()
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), handler_for(api))
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), documents_handler(api))
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -255,6 +369,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 route.abort()
 
             context.route("https://discord.com/**", leaving)
+            context.route("https://paste.example/**", leaving)
             version = context.browser.version if context.browser else "Chromium"
             page = context.pages[0]
             errors: list[str] = []
@@ -269,6 +384,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                                  "the channel did not open in All")
             reader.desk.settled()
             reader.walk()
+            if not phone:
+                reader.side_document()
             check(not left, f"{label}: a tap left for the service: {left}")
             check(not errors, f"{label}: the page threw: {errors}")
             context.close()
@@ -294,6 +411,64 @@ class Reader:
     def spot(self, message_id: str) -> Spot:
         found: Json = self.page.evaluate(SPOT_JS, message_id)
         return Spot(found)
+
+    def side_state(self) -> SideState:
+        found: Json = self.page.evaluate(SIDE_JS)
+        return SideState(found)
+
+    def side_document(self) -> None:
+        """`#1336 doc-back-side-thread-hidden`: on the desk, open the side thread's document and
+        come back with the reader's Back. The thread the reader came from must be visible again."""
+        page = self.page
+        page.click("#column-toggle")
+        self.desk.wait_for("() => document.getElementById('side-column').getClientRects().length > 0"
+                           " && document.querySelectorAll('#side-cards > li').length === 3",
+                           "two columns did not open for the side document walk")
+        page.click(f"#side-cards > li[data-id='{RUNNER}'] .side-card-open")
+        self.desk.wait_for("() => document.querySelectorAll('#side-log > li[data-id]').length === 9"
+                           " && Boolean(document.querySelector('#side-log > li[data-id=\"208\"] .md a[data-doc]'))",
+                           "the side thread with the document link did not open")
+        self.desk.settled()
+        before = self.side_state()
+        self.desk.check(not before.side_hidden and before.side_display != "none" and before.side_rects > 0,
+                        f"fixture: the side thread is not visible before its document opens: {before}")
+        self.desk.check(before.rows == 9 and "the side guide" in before.linked_text,
+                        f"fixture: the side thread does not draw its linking reply: {before}")
+
+        found: Json | None = page.evaluate(DOC_LINK_JS)
+        self.desk.check(found is not None, "208 draws no document link in the side thread")
+        self.desk.settled()
+        found = page.evaluate(DOC_LINK_JS)
+        assert found is not None
+        link = Link(found)
+        self.desk.check(link.text == "the side guide" and link.in_app,
+                        f"the side thread's document link is not the app's: {link.text!r} inApp={link.in_app}")
+        page.mouse.click(link.x, link.y)
+        self.desk.wait_for("() => !document.getElementById('docs-reader').hidden"
+                           " && document.getElementById('doc-title').textContent.includes('Side guide')",
+                           "the side thread's document link did not open the reader")
+        self.desk.settled()
+        reading = self.side_state()
+        self.desk.shot("side-document")
+
+        page.click("#doc-back")
+        self.desk.wait_for("() => document.getElementById('pane-docs').hidden"
+                           " && document.getElementById('status').textContent === 'Back where you were.'",
+                           "Back from the side thread's document did not return to the channel")
+        self.desk.settled()
+        after = self.side_state()
+        self.desk.check(after.view_label == "Channel" and after.columns == "two" and after.docs_hidden,
+                        f"Back did not restore the channel in two columns: {after}")
+        self.desk.check(not after.side_hidden and after.side_display != "none"
+                        and after.side_visibility != "hidden" and after.side_rects > 0,
+                        f"Back left the side thread hidden ({after.side_display}, {after.side_rects} boxes): {after}")
+        self.desk.check(after.rows == 9 and after.linked_rects > 0 and after.linked_inside
+                        and "the side guide" in after.linked_text,
+                        f"Back did not put the side thread's linking reply back on screen: {after}")
+        self.desk.check(reading.discord_hidden,
+                        f"while the document was open the channel's own pane was never hidden: {reading}")
+        self.desk.shot("side-document-back")
+        self.desk.notes.append("side thread's document opened and Back restored the thread visibly")
 
     def scroll_to_middle(self, message_id: str) -> Spot:
         """Scroll the list so the row sits a third of the way down the window, as a reader reading it."""
