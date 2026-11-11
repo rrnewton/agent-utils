@@ -1,6 +1,6 @@
 ---
 title: 'validate-mount-fence: unmount an image-mounted validation checkout before the path fence'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: mu-fence
@@ -37,3 +37,5 @@ This is the second such refusal since last evening. The checkout path is itself 
 # Notes
 
 Reported by the originating validator's lead 2026-11-11 11:07 AM ET; job 20261111T160025634-59d765ba592a-7ab0c5a0. Evidence is preserved in place on the reporting host: nobody unmounts, recovers, removes, or releases locks on that checkout without the evidence owner's explicit OK. mu-retirelock's #1287 gates in the same remove code: rebase onto github/main right before the gate, and if #1287 lands first, rebase over it and re-verify the combined tree. Known main red, unrelated: the restore-drill reds (fixtures vs #1216); an untouched red needs one local solo pass.
+
+Resolution (mu-fence): landed on main as 844cf3e2 (fence), 76346059 (rustfmt), 5b89ce89 (clippy), gated at owner priority. `_rename_slot_path` (Python) and `fence_slot_path` (Rust) now relieve a mount point before renaming: a worktrees-image subvolume mounted at the fence source without a bind record (recognised by its mount root) is recorded and relocated through the existing bind relocation; an unmount failure or any other mount point refuses EBUSY naming the mount, leaving checkout, mount and records for a retry. Agent-slot removal shares the same fence helper in both editions, closing the identical Rust gap (its fence previously did no mount relocation at all); Python agent slots with a bind record already relocated. Read-only follow-up on the reporting host: no validate slot has a slot-image record at all (validate checkouts are worktrees-image bind mounts), and both preserved evidence checkouts hold bind records today, so the refusal is the missing/unrecognised-mount and busy-unmount cases this fallback now covers. Fixtures: test_validate_mount_fence_without_a_bind_record and test_validate_mount_fence_refuses_when_the_unmount_fails. Not verified live: the preserved evidence checkouts were never retried (owner's hold); the reporting host deploys through its pin path.
