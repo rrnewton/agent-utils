@@ -858,42 +858,82 @@ impl Host for SystemHost {
                 }
             }
         };
+        // Drain both pipes while the child runs. Reading only after exit
+        // deadlocks a child that fills a pipe buffer, and keeping only a
+        // tail of the capture corrupts the documents callers parse from
+        // stdout (#1322 slot-bind-status-parse).
+        let stdout_reader = child
+            .stdout
+            .take()
+            .map(|mut pipe| std::thread::spawn(move || drain_capped(&mut pipe)));
+        let stderr_reader = child
+            .stderr
+            .take()
+            .map(|mut pipe| std::thread::spawn(move || drain_capped(&mut pipe)));
         let deadline = Instant::now() + timeout;
-        loop {
+        let status = loop {
             match child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(status)) => break status,
                 Ok(None) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 _ => {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = stdout_reader.map(|reader| reader.join());
+                    let _ = stderr_reader.map(|reader| reader.join());
                     return CommandOutcome {
                         stderr: format!("{program} did not finish within {}s", timeout.as_secs()),
                         ..CommandOutcome::default()
                     };
                 }
             }
-        }
-        match child.wait_with_output() {
-            Ok(output) => CommandOutcome {
-                status: output.status.code(),
-                stdout: bounded_text(&output.stdout),
-                stderr: bounded_text(&output.stderr),
-            },
-            Err(error) => CommandOutcome {
-                stderr: format!("cannot read {program}: {error}"),
+        };
+        let stdout = stdout_reader.and_then(|reader| reader.join().ok());
+        let stderr = stderr_reader.and_then(|reader| reader.join().ok());
+        let (stdout, stdout_overflow) = stdout.unwrap_or_default();
+        let (stderr, stderr_overflow) = stderr.unwrap_or_default();
+        if stdout_overflow || stderr_overflow {
+            let stream = if stdout_overflow { "stdout" } else { "stderr" };
+            return CommandOutcome {
+                stderr: format!(
+                    "{program} printed more than {MAX_CAPTURED_OUTPUT} bytes on {stream}; output not captured"
+                ),
                 ..CommandOutcome::default()
-            },
+            };
+        }
+        CommandOutcome {
+            status: status.code(),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
         }
     }
 }
 
-/// Keep reports bounded: the last 16 KiB of a command's output.
-fn bounded_text(bytes: &[u8]) -> String {
-    const LIMIT: usize = 16 << 10;
-    let start = bytes.len().saturating_sub(LIMIT);
-    String::from_utf8_lossy(&bytes[start..]).into_owned()
+/// Most bytes one captured stream may hold. Past it the run fails loudly
+/// (see `SystemHost::run`) instead of silently keeping a tail that callers
+/// then misparse (#1322). Mirrors the Herdr control capture's stdout cap.
+const MAX_CAPTURED_OUTPUT: usize = 8 * 1024 * 1024;
+
+/// Read `pipe` to end, retaining at most [`MAX_CAPTURED_OUTPUT`] bytes and
+/// reporting whether the stream ran past that. Draining never stops at the
+/// cap, so the child never blocks on a full pipe.
+fn drain_capped(pipe: &mut impl Read) -> (Vec<u8>, bool) {
+    let mut kept = Vec::new();
+    let mut overflow = false;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        match pipe.read(&mut buffer) {
+            Ok(0) => return (kept, overflow),
+            Ok(count) => {
+                let room = MAX_CAPTURED_OUTPUT.saturating_sub(kept.len());
+                kept.extend_from_slice(&buffer[..count.min(room)]);
+                overflow |= count > room;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return (kept, overflow),
+        }
+    }
 }
 
 /// How restore was asked to run.
@@ -1655,8 +1695,14 @@ pub(crate) fn slot_row(
 }
 
 fn slot_row_document(stdout: &str, slot: &str) -> Result<Value> {
-    let document: Value = serde_json::from_str(stdout)
-        .map_err(|error| fail(format!("wrkslots status printed no JSON: {error}")))?;
+    let document: Value = serde_json::from_str(stdout).map_err(|error| {
+        // Name the first bytes seen, so a capture or format break is
+        // self-explaining instead of a bare position (#1322).
+        let preview: String = stdout.chars().take(120).collect();
+        fail(format!(
+            "wrkslots status printed no JSON: {error}; first bytes: {preview:?}"
+        ))
+    })?;
     document["active"]
         .as_array()
         .and_then(|rows| rows.iter().find(|row| row["slot"] == slot))
@@ -4326,6 +4372,65 @@ mod tests {
         .unwrap();
         assert_eq!(row["generation"], 3);
         assert_eq!(*host.status_calls.borrow(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_reads_a_large_status_document_with_stderr_noise() {
+        use std::os::unix::fs::PermissionsExt;
+        // #1322 slot-bind-status-parse: a status document past the old
+        // 16 KiB capture tail (and past the 64 KiB pipe buffer) must still
+        // bind, with the soak banners on stderr kept out of the parse.
+        for target in [20_000usize, 200_000] {
+            let directory = std::env::temp_dir().join(format!(
+                "restore-big-status-{}-{target}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&directory).unwrap();
+            let mut rows = vec![json!({
+                "slot": "edone",
+                "generation": 7,
+                "agent": "mu-edone",
+                "owner": {"pid": 4242, "kind": "process"},
+            })];
+            let mut document = json!({
+                "machine": "test",
+                "active": rows.clone(),
+                "archive": [],
+                "holds": [],
+            });
+            while serde_json::to_string_pretty(&document).unwrap().len() < target {
+                rows.push(json!({
+                    "slot": format!("filler-{}", rows.len()),
+                    "generation": 1,
+                    "agent": "filler",
+                    "note": "x".repeat(512),
+                }));
+                document["active"] = json!(rows);
+            }
+            let payload = serde_json::to_string_pretty(&document).unwrap();
+            assert!(
+                payload.len() >= target,
+                "payload is {} bytes",
+                payload.len()
+            );
+            fs::write(directory.join("status.json"), &payload).unwrap();
+            let script = directory.join("wrkslots");
+            fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\necho '[wrkslots] status: rust (soak)' >&2\necho '[wrkslotsd] rust cache=verified source=test binary=test' >&2\ncase \" $* \" in *\" transfer-owner \"*) echo transferred; exit 0;; esac\ncat \"{}\"\n",
+                    directory.join("status.json").display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            let row = bind_slot_owner(&SystemHost, &script, &directory, "edone", "mu-edone", 4242)
+                .unwrap();
+            assert_eq!(row["generation"], 7);
+            assert_eq!(row["agent"], "mu-edone");
+            fs::remove_dir_all(&directory).unwrap();
+        }
     }
 
     #[test]
