@@ -562,3 +562,128 @@ def test_post_write_check_reads_only_the_events_appended_after_the_verified_tip(
     assert not cli._appended_events_limited_to_slot(
         config, shifted, [f"{local.sequence + 1:020d}.json"], "slot01"
     )
+
+
+@pytest.mark.parametrize("operation", ("adopt", "create"))
+def test_a_quarantine_only_change_during_validation_sends_the_command_back_to_validate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    operation: str,
+) -> None:
+    """The quarantined journals are registry state the validation reads (review F1).
+
+    Nothing but the quarantine directory changes between the lock-free validation and the
+    identity compare, so only an identity that covers it sends the command back.
+    """
+
+    project = _three_slot_project(tmp_path)
+    ledger = _LockLedger(monkeypatch, project)
+    quarantine = control_directory(project) / "quarantine"
+    journals: list[str] = []
+
+    def quarantine_a_journal() -> None:
+        if not journals:
+            quarantine.mkdir(exist_ok=True)
+            journal = quarantine / "CREATE.8.testhost.6.slot09.journal"
+            journal.write_text("{}\n", encoding="utf-8")
+            journals.append(journal.name)
+
+    ledger.during_validation = quarantine_a_journal
+    argv = _adopt_argv(project) if operation == "adopt" else _create_argv(project)
+
+    rc = cli.main(argv)
+
+    captured = capsys.readouterr()
+    assert rc == 0, captured.err
+    assert journals == ["CREATE.8.testhost.6.slot09.journal"]
+    if operation == "adopt":
+        row = _row(project, "slot01")
+        assert row is not None and isinstance(row["owner"], dict)
+    else:
+        assert _row(project, "slot03") is not None
+    assert ledger.count("validate", held=False) == 2
+    assert ledger.count("validate", held=True) == 0
+    assert ledger.exclusive_rounds == 2
+
+
+def test_registry_identity_covers_quarantined_journals_and_slot_image_records(
+    tmp_path: Path,
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    config = cli._load_config(str(project), "testhost")
+    control = control_directory(project)
+    quarantine = control / "quarantine"
+    quarantine.mkdir()
+    notes = quarantine / "README.txt"
+    notes.write_text("operator notes\n", encoding="utf-8")
+    image_directory = control / "slot-images" / "agent" / "slot01"
+    image_directory.mkdir(parents=True)
+    image = image_directory / "slot.img"
+    image.write_bytes(b"\0" * 4096)
+    before = cli._registry_identity(config)
+
+    # Not registry state: another file in the quarantine directory, and the image beside a
+    # record, whose times change with every write inside the slot.
+    notes.write_text("operator notes, edited\n", encoding="utf-8")
+    with image.open("r+b") as handle:
+        handle.write(b"written")
+    assert cli._registry_identity(config) == before
+
+    # Registry state: a quarantined journal, and a slot's image record.
+    journal = quarantine / "CREATE.8.testhost.6.slot09.journal"
+    journal.write_text("{}\n", encoding="utf-8")
+    quarantined = cli._registry_identity(config)
+    assert before.changed_names(quarantined) == [f"quarantine/{journal.name}"]
+    assert "1 file(s) in quarantine" in cli._describe_registry_change(before, quarantined)
+    record = image_directory / "IMAGE.json"
+    record.write_text("{}\n", encoding="utf-8")
+    recorded = cli._registry_identity(config)
+    assert quarantined.changed_names(recorded) == ["slot-images/agent/slot01/IMAGE.json"]
+    replacement = image_directory / "IMAGE.json.tmp"
+    replacement.write_text('{"replaced": true}\n', encoding="utf-8")
+    os.replace(replacement, record)
+    assert recorded.changed_names(cli._registry_identity(config)) == [
+        "slot-images/agent/slot01/IMAGE.json"
+    ]
+
+
+def test_post_write_check_accepts_only_the_slots_own_image_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+    for slot, agent, branch in (("slot01", "codex-1", "codex/task"), ("slot02", "codex-2", "codex/task2")):
+        made = create(project, slot=slot, agent=agent, branch=branch)
+        assert made.returncode == 0, made.stderr
+    config = cli._load_config(str(project), "testhost")
+    states, archives = cli._validate_global_state(config)
+    before = cli._global_rows(states, archives)
+    reference = cli._registry_identity(config)
+    local = cli._verified_local_log(config, reference, states, archives)
+    assert local is not None
+    validations: list[str] = []
+    validate = cli._validate_global_state
+
+    def counted(
+        config: cli.Config, *, require_repository: bool = True
+    ) -> tuple[list[cli.ActiveState], list[cli.ArchiveState]]:
+        validations.append("validate")
+        return validate(config, require_repository=require_repository)
+
+    monkeypatch.setattr(cli, "_validate_global_state", counted)
+    images = control_directory(project) / "slot-images" / "agent"
+
+    # An image-backed create writes its own slot's record: still the cheap check.
+    own = images / "slot01" / "IMAGE.json"
+    own.parent.mkdir(parents=True)
+    own.write_text("{}\n", encoding="utf-8")
+    cli._assert_registry_change_limited_to_slot(config, reference, before, "slot01", local)
+    assert validations == []
+    # Another slot's record is not this mutation's to write: the full re-validation runs.
+    other = images / "slot02" / "IMAGE.json"
+    other.parent.mkdir(parents=True)
+    other.write_text("{}\n", encoding="utf-8")
+    cli._assert_registry_change_limited_to_slot(config, reference, before, "slot01", local)
+    assert validations == ["validate"]
