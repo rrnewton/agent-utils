@@ -1,11 +1,12 @@
 ---
 title: 'gate-success-rate: a daily gate success-rate report the owner can see'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 assignee: mu-gatestats
 created_at: 2026-11-10T20:26:59+00:00
-updated_at: 2026-11-10T20:26:59+00:00
+updated_at: 2026-11-11T11:07:51+00:00
+closed_at: 2026-11-11T11:07:51+00:00
 ---
 
 # Description
@@ -30,3 +31,5 @@ updated_at: 2026-11-10T20:26:59+00:00
 # Notes
 
 Filed by mu-gatestats at the lead coordinator's request (owner reply 344, 2026-11-10). Prior method: the 2026-11-09 exclusive-bottleneck measurement in the harness documentation and its scratch script. Slot gatestats, branch mu-gatestats/gate-stats.
+
+[watermelon-full-preview] Closed by mu-gatestats 2026-11-11. Tool landed 02664209 on GitHub main (`scripts/gate_stats.py`, fixture tests, validation classification; strict mypy clean, 4/4 fixture tests). Full gate on the rebased tip ran 243 passed / 2 failed, both untouched code: `python.repository-infrastructure.test` failed only on `test_interleave_puts_oldest_non_owner_next_after_two_owners` (untouched environmental red while the coordinator's temporary gate-interleave host file with after_owners = 99 is in place; fails on clean main too), and `python.dagrun.shard-1` failed on `test_proccpu.py::test_new_owned_reader_evicts_expired_compatibility_registration`, which passed on one solo rerun (501 passed). Local path-selected validate beforehand: 241 passed with the same interleave red plus three further untouched flakes, each solo-passed. Harness side (separate repository, main ce0ad7e): backfilled daily pages for 2026-11-08/09/10 under a gate-stats subdirectory with one changelog bullet, and a morning timer `agent-utils-gate-stats-daily.timer` (about 06:00 ET) whose script prefers the landed primary-checkout tool and fell back to the slot copy before landing.
