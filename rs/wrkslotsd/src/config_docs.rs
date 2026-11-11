@@ -15,6 +15,7 @@ pub(crate) const TOP_DOCS: &[(&str, &str)] = &[
     ("liveness_command", "Project-relative program run with the agent name. Exit 0: dead, 1: alive, 2: cannot tell."),
     ("liveness_batch_command", "Project-relative batch liveness program (one wrkslots-liveness-batch-request/v1 JSON request for many agents), used by audit on large registries."),
     ("max_active_slots", "Cap on active slots. Absent means uncapped."),
+    ("eden_host_cap", "Host-wide Eden checkout cap, counted across every daemon config dir."),
     ("cache_globs", "Slot-relative globs of regenerable caches that `clean-caches` may delete."),
     ("repo_cache_globs", "Per-repository cache globs: repository name to a list of globs."),
     (
@@ -89,6 +90,7 @@ pub(crate) const OPTIONAL_KEYS: &[&str] = &[
     "layout",
     "liveness_batch_command",
     "max_active_slots",
+    "eden_host_cap",
     "cache_globs",
     "repo_cache_globs",
     "post_provision_hooks",

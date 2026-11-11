@@ -32,9 +32,10 @@ const REQUIRED: [&str; 7] = [
     "heartbeat_ttl_seconds",
     "liveness_command",
 ];
-const OPTIONAL: [&str; 19] = [
+const OPTIONAL: [&str; 20] = [
     "liveness_batch_command",
     "max_active_slots",
+    "eden_host_cap",
     "layout",
     "cache_globs",
     "repo_cache_globs",
@@ -1401,6 +1402,10 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
         None | Some(Value::Null) => Value::Null,
         Some(value) => json!(as_int(value, "configuration.max_active_slots", 0)?),
     };
+    let eden_cap = match raw.get("eden_host_cap") {
+        None | Some(Value::Null) => json!(3),
+        Some(value) => json!(as_int(value, "configuration.eden_host_cap", 1)?),
+    };
     let cache_globs = match raw.get("cache_globs") {
         None => Vec::new(),
         Some(value) => string_tuple(
@@ -1565,6 +1570,7 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
         "liveness_command": liveness.to_string_lossy(),
         "machine": machine,
         "max_active_slots": cap,
+        "eden_host_cap": eden_cap,
         "post_provision_hooks": hooks,
         "post_provision_hook_slot_types": hook_slot_types,
         "reclaimable_ignored_paths": reclaimable,
