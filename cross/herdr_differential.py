@@ -59,7 +59,13 @@ from pathlib import Path
 from typing import cast
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-TIMEOUT_SECONDS = 30
+#: Hang guard for one invocation, in seconds
+#: (#1249 cross-differentials-robust). It is never a verdict about
+#: speed: only an invocation that stops making progress for this long,
+#: burns twice this much CPU, or runs four times this long in wall time
+#: is reported as hung. Minutes, so an edition starved on a host above
+#: 75% CPU is never mistaken for a hang.
+TIMEOUT_SECONDS = 300
 
 #: The documented launcher every engine is reached through.
 LAUNCHER = REPO_ROOT / "common" / "bin" / "herdr-run"
@@ -714,26 +720,20 @@ def _tree_cpu_seconds(pid: int) -> float | None:
 def _finish_tolerant(
     process: subprocess.Popen[bytes], argv: Sequence[str]
 ) -> subprocess.CompletedProcess[bytes]:
-    """Wait for ``process`` under a CPU-progress budget instead of a plain wall timeout.
+    """Wait for ``process`` under the generous hang guard.
 
-    What an invocation is now judged on: it is a timeout -- raised as ``TimeoutExpired`` carrying
+    It is a hang report, never a verdict about speed: raised as ``TimeoutExpired`` carrying
     the output gathered so far, so every caller still maps it to rc 124 ``TIMEOUT`` exactly as
-    the old ``subprocess.run(timeout=...)`` did -- when its process tree makes no CPU progress
-    for :data:`TIMEOUT_SECONDS`, or burns more than twice that in CPU, or runs past four times
-    that in wall time. The plain wall timeout it replaces also failed an edition that was merely
-    starved of CPU on a loaded host: runnable the whole time, but rarely scheduled, it read as
-    hung at ``TIMEOUT_SECONDS`` of wall.
-
-    Why a real slowdown still fails: a genuinely slower path spends the extra time as CPU
-    (caught at twice the CPU budget) or as waiting on something that never comes (caught by the
-    idle limit, unchanged at ``TIMEOUT_SECONDS``), and nothing runs past four times the wall
-    budget. Only scheduling pauses -- wall time in which the tree burned almost no CPU because
-    the host was busy elsewhere -- no longer count against an edition. The budget mirrors
-    ``run_tolerant`` in ``herdr_agent_differential.py``; unlike ``subprocess.run``'s timeout,
-    which killed only the direct child, a timeout here kills the whole process group (every
-    caller starts the child in its own session), so grandchildren cannot leak holding the
-    captured pipes or a fixture lock. Output is drained throughout by retried ``communicate``
-    calls, which keep what was already read.
+    the old ``subprocess.run(timeout=...)`` did -- only when its process tree makes no CPU
+    progress for :data:`TIMEOUT_SECONDS` (minutes), or burns more than twice that in CPU, or
+    runs past four times that in wall time. Scheduling pauses -- wall time in which the tree
+    burned almost no CPU because the host was busy elsewhere -- never count against an
+    edition (#1249 cross-differentials-robust). The guard mirrors ``run_tolerant`` in
+    ``herdr_agent_differential.py``; unlike ``subprocess.run``'s timeout, which killed only
+    the direct child, a timeout here kills the whole process group (every caller starts the
+    child in its own session), so grandchildren cannot leak holding the captured pipes or a
+    fixture lock. Output is drained throughout by retried ``communicate`` calls, which keep
+    what was already read.
     """
     started = time.monotonic()
     last_progress = started
@@ -3336,9 +3336,15 @@ _PROBE_GIT = """#!/bin/sh
 exit 1
 """
 
+#: Lifetime of the held-pipe descendant below, in seconds. The held-pipe
+#: check compares the editions' wait against this landmark -- the fake's
+#: own programmed lifetime -- never against an absolute speed budget
+#: (#1249 cross-differentials-robust).
+_HOLDING_DESCENDANT_SECONDS = 120
+
 #: A stand-in ``git`` that exits at once while a descendant keeps its stdout and stderr open.
 _HOLDING_GIT = """#!/bin/sh
-/usr/bin/sleep 60 &
+/usr/bin/sleep 120 &
 exit 1
 """
 
@@ -3562,14 +3568,17 @@ def _held_pipe(harness: Harness, report: Report) -> None:
     )
     elapsed = time.monotonic() - started
     report.exact("held-pipe/bounded", python, rust, expected_rc=0)
-    # Kept as a wall bound on the pair, deliberately not relaxed to match _finish_tolerant's
-    # per-invocation budget: what this compares is each edition's own ten-second bound on waiting
-    # for `git check-ignore`, so an edition that regressed to waiting the descendant's full
-    # minute (~60s for one edition alone) still fails here even on a host too loaded for the
-    # harness's CPU-progress budget to notice anything wrong.
+    # Landmark-relative, not a speed budget
+    # (#1249 cross-differentials-robust): the pair must stop waiting
+    # before the fake descendant's own programmed lifetime ends. Each
+    # edition's product bound on waiting for `git check-ignore` is ten
+    # seconds, so a healthy pair takes ~20 s however loaded the host is
+    # (the product's wait is its own timer, not host-paced work), while
+    # an edition that regressed to waiting the descendant out cannot
+    # finish inside the landmark.
     report.require(
         "held-pipe/within-the-bound",
-        elapsed < 2 * TIMEOUT_SECONDS,
+        elapsed < _HOLDING_DESCENDANT_SECONDS,
         f"waiting on a held pipe took {elapsed:.1f}s for the two editions together",
     )
 

@@ -1115,10 +1115,11 @@ def test_all_cross_filter_fails_closed() -> None:
 def test_all_list_names_skipped_cross_steps_and_cross_all_forces_them(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """#1190/#1249: `--all --list` on a page-only change names all five
-    exclusive steps as skipped and plans none of them; `--all --cross-all
-    --list` still plans none (disabled by default, #1249); only
-    `--cross-differentials` plans them."""
+    """#1190/#1249: `--all --list` on a page-only change names the three
+    still-disabled agentctl shards as skipped and plans none of them, while
+    the re-enabled herdr-agent and herdr-run differentials are planned;
+    `--all --cross-all --list` still plans none of the disabled shards;
+    only `--cross-differentials` plans those too."""
     validate = _validate_module()
     monkeypatch.delenv(validate.CROSS_MAIN_PHASE_ENV, raising=False)
     monkeypatch.setattr(
@@ -1131,18 +1132,19 @@ def test_all_list_names_skipped_cross_steps_and_cross_all_forces_them(
         "cross.agentctl.differential-0",
         "cross.agentctl.differential-1",
         "cross.agentctl.differential-2",
+    ):
+        assert listed.count(tag) == 1, tag  # named once, as skipped
+        assert f"STEP  {tag}" not in listed, tag
+    for tag in (
         "cross.agentctl.herdr-agent-differential",
         "cross.herdr-run.differential",
     ):
-        assert listed.count(tag) == 1, tag  # named once, as skipped; not a STEP line
+        assert f"STEP  {tag}" in listed, tag  # re-enabled in the main phase
     assert validate.main(["--all", "--cross-all", "--list"]) == 0
     forced = capsys.readouterr().out
     assert "cross differentials disabled by default" in forced
-    for tag in (
-        "cross.agentctl.differential-0",
-        "cross.herdr-run.differential",
-    ):
-        assert f"STEP  {tag}" not in forced, tag
+    assert "STEP  cross.agentctl.differential-0" not in forced
+    assert "STEP  cross.herdr-run.differential" in forced
     assert validate.main(["--all", "--cross-differentials", "--list"]) == 0
     opted = capsys.readouterr().out
     for tag in (

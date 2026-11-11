@@ -158,7 +158,11 @@ steps:
     desc: herdr-run Python and Rust commands agree
     cmd: python3 cross/differential.py --tool herdr-run
     jobs_flag: ""
-    labels: [component-herdr-run, gate-exclusive]
+    # Main phase (#1249 cross-differentials-robust): de-timed (generous
+    # hang guard; the held-pipe check compares against the fake
+    # descendant's own lifetime, not a speed budget) and qualified under
+    # topped-up load above 75% CPU; record in #1249.
+    labels: [component-herdr-run]
     timeout: 9600
     cpu_timeout: 1200
     hint: *cross_hint
