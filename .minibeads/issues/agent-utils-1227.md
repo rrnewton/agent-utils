@@ -1,13 +1,14 @@
 ---
 title: 'poll-storm-stale-thread: a failed cache refresh re-polls in 3 s and starves the upstream route it waits on'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - vibe-talk
 - cache
 created_at: 2026-11-10T17:34:00+00:00
-updated_at: 2026-11-10T17:34:00+00:00
+updated_at: 2026-11-11T00:12:00+00:00
+closed_at: 2026-11-11T00:12:00+00:00
 ---
 
 # Description
@@ -62,3 +63,9 @@ Against a fake provider:
 - The provider shim (a deployed program outside this tree) logged `BrokenPipeError` tracebacks when the app closed a connection before a slow replies call answered, and counted the call `internal_error`. With serving restored this fix removes the pattern from the read path: cache-held views never wait on the shim, and refresh reads run detached to completion on their own connection. A cache-miss read still waits upstream, bounded by the existing stand-in waits. Quietly logging a client-gone write in the shim itself is a deployment-side change, noted here and not part of this fix.
 - Cosmetic, unrelated, no fix wanted here: one settled send can log `send_timing` twice (the posting task logs it, and the two-phase send's detached task logs it again after its own settle note). One upstream post either way.
 - Coordinates with the lanes holding the page trace/selection work, the redraw/reads work, and the voice-page code move: file map shared before editing shared files.
+
+# Resolution
+
+[watermelon-full-preview] Landed on `github/main` as 75671087 (gate green on the path-selected run; issue filed as b090972b). Deployed 2026-11-10 5:37 PM ET and `[message_cache] serve` restored to `true` at 5:38 PM ET. Live verification from the app log: polls bounded at the normal cadence per channel (13-21 per 10 minutes across four channels, against 232-375 on two channels in the storm), behind-read failures down about 25x and only on the server schedule with back-off, no 3 s loop, live ingestion recovering between shared-bucket rate-limit bursts.
+
+The `--all` follow-up finished red on seven steps in areas this change does not touch. Five pass alone locally (keyboard-browser, chat-subscription fake, fold-latency, dagrun, wrkslots-debug; exit 0 each). The two lifecycle host shards are pre-existing and load-sensitive: they fail on `github/main` under load, are untouched here, and are being quarantined separately (wrkslots-load-robust). Shard-0 failed alone at its time cap and shard-2 was skipped on that basis.
