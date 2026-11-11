@@ -1066,6 +1066,7 @@ def test_all_list_names_skipped_timing_steps_and_optin_plans_them(
     disabled = (
         "vibe-talk.check.scroll-stability-browser",
         "vibe-talk.check.read-pause-reply-browser",
+        "vibe-talk.check.offline-cache-phone-browser",
     )
     assert validate.main(["--all", "--list"]) == 0
     listed = capsys.readouterr().out

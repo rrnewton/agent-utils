@@ -50,9 +50,13 @@
 # names them as skipped; `--include-disabled` (or AGENT_UTILS_INCLUDE_DISABLED=1) runs them
 # on demand, and a direct dagrun run of this fragment still runs them (the label is inert
 # here). Disabled at filing: check.fold-steps-browser, check.scroll-stability-browser,
-# check.typing-scroll-browser, check.read-pause-reply-browser. Each returns only as a
-# behaviour-only check proved under load (#1248 fold-latency-behaviour-verdict is the
-# pattern; fold-latency, keyboard and keyboard-hides-bar stay enabled under it).
+# check.typing-scroll-browser, check.read-pause-reply-browser, of which fold-steps and
+# typing-scroll have since returned behaviour-only. check.offline-cache-phone-browser was
+# quarantined under the same label on 2026-11-11 after its second gate red (its jump-offer
+# visibility assertion at 412x915 flakes under gate load and passes solo; tracking is #1250's
+# Notes). Each returns only as a behaviour-only check proved under load (#1248
+# fold-latency-behaviour-verdict is the pattern; fold-latency, keyboard and
+# keyboard-hides-bar stay enabled under it).
 #
 # HOW TO RUN IT
 #
@@ -319,7 +323,7 @@ steps:
   - group: check
     job: offline-cache-phone-browser
     desc: saved-message snapshot and a read-scope sign-in in current Chromium at a 412x915 Android viewport
-    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    labels: [validation-vibe-talk, validation-vibe-talk-page, disabled-optin]
     cmd: cd vibe-talk && python3 tests/offline_cache_browser.py --profile phone
     jobs_flag: ""
     deps: [setup.contract-tools]
