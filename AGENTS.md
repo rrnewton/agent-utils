@@ -295,9 +295,23 @@ the worked example.
 
 ## Documentation
 
-`common/docs/` is for settled, user-facing documentation. Put working designs,
-proposals, and other temporary research under `ai_docs/transient/` in dated files
-or dated directories. Do not present an unimplemented interface as a shipped tool.
+`common/docs/` is for settled, user-facing documentation. Working documents
+live under `ai_docs/` in dated files or dated directories, in one of two places:
+
+- `ai_docs/plans/` holds **living plans**: maintained, current plans that open
+  issues and active lanes cite as their governing plan. A plan here is kept up
+  to date as the work it describes changes; when part of it lands, the plan is
+  updated or the landed part is marked, not left to go stale.
+- `ai_docs/transient/` holds **disposable research and one-off proposals**:
+  investigations, audits, comparisons, and design notes written for a single
+  decision. They record what was found at a date; they are not maintained.
+
+A document starts in `ai_docs/transient/`. Move it to `ai_docs/plans/` (keeping
+its name, with a one-line redirect stub left at the old path) when it becomes
+the plan that live issues or lanes work from. When a plan is fully implemented
+and verified, write the settled user-facing explanation in `common/docs/` and
+remove or clearly supersede the plan. Do not present an unimplemented interface
+as a shipped tool.
 
 Every top-level tool needs a `RELATED_WORK.md` comparing relevant public
 open-source systems. Keep private organizational sources and deployment details
