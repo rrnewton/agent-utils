@@ -969,6 +969,56 @@ pub(crate) fn sandbox_show_config(raw_section: Option<&Value>) -> (i32, String, 
     (0, render_settings_json(&settings), String::new())
 }
 
+/// `wrkslots sandbox write-defaults` (#1401): the
+/// dispatch-shaped handler. Glue supplies the parsed raw config
+/// (read under the config lock) and writes the returned updated
+/// config under the same lock when one is returned, mirroring
+/// Python `_cmd_sandbox_write_defaults`.
+pub(crate) fn sandbox_write_defaults(
+    raw_config: &Value,
+    config_path: &str,
+) -> (i32, String, String, Option<Value>) {
+    let refusal = |message: &str| -> (i32, String, String, Option<Value>) {
+        (
+            3,
+            String::new(),
+            format!(
+                "REFUSED: {message}\nREMEDY: run 'wrkslots sandbox --help', correct the named condition, then rerun 'wrkslots sandbox' with the required arguments\n"
+            ),
+            None,
+        )
+    };
+    let existing = raw_config.get("sandbox").cloned().unwrap_or(json!({}));
+    if !existing.is_object() {
+        return refusal("configuration.sandbox must be an object");
+    }
+    let (merged, added) = match merge_defaults(&existing) {
+        Ok(pair) => pair,
+        Err(message) => return refusal(&message),
+    };
+    if added.is_empty() {
+        return (
+            0,
+            format!("configuration.sandbox in {config_path} already has every key\n"),
+            String::new(),
+            None,
+        );
+    }
+    let mut updated = raw_config.clone();
+    if let Some(map) = updated.as_object_mut() {
+        map.insert("sandbox".to_string(), merged);
+    }
+    (
+        0,
+        format!(
+            "added to configuration.sandbox in {config_path}: {}\n",
+            added.join(", ")
+        ),
+        String::new(),
+        Some(updated),
+    )
+}
+
 /// The `sandbox` section for a new project, mirroring Python
 /// `default_config_obj`.
 pub(crate) fn default_config_obj() -> Value {
@@ -987,24 +1037,29 @@ pub(crate) fn merge_defaults(existing: &Value) -> Result<(Value, Vec<String>), S
     let mut added = Vec::new();
     let defaults = default_config_obj();
     let default_map = defaults.as_object().expect("default object");
-    for (key, value) in default_map {
+    // Python iterates `default_config_obj()` in `settings_to_obj`
+    // order (SETTING_KEYS / LIMIT_KEYS), and the `added` report
+    // preserves it; serde maps here are key-sorted, so the order
+    // is named explicitly.
+    for key in SETTING_KEYS {
+        let value = &default_map[key];
         match merged.get(key) {
             None => {
-                merged.insert(key.clone(), value.clone());
-                added.push(key.clone());
+                merged.insert(key.to_string(), value.clone());
+                added.push(key.to_string());
             }
             Some(current) if key == "limits" => {
                 if let (Some(current_map), Some(default_limits)) =
                     (current.as_object(), value.as_object())
                 {
                     let mut limits = current_map.clone();
-                    for (limit_key, limit_value) in default_limits {
+                    for limit_key in LIMIT_KEYS {
                         if !limits.contains_key(limit_key) {
-                            limits.insert(limit_key.clone(), limit_value.clone());
+                            limits.insert(limit_key.to_string(), default_limits[limit_key].clone());
                             added.push(format!("limits.{limit_key}"));
                         }
                     }
-                    merged.insert(key.clone(), Value::Object(limits));
+                    merged.insert(key.to_string(), Value::Object(limits));
                 }
             }
             _ => {}
@@ -1585,6 +1640,95 @@ sys.stdout.write("0\n" + json.dumps(sandbox.settings_to_obj(settings), indent=2)
             assert_eq!(sandbox_show_config(raw.as_ref()), expected, "case {case}");
         }
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    const WRITE_DEFAULTS_DRIVER: &str = r####"import argparse, io, json, os, sys
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+sys.path.insert(0, os.environ["WRKSLOTS_PY_ROOT"])
+from wrkslots import cli, imagecmd
+
+path = Path(sys.argv[1])
+stub = argparse.Namespace(config_path=path)
+imagecmd._config = lambda args: stub
+args = argparse.Namespace(project_root=None, machine=None, wait_lock=5)
+out, err = io.StringIO(), io.StringIO()
+try:
+    with redirect_stdout(out), redirect_stderr(err):
+        rc = imagecmd._cmd_sandbox_write_defaults(args)
+except cli.Refusal as exc:
+    remedy = cli._refusal_remedy(argparse.Namespace(command="sandbox"), exc)
+    sys.stdout.write(f"3\n{out.getvalue()}---STDERR---\nREFUSED: {exc}\nREMEDY: {remedy}\n---CONFIG---\n")
+    sys.stdout.write(json.dumps(cli._read_config(path), sort_keys=True) + "\n")
+    sys.exit(0)
+sys.stdout.write(f"{rc}\n{out.getvalue()}---STDERR---\n{err.getvalue()}---CONFIG---\n")
+sys.stdout.write(json.dumps(cli._read_config(path), sort_keys=True) + "\n")
+"####;
+
+    /// Oracle differential (#1401): Python
+    /// `_cmd_sandbox_write_defaults` on a fixture config file
+    /// vs `sandbox_write_defaults` on the same raw config.
+    #[test]
+    fn write_defaults_matches_python_oracle() {
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("repo root")
+            .to_path_buf();
+        let root =
+            std::env::temp_dir().join(format!("wrkslotsd-write-defaults-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("dir");
+        let driver_path = root.join("write_defaults_driver.py");
+        std::fs::write(&driver_path, WRITE_DEFAULTS_DRIVER).expect("driver");
+        let complete = {
+            let mut raw = json!({"name": "fixture"});
+            raw["sandbox"] = default_config_obj();
+            raw
+        };
+        for (case, raw) in [
+            ("absent", json!({"name": "fixture"})),
+            ("partial", json!({"sandbox": {"isolation": "root"}})),
+            ("complete", complete),
+            ("non-object", json!({"sandbox": "nope"})),
+            (
+                "partial-limits",
+                json!({"sandbox": {"limits": {"memory_max": "1G"}}}),
+            ),
+        ] {
+            let config_path = root.join(format!("config-{case}.json"));
+            std::fs::write(&config_path, serde_json::to_string(&raw).expect("raw json"))
+                .expect("config");
+            let output = std::process::Command::new("python3")
+                .arg(&driver_path)
+                .arg(&config_path)
+                .env("WRKSLOTS_PY_ROOT", repo.join("py"))
+                .output()
+                .expect("python oracle runs");
+            assert!(output.status.success(), "case {case}: {:?}", output.stderr);
+            let text = String::from_utf8(output.stdout).expect("utf8");
+            let (head, rest) = text.split_once('\n').expect("exit line");
+            let (io, final_config) = rest.split_once("---CONFIG---\n").expect("config marker");
+            let (stdout, stderr) = io.split_once("---STDERR---\n").expect("marker");
+            let (exit, out, err, updated) =
+                sandbox_write_defaults(&raw, &config_path.to_string_lossy());
+            assert_eq!(
+                (exit, out, err),
+                (
+                    head.trim().parse::<i32>().expect("exit"),
+                    stdout.to_string(),
+                    stderr.to_string()
+                ),
+                "case {case}"
+            );
+            let ours = updated.unwrap_or(raw);
+            assert_eq!(
+                py_json_compact_sorted(&ours),
+                final_config.trim_end(),
+                "case {case} config"
+            );
+        }
+        std::fs::remove_dir_all(&root).expect("cleanup");
     }
 
     const SPEC_DRIVER: &str = r####"import json, os, sys
