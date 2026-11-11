@@ -24455,6 +24455,103 @@ def _ttl_report_rows(
     return rows
 
 
+def _ttl_rescue_ref(slot: str, date_str: str, name: str) -> str:
+    return f"refs/heads/rescue/{slot}/{date_str}/{name}"
+
+
+def _execute_ttl_rescue(
+    checkout_dir: Path,
+    *,
+    slot: str,
+    date_str: str,
+    remote: str,
+    bundle_path: Path,
+) -> dict[str, object]:
+    """Deterministic code-based rescue for one checkout (#1293 slice 3).
+
+    Every worktree of the checkout is rescued: uncommitted changes become
+    a WIP commit, then HEAD is pushed to the dated rescue ref on
+    ``remote``; a stash, when present, is pushed the same way. When any
+    push fails, a verified bundle holding every ref is written to
+    ``bundle_path`` instead. Heuristics are deliberate here: rescue never
+    refuses, it only reports what it could not push. The caller decides
+    teardown; this function only preserves.
+    """
+
+    def git(path: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return _GitVcs._run(path, list(args), check=check)
+
+    listing = git(checkout_dir, "worktree", "list", "--porcelain").stdout
+    worktrees = [
+        Path(line[len("worktree "):])
+        for line in listing.splitlines()
+        if line.startswith("worktree ")
+    ] or [checkout_dir]
+    rescued: list[dict[str, object]] = []
+    operations = 0
+    for worktree in worktrees:
+        dirty = bool(git(worktree, "status", "--porcelain").stdout.strip())
+        operations += 1
+        wip_commit: str | None = None
+        if dirty:
+            git(worktree, "add", "-A")
+            git(
+                worktree,
+                "-c", "user.name=wrkslots-rescue",
+                "-c", "user.email=wrkslots-rescue@localhost",
+                "commit", "-q", "-m", f"wrkslots ttl rescue WIP {slot} {date_str}",
+            )
+            operations += 2
+            wip_commit = git(worktree, "rev-parse", "HEAD").stdout.strip()
+        branch_proc = git(
+            worktree, "symbolic-ref", "--short", "-q", "HEAD", check=False
+        )
+        branch = branch_proc.stdout.strip()
+        if branch_proc.returncode != 0 or not branch:
+            short = git(worktree, "rev-parse", "--short", "HEAD").stdout.strip()
+            branch = f"detached-{short}"
+        ref = _ttl_rescue_ref(slot, date_str, branch)
+        push = git(worktree, "push", remote, f"HEAD:{ref}", check=False)
+        operations += 1
+        rescued.append(
+            {
+                "worktree": str(worktree),
+                "branch": branch,
+                "rescue_ref": ref,
+                "pushed": push.returncode == 0,
+                "wip_commit": wip_commit,
+            }
+        )
+    stash = git(checkout_dir, "rev-parse", "-q", "--verify", "refs/stash", check=False)
+    if stash.returncode == 0 and stash.stdout.strip():
+        ref = _ttl_rescue_ref(slot, date_str, "stash")
+        push = git(checkout_dir, "push", remote, f"refs/stash:{ref}", check=False)
+        operations += 1
+        rescued.append(
+            {
+                "worktree": str(checkout_dir),
+                "branch": "stash",
+                "rescue_ref": ref,
+                "pushed": push.returncode == 0,
+                "wip_commit": None,
+            }
+        )
+    bundle: str | None = None
+    if any(not entry["pushed"] for entry in rescued):
+        bundle_path.parent.mkdir(parents=True, exist_ok=True)
+        git(checkout_dir, "bundle", "create", str(bundle_path), "--all")
+        git(checkout_dir, "bundle", "verify", str(bundle_path))
+        operations += 2
+        bundle = str(bundle_path)
+    return {
+        "slot": slot,
+        "date": date_str,
+        "rescued": rescued,
+        "bundle": bundle,
+        "operations": operations,
+    }
+
+
 def _ttl_health_lines(
     rows: list[_TtlReportRow], thresholds: TtlThresholds
 ) -> list[str]:
