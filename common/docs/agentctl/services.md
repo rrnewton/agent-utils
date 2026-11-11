@@ -291,6 +291,60 @@ the ordered plan including pins and notify calls. A turnover run exits
 affecting change it restarts nothing, which is what makes a separate
 global-binary timer redundant on any host running turnover on a timer.
 
+A daily timer is a `scheduled` entry in `restore.json` rendered by
+`install-units --scheduled`, for example `*-*-* 05:30:00
+America/New_York` (a named timezone is honoured year-round). The entry
+can declare `timeout_start_seconds` (long enough for a cold snapshot
+build plus health windows), `environment` (such as PATH, HOME and
+`AGENTCTL_AGENT=turnover-timer`, the timer's designed notify identity),
+`after` (such as the local mirror sync unit) and
+`success_exit_status`. For turnover, exits 0 and 74 are scheduled
+successes; 1 (rolled back), 4 (rollback failed) and 75 (nothing could
+move, or errors or unknowns) are failures, and a failure sends a
+`run-failed` phase through the notify command. Use
+`agentctl services turnover-notify` as that command: it formats the
+TURNOVER_* environment (phase, registry, unit, both commits, verdict)
+into a file and sends it to the coordinator under the timer identity.
+Other-daemon rows are report-only even when their binary reports no
+commit, so a report where every agentctl service is current exits 0 or
+74. A legacy bridge run as `chat run --state DIR` is discovered as a
+bridge. Before a bridge restart, turnover warns the agent behind it to
+use `agentctl chat reply --file` during the window, since an inline
+reply marker emitted while the bridge is down may not be captured; the
+restarted bridge's startup recovery captures any marker left in its
+target's output or transcript. When the global binary is a symlink, no
+backup file is written and the report names the previous symlink target
+as the rollback. An empty `turnover-pins` directory is removed by an
+apply run (a kept one is made private), and `turnover-pins` is never
+scanned as an agent.
+
+A daily timer is a `scheduled` entry in `restore.json` rendered by
+`install-units --scheduled`, for example `*-*-* 05:30:00
+America/New_York` (a named timezone is honoured year-round). The entry
+can declare `timeout_start_seconds` (long enough for a cold snapshot
+build plus health windows), `environment` (such as PATH, HOME and
+`AGENTCTL_AGENT=turnover-timer`, the timer's designed notify identity),
+`after` (such as the local mirror sync unit) and
+`success_exit_status`. For turnover, exits 0 and 74 are scheduled
+successes; 1 (rolled back), 4 (rollback failed) and 75 (nothing could
+move, or errors or unknowns) are failures, and a failure sends a
+`run-failed` phase through the notify command. Use
+`agentctl services turnover-notify` as that command: it formats the
+TURNOVER_* environment (phase, registry, unit, both commits, verdict)
+into a file and sends it to the coordinator under the timer identity.
+Other-daemon rows are report-only even when their binary reports no
+commit, so a report where every agentctl service is current exits 0 or
+74. A legacy bridge run as `chat run --state DIR` is discovered as a
+bridge. Before a bridge restart, turnover warns the agent behind it to
+use `agentctl chat reply --file` during the window, since an inline
+reply marker emitted while the bridge is down may not be captured; the
+restarted bridge's startup recovery captures any marker left in its
+target's output or transcript. When the global binary is a symlink, no
+backup file is written and the report names the previous symlink target
+as the rollback. An empty `turnover-pins` directory is removed by an
+apply run (a kept one is made private), and `turnover-pins` is never
+scanned as an agent.
+
 ## Trying it without touching real services
 
 Use a scratch registry and throwaway units:

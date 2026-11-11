@@ -1,6 +1,6 @@
 ---
 title: 'services-turnover-timer-gaps: close the gaps from the first live turnover before the 05:30 ET timer'
-status: open
+status: closed
 priority: 1
 issue_type: task
 created_at: 2026-11-10T15:41:18+00:00
@@ -56,6 +56,34 @@ Discovery and reporting:
 - Moving a symlinked global binary reports a rollback that exists: the previous symlink target, named in the output.
 
 # Notes
+
+## Resolution
+
+[watermelon-full-preview] Delivered in two commits. Timer path: the
+calendar validator accepts timezone names (`*-*-* 05:30:00
+America/New_York`, rendered-unit test), and a scheduled entry may
+declare `timeout_start_seconds`, `environment`, `after` and
+`success_exit_status`, rendered into the oneshot (After the mirror job,
+TimeoutStartSec covering a cold build plus health windows, PATH/HOME
+and the designed `AGENTCTL_AGENT=turnover-timer` identity). Turnover
+exits map to scheduled outcomes (0/74 success; 1/4/75 failure, tested
+for every code) and a failure sends a `run-failed` notify phase;
+`agentctl services turnover-notify` is the file-based wrapper that
+formats phase, registry, unit, both commits and verdict and sends it
+to the coordinator under the timer identity. Discovery/report: legacy
+`chat run --state DIR` units classify as bridges; other-daemon rows
+are report-only even with no commit, so an all-current host exits 0/74;
+`turnover-pins` is a reserved registry name, a kept pin directory is
+made private, and an apply run removes an empty one. Later commit:
+before a bridge restart turnover warns the agent behind it to use
+`agentctl chat reply --file` during the window (a failed warning is
+named in the report; the restarted bridge's existing startup recovery
+captures markers left in output or transcript — the full
+scan-on-restart pickup remains the follow-up the Design allows after
+this interim), and moving a symlinked global binary names its previous
+target as the rollback. Unverified: the 05:30 timer install on the
+first host still needs the coordinator's OK and its first morning
+report; no live unit, registry or global binary was touched.
 
 Live run evidence, 2026-11-10: the host report at the pinned candidate listed 12 services, 9 to refresh. The two registries on the host each moved their watch, watch-agents, and restore units (restores updated-inactive, not started), both chat bridges moved last in their scope and passed chat health, the global binary moved last and reported the candidate commit, and a new post through the restarted bridge was confirmed. The only pins left after that run are for an inactive legacy bridge, to be migrated by hand under services before unpinning.
 

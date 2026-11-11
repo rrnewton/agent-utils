@@ -15,8 +15,8 @@ use super::host::{Host, UnitState};
 use super::refresh::{definition, refresh, RefreshOptions, DROP_IN};
 use super::snapshot::{self, Snapshot};
 use super::turnover::{
-    notify_message, scheduled_outcome, turnover, ScheduledOutcome, TurnoverOptions,
-    TIMER_NOTIFY_AGENT,
+    move_global_binary, notify_message, scheduled_outcome, turnover, warn_agent_behind_bridge,
+    ScheduledOutcome, TurnoverOptions, TIMER_NOTIFY_AGENT,
 };
 use super::unit::{quote_word, shell_words, split_words, ExecCommand, UnitText};
 
@@ -1504,6 +1504,94 @@ fn turnover_apply_tidies_an_empty_pin_directory() {
     options.report_only = false;
     turnover(&world.fake, &Tables, &options).unwrap();
     assert!(!registry.join("turnover-pins").exists());
+}
+
+#[test]
+fn bridge_restart_warning_tells_the_agent_to_use_file_replies() {
+    // #1220: before a bridge restart, its agent is warned to use
+    // file-based replies during the window; the warning is observed.
+    let world = world();
+    let state = world._temporary.0.join("bridge-state");
+    fs::create_dir_all(&state).unwrap();
+    fs::write(
+        state.join("bridge.json"),
+        r#"{"config": {"agent_name": "coordinator"}}"#,
+    )
+    .unwrap();
+    world.fake.add_unit_file(
+        "warn-bridge.service",
+        &format!(
+            "[Service]\nExecStart=/state/bin/agentctl-old --registry {} chat run --bridge-state {}\nWorkingDirectory=/tmp\n",
+            world._temporary.0.join("team/.agentctl").display(),
+            state.display()
+        ),
+    );
+    let (services, _) = discover_all(&world.fake, &Tables).unwrap();
+    let service = services
+        .iter()
+        .find(|service| service.unit == "warn-bridge.service")
+        .expect("bridge discovered");
+    let mut notes = Vec::new();
+    warn_agent_behind_bridge(&world.fake, service, NEW, &mut notes);
+    assert!(
+        notes.iter().any(|note| note.contains("warned coordinator")),
+        "{notes:?}"
+    );
+    let calls = world.fake.notify_calls.borrow();
+    assert!(
+        calls.iter().any(|(_, environment)| {
+            environment
+                .iter()
+                .any(|(name, value)| name == "TURNOVER_PHASE" && value == "bridge-restart-warning")
+                && environment
+                    .iter()
+                    .any(|(name, value)| name == "AGENTCTL_AGENT" && value == TIMER_NOTIFY_AGENT)
+        }),
+        "{calls:?}"
+    );
+    // No bridge.json agent: the failure to warn is named, not silent.
+    fs::write(state.join("bridge.json"), "{}").unwrap();
+    let mut notes = Vec::new();
+    warn_agent_behind_bridge(&world.fake, service, NEW, &mut notes);
+    assert!(
+        notes.iter().any(|note| note.contains("names no agent")),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn moving_a_symlinked_global_binary_names_its_previous_target() {
+    // #1220: no backup file is written for a symlink; the rollback named
+    // is repointing it at its previous target.
+    let world = world();
+    let base = &world._temporary.0;
+    let snapshot_dir = base.join("snap-for-global");
+    fs::create_dir_all(snapshot_dir.join("bin")).unwrap();
+    fs::write(snapshot_dir.join("bin/agentctl"), "new binary\n").unwrap();
+    let snapshot = Snapshot {
+        path: snapshot_dir,
+        commit: NEW.to_owned(),
+        built_at: 0,
+        document: json!({}),
+    };
+    let previous = base.join("agentctl-previous");
+    fs::write(&previous, "old binary\n").unwrap();
+    let global = base.join("global-agentctl");
+    std::os::unix::fs::symlink(&previous, &global).unwrap();
+    world
+        .fake
+        .commits
+        .borrow_mut()
+        .insert(global.clone(), NEW.to_owned());
+    let mut options = turnover_options(&world, base.join("checkout"));
+    options.global_binary = Some(global.clone());
+    let detail = move_global_binary(&world.fake, &options, &snapshot, NEW).unwrap();
+    assert!(
+        detail.contains(&format!("repoint the symlink to {}", previous.display())),
+        "{detail}"
+    );
+    assert!(!detail.contains("backup"), "{detail}");
+    assert_eq!(fs::read_link(&global).unwrap(), snapshot.agentctl());
 }
 
 #[test]

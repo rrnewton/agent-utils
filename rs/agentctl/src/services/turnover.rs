@@ -419,9 +419,82 @@ fn notify(
     }
 }
 
+/// #1220 interim for inline replies across a bridge restart: before a
+/// bridge is restarted, warn the agent behind it to use file-based
+/// replies (`agentctl chat reply --file`) during the window, since an
+/// inline reply marker emitted while the bridge is down may not be
+/// captured. The new bridge's startup recovery still captures any marker
+/// left in its target's output or transcript. A warning that cannot be
+/// sent is named in the report, never dropped silently.
+pub(crate) fn warn_agent_behind_bridge(
+    host: &dyn Host,
+    service: &Service,
+    candidate: &str,
+    notes: &mut Vec<String>,
+) {
+    let Some(state) = service.bridge_state.as_deref() else {
+        notes.push(format!(
+            "bridge {}: no bridge state; could not warn its agent to use file-based replies during the restart",
+            service.unit
+        ));
+        return;
+    };
+    let agent = host
+        .read_file(&state.join("bridge.json"))
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|document| {
+            document["config"]["agent_name"]
+                .as_str()
+                .or_else(|| document["agent_name"].as_str())
+                .map(str::to_owned)
+        });
+    let Some(agent) = agent else {
+        notes.push(format!(
+            "bridge {}: {} names no agent; could not warn it to use file-based replies during the restart",
+            service.unit,
+            state.join("bridge.json").display()
+        ));
+        return;
+    };
+    let text = format!(
+        "turnover: your chat bridge {} is about to restart for a services turnover. Until it is back, send replies with `agentctl chat reply --file FILE`, not as inline reply markers: a marker emitted while the bridge is down may not be captured.",
+        service.unit
+    );
+    let args = vec![
+        "--registry".to_owned(),
+        service.registry.display().to_string(),
+        "send".to_owned(),
+        agent.clone(),
+        text,
+    ];
+    let environment = vec![
+        ("AGENTCTL_AGENT".to_owned(), TIMER_NOTIFY_AGENT.to_owned()),
+        (
+            "TURNOVER_PHASE".to_owned(),
+            "bridge-restart-warning".to_owned(),
+        ),
+        ("TURNOVER_UNIT".to_owned(), service.unit.clone()),
+        ("TURNOVER_NEW_SHA".to_owned(), candidate.to_owned()),
+    ];
+    match host.run(&service.binary, &args, &environment) {
+        Ok((0, _)) => notes.push(format!(
+            "bridge {}: warned {agent} to use file-based replies during the restart",
+            service.unit
+        )),
+        Ok((code, _)) => notes.push(format!(
+            "bridge {}: warning {agent} to use file-based replies during the restart exited {code}; inline replies in the window may not be captured",
+            service.unit
+        )),
+        Err(error) => notes.push(format!(
+            "bridge {}: could not warn {agent} to use file-based replies during the restart: {error}; inline replies in the window may not be captured",
+            service.unit
+        )),
+    }
+}
+
 /// Move the global binary onto the snapshot, keeping a backup the rollback
 /// restores when the new binary does not report the candidate commit.
-fn move_global_binary(
+pub(crate) fn move_global_binary(
     host: &dyn Host,
     options: &TurnoverOptions,
     snapshot: &Snapshot,
@@ -494,12 +567,22 @@ fn move_global_binary(
             }
         });
     }
-    Ok(format!(
-        "moved {} -> {} (backup {})",
-        sha8(old_commit.as_deref()),
-        sha8(Some(candidate)),
-        backup.display()
-    ))
+    // #1220: name a rollback that exists — the backup file when one was
+    // written, the previous symlink target when the binary is a symlink.
+    Ok(match &link_target {
+        Some(target) => format!(
+            "moved {} -> {} (rollback: repoint the symlink to {})",
+            sha8(old_commit.as_deref()),
+            sha8(Some(candidate)),
+            target.display()
+        ),
+        None => format!(
+            "moved {} -> {} (backup {})",
+            sha8(old_commit.as_deref()),
+            sha8(Some(candidate)),
+            backup.display()
+        ),
+    })
 }
 
 fn write_private(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
@@ -806,6 +889,15 @@ pub fn turnover(
             for group in [&rest, &bridges] {
                 if group.is_empty() || stopped {
                     continue;
+                }
+                // Warn agents behind bridges before their bridge goes
+                // down (#1220, see warn_agent_behind_bridge).
+                for row in group.iter() {
+                    if row.service.as_ref().map(|s| s.kind) == Some(Kind::Bridge) {
+                        if let Some(service) = &row.service {
+                            warn_agent_behind_bridge(host, service, &candidate, &mut notes);
+                        }
+                    }
                 }
                 let only: Vec<String> = group.iter().map(|row| row.unit.clone()).collect();
                 let refresh_options = RefreshOptions {
