@@ -136,12 +136,31 @@ pub fn notify_recipient(registry: Option<&Path>, explicit: Option<&str>) -> Stri
     designated.unwrap_or_else(|| "coordinator".to_owned())
 }
 
+/// Why a notify environment must not be sent (#1292): a wrapper run
+/// outside turnover (a hand invocation, a bare shell) has no phase or
+/// no registry, and sending it would deliver a blank report to a
+/// coordinator. `None` when the environment is a real turnover phase.
+#[must_use]
+pub fn notify_env_problem(get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    for name in ["TURNOVER_PHASE", "TURNOVER_REGISTRY"] {
+        if get(name).is_none_or(|value| value.trim().is_empty()) {
+            return Some(format!(
+                "{name} is empty or unset; turnover-notify only sends a real turnover phase and refuses to send a blank report"
+            ));
+        }
+    }
+    None
+}
+
 /// Run as the timer's `--notify` command (`services turnover-notify`):
 /// format the TURNOVER_* environment into a file and send it under the
 /// timer notify identity to the coordinator of the registry
 /// TURNOVER_REGISTRY names (see [`notify_recipient`]), resolved in that
 /// registry. Returns the send's exit code.
 pub fn run_turnover_notify(to: Option<&str>, agent: &str) -> Result<i32, String> {
+    if let Some(problem) = notify_env_problem(|name| std::env::var(name).ok()) {
+        return Err(problem);
+    }
     let message = notify_message(|name| std::env::var(name).ok());
     let registry = std::env::var("TURNOVER_REGISTRY")
         .ok()

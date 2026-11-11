@@ -15,8 +15,8 @@ use super::host::{Host, UnitState};
 use super::refresh::{definition, refresh, RefreshOptions, DROP_IN};
 use super::snapshot::{self, Snapshot};
 use super::turnover::{
-    move_global_binary, notify_message, notify_recipient, scheduled_outcome, turnover,
-    warn_agent_behind_bridge, ScheduledOutcome, TurnoverOptions, TIMER_NOTIFY_AGENT,
+    move_global_binary, notify_env_problem, notify_message, notify_recipient, scheduled_outcome,
+    turnover, warn_agent_behind_bridge, ScheduledOutcome, TurnoverOptions, TIMER_NOTIFY_AGENT,
 };
 use super::unit::{quote_word, shell_words, split_words, ExecCommand, UnitText};
 
@@ -1411,6 +1411,42 @@ fn turnover_scheduled_outcomes_map_every_exit_code() {
     assert_eq!(
         message,
         format!("turnover unit-done: registry /r/.agentctl, unit bridge.service, {OLD} -> {NEW}, verdict refreshed\n")
+    );
+}
+
+#[test]
+fn turnover_notify_refuses_a_phase_with_no_phase_or_registry() {
+    // #1292: a wrapper run outside turnover sends nothing.
+    assert!(notify_env_problem(|name| match name {
+        "TURNOVER_PHASE" => None,
+        "TURNOVER_REGISTRY" => None,
+        _ => None,
+    })
+    .is_some_and(|problem| problem.contains("TURNOVER_PHASE")));
+    assert!(notify_env_problem(|name| match name {
+        "TURNOVER_PHASE" => Some("unit-done".to_owned()),
+        _ => None,
+    })
+    .is_some_and(|problem| problem.contains("TURNOVER_REGISTRY")));
+    assert!(notify_env_problem(|name| match name {
+        "TURNOVER_PHASE" => Some("  ".to_owned()),
+        "TURNOVER_REGISTRY" => Some("/r/.agentctl".to_owned()),
+        _ => None,
+    })
+    .is_some_and(|problem| problem.contains("TURNOVER_PHASE")));
+    assert!(notify_env_problem(|name| match name {
+        "TURNOVER_PHASE" => Some("unit-done".to_owned()),
+        "TURNOVER_REGISTRY" => Some(String::new()),
+        _ => None,
+    })
+    .is_some_and(|problem| problem.contains("TURNOVER_REGISTRY")));
+    assert_eq!(
+        notify_env_problem(|name| match name {
+            "TURNOVER_PHASE" => Some("unit-done".to_owned()),
+            "TURNOVER_REGISTRY" => Some("/r/.agentctl".to_owned()),
+            _ => None,
+        }),
+        None
     );
 }
 
