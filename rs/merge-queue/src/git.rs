@@ -950,8 +950,24 @@ impl Git {
             Err((_, paths)) => return Ok(Combined::Conflict(paths)),
             Ok(tree) => (tree, Vec::new()),
         };
-        // Like `git rebase`, drop a commit whose change the target already has.
-        let new = if tree == self.tree_of(onto)? {
+        // Like `git rebase`, drop a commit whose change the target already
+        // has — unless its message carries trailers (#1274
+        // empty-commit-trailers): an empty commit whose only job is to
+        // carry trailers (for example Test-Dropped) must survive the
+        // replay, or the trailers vanish from the candidate's log.
+        // Generic: any `Key: value` trailer line counts.
+        let carries_trailers = {
+            let (_, _, _, message) = self.commit_meta(commit)?;
+            message.lines().any(|line| {
+                let line = line.trim();
+                line.split_once(':').is_some_and(|(key, value)| {
+                    !key.is_empty()
+                        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                        && !value.trim().is_empty()
+                })
+            })
+        };
+        let new = if tree == self.tree_of(onto)? && !carries_trailers {
             onto.to_owned()
         } else {
             let (name, email, date, message) = self.commit_meta(commit)?;
@@ -1286,6 +1302,59 @@ mod unit {
             vec!["a.txt".to_owned()]
         );
         assert!(git.merge_conflicts(&a, &b).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_empty_commit_carrying_trailers_survives_a_replay() {
+        // #1274 empty-commit-trailers: an empty commit whose message
+        // carries trailers must not be dropped by the replay, or the
+        // trailers vanish from the candidate's log. A plain empty
+        // commit still drops, as git rebase drops it.
+        let tmp = TempDir::new("git-trailers");
+        let git = init(&tmp.0);
+        let base = git.rev_parse("main").unwrap();
+        let change = branch(&tmp.0, "a", "main", &[("a.txt", "a\n")]);
+        testrepo::git(&tmp.0, &["checkout", "-q", "-b", "t", "main"]);
+        testrepo::git(
+            &tmp.0,
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "carry drops",
+                "-m",
+                "Test-Dropped: some.test (reason)",
+            ],
+        );
+        let trailer_head = git.rev_parse("t").unwrap();
+        testrepo::git(&tmp.0, &["checkout", "-q", "main"]);
+        let Combined::Clean(tip) = git
+            .combine(CombineMode::Rebase, &change, &trailer_head, &[], "")
+            .unwrap()
+        else {
+            panic!("the trailer commit should replay");
+        };
+        let log = git
+            .run(&["log", "--format=%B", &format!("{change}..{tip}")])
+            .unwrap();
+        assert!(log.contains("Test-Dropped: some.test"), "{log}");
+        // A plain empty commit still drops.
+        testrepo::git(&tmp.0, &["checkout", "-q", "-b", "e", "main"]);
+        testrepo::git(
+            &tmp.0,
+            &["commit", "-q", "--allow-empty", "-m", "plain empty"],
+        );
+        let empty_head = git.rev_parse("e").unwrap();
+        testrepo::git(&tmp.0, &["checkout", "-q", "main"]);
+        let Combined::Clean(tip2) = git
+            .combine(CombineMode::Rebase, &change, &empty_head, &[], "")
+            .unwrap()
+        else {
+            panic!("the plain empty commit should replay (by dropping)");
+        };
+        assert_eq!(tip2, change);
+        let _ = base;
     }
 
     #[test]

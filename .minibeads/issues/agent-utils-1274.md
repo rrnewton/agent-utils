@@ -1,6 +1,6 @@
 ---
 title: 'empty-commit-trailers: replay drops an empty commit that only carries trailers'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-11-11T07:00:00.000000000+00:00
