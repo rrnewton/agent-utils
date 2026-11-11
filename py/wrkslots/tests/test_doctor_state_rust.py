@@ -12,13 +12,16 @@ compared within ten seconds.
 
 from __future__ import annotations
 
+import argparse
 import datetime as dt
 import json
 import os
+import socket
 import subprocess
 from pathlib import Path
 from typing import cast
 
+import pytest
 from wrkslots import cli as wrkslots_cli
 
 from wrkslots.tests.rust_binary import rust_wrkslotsd
@@ -230,6 +233,53 @@ def test_parse_doctor_all_machines_matches_python(tmp_path: Path) -> None:
     assert actual == expected
     kinds = [str(item["kind"]) for item in cast(list[dict[str, object]], actual["findings"])]
     assert kinds.count("dead-owner") == 2
+
+
+def _rust_doctor(root: Path, output_format: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            str(rust_wrkslotsd()), "doctor-text", "--root", str(root),
+            "--format", output_format,
+        ],
+        cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
+    )
+
+
+def test_doctor_machine_auto_note_matches_python(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.delenv("WRKSLOTS_MACHINE", raising=False)
+    root = _root(tmp_path)
+    host = socket.gethostname().split(".")[0]
+    config_path = root / ".wrkslots.yml"
+    config_path.write_text(
+        config_path.read_text().replace("machine: node-a", "machine: auto")
+    )
+    control = root / "worktrees"
+    (control / f"ACTIVE.{host}.json").write_text(
+        json.dumps({"schema": 2, "machine": host, "revision": 0, "slots": []})
+    )
+    (control / f"ARCHIVED.{host}.json").write_text(
+        json.dumps({"schema": 2, "machine": host, "revision": 0, "records": []})
+    )
+    args = argparse.Namespace(
+        project_root=str(root), machine=None, wait_lock=0.0,
+        all_machines=False, format="json",
+    )
+    assert wrkslots_cli._cmd_doctor(args) == 0
+    expected = json.loads(capsys.readouterr().out)
+    result = _rust_doctor(root, "json")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == expected
+
+    args.format = "human"
+    assert wrkslots_cli._cmd_doctor(args) == 0
+    expected_text = capsys.readouterr().out
+    result = _rust_doctor(root, "human")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected_text
 
 
 def test_parse_doctor_clean_registry(tmp_path: Path) -> None:

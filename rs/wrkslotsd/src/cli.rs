@@ -93,7 +93,7 @@ pub(crate) enum Writers {
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
-        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        /// Override the machine shard (else WRKSLOTS_MACHINE, else the configured machine, where an absent key or the value auto means the short host name)
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
@@ -205,7 +205,7 @@ pub(crate) enum Readers {
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
-        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        /// Override the machine shard (else WRKSLOTS_MACHINE, else the configured machine, where an absent key or the value auto means the short host name)
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
         /// Read every ACTIVE machine shard instead of only the selected machine
@@ -353,7 +353,7 @@ pub(crate) enum Readers {
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
-        /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
+        /// Override the machine shard (else WRKSLOTS_MACHINE, else the configured machine, where an absent key or the value auto means the short host name)
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
         /// Diagnose every machine instead of only the selected machine

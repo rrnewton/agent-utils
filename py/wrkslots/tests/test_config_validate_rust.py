@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import socket
 import subprocess
 from pathlib import Path
 
@@ -40,8 +41,10 @@ def _root(tmp_path: Path, extra: str = "") -> Path:
     return root
 
 
-def _expected(root: Path) -> dict[str, object]:
-    config = wrkslots_cli._load_config(str(root), None)
+def _expected(
+    root: Path, machine_override: str | None = None
+) -> dict[str, object]:
+    config = wrkslots_cli._load_config(str(root), machine_override)
     return {
         "cache_globs": list(config.cache_globs),
         "config_path": str(config.config_path),
@@ -62,6 +65,7 @@ def _expected(root: Path) -> dict[str, object]:
         ),
         "liveness_command": str(config.liveness_command),
         "machine": config.machine,
+        "machine_source": config.machine_source,
         "max_active_slots": config.max_active_slots,
         "post_provision_hooks": list(config.post_provision_hooks),
         "post_provision_hook_slot_types": [
@@ -98,9 +102,14 @@ def _expected(root: Path) -> dict[str, object]:
     }
 
 
-def _rust(root: Path) -> subprocess.CompletedProcess[str]:
+def _rust(
+    root: Path, machine: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    argv = [str(rust_wrkslotsd()), "validate-config", "--root", str(root)]
+    if machine is not None:
+        argv.extend(("--machine", machine))
     return subprocess.run(
-        [str(rust_wrkslotsd()), "validate-config", "--root", str(root)],
+        argv,
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900,
     )
 
@@ -114,6 +123,52 @@ def test_validate_config_matches_python(tmp_path: Path) -> None:
     result = _rust(root)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == _expected(root)
+
+
+def test_validate_config_machine_resolution_matches_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("WRKSLOTS_MACHINE", raising=False)
+    host = socket.gethostname().split(".")[0]
+    cases = (
+        (None, host, "host name (machine absent)"),
+        ("auto", host, "host name (machine: auto)"),
+        ("configured", "configured", "configuration.machine"),
+    )
+    for configured, expected_machine, expected_source in cases:
+        root = _root(tmp_path / (configured or "absent"))
+        config_path = root / ".wrkslots.yml"
+        text = config_path.read_text()
+        if configured is None:
+            text = text.replace("machine: node-a\n", "")
+        else:
+            text = text.replace("machine: node-a", f"machine: {configured}")
+        config_path.write_text(text)
+        result = _rust(root)
+        assert result.returncode == 0, result.stderr
+        payload = json.loads(result.stdout)
+        assert payload == _expected(root)
+        assert payload["machine"] == expected_machine
+        assert payload["machine_source"] == expected_source
+
+
+def test_validate_config_machine_overrides_match_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _root(tmp_path)
+    config_path = root / ".wrkslots.yml"
+    config_path.write_text(config_path.read_text().replace("machine: node-a\n", ""))
+
+    monkeypatch.setenv("WRKSLOTS_MACHINE", "env-machine")
+    result = _rust(root)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == _expected(root)
+    assert json.loads(result.stdout)["machine_source"] == "WRKSLOTS_MACHINE"
+
+    result = _rust(root, machine="flag-machine")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == _expected(root, "flag-machine")
+    assert json.loads(result.stdout)["machine_source"] == "--machine"
 
 
 def test_validate_config_with_sections_matches_python(tmp_path: Path) -> None:

@@ -1,6 +1,6 @@
 ---
 title: "wrkslots-machine-auto-rust: Rust parity for optional machine and doctor machine_source"
-status: open
+status: closed
 priority: 1
 issue_type: task
 created_at: 2026-11-10T02:42:52.000000000+00:00
@@ -50,3 +50,28 @@ command inherits it:
 Split from #1163 at the lead coordinator's request on 2026-11-09: the Rust
 half is P1 because it blocks re-enabling the reader soak once shared
 configurations start dropping `machine:`.
+
+## Resolution
+
+[muse watermelon] Done. `rs/wrkslotsd/src/config_validate.rs` no longer
+requires `machine`: an absent key, a null value, or the literal `auto`
+resolves to the short host name read from `/proc/sys/kernel/hostname`,
+name-validated like any other machine. Precedence matches Python: a
+non-empty `--machine`, then a non-empty `WRKSLOTS_MACHINE`, then the
+configured value. The normalized config carries the same `machine_source`
+values as Python (`--machine`, `WRKSLOTS_MACHINE`,
+`host name (machine absent)`, `host name (machine: auto)`,
+`configuration.machine`). `doctor_state.rs` prints
+`machine: <name> (<source>)` in human output and a `machine` field in JSON
+output only when the source is a host-name source, with the Python strings
+byte for byte; explicit-configuration output is unchanged. The `--machine`
+help on the config and doctor commands states the absent/`auto` meaning.
+
+Proof: `test_validate_config_machine_resolution_matches_python` and
+`test_validate_config_machine_overrides_match_python` in
+`py/wrkslots/tests/test_config_validate_rust.py` compare the full normalized
+config against the Python oracle for absent, `auto`, explicit, environment
+override, and flag override; `test_doctor_machine_auto_note_matches_python`
+in `py/wrkslots/tests/test_doctor_state_rust.py` compares doctor human and
+JSON output byte for byte. The full config and doctor differentials pass
+(51 tests).

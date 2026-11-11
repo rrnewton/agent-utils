@@ -485,6 +485,16 @@ fn doctor_cli_once(
         }
         records.push(record);
     }
+    let machine_note = match config.get("machine_source").and_then(Value::as_str) {
+        Some(source) if source.starts_with("host name") => Some(format!(
+            "{} ({source})",
+            config
+                .get("machine")
+                .and_then(Value::as_str)
+                .unwrap_or(&selected)
+        )),
+        _ => None,
+    };
     // The worktrees-image scope line, only when a section is
     // configured, with the Python doctor's exact strings.
     let wt_scope = if let Some(reason) = config
@@ -547,6 +557,9 @@ fn doctor_cli_once(
         if let (Some(scope), Some(object)) = (&wt_scope, envelope.as_object_mut()) {
             object.insert("worktrees_image".to_string(), json!(scope));
         }
+        if let (Some(note), Some(object)) = (&machine_note, envelope.as_object_mut()) {
+            object.insert("machine".to_string(), json!(note));
+        }
         return Ok(format!(
             "{}\n",
             serde_json::to_string_pretty(&envelope)
@@ -570,6 +583,9 @@ fn doctor_cli_once(
     );
     if let Some(scope) = &wt_scope {
         out.push_str(&format!("worktrees-image: {scope}\n"));
+    }
+    if let Some(note) = &machine_note {
+        out.push_str(&format!("machine: {note}\n"));
     }
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for item in &findings {

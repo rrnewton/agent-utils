@@ -23,16 +23,16 @@ const SCHEMA: i64 = 2;
 /// The wrkslots version this build is, as `min_wrkslots_version` names it;
 /// always the Python edition's `wrkslots.__version__` (#1109).
 pub(crate) const WRKSLOTS_VERSION: &str = "0.10.0";
-const REQUIRED: [&str; 7] = [
+const REQUIRED: [&str; 6] = [
     "schema",
     "worktrees_dir",
-    "machine",
     "default_remote",
     "default_landed_ref",
     "heartbeat_ttl_seconds",
     "liveness_command",
 ];
-const OPTIONAL: [&str; 20] = [
+const OPTIONAL: [&str; 21] = [
+    "machine",
     "liveness_batch_command",
     "max_active_slots",
     "eden_host_cap",
@@ -162,6 +162,14 @@ fn name_valid(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+pub(crate) fn short_hostname() -> Result<String> {
+    let raw = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map_err(|error| format!("cannot read the machine hostname: {error}"))?;
+    let name = raw.trim().split('.').next().unwrap_or_default().to_string();
+    validate_name(&name, "machine")?;
+    Ok(name)
 }
 
 pub(crate) fn validate_name(value: &str, label: &str) -> Result<String> {
@@ -1337,13 +1345,27 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
             raw["schema"]
         ));
     }
-    let machine = match machine_override {
-        Some(machine) => machine.to_owned(),
-        None => match std::env::var("WRKSLOTS_MACHINE") {
-            Ok(machine) => machine,
-            Err(_) => as_str(&raw["machine"], "configuration.machine")?.to_owned(),
-        },
-    };
+    let env_machine = std::env::var("WRKSLOTS_MACHINE")
+        .ok()
+        .filter(|machine| !machine.is_empty());
+    let (machine, machine_source) =
+        if let Some(machine) = machine_override.filter(|machine| !machine.is_empty()) {
+            (machine.to_owned(), "--machine")
+        } else if let Some(machine) = env_machine {
+            (machine, "WRKSLOTS_MACHINE")
+        } else {
+            match raw.get("machine") {
+                None | Some(Value::Null) => (short_hostname()?, "host name (machine absent)"),
+                Some(value) => {
+                    let configured = as_str(value, "configuration.machine")?;
+                    if configured == "auto" {
+                        (short_hostname()?, "host name (machine: auto)")
+                    } else {
+                        (configured.to_owned(), "configuration.machine")
+                    }
+                }
+            }
+        };
     validate_name(&machine, "machine")?;
     let (_rel, worktrees) = relative_inside(
         &root,
@@ -1569,6 +1591,7 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
         "liveness_batch_command": liveness_batch,
         "liveness_command": liveness.to_string_lossy(),
         "machine": machine,
+        "machine_source": machine_source,
         "max_active_slots": cap,
         "post_provision_hooks": hooks,
         "post_provision_hook_slot_types": hook_slot_types,
