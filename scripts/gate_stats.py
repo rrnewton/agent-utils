@@ -44,20 +44,106 @@ import os
 import statistics
 import sys
 from collections import Counter, defaultdict
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, time, timedelta
 from pathlib import Path
+from typing import Callable, TypedDict
 from zoneinfo import ZoneInfo
 
 ET = ZoneInfo("America/New_York")
 DEFAULT_HISTORY = "/tmp/dev-agent-utils-gate-admission/history.jsonl"
 DEFAULT_LEDGER = "~/.local/state/agent-utils/gate-ledger.jsonl"
+Row = dict[str, object]
+InDay = Callable[[float | None], bool]
 
 
-def load_jsonl(path: Path) -> list[dict]:
+class Dist(TypedDict):
+    n: int
+    p50_s: float | None
+    p90_s: float | None
+    sum_s: float
+
+
+Split = TypedDict("Split", {"tier": str, "class": str, "tickets": int, "wait": Dist,
+                            "run": Dist, "red_tickets": int, "red_rate": float | None})
+
+
+class Overall(TypedDict):
+    tickets: int
+    shared_tickets: int
+    exclusive_tickets: int
+    wait: Dist
+    run: Dist
+    gates_per_hour: float
+    exclusive_host_hours: float
+
+
+GatesBlock = TypedDict("GatesBlock", {"full_gates": int, "pass": int, "fail": int, "partial": int,
+                                      "red_gate_rate": float | None, "batch_gates": int,
+                                      "red_batch_rate": float | None})
+
+
+class TierHeads(TypedDict):
+    tier: str
+    heads: int
+    first_try_pass: int
+    first_try_pass_rate: float | None
+
+
+class FirstTry(TypedDict):
+    heads: int
+    first_try_pass: int
+    first_try_pass_rate: float | None
+    by_tier: list[TierHeads]
+
+
+class FlakeStep(TypedDict):
+    step: str
+    failed: int
+    flaky: int
+    flake_rate: float | None
+    heads: int
+
+
+class Flakes(TypedDict):
+    failed_step_instances: int
+    flaky_step_instances: int
+    flake_rate: float | None
+    per_step: list[FlakeStep]
+    top_flaky: list[FlakeStep]
+
+
+class Sources(TypedDict):
+    history_records: int
+    history_records_day: int
+    ledger_records: int
+    ledger_records_day: int
+
+
+class Report(TypedDict):
+    day: str
+    timezone: str
+    sources: Sources
+    overall: Overall
+    splits: list[Split]
+    gates: GatesBlock
+    first_try: FirstTry
+    flakes: Flakes
+    notes: list[str]
+
+
+class FlakeAcc(TypedDict):
+    step: str
+    failed: int
+    flaky: int
+    heads: set[str]
+
+
+
+def load_jsonl(path: Path) -> list[Row]:
     """JSON-lines records; missing file is empty, malformed lines are skipped."""
     if not path.exists():
         return []
-    rows: list[dict] = []
+    rows: list[Row] = []
     for line in path.read_text(errors="replace").splitlines():
         if not line.strip():
             continue
@@ -70,11 +156,11 @@ def load_jsonl(path: Path) -> list[dict]:
     return rows
 
 
-def tier_of(row: dict) -> str:
+def tier_of(row: Row) -> str:
     return "owner" if row.get("priority") == "owner" else "normal"
 
 
-def ledger_class(row: dict) -> str | None:
+def ledger_class(row: Row) -> str | None:
     kind = row.get("kind")
     if kind == "gate":
         return "shared"
@@ -92,7 +178,7 @@ def parse_iso(value: object) -> float | None:
         return None
 
 
-def ledger_queued_ts(row: dict) -> float | None:
+def ledger_queued_ts(row: Row) -> float | None:
     return parse_iso(row.get("queued_utc")) or parse_iso(row.get("started_utc"))
 
 
@@ -111,7 +197,7 @@ def percentile(values: list[float], q: float) -> float | None:
     return float(ordered[rank - 1])
 
 
-def dist(values: list[float]) -> dict:
+def dist(values: list[float]) -> Dist:
     clean = [float(v) for v in values]
     return {
         "n": len(clean),
@@ -125,7 +211,7 @@ def rate(part: int, whole: int) -> float | None:
     return round(part / whole, 4) if whole else None
 
 
-def compute(history: list[dict], ledger: list[dict], day: str) -> dict:
+def compute(history: list[Row], ledger: list[Row], day: str) -> Report:
     start, end = day_window(day)
 
     def in_day(ts: float | None) -> bool:
@@ -133,26 +219,23 @@ def compute(history: list[dict], ledger: list[dict], day: str) -> dict:
 
     hist_day = [r for r in history if in_day(_as_float(r.get("queued_at")))]
     # Splits by tier x class, from history (the only source with wait/run for all).
-    splits = []
+    splits: list[Split] = []
     for tier in ("owner", "normal"):
         for cls in ("shared", "exclusive"):
             rows = [r for r in hist_day if tier_of(r) == tier and r.get("class") == cls]
             red = sum(1 for r in rows if _as_float(r.get("exit_code")) not in (None, 0.0))
             splits.append({
                 "tier": tier, "class": cls, "tickets": len(rows),
-                "wait": dist([float(r["wait_s"]) for r in rows if _is_num(r.get("wait_s"))]),
-                "run": dist([float(r["run_s"]) for r in rows if _is_num(r.get("run_s"))]),
+                "wait": dist(_nums(rows, "wait_s")), "run": dist(_nums(rows, "run_s")),
                 "red_tickets": red, "red_rate": rate(red, len(rows)),
             })
 
-    exclusive_run_s = sum(float(r["run_s"]) for r in hist_day
-                          if r.get("class") == "exclusive" and _is_num(r.get("run_s")))
-    overall = {
+    exclusive_run_s = sum(_nums([r for r in hist_day if r.get("class") == "exclusive"], "run_s"))
+    overall: Overall = {
         "tickets": len(hist_day),
         "shared_tickets": sum(1 for r in hist_day if r.get("class") == "shared"),
         "exclusive_tickets": sum(1 for r in hist_day if r.get("class") == "exclusive"),
-        "wait": dist([float(r["wait_s"]) for r in hist_day if _is_num(r.get("wait_s"))]),
-        "run": dist([float(r["run_s"]) for r in hist_day if _is_num(r.get("run_s"))]),
+        "wait": dist(_nums(hist_day, "wait_s")), "run": dist(_nums(hist_day, "run_s")),
         "gates_per_hour": round(len(hist_day) / 24.0, 3),
         "exclusive_host_hours": round(exclusive_run_s / 3600.0, 3),
     }
@@ -161,7 +244,7 @@ def compute(history: list[dict], ledger: list[dict], day: str) -> dict:
     gates_day = [r for r in ledger if ledger_class(r) == "shared"
                  and in_day(ledger_queued_ts(r)) and r.get("verdict") != "aborted"]
     verdicts = Counter(str(r.get("verdict")) for r in gates_day)
-    gates_block = {
+    gates_block: GatesBlock = {
         "full_gates": len(gates_day),
         "pass": verdicts.get("pass", 0), "fail": verdicts.get("fail", 0),
         "partial": verdicts.get("partial", 0),
@@ -191,15 +274,15 @@ def compute(history: list[dict], ledger: list[dict], day: str) -> dict:
     }
 
 
-def _first_try(ledger: list[dict], in_day) -> dict:
+def _first_try(ledger: list[Row], in_day: InDay) -> FirstTry:
     gates = [r for r in ledger if ledger_class(r) == "shared"
              and r.get("verdict") != "aborted" and r.get("head_sha")]
     gates.sort(key=lambda r: parse_iso(r.get("started_utc")) or parse_iso(r.get("finished_utc")) or 0.0)
-    first_by_head: dict[str, dict] = {}
+    first_by_head: dict[str, Row] = {}
     for row in gates:
         first_by_head.setdefault(str(row["head_sha"]), row)
     todays = [r for r in first_by_head.values() if in_day(ledger_queued_ts(r))]
-    by_tier = []
+    by_tier: list[TierHeads] = []
     for tier in ("owner", "normal"):
         rows = [r for r in todays if tier_of(r) == tier]
         passed = sum(1 for r in rows if r.get("verdict") == "pass")
@@ -210,14 +293,14 @@ def _first_try(ledger: list[dict], in_day) -> dict:
             "first_try_pass_rate": rate(passed, len(todays)), "by_tier": by_tier}
 
 
-def _flakes(ledger: list[dict], in_day) -> dict:
+def _flakes(ledger: list[Row], in_day: InDay) -> Flakes:
     reruns: dict[str, list[float]] = defaultdict(list)
     for row in ledger:
         if ledger_class(row) == "exclusive" and row.get("head_sha") and row.get("rerun_passed") is True:
             ts = parse_iso(row.get("finished_utc")) or parse_iso(row.get("started_utc"))
             if ts is not None:
                 reruns[str(row["head_sha"])].append(ts)
-    per_step: dict[str, dict] = {}
+    per_step: dict[str, FlakeAcc] = {}
     failed_total = flaky_total = 0
     for row in ledger:
         if ledger_class(row) != "shared" or not in_day(ledger_queued_ts(row)):
@@ -236,7 +319,7 @@ def _flakes(ledger: list[dict], in_day) -> dict:
                 entry["flaky"] += 1
                 entry["heads"].add(head)
                 flaky_total += 1
-    rows = []
+    rows: list[FlakeStep] = []
     for entry in per_step.values():
         rows.append({"step": entry["step"], "failed": entry["failed"], "flaky": entry["flaky"],
                      "flake_rate": rate(entry["flaky"], entry["failed"]),
@@ -259,6 +342,15 @@ def _is_num(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _nums(rows: list[Row], key: str) -> list[float]:
+    out: list[float] = []
+    for row in rows:
+        value = row.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            out.append(float(value))
+    return out
+
+
 def _fmt(value: object, suffix: str = "") -> str:
     if value is None:
         return "—"
@@ -271,7 +363,7 @@ def _pct(value: float | None) -> str:
     return "—" if value is None else f"{100 * value:.1f}%"
 
 
-def render_markdown(report: dict) -> str:
+def render_markdown(report: Report) -> str:
     day = report["day"]
     o, g, f, ft = report["overall"], report["gates"], report["flakes"], report["first_try"]
     lines = [
@@ -310,8 +402,8 @@ def render_markdown(report: dict) -> str:
         "| Tier | Heads | First-try pass | Rate |",
         "|---|---:|---:|---:|",
     ]
-    for row in ft["by_tier"]:
-        lines.append(f"| {row['tier']} | {row['heads']} | {row['first_try_pass']} | {_pct(row['first_try_pass_rate'])} |")
+    for ft_row in ft["by_tier"]:
+        lines.append(f"| {ft_row['tier']} | {ft_row['heads']} | {ft_row['first_try_pass']} | {_pct(ft_row['first_try_pass_rate'])} |")
     lines += [
         "",
         "## Top flaky steps",
@@ -320,8 +412,8 @@ def render_markdown(report: dict) -> str:
         "|---|---:|---:|---:|---:|",
     ]
     if f["top_flaky"]:
-        for row in f["top_flaky"]:
-            lines.append(f"| `{row['step']}` | {row['failed']} | {row['flaky']} | {_pct(row['flake_rate'])} | {row['heads']} |")
+        for flake_row in f["top_flaky"]:
+            lines.append(f"| `{flake_row['step']}` | {flake_row['failed']} | {flake_row['flaky']} | {_pct(flake_row['flake_rate'])} | {flake_row['heads']} |")
     else:
         lines.append("| — | 0 | 0 | — | 0 |")
     lines += ["", "## Notes", ""]

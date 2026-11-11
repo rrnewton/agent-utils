@@ -26,7 +26,7 @@ def _utc(day: str, hour: int) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _hist(day="2026-11-09"):
+def _hist(day: str = "2026-11-09") -> list[dict[str, object]]:
     return [
         {"class": "shared", "priority": "owner", "queued_at": _ts(day, 9), "wait_s": 100.0, "run_s": 600.0, "exit_code": 0},
         {"class": "shared", "queued_at": _ts(day, 10), "wait_s": 300.0, "run_s": 900.0, "exit_code": 1},
@@ -37,7 +37,7 @@ def _hist(day="2026-11-09"):
     ]
 
 
-def _ledger(day="2026-11-09"):
+def _ledger(day: str = "2026-11-09") -> list[dict[str, object]]:
     return [
         # Head A: first gate fails on two steps, solo rerun later passes -> flaky.
         {"kind": "gate", "head_sha": "aaa", "verdict": "fail", "failed_steps": ["s.one", "s.two"],
@@ -58,7 +58,7 @@ def _ledger(day="2026-11-09"):
     ]
 
 
-def test_first_try_flake_and_red_rates():
+def test_first_try_flake_and_red_rates() -> None:
     r = gate_stats.compute(_hist(), _ledger(), "2026-11-09")
     assert r["first_try"]["heads"] == 3
     assert r["first_try"]["first_try_pass"] == 1
@@ -75,7 +75,7 @@ def test_first_try_flake_and_red_rates():
     assert top["s.two"]["flake_rate"] == 1.0 and top["s.one"]["flaky"] == 1
 
 
-def test_splits_percentiles_and_host_hours():
+def test_splits_percentiles_and_host_hours() -> None:
     r = gate_stats.compute(_hist(), _ledger(), "2026-11-09")
     assert r["overall"]["tickets"] == 4
     assert r["overall"]["gates_per_hour"] == round(4 / 24, 3)
@@ -87,7 +87,7 @@ def test_splits_percentiles_and_host_hours():
     assert splits[("owner", "exclusive")]["run"]["p90_s"] == 1800.0
 
 
-def test_batch_column_ready_and_empty_day():
+def test_batch_column_ready_and_empty_day() -> None:
     r = gate_stats.compute(_hist(), _ledger(), "2026-11-09")
     assert r["gates"]["red_batch_rate"] is None and r["gates"]["batch_gates"] == 0
     empty = gate_stats.compute([], [], "2026-11-09")
@@ -97,7 +97,7 @@ def test_batch_column_ready_and_empty_day():
     assert "—" in gate_stats.render_markdown(empty)
 
 
-def test_cli_json_and_markdown(tmp_path: Path):
+def test_cli_json_and_markdown(tmp_path: Path) -> None:
     hist, led = tmp_path / "h.jsonl", tmp_path / "l.jsonl"
     hist.write_text("\n".join(json.dumps(r) for r in _hist()) + "\n")
     led.write_text("\n".join(json.dumps(r) for r in _ledger()) + "\n")
