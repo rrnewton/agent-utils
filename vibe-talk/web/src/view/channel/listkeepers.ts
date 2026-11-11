@@ -63,6 +63,9 @@ export interface ListKeepersDependencies<Column> extends SizeWatching {
   /** Whether `area` is within `slack` px of its foot (the page's slack by default), and taking it to its foot. */
   atBottom(area: HTMLElement, slack?: number): boolean;
   followFoot(area: HTMLElement): void;
+  /** Take `area` to its foot, or to a measured scroll position, through the scroll owner (`#1251`). */
+  toFoot(area: HTMLElement): void;
+  toPosition(area: HTMLElement, top: number): void;
   /** Whether the right column is drawn, and showing. */
   sideColumnUp(): boolean;
   sideShowing(): boolean;
@@ -178,11 +181,11 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
       // `#429 keyboard-hides-bar`: the channel's box and a reply in the stream as well, where they were in view.
       if (keepWrittenBox(area, seen, now)) return;
       if (grew > 0 && seen !== null && seen.gap !== undefined) {
-        if (seen.gap <= BOTTOM_SLACK_PX) area.scrollTop = area.scrollHeight;
+        if (seen.gap <= BOTTOM_SLACK_PX) deps.toFoot(area);
         return;
       }
       if (grew > 0 && atBottom(area, BOTTOM_SLACK_PX + grew)) {
-        area.scrollTop = area.scrollHeight;
+        deps.toFoot(area);
       }
     }).observe(el("scroll-area"));
     // `#229 desktop-two-column`. The same for the right column's reader, under the same dock.
@@ -349,7 +352,7 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
           && was.context === context && !atBottom(area, 1) && free()) {
         // To the rows' foot, not past it: room the keyboard keeps under the composer (a row
         // parked under the box, #1135) stays below the keys, where the reader left it.
-        if (footTop) area.scrollTop = footTop(area);
+        if (footTop) deps.toPosition(area, footTop(area));
         else followFoot(area);
       }
       // A change of what the list shows (another screen, view, channel or thread) places the

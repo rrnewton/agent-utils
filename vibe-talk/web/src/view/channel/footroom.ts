@@ -54,6 +54,10 @@ export interface FootRoomsDependencies {
    * over a composer in `area`.
    */
   keyboardRoom?(area: Scroller): number;
+  /** Take `area` to its foot, and move it by a measured delta, through the scroll owner (`#1251`). */
+  toFoot(area: Scroller): void;
+  nudge(area: Scroller, delta: number): void;
+  wheelBy(area: Scroller, px: number): void;
 }
 
 /** The rooms' commands and questions. */
@@ -243,7 +247,7 @@ export function createFootRooms(deps: FootRoomsDependencies): FootRooms {
     if (held.row === deps.lastCard()) {
       const box = held.row.getBoundingClientRect();
       const moved = box.top - area.getBoundingClientRect().top - held.top;
-      if (Math.abs(box.height - held.height) > 0.5 && Math.abs(moved) > 0.5) area.scrollTop += moved;
+      if (Math.abs(box.height - held.height) > 0.5 && Math.abs(moved) > 0.5) deps.nudge(area, moved);
     }
     noteOverscrollReader(area);
   }
@@ -260,14 +264,14 @@ export function createFootRooms(deps: FootRoomsDependencies): FootRooms {
       if (overscroll !== null && area.scrollTop >= footTop(area) - 0.5) return;
       closeOverscroll();
     }
-    area.scrollTop = area.scrollHeight;
+    deps.toFoot(area);
   }
 
   function toFoot(area: Scroller): void {
     // `#459 pack-keeps-card-still`. Out of the room a card held where it stood left, too.
     if (area === deps.side()) closeOverextend();
     if (area === deps.side()) closeOverscroll();
-    area.scrollTop = area.scrollHeight;
+    deps.toFoot(area);
   }
 
   function overextendRoom(area: Scroller): number {
@@ -345,8 +349,7 @@ export function createFootRooms(deps: FootRoomsDependencies): FootRooms {
       if (!resting || !openOverscroll(area)) return;
       // A line is 40px, as Chromium scrolls one; a page is what a page key moves (`pageStep`).
       const px = event.deltaMode === 1 ? event.deltaY * 40 : event.deltaMode === 2 ? event.deltaY * deps.pageStep(area) : event.deltaY;
-      if (typeof area.scrollBy === "function") area.scrollBy({ top: px, behavior: "smooth" });
-      else area.scrollTop += px;
+      deps.wheelBy(area, px);
     },
     scrolled(at) {
       const area = deps.side();

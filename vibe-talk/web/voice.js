@@ -2204,6 +2204,9 @@ const footRooms = createFootRooms({
     ? parseFloat(window.getComputedStyle(area).paddingBottom) || 0 : 0),
   pageStep: (area) => pageStep(area),
   keyboardRoom: (area) => (screenKeyboardRoom ? screenKeyboardRoom.roomIn(area) : 0),
+  toFoot: (area) => scrollKeeping.toFoot(area),
+  nudge: (area, delta) => scrollKeeping.nudge(area, delta),
+  wheelBy: (area, px) => scrollKeeping.wheelBy(area, px),
 });
 const {
   overscrollRoom, overextendRoom, footGap, footTop, closeOverscroll, waitOverscrollIdle, openOverscroll, fitOverscroll,
@@ -9416,6 +9419,8 @@ const listKeepersMount = mountListKeepers({
   footTop: (area) => footTop(area),
   atBottom: (...args) => atBottom(...args),
   followFoot: (area) => followFoot(area),
+  toFoot: (area) => scrollKeeping.toFoot(area),
+  toPosition: (area, top) => scrollKeeping.toPosition(area, top),
   sideColumnUp: () => sideColumnUp(),
   sideShowing: () => sideShowing(),
   inColumn: (column, act) => inColumn(column, act),

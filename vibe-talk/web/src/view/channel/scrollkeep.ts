@@ -111,6 +111,14 @@ export interface ScrollKeeping {
    * than the room brings its head to the scroller's top, as it always has.
    */
   preservingCollapse(area: HTMLElement, row: HTMLElement, head: number, foot: number, mutate: () => void): void;
+  /** Take `area` to its foot: the one foot write, for the keepers that decide when (`#1251`). */
+  toFoot(area: HTMLElement): void;
+  /** Move `area` by `delta` px: the one relative write, for a holder that measured the move (`#1251`). */
+  nudge(area: HTMLElement, delta: number): void;
+  /** Put `area` at scroll position `top`: the one absolute write, for a keeper's measured foot (`#1251`). */
+  toPosition(area: HTMLElement, top: number): void;
+  /** A wheel turn's smooth scroll of `area` by `px`, by the plain write where no `scrollBy` stands (`#1251`). */
+  wheelBy(area: HTMLElement, px: number): void;
   /** `preservingScroll` for a change that resizes the list's window or the room at its head. */
   holdingReader(mutate: () => void): void;
   /** Where the reader is: which message their eye is on, and how far down the viewport it sits. */
@@ -256,6 +264,23 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     if (selection && deps.restoreSelectionIn) deps.restoreSelectionIn(area, selection);
   }
 
+  function toFoot(area: HTMLElement): void {
+    area.scrollTop = area.scrollHeight;
+  }
+
+  function nudge(area: HTMLElement, delta: number): void {
+    area.scrollTop += delta;
+  }
+
+  function toPosition(area: HTMLElement, top: number): void {
+    area.scrollTop = top;
+  }
+
+  function wheelBy(area: HTMLElement, px: number): void {
+    if (typeof area.scrollBy === "function") area.scrollBy({ top: px, behavior: "smooth" });
+    else area.scrollTop += px;
+  }
+
   function preservingCollapse(area: HTMLElement, row: HTMLElement, head: number, foot: number, mutate: () => void): void {
     if (deps.atBottom(area, deps.restSlackPx)) {
       mutate();
@@ -324,5 +349,5 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     deps.setJumpNewest(true, view, turns);
   }
 
-  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, holdingReader, captureScroll, restoreScroll, followIfPinned };
+  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, toFoot, nudge, toPosition, wheelBy, holdingReader, captureScroll, restoreScroll, followIfPinned };
 }

@@ -412,6 +412,7 @@ test("`#624 voice-page-modularity`: the rooms past the right column's foot open 
     side: () => area, overscrollBox: () => overscrollBox, overextendBox: () => overextendBox,
     context: () => context, offered: () => true, sideUp: () => true, lastCard: () => card,
     paddingBottom: () => 0, pageStep: () => 360,
+    toFoot: (area) => { area.scrollTop = area.scrollHeight; }, nudge: (area, delta) => { area.scrollTop += delta; }, wheelBy: (area, px) => { area.scrollTop += px; },
   });
   assert.equal(rooms.footGap(area), 0, "at the foot");
   rooms.scrolled(1000);
@@ -445,6 +446,7 @@ test("`#624 voice-page-modularity`: the rooms past the right column's foot open 
     side: () => area, overscrollBox: () => overscrollBox, overextendBox: () => overextendBox,
     context: () => context, offered: () => true, sideUp: () => true, lastCard: () => card,
     paddingBottom: () => 0, pageStep: () => 360,
+    toFoot: (area) => { area.scrollTop = area.scrollHeight; }, nudge: (area, delta) => { area.scrollTop += delta; }, wheelBy: (area, px) => { area.scrollTop += px; },
     keyboardRoom: (one) => (one === mainArea ? 120 : 0),
   });
   assert.equal(mainRooms.footTop(mainArea), 880, "the rows' foot leaves the keyboard's room out");
@@ -1192,6 +1194,7 @@ test("`#624 voice-page-modularity`: the keepers hold a reader on the newest line
       writingIn: () => state.writingIn,
       atBottom: (area, slack) => { log.push(`at bottom? ${area.id} ${slack}`); return state.bottom.has(area.id); },
       followFoot: (area) => log.push(`follow ${area.id}`),
+      toFoot: (area) => { area.scrollTop = area.scrollHeight; }, toPosition: (area, top) => { area.scrollTop = top; },
       sideColumnUp: () => state.sideUp,
       sideShowing: () => state.showing,
       inColumn: (column, act) => { log.push(`in ${column.name}`); return act(); },
