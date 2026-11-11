@@ -307,8 +307,9 @@ body {
   /* Explicit, because #channel-freshness-anchor shares this cell: two items auto-placed into one
      row are given two columns. */
   grid-column: 1;
-  /* `#1251 scroll-single-owner`: native anchoring stays ON here until the foot/place holders
-     (keepers, composer keyboard) route through the owner; #side-scroll is already owner-held. */
+  /* `#1251 scroll-single-owner`: the loop owner (scrollkeep) is the one scroll correction per
+     frame, its foot/place holders routed (P1, P7); native anchoring off. */
+  overflow-anchor: none;
 }
 
 /* `hidden` has to beat the layout modes below, all of which set `display`.
