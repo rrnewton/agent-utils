@@ -53,6 +53,7 @@ PATH_BY_FILE: dict[str, str] = {
     "web/src/view/channel/listkeepers.ts": "P1",
     "web/src/view/channel/footroom.ts": "P1",
     "web/src/view/channel/cardplace.ts": "P2",
+    "web/src/view/channel/cardplaceacts.ts": "P2",
     "web/src/view/channel/filterplace.ts": "P2",
     "web/src/view/channel/threadentry.ts": "P2",
     "web/src/view/channel/channelviews.ts": "P2",
