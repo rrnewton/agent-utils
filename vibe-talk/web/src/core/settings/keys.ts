@@ -42,6 +42,8 @@ export const SYNCED_SETTING_KEYS: readonly string[] = [
   // `#488 slack-app-agents`. Who is who: which account is the owner, the coding agent, a person or
   // another bot, chosen once for every device. The census of who spoke where stays local: a cache.
   "vibe-talk.voice.identities",
+  // `#1265 documents-star-hide`. Per-document starred/hidden state, as JSON by document key.
+  "vibe-talk.voice.doc-states",
 ];
 
 /** `#488 slack-app-agents`. Who is who: which account is the owner, the coding agent, a person or

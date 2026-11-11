@@ -10,6 +10,8 @@
 // through `textContent`.
 
 import { createListening } from "../dom/index.ts";
+import { createDocStatesStore, docStateOf } from "./docstate.ts";
+import type { DocStatesStore } from "./docstate.ts";
 import type { DocumentRow, DocumentsListAnswer } from "./types.ts";
 
 export interface DocumentsListDependencies {
@@ -18,6 +20,8 @@ export interface DocumentsListDependencies {
   onOpen(key: string): unknown;
   onMentions?(row: DocumentRow): unknown;
   onStatus?(text: string): unknown;
+  /** Per-document starred/hidden state (`#1265 documents-star-hide`); memory alone without one. */
+  docStates?: DocStatesStore;
 }
 
 /** A list place a return lands on (`#1264 documents-scroll-landings`). */
@@ -44,6 +48,20 @@ export interface DocumentsList {
   refreshFetched(progress?: (done: number, total: number) => unknown): Promise<{ updated: number; current: number }>;
   /** Drop every cached copy and redraw; how many were held. */
   clearCached(): Promise<number>;
+  /** Whether hidden documents are being shown (dimmed, with Unhide). */
+  showHidden(): boolean;
+  /** Show or stop showing hidden documents; the hamburger's toggle (`#1265`). */
+  setShowHidden(on: boolean): void;
+  /** Star or unstar one document, as its card's and the reader's star do. */
+  setStarred(key: string, on: boolean): void;
+  /** Whether one document is starred. */
+  isStarred(key: string): boolean;
+  /** Hide one document, offering Undo as a swipe does; unhide with `undoHide`. */
+  hide(key: string): void;
+  /** Take back the hide the Undo chip currently offers; say whether it did. */
+  undoHide(): boolean;
+  /** State from another device landed: reread it and redraw. */
+  reloadStates(): void;
   unmount(): void;
 }
 
@@ -233,25 +251,64 @@ export const FOLLOW_SLACK_PX = 24;
 /** How near the top scrolling pages older documents in, in px. */
 const OLDER_TRIGGER_PX = 500;
 
+/** How far a card swipe goes before letting go hides it, in px: the message rows' commit. */
+const HIDE_SWIPE_COMMIT_PX = 90;
+/** How far a finger moves before a card press is a swipe or a scroll, in px: the rows' start. */
+const HIDE_SWIPE_START_PX = 12;
+/** How long the Undo chip offers to put a hidden document back, in ms: the Done Undo's window. */
+const HIDE_UNDO_MS = 10_000;
+
 export function createDocumentsList(deps: DocumentsListDependencies): DocumentsList {
   const listening = createListening();
   const busy = new Set<string>();
   const errors = new Map<string, string>();
+  const states: DocStatesStore = deps.docStates ?? createDocStatesStore(null);
   let rowsNow: readonly DocumentRow[] = [];
   // The type filter's state lives with the list's other view state (no new
   // persistence key): `#1176 doc-kind-buckets`.
   let bucketFilter: DocumentBucket | "all" = "all";
+  // The Starred chip (`#1265`): beside the buckets, and a row must pass both.
+  let starredOnly = false;
+  // Hidden documents shown dimmed (the hamburger's "Show hidden"); this device only.
+  let showingHidden = false;
+  // The hide the Undo chip offers to take back, and its timer.
+  let undoOffer: { key: string; timer: ReturnType<typeof setTimeout> } | null = null;
+  // A committed swipe's click, claimed so the card does not also open.
+  let swipeClaimedClick = false;
 
   function visibleRows(): readonly DocumentRow[] {
-    if (bucketFilter === "all") return rowsNow;
-    return rowsNow.filter((row) => bucketOfKind(row.kind) === bucketFilter);
+    const held = states.states();
+    return rowsNow.filter((row) => {
+      if (bucketFilter !== "all" && bucketOfKind(row.kind) !== bucketFilter) return false;
+      const state = docStateOf(held, row.key);
+      if (state.hidden && !showingHidden) return false;
+      if (starredOnly && !state.starred) return false;
+      return true;
+    });
+  }
+
+  function endUndoOffer(): void {
+    if (undoOffer) clearTimeout(undoOffer.timer);
+    undoOffer = null;
+  }
+
+  function hideRow(row: DocumentRow): void {
+    states.setHidden(row.key, true);
+    endUndoOffer();
+    const offer = { key: row.key, timer: setTimeout(() => { undoOffer = null; render(rowsNow); }, HIDE_UNDO_MS) };
+    undoOffer = offer;
+    deps.onStatus?.(`Hid ${row.file_name}.`);
+    render(rowsNow);
   }
 
   function cardFor(row: DocumentRow): HTMLElement {
     const isBusy = busy.has(row.key);
+    const state = docStateOf(states.states(), row.key);
     const card = document.createElement("div");
     card.className = row.fetched ? "doc-card" : "doc-card doc-unfetched";
     if (isBusy) card.className += " doc-busy";
+    if (state.hidden) card.className += " doc-hidden";
+    if (state.starred) card.className += " doc-starred";
     card.setAttribute("role", "button");
     card.setAttribute("tabindex", "0");
     card.setAttribute("data-key", row.key);
@@ -330,7 +387,93 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     });
     card.appendChild(download);
 
-    listening.listen(card, "click", () => void open(row));
+    // The star (`#1265`): a small toggle on every card, filled where starred.
+    const star = document.createElement("button");
+    star.setAttribute("type", "button");
+    star.className = "doc-star";
+    star.textContent = state.starred ? "★" : "☆";
+    star.setAttribute("aria-pressed", String(state.starred));
+    star.setAttribute("aria-label", state.starred ? `Unstar ${row.file_name}` : `Star ${row.file_name}`);
+    star.title = star.getAttribute("aria-label") ?? "";
+    listening.listen(star, "click", (event: Event) => {
+      event.stopPropagation();
+      states.setStarred(row.key, !state.starred);
+      render(rowsNow);
+    });
+    card.appendChild(star);
+
+    // Hide, or Unhide where hidden cards are being shown: the desktop equivalent
+    // of the swipe, and the only way back short of Undo.
+    const hide = document.createElement("button");
+    hide.setAttribute("type", "button");
+    hide.className = state.hidden ? "doc-unhide" : "doc-hide";
+    hide.textContent = state.hidden ? "Unhide" : "Hide";
+    hide.setAttribute("aria-label", `${hide.textContent} ${row.file_name}`);
+    listening.listen(hide, "click", (event: Event) => {
+      event.stopPropagation();
+      if (state.hidden) {
+        states.setHidden(row.key, false);
+        render(rowsNow);
+      } else {
+        hideRow(row);
+      }
+    });
+    card.appendChild(hide);
+
+    // Swipe to hide (`#1265`): the message rows' gesture in shape — a touch
+    // pointer stream, the axis decided once at 12px, the card following the
+    // finger, 90px committing on release, and the click behind a committed
+    // swipe claimed so it does not also open. A mouse never swipes here; the
+    // Hide button above is its equivalent.
+    let swipe: { x: number; y: number; dragging: boolean; active: boolean } | null = null;
+    listening.listen(card, "pointerdown", (event: PointerEvent) => {
+      swipeClaimedClick = false;
+      if (!event || event.pointerType === "mouse") {
+        swipe = null;
+        return;
+      }
+      swipe = { x: event.clientX, y: event.clientY, dragging: false, active: true };
+    });
+    listening.listen(card, "pointermove", (event: PointerEvent) => {
+      if (!swipe?.active) return;
+      const dx = event.clientX - swipe.x;
+      const dy = event.clientY - swipe.y;
+      if (!swipe.dragging) {
+        if (Math.abs(dx) < HIDE_SWIPE_START_PX && Math.abs(dy) < HIDE_SWIPE_START_PX) return;
+        if (Math.abs(dy) >= Math.abs(dx)) {
+          swipe.active = false;
+          return;
+        }
+        swipe.dragging = true;
+      }
+      const style = (card as HTMLElement).style;
+      if (style) style.transform = `translateX(${dx}px)`;
+    });
+    const finishSwipe = (event: PointerEvent): void => {
+      if (!swipe?.active) return;
+      const dx = swipe.dragging ? event.clientX - swipe.x : 0;
+      swipe = null;
+      const style = (card as HTMLElement).style;
+      if (style) style.transform = "";
+      if (Math.abs(dx) >= HIDE_SWIPE_COMMIT_PX && !state.hidden) {
+        swipeClaimedClick = true;
+        hideRow(row);
+      }
+    };
+    listening.listen(card, "pointerup", finishSwipe);
+    listening.listen(card, "pointercancel", () => {
+      swipe = null;
+      const style = (card as HTMLElement).style;
+      if (style) style.transform = "";
+    });
+
+    listening.listen(card, "click", () => {
+      if (swipeClaimedClick) {
+        swipeClaimedClick = false;
+        return;
+      }
+      void open(row);
+    });
     listening.listen(card, "keydown", (event: KeyboardEvent) => {
       if (event.key === "Enter" || event.key === " ") {
         event.preventDefault();
@@ -457,7 +600,44 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
       });
       bar.appendChild(button);
     }
+    // The Starred chip (`#1265`): the existing chips, reused — a row must pass
+    // it and the bucket both, so Starred narrows whatever bucket is chosen.
+    const starred = document.createElement("button");
+    starred.setAttribute("type", "button");
+    starred.className = "doc-bucket doc-starred-chip";
+    starred.setAttribute("data-bucket", "starred");
+    starred.textContent = "Starred";
+    starred.setAttribute("aria-pressed", String(starredOnly));
+    listening.listen(starred, "click", () => {
+      starredOnly = !starredOnly;
+      render(rowsNow);
+    });
+    bar.appendChild(starred);
     return bar;
+  }
+
+  /** The Undo chip a hide leaves behind, in the Done Undo's shape. */
+  function undoChip(): HTMLElement | null {
+    if (!undoOffer) return null;
+    const row = rowsNow.find((one) => one.key === undoOffer?.key);
+    const chip = document.createElement("button");
+    chip.setAttribute("type", "button");
+    chip.className = "chip doc-undo";
+    chip.setAttribute("id", "docs-undo");
+    chip.textContent = `Undo hide ${row ? row.file_name : "document"}`;
+    listening.listen(chip, "click", () => {
+      if (undoHide()) deps.onStatus?.("Document is back in the list.");
+    });
+    return chip;
+  }
+
+  function undoHide(): boolean {
+    if (!undoOffer) return false;
+    const key = undoOffer.key;
+    endUndoOffer();
+    states.setHidden(key, false);
+    render(rowsNow);
+    return true;
   }
 
   function render(rows: readonly DocumentRow[]): void {
@@ -477,18 +657,22 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     head.textContent = `Oldest first · ${totalNow || rowsNow.length} documents · newest at the bottom`;
     const shown = visibleRows();
     const cards = shown.map(cardFor);
+    const undo = undoChip();
     if (shown.length === 0) {
       const note = document.createElement("p");
       note.className = "doc-empty";
-      note.textContent = "No documents of this type.";
-      list.replaceChildren(head, note, bucketBar());
+      note.textContent = starredOnly
+        ? "No starred documents."
+        : "No documents of this type.";
+      list.replaceChildren(head, note, ...(undo ? [undo] : []), bucketBar());
       return;
     }
     // The filter chips dock at the bottom (`#1263 documents-list-cards`):
     // the list opens at its newest end, so the chips are the last row and
     // stick above the bottom bar. One `.doc-buckets` bar (see bucketBar),
-    // so a later Starred chip joins this same element.
-    list.replaceChildren(head, ...cards, bucketBar());
+    // and the Starred chip (`#1265`) joins this same element. The Undo chip
+    // sits just above it, where the reader's eye already is.
+    list.replaceChildren(head, ...cards, ...(undo ? [undo] : []), bucketBar());
     // Arrow keys walk the cards; Enter opens (above).
     listening.listen(list, "keydown", (event: KeyboardEvent) => {
       if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
@@ -624,7 +808,31 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
       await refresh();
       return cleared;
     },
+    showHidden: () => showingHidden,
+    setShowHidden(on: boolean): void {
+      showingHidden = on === true;
+      render(rowsNow);
+    },
+    setStarred(key: string, on: boolean): void {
+      states.setStarred(key, on);
+      render(rowsNow);
+    },
+    isStarred: (key: string) => docStateOf(states.states(), key).starred,
+    hide(key: string): void {
+      const row = rowsNow.find((one) => one.key === key);
+      if (row) hideRow(row);
+      else {
+        states.setHidden(key, true);
+        render(rowsNow);
+      }
+    },
+    undoHide,
+    reloadStates(): void {
+      states.reload();
+      render(rowsNow);
+    },
     unmount(): void {
+      endUndoOffer();
       wiredOuter = false;
       outer.unmount();
       listening.unmount();

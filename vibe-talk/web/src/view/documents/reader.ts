@@ -44,6 +44,14 @@ export interface DocumentsReaderDependencies {
   onOpenDocument?(key: string): unknown;
   /** The outline pop-up opened or closed: the page's back levels changed. */
   onOutlineChange?(open: boolean): unknown;
+  /**
+   * The header star (`#1265 documents-star-hide`): whether the open document is
+   * starred, and toggling it. Without it, the header star is not wired.
+   */
+  star?: {
+    isStarred(key: string): boolean;
+    toggle(key: string): unknown;
+  };
 }
 
 /**
@@ -126,6 +134,8 @@ export interface DocumentsReader {
   toggleOutline(): void;
   /** Close the outline pop-up where open; say whether it was. */
   closeOutline(): boolean;
+  /** Redraw the header star for the open document, as state lands from elsewhere. */
+  refreshStar(): void;
   /** Stop any reading in progress. */
   close(): void;
   /** Take down every listener the reader added. */
@@ -667,6 +677,10 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     const docTitle = typeof rawTitle === "string" ? rawTitle : "";
     const titleText = docTitle !== "" ? docTitle : (outline[0] ?? entries[0]?.text ?? key);
     drawTitle(titleText, answer.document?.url);
+    if (markdown !== null) {
+      // The star names the document just opened; a failed load keeps no star.
+      drawStarFor(key);
+    }
     const movedTo = answer.document?.moved_to;
     if (typeof movedTo === "string" && movedTo !== "") deps.onStatus?.(`Moved to ${movedTo}`);
     if (markdown !== null) currentDoc = { key, title: titleText, outline, markdown };
@@ -677,6 +691,24 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
         first.scrollIntoView({ block: "center" });
       }
     }
+  }
+
+  /** Draw the header star for the open document; hidden where no star was wired. */
+  function drawStarFor(key: string | undefined): void {
+    if (!deps.star) return;
+    let button: HTMLElement;
+    try {
+      button = deps.byId("doc-star");
+    } catch {
+      return;
+    }
+    if (!button) return;
+    button.hidden = key === undefined;
+    if (key === undefined) return;
+    const starred = deps.star.isStarred(key);
+    button.textContent = starred ? "★" : "☆";
+    button.setAttribute("aria-pressed", String(starred));
+    button.setAttribute("aria-label", starred ? "Unstar this document" : "Star this document");
   }
 
   /** Add the Back, Read and Outline listeners, the first time the reader is opened. */
@@ -693,6 +725,17 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     listening.listen(deps.byId("doc-read"), "click", () => {
       readAloud();
     });
+    if (deps.star) {
+      try {
+        listening.listen(deps.byId("doc-star"), "click", () => {
+          if (currentDoc === null) return;
+          deps.star?.toggle(currentDoc.key);
+          drawStarFor(currentDoc.key);
+        });
+      } catch {
+        // A host without the header star keeps the reader as it was.
+      }
+    }
     listening.listen(deps.byId("doc-outline-open"), "click", () => {
       setOutlineOpen(!outlineOpen);
     });
@@ -731,6 +774,9 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
       if (!outlineOpen) return false;
       closeOutline(true);
       return true;
+    },
+    refreshStar(): void {
+      drawStarFor(currentDoc?.key);
     },
     close(): void {
       stopOwnReading();

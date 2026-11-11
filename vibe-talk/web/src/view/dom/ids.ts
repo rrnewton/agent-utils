@@ -136,6 +136,7 @@ export interface ElementById {
   "doc-outline-open": HTMLButtonElement;
   "doc-outline-pop": HTMLDivElement;
   "doc-read": HTMLButtonElement;
+  "doc-star": HTMLButtonElement;
   "doc-title": HTMLHeadingElement;
   "dock": HTMLElement;
   "docs-fetch": HTMLButtonElement;
@@ -153,6 +154,8 @@ export interface ElementById {
   "docs-search-note": HTMLParagraphElement;
   "docs-search-results": HTMLOListElement;
   "docs-search-toggle": HTMLButtonElement;
+  "docs-show-hidden": HTMLButtonElement;
+  "docs-show-hidden-label": HTMLSpanElement;
   "docs-since": HTMLDivElement;
   "docs-since-days": HTMLInputElement;
   "docs-since-go": HTMLButtonElement;

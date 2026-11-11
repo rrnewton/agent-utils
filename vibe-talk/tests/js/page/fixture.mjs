@@ -5683,6 +5683,18 @@ const TUNING_BANDS = {
     "how far a row must be dragged for the archive to happen. Too short and a scroll that started " +
     "slightly sideways files a message away without being asked; too long and the gesture cannot " +
     "be completed on a narrow phone at all"],
+  HIDE_SWIPE_START_PX: [4, 40,
+    "how far a finger travels before a document card's press is a swipe or a scroll (`#1265 " +
+    "documents-star-hide), the message rows' own start. Below a few pixels a tap with tremor " +
+    "hides a document; far above it the card does not follow the finger"],
+  HIDE_SWIPE_COMMIT_PX: [40, 400,
+    "how far a document card must be dragged for the hide to happen, the message rows' commit. " +
+    "Too short and a sideways scroll hides a document unasked; too long and the gesture cannot " +
+    "be completed on a narrow phone"],
+  DOC_STATES_KEPT: [100, 5000,
+    "how many documents' starred/hidden state is kept in the one synced value (`#1265). Under " +
+    "a hundred a busy list forgets stars the reader made; past a few thousand the value nears " +
+    "the synced settings' size limit and stops syncing"],
   MIN_MSG_SCALE: [50, 100,
     "the smallest message text the reader may choose. Much under eighty per cent and the words " +
     "stop being readable at arm's length on a phone, which is the device this view is for"],

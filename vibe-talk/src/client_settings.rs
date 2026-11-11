@@ -107,6 +107,9 @@ pub const SYNCED_KEYS: &[&str] = &[
     // Channels: who is who, the owner's choice of which account is him, the coding agent,
     // a person or another bot. `#488 slack-app-agents`.
     "vibe-talk.voice.identities",
+    // Per-document starred/hidden state (`#1265 documents-star-hide`): a JSON map
+    // by canonical document key, kept per item as the thread-card states are.
+    "vibe-talk.voice.doc-states",
 ];
 
 /// Summarize collapsed messages: `"1"` is on; anything else, or nothing held, is off.
@@ -256,6 +259,18 @@ mod tests {
                 "the page syncs {quoted}, which the server would refuse"
             );
         }
+    }
+
+    #[test]
+    fn document_star_hide_state_is_a_synced_key() {
+        // `#1265 documents-star-hide`: per-document state syncs like the
+        // per-thread card states beside it.
+        assert!(SYNCED_KEYS.contains(&"vibe-talk.voice.doc-states"));
+        assert!(validate(&[(
+            "vibe-talk.voice.doc-states".into(),
+            Some(r#"{"github:o/r@main:a.md":{"s":1,"h":1}}"#.into()),
+        )])
+        .is_ok());
     }
 
     #[test]

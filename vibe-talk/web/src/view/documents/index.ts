@@ -4,6 +4,7 @@
 
 export { createDocumentsList, dedupeDocumentRows, documentIdentity } from "./list.ts";
 export type { DocumentsList, DocumentsListDependencies, DocumentsListPlace } from "./list.ts";
+export { DOC_STATES_KEY, parseDocStates, serializeDocStates, withDocFlag } from "./docstate.ts";
 export { createDocumentsReader, currentOutlineIndex, highlightSearchTerms, openDocumentNotice } from "./reader.ts";
 export { createDocumentsSearch } from "./search.ts";
 export type { DocumentsSearch, DocumentsSearchDependencies, DocumentSearchHit } from "./search.ts";
@@ -14,6 +15,8 @@ export type { DocViewName, ViewSelector, ViewSelectorDependencies } from "./sele
 export type { DocumentMention, DocumentRow, DocumentsListAnswer } from "./types.ts";
 
 import { createListening } from "../dom/index.ts";
+import { createDocStatesStore } from "./docstate.ts";
+import type { DocStateStorage } from "./docstate.ts";
 import { createDocumentsList, FOLLOW_SLACK_PX } from "./list.ts";
 import type { DocumentsListPlace } from "./list.ts";
 import { createDocumentsReader, openDocumentNotice } from "./reader.ts";
@@ -40,6 +43,13 @@ export interface DocumentsViewDependencies {
   onBack?(): unknown;
   /** Jump to the message that mentioned a document. */
   onJumpToMention?(mention: import("./types.ts").DocumentMention): unknown;
+  /**
+   * The device storage per-document state is kept in (`#1265`), read on use so
+   * an owner made before the ports still works; memory alone without one.
+   */
+  storage?(): DocStateStorage;
+  /** Close the hamburger menu, where the page wired its owner (`#1265`). */
+  closeActionMenu?(): unknown;
 }
 
 /** The Documents view, once mounted. */
@@ -69,6 +79,12 @@ export interface DocumentsView {
   toggleOutline(): void;
   /** Close the outline pop-up where open; say whether it was. */
   closeOutline(): boolean;
+  /** Whether hidden documents are being shown dimmed (the hamburger toggle). */
+  showHidden(): boolean;
+  /** Show or stop showing hidden documents, as the hamburger item does. */
+  setShowHidden(on: boolean): void;
+  /** Per-document state landed from another device: reread and redraw both surfaces. */
+  reloadDocStates(): void;
   /** Take down every listener the view added. */
   unmount(): void;
 }
@@ -135,11 +151,25 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     }
   }
 
+  // One store for the list's cards and the reader's header star (`#1265`),
+  // over the device storage the page hands in, read on use.
+  const docStates = deps.storage
+    ? createDocStatesStore({
+        getItem: (key) => deps.storage?.().getItem(key) ?? null,
+        setItem: (key, value) => deps.storage?.().setItem(key, value),
+        removeItem: (key) => deps.storage?.().removeItem(key),
+      })
+    : createDocStatesStore(null);
+
   const reader = createDocumentsReader({
     api: deps.api,
     byId: deps.byId,
     readDocument: deps.readDocument,
     stopSpeaking: deps.stopSpeaking,
+    star: {
+      isStarred: (key) => list.isStarred(key),
+      toggle: (key) => list.setStarred(key, !list.isStarred(key)),
+    },
     onBack: () => {
       // The same pop as the gesture, where the page wired its navigation;
       // the view's own one step where it did not.
@@ -156,6 +186,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
   const list = createDocumentsList({
     api: deps.api,
     byId: deps.byId,
+    docStates,
     onOpen: (key) => {
       void openDocument(key);
     },
@@ -338,6 +369,25 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
         }
       });
     }
+    // The hamburger's "Show hidden" (`#1265`): an item in #action-menu, drawn
+    // only in this view by the bar, toggling the list's dimmed hidden cards.
+    try {
+      const showHiddenItem = deps.byId("docs-show-hidden");
+      const drawShowHidden = (): void => {
+        const on = list.showHidden();
+        showHiddenItem.setAttribute("aria-pressed", String(on));
+        const label = deps.byId("docs-show-hidden-label");
+        if (label) label.textContent = on ? "Hide hidden" : "Show hidden";
+      };
+      drawShowHidden();
+      listening.listen(showHiddenItem, "click", () => {
+        list.setShowHidden(!list.showHidden());
+        drawShowHidden();
+        deps.closeActionMenu?.();
+      });
+    } catch {
+      // A host without the hamburger item keeps the list as it was.
+    }
     listening.listen(deps.byId("docs-since-go"), "click", () => {
       const days = Number((deps.byId("docs-since-days") as HTMLInputElement).value) || 0;
       const hours = Number((deps.byId("docs-since-hours") as HTMLInputElement).value) || 0;
@@ -391,6 +441,23 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
       if (readingNow) reader.toggleOutline();
     },
     closeOutline: (): boolean => (readingNow ? reader.closeOutline() : false),
+    showHidden: () => list.showHidden(),
+    setShowHidden(on: boolean): void {
+      wire();
+      list.setShowHidden(on);
+      try {
+        const item = deps.byId("docs-show-hidden");
+        item.setAttribute("aria-pressed", String(on));
+        const label = deps.byId("docs-show-hidden-label");
+        if (label) label.textContent = on ? "Hide hidden" : "Show hidden";
+      } catch {
+        // No hamburger item in this host.
+      }
+    },
+    reloadDocStates(): void {
+      list.reloadStates();
+      if (readingNow) reader.refreshStar();
+    },
     unmount(): void {
       if (liveTimer !== 0) clearTimeout(liveTimer);
       liveTimer = 0;

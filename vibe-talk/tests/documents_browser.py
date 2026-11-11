@@ -18,6 +18,12 @@ is long enough to scroll several viewports, and at 393x852 (touch) and again
 at 1280x800 (mouse) the Outline button opens the pop-up, an entry tap/click
 jumps to its heading, the HERE mark follows scrolling, and the title links
 to the document's original source in a new tab.
+
+The last steps cover `#1265 documents-star-hide`: starring from a card and
+the reader header, persistence across reload and through the server's
+synced settings to a fresh device, the Starred chip, a real touch swipe to
+hide with its Undo chip, the hamburger's Show hidden with dimmed cards and
+Unhide, and the desktop Hide button.
 """
 
 import json
@@ -543,6 +549,160 @@ def main() -> int:
                 dpage.wait_for_selector("#documents-list .doc-card", timeout=20_000)
                 check_doc_search(dpage, 1280, 800)
                 dctx.close()
+
+                # Star and hide (`#1265 documents-star-hide`) at phone size,
+                # with a real touch swipe, and again on the desktop.
+                sctx = browser.new_context(
+                    viewport={"width": 393, "height": 852}, has_touch=True, is_mobile=True)
+                spage = sctx.new_page()
+                spage.add_init_script(
+                    f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
+                spage.goto(base + "/?v=docs", wait_until="load")
+                spage.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                paste_key = str(by_file["demo-doc"]["key"])
+
+                # Star the paste document from its card; the star fills and
+                # the state reaches the server's synced settings.
+                paste_card = spage.locator("#documents-list .doc-card", has_text="demo-doc")
+                paste_card.locator(".doc-star").tap()
+                spage.wait_for_function(
+                    "() => [...document.querySelectorAll('#documents-list .doc-card')]"
+                    ".some((c) => c.textContent.includes('demo-doc')"
+                    " && c.querySelector('.doc-star')?.getAttribute('aria-pressed') === 'true')",
+                    timeout=20_000)
+                deadline = time.time() + 30
+                held_states: dict[str, object] = {}
+                while time.time() < deadline:
+                    settings = call(base, "GET", "/api/v1/client-settings", READ_TOKEN)
+                    for entry in cast(list[dict[str, object]], settings["settings"]):
+                        if entry["key"] == "vibe-talk.voice.doc-states" and entry["value"]:
+                            held_states = json.loads(str(entry["value"]))
+                    if held_states.get(paste_key) == {"s": 1}:
+                        break
+                    time.sleep(0.5)
+                check(held_states.get(paste_key) == {"s": 1},
+                      f"the star did not reach the server state: {held_states}")
+
+                # The Starred chip shows only it; a reload keeps the star.
+                spage.locator(".doc-bucket[data-bucket='starred']").tap()
+                spage.wait_for_function(
+                    "() => document.querySelectorAll('#documents-list .doc-card').length === 1",
+                    timeout=20_000)
+                spage.reload(wait_until="load")
+                # Four by now: the linked next.md was admitted in the #1081 walk.
+                spage.wait_for_function(
+                    "() => document.querySelectorAll('#documents-list .doc-card').length >= 3",
+                    timeout=20_000)
+                starred = spage.locator(
+                    "#documents-list .doc-card", has_text="demo-doc").locator(".doc-star")
+                check(starred.get_attribute("aria-pressed") == "true",
+                      "the star did not persist across reload")
+
+                # The reader header carries the same star.
+                tap_card(spage, spage.locator("#documents-list .doc-card", has_text="demo-doc"))
+                spage.wait_for_selector("#doc-body h1", timeout=20_000)
+                check(spage.locator("#doc-star").get_attribute("aria-pressed") == "true",
+                      "the reader header does not show the card's star")
+                spage.tap("#doc-back")
+                spage.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+
+                # A real swipe hides the guide card; Undo brings it back.
+                guide_card = spage.locator("#documents-list .doc-card", has_text="guide.md")
+                guide_card.scroll_into_view_if_needed()
+                box = guide_card.bounding_box()
+                check(box is not None, "the guide card has no box to swipe")
+                assert box is not None
+                cdp = sctx.new_cdp_session(spage)
+                sx, sy = box["x"] + 60, box["y"] + box["height"] / 2
+                cdp.send("Input.dispatchTouchEvent",
+                         {"type": "touchStart", "touchPoints": [{"x": sx, "y": sy}]})
+                for step in range(1, 7):
+                    cdp.send("Input.dispatchTouchEvent",
+                             {"type": "touchMove",
+                              "touchPoints": [{"x": sx + 24 * step, "y": sy}]})
+                cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+                spage.wait_for_function(
+                    "() => ![...document.querySelectorAll('#documents-list .doc-card')]"
+                    ".some((c) => c.textContent.includes('guide.md'))",
+                    timeout=20_000)
+                spage.locator("#docs-undo").click()
+                spage.wait_for_function(
+                    "() => [...document.querySelectorAll('#documents-list .doc-card')]"
+                    ".some((c) => c.textContent.includes('guide.md'))",
+                    timeout=20_000)
+
+                # Swipe again, then the hamburger's Show hidden shows it
+                # dimmed, and Unhide restores it for good.
+                guide_card = spage.locator("#documents-list .doc-card", has_text="guide.md")
+                guide_card.scroll_into_view_if_needed()
+                box = guide_card.bounding_box()
+                check(box is not None, "the guide card has no box to swipe again")
+                assert box is not None
+                sx, sy = box["x"] + 60, box["y"] + box["height"] / 2
+                cdp.send("Input.dispatchTouchEvent",
+                         {"type": "touchStart", "touchPoints": [{"x": sx, "y": sy}]})
+                for step in range(1, 7):
+                    cdp.send("Input.dispatchTouchEvent",
+                             {"type": "touchMove",
+                              "touchPoints": [{"x": sx + 24 * step, "y": sy}]})
+                cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+                spage.wait_for_function(
+                    "() => ![...document.querySelectorAll('#documents-list .doc-card')]"
+                    ".some((c) => c.textContent.includes('guide.md'))",
+                    timeout=20_000)
+                spage.locator("#action-menu-open").click()
+                spage.wait_for_selector("#docs-show-hidden", state="visible", timeout=20_000)
+                spage.locator("#docs-show-hidden").click()
+                dimmed = spage.locator("#documents-list .doc-card.doc-hidden", has_text="guide.md")
+                dimmed.wait_for(state="visible", timeout=20_000)
+                opacity = dimmed.evaluate("(el) => getComputedStyle(el).opacity")
+                check(float(opacity) < 0.9, f"the shown hidden card is not dimmed (opacity {opacity})")
+                dimmed.locator(".doc-unhide").click()
+                spage.wait_for_function(
+                    "() => ![...document.querySelectorAll('#documents-list .doc-card')]"
+                    ".some((c) => c.classList.contains('doc-hidden'))",
+                    timeout=20_000)
+                sctx.close()
+
+                # A fresh device (empty storage) converges from the server:
+                # the paste is starred, and nothing is hidden any more.
+                fctx = browser.new_context(viewport={"width": 393, "height": 852})
+                fpage = fctx.new_page()
+                fpage.add_init_script(
+                    f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
+                fpage.goto(base + "/?v=docs", wait_until="load")
+                fpage.wait_for_function(
+                    "() => [...document.querySelectorAll('#documents-list .doc-card')]"
+                    ".some((c) => c.textContent.includes('demo-doc')"
+                    " && c.querySelector('.doc-star')?.getAttribute('aria-pressed') === 'true')",
+                    timeout=30_000)
+                fctx.close()
+
+                # Desktop: the Hide button hides, Show hidden and Unhide undo it.
+                hctx = browser.new_context(viewport={"width": 1280, "height": 800})
+                hpage = hctx.new_page()
+                hpage.add_init_script(
+                    f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
+                hpage.goto(base + "/?v=docs", wait_until="load")
+                hpage.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                hpage.locator("#documents-list .doc-card", has_text="guide.md") \
+                    .locator(".doc-hide").click()
+                hpage.wait_for_function(
+                    "() => ![...document.querySelectorAll('#documents-list .doc-card')]"
+                    ".some((c) => c.textContent.includes('guide.md'))",
+                    timeout=20_000)
+                hpage.click("#action-menu-open")
+                hpage.wait_for_selector("#docs-show-hidden", state="visible", timeout=20_000)
+                hpage.click("#docs-show-hidden")
+                hdim = hpage.locator("#documents-list .doc-card.doc-hidden", has_text="guide.md")
+                hdim.wait_for(state="visible", timeout=20_000)
+                hdim.locator(".doc-unhide").click()
+                hpage.wait_for_function(
+                    "() => [...document.querySelectorAll('#documents-list .doc-card')]"
+                    ".some((c) => c.textContent.includes('guide.md')"
+                    " && !c.classList.contains('doc-hidden'))",
+                    timeout=20_000)
+                hctx.close()
                 browser.close()
             print("documents browser check: real-server list, touch fetch, reader, outline pop-up, "
                   "source link, fetch error, and in-document links all seen")

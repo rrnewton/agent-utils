@@ -242,6 +242,11 @@
   :root:not([data-input="keys"]) #discord-log[data-focus-thread] > li:not([data-thread-in]) > .thread-strip:hover::before {
     background: hsl(var(--thread-hue, 210) 55% 50%);
   }
+
+  /* `#1265 documents-star-hide`: a document card's Hide button appears under a resting mouse. */
+  :root:not([data-input="keys"]) .doc-card:hover .doc-hide {
+    opacity: 1;
+  }
 }
 
 /* A touch screen keeps what it had: a row holding the focus (a finger on one of its controls focuses

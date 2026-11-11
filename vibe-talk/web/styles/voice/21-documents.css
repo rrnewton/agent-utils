@@ -147,6 +147,11 @@
   user-select: none;
   -webkit-user-select: none;
   -webkit-touch-callout: none;
+  /* The swipe to hide (`#1265`): `pan-y` gives the vertical axis to the
+     scroller and keeps the horizontal one for the card, as the message
+     rows' swipe does. The transition is for the snap back. */
+  touch-action: pan-y;
+  transition: transform 0.18s ease-out;
 }
 .doc-card:focus-visible {
   outline: 2px solid var(--accent, Highlight);
@@ -214,6 +219,56 @@
   min-width: 36px;
   min-height: 36px;
   cursor: pointer;
+}
+/* Star, Hide and hidden cards (`#1265 documents-star-hide`). */
+.doc-star {
+  flex: none;
+  min-width: 36px;
+  min-height: 36px;
+  cursor: pointer;
+  font-size: 1.1em;
+}
+.doc-star[aria-pressed="true"] {
+  color: var(--accent, Highlight);
+}
+.doc-hide,
+.doc-unhide {
+  flex: none;
+  min-height: 36px;
+  cursor: pointer;
+  font-size: 0.85em;
+}
+/* The Hide button rests invisible until the card is hovered (the one hover
+   block in 12-channel-rows.css) or holds the focus; on a phone the swipe
+   hides, so the button would only squeeze the card. */
+.doc-hide {
+  opacity: 0;
+}
+.doc-card:focus-within .doc-hide {
+  opacity: 1;
+}
+@media (hover: none), (pointer: coarse) {
+  .doc-hide {
+    display: none;
+  }
+}
+.doc-hidden {
+  opacity: 0.45;
+}
+.doc-undo {
+  margin: 0 0 8px;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+#doc-star {
+  flex: none;
+  min-width: 40px;
+  min-height: 36px;
+  cursor: pointer;
+  font-size: 1.2em;
+}
+#doc-star[aria-pressed="true"] {
+  color: var(--accent, Highlight);
 }
 
 .doc-list-head {

@@ -31,6 +31,7 @@ export interface SettingsSyncViewDependencies {
     readonly LINK_RAW_KEY: string;
     readonly THREADS_UNPACKED_KEY: string;
     readonly THREAD_CARD_STATES_KEY: string;
+    readonly DOC_STATES_KEY: string;
     readonly THREADS_MAIN_KEY: string;
     readonly THREAD_ORDER_KEY: string;
     readonly THREAD_CARD_FOLD_KEY: string;
@@ -61,6 +62,8 @@ export interface SettingsSyncViewDependencies {
   linkRaw(): void;
   threadsUnpacked(): void;
   threadCardStates(): void;
+  /** `#1265 documents-star-hide`. Another device starred or hid a document. */
+  docStates(): void;
   threadsMain(): void;
   threadOrder(): void;
   threadCardFold(): void;
@@ -156,6 +159,10 @@ export function mountSettingsSyncView(deps: SettingsSyncViewDependencies) {
           break;
         case deps.keys.THREAD_CARD_STATES_KEY: {
           deps.threadCardStates();
+          break;
+        }
+        case deps.keys.DOC_STATES_KEY: {
+          deps.docStates();
           break;
         }
         case deps.keys.THREADS_MAIN_KEY:

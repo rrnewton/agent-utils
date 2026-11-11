@@ -97,6 +97,8 @@ export function createControlBar(deps: ControlBarDependencies): ControlBar {
     deps.el("action-menu-open").hidden = !main;
     deps.el("reader-toggle").hidden = deps.view() !== "discord";
     deps.el("autoplay-toggle").hidden = deps.view() !== "discord";
+    // `#1265 documents-star-hide`. Show hidden, on the Documents view only.
+    deps.el("docs-show-hidden").hidden = deps.view() !== "docs";
     if (deps.actionMenuOpen()) deps.renderActionMenu();
     deps.el("open-settings").hidden = deps.screenHasTitle(deps.screen());
     // The pack, by the same rule and as a LOOP rather than by name: `#60 canned-prompt-buttons` adds

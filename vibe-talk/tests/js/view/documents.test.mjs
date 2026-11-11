@@ -1595,3 +1595,178 @@ test("issue header: front matter splits into a header over the body", () => {
   assert.equal(mod.splitIssueHeader("# No front matter\n"), null);
   assert.equal(mod.splitIssueHeader("---\ntitle: x\n"), null, "an unterminated block is not a header");
 });
+
+// ---- 8. star and hide (`#1265 documents-star-hide`) -------------------------------------------
+
+const DOCSTATE = await load("src/view/documents/docstate.ts");
+
+test("doc-states: parse, toggle and prune keep only flagged documents", () => {
+  const mod = requireModule(DOCSTATE, "src/view/documents/docstate.ts");
+  assert.equal(mod.DOC_STATES_KEY, "vibe-talk.voice.doc-states");
+  assert.deepEqual([...mod.parseDocStates(null)], [], "no value is no state");
+  assert.deepEqual([...mod.parseDocStates("not json")], [], "garbage is no state");
+  assert.deepEqual([...mod.parseDocStates('{"a":{"x":1}}')], [], "flagless is no state");
+  let states = mod.parseDocStates('{"a":{"s":1},"b":{"h":1},"c":{"s":1,"h":1}}');
+  assert.deepEqual(mod.docStateOf(states, "a"), { starred: true, hidden: false });
+  assert.deepEqual(mod.docStateOf(states, "b"), { starred: false, hidden: true });
+  assert.deepEqual(mod.docStateOf(states, "c"), { starred: true, hidden: true });
+  assert.deepEqual(mod.docStateOf(states, "missing"), { starred: false, hidden: false });
+  states = mod.withDocFlag(states, "a", "starred", false);
+  assert.equal(states.has("a"), false, "clearing the last flag drops the entry");
+  assert.equal(mod.serializeDocStates(states), '{"b":{"h":1},"c":{"s":1,"h":1}}');
+  let big = new Map();
+  for (let i = 0; i < mod.DOC_STATES_KEPT + 10; i += 1) {
+    big = mod.withDocFlag(big, `doc-${i}`, "starred", true);
+  }
+  assert.equal(big.size, mod.DOC_STATES_KEPT, "the map is not capped");
+  assert.equal(big.has("doc-0"), false, "the oldest state was not pruned");
+  assert.equal(big.has(`doc-${mod.DOC_STATES_KEPT + 9}`), true, "the newest state was pruned");
+});
+
+function memoryStorage() {
+  const held = new Map();
+  return {
+    getItem: (key) => (held.has(key) ? held.get(key) : null),
+    setItem: (key, value) => held.set(key, String(value)),
+    removeItem: (key) => held.delete(key),
+    held,
+  };
+}
+
+// One list over fakes with a real doc-states store over memory storage.
+async function withStateList(run) {
+  const listMod = requireModule(LIST, "src/view/documents/list.ts");
+  const stateMod = requireModule(DOCSTATE, "src/view/documents/docstate.ts");
+  const storage = memoryStorage();
+  const store = stateMod.createDocStatesStore(storage);
+  const rows = [docRow("md-doc", 100), docRow("paste-doc", 200)];
+  rows[0].kind = "github_markdown";
+  rows[1].kind = "paste";
+  const listEl = fakeElement("div");
+  const scroller = fakeElement("div");
+  scroller.scrollTop = 0;
+  scroller.clientHeight = 100;
+  Object.defineProperty(scroller, "scrollHeight", { get: () => listEl.children.length * 300 });
+  const byId = (id) => ({
+    "documents-list": listEl, "scroll-area": scroller,
+    "pane-docs": fakeElement("div"), "docs-list-view": fakeElement("div"),
+  })[id];
+  const list = listMod.createDocumentsList({
+    api: async () => ({ documents: rows, total: rows.length }),
+    byId,
+    onOpen: () => {},
+    docStates: store,
+  });
+  const savedDocument = globalThis.document;
+  globalThis.document = {
+    createElement: (tag) => fakeElement(tag),
+    createElementNS: (_ns, tag) => fakeElement(tag),
+    createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }),
+    querySelector: () => null,
+  };
+  const fire = (el, type, event = {}) => {
+    for (const listener of [...(el.listeners[type] || [])]) listener(event);
+  };
+  const cards = () => listEl.children.filter((kid) => String(kid.className).includes("doc-card"));
+  const cardOf = (key) => cards().find((kid) => kid.getAttribute("data-key") === key);
+  const chip = (name) => {
+    const bar = listEl.children.find((kid) => String(kid.className).includes("doc-buckets"));
+    return bar?.children.find((kid) => kid.getAttribute && kid.getAttribute("data-bucket") === name);
+  };
+  const buttonIn = (card, cls) => card.children.find((kid) => String(kid.className).includes(cls));
+  try {
+    await run({ list, listEl, storage, store, fire, cards, cardOf, chip, buttonIn });
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
+    list.unmount();
+  }
+}
+
+test("documents list: the card star toggles, writes the synced value, and the Starred chip filters", async () => {
+  await withStateList(async ({ list, storage, fire, cards, cardOf, chip, buttonIn }) => {
+    await list.refresh();
+    const star = buttonIn(cardOf("md-doc"), "doc-star");
+    assert.ok(star, "the card has no star");
+    assert.equal(star.getAttribute("aria-pressed"), "false");
+    fire(star, "click", { stopPropagation() {} });
+    const held = JSON.parse(storage.held.get("vibe-talk.voice.doc-states"));
+    assert.deepEqual(held, { "md-doc": { s: 1 } }, "the star did not write the synced value");
+    assert.equal(cardOf("md-doc").className.includes("doc-starred"), true, "the starred card is not marked");
+    assert.equal(buttonIn(cardOf("md-doc"), "doc-star").getAttribute("aria-pressed"), "true");
+    fire(chip("starred"), "click", {});
+    assert.deepEqual(cards().map((kid) => kid.getAttribute("data-key")), ["md-doc"],
+      "the Starred chip did not show only the starred document");
+    fire(chip("starred"), "click", {});
+    // Starring composes with the kind bucket: paste has no starred rows.
+    list.setStarred("paste-doc", false);
+    fire(chip("pastes"), "click", {});
+    fire(chip("starred"), "click", {});
+    assert.equal(cardOf("paste-doc"), undefined, "an unstarred paste shows under Starred+Pastes");
+    assert.equal(cardOf("md-doc"), undefined, "a markdown row shows under the Pastes bucket");
+  });
+});
+
+test("documents list: Hide removes the card, Undo puts it back, Show hidden shows it dimmed with Unhide", async () => {
+  await withStateList(async ({ list, listEl, storage, fire, cardOf, buttonIn }) => {
+    await list.refresh();
+    fire(buttonIn(cardOf("md-doc"), "doc-hide"), "click", { stopPropagation() {} });
+    assert.equal(cardOf("md-doc"), undefined, "Hide left the card in the list");
+    assert.deepEqual(JSON.parse(storage.held.get("vibe-talk.voice.doc-states")), { "md-doc": { h: 1 } });
+    const chip = listEl.children.find((kid) => String(kid.className).includes("doc-undo"));
+    assert.ok(chip, "the hide left no Undo chip");
+    assert.ok(chip.textContent.includes("Undo"), "the Undo chip does not say Undo");
+    fire(chip, "click", {});
+    assert.ok(cardOf("md-doc"), "the Undo chip did not restore the card");
+    assert.equal(list.undoHide(), false, "a spent Undo offer still takes something back");
+    // Hide again; Show hidden brings it back dimmed, and Unhide restores it.
+    fire(buttonIn(cardOf("md-doc"), "doc-hide"), "click", { stopPropagation() {} });
+    list.setShowHidden(true);
+    const shown = cardOf("md-doc");
+    assert.ok(shown, "Show hidden did not show the hidden card");
+    assert.ok(shown.className.includes("doc-hidden"), "the shown hidden card is not dimmed");
+    fire(buttonIn(shown, "doc-unhide"), "click", { stopPropagation() {} });
+    assert.equal(cardOf("md-doc").className.includes("doc-hidden"), false, "Unhide left the card hidden");
+    assert.deepEqual(JSON.parse(storage.held.get("vibe-talk.voice.doc-states")), {}, "Unhide left state behind");
+  });
+});
+
+test("documents list: a swipe past 90px hides, a short swipe does not", async () => {
+  await withStateList(async ({ list, fire, cardOf }) => {
+    await list.refresh();
+    const swipe = (card, dx) => {
+      fire(card, "pointerdown", { pointerType: "touch", clientX: 100, clientY: 100 });
+      fire(card, "pointermove", { pointerType: "touch", clientX: 100 + dx / 2, clientY: 100 });
+      fire(card, "pointermove", { pointerType: "touch", clientX: 100 + dx, clientY: 100 });
+      fire(card, "pointerup", { pointerType: "touch", clientX: 100 + dx, clientY: 100 });
+    };
+    swipe(cardOf("paste-doc"), 40);
+    assert.ok(cardOf("paste-doc"), "a short swipe hid the card");
+    swipe(cardOf("paste-doc"), 140);
+    assert.equal(cardOf("paste-doc"), undefined, "a full swipe did not hide the card");
+    // A vertical drag is a scroll, not a hide.
+    const card = cardOf("md-doc");
+    fire(card, "pointerdown", { pointerType: "touch", clientX: 100, clientY: 100 });
+    fire(card, "pointermove", { pointerType: "touch", clientX: 104, clientY: 220 });
+    fire(card, "pointerup", { pointerType: "touch", clientX: 104, clientY: 260 });
+    assert.ok(cardOf("md-doc"), "a vertical drag hid the card");
+  });
+});
+
+test("documents reader: the header star toggles the open document's star", async () => {
+  await withDocumentsView({}, async ({ view, byId }) => {
+    await view.show("doc-a");
+    const star = byId("doc-star");
+    assert.equal(star.hidden, false, "the header star stays hidden with a document open");
+    assert.equal(star.getAttribute("aria-pressed"), "false");
+    assert.equal(star.textContent, "☆");
+    dispatchClick(star);
+    assert.equal(star.getAttribute("aria-pressed"), "true", "the header star did not toggle on");
+    assert.equal(star.textContent, "★");
+    dispatchClick(star);
+    assert.equal(star.getAttribute("aria-pressed"), "false", "the header star did not toggle off");
+    // Show hidden is the view's to drive, as the hamburger drives it.
+    assert.equal(view.showHidden(), false);
+    view.setShowHidden(true);
+    assert.equal(view.showHidden(), true);
+  });
+});

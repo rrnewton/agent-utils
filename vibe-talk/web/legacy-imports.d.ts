@@ -354,6 +354,7 @@ declare const staleWords: LegacyImports["staleWords"];
 declare const tokenFingerprint: LegacyImports["tokenFingerprint"];
 // view/documents (documents-view-client)
 declare const createDocumentsView: LegacyImports["createDocumentsView"];
+declare const DOC_STATES_KEY: LegacyImports["DOC_STATES_KEY"];
 declare const createViewSelector: LegacyImports["createViewSelector"];
 declare const createTimelineView: LegacyImports["createTimelineView"];
 declare const COLLAPSE_OVER_CHARS: LegacyImports["COLLAPSE_OVER_CHARS"];

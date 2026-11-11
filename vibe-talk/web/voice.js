@@ -1052,6 +1052,10 @@ const screens = createScreens();
 const documentsView = createDocumentsView({
   api: (path, options) => api(path, options),
   byId: (id) => el(id),
+  // Per-document starred/hidden state (`#1265 documents-star-hide`): kept in
+  // device storage under a synced key, so the settings sync mirrors it.
+  storage: () => deviceStorageOnUse(),
+  closeActionMenu: () => setActionMenuOpen(false),
   readDocument: (doc) => readAloudOwner().readDocument(doc),
   // Page-side kind-and-id awareness (`#1039` stage 3): the reader names only its
   // own document's key; whether that document's is the read playing (or pending)
@@ -8250,6 +8254,7 @@ const settingsSyncGlue = createSettingsSyncGlue({
       get LINK_RAW_KEY() { return LINK_RAW_KEY; },
       get THREADS_UNPACKED_KEY() { return THREADS_UNPACKED_KEY; },
       get THREAD_CARD_STATES_KEY() { return THREAD_CARD_STATES_KEY; },
+      get DOC_STATES_KEY() { return DOC_STATES_KEY; },
       get THREADS_MAIN_KEY() { return THREADS_MAIN_KEY; },
       get THREAD_ORDER_KEY() { return THREAD_ORDER_KEY; },
       get THREAD_CARD_FOLD_KEY() { return THREAD_CARD_FOLD_KEY; },
@@ -8327,6 +8332,9 @@ const settingsSyncGlue = createSettingsSyncGlue({
       cardPacking.reloadChoices();
       cardsDrawn.forget();
       if (sideColumnUp()) renderSideColumn();
+    },
+    docStates: () => {
+      documentsView.reloadDocStates();
     },
     threadsMain: () => {
       setMainRowsShown(mainRowsChoice.stored());

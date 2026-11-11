@@ -775,6 +775,9 @@
                 <div class="row docs-toolbar">
                   <button id="doc-back" type="button">Back</button>
                   <h2 id="doc-title"></h2>
+                  <!-- The header star (`#1265 documents-star-hide`): the open document's
+                       star, the same per-document state as its card's. -->
+                  <button id="doc-star" type="button" aria-pressed="false" aria-label="Star this document" title="Star this document" hidden>☆</button>
                   <!-- Outline is in the control bar now (`#1078 bottom-bar-switcher`), under the
                        thumb however far this toolbar has scrolled away; see #doc-outline-open. -->
                   <button id="doc-read" type="button">Read</button>
@@ -4194,6 +4197,12 @@
                  with the reader's row hidden. On the channel's view only, as reading is. -->
             <button id="autoplay-toggle" class="tray-button" type="button" hidden>
               <span id="autoplay-toggle-label" class="tray-label">Autoplay: off</span>
+            </button>
+            <!-- `#1265 documents-star-hide`. Hidden documents, shown dimmed with an
+                 Unhide on each card. On the Documents view only; its word is what a
+                 press does, as Hide reader's is. -->
+            <button id="docs-show-hidden" class="tray-button" type="button" aria-pressed="false" hidden>
+              <span id="docs-show-hidden-label" class="tray-label">Show hidden</span>
             </button>
             <p id="action-menu-empty" class="hint" hidden>Nothing to expand, collapse or summarize here.</p>
           </div>
