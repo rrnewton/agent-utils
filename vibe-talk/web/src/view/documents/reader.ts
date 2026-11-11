@@ -28,8 +28,16 @@ export interface DocumentsReaderDependencies {
    * (`#1039 documents-read-parity`): one call for the whole document, its
    * blocks as `texts`. A second call for the document already playing stops
    * it — the owner's own semantics, which the Read button relies on.
+   * `onReadingBlock` (`#1330 doc-read-highlight`) is the owner's position
+   * report: the block being read and the drawn element it is a piece of, or
+   * a null block where the read stopped, finished or failed.
    */
-  readDocument(doc: { key: string; title?: string; texts: readonly string[] }): unknown;
+  readDocument(doc: {
+    key: string;
+    title?: string;
+    texts: readonly string[];
+    onReadingBlock?: (block: number | null, element?: number | null) => unknown;
+  }): unknown;
   /** Stop the reading of document `key`, where that document's is the one playing; no other. */
   stopSpeaking?(key: string): unknown;
   onBack(): unknown;
@@ -393,6 +401,14 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
   let buttons: HTMLButtonElement[] = [];
   let hereIndex = -1;
   let observer: IntersectionObserver | null = null;
+  // The reading light (`#1330 doc-read-highlight`): the drawn block lit now,
+  // the read it belongs to (its document's key and the texts it was handed,
+  // in `plainChunks` order), and where the block hunt last landed, so a
+  // repeated block's words are found at their later occurrence.
+  let litElement: HTMLElement | null = null;
+  let readKey: string | null = null;
+  let readTexts: readonly string[] = [];
+  let litScanFrom = 0;
 
   /** Scroll the rendered heading `id` into view; say whether it was drawn. */
   function scrollToHeading(id: string): boolean {
@@ -617,6 +633,136 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     if (target !== undefined && typeof target.focus === "function") target.focus();
   }
 
+  /** The attribute on the block being read: read-aloud's own for a message's block. */
+  const READING_BLOCK_ATTRIBUTE = "data-reading-block";
+
+  /** The element each drawn block is, by tag: read-aloud's `readingBlocks` rule. */
+  const READING_BLOCK_TAGS = new Set([
+    "p", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre", "table",
+  ]);
+
+  /**
+   * The blocks the drawn body holds, in document order, walked as read-aloud
+   * walks a message body (`readingBlocks`): a paragraph, heading, quote,
+   * `pre` and table are each one block; a list item is one, and the items of
+   * lists nested in it are blocks of their own; lists and wrapping `div`s
+   * are walked through.
+   */
+  function documentBlocks(body: HTMLElement): HTMLElement[] {
+    const found: HTMLElement[] = [];
+    const walk = (node: Element, inside: string): void => {
+      for (const kid of Array.from(node.children ?? [])) {
+        const tag = String((kid as Element).tagName || "").toLowerCase();
+        if (tag === "ul" || tag === "ol" || (inside === "blocks" && tag === "div")) {
+          walk(kid as Element, "blocks");
+          continue;
+        }
+        if (inside !== "blocks") continue;
+        if (tag === "li") {
+          found.push(kid as HTMLElement);
+          walk(kid as Element, "lists");
+          continue;
+        }
+        if (READING_BLOCK_TAGS.has(tag)) found.push(kid as HTMLElement);
+      }
+    };
+    walk(body as unknown as Element, "blocks");
+    return found;
+  }
+
+  /** Words compared as the reader hunts a block: case and spacing set aside. */
+  function huntWords(text: string): string {
+    return text.toLowerCase().replace(/\s+/g, "");
+  }
+
+  /** Take the reading light off whichever block holds it. */
+  function clearReadingLight(): void {
+    if (litElement !== null && typeof litElement.removeAttribute === "function") {
+      litElement.removeAttribute(READING_BLOCK_ATTRIBUTE);
+    }
+    litElement = null;
+    litScanFrom = 0;
+  }
+
+  /**
+   * Keep `el` in the scroller's view: centred where it stands outside it, by
+   * the reader's own scroll act (as a heading jump and a search hit land).
+   * Where boxes cannot be measured, nothing scrolls and nothing throws.
+   */
+  function keepBlockInView(el: HTMLElement): void {
+    if (typeof el.scrollIntoView !== "function") return;
+    let root: HTMLElement | null = null;
+    try {
+      root = deps.byId("scroll-area");
+    } catch {
+      root = null;
+    }
+    if (root !== null && typeof root.getBoundingClientRect === "function" &&
+        typeof el.getBoundingClientRect === "function") {
+      const view = root.getBoundingClientRect();
+      const box = el.getBoundingClientRect();
+      if (box.top >= view.top && box.bottom <= view.bottom) return;
+    }
+    el.scrollIntoView({ block: "center" });
+  }
+
+  /**
+   * The owner's position report (`#1330 doc-read-highlight`): light the drawn
+   * block the read has reached and keep it in view, as a message's block is
+   * lit; a null block (stopped, finished, failed) takes the light off.
+   *
+   * The block is found by its words first: the device read's blocks are
+   * `plainChunks` of the same markdown this body was rendered from, in the
+   * same order, so a chunk's words are its drawn block's — equal where a
+   * blank-line chunk is one drawn block; a chunk spanning a heading and the
+   * prose under it (no blank line between them) lights the first of them,
+   * and chunks cut by a blank line inside one drawn block (a code fence)
+   * light that block. Where no block's words match — a cloud read, whose
+   * blocks the server cut from its own rendering and may have cut into
+   * pieces — the drawn element the owner names is lit instead, counted over
+   * these same blocks; where that too falls outside them, nothing is lit
+   * rather than the wrong block lit.
+   */
+  function onReadingBlock(block: number | null, element?: number | null): void {
+    if (block === null || currentDoc === null || currentDoc.key !== readKey) {
+      clearReadingLight();
+      return;
+    }
+    let body: HTMLElement;
+    try {
+      body = deps.byId("doc-body");
+    } catch {
+      return;
+    }
+    if (!body) return;
+    const blocks = documentBlocks(body);
+    let at = -1;
+    const wanted = readTexts[block] !== undefined ? huntWords(readTexts[block] as string) : "";
+    if (wanted !== "") {
+      const order = blocks.map((_, index) => index)
+        .sort((a, b) => ((a - litScanFrom + blocks.length) % blocks.length) -
+          ((b - litScanFrom + blocks.length) % blocks.length));
+      for (const index of order) {
+        const words = huntWords((blocks[index] as HTMLElement).textContent ?? "");
+        if (words !== "" && (words === wanted || wanted.startsWith(words) || words.includes(wanted))) {
+          at = index;
+          break;
+        }
+      }
+    }
+    if (at === -1) {
+      const named = typeof element === "number" && Number.isInteger(element) ? element : block;
+      if (named >= 0 && named < blocks.length) at = named;
+    }
+    clearReadingLight();
+    if (at === -1) return;
+    const target = blocks[at] as HTMLElement;
+    target.setAttribute(READING_BLOCK_ATTRIBUTE, "current");
+    litElement = target;
+    litScanFrom = at;
+    keepBlockInView(target);
+  }
+
   /**
    * Hand the retained document to the shared read-aloud owner in one call
    * (`#1039 documents-read-parity`), its plain text a chunk per blank-line
@@ -633,9 +779,14 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
       deps.onStatus?.("Nothing to read yet.");
       return;
     }
+    // The light's read, named before the ask: a device read reports its
+    // first block inside the call (`#1330 doc-read-highlight`).
+    readKey = currentDoc.key;
+    readTexts = texts;
+    litScanFrom = 0;
     // The owner reports its own failures; nothing here follows the ask.
     void Promise.resolve(
-      deps.readDocument({ key: currentDoc.key, title: currentDoc.title, texts }),
+      deps.readDocument({ key: currentDoc.key, title: currentDoc.title, texts, onReadingBlock }),
     ).catch(() => undefined);
   }
 
@@ -699,6 +850,10 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     // open's own document is drawn, so a failed load cannot leave the
     // previous document's kind over whatever stands in the reader.
     drawKind(null);
+    // A new open carries no reading light from the last document (`#1330`).
+    clearReadingLight();
+    readKey = null;
+    readTexts = [];
     setOutlineOpen(false);
     stopWatching();
     const path = `/api/v1/documents/${encodeURIComponent(key)}`;
@@ -871,10 +1026,12 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     },
     close(): void {
       stopOwnReading();
+      clearReadingLight();
       closeOutline(false);
       stopWatching();
     },
     unmount(): void {
+      clearReadingLight();
       closeOutline(false);
       stopWatching();
       wired = false;

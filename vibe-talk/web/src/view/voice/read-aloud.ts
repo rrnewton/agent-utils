@@ -42,6 +42,16 @@ interface TransportPlayer extends ReadPlayer {
   addEventListener(type: string, fn: (...details: unknown[]) => void): void;
 }
 /**
+ * `#1330 doc-read-highlight`. Where a document read has got to, told to the surface that
+ * drew the document: the block being read (its place in the read's blocks, as
+ * `segment.block` names it) and the drawn element that block is a piece of, where the
+ * prepared blocks say so, else the block itself; or null for the block where the read
+ * stopped, finished or failed. The one position report `showReadingPosition` already
+ * keeps for message rows, handed out for a surface with no row to light.
+ */
+type DocumentReadingBlock = (block: number | null, element?: number | null) => unknown;
+
+/**
  * `#1039 documents-read-parity`. What a document read is of, kept whole on the read itself: a jump,
  * a restart or a recovery rebuilds the read from `Playing` alone, and a document has no row to look
  * its words up in. `texts` are the blocks as the device voice says them, one a block; `entry` is the
@@ -52,6 +62,8 @@ interface DocumentPayload {
   title?: string;
   entry: PreparedEntry | null;
   texts: readonly string[];
+  /** `#1330 doc-read-highlight`: where this read is, for the surface that drew it. */
+  onReadingBlock?: DocumentReadingBlock;
 }
 /** Fields are filled by the selected transport; guards retain the original read ticket and lifetime rules. */
 interface Playing {
@@ -681,6 +693,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
         : {}) };
     // `#828 voice-page-read-nav-center`: its strip, React alone, from the first word.
     renderReadSteer();
+    // `#1330 doc-read-highlight`: the first block is the surface's to light from the start.
+    if (docPayload !== null) showDocumentBlock();
     // `#1039 documents-read-parity`: a document of several blocks holds the media keys, as a cloud
     // read of several does; one of a single block has nowhere for them to steer to.
     if (docPayload !== null && segments!.length > 1) claimMediaSession();
@@ -1159,7 +1173,10 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
       return;
     }
     const { audio, urls, speechTimer, players } = nowPlaying;
+    const stoppedDocument = nowPlaying.kind === "document" ? nowPlaying.document : undefined;
     nowPlaying = null;
+    // `#1330 doc-read-highlight`: a stopped document read's surface takes its light off.
+    if (stoppedDocument && stoppedDocument.onReadingBlock) stoppedDocument.onReadingBlock(null);
     // `#376 read-aloud-blocks`. The media keys and the steering strip belong to a read in progress,
     // and a jump to another block of it is still that read.
     if (!readJumping) releaseMediaSession();
@@ -2304,10 +2321,33 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
   }
 
   /**
+   * `#1330 doc-read-highlight`. Tell a document read's surface the block being read, as
+   * `markReadingBlock` lights a message's: run where that runs — at a read's start and at
+   * every block boundary (`showReadingPosition`) — so the document's light moves with the
+   * voice by the same signal, on either transport. A message read, and a document read
+   * whose surface asked for no report, are untouched.
+   */
+  function showDocumentBlock() {
+    const playing = nowPlaying;
+    if (playing === null || playing.kind !== "document" || !playing.document || !playing.document.onReadingBlock) return;
+    const tell = playing.document.onReadingBlock;
+    const segment = playing.segments && playing.segment !== undefined ? playing.segments[playing.segment] : undefined;
+    if (!segment || segment.block === null) {
+      tell(null);
+      return;
+    }
+    const listed = playing.blocks && playing.blocks[segment.part] ? playing.blocks[segment.part]![segment.block] : undefined;
+    const element = listed && Number.isInteger(listed.element) ? listed.element as number : segment.block;
+    tell(segment.block, element);
+  }
+
+  /**
    * Show where in its message the read is: the block lit, "reading 2 of 5" where the author was, and
    * the steering strip. Cheap, so it runs at every boundary rather than redrawing the lists.
    */
   function showReadingPosition() {
+    // `#1330 doc-read-highlight`: a document read's surface is told at the same boundaries.
+    showDocumentBlock();
     // `#540 read-aloud-desktop`: in every list a row of the read is drawn in, the cards' list included.
     for (const row of READABLE_LISTS.flatMap(listRows)) {
       const reading = nowPlaying !== null && row.getAttribute("data-id") === nowPlaying!.id;
@@ -3336,6 +3376,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     // A document read lights no channel row: there is none of it to redraw.
     if (!isDocument) deps.eachColumn(deps.renderChannelRows);
     renderReadSteer();
+    // `#1330 doc-read-highlight`: the first block is the surface's to light from the start.
+    if (isDocument) showDocumentBlock();
     if (segments.length > 1) {
       claimMediaSession();
       // A document has no drawn sentence to light (`#1039 documents-read-parity`).
@@ -3512,7 +3554,7 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
    * read alone. Nothing calls this yet: the documents view wires it in a later stage.
    */
   async function readDocument(
-    doc: { key: string; title?: string; texts: readonly string[]; entry?: PreparedEntry | null },
+    doc: { key: string; title?: string; texts: readonly string[]; entry?: PreparedEntry | null; onReadingBlock?: DocumentReadingBlock },
     from: ReadFrom | null = null
   ) {
     const tapBegan = speechTimingNow();
@@ -3527,7 +3569,8 @@ export function createReadAloud<Column>(deps: ReadAloudDependencies<Column>) {
     const ticket = readingTicket;
     pendingRead = id;
     setReadState("working");
-    const payload: DocumentPayload = { key, title: doc.title, entry: doc.entry ?? null, texts: doc.texts };
+    const payload: DocumentPayload = { key, title: doc.title, entry: doc.entry ?? null, texts: doc.texts,
+      ...(doc.onReadingBlock ? { onReadingBlock: doc.onReadingBlock } : {}) };
     if (readAloudPlayback !== "audio") {
       try {
         if (readAloudPlayback !== "browser") throw new Error("This speech playback method is not supported by this page.");

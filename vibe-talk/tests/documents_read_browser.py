@@ -18,6 +18,12 @@ a time, Next and Previous step it, the media nexttrack steps it, and Next
 on the last block finishes it (the strip clears). Flipping the toggle back
 makes the next read the server voice's: the sidecar is asked for the
 document's words and the device says nothing new. Back stops a read.
+
+The block being read is lit in the reader and kept in view (`#1330
+doc-read-highlight`), as a message's block is lit: starting Read lights the
+first block, Next moves the light, a timeline jump to the last block (off
+screen in a document this long) brings the lit block inside the scroller,
+and finishing, stopping and Back all take the light off.
 """
 
 import io
@@ -47,17 +53,23 @@ WRITE_TOKEN = "documents-read-check-write-token-not-a-real-credential"
 # One document per viewport, differently worded: the server caches synthesized
 # speech, so a second walk over the same words would be served from the cache
 # and the sidecar would honestly have nothing new to record.
+#
+# Twelve blocks, each one sentence under the device voice's utterance cap, so
+# a block is said in one utterance and the document stands well taller than
+# either viewport: the last block starts off screen, which is what makes the
+# reading light's follow observable (`#1330 doc-read-highlight`).
+def make_blocks(label: str) -> list[str]:
+    return [
+        f"Block {number} of the {label} document carries its own plain words"
+        " along the page so the reading light has somewhere far to travel"
+        " before it rests here."
+        for number in range(1, 13)
+    ]
+
+
 DOCS: list[tuple[str, list[str]]] = [
-    ("read-doc", [
-        "Opening block of the document says hello.",
-        "Middle block of the document says more.",
-        "Closing block of the document says goodbye.",
-    ]),
-    ("desk-doc", [
-        "First part of the desk document begins.",
-        "Second part of the desk document follows.",
-        "Final part of the desk document ends.",
-    ]),
+    ("read-doc", make_blocks("reading")),
+    ("desk-doc", make_blocks("desk")),
 ]
 # Slow enough that no block ends by itself while the walk steps it: every
 # move the walk sees is one it asked for. Cancellation is the owner's to do.
@@ -223,6 +235,58 @@ def wait_stopped(page: Page) -> None:
     )
 
 
+def wait_lit(page: Page, block: str) -> None:
+    """The one block lit in the reader is `block` (`#1330 doc-read-highlight`)."""
+    page.wait_for_function(
+        """(words) => {
+          const lit = [...document.querySelectorAll('#doc-body [data-reading-block="current"]')];
+          return lit.length === 1 && lit[0].textContent.trim().startsWith(words);
+        }""",
+        arg=block[:30],
+        timeout=20_000,
+    )
+
+
+def wait_unlit(page: Page) -> None:
+    """No block in the reader carries the reading light any more."""
+    page.wait_for_function(
+        "() => document.querySelectorAll('#doc-body [data-reading-block]').length === 0",
+        timeout=20_000,
+    )
+
+
+def wait_lit_in_view(page: Page) -> None:
+    """The lit block's box stands inside the scroller's box."""
+    page.wait_for_function(
+        """() => {
+          const lit = document.querySelector('#doc-body [data-reading-block="current"]');
+          const area = document.getElementById('scroll-area');
+          if (!lit || !area) return false;
+          const box = lit.getBoundingClientRect();
+          const view = area.getBoundingClientRect();
+          return box.top >= view.top - 1 && box.bottom <= view.bottom + 1;
+        }""",
+        timeout=20_000,
+    )
+
+
+def block_off_screen(page: Page, block: str) -> bool:
+    """Whether the drawn block saying `block` stands outside the scroller."""
+    off: bool = page.evaluate(
+        """(words) => {
+          const area = document.getElementById('scroll-area');
+          const drawn = [...document.querySelectorAll('#doc-body > p')];
+          const el = drawn.find((one) => one.textContent.trim().startsWith(words));
+          if (!el || !area) return false;
+          const box = el.getBoundingClientRect();
+          const view = area.getBoundingClientRect();
+          return box.bottom <= view.top || box.top >= view.bottom;
+        }""",
+        block[:30],
+    )
+    return off
+
+
 def owner_state(page: Page) -> dict[str, object]:
     state: dict[str, object] = page.evaluate(OWNER_STATE)
     return state
@@ -266,10 +330,14 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
         "() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
         timeout=20_000)
 
+    count = len(blocks)
     # Read: the strip counts the blocks, the device voice says them in order,
     # and the read is the owner's document read — no queue of the reader's own.
+    # The block being read is lit in the reader (`#1330 doc-read-highlight`).
     act("#doc-read")
-    wait_count(page, "1 of 3")
+    wait_count(page, f"1 of {count}")
+    wait_lit(page, blocks[0])
+    wait_lit_in_view(page)
     state = owner_state(page)
     check(state["id"] == f"doc:paste:{name}", f"Read started {state}, not the document read")
     check(state["kind"] == "document", f"the playing read is not a document: {state}")
@@ -281,24 +349,38 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
           f"the document read holds media handlers {handlers}")
 
     act("#read-next")
-    wait_count(page, "2 of 3")
+    wait_count(page, f"2 of {count}")
+    wait_lit(page, blocks[1])
     page.wait_for_function("() => window.deviceSpeech.length >= 2", timeout=20_000)
     check(utterances(page)[-1] == blocks[1], "Next did not say the second block")
     page.evaluate("() => window.mediaProbe.handlers.nexttrack({action: 'nexttrack'})")
-    wait_count(page, "3 of 3")
+    wait_count(page, f"3 of {count}")
+    wait_lit(page, blocks[2])
     page.wait_for_function("() => window.deviceSpeech.length >= 3", timeout=20_000)
-    check(utterances(page)[-1] == blocks[2], "the media Next did not say the last block")
+    check(utterances(page)[-1] == blocks[2], "the media Next did not say the third block")
+    # A jump to the last block, off screen until now: the light lands on it
+    # and the reader follows it into the scroller's view (`#1330`).
+    check(block_off_screen(page, blocks[-1]),
+          "the premise: the last block already stands in view before the jump")
+    act(f'#read-timeline button[aria-label="Read from block {count} of {count}"]')
+    wait_count(page, f"{count} of {count}")
+    wait_lit(page, blocks[-1])
+    wait_lit_in_view(page)
     # On the last block the strip's Next is not offered, as a message's is not.
     check(page.evaluate("() => document.getElementById('read-next').disabled") is True,
           "Next is offered on the document's last block")
     act("#read-prev")
-    wait_count(page, "2 of 3")
+    wait_count(page, f"{count - 1} of {count}")
+    wait_lit(page, blocks[-2])
     act("#read-next")
-    wait_count(page, "3 of 3")
+    wait_count(page, f"{count} of {count}")
+    wait_lit(page, blocks[-1])
     said_before_finish = len(utterances(page))
-    # The media Next on the last block finishes the read (`#1035`): strip gone, owner idle.
+    # The media Next on the last block finishes the read (`#1035`): strip
+    # gone, owner idle, and the reading light off with it (`#1330`).
     page.evaluate("() => window.mediaProbe.handlers.nexttrack({action: 'nexttrack'})")
     wait_stopped(page)
+    wait_unlit(page)
     check(len(utterances(page)) == said_before_finish, "finishing the read said something after it")
 
     # Flip back: the next read is the server voice's — the sidecar is asked
@@ -311,12 +393,15 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
         timeout=20_000)
     act("#doc-read")
     page.wait_for_function(
-        """() => {
+        """(tail) => {
           const strip = document.getElementById('read-steer');
           const count = document.getElementById('read-steer-count');
-          return !!strip && !strip.hidden && !!count && count.textContent.trim().endsWith('of 3');
+          return !!strip && !strip.hidden && !!count && count.textContent.trim().endsWith(tail);
         }""",
+        arg=f"of {count}",
         timeout=20_000)
+    # The server voice's read lights its block in the reader too (`#1330`).
+    wait_lit(page, blocks[0])
     deadline = time.time() + 20
     while len(sidecar_texts()) <= asked and time.time() < deadline:
         time.sleep(0.1)
@@ -329,16 +414,33 @@ def walk(page: Page, base: str, touch: bool, name: str, blocks: list[str]) -> No
     check(state["kind"] == "document", f"the cloud read is not the document's: {state}")
     act("#doc-read")
     wait_stopped(page)
+    wait_unlit(page)
 
-    # Back stops a document read where it stands.
+    # Back stops a document read where it stands, its light with it; and a
+    # document opened afresh carries no light from the last read (`#1330`).
     act("#audio-source")
     page.wait_for_function(
         "() => document.getElementById('audio-source').getAttribute('aria-checked') === 'false'",
         timeout=20_000)
     act("#doc-read")
-    wait_count(page, "1 of 3")
+    wait_count(page, f"1 of {count}")
+    wait_lit(page, blocks[0])
     act("#doc-back")
     wait_stopped(page)
+    wait_unlit(page)
+    page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+    card = page.locator("#documents-list .doc-card", has_text=name)
+    if touch:
+        card.tap()
+    else:
+        card.click()
+    page.wait_for_function(
+        "(words) => (document.getElementById('doc-body')?.textContent || '').includes(words)",
+        arg=blocks[0][:20],
+        timeout=20_000)
+    check(page.evaluate("() => document.querySelectorAll('#doc-body [data-reading-block]').length") == 0,
+          "a freshly opened document still carries the last read's light")
+    act("#doc-back")
     page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
 
 
@@ -409,7 +511,8 @@ def main() -> int:
                     ctx.close()
                 browser.close()
             print("documents read browser check: strip, device blocks, Next/Prev, media next, "
-                  "finish-on-last, device/cloud toggle and Back-stop all seen at 393x852 and 1280x800")
+                  "finish-on-last, device/cloud toggle, Back-stop and the reading light lit, "
+                  "followed and cleared all seen at 393x852 and 1280x800")
             return 0
         finally:
             server.terminate()

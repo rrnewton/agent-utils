@@ -1641,11 +1641,18 @@ test("documents reader: Read hands the owner the retained document in one call (
     { title: "Field notes", content: "Alpha block here.\n\nBeta **block** here.\n", outline: [] },
     async ({ els, reads, stops, statuses }) => {
       dispatchClick(els["doc-read"]);
-      assert.deepEqual(reads, [{
-        key: "demo-doc",
-        title: "Field notes",
-        texts: ["Alpha block here.", "Beta block here."],
-      }], "Read did not hand the owner the whole document at once");
+      assert.equal(reads.length, 1, "Read did not hand the owner the whole document at once");
+      assert.deepEqual(
+        { key: reads[0].key, title: reads[0].title, texts: reads[0].texts },
+        {
+          key: "demo-doc",
+          title: "Field notes",
+          texts: ["Alpha block here.", "Beta block here."],
+        },
+        "Read did not hand the owner the whole document at once");
+      // `#1330 doc-read-highlight`: the owner's position report rides the same call.
+      assert.equal(typeof reads[0].onReadingBlock, "function",
+        "Read did not ask the owner where the read has got to");
       assert.deepEqual(stops, [], "starting a read stopped something");
       assert.deepEqual(statuses, [], "starting a read said there was nothing to read");
       // A second Read is forwarded as it comes: what it means for the document
