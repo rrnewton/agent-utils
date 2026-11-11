@@ -494,6 +494,9 @@ def bookmark_walk(walk: Walk) -> None:
     walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {COUNT}",
                   "the channel did not open")
     walk.settled()
+    # `#1321 after-done-setting`: this walk is about a Done advancing the bookmark and the
+    # selection together, which is the Next unread choice; Stay is the default.
+    page.evaluate("() => localStorage.setItem('vibe-talk.voice.after-done', 'unread')")
     walk.check(walk.measure(marked).found["atEnd"] is True, "the channel did not open at its newest message")
 
     # Set it: Shift+B on the selected message at a desk, the row's own ⋯ item on a phone.

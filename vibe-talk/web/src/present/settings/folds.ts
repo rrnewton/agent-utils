@@ -24,6 +24,7 @@ const SETTINGS_FOLDS: readonly string[] = Object.freeze([
   "combining",
   "rich-headers",
   "message-links",
+  "after-done",
   "summaries",
   "dismissed",
   "settings-channels",

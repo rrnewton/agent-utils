@@ -6,6 +6,7 @@
 // page's: its acts come in as dependencies.
 
 import { isLink, isTextField } from "../dom/index.ts";
+import type { AfterDone } from "./donekeys.ts";
 import { modHeld, typedKey } from "./chords.ts";
 import type { KeyChord } from "./chords.ts";
 import type { DispatchedKey } from "./keydispatch.ts";
@@ -104,6 +105,8 @@ export interface KeymapActs<Target> {
   copyFromKeyboard(): unknown;
   nextUnreadFromKeyboard(target: Target): unknown;
   stepUnreadFromKeyboard(target: Target, direction: number): unknown;
+  /** `#1321 after-done-setting`. What e does after marking Done, as kept in Settings. */
+  afterDone(): AfterDone;
   doneFromKeyboard(target: Target): unknown;
   readCollapseFromKeyboard(target: Target): unknown;
   foldOneFromKeyboard(target: Target): unknown;
@@ -140,7 +143,7 @@ export function createKeymap<Target>(acts: KeymapActs<Target>): KeymapBinding<Ta
     settingsFromKeyboard, keysFromKeyboard, stepFromKeyboard, stepChannel, pickChannel, openFromKeyboard,
     threadFromKeyboard, threadOutFromKeyboard, threadStripFromKeyboard, columnFromKeyboard, replyFromKeyboard, quoteFromKeyboard,
     menuFromKeyboard, readFromKeyboard, detailsFromKeyboard, copyLinkFromKeyboard, deepLinkFromKeyboard, standalone,
-    copyChordFromKeyboard, copyFromKeyboard, nextUnreadFromKeyboard, stepUnreadFromKeyboard, doneFromKeyboard, readCollapseFromKeyboard, foldOneFromKeyboard,
+    copyChordFromKeyboard, copyFromKeyboard, nextUnreadFromKeyboard, stepUnreadFromKeyboard, afterDone, doneFromKeyboard, readCollapseFromKeyboard, foldOneFromKeyboard,
     foldStepFromKeyboard, collapsedLinesFromKeyboard, packFromKeyboard, unpackFromKeyboard, bookmarkFromKeyboard,
     bookmarkJumpFromKeyboard, viewFromKeyboard, voiceFromKeyboard, readModeFromKeyboard, filterFromKeyboard,
     undoFromKeyboard, orderFromKeyboard, mainRowsFromKeyboard, columnsFromKeyboard, outlineFromKeyboard, composeFromKeyboard,
@@ -351,7 +354,11 @@ export function createKeymap<Target>(acts: KeymapActs<Target>): KeymapBinding<Ta
       // default before anything is done, and this one is the browser's while there is no message to mark;
       // and it is heard here, after `keyDispatch.macFieldEditKey`, so Ctrl+E in a field on a Mac stays the field's.
       group: KEYS_MESSAGE, chords: [{ key: "e" }, { key: "e", mod: true }], repeats: true,
-      does: () => `Done, or not Done. Marked Done, on to the next unread below. ${modKeyName()}+E does it from a ` +
+      does: () => `Done, or not Done. ${afterDone() === "next"
+        ? "Marked Done, on to the next message below."
+        : afterDone() === "unread"
+          ? "Marked Done, on to the next unread below."
+          : "Marked Done, the selection stays on it."} ${modKeyName()}+E does it from a ` +
         "message box or the search too, where e is typed, with single keys on or off; the box keeps what you are typing",
       rowControls: ["done-button"],
       run: (event, target) => (event.repeat ? modHeld(event) && keyContext(target).row !== null : doneFromKeyboard(target)),

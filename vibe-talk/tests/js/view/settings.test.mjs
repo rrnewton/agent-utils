@@ -286,7 +286,7 @@ test("`#624 voice-page-modularity`: Settings' switches mount where the browser h
 test("`#624 voice-page-modularity`: every setting is restored as kept, once, in the page's order", () => {
   const { restoreStoredSettings } = VIEW_SETTINGS;
   const order = ["readingWidth", "textSize", "collapsedLines", "cardMaxLines", "quoteReadPercent", "readSpeed", "ownRead", "combine",
-    "hideEmpty", "richHeaders", "inAppLinks", "openInView", "summarizeCollapsed", "enterSends"];
+    "hideEmpty", "richHeaders", "inAppLinks", "openInView", "afterDone", "summarizeCollapsed", "enterSends"];
   const log = [];
   const deps = Object.fromEntries([...order].reverse().map((name) => [name, (...args) => log.push(`${name}${args.length ? ` ${args.length}` : ""}`)]));
   assert.equal(restoreStoredSettings(deps), undefined);
@@ -343,17 +343,17 @@ test("`#624 voice-page-modularity`: the reading preferences' switches reach what
     lookup: (id) => target(id),
     toggleSpeedPopover: act("pace"), applyOwnRead: act("own apply"), undoOwnRead: act("own undo"), markOwnReadChanged: act("own"),
     hideEmptyChanged: act("empty"), combineChanged: act("combine"), richHeadersChanged: act("headers"), inAppLinksChanged: act("links"),
-    openInViewChanged: act("open in view"), summariesChanged: act("summaries"), enterSendsChanged: act("enter sends"),
+    openInViewChanged: act("open in view"), afterDoneChanged: act("after done"), summariesChanged: act("summaries"), enterSendsChanged: act("enter sends"),
   });
   const order = [["read-speed", "click"], ["own-read-apply", "click"], ["own-read-undo", "click"], ["mark-own-read", "change"],
     ["hide-empty-messages", "change"], ["combine-messages", "change"], ["rich-headers", "change"], ["in-app-links", "change"],
-    ["open-in-view", "change"], ["summarize-collapsed", "change"], ["enter-sends", "change"]];
+    ["open-in-view", "change"], ["after-done", "change"], ["summarize-collapsed", "change"], ["enter-sends", "change"]];
   assert.deepStrictEqual(log, order.map(([id, type]) => `listen ${id} ${type}`), "a switch was heard out of the page's order");
   log.length = 0;
   nodes["enter-sends"].checked = true;
   assert.deepStrictEqual(order.flatMap(([id, type]) => fire(id, type)),
-    ["pace", "own apply", "own undo", "own", "empty", "combine", "headers", "links", "open in view", "summaries", "enter sends"]);
-  assert.deepStrictEqual(log, ["pace", "own apply", "own undo", "own", "empty", "combine", "headers", "links", "open in view", "summaries",
+    ["pace", "own apply", "own undo", "own", "empty", "combine", "headers", "links", "open in view", "after done", "summaries", "enter sends"]);
+  assert.deepStrictEqual(log, ["pace", "own apply", "own undo", "own", "empty", "combine", "headers", "links", "open in view", "after done", "summaries",
     "enter sends true"], "an act was handed the event, or Enter sends not read as the switch says");
   switches.unmount();
   assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");

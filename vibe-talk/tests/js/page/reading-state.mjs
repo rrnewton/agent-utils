@@ -4100,6 +4100,7 @@ test("`#240 reading-bookmark`: Done through here at or below the line slides it 
 
 test("`#240 reading-bookmark`: e moves the bookmark and the selection together, and z takes both back", async () => {
   const page = newPage();
+  page.storage.set("vibe-talk.voice.after-done", "unread"); // `#1321 after-done-setting`: e steps on, as this walk expects.
   await signIn(page);
   await showDiscord(page, backlog(4));
   page.el("scroll-area").scrollTop = 0;

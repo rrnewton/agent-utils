@@ -118,6 +118,7 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
     onOff("hideEmptyMessages", "vibe-talk.voice.hide-empty", true, THROWN),
     onOff("combineMessages", "vibe-talk.voice.combine", true, THROWN),
     ["openInView", "vibe-talk.voice.open-in-view", "flat", [["main", "main"], ["flat", "flat"]], THROWN],
+    ["afterDone", "vibe-talk.voice.after-done", "stay", [["next", "next"], ["unread", "unread"], ["stay", "stay"]], "stay"],
     ["readAudioSource", "vibe-talk.voice.read-audio-source", null, [["agent", "agent"], ["device", "device"], ["wit", "wit"]], null],
     ["witVoice", "vibe-talk.voice.wit-voice", "", [["Charlie", "Charlie"], ["", null]], ""],
     ["readSteerOffset", "vibe-talk.voice.read-steer-offset", null, [[{ x: 3, y: -4 }, '{"x":3,"y":-4}'], [null, null]], null],

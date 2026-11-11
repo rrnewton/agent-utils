@@ -1028,6 +1028,7 @@ test("THE SELECTION OUTLIVES A REDRAW: the new row takes the focus; a row that g
 
 test("e MARKS THE SELECTED MESSAGE DONE and moves on to the next unread below; e on a Done one puts it back", async () => {
   const page = await keyboardPageAtTop();
+  page.storage.set("vibe-talk.voice.after-done", "unread"); // `#1321 after-done-setting`: the Next unread choice.
   await press(page, page.el("scroll-area"), "ArrowDown");
   let event = await pressHere(page, "e");
   assert.equal(event.defaulted, false);
@@ -1354,6 +1355,7 @@ const ASKS_SERVICE = "    const mark = await deps.markReadInService(channel, ids
 async function readCollapseTwice(script = SCRIPT) {
   let asked = null;
   const { page, before } = await readCollapseMarked(script, (p) => { asked = serverFloor(p); });
+  page.storage.set("vibe-talk.voice.after-done", "unread"); // `#1321 after-done-setting`: e steps on, as these walks expect.
   const said = [page.el("status").textContent];
   await pressHere(page, "Enter");
   assert.equal(channelRow(page, "3").getAttribute("data-collapsed"), "false", "the premise is the message opened again");
@@ -1477,6 +1479,7 @@ async function readCollapseWhileSaving(answer, first, script = SCRIPT) {
     p.inboxWriteHook = async (kind) => (kind === "dismiss"
       ? new Promise((resolve) => { release = () => resolve(answer); }) : null);
   });
+  page.storage.set("vibe-talk.voice.after-done", "unread"); // `#1321 after-done-setting`: e steps on, as this walk expects.
   if (first === "e") {
     await pressHere(page, "e");
     await pressHere(page, "k");
@@ -2160,6 +2163,7 @@ test("`#239 single-selection`: A LIST SCROLLED UNDER A STILL MOUSE takes nothing
 
 test("`#239 single-selection`: Enter, e and the rest act on THE ONE SELECTION — the message the mouse moved to after the keys", async () => {
   const page = await keyboardPageAtTop();
+  page.storage.set("vibe-talk.voice.after-done", "unread"); // `#1321 after-done-setting`: e steps on, as this walk expects.
   await press(page, page.el("scroll-area"), "ArrowDown");
   assert.equal(selectedId(page), "1");
   await mouseTo(page, channelRow(page, "2"), 100, 300);
@@ -4007,6 +4011,8 @@ test("aria-keyshortcuts names each control's key, from the same table, and drops
 
 /** A channel at its top on `platform`, `store` holding the reader's settings, with the first message selected by ↓. */
 async function cmdEPage(platform = "Linux x86_64", store = new Map()) {
+  // `#1321 after-done-setting`: the chord walks expect e to step on to the next unread.
+  if (!store.has("vibe-talk.voice.after-done")) store.set("vibe-talk.voice.after-done", "unread");
   const page = newPage(store, SCRIPT, (p) => p.setPlatform(platform));
   await signIn(page);
   await showDiscord(page, tallChannel(30));
@@ -5032,6 +5038,7 @@ async function pressesInPlace(page, key, fields, times, own) {
 
 test("`#532 shift-o-latency`: four Shift+O and four e in an unpacked Threads view each draw in place, press CPU printed against a benchmark-only budget, and the folds, Dones and Undo are right", async () => {
   const page = await shiftOPage();
+  page.storage.set("vibe-talk.voice.after-done", "unread"); // `#1321 after-done-setting`: e steps down, as this walk expects.
   const own = "spaces/A/threads/s11";
   const rows = () => unpackRows(page, own);
   assert.equal(rows().length, SHIFT_O_REPLIES, "the premise is the last thread's replies unpacked under its card");

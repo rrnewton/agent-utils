@@ -1,6 +1,6 @@
 ---
 title: 'after-done-setting: a synced dropdown chooses what e does after marking Done (Stay, Next message, Next unread)'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 labels:
@@ -35,3 +35,17 @@ Today e and Mod+E (`cmd-e-done` in web/src/view/shell/keymap.ts, `doneFromKeyboa
 # Notes
 
 Related: #1314 unread-step-keys, #295 shift-e-read-collapse. The owner has been told Stay is the new default.
+
+## Resolution
+
+[watermelon-full-preview] Delivered: a synced setting `vibe-talk.voice.after-done` (server
+`SYNCED_KEYS` and the page's synced list) shown as a dropdown "After Done (e)" in Settings'
+Messages section — Stay (the default, nothing kept), Next message, Next unread. e and Mod+E
+read it at each press: Stay lands back on the marked message, Next message selects the row
+below read or not, Next unread keeps the previous behaviour; putting a message back never
+moves, marking is unchanged, Shift+E unchanged, and landing still goes through the single
+scroll owner's path. The keymap's `does` text, the key hints and the Help list word e by the
+choice and never promise the next unread under Stay. Covered by module tests for all three
+landings and the help wording, and by a 1280x800 browser walk (one pass per choice through
+the Settings dropdown, plus the help text under Next unread and under Stay). Settings page
+looked at on desktop 1280x800 and on a phone viewport.

@@ -84,6 +84,9 @@ pub const SYNCED_KEYS: &[&str] = &[
     "vibe-talk.voice.in-app-links",
     // The view a sent card's Open in channel lands in (`#580 open-in-chat-jump`).
     "vibe-talk.voice.open-in-view",
+    // What e does after marking Done: stay, next message, or next unread
+    // (`#1321 after-done-setting`).
+    "vibe-talk.voice.after-done",
     "vibe-talk.voice.collapsed-lines",
     "vibe-talk.voice.hidden-link-kinds",
     // Whether the search bar's Links view writes each link as its address (`#620 link-url-chip`).

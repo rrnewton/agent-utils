@@ -29,7 +29,7 @@ under a person's fingers, and measures the list that is on screen:
   Ctrl+End take the list to its top and its newest message -> the keymap: Home selects the first
   message with a ring drawn round it (real focus, `:focus-visible`), j, k and the arrows move the
   ring and the list follows it, e marks the selected message Done on the server (and asks the chat
-  service nothing) and moves on to the next unread, PgDn moves the ring to the first message the page
+  service nothing) and stays on it (After Done's default), PgDn moves the ring to the first message the page
   shows, Shift+E on a long message opened with Enter marks that message alone Done on the server,
   then asks the chat service once to mark it read (`after_reply`), and folds it, the ring staying on
   it, no other message changed and neither the list nor the message moving by a pixel, and pressed
@@ -53,7 +53,7 @@ it was chosen from — two columns, and All in one column, from a card and from 
 the bare 1, 2 and 3 change nothing.
 
 `cmd-e-done`: Ctrl+E, from the channel's message box with a draft typed in it, marks the selected message
-near the newest Done on the server and moves the selection on, the box keeping the focus and the draft and
+near the newest Done on the server and the selection stays on it, the box keeping the focus and the draft and
 the browser's own Ctrl+E refused; a message selected at the top, out of sight once the box has the focus
 (the box is at the foot of the list, which goes there with it), is not marked: the first message showing
 is selected instead. In the Mac tab Cmd+E does the same, and Ctrl+E in the box is the box's.
@@ -899,7 +899,7 @@ def keymap_keys(walk: Walk, api: FakeApi) -> None:
     check(row["id"] == ids[13], f"twelve more j selected {row['id']}, not {ids[13]}")
     check(walk.settled()["top"] != 0, "the list did not follow the ring down")
 
-    # e: Done on the server, and on to the next unread message.
+    # e: Done on the server, and the selection stays on it (After Done's default, Stay).
     done = row["id"]
     before = len(api.dismissals())
     after = ringed(walk, "e", "e")
@@ -914,7 +914,7 @@ def keymap_keys(walk: Walk, api: FakeApi) -> None:
                   "the message e marked does not show as Done")
     marked = walk.page.evaluate("(id) => document.querySelector(`#discord-log > li[data-id='${id}']`).dataset.archived", done)
     check(marked == "true", f"the message e marked does not show as Done: {marked!r}")
-    check(after["id"] == ids[14], f"after e the ring went to {after['id']}, not the next unread {ids[14]}")
+    check(after["id"] == done, f"after e the ring went to {after['id']}, not staying on {done}")
     walk.shot("keymap-done")
 
     # PgDn from the selected message: the browser pages the list, and the ring comes to the screen.
@@ -961,8 +961,96 @@ def keymap_keys(walk: Walk, api: FakeApi) -> None:
         check(row["id"] == root_id and row["visible"] is True,
               f"back from the thread with {back}, the ring is on {row['id']}, not the message it was opened from")
     walk.notes.append(f"the keymap: Home, j/k and the arrows moved a visible focus ring the list followed, e marked "
-                      f"{done} Done on the server and moved on to the next unread, PgDn brought the ring to the page, "
+                      f"{done} Done on the server and stayed on it, PgDn brought the ring to the page, "
                       "Enter opened and closed the long message, -> entered its thread and <- and Esc came back to it")
+
+
+def after_done_choices(walk: Walk, api: FakeApi) -> None:
+    """`#1321 after-done-setting`: each After Done choice in Settings, and the help text, at 1280x800.
+
+    Two messages are marked Done on the server first, so the list has read rows below the ones
+    the keys walk; the page is reloaded onto it. Stay (the default, nothing kept) leaves the
+    selection on the message e marks; Next message selects the read row below; Next unread
+    skips it. The dropdown is changed in Settings each time, and the list of keys is read on
+    Help under Stay and under Next unread. No wall-clock waits: each step waits on the ring or
+    the server's Done list."""
+    ids = [str(m["id"]) for m in api.messages]
+    read_below = {ids[2], ids[4]}
+    with api.lock:
+        dismissed_before = set(api.dismissed)
+    api.dismiss({"messages": sorted(read_below)})
+    walk.page.reload(wait_until="load")
+    walk.page.wait_for_selector('#discord-log > li[data-id]', state="visible", timeout=10_000)
+    walk.page.evaluate(RECORD_KEYS_JS)
+
+    def choose(choice: str) -> None:
+        walk.key_until(",", "() => !document.getElementById('screen-settings').hidden",
+                       "',' did not open Settings", "screen-settings")
+        walk.page.evaluate("""() => {
+          for (const id of ['fold-settings-messages', 'fold-after-done']) {
+            const body = document.getElementById(id + '-body');
+            if (body && body.hidden) document.getElementById(id).click();
+          }
+        }""")
+        walk.page.select_option("#after-done", choice)
+        walk.settled()
+        shown = walk.page.evaluate("() => document.getElementById('after-done').value")
+        check(shown == choice, f"After Done shows {shown!r}, not {choice!r}")
+        walk.key("Escape")
+        walk.settled()
+
+    def marked(before: int, want: str) -> None:
+        for _ in range(100):
+            if len(api.dismissals()) > before:
+                break
+            walk.page.wait_for_timeout(20)
+        check(api.dismissals()[before:] == [[want]], f"e did not mark {want} Done on the server: {api.dismissals()[before:]}")
+
+    # Stay, the default: nothing kept in Settings, and e leaves the selection where it was.
+    kept = walk.page.evaluate("() => localStorage.getItem('vibe-talk.voice.after-done')")
+    check(kept is None, f"After Done is kept before it is ever chosen: {kept!r}")
+    first = ringed(walk, "Home", "after-done: Home")
+    check(first["id"] == ids[0], f"after-done: Home selected {first['id']}, not {ids[0]}")
+    before = len(api.dismissals())
+    after = ringed(walk, "e", "after-done: e under Stay")
+    marked(before, ids[0])
+    check(after["id"] == ids[0], f"under Stay e moved the selection to {after['id']}, not staying on {ids[0]}")
+    # Next message: from the next message, e selects the read row below it.
+    choose("next")
+    row = ringed(walk, "j", "after-done: j to the second message")
+    check(row["id"] == ids[1], f"after-done: j selected {row['id']}, not {ids[1]}")
+    before = len(api.dismissals())
+    after = ringed(walk, "e", "after-done: e under Next message")
+    marked(before, ids[1])
+    check(after["id"] == ids[2], f"under Next message e went to {after['id']}, not the next (read) message {ids[2]}")
+    # Next unread: from the fourth message, e skips the read fifth and selects the sixth.
+    choose("unread")
+    row = ringed(walk, "j", "after-done: j to the fourth message")
+    check(row["id"] == ids[3], f"after-done: j selected {row['id']}, not {ids[3]}")
+    before = len(api.dismissals())
+    after = ringed(walk, "e", "after-done: e under Next unread")
+    marked(before, ids[3])
+    check(after["id"] == ids[5], f"under Next unread e went to {after['id']}, not the next unread {ids[5]}")
+    # The help text follows the choice: Next unread promises the jump, Stay does not.
+    walk.key_until("Shift+?", "() => !document.getElementById('screen-help').hidden",
+                   "'?' did not open Help", "screen-help")
+    words = str(walk.page.evaluate("() => document.getElementById('keyboard-keys').textContent"))
+    check("Marked Done, on to the next unread below." in words,
+          "under Next unread the list of keys does not say e goes to the next unread")
+    walk.key("Escape")
+    choose("stay")
+    walk.key_until("Shift+?", "() => !document.getElementById('screen-help').hidden",
+                   "'?' did not open Help after Stay", "screen-help")
+    words = str(walk.page.evaluate("() => document.getElementById('keyboard-keys').textContent"))
+    check("Marked Done, the selection stays on it." in words and "next unread below" not in words.split("Marked Done")[1].split("Ctrl")[0],
+          "under Stay the list of keys still promises the next unread")
+    walk.key("Escape")
+    walk.settled()
+    walk.notes.append("After Done: Stay (the default) kept the selection on the marked message, Next message "
+                      "selected the read row below, Next unread skipped it, and the list of keys followed the choice")
+    with api.lock:
+        api.dismissed.clear()
+        api.dismissed.update(dismissed_before)
 
 
 # `cmd-e-done`. The message box, the row the keys act on and whether any of it shows in the list, the row
@@ -1035,7 +1123,7 @@ def cmd_e_keys(walk: Walk, api: FakeApi, mod: str, words: str) -> None:
     check(after["archived"] == "true", f"the message {words}+E marked does not show as Done: {after}")
     check(after["focus"] == "channel-compose-text", f"{words}+E took the focus out of the box, to {after['focus']!r}")
     check(after["value"] == "draft", f"{words}+E touched the draft: {after['value']!r}")
-    check(after["lit"] not in (None, target), f"{words}+E left the selection on {after['lit']!r}, not the next unread")
+    check(after["lit"] == target, f"{words}+E moved the selection to {after['lit']!r}, not staying on {target}")
     walk.shot(f"cmd-e-{mod.lower()}")
 
     # Out of sight: Esc leaves the box for the list with the draft kept, Home selects the top message, and
@@ -1060,7 +1148,7 @@ def cmd_e_keys(walk: Walk, api: FakeApi, mod: str, words: str) -> None:
     walk.page.evaluate("() => { const box = document.getElementById('channel-compose-text'); box.value = ''; "
                        "box.dispatchEvent(new Event('input')); }")
     walk.key("Escape")
-    walk.notes.append(f"{words}+E in the message box marked {target} Done and moved the selection on to "
+    walk.notes.append(f"{words}+E in the message box marked {target} Done and kept the selection on "
                       f"{after['lit']}, the box keeping the focus and the draft; on a message out of sight it "
                       "selected the first showing and marked nothing" +
                       (", and Ctrl+E there was the box's" if mod == "Meta" else ""))
@@ -1722,6 +1810,7 @@ def main() -> int:
             settings_tab_order(walk)
             composer_keys(walk)
             keymap_keys(walk, api)
+            after_done_choices(walk, api)
             cmd_e_keys(walk, api, "Control", "Ctrl")
             single_selection(walk, api)
             picker_and_help_keys(walk)

@@ -1076,6 +1076,7 @@ const flashOf = (page, id) => channelRow(page, id).getAttribute("data-done-flash
 
 test("e DRAWS THE MOMENT ON THE ROW IT MARKED, though the selection moves on: marking, fading, gone (#245)", async () => {
   const page = await keyboardPageAtTop();
+  page.storage.set("vibe-talk.voice.after-done", "unread"); // `#1321 after-done-setting`: this walk is about the row e leaves.
   await press(page, page.el("scroll-area"), "ArrowDown");
   assert.equal(selectedId(page), "1");
   await pressHere(page, "e");

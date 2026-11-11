@@ -7314,7 +7314,7 @@ const focusName = (page) => (focused(page) ? `#${focused(page).id || focused(pag
 // --- the keymap (#224 keyboard-shortcuts) ---------------------------------------------------------
 //
 // The proposal's section 4, with the owner's go-ahead and the coordinator's answers to section 6:
-// j/k as well as the arrows; after e, on to the next unread below; ←/→ thread out and in, Enter and o
+// j/k as well as the arrows; after e, where Settings' After Done choice says (`#1321 after-done-setting`); ←/→ thread out and in, Enter and o
 // fold; Esc in a box with text leaves the box first; Esc marks nothing read; single keys on by default
 // with a switch; 1/2/3 for Main/Threads/All; Ctrl+K opens the channel picker. THE SELECTION IS THE
 // FOCUS: each test below says where the focus is after a key, because that is the selection.

@@ -1947,6 +1947,28 @@
 
                   <section class="settings-group">
                     <div class="group-head">
+                      <h3 title="Where the selection goes after e marks a message Done."><button class="fold-toggle" id="fold-after-done" type="button" aria-expanded="false" aria-controls="fold-after-done-body">After Done</button></h3>
+                    </div>
+                    <div class="fold-body" id="fold-after-done-body" hidden="until-found">
+                      <!--
+                        `#1321 after-done-setting`. What e (and Ctrl+E / Cmd+E) does after marking a
+                        message Done: Stay on it, by default (the owner, 2026-11-11: once the
+                        Shift+arrows step through unread, the jump is a choice), go to the next
+                        message below, or go to the next unread below. Marking itself is unchanged,
+                        and putting a message back never moves. Synced, as the other choices in
+                        Messages are.
+                      -->
+                      <label for="after-done">After Done (e)</label>
+                      <select id="after-done">
+                        <option value="stay">Stay — stay on the message</option>
+                        <option value="next">Next message</option>
+                        <option value="unread">Next unread</option>
+                      </select>
+                    </div>
+                  </section>
+
+                  <section class="settings-group">
+                    <div class="group-head">
                       <h3 title="A collapsed long message shows a model's one-line summary in place of its opening lines."><button class="fold-toggle" id="fold-summaries" type="button" aria-expanded="false" aria-controls="fold-summaries-body">Summaries</button></h3>
                       <button class="help-link" id="help-link-summaries" type="button" data-help="summaries" aria-label="About summaries" title="A collapsed long message shows a model's one-line summary in place of its opening lines.">?</button>
                     </div>

@@ -77,6 +77,7 @@ function fakeDeps(log, overrides = {}) {
     bookmarkFromKeyboard: () => {}, bookmarkJumpFromKeyboard: () => {}, orderFromKeyboard: () => {},
     mainRowsFromKeyboard: () => {}, columnsFromKeyboard: () => {},
     childByClass: () => null,
+    afterDone: () => "stay",
     deviceSettings: () => ({ get: () => true, keep: () => {} }),
     keyTimingSetting: () => false, locationSearch: () => "?key-timing=1",
     ...overrides,

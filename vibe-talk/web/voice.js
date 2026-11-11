@@ -92,6 +92,8 @@ const RICH_HEADERS_KEY = DEVICE_SETTINGS.richHeaders.key;
 const IN_APP_LINKS_KEY = DEVICE_SETTINGS.inAppLinks.key;
 /** `#580 open-in-chat-jump`. The view a sent card's Open in channel lands in: "flat" (All) or "main". */
 const OPEN_IN_VIEW_KEY = DEVICE_SETTINGS.openInView.key;
+/** `#1321 after-done-setting`. What e does after marking Done: "stay", "next" or "unread". */
+const AFTER_DONE_KEY = DEVICE_SETTINGS.afterDone.key;
 const SUMMARIZE_COLLAPSED_KEY = DEVICE_SETTINGS.summarizeCollapsed.key;
 const ACTIVE_CHANNEL_KEY = "vibe-talk.voice.active-channel";
 
@@ -938,6 +940,8 @@ const messagePreferences = mountMessagePreferences({
   regroupChannelRows: () => eachColumn(regroupChannelRows),
   chooseOpenInView: (view) => chooseOpenInView(view),
   storedOpenInView: () => storedOpenInView(),
+  chooseAfterDone: (choice) => chooseAfterDone(choice),
+  storedAfterDone: () => storedAfterDone(),
 });
 
 /** Which view Open in channel lands in, and the links redrawn for it: web/src/view/channel/openinview.ts (`createOpenInView`, #624). */
@@ -956,6 +960,23 @@ const openInViewOwner = createOpenInView({
   renderChoice: () => messagePreferences.openInView.render(),
 });
 const { redrawMessageLinks, storedOpenInView, renderOpenInView, chooseOpenInView } = openInViewOwner;
+
+/**
+ * What e does after marking Done (`#1321 after-done-setting`): kept in Settings, read at each
+ * press, so a synced change from another device applies without a reload. Choosing it also
+ * says the keys again, since the list of keys words e by this choice.
+ */
+const storedAfterDone = () => deviceSettings().get(DEVICE_SETTINGS.afterDone);
+const renderAfterDone = () => messagePreferences.afterDone.render();
+const chooseAfterDone = (choice) => {
+  try {
+    deviceSettings().keep(DEVICE_SETTINGS.afterDone, choice);
+  } catch (_error) {
+    // A browser that refuses storage keeps the shipped default.
+  }
+  renderAfterDone();
+  keyHints.render();
+};
 
 
 
@@ -3264,6 +3285,7 @@ const keyboard = createKeyboardComposition({
   mainRowsFromKeyboard: () => mainRowsFromKeyboard(),
   columnsFromKeyboard: () => columnsFromKeyboard(),
   childByClass: (row, className) => childByClass(row, className),
+  afterDone: () => storedAfterDone(),
   deviceSettings: () => deviceSettings(),
   keyTimingSetting: () => deviceSettings().get(DEVICE_SETTINGS.keyTiming),
   locationSearch: () => window.location.search || "",
@@ -7792,6 +7814,7 @@ const settingsSyncGlue = createSettingsSyncGlue({
       get SUMMARIZE_COLLAPSED_KEY() { return SUMMARIZE_COLLAPSED_KEY; },
       get IN_APP_LINKS_KEY() { return IN_APP_LINKS_KEY; },
       get OPEN_IN_VIEW_KEY() { return OPEN_IN_VIEW_KEY; },
+      get AFTER_DONE_KEY() { return AFTER_DONE_KEY; },
       get COLLAPSED_LINES_KEY() { return COLLAPSED_LINES_KEY; },
       get CARD_MAX_LINES_KEY() { return CARD_MAX_LINES_KEY; },
       get READ_SPEED_KEY() { return READ_SPEED_KEY; },
@@ -7837,6 +7860,10 @@ const settingsSyncGlue = createSettingsSyncGlue({
     },
     openInView: () => {
       renderOpenInView();
+    },
+    afterDone: () => {
+      renderAfterDone();
+      keyHints.render();
     },
     collapsedLines: () => {
       collapsedLines.apply(collapsedLines.stored());
@@ -8058,6 +8085,7 @@ restoreStoredSettings({
   richHeaders: () => applyRichHeaders(storedRichHeaders()),
   inAppLinks: () => inAppLinks.apply(inAppLinks.stored()),
   openInView: () => renderOpenInView(),
+  afterDone: () => renderAfterDone(),
   summarizeCollapsed: () => applySummarizeCollapsed(storedSummarizeCollapsed()),
   enterSends: () => enterSends.apply(enterSends.stored()),
 });
@@ -8224,6 +8252,7 @@ application.track(mountPreferenceSwitches({
   richHeadersChanged: messagePreferences.richHeaders.changed,
   inAppLinksChanged: messagePreferences.inAppLinks.changed,
   openInViewChanged: messagePreferences.openInView.changed,
+  afterDoneChanged: messagePreferences.afterDone.changed,
   summariesChanged: messagePreferences.summaries.changed,
   enterSendsChanged: (on) => enterSends.apply(on),
 }));

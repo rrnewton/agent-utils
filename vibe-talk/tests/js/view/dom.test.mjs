@@ -1289,7 +1289,7 @@ test("`#624 voice-page-modularity`: n goes to the next unread row below the sele
   const log = [];
   const rowOf = (id, attributes = {}) => ({ id, attributes, getAttribute(name) { return name === "data-id" ? id : this.attributes[name] ?? null; }, hasAttribute(name) { return name in this.attributes; } });
   let rows = [rowOf("1"), rowOf("2"), rowOf("3"), rowOf("c4", { "data-card": "" }), rowOf("5")];
-  const state = { read: new Set(["1", "2", "3"]), done: new Set(), inView: new Set(["2", "3", "c4", "5"]), row: null, took: true, again: true };
+  const state = { read: new Set(["1", "2", "3"]), done: new Set(), inView: new Set(["2", "3", "c4", "5"]), row: null, took: true, again: true, after: "unread" };
   const keys = createDoneKeys({
     keyContext: () => ({ pane: "pane", row: state.row }),
     rowForAct: (_target, runLine, stay) => { log.push(`rowForAct ${runLine} ${stay}`); return { pane: state.row ? "pane" : null, row: state.row, took: state.took }; },
@@ -1305,6 +1305,7 @@ test("`#624 voice-page-modularity`: n goes to the next unread row below the sele
     idsOf: (row) => (row.hasAttribute("data-card") ? [] : [row.id]),
     isDone: (id) => state.done.has(id),
     toggleDone: (ids) => log.push(`toggle ${ids}`),
+    afterDone: () => state.after,
   });
   const run = (act) => { log.length = 0; return [act(), ...log]; };
   assert.deepStrictEqual(run(() => keys.nextUnreadFromKeyboard({})), [true, "select c4"], "n with nothing selected did not start below the screen's top, or skipped a card with unread replies");
@@ -1383,6 +1384,47 @@ test("`#1314 unread-step-keys`: Shift+arrows step the selection through unread r
   assert.deepStrictEqual(run(() => keys.stepUnreadFromKeyboard({}, 1)), [true, "select 2"]);
   state.row = null;
   assert.deepStrictEqual(run(() => keys.stepUnreadFromKeyboard({}, -1)), [true, "say No more unread above."], "Shift+Up with nothing selected went somewhere");
+});
+
+test("`#1321 after-done-setting`: e stays, goes to the next message, or goes to the next unread, as Settings says", () => {
+  const { createDoneKeys } = VIEW_SHELL;
+  const log = [];
+  const rowOf = (id, attributes = {}) => ({ id, attributes, getAttribute(name) { return name === "data-id" ? id : this.attributes[name] ?? null; }, hasAttribute(name) { return name in this.attributes; } });
+  const rows = [rowOf("1"), rowOf("2"), rowOf("3"), rowOf("4")];
+  const state = { read: new Set(["3"]), done: new Set(), row: rows[0], after: "stay" };
+  const keys = createDoneKeys({
+    keyContext: () => ({ pane: "pane", row: state.row }),
+    rowForAct: () => ({ pane: "pane", row: state.row, took: true }),
+    paneRows: () => rows,
+    rowInView: () => true,
+    rowIsRead: (row) => state.read.has(row.id),
+    selectRow: () => {},
+    setStatus: (text) => log.push(`say ${text}`),
+    paneRowFor: (_pane, id, card) => rows.find((row) => row.id === id && row.hasAttribute("data-card") === card) || null,
+    nearRow: (_pane, at) => rows[at] || null,
+    takeRow: (_pane, row, focus) => log.push(`take ${row.id} ${focus}`),
+    bringIntoView: (_pane, row) => log.push(`bring ${row.id}`),
+    idsOf: (row) => [row.id],
+    isDone: (id) => state.done.has(id),
+    toggleDone: (ids) => log.push(`toggle ${ids}`),
+    afterDone: () => state.after,
+  });
+  const run = (act) => { log.length = 0; return [act(), ...log]; };
+  // Stay (the default): marked, and the selection lands back on the message itself.
+  assert.deepStrictEqual(run(() => keys.doneFromKeyboard({})), [true, "toggle 1", "take 1 true", "bring 1"], "e under Stay moved the selection");
+  // Next message: the row below, read or not (3 is read; from 2 it is next anyway, from 1 it is 2).
+  state.after = "next";
+  assert.deepStrictEqual(run(() => keys.doneFromKeyboard({})), [true, "toggle 1", "take 2 true", "bring 2"], "e under Next message did not select the next message");
+  // Next unread: past the read row 3 to 4, from row 2.
+  state.row = rows[1];
+  state.after = "unread";
+  assert.deepStrictEqual(run(() => keys.doneFromKeyboard({})), [true, "toggle 2", "take 4 true", "bring 4"], "e under Next unread did not skip the read row");
+  state.after = "next";
+  assert.deepStrictEqual(run(() => keys.doneFromKeyboard({})), [true, "toggle 2", "take 3 true", "bring 3"], "e under Next message stopped on skipping a read row");
+  // Putting one back never moves, whatever the choice.
+  state.done.add("2");
+  state.after = "unread";
+  assert.deepStrictEqual(run(() => keys.doneFromKeyboard({})), [true, "toggle 2", "take 2 true", "bring 2"], "e putting a message back moved the selection");
 });
 
 test("`#624 voice-page-modularity`: Shift+E's fold keeps the reader's place, and Shift+O folds a message away, marks it Done and steps above it", () => {
@@ -1999,7 +2041,7 @@ test("`#624 voice-page-modularity`: the keymap lists every key in a group, hands
   const { createKeymap, KEYS_PAGE, KEYS_MOVING, KEYS_MESSAGE, KEYS_VIEW, KEYS_WRITING } = VIEW_SHELL;
   const calls = [];
   const answers = { modKeyName: "Cmd", manyChatServices: false, chatServiceName: "Chat", threadOrderWords: "Newest, Oldest",
-    minCollapsedLines: 0, maxCollapsedLines: 8, keyContext: { row: null }, pressRowButton: "took" };
+    minCollapsedLines: 0, maxCollapsedLines: 8, keyContext: { row: null }, pressRowButton: "took", afterDone: "stay" };
   const acts = new Proxy({}, { get: (_acts, name) => (...args) => {
     calls.push([name, ...args]);
     return name in answers ? answers[name] : `${String(name)} did`;
@@ -2102,7 +2144,7 @@ test("`#624 voice-page-modularity`: the keymap lists every key in a group, hands
     "replyFromKeyboard", "searchFromAnywhere", "searchFromKeyboard", "settingsFromKeyboard", "stepChannel", "stepFromKeyboard", "stepUnreadFromKeyboard",
     "threadFromKeyboard", "threadOutFromKeyboard", "threadStripFromKeyboard", "undoFromKeyboard", "unpackFromKeyboard",
     "viewFromKeyboard", "voiceFromKeyboard", "writeFromKeyboard"];
-  const wording = ["chatServiceName", "manyChatServices", "maxCollapsedLines", "minCollapsedLines", "modKeyName", "standalone",
+  const wording = ["afterDone", "chatServiceName", "manyChatServices", "maxCollapsedLines", "minCollapsedLines", "modKeyName", "standalone",
     "threadOrderWords"];
   assert.deepStrictEqual([...reached].sort(), [...expected, ...wording].sort(), "an act is reached by no key, or a key asks for one the page does not give");
   // What the list says asks the page for the reader's words.
@@ -2113,6 +2155,16 @@ test("`#624 voice-page-modularity`: the keymap lists every key in a group, hands
     "the list of keys does not say the Shift+arrow unread steps");
   answers.manyChatServices = true;
   assert.ok(keymap.map((binding) => (typeof binding.does === "function" ? binding.does() : "")).join("\n").includes("Copy its link in its chat service:"));
+  // `#1321 after-done-setting`. The list of keys words e by the After Done choice, and never
+  // promises a jump the choice does not make.
+  const eWords = () => keymap.find((binding) => binding.rowControls && binding.rowControls.includes("done-button")).does();
+  answers.afterDone = "stay";
+  assert.ok(eWords().includes("Marked Done, the selection stays on it.") && !eWords().includes("next unread") && !eWords().includes("next message below"),
+    "under Stay the list of keys promises a jump");
+  answers.afterDone = "next";
+  assert.ok(eWords().includes("Marked Done, on to the next message below.") && !eWords().includes("next unread"), "under Next message the list of keys does not say so");
+  answers.afterDone = "unread";
+  assert.ok(eWords().includes("Marked Done, on to the next unread below."), "under Next unread the list of keys does not say so");
 });
 
 test("`#624 voice-page-modularity`, `#892 voice-page-optimistic-done`: Shift+E folds first, marks Done only what is not Done and says so at once, waits for the Done to be saved before asking the service, and says its answer only over its own words", async () => {

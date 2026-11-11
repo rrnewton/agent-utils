@@ -1413,8 +1413,10 @@ test("`#271 settings-groups`: the Messages section holds the message options, an
   // and Screen and keys is the one per-device section. `#543 in-app-message-links` put Message links
   // after Rich headers: whether a link to a message opens it here is a choice about drawing messages.
   // `#728 vt-quote-read-threshold` put Quoted replies under Your own messages: both say what marks read.
+  // `#1321 after-done-setting` put After Done after Message links: what e does after marking
+  // is a choice about marking messages, and it syncs as the choices beside it do.
   assert.deepStrictEqual(messages, ["Your own messages", "Quoted replies", "Mark-read automatically", "Empty messages", "Combining messages",
-    "Rich headers", "Message links", "Summaries", "Collapsed message lines", "Thread card lines", "Recently dismissed"]);
+    "Rich headers", "Message links", "After Done", "Summaries", "Collapsed message lines", "Thread card lines", "Recently dismissed"]);
   for (const agentGroup of ["Sending", "Instructions", "Resuming", "Arriving messages during a call",
     "Reading full messages in channel view"]) {
     assert.ok(!messages.includes(agentGroup), `"${agentGroup}" is in Messages`);
@@ -2736,8 +2738,9 @@ function foldProblems(html, css, script) {
 test("`#346 settings-collapsible`: every section but Server and every group in them folds, hidden until found", () => {
   assert.deepStrictEqual(foldProblems(HTML, CSS_CODE, PAGE_CODE), []);
   // 31 since `#481 slack-app-deep-link` added Opening links, 35 since `#728 vt-quote-read-threshold`
-  // added Quoted replies, 36 since `#1212 settings-debug-section` added Debug, counted and checked above.
-  assert.equal(scriptFolds(PAGE_CODE).length, 36, "a fold went missing from the list, or one was added unchecked");
+  // added Quoted replies, 36 since `#1212 settings-debug-section` added Debug, 37 since
+  // `#1321 after-done-setting` added After Done, counted and checked above.
+  assert.equal(scriptFolds(PAGE_CODE).length, 37, "a fold went missing from the list, or one was added unchecked");
 });
 
 test("`#346 settings-collapsible`: the check refuses a fold out of find's reach, an unfolding group, and a list that disagrees (negative controls)", () => {

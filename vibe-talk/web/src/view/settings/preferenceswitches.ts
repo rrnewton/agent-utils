@@ -21,6 +21,7 @@ export interface PreferenceSwitchesDependencies {
   richHeadersChanged(): unknown;
   inAppLinksChanged(): unknown;
   openInViewChanged(): unknown;
+  afterDoneChanged(): unknown;
   summariesChanged(): unknown;
   /** `#225 enter-to-send`. Whether Enter sends, as the switch now says. */
   enterSendsChanged(on: boolean): unknown;
@@ -53,6 +54,8 @@ export function mountPreferenceSwitches(deps: PreferenceSwitchesDependencies): P
   listen<Event>(el("in-app-links"), "change", () => deps.inAppLinksChanged());
   // `#580 open-in-chat-jump`.
   listen<Event>(el("open-in-view"), "change", () => deps.openInViewChanged());
+  // `#1321 after-done-setting`.
+  listen<Event>(el("after-done"), "change", () => deps.afterDoneChanged());
   // `#564 message-summary-toggle`. The chip over the list follows it (`setSummaryMode`).
   listen<Event>(el("summarize-collapsed"), "change", () => deps.summariesChanged());
   // `#225 enter-to-send`. Nothing to redraw and nothing to say on the status line: the hint under the switch changes in

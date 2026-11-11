@@ -34,6 +34,7 @@ import {
   keyTimingLine,
 } from "../view/shell/index.ts";
 import type {
+  AfterDone,
   ChannelKeys,
   ChannelPicker,
   DoneKeys,
@@ -258,6 +259,8 @@ export interface KeyboardCompositionDependencies<
   columnsFromKeyboard(): unknown;
   /** Toggle the open document's outline pop-up from the keyboard (`#1038`); whether it did. */
   toggleDocumentOutline?(): unknown;
+  /** `#1321 after-done-setting`. What e does after marking Done, as kept in Settings. */
+  afterDone(): AfterDone;
   // Dispatch, timing and hints.
   childByClass(row: HTMLElement, className: string): HTMLElement | null;
   deviceSettings(): DeviceSettings;
@@ -548,6 +551,7 @@ export function createKeyboardComposition<
     idsOf: (row) => deps.idsOf(row),
     isDone: (id) => deps.isDone(id),
     toggleDone: (ids, row) => deps.guardQuietly(() => deps.toggleArchived(ids, row))(),
+    afterDone: () => deps.afterDone(),
   });
   const { nextUnreadFromKeyboard, stepUnreadFromKeyboard, doneFromKeyboard } = doneKeys;
 
@@ -810,6 +814,7 @@ export function createKeyboardComposition<
     copyFromKeyboard: () => highlightCopy.copyFromKeyboard(),
     nextUnreadFromKeyboard: (target) => nextUnreadFromKeyboard(target),
     stepUnreadFromKeyboard: (target, direction) => stepUnreadFromKeyboard(target, direction),
+    afterDone: () => deps.afterDone(),
     doneFromKeyboard: (target) => doneFromKeyboard(target),
     readCollapseFromKeyboard: (target) => readCollapseFromKeyboard(target),
     foldOneFromKeyboard: (target) => foldOneFromKeyboard(target),

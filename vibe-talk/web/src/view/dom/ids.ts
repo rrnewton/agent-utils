@@ -11,6 +11,7 @@ export interface ElementById {
   "add-channel-fields": HTMLDivElement;
   "add-channel-state": HTMLParagraphElement;
   "add-noise-rule": HTMLButtonElement;
+  "after-done": HTMLSelectElement;
   "agent-console-link": HTMLAnchorElement;
   "agent-id": HTMLElement;
   "agent-settings": HTMLElement;
@@ -189,6 +190,8 @@ export interface ElementById {
   "error-wrap": HTMLDivElement;
   "expand-all": HTMLButtonElement;
   "expand-all-label": HTMLSpanElement;
+  "fold-after-done": HTMLButtonElement;
+  "fold-after-done-body": HTMLDivElement;
   "fold-auto-read": HTMLButtonElement;
   "fold-auto-read-body": HTMLDivElement;
   "fold-canned-prompts": HTMLButtonElement;

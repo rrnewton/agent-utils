@@ -21,6 +21,7 @@ export interface StoredSettingsDependencies {
   richHeaders(): unknown;
   inAppLinks(): unknown;
   openInView(): unknown;
+  afterDone(): unknown;
   summarizeCollapsed(): unknown;
   enterSends(): unknown;
 }
@@ -39,6 +40,7 @@ export function restoreStoredSettings(deps: StoredSettingsDependencies): void {
   deps.richHeaders();
   deps.inAppLinks();
   deps.openInView();
+  deps.afterDone();
   deps.summarizeCollapsed();
   deps.enterSends();
 }

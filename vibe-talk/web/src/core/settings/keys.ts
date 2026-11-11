@@ -22,6 +22,8 @@ export const SYNCED_SETTING_KEYS: readonly string[] = [
   "vibe-talk.voice.in-app-links",
   // `#580 open-in-chat-jump`. The view a sent card's Open in channel lands in.
   "vibe-talk.voice.open-in-view",
+  // `#1321 after-done-setting`. What e does after marking Done: stay, next message, or next unread.
+  "vibe-talk.voice.after-done",
   "vibe-talk.voice.collapsed-lines",
   "vibe-talk.voice.hidden-link-kinds",
   // `#620 link-url-chip`. Whether the Links view writes each link as its address.

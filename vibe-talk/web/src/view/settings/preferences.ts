@@ -49,6 +49,8 @@ export interface MessagePreferencesDependencies {
   regroupChannelRows(): void;
   chooseOpenInView(view: string): void;
   storedOpenInView(): string;
+  chooseAfterDone(choice: string): void;
+  storedAfterDone(): string;
 }
 
 /** A value rendered by its feature, and changed through that feature's command. */
@@ -81,6 +83,7 @@ export interface MessagePreferences {
   readonly hideEmpty: BooleanPreferenceView;
   readonly combine: BooleanPreferenceView;
   readonly openInView: { render(): void; changed(): void };
+  readonly afterDone: { render(): void; changed(): void };
 }
 
 /** No setting is read, applied, kept, or listened to until the page calls its existing path. */
@@ -217,6 +220,13 @@ export function mountMessagePreferences(deps: MessagePreferencesDependencies): M
       changed() {
         deps.chooseOpenInView((deps.lookup("open-in-view") as HTMLSelectElement).value);
         deps.status(MESSAGE_PREFERENCE_WORDS.openInView(deps.storedOpenInView()));
+      },
+    },
+    afterDone: {
+      render() { (deps.lookup("after-done") as HTMLSelectElement).value = deps.storedAfterDone(); },
+      changed() {
+        deps.chooseAfterDone((deps.lookup("after-done") as HTMLSelectElement).value);
+        deps.status(MESSAGE_PREFERENCE_WORDS.afterDone(deps.storedAfterDone()));
       },
     },
   };

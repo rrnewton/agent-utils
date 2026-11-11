@@ -5,6 +5,9 @@
 
 import { isTextField } from "../dom/index.ts";
 
+/** `#1321 after-done-setting`. What e does after marking Done: stay on it, the next message below, or the next unread below. Kept in Settings (`core/settings`' `afterDone`), said here so the keys need no setting but the choice. */
+export type AfterDone = "stay" | "next" | "unread";
+
 /** The row a key acts on: its pane and row, and whether the key was taken even with no row to act on. */
 export interface DoneRow<Pane> {
   readonly pane: Pane | null;
@@ -41,6 +44,8 @@ export interface DoneKeysDependencies<Pane> {
   isDone(id: string): boolean;
   /** Mark the messages `ids` of `row` Done, or not, as its Done button does; a failure reported without ending a call. */
   toggleDone(ids: string[], row: HTMLElement): void;
+  /** `#1321 after-done-setting`. What e does after marking Done, as kept in Settings. */
+  afterDone(): AfterDone;
 }
 
 /** The keys. Each returns whether it did anything, as a binding of the keymap does. */
@@ -53,8 +58,9 @@ export interface DoneKeys {
    */
   stepUnreadFromKeyboard(target: HTMLElement, direction: number): boolean;
   /**
-   * e, and Ctrl+E (Cmd+E): Done or not Done, the act of the row's Done button; marked Done, on to the
-   * next unread below (question 2).
+   * e, and Ctrl+E (Cmd+E): Done or not Done, the act of the row's Done button; marked Done, on to
+   * wherever Settings' After Done choice says (`#1321 after-done-setting`: stay by default, the
+   * next message, or the next unread below — question 2's behaviour).
    *
    * The chord is e for a reader typing (`cmd-e-done`): in a message box or the search, where e is a
    * letter, it acts on the message the keys act on, the selected one of the column of the box, and moves
@@ -132,7 +138,13 @@ export function createDoneKeys<Pane>(deps: DoneKeysDependencies<Pane>): DoneKeys
       const marking = !ids.every((id) => deps.isDone(id));
       const rows = deps.paneRows(pane);
       const at = rows.indexOf(row);
-      const next = marking ? unreadAfter(rows, at) : null;
+      // `#1321 after-done-setting`. Only a marking moves, and only as the choice says: "stay"
+      // chooses no row (landAfterDone then lands back on the message itself), "next" the row
+      // below read or not, "unread" the next unread below. Putting one back never moves.
+      const choice = deps.afterDone();
+      const next = !marking || choice === "stay" ? null
+        : choice === "next" ? (rows[at + 1] || null)
+        : unreadAfter(rows, at);
       deps.toggleDone(ids, row);
       landAfterDone(pane, next, ids[0] as string, at, stay);
       return true;

@@ -62,6 +62,9 @@ function onOrOff(key: string): DeviceSetting<boolean> {
 /** A voice that reads messages aloud: the voice agent's, the device's, or Wit.ai's. */
 export type ReadAudioSource = "agent" | "device" | "wit";
 
+/** What `e` does after marking a message Done (`#1321 after-done-setting`): stay on it, go to the next message, or go to the next unread one. */
+export type AfterDone = "stay" | "next" | "unread";
+
 /** An offset on screen, in CSS pixels. */
 export interface SteerOffset {
   readonly x: number;
@@ -110,6 +113,17 @@ export const DEVICE_SETTINGS = Object.freeze({
     read: (raw: string | null): "flat" | "main" => (raw === "main" ? "main" : "flat"),
     write: (view: "flat" | "main") => (view === "main" ? "main" : "flat"),
   } satisfies DeviceSetting<"flat" | "main">,
+  /**
+   * `#1321 after-done-setting`. What `e` (and Mod+E) does after marking Done: "stay" on the
+   * message unless the reader chose "next" (the next message below) or "unread" (the next
+   * unread below). ABSENT MEANS STAY, the owner's choice. Synced.
+   */
+  afterDone: {
+    key: "vibe-talk.voice.after-done",
+    read: (raw: string | null): AfterDone => (raw === "next" || raw === "unread" ? raw : "stay"),
+    write: (choice: AfterDone) => choice,
+    refused: { value: "stay" },
+  } satisfies DeviceSetting<AfterDone>,
   /** Which voice reads messages aloud, as chosen: null for no choice (or one this page does not know). */
   readAudioSource: {
     key: "vibe-talk.voice.read-audio-source",

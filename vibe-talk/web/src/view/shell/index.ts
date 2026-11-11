@@ -46,7 +46,7 @@ export type { ChannelKeys, ChannelKeysDependencies, ChannelPicker, SteppedChanne
 export { createRowKeys } from "./rowkeys.ts";
 export type { ActedRow, OpenRowMenu, RowKeys, RowKeysDependencies } from "./rowkeys.ts";
 export { createDoneKeys } from "./donekeys.ts";
-export type { DoneKeys, DoneKeysDependencies, DoneRow } from "./donekeys.ts";
+export type { AfterDone, DoneKeys, DoneKeysDependencies, DoneRow } from "./donekeys.ts";
 export { createFoldKeys } from "./foldkeys.ts";
 export type { FoldKeys, FoldKeysDependencies, FoldableRow, FoldedPane } from "./foldkeys.ts";
 export { READ_STEP, createSelectionKeys } from "./selectionkeys.ts";

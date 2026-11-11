@@ -2526,6 +2526,9 @@ def _act_done_feedback(driver: Driver) -> None:
     _act_open_channel(driver)
     driver.page.mouse.move(1, 1)
     driver.js("(() => { document.getElementById('scroll-area').focus(); return true; })()")
+    # After Done is Next unread for this scene (`#1321 after-done-setting`): the picture is the
+    # ring e leaves behind as the selection moves on, which Stay (the default) would keep selected.
+    driver.js("(() => { localStorage.setItem('vibe-talk.voice.after-done', 'unread'); return true; })()")
     # n, not an arrow: the first UNREAD message below the top of the screen, so e marks it Done
     # rather than putting back a message something before this state left read.
     driver.page.keyboard.press("n")

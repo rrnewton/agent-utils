@@ -561,6 +561,8 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             assert isinstance(other, list)
             select(desk, str(other[0]))
             marked = [str(one) for one in other[:4]]
+            # `#1321 after-done-setting`: e stepping down the rows is the Next unread choice.
+            page.evaluate("() => localStorage.setItem('vibe-talk.voice.after-done', 'unread')")
             first_batch = presses(desk, "e", marked)
             other2 = page.evaluate(BLOCK_IDS_JS, OTHER2)
             assert isinstance(other2, list)

@@ -2,7 +2,8 @@
 """Mark the selected message Done in real Chromium, and read what the browser draws.
 
 `#245 done-feedback`. The owner likes that a read message lights up again when it is selected, and
-asked for "SOME indication of what just happened" when he marks the selected one read: e moves the
+asked for "SOME indication of what just happened" when he marks the selected one read: with After
+Done set to Next unread for this walk (`#1321 after-done-setting`), e moves the
 selection straight on to the next unread message, and a lit read row looked exactly like a lit unread
 one. The page now rings a selected unread message in the solid accent and a selected read one in a
 dashed, lighter grey, and draws the moment of marking on the row that was marked: its ring turns grey
@@ -374,7 +375,12 @@ def open_channel(browser: Browser, api: FakeApi, *, reduced: bool = False, schem
 
 
 def marking(walk: Walk, before_mark: Callable[[str], None] | None = None) -> str:
-    """Select a message from the keyboard, see it ringed in the accent, press e. Answers its id."""
+    """Select a message from the keyboard, see it ringed in the accent, press e. Answers its id.
+
+    After Done is set to Next unread for this walk: it is about the flash on the row e leaves,
+    which Stay (the default) would keep selected.
+    """
+    walk.page.evaluate("() => localStorage.setItem('vibe-talk.voice.after-done', 'unread')")
     walk.key("ArrowDown")
     walk.page.wait_for_timeout(100)
     marked = walk.selected()

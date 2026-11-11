@@ -39,6 +39,11 @@ export const MESSAGE_PREFERENCE_WORDS = {
   openInView: (view: string): string => view === "main"
     ? "Open in channel lands in Main."
     : "Open in channel lands in All, every message in order.",
+  afterDone: (choice: string): string => choice === "next"
+    ? "After Done, e goes to the next message."
+    : choice === "unread"
+      ? "After Done, e goes to the next unread message."
+      : "After Done, e stays on the message.",
   summaries: (on: boolean): string => on
     ? "collapsed messages show a summary when one arrives."
     : "collapsed messages show their opening lines; nothing is summarised.",
