@@ -1063,10 +1063,7 @@ def test_all_list_names_skipped_timing_steps_and_optin_plans_them(
     monkeypatch.setattr(
         validate, "changed_paths", lambda _base: ["vibe-talk/web/index.html"]
     )
-    disabled = (
-        "vibe-talk.check.scroll-stability-browser",
-        "vibe-talk.check.offline-cache-phone-browser",
-    )
+    disabled = ("vibe-talk.check.scroll-stability-browser",)
     assert validate.main(["--all", "--list"]) == 0
     listed = capsys.readouterr().out
     assert "timing-sensitive steps disabled by default" in listed

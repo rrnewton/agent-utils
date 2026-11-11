@@ -199,7 +199,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, TypedDict, cast
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import page_sources
@@ -232,7 +232,24 @@ GLASS_MIN_PX = 36
 # type, about 8.5px each, a word or two of a query. Measured where a reader's own settings narrow the
 # line (`BAR_SCALES`), where buttons sized in rem once left it none at all.
 FIELD_TEXT_MIN_PX = 60
+# The most a jump-offer wait (4b2 below) waits for the drawn state it expects (#1250
+# vibe-talk-timing-robust, the STATE_S precedent of the read-aloud checks). Every such wait polls
+# the jump as drawn — shown or gone, its gap, its geometry problems — so a pass takes as long as
+# the page does on a hot host and this only bounds a failure; no verdict is taken from a clock.
+STATE_S = 30.0
 Json = dict[str, object]
+
+
+class JumpMeasure(TypedDict):
+    """What JUMP_JS measures of the jump to the newest message, as drawn."""
+
+    shown: bool
+    gap: float
+    label: str
+    problems: list[str]
+    centre: list[float]
+    top: float
+    lines: int
 
 
 def message(index: int, content: str, thread: Json | None = None) -> Json:
@@ -2550,37 +2567,62 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                 return str(found["area"])
 
             def wait_jump(up: bool) -> None:
-                """`#207 scrollback-jump`: until the jump is up (or gone), for ten seconds at most.
+                """`#207 scrollback-jump`: until the jump is up (or gone), STATE_S at most, then judged.
 
                 Waited for rather than given two frames. The page decides the jump on the list's scroll
                 event, which the browser dispatches in its next RENDERING frame, and a loaded host can
                 hold that frame back for half a second; `page.clock` has made requestAnimationFrame a
                 16ms timer, so two frames counted in the page pass whether one was drawn or not. A jump
-                that is stuck, rather than late, still fails here: ten seconds later.
+                that is stuck, rather than late, still fails here — by name, with the state it stuck in
+                (`#1250`: this wait once returned silently at ten seconds and the one-shot read after it
+                took the blame).
                 """
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + STATE_S
                 while time.monotonic() < deadline and bool(page.evaluate(JUMP_UP_JS)) != up:
                     page.wait_for_timeout(50)
+                check(bool(page.evaluate(JUMP_UP_JS)) == up,
+                      f"{label}: the jump to the newest message never {'came up' if up else 'went away'}")
 
             def wait_room() -> None:
-                """Until the room under the composer has caught up with the chip row, ten seconds at most."""
-                deadline = time.monotonic() + 10
+                """Until the room under the composer has caught up with the chip row, STATE_S at most."""
+                deadline = time.monotonic() + STATE_S
                 while time.monotonic() < deadline and not page.evaluate(ROOM_SETTLED_JS):
                     page.wait_for_timeout(50)
+                check(bool(page.evaluate(ROOM_SETTLED_JS)),
+                      f"{label}: the room under the composer never caught up with the chip row")
 
             def park_still(gap: int) -> None:
                 """Park the reader `gap` px short of the end, and again until the end stays where it is.
 
                 The room under the composer follows the chip row a frame late (ROOM_SETTLED_JS), and a jump
                 that has just come or gone has just changed the row, so the end of the list can move after
-                the reader was put somewhere relative to it. Ten seconds at most.
+                the reader was put somewhere relative to it. STATE_S at most, then judged by the gap drawn.
                 """
-                deadline = time.monotonic() + 10
+                deadline = time.monotonic() + STATE_S
                 while True:
                     page.evaluate(PARK_JS, gap)
                     wait_room()
-                    if abs(float(page.evaluate(JUMP_JS)["gap"]) - gap) <= 1 or time.monotonic() > deadline:
+                    drawn = float(page.evaluate(JUMP_JS)["gap"])
+                    if abs(drawn - gap) <= 1:
                         return
+                    check(time.monotonic() <= deadline,
+                          f"{label}: the reader could not be parked {gap}px short of the end (drawn {drawn:.1f}px)")
+
+            def wait_jump_drawn(what: str, drawn_as: Callable[[JumpMeasure], bool]) -> JumpMeasure:
+                """The jump as drawn, polled until `drawn_as` holds of its measure, STATE_S at most.
+
+                One-shot measures after a style change or a tap read a chip row whose clearance follows
+                a ResizeObserver a frame late, so on a loaded host they could catch it mid-relayout and
+                blame geometry the page was about to draw (`#1250`). The judgement is unchanged — the
+                same JUMP_JS measure, its shown/gap/problems — waited for as drawn state instead.
+                """
+                deadline = time.monotonic() + STATE_S
+                found = cast("JumpMeasure", page.evaluate(JUMP_JS))
+                while not drawn_as(found) and time.monotonic() < deadline:
+                    page.wait_for_timeout(100)
+                    found = cast("JumpMeasure", page.evaluate(JUMP_JS))
+                check(drawn_as(found), f"{label}: {what}: {found}")
+                return found
 
             # 1. Sign in and open the channel: in All, the default where the provider has threads
             # (`#189 restore-ui-state`); then Threads and Main. The call view comes up first: its
@@ -2749,34 +2791,33 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             page.emulate_media(color_scheme="dark")
             page.evaluate(PARK_JS, 0)
             wait_jump(False)
-            resting = page.evaluate(JUMP_JS)
-            check(float(resting["gap"]) <= 2, f"{label}: could not park the reader at the newest line: {resting}")
-            check(not resting["shown"], f"{label}: the jump to the newest message is up at the newest line: {resting}")
+            wait_jump_drawn("could not park the reader at the newest line with no jump up",
+                            lambda found: not found["shown"] and float(found["gap"]) <= 2)
             page.evaluate(PARK_JS, "middle")
             wait_jump(True)
-            back = page.evaluate(JUMP_JS)
+            jump_back = wait_jump_drawn("halfway up the channel there is no jump to the newest message",
+                                        lambda found: bool(found["shown"]) and float(found["gap"]) > 100)
             shot("4b2-jump-scrolled-back")
-            check(bool(back["shown"]) and float(back["gap"]) > 100,
-                  f"{label}: halfway up the channel there is no jump to the newest message: {back}")
             # `#1057 newest-count-chip`: the plain offer now carries its count of rows below, still
             # claiming no arrival with nothing new there.
-            check(re.fullmatch(r"Newest( \(\d+\))?", str(back["label"])) is not None,
-                  f"{label}: the jump says {back['label']!r} with nothing new below")
-            check(not back["problems"], f"{label}, the jump halfway up the channel: {back['problems']}")
+            check(re.fullmatch(r"Newest( \(\d+\))?", str(jump_back["label"])) is not None,
+                  f"{label}: the jump says {jump_back['label']!r} with nothing new below")
+            wait_jump_drawn(f"the jump halfway up the channel: {jump_back['problems']}",
+                            lambda found: bool(found["shown"]) and not found["problems"])
             crowd = page.add_style_tag(content="#scroll-tools .chip[hidden] { display: inline-flex !important; }")
             for size in ("100%", "150%"):
                 font = page.add_style_tag(content=f"html {{ font-size: {size} !important; }}")
-                crowded = page.evaluate(JUMP_JS)
+                crowded = wait_jump_drawn(f"the jump beside every chip at {size} type",
+                                          lambda found: bool(found["shown"]) and not found["problems"]
+                                          and (int(found["lines"]) >= 2 or not mobile))
                 shot(f"4b2-jump-beside-every-chip-{size.rstrip('%')}")
                 lines = int(crowded["lines"])
-                check(not crowded["problems"],
-                      f"{label}, the jump beside every chip at {size} type, {lines} lines: {crowded['problems']}")
                 # On a phone the full row does not fit one line, so this IS the overflow case.
                 check(lines >= 2 or not mobile, f"{label}: every chip at {size} type fit one line, so nothing wrapped")
                 font.evaluate("element => element.remove()")
             crowd.evaluate("element => element.remove()")
-            ready = page.evaluate(JUMP_JS)
-            check(bool(ready["shown"]) and not ready["problems"], f"{label}: the jump before the tap: {ready}")
+            ready = wait_jump_drawn("the jump before the tap",
+                                    lambda found: bool(found["shown"]) and not found["problems"])
             reads_before = len(api.reads())
             tap_x, tap_y = float(ready["centre"][0]), float(ready["top"]) - 4
             if mobile:
@@ -2784,11 +2825,10 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             else:
                 page.mouse.click(tap_x, tap_y)
             wait_jump(False)
-            landed = page.evaluate(JUMP_JS)
+            landed = wait_jump_drawn("a tap 4px above the jump did not land on the newest line with the jump gone",
+                                     lambda found: not found["shown"] and float(found["gap"]) <= 2)
             newest = page.evaluate(NEWEST_ROW_JS)
             shot("4b2-jump-tapped")
-            check(float(landed["gap"]) <= 2,
-                  f"{label}: a tap 4px above the jump left the newest line {float(landed['gap']):.1f}px below")
             check(bool(newest["visible"]), f"{label}: after the tap the end of the newest message is not on screen: {newest}")
             check(not landed["shown"], f"{label}: the jump is still up at the newest line: {landed}")
             check(len(api.reads()) == reads_before, f"{label}: the tap read the channel: {api.reads()[reads_before:]}")
@@ -2815,25 +2855,24 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             page.evaluate("() => { window.__holdScrolls = true; }")
             grown = page.add_style_tag(content=newest_row_taller(200))
             wait_jump(True)
-            below = page.evaluate(JUMP_JS)
+            below = wait_jump_drawn("the newest message grew 200px below a reader on the newest line, and no jump came",
+                                    lambda found: bool(found["shown"]) and float(found["gap"]) > 100)
             page.evaluate("() => { window.__holdScrolls = false; }")
-            check(bool(below["shown"]) and float(below["gap"]) > 100,
-                  f"{label}: the newest message grew 200px below a reader on the newest line, and no jump came: {below}")
+            check(bool(below["shown"]), f"{label}: the jump went again once scrolls were let through: {below}")
             # Down from halfway up, so the jump is up by the scroll listener's own decision.
             page.evaluate(PARK_JS, "middle")
             wait_jump(True)
             park_still(40)
-            parked = page.evaluate(JUMP_JS)
-            check(bool(parked["shown"]) and abs(float(parked["gap"]) - 40) <= 1,
-                  f"{label}: come down to 40px short of the end from halfway up, the jump is not still up: {parked}")
+            wait_jump_drawn("come down to 40px short of the end from halfway up, the jump is not still up",
+                            lambda found: bool(found["shown"]) and abs(float(found["gap"]) - 40) <= 1)
             page.evaluate("() => { window.__holdScrolls = true; }")
             grown.evaluate(f"(element) => {{ element.textContent = {json.dumps(newest_row_taller(170))}; }}")
             wait_jump(False)
-            met = page.evaluate(JUMP_JS)
+            met = wait_jump_drawn("the newest message shrank 30px under a reader 40px up, onto the newest line, "
+                                  "and the jump stayed",
+                                  lambda found: not found["shown"] and float(found["gap"]) <= 24)
             page.evaluate("() => { window.__holdScrolls = false; }")
-            check(not met["shown"] and float(met["gap"]) <= 24,
-                  f"{label}: the newest message shrank 30px under a reader 40px up, onto the newest line, and the"
-                  f" jump stayed: {met}")
+            check(not met["shown"], f"{label}: the jump came back once scrolls were let through: {met}")
             grown.evaluate("element => element.remove()")
             page.evaluate(PARK_JS, 0)
             wait_jump(False)
