@@ -9,6 +9,7 @@ members = [
     "agent-queue",
     "agent-harness",
     "agentctl",
+    "claude-session",
     "term-backend",
     "chat-subscription",
     "chat-subscription-plugin",
