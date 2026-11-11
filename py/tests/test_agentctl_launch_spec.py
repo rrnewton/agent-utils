@@ -351,6 +351,35 @@ def test_rust_only_restore_commands_are_refused_by_this_edition(
     assert f"{command} is implemented only by the Rust edition" in capsys.readouterr().err
 
 
+def test_start_without_declared_effort_is_refused_like_the_rust_edition(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    # #1216 parity (owner rule 319: effort is always declared): the Rust
+    # edition refuses a launch with no profile or --effort effort, rc 2,
+    # before any Herdr contact; this edition must say the same.
+    from agentctl import cli
+    assert cli.main([
+        "--registry", str(tmp_path / "registry"), "start", "worker",
+        "--cwd", str(tmp_path),
+    ]) == 2
+    assert capsys.readouterr().err == (
+        'agentctl: no reasoning effort declared for harness "codex" '
+        "(mode interactive): declare reasoning_effort in the launch "
+        "profile or pass --effort LEVEL (accepted levels: minimal, low, "
+        "medium, high, xhigh, max, ultra)\n"
+    )
+    assert cli.main([
+        "--registry", str(tmp_path / "registry"), "start", "worker",
+        "--cwd", str(tmp_path), "--harness", "claude", "--mode", "headless",
+    ]) == 2
+    assert capsys.readouterr().err == (
+        'agentctl: no reasoning effort declared for harness "claude" '
+        "(mode headless): declare reasoning_effort in the launch "
+        "profile or pass --effort LEVEL (accepted levels: low, medium, "
+        "high, xhigh, max)\n"
+    )
+
+
 def test_revive_fresh_is_a_rust_only_flag_in_this_edition() -> None:
     # agent-utils-986 parity note: same-pane reuse and revive --fresh are
     # Rust-edition behaviour; this edition refuses the flag by name.

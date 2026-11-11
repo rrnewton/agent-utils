@@ -1452,7 +1452,8 @@ def test_the_unfixed_retirement_goal_query_reached_the_host_codex(
         case = harness.case("unfixed-goal-query")
         common = ("--herdr-bin", "<HERDR>", "--registry", "<ROOT>/registry")
         started = harness.invoke(case, (
-            "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1", *common,
+            "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
+            "--effort", "medium", *common,
         ))
         assert [outcome.returncode for outcome in started] == [0, 0], started
         harness.invoke(case, ("goal", "worker", *common))

@@ -1168,7 +1168,9 @@ def test_profiles_come_from_the_registry_project_when_cwd_has_none(
 ) -> None:
     project = tmp_path / "project"
     project.mkdir()
-    _write_profiles(project, {"local": {"harness": "codex", "mode": "interactive"}})
+    _write_profiles(project, {"local": {
+        "harness": "codex", "mode": "interactive", "reasoning_effort": "medium",
+    }})
     slot = tmp_path / "worktrees" / "slot-a"
     slot.mkdir(parents=True)
     registry = project / ".agentctl"
@@ -1549,16 +1551,34 @@ def test_profile_resume_cli_keeps_headless_resume_out_of_scope(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     sessions, fake, _calls = setup(tmp_path, monkeypatch)
-    _write_profiles(tmp_path, {"headless": {"harness": harness, "mode": "headless", "env": {}}})
+    # Only muse headless profiles may declare an effort; a codex headless
+    # profile therefore declares none and hits the effort gate first.
+    profile: dict[str, object] = {"harness": harness, "mode": "headless", "env": {}}
+    if harness == "muse":
+        profile["reasoning_effort"] = "medium"
+    _write_profiles(tmp_path, {"headless": profile})
     monkeypatch.setattr(cli, "HerdrClient", lambda **_kwargs: cast(HerdrClient, fake))
     monkeypatch.setattr(Sessions, "_worker", lambda *_args, **_kwargs: pytest.fail("no worker dispatch"))
     assert cli.main([
         "start", "worker", "--cwd", str(tmp_path), "--registry", str(sessions.registry),
         "--profile", "headless", "--resume", "selected-conversation",
-    ]) == 75
+    ]) == (75 if harness == "muse" else 2)
     captured = capsys.readouterr()
-    assert "headless start does not accept resume" in captured.err and captured.out == ""
+    expected = "headless start does not accept resume" if harness == "muse" else (
+        "no reasoning effort declared"
+    )
+    assert expected in captured.err and captured.out == ""
     assert not sessions.registry.exists() and fake.environments == [] and fake.launched == []
+    if harness == "codex":
+        # Without a profile, a declared effort reaches the same scope refusal.
+        assert cli.main([
+            "start", "worker", "--cwd", str(tmp_path), "--registry", str(sessions.registry),
+            "--harness", "codex", "--mode", "headless", "--effort", "medium",
+            "--resume", "selected-conversation",
+        ]) == 75
+        captured = capsys.readouterr()
+        assert "headless start does not accept resume" in captured.err and captured.out == ""
+        assert not sessions.registry.exists() and fake.environments == [] and fake.launched == []
 
 
 def test_profile_resume_cli_keeps_agentcloud_as_a_rust_only_adapter(

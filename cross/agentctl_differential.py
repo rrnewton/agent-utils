@@ -113,9 +113,27 @@ def _json(outcome: Outcome) -> object:
         return outcome.stdout
 
 
+def _with_effort(arguments: Sequence[str]) -> tuple[str, ...]:
+    """Declare an effort on a success-expecting `start` (#1216 parity).
+
+    Owner rule 319: effort is always declared, and both editions now
+    refuse a start with no profile or --effort effort. Fixture starts
+    that expect to launch therefore declare a level every harness
+    accepts; refusal-expecting and parse-only starts keep their literal
+    arguments (they never reach this helper's callers unchanged).
+    """
+    args = tuple(arguments)
+    if "start" not in args or "--profile" in args:
+        return args
+    if "--effort" in args or "--reasoning-effort" in args:
+        return args
+    at = args.index("start")
+    return (*args[: at + 2], "--effort", "medium", *args[at + 2:])
+
+
 def _pair(harness: Harness, report: Report, case: PairCase, label: str,
           arguments: Sequence[str], expected: int = 0) -> tuple[Outcome, Outcome]:
-    python, rust = harness.invoke(case, arguments)
+    python, rust = harness.invoke(case, _with_effort(arguments))
     report.require(label, python.returncode == rust.returncode == expected
                    and _json(python) == _json(rust)
                    and (python.stderr == rust.stderr if expected == 0 else True),
@@ -374,7 +392,7 @@ def _conversations(harness: Harness, report: Report) -> None:
                        and native.get("agent") == "claude" and native.get("source") == "asserted"
                        and isinstance(native.get("value"), str)
                        and re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", native["value"]) is not None
-                       and arguments == ["--session-id", native["value"]]
+                       and arguments == ["--session-id", native["value"], "--effort", "medium"]
                        and value.get("session_value") is None,
                        f"generated conversation not retained separately from routing identity: {value!r}")
     _pair(harness, report, case, "primary/conversation/claude/status", ("status", "worker", *_COMMON))
@@ -2116,7 +2134,7 @@ def _registry_and_interop(harness: Harness, report: Report) -> None:
     for label, producer, consumer in (("python-rust", harness.python, harness.rust), ("rust-python", harness.rust, harness.python)):
         case = harness.case(f"primary/interop/{label}")
         root = case.python_root
-        started = harness._invoke_one(producer, root, ("start", "worker", *_COMMON))
+        started = harness._invoke_one(producer, root, _with_effort(("start", "worker", *_COMMON)))
         path = root / "registry/agents/worker/agent.json"
         if path.exists():
             record = json.loads(path.read_text(encoding="utf-8"))

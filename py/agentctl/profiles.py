@@ -861,6 +861,11 @@ def validate_muse_headless_arguments(
         index += 1
 
 
+def effort_levels(harness: str) -> tuple[str, ...] | None:
+    """Accepted reasoning-effort levels for one harness, or None if unlisted."""
+    return _EFFORT_LEVELS.get(harness)
+
+
 def reasoning_arguments(harness: str, effort: str | None) -> tuple[str, ...]:
     """Translate one explicit effort without inventing permission policy."""
     if effort is None:

@@ -20,7 +20,8 @@ from agentctl.errors import AgentPending, AgentPossiblySubmitted, HerdrRunError
 from agentctl.legacy_cli import _ascii_float, _bounded_uint
 from agentctl.profiles import (
     AGENTCLOUD_HARNESS,
-    configuration_root, load_configuration, load_profiles, validate_raw_harness_arguments,
+    configuration_root, effort_levels, load_configuration, load_profiles,
+    validate_raw_harness_arguments,
 )
 from agentctl.sessions import Sessions
 from agentctl.skill_install import install_skill
@@ -606,6 +607,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                     structured_model=args.model is not None,
                     structured_effort=args.reasoning_effort is not None,
                     structured_resume=args.resume is not None,
+                )
+            if reasoning_effort is None:
+                # #1216 parity (owner rule 319): effort is always declared
+                # by the agentctl layer, never left to a harness or machine
+                # default; the Rust edition refuses here, after raw-argument
+                # validation, with this message.
+                levels = effort_levels(harness)
+                accepted = ", ".join(levels) if levels else (
+                    "none, minimal, low, medium, high, xhigh, max, ultra"
+                )
+                raise ValueError(
+                    f'no reasoning effort declared for harness "{harness}" '
+                    f"(mode {mode}): declare reasoning_effort in the launch "
+                    f"profile or pass --effort LEVEL (accepted levels: {accepted})"
                 )
             harness_args = list(profile.argv) if profile else args.harness_arg
             environment = list(profile.environment) if profile else args.env
