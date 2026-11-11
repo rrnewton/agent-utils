@@ -264,6 +264,78 @@ def test_bind_fence_and_remove_cycle(
     assert worktreesimage.load_binds(control) == {}
 
 
+def test_validate_mount_fence_without_a_bind_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1318: a validation checkout that is itself an image mount point with
+    # no bind record reaches the fence still mounted; rename(2) refuses
+    # EBUSY. The fence must relocate the mount, not rename it mounted.
+    config = _config(tmp_path, worktreesimage.MOUNTED)
+    control = config.control
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "v1").mkdir(parents=True)
+    slot_path = cli._slot_directory(config, "v1", "validate")
+    slot_path.mkdir(parents=True)
+    fake = _FakeMounts()
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    monkeypatch.setattr(worktreesimage, "mount_id_at", lambda point: 777)
+    monkeypatch.setattr(
+        slotimage,
+        "mount_table",
+        lambda: [
+            slotimage.MountEntry(
+                mount_point=slot_path,
+                fstype="btrfs",
+                source="/dev/loop9",
+                device="0:999",
+                root="/v1",
+            )
+        ],
+    )
+    assert worktreesimage.load_binds(control) == {}
+
+    fenced = slot_path.parent / (".v1.fenced.1." + "c" * 32)
+    cli._rename_slot_path(config, slot_path, fenced)
+    assert fenced.is_dir() and not slot_path.exists()
+    assert [call[0] for call in fake.calls] == ["umount", "mount"]
+    assert worktreesimage.load_bind_records(control)["v1"].target == str(fenced)
+
+
+def test_validate_mount_fence_refuses_when_the_unmount_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1318: an unmount failure fails closed naming the mount; the
+    # checkout, its mount and the subvolume stay for a retry.
+    config = _config(tmp_path, worktreesimage.MOUNTED)
+    control = config.control
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "v1").mkdir(parents=True)
+    slot_path = cli._slot_directory(config, "v1", "validate")
+    slot_path.mkdir(parents=True)
+    failing = _FakeMounts(fail_umount=True)
+    monkeypatch.setattr(worktreesimage, "_run", failing.run)
+    monkeypatch.setattr(worktreesimage, "mount_id_at", lambda point: 777)
+    monkeypatch.setattr(
+        slotimage,
+        "mount_table",
+        lambda: [
+            slotimage.MountEntry(
+                mount_point=slot_path,
+                fstype="btrfs",
+                source="/dev/loop9",
+                device="0:999",
+                root="/v1",
+            )
+        ],
+    )
+
+    fenced = slot_path.parent / (".v1.fenced.1." + "d" * 32)
+    with pytest.raises(OSError, match="cannot unmount image mount"):
+        cli._rename_slot_path(config, slot_path, fenced)
+    assert slot_path.is_dir() and not fenced.exists()
+    assert (mount_dir / "v1").is_dir()
+
+
 def test_remove_refuses_when_the_bind_unmount_fails_and_a_retry_finishes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

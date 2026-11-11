@@ -4924,20 +4924,87 @@ def _worktrees_bind_slot(config: Config, path: Path) -> str | None:
     return None
 
 
+def _mount_entry_at(path: Path) -> slotimage.MountEntry | None:
+    """The mount-table entry mounted exactly at ``path``, or None."""
+
+    try:
+        table = slotimage.mount_table()
+    except slotimage.ImageError:
+        return None
+    target = Path(os.path.abspath(path))
+    for entry in table:
+        if entry.mount_point == target:
+            return entry
+    return None
+
+
+def _relocate_unrecorded_image_mount(
+    config: Config, source: Path, destination: Path, entry: slotimage.MountEntry
+) -> bool:
+    """Relocate a worktrees-image mount that has no bind record (#1318).
+
+    A validation checkout can be an image subvolume mounted at its own
+    path without a recorded bind (its removal sits outside the agent
+    batch's ``image_targets``). The mount root names the subvolume: when
+    that subvolume sits in the project image, record the bind and let
+    ``relocate_bind`` unmount, rename, and remount it at the fence.
+    Returns False for any other mount, whose fence the caller refuses.
+    """
+
+    subvolume = entry.root.removeprefix("/")
+    if not subvolume or "/" in subvolume:
+        return False
+    mount_dir = worktreesimage.image_mount_dir(config.control)
+    if not (mount_dir / subvolume).is_dir():
+        return False
+    try:
+        records = worktreesimage.load_bind_records(config.control)
+        if subvolume not in records:
+            updated = dict(records)
+            updated[subvolume] = worktreesimage.BindRecord(
+                subvolume=subvolume, target=str(source)
+            )
+            worktreesimage.save_bind_records(config.control, updated)
+        worktreesimage.relocate_bind(
+            config.control, mount_dir, subvolume, source, destination
+        )
+    except worktreesimage.WorktreesImageError as exc:
+        raise OSError(
+            errno.EBUSY,
+            f"cannot unmount image mount at {source} before the path fence: {exc}",
+        ) from exc
+    finally:
+        _refresh_owned_mounts(config)
+    return True
+
+
 def _rename_slot_path(config: Config, source: Path, destination: Path) -> None:
     """Rename a slot directory, relocating its image mount when it has one.
 
     A mount point cannot be renamed. For an image-backed slot the image is
     unmounted, the empty mount point renamed, and the image mounted again at
     the destination. A slot born in the worktrees image gets the same
-    treatment for its recorded bind (#898). Failures surface as OSError so
-    every caller's existing rename error handling still applies.
+    treatment for its recorded bind (#898). A mount point with no such
+    record is relocated from its mount root when it is a worktrees-image
+    subvolume (#1318); any other mount point refuses here, naming the
+    mount, instead of failing the rename with EBUSY. Failures surface as
+    OSError so every caller's existing rename error handling still applies.
     """
 
     image = _slot_image_at(config, source)
     if image is None:
         bind_slot = _worktrees_bind_slot(config, source)
         if bind_slot is None:
+            entry = _mount_entry_at(source)
+            if entry is not None:
+                if _relocate_unrecorded_image_mount(config, source, destination, entry):
+                    return
+                raise OSError(
+                    errno.EBUSY,
+                    f"cannot fence mounted path {source}: it is a mount point "
+                    f"({entry.source}); unmount it or record it as an image "
+                    "target before removal",
+                )
             os.rename(source, destination)
             return
         try:

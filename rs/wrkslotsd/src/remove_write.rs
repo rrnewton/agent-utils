@@ -48,6 +48,143 @@ use crate::status_state::{process_state, read_process_identity, Identity};
 
 type Result<T> = std::result::Result<T, String>;
 
+/// The mount-table entry mounted exactly at `path`, mirroring the
+/// Python `_mount_entry_at` (#1318).
+fn mount_entry_at(path: &Path) -> Option<crate::image_mounts::MountEntry> {
+    let text = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let entries = crate::image_mounts::parse_mountinfo(&text);
+    crate::image_mounts::top_entry(path, &entries).cloned()
+}
+
+/// The mount ID of the mount at `path` in this namespace, mirroring
+/// Python `mount_id_at` for the bind record written after a relocation.
+fn mount_id_at(path: &Path) -> Option<i64> {
+    let text = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let target = crate::image_mounts::normalize_absolute(path);
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() >= 5
+            && crate::image_mounts::normalize_absolute(Path::new(fields[4])) == target
+        {
+            if let Ok(id) = fields[0].parse::<i64>() {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// Run one privileged mount command, mirroring Python
+/// `worktreesimage._run(argv, sudo=True)` (`sudo -n` + argv).
+fn run_mount_command(argv: &[String]) -> Result<()> {
+    let output = Command::new("sudo")
+        .arg("-n")
+        .args(argv)
+        .output()
+        .map_err(|error| format!("{} failed to run: {error}", argv.join(" ")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    };
+    Err(format!("sudo -n {} failed: {detail}", argv.join(" ")))
+}
+
+/// Establish the path fence, mirroring Python `_rename_slot_path`
+/// (#1318): a mount point cannot be renamed, so a recorded worktrees
+/// bind — or an unrecorded worktrees-image subvolume mount, recognised
+/// by its mount root — is unmounted, the empty mount point renamed, and
+/// the subvolume bound again at the fenced path. Any other mount point
+/// fails closed here, naming the mount. Failures keep the existing
+/// `cannot establish path fence` refusal shape.
+fn fence_slot_path(cfg: &Cfg, slot: &str, slot_path: &Path, fenced_path: &Path) -> Result<()> {
+    let records = crate::worktrees_image::load_bind_records(&cfg.control)
+        .map_err(|error| format!("cannot read worktrees image record: {error}"))?;
+    let entry = mount_entry_at(slot_path);
+    let mut bind_key: Option<String> = None;
+    if records.contains_key(slot) {
+        bind_key = Some(slot.to_string());
+    } else if let Some(mount) = &entry {
+        let subvolume = mount.root.strip_prefix('/').unwrap_or_default();
+        if !subvolume.is_empty()
+            && !subvolume.contains('/')
+            && crate::worktrees_image::image_mount_dir(&cfg.control)
+                .join(subvolume)
+                .is_dir()
+        {
+            bind_key = Some(subvolume.to_string());
+        }
+    }
+    if let Some(key) = bind_key {
+        let mount_dir = crate::worktrees_image::image_mount_dir(&cfg.control);
+        let subvolume = records
+            .get(&key)
+            .map(|record| record.subvolume.clone())
+            .unwrap_or_else(|| key.clone());
+        if !records.contains_key(&key) {
+            let source = slot_path.to_string_lossy().into_owned();
+            let record = crate::worktrees_image::BindRecord {
+                subvolume: subvolume.clone(),
+                mount_id: None,
+                target: Some(source),
+            };
+            let record_key = key.clone();
+            crate::worktrees_image::update_bind_records(&cfg.control, move |mut current| {
+                current.entry(record_key).or_insert(record);
+                current
+            })
+            .map_err(|error| {
+                format!("cannot unmount image mount at {} before the path fence: {error}", slot_path.display())
+            })?;
+        }
+        run_mount_command(&["umount".to_string(), slot_path.to_string_lossy().into_owned()])
+            .map_err(|error| {
+                format!("cannot unmount image mount at {} before the path fence: {error}", slot_path.display())
+            })?;
+        if let Err(error) = std::fs::rename(slot_path, fenced_path) {
+            let _ = run_mount_command(&[
+                "mount".to_string(),
+                "--bind".to_string(),
+                mount_dir.join(&subvolume).to_string_lossy().into_owned(),
+                slot_path.to_string_lossy().into_owned(),
+            ]);
+            return Err(error.to_string());
+        }
+        run_mount_command(&[
+            "mount".to_string(),
+            "--bind".to_string(),
+            mount_dir.join(&subvolume).to_string_lossy().into_owned(),
+            fenced_path.to_string_lossy().into_owned(),
+        ])
+        .map_err(|error| {
+            format!("cannot unmount image mount at {} before the path fence: {error}", slot_path.display())
+        })?;
+        let target = fenced_path.to_string_lossy().into_owned();
+        let mount_id = mount_id_at(fenced_path);
+        crate::worktrees_image::update_bind_records(&cfg.control, move |mut current| {
+            if let Some(record) = current.get_mut(&key) {
+                record.mount_id = mount_id;
+                record.target = Some(target);
+            }
+            current
+        })?;
+        return Ok(());
+    }
+    if let Some(mount) = entry {
+        return Err(format!(
+            "cannot fence mounted path {}: it is a mount point ({}); unmount it or record it as an image target before removal",
+            slot_path.display(),
+            mount.source
+        ));
+    }
+    std::fs::rename(slot_path, fenced_path).map_err(|error| error.to_string())
+}
+
 fn identity_of(value: &Value) -> Identity {
     Identity {
         pid: value.get("pid").and_then(Value::as_i64).unwrap_or(0),
@@ -2653,7 +2790,7 @@ pub(crate) fn remove_slot(
                 "both canonical and fenced slot paths exist for {slot}"
             ));
         }
-        std::fs::rename(&slot_path, &fenced_path).map_err(|error| {
+        fence_slot_path(&cfg, &slot, &slot_path, &fenced_path).map_err(|error| {
             format!(
                 "cannot establish path fence {} -> {}: {error}",
                 slot_path.display(),
