@@ -4705,6 +4705,13 @@ const { noteSelfAuthor, messageChannel } = speakers;
 
 
 function renderChannelRows() {
+  // `#1251 scroll-single-owner`: every Main-list redraw is held by the owner — except under a
+  // quick-reply hold, whose own holder places the box (`placeQuickReply`).
+  if (quickReplyHolds(el("scroll-area"))) renderChannelRowsNow();
+  else preservingScroll(() => renderChannelRowsNow());
+}
+
+function renderChannelRowsNow() {
   // `#206 pin-message`. The Pinned filter's list first, so that the pass below derives its rows as
   // well: it is drawn from the same messages and has to agree with the channel about every one.
   syncPinnedList();
@@ -7200,7 +7207,7 @@ const liveStream = createLiveStream({
   relayToAgent: (message, selfPosted, replayed, arrival) => voiceCall().relayToAgent(message, selfPosted, replayed, arrival),
   refreshAfterMutation: () => refreshAfterLiveMutation(), noteChannelReadFailure,
   foldLiveMessage: timelineView.foldLiveMessage, appendChannelRow: timelineView.appendChannelRow,
-  appendToColumns: timelineView.appendToColumns, renderOutgoingEverywhere: () => renderOutgoingEverywhere(), noteServerThreadHuesIn: (messages, summaries, channel, provisional) => noteServerThreadHuesIn(messages, summaries, channel, provisional),
+  appendToColumns: timelineView.appendToColumns, preservingScroll: (act) => preservingScroll(act), renderOutgoingEverywhere: () => renderOutgoingEverywhere(), noteServerThreadHuesIn: (messages, summaries, channel, provisional) => noteServerThreadHuesIn(messages, summaries, channel, provisional),
   threadOf, loadCanon,
   replayLedger,
   replaysWaiting: () => replayLedger.waiting(), readLedgerEpoch: () => readLedger.epoch(),
