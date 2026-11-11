@@ -6016,11 +6016,13 @@ def _journal_fingerprint(config: Config) -> tuple[tuple[str, int, int], ...]:
 #: round and the identity check under the configuration lock (#1274).
 REGISTRY_VALIDATION_ATTEMPTS = 5
 
-#: Top-level control-directory names that a global validation reads, besides the event logs:
-#: the ACTIVE and ARCHIVED shards, every mutation journal, holds, handoff sidecars, and the
-#: partial-update leftovers of each. An allowlist, never "every file but the locks": the control
-#: directory can also hold storage that is not registry state at all, such as a project
-#: worktrees image hundreds of GiB in size whose times change with every slot write.
+#: Top-level control-directory names that a global validation reads, besides the event logs,
+#: the quarantine directory's journals and the slot-image records: the ACTIVE and ARCHIVED
+#: shards, every mutation journal (any top-level ``*.journal``), holds, handoff sidecars, and
+#: the partial-update leftovers of each. The same files ``_registry_read_identity`` covers. An
+#: allowlist, never "every file but the locks": the control directory can also hold storage
+#: that is not registry state at all, such as a project worktrees image hundreds of GiB in size
+#: whose times change with every slot write, and per-slot images beside their records.
 _REGISTRY_IDENTITY_PREFIXES = (
     "ACTIVE.",
     "ARCHIVED.",
@@ -6041,8 +6043,11 @@ class _RegistryIdentity:
     """Cheap identity of every registry file a global validation reads (#1274).
 
     One lstat per file, never a content read: the names listed by
-    ``_REGISTRY_IDENTITY_PREFIXES`` and every file in every ``EVENTS.*`` log (78,892 files
-    took about 0.2 s on the measured host). Every wrkslots mutation changes at least one of
+    ``_REGISTRY_IDENTITY_PREFIXES``, every top-level journal, every file in every ``EVENTS.*``
+    log (78,892 files took about 0.2 s on the measured host), the journals in the quarantine
+    directory, and every slot-image record (``slot-images/TYPE/SLOT/IMAGE.json``, never the
+    image beside it). Those are the files ``_registry_read_identity`` covers for readers.
+    Every wrkslots mutation changes at least one of
     them -- it appends an event, replaces a shard, or writes or removes a journal -- and an
     atomic replacement always brings a new inode, so an equal identity proves that no wrkslots
     writer committed anything between the two readings. Lock files are left out (opening one
@@ -6066,9 +6071,9 @@ class _RegistryIdentity:
         )
 
 
-def _registry_entry_identity(entry: os.DirEntry[str]) -> _RegistryEntryIdentity | None:
+def _registry_entry_identity(entry: os.DirEntry[str] | Path) -> _RegistryEntryIdentity | None:
     try:
-        status = entry.stat(follow_symlinks=False)
+        status = os.lstat(entry) if isinstance(entry, Path) else entry.stat(follow_symlinks=False)
     except OSError:
         return None
     return (
@@ -6081,32 +6086,57 @@ def _registry_entry_identity(entry: os.DirEntry[str]) -> _RegistryEntryIdentity 
     )
 
 
+def _registry_journal_name(name: str) -> bool:
+    """A mutation journal, or the partial-update leftover of one."""
+
+    return name.endswith(".journal") or ".journal.tmp." in name
+
+
 def _registry_identity(config: Config) -> _RegistryIdentity:
     """Take the registry identity a prevalidated mutation compares under its locks (#1274)."""
 
+    def listed(path: str, label: str) -> list[os.DirEntry[str]]:
+        try:
+            with os.scandir(path) as listing:
+                return sorted(listing, key=lambda child: child.name)
+        except OSError as exc:
+            raise Refusal(f"cannot list {label} {path}: {exc}") from exc
+
     entries: list[tuple[str, _RegistryEntryIdentity | None]] = []
-    try:
-        with os.scandir(config.control) as listing:
-            top = sorted(listing, key=lambda entry: entry.name)
-    except OSError as exc:
-        raise Refusal(f"cannot list registry directory {config.control}: {exc}") from exc
-    for entry in top:
+    quarantine = _quarantine_directory(config).name
+    for entry in listed(str(config.control), "registry directory"):
         name = entry.name
+        if name.endswith(".lock"):
+            continue
         if name.startswith("EVENTS.") and entry.is_dir(follow_symlinks=False):
-            try:
-                with os.scandir(entry.path) as listing:
-                    children = sorted(listing, key=lambda child: child.name)
-            except OSError as exc:
-                raise Refusal(f"cannot list event log {entry.path}: {exc}") from exc
             entries.extend(
-                (f"{name}/{child.name}", _registry_entry_identity(child)) for child in children
+                (f"{name}/{child.name}", _registry_entry_identity(child))
+                for child in listed(entry.path, "event log")
             )
             continue
-        if name.endswith(".lock") or not name.startswith(
-            (*_REGISTRY_IDENTITY_PREFIXES, "EVENTS.")
-        ):
+        if name == quarantine and entry.is_dir(follow_symlinks=False):
+            # The quarantined journals, which the global validation reads too.
+            entries.extend(
+                (f"{name}/{child.name}", _registry_entry_identity(child))
+                for child in listed(entry.path, "quarantine directory")
+                if _registry_journal_name(child.name)
+            )
             continue
-        entries.append((name, _registry_entry_identity(entry)))
+        if name == slotimage.IMAGES_DIRECTORY and entry.is_dir(follow_symlinks=False):
+            # Each slot's image record, never the image beside it, whose times change with
+            # every write inside the slot.
+            root = Path(entry.path)
+            entries.extend(
+                (f"{name}/{record.relative_to(root).as_posix()}", _registry_entry_identity(record))
+                for record in sorted(root.glob(f"*/*/{slotimage.RECORD_NAME}"))
+            )
+            continue
+        if (
+            name.startswith((*_REGISTRY_IDENTITY_PREFIXES, "EVENTS."))
+            or _registry_journal_name(name)
+            or name in (quarantine, slotimage.IMAGES_DIRECTORY)
+        ):
+            entries.append((name, _registry_entry_identity(entry)))
     return _RegistryIdentity(_file_sha256(config.config_path), tuple(entries))
 
 
@@ -6356,8 +6386,8 @@ def _assert_registry_change_limited_to_slot(
     ``reference`` is the identity a prevalidated mutation verified under its locks (#1274),
     and ``local`` this machine's verified state and log tip. Under those locks no other
     wrkslots writer can commit, and the mutation writes only this machine's ACTIVE and
-    ARCHIVED shards and event log. Suppose those are the only registry entries that differ
-    from the reference. If the events appended after ``local``'s tip are a run that
+    ARCHIVED shards and event log, plus the slot's own image record for an image-backed
+    create. Suppose those are the only registry entries that differ from the reference. If the events appended after ``local``'s tip are a run that
     ``_appended_events_limited_to_slot`` accepts, reading those events is the whole check.
     Otherwise this machine's rows are re-derived by replaying its log, and every other row
     is the validated ``before`` row. Any other difference, and every caller without a
@@ -6368,9 +6398,18 @@ def _assert_registry_change_limited_to_slot(
         current = _registry_identity(config)
         local_shards = {f"ACTIVE.{config.machine}.json", f"ARCHIVED.{config.machine}.json"}
         events = f"EVENTS.{config.machine}/"
+        # The slot's own image record, which an image-backed create writes: it is that slot's
+        # storage, not another row.
+        own_image_record = re.compile(
+            rf"{re.escape(slotimage.IMAGES_DIRECTORY)}/[^/]+/{re.escape(slot)}/"
+            rf"{re.escape(slotimage.RECORD_NAME)}"
+        )
         changed = reference.changed_names(current)
         if reference.config_sha256 == current.config_sha256 and all(
-            name in local_shards or name.startswith(events) for name in changed
+            name in local_shards
+            or name.startswith(events)
+            or own_image_record.fullmatch(name) is not None
+            for name in changed
         ):
             appended = [name[len(events) :] for name in changed if name.startswith(events)]
             if local is not None and _appended_events_limited_to_slot(
@@ -32495,6 +32534,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
             _stored_repository_path(config, item.repository)[1] for item in plan
         )
         _assert_git_identity_supported(config, plan_repositories, vcs)
+        # The lock-free storage report is reused when the plan names the same repositories.
+        # It only feeds the warnings printed below. Git registrations and checkout HEADs are
+        # not registry state, so a `git worktree` change made outside wrkslots since the
+        # validation can leave it stale about other slots; this create's own target is
+        # checked fresh under the lock by _assert_create_target_clear.
         storage_inconsistencies = (
             prepared.storage_inconsistencies
             if prepared is not None and prepared.repositories == plan_repositories
