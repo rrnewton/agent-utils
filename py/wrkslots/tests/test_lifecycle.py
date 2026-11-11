@@ -14192,6 +14192,79 @@ def test_interrupted_finish_recovers_archive_and_removal(tmp_path: Path) -> None
     assert len(archive["records"]) == 1
 
 
+def _hand_lock_worktree(project: Path, reason: str) -> None:
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(project / "repo"),
+            "worktree",
+            "lock",
+            "--reason",
+            reason,
+            str(checkout(project)),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _finished_dead_project(tmp_path: Path) -> Path:
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    commit_task(repository, checkout(project), "codex/task")
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    return project
+
+
+def test_remove_drops_hand_placed_worktrees_image_lock(tmp_path: Path) -> None:
+    # #1183: a lock placed by hand with wrkslots' exact image reason (the
+    # pre-#1162 interim recipe) is dropped after the fence; remove succeeds.
+    project = _finished_dead_project(tmp_path)
+    _hand_lock_worktree(project, "in worktrees image")
+    removed = remove(project)
+    assert removed.returncode == 0, removed.stderr
+    assert active_slots(project) == []
+
+
+def test_recover_after_fence_drops_hand_placed_worktrees_image_lock(
+    tmp_path: Path,
+) -> None:
+    project = _finished_dead_project(tmp_path)
+    _hand_lock_worktree(project, "in worktrees image")
+    interrupted = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-path-fence"},
+    )
+    assert interrupted.returncode == 86, interrupted.stderr
+    recovered = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+    assert recovered.returncode == 0, recovered.stderr
+    assert active_slots(project) == []
+
+
+def test_remove_refuses_foreign_worktree_lock(tmp_path: Path) -> None:
+    project = _finished_dead_project(tmp_path)
+    _hand_lock_worktree(project, "operator hold")
+    removed = remove(project)
+    assert removed.returncode != 0
+    assert active_slots(project) != []
+    # Recovery of the refused removal also keeps refusing the foreign lock.
+    recovered = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+    assert recovered.returncode != 0
+    assert active_slots(project) != []
+
+
 def test_recover_archives_residue_of_a_journaled_removed_checkout(
     tmp_path: Path,
 ) -> None:
@@ -34732,10 +34805,11 @@ def test_clean_caches_only_does_not_traverse_unselected_journal_targets_or_cache
         record: wrkslots.ActiveRecord,
         *,
         require_repository: bool = True,
+        historical: bool = False,
     ) -> None:
         validated_records.add(record.slot)
         validate_record_paths(
-            config, record, require_repository=require_repository
+            config, record, require_repository=require_repository, historical=historical
         )
 
     monkeypatch.setattr(wrkslots, "_assert_record_paths", record_global_path_validation)

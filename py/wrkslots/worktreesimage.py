@@ -55,8 +55,9 @@ MOUNT_ATS = (MOUNT_AT_BINDS, MOUNT_AT_WORKTREES_DIR)
 #: supported) or full qgroups. See ``apply_quota_mode``.
 QUOTA_MODES = ("simple", "full")
 
-#: Name of the validation-slots directory inside the image when the image
-#: mounts at the slots directory: ``<worktrees_dir>/validate/<slot>``.
+#: Name of the validation-slots directory: inside the image it is the
+#: top-level ``validate`` entry; in every layout validation slots surface
+#: at ``<managed-root>/validate/<slot>`` (see ``validate_external_dir``).
 VALIDATE_SUBDIR = "validate"
 
 #: Mount classification states (see ``classify_mount``).
@@ -290,6 +291,58 @@ def current_state(root: Path, worktrees: Path, settings: WorktreesImageSettings)
     )
 
 
+def validate_image_dir(slots_dir: Path) -> Path:
+    """The validation storage directory inside the mounted image."""
+
+    return slots_dir / VALIDATE_SUBDIR
+
+
+def validate_external_dir(slots_dir: Path) -> Path:
+    """Where validation slots surface, in every layout.
+
+    ``worktrees/validate`` when the slots directory is named ``slots``
+    (the managed root is its parent), else inside the slots directory
+    itself, where it coincides with the image directory.
+    """
+
+    managed = slots_dir.parent if slots_dir.name == "slots" else slots_dir
+    return managed / VALIDATE_SUBDIR
+
+
+def _mounted_at(point: Path) -> bool:
+    return any(entry.mount_point == point for entry in slotimage.mount_table())
+
+
+def ensure_validate_bind(slots_dir: Path) -> None:
+    """Bind the image's validate directory at its surface path.
+
+    One extra bind, owned by wrkslots: mounted here and in
+    ``mount_image``, unmounted in ``unmount_image`` and reported in
+    ``status_report``. When the surface coincides with the storage
+    directory there is nothing to bind.
+    """
+
+    internal = validate_image_dir(slots_dir)
+    internal.mkdir(parents=True, exist_ok=True)
+    external = validate_external_dir(slots_dir)
+    if external == internal:
+        return
+    external.mkdir(parents=True, exist_ok=True)
+    if _mounted_at(external):
+        return
+    _run(["mount", "--bind", str(internal), str(external)], sudo=True)
+
+
+def unmount_validate_bind(slots_dir: Path) -> None:
+    """Unmount the validate bind, if it is mounted."""
+
+    external = validate_external_dir(slots_dir)
+    if external == validate_image_dir(slots_dir):
+        return
+    if _mounted_at(external):
+        _run(["umount", str(external)], sudo=True)
+
+
 def ensure_image_mounted(
     root: Path,
     control: Path,
@@ -300,7 +353,7 @@ def ensure_image_mounted(
 
     if settings.direct:
         mount_image(settings.image_file(root), slots_dir, settings)
-        (slots_dir / VALIDATE_SUBDIR).mkdir(exist_ok=True)
+        ensure_validate_bind(slots_dir)
         return
     mount_dir = image_mount_dir(control)
     mount_dir.mkdir(parents=True, exist_ok=True)
@@ -452,6 +505,7 @@ def mount_image(
     if state == MOUNTED:
         if direct:
             _ensure_mount_root_owner(mount_point)
+            ensure_validate_bind(mount_point)
         return
     if state in (WRONG_MOUNT, NOT_EMPTY_UNMOUNTED):
         raise WorktreesImageError(
@@ -470,11 +524,18 @@ def mount_image(
     )
     if direct:
         _ensure_mount_root_owner(mount_point)
+        ensure_validate_bind(mount_point)
 
 
 def unmount_image(mount_point: Path) -> None:
-    """Unmount the worktrees image from ``mount_point``."""
+    """Unmount the worktrees image from ``mount_point``.
 
+    For the direct layout (``mount_point`` is the slots directory) the
+    validate bind at ``validate_external_dir(mount_point)`` comes down
+    first; unmounting the image would otherwise leave it dangling.
+    """
+
+    unmount_validate_bind(mount_point)
     _run(["umount", str(mount_point)], sudo=True)
 
 
@@ -1005,6 +1066,14 @@ def status_report(root: Path, worktrees: Path, settings: WorktreesImageSettings)
         ),
         "configured_quota_mode": settings.quota_mode,
         "binds": {} if settings.direct else load_binds(worktrees.parent),
+        "validate_dir": str(validate_external_dir(worktrees)),
+        "validate_bind": (
+            "mounted"
+            if settings.direct and _mounted_at(validate_external_dir(worktrees))
+            else "not-mounted"
+            if settings.direct
+            else "n/a"
+        ),
     }
     if image_file.is_file():
         stat = image_file.stat()

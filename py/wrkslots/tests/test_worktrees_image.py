@@ -1489,12 +1489,182 @@ def test_direct_state_and_status_classify_the_slots_directory(
     assert report["quota_mode"] == "simple"
     assert report["configured_quota_mode"] == "simple"
     assert report["binds"] == {}
-    assert cli._validate_slots_directory(config) == config.worktrees / "validate"
+    assert cli._validate_slots_directory(config) == (
+        tmp_path / "worktrees" / "validate"
+    )
+    assert report["validate_dir"] == str(tmp_path / "worktrees" / "validate")
     with pytest.raises(cli.Refusal, match="reserved"):
         cli._slot_directory(config, "validate", "agent")
     assert cli._slot_directory(config, "v1", "validate") == (
-        config.worktrees / "validate" / "v1"
+        tmp_path / "worktrees" / "validate" / "v1"
     )
+    assert worktreesimage.validate_external_dir(config.worktrees) == (
+        tmp_path / "worktrees" / "validate"
+    )
+    assert worktreesimage.validate_image_dir(config.worktrees) == (
+        config.worktrees / "validate"
+    )
+
+
+def _checkout(path: str) -> cli.Checkout:
+    return cli.Checkout(
+        name="repo",
+        path=path,
+        repository=".",
+        branch="b1",
+        start_point="0" * 40,
+        remote="origin",
+        remote_url_sha256="0" * 64,
+        landed_ref="refs/remotes/origin/main",
+        head="0" * 40,
+    )
+
+
+def test_historical_validate_paths_survive_direct_config(tmp_path: Path) -> None:
+    # #1183: archived/replayed validate rows at either validate root must
+    # not brick a direct-layout registry; active rows stay strict.
+    import dataclasses as _dc
+
+    config = _direct_config(tmp_path, worktreesimage.MOUNTED)
+    for path in ("worktrees/validate/v1", "worktrees/slots/validate/v1"):
+        record = _dc.replace(
+            _record("v1", "validate"), checkouts=(_checkout(path),), layout="flat"
+        )
+        cli._assert_record_paths(config, record, require_repository=False, historical=True)
+    active_old = _dc.replace(
+        _record("v1", "validate"),
+        checkouts=(_checkout("worktrees/slots/validate/v1"),),
+        layout="flat",
+    )
+    with pytest.raises(cli.StateError, match="does not match its slot"):
+        cli._assert_record_paths(config, active_old, require_repository=False)
+    cli._assert_record_paths(
+        config,
+        _dc.replace(
+            _record("v1", "validate"),
+            checkouts=(_checkout("worktrees/validate/v1"),),
+            layout="flat",
+        ),
+        require_repository=False,
+    )
+    bogus = _dc.replace(
+        _record("v1", "validate"),
+        checkouts=(_checkout("worktrees/elsewhere/v1"),),
+        layout="flat",
+    )
+    with pytest.raises(cli.StateError):
+        cli._assert_record_paths(config, bogus, require_repository=False, historical=True)
+
+
+def test_archive_validate_paths_accept_either_root(tmp_path: Path) -> None:
+    config = _direct_config(tmp_path, worktreesimage.MOUNTED)
+
+    def archive(path: str) -> dict[str, object]:
+        finished = "2026-11-05T01:00:00+00:00"
+        return {
+            "schema": cli.SCHEMA,
+            "machine": "testhost",
+            "revision": 1,
+            "records": [
+                {
+                    "archive_id": f"testhost:v1:1:{finished}",
+                    "slot": "v1",
+                    "agent": "worker-a",
+                    "task": "t1",
+                    "purpose": "probe",
+                    "machine": "testhost",
+                    "generation": 1,
+                    "created_at": "2026-11-05T00:00:00+00:00",
+                    "finished_at": finished,
+                    "mode": "remove",
+                    "actor": "coordinator",
+                    "physical_storage": "removed",
+                    "validation": ["ok"],
+                    "limitations": [],
+                    "continuation": "done",
+                    "slot_type": "validate",
+                    "layout": "flat",
+                    "checkouts": [
+                        {
+                            "name": "repo",
+                            "path": path,
+                            "repository": ".",
+                            "branch": "b1",
+                            "start_point": "0" * 40,
+                            "remote": "origin",
+                            "remote_url_sha256": "0" * 64,
+                            "landed_ref": "refs/remotes/origin/main",
+                            "head": "0" * 40,
+                            "containing_remote_refs": [],
+                            "vcs": "git",
+                        }
+                    ],
+                }
+            ],
+        }
+
+    for path in ("worktrees/validate/v1", "worktrees/slots/validate/v1"):
+        state = cli._archive_from_obj(config, archive(path), "testhost", "archive state")
+        assert state.records[0]["slot"] == "v1"
+    with pytest.raises(cli.StateError, match="escaped its archived slot"):
+        cli._archive_from_obj(
+            config, archive("worktrees/elsewhere/v1"), "testhost", "archive state"
+        )
+
+
+def test_migrate_preflight_refuses_before_switching(tmp_path: Path) -> None:
+    from wrkslots import imagecmd
+    import dataclasses as _dc
+
+    config = _config(tmp_path, worktreesimage.MOUNTED)
+    assert config.worktrees_image is not None
+    bad = _dc.replace(
+        _record("validate", "agent"),
+        checkouts=(_checkout("worktrees/slots/validate"),),
+        layout="flat",
+    )
+    with pytest.raises(cli.Refusal, match="would leave slot validate unusable"):
+        imagecmd._assert_target_layout_paths(config, config.worktrees_image, [bad], True)
+    good = _dc.replace(
+        _record("s1", "agent"), checkouts=(_checkout("worktrees/slots/s1"),), layout="flat"
+    )
+    imagecmd._assert_target_layout_paths(config, config.worktrees_image, [good], True)
+    imagecmd._assert_target_layout_paths(config, config.worktrees_image, [good], False)
+
+
+def test_validate_bind_ensure_and_unmount_use_one_bind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slots = tmp_path / "worktrees" / "slots"
+    slots.mkdir(parents=True)
+    fake = _FakeMounts()
+    mounted: list[Path] = []
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    monkeypatch.setattr(
+        slotimage, "mount_table", lambda: [slotimage.MountEntry(mount_point=p, fstype="btrfs", source="/dev/loop0") for p in mounted]
+    )
+    orig_run = fake.run
+
+    def run(argv: list[str], *, sudo: bool = False) -> object:
+        if argv[:2] == ["mount", "--bind"]:
+            mounted.append(Path(argv[-1]))
+        if argv[:1] == ["umount"]:
+            point = Path(argv[-1])
+            if point in mounted:
+                mounted.remove(point)
+        return orig_run(argv, sudo=sudo)
+
+    monkeypatch.setattr(worktreesimage, "_run", run)
+    worktreesimage.ensure_validate_bind(slots)
+    assert (slots / "validate").is_dir()
+    assert mounted == [tmp_path / "worktrees" / "validate"]
+    worktreesimage.ensure_validate_bind(slots)
+    assert mounted == [tmp_path / "worktrees" / "validate"]
+    worktreesimage.unmount_validate_bind(slots)
+    assert mounted == []
+    assert [c for c in fake.calls if c[:2] == ["mount", "--bind"]] == [
+        ["mount", "--bind", str(slots / "validate"), str(tmp_path / "worktrees" / "validate")]
+    ]
 
 
 def test_direct_fence_renames_plainly_and_remove_deletes_the_subvolume(
@@ -1780,6 +1950,103 @@ def test_migrate_layout_round_trip_with_fake_mounts(
     assert locked == ["s1", "s1"]
 
 
+def _archive_record(slot: str, slot_type: str, path: str) -> dict[str, object]:
+    finished = "2026-11-05T01:00:00+00:00"
+    return {
+        "archive_id": f"testhost:{slot}:1:{finished}",
+        "slot": slot,
+        "agent": "worker-a",
+        "task": "t1",
+        "purpose": "probe",
+        "machine": "testhost",
+        "generation": 1,
+        "created_at": "2026-11-05T00:00:00+00:00",
+        "finished_at": finished,
+        "mode": "remove",
+        "actor": "coordinator",
+        "physical_storage": "removed",
+        "validation": ["ok"],
+        "limitations": [],
+        "continuation": "done",
+        "slot_type": slot_type,
+        "layout": "flat",
+        "checkouts": [
+            {
+                "name": "repo",
+                "path": path,
+                "repository": ".",
+                "branch": "b1",
+                "start_point": "0" * 40,
+                "remote": "origin",
+                "remote_url_sha256": "0" * 64,
+                "landed_ref": "refs/remotes/origin/main",
+                "head": "0" * 40,
+                "containing_remote_refs": [],
+                "vcs": "git",
+            }
+        ],
+    }
+
+
+def test_migrate_layout_with_archived_validate_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #1183 acceptance in miniature: archived validate rows at
+    # worktrees/validate (and an archived agent row) must not brick the
+    # switch to direct, nor the switch back.
+    from wrkslots import imagecmd
+
+    config = _layout_project(tmp_path)
+    assert config.worktrees_image is not None
+    config.worktrees_image.image_file(config.root).touch()
+    control = config.control
+    mount_dir = worktreesimage.image_mount_dir(control)
+    (mount_dir / "s1").mkdir(parents=True)
+    (mount_dir / "s1" / "keep.txt").write_text("image copy\n", encoding="utf-8")
+    slot_path = config.worktrees / "s1"
+    slot_path.mkdir(parents=True)
+    worktreesimage.save_bind_records(
+        control,
+        {"s1": worktreesimage.BindRecord(subvolume="s1", target=str(slot_path))},
+    )
+    archive = {
+        "schema": cli.SCHEMA,
+        "machine": "testhost",
+        "revision": 2,
+        "records": [
+            _archive_record("v-old", "validate", "worktrees/validate/v-old"),
+            _archive_record("a-old", "agent", "worktrees/slots/a-old"),
+        ],
+    }
+    cli._atomic_write_json(cli._archive_path(config), archive)
+    assert cli._load_archive(config).records[0]["slot"] == "v-old"
+    fake = _FakeLayoutHost(mount_dir, config.worktrees)
+    monkeypatch.setattr(worktreesimage, "_run", fake.run)
+    monkeypatch.setattr(worktreesimage, "mount_id_at", lambda point: 99)
+    monkeypatch.setattr(worktreesimage, "is_subvolume", lambda path: path.is_dir())
+    monkeypatch.setattr(slotimage, "mount_table", lambda: [])
+    monkeypatch.setattr(
+        imagecmd, "_lock_slot_checkouts", lambda cfg, slot, slot_type: None
+    )
+    import dataclasses as _dc
+
+    record = _dc.replace(
+        _record(), checkouts=(_checkout("worktrees/slots/s1"),), layout="flat"
+    )
+    imagecmd._assert_target_layout_paths(config, config.worktrees_image, [record], True)
+    imagecmd._migrate_layout_to_direct(config, config.worktrees_image, [record])
+    assert cli._load_archive(config).records[0]["slot"] == "v-old"
+    assert cli._slot_directory(config, "v-new", "validate") == (
+        tmp_path / "worktrees" / "validate" / "v-new"
+    )
+    direct = worktreesimage.settings_from_obj(
+        {"path": "worktrees.img", "size_bytes": 2 * GIB, "mount_at": "worktrees_dir"}
+    )
+    imagecmd._assert_target_layout_paths(config, direct, [record], False)
+    imagecmd._migrate_layout_to_binds(config, direct, [record])
+    assert cli._load_archive(config).records[0]["slot"] == "v-old"
+
+
 def test_doctor_reports_a_missing_image_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1872,6 +2139,17 @@ def test_real_direct_image_lifecycle(tmp_path: Path) -> None:
         )
         assert slots.stat().st_uid == os.getuid()
         assert (slots / "validate").is_dir()
+        validate_surface = worktreesimage.validate_external_dir(slots)
+        assert validate_surface == control / "validate"
+        assert validate_surface.is_dir()
+        vslot = validate_surface / "v1"
+        worktreesimage.create_slot_subvolume(vslot, settings.slot_quota_bytes)
+        assert worktreesimage.is_subvolume(vslot)
+        assert (slots / "validate" / "v1").is_dir()
+        (vslot / "val.txt").write_text("val\n", encoding="utf-8")
+        assert (slots / "validate" / "v1" / "val.txt").read_text(encoding="utf-8") == "val\n"
+        worktreesimage.delete_slot_subvolume(vslot)
+        assert not vslot.exists()
         mode = worktreesimage.quota_mode_at(slots, image)
         if mode != "simple":
             pytest.skip(f"simple quotas unsupported on this host (mode={mode})")
@@ -1887,12 +2165,19 @@ def test_real_direct_image_lifecycle(tmp_path: Path) -> None:
         assert report["mount_point"] == str(slots)
         assert report["quota_mode"] == "simple"
         assert report["binds"] == {}
+        assert report["validate_bind"] == "mounted"
+        assert report["validate_dir"] == str(validate_surface)
         # A remount never flips the existing mode.
         worktreesimage.apply_quota_mode(slots, image, "full")
         assert worktreesimage.quota_mode_at(slots, image) == "simple"
         worktreesimage.delete_slot_subvolume(slot)
         assert not slot.exists()
     finally:
+        subprocess.run(
+            ["sudo", "-n", "umount", str(worktreesimage.validate_external_dir(slots))],
+            capture_output=True,
+            check=False,
+        )
         subprocess.run(
             ["sudo", "-n", "umount", str(slots)], capture_output=True, check=False
         )
@@ -1947,6 +2232,11 @@ def test_real_migrate_layout_round_trip(
     finally:
         subprocess.run(
             ["sudo", "-n", "umount", str(slot_path)], capture_output=True, check=False
+        )
+        subprocess.run(
+            ["sudo", "-n", "umount", str(worktreesimage.validate_external_dir(config.worktrees))],
+            capture_output=True,
+            check=False,
         )
         subprocess.run(
             ["sudo", "-n", "umount", str(mount_dir)], capture_output=True, check=False

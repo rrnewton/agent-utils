@@ -241,10 +241,14 @@ def register(subparsers: argparse._SubParsersAction[_ParserT], formatter: type[a
             "reclaims any host original left beneath a bind (the verified image "
             "copy is kept), unmounts beside the control files and mounts the image "
             "at the slots directory itself, so slot subvolumes become its top-level "
-            "entries. --to binds does the reverse. Refuses while any slot is in use "
-            "(the removal census, a live or unverifiable owner, or a hold), while a "
-            "validation slot exists (finish or remove it first), or while any entry "
-            "in the slots directory is not a recorded slot. The worktrees_image "
+            "entries. Validation slots stay at worktrees/validate in both layouts "
+            "(in direct, the image's validate directory is bind-mounted there). "
+            "--to binds does the reverse. Refuses before switching if any active "
+            "record would fail the target layout's path checks, while any slot is "
+            "in use (the removal census, a live or unverifiable owner, or a hold), "
+            "while an active validation slot exists (finish or remove it first; "
+            "archived validation rows never block), or while any entry in the "
+            "slots directory is not a recorded slot. The worktrees_image "
             "mount_at key is rewritten only after the new mount verifiably holds "
             "every slot; on refusal the previous layout is re-established."
         ),
@@ -863,6 +867,7 @@ def _cmd_wt_image_status(args: argparse.Namespace) -> int:
         f"mount point: {report['mount_point']} state={report['state']} "
         f"mount_at={report['mount_at']} quota={report['quota_mode']}"
     )
+    print(f"validate: {report['validate_dir']} bind={report['validate_bind']}")
     if report["image_exists"]:
         print(f"apparent={report['apparent_bytes']} allocated={report['allocated_bytes']}")
     for entry in lock_missing:
@@ -1198,6 +1203,38 @@ def _layout_census(
     return records
 
 
+def _assert_target_layout_paths(
+    config: "cli.Config",
+    settings: worktreesimage.WorktreesImageSettings,
+    records: "list[cli.ActiveRecord]",
+    want_direct: bool,
+) -> None:
+    """Refuse before switching if a post-switch command would refuse.
+
+    Runs the strict record-path assertions against a copy of the
+    configuration carrying the target ``mount_at`` (#1183), so a record
+    whose path or reserved name only works in the current layout stops
+    the switch before any mount moves.
+    """
+
+    from wrkslots import cli
+
+    target_at = (
+        worktreesimage.MOUNT_AT_WORKTREES_DIR if want_direct else worktreesimage.MOUNT_AT_BINDS
+    )
+    target_settings = dataclasses.replace(settings, mount_at=target_at)
+    target_config = dataclasses.replace(config, worktrees_image=target_settings)
+    for record in records:
+        try:
+            cli._assert_record_paths(target_config, record, require_repository=False)
+        except (cli.StateError, cli.Refusal) as exc:
+            raise _refuse(
+                f"migrate-layout to {'direct' if want_direct else 'binds'} would "
+                f"leave slot {record.slot} unusable: {exc}; fix or remove that "
+                "slot before switching layout"
+            ) from exc
+
+
 def _write_mount_at(config: "cli.Config", mount_at: str) -> None:
     """Rewrite only ``worktrees_image.mount_at``; caller holds mutation locks."""
 
@@ -1243,6 +1280,8 @@ def _cmd_wt_migrate_layout(args: argparse.Namespace) -> int:
     with cli._mutation_locks(config, args.wait_lock):
         cli._refuse_partial_state(config)
         state = cli._load_active(config)
+        cli._load_archive(config)
+        _assert_target_layout_paths(config, settings, list(state.slots), want_direct)
         agents = _layout_census(config, state)
         if want_direct:
             _migrate_layout_to_direct(config, settings, agents)
@@ -1310,6 +1349,11 @@ def _migrate_layout_to_direct(
         {record.slot for record in agents},
         what=f"slots directory {config.worktrees}",
     )
+    _layout_unknown_entries(
+        cli._validate_slots_directory(config),
+        set(),
+        what=f"validation directory {cli._validate_slots_directory(config)}",
+    )
     image_file = settings.image_file(config.root)
     direct_settings = dataclasses.replace(
         settings, mount_at=worktreesimage.MOUNT_AT_WORKTREES_DIR
@@ -1330,7 +1374,7 @@ def _migrate_layout_to_direct(
                 shutil.rmtree(host_path)
         worktreesimage.unmount_image(mount_dir)
         worktreesimage.mount_image(image_file, config.worktrees, direct_settings)
-        (config.worktrees / worktreesimage.VALIDATE_SUBDIR).mkdir(exist_ok=True)
+        worktreesimage.ensure_validate_bind(config.worktrees)
         for record in agents:
             slot_path = cli._slot_directory(config, record.slot, record.slot_type)
             if not worktreesimage.is_subvolume(slot_path):
@@ -1384,7 +1428,7 @@ def _migrate_layout_to_binds(
         {record.slot for record in agents} | {worktreesimage.VALIDATE_SUBDIR},
         what=f"slots directory {config.worktrees}",
     )
-    validate_dir = config.worktrees / worktreesimage.VALIDATE_SUBDIR
+    validate_dir = cli._validate_slots_directory(config)
     if validate_dir.is_dir() and next(validate_dir.iterdir(), None) is not None:
         raise _refuse(
             f"{validate_dir} is not empty; remove its validation slots before "

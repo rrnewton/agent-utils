@@ -4630,6 +4630,9 @@ _OWNED_WORKTREES_BIND_MOUNTS: frozenset[tuple[Path, str, str]] = frozenset()
 #: the slot's own storage root, judged like a recorded bind root when Git
 #: removes the checkout.
 _DIRECT_WORKTREES_IMAGE_ROOT: Path | None = None
+#: The surface validate directory (worktrees/validate) in the direct
+#: layout, where validate subvolumes appear through the validate bind.
+_DIRECT_VALIDATE_ROOT: Path | None = None
 #: ``(mount point, MAJOR:MINOR, /dev/loopN)`` of every second attachment of a
 #: doubly attached image: an independent, stale file system on the same image
 #: file. The census reports such a line as use, naming it, unless this command
@@ -4762,18 +4765,31 @@ def _refresh_worktrees_bind_mounts(config: Config) -> None:
     counts only when the table shows the recorded subvolume bound there.
     """
 
-    global _OWNED_WORKTREES_BIND_MOUNTS, _DIRECT_WORKTREES_IMAGE_ROOT
+    global _OWNED_WORKTREES_BIND_MOUNTS, _DIRECT_WORKTREES_IMAGE_ROOT, _DIRECT_VALIDATE_ROOT
     if config.worktrees_image is None:
         _OWNED_WORKTREES_BIND_MOUNTS = frozenset()
         _DIRECT_WORKTREES_IMAGE_ROOT = None
+        _DIRECT_VALIDATE_ROOT = None
         return
     if config.worktrees_image.direct:
-        # No binds exist to own; the image mount at the slots directory is
-        # every slot's parent mount, never a mount inside a slot.
-        _OWNED_WORKTREES_BIND_MOUNTS = frozenset()
+        # The only bind is the validate directory itself; the image mount
+        # at the slots directory is every agent slot's parent mount.
         _DIRECT_WORKTREES_IMAGE_ROOT = Path(os.path.abspath(config.worktrees))
+        _DIRECT_VALIDATE_ROOT = Path(os.path.abspath(_validate_slots_directory(config)))
+        try:
+            table = slotimage.mount_table()
+        except (slotimage.ImageError, Refusal):
+            table = []
+        owned_direct: set[tuple[Path, str, str]] = set()
+        for entry in table:
+            if entry.mount_point == _DIRECT_VALIDATE_ROOT and entry.root == (
+                "/" + worktreesimage.VALIDATE_SUBDIR
+            ):
+                owned_direct.add((entry.mount_point, entry.device, entry.root))
+        _OWNED_WORKTREES_BIND_MOUNTS = frozenset(owned_direct)
         return
     _DIRECT_WORKTREES_IMAGE_ROOT = None
+    _DIRECT_VALIDATE_ROOT = None
     try:
         records = worktreesimage.load_bind_records(config.control)
         table = slotimage.mount_table()
@@ -5161,7 +5177,10 @@ def _is_owned_direct_subvolume_root(path: Path) -> bool:
     if root is None:
         return False
     target = Path(os.path.abspath(path))
-    if target.parent not in (root, root / worktreesimage.VALIDATE_SUBDIR):
+    parents = {root, root / worktreesimage.VALIDATE_SUBDIR}
+    if _DIRECT_VALIDATE_ROOT is not None:
+        parents.add(_DIRECT_VALIDATE_ROOT)
+    if target.parent not in parents:
         return False
     return worktreesimage.is_subvolume(target)
 
@@ -8009,12 +8028,16 @@ def _archive_record_from_obj(
         ):
             raise StateError(f"{label} differs from its historical source row")
     for checkout in checkouts:
-        slot_path = _slot_directory(config, slot, slot_type)
-        destination = (
-            slot_path if record_layout == "flat" else slot_path / checkout.name
-        )
-        expected = destination.relative_to(config.root).as_posix()
-        if checkout.path != expected:
+        # Archived rows keep the path they were created with (#1183):
+        # accept every historical validate root, keep identity checks.
+        candidates = _historical_slot_candidates(config, slot, slot_type)
+        expecteds = {
+            (candidate if record_layout == "flat" else candidate / checkout.name)
+            .relative_to(config.root)
+            .as_posix()
+            for candidate in candidates
+        }
+        if checkout.path not in expecteds:
             raise StateError(
                 f"{label} checkout {checkout.name} path escaped its archived slot"
             )
@@ -8864,7 +8887,9 @@ def _states_from_events(
                     )
                 path_key = _record_path_check_key(record)
                 if path_key not in path_checks:
-                    _assert_record_paths(config, record, require_repository=False)
+                    _assert_record_paths(
+                        config, record, require_repository=False, historical=True
+                    )
                     path_checks[path_key] = record
                 if current is not None and current.slot_type == "agent" and current.import_source is None:
                     active_agents.pop(current.agent, None)
@@ -10953,7 +10978,7 @@ def _registry_storage_inconsistencies(
                 and not _is_representation_directory(config, entry)
                 and not (
                     slot_type == "agent"
-                    and entry == _validate_slots_directory(config)
+                    and _is_validate_storage_entry(config, entry)
                 )
             }
         except OSError as exc:
@@ -13545,7 +13570,7 @@ def _assert_registry_storage_consistent(
             and not _is_representation_directory(config, entry)
             and not (
                 slot_type == "agent"
-                and entry == _validate_slots_directory(config)
+                and _is_validate_storage_entry(config, entry)
             )
         }
         unexpected.extend(
@@ -20528,12 +20553,21 @@ def _managed_worktrees_root(config: Config) -> Path:
 
 
 def _validate_slots_directory(config: Config) -> Path:
-    if config.worktrees_image is not None and config.worktrees_image.direct:
-        # Direct layout: validation slots live inside the image with the
-        # agent slots, under one plain directory at its top level. The
-        # agent slot name "validate" is refused there (_slot_directory).
-        return config.worktrees / worktreesimage.VALIDATE_SUBDIR
+    # Validation slots surface at worktrees/validate in every layout
+    # (#1183 direct-validate-path). In the direct layout their storage
+    # is <image>/validate, bind-mounted there (worktreesimage
+    # ensure_validate_bind); the path itself never depends on mount_at.
     return _managed_worktrees_root(config) / "validate"
+
+
+def _validate_image_directory(config: Config) -> Path:
+    """Validation storage inside the direct image: slots/validate."""
+
+    return config.worktrees / worktreesimage.VALIDATE_SUBDIR
+
+
+def _is_validate_storage_entry(config: Config, entry: Path) -> bool:
+    return entry in (_validate_slots_directory(config), _validate_image_directory(config))
 
 
 def _slot_roots(config: Config) -> dict[str, Path]:
@@ -20553,6 +20587,9 @@ def _slot_directory(config: Config, slot: str, slot_type: str = "agent") -> Path
         and config.worktrees_image is not None
         and config.worktrees_image.direct
     ):
+        # Kept in the direct layout (#1183): <image>/validate still sits
+        # at worktrees/slots/validate inside the image, so an agent slot
+        # of that name would collide with the validation storage dir.
         raise Refusal(
             "agent slot name 'validate' is reserved when the worktrees image "
             "mounts at the slots directory: that top-level entry holds the "
@@ -24192,14 +24229,39 @@ def _heartbeat_diagnosis(record: ActiveRecord) -> tuple[float, bool]:
     return age, age > record.heartbeat_ttl_seconds
 
 
+def _historical_slot_candidates(config: Config, slot: str, slot_type: str) -> list[Path]:
+    """Every slot directory a historical record may legitimately name.
+
+    Validation slots lived at slots/validate under the pre-#1183 direct
+    layout and at worktrees/validate in every other layout; archived
+    and replayed rows keep the path they were created with.
+    """
+
+    if slot_type == "validate":
+        candidates = [_validate_slots_directory(config) / slot, _validate_image_directory(config) / slot]
+    else:
+        candidates = [config.worktrees / slot]
+    seen: list[Path] = []
+    for candidate in candidates:
+        if candidate not in seen:
+            seen.append(candidate)
+    return seen
+
+
 def _assert_record_paths(
     config: Config,
     record: ActiveRecord,
     *,
     require_repository: bool = True,
+    historical: bool = False,
 ) -> None:
-    expected_slot = _slot_directory(config, record.slot, record.slot_type)
-    if require_repository:
+    if historical:
+        # Historical rows are judged against the layouts they could
+        # have been created under, never only the current one (#1183).
+        expected_slot = _historical_slot_candidates(config, record.slot, record.slot_type)[0]
+    else:
+        expected_slot = _slot_directory(config, record.slot, record.slot_type)
+    if require_repository and not historical:
         _ensure_no_symlink_components(config.root, expected_slot, "slot")
     layout = _record_layout(config, record)
     if layout == "flat" and len(record.checkouts) != 1:
@@ -24209,7 +24271,25 @@ def _assert_record_paths(
             raise StateError(
                 f"slot {record.slot} checkout {checkout.name} differs from configured authority"
             )
-        if require_repository:
+        if historical:
+            candidates = _historical_slot_candidates(config, record.slot, record.slot_type)
+            matched: Path | None = None
+            for candidate in candidates:
+                absolute = candidate if layout == "flat" else candidate / checkout.name
+                if checkout.path == absolute.relative_to(config.root).as_posix():
+                    matched = absolute
+                    break
+            if matched is None:
+                expected_absolute = (
+                    expected_slot if layout == "flat" else expected_slot / checkout.name
+                )
+                raise StateError(
+                    f"slot {record.slot} checkout {checkout.name} path does not match its slot: "
+                    f"{checkout.path!r} != {expected_absolute.relative_to(config.root).as_posix()!r}"
+                )
+            expected_absolute = matched
+            expected_relative = expected_absolute.relative_to(config.root).as_posix()
+        elif require_repository:
             expected_relative, expected_absolute = _checkout_path_for_layout(
                 config, record.slot, checkout.name, record.slot_type, layout
             )
@@ -32866,6 +32946,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
             assert config.worktrees_image is not None
             try:
                 if config.worktrees_image.direct:
+                    if args.slot_type == "validate":
+                        # The subvolume is created through the validate
+                        # bind, inside <image>/validate (#1183).
+                        worktreesimage.ensure_validate_bind(config.worktrees)
                     worktreesimage.create_slot_subvolume(
                         slot_path, config.worktrees_image.slot_quota_bytes
                     )
@@ -42108,7 +42192,7 @@ def _cmd_clean_caches(args: argparse.Namespace) -> int:
                 or not entry.is_dir()
                 or entry.is_symlink()
                 or entry.name.startswith("EVENTS.")
-                or entry == _validate_slots_directory(config)
+                or _is_validate_storage_entry(config, entry)
                 or _is_representation_directory(config, entry)
                 or entry.name in registered_slots
             ):
@@ -42765,7 +42849,7 @@ def _audit_slot_root_listing(
                     and not _is_representation_directory(config, entry)
                     and not (
                         slot_type == "agent"
-                        and entry == _validate_slots_directory(config)
+                        and _is_validate_storage_entry(config, entry)
                     )
                 ):
                     continue

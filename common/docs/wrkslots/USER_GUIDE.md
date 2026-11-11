@@ -2824,11 +2824,15 @@ The image file is created owner-only (0600): it holds every slot.
 - `binds` (the default): the image mounts at `<control>/.slots-image` and each slot subvolume is
   bind-mounted at its slot path, recorded in `<control>/.worktrees-image.json`. Validation slots
   stay at `worktrees/validate/<slot>` and are bound the same way.
-- `worktrees_dir`: the image mounts at the slots directory itself and slot subvolumes are its
-  top-level entries; there are no binds and no bind records. Validation slots live inside the
-  image at `worktrees/slots/validate/<slot>` (for `worktrees_dir: worktrees/slots`), and the agent
-  slot name `validate` is reserved. The image root is owned by the invoking user so slot creates
-  and removal fences (renames of a subvolume) work without privilege beyond the mount itself.
+- `worktrees_dir`: the image mounts at the slots directory itself and agent slot subvolumes are
+  its top-level entries; there are no per-slot binds and no bind records. Validation slots stay
+  at `worktrees/validate/<slot>` in this layout too: their storage is the image's top-level
+  `validate` directory (one subvolume per validation slot), bind-mounted as a whole at
+  `worktrees/validate` by wrkslots. That is the layout's only bind, and `worktrees-image status`
+  reports it. The agent slot name `validate` is reserved, because that top-level entry inside
+  the image holds the validation storage. The image root is owned by the invoking user so slot
+  creates and removal fences (renames of a subvolume) work without privilege beyond the mount
+  itself.
 
 Switch layouts with `wrkslots worktrees-image migrate-layout --to direct|binds` once no slot is
 in use: it refuses on a live or unverifiable owner, a hold, any process found by the removal

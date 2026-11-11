@@ -220,14 +220,20 @@ fn archive_from_obj(cfg: &Cfg, value: &Value, selected: &str, label_prefix: &str
             }
         }
         for checkout in &checkouts {
+            // Archived rows keep their creation path (#1183): validate may
+            // name worktrees/validate or slots/validate; identity checks stay.
             let slot_path = slot_directory(cfg, &slot, &slot_type)?;
-            let destination = if record_layout == "flat" {
-                slot_path
-            } else {
-                slot_path.join(&checkout.name)
-            };
-            let expected = posix_relative(&cfg.root, &destination)?;
-            if checkout.path != expected {
+            let alt_slot_path = cfg.worktrees.join("validate").join(&slot);
+            let mut expecteds = Vec::new();
+            for candidate in [slot_path, alt_slot_path] {
+                let destination = if record_layout == "flat" {
+                    candidate
+                } else {
+                    candidate.join(&checkout.name)
+                };
+                expecteds.push(posix_relative(&cfg.root, &destination)?);
+            }
+            if !expecteds.iter().any(|expected| &checkout.path == expected) {
                 return Err(format!(
                     "{label} checkout {} path escaped its archived slot",
                     checkout.name
