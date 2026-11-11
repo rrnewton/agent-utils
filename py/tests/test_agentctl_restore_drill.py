@@ -23,10 +23,11 @@ answers) remains the Rust unit suites' coverage; this drill exercises the
 binary, its exit classes and its report replay against real processes.
 
 Environment survival: a profile's ``env`` entries are tab-creation entries,
-while the registry ``launch_env`` is typed into the pane on every start and
-revive, reused panes included. The drill therefore pins profile env at first
-start and ``launch_env`` (``BASH_ENV`` and the ``PATH`` prefix) after a
-revive through a reused, server-restored pane.
+so an env-carrying revive takes a fresh tab instead of reusing the
+server-restored shell; the registry ``launch_env`` is typed into the pane
+on every start and revive. The drill therefore pins profile env at first
+start and both profile env and ``launch_env`` (``BASH_ENV`` and the
+``PATH`` prefix) after a revive into a fresh pane.
 
 Isolation: the scratch server is reached only as ``herdr --session NAME``
 (through a wrapper given as ``--herdr-bin``) with ``HERDR_SOCKET_PATH`` set
@@ -619,14 +620,15 @@ def _registry_report(document: dict[str, object]) -> dict[str, object]:
     return cast(dict[str, object], report)
 
 
-def test_restore_drill_happy_path_reused_pane_slot_and_rerun(tmp_path: Path) -> None:
+def test_restore_drill_happy_path_fresh_pane_slot_and_rerun(tmp_path: Path) -> None:
     """Four lanes back after one command; a rerun replays and relaunches nothing.
 
     The slot lane uses a plain worktree slot here (owner transfer is the
     behaviour under test); the image-backed bind check has its own variant
-    below. The profile lane proves reuse: the restarted server restores its
-    pane as an idle shell under the same pane id, revive relaunches there,
-    and the registry launch environment is present again afterwards.
+    below. Every drill profile carries environment, so revive must not
+    reuse the auto-restored shell (its tab environment died with the old
+    shell); each lane relaunches in a fresh pane and both the profile
+    value and the registry launch environment are present again.
     """
     sessions = {
         "coord": "drill-session-coord",
@@ -678,15 +680,19 @@ def test_restore_drill_happy_path_reused_pane_slot_and_rerun(tmp_path: Path) -> 
         assert report["restart_detected"] is True
         assert report["previous_boots"] == [PREVIOUS_BOOT]
         assert drill.report_file()["complete"] is True
+        new_panes: dict[str, str] = {}
         for name, session in sessions.items():
             assert rows[name]["action"] == "revived", rows[name]
             assert rows[name]["replayed"] is False
-            # Reused pane: the revived lane sits in the auto-restored shell.
-            assert drill.record(name)["pane_id"] == old_panes[name], name
+            # Env-carrying launches never reuse the restored shell: a fresh
+            # pane receives the tab environment the shell lost.
+            new_panes[name] = cast(str, drill.record(name)["pane_id"])
+            assert new_panes[name] != old_panes[name], name
             assert _ps_comm(drill.harness_pid(name)) == FAKE_NAME, name
             assert len(drill.launches(session)) == 2, name
-        # The launch environment is re-typed on revive, reuse included.
+        # Profile and launch environment both survive the revive.
         prof_after = drill.launches(sessions["prof"])[1]
+        assert f"DRILL_PROFILE_VALUE={PROFILE_VALUE}" in prof_after
         assert f"BASH_ENV={drill.env_file}" in prof_after
         assert f"PATH={drill.tools_dir}:" in prof_after
         # The slot is owned by the new harness pid, read through wrkslots.
@@ -725,7 +731,7 @@ def test_restore_drill_happy_path_reused_pane_slot_and_rerun(tmp_path: Path) -> 
         for name, session in sessions.items():
             assert rows[name]["action"] == "revived", rows[name]
             assert rows[name]["replayed"] is True, rows[name]
-            assert drill.record(name)["pane_id"] == old_panes[name], name
+            assert drill.record(name)["pane_id"] == new_panes[name], name
             assert len(drill.launches(session)) == 2, name
         for name in ("cheap", "prof", "slotlane"):
             assert drill.queued(name) == [
