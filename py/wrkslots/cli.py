@@ -7795,15 +7795,25 @@ def _event_from_path(
 # the chain before it changes the directory.
 _EVENT_MEMO_STABLE_NS = 2_000_000_000
 _EVENT_MEMO_ENTRIES_LIMIT = 1 << 17
-#: Total parsed-event bytes the per-file memo and a kept chain may retain
-#: (#1247). The memo exists so one command parses each event once (a batch
-#: loads the log dozens of times); uncapped, it also kept the whole parsed
-#: history for the command's life, which is the growth behind the 640 GiB
-#: status kill. Past the cap the memo starts over: later loads re-read what
-#: they need, and retained bytes stay flat however long the log grows.
+#: Total parsed-event bytes a read-only scan's memo may retain, and the
+#: longest verified chain it may keep whole (#1247). The memo exists so one
+#: command parses each event once (a batch loads the log dozens of times);
+#: uncapped, a reader also kept the whole parsed history for its life. The
+#: caps apply only to read-only scans (see _bound_event_retention): capping
+#: mutations made every load on a large registry a cold re-read under the
+#: exclusive lock (adopt 19 s -> 95 s), so mutations keep parse-once and
+#: readers keep the bound.
 _EVENT_MEMO_BYTES_LIMIT = 256 << 20
-#: A verified chain longer than this is not retained whole (#1247).
 _CHAIN_MEMO_EVENTS_LIMIT = 5000
+
+
+def _bound_event_retention() -> None:
+    """Apply the read-only retention caps to this command's event memo."""
+
+    if _ACTIVE_EVENT_MEMO:
+        memo = _ACTIVE_EVENT_MEMO[-1]
+        memo.bytes_limit = _EVENT_MEMO_BYTES_LIMIT
+        memo.chain_limit = _CHAIN_MEMO_EVENTS_LIMIT
 _REPLAY_MEMO_ENTRIES_LIMIT = 8
 _PENDING_MEMO_ENTRIES_LIMIT = 8
 _EPISODE_MEMO_ENTRIES_LIMIT = 64
@@ -7847,6 +7857,10 @@ class _EventMemo:
     )
     #: Sum of the file sizes of the events kept in ``files`` (#1247 cap).
     file_bytes: int = 0
+    #: Retention caps for this scope; None keeps the parse-once behaviour
+    #: mutations rely on. Read-only scans set both (see _bound_event_retention).
+    bytes_limit: int | None = None
+    chain_limit: int | None = None
 
 
 _ACTIVE_EVENT_MEMO: list[_EventMemo] = []
@@ -7932,9 +7946,9 @@ def _verify_event_paths(
                 and _event_file_identity(path) == identity
             ):
                 memo_scope = _ACTIVE_EVENT_MEMO[-1]
-                if (
-                    len(memo) >= _EVENT_MEMO_ENTRIES_LIMIT
-                    or memo_scope.file_bytes + identity[2] > _EVENT_MEMO_BYTES_LIMIT
+                if len(memo) >= _EVENT_MEMO_ENTRIES_LIMIT or (
+                    memo_scope.bytes_limit is not None
+                    and memo_scope.file_bytes + identity[2] > memo_scope.bytes_limit
                 ):
                     memo.clear()
                     memo_scope.file_bytes = 0
@@ -7976,10 +7990,9 @@ def _load_events(config: Config, machine: str | None = None) -> tuple[dict[str, 
         [directory / name for name in names], selected
     )
     identities = tuple(identity for identity in trusted if identity is not None)
-    if (
-        len(identities) == len(names)
-        and len(names) <= _CHAIN_MEMO_EVENTS_LIMIT
-        and sum(item[2] for item in identities) <= _EVENT_MEMO_BYTES_LIMIT
+    chain_limit = _ACTIVE_EVENT_MEMO[-1].chain_limit
+    if len(identities) == len(names) and (
+        chain_limit is None or len(names) <= chain_limit
     ):
         chains[key] = _VerifiedEventChain(names, identities, events)
     return events
@@ -41938,6 +41951,7 @@ def _audit_slot_root_listing(
 
 def _cmd_audit(args: argparse.Namespace) -> int:
     _apply_scan_memory_limit(args)
+    _bound_event_retention()
     try:
         return _cmd_audit_scan(args)
     except (_ScanTimeout, MemoryError) as exc:
@@ -43047,6 +43061,7 @@ def _cmd_unpushed(args: argparse.Namespace) -> int:
         _validate_name(args.slot, "slot")
     deadline = _scan_deadline(args)
     _apply_scan_memory_limit(args)
+    _bound_event_retention()
     _prewarm_registry_read(lambda: _validate_global_state(config))
     # Snapshot under a short shared lock, scan outside it (#1247). This
     # command used to hold the lock across every per-checkout Git probe and
@@ -43920,6 +43935,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     )
     deadline = _scan_deadline(args)
     _apply_scan_memory_limit(args)
+    _bound_event_retention()
     cache = _PhasedReadCache(deadline=deadline)
 
     def snapshot() -> tuple[
@@ -44128,6 +44144,7 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
     )
     deadline = _scan_deadline(args)
     _apply_scan_memory_limit(args)
+    _bound_event_retention()
     cache = _PhasedReadCache(deadline=deadline)
 
     def snapshot() -> tuple[

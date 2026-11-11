@@ -273,9 +273,13 @@ def test_event_retention_stays_flat_as_the_log_grows(
     root = _registry(tmp_path / "case", 1)
     config = wrkslots_cli._load_config(str(root), None)
     # Keep every written event settled, so the memo may keep it at once.
+    import time as _time
+
     later = wrkslots_cli._EVENT_MEMO_STABLE_NS * 10
     monkeypatch.setattr(
-        wrkslots_cli, "_event_memo_clock_ns", lambda: 10**18 + later
+        wrkslots_cli,
+        "_event_memo_clock_ns",
+        lambda: _time.time_ns() + later,
     )
     monkeypatch.setattr(wrkslots_cli, "_EVENT_MEMO_BYTES_LIMIT", 4096)
     monkeypatch.setattr(wrkslots_cli, "_CHAIN_MEMO_EVENTS_LIMIT", 4)
@@ -286,6 +290,7 @@ def test_event_retention_stays_flat_as_the_log_grows(
             wrkslots_cli._write_event_file(config, "node-a", "heartbeat", {})
         total += batch
         with wrkslots_cli._event_memo_scope() as memo:
+            wrkslots_cli._bound_event_retention()
             events = wrkslots_cli._load_events(config, "node-a")
             assert len(events) == total
             retained.append(memo.file_bytes)
@@ -295,6 +300,40 @@ def test_event_retention_stays_flat_as_the_log_grows(
     assert all(size <= 4096 for size in retained), retained
     # The streaming verifier still sees every record, retaining none.
     assert sum(1 for _ in wrkslots_cli._iter_events(config, "node-a")) == 150
+
+
+def test_mutation_loads_parse_each_event_file_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _registry(tmp_path / "case", 1)
+    config = wrkslots_cli._load_config(str(root), None)
+    import time as _time
+
+    later = wrkslots_cli._EVENT_MEMO_STABLE_NS * 10
+    monkeypatch.setattr(
+        wrkslots_cli,
+        "_event_memo_clock_ns",
+        lambda: _time.time_ns() + later,
+    )
+    files = 60
+    for _ in range(files):
+        wrkslots_cli._write_event_file(config, "node-a", "heartbeat", {})
+    parses = {"n": 0}
+    original = wrkslots_cli._event_from_path
+
+    def counting(*args: object, **kwargs: object) -> object:
+        parses["n"] += 1
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(wrkslots_cli, "_event_from_path", counting)
+    with wrkslots_cli._event_memo_scope():
+        # A mutation loads the log several times in one command (adopt and
+        # create validate global state repeatedly under the exclusive lock).
+        # Without the read-only retention bound it must still parse each
+        # event file once and reuse it, never re-read per load.
+        for _ in range(3):
+            assert len(wrkslots_cli._load_events(config, "node-a")) == files
+    assert parses["n"] == files, parses
 
 
 def test_status_memory_bound_reports_partial_and_exits_nonzero(
