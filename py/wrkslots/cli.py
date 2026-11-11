@@ -51532,6 +51532,7 @@ def _prepare_retirement_removal(
     unlocked_refusal: Refusal | None,
     live_use_recheck: _LiveUseRecheckBudget,
     salvage_archive_root: Path | None,
+    wait_deadline: float | None = None,
 ) -> _PreparedRemoval | None:
     """Validate and plan one retire-pending candidate with no lock held (#1287).
 
@@ -51594,6 +51595,71 @@ def _prepare_retirement_removal(
             raise _RetirementDeferred(
                 "retirement candidate was superseded before its guarded attempt"
             )
+        # The attempt is durable before any further check, as it was when
+        # the whole removal ran under the lock: a refusal below still
+        # leaves the attempt in the log for the queue's rotation. This
+        # append is the one record-sized lock hold of the lock-free
+        # validation; the commit below re-checks the identity it leaves.
+        attempt_scope = (
+            _mutation_locks(config, float(args.wait_lock))
+            if wait_deadline is None
+            else _mutation_locks(
+                config, float(args.wait_lock), deadline=wait_deadline
+            )
+        )
+        with attempt_scope:
+            _refuse_partial_state(config)
+            _assert_no_journal(config)
+            try:
+                current = _find_record(
+                    _load_active_snapshot(config, require_repository=False),
+                    record.slot,
+                )
+            except Refusal as exc:
+                raise _RetirementDeferred(
+                    "retirement candidate was superseded before its guarded attempt"
+                ) from exc
+            if (current.machine, current.slot, current.generation) != (
+                record.machine,
+                record.slot,
+                record.generation,
+            ):
+                raise _RetirementDeferred(
+                    "retirement candidate generation changed before its guarded attempt"
+                )
+            current_latest = _latest_handoff_read(
+                current, _load_events(config, current.machine)
+            )
+            if current_latest is None or (
+                current_latest.sha256,
+                current_latest.retirement_enqueued,
+                current_latest.sequence,
+            ) != (
+                retirement_candidate.sha256,
+                True,
+                retirement_candidate.event_sequence,
+            ):
+                raise _RetirementDeferred(
+                    "retirement candidate was superseded before its guarded attempt"
+                )
+            sequence, tip = _chain_tip(config, record.machine)
+            writer = _EventWriter(
+                directory=_event_write_directory(config, record.machine),
+                machine=record.machine,
+                sequence=sequence,
+                previous_sha256="0" * 64 if tip is None else tip,
+            )
+            writer.append(
+                "retirement-attempted",
+                {
+                    "slot": record.slot,
+                    "generation": record.generation,
+                    "sha256": retirement_candidate.sha256,
+                    "handoff_read_sequence": retirement_candidate.event_sequence,
+                    "reason": "selected by bounded retirement queue",
+                },
+            )
+            _interrupt_for_test("after-retirement-attempt")
         _assert_target_record_storage_consistent(
             config, states, record, before_any_change=True
         )
@@ -51673,13 +51739,6 @@ def _prepare_retirement_removal(
             evidence=evidence,
             stale_image=None,
             stale_holders=(),
-        )
-        sequence, tip = _chain_tip(config, record.machine)
-        writer = _EventWriter(
-            directory=_event_write_directory(config, record.machine),
-            machine=record.machine,
-            sequence=sequence,
-            previous_sha256="0" * 64 if tip is None else tip,
         )
         return _PreparedRemoval(
             state=state,
@@ -52216,6 +52275,7 @@ def _cmd_remove_in_scope(
             unlocked_refusal=unlocked_refusal,
             live_use_recheck=live_use_recheck,
             salvage_archive_root=salvage_archive_root,
+            wait_deadline=getattr(args, "_wait_deadline", None),
         )
     wait_deadline = getattr(args, "_wait_deadline", None)
     lock_scope = (
@@ -52236,23 +52296,10 @@ def _cmd_remove_in_scope(
             _refuse_partial_state(config)
             _assert_prepared_removal_current(config, prepared_removal)
             _assert_no_journal(config)
-            retirement_candidate = getattr(args, "_retirement_candidate", None)
-            assert isinstance(retirement_candidate, _RetirementCandidate)
             record = prepared_removal.record
             state = prepared_removal.state
             writer = prepared_removal.writer
             admission = prepared_removal.admission
-            writer.append(
-                "retirement-attempted",
-                {
-                    "slot": record.slot,
-                    "generation": record.generation,
-                    "sha256": retirement_candidate.sha256,
-                    "handoff_read_sequence": retirement_candidate.event_sequence,
-                    "reason": "selected by bounded retirement queue",
-                },
-            )
-            _interrupt_for_test("after-retirement-attempt")
             basis = _removal_basis(
                 admission,
                 record,

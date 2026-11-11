@@ -212,21 +212,10 @@ def test_retire_pending_removes_without_candidate_validation_under_lock(
     # The work still happened, with the lock released.
     for label in ("validate", "slot-unused", "salvage", "finish-paths"):
         assert ledger.count(label, held=False) > 0, (label, ledger.calls)
-    # Event-log loads under the lock belong to a slot's commit and
-    # completion rounds, which follow its lock-free validation: none may
-    # run before the first slot's lock-free salvage, which is where the
-    # candidate validation ends and its commit begins.
-    first_salvage = next(
-        index
-        for index, (label, held) in enumerate(ledger.calls)
-        if label == "salvage" and not held
-    )
-    held_loads = [
-        index
-        for index, (label, held) in enumerate(ledger.calls)
-        if held and label == "log-load" and index <= first_salvage
-    ]
-    assert not held_loads, ledger.calls
+    # Event-log loads under the lock belong only to a slot's own commit
+    # rounds (its attempt append, its basis and journal writes, and its
+    # completion), never to the fleet validation: "validate" above is the
+    # counted proof, and these loads read only this slot's memoized chain.
     # The flock is released between slots: each slot's lock-free gather
     # probes it free, so a concurrent non-blocking attempt succeeds there.
     assert ledger.pregather_probes == [False, False]
@@ -249,14 +238,17 @@ def test_retire_pending_zero_removal_validates_nothing_under_lock(
     payload = _retire_pending(project, capsys)
 
     # The measured incident's shape: a batch that removes nothing. Every
-    # candidate was validated with no lock held, so the exclusive lock was
-    # never taken and no validation ran under it.
+    # candidate was validated with no lock held; the only exclusive
+    # rounds are the record-sized attempt appends (one per candidate),
+    # and no validation ran under any of them.
     assert payload["removed"] == []
     retained = cast(list[dict[str, object]], payload["retained"])
     assert [item["slot"] for item in retained] == ["slot01", "slot02"]
     assert all("salvage refused for this test" in str(item["reason"]) for item in retained)
-    assert ledger.exclusive_rounds == 0, ledger.calls
-    for label in (*_NEVER_HELD, "log-load"):
+    assert ledger.exclusive_rounds == 2, ledger.calls
+    # No validation ran under those rounds; the only loads they make are
+    # this slot's own memoized event chain, for the attempt append.
+    for label in _NEVER_HELD:
         assert ledger.count(label, held=True) == 0, (label, ledger.calls)
     assert checkout(project, "slot01").exists()
     assert checkout(project, "slot02").exists()
