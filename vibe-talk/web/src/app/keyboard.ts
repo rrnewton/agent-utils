@@ -167,6 +167,7 @@ export interface KeyboardCompositionDependencies<
   setFolded(entry: KeyboardFoldEntry, folded: boolean): void;
   atBottom(area: HTMLElement): boolean;
   preservingScroll(act: () => void): void;
+  preservingCollapse(area: HTMLElement, row: HTMLElement, head: number, foot: number, act: () => void): void;
   renderScrollTools(): void;
   rowMessages(row: HTMLElement): Message[];
   isOpenThreadRoot(row: HTMLElement): boolean;
@@ -572,8 +573,7 @@ export function createKeyboardComposition<
     showingLinks: (row) => deps.showingLinks(row),
     isFolded: (entry) => deps.isFolded(entry),
     setFolded: (entry, folded) => deps.setFolded(entry, folded),
-    atBottom: (area) => deps.atBottom(area),
-    preservingScroll: (act) => deps.preservingScroll(act),
+    preservingCollapse: (area, row, head, foot, act) => deps.preservingCollapse(area, row, head, foot, act),
     renderScrollTools: () => deps.renderScrollTools(),
     rowForAct: (target) => rowForAct(target),
     paneRows: (pane) => paneRows(pane),

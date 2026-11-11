@@ -607,6 +607,53 @@ test("`#1229 keyed-row-patching`: a redraw keeps the node of every row whose mes
   assert.equal(list.children[1], forThread, "a row built for the view it is drawn in was rebuilt");
 });
 
+test("`#1251 scroll-single-owner` + `#1215 collapse-anchor-below`: a collapse holds its row, the next row, its head, or the foot", () => {
+  const { createScrollKeeping } = CHANNEL_VIEW;
+  const tops = new Map();
+  const mk = (id) => ({
+    id, parentNode: null, nextElementSibling: null, getAttribute: () => null,
+    getBoundingClientRect: () => ({ top: tops.get(id)[0], bottom: tops.get(id)[1] }),
+  });
+  const a = mk("a");
+  const b = mk("b");
+  const c = mk("c");
+  a.nextElementSibling = b;
+  b.nextElementSibling = c;
+  const list = { id: "discord-log", children: [a, b, c] };
+  for (const one of [a, b, c]) one.parentNode = list;
+  const area = { scrollTop: 300, scrollHeight: 900, clientHeight: 200, getBoundingClientRect: () => ({ top: 0 }) };
+  const els = { "discord-log": list, "pinned-log": { id: "pinned-log", children: [] }, "scroll-area": area, "load-older": { hidden: true, getBoundingClientRect: () => ({ top: 0 }) }, transcript: { children: [] } };
+  let bottom = false;
+  const keep = createScrollKeeping({
+    el: (id) => els[id], onMain: () => true, currentView: () => "discord", channelView: () => "main", pinnedOnly: () => false,
+    heldFilterRow: () => null, searchWalk: () => null, atBottom: () => bottom,
+    scrollToNewest: () => {}, renderJumpNewest: () => {}, setJumpNewest: () => {},
+  });
+  // Head on screen: the row itself is held, so a shift above it is corrected in full.
+  tops.set("a", [-40, 40]);
+  tops.set("b", [40, 120]);
+  tops.set("c", [120, 200]);
+  keep.preservingCollapse(area, b, 0, 200, () => tops.set("b", [10, 50]));
+  assert.equal(area.scrollTop, 270, "a collapse with its head on screen did not hold the row");
+  // Head above the viewport, foot on screen: the next row is held (`#1215`); holding the
+  // collapsed row itself, whose top never moves, would leave the next row thrown up by 60px.
+  area.scrollTop = 300;
+  tops.set("b", [-80, 40]);
+  tops.set("c", [40, 120]);
+  keep.preservingCollapse(area, b, 0, 200, () => { tops.set("b", [-80, -20]); tops.set("c", [-20, 60]); });
+  assert.equal(area.scrollTop, 240, "a collapse with its head off screen did not hold the next row");
+  // Taller than the room: its head comes to the scroller's top, as it always has.
+  area.scrollTop = 300;
+  tops.set("b", [-80, 500]);
+  keep.preservingCollapse(area, b, 0, 200, () => tops.set("b", [-80, 60]));
+  assert.equal(area.scrollTop, 220, "a row taller than the screen did not bring its head to the top");
+  // Following the foot: the foot is held, whatever the row.
+  area.scrollTop = 300;
+  bottom = true;
+  keep.preservingCollapse(area, b, 0, 200, () => {});
+  assert.equal(area.scrollTop, 900, "a reader following the foot was not kept on it");
+});
+
 test("`#1057 newest-count-chip`: the rows below the reading position, from the last row wholly on screen", () => {
   const { rowsBelowReadingPosition } = CHANNEL_VIEW;
   const row = (top, bottom) => ({ getBoundingClientRect: () => ({ top, bottom }) });

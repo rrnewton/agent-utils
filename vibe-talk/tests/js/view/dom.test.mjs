@@ -1362,7 +1362,17 @@ test("`#624 voice-page-modularity`: Shift+E's fold keeps the reader's place, and
     isFolded: (entry) => folds.get(entry.id) === true,
     setFolded: (entry, on) => { log.push(`fold ${entry.id} ${on}`); folds.set(entry.id, on); state.rect = state.after; },
     atBottom: () => state.bottom,
-    preservingScroll: (act) => { log.push("hold"); act(); },
+    preservingCollapse: (area2, row2, head, foot, act) => {
+      // The owner's per-act choice, modelled on this fixture's geometry (`#1251`, `#1215`):
+      // at the foot or with the head on screen the act is simply held; with the head above the
+      // viewport the next row abuts the foot here, so holding it moves by the foot's shift; a
+      // row taller than the screen brings its head to the top.
+      const was = row2.getBoundingClientRect();
+      if (state.bottom || was.top >= head - 1) { log.push("hold"); act(); return; }
+      act();
+      const now = row2.getBoundingClientRect();
+      area2.scrollTop += was.bottom <= foot ? now.bottom - was.bottom : now.top - head;
+    },
     renderScrollTools: () => log.push("tools"),
     rowForAct: (...args) => { if (args.length !== 1) log.push(`rowForAct ${args.length} args`); return state.acted; },
     paneRows: () => rows,

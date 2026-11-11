@@ -111,10 +111,6 @@ ALLOW_LIST: tuple[tuple[str, str, str], ...] = (
     ),
 )
 
-# Files under #1227 that this lane must not touch without asking the coordinator. The guard
-# still lists their writers (they count toward the inventory) but flags them in the report.
-HELD_FILES = frozenset({"web/src/view/channel/readcore.ts"})
-
 SCROLLTOP_WRITE = re.compile(r"\.scrollTop\s*(?:\+=|-=|=(?!=))")
 SCROLL_CALLS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("scrollTo", re.compile(r"\.scrollTo\s*\(")),
@@ -194,9 +190,8 @@ def report(writers: list[Writer]) -> str:
         group = by_path.get(path, [])
         lines.append(f"{path} {PATH_TITLES[path]}: {len(group)} writer(s)")
         for writer in group:
-            held = " [HELD #1227: do not touch without asking]" if writer.file in HELD_FILES else ""
             allowed = f" [allow-listed: {writer.allowed}]" if writer.allowed is not None else ""
-            lines.append(f"  {writer.file}:{writer.line} [{writer.kind}] {writer.text}{held}{allowed}")
+            lines.append(f"  {writer.file}:{writer.line} [{writer.kind}] {writer.text}{allowed}")
     lines.append(f"total: {len(writers)} direct writer(s) outside the owner.")
     return "\n".join(lines)
 

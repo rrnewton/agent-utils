@@ -22,10 +22,12 @@ export interface FoldKeysDependencies<Pane extends FoldedPane, Entry, Message, C
   /** Whether the fold `entry` is folded, and folding or unfolding it. */
   isFolded(entry: Entry): boolean;
   setFolded(entry: Entry, folded: boolean): void;
-  /** Whether `area` is scrolled to its newest line. */
-  atBottom(area: HTMLElement): boolean;
-  /** Run `act` with what the reader is looking at kept where it was. */
-  preservingScroll(act: () => void): void;
+  /**
+   * Collapse `row` in `area` under the scroll owner's per-act anchor choice (`#1251
+   * scroll-single-owner`, `#1215 collapse-anchor-below`): the owner holds the row, the next
+   * row, the foot or the row's head, by where the row stands.
+   */
+  preservingCollapse(area: HTMLElement, row: HTMLElement, head: number, foot: number, act: () => void): void;
   /** Draw the chips over the lists' feet again. */
   renderScrollTools(): void;
   /** The row a key acts on from `target`, and whether the key was taken even with no row to act on. */
@@ -74,12 +76,10 @@ export interface FoldKeys<Pane> {
    * scroll-stability`), and answer whether it is folded now. A short message has no fold, and a row
    * showing its links in place of its text is not folded out of sight (`actOnRow`).
    *
-   * With its head on screen it is the fold control's own act: held by `preservingScroll`, the rows above
-   * stay and the rows below close up under it. With its head scrolled off the top that would carry the
-   * folded row off the screen and lift the rows below up past the place being read, so there its foot
-   * holds when the foot is on screen, and the rows below stay where they are; a row taller than the
-   * screen, read part way through, brings its head to the top of the list, the rows after it below.
-   * A reader on the newest line stays on it, as `preservingScroll` keeps them.
+   * The anchor is the scroll owner's per-act choice (`#1251 scroll-single-owner`, `#1215
+   * collapse-anchor-below`): the row itself while its head is on screen, the next row when its
+   * head is already above the viewport, its head brought to the top when it is taller than the
+   * screen, and the foot for a reader on the newest line.
    */
   foldForRead(pane: Pane, row: HTMLElement): boolean;
   /**
@@ -106,16 +106,7 @@ export function createFoldKeys<Pane extends FoldedPane, Entry, Message, Column>(
       const entry = (row as FoldableRow<Entry>).foldEntry;
       if (!entry || deps.showingLinks(row)) return Boolean(entry && deps.isFolded(entry));
       if (deps.isFolded(entry)) return true;
-      const area = pane.scroller();
-      const head = pane.head();
-      const was = row.getBoundingClientRect();
-      if (was.top >= head - 1 || deps.atBottom(area)) {
-        deps.preservingScroll(() => deps.setFolded(entry, true));
-      } else {
-        deps.setFolded(entry, true);
-        const now = row.getBoundingClientRect();
-        area.scrollTop += was.bottom <= pane.foot() ? now.bottom - was.bottom : now.top - head;
-      }
+      deps.preservingCollapse(pane.scroller(), row, pane.head(), pane.foot(), () => deps.setFolded(entry, true));
       deps.renderScrollTools();
       return true;
     },

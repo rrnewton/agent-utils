@@ -1197,11 +1197,11 @@ test("Shift+E ON A MESSAGE READ PART WAY PAST keeps the line below where it was,
   assert.equal(foot, 0, `the collapsed message's foot moved ${foot}px`);
   assert.ok(now.bottom > 0, "the collapsed message went off the top of the screen");
   assert.equal(selectedId(page), "5");
-  // The control: the fold control's own hold, on the row's head, wherever that head is. Holding a
-  // head that is off the screen carries the folded message off it, and lifts the rest up past the
-  // place being read.
-  const control = await readCollapseScrolledPast(await brokenModule([{ file: "src/view/shell/foldkeys.ts",
-    find: "if (was.top >= head - 1 || deps.atBottom(area)) {", replace: "if (true) {" }]));
+  // The control: the scroll owner's choice broken to hold the row's head, wherever that head is.
+  // Holding a head that is off the screen carries the folded message off it, and lifts the rest
+  // up past the place being read.
+  const control = await readCollapseScrolledPast(await brokenModule([{ file: "src/view/channel/scrollkeep.ts",
+    find: "if (box.top >= head - 1) {", replace: "if (true) {" }]));
   assert.notEqual(control.moved, 0, "the negative control held the line below too, so this fixture cannot tell them apart");
   assert.ok(control.now.bottom <= 0, "the negative control kept the folded message on screen, so the check above proves nothing");
 });
@@ -1241,8 +1241,8 @@ test("Shift+E ON A MESSAGE TALLER THAN THE SCREEN, read part way through, brings
     "the message after it is not right below it");
   // The control: its foot held, though the foot is below the screen. The list runs back up past
   // everything the reader had read, and the folded message is nowhere near the top.
-  const control = await readCollapseTall(await brokenModule([{ file: "src/view/shell/foldkeys.ts",
-    find: "now.bottom - was.bottom : now.top - head;", replace: "now.bottom - was.bottom : now.bottom - was.bottom;" }]));
+  const control = await readCollapseTall(await brokenModule([{ file: "src/view/channel/scrollkeep.ts",
+    find: "} else if (box.bottom <= foot + 1) {", replace: "} else if (true) {" }]));
   assert.notEqual(control.top, head,
     "the negative control also brought the folded message to the top, so the check above proves nothing");
 });

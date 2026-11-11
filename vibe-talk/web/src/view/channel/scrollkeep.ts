@@ -103,6 +103,14 @@ export interface ScrollKeeping {
   scrollAnchor(area: HTMLElement): Element | null;
   /** Run a mutation and leave the reader looking at the same thing afterwards. */
   preservingScroll(mutate: () => void): void;
+  /**
+   * Collapse or expand `row` in `area` under the per-act anchor choice (`#1251
+   * scroll-single-owner`, `#1215 collapse-anchor-below`): a reader following the foot stays on
+   * it; while the row's top is on screen the row itself is held; with its top above the
+   * viewport the next drawn row is held and the history above absorbs the change; a row taller
+   * than the room brings its head to the scroller's top, as it always has.
+   */
+  preservingCollapse(area: HTMLElement, row: HTMLElement, head: number, foot: number, mutate: () => void): void;
   /** `preservingScroll` for a change that resizes the list's window or the room at its head. */
   holdingReader(mutate: () => void): void;
   /** Where the reader is: which message their eye is on, and how far down the viewport it sits. */
@@ -219,6 +227,54 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     };
   }
 
+  /** The next drawn row below `row` in its list: the first sibling with a box of its own. */
+  function nextDrawnRow(row: Element): Element | null {
+    const parent = row.parentNode;
+    if (!parent) return null;
+    const kids = [...parent.children];
+    for (let at = kids.indexOf(row) + 1; at < kids.length; at += 1) {
+      const next = kids[at] as Element;
+      if (next.getAttribute("data-read-run") === "member") continue;
+      const box = next.getBoundingClientRect();
+      if (box.bottom > box.top) return next;
+    }
+    return null;
+  }
+
+  /** Hold `anchor` at `targetTop` in `area` across `mutate`, the selection kept as in `preservingScroll`. */
+  function preservingScrollAt(area: HTMLElement, anchor: Element, targetTop: number, mutate: () => void): void {
+    const selection = deps.selectionIn ? deps.selectionIn(area) : null;
+    mutate();
+    if (!anchor.parentNode) {
+      deps.renderJumpNewest();
+    } else {
+      const shown = shownRowFor(anchor);
+      const held = shown !== anchor ? shown as Element : anchor;
+      area.scrollTop += held.getBoundingClientRect().top - targetTop;
+      deps.renderJumpNewest();
+    }
+    if (selection && deps.restoreSelectionIn) deps.restoreSelectionIn(area, selection);
+  }
+
+  function preservingCollapse(area: HTMLElement, row: HTMLElement, head: number, foot: number, mutate: () => void): void {
+    if (deps.atBottom(area, deps.restSlackPx)) {
+      mutate();
+      area.scrollTop = area.scrollHeight;
+      deps.renderJumpNewest();
+      return;
+    }
+    const box = row.getBoundingClientRect();
+    if (box.top >= head - 1) {
+      preservingScrollAt(area, row, box.top, mutate);
+    } else if (box.bottom <= foot + 1) {
+      const next = nextDrawnRow(row);
+      if (next) preservingScrollAt(area, next, next.getBoundingClientRect().top, mutate);
+      else preservingScrollAt(area, row, box.top, mutate);
+    } else {
+      preservingScrollAt(area, row, head, mutate);
+    }
+  }
+
   function restoreScroll(mark: ScrollMark): void {
     const area = el("scroll-area");
     if (mark.pinned) {
@@ -268,5 +324,5 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     deps.setJumpNewest(true, view, turns);
   }
 
-  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, holdingReader, captureScroll, restoreScroll, followIfPinned };
+  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, holdingReader, captureScroll, restoreScroll, followIfPinned };
 }

@@ -1173,6 +1173,8 @@ li.discord-message[data-root-continuation] > .thread-replies {
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
+  /* `#1251 scroll-single-owner`: as #scroll-area — the loop owner corrects, not the browser. */
+  overflow-anchor: none;
   padding: 0.35rem 0.75rem 0.5rem;
 }
 

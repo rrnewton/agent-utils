@@ -2529,7 +2529,7 @@ const scrollKeeping = createScrollKeeping({
   setJumpNewest: (on, view, turns) => setJumpNewest(on, view, turns),
 });
 const {
-  visibleList, shownChannelList, scrollAnchor, preservingScroll, holdingReader, captureScroll, restoreScroll, followIfPinned,
+  visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, holdingReader, captureScroll, restoreScroll, followIfPinned,
 } = scrollKeeping;
 
 /** The invitation only makes sense while there is nothing else in the transcript. */
@@ -3363,6 +3363,7 @@ const keyboard = createKeyboardComposition({
   setFolded: (entry, folded) => setFolded(/** @type {import("./src/view/channel/index.ts").FoldEntry} */ (/** @type {unknown} */ (entry)), folded),
   atBottom: (area) => atBottom(area),
   preservingScroll: (act) => preservingScroll(act),
+  preservingCollapse: (area, row, head, foot, act) => preservingCollapse(area, row, head, foot, act),
   renderScrollTools: () => renderScrollTools(),
   rowMessages: (row) => rowMessages(/** @type {any} */ (row)),
   isOpenThreadRoot: (row) => isOpenThreadRoot(row, openThreadRootId()),

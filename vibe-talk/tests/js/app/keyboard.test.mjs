@@ -50,7 +50,7 @@ function fakeDeps(log, overrides = {}) {
     doneReadWords: () => "done", serviceReadWords: () => "service", localReadWords: () => "local",
     statusSays: () => false, dismissStatus: () => {},
     showingLinks: () => false, isFolded: () => false, setFolded: () => {}, atBottom: () => false,
-    preservingScroll: (act) => act(), renderScrollTools: () => {}, rowMessages: () => [{ thread: null }],
+    preservingScroll: (act) => act(), preservingCollapse: (_area, _row, _head, _foot, act) => act(), renderScrollTools: () => {}, rowMessages: () => [{ thread: null }],
     isOpenThreadRoot: () => false, viewKey: (...args) => args.join(":"), foldedOnes: () => new Map(),
     closeReadRun: () => {}, renderSideColumn: () => {}, applyReadRuns: () => {},
     openReadRun: () => {}, liveUnpackedRow: () => null, liveCardRow: () => null, actOnRow: () => {},
