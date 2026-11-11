@@ -113,6 +113,11 @@ export interface ScrollKeeping {
    * than the room brings its head to the scroller's top, as it always has.
    */
   preservingCollapse(area: HTMLElement, row: HTMLElement, head: number, foot: number, mutate: () => void): void;
+  /**
+   * Run a redraw of the channel's rows with the reader held where they are, and nothing
+   * else decided: no jump recount, which the landing that asked for the redraw owns.
+   */
+  holdingRows(mutate: () => void): void;
   /** Take `area` to its foot: the one foot write, for the keepers that decide when (`#1251`). */
   toFoot(area: HTMLElement): void;
   /** Move `area` by `delta` px: the one relative write, for a holder that measured the move (`#1251`). */
@@ -284,6 +289,24 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     else area.scrollTop += px;
   }
 
+  function holdingRows(mutate: () => void): void {
+    const mark = captureScroll();
+    const area = el("scroll-area");
+    const selection = deps.selectionIn ? deps.selectionIn(area) : null;
+    mutate();
+    if (mark.pinned) {
+      deps.scrollToNewest();
+    } else if (mark.anchor && mark.anchor.parentNode) {
+      const shown = shownRowFor(mark.anchor);
+      const held = shown !== mark.anchor ? shown as Element : mark.anchor;
+      area.scrollTop += held.getBoundingClientRect().top - mark.top;
+    } else if (mark.anchorId) {
+      const refound = [...visibleList().children].find((one) => one.getAttribute("data-id") === mark.anchorId);
+      if (refound) area.scrollTop += (refound as Element).getBoundingClientRect().top - mark.top;
+    }
+    if (selection && deps.restoreSelectionIn) deps.restoreSelectionIn(area, selection);
+  }
+
   function preservingCollapse(area: HTMLElement, row: HTMLElement, head: number, foot: number, mutate: () => void): void {
     if (deps.atBottom(area, deps.restSlackPx)) {
       mutate();
@@ -357,5 +380,5 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     deps.setJumpNewest(true, view, turns);
   }
 
-  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, toFoot, nudge, toPosition, wheelBy, holdingReader, captureScroll, restoreScroll, followIfPinned };
+  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, holdingRows, toFoot, nudge, toPosition, wheelBy, holdingReader, captureScroll, restoreScroll, followIfPinned };
 }

@@ -4708,7 +4708,7 @@ function renderChannelRows() {
   // `#1251 scroll-single-owner`: every Main-list redraw is held by the owner — except under a
   // quick-reply hold, whose own holder places the box (`placeQuickReply`).
   if (quickReplyHolds(el("scroll-area"))) renderChannelRowsNow();
-  else preservingScroll(() => renderChannelRowsNow());
+  else scrollKeeping.holdingRows(() => renderChannelRowsNow());
 }
 
 function renderChannelRowsNow() {
