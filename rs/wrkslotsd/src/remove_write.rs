@@ -1356,16 +1356,16 @@ fn salvage_checkout(cfg: &Cfg, checkout: &Value, repository: &Path) -> Result<Va
             ));
         }
     }
-    let assume = git(&path, &["ls-files", "-v"])?;
-    if assume.lines().any(|line| {
+    // One `-v` listing answers both questions (#1284, as in the oracle).
+    let listed = git(&path, &["ls-files", "-v"])?;
+    if listed.lines().any(|line| {
         line.chars()
             .next()
             .is_some_and(|ch| ch.is_ascii_lowercase())
     }) {
         return Err(format!("checkout {name} has assume-unchanged index state"));
     }
-    let skip = git(&path, &["ls-files", "-t"])?;
-    if skip.lines().any(|line| line.starts_with("S ")) {
+    if listed.lines().any(|line| line.starts_with("S ")) {
         return Err(format!("checkout {name} has skip-worktree index state"));
     }
     let head = updated

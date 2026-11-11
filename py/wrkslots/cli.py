@@ -2062,6 +2062,32 @@ def _glob_matches_path(pattern: str, path: str) -> bool:
     )
 
 
+def _literal_cache_pathspecs(
+    cache_globs: Sequence[str],
+) -> tuple[str, ...] | None:
+    """Git pathspecs listing every path the globs can contain, or None.
+
+    Only an all-literal glob set qualifies: its containment test compares
+    components directly and never reaches ``fnmatch``, so listing just the
+    paths under each glob and testing those returns exactly what testing
+    the whole index and tree returns, in the same order (#1284). A glob
+    with a wildcard or ``**``, an empty glob, or a component Git would
+    read as pathspec syntax makes the caller list everything, as before.
+    """
+
+    pathspecs: list[str] = []
+    for pattern in cache_globs:
+        parts = _glob_pattern_parts(pattern)
+        if not parts or not _glob_parts_are_literal(parts):
+            return None
+        if any(part in {".", ".."} or part.startswith(":") for part in parts):
+            return None
+        pathspec = "/".join(parts)
+        if pathspec not in pathspecs:
+            pathspecs.append(pathspec)
+    return tuple(pathspecs)
+
+
 def _cache_glob_contains_path(pattern: str, path: str) -> bool:
     """Whether any prefix of ``path`` is the cache directory named by ``pattern``.
 
@@ -18304,11 +18330,22 @@ class _GitVcs:
     ) -> tuple[str, ...]:
         if not cache_globs:
             return ()
-        indexed = self._run(checkout, ["ls-files", "--recurse-submodules", "-z"])
-        committed = self._run(
-            checkout,
-            ["ls-tree", "-r", "--name-only", "-z", "HEAD"],
-        )
+        pathspecs = _literal_cache_pathspecs(cache_globs)
+        if pathspecs is None:
+            indexed = self._run(checkout, ["ls-files", "--recurse-submodules", "-z"])
+            committed = self._run(
+                checkout,
+                ["ls-tree", "-r", "--name-only", "-z", "HEAD"],
+            )
+        else:
+            indexed = self._run(
+                checkout,
+                ["ls-files", "--recurse-submodules", "-z", "--", *pathspecs],
+            )
+            committed = self._run(
+                checkout,
+                ["ls-tree", "-r", "--name-only", "-z", "HEAD", "--", *pathspecs],
+            )
         # A listing holds tens of thousands of paths and nearly none are cache,
         # so testing every path against every glob made this the audit's
         # largest cost. Each path is tested against the globs that can contain
@@ -18338,16 +18375,14 @@ class _GitVcs:
         return tuple(dict.fromkeys(paths))
 
     def submodule_paths(self, checkout: Path) -> tuple[str, ...]:
-        indexed = self._run(checkout, ["ls-files", "--stage", "-z"])
+        paths: list[str] = list(self._indexed_gitlink_paths(checkout))
         committed = self._run(checkout, ["ls-tree", "-r", "-z", "HEAD"])
-        paths: list[str] = []
-        for output in (indexed.stdout, committed.stdout):
-            for record in output.split("\x00"):
-                if not record:
-                    continue
-                metadata, separator, path = record.partition("\t")
-                if separator and metadata.startswith("160000 "):
-                    paths.append(path)
+        for record in committed.stdout.split("\x00"):
+            if not record:
+                continue
+            metadata, separator, path = record.partition("\t")
+            if separator and metadata.startswith("160000 "):
+                paths.append(path)
         return tuple(dict.fromkeys(paths))
 
     def _indexed_gitlink_paths(self, repository: Path) -> tuple[str, ...]:
@@ -18401,14 +18436,18 @@ class _GitVcs:
         return tuple(dict.fromkeys(found))
 
     def assert_ordinary_index(self, checkout: Path) -> None:
-        assume = self._run(checkout, ["ls-files", "-v"])
-        for line in assume.stdout.splitlines():
+        # One listing answers both questions: in `-v` output a lowercase
+        # tag is the assume-unchanged form of a tag, and `S` is
+        # skip-worktree, exactly what the separate `-t` listing reported.
+        # The two passes keep the old order: every assume-unchanged entry
+        # is reported before any skip-worktree one (#1284).
+        listed = self._run(checkout, ["ls-files", "-v"])
+        for line in listed.stdout.splitlines():
             if line and line[0].islower():
                 raise Refusal(
                     f"checkout has assume-unchanged index state: {line[2:]}"
                 )
-        skip = self._run(checkout, ["ls-files", "-t"])
-        for line in skip.stdout.splitlines():
+        for line in listed.stdout.splitlines():
             if line.startswith("S "):
                 raise Refusal(f"checkout has skip-worktree index state: {line[2:]}")
 
@@ -20451,6 +20490,7 @@ class _AuditGitVcs(_GitVcs):
             tuple[Path, tuple[str, ...]], tuple[str, ...]
         ] = {}
         self._submodule_paths: dict[Path, tuple[str, ...]] = {}
+        self._indexed_gitlinks: dict[Path, tuple[str, ...]] = {}
 
     def common_directory(self, repository: Path) -> Path:
         key = repository.absolute()
@@ -20506,6 +20546,17 @@ class _AuditGitVcs(_GitVcs):
         if key not in self._submodule_paths:
             self._submodule_paths[key] = super().submodule_paths(checkout)
         return self._submodule_paths[key]
+
+    def _indexed_gitlink_paths(self, repository: Path) -> tuple[str, ...]:
+        # submodule_paths and the submodule salvage inventory both parse
+        # this one listing; an audit asks both of the same checkout, so
+        # the listing is taken once and shared (#1284).
+        key = repository.absolute()
+        if key not in self._indexed_gitlinks:
+            self._indexed_gitlinks[key] = super()._indexed_gitlink_paths(
+                repository
+            )
+        return self._indexed_gitlinks[key]
 
 
 def _resolved_repository_path(
@@ -44181,6 +44232,8 @@ def _audit_record(
     process_census_error: str | None = None,
     registered_liveness: tuple[str, str] | None = None,
     cache_measurement: _AuditCacheMeasurement | None = None,
+    holds: Mapping[tuple[str, str], dict[str, object] | None] | None = None,
+    owner_releases: Mapping[tuple[str, int], _OwnerRelease] | None = None,
 ) -> tuple[dict[str, object], bool]:
     selected_vcs = vcs or _GitVcs()
     owner_state, owner_detail = _process_state(record.owner)
@@ -44196,8 +44249,14 @@ def _audit_record(
         liveness_state == "dead"
         and owner_state == "dead"
     )
-    hold = _load_hold(config, record.slot, record.machine, events=events)
-    release, release_void = _owner_release_state(config, record, events)
+    hold = (
+        holds[(record.machine, record.slot)]
+        if holds is not None
+        else _load_hold(config, record.slot, record.machine, events=events)
+    )
+    release, release_void = _owner_release_state(
+        config, record, events, releases=owner_releases
+    )
     # Remove honours a release exactly when this is true; audit must agree
     # with it so that DELETABLE never names a slot remove would refuse and a
     # released slot is not reported as waiting for its owner's exit.
@@ -45006,6 +45065,35 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
                 "validation_seals": len(seal_targets),
             },
         )
+    # Holds and owner releases are folds over a machine's whole event log,
+    # so they are replayed once per machine here and handed to every row.
+    # Replaying them per row made registered-rows quadratic in the fleet:
+    # each of the 201 rows rescanned all 79,398 events twice (#1284).
+    audit_holds: dict[tuple[str, str], dict[str, object] | None] = {}
+    audit_releases: dict[str, dict[tuple[str, int], _OwnerRelease]] = {}
+    for machine, machine_events in event_logs.items():
+        machine_records = [
+            record for record in records if record.machine == machine
+        ]
+        audit_releases[machine] = _latest_owner_releases(
+            machine_events,
+            {(record.slot, record.generation) for record in machine_records},
+        )
+        if machine_events:
+            machine_holds = _holds_from_events(
+                machine_events,
+                machine,
+                {record.slot for record in machine_records},
+            )
+            for record in machine_records:
+                audit_holds[(machine, record.slot)] = machine_holds.get(
+                    record.slot
+                )
+        else:
+            for record in machine_records:
+                audit_holds[(machine, record.slot)] = _load_hold_snapshot(
+                    config, record.slot, machine
+                )
     _check_scan_deadline(scan_deadline)
     liveness_started = metrics.start()
     # Validation rows are answered by their runs, agent rows by the
@@ -45049,7 +45137,10 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
         ]
         owner_state, _owner_detail = _process_state(record.owner)
         release, release_void = _owner_release_state(
-            config, record, event_logs[record.machine]
+            config,
+            record,
+            event_logs[record.machine],
+            releases=audit_releases[record.machine],
         )
         release_honoured = (
             release is not None
@@ -45235,6 +45326,8 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
                     (record.machine, record.slot, record.generation)
                 ]
             ],
+            holds=audit_holds,
+            owner_releases=audit_releases[record.machine],
         )
 
     # Rows are judged independently from the same snapshot, census and cache measurements, so

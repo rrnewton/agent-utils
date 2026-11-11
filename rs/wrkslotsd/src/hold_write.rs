@@ -244,6 +244,64 @@ pub(crate) fn hold_from_events(events: &[Value], machine: &str, slot: &str) -> V
     held.unwrap_or(Value::Null)
 }
 
+/// Every requested slot's hold from one replay of a machine event
+/// chain: the batch form of `hold_from_events` (#1284), so an audit
+/// folds the log once per machine instead of once per row. A slot with
+/// no hold maps to `Value::Null`, as `hold_from_events` returns.
+pub(crate) fn holds_from_events(
+    events: &[Value],
+    machine: &str,
+    slots: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeMap<String, Value> {
+    let mut held: std::collections::BTreeMap<String, Option<Value>> =
+        slots.iter().map(|slot| (slot.clone(), None)).collect();
+    for event in events {
+        let Some(payload) = event.get("payload") else {
+            continue;
+        };
+        match event.get("kind").and_then(Value::as_str) {
+            Some("state-imported") => {
+                if let Some(holds) = payload.get("holds").and_then(Value::as_array) {
+                    for hold in holds {
+                        if let Some(slot) = hold.get("slot").and_then(Value::as_str) {
+                            if let Some(entry) = held.get_mut(slot) {
+                                *entry = Some(hold.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            Some("slot-held") => {
+                if let Some(slot) = payload.get("slot").and_then(Value::as_str) {
+                    if let Some(entry) = held.get_mut(slot) {
+                        *entry = Some(json!({
+                            "schema": 1,
+                            "machine": machine,
+                            "slot": slot,
+                            "held_at": event
+                                .get("recorded_at")
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                            "reason": payload.get("reason").cloned().unwrap_or(Value::Null),
+                        }));
+                    }
+                }
+            }
+            Some("slot-hold-released") => {
+                if let Some(slot) = payload.get("slot").and_then(Value::as_str) {
+                    if let Some(entry) = held.get_mut(slot) {
+                        *entry = None;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    held.into_iter()
+        .map(|(slot, hold)| (slot, hold.unwrap_or(Value::Null)))
+        .collect()
+}
+
 /// The current hold for one slot: replayed from the event log when the
 /// log derives the machine, else the snapshot HOLD record.
 pub(crate) fn current_hold(

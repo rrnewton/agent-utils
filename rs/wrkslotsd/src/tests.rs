@@ -6922,6 +6922,75 @@ fn zero_second_offsets_discard_their_fraction_like_python() {
 }
 
 #[test]
+fn batched_hold_fold_matches_per_slot_folds() {
+    // #1284: one fold per machine gives every slot what its own fold gave.
+    let events = vec![
+        json!({"kind": "state-imported", "recorded_at": "2026-01-01T00:00:00+00:00",
+               "payload": {"holds": [{"slot": "slot-a", "reason": "imported hold"},
+                                     {"slot": "other", "reason": "not audited"}]}}),
+        json!({"kind": "slot-held", "recorded_at": "2026-01-01T01:00:00+00:00",
+               "payload": {"slot": "slot-b", "reason": "held"}}),
+        json!({"kind": "slot-hold-released", "recorded_at": "2026-01-01T02:00:00+00:00",
+               "payload": {"slot": "slot-b"}}),
+        json!({"kind": "slot-held", "recorded_at": "2026-01-01T03:00:00+00:00",
+               "payload": {"slot": "slot-b", "reason": "held again"}}),
+        json!({"kind": "heartbeat", "recorded_at": "2026-01-01T04:00:00+00:00",
+               "payload": {"slot": "slot-a"}}),
+    ];
+    let slots: BTreeSet<String> = ["slot-a", "slot-b", "slot-c"]
+        .iter()
+        .map(|slot| slot.to_string())
+        .collect();
+    let batched = crate::hold_write::holds_from_events(&events, "testhost", &slots);
+    for slot in &slots {
+        let per_slot = crate::hold_write::hold_from_events(&events, "testhost", slot);
+        assert_eq!(batched.get(slot), Some(&per_slot), "slot {slot}");
+    }
+    assert_eq!(
+        batched["slot-b"].get("reason").and_then(Value::as_str),
+        Some("held again")
+    );
+}
+
+#[test]
+fn latest_release_events_keeps_only_well_formed_latest() {
+    // #1284: the batch scan keeps the last well-formed release per
+    // (slot, generation), exactly as the per-row scan matched it; an
+    // event whose payload lacks a slot or generation never matched a
+    // row and must not enter the map under a default key.
+    let release = |slot: &str, generation: i64, sequence: i64| {
+        json!({"kind": "owner-released", "sequence": sequence,
+               "recorded_at": "2026-01-01T00:00:00+00:00",
+               "payload": {"slot": slot, "generation": generation}})
+    };
+    let events = vec![
+        release("slot-a", 1, 10),
+        release("slot-a", 1, 12),
+        release("slot-a", 2, 13),
+        json!({"kind": "owner-released", "sequence": 14,
+               "recorded_at": "2026-01-01T00:00:00+00:00",
+               "payload": {"slot": "slot-b"}}),
+        json!({"kind": "heartbeat", "sequence": 15,
+               "recorded_at": "2026-01-01T00:00:00+00:00",
+               "payload": {"slot": "slot-a", "generation": 1}}),
+    ];
+    let latest = crate::audit_state::latest_release_events(&events);
+    assert_eq!(latest.len(), 2);
+    assert_eq!(
+        latest[&("slot-a".to_string(), 1)]
+            .get("sequence")
+            .and_then(Value::as_i64),
+        Some(12)
+    );
+    assert_eq!(
+        latest[&("slot-a".to_string(), 2)]
+            .get("sequence")
+            .and_then(Value::as_i64),
+        Some(13)
+    );
+}
+
+#[test]
 fn timestamp_instants_match_python_for_every_accepted_matrix_value() {
     let (accepted_count, mut values) = python_timestamp_matrix();
     values.truncate(accepted_count);

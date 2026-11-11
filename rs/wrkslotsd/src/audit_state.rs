@@ -32,12 +32,12 @@ use crate::finish_write::{
     assert_cache_policy_untracked, assert_record_paths, cache_globs_for, fnmatch_component,
     glob_parts, stored_path, stored_repository_path, verify_existing_worktree,
 };
-use crate::global_state::{discover_machines, load_event_chain};
+use crate::global_state::{discover_machines, event_log_status, load_event_chain, EventLogStatus};
 use crate::handoff_state::{
     load_sidecar_artifact, read_regular_file_identity, sidecar_path, strict_json_object,
 };
 use crate::handoff_write::publication;
-use crate::hold_write::{active_document, current_hold, validate_global};
+use crate::hold_write::{active_document, current_hold, holds_from_events, validate_global};
 use crate::journal_state::{journal_forward_compatible, JOURNAL_EXTENSION_KEYS};
 use crate::remove_write::{
     assert_slot_unused_snapshot, capture_process_snapshot, liveness_answer, ProcessSnapshot,
@@ -77,6 +77,42 @@ pub(crate) fn release_state(
         {
             latest = Some(event.clone());
         }
+    }
+    release_state_with_latest(cfg, record, events, latest.as_ref())
+}
+
+/// The latest `owner-released` event of each (slot, generation) in one
+/// pass over a machine's chain (#1284): the batch form of the scan
+/// `release_state` repeats per row, so an audit folds the log once per
+/// machine and hands each row its own latest event.
+pub(crate) fn latest_release_events(events: &[Value]) -> BTreeMap<(String, i64), Value> {
+    let mut latest: BTreeMap<(String, i64), Value> = BTreeMap::new();
+    for event in events {
+        if event.get("kind").and_then(Value::as_str) != Some("owner-released") {
+            continue;
+        }
+        let payload = event.get("payload").cloned().unwrap_or(Value::Null);
+        let (Some(slot), Some(generation)) = (
+            payload.get("slot").and_then(Value::as_str),
+            payload.get("generation").and_then(Value::as_i64),
+        ) else {
+            continue;
+        };
+        latest.insert((slot.to_string(), generation), event.clone());
+    }
+    latest
+}
+
+/// `release_state` for a row whose latest release event an audit
+/// already folded from the machine's chain (#1284).
+pub(crate) fn release_state_with_latest(
+    cfg: &Cfg,
+    record: &Value,
+    events: &[Value],
+    latest: Option<&Value>,
+) -> Result<(Option<Value>, Option<String>)> {
+    if record.get("slot_type").and_then(Value::as_str) != Some("agent") {
+        return Ok((None, None));
     }
     let Some(event) = latest else {
         return Ok((None, None));
@@ -5521,7 +5557,7 @@ fn judge_in_pool<T: Send>(count: usize, jobs: usize, judge: impl Fn(usize) -> T 
 
 #[allow(clippy::too_many_arguments)]
 fn audit_record(
-    root: Option<&Path>,
+    _root: Option<&Path>,
     cfg: &Cfg,
     config: &Value,
     record: &Value,
@@ -5533,6 +5569,8 @@ fn audit_record(
     measurement: &CacheMeasurement,
     process_census: &std::sync::OnceLock<std::result::Result<ProcessSnapshot, String>>,
     census_targets: &[PathBuf],
+    audit_hold: &Value,
+    release_latest: Option<&Value>,
 ) -> Result<(Value, bool)> {
     let slot = record
         .get("slot")
@@ -5563,8 +5601,8 @@ fn audit_record(
     };
     let (heartbeat_age, heartbeat_expired) = heartbeat_diagnosis(record)?;
     let mut agent_running = !(liveness.state == "dead" && owner_state == "dead");
-    let hold = current_hold(root, cfg, &machine, &slot)?;
-    let (release, void_reason) = release_state(cfg, record, events)?;
+    let hold = audit_hold.clone();
+    let (release, void_reason) = release_state_with_latest(cfg, record, events, release_latest)?;
     let release_honoured = release.is_some()
         && void_reason.is_none()
         && matches!(owner_state.as_str(), "live" | "dead")
@@ -6505,7 +6543,60 @@ pub(crate) fn parse_audit(
     // Registered rows are judged by a bounded pool (#1200
     // rust-status-consistency), as the Python audit does; rows keep
     // their registry order and the first refusal in that order wins.
-    let judge = |index: usize| {
+    // Holds and owner releases are folds over a machine's whole event
+    // log, replayed once per machine here and handed to every row.
+    // Replaying them per row (reloading the chain for each) made
+    // judging quadratic in the fleet (#1284).
+    let mut audit_holds: BTreeMap<(String, String), Value> = BTreeMap::new();
+    let mut audit_releases: BTreeMap<(String, String, i64), Value> = BTreeMap::new();
+    {
+        let mut machines_seen: BTreeSet<String> = BTreeSet::new();
+        for record in &records {
+            let machine = record
+                .get("machine")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !machines_seen.insert(machine.to_string()) {
+                continue;
+            }
+            let machine_events: &[Value] = match events_by_machine.get(machine) {
+                Some(events) => events.as_slice(),
+                None => &[],
+            };
+            for ((slot, generation), event) in latest_release_events(machine_events) {
+                audit_releases.insert((machine.to_string(), slot, generation), event);
+            }
+            let directory = cfg.control.join(format!("EVENTS.{machine}"));
+            match event_log_status(&directory) {
+                EventLogStatus::Invalid(message) => return Err(message),
+                EventLogStatus::Derived => {
+                    let slots: BTreeSet<String> = records
+                        .iter()
+                        .filter(|item| item.get("machine").and_then(Value::as_str) == Some(machine))
+                        .filter_map(|item| {
+                            item.get("slot").and_then(Value::as_str).map(str::to_string)
+                        })
+                        .collect();
+                    for (slot, hold) in holds_from_events(machine_events, machine, &slots) {
+                        audit_holds.insert((machine.to_string(), slot), hold);
+                    }
+                }
+                EventLogStatus::Snapshot => {
+                    for item in records
+                        .iter()
+                        .filter(|item| item.get("machine").and_then(Value::as_str) == Some(machine))
+                    {
+                        let slot = item.get("slot").and_then(Value::as_str).unwrap_or_default();
+                        audit_holds.insert(
+                            (machine.to_string(), slot.to_string()),
+                            crate::hold_state::parse_hold(root, Some(machine), slot)?,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let judge = |index: usize| -> Result<(Value, bool)> {
         let record = &records[index];
         let machine = record
             .get("machine")
@@ -6515,14 +6606,27 @@ pub(crate) fn parse_audit(
             .get("slot")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        let generation = record
+            .get("generation")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
         let sealed = seal_by_slot.get(&(machine.to_string(), slot.to_string()));
-        let events = events_by_machine.get(machine).cloned().unwrap_or_default();
+        let events: &[Value] = match events_by_machine.get(machine) {
+            Some(events) => events.as_slice(),
+            None => &[],
+        };
+        let hold = match audit_holds.get(&(machine.to_string(), slot.to_string())) {
+            Some(hold) => hold.clone(),
+            None => current_hold(root, &cfg, machine, slot)?,
+        };
+        let release_latest =
+            audit_releases.get(&(machine.to_string(), slot.to_string(), generation));
         audit_record(
             root,
             &cfg,
             &config,
             record,
-            &events,
+            events,
             &row_journals,
             &strays,
             sealed.map(|(generation, _path)| *generation),
@@ -6530,6 +6634,8 @@ pub(crate) fn parse_audit(
             &census_measurements[index],
             &process_census,
             &census_targets,
+            &hold,
+            release_latest,
         )
     };
     let judged = judge_in_pool(records.len(), jobs, judge);

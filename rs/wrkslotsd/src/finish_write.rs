@@ -536,6 +536,33 @@ pub(crate) fn cache_glob_contains_path(pattern: &str, path: &str) -> bool {
     glob_parts_match(&pattern_parts, &path_parts[..pattern_parts.len()])
 }
 
+/// Git pathspecs listing every path the globs can contain, when the
+/// glob set is all-literal: the oracle's `_literal_cache_pathspecs`.
+/// A wildcard or `**` component, an empty glob, or a component Git
+/// would read as pathspec syntax declines, and the caller lists
+/// everything, as before (#1284).
+pub(crate) fn literal_cache_pathspecs(globs: &[String]) -> Option<Vec<String>> {
+    let mut pathspecs: Vec<String> = Vec::new();
+    for pattern in globs {
+        let parts = glob_parts(pattern);
+        if parts.is_empty()
+            || parts
+                .iter()
+                .any(|part| part.chars().any(|ch| matches!(ch, '*' | '?' | '[')))
+            || parts
+                .iter()
+                .any(|part| part == "." || part == ".." || part.starts_with(':'))
+        {
+            return None;
+        }
+        let pathspec = parts.join("/");
+        if !pathspecs.contains(&pathspec) {
+            pathspecs.push(pathspec);
+        }
+    }
+    Some(pathspecs)
+}
+
 /// The oracle's `_assert_cache_policy_untracked_path`: configured
 /// cache globs must not overlap tracked source or cross a submodule.
 pub(crate) fn assert_cache_policy_untracked(
@@ -546,8 +573,29 @@ pub(crate) fn assert_cache_policy_untracked(
     if globs.is_empty() {
         return Ok(());
     }
-    let indexed = git(path, &["ls-files", "--recurse-submodules", "-z"])?;
-    let committed = git(path, &["ls-tree", "-r", "--name-only", "-z", "HEAD"])?;
+    let pathspecs = literal_cache_pathspecs(globs);
+    let (indexed, committed) = match &pathspecs {
+        None => (
+            git(path, &["ls-files", "--recurse-submodules", "-z"])?,
+            git(path, &["ls-tree", "-r", "--name-only", "-z", "HEAD"])?,
+        ),
+        Some(pathspecs) => {
+            let mut indexed_args: Vec<String> = ["ls-files", "--recurse-submodules", "-z", "--"]
+                .iter()
+                .map(|item| item.to_string())
+                .collect();
+            indexed_args.extend(pathspecs.iter().cloned());
+            let indexed_refs: Vec<&str> = indexed_args.iter().map(String::as_str).collect();
+            let mut committed_args: Vec<String> =
+                ["ls-tree", "-r", "--name-only", "-z", "HEAD", "--"]
+                    .iter()
+                    .map(|item| item.to_string())
+                    .collect();
+            committed_args.extend(pathspecs.iter().cloned());
+            let committed_refs: Vec<&str> = committed_args.iter().map(String::as_str).collect();
+            (git(path, &indexed_refs)?, git(path, &committed_refs)?)
+        }
+    };
     let mut tracked: Vec<String> = Vec::new();
     for output in [&indexed, &committed] {
         for candidate in output.split('\0') {
@@ -1048,8 +1096,12 @@ pub(crate) fn assert_checkout_safe(
             replacements.lines().next().unwrap_or_default()
         ));
     }
-    let assume = git(&path, &["ls-files", "-v"])?;
-    for line in assume.lines() {
+    // One `-v` listing answers both questions: a lowercase tag is the
+    // assume-unchanged form, and `S` is skip-worktree, exactly what the
+    // separate `-t` listing reported. Assume-unchanged is reported
+    // first, as when the two listings were separate (#1284).
+    let listed = git(&path, &["ls-files", "-v"])?;
+    for line in listed.lines() {
         if line
             .chars()
             .next()
@@ -1062,8 +1114,7 @@ pub(crate) fn assert_checkout_safe(
             ));
         }
     }
-    let skip = git(&path, &["ls-files", "-t"])?;
-    for line in skip.lines() {
+    for line in listed.lines() {
         if let Some(rest) = line.strip_prefix("S ") {
             return Err(format!("checkout has skip-worktree index state: {rest}"));
         }

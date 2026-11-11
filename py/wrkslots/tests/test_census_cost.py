@@ -1995,3 +1995,232 @@ def test_user_systemd_stdout_budget_scales_with_process_count(
     assert cli._user_systemd_stdout_bytes() == 1024 * 1024
     monkeypatch.setattr(cli, "_host_process_count", lambda: 4600)
     assert cli._user_systemd_stdout_bytes() == 4600 * 512
+
+
+def _release_event(
+    slot: str, generation: int, sequence: int, *, heartbeat: str
+) -> dict[str, object]:
+    owner = cli._identity_to_obj(
+        cli.ProcessIdentity(4321, 99, "boot", "host", "/fixture")
+    )
+    return {
+        "kind": "owner-released",
+        "sequence": sequence,
+        "recorded_at": "2026-01-02T00:00:00+00:00",
+        "payload": {
+            "slot": slot,
+            "generation": generation,
+            "agent": "agent-a",
+            "owner": owner,
+            "heartbeat_at": heartbeat,
+            "handoff": {
+                "path": "/fixture/HANDOFF.json",
+                "sha256": "0" * 64,
+                "source": "write-handoff",
+                "intent_sequence": sequence,
+            },
+        },
+    }
+
+
+def _fold_events() -> list[dict[str, object]]:
+    return [
+        {
+            "kind": "state-imported",
+            "recorded_at": "2026-01-01T00:00:00+00:00",
+            "payload": {
+                "holds": [
+                    {"slot": "slot-a", "reason": "imported hold"},
+                    {"slot": "other", "reason": "not audited"},
+                ]
+            },
+        },
+        {
+            "kind": "slot-held",
+            "recorded_at": "2026-01-01T01:00:00+00:00",
+            "payload": {"slot": "slot-b", "reason": "held"},
+        },
+        {
+            "kind": "slot-hold-released",
+            "recorded_at": "2026-01-01T02:00:00+00:00",
+            "payload": {"slot": "slot-b"},
+        },
+        {
+            "kind": "slot-held",
+            "recorded_at": "2026-01-01T03:00:00+00:00",
+            "payload": {"slot": "slot-b", "reason": "held again"},
+        },
+        _release_event("slot-a", 1, 10, heartbeat="2026-01-01T00:00:00+00:00"),
+        _release_event("slot-a", 1, 12, heartbeat="2026-01-01T04:00:00+00:00"),
+        _release_event("slot-a", 2, 13, heartbeat="2026-01-01T05:00:00+00:00"),
+        _release_event("slot-b", 1, 14, heartbeat="2026-01-01T06:00:00+00:00"),
+        {
+            "kind": "heartbeat",
+            "recorded_at": "2026-01-01T07:00:00+00:00",
+            "payload": {"slot": "slot-a"},
+        },
+    ]
+
+
+def test_batched_event_folds_match_per_row_folds() -> None:
+    """One fold per machine gives every row what its own fold gave (#1284)."""
+
+    events = _fold_events()
+    slots = {"slot-a", "slot-b", "slot-c"}
+    batched_holds = cli._holds_from_events(events, "testhost", slots)
+    for slot in slots:
+        per_row = cli._holds_from_events(events, "testhost", {slot})
+        assert batched_holds.get(slot) == per_row.get(slot)
+    assert batched_holds["slot-a"]["reason"] == "imported hold"
+    assert batched_holds["slot-b"]["reason"] == "held again"
+    assert "slot-c" not in batched_holds
+
+    pairs = {("slot-a", 1), ("slot-a", 2), ("slot-b", 1), ("slot-c", 1)}
+    batched_releases = cli._latest_owner_releases(events, pairs)
+    for pair in pairs:
+        per_pair = cli._latest_owner_releases(events, {pair})
+        assert batched_releases.get(pair) == per_pair.get(pair)
+    assert batched_releases[("slot-a", 1)].sequence == 12
+    assert ("slot-c", 1) not in batched_releases
+
+
+def test_audit_record_with_precomputed_folds_never_refolds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row judged from the audit's folds equals the per-row row, and
+    judging it folds nothing again: restore the per-row folds and the
+    counting half of this test fails, which the equality half cannot see.
+    """
+
+    config = _config(tmp_path)
+    (record,) = _records(1)
+    events: list[dict[str, object]] = [
+        {
+            "kind": "slot-held",
+            "recorded_at": "2026-01-02T00:00:00+00:00",
+            "payload": {"slot": record.slot, "reason": "pinned for audit"},
+        }
+    ]
+    expected, expected_running = cli._audit_record(config, record, events=events)
+    holds = {
+        (record.machine, record.slot): cli._holds_from_events(
+            events, record.machine, {record.slot}
+        ).get(record.slot)
+    }
+    releases = cli._latest_owner_releases(
+        events, {(record.slot, record.generation)}
+    )
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError("audit row re-folded the event log")
+
+    monkeypatch.setattr(cli, "_load_hold", forbidden)
+    monkeypatch.setattr(cli, "_latest_owner_releases", forbidden)
+    row, running = cli._audit_record(
+        config,
+        record,
+        events=events,
+        holds=holds,
+        owner_releases=releases,
+    )
+    assert row == expected
+    assert running == expected_running
+    assert row["verdict"] == "HELD"
+
+
+def test_tracked_cache_paths_lists_only_literal_glob_prefixes(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Literal globs list only their own prefixes in Git, and return
+    exactly what listing the whole index and tree returns (#1284)."""
+
+    (repository / "rs" / "target").mkdir(parents=True)
+    (repository / "rs" / "target" / "kept.txt").write_text("tracked\n")
+    (repository / "rs" / "other.txt").write_text("tracked\n")
+    _git(repository, "add", "-A")
+    _git(repository, "commit", "-m", "more")
+    globs = ("rs/target", "vibe-talk/target")
+
+    invocations: list[list[str]] = []
+    original = cli._GitVcs._run
+
+    def counting(
+        target: Path, arguments: list[str], **keywords: object
+    ) -> subprocess.CompletedProcess[str]:
+        invocations.append(list(arguments))
+        return original(target, arguments, **keywords)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli._GitVcs, "_run", staticmethod(counting))
+    found = cli._GitVcs().tracked_cache_paths(repository, globs)
+    assert found == ("rs/target/kept.txt",)
+    listings = [args for args in invocations if args[0] in {"ls-files", "ls-tree"}]
+    assert len(listings) == 2
+    assert all("--" in args for args in listings), invocations
+
+    monkeypatch.setattr(cli, "_literal_cache_pathspecs", lambda globs: None)
+    invocations.clear()
+    unfiltered = cli._GitVcs().tracked_cache_paths(repository, globs)
+    assert unfiltered == found
+    listings = [args for args in invocations if args[0] in {"ls-files", "ls-tree"}]
+    assert all("--" not in args for args in listings), invocations
+
+
+def test_assert_ordinary_index_uses_one_listing_and_keeps_its_order(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One `ls-files -v` listing answers both index questions, and an
+    assume-unchanged entry is still reported before a skip-worktree one
+    even when the skip-worktree path sorts first (#1284)."""
+
+    (repository / "aaa.txt").write_text("a\n")
+    (repository / "zzz.txt").write_text("z\n")
+    _git(repository, "add", "-A")
+    _git(repository, "commit", "-m", "more")
+    _git(repository, "update-index", "--skip-worktree", "aaa.txt")
+    _git(repository, "update-index", "--assume-unchanged", "zzz.txt")
+
+    invocations: list[list[str]] = []
+    original = cli._GitVcs._run
+
+    def counting(
+        target: Path, arguments: list[str], **keywords: object
+    ) -> subprocess.CompletedProcess[str]:
+        invocations.append(list(arguments))
+        return original(target, arguments, **keywords)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli._GitVcs, "_run", staticmethod(counting))
+    with pytest.raises(cli.Refusal, match="assume-unchanged"):
+        cli._GitVcs().assert_ordinary_index(repository)
+    assert invocations == [["ls-files", "-v"]]
+
+    _git(repository, "update-index", "--no-assume-unchanged", "zzz.txt")
+    invocations.clear()
+    with pytest.raises(cli.Refusal, match="skip-worktree"):
+        cli._GitVcs().assert_ordinary_index(repository)
+    assert invocations == [["ls-files", "-v"]]
+
+
+def test_audit_vcs_shares_the_index_stage_listing(repository: Path) -> None:
+    """The audit's submodule questions share one `ls-files --stage`:
+    the cache-policy check and the salvage inventory parse the same
+    listing instead of each listing the whole index (#1284)."""
+
+    invocations: list[list[str]] = []
+    original = cli._GitVcs._run
+
+    def counting(
+        target: Path, arguments: list[str], **keywords: object
+    ) -> subprocess.CompletedProcess[str]:
+        invocations.append(list(arguments))
+        return original(target, arguments, **keywords)  # type: ignore[arg-type]
+
+    audit_vcs = cli._AuditGitVcs()
+    base_vcs = cli._GitVcs()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cli._GitVcs, "_run", staticmethod(counting))
+        submodules = audit_vcs.submodule_paths(repository)
+        initialized = audit_vcs.initialized_submodules(repository)
+    stage_calls = [args for args in invocations if args[:2] == ["ls-files", "--stage"]]
+    assert len(stage_calls) == 1, invocations
+    assert submodules == base_vcs.submodule_paths(repository)
+    assert initialized == base_vcs.initialized_submodules(repository)

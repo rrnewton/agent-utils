@@ -503,16 +503,16 @@ pub(crate) fn recover_ownerless_agent_worktree(
     if !replacements.trim().is_empty() {
         return Err("ownerless agent worktree contains replacement refs".to_string());
     }
-    let assume = git(&target, &["ls-files", "-v"])?;
-    if assume.lines().any(|line| {
+    // One `-v` listing answers both questions (#1284, as in the oracle).
+    let listed = git(&target, &["ls-files", "-v"])?;
+    if listed.lines().any(|line| {
         line.chars()
             .next()
             .is_some_and(|ch| ch.is_ascii_lowercase())
     }) {
         return Err("ownerless agent worktree has assume-unchanged index state".to_string());
     }
-    let skip = git(&target, &["ls-files", "-t"])?;
-    if skip.lines().any(|line| line.starts_with("S ")) {
+    if listed.lines().any(|line| line.starts_with("S ")) {
         return Err("ownerless agent worktree has skip-worktree index state".to_string());
     }
     let (authority_sha, _url) = remote_authority(&target, remote)?;
