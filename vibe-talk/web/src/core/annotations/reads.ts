@@ -30,7 +30,7 @@ export interface ReadLedger {
   /** A write of `ids`' read state starts: the epoch moves, and each has one more write on its way. */
   writeStarted(ids: readonly string[]): void;
   /** A write of `ids`' read state ended: the epoch moves, and each settles there once none is left on its way. */
-  writeSettled(ids: readonly string[]): void;
+  writeSettled(ids: readonly string[], done?: boolean): void;
   /** Message `id`'s read state is the page's own as of `epoch`, with no write on its way. */
   seed(id: string, epoch: number): void;
 }
@@ -39,6 +39,13 @@ export interface ReadLedger {
 export function createReadLedger(): ReadLedger {
   let readStateEpoch = 0;
   const localReadWrites = new Map<string, { pending: number; from: number }>();
+  // A Done settled here, with the newest server observation the page had then seen:
+  // a later read whose answer the server began no later than that (a cache-first
+  // answer taken before the Done reached it) does not speak for the message. A read
+  // the server began after, or one from a server that says when it began, lacking
+  // the message speaks as ever — a put back made elsewhere still lands.
+  const unconfirmedDone = new Map<string, number>();
+  let newestObserved = Number.NEGATIVE_INFINITY;
   const readSentEpochs = new WeakMap<object, number>();
   const sentEpochOf = (payload: object): number => {
     const sent = readSentEpochs.get(payload);
@@ -49,13 +56,28 @@ export function createReadLedger(): ReadLedger {
     bump: () => ++readStateEpoch,
     noteSent(payload, sent) {
       readSentEpochs.set(payload, sent);
+      const observed = (payload as { observed_ms?: unknown }).observed_ms;
+      if (typeof observed === "number" && observed > newestObserved) newestObserved = observed;
     },
     sentEpochOf,
     speaksFor(payload, id) {
       const write = localReadWrites.get(String(id));
       if (!write) return true;
       if (write.pending > 0) return false;
-      return sentEpochOf(payload) >= write.from;
+      if (sentEpochOf(payload) < write.from) return false;
+      const floor = unconfirmedDone.get(String(id));
+      if (floor === undefined) return true;
+      const dismissed = (payload as { dismissed?: unknown }).dismissed;
+      if (Array.isArray(dismissed) && dismissed.map(String).includes(String(id))) {
+        unconfirmedDone.delete(String(id));
+        return true;
+      }
+      const observed = (payload as { observed_ms?: unknown }).observed_ms;
+      if (typeof observed !== "number" || observed > floor) {
+        unconfirmedDone.delete(String(id));
+        return true;
+      }
+      return false;
     },
     written: (id) => localReadWrites.has(id),
     writtenIds: () => localReadWrites.keys(),
@@ -67,13 +89,15 @@ export function createReadLedger(): ReadLedger {
         localReadWrites.set(id, write);
       }
     },
-    writeSettled(ids) {
+    writeSettled(ids, done) {
       readStateEpoch += 1;
       for (const id of ids) {
         const write = localReadWrites.get(id);
         if (!write) continue;
         write.pending = Math.max(0, write.pending - 1);
         if (write.pending === 0) write.from = readStateEpoch;
+        if (write.pending === 0 && done === true) unconfirmedDone.set(id, newestObserved);
+        else if (write.pending === 0 && done === false) unconfirmedDone.delete(id);
       }
     },
     seed(id, epoch) {

@@ -3821,3 +3821,91 @@ test("`#892 voice-page-optimistic-done`: a page closed before the server heard a
   assert.deepStrictEqual(other.dismissCalls, [], "another sign-in's Done was sent under this one");
   assert.deepStrictEqual(keptWrites(other), [], "another sign-in's Done was kept for later");
 });
+
+test("DISMISS WITH A READ SENT BEFORE IT STILL OUT: no restore is sent and the row stays Done", async () => {
+  const page = newPage();
+  const messages = inboxChannel(page);
+  await signIn(page);
+  await showDiscord(page, messages);
+  const serve = page.timeline;
+  let land = () => {};
+  page.timeline = (path, options) => {
+    const answered = serve(path, options);
+    page.timeline = serve;
+    return new Promise((resolve) => { land = () => resolve(answered); });
+  };
+  page.expireTimers(DISCORD_POLL_MS);
+  await page.settle();
+  const calls = page.timelineCalls.length;
+  await doneButton(rowWithId(page, inboxId(12))).click();
+  await page.settle();
+  assert.equal(rowWithId(page, inboxId(12)).getAttribute("data-archived"), "true", "the row was not drawn Done at once");
+  land();
+  await page.settle();
+  await page.settle();
+  assert.equal(page.timelineCalls.length, calls, "a later read answered for the Done, so this proves nothing");
+  assert.deepStrictEqual(page.restoreCalls, [], "a read sent before the dismiss sent a restore");
+  assert.equal(rowWithId(page, inboxId(12)).getAttribute("data-archived"), "true",
+    "a read sent before the dismiss put the row back");
+  await reReadChannel(page);
+  assert.deepStrictEqual(page.restoreCalls, [], "the poll after the stale read sent a restore");
+  assert.equal(rowWithId(page, inboxId(12)).getAttribute("data-archived"), "true",
+    "the poll after the stale read put the row back");
+});
+
+test("REPLY DONE WITH A READ SENT BEFORE IT STILL OUT: no restore is sent and the row stays Done", async () => {
+  const page = newPage();
+  const messages = inboxChannel(page);
+  await signIn(page);
+  await showDiscord(page, messages);
+  const serve = page.timeline;
+  let land = () => {};
+  page.timeline = (path, options) => {
+    const answered = serve(path, options);
+    page.timeline = serve;
+    return new Promise((resolve) => { land = () => resolve(answered); });
+  };
+  page.expireTimers(DISCORD_POLL_MS);
+  await page.settle();
+  await replyAndSend(page, inboxId(12), "looking at it now");
+  await page.settle();
+  assert.deepStrictEqual(page.dismissCalls, [{ messages: [inboxId(12)] }], "the reply did not mark its message Done");
+  assert.equal(rowWithId(page, inboxId(12)).getAttribute("data-archived"), "true");
+  land();
+  await page.settle();
+  await page.settle();
+  assert.deepStrictEqual(page.restoreCalls, [], "a read sent before the reply's Done sent a restore");
+  assert.equal(rowWithId(page, inboxId(12)).getAttribute("data-archived"), "true",
+    "a read sent before the reply's Done put the row back");
+  await reReadChannel(page);
+  assert.deepStrictEqual(page.restoreCalls, [], "the poll after the stale read sent a restore");
+  assert.equal(rowWithId(page, inboxId(12)).getAttribute("data-archived"), "true",
+    "the poll after the stale read put the row back");
+});
+
+test("DISMISS THEN A LAGGED READ ANSWERING AS BEFORE IT: no restore is sent and the row stays Done", async () => {
+  const page = newPage();
+  const messages = inboxChannel(page);
+  const raw = page.timeline;
+  const at = (ms) => async (path, options) => {
+    const answer = await raw(path, options);
+    const body = JSON.parse(await answer.text());
+    return { ...answer, text: async () => JSON.stringify({ ...body, observed_ms: ms }) };
+  };
+  page.timeline = at(2000);
+  await signIn(page);
+  await showDiscord(page, messages);
+  // The server's cached answer as it stood before the dismiss below: begun earlier.
+  page.timeline = at(1000);
+  const stale = await page.timeline("/api/v1/channels/x/timeline?view=flat", {});
+  page.timeline = at(2000);
+  await doneButton(rowWithId(page, inboxId(12))).click();
+  await page.settle();
+  assert.equal(rowWithId(page, inboxId(12)).getAttribute("data-archived"), "true", "the row was not drawn Done at once");
+  const serve = page.timeline;
+  page.timeline = async () => { page.timeline = serve; return stale; };
+  await reReadChannel(page);
+  assert.deepStrictEqual(page.restoreCalls, [], "a lagged read sent a restore");
+  assert.equal(rowWithId(page, inboxId(12)).getAttribute("data-archived"), "true",
+    "a lagged read answered as before the dismiss put the row back");
+});

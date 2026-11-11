@@ -69,7 +69,7 @@ export function createHeldDone(deps: HeldDoneDependencies): HeldDone {
    */
   function settleHeldDone(mark: HeldDoneMark, ok: boolean): void {
     // The epoch moves, and each settles there once none is left on its way (`ReadLedger.writeSettled`).
-    deps.readLedger.writeSettled(mark.ids);
+    deps.readLedger.writeSettled(mark.ids, ok && mark.done);
     // Failed, exactly what it changed in the store goes back (web/src/core/channels `settleDoneIn`).
     settleDoneIn(mark, ok);
   }
