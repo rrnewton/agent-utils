@@ -1,12 +1,13 @@
 ---
 title: 'wrkslots-salvage-report-clarity: name the object behind each salvage count and bundle, and print each scan once'
-status: open
+status: closed
 priority: 3
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-11T14:41:03+00:00
 updated_at: 2026-11-11T14:41:03+00:00
+closed_at: 2026-11-11T14:41:03+00:00
 ---
 
 # Description
@@ -34,3 +35,25 @@ In the same run, one nested checkout's count lines printed four times, once per 
 # Notes
 
 Lead ruling 2026-11-11: one issue for both, taken by an idle lane, no new lane. Receipt fields confirmed by the consumer's coordinator. Not a data-loss bug: the dropped tip falls under #1280's fetched-only, past-expiry rule.
+
+## Resolution
+
+[watermelon-full-preview] Delivered with this closing commit. The
+not-kept report now names its objects: `_PrivateHistory.not_kept`
+carries (category, commit, first naming ref) per tip, and the line
+prints up to three as `SHA12 (ref, category)` with the rest counted
+in the salvage receipt (whose `private_history_counts` shape is
+unchanged, so no new archive-record key). The local-archive warning
+and the reclaim evidence now name the bundled salvage commit
+("salvage commit <sha> is bundled there", "bundled locally in
+<bundle>"). Per-checkout count lines (the not-keeping line and both
+keeping lines) print once per removal through
+`_print_count_line_once`, keyed by checkout identity with the fence
+rename folded away, so the several scans of one removal (pregather,
+before and after the fence, final pass) log each distinct result
+once. Rust `remove_write.rs` needed no change: private-history
+salvage stays with the Python edition there, and the receipt fields
+both editions validate are untouched, keeping the differential
+exact. Tests: `test_private_history_not_kept_line_names_the_tip_and_prints_once`
+and `test_archive_private_history_names_bundled_commit_and_not_kept_tip`.
+Unverified: no consumer-host removal was run; fixtures stand in.

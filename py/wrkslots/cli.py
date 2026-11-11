@@ -25420,11 +25420,12 @@ def _partition_kept_commits(
     if collective.returncode == 0 and not any(
         line.startswith("?") for line in collective.stdout.splitlines()
     ):
-        print(
+        _print_count_line_once(
+            checkout_name,
+            f"keeping {len(tips)}/0",
             f"wrkslots: checkout {checkout_name}: keeping {len(tips)} kept "
             "commit(s); excluded 0 already-incomplete kept commit(s) "
             "(promisor gap); recorded in the salvage receipt",
-            file=sys.stderr,
         )
         return tuple(tips), ()
     kept: list[str] = []
@@ -25474,11 +25475,12 @@ def _partition_kept_commits(
             f"{tip}: object {tip} is missing from every object store "
             f"searched: {searched}; nothing was removed"
         )
-    print(
+    _print_count_line_once(
+        checkout_name,
+        f"keeping {len(kept)}/{len(excluded)}",
         f"wrkslots: checkout {checkout_name}: keeping {len(kept)} kept "
         f"commit(s); excluded {len(excluded)} already-incomplete kept "
         "commit(s) (promisor gap); recorded in the salvage receipt",
-        file=sys.stderr,
     )
     return tuple(kept), tuple(excluded)
 
@@ -25991,7 +25993,8 @@ def _archive_salvage_locally(
         reason = "remote salvage did not complete"
     print(
         f"WARNING: {reason} for checkout {checkout.name}; "
-        f"using verified local archive {bundle}",
+        f"using verified local archive {bundle}; "
+        f"salvage commit {facts.commit} is bundled there",
         file=sys.stderr,
     )
     return {
@@ -26184,6 +26187,10 @@ class _PrivateHistory:
     # (category, count) in _PRIVATE_HISTORY_COUNT_KEYS order. The not-kept
     # categories are reported, never silently dropped.
     counts: tuple[tuple[str, int], ...] = ()
+    # The not-kept tips themselves (#1297): (category, commit, first ref
+    # naming it or ""), so the report can name the object each count is
+    # about instead of leaving a bare category total.
+    not_kept: tuple[tuple[str, str, str], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -26901,6 +26908,41 @@ _NOT_KEPT_COUNT_KEYS: tuple[str, ...] = (
     "dangling, slot-only, past prune expiry",
 )
 
+#: Per-checkout count lines already printed in this process (#1297),
+#: as (checkout identity, line text without any path): a removal scans
+#: each checkout several times, and an identical scan result is
+#: printed once.
+_REPORTED_COUNT_LINES: set[tuple[str, str]] = set()
+
+
+def _reported_not_kept_key(path: Path) -> str:
+    """The dedupe key for a checkout's count lines: its path with any
+    fence directory (`.NAME.fenced.GEN.HASH`) folded back to NAME, since
+    the fence renames the tree between the scans of one removal."""
+
+    return str(
+        Path(
+            *(
+                part.split(".fenced.")[0].lstrip(".")
+                if ".fenced." in part
+                else part
+                for part in path.parts
+            )
+        )
+    )
+
+
+def _print_count_line_once(identity: str, dedupe_text: str, line: str) -> None:
+    """Print a per-checkout count line the first time this process
+    reaches it (#1297); later identical scans of the same checkout in
+    the same removal stay silent."""
+
+    key = (identity, dedupe_text)
+    if key in _REPORTED_COUNT_LINES:
+        return
+    _REPORTED_COUNT_LINES.add(key)
+    print(line, file=sys.stderr)
+
 
 def _private_history_counts_obj(
     counts: Sequence[tuple[str, int]],
@@ -27338,29 +27380,47 @@ def _submodule_private_history(
         return "dangling, slot-only, kept", True
 
     kept_tips: list[str] = []
+    not_kept_tips: list[tuple[str, str, str]] = []
     for tip in tips:
         category, keep = classify(tip)
         counts_by_key[category] += 1
         if keep:
             kept_tips.append(tip)
+        else:
+            not_kept_tips.append((category, tip, naming.get(tip, [""])[0]))
     counts = tuple((key, counts_by_key[key]) for key in _PRIVATE_HISTORY_COUNT_KEYS)
-    not_kept = sum(counts_by_key[key] for key in _NOT_KEPT_COUNT_KEYS)
+    not_kept = tuple(not_kept_tips)
     if not_kept:
-        detail = ", ".join(
-            f"{key}={counts_by_key[key]}"
-            for key in _NOT_KEPT_COUNT_KEYS
-            if counts_by_key[key]
+        # Name the objects behind the counts (#1297): up to a few tips
+        # inline with their refs and categories, the rest by count in
+        # the salvage receipt. A removal scans a checkout several times
+        # (before and after the fence, and the final pass); print each
+        # distinct result once, so identical scans do not repeat it.
+        shown = ", ".join(
+            f"{commit[:12]} ({ref + ', ' if ref else ''}{category})"
+            for category, commit, ref in not_kept[:3]
         )
-        print(
+        rest = (
+            f"; and {len(not_kept) - 3} more, counted in the salvage receipt"
+            if len(not_kept) > 3
+            else "; counted in the salvage receipt"
+        )
+        line = (
             f"wrkslots: private history at {path}: not keeping "
-            f"{not_kept} commit(s) ({detail}); counted in the salvage receipt",
-            file=sys.stderr,
+            f"{len(not_kept)} commit(s): {shown}{rest}"
+        )
+        # The fence also renames the tree, so the printed line's own
+        # path differs between scans; dedupe on the named tips instead.
+        _print_count_line_once(
+            _reported_not_kept_key(path), f"{shown}{rest}", line
         )
     if kept_tips:
         summary = _private_history_summary(
             vcs, path, tuple(kept_tips), negatives, environment, coverage
         )
-        return dataclasses.replace(summary, tips=tuple(kept_tips), counts=counts)
+        return dataclasses.replace(
+            summary, tips=tuple(kept_tips), counts=counts, not_kept=not_kept
+        )
     return _PrivateHistory(
         tips=(),
         commits=0,
@@ -27368,6 +27428,7 @@ def _submodule_private_history(
         unreferenced=0,
         remote_unchecked=None if coverage is None else coverage.unchecked,
         counts=counts,
+        not_kept=not_kept,
     )
 
 
@@ -51776,7 +51837,7 @@ def _cmd_remove_in_scope(
                     f" at {item['remote_ref']}"
                     if item.get("remote_ref") is not None
                     else (
-                        f" in {item['archive_bundle']}"
+                        f" bundled locally in {item['archive_bundle']}"
                         if item["disposition"] == "archived-local"
                         else " on an existing remote ref"
                     )

@@ -62137,6 +62137,44 @@ def test_remove_refuses_private_history_in_a_declared_submodule(tmp_path: Path) 
     assert len(active_slots(project)) == 1
 
 
+def test_archive_private_history_names_bundled_commit_and_not_kept_tip(
+    tmp_path: Path,
+) -> None:
+    """#1297: one line names the bundled salvage commit, one names the
+    stale tip that is not kept, and the not-kept line prints once."""
+
+    project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)
+    branch_commit, _tag_commit = _leaf_private_branch_and_tag(component)
+    base = git(component, "rev-parse", "HEAD").stdout.strip()
+    old = _dangling_commit(component, base, "e2eold", "expired\n")
+    _set_loose_mtime(component, old, _KEPT_SET_OLD)
+
+    removed = _remove_archiving(project, "--archive-private-history")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    receipt = _drift_receipts(project)["product/component"]
+    assert receipt["disposition"] == "archived-local"
+    salvage = str(receipt["salvage_commit"])
+    bundled = [
+        line for line in removed.stderr.splitlines() if "is bundled there" in line
+    ]
+    assert len(bundled) == 1, removed.stderr
+    assert salvage in bundled[0]
+    not_kept = [
+        line for line in removed.stderr.splitlines() if "not keeping" in line
+    ]
+    assert len(not_kept) == 1, removed.stderr
+    assert old[:12] in not_kept[0]
+    assert "dangling, slot-only, past prune expiry" in not_kept[0]
+    keeping = [
+        line for line in removed.stderr.splitlines() if "keeping 2 kept" in line
+    ]
+    assert len(keeping) == 1, removed.stderr
+    counts = cast(Mapping[str, object], receipt["private_history_counts"])
+    assert counts["dangling, slot-only, past prune expiry"] == 1
+    assert branch_commit != old
+
+
 def test_archive_private_history_bundles_a_declared_submodule(tmp_path: Path) -> None:
     """#1257: the flag keeps a declared submodule's private history in a local bundle."""
     project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)
@@ -62412,6 +62450,31 @@ def test_private_history_counts_kept_commits_by_category(tmp_path: Path) -> None
     assert counts["dangling, slot-only, past prune expiry"] == 1
     assert counts["dangling, held by source store"] == 1
     assert set(history.tips) == {named_branch, named_tag, fresh}
+
+
+def test_private_history_not_kept_line_names_the_tip_and_prints_once(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """#1297: the not-kept line names its tip (SHA, category), and
+    identical scans print it once, not once per scan."""
+
+    _origin, parent, slot, base = _kept_set_repos(tmp_path)
+    old = _dangling_commit(slot, base, "old", "old\n")
+    _set_loose_mtime(slot, old, _KEPT_SET_OLD)
+
+    first = _private_history(slot, base, parent)
+    second = _private_history(slot, base, parent)
+
+    assert first is not None and second is not None
+    assert first.not_kept == (("dangling, slot-only, past prune expiry", old, ""),)
+    lines = [
+        line
+        for line in capsys.readouterr().err.splitlines()
+        if "not keeping" in line
+    ]
+    assert len(lines) == 1, lines
+    assert old[:12] in lines[0]
+    assert "dangling, slot-only, past prune expiry" in lines[0]
 
 
 def test_private_history_keeps_a_fresh_object_with_an_old_committer_date(
