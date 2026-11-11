@@ -19,7 +19,7 @@ import urllib.request
 from pathlib import Path
 from typing import cast
 
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import Page, Route, sync_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
 CHANNEL = "100000000000000001"
@@ -78,11 +78,11 @@ def at_bottom(page: Page) -> bool:
 def delay_routes(page: Page, pattern: str) -> re.Pattern[str]:
     regex = re.compile(pattern)
 
-    def handler(route: object) -> None:
+    def handler(route: Route) -> None:
         time.sleep(1.2)
-        route.continue_()  # type: ignore[attr-defined]
+        route.continue_()
 
-    page.route(regex, handler)  # type: ignore[arg-type]
+    page.route(regex, handler)
     return regex
 
 
@@ -123,7 +123,7 @@ def walk(page: Page, base: str, has_touch: bool, label: str) -> None:
     single = delay_routes(page, r"/api/v1/documents/[^/?]+$")
     tap_visible_card(page, has_touch)
     page.wait_for_selector("#doc-body h1", timeout=20_000)
-    page.unroute(single)  # type: ignore[arg-type]
+    page.unroute(single)
     page.wait_for_function(
         "() => document.getElementById('scroll-area').scrollTop === 0", timeout=20_000)
     state = scroll_state(page)
@@ -139,7 +139,7 @@ def walk(page: Page, base: str, has_touch: bool, label: str) -> None:
           const root = document.getElementById('scroll-area');
           return root.scrollTop + root.clientHeight >= root.scrollHeight - 2;
         }""", timeout=20_000)
-    page.unroute(listing)  # type: ignore[arg-type]
+    page.unroute(listing)
     check(at_bottom(page), f"{label}: Back did not land at the list's bottom: {scroll_state(page)}")
 
     # (B') Back after deliberately scrolling up returns exactly there.
@@ -156,7 +156,7 @@ def walk(page: Page, base: str, has_touch: bool, label: str) -> None:
     listing = delay_routes(page, r"/api/v1/documents\?")
     page.tap("#doc-back") if has_touch else page.click("#doc-back")
     page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
-    page.unroute(listing)  # type: ignore[arg-type]
+    page.unroute(listing)
     page.wait_for_function(
         "(want) => document.getElementById('scroll-area').scrollTop === want",
         arg=120, timeout=20_000)
