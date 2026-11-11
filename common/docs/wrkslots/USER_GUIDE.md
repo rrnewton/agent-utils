@@ -1651,7 +1651,7 @@ refuses.
 Two opt-in `remove` flags (also accepted by `remove-agent-batch` and `retire-pending`) reclaim
 dead-owner agent slots that the checks above otherwise refuse forever, by keeping the work in a
 verified local bundle first. Both are off by default; without them those slots keep their refusals.
-A third, `--archive-private-history`, covers a submodule that its source no longer declares; it is
+A third, `--archive-private-history`, covers unpushed private history in any submodule; it is
 described after them.
 
 `--archive-drifted-checkouts` covers a checkout that is on another branch than the recorded one, on
@@ -1686,7 +1686,9 @@ unless a ref of a repository removal keeps contains it: the source submodule rep
 submodule's remote when that remote, as configured or as the invoking user's Git configuration
 rewrites it (`insteadOf`), is a local repository outside the slot (at its canonical or fenced
 path) and outside the Git directories of its checkouts. Every ref of such a repository counts,
-`refs/remotes/*` included. A submodule whose remote lies inside the slot gets its bundle, and then
+`refs/remotes/*` included, and so does every branch and tag the submodule's recorded remote
+advertises now (asked only about commits those repositories leave; see "Unpushed private history
+in a submodule" below). A submodule whose remote lies inside the slot gets its bundle, and then
 refuses after the path fence, because its remote no longer exists where it is configured. A submodule with any such state is kept in its own verified
 local bundle instead of being recorded as already published.
 
@@ -1735,15 +1737,44 @@ file again rather than reuse a blob that conversion made when it was staged.
 `.git/info/attributes` cannot be switched off that way, so a repository with rules there refuses
 (a nested repository with one refuses salvage).
 
-### Unpushed private history in a submodule its source no longer declares
+### Unpushed private history in a submodule
+
+A slot's copy of a submodule has a repository of its own, which removal deletes with the slot.
+Ordinary salvage keeps its HEAD and its worktree. Anything else that repository holds (commits
+on local branches or tags, in the stash, in reflogs, or named by nothing) is unpushed private
+history, unless something that survives removal reaches it: the salvage commit, a ref of the
+source submodule repository in the primary checkout, a ref of a local mirror outside the slot,
+or a branch or tag that the submodule's recorded remote advertises now. The remote is asked only
+about commits the local repositories leave, so a submodule whose refs those repositories already
+hold costs no network call. For a submodule its source still declares, private history refuses
+before anything is salvaged:
+
+```text
+unpushed private history in submodule product/component: 2 commits on 2 refs not on any remote
+(refs/heads/side, refs/tags/local-tag). Removal deletes the slot's own copy of its repository,
+so it would delete the only copy. remedy: keep that history in a verified local bundle in the
+salvage archive, never pushed, by rerunning 'wrkslots remove slot01' with the same options plus
+--archive-private-history; or publish it by hand and rerun remove
+```
+
+A remote-tracking ref of the recorded remote counts like any other ref. When the commits only such
+refs reach are private, the remote has deleted that branch or moved it to a commit that does not
+reach them, and the refusal says which, for example `...; 2 of those commits only on stale
+refs/remotes/origin/feature-x, deleted upstream`. In `remove-agent-batch` and `retire-pending`
+this refusal is an ordinary per-slot refusal: the slot is reported and left in place, and the
+other slots are still attempted.
+
+With `--archive-private-history`, that submodule is never pushed: its salvage commit gains the
+private tips and its index state as extra parents and is kept in a verified local bundle, as
+described below. Its uncommitted work is salvaged as it always was.
 
 When the primary repository no longer initialises a submodule that the slot's checkout still holds,
 the slot's copy is judged by its own recorded remote: a published HEAD is recorded as
 `remote-verified`, an unpublished one is kept in a verified local bundle, and uncommitted changes in
 it refuse ("submodule NAME has uncommitted changes and its source no longer declares it"). Its own
 repository is the only copy of everything else it holds, and removal deletes that repository, so
-none of its own refs count as kept. Removal asks the recorded remote which branches and tags it
-advertises now (`git ls-remote` with the recorded URL, your global Git configuration ignored). A
+none of its own refs count as kept. As for every submodule, removal asks the recorded remote which
+branches and tags it advertises now (`git ls-remote` with the recorded URL, your global Git configuration ignored). A
 commit counts as kept when one of those reaches it. An advertised commit already in the submodule
 counts directly, and so does an annotated tag whose exact tag object is there, through the commit
 it names. When commits remain, the advertised tips missing locally are fetched, commits only, into

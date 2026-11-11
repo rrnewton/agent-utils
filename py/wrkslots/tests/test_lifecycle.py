@@ -62025,6 +62025,183 @@ def test_remove_no_longer_drops_a_local_side_branch(tmp_path: Path) -> None:
     assert len(active_slots(project)) == 1
 
 
+def _dead_owner_slot_with_declared_component(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A dead-owner, undrifted slot whose component submodule the primary declares (#1257)."""
+    project, tree, component, _component_head = _drifted_slot_with_submodules(tmp_path)
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    return project, tree, component
+
+
+def test_remove_refuses_private_history_in_a_declared_submodule(tmp_path: Path) -> None:
+    """#1257: local-only refs of a declared submodule refuse; they used to be deleted."""
+    project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)
+    branch_commit, tag_commit = _leaf_private_branch_and_tag(component)
+    component_remote = tmp_path / "component.git"
+    remote_before = remote_refs(component_remote)
+
+    removed = remove(project)
+
+    assert removed.returncode == 3, removed.stdout + removed.stderr
+    assert (
+        "unpushed private history in submodule product/component: 2 commits on 2 refs "
+        "not on any remote (refs/heads/side, refs/tags/local-tag). Removal deletes the "
+        "slot's own copy of its repository, so it would delete the only copy. "
+        + _PRIVATE_HISTORY_REMEDY
+    ) in removed.stderr
+    assert tree.is_dir()
+    assert git(component, "rev-parse", "side").stdout.strip() == branch_commit
+    assert git(component, "rev-parse", "local-tag^{commit}").stdout.strip() == tag_commit
+    # Refused before anything was salvaged or pushed.
+    assert remote_refs(component_remote) == remote_before
+    assert len(active_slots(project)) == 1
+
+
+def test_archive_private_history_bundles_a_declared_submodule(tmp_path: Path) -> None:
+    """#1257: the flag keeps a declared submodule's private history in a local bundle."""
+    project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)
+    branch_commit, tag_commit = _leaf_private_branch_and_tag(component)
+    component_remote = tmp_path / "component.git"
+    remote_before = remote_refs(component_remote)
+
+    removed = _remove_archiving(project, "--archive-private-history")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    assert remote_refs(component_remote) == remote_before
+    receipt = _drift_receipts(project)["product/component"]
+    assert receipt["disposition"] == "archived-local"
+    assert receipt["archive_reason"] == "private-history-kept"
+    restored = tmp_path / "restored-declared.git"
+    git(tmp_path, "clone", "-q", "--bare", str(receipt["archive_bundle"]), str(restored))
+    salvage = str(receipt["salvage_commit"])
+    parents = git(restored, "rev-list", "--parents", "-n", "1", salvage).stdout.split()[2:]
+    assert sorted(parents) == sorted((branch_commit, tag_commit))
+
+
+def test_remove_counts_declared_submodule_history_the_source_holds(tmp_path: Path) -> None:
+    """#1257: a commit the source submodule repository holds needs no remote and no salvage."""
+    project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)
+    source = project / "repo" / "component"
+    git(source, "config", "user.name", "Wrkslots Test")
+    git(source, "config", "user.email", "wrkslots@example.invalid")
+    source_head = git(source, "rev-parse", "HEAD").stdout.strip()
+    git(source, "checkout", "-q", "-b", "source-only")
+    held = commit_local(source, "source.txt", "source only\n", "source only")
+    git(source, "checkout", "-q", "--detach", source_head)
+    git(component, "fetch", "-q", str(source), "source-only")
+    git(component, "branch", "-q", "side", "FETCH_HEAD")
+    # The remote never had it; only the source repository's branch does.
+    assert held not in remote_refs(tmp_path / "component.git")
+    assert git(component, "rev-parse", "side").stdout.strip() == held
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    assert _drift_receipts(project)["product/component"]["disposition"] == (
+        "already-published"
+    )
+
+
+def test_remove_counts_a_declared_submodule_tag_the_remote_advertises(tmp_path: Path) -> None:
+    """#1257: a commit only a tag holds, which the remote also advertises, is kept."""
+    project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)
+    source = tmp_path / "component-source"
+    git(source, "checkout", "-q", "--detach")
+    tagged = commit_local(source, "release.txt", "release\n", "release")
+    git(source, "tag", "-a", "-m", "release", "release-1")
+    git(source, "push", "-q", "origin", "release-1")
+    git(component, "fetch", "-q", "origin", "--tags")
+    assert git(component, "rev-parse", "release-1^{commit}").stdout.strip() == tagged
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+
+
+def test_remove_counts_a_declared_submodule_stash_as_private_history(tmp_path: Path) -> None:
+    """#1257: a stash entry is private history: two commits on one ref."""
+    project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)
+    (component / "component.txt").write_text("stashed\n", encoding="utf-8")
+    git(component, "stash", "-q")
+    assert git(component, "status", "--porcelain").stdout == ""
+
+    removed = remove(project)
+
+    assert removed.returncode == 3, removed.stdout + removed.stderr
+    # git stash records two commits: the worktree commit refs/stash names,
+    # and the index commit that is its second parent (HEAD is the first,
+    # and is kept). Both are counted, on the one ref that reaches them.
+    assert (
+        "unpushed private history in submodule product/component: 2 commits on 1 ref "
+        "not on any remote (refs/stash)."
+    ) in removed.stderr
+    assert git(component, "stash", "list").stdout.count("\n") == 1
+
+
+def test_remove_names_commits_only_a_stale_remote_tracking_ref_holds(tmp_path: Path) -> None:
+    """#1257: a remote-tracking ref for a branch deleted upstream is named as stale."""
+    project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)
+    source = tmp_path / "component-source"
+    git(source, "checkout", "-q", "-b", "feature-x")
+    first = commit_local(source, "x1.txt", "one\n", "feature one")
+    second = commit_local(source, "x2.txt", "two\n", "feature two")
+    git(source, "push", "-q", "origin", "feature-x")
+    git(component, "fetch", "-q", "origin", "feature-x:refs/remotes/origin/feature-x")
+    git(source, "push", "-q", "origin", "--delete", "feature-x")
+    assert git(component, "rev-parse", "refs/remotes/origin/feature-x").stdout.strip() == second
+
+    removed = remove(project)
+
+    assert removed.returncode == 3, removed.stdout + removed.stderr
+    assert (
+        "unpushed private history in submodule product/component: 2 commits on 1 ref not "
+        "on any remote (refs/remotes/origin/feature-x); 2 of those commits only on stale "
+        "refs/remotes/origin/feature-x, deleted upstream."
+    ) in removed.stderr
+    assert git(component, "cat-file", "-t", first).stdout.strip() == "commit"
+
+
+def test_remove_agent_batch_reports_every_private_history_refusal(tmp_path: Path) -> None:
+    """#1257: a batch reports each refusing slot and still removes the clean one."""
+    project, repository, _remote = make_project(tmp_path)
+    add_recursive_submodules(tmp_path, project, repository)
+    slots = ["slot01", "slot02", "slot03"]
+    for index, slot in enumerate(slots, start=1):
+        made = create(project, slot=slot, agent=f"codex-{index}", branch=f"codex/{slot}")
+        assert made.returncode == 0, made.stderr
+        commit_task(repository, checkout(project, slot), f"codex/{slot}")
+        handed_off = finish(project, slot, f"codex-{index}")
+        assert handed_off.returncode == 0, handed_off.stderr
+        mark_owner_dead(project, slot=slot)
+    set_liveness(project, "dead")
+    for slot in slots[:2]:
+        component = checkout(project, slot) / "component"
+        git(component, "config", "user.name", "Wrkslots Test")
+        git(component, "config", "user.email", "wrkslots@example.invalid")
+        _leaf_private_branch_and_tag(component)
+
+    batch = raw_command(
+        project,
+        "remove-agent-batch",
+        "--coordinator-pid",
+        str(os.getpid()),
+        *(f"--slot={slot}=1" for slot in slots),
+    )
+
+    assert batch.returncode == 1, batch.stdout + batch.stderr
+    assert "requested=3 removed=1 refused=2" in batch.stdout
+    for slot in slots[:2]:
+        assert (
+            f"REFUSED: {slot} generation=1 reason=unpushed private history in submodule "
+            "product/component: 2 commits on 2 refs not on any remote"
+        ) in batch.stdout
+    assert "REMOVED: slot03 generation=1" in batch.stdout
+    assert active_slot_names(project) == slots[:2]
+
+
 def test_remove_skips_an_uninitialised_nested_submodule(tmp_path: Path) -> None:
     project, tree, component, _leaf = _slot_with_primary_dropped_leaf(tmp_path)
     git(
