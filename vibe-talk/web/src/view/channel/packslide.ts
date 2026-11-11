@@ -143,3 +143,11 @@ export function createPackSlides(deps: PackSlidesDependencies): PackSlides {
 
   return { finishPackSlide, slideKey, itemAfterBlock, slideIntoPlace };
 }
+
+/** A duration the stylesheet says on #screen-main, in ms: 0 where it says none (`cardFlightMs`). */
+export function screenMotionMs(name: string): number {
+  const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(document.getElementById("screen-main") as HTMLElement) : null;
+  const said = style ? String(style.getPropertyValue(name)).trim() : "";
+  const parsed = /^(\d+(?:\.\d+)?)(ms|s)$/.exec(said);
+  return parsed ? Number(parsed[1]) * (parsed[2] === "s" ? 1000 : 1) : 0;
+}

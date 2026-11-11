@@ -78,3 +78,23 @@ test("selection, rows, composer and the view key follow the working column", () 
   assert.deepEqual(inSide, ["thread", 0, ""], "the side column's records are its own");
   assert.equal(access.timelineRows().messages.length, 1);
 });
+
+test("element lookup follows the working column; leftEl always names the left column", () => {
+  globalThis.document = { getElementById: (id) => ({ id }) };
+  const makers = {
+    older: () => ({}), arrows: () => ({}), load: () => CHANNEL.freshLoadState(),
+    entry: () => ({}), pins: () => ({}), tools: () => CHANNEL.freshScrollTools(),
+    filter: () => ({}), list: () => ({}), rows: () => CHANNEL.freshTimelineRows(),
+    selection: (view) => CHANNEL.freshSelection(view), composer: () => CHANNEL.freshComposerState(),
+    done: () => ({}), place: () => CHANNEL.freshScrollPlace(), gather: () => ({}),
+  };
+  const columns = CHANNEL.createColumns(makers);
+  const work = CHANNEL.createColumnWork(columns);
+  const lookup = CHANNEL.createElementLookup(work);
+  assert.equal(lookup.el("discord-log").id, "discord-log");
+  assert.equal(lookup.el("api-token").id, "api-token", "an id with no stand-in is itself");
+  assert.equal(lookup.leftEl("discord-log").id, "discord-log");
+  const inSide = work.inColumn(columns.side, () => [lookup.el("discord-log").id, lookup.leftEl("discord-log").id]);
+  assert.deepEqual(inSide, ["side-log", "discord-log"], "el follows the column worked on; leftEl never does");
+  assert.equal(lookup.el("discord-log").id, "discord-log", "the working column is restored after inColumn");
+});

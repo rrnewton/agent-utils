@@ -5,6 +5,8 @@
 // on and left since it was last made afresh (`left`). The columns and their records are the page's.
 
 import type { Message, ThreadSummary } from "../../contract/index.ts";
+import { elementIn } from "../dom/index.ts";
+import type { ElementById } from "../dom/index.ts";
 
 /** A column, as far as working on it reads it. */
 export interface WorkedColumn {
@@ -352,4 +354,37 @@ export function freshTimelineRows(): TimelineRowsRecord {
  */
 export function freshComposerState(): ComposerRecord {
   return { key: "" };
+}
+
+/** Finding the page's elements in the column being worked on, and in the left one. */
+export interface ElementLookup {
+  /**
+   * The element with this id: in the column being worked on, for the ids of the channel's pane (see
+   * `COLUMN_IDS`). Typed by the kind of element voice.html gives the id (web/src/view/dom `ElementById`,
+   * generated from the markup by web/ids.mjs, `#624 voice-page-modularity`), so the checker knows `.value`
+   * and `.checked` exist on a form control; an id not known as a literal is a plain HTMLElement.
+   */
+  el<K extends string>(id: K): K extends keyof ElementById ? ElementById[K] : HTMLElement;
+  /**
+   * The element with this id in the LEFT column whichever column is being worked on: for the few
+   * things that belong to the left column alone (the call's pane beside the channel's, the chips and
+   * the pull gesture over #scroll-area, the keyboard's pane for it) and may be asked about from inside
+   * `inColumn`.
+   */
+  leftEl(id: string): HTMLElement;
+}
+
+/** The element lookup over the working column (`columnWork`). */
+export function createElementLookup(columnWork: ColumnWorkReader<WorkedColumn>): ElementLookup {
+  function el<K extends string>(id: K): K extends keyof ElementById ? ElementById[K] : HTMLElement {
+    // The column worked on decides (web/src/view/dom `elementIn`, `#624 voice-page-modularity`).
+    // Typed by the id, as the JSDoc above says; the lookup itself answers an HTMLElement.
+    return elementIn(id, columnWork.side(), COLUMN_IDS) as K extends keyof ElementById ? ElementById[K] : HTMLElement;
+  }
+
+  function leftEl(id: string): HTMLElement {
+    return document.getElementById(id) as HTMLElement;
+  }
+
+  return { el, leftEl };
 }

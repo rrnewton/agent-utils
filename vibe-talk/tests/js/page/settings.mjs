@@ -73,10 +73,14 @@ test("`#372 settings-header-layout`: the server host is quiet: small, ordinary w
   assert.deepStrictEqual(serverHostProblems(flex), ["the host's parts are blocks, and its copy breaks before the port"]);
 });
 
-test("`#372 settings-header-layout`: the host's port is its own part, an IPv6 address's colons kept in the name", () => {
+test("`#372 settings-header-layout`: the host's port is its own part, an IPv6 address's colons kept in the name", async () => {
   for (const [host, name, port] of [["vibe.example:8443", "vibe.example", ":8443"], ["[::1]:8443", "[::1]", ":8443"],
     ["[::1]", "[::1]", ""], ["vibe.example", "vibe.example", ""]]) {
-    const page = newPage(new Map(), SCRIPT.replace("function deploymentHost() {", `function deploymentHost() {\n  return ${JSON.stringify(host)};`));
+    const page = newPage(new Map(), await brokenModule([{
+      file: "src/view/shell/deployment.ts",
+      find: "  function deploymentHost(): string {\n",
+      replace: `  function deploymentHost(): string {\n    return ${JSON.stringify(host)};\n`,
+    }]));
     const parts = page.el("settings-server-host").children.map((part) => part.textContent);
     assert.deepStrictEqual(parts, [name, port], `${host} split as ${JSON.stringify(parts)}`);
     assert.equal(page.el("settings-server-host").title, host);

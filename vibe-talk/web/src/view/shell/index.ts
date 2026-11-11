@@ -77,3 +77,5 @@ export { createPageVisibility } from "./visibility.ts";
 export type { PageVisibility, PageVisibilityDependencies } from "./visibility.ts";
 export { createChannelSelection } from "./channelselection.ts";
 export type { ChannelSelection, ChannelSelectionDependencies, NavigationLike } from "./channelselection.ts";
+export { createDeploymentWords } from "./deployment.ts";
+export type { DeploymentWords, DeploymentWordsDependencies } from "./deployment.ts";

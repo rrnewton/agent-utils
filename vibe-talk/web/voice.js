@@ -167,6 +167,7 @@ const columns = createColumns({
 const columnWork = createColumnWork(columns);
 const { useColumn, inColumn } = columnWork;
 const { loadState, scrollPlace, scrollTools, selection, timelineRows, composerState, viewKey } = createColumnStateAccess(columnWork);
+const { el, leftEl } = createElementLookup(columnWork);
 
 /**
  * The page's way to the browser and the server: web/src/app's now (`createServerAccess`, `#624`),
@@ -187,21 +188,6 @@ const { browserPorts, deviceStorage, deviceStorageOnUse, clockOnUse, windowStora
  */
 const ALL_CHANNELS = "*";
 
-/**
- * The element with this id: in the column being worked on, for the ids of the channel's pane (see
- * `COLUMN_IDS`). Typed by the kind of element voice.html gives the id (web/src/view/dom `ElementById`,
- * generated from the markup by web/ids.mjs, `#624 voice-page-modularity`), so the checker knows `.value`
- * and `.checked` exist on a form control; an id not known as a literal is a plain HTMLElement.
- *
- * @template {string} K
- * @param {K} id
- * @returns {K extends keyof import("./src/view/dom/index.ts").ElementById ? import("./src/view/dom/index.ts").ElementById[K] : HTMLElement}
- */
-function el(id) {
-  // The column worked on decides (web/src/view/dom `elementIn`, `#624 voice-page-modularity`).
-  // Typed by the id, as the JSDoc above says; the lookup itself answers an HTMLElement.
-  return /** @type {any} */ (elementIn(id, columnWork.side(), COLUMN_IDS));
-}
 
 /** The channel chosen to read: web/src/view/shell's now (`createChannelSelection`, `#624`). */
 const channelSelection = createChannelSelection({
@@ -212,39 +198,19 @@ const channelSelection = createChannelSelection({
 const { selectionOwner, selectedChannelId, chooseChannel } = channelSelection;
 
 
-/**
- * The element with this id in the LEFT column whichever column is being worked on: for the few
- * things that belong to the left column alone (the call's pane beside the channel's, the chips and
- * the pull gesture over #scroll-area, the keyboard's pane for it) and may be asked about from inside
- * `inColumn`.
- *
- * @param {string} id
- */
-function leftEl(id) {
-  return document.getElementById(id);
-}
 
-/** The origin receiving the token and API requests, shown before and after sign-in. */
-function deploymentOrigin() {
-  const origin = window.location && typeof window.location.origin === "string"
-    ? window.location.origin.trim()
-    : "";
-  return origin || "this server";
-}
+/** Which deployment's origin and host, and redacting its token: web/src/view/shell's now (`createDeploymentWords`, `#624`). */
+const deploymentWords = createDeploymentWords({
+  token: () => token(),
+  tokenField: () => el("api-token"),
+});
+const { deploymentOrigin, deploymentHost, redact } = deploymentWords;
+
 
 for (const id of ["signin-server-url", "settings-server-url"]) {
   el(id).textContent = deploymentOrigin();
 }
 
-/** The host this page was opened at, port included: `#342 settings-server-hostname`. */
-function deploymentHost() {
-  const host = window.location && typeof window.location.host === "string"
-    ? window.location.host.trim()
-    : "";
-  if (host) return host;
-  const origin = deploymentOrigin().replace(/^[a-z][a-z0-9+.-]*:\/\//i, "");
-  return origin.split("/")[0] || deploymentOrigin();
-}
 
 const settingsReadouts = mountSettingsReadouts({
   lookup: (id) => el(id),
@@ -439,25 +405,6 @@ const { setStatus, statusSays, dismissStatus, setState, showError, clearError, s
 // is `voice-unresponsive-signal`: the socket is open and the call may recover, but the service has stopped
 // producing anything audible or readable.
 
-// Nothing this page displays may contain a credential.
-//
-// The server redacts its own secrets before answering, but this page holds one the server has
-// never seen: the API token in this browser. An error message is assembled from whatever came
-// back, and a server — or something in between it and here — is free to echo a request back
-// verbatim. So the last thing before any text reaches the DOM is this: the token, if it is in
-// there, is replaced. It is one line, it costs nothing, and it removes a whole class of "the
-// error message leaked the key" from being possible at all.
-function redact(text) {
-  let out = String(text);
-  const secrets = [token(), el("api-token").value || ""];
-  for (const secret of secrets) {
-    // Short strings are not credentials, and blanket-replacing one would mangle ordinary words.
-    if (secret.length >= 8) {
-      out = out.split(secret).join("[redacted]");
-    }
-  }
-  return out;
-}
 
 // The whole point of an earlier pass: a failure is SHOWN, in the page, in words the owner can act
 // on. The reported bug was that a 502 naming a missing API-key permission appeared only in the dev
@@ -2375,13 +2322,6 @@ function keepingCardStill(id, change, slide = false) {
 // of their own; not while a reply is open under a row, whose box is anchored to it; and ended at once by
 // the reader's own wheel or key on the list, any redraw of the cards, or another pack.
 
-/** A duration the stylesheet says on #screen-main, in ms: 0 where it says none (`cardFlightMs`). */
-function screenMotionMs(name) {
-  const style = typeof window.getComputedStyle === "function" ? window.getComputedStyle(leftEl("screen-main")) : null;
-  const said = style ? String(style.getPropertyValue(name)).trim() : "";
-  const parsed = /^(\d+(?:\.\d+)?)(ms|s)$/.exec(said);
-  return parsed ? Number(parsed[1]) * (parsed[2] === "s" ? 1000 : 1) : 0;
-}
 
 /**
  * The slides running and the card drawn over them, ending them, what an item of the cards is across a
