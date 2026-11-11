@@ -14,7 +14,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
 use super::*;
-use crate::config::{LlmBackend, ReasoningEffort};
+use crate::config::{KindModels, LlmBackend, ReasoningEffort, SummaryKind};
 use crate::model::{ChannelId, Message, MessageId, UserId};
 use crate::summarize::threads::ThreadRequest;
 
@@ -286,6 +286,40 @@ async fn a_thread_is_named_by_one_gateway_call() {
 }
 
 #[tokio::test]
+async fn each_kind_sends_its_own_effective_model() {
+    // `#1324 per-kind-summarizer-model`: message and thread_name name their own models;
+    // an override changes only its own kind's calls.
+    let mock = Mock::start(vec![
+        Reply::text("The runner pool is down to one wedged mac."),
+        Reply::text("runner-wedged\nThe only mac runner is stuck."),
+    ])
+    .await;
+    let mut config = gateway(&mock);
+    config.models = KindModels {
+        message: Some("kind-message-model".to_owned()),
+        thread_name: Some("kind-thread-model".to_owned()),
+        digest: None,
+        side_agent: None,
+    };
+    let under = MetaGatewaySummarizer::new(config);
+    summarise(&under, "a wall of text").await.expect("answers");
+    let messages = [message("the arm64 job never reported")];
+    under
+        .name_thread(&ThreadRequest::new(&messages, 160))
+        .await
+        .expect("named");
+    let sent = mock.captured();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0].body["model"], "kind-message-model");
+    assert_eq!(sent[1].body["model"], "kind-thread-model");
+    assert!(
+        under.policy_input().contains("kind-message-model"),
+        "the cache key must name the effective per-kind models: {}",
+        under.policy_input()
+    );
+}
+
+#[tokio::test]
 async fn a_budget_spent_reasoning_is_a_shape_error_and_a_refusal_is_a_refusal() {
     // The answer a reasoning model gives when `max_tokens` bought only thought: HTTP 200, a
     // `length` stop, and no text. Served as a summary it would be an empty row with no error.
@@ -362,7 +396,13 @@ fn the_endpoint_is_the_chat_completions_path_under_the_base() {
         endpoint(&config),
         "https://gateway.example/v1/chat/completions"
     );
-    let body = serde_json::to_value(ChatRequest::new(&config, "sys", "prompt")).expect("JSON");
+    let body = serde_json::to_value(ChatRequest::new(
+        &config,
+        SummaryKind::Message,
+        "sys",
+        "prompt",
+    ))
+    .expect("JSON");
     let object = body.as_object().expect("a JSON object");
     for absent in ["tools", "tool_choice", "temperature", "max_tokens"] {
         assert!(!object.contains_key(absent), "{absent:?} in {object:?}");
@@ -375,7 +415,13 @@ fn the_endpoint_is_the_chat_completions_path_under_the_base() {
         reasoning_effort: ReasoningEffort::Off,
         ..crate::summarize::tests::llm()
     };
-    let body = serde_json::to_value(ChatRequest::new(&off, "sys", "prompt")).expect("JSON");
+    let body = serde_json::to_value(ChatRequest::new(
+        &off,
+        SummaryKind::Message,
+        "sys",
+        "prompt",
+    ))
+    .expect("JSON");
     assert!(
         !body.as_object().unwrap().contains_key("reasoning_effort"),
         "off still sent an effort: {body:?}"

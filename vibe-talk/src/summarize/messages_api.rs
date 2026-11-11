@@ -52,7 +52,7 @@ use super::agent::{plain_uncut, PLAIN_TEXT_RULE};
 use super::rate_limit::{Priority, RateLimiter};
 use super::threads::{parse_thread_answer, ThreadNaming, ThreadRequest, THREAD_RULE, THREAD_STYLE};
 use super::{Summarizer, Summary, SummaryError, SummaryRequest, PROMPT};
-use crate::config::{LlmConfig, LlmDialect, Secret};
+use crate::config::{LlmConfig, LlmDialect, Secret, SummaryKind};
 
 /// The slug this backend contributes to [`super::policy_version`].
 pub const BACKEND: &str = "messages-api";
@@ -117,9 +117,9 @@ pub struct UserTurn<'a> {
 impl<'a> MessagesRequest<'a> {
     /// The body `config`'s dialect sends for one instruction and one prompt.
     #[must_use]
-    pub fn new(config: &'a LlmConfig, system: &'a str, prompt: &'a str) -> Self {
+    pub fn new(config: &'a LlmConfig, kind: SummaryKind, system: &'a str, prompt: &'a str) -> Self {
         let (model, anthropic_version) = match config.dialect {
-            LlmDialect::Anthropic => (Some(config.model.as_str()), None),
+            LlmDialect::Anthropic => (Some(config.model_for(kind)), None),
             LlmDialect::Vertex => (None, Some(VERTEX_ANTHROPIC_VERSION)),
         };
         Self {
@@ -137,7 +137,7 @@ impl<'a> MessagesRequest<'a> {
 
 /// Where `config`'s dialect sends a request.
 #[must_use]
-pub fn endpoint(config: &LlmConfig) -> String {
+pub fn endpoint(config: &LlmConfig, kind: SummaryKind) -> String {
     match config.dialect {
         LlmDialect::Anthropic => format!("{}/v1/messages", config.base_url),
         LlmDialect::Vertex => format!(
@@ -145,7 +145,7 @@ pub fn endpoint(config: &LlmConfig) -> String {
             config.base_url,
             config.project.as_deref().unwrap_or_default(),
             config.region.as_deref().unwrap_or_default(),
-            config.model
+            config.model_for(kind)
         ),
     }
 }
@@ -234,13 +234,18 @@ impl MessagesApiSummarizer {
     pub fn new(config: LlmConfig) -> Self {
         // What decides what a summary SAYS, and nothing else: see `LlmConfig`. Both instructions
         // are in, because one cache version covers summaries and thread names alike.
-        let policy_input = format!(
+        let mut policy_input = format!(
             "{PROMPT}\n{PLAIN_TEXT_RULE}\n{THREAD_RULE}\nbackend={BACKEND}\ndialect={}\nmodel={}\n\
              max_tokens={}",
             config.dialect.as_str(),
             config.model,
             config.max_tokens
         );
+        // `#1324 per-kind-summarizer-model`: as on the gateway backend, an override joins
+        // the cache key; absent overrides keep the existing key byte for byte.
+        if let Some(models) = config.models_segment() {
+            policy_input.push_str(&format!("\nmodels={models}"));
+        }
         let limiter = RateLimiter::new(config.requests_per_minute, config.burst);
         Self {
             config,
@@ -347,6 +352,7 @@ impl MessagesApiSummarizer {
     async fn complete(
         &self,
         priority: Priority,
+        kind: SummaryKind,
         system: &str,
         prompt: &str,
     ) -> Result<String, SummaryError> {
@@ -375,7 +381,7 @@ impl MessagesApiSummarizer {
                     }
                 )));
             }
-            match self.send(system, prompt).await {
+            match self.send(kind, system, prompt).await {
                 Attempt::Answered(text) => {
                     tracing::debug!(
                         attempts = attempt + 1,
@@ -410,14 +416,14 @@ impl MessagesApiSummarizer {
     }
 
     /// One HTTP request and its interpretation.
-    async fn send(&self, system: &str, prompt: &str) -> Attempt {
+    async fn send(&self, kind: SummaryKind, system: &str, prompt: &str) -> Attempt {
         let client = match self.client() {
             Ok(client) => client,
             Err(error) => return Attempt::Failed(error),
         };
-        let body = MessagesRequest::new(&self.config, system, prompt);
+        let body = MessagesRequest::new(&self.config, kind, system, prompt);
         let mut request = client
-            .post(endpoint(&self.config))
+            .post(endpoint(&self.config, kind))
             .timeout(Duration::from_secs(self.config.timeout_secs))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .json(&body);
@@ -475,7 +481,7 @@ impl MessagesApiSummarizer {
             Err(error) => return Attempt::Failed(error),
         };
         if status.is_success() {
-            return self.interpret(&body, started.elapsed());
+            return self.interpret(kind, &body, started.elapsed());
         }
         let detail = describe_failure(status, error_code.as_deref(), &body);
         match status.as_u16() {
@@ -496,7 +502,7 @@ impl MessagesApiSummarizer {
     }
 
     /// Turn a successful response into text, or say why it is not one.
-    fn interpret(&self, body: &[u8], elapsed: Duration) -> Attempt {
+    fn interpret(&self, kind: SummaryKind, body: &[u8], elapsed: Duration) -> Attempt {
         let Ok(parsed) = serde_json::from_slice::<MessagesResponse>(body) else {
             return Attempt::Failed(SummaryError::Shape(
                 "the model provider answered 2xx with something that is not a Messages API \
@@ -508,7 +514,7 @@ impl MessagesApiSummarizer {
         tracing::info!(
             backend = BACKEND,
             dialect = self.config.dialect.as_str(),
-            model = %self.config.model,
+            model = %self.config.model_for(kind),
             answer_ms = elapsed.as_millis(),
             stop_reason = parsed.stop_reason.as_deref().unwrap_or("(none)"),
             input_tokens = usage.input_tokens,
@@ -886,7 +892,12 @@ impl Summarizer for MessagesApiSummarizer {
             request.target_chars
         );
         let reply = self
-            .complete(Priority::Interactive, &system, request.prompt())
+            .complete(
+                Priority::Interactive,
+                SummaryKind::Message,
+                &system,
+                request.prompt(),
+            )
             .await?;
         // Asked for `target_chars`, stored uncut and cut only well past it when served: see
         // `plain_uncut`. `#257 summary-truncation`, `#208 persistent-cache`. A `max_tokens` stop
@@ -911,7 +922,12 @@ impl Summarizer for MessagesApiSummarizer {
             request.sentence_chars
         );
         let reply = self
-            .complete(Priority::Background, &system, request.prompt())
+            .complete(
+                Priority::Background,
+                SummaryKind::ThreadName,
+                &system,
+                request.prompt(),
+            )
             .await?;
         parse_thread_answer(&reply, request.sentence_chars)
     }

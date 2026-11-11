@@ -13,6 +13,13 @@
 //! * otherwise [`agent::AgentSummarizer`], which asks the deployment's ElevenLabs conversational
 //!   agent.
 //!
+//! The ElevenLabs agent summarizer backend ([`agent`]) is maintained and first-class (the
+//! owner's external OSS deployments); keep it working and tested in summarizer changes.
+//! The per-kind model map (`[summaries.llm.models]`, `#1324 per-kind-summarizer-model`)
+//! applies to the two direct-LLM backends; on the agent backend every kind is served by
+//! the one configured agent, whose model is a property of that agent, and thread naming
+//! is not offered there.
+//!
 //! A truncating stand-in used to live here beside them and has been deleted: it comprehended
 //! nothing — a wall of text became the first 160 characters of a wall of text — and the page
 //! already shows a clamped prefix under the collapsed state, so it produced nothing the reader did
@@ -437,17 +444,25 @@ pub fn policy_version_v2(prompt: &str, config: &SummariesConfig, backend: &str) 
     // `meta_gateway` form names its backend and folds in the reasoning effort, which decides
     // how much of the budget is left for the sentence itself.
     // `#1027 vibe-talk-spark-summarizer`.
-    let llm = config.llm.as_ref().map(|llm| match llm.backend {
-        crate::config::LlmBackend::MessagesApi => {
-            format!("{}|{}|{}", llm.dialect.as_str(), llm.model, llm.max_tokens)
+    let llm = config.llm.as_ref().map(|llm| {
+        let base = match llm.backend {
+            crate::config::LlmBackend::MessagesApi => {
+                format!("{}|{}|{}", llm.dialect.as_str(), llm.model, llm.max_tokens)
+            }
+            crate::config::LlmBackend::MetaGateway => format!(
+                "{}|{}|{}|{}",
+                llm.backend.as_str(),
+                llm.model,
+                llm.max_tokens,
+                llm.reasoning_effort.as_str()
+            ),
+        };
+        // `#1324 per-kind-summarizer-model`: cache keys use the EFFECTIVE model per kind.
+        // No overrides, no segment: existing deployments keep their keys byte for byte.
+        match llm.models_segment() {
+            Some(models) => format!("{base}|models={models}"),
+            None => base,
         }
-        crate::config::LlmBackend::MetaGateway => format!(
-            "{}|{}|{}|{}",
-            llm.backend.as_str(),
-            llm.model,
-            llm.max_tokens,
-            llm.reasoning_effort.as_str()
-        ),
     });
     let mut hash = FNV_OFFSET;
     for part in [
@@ -589,6 +604,7 @@ mod tests {
             dialect: crate::config::LlmDialect::Anthropic,
             base_url: crate::config::DEFAULT_ANTHROPIC_BASE_URL.to_owned(),
             model: crate::config::DEFAULT_LLM_MODEL.to_owned(),
+            models: crate::config::KindModels::default(),
             reasoning_effort: crate::config::ReasoningEffort::DEFAULT,
             project: None,
             region: None,
@@ -917,6 +933,16 @@ mod tests {
             gateway_base,
             policy_version(&gateway_off, meta_gateway::BACKEND),
             "switching llm.reasoning_effort off left a meta_gateway cache key unchanged"
+        );
+        // `#1324 per-kind-summarizer-model`: an override changes the EFFECTIVE model of its
+        // kind, so it moves the cache key; without one the key is byte-identical to before.
+        let overridden = with_llm(|l| {
+            l.models.message = Some("other-model".to_owned());
+        });
+        assert_ne!(
+            base,
+            policy_version(&overridden, messages_api::BACKEND),
+            "a per-kind model override left the cache key unchanged"
         );
     }
 

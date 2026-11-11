@@ -2443,6 +2443,7 @@ reasoning_effort = "low"                         # or "off" for a model that ref
 | `dialect` | `anthropic` | `messages_api` only: `anthropic` or `vertex` |
 | `base_url` | per dialect | `https://` only; plain `http://` is accepted for a loopback address (a local mock or sidecar). No credentials, query or fragment. **Required for `meta_gateway`** |
 | `model` | `claude-haiku-4-5` | letters, digits, `-`, `.`, `_`, `@`. Never taken from `summaries.model`. **Required for `meta_gateway`** (no default) |
+| `models` | none | optional per-kind models (`#1324 per-kind-summarizer-model`): a `[summaries.llm.models]` table with any of `message`, `thread_name`, `digest`, `side_agent`; an absent kind uses `model`. Cache keys use the effective model per kind. On the ElevenLabs agent backend (maintained, first-class) there is no `[summaries.llm]` section: every kind is served by the one configured agent and thread naming is not offered |
 | `reasoning_effort` | `low` | `meta_gateway` only: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `off` (send no effort field, for a model that refuses one) |
 | `project`, `region` | — | Vertex only, and required there |
 | `api_key_file` | — | **required for `anthropic`**; on `vertex`, sent only when set; refused on `meta_gateway` |

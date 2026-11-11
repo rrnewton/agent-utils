@@ -675,12 +675,13 @@ pub struct SummariesConfig {
     pub context_messages: usize,
     /// A model name, folded into the cache key and read by no backend.
     ///
-    /// **Vestigial.** The shipped summariser asks a configured ElevenLabs agent, and WHICH model
-    /// that agent runs is a property of the agent, set in the vendor's dashboard, not something
+    /// The ElevenLabs agent backend is maintained and first-class; WHICH model its configured
+    /// agent runs is a property of the agent, set in the vendor's dashboard, not something
     /// this server can choose per request. Setting this therefore changes nothing about a summary
     /// except that every previously cached one becomes unreachable. It is folded into
-    /// [`crate::summarize::policy_version`] anyway, as a model name would change the wording, and
-    /// it should probably be deleted rather than documented as a selector.
+    /// [`crate::summarize::policy_version`] anyway, as a model name would change the wording.
+    /// Per-kind model choice for the direct-LLM backends lives in `[summaries.llm.models]`
+    /// (`#1324 per-kind-summarizer-model`), not here.
     pub model: Option<String>,
     /// How many summaries share one conversation with the agent before it is recycled.
     ///
@@ -835,6 +836,82 @@ impl LlmDialect {
     }
 }
 
+/// One kind of summary a per-kind model can be chosen for. `#1324 per-kind-summarizer-model`.
+///
+/// `message` and `thread_name` are served by this server's summariser; `digest` (the
+/// per-message lines a catch-up is built from) and `side_agent` (the catch-up side agent)
+/// are read from the same `[summaries.llm.models]` table by the catch-up consumers, so one
+/// deployment names every kind's model in one place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SummaryKind {
+    /// One message summary.
+    Message,
+    /// A thread name and its sentence.
+    ThreadName,
+    /// The per-message digest lines of a catch-up.
+    Digest,
+    /// The catch-up side agent.
+    SideAgent,
+}
+
+impl SummaryKind {
+    /// Every kind, in configuration order.
+    pub const ALL: [Self; 4] = [
+        Self::Message,
+        Self::ThreadName,
+        Self::Digest,
+        Self::SideAgent,
+    ];
+
+    /// The `[summaries.llm.models]` key spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Message => "message",
+            Self::ThreadName => "thread_name",
+            Self::Digest => "digest",
+            Self::SideAgent => "side_agent",
+        }
+    }
+}
+
+/// Per-kind model overrides from `[summaries.llm.models]`. `#1324 per-kind-summarizer-model`.
+///
+/// Each absent kind falls back to [`LlmConfig::model`], so a section without the table
+/// means exactly what it always meant.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KindModels {
+    /// Model for [`SummaryKind::Message`].
+    pub message: Option<String>,
+    /// Model for [`SummaryKind::ThreadName`].
+    pub thread_name: Option<String>,
+    /// Model for [`SummaryKind::Digest`].
+    pub digest: Option<String>,
+    /// Model for [`SummaryKind::SideAgent`].
+    pub side_agent: Option<String>,
+}
+
+impl KindModels {
+    /// The override named for `kind`, if any.
+    #[must_use]
+    pub fn get(&self, kind: SummaryKind) -> Option<&str> {
+        match kind {
+            SummaryKind::Message => self.message.as_deref(),
+            SummaryKind::ThreadName => self.thread_name.as_deref(),
+            SummaryKind::Digest => self.digest.as_deref(),
+            SummaryKind::SideAgent => self.side_agent.as_deref(),
+        }
+    }
+
+    /// Whether any kind names its own model.
+    #[must_use]
+    pub fn any(&self) -> bool {
+        SummaryKind::ALL
+            .iter()
+            .any(|kind| self.get(*kind).is_some())
+    }
+}
+
 /// `[summaries.llm]`: summaries from one plain Messages API call, with no agent harness and no
 /// tools. `#233 llm-summarizer`.
 ///
@@ -850,6 +927,8 @@ impl LlmDialect {
 /// endpoints, credentials, timeouts and the rate limit. Folding those in would throw every
 /// cached summary away on a key rotation, and would write a deployment's file layout into a
 /// cache key on disk.
+/// The resolved `[summaries.llm]` section: see the module-level note above [`SummaryKind`]
+/// for the secret-handling and cache-key rules this type follows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LlmConfig {
     /// Which summariser this section builds. Default [`LlmBackend::MessagesApi`].
@@ -866,6 +945,9 @@ pub struct LlmConfig {
     /// dialects. The `meta_gateway` backend has no default either — no model name is valid on
     /// every gateway — so a section using it names its model.
     pub model: String,
+    /// Per-kind model overrides (`[summaries.llm.models]`); an absent kind uses `model`.
+    /// `#1324 per-kind-summarizer-model`.
+    pub models: KindModels,
     /// How hard the model reasons before writing. `meta_gateway` only; held at
     /// [`ReasoningEffort::DEFAULT`] and never sent by `messages_api`.
     pub reasoning_effort: ReasoningEffort,
@@ -898,6 +980,31 @@ pub struct LlmConfig {
     pub requests_per_minute: u32,
     /// How many calls may go out back to back before the per-minute pace applies.
     pub burst: u32,
+}
+
+impl LlmConfig {
+    /// The model to ask for `kind`: its `[summaries.llm.models]` override, else `model`.
+    /// `#1324 per-kind-summarizer-model`.
+    #[must_use]
+    pub fn model_for(&self, kind: SummaryKind) -> &str {
+        self.models.get(kind).unwrap_or(&self.model)
+    }
+
+    /// The per-kind models as one cache-key segment, or `None` when no kind is overridden
+    /// (so a section without `[summaries.llm.models]` keeps its existing cache keys).
+    #[must_use]
+    pub fn models_segment(&self) -> Option<String> {
+        if !self.models.any() {
+            return None;
+        }
+        Some(
+            SummaryKind::ALL
+                .iter()
+                .map(|kind| format!("{}={}", kind.as_str(), self.model_for(*kind)))
+                .collect::<Vec<_>>()
+                .join("|"),
+        )
+    }
 }
 
 /// The model `[summaries.llm]` asks when none is named: a small, fast model whose alias is
@@ -1983,6 +2090,7 @@ struct FileLlm {
     client_identity_file: Option<String>,
     ca_bundle_file: Option<String>,
     extra_headers: Option<BTreeMap<String, String>>,
+    models: Option<FileKindModels>,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
     requests_per_minute: Option<u32>,
@@ -1992,6 +2100,16 @@ struct FileLlm {
     api_key: Option<toml::Value>,
     /// As `api_key`.
     bearer_token: Option<toml::Value>,
+}
+
+/// `[summaries.llm.models]` as written. See [`KindModels`].
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileKindModels {
+    message: Option<String>,
+    thread_name: Option<String>,
+    digest: Option<String>,
+    side_agent: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3282,6 +3400,22 @@ fn llm_config(file: FileLlm) -> Result<LlmConfig, ConfigError> {
         Ok(())
     };
     identifier("model", &model, "._@")?;
+    // `#1324 per-kind-summarizer-model`: each override is a model name on the same terms.
+    let kind_model =
+        |kind: SummaryKind, value: Option<String>| -> Result<Option<String>, ConfigError> {
+            let Some(value) = text(value) else {
+                return Ok(None);
+            };
+            identifier(&format!("models.{}", kind.as_str()), &value, "._@")?;
+            Ok(Some(value))
+        };
+    let file_models = file.models.unwrap_or_default();
+    let models = KindModels {
+        message: kind_model(SummaryKind::Message, file_models.message)?,
+        thread_name: kind_model(SummaryKind::ThreadName, file_models.thread_name)?,
+        digest: kind_model(SummaryKind::Digest, file_models.digest)?,
+        side_agent: kind_model(SummaryKind::SideAgent, file_models.side_agent)?,
+    };
     let project = text(file.project);
     let region = text(file.region);
     if let Some(project) = &project {
@@ -3526,6 +3660,7 @@ fn llm_config(file: FileLlm) -> Result<LlmConfig, ConfigError> {
         dialect,
         base_url,
         model,
+        models,
         reasoning_effort,
         project,
         region,

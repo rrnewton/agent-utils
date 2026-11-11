@@ -52,7 +52,7 @@ use super::messages_api::{
 use super::rate_limit::{Priority, RateLimiter};
 use super::threads::{parse_thread_answer, ThreadNaming, ThreadRequest, THREAD_RULE, THREAD_STYLE};
 use super::{Summarizer, Summary, SummaryError, SummaryRequest, PROMPT};
-use crate::config::LlmConfig;
+use crate::config::{LlmConfig, SummaryKind};
 
 /// The slug this backend contributes to [`super::policy_version`].
 pub const BACKEND: &str = "meta-gateway";
@@ -93,9 +93,9 @@ pub struct ChatTurn<'a> {
 impl<'a> ChatRequest<'a> {
     /// The body `config` sends for one instruction and one prompt.
     #[must_use]
-    pub fn new(config: &'a LlmConfig, system: &'a str, prompt: &'a str) -> Self {
+    pub fn new(config: &'a LlmConfig, kind: SummaryKind, system: &'a str, prompt: &'a str) -> Self {
         Self {
-            model: &config.model,
+            model: config.model_for(kind),
             max_completion_tokens: config.max_tokens,
             reasoning_effort: config.reasoning_effort.sent(),
             messages: [
@@ -203,13 +203,19 @@ impl MetaGatewaySummarizer {
     pub fn new(config: LlmConfig) -> Self {
         // What decides what a summary SAYS, and nothing else: see `LlmConfig`. Both instructions
         // are in, because one cache version covers summaries and thread names alike.
-        let policy_input = format!(
+        let mut policy_input = format!(
             "{PROMPT}\n{PLAIN_TEXT_RULE}\n{THREAD_RULE}\nbackend={BACKEND}\nmodel={}\n\
              max_tokens={}\nreasoning_effort={}",
             config.model,
             config.max_tokens,
             config.reasoning_effort.as_str()
         );
+        // `#1324 per-kind-summarizer-model`: the EFFECTIVE model per kind decides what a
+        // summary says, so an override joins the cache key. Absent overrides keep the
+        // existing key byte for byte.
+        if let Some(models) = config.models_segment() {
+            policy_input.push_str(&format!("\nmodels={models}"));
+        }
         let limiter = RateLimiter::new(config.requests_per_minute, config.burst);
         Self {
             config,
@@ -291,6 +297,7 @@ impl MetaGatewaySummarizer {
     async fn complete(
         &self,
         priority: Priority,
+        kind: SummaryKind,
         system: &str,
         prompt: &str,
     ) -> Result<String, SummaryError> {
@@ -317,7 +324,7 @@ impl MetaGatewaySummarizer {
                     }
                 )));
             }
-            match self.send(system, prompt).await {
+            match self.send(kind, system, prompt).await {
                 Attempt::Answered(text) => {
                     tracing::debug!(
                         attempts = attempt + 1,
@@ -353,12 +360,12 @@ impl MetaGatewaySummarizer {
     /// One HTTP request and its interpretation. The only credential is the client certificate
     /// the shared [`build_client`] put on the connection: no key, no bearer token, and the
     /// loader refuses a section that configures one for this backend.
-    async fn send(&self, system: &str, prompt: &str) -> Attempt {
+    async fn send(&self, kind: SummaryKind, system: &str, prompt: &str) -> Attempt {
         let client = match self.client() {
             Ok(client) => client,
             Err(error) => return Attempt::Failed(error),
         };
-        let body = ChatRequest::new(&self.config, system, prompt);
+        let body = ChatRequest::new(&self.config, kind, system, prompt);
         let mut request = client
             .post(endpoint(&self.config))
             .timeout(Duration::from_secs(self.config.timeout_secs))
@@ -394,7 +401,7 @@ impl MetaGatewaySummarizer {
             Err(error) => return Attempt::Failed(error),
         };
         if status.is_success() {
-            return self.interpret(&body, started.elapsed());
+            return self.interpret(kind, &body, started.elapsed());
         }
         let detail = describe_failure(status, code.as_deref(), &body);
         match status.as_u16() {
@@ -410,7 +417,7 @@ impl MetaGatewaySummarizer {
     }
 
     /// Turn a successful response into text, or say why it is not one.
-    fn interpret(&self, body: &[u8], elapsed: Duration) -> Attempt {
+    fn interpret(&self, kind: SummaryKind, body: &[u8], elapsed: Duration) -> Attempt {
         let Ok(parsed) = serde_json::from_slice::<ChatResponse>(body) else {
             return Attempt::Failed(SummaryError::Shape(
                 "the AI gateway answered 2xx with something that is not a chat-completions \
@@ -426,7 +433,7 @@ impl MetaGatewaySummarizer {
         };
         tracing::info!(
             backend = BACKEND,
-            model = %self.config.model,
+            model = %self.config.model_for(kind),
             answer_ms = elapsed.as_millis(),
             finish_reason = choice.finish_reason.as_deref().unwrap_or("(none)"),
             prompt_tokens = usage.prompt_tokens,
@@ -493,7 +500,12 @@ impl Summarizer for MetaGatewaySummarizer {
             request.target_chars
         );
         let reply = self
-            .complete(Priority::Interactive, &system, request.prompt())
+            .complete(
+                Priority::Interactive,
+                SummaryKind::Message,
+                &system,
+                request.prompt(),
+            )
             .await?;
         // Asked for `target_chars`, stored uncut and cut only well past it when served: see
         // `plain_uncut`. `#257 summary-truncation`, `#208 persistent-cache`. A `length` stop
@@ -518,7 +530,12 @@ impl Summarizer for MetaGatewaySummarizer {
             request.sentence_chars
         );
         let reply = self
-            .complete(Priority::Background, &system, request.prompt())
+            .complete(
+                Priority::Background,
+                SummaryKind::ThreadName,
+                &system,
+                request.prompt(),
+            )
             .await?;
         parse_thread_answer(&reply, request.sentence_chars)
     }

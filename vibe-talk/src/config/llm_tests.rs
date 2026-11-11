@@ -606,3 +606,59 @@ fn each_llm_backend_refuses_the_others_keys_and_the_gateway_has_no_defaults_to_g
         );
     }
 }
+
+#[test]
+fn per_kind_models_fall_back_to_the_section_model() {
+    // `#1324 per-kind-summarizer-model`.
+    let cfg = load(
+        "[summaries.llm]\nbackend = \"meta_gateway\"\n\
+         base_url = \"https://models.gateway.example/v1\"\nmodel = \"base-model\"\n\
+         client_identity_file = \"/run/secrets/identity.pem\"\n\
+         [summaries.llm.models]\nmessage = \"message-model\"\nside_agent = \"agent-model\"\n",
+    )
+    .expect("valid");
+    let llm = cfg.summaries.llm.expect("read");
+    assert_eq!(
+        llm.model_for(crate::config::SummaryKind::Message),
+        "message-model"
+    );
+    assert_eq!(
+        llm.model_for(crate::config::SummaryKind::ThreadName),
+        "base-model"
+    );
+    assert_eq!(
+        llm.model_for(crate::config::SummaryKind::Digest),
+        "base-model"
+    );
+    assert_eq!(
+        llm.model_for(crate::config::SummaryKind::SideAgent),
+        "agent-model"
+    );
+    let segment = llm.models_segment().expect("overrides named");
+    assert!(segment.contains("message=message-model"), "{segment}");
+    assert!(segment.contains("thread_name=base-model"), "{segment}");
+    // No table at all: every kind is the section model and no segment is added.
+    let cfg = load(
+        "[summaries.llm]\nbackend = \"meta_gateway\"\n\
+         base_url = \"https://models.gateway.example/v1\"\nmodel = \"base-model\"\n\
+         client_identity_file = \"/run/secrets/identity.pem\"\n",
+    )
+    .expect("valid");
+    let llm = cfg.summaries.llm.expect("read");
+    assert_eq!(llm.models_segment(), None);
+    // An unknown kind and a malformed model are refused at load.
+    assert!(load(
+        "[summaries.llm]\nbackend = \"meta_gateway\"\n\
+         base_url = \"https://models.gateway.example/v1\"\nmodel = \"base-model\"\n\
+         client_identity_file = \"/run/secrets/identity.pem\"\n\
+         [summaries.llm.models]\nweekly = \"x\"\n",
+    )
+    .is_err());
+    assert!(load(
+        "[summaries.llm]\nbackend = \"meta_gateway\"\n\
+         base_url = \"https://models.gateway.example/v1\"\nmodel = \"base-model\"\n\
+         client_identity_file = \"/run/secrets/identity.pem\"\n\
+         [summaries.llm.models]\nmessage = \"bad model!\"\n",
+    )
+    .is_err());
+}

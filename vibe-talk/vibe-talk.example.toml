@@ -765,6 +765,11 @@ enabled = true
 # timeout_secs = 30
 # requests_per_minute = 15
 # burst = 3
+# [summaries.llm.models]                          # optional per-kind models (#1324); an
+# message = "small-elk-internal"                   # absent kind uses model above. This is a
+# thread_name = "small-elk-internal"               # preview id that may be withdrawn; rollback
+# digest = "muse-spark-1.4-internal"               # is deleting these override lines.
+# side_agent = "muse-spark-1.4-internal"
 
 [replay]
 # RESUMING A CONVERSATION ACROSS A HANG-UP. The vendor cannot resume a closed conversation, so
