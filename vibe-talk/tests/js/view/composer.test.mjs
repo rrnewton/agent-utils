@@ -568,3 +568,23 @@ test("`#624 voice-page-modularity`: the boxes' Enter is said in Settings and on 
   assert.equal(boxes.growingBoxList({ id: "side-compose-text" }), el("side-scroll"));
   assert.equal(boxes.modKeyName(), "Cmd");
 });
+
+test("the keyboard debug choice is kept on this device, absent off, and shown either way", () => {
+  const kept = [];
+  const held = new Map();
+  const shown = [];
+  const debug = VIEW_COMPOSER.createKeyboardDebug({
+    deviceSettings: () => ({
+      get: () => held.get("v") === true,
+      keep: (_descriptor, value) => { kept.push(value); held.set("v", value); },
+    }),
+    keyboardDebugSetting: "descriptor",
+    showKeyboardDebug: (on) => shown.push(on),
+  });
+  assert.equal(debug.storedKeyboardDebug(), false, "absent reads as off");
+  debug.applyKeyboardDebug(true);
+  assert.deepEqual([kept, shown], [[true], [true]]);
+  assert.equal(debug.storedKeyboardDebug(), true);
+  debug.applyKeyboardDebug(false);
+  assert.deepEqual(shown, [true, false], "a refused keep still draws it for this session");
+});

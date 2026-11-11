@@ -133,3 +133,13 @@ test("`#624 voice-page-modularity`: a chosen device already live — by id, or b
   assert.equal(byLabel.finalTrack, byLabelTrack);
   assert.deepStrictEqual(log, ["begin", "input AirPods"]);
 });
+
+test("the microphone constraints state only an OFF gain, byte for byte as ever", () => {
+  assert.deepStrictEqual(
+    CALL.audioConstraints({ echoCancellation: true, noiseSuppression: true, autoGainControl: true }),
+    { audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } },
+    "the default position says nothing about gain, as it always did");
+  assert.deepStrictEqual(
+    CALL.audioConstraints({ echoCancellation: false, noiseSuppression: false, autoGainControl: false }),
+    { audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+});

@@ -2528,52 +2528,10 @@ function renderEmptyState() {
   el("empty-state").hidden = el("transcript").children.length > 0;
 }
 
-// --- which day a message was sent ----------------------------------------------------------------
-//
-// `#260 timestamp-hover`. A row's time is the hour and minute; hovering it says the day as well.
-// How a day, a time and an age are worded is web/src/present/time's (`dayLabel`, THE ONE DAY
-// FORMATTER, and its section note); what is left here draws them.
+/** Saying a message's day on the status line: web/src/view/channel's now (`createDayTap`, `#624`). */
+const dayTap = createDayTap({ setStatus: (text) => setStatus(text) });
+const { sayTimeDay, onTimeTap, onTimeKey } = dayTap;
 
-/** Say a time element's full day on the status line: a tap on a phone, Enter on the keys. */
-function sayTimeDay(node) {
-  const at = new Date(String(node.getAttribute("datetime") || ""));
-  if (Number.isNaN(at.getTime())) return;
-  setStatus(fullLocalAt(at));
-}
-
-/**
- * A tap (or click) on a message's time says its full day on the status line: the one press on
- * a phone that says when a message was from, without the details sheet a press-and-hold on
- * the row opens. The press itself is the row's as it always was — at zero collapsed lines the
- * header is all of a row there is to press, and a press there must still open it.
- * `#479 message-time-full-date`.
- *
- * @param {Event} event
- */
-function onTimeTap(event) {
-  const node = /** @type {Element | null} */ (event ? event.target : null);
-  if (!node || typeof node.getAttribute !== "function" || String(node.tagName).toLowerCase() !== "time") return;
-  if (!DAY_TITLED.has(String(node.className))) return;
-  freshenDayTitle(event);
-  sayTimeDay(/** @type {Element} */ (node));
-}
-
-/**
- * Enter or Space on a focused time says its day, as a tap does; every other key is the row's.
- * `#479 message-time-full-date`.
- *
- * @param {KeyboardEvent} event
- */
-function onTimeKey(event) {
-  if (!event || (event.key !== "Enter" && event.key !== " ")) return;
-  const node = /** @type {Element | null} */ (event.target);
-  if (!node || typeof node.getAttribute !== "function" || String(node.tagName).toLowerCase() !== "time") return;
-  if (!DAY_TITLED.has(String(node.className))) return;
-  event.stopPropagation();
-  event.preventDefault();
-  freshenDayTitle(event);
-  sayTimeDay(/** @type {Element} */ (node));
-}
 
 // --- long messages, folded -----------------------------------------------------------------------
 //
@@ -3631,29 +3589,6 @@ const microphoneSettings = mountMicrophoneSettings({
   streamOpen: () => Boolean(voiceCall().session.stream),
 });
 
-// The constraint object handed to getUserMedia.
-//
-// Echo cancellation and noise suppression are already stated explicitly, so a toggle simply
-// supplies the value that was hard-coded.
-//
-// Automatic gain control is the careful one. It is NOT in the constraint object at all by default,
-// so whatever the browser's own default is, is what applies — in practice on, but the spec makes
-// that the implementation's choice, not a promise. Passing `autoGainControl: true` would convert an
-// implicit default into an explicit request, and those are not guaranteed to be the same thing on
-// every browser. So the ON state — the default — says nothing at all, and only the OFF state is
-// stated. With every toggle in its default position this returns the byte-for-byte constraint
-// object the page has always sent.
-function audioConstraints(settings) {
-  const audio = {
-    channelCount: 1,
-    echoCancellation: settings.echoCancellation,
-    noiseSuppression: settings.noiseSuppression,
-  };
-  if (!settings.autoGainControl) {
-    audio.autoGainControl = false;
-  }
-  return { audio };
-}
 
 // --- audio devices: `#619 voice-bluetooth-output` -------------------------------------------------
 //
@@ -3705,7 +3640,7 @@ const callDevices = createCallDevices({
     noteOutput: (label) => audioRoute.noteOutput(label),
   },
   openMicrophone: (constraints) => browserPorts().microphone.open(/** @type {any} */ (constraints)),
-  constraintsFor: (mic) => audioConstraints(mic),
+  constraintsFor: (mic) => audioConstraints(/** @type {any} */ (mic)),
   mediaDevices: () => navigator.mediaDevices,
   preferences: () => audioDevices.preferences(),
   audioContextClass: () => browserPorts().audio.contextClass(),
@@ -4975,25 +4910,14 @@ const { removalRecord, noteRemoved, removedAfterRead, believeCarried, removedUps
 //   * ONLY THE ROW'S FIRST MESSAGE. A combined row (see `glom`) is headed by its first message; the
 //     later ones keep their first lines as written.
 
-/**
- * Show headings in the header, or draw every first line as written, and remember which. The root's
- * attribute is the whole of the switch: nothing else here asks whether it is on.
- */
-function applyRichHeaders(on) {
-  const shown = Boolean(on);
-  messagePreferences.richHeaders.render(shown);
-  try {
-    deviceSettings().keep(DEVICE_SETTINGS.richHeaders, shown);
-  } catch (_error) {
-    // A browser that refuses storage still honours the choice for this session.
-  }
-}
+/** Showing rich headers: web/src/view/channel's now (`createRichHeaders`, `#624`). */
+const richHeaders = createRichHeaders({
+  renderRichHeaders: (shown) => messagePreferences.richHeaders.render(shown),
+  deviceSettings: () => deviceSettings(),
+  richHeadersSetting: DEVICE_SETTINGS.richHeaders,
+});
+const { applyRichHeaders, storedRichHeaders } = richHeaders;
 
-/** What was stored. ABSENT MEANS ON: the default is the behaviour, not merely the initial value. */
-function storedRichHeaders() {
-  // A browser refusing storage reads as on (`DEVICE_SETTINGS.richHeaders.refused`).
-  return deviceSettings().get(DEVICE_SETTINGS.richHeaders);
-}
 
 
 
@@ -5456,7 +5380,7 @@ const channelRows = createChannelRows({
   toggleBookmarkAt,
   copyDeepLink,
   toggleArchived,
-  markNotNoise,
+  markNotNoise: (ids) => markNotNoise(ids),
   swipeable,
   searchable,
   anchorsIn,
@@ -6106,53 +6030,20 @@ const noiseSettings = mountNoiseRules({
   reloadChannel: () => timelineView.loadDiscord({ keepPosition: true, readAs: "mutation" }),
 });
 
-/**
- * How many of the LOADED messages the server calls noise, and out of how many.
- *
- * The rows on screen, or the threaded view's messages — except in the plain to-do list, where the
- * server already left the placeholders out and said how many it left, so that number is the one.
- */
-function noiseTally() {
-  if (!providerFacts.threading() && readModes.hiding()) {
-    return { matched: todoView.state().noise || 0, total: todoView.state().window || 0 };
-  }
-  const loaded = providerFacts.threading()
-    ? timelineRows().messages
-    : [...el("discord-log").children].flatMap(rowMessages);
-  return { matched: loaded.filter(isNoise).length, total: loaded.length };
-}
+/** What the server calls noise, tallied and rescued: web/src/view/channel's now (`createNoiseActs`, `#624`). */
+const noiseActs = createNoiseActs({
+  providerFacts, readModes: () => readModes, todoView: () => todoView,
+  timelineRows: () => timelineRows(), el: (id) => el(id),
+  rowMessages: (row) => rowMessages(/** @type {any} */ (row)),
+  selectedChannelId: () => selectedChannelId(),
+  api: (path, options) => api(path, /** @type {any} */ (options)),
+  channelStore, eachColumn: (act) => eachColumn(act),
+  guardQuietly: (fn) => guardQuietly(fn),
+  refreshAfterInboxChange: () => refreshAfterInboxChange(),
+  setStatus: (text) => setStatus(text),
+});
+const { noiseTally, markNotNoise } = noiseActs;
 
-/**
- * Rescue messages a rule caught by mistake: the server records them as not noise, and every copy
- * of them this page holds is told the same, so the row is ordinary at once rather than after the
- * next read.
- *
- * Not optimistic, unlike Done. Done is undoable and its failure puts back a row the reader can
- * see; a rescue that failed silently would leave him believing a message is safe from a rule that
- * is still hiding it.
- */
-async function markNotNoise(ids) {
-  const channel = selectedChannelId();
-  const rescued = new Set(ids.map(String));
-  if (!channel || rescued.size === 0) return;
-  await api(`/api/v1/channels/${encodeURIComponent(channel)}/not-noise`, {
-    method: "POST",
-    body: { messages: [...rescued] },
-  });
-  /** @type {any[]} */
-  const copies = [...channelStore.current().messages];
-  // Every column's copies: the message's verdict is not one column's. `#229 desktop-two-column`.
-  eachColumn(() => copies.push(...timelineRows().messages, ...[...el("discord-log").children].flatMap(rowMessages)));
-  for (const message of copies) {
-    if (rescued.has(String(message.id))) message.noise = false;
-  }
-  if (providerFacts.threading()) eachColumn(() => guardQuietly(refreshAfterInboxChange)());
-  else await refreshAfterInboxChange();
-  const count = rescued.size;
-  setStatus(
-    `${count} message${count === 1 ? "" : "s"} no longer read automatically — the rule still applies to the others.`
-  );
-}
 
 // Voice Settings own the approval switch, prefix and prompt editors (#624 voice-page-modularity).
 // The session's pending prompt remains call composition; handing it over records the last call in Settings.
@@ -9344,21 +9235,14 @@ screenKeyboardRoom = screenKeyboard;
 // Typing › "Keyboard layout debug" draws them over the top of the page, live, for a screenshot to carry
 // back. Off by default, kept on this device alone.
 
-/** What was stored. ABSENT MEANS OFF. */
-function storedKeyboardDebug() {
-  // A browser refusing storage reads as off (`DEVICE_SETTINGS.keyboardDebug.refused`).
-  return deviceSettings().get(DEVICE_SETTINGS.keyboardDebug);
-}
+/** The keyboard layout debug choice: web/src/view/composer's now (`createKeyboardDebug`, `#624`). */
+const keyboardDebug = createKeyboardDebug({
+  deviceSettings: () => deviceSettings(),
+  keyboardDebugSetting: DEVICE_SETTINGS.keyboardDebug,
+  showKeyboardDebug: (on) => showKeyboardDebug(on),
+});
+const { storedKeyboardDebug, applyKeyboardDebug } = keyboardDebug;
 
-/** The reader's choice, kept on this device. @param {boolean} on */
-function applyKeyboardDebug(on) {
-  try {
-    deviceSettings().keep(DEVICE_SETTINGS.keyboardDebug, on);
-  } catch (_error) {
-    // A browser that refuses storage still draws it for this session.
-  }
-  showKeyboardDebug(on);
-}
 
 // --- what moved a list, kept for the log -------------------------------------------------------------------
 //

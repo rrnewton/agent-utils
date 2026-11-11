@@ -31,3 +31,5 @@ export { mountQuickReplyListeners } from "./quickreply.ts";
 export type { QuickReplyListeners, QuickReplyListenersDependencies } from "./quickreply.ts";
 export { createChannelSend } from "./send.ts";
 export type { ChannelSend, ChannelSendDependencies } from "./send.ts";
+export { createKeyboardDebug } from "./keyboarddebug.ts";
+export type { KeyboardDebug, KeyboardDebugDependencies, KeyboardDebugSettings } from "./keyboarddebug.ts";

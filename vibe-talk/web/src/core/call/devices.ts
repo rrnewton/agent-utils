@@ -54,6 +54,14 @@ export interface CallDevicesDependencies {
   audioContextClass(): { prototype: object } | null | undefined;
 }
 
+
+/** The microphone sound settings a constraints ask reads. */
+export interface MicSoundSettings {
+  echoCancellation: boolean;
+  noiseSuppression: boolean;
+  autoGainControl: boolean;
+}
+
 /** The call devices' questions and commands. */
 export interface CallDevices {
   deviceLabel(device: unknown): string;
@@ -205,4 +213,28 @@ export function createCallDevices(deps: CallDevicesDependencies): CallDevices {
   }
 
   return { deviceLabel, classifyAudioDevice, pickCallInput, outputSinkSupported, openCallMicrophone, applyCallOutput };
+}
+
+// The constraint object handed to getUserMedia.
+//
+// Echo cancellation and noise suppression are already stated explicitly, so a toggle simply
+// supplies the value that was hard-coded.
+//
+// Automatic gain control is the careful one. It is NOT in the constraint object at all by default,
+// so whatever the browser's own default is, is what applies — in practice on, but the spec makes
+// that the implementation's choice, not a promise. Passing `autoGainControl: true` would convert an
+// implicit default into an explicit request, and those are not guaranteed to be the same thing on
+// every browser. So the ON state — the default — says nothing at all, and only the OFF state is
+// stated. With every toggle in its default position this returns the byte-for-byte constraint
+// object the page has always sent.
+export function audioConstraints(settings: MicSoundSettings): { audio: Record<string, unknown> } {
+  const audio: Record<string, unknown> = {
+    channelCount: 1,
+    echoCancellation: settings.echoCancellation,
+    noiseSuppression: settings.noiseSuppression,
+  };
+  if (!settings.autoGainControl) {
+    audio.autoGainControl = false;
+  }
+  return { audio };
 }
