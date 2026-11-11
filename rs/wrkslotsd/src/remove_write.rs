@@ -2278,7 +2278,10 @@ fn prepare_remove(
         })
         .cloned()
         .ok_or_else(|| format!("slot '{slot}' is not active on machine {selected}"))?;
-    let generation = record.get("generation").and_then(Value::as_i64).unwrap_or(0);
+    let generation = record
+        .get("generation")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
     if generation != expected_generation {
         return Err(format!(
             "stale generation for slot {slot}: expected {expected_generation}, current {generation}"
@@ -2302,7 +2305,9 @@ fn prepare_remove(
         if !hold.is_null() {
             return Err(format!(
                 "slot {slot} is held: {}",
-                hold.get("reason").and_then(Value::as_str).unwrap_or_default()
+                hold.get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
             ));
         }
     }
