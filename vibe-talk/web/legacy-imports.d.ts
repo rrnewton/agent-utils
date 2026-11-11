@@ -361,6 +361,7 @@ declare const staleWords: LegacyImports["staleWords"];
 declare const tokenFingerprint: LegacyImports["tokenFingerprint"];
 // view/documents (documents-view-client)
 declare const createDocumentsView: LegacyImports["createDocumentsView"];
+declare const createDiscussView: LegacyImports["createDiscussView"];
 declare const DOC_STATES_KEY: LegacyImports["DOC_STATES_KEY"];
 declare const createViewSelector: LegacyImports["createViewSelector"];
 declare const createTimelineView: LegacyImports["createTimelineView"];

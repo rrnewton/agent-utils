@@ -1,0 +1,163 @@
+/* Discuss (`catchup-side-agent`): the catch-up panel over the channel.
+ *
+ * An overlay in the outline pop-up's dress and values (21-documents.css): outside
+ * #scroll-area, so it never scrolls away, never reflows the list and never resizes
+ * the scroller; its own overflow carries a long answer. A bottom sheet on a phone;
+ * on a desk (wide enough, with a fine pointer) a pop-out at the right. ALWAYS DARK,
+ * in either colour scheme, for the outline pop-up's reason: it reads as an overlay,
+ * a step away from the window under it. */
+
+#discuss-panel {
+  position: absolute;
+  left: calc(8px + env(safe-area-inset-left));
+  right: calc(8px + env(safe-area-inset-right));
+  bottom: 8px;
+  max-height: 70vh;
+  overflow-y: auto;
+  padding: 10px;
+  border: 1px solid #3d4452;
+  border-radius: 8px;
+  background: #1f232b;
+  color: #e7e9ee;
+  box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 35%);
+  z-index: var(--z-modal);
+}
+
+body:has(#control-bar[data-placement="top"]) #discuss-panel {
+  top: calc(4.5rem + env(safe-area-inset-top));
+  bottom: auto;
+}
+
+#discuss-panel[hidden] {
+  display: none;
+}
+
+@media (min-width: 900px) and (pointer: fine) {
+  #discuss-panel {
+    left: auto;
+    width: min(24rem, calc(100vw - 16px));
+    max-height: calc(100vh - 6rem);
+  }
+}
+
+.discuss-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.discuss-title {
+  margin: 0;
+  font-size: 1rem;
+}
+
+#discuss-close {
+  margin-left: auto;
+  padding: 4px 8px;
+  cursor: pointer;
+  background: #262c36;
+  color: #e7e9ee;
+  border: 1px solid #3d4452;
+  border-radius: 6px;
+  font: inherit;
+}
+
+#discuss-scope {
+  margin: 2px 0 0;
+  color: #aab2c0;
+  font-size: 0.85rem;
+}
+
+#discuss-status {
+  margin: 8px 0 0;
+  color: #aab2c0;
+  font-size: 0.85rem;
+}
+
+/* The model's words, as text: newlines kept, nothing of markup's. */
+#discuss-answer {
+  margin-top: 8px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+#discuss-covers {
+  margin: 12px 0 4px;
+  font-size: 0.9rem;
+}
+
+#discuss-links {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.discuss-link {
+  display: block;
+  width: 100%;
+  padding: 6px 8px;
+  text-align: left;
+  cursor: pointer;
+  background: #262c36;
+  color: #e7e9ee;
+  border: 1px solid #3d4452;
+  border-radius: 6px;
+  font: inherit;
+}
+
+.discuss-link:hover {
+  background: #2b323e;
+}
+
+.discuss-link:focus-visible,
+#discuss-close:focus-visible,
+#discuss-mark-read:focus-visible,
+#discuss-mark-unread:focus-visible,
+#discuss-retry:focus-visible {
+  outline: 2px solid #7ab3e3;
+  outline-offset: 1px;
+}
+
+.discuss-marks {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+#discuss-mark-read,
+#discuss-mark-unread,
+#discuss-retry {
+  padding: 6px 10px;
+  cursor: pointer;
+  background: #262c36;
+  color: #e7e9ee;
+  border: 1px solid #3d4452;
+  border-radius: 6px;
+  font: inherit;
+}
+
+#discuss-mark-read[disabled],
+#discuss-mark-unread[disabled] {
+  opacity: 0.55;
+  cursor: default;
+}
+
+#discuss-unmarkable {
+  margin: 6px 0 0;
+  color: #aab2c0;
+  font-size: 0.8rem;
+}
+
+#discuss-retry {
+  margin-top: 8px;
+}
+
+/* The stamp's debug line: small and muted, under everything it describes. */
+#discuss-stamp {
+  margin: 10px 0 0;
+  color: #aab2c0;
+  font-size: 0.75rem;
+}

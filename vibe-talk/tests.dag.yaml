@@ -1171,6 +1171,22 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # Discuss (`catchup-side-agent`, slice 1): the panel opens, reads, marks and jumps.
+  - group: check
+    job: discuss-browser
+    desc: the Discuss panel opened, read, marked and jumped from, against the real server (fake chat upstream, contract-shaped catchup answer at the network edge) in current Chromium at 393x852 and 1280x800
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
+    cmd: cd vibe-talk && python3 tests/discuss_browser.py
+    jobs_flag: ""
+    deps: [build.release, setup.contract-tools]
+    timeout: 480
+    cpu_timeout: 120
+    hint:
+      resources: {browser: 1}
+      est_duration_s: 60
+      classification: latency-bound
+      rss_baseline_bytes: 1073741824
+
   # `#1176 doc-kind-buckets`: one item of each kind in the Documents view.
   - group: check
     job: documents-buckets-browser

@@ -68,6 +68,9 @@ export const PACK_VIEWS: Record<string, string[]> = {
   // this control in the same breath as asking for the tray, and the arithmetic is why one had to
   // precede the other.
   "read-new": ["voice"],
+  // `catchup-side-agent`. Discuss summarizes the channel or thread on screen, so it
+  // belongs on the channel view and nowhere else.
+  "discuss-open": ["discord"],
 };
 
 /** Make the control bar from the page's screens, menus and search. */

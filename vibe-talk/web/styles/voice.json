@@ -22,6 +22,7 @@
     "voice/18-control-bar.css",
     "voice/19-control-pane.css",
     "voice/20-desktop-regime.css",
-    "voice/21-documents.css"
+    "voice/21-documents.css",
+    "voice/22-discuss.css"
   ]
 }

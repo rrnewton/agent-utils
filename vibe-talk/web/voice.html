@@ -385,6 +385,32 @@
             <ul id="doc-outline"></ul>
           </div>
 
+          <!-- Discuss (`catchup-side-agent`): the catch-up panel. A sibling of
+               #doc-outline-pop and outside #scroll-area for its reasons: it floats
+               over the channel, scrolls itself, and never resizes the list. The
+               skeleton is static; web/src/view/catchup fills the scope, status,
+               answer, footer and stamp as text. -->
+          <div id="discuss-panel" role="dialog" aria-label="Discuss" hidden>
+            <div class="discuss-head">
+              <h2 class="discuss-title">Discuss</h2>
+              <button id="discuss-close" type="button">Close</button>
+            </div>
+            <p id="discuss-scope"></p>
+            <p id="discuss-status" role="status"></p>
+            <div id="discuss-answer"></div>
+            <div id="discuss-footer" hidden>
+              <p id="discuss-covers"></p>
+              <ul id="discuss-links"></ul>
+              <div class="discuss-marks">
+                <button id="discuss-mark-read" type="button">Mark read</button>
+                <button id="discuss-mark-unread" type="button">Mark unread</button>
+              </div>
+              <p id="discuss-unmarkable" hidden></p>
+            </div>
+            <button id="discuss-retry" type="button" hidden>Retry</button>
+            <p id="discuss-stamp" hidden></p>
+          </div>
+
           <!--
             THE one scrolling element on the page.
 
@@ -4137,6 +4163,13 @@
                 <path class="wave wave-far" d="M17.75 7a7.5 7.5 0 0 1 0 10" />
               </svg>
               <span id="read-new-label" class="mini-label">Gist</span>
+            </button>
+
+            <!-- Discuss (`catchup-side-agent`): a catch-up over the channel or the
+                 thread on screen, drawn by web/src/view/catchup into #discuss-panel.
+                 On the channel view only (PACK_VIEWS), where its subject is. -->
+            <button id="discuss-open" class="bar-button" type="button" aria-haspopup="dialog" aria-controls="discuss-panel" aria-expanded="false" title="Catch up on this channel or thread" hidden>
+              <span class="mini-label">Discuss</span>
             </button>
           </div>
 

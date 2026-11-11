@@ -1012,6 +1012,36 @@ const documentsView = createDocumentsView({
   },
 });
 
+// --- discuss (`catchup-side-agent`) -------------------------------------------------------------
+//
+// The Discuss panel: a one-shot catch-up over the channel or thread on screen, in
+// web/src/view/catchup. The page's whole share is this construction, tracking its
+// controls with the boot, and `sync()` from `showView`; its scope, request and
+// drawing are the view's. The Done acts it marks through are made below and read
+// only inside these thunks, as the Documents view's are.
+
+/** The mounted Discuss view. */
+const discussView = createDiscussView({
+  byId: (id) => el(id),
+  api: (path, options) => api(path, options),
+  // No direct LLM summarizer, no Discuss: the summaries capability the boot
+  // already holds (`summaries_unavailable`, via summaryRows) until the server's
+  // `discuss_available` client-config field lands and this reads that instead.
+  discussAvailable: () => summaryRows.disabledByServer() === "",
+  selectedChannelId: () => String(selectedChannelId() ?? ""),
+  selection: () => selection(),
+  serviceName: (channel) => chatServiceOf(channel),
+  channelLabel: (id) => channelLabel(id),
+  onJump: (ref) => {
+    discussView.close();
+    void shellNavigation.jumpToMessageLink(ref);
+  },
+  dismissMessages: (body) => dismissMessages(body),
+  restoreMessages: (ids) => restoreMessages(ids),
+  showError: (text) => showError(text),
+  setStatus: (text) => setStatus(text),
+});
+
 /** The three-way selector over `#view-switch`; its press is `pressViewSwitch`. */
 const documentsSelector = createViewSelector({
   byId: (id) => el(id),
@@ -1972,6 +2002,7 @@ function showView(name) {
       ? "Showing the documents. Press to show the call."
       : "Showing the call. Press to show the channel.";
   documentsSelector.sync();
+  discussView.sync();
   // Both panes share ONE scroll container, so a switch swaps the content out from under a
   // scrollTop that belonged to the other pane. On a FIRST entry, landing on the newest message is
   // right and landing at the top is badly wrong: arriving at the top of a long channel means
@@ -8402,6 +8433,9 @@ application.track(mountChannelViewControls({
   selectThread: () => guardQuietly(onThreadSelect)(),
   refreshThreadDirectory: () => guardQuietly(refreshThreadDirectory)(),
 }));
+// Discuss (`catchup-side-agent`): the bar's button and its panel's controls, in
+// web/src/view/catchup, tracked here in the page's order.
+application.track(discussView.mountControls());
 // The channel's box, and a thread's, which is the same box posting somewhere else: what is written kept as it is
 // written, Send, its keys, and what is pasted (web/src/view/composer/boxlisteners.ts).
 application.track(mountMessageBox({
