@@ -315,3 +315,48 @@ test("`#624 voice-page-modularity`: the call's box and the canned prompts are re
   composer.unmount();
   assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
 });
+
+test("`#1251 scroll-single-owner`: the transcript follows while its footing note stands, until the reader scrolls away", () => {
+  const { createVoiceTranscript } = VIEW_VOICE;
+  const follows = [];
+  let atFoot = true;
+  const label = { className: "seam-label", textContent: "", childNodes: [], children: [] };
+  const chip = { className: "seam-recap", textContent: "", childNodes: [], children: [] };
+  const summary = { className: "seam-summary", childNodes: [label, chip], children: [label, chip], setAttribute: () => {}, insertBefore: () => {} };
+  const detail = { className: "seam-detail", textContent: "", childNodes: [], children: [], parentNode: null };
+  const recapDetail = { className: "seam-recap-detail", textContent: "", childNodes: [], children: [], parentNode: null };
+  const details = { className: "", childNodes: [summary, detail, recapDetail], children: [summary, detail, recapDetail] };
+  detail.parentNode = details;
+  recapDetail.parentNode = details;
+  const seamRow = {
+    className: "seam", childNodes: [details], children: [details],
+    getAttribute: (name) => (name === "data-ends" ? "c1" : name === "data-cause" ? "hangup" : null),
+    getBoundingClientRect: () => ({ height: 20 }),
+  };
+  const list = { children: [seamRow] };
+  const area = { scrollHeight: 1000, scrollTop: 300, clientHeight: 660 };
+  const generic = { hidden: true, textContent: "", childNodes: [], children: [], setAttribute: () => {}, getAttribute: () => null, style: { setProperty: () => {} } };
+  const deps = new Proxy({}, {
+    get(_target, key) {
+      if (key === "session") return {};
+      if (key === "leftEl") return (id) => (id === "scroll-area" ? area : list);
+      if (key === "el") return () => generic;
+      if (key === "atBottom") return () => atFoot;
+      if (key === "followIfPinned") return (pinned) => follows.push(pinned);
+      return () => undefined;
+    },
+  });
+  const transcript = createVoiceTranscript(deps);
+  const recap = { state: "sent", words: 11, lines: 2, dropped: 0, transport: "replay_frame" };
+  transcript.noteCallRecap(recap);
+  assert.deepStrictEqual(follows, [true], "a reader at the foot was not followed, noting the footing");
+  // A growth the instantaneous measure would lose (the reader now stands past the slack,
+  // never having scrolled): the note still follows.
+  atFoot = false;
+  transcript.noteCallRecap(recap);
+  assert.deepStrictEqual(follows, [true, true], "an unfollowed growth cleared the transcript's footing");
+  // The reader scrolls away: the note is cleared and later growths are not followed.
+  area.scrollTop = 100;
+  transcript.noteCallRecap(recap);
+  assert.deepStrictEqual(follows, [true, true, false], "a reader who scrolled away was still followed");
+});

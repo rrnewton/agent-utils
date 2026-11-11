@@ -122,6 +122,37 @@ import { unsayableDraft } from "../../present/call/index.ts";
 
 export function createVoiceTranscript<Column extends object>(deps: VoiceTranscriptDependencies<Column>) {
 
+// `#1251 scroll-single-owner`: the transcript's follow state, noted from the reader's own
+// place as the listkeepers note Main's. Each instantaneous `atBottom` measure alone loses
+// the reader after one unfollowed growth (a seam's detail landing, a chip wrapping): the
+// gap passes the slack once, and every later measure reads false though the reader never
+// scrolled away. The note stands from the last time the reader was at the foot, and is
+// cleared only when their scroll has dropped below where following left it — the owner's
+// own writes take the scroll to the foot or hold it, never below the noted place.
+let footing = false;
+let footingTop = 0;
+
+/** Whether this act follows the foot, and the note kept up to date by the answer. */
+function pinnedHere(area: HTMLElement): boolean {
+  if (deps.atBottom(area)) {
+    footing = true;
+    footingTop = area.scrollTop;
+    return true;
+  }
+  if (footing && area.scrollTop >= footingTop - 1) return true;
+  footing = false;
+  return false;
+}
+
+/** Follow as `pinnedHere` decided, and note where the follow left the reader. */
+function followHere(area: HTMLElement, pinned: boolean, unseen?: number, view?: string): void {
+  deps.followIfPinned(pinned, unseen, view);
+  if (pinned) {
+    footing = true;
+    footingTop = area.scrollTop;
+  }
+}
+
 
 // Recording is FIRE-AND-FORGET, and a failure is retried, never latched.
 //
@@ -191,14 +222,15 @@ function turnNode(who: string, text: string, atMs?: number | undefined) {
 /** One turn, at the end of the transcript — where everything said in the LIVE call goes. */
 function line(who: string, text: string, atMs?: number | undefined) {
   // Measured BEFORE the append: appending is what changes the answer.
-  const pinned = deps.atBottom(deps.el("scroll-area"));
+  const area = deps.el("scroll-area");
+  const pinned = pinnedHere(area);
   const li = turnNode(who, text, atMs);
   deps.el("transcript").append(li);
   deps.renderEmptyState();
   // A row arriving into a filtered list is filtered too. Without this, a live turn spoken while
   // the reader is searching lands on screen among the matches whether or not it is one.
   deps.applySearch();
-  deps.followIfPinned(pinned, 1);
+  followHere(area, pinned, 1);
   return li;
 }
 
@@ -265,13 +297,14 @@ function transcriptSeam(label: string, detail: string, into: HTMLElement[] | nul
     return li;
   }
   // Measured before the append and not before the build: building one attaches nothing.
-  const pinned = deps.atBottom(deps.el("scroll-area"));
+  const area = deps.el("scroll-area");
+  const pinned = pinnedHere(area);
   deps.el("transcript").append(li);
   deps.renderEmptyState();
   // A seam explains the rows beside it, so while a filter is on it goes away with them. It
   // declares nothing to `searchable`, which is exactly how `applySearch` knows that.
   deps.applySearch();
-  deps.followIfPinned(pinned);
+  followHere(area, pinned);
   return li;
 }
 
@@ -475,9 +508,10 @@ function fillBoundary(li: Element, boundary: {word: string, chip: string | null,
 
 /** {@link fillBoundary} on a seam in the live list, which may wrap at 360: followed only by a reader at the newest line. */
 function setSeamRecap(li: Element, boundary: Boundary) {
-  const pinned = deps.atBottom(deps.leftEl("scroll-area"));
+  const area = deps.leftEl("scroll-area");
+  const pinned = pinnedHere(area);
   fillBoundary(li, boundary);
-  deps.followIfPinned(pinned);
+  followHere(area, pinned);
 }
 
 
@@ -569,7 +603,8 @@ function renderCallRecap() {
   const line = deps.el("call-recap");
   const said = deps.session.socket && deps.session.recap ? callRecapLine(deps.session.recap, deps.session.recapAck) : "";
   if (line.textContent === said && line.hidden === !said) return;
-  const pinned = deps.atBottom(deps.leftEl("scroll-area"));
+  const area = deps.leftEl("scroll-area");
+  const pinned = pinnedHere(area);
   line.textContent = said;
   line.hidden = !said;
   if (said) {
@@ -580,7 +615,7 @@ function renderCallRecap() {
   // `#352 voice-reconnect-on-bridge-error`. Whether the session now running is one a reconnect opened.
   if (said && deps.session.recap!.reconnected) line.setAttribute("data-reconnected", "");
   else line.removeAttribute("data-reconnected");
-  deps.followIfPinned(pinned);
+  followHere(area, pinned);
 }
 
 
@@ -2475,7 +2510,8 @@ function placeSentCard(turn: StoredTurn, conversationId: string | null) {
  */
 function placeInConversation(li: HTMLElement, conversationId: string | null, turns: number = 0) {
   const list = deps.leftEl("transcript");
-  const pinned = deps.atBottom(deps.leftEl("scroll-area"));
+  const area = deps.leftEl("scroll-area");
+  const pinned = pinnedHere(area);
   const boundary = conversationId
     ? [...list.children].reverse().find((row) => row.getAttribute("data-ends") === conversationId)
     : undefined;
@@ -2483,7 +2519,7 @@ function placeInConversation(li: HTMLElement, conversationId: string | null, tur
   else list.append(li);
   deps.renderEmptyState();
   deps.applySearch();
-  deps.followIfPinned(pinned, turns);
+  followHere(area, pinned, turns);
   return li;
 }
 
@@ -3883,10 +3919,11 @@ function releaseYesHold(hold: YesHold | null, kept: boolean = false) {
   hold.timer = null;
   const li = hold.li;
   if (!li || !li.hasAttribute("data-absorbed")) return;
-  const pinned = deps.atBottom(deps.el("scroll-area"));
+  const area = deps.el("scroll-area");
+  const pinned = pinnedHere(area);
   li.removeAttribute("data-absorbed");
   deps.applySearch();
-  deps.followIfPinned(pinned);
+  followHere(area, pinned);
 }
 
 
