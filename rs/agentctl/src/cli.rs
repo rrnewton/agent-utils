@@ -581,9 +581,9 @@ enum ServicesCommand {
 
 #[derive(Args)]
 struct ServicesTurnoverNotify {
-    /// Agent to send the formatted turnover message to (default: coordinator)
-    #[arg(long, value_name = "NAME", default_value = "coordinator")]
-    to: String,
+    /// Agent to send the formatted turnover message to (default: the designated coordinator of the registry TURNOVER_REGISTRY names — its restore.json coordinator, else its coordinator.json name, else coordinator — resolved in that registry)
+    #[arg(long, value_name = "NAME")]
+    to: Option<String>,
     /// Sender identity for the send (default: turnover-timer, the designed timer identity)
     #[arg(long, value_name = "NAME", default_value = "turnover-timer")]
     agent: String,
@@ -3238,7 +3238,7 @@ fn run_services(registry: &Path, value: Services) -> Result<i32, Failure> {
     let registry = absolute(registry)?;
     match value.command {
         ServicesCommand::TurnoverNotify(notify) => {
-            crate::services::turnover::run_turnover_notify(&notify.to, &notify.agent)
+            crate::services::turnover::run_turnover_notify(notify.to.as_deref(), &notify.agent)
                 .map_err(failed)
         }
         ServicesCommand::Userguide => {

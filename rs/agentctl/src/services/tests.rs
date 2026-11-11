@@ -15,8 +15,8 @@ use super::host::{Host, UnitState};
 use super::refresh::{definition, refresh, RefreshOptions, DROP_IN};
 use super::snapshot::{self, Snapshot};
 use super::turnover::{
-    move_global_binary, notify_message, scheduled_outcome, turnover, warn_agent_behind_bridge,
-    ScheduledOutcome, TurnoverOptions, TIMER_NOTIFY_AGENT,
+    move_global_binary, notify_message, notify_recipient, scheduled_outcome, turnover,
+    warn_agent_behind_bridge, ScheduledOutcome, TurnoverOptions, TIMER_NOTIFY_AGENT,
 };
 use super::unit::{quote_word, shell_words, split_words, ExecCommand, UnitText};
 
@@ -1412,6 +1412,34 @@ fn turnover_scheduled_outcomes_map_every_exit_code() {
         message,
         format!("turnover unit-done: registry /r/.agentctl, unit bridge.service, {OLD} -> {NEW}, verdict refreshed\n")
     );
+}
+
+#[test]
+fn turnover_notify_routes_to_each_registry_designated_coordinator() {
+    // #1220 (b): TURNOVER_REGISTRY's own coordinator gets its reports —
+    // restore.json wins, coordinator.json is the fallback, an explicit
+    // recipient beats both, and nothing is written into the registry.
+    let world = world();
+    let base = &world._temporary.0;
+    let ours = base.join("ours/.agentctl");
+    fs::create_dir_all(&ours).unwrap();
+    fs::write(
+        ours.join("restore.json"),
+        r#"{"coordinator": "coordinator"}"#,
+    )
+    .unwrap();
+    fs::write(ours.join("coordinator.json"), r#"{"name": "coordinator"}"#).unwrap();
+    assert_eq!(notify_recipient(Some(&ours), None), "coordinator");
+    let other = base.join("other-a/.agentctl");
+    fs::create_dir_all(&other).unwrap();
+    fs::write(other.join("coordinator.json"), r#"{"name": "coord-b"}"#).unwrap();
+    assert_eq!(notify_recipient(Some(&other), None), "coord-b");
+    let third = base.join("other-b/.agentctl");
+    fs::create_dir_all(&third).unwrap();
+    fs::write(third.join("restore.json"), r#"{"coordinator": "coord-c"}"#).unwrap();
+    assert_eq!(notify_recipient(Some(&third), None), "coord-c");
+    assert_eq!(notify_recipient(Some(&third), Some("owner")), "owner");
+    assert_eq!(notify_recipient(None, None), "coordinator");
 }
 
 #[test]

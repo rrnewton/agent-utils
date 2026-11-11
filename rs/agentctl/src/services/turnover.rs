@@ -111,22 +111,57 @@ pub fn notify_message(get: impl Fn(&str) -> Option<String>) -> String {
     )
 }
 
+/// Who a registry's turnover reports go to (#1220): an explicit recipient
+/// wins, else that registry's designated coordinator — its restore.json
+/// `coordinator`, else the name in its coordinator.json — else
+/// `coordinator`. Each registry's phases route to its own coordinator, so
+/// no team needs a file written into its registry.
+#[must_use]
+pub fn notify_recipient(registry: Option<&Path>, explicit: Option<&str>) -> String {
+    if let Some(to) = explicit.filter(|to| !to.is_empty()) {
+        return to.to_owned();
+    }
+    let designated = registry.and_then(|registry| {
+        let from_restore = fs::read(registry.join("restore.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|document| document["coordinator"].as_str().map(str::to_owned));
+        from_restore.or_else(|| {
+            fs::read(registry.join("coordinator.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|document| document["name"].as_str().map(str::to_owned))
+        })
+    });
+    designated.unwrap_or_else(|| "coordinator".to_owned())
+}
+
 /// Run as the timer's `--notify` command (`services turnover-notify`):
-/// format the TURNOVER_* environment into a file and send it with
-/// `agentctl send TO --file FILE` under the timer notify identity.
-/// Returns the send's exit code.
-pub fn run_turnover_notify(to: &str, agent: &str) -> Result<i32, String> {
+/// format the TURNOVER_* environment into a file and send it under the
+/// timer notify identity to the coordinator of the registry
+/// TURNOVER_REGISTRY names (see [`notify_recipient`]), resolved in that
+/// registry. Returns the send's exit code.
+pub fn run_turnover_notify(to: Option<&str>, agent: &str) -> Result<i32, String> {
     let message = notify_message(|name| std::env::var(name).ok());
+    let registry = std::env::var("TURNOVER_REGISTRY")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let recipient = notify_recipient(registry.as_deref(), to);
     let file = std::env::temp_dir().join(format!(
         "agentctl-turnover-notify-{}.txt",
         std::process::id()
     ));
     write_private(&file, message.as_bytes(), 0o600)?;
     let agentctl = std::env::current_exe().map_err(|error| error.to_string())?;
-    let status = std::process::Command::new(&agentctl)
-        .env("AGENTCTL_AGENT", agent)
+    let mut command = std::process::Command::new(&agentctl);
+    command.env("AGENTCTL_AGENT", agent);
+    if let Some(registry) = &registry {
+        command.arg("--registry").arg(registry);
+    }
+    let status = command
         .arg("send")
-        .arg(to)
+        .arg(&recipient)
         .arg("--file")
         .arg(&file)
         .status()

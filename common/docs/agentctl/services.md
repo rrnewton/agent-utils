@@ -304,7 +304,12 @@ move, or errors or unknowns) are failures, and a failure sends a
 `run-failed` phase through the notify command. Use
 `agentctl services turnover-notify` as that command: it formats the
 TURNOVER_* environment (phase, registry, unit, both commits, verdict)
-into a file and sends it to the coordinator under the timer identity.
+into a file and sends it under the timer identity to the coordinator
+of the registry each phase names: the wrapper reads TURNOVER_REGISTRY,
+takes that registry's designated coordinator (its restore.json
+`coordinator`, else the name in its coordinator.json, else
+`coordinator`) and resolves the send in that registry, so every team's
+phases reach its own coordinator with no file in its registry.
 Other-daemon rows are report-only even when their binary reports no
 commit, so a report where every agentctl service is current exits 0 or
 74. A legacy bridge run as `chat run --state DIR` is discovered as a
@@ -331,7 +336,12 @@ move, or errors or unknowns) are failures, and a failure sends a
 `run-failed` phase through the notify command. Use
 `agentctl services turnover-notify` as that command: it formats the
 TURNOVER_* environment (phase, registry, unit, both commits, verdict)
-into a file and sends it to the coordinator under the timer identity.
+into a file and sends it under the timer identity to the coordinator
+of the registry each phase names: the wrapper reads TURNOVER_REGISTRY,
+takes that registry's designated coordinator (its restore.json
+`coordinator`, else the name in its coordinator.json, else
+`coordinator`) and resolves the send in that registry, so every team's
+phases reach its own coordinator with no file in its registry.
 Other-daemon rows are report-only even when their binary reports no
 commit, so a report where every agentctl service is current exits 0 or
 74. A legacy bridge run as `chat run --state DIR` is discovered as a
