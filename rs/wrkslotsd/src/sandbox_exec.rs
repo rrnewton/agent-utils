@@ -138,6 +138,99 @@ pub(crate) fn placement(slot_type: &str, slot: &str, cgroup_text: Option<&str>) 
     }
 }
 
+/// Which `run` options were given alongside `--place-only`,
+/// mirroring the flags Python `_cmd_run`/`_place_only` check.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PlaceOnlyGiven {
+    pub(crate) command: bool,
+    pub(crate) print_only: bool,
+    pub(crate) cwd: bool,
+    pub(crate) in_scope: bool,
+    pub(crate) expect_slices: bool,
+    pub(crate) expect_writable: bool,
+    pub(crate) git_config_policy: bool,
+    pub(crate) expect_masks: bool,
+    pub(crate) closed_set: bool,
+}
+
+fn run_refusal(message: &str) -> (i32, String, String) {
+    (
+        3,
+        String::new(),
+        format!(
+            "REFUSED: {message}\nREMEDY: run 'wrkslots run --help', correct the named condition, then rerun 'wrkslots run' with the required arguments\n"
+        ),
+    )
+}
+
+/// `wrkslots run --place-only` (#1304): apply the slot's slice
+/// limits through the runner and print the placement, running
+/// nothing. Mirrors Python `_cmd_run`'s place-only branch and
+/// `_place_only`: placement is derived once from the injected
+/// cgroup text and limits are applied to exactly those names.
+pub(crate) fn run_place_only(
+    runner: &impl PrivilegedRunner,
+    slot_type: &str,
+    slot: &str,
+    limits: &SandboxLimits,
+    cgroup_text: Option<&str>,
+    format_json: bool,
+    given: &PlaceOnlyGiven,
+) -> (i32, String, String) {
+    for (option, is_given) in [
+        ("--in-scope", given.in_scope),
+        ("--expect-slices", given.expect_slices),
+        ("--expect-writable", given.expect_writable),
+        ("--git-config-policy", given.git_config_policy),
+        ("--expect-masks", given.expect_masks),
+        ("--closed-set", given.closed_set),
+    ] {
+        if is_given {
+            return run_refusal(&format!("--place-only runs nothing and takes no {option}"));
+        }
+    }
+    for (option, is_given) in [
+        ("COMMAND", given.command),
+        ("--print", given.print_only),
+        ("--cwd", given.cwd),
+    ] {
+        if is_given {
+            return run_refusal(&format!("--place-only runs nothing and takes no {option}"));
+        }
+    }
+    let place = placement(slot_type, slot, cgroup_text);
+    let parent = place.enclosing.as_deref().unwrap_or("");
+    let plan = slice_application_plan(limits, slot_type, slot, Some(parent), None);
+    let applied = match run_slice_plan(runner, &plan) {
+        Ok(applied) => applied,
+        Err(message) => return run_refusal(&message),
+    };
+    let mut stderr = String::new();
+    for line in &applied {
+        stderr.push_str(&format!("wrkslots run: limits {line}\n"));
+    }
+    let stdout = if format_json {
+        let enclosing = match &place.enclosing {
+            Some(name) => serde_json::to_string(name).unwrap_or_default(),
+            None => "null".to_string(),
+        };
+        format!(
+            "{{\"all_slots\": {}, \"enclosing\": {}, \"slot\": {}}}\n",
+            serde_json::to_string(&place.all_slots).unwrap_or_default(),
+            enclosing,
+            serde_json::to_string(&place.slot).unwrap_or_default(),
+        )
+    } else {
+        format!(
+            "enclosing: {}\nall_slots: {}\nslot: {}\n",
+            place.enclosing.as_deref().unwrap_or("-"),
+            place.all_slots,
+            place.slot,
+        )
+    };
+    (0, stdout, stderr)
+}
+
 /// The default transient scope unit for one launch, mirroring
 /// Python `run`'s `wrkslots-{kind}-{slot}-{pid}.scope`.
 pub(crate) fn scope_unit_name(kind: &str, slot: &str, pid: u32) -> String {
@@ -530,5 +623,199 @@ sys.stdout.write(f"{rc}\n{out.getvalue()}---STDERR---\n{err.getvalue()}")
             "{stderr}"
         );
         std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    const PLACE_ONLY_DRIVER: &str = r####"import argparse, io, os, subprocess, sys
+from contextlib import redirect_stdout, redirect_stderr
+from pathlib import Path
+sys.path.insert(0, os.environ["WRKSLOTS_PY_ROOT"])
+from wrkslots import cli, imagecmd, sandbox
+
+case = sys.argv[1]
+real_run = subprocess.run
+def fake_run(argv, **kwargs):
+    if argv[0] == "systemctl":
+        if case == "failing" and "set-property" in argv:
+            return subprocess.CompletedProcess(argv, 1, "", "denied\n")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    return real_run(argv, **kwargs)
+subprocess.run = fake_run
+sandbox.parent_slice = lambda cgroup_file=None: ("s.slice" if case.startswith("enclosing") else None)
+view = sandbox.SlotView(slot="slot-a", slot_type="agent", slot_path=Path("/slots/slot-a"), state_directory=Path("/state/slot-a"), git_directories=(), control_directory=Path("/control"), representation="worktree")
+limits_obj = {} if case == "default-limits" else {"memory_max": "32G", "all_slots_cpu_quota": "1600%"}
+settings = sandbox.SandboxSettings(limits=sandbox.limits_from_obj(limits_obj))
+args = argparse.Namespace(command=["/bin/true"] if case == "with-command" else [], print_only=(case == "with-print"), cwd=("/tmp" if case == "with-cwd" else None))
+fmt = "json" if case.endswith("json") else "human"
+out, err = io.StringIO(), io.StringIO()
+try:
+    with redirect_stdout(out), redirect_stderr(err):
+        rc = imagecmd._place_only(args, view, settings, None, fmt)
+except sandbox.SandboxError as exc:
+    exc = cli.Refusal(str(exc))
+    remedy = cli._refusal_remedy(argparse.Namespace(command="run"), exc)
+    sys.stdout.write(f"3\n{out.getvalue()}---STDERR---\nREFUSED: {exc}\nREMEDY: {remedy}\n")
+    sys.exit(0)
+except cli.Refusal as exc:
+    remedy = cli._refusal_remedy(argparse.Namespace(command="run"), exc)
+    sys.stdout.write(f"3\n{out.getvalue()}---STDERR---\nREFUSED: {exc}\nREMEDY: {remedy}\n")
+    sys.exit(0)
+sys.stdout.write(f"{rc}\n{out.getvalue()}---STDERR---\n{err.getvalue()}")
+"####;
+
+    /// Oracle differential (#1304): Python `_place_only` with a
+    /// stubbed parent slice and systemctl vs `run_place_only`
+    /// through a recording fake, byte for byte.
+    #[test]
+    fn place_only_matches_python_oracle() {
+        struct Fake {
+            fail_set: bool,
+        }
+        impl PrivilegedRunner for Fake {
+            fn run(&self, spec: &CommandSpec) -> Result<RunOutcome, String> {
+                let failing = self.fail_set && spec.argv.iter().any(|a| a == "set-property");
+                Ok(RunOutcome {
+                    returncode: if failing { 1 } else { 0 },
+                    stdout: String::new(),
+                    stderr: if failing {
+                        "denied\n".to_string()
+                    } else {
+                        String::new()
+                    },
+                })
+            }
+        }
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("repo root")
+            .to_path_buf();
+        let dir = std::env::temp_dir().join(format!("wrkslotsd-place-only-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let driver_path = dir.join("place_only_driver.py");
+        std::fs::write(&driver_path, PLACE_ONLY_DRIVER).expect("driver");
+        let no_enclosing = "0::/user.slice/user@1000.service/app.scope\n";
+        let enclosing = "0::/user.slice/user@1000.service/s.slice/app.scope\n";
+        let explicit = limits_from_obj(&json!({
+            "memory_max": "32G",
+            "all_slots_cpu_quota": "1600%"
+        }))
+        .expect("limits");
+        let defaults = limits_from_obj(&json!({})).expect("default limits");
+        let clean = PlaceOnlyGiven::default();
+        for (case, cgroup, format_json, given, use_defaults, fail_set) in [
+            ("plain", no_enclosing, false, clean, false, false),
+            ("plain-json", no_enclosing, true, clean, false, false),
+            ("enclosing", enclosing, false, clean, false, false),
+            ("enclosing-json", enclosing, true, clean, false, false),
+            ("default-limits", no_enclosing, false, clean, true, false),
+            (
+                "with-command",
+                no_enclosing,
+                false,
+                PlaceOnlyGiven {
+                    command: true,
+                    ..clean
+                },
+                false,
+                false,
+            ),
+            (
+                "with-print",
+                no_enclosing,
+                false,
+                PlaceOnlyGiven {
+                    print_only: true,
+                    ..clean
+                },
+                false,
+                false,
+            ),
+            (
+                "with-cwd",
+                no_enclosing,
+                false,
+                PlaceOnlyGiven { cwd: true, ..clean },
+                false,
+                false,
+            ),
+            ("failing", no_enclosing, false, clean, false, true),
+        ] {
+            let output = std::process::Command::new("python3")
+                .arg(&driver_path)
+                .arg(case)
+                .env("WRKSLOTS_PY_ROOT", repo.join("py"))
+                .output()
+                .expect("python oracle runs");
+            assert!(output.status.success(), "case {case}: {:?}", output.stderr);
+            let text = String::from_utf8(output.stdout).expect("utf8");
+            let (head, rest) = text.split_once('\n').expect("exit line");
+            let (stdout, stderr) = rest.split_once("---STDERR---\n").expect("marker");
+            let outcome = run_place_only(
+                &Fake { fail_set },
+                "agent",
+                "slot-a",
+                if use_defaults { &defaults } else { &explicit },
+                Some(cgroup),
+                format_json,
+                &given,
+            );
+            assert_eq!(
+                outcome,
+                (
+                    head.trim().parse::<i32>().expect("exit"),
+                    stdout.to_string(),
+                    stderr.to_string()
+                ),
+                "case {case}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn place_only_refuses_cmd_run_option_combinations() {
+        struct Fake;
+        impl PrivilegedRunner for Fake {
+            fn run(&self, _spec: &CommandSpec) -> Result<RunOutcome, String> {
+                Ok(RunOutcome {
+                    returncode: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let limits = limits_from_obj(&json!({})).expect("limits");
+        for (given, option) in [
+            (
+                PlaceOnlyGiven {
+                    in_scope: true,
+                    ..Default::default()
+                },
+                "--in-scope",
+            ),
+            (
+                PlaceOnlyGiven {
+                    expect_slices: true,
+                    ..Default::default()
+                },
+                "--expect-slices",
+            ),
+            (
+                PlaceOnlyGiven {
+                    closed_set: true,
+                    ..Default::default()
+                },
+                "--closed-set",
+            ),
+        ] {
+            let (exit, stdout, stderr) =
+                run_place_only(&Fake, "agent", "slot-a", &limits, None, false, &given);
+            assert_eq!(exit, 3);
+            assert!(stdout.is_empty());
+            assert!(
+                stderr.contains(&format!("--place-only runs nothing and takes no {option}")),
+                "{stderr}"
+            );
+        }
     }
 }
