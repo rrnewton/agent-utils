@@ -121,12 +121,17 @@ pub fn could_not_run_busy(log_text: &str) -> bool {
 
 /// Whether a refusal's output names the host credential pacing guard: a
 /// git call was refused (or throttled into giving up) because logins are
-/// paced per host (`GH-PACED REFUSED` / `GH-PACED WARNING` on stderr,
-/// exit 75). The adapter that prints those lines is authoritative about
-/// its refusal cause (#1241 paced-edges). Shared-budget contention, not
-/// a host defect: transient, never a host fault (see `donor.rs`).
+/// paced per host (`GH-PACED REFUSED` on stderr, exit 75). A
+/// `GH-PACED WARNING` counts only on a run that actually refused (it
+/// carries `COULD_NOT_RUN`): a warning alone means a credential lookup
+/// waited and then SUCCEEDED, which is not a pacing failure and must
+/// never fault the host (#1294). The adapter that prints those lines is
+/// authoritative about its refusal cause (#1241 paced-edges).
+/// Shared-budget contention, not a host defect: transient, never a host
+/// fault (see `donor.rs`).
 pub fn gh_paced_refusal(log_text: &str) -> bool {
-    log_text.contains("GH-PACED REFUSED") || log_text.contains("GH-PACED WARNING")
+    log_text.contains("GH-PACED REFUSED")
+        || (log_text.contains("GH-PACED WARNING") && log_text.contains("COULD_NOT_RUN"))
 }
 
 /// The line of a refusal's log that names why it refused — its cause, in
@@ -2202,6 +2207,12 @@ mod unit {
         // adapter is authoritative about its refusal cause.
         assert!(gh_paced_refusal(
             "GH-PACED WARNING: throttled, slot in 10 s\nCOULD_NOT_RUN"
+        ));
+        // #1294 donor-probe-pacing-bound: a WARNING that then SUCCEEDED
+        // (the credential lookup waited about 9 s and proceeded) is not a
+        // pacing failure: no refusal, no COULD_NOT_RUN, exit 0.
+        assert!(!gh_paced_refusal(
+            "GH-PACED WARNING: credential lookup waited 9 s\nprobe: ready"
         ));
         assert!(!gh_paced_refusal("COULD_NOT_RUN: slots full"));
         assert!(!gh_paced_refusal(""));

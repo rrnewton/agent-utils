@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -3254,7 +3255,10 @@ fn write_host_pause(work: &Path, pause: &HostPause) {
 /// cannot resume probing (malformed, or a legacy `{reason, since}` file
 /// with no validator snapshot), so the caller can log it loudly instead of
 /// silently deadlocking against the queue-side host fault.
-fn restored_host_pause(work: &Path) -> Result<Option<HostPause>, String> {
+fn restored_host_pause(
+    work: &Path,
+    live: Option<&ValidatorConfig>,
+) -> Result<Option<HostPause>, String> {
     let path = work.join("host-pause.json");
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
@@ -3284,6 +3288,16 @@ fn restored_host_pause(work: &Path) -> Result<Option<HostPause>, String> {
             "{} has a validator snapshot with no kind; cannot resume probing from it",
             path.display()
         ));
+    }
+    // #1294: a snapshot written before #1271 has no probe bound; fall
+    // back to the live config's bound rather than the code default.
+    let mut validator = validator;
+    if validator.probe_timeout_secs == 0 {
+        if let Some(live) = live {
+            if live.probe_timeout_secs != 0 {
+                validator.probe_timeout_secs = live.probe_timeout_secs;
+            }
+        }
     }
     let delay_secs = value["delay_secs"]
         .as_u64()
@@ -3322,8 +3336,11 @@ impl Worker<'_> {
                 return true;
             }
             let lock_wait = output.contains(ENTRY_LOCK_WAIT_MARKER);
-            let paced =
-                crate::validate::gh_paced_refusal(&output) || output.contains("GH-PACED WARNING");
+            // #1294: only a real pacing failure counts (a REFUSED line,
+            // or a WARNING on a run that actually refused); a WARNING
+            // that then succeeded never reaches here, as a passing
+            // probe returns above.
+            let paced = crate::validate::gh_paced_refusal(&output);
             if attempt == PROBE_LOCK_WAIT_ATTEMPTS || !(lock_wait || paced) {
                 return false;
             }
@@ -3364,11 +3381,21 @@ impl Worker<'_> {
             .env("MQ_RESULTS", &results)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::from(output_file))
-            .stderr(std::process::Stdio::from(stderr_file));
+            .stderr(std::process::Stdio::from(stderr_file))
+            // Its own process group, so a timeout kills and reaps
+            // everything it started (#1294).
+            .process_group(0);
         let Ok(mut child) = command.spawn() else {
             return (false, String::new());
         };
-        let bound = cfg.probe_timeout();
+        // #1294: a snapshot without a bound falls back to the live
+        // config (the last validator this donor ran), not the default.
+        let live = self
+            .last_validator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let bound = cfg.probe_timeout_with_live(live.as_ref());
         let started = std::time::Instant::now();
         let mut killed = false;
         let passed = loop {
@@ -3378,7 +3405,9 @@ impl Worker<'_> {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 _ => {
-                    let _ = child.kill();
+                    // Kill the whole group and reap the child: no
+                    // zombies under the donor (#1294).
+                    crate::bounded::kill_group(&mut child);
                     killed = true;
                     break false;
                 }
@@ -4115,7 +4144,7 @@ pub fn run_donor(options: &DonorOptions) -> Result<i32, String> {
     // A previous process may have paused on a host fault: restore that
     // pause (due to probe at once) or the queue-side fault would refuse
     // every claim and no probe would ever clear it.
-    let restored_pause = match restored_host_pause(&options.work) {
+    let restored_pause = match restored_host_pause(&options.work, None) {
         Ok(Some(pause)) => {
             eprintln!(
                 "merge-queue donor {}: restoring host pause from {} ({}; paused since {}); probing",
@@ -4883,6 +4912,128 @@ mod unit {
     }
 
     #[test]
+    fn a_warning_then_success_probe_is_no_pacing_failure() {
+        // #1294 donor-probe-pacing-bound: the probe prints a GH-PACED
+        // WARNING (a credential lookup waited about 9 s) and then
+        // SUCCEEDS (exit 0). That is not a pacing failure: the probe
+        // passes on the first attempt, with no in-probe pacing retry
+        // and no fault (the caller faults only on a false return).
+        let work = temp("probe-warning-success");
+        let count = work.join("count");
+        let run = format!(
+            "n=$(cat {} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {}; \
+             echo 'GH-PACED WARNING: credential lookup waited 9 s'; exit 0",
+            count.display(),
+            count.display()
+        );
+        let (options, route) = probe_worker(&work);
+        let worker = Worker {
+            options: &options,
+            route: &route,
+            host: "h1".to_owned(),
+            slots: Mutex::new(vec![0]),
+            host_pause: Mutex::new(None),
+            probe_passed: AtomicBool::new(false),
+            next_host_delay: Mutex::new(std::time::Duration::from_secs(60)),
+            last_validator: Mutex::new(None),
+            next_fault_probe: Mutex::new(std::time::Instant::now()),
+            fault_probe_current: Mutex::new(std::time::Duration::from_secs(60)),
+            paced_refusals: Mutex::new(0),
+        };
+        assert!(worker.probe_host_validator(&probe_cfg(run)));
+        assert_eq!(
+            std::fs::read_to_string(&count).unwrap().trim(),
+            "1",
+            "a warning-then-success probe runs once, with no pacing retry"
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_snapshot_without_a_probe_bound_uses_the_live_config_value() {
+        // #1294 donor-probe-pacing-bound: a pause snapshot written
+        // before #1271 has no probe_timeout_secs key. Restored with a
+        // live config that sets 180 s, the probe bound is the live
+        // value, not the 60 s code default.
+        let work = temp("host-pause-live-bound");
+        std::fs::write(
+            work.join("host-pause.json"),
+            r#"{"reason":"wedged","since":"2026-11-10T20:40:05Z","validator":{"kind":"command","run":"exit 0"},"delay_secs":30}"#,
+        )
+        .unwrap();
+        let mut live = probe_cfg("exit 0".to_owned());
+        live.probe_timeout_secs = 180;
+        let restored = restored_host_pause(&work, Some(&live))
+            .unwrap()
+            .expect("a persisted pause must restore");
+        assert_eq!(
+            restored.validator.probe_timeout(),
+            std::time::Duration::from_secs(180)
+        );
+        // With no live config the code default still applies.
+        let restored = restored_host_pause(&work, None)
+            .unwrap()
+            .expect("a persisted pause must restore");
+        assert_eq!(
+            restored.validator.probe_timeout(),
+            std::time::Duration::from_secs(crate::state::DEFAULT_PROBE_TIMEOUT_SECS)
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn a_killed_probe_leaves_no_zombie_children() {
+        // #1294 donor-probe-pacing-bound: a probe killed at its bound
+        // is reaped (child and process group waited on). Count zombie
+        // children via /proc; never timing.
+        let work = temp("probe-reap");
+        let (options, route) = probe_worker(&work);
+        let worker = Worker {
+            options: &options,
+            route: &route,
+            host: "h1".to_owned(),
+            slots: Mutex::new(vec![0]),
+            host_pause: Mutex::new(None),
+            probe_passed: AtomicBool::new(false),
+            next_host_delay: Mutex::new(std::time::Duration::from_secs(60)),
+            last_validator: Mutex::new(None),
+            next_fault_probe: Mutex::new(std::time::Instant::now()),
+            fault_probe_current: Mutex::new(std::time::Duration::from_secs(60)),
+            paced_refusals: Mutex::new(0),
+        };
+        let mut cfg = probe_cfg("sleep 30".to_owned());
+        cfg.probe_timeout_secs = 1;
+        let (passed, output) = worker.probe_once(&cfg);
+        assert!(!passed);
+        assert!(output.contains("probe killed at the 1 s bound"), "{output}");
+        assert_eq!(zombie_children(), 0, "a killed probe must be reaped");
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Zombie (`Z` state) children of this process, counted via /proc.
+    fn zombie_children() -> usize {
+        let me = std::process::id().to_string();
+        let mut zombies = 0;
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return 0;
+        };
+        for entry in entries.flatten() {
+            let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            // stat: pid (comm) state ppid ...; comm may hold spaces.
+            let Some(close) = stat.rfind(')') else {
+                continue;
+            };
+            let fields: Vec<&str> = stat[close + 2..].split_whitespace().collect();
+            if fields.len() >= 2 && fields[0] == "Z" && fields[1] == me {
+                zombies += 1;
+            }
+        }
+        zombies
+    }
+
+    #[test]
     fn a_probe_slower_than_the_default_bound_passes_with_a_raised_one() {
         // #1271 probe-timeout-bound: the probe needs 2 s; killed at a 1 s
         // bound (named as a timeout), it passes with the bound raised.
@@ -5330,7 +5481,7 @@ mod unit {
     #[test]
     fn a_persisted_host_pause_restores_its_validator_for_a_restart() {
         let work = temp("host-pause-restore");
-        assert!(restored_host_pause(&work).unwrap().is_none());
+        assert!(restored_host_pause(&work, None).unwrap().is_none());
         let pause = HostPause {
             reason: "wedged".to_owned(),
             since: "2026-11-05T20:40:05Z".to_owned(),
@@ -5344,7 +5495,7 @@ mod unit {
         assert_eq!(written["validator"]["kind"], "command");
         assert_eq!(written["validator"]["run"], "exit 0");
         assert_eq!(written["delay_secs"], 120);
-        let restored = restored_host_pause(&work)
+        let restored = restored_host_pause(&work, None)
             .unwrap()
             .expect("a persisted pause must restore");
         assert_eq!(restored.reason, "wedged");
@@ -5365,7 +5516,7 @@ mod unit {
             r#"{"reason":"wedged","since":"2026-11-05T20:40:05Z"}"#,
         )
         .unwrap();
-        let error = match restored_host_pause(&work) {
+        let error = match restored_host_pause(&work, None) {
             Ok(_) => panic!("a legacy pause must not restore"),
             Err(error) => error,
         };
@@ -5373,7 +5524,7 @@ mod unit {
         assert!(error.contains("cannot resume probing"), "{error}");
 
         std::fs::write(work.join("host-pause.json"), "not json").unwrap();
-        let error = match restored_host_pause(&work) {
+        let error = match restored_host_pause(&work, None) {
             Ok(_) => panic!("a malformed pause must not restore"),
             Err(error) => error,
         };

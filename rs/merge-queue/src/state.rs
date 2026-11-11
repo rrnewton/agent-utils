@@ -676,6 +676,20 @@ impl ValidatorConfig {
         })
     }
 
+    /// Probe bound with a live-config fallback (#1294): a snapshot
+    /// written before `probe_timeout_secs` existed carries 0 here; the
+    /// live config's bound then applies instead of the code default.
+    /// A bound this config sets itself always wins.
+    pub fn probe_timeout_with_live(&self, live: Option<&ValidatorConfig>) -> std::time::Duration {
+        if self.probe_timeout_secs != 0 {
+            return self.probe_timeout();
+        }
+        match live {
+            Some(live) if live.probe_timeout_secs != 0 => live.probe_timeout(),
+            _ => self.probe_timeout(),
+        }
+    }
+
     /// Resolved wall limit of a suspect-flake rerun.
     pub fn suspect_flake_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(if self.suspect_flake_timeout_secs == 0 {
