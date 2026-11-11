@@ -19,6 +19,23 @@ GATE = Path(__file__).resolve().parents[2] / "scripts" / "gate.py"
 PY = sys.executable
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_gate_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """No host gate config may change a test result: every per-host file
+    gate.py reads (interleave, slots, phase priority, blackout) points at
+    a test-owned path that does not exist, and the interleave env hook is
+    cleared. Tests that exercise a config set their own path or value
+    after this fixture. The 2026-11-11 failure: the host's
+    gate-interleave.toml held a temporary after_owners = 99, and the
+    in-process interleave test read it and saw no interleave."""
+    monkeypatch.setenv("GATE_INTERLEAVE_CONFIG", str(tmp_path / "hostless-gate-interleave.toml"))
+    monkeypatch.setenv("GATE_SLOTS_CONFIG", str(tmp_path / "hostless-gate-slots.toml"))
+    monkeypatch.setenv("GATE_SLOTS", "2")
+    monkeypatch.setenv("GATE_PHASE_PRIORITY_CONFIG", str(tmp_path / "hostless-gate-phase-priority.toml"))
+    monkeypatch.setenv("GATE_BLACKOUT_CONFIG", str(tmp_path / "hostless-gate.toml"))
+    monkeypatch.delenv("GATE_INTERLEAVE_AFTER", raising=False)
+
+
 def _env(tmp_path: Path) -> dict[str, str]:
     base = {key: value for key, value in os.environ.items()
             if key not in ("GATE_PHASE_PRIORITY", "GATE_PRIORITY", "GATE_PRIORITY_REASON",
@@ -28,6 +45,7 @@ def _env(tmp_path: Path) -> dict[str, str]:
             "GATE_SLOTS_CONFIG": str(tmp_path / "gate-slots.toml"),
             "GATE_INTERLEAVE_CONFIG": str(tmp_path / "gate-interleave.toml"),
             "GATE_PHASE_PRIORITY_CONFIG": str(tmp_path / "gate-phase-priority.toml"),
+            "GATE_BLACKOUT_CONFIG": str(tmp_path / "gate.toml"),
             # A lane may run the suite under GATE_SLOTS=1; the tests assume the default.
             "GATE_SLOTS": "2",
             # The real preflight runs validation steps; these tests give it a stand-in.
