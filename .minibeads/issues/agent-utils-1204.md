@@ -4,7 +4,7 @@ status: open
 priority: 1
 issue_type: task
 created_at: 2026-11-10T12:41:39.328513866+00:00
-updated_at: 2026-11-10T12:52:06.282677897+00:00
+updated_at: 2026-11-10T14:18:02.452029495+00:00
 ---
 
 # Description
@@ -22,3 +22,5 @@ Phase 1: design recorded in this issue (or linked ai_docs report) covering slot 
 # Notes
 
 Phase 2 answers (2026-11-10, mu-eden). 1 Daemons: one shared daemon holds 8.3 GB private (19.5 GB resident) for 3 checkouts, with one root-owned privhelper. A per-slot config dir therefore costs roughly one extra daemon plus privhelper per Eden slot (GBs, tens of seconds startup); Phase 2 fakes assume this and the real trial must measure it. The cap of 3 still holds because create counts checkouts, not daemons, and refuses at 3. 2 Cap discovery: enumerate config dirs from running edenfs processes (their --edenDir argument in /proc/*/cmdline), plus the edenDirectory from eden config and every wrkslots Eden slot config dir, run eden list per dir, dedupe by mount path; any dir that cannot be queried refuses creation (fail closed). 3 Size: 256 GiB bounds mount-visible writes plus overlay and buck-out inside the subvolume; a real build is expected to fit, but at the qgroup limit writes fail with quota errors and the FUSE checkout wedges until space is freed, so remove and audit must report quota exhaustion explicitly and never hang on the mount. 4 Remove: uncommitted Sapling work is preserved as a patch plus a bundle of the draft stack in the salvage archive with read-back verification, like git bundles; salvage failure refuses removal.
+
+Owner input 2026-11-10 (reply 297) is folded into the design (DESIGN.md, Owner input section): cap becomes config eden_host_cap aiming for about 10 once metadata is isolated (Eden documented limit 10, guard 75/85 percent), Buck daemons pool by concurrency (max 2, per-root isolation, kill after build) with RE cache shared. Sized daemon measurement plan included; nothing measured yet. The Phase 2 code slice still hardcodes cap 3 and must be updated to the config value in the next slice.

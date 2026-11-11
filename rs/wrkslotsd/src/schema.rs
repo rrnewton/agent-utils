@@ -441,7 +441,9 @@ fn validate_checkouts(value: &Value, parent: &str) -> Result<Vec<Checkout>, Obse
                 )));
             }
             if !containing.is_empty() {
-                return Err(invalid(format!("{label} Eden rows name no containing refs")));
+                return Err(invalid(format!(
+                    "{label} Eden rows name no containing refs"
+                )));
             }
             result.push(Checkout {
                 name,
