@@ -19,6 +19,12 @@ under the keys. The rules this walk pins, as the owner settled them that day:
   * Mouse movement or hover never scrolls anything: resting on a thread card or its root in two
     columns draws its link and moves neither column (the dwell glide is gone).
 
+The verdict is that drawn state, waited for (`#1250 vibe-talk-timing-robust`): after an arrival, a
+resize or a row grown late, the walk waits for the composer's drawn place and the list's foot gap
+themselves (30 s failure bounds) instead of reading them after a fixed quiet that a hot host can
+outrun, and `Reader.quiet` here means the first row observed unchanged across frames. The hover
+rests stay dwells — outwaiting the old glide is their point, and a loaded host only lengthens them.
+
 The keyboard is simulated as Chrome on Android lays it out (the viewport 336px shorter), as in
 tests/keyboard_hides_bar_browser.py; the late growth is a row at the foot given 180px more height
 after it lands, as an image or embed settling does, with no redraw to correct it. The fake API and
@@ -34,6 +40,7 @@ import argparse
 import os
 import tempfile
 import threading
+import time
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -48,6 +55,23 @@ if TYPE_CHECKING:
 
 KEYBOARD_PX = 336
 SIZES = (("phone-412", 412, 915, True), ("phone-360", 360, 800, True), ("desk-1280", 1280, 800, False))
+# The most a walk waits for a drawn state it expects (#998 STATE_S precedent): passes take as long
+# as the page does; this only bounds a failure.
+STATE_S = 30.0
+
+
+class TypingReader(Reader):
+    """Reader with state waits instead of fixed quiets (scroll_stability's Reader is not edited).
+
+    `quiet` waits for the first row to be observed unchanged across frames (Reader.settled), and
+    every wait_for takes the STATE_S failure bound, whatever smaller bound a call site names.
+    """
+
+    def wait_for(self, condition: str, why: str, seconds: float = STATE_S) -> None:
+        super().wait_for(condition, why, max(seconds, STATE_S))
+
+    def quiet(self, settle_ms: int = 400) -> None:
+        self.settled(seconds=STATE_S)
 
 PLACE_JS = """() => {
     const area = document.getElementById('scroll-area');
@@ -118,7 +142,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
             errors: list[str] = []
             page.on("pageerror", lambda error: errors.append(str(error)))
             page.add_init_script(READS_JS)
-            reader = Reader(page, api, args.screenshots, label, touch)
+            reader = TypingReader(page, api, args.screenshots, label, touch)
             reader.width, reader.height = width, height  # type: ignore[attr-defined]
             page.goto(f"http://127.0.0.1:{server.server_port}/", wait_until="load")
             open_main(reader)
@@ -164,6 +188,34 @@ def whole_composer(reader: Reader, found: Json, when: str) -> None:
                  f"{when}: the composer is not whole on screen: {found}")
 
 
+def is_whole(found: Json) -> bool:
+    return (found["box"] is not None and number(found, "box", "top") >= -1
+            and number(found, "box", "bottom") <= number(found, "viewport") + 1
+            and found["composer"] is not None and number(found, "composer", "top") >= -1)
+
+
+def place_whole(reader: Reader, when: str) -> Json:
+    """The composer's drawn place once it is whole on screen, waited for to STATE_S."""
+    deadline = time.monotonic() + STATE_S
+    found = place(reader)
+    while time.monotonic() < deadline and not is_whole(found):
+        reader.page.wait_for_timeout(25)
+        found = place(reader)
+    whole_composer(reader, found, when)
+    return found
+
+
+def wait_gap(reader: Reader, at_most: float, why: str) -> Json:
+    """The list's drawn place once its foot gap is at most `at_most` px, waited for to STATE_S."""
+    deadline = time.monotonic() + STATE_S
+    found = place(reader)
+    while time.monotonic() < deadline and number(found, "gap") > at_most:
+        reader.page.wait_for_timeout(25)
+        found = place(reader)
+    reader.check(number(found, "gap") <= at_most, f"{why}: {found}")
+    return found
+
+
 def keyboard(reader: Reader, height: int, why: str) -> Json:
     """The viewport at `height`, as the keyboard (or its strip) resizes it, and the page once settled."""
     reader.page.set_viewport_size({"width": reader.width, "height": height})  # type: ignore[attr-defined]
@@ -207,27 +259,24 @@ def foot_walk(reader: Reader) -> None:
     rest_gap = number(found, "gap")
     page.keyboard.type("a long reply being typed while the channel moves ", delay=20)
     arrive(reader, "An agent message arriving while the owner types at the foot.")
-    found = place(reader)
-    reader.check(number(found, "gap") <= rest_gap + 17, f"an arrival while typing left the reader above the foot: {found}")
+    found = wait_gap(reader, rest_gap + 17, "an arrival while typing left the reader above the foot")
     whole_composer(reader, found, "an arrival while typing")
     page.keyboard.type("and more words ", delay=20)
-    found = keyboard(reader, up - 48, "the keyboard's strip did not grow")
-    whole_composer(reader, found, "the strip grown while typing")
+    keyboard(reader, up - 48, "the keyboard's strip did not grow")
+    place_whole(reader, "the strip grown while typing")
     page.keyboard.type("still typing ", delay=20)
-    found = keyboard(reader, up, "the keyboard's strip did not shrink back")
-    whole_composer(reader, found, "the strip shrunk while typing")
+    keyboard(reader, up, "the keyboard's strip did not shrink back")
+    found = place_whole(reader, "the strip shrunk while typing")
     reader.check(number(found, "gap") <= rest_gap + 17, f"the strip's comings and goings left the reader above the foot: {found}")
     grow_last_row(reader)
-    found = place(reader)
-    reader.check(number(found, "gap") <= rest_gap + 17,
-                 f"a row grown late at the foot sank the composer and stopped the following (gap {number(found, 'gap'):.0f}px): {found}")
+    found = wait_gap(reader, rest_gap + 17,
+                     "a row grown late at the foot sank the composer and stopped the following")
     whole_composer(reader, found, "a row grown late while typing")
     page.keyboard.type("x", delay=20)
     reader.quiet(500)
-    whole_composer(reader, place(reader), "the key after the growth")
+    place_whole(reader, "the key after the growth")
     arrive(reader, "An arrival after the late growth, while typing at the foot.")
-    found = place(reader)
-    reader.check(number(found, "gap") <= rest_gap + 17, f"the arrival after the growth was not followed: {found}")
+    wait_gap(reader, rest_gap + 17, "the arrival after the growth was not followed")
     reader.notes.append("typing at the foot: arrivals, strip resizes and a row grown 180px late all followed, "
                         "the whole composer on screen throughout")
 
@@ -254,7 +303,7 @@ def reading_walk(reader: Reader) -> None:
     reader.still(anchor, "the keyboard shrunk while reading scrollback")
     page.keyboard.type("resuming the draft from scrollback ", delay=20)
     reader.quiet(600)
-    whole_composer(reader, place(reader), "typing resumed from scrollback")
+    place_whole(reader, "typing resumed from scrollback")
     found = keyboard(reader, reader.height, "the keyboard did not go down")  # type: ignore[attr-defined]
     reader.check(found["box"] is not None, f"the box went with the keyboard: {found}")
     reader.notes.append("reading scrollback mid-draft: arrivals and strip resizes held the anchor; typing "
@@ -269,12 +318,10 @@ def desk_walk(reader: Reader) -> None:
     page.click("#channel-compose-text")
     page.keyboard.type("a desktop draft being typed at the foot ", delay=15)
     arrive(reader, "A desktop arrival while typing at the foot.")
-    found = place(reader)
-    reader.check(number(found, "gap") <= 25, f"a desktop arrival while typing left the foot: {found}")
+    found = wait_gap(reader, 25, "a desktop arrival while typing left the foot")
     whole_composer(reader, found, "a desktop arrival while typing")
     grow_last_row(reader)
-    found = place(reader)
-    reader.check(number(found, "gap") <= 25, f"a row grown late sank the desktop composer: {found}")
+    found = wait_gap(reader, 25, "a row grown late sank the desktop composer")
     whole_composer(reader, found, "a row grown late on the desktop")
     page.evaluate("() => document.getElementById('scroll-area').focus({preventScroll: true})")
     reader.scroll_main(0.45)
@@ -316,6 +363,10 @@ def selection_walk(reader: Reader) -> None:
     reader.quiet(600)
     page.evaluate("() => document.getElementById('channel-view-main').click()")
     reader.quiet(900)
+    # The landing rebuilding the rows can land after the first row settles; wait for a selection
+    # itself, to the same failure bound, before judging that it survived.
+    reader.wait_for("() => { const sel = window.getSelection(); return !!sel && !sel.isCollapsed && sel.rangeCount > 0; }",
+                    "the landing cleared the reader's selection")
     after = page.evaluate("""() => {
         const sel = window.getSelection();
         if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
@@ -339,6 +390,17 @@ def hover_walk(reader: Reader) -> None:
     reader.scroll_main(0.5)
     page.evaluate("() => { const a = document.getElementById('side-scroll'); a.scrollTop = (a.scrollHeight - a.clientHeight) * 0.3; }")
     reader.quiet(500)
+    # Both columns observed still across further frames before the rests are judged against them:
+    # a capture taken mid-settle would blame the hover for the settling scroll.
+    _deadline = time.monotonic() + STATE_S
+    _last: tuple[float, float] | None = None
+    while time.monotonic() < _deadline:
+        _now = page.evaluate(TOPS_JS)
+        _pair = (float(_now["main"]), float(_now["side"]))
+        if _pair == _last:
+            break
+        _last = _pair
+        reader.frames(2)
 
     def tops() -> tuple[float, float]:
         found = page.evaluate(TOPS_JS)

@@ -2228,10 +2228,13 @@ steps:
       classification: latency-bound
       rss_baseline_bytes: 1073741824
 
+  # `#1144 scrollback-typing-jump`: typing at the foot is followed, reading scrollback holds, and
+  # hover scrolls neither column. Steps wait for the drawn place itself (`#1250
+  # vibe-talk-timing-robust`); the hover rests stay dwells past the old glide's wait by design.
   - group: check
     job: typing-scroll-browser
     desc: typing at the foot keeps the whole composer in view across arrivals, keyboard resizes and late row growth, reading scrollback holds, and hover scrolls neither column, in current Chromium at 412x915, 360x800 and 1280x800
-    labels: [validation-vibe-talk, validation-vibe-talk-page, disabled-optin]
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/typing_scroll_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
