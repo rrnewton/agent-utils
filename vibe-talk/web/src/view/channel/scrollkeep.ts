@@ -139,6 +139,8 @@ export interface ScrollKeeping {
 /** Keeping the reader in the page's lists. */
 export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeeping {
   const el = deps.el;
+  /** Owner holds currently being applied; a redraw inside one is held by the outer hold. */
+  let holdDepth = 0;
 
   function visibleList(): HTMLElement {
     return el(deps.currentView() === "discord"
@@ -182,7 +184,12 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     // put back on the rebuilt row after (`#1209 selection-survives-updates`).
     const area = el("scroll-area");
     const selection = deps.selectionIn ? deps.selectionIn(area) : null;
-    mutate();
+    holdDepth += 1;
+    try {
+      mutate();
+    } finally {
+      holdDepth -= 1;
+    }
     restoreScroll(mark);
     if (selection && deps.restoreSelectionIn) deps.restoreSelectionIn(area, selection);
   }
@@ -290,13 +297,20 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
   }
 
   function holdingRows(mutate: () => void): void {
+    if (holdDepth > 0) {
+      mutate();
+      return;
+    }
     const mark = captureScroll();
     const area = el("scroll-area");
     const selection = deps.selectionIn ? deps.selectionIn(area) : null;
-    mutate();
-    if (mark.pinned) {
-      deps.scrollToNewest();
-    } else if (mark.anchor && mark.anchor.parentNode) {
+    holdDepth += 1;
+    try {
+      mutate();
+    } finally {
+      holdDepth -= 1;
+    }
+    if (mark.anchor && mark.anchor.parentNode) {
       const shown = shownRowFor(mark.anchor);
       const held = shown !== mark.anchor ? shown as Element : mark.anchor;
       area.scrollTop += held.getBoundingClientRect().top - mark.top;
