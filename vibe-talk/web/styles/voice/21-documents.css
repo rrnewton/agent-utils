@@ -352,10 +352,33 @@
   gap: 8px;
   padding: 8px 0;
 }
-.docs-toolbar h2 {
+/* Title over kind (`#1327 doc-reader-kind-header`): the block takes the
+   bar's spare width and may shrink (min-width 0), so Back, the star and
+   Read keep their own room on a phone whatever the title says; a long
+   title or repository wraps inside the block instead of pushing the
+   controls off the screen. */
+.doc-title-block {
   flex: 1;
+  min-width: 0;
+}
+.docs-toolbar h2 {
   margin: 0;
   font-size: 1.05em;
+  overflow-wrap: anywhere;
+}
+#docs-reader .docs-toolbar > button {
+  flex: none;
+}
+/* What the open document is, under its title: quieter than the title, in
+   the card meta line's dress (smaller, dimmed). */
+#doc-kind {
+  margin: 2px 0 0;
+  font-size: 0.8em;
+  opacity: 0.8;
+  overflow-wrap: anywhere;
+}
+#doc-kind[hidden] {
+  display: none;
 }
 
 /* In Documents the floating search glass would sit on the top card's fetch
@@ -400,6 +423,27 @@
 #doc-body h5,
 #doc-body h6 {
   margin: 1.2em 0 0.6em;
+}
+/* Heading sizes (`#1328 doc-heading-size`): a document's scale, as the code
+   host sizes the same headings — not the message column's, whose `.md`
+   scale (11-message-text.css: 1.25/1.16/1.08em) is sized for chat. Without
+   sizes of its own the reader's h1 fell to the shell's global 1.1rem
+   (style.css), under its own h2. The weight and line-height are the
+   message headings' own, so a heading reads the same in either place. */
+#doc-body h1,
+#doc-body h2,
+#doc-body h3 {
+  font-weight: 650;
+  line-height: 1.25;
+}
+#doc-body h1 {
+  font-size: 1.8em;
+}
+#doc-body h2 {
+  font-size: 1.5em;
+}
+#doc-body h3 {
+  font-size: 1.3em;
 }
 #doc-body > :first-child {
   margin-top: 0;

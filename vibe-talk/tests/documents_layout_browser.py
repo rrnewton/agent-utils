@@ -8,7 +8,10 @@ bounded and centred on the desk and full-width on the phone, the
 reading-width grip has no box over the text and no point over the column
 hits it, table body rows alternate grounds, `h1`/`h2` carry a bottom rule,
 the list keeps its air around it with dense items, and the hamburger menu
-offers no "Expand all" in this view. Back in the channel, where the seeded
+offers no "Expand all" in this view. The header bar names the document's
+kind (`#1327 doc-reader-kind-header`) — a paste here — with title, kind and
+controls all in the phone's width, and `h1`-`h3` stand in size order clear
+of the body text (`#1328 doc-heading-size`). Back in the channel, where the seeded
 long message folds, the grip and the item are offered again. No documents
 API is stubbed: list, fetch and render all go through the server under test.
 
@@ -53,6 +56,7 @@ DOC_BODY = (
     "# Layout report\n\nThe **nightly** run finished green.\n\n"
     + _LAYOUT_LIST + "\n" + _LAYOUT_TABLE
     + "\n## Details\n\nThe detail under the second heading.\n"
+    + "\n### Detail notes\n\nThe notes under the third heading.\n"
 )
 # A channel message well past the fold: in the channel it gives "Expand all"
 # work to do, which is what makes its absence from the menu in the Documents
@@ -102,6 +106,8 @@ def check_reader_layout(page: Page, *, desktop: bool) -> None:
             return s.borderBottomStyle !== 'none'
               && parseFloat(s.borderBottomWidth) > 0;
           };
+          const size = (el) => parseFloat(getComputedStyle(el).fontSize);
+          const kind = document.getElementById('doc-kind');
           return {
             bodyLeft: r.left, bodyRight: r.right, bodyWidth: r.width,
             areaLeft: a.left, areaClientWidth: area.clientWidth,
@@ -116,6 +122,12 @@ def check_reader_layout(page: Page, *, desktop: bool) -> None:
               getComputedStyle(body.querySelector('ul')).marginTop),
             itemMarginTop: parseFloat(
               getComputedStyle(body.querySelector('li')).marginTop),
+            h1Size: size(body.querySelector('h1')),
+            h2Size: size(body.querySelector('h2')),
+            h3Size: size(body.querySelector('h3')),
+            pSize: size(body.querySelector('p')),
+            kindText: kind === null ? null : kind.textContent,
+            kindHidden: kind === null ? null : kind.hidden,
           };
         }""")
     if desktop:
@@ -143,6 +155,62 @@ def check_reader_layout(page: Page, *, desktop: bool) -> None:
           "h1/h2 carry no bottom rule in the reader")
     check(layout["listMarginTop"] >= 8 and layout["itemMarginTop"] <= 6,
           f"the list's air is not around it with dense items: {layout}")
+    # The header bar names the document's kind (`#1327 doc-reader-kind-header`):
+    # the seeded document is a paste, at either size.
+    check(layout["kindText"] == "Paste" and layout["kindHidden"] is False,
+          f"the header does not name the document's kind: {layout}")
+    # Reader headings stand clear of the body text (`#1328 doc-heading-size`):
+    # strictly in order, each above its floor over the paragraph size.
+    check(layout["h1Size"] > layout["h2Size"] > layout["h3Size"] > layout["pSize"],
+          f"reader headings are not in size order: {layout}")
+    check(layout["h1Size"] >= 1.7 * layout["pSize"]
+          and layout["h2Size"] >= 1.4 * layout["pSize"]
+          and layout["h3Size"] >= 1.2 * layout["pSize"],
+          f"reader headings do not stand clear of the body text: {layout}")
+
+
+def check_header_fit(page: Page) -> None:
+    """The reader's header bar on the phone (`#1327 doc-reader-kind-header`).
+
+    Title, kind and every control keep their own room inside 393px: nothing
+    spills past the screen, the page does not grow sideways, and each
+    control's centre still hits the control itself.
+    """
+    fit = page.evaluate(
+        """() => {
+          const box = (el) => {
+            const r = el.getBoundingClientRect();
+            const hit = document.elementFromPoint(
+              r.left + r.width / 2, r.top + r.height / 2);
+            return {
+              left: r.left, right: r.right, width: r.width,
+              height: r.height, hidden: el.hidden,
+              hit: hit === el || (hit !== null && el.contains(hit)),
+            };
+          };
+          const out = {
+            innerWidth,
+            scrollWidth: document.documentElement.scrollWidth,
+          };
+          for (const id of ['doc-back', 'doc-title', 'doc-kind',
+                            'doc-star', 'doc-read']) {
+            const el = document.getElementById(id);
+            out[id] = el === null ? null : box(el);
+          }
+          return out;
+        }""")
+    check(fit["scrollWidth"] <= fit["innerWidth"] + 1,
+          f"the reader grew sideways past the phone: {fit}")
+    for id_ in ["doc-back", "doc-title", "doc-kind", "doc-star", "doc-read"]:
+        part = fit[id_]
+        check(part is not None and not part["hidden"] and part["width"] > 0
+              and part["height"] > 0,
+              f"#{id_} has no room in the header bar: {fit}")
+        check(part["left"] >= -1 and part["right"] <= fit["innerWidth"] + 1,
+              f"#{id_} spills out of the phone's width: {fit}")
+    for id_ in ["doc-back", "doc-star", "doc-read"]:
+        check(fit[id_]["hit"] is True,
+              f"the centre of #{id_} hits something else: {fit}")
 
 
 def check_action_menu(page: Page, *, desktop: bool, expand_visible: bool) -> None:
@@ -272,6 +340,7 @@ def main() -> int:
                 # width, no grip over the text, zebra rows, heading rules,
                 # and no "Expand all".
                 check_reader_layout(page, desktop=False)
+                check_header_fit(page)
                 check_action_menu(page, desktop=False, expand_visible=False)
                 ctx.close()
 

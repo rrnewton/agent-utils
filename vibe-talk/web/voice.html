@@ -774,7 +774,13 @@
               <div id="docs-reader" hidden>
                 <div class="row docs-toolbar">
                   <button id="doc-back" type="button">Back</button>
-                  <h2 id="doc-title"></h2>
+                  <div class="doc-title-block">
+                    <h2 id="doc-title"></h2>
+                    <!-- What the open document is (`#1327 doc-reader-kind-header`): its
+                         kind and, for a github.com address, its repository. The reader
+                         sets it as text on every open; hidden while it names nothing. -->
+                    <p id="doc-kind" hidden></p>
+                  </div>
                   <!-- The header star (`#1265 documents-star-hide`): the open document's
                        star, the same per-document state as its card's. -->
                   <button id="doc-star" type="button" aria-pressed="false" aria-label="Star this document" title="Star this document" hidden>☆</button>

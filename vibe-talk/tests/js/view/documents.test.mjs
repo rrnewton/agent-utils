@@ -788,13 +788,16 @@ async function withReader(options, run) {
   const mod = requireModule(READER, "src/view/documents/reader.ts");
   assert.equal(typeof mod.createDocumentsReader, "function", "reader does not export createDocumentsReader");
   const els = {};
-  for (const id of ["doc-title", "doc-outline", "doc-outline-pop", "doc-outline-open",
+  for (const id of ["doc-title", "doc-kind", "doc-outline", "doc-outline-pop", "doc-outline-open",
     "doc-back", "doc-read", "doc-body", "scroll-area"]) els[id] = readerEl("div");
   const headings = options.headings || [];
   els["doc-body"].querySelectorAll = () => headings;
   els["scroll-area"].rectTop = options.rootTop ?? 0;
   const documentRow = { title: options.title ?? "Demo deployment report" };
   if (options.url !== undefined) documentRow.url = options.url;
+  if (options.kind !== undefined) documentRow.kind = options.kind;
+  if (options.issueNumber !== undefined) documentRow.issue_number = options.issueNumber;
+  if (options.issueStatus !== undefined) documentRow.issue_status = options.issueStatus;
   const api = async () => ({
     document: documentRow,
     content: options.content ?? "# Demo deployment report\n\nBody text.\n",
@@ -1319,6 +1322,129 @@ test("documents reader: an unindexed key falls through to fetch, other failures 
   }
   assert.deepEqual(refused, [`GET /api/v1/documents/${encodeURIComponent(key)}`]);
   assert.deepEqual(statuses, ["Could not load the document."]);
+});
+
+// ---- reader kind header (`#1327 doc-reader-kind-header`) ---------------------------------------
+//
+// The header bar names what the open document IS: `github_issue` is a
+// `.minibeads/issues` file and reads "Minibeads issue" (never "GitHub
+// issue"); the repository joins it only where the document's own address is
+// a github.com/owner/repo one. An unknown kind names nothing.
+
+test("documents reader kind: documentKindLabel names every kind, repo only from github.com", () => {
+  const { documentKindLabel } = requireModule(READER, "src/view/documents/reader.ts");
+  assert.equal(typeof documentKindLabel, "function", "reader does not export documentKindLabel");
+  const issueUrl = "https://github.com/octo/widgets/blob/main/.minibeads/issues/widgets-833.md";
+  assert.equal(
+    documentKindLabel({ kind: "github_issue", issue_number: 833, issue_status: "open", url: issueUrl }),
+    "Minibeads issue #833 · open · octo/widgets");
+  assert.equal(
+    documentKindLabel({ kind: "github_issue", issue_number: null, issue_status: "open", url: issueUrl }),
+    "Minibeads issue · open · octo/widgets", "a missing number still names the kind");
+  assert.equal(
+    documentKindLabel({ kind: "github_issue", issue_number: 833, issue_status: null, url: issueUrl }),
+    "Minibeads issue #833 · octo/widgets", "a missing status still names the kind");
+  assert.equal(
+    documentKindLabel({ kind: "github_issue", issue_number: "833", issue_status: "", url: issueUrl }),
+    "Minibeads issue · octo/widgets", "a string number and an empty status name neither");
+  assert.equal(
+    documentKindLabel({ kind: "github_issue", issue_number: 833, issue_status: "open", url: "not a url" }),
+    "Minibeads issue #833 · open", "an unparseable address names no repository");
+  assert.equal(
+    documentKindLabel({ kind: "github_markdown", url: "https://github.com/octo/widgets/blob/main/docs/guide.md" }),
+    "GitHub markdown · octo/widgets");
+  assert.equal(
+    documentKindLabel({ kind: "github_markdown", url: "https://www.github.com/octo/widgets/blob/main/docs/guide.md" }),
+    "GitHub markdown", "only github.com itself names the repository");
+  assert.equal(
+    documentKindLabel({ kind: "github_markdown", url: "https://github.com/octo" }),
+    "GitHub markdown", "an owner alone names no repository");
+  assert.equal(
+    documentKindLabel({ kind: "github_markdown", url: "ftp://github.com/octo/widgets" }),
+    "GitHub markdown", "a non-web address names no repository");
+  assert.equal(
+    documentKindLabel({ kind: "github_file", url: "https://github.com/octo/widgets/blob/main/src/main.rs" }),
+    "GitHub file · octo/widgets");
+  assert.equal(
+    documentKindLabel({ kind: "github_gist", url: "https://gist.github.com/octo/0123456789abcdef" }),
+    "Gist");
+  assert.equal(
+    documentKindLabel({ kind: "paste", url: "https://paste.example/demo-doc" }), "Paste");
+  assert.equal(
+    documentKindLabel({ kind: "google_doc", url: "https://docs.google.com/document/d/abc123/edit" }),
+    "Google Doc");
+  assert.equal(
+    documentKindLabel({ kind: "mystery", url: "https://github.com/octo/widgets" }), "",
+    "an unknown kind wears no label, repository or not");
+  assert.equal(documentKindLabel({ url: issueUrl }), "", "no kind wears no label");
+  assert.equal(documentKindLabel(null), "", "no document wears no label");
+  assert.equal(documentKindLabel(undefined), "", "no document wears no label");
+});
+
+test("documents reader kind: the header shows the open document's kind as text", async () => {
+  await withReader({
+    kind: "github_issue", issueNumber: 833, issueStatus: "open",
+    url: "https://github.com/octo/widgets/blob/main/.minibeads/issues/widgets-833.md",
+  }, async ({ els }) => {
+    assert.equal(els["doc-kind"].textContent, "Minibeads issue #833 · open · octo/widgets");
+    assert.equal(els["doc-kind"].hidden, false, "a named kind hides in the header");
+    assert.equal(els["doc-kind"].children.length, 0, "the kind label carries markup, not text");
+  });
+  await withReader({ kind: "paste", url: "https://paste.example/demo-doc" }, async ({ els }) => {
+    assert.equal(els["doc-kind"].textContent, "Paste");
+    assert.equal(els["doc-kind"].hidden, false, "a named kind hides in the header");
+  });
+  await withReader({}, async ({ els }) => {
+    assert.equal(els["doc-kind"].textContent, "", "a document of no known kind wears a label");
+    assert.equal(els["doc-kind"].hidden, true, "an empty kind label still takes header room");
+  });
+});
+
+test("documents reader kind: a failed or different open leaves no stale kind", async () => {
+  const mod = requireModule(READER, "src/view/documents/reader.ts");
+  const els = {};
+  for (const id of ["doc-title", "doc-kind", "doc-outline", "doc-outline-pop", "doc-outline-open",
+    "doc-back", "doc-read", "doc-body", "scroll-area"]) els[id] = readerEl("div");
+  els["doc-body"].querySelectorAll = () => [];
+  let answer = {
+    document: {
+      title: "Issue", kind: "github_issue", issue_number: 833, issue_status: "open",
+      url: "https://github.com/octo/widgets/blob/main/.minibeads/issues/widgets-833.md",
+    },
+    content: "# Issue\n\nBody.\n", outline: [],
+  };
+  let fail = false;
+  const reader = mod.createDocumentsReader({
+    api: async () => {
+      if (fail) throw Object.assign(new Error("HTTP 500 boom"), { code: "boom" });
+      return answer;
+    },
+    byId: (id) => {
+      assert.ok(id in els, `reader looked up an element the test did not provide: ${id}`);
+      return els[id];
+    },
+    readDocument: () => {},
+    onBack: () => {},
+  });
+  const savedDocument = globalThis.document;
+  globalThis.document = { createElement: (tag) => readerEl(tag) };
+  try {
+    await reader.open("issue-doc");
+    assert.equal(els["doc-kind"].textContent, "Minibeads issue #833 · open · octo/widgets");
+    fail = true;
+    await assert.rejects(reader.open("other-doc"), /boom/);
+    assert.equal(els["doc-kind"].textContent, "", "a failed open kept the previous kind");
+    assert.equal(els["doc-kind"].hidden, true, "a failed open keeps the kind's header room");
+    fail = false;
+    answer = {
+      document: { title: "Note", kind: "paste", url: "https://paste.example/note" },
+      content: "# Note\n\nBody.\n", outline: [],
+    };
+    await reader.open("note-doc");
+    assert.equal(els["doc-kind"].textContent, "Paste", "a different open kept the previous kind");
+  } finally {
+    if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
+  }
 });
 
 // ---- 6. the back chain (`#1082 documents-back-chain`) -----------------------------------------

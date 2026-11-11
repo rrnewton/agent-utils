@@ -132,6 +132,7 @@ export interface ElementById {
   "dismissed-sends-state": HTMLParagraphElement;
   "doc-back": HTMLButtonElement;
   "doc-body": HTMLDivElement;
+  "doc-kind": HTMLParagraphElement;
   "doc-outline": HTMLUListElement;
   "doc-outline-open": HTMLButtonElement;
   "doc-outline-pop": HTMLDivElement;

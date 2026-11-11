@@ -5,8 +5,12 @@ a paste) through the reply route, then walks the Documents view at 393x852:
 every row lists, the bucket filter shows one type at a time (the gist sits
 with the paste), the issue card names its number and (once fetched from the
 local raw stub) its status, and opening the issue renders its front matter
-as a header — `#<n>`, title, status — not raw YAML. The gist's API fetch is
-not stubbed (its host is fixed), so only its listing and bucket are walked.
+as a header — `#<n>`, title, status — not raw YAML. The reader's header bar
+names each opened document's kind (`#1327 doc-reader-kind-header`): the
+minibeads issue with number, status and repository, the guide as GitHub
+markdown under its repository, and the paste as a paste. The gist's API
+fetch is not stubbed (its host is fixed), so only its listing and bucket
+are walked.
 """
 
 import json
@@ -178,6 +182,33 @@ def main() -> int:
                 check("in_progress" in body_text, "the issue header names no status")
                 check("status:" not in body_text, "the reader shows raw front matter")
                 check("The issue body." in body_text, "the reader lost the issue body")
+
+                # The header bar names the kind (`#1327 doc-reader-kind-header`):
+                # a minibeads issue with its number, status and repository —
+                # never "GitHub issue" — and the guide and the paste theirs.
+                def kind_is(text: str) -> None:
+                    page.wait_for_function(
+                        "(wanted) => { const el = document.getElementById('doc-kind');"
+                        " return el !== null && !el.hidden && el.textContent === wanted; }",
+                        arg=text, timeout=20_000)
+
+                kind_is("Minibeads issue #1176 · in_progress · octo/widgets")
+                page.locator("#doc-back").click()
+                page.wait_for_function(
+                    "() => !document.getElementById('docs-list-view').hidden",
+                    timeout=20_000)
+                page.locator(".doc-bucket[data-bucket='all']").click()
+                page.locator(
+                    "#documents-list .doc-card"
+                    "[data-key='github:octo/widgets@main:docs/guide.md']").click()
+                kind_is("GitHub markdown · octo/widgets")
+                page.locator("#doc-back").click()
+                page.wait_for_function(
+                    "() => !document.getElementById('docs-list-view').hidden",
+                    timeout=20_000)
+                page.locator(
+                    "#documents-list .doc-card[data-key='paste:demo-doc']").click()
+                kind_is("Paste")
                 browser.close()
             print("documents buckets browser walk: ok")
             return 0

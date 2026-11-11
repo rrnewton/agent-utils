@@ -2,8 +2,8 @@
 //
 // The document body is the one place in this view set from markup, and it is fed
 // only by `renderDocumentMarkdown`, whose output carries no markup the document
-// itself wrote. Everything else the reader shows (the title, the outline, any
-// status) is set as text. Construction does nothing: no element is looked up, no
+// itself wrote. Everything else the reader shows (the title, the kind, the
+// outline, any status) is set as text. Construction does nothing: no element is looked up, no
 // listener is added, and nothing is fetched until `open` is called.
 //
 // The outline is a pop-up (`#1038 documents-outline-popup`): the control bar's
@@ -203,6 +203,72 @@ function safeSourceHref(value: unknown): string | null {
   const lower = trimmed.toLowerCase();
   if (lower.startsWith("http://") || lower.startsWith("https://")) return trimmed;
   return null;
+}
+
+/**
+ * The `owner/repo` a document's address is under, or null where it is not a
+ * github.com web address naming both parts: parsed strictly from the address
+ * itself (`#1327 doc-reader-kind-header`), never guessed from the document's
+ * key or title, and omitted wherever the address does not parse as one.
+ */
+function githubRepoOf(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(value.trim());
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  if (parsed.hostname !== "github.com") return null;
+  const segments = parsed.pathname.split("/").filter((part) => part !== "");
+  const owner = segments[0];
+  const repo = segments[1];
+  if (owner === undefined || repo === undefined) return null;
+  const name = repo.endsWith(".git") ? repo.slice(0, -".git".length) : repo;
+  if (name === "." || name === "..") return null;
+  if (!/^[A-Za-z0-9_.-]+$/.test(owner) || !/^[A-Za-z0-9_.-]+$/.test(name)) return null;
+  return `${owner}/${name}`;
+}
+
+/** What the header bar calls each document kind (`types.ts`'s wire strings). */
+const KIND_LABELS: Readonly<Record<string, string>> = {
+  github_issue: "Minibeads issue",
+  github_markdown: "GitHub markdown",
+  github_file: "GitHub file",
+  github_gist: "Gist",
+  paste: "Paste",
+  google_doc: "Google Doc",
+};
+
+/**
+ * What the header bar says the open document is (`#1327
+ * doc-reader-kind-header`): its kind — a `github_issue` is a
+ * `.minibeads/issues` file, so "Minibeads issue", never "GitHub issue" —
+ * with an issue's number and status where the server named them, and the
+ * repository where the document's own address is a github.com one. The
+ * empty string where the kind is not one the header knows: no label at all
+ * rather than a wrong one. Pure over the answer's document fields, so it
+ * is testable without a reader.
+ */
+export function documentKindLabel(
+  doc: { kind?: unknown; issue_number?: unknown; issue_status?: unknown; url?: unknown } | null | undefined,
+): string {
+  if (doc === null || doc === undefined) return "";
+  const kind = typeof doc.kind === "string" ? doc.kind : "";
+  const base = KIND_LABELS[kind];
+  if (base === undefined) return "";
+  let head = base;
+  const parts: string[] = [];
+  if (kind === "github_issue") {
+    const number = doc.issue_number;
+    if (typeof number === "number" && Number.isInteger(number) && number > 0) head = `${base} #${number}`;
+    const status = typeof doc.issue_status === "string" ? doc.issue_status.trim() : "";
+    if (status !== "") parts.push(status);
+  }
+  const repo = githubRepoOf(doc.url);
+  if (repo !== null) parts.push(repo);
+  return [head, ...parts].join(" · ");
 }
 
 /**
@@ -510,6 +576,26 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     title.appendChild(anchor);
   }
 
+  /**
+   * Draw what the open document is in the header bar (`#1327
+   * doc-reader-kind-header`), as text: `documentKindLabel` over the
+   * answer's fields, the element hidden where it names nothing. A host
+   * without the element keeps the reader as it was — the header star's
+   * discipline, so hosts predating the element open documents unchanged.
+   */
+  function drawKind(doc: DocumentAnswer["document"]): void {
+    let el: HTMLElement;
+    try {
+      el = deps.byId("doc-kind");
+    } catch {
+      return;
+    }
+    if (!el) return;
+    const label = documentKindLabel(doc);
+    el.textContent = label;
+    el.hidden = label === "";
+  }
+
   /** The panel's keys: arrows move between entries, Home/End to the ends, Escape away. */
   function onOutlineKey(event: KeyboardEvent): void {
     if (buttons.length === 0) return;
@@ -609,6 +695,10 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
   async function open(key: string, highlightTerms?: readonly string[]): Promise<void> {
     wire();
     currentDoc = null;
+    // No stale kind either (`#1327`): the header names nothing until this
+    // open's own document is drawn, so a failed load cannot leave the
+    // previous document's kind over whatever stands in the reader.
+    drawKind(null);
     setOutlineOpen(false);
     stopWatching();
     const path = `/api/v1/documents/${encodeURIComponent(key)}`;
@@ -677,6 +767,7 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     const docTitle = typeof rawTitle === "string" ? rawTitle : "";
     const titleText = docTitle !== "" ? docTitle : (outline[0] ?? entries[0]?.text ?? key);
     drawTitle(titleText, answer.document?.url);
+    drawKind(answer.document);
     if (markdown !== null) {
       // The star names the document just opened; a failed load keeps no star.
       drawStarFor(key);
