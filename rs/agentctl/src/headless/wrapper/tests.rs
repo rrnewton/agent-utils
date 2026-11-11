@@ -434,7 +434,9 @@ fn console_input_queues_a_plain_turn_with_its_origin() {
     }));
     // The harness answered the text itself, which only the exact
     // stream-json user line with that content produces.
-    assert!(fixture.has_event("assistant.text", |data| data["text"] == "echo: run `date`"));
+    fixture.wait("assistant.text", || {
+        fixture.has_event("assistant.text", |data| data["text"] == "echo: run `date`")
+    });
     fixture.stop(handle);
 }
 
@@ -449,6 +451,12 @@ fn console_input_from_inside_the_harness_is_refused_and_logged() {
                 .as_str()
                 .is_some_and(|message| message.contains("inside the agent's own harness"))
         })
+    });
+    // The harness writes its copy of the reply after the refusal is
+    // logged; wait for that write instead of racing it.
+    fixture.wait("self reply written", || {
+        fs::read_to_string(fixture.root.join("self.log"))
+            .is_ok_and(|answer| answer.contains("\"ok\":false"))
     });
     let answer = fs::read_to_string(fixture.root.join("self.log")).unwrap();
     assert!(answer.contains("\"ok\":false"), "{answer}");
