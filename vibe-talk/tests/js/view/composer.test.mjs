@@ -371,7 +371,8 @@ test("`#624 voice-page-modularity`: the quoted words' and the quick-reply box's 
       pressDraftChip: () => log.push("draft chip"),
       reactToHeldSentence: () => log.push("react"),
       quickReplyOpen: () => open,
-      putDownQuickReply: () => log.push("put down"),
+      putDownQuickReply: () => { log.push("put down"); return true; },
+      claimClick: () => log.push("claim click"),
       quickReplyListMoved: (moved) => log.push(`list moved ${moved}`),
       visualViewport: () => viewport,
       placeQuickReply: () => log.push("place box"),
@@ -384,7 +385,8 @@ test("`#624 voice-page-modularity`: the quoted words' and the quick-reply box's 
       "listen quick-reply-discard-yes keydown", "listen quick-reply-discard-no keydown", "listen quick-reply-discard-no click",
       "listen quick-reply-text keydown", "watch quick-reply-text", "listen quick-reply-text input", "listen quick-reply-text pointerdown",
       "listen quick-reply-mic mousedown", "listen quick-reply-mic click", "listen left:draft-chip click", "listen read-react click",
-      "listen document pointerdown capture", "listen document scroll capture passive", "listen viewport resize",
+      "listen document pointerdown capture", "listen document pointerup capture", "listen document pointercancel capture",
+      "listen document scroll capture passive", "listen viewport resize",
       "listen document scroll capture passive"], "a listener was added out of the page's order");
     log.length = 0;
     fire("document", "selectionchange", event({ n: 1 }));
@@ -423,11 +425,14 @@ test("`#624 voice-page-modularity`: the quoted words' and the quick-reply box's 
     fire("document", "pointerdown", { target: target("elsewhere") });
     open = false;
     fire("document", "pointerdown", { target: target("elsewhere") });
+    // `#1402 docked-cancel-putdown`. The press that put it down claims its click on the way up, once.
+    fire("document", "pointerup", {});
+    fire("document", "pointerup", {});
     fire("document", "scroll", { target: "channel" });
     fire("viewport", "resize");
     held = true;
     fire("document", "scroll", { target: "side" });
-    assert.deepStrictEqual(log, ["put down", "put down", "list moved channel", "place box", "list moved side", "place chip"]);
+    assert.deepStrictEqual(log, ["put down", "put down", "claim click", "list moved channel", "place box", "list moved side", "place chip"]);
     mounted.unmount();
     assert.ok(Object.values(nodes).every((one) => one.listeners.length === 0), "a listener outlived unmount");
   } finally {

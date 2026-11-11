@@ -61,6 +61,11 @@ words, a draft in the floating box, and its lower-left dock icon -> the inline r
 message holds the quote and the draft, focused, the floating box gone, and Send posts it; in
 the post-to-main walk the same dock keeps a ticked Post to main ticked.
 
+`#1402 docked-cancel-putdown`. Then, at 1280x800 and on a phone, on the same channel with the
+tall folded message in the middle of the list: a floating reply docked under it and discarded
+with Cancel (Yes to "Discard this draft?"), another floating reply written on the same words,
+and a tap outside it -> the reply open under the message, in view; nothing is sent.
+
 Pass --screenshots DIR to keep a PNG of the open reply for each case; --web-root DIR to run the
 same walk against another copy of the page.
 """
@@ -1195,6 +1200,90 @@ def dock_reply_walk(walk: Walk) -> None:
                       "into the focused reply under its message, and sent from there")
 
 
+def docked_cancel_putdown_walk(walk: Walk) -> None:
+    """`#1402 docked-cancel-putdown`. The tall folded message in the middle of the list: a floating
+    reply docked under it, discarded with Cancel, then another floating reply on the same words
+    put down by a tap outside it. The put-down's reply is open under its message and in view:
+    the tap that puts it down is the put-down's own, and does not also unfold the tall row and
+    carry the box below the list's foot with it."""
+    page = walk.page
+    row_id = message_id(TALL)
+    page.fill("#api-token", TOKEN)
+    page.click("#save-token")
+    page.wait_for_selector("#search-toggle", state="visible", timeout=10_000)
+    page.click("#view-switch")
+    walk.wait_for(f"() => document.querySelectorAll('#discord-log > li[data-id]').length === {COUNT}",
+                  "docked-cancel: the channel did not open")
+    walk.settled()
+    walk.place(TALL, 200)
+    page.evaluate(SELECTION_JS, [row_id, 4, 20, True])
+    walk.wait_for("() => !document.getElementById('selection-chip').hidden",
+                  "docked-cancel: no chip under the words")
+    if walk.touch:
+        walk.press("#selection-chip")
+    else:
+        page.keyboard.press("q")
+    walk.wait_for("() => !document.getElementById('quick-reply').hidden",
+                  "docked-cancel: no floating box")
+    walk.settled()
+    page.fill("#quick-reply-text", "docked thought")
+    walk.press("#quick-reply-dock")
+    walk.wait_for("() => document.getElementById('quick-reply').hidden",
+                  "docked-cancel: the floating box stayed up")
+    walk.wait_for("() => !document.getElementById('column-reply').hidden",
+                  "docked-cancel: no reply open under the message")
+    walk.settled()
+    docked: object = page.evaluate(PUT_DOWN_JS, row_id)
+    assert isinstance(docked, dict)
+    dock_box = docked.get("box")
+    walk.check(isinstance(dock_box, dict) and float(dock_box["top"]) >= num(docked["areaTop"]) - 0.5
+               and float(dock_box["bottom"]) <= num(docked["areaBottom"]) + 0.5,
+               f"docked-cancel: the docked reply's box is not on the screen: {docked}")
+    walk.press("#reply-cancel")
+    walk.wait_for("() => !document.getElementById('reply-discard').hidden",
+                  "docked-cancel: Cancel asked nothing about the draft")
+    walk.press("#reply-discard-yes")
+    walk.wait_for(CLOSED, "docked-cancel: discarding did not put the docked reply away")
+    walk.settled()
+    page.evaluate(SELECTION_JS, [row_id, 4, 20, True])
+    walk.wait_for("() => !document.getElementById('selection-chip').hidden",
+                  "docked-cancel, put down: no chip under the words")
+    walk.press("#selection-chip")
+    walk.wait_for("() => !document.getElementById('quick-reply').hidden",
+                  "docked-cancel, put down: the chip opened no box")
+    walk.settled()
+    page.fill("#quick-reply-text", "second thought")
+    before = len(walk.api.replies)
+    point: object = page.evaluate(OUTSIDE_JS, row_id)
+    assert isinstance(point, dict)
+    if walk.touch:
+        page.touchscreen.tap(num(point["x"]), num(point["y"]))
+    else:
+        page.mouse.click(num(point["x"]), num(point["y"]))
+    walk.wait_for("() => document.getElementById('quick-reply').hidden",
+                  "docked-cancel, put down: a tap outside left the box up")
+    walk.wait_for("() => !document.getElementById('column-reply').hidden",
+                  "docked-cancel, put down: a tap outside hid the draft: no reply open under the message")
+    walk.wait_for(f"() => {{ const t = document.getElementById('reply-text').value; "
+                  f"return t.startsWith('> ') && t.endsWith('\\n\\nsecond thought') "
+                  f"&& document.getElementById('reply-target-meta').textContent.endsWith('id {row_id}'); }}",
+                  "docked-cancel, put down: the reply under the message does not hold the words")
+    walk.settled()
+    put: object = page.evaluate(PUT_DOWN_JS, row_id)
+    assert isinstance(put, dict)
+    box = put.get("box")
+    walk.check(isinstance(box, dict) and float(box["top"]) >= num(put["areaTop"]) - 0.5
+               and float(box["bottom"]) <= num(put["areaBottom"]) + 0.5,
+               f"docked-cancel, put down: the reply's box is not on the screen: {put}")
+    walk.check(isinstance(box, dict) and float(box["top"]) >= num(put["rowTop"]),
+               f"docked-cancel, put down: the reply's box is not under its message: {put}")
+    walk.check(len(walk.api.replies) == before, "docked-cancel, put down: the tap sent something")
+    walk.shot("docked-cancel-put-down")
+    walk.notes.append("a floating reply docked under the tall folded message and discarded with "
+                      "Cancel; a later one, tapped away from, open with its words under the "
+                      "message and in view")
+
+
 # `#819 voice-page-quoted-reply-and-draft-chip`: what the Draft chip says, what is focused, and its words.
 DRAFT_JS = """() => {
   const chip = document.getElementById('draft-chip');
@@ -1687,12 +1776,15 @@ def main() -> int:
         ("1280x800-post-to-main", 1280, 800, False, "dark"),
         # `#1315 floating-reply-dock`, on the quick replies' channel, at a desk.
         ("1280x800-dock-reply", 1280, 800, False, "dark"),
+        # `#1402 docked-cancel-putdown`, on the quick replies' channel, at a desk and on a phone.
+        ("1280x800-docked-cancel", 1280, 800, False, "dark"),
+        ("412x915-docked-cancel", 412, 915, True, "dark"),
     )
     report: list[str] = []
     with sync_playwright() as playwright:
         for label, width, height, phone, scheme in runs:
             api = (FakeApi(messages=layout_messages()) if label.endswith("quote-layout")
-                   else FakeApi(messages=quick_messages(), reply_author=OWNER) if label.endswith(("quick-reply", "drafts", "dock-reply"))
+                   else FakeApi(messages=quick_messages(), reply_author=OWNER) if label.endswith(("quick-reply", "drafts", "dock-reply", "docked-cancel"))
                    else FakeApi(messages=threaded_messages()) if label.endswith("post-to-main")
                    else FakeApi(empty_threads=label.endswith("new-thread")))
             server, thread, url = serve(api, web_root)
@@ -1726,6 +1818,8 @@ def main() -> int:
                         post_to_main_walk(walk)
                     elif label.endswith("dock-reply"):
                         dock_reply_walk(walk)
+                    elif label.endswith("docked-cancel"):
+                        docked_cancel_putdown_walk(walk)
                     elif api.empty_threads:
                         new_thread_walk(walk)
                     elif scheme == "dark":

@@ -38,7 +38,9 @@ export interface QuickReplyListenersDependencies {
   reactToHeldSentence(): unknown;
   /** Whether the box is open; putting it down puts what was written back under its message. */
   quickReplyOpen(): boolean;
-  putDownQuickReply(): unknown;
+  putDownQuickReply(): boolean;
+  /** Take the click a put-down tap ends in, so it presses nothing else (`rowGestures.claimClick`). */
+  claimClick(): unknown;
   /** A list scrolled, and the box placed again as the window's visible part changes. */
   quickReplyListMoved(target: EventTarget | null): unknown;
   visualViewport(): EventTarget | null;
@@ -106,13 +108,25 @@ export function mountQuickReplyListeners(deps: QuickReplyListenersDependencies):
   // `#821 voice-page-read-aloud-react`. React, in the paused read's strip.
   listen<Event>(el("read-react"), "click", () => deps.reactToHeldSentence());
   // A tap outside the box and the chips that open it puts the box down, heard before anything it lands on.
+  // `#1402 docked-cancel-putdown`. A tap that put a reply down claims the click behind it, as a swipe
+  // or a hold does (`rowGestures.claimClick`): the press is the put-down's, and its click does not also
+  // unfold the tall folded row it landed on, which would carry the box just opened below the list's foot.
+  let putDownPress = false;
   listen<PointerEvent>(document, "pointerdown", (event) => {
     if (!deps.quickReplyOpen()) return;
     const target = (event && event.target) as Node | null;
     if (target && (nodeWithin(el("quick-reply"), target) || nodeWithin(left("selection-chip"), target) ||
       nodeWithin(left("read-steer-quote"), target) || nodeWithin(left("draft-chip"), target) ||
       nodeWithin(left("read-react"), target))) return;
-    deps.putDownQuickReply();
+    putDownPress = deps.putDownQuickReply();
+  }, { capture: true });
+  listen<PointerEvent>(document, "pointerup", () => {
+    if (!putDownPress) return;
+    putDownPress = false;
+    deps.claimClick();
+  }, { capture: true });
+  listen<PointerEvent>(document, "pointercancel", () => {
+    putDownPress = false;
   }, { capture: true });
   listen<Event>(document, "scroll", (event) => deps.quickReplyListMoved(event && event.target), { capture: true, passive: true });
   const viewport = deps.visualViewport();

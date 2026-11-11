@@ -8194,6 +8194,7 @@ application.track(mountQuickReplyListeners({
   reactToHeldSentence: () => readAloudOwner().reactToHeldSentence(),
   quickReplyOpen: () => quoteOwner.quickReplyOpen(),
   putDownQuickReply: () => putDownQuickReply(),
+  claimClick: () => rowGestures.claimClick(),
   quickReplyListMoved: (target) => quickReplyListMoved(target),
   visualViewport: () => window.visualViewport || null,
   placeQuickReply: () => placeQuickReply(),

@@ -70,7 +70,9 @@
 //     So I think if I click anywhere else in the screen my drafted reply should go back to the normal
 //     position under the current message and should be open and visible." With words in it, the box's
 //     quote and words become the message's reply draft and its reply opens in the stream under it, as
-//     Reply opens it (`putDownQuickReply`); with none, the box just closes.
+//     Reply opens it (`putDownQuickReply`); with none, the box just closes. The tap is the put-down's
+//     own: its click is claimed where the tap is heard (view/composer), so the tap does not also
+//     unfold the tall row it lands on and carry the box below the list's foot (`#1402 docked-cancel-putdown`).
 //   * DOCKED BACK. `#1315 floating-reply-dock`: the dock icon at the box's lower-left does the tap
 //     outside's move on purpose, and more: the inline reply opens focused, and a Post to main tick
 //     is carried with the draft, where a tap outside leaves it behind.
@@ -236,8 +238,8 @@ export interface Quoting {
   placeQuickReply(): void;
   /** Close the quick reply, keeping what was written for the same words. */
   closeQuickReply(): void;
-  /** A tap outside the box: what was written goes back under its message, open and shown; nothing written, it closes. */
-  putDownQuickReply(): void;
+  /** A tap outside the box: what was written goes back under its message, open and shown; nothing written, it closes. True where it put a reply down. */
+  putDownQuickReply(): boolean;
   /** `#1315 floating-reply-dock`. The dock icon: the draft, its quote and its Post to main choice go into the reply in the stream, focused; the box closes. */
   dockQuickReply(): void;
   /** Send the quick reply, then close it. */
@@ -582,13 +584,13 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
    * the message's reply in the stream, open and shown under it (`toStream`), and the box closes holding
    * nothing for those words, the draft being the stream reply's now, where it can be seen.
    */
-  function putDownQuickReply(): void {
+  function putDownQuickReply(): boolean {
     const open = quickReply;
-    if (!open) return;
+    if (!open) return false;
     const written = deps.byId("quick-reply-text").value;
     if (!written.trim()) {
       closeQuickReply();
-      return;
+      return false;
     }
     // Into the stream's draft first, and only then let go of its own (`#819`): never in neither.
     // A Post to main tick is not carried with it: the stream box opens unticked, as every open
@@ -596,6 +598,7 @@ export function createQuoting(deps: QuotingDependencies): Quoting {
     deps.toStream(open.row, open.message, `${quoteBlock(open.quote)}${written}`);
     deps.byId("quick-reply-text").value = "";
     closeQuickReply();
+    return true;
   }
 
   /**
