@@ -1026,7 +1026,8 @@ fn write_html<'a>(
 /// After the sanitizer, so only an address it kept is read, as the browser will read it. Every
 /// `<a href="` in its output is a link comrak made — raw HTML in a message is escaped long before,
 /// and code is text — and the value written is percent-encoded, so it needs no escaping. The
-/// sanitizer keeps the attribute when it sees the body again ([`mark_restated`]).
+/// sanitizer keeps each attribute (`data-doc` included) when it sees the body again
+/// ([`mark_restated`]), which is what lets a headed body keep both marks.
 fn mark_message_links(html: &str) -> String {
     const OPEN: &str = "<a href=\"";
     let mut out = String::with_capacity(html.len());
@@ -2351,7 +2352,7 @@ static SANITIZER: LazyLock<ammonia::Builder<'static>> = LazyLock::new(|| {
         .tag_attributes(HashMap::from([
             (
                 "a",
-                HashSet::from(["href", "title", crate::message_links::ATTRIBUTE]),
+                HashSet::from(["href", "title", crate::message_links::ATTRIBUTE, "data-doc"]),
             ),
             ("ol", HashSet::from(["start"])),
             ("input", HashSet::from(["checked"])),
@@ -5980,6 +5981,69 @@ mod message_link_tests {
             "{html}"
         );
         assert!(!html.contains("data-doc=\"github:example"), "{html}");
+    }
+
+    #[test]
+    fn a_bare_document_link_ending_a_sentence_in_a_bullet_is_marked() {
+        // `#1326 doc-link-bare-url`: a thread reply as agents write them in
+        // Slack — • bullets, a bare address ending its sentence, and a
+        // parenthesised one beside it. The sentence's dot is the
+        // autolinker's punctuation, never part of the address or its key,
+        // and both links are marked for the reader.
+        let bare = "https://github.com/octo/widgets/blob/main/ai_docs/design.md";
+        let paren = "https://github.com/octo/gizmo/blob/main/.minibeads/issues/gizmo-833.md";
+        let text = format!(
+            "We built it and switched it off.\n\n\
+             • *Never built.* The design is here: {bare}. It covers the \
+             picker. The issue it replaces (#833 ({paren})), is still open."
+        );
+        let html = to_html(&text, Markup::Slack);
+        assert!(html.contains("<li>"), "the bullets drew as no list: {html}");
+        assert!(
+            html.contains(&format!(
+                "href=\"{bare}\" data-doc=\"github:octo/widgets@main:ai_docs/design.md\""
+            )),
+            "the bare link is unmarked or keeps its dot: {html}"
+        );
+        assert!(
+            html.contains(&format!(
+                "href=\"{paren}\" data-doc=\"github:octo/gizmo@main:.minibeads/issues/gizmo-833.md\""
+            )),
+            "the parenthesised link is unmarked: {html}"
+        );
+        assert!(
+            !html.contains("design.md.\""),
+            "the dot rode into an address: {html}"
+        );
+        // The fold reads the same text the same way, dot and all.
+        let found = crate::documents::recognize(&text, &[]);
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(
+            found
+                .iter()
+                .any(|rec| rec.key == "github:octo/widgets@main:ai_docs/design.md"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_document_mark_survives_a_heading_being_marked_in_the_same_body() {
+        // As `the_mark_survives_…` below, for `data-doc`: the marked body is
+        // sanitized again by `mark_restated`, so the sanitizer must keep the
+        // attribute or every headed body with a document link loses either
+        // its heading (today's fail-safe) or its marks.
+        let (html, heading) = headed_body(
+            "(plan) Status: done\nsee https://github.com/octo/widgets/blob/main/docs/guide.md",
+            Markup::Discord,
+            true,
+            &|_| true,
+            &[],
+        );
+        assert!(heading.is_some(), "the heading was dropped: {html}");
+        assert!(
+            html.contains("data-doc=\"github:octo/widgets@main:docs/guide.md\""),
+            "{html}"
+        );
     }
 
     #[test]

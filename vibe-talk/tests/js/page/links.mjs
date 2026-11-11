@@ -218,6 +218,61 @@ test("`#1082 documents-back-chain`: a document link in a message opens the reade
     `Back put the linking message at ${back.getBoundingClientRect().top}, not ${before.top}`);
 });
 
+test("`#1326 doc-link-bare-url`: document links in a bullet in a thread reply — a bare one ending its sentence and a parenthesised one — open the reader, and a modified tap still leaves", async () => {
+  const bareKey = "github:octo/widgets@main:ai_docs/design.md";
+  const bareHref = "https://github.com/octo/widgets/blob/main/ai_docs/design.md";
+  const parenKey = "github:octo/gizmo@main:.minibeads/issues/gizmo-833.md";
+  const parenHref = "https://github.com/octo/gizmo/blob/main/.minibeads/issues/gizmo-833.md";
+  const page = newPage(new Map(), SCRIPT, (p) => p.enableHistory());
+  page.documents = [
+    { key: bareKey, title: "Design doc", content: "# Design doc\n\nWords.\n", outline: ["Design doc"] },
+    { key: parenKey, title: "Issue doc", content: "# Issue doc\n\nWords.\n", outline: ["Issue doc"] },
+  ];
+  const data = threadData();
+  const second = data.messages[4].thread;
+  const stamp = data.messages[4].timestamp;
+  // The body as the server renders that reply (`render.rs`): the bullets a
+  // list, each bare address shortened, the sentence's dot outside its anchor.
+  data.messages[4] = message({
+    id: "204", content: `see ${bareHref}`,
+    content_html: `<p>head</p>\n<ul>\n<li><strong>Never built.</strong> The design is here: <a href="${bareHref}" data-doc="${bareKey}" title="${bareHref}" ${MSG_LINK_ATTRS}>widgets:design.md</a>. It covers things. The issue (#833 (<a href="${parenHref}" data-doc="${parenKey}" title="${parenHref}" ${MSG_LINK_ATTRS}>gizmo:gizmo-833.md</a>), is open.</li>\n</ul>\n`,
+    thread: second,
+  });
+  data.messages[4].timestamp = stamp;
+  page.threadingSupported = true;
+  page.threads = data.threads;
+  await signIn(page);
+  await showDiscord(page, data.messages);
+  await page.settle();
+  page.el("thread-select").value = "thread:spaces/A/threads/another";
+  await page.el("thread-select").dispatch("change");
+  await page.settle();
+  const row = rowWithId(page, "204");
+  assert.ok(row, "fixture: the reply is not drawn in its thread");
+  const anchors = row.descendants().filter((node) => node.tagName === "a");
+  assert.equal(anchors.length, 2, "fixture: the reply does not draw both links");
+  const [bare, paren] = anchors;
+  assert.equal(bare.getAttribute("data-doc"), bareKey, "the bare link lost its mark");
+  assert.equal(paren.getAttribute("data-doc"), parenKey, "the parenthesised link lost its mark");
+  assert.ok(bare.hasAttribute("data-in-app"), "the bare document link in a bullet was not wired");
+  assert.ok(paren.hasAttribute("data-in-app"), "the parenthesised document link was not wired");
+  assert.equal((await tapLink(page, bare, { ctrlKey: true })).prevented, false,
+    "Ctrl+click on the bare link was taken from the browser");
+  assert.equal((await tapLink(page, bare, { metaKey: true })).prevented, false,
+    "Cmd+click on the bare link was taken from the browser");
+  const tap = await tapLink(page, bare);
+  assert.equal(tap.prevented, true, "a plain tap on the bare link was left to the browser");
+  await untilDeepLink(page, () => !page.el("docs-reader").hidden && page.el("doc-title").text().includes("Design doc"));
+  assert.equal(page.tab(), "docs", "the bare link did not open the Documents view");
+  await page.browserBack();
+  await untilDeepLink(page, () => !page.el("pane-discord").hidden);
+  const again = rowWithId(page, "204").descendants().filter((node) => node.tagName === "a");
+  const parenTap = await tapLink(page, again[1]);
+  assert.equal(parenTap.prevented, true, "a plain tap on the parenthesised link was left to the browser");
+  await untilDeepLink(page, () => !page.el("docs-reader").hidden && page.el("doc-title").text().includes("Issue doc"));
+  assert.equal(page.tab(), "docs", "the parenthesised link did not open the Documents view");
+});
+
 test("`#1082 documents-back-chain`: list -> document -> Back lands on the list, and a further Back is the browser's as ever", async () => {
   const page = newPage(new Map(), SCRIPT, (p) => p.enableHistory());
   page.documents = [{ key: "paste:listed", title: "Listed report", content: "# Listed report\n\nWords.\n", outline: ["Listed report"] }];
