@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-ignored-evidence-salvage: removal refuses to delete gitignored files unless they are archived or explicitly discarded'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -37,3 +37,7 @@ Deterministic rather than heuristic:
 Lead ruling 2026-11-11: P1. Design, fixtures and tests first; gate only after #1287 lands, rebased on top, because #1287 and the /proc-scan P0 are both in the remove path of py/wrkslots/cli.py. Interim rule for both teams until this lands: before any slot removal, run `git status --ignored --short` in each checkout and hand-archive anything that isn't a regenerable cache.
 
 A transient seen in the same run: one attempt refused with systemd-run "Remote peer disconnected" (the host handoff failed; nothing changed). A clearer message or a bounded retry would help.
+
+## Resolution
+
+Removal now judges gitignored files before salvage in both editions. By default `remove` refuses when any checkout holds gitignored files outside the regenerable caches (the cache globs `clean-caches` uses via `_cache_globs_for`, a checkout's own cargo `target` when no per-repository policy is configured, and marker-proven nested cargo targets), naming each checkout, file and size; a bounded warning-only scan also names ignored paths referenced from `.minibeads/issues`, `ai_docs` or `reviews`. `--archive-ignored` writes a deterministic USTAR tar beside the salvage bundles (512 MiB total cap, refused above it), verifies every member's sha256 on read-back, and lists each file with size, sha256 and disposition in the salvage receipt; `--discard-ignored` deletes explicitly with the same listing. The Python salvage recheck re-verifies the inventory and archive before deletion, and Rust `remove_write.rs` `salvage_gate` produces the identical receipt fields and byte-identical tar, keeping the differential exact. `slotimage._run_on_host` retries a systemd-run "Remote peer disconnected" once and then reports that the handoff did not run and nothing changed. Validation-slot removal and ownerless-worktree recovery keep their own ignored-residue contracts and are unchanged.

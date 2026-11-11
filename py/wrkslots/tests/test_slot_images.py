@@ -327,6 +327,44 @@ def test_slot_slices_nest_under_the_callers_slice(tmp_path: Path) -> None:
     assert sandbox.slice_name("validate", "v1", "x.slice").startswith("x-wrkslots-validate")
 
 
+def test_host_handoff_retries_remote_peer_disconnect_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def flaky(argv: object, *, timeout: float = 120.0) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise slotimage.ImageError("systemd-run exited 1: Remote peer disconnected")
+        return "ran\n"
+
+    monkeypatch.setattr(slotimage, "_via_user_manager", lambda anchor=None: True)
+    monkeypatch.setattr(slotimage, "_user_manager_argv", lambda argv: list(argv))
+    monkeypatch.setattr(slotimage, "_run", flaky)
+    assert slotimage._run_on_host(["/bin/true"]) == "ran\n"
+    assert calls == 2
+
+
+def test_host_handoff_reports_remote_peer_disconnect_after_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def broken(argv: object, *, timeout: float = 120.0) -> str:
+        nonlocal calls
+        calls += 1
+        raise slotimage.ImageError("systemd-run exited 1: Remote peer disconnected")
+
+    monkeypatch.setattr(slotimage, "_via_user_manager", lambda anchor=None: True)
+    monkeypatch.setattr(slotimage, "_user_manager_argv", lambda argv: list(argv))
+    monkeypatch.setattr(slotimage, "_run", broken)
+    with pytest.raises(slotimage.ImageError) as caught:
+        slotimage._run_on_host(["/bin/true"])
+    assert calls == 2
+    assert "nothing was changed" in str(caught.value)
+
+
 def test_owned_mount_lines_are_excluded_from_use_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
     # Owned lines are keyed by mount point and device (MAJOR:MINOR), never by a
     # rendered source path, and only a whole-file-system mount (root "/") counts.

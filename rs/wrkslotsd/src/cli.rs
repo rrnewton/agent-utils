@@ -214,6 +214,12 @@ pub(crate) enum Writers {
         /// Machine shard override (else WRKSLOTS_MACHINE, else the configured machine)
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
+        /// Archive gitignored files outside the caches before removal
+        #[arg(long, conflicts_with = "discard_ignored")]
+        archive_ignored: bool,
+        /// Delete gitignored files outside the caches, listing them in the receipt
+        #[arg(long)]
+        discard_ignored: bool,
     },
     /// Strictly replay an event log and atomically replace the derived index
     Rebuild {
@@ -2495,13 +2501,23 @@ pub fn run() -> u8 {
                 expected_generation,
                 root,
                 machine,
+                archive_ignored,
+                discard_ignored,
             } => {
+                let ignored_mode = if archive_ignored {
+                    crate::remove_write::IgnoredMode::Archive
+                } else if discard_ignored {
+                    crate::remove_write::IgnoredMode::Discard
+                } else {
+                    crate::remove_write::IgnoredMode::Refuse
+                };
                 match crate::remove_write::remove_slot(
                     root.as_deref(),
                     machine.as_deref(),
                     &slot,
                     coordinator_pid,
                     expected_generation,
+                    ignored_mode,
                 ) {
                     Ok(value) => {
                         println!(

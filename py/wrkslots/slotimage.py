@@ -538,12 +538,29 @@ def verification_table() -> list[MountEntry]:
 
 def _run_on_host(argv: Sequence[str], *, anchor: Path | None = None, timeout: float = 120.0) -> str:
     routed = _via_user_manager(anchor)
+    command = _user_manager_argv(argv) if routed else list(argv)
     try:
-        return _run(_user_manager_argv(argv) if routed else list(argv), timeout=timeout)
-    except ImageError as exc:
-        if routed:
-            raise ImageError(f"{exc} ({_BOX_MOUNT_HINT})") from exc
-        raise
+        attempts = 2 if routed else 1
+        for attempt in range(attempts):
+            try:
+                return _run(command, timeout=timeout)
+            except ImageError as exc:
+                # A transient user-manager disconnect (#1302) means the
+                # host handoff never ran the command: retry once, then
+                # say plainly that nothing changed.
+                if routed and "Remote peer disconnected" in str(exc):
+                    if attempt + 1 < attempts:
+                        continue
+                    raise ImageError(
+                        f"host handoff through systemd-run failed: {exc}; the user "
+                        "systemd manager dropped the connection twice and the command "
+                        "did not run on the host, so nothing was changed; retry the "
+                        f"command ({_BOX_MOUNT_HINT})"
+                    ) from exc
+                if routed:
+                    raise ImageError(f"{exc} ({_BOX_MOUNT_HINT})") from exc
+                raise
+        raise AssertionError("unreachable")
     finally:
         _forget_host_table()
 

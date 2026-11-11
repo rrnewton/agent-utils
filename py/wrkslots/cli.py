@@ -36,6 +36,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import textwrap
 import threading
@@ -46,7 +47,7 @@ import urllib.parse
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set as AbstractSet
 from pathlib import Path, PurePosixPath
-from typing import IO, NoReturn, Protocol, TextIO, TypedDict, TypeVar, cast, overload
+from typing import IO, Literal, NoReturn, Protocol, TextIO, TypedDict, TypeVar, cast, overload
 
 from wrkslots import __version__, eden, imagecmd, sandbox, slotimage, sockdiag, worktreesimage, yamlconfig
 
@@ -84,6 +85,11 @@ _LOCAL_SALVAGE_DIRECTORY = "wrkslots-salvage"
 #: count every receipt that names a bundle here.
 _SHARED_SALVAGE_DIRECTORY = "_by-commit"
 _SHARED_SALVAGE_METADATA_SCHEMA = 1
+#: Most gitignored bytes one removal archives with --archive-ignored (#1302).
+#: Above this, archiving refuses and names the total, so an evidence
+#: directory stays a deliberate, visible decision rather than a silent
+#: multi-gigabyte copy in the salvage archive.
+_IGNORED_ARCHIVE_LIMIT_BYTES = 512 * 1024 * 1024
 # Remote salvage and rescue refs are published outside refs/heads/. A branch
 # namespace would make every reclaim create a visible branch on the recorded
 # remote, which a main-only repository must not accumulate. Custom refs are
@@ -31993,6 +31999,550 @@ def _drifted_checkout_refusal(
     )
 
 
+_IgnoredMode = Literal["refuse", "archive", "discard"]
+
+
+@dataclasses.dataclass(frozen=True)
+class _IgnoredFile:
+    """One gitignored regular file or symlink removal would otherwise lose."""
+
+    path: str
+    size: int
+    sha256: str
+    link_target: str | None = None
+    executable: bool = False
+
+    def receipt_entry(self, disposition: str) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "bytes": self.size,
+            "sha256": self.sha256,
+            "disposition": disposition,
+        }
+
+
+def _ignored_path_is_cache(
+    config: Config,
+    checkout: Checkout,
+    checkout_path: Path,
+    relative: str,
+    cargo_targets: dict[str, bool],
+) -> bool:
+    """Whether one ignored path lies in a known regenerable cache (#1302).
+
+    This is the cache definition ``clean-caches`` uses: the configured
+    cache globs for the checkout (``_cache_globs_for``), a checkout's own
+    cargo ``target`` when no per-repository cache policy is configured
+    (#1042), and any marker-proven nested cargo target.  The caller
+    memoises the marker probes in ``cargo_targets`` because one cache can
+    hold many files.
+    """
+
+    if any(
+        _cache_glob_contains_path(pattern, relative)
+        for pattern in _cache_globs_for(config, checkout.name)
+    ):
+        return True
+    parts = tuple(part for part in relative.split("/") if part)
+    if parts and parts[0] == "target" and not config.repo_cache_globs:
+        return True
+    for end in range(1, len(parts)):
+        ancestor = "/".join(parts[:end])
+        cached = cargo_targets.get(ancestor)
+        if cached is None:
+            cached = _is_cargo_target_dir(checkout_path.joinpath(*parts[:end]))
+            cargo_targets[ancestor] = cached
+        if cached:
+            return True
+    return False
+
+
+def _record_ignored_file(
+    checkout: Checkout,
+    checkout_path: Path,
+    relative: str,
+    found: dict[str, _IgnoredFile],
+) -> None:
+    try:
+        relative.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise Refusal(
+            f"checkout {checkout.name} holds a gitignored path that is not valid UTF-8: "
+            f"{relative!r}; rename it before removal"
+        ) from exc
+    full = checkout_path.joinpath(*relative.split("/"))
+    current = checkout_path
+    for part in relative.split("/")[:-1]:
+        current /= part
+        try:
+            if current.is_symlink():
+                raise Refusal(
+                    f"gitignored path crosses a symlink in checkout {checkout.name}: {relative}"
+                )
+        except OSError as exc:
+            raise Refusal(
+                f"cannot inspect gitignored path {relative} in checkout {checkout.name}: {exc}"
+            ) from exc
+    try:
+        metadata = os.lstat(full)
+    except OSError as exc:
+        raise Refusal(
+            f"cannot inspect gitignored path {relative} in checkout {checkout.name}: {exc}"
+        ) from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        try:
+            target = os.readlink(full)
+        except OSError as exc:
+            raise Refusal(
+                f"cannot read gitignored symlink {relative} in checkout {checkout.name}: {exc}"
+            ) from exc
+        encoded = os.fsencode(target)
+        if len(encoded) != metadata.st_size:
+            raise Refusal(
+                f"gitignored symlink changed while it was read in checkout "
+                f"{checkout.name}: {relative}"
+            )
+        found[relative] = _IgnoredFile(
+            relative,
+            len(encoded),
+            hashlib.sha256(encoded).hexdigest(),
+            link_target=target,
+        )
+        return
+    if not stat.S_ISREG(metadata.st_mode):
+        raise Refusal(
+            f"checkout {checkout.name} holds gitignored path {relative} that is not a "
+            "regular file or symlink; remove it by hand before removal"
+        )
+    digest, size = _sha256_regular_file(full, "gitignored file")
+    found[relative] = _IgnoredFile(
+        relative,
+        size,
+        digest,
+        executable=bool(metadata.st_mode & 0o111),
+    )
+
+
+def _collect_ignored_directory(
+    config: Config,
+    checkout: Checkout,
+    checkout_path: Path,
+    relative: str,
+    *,
+    vcs: _GitVcs,
+    cargo_targets: dict[str, bool],
+    found: dict[str, _IgnoredFile],
+) -> None:
+    """Collect ignored files below a directory Git collapsed into one entry."""
+
+    directory = checkout_path.joinpath(*relative.split("/"))
+    if (directory / ".git").exists() or (directory / ".git").is_symlink():
+        _collect_ignored_files(
+            config,
+            checkout,
+            checkout_path,
+            directory,
+            f"{relative}/",
+            vcs=vcs,
+            cargo_targets=cargo_targets,
+            found=found,
+        )
+        return
+    try:
+        entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+    except OSError as exc:
+        raise Refusal(
+            f"cannot read gitignored directory {relative} in checkout {checkout.name}: {exc}"
+        ) from exc
+    for entry in entries:
+        child = f"{relative}/{entry.name}"
+        if entry.name == ".git":
+            continue
+        if _ignored_path_is_cache(config, checkout, checkout_path, child, cargo_targets):
+            continue
+        try:
+            if entry.is_dir(follow_symlinks=False):
+                _collect_ignored_directory(
+                    config,
+                    checkout,
+                    checkout_path,
+                    child,
+                    vcs=vcs,
+                    cargo_targets=cargo_targets,
+                    found=found,
+                )
+            else:
+                _record_ignored_file(checkout, checkout_path, child, found)
+        except OSError as exc:
+            raise Refusal(
+                f"cannot inspect gitignored path {child} in checkout {checkout.name}: {exc}"
+            ) from exc
+
+
+def _collect_ignored_files(
+    config: Config,
+    checkout: Checkout,
+    checkout_path: Path,
+    repository: Path,
+    prefix: str,
+    *,
+    vcs: _GitVcs,
+    cargo_targets: dict[str, bool],
+    found: dict[str, _IgnoredFile],
+) -> None:
+    raw = vcs._run(
+        repository,
+        ["ls-files", "--others", "--ignored", "--exclude-standard", "-z", "--", "."],
+    ).stdout
+    for name in raw.split("\x00"):
+        if not name:
+            continue
+        relative = f"{prefix}{name}"
+        if _ignored_path_is_cache(
+            config, checkout, checkout_path, relative, cargo_targets
+        ):
+            continue
+        full = checkout_path.joinpath(*relative.split("/"))
+        try:
+            metadata = os.lstat(full)
+        except OSError as exc:
+            raise Refusal(
+                f"cannot inspect gitignored path {relative} in checkout {checkout.name}: {exc}"
+            ) from exc
+        if stat.S_ISDIR(metadata.st_mode):
+            _collect_ignored_directory(
+                config,
+                checkout,
+                checkout_path,
+                relative,
+                vcs=vcs,
+                cargo_targets=cargo_targets,
+                found=found,
+            )
+        else:
+            _record_ignored_file(checkout, checkout_path, relative, found)
+
+
+def _ignored_files_outside_caches(
+    config: Config, checkout: Checkout, path: Path, vcs: _GitVcs
+) -> tuple[_IgnoredFile, ...]:
+    """Every gitignored file in ``path`` outside the regenerable caches.
+
+    The single cache definition is ``_ignored_path_is_cache`` (shared
+    with ``clean-caches``); everything else Git ignores -- tracked
+    .gitignore rules and .git/info/exclude alike -- is evidence removal
+    must not silently delete (#1302).  A module repository with no
+    worktree (#864) holds no ignored files by construction.
+    """
+
+    if (path / "HEAD").is_file() and (path / "objects").is_dir():
+        return ()
+    found: dict[str, _IgnoredFile] = {}
+    _collect_ignored_files(
+        config,
+        checkout,
+        path,
+        path,
+        "",
+        vcs=vcs,
+        cargo_targets={},
+        found=found,
+    )
+    return tuple(found[path] for path in sorted(found))
+
+
+def _ignored_refusal(
+    ignored_by_checkout: Mapping[str, tuple[_IgnoredFile, ...]],
+) -> Refusal:
+    segments: list[str] = []
+    for name in sorted(ignored_by_checkout):
+        files = ignored_by_checkout[name]
+        total = sum(item.size for item in files)
+        shown = ", ".join(
+            f"{item.path} ({item.size} bytes)" for item in files[:10]
+        )
+        if len(files) > 10:
+            shown += f" and {len(files) - 10} more"
+        segments.append(
+            f"checkout {name} holds {len(files)} gitignored file(s) outside the "
+            f"known regenerable caches ({total} bytes) that removal would delete: "
+            f"{shown}"
+        )
+    return Refusal(
+        "; ".join(segments)
+        + "; rerun with --archive-ignored to keep them in the salvage archive "
+        "or --discard-ignored to delete them explicitly. "
+        "state: REFUSED -- no checkout was salvaged or removed"
+    )
+
+
+def _warn_ignored_paths_referenced(
+    config: Config, ignored_by_checkout: Mapping[str, tuple[_IgnoredFile, ...]]
+) -> None:
+    """Warning only: name ignored paths the source tree's records cite.
+
+    Bounded (at most 1000 files and 32 MiB scanned) and never a refusal:
+    the deterministic guard is the refusal itself; this only helps the
+    operator see which ignored files other work points at (#1302).
+    """
+
+    paths = sorted(
+        {item.path for files in ignored_by_checkout.values() for item in files}
+    )
+    if not paths:
+        return
+    scanned_files = 0
+    scanned_bytes = 0
+    for base in (
+        config.root / ".minibeads" / "issues",
+        config.root / "ai_docs",
+        config.root / "reviews",
+    ):
+        if not base.is_dir():
+            continue
+        for candidate in sorted(base.rglob("*")):
+            if scanned_files >= 1000 or scanned_bytes >= 32 * 1024 * 1024:
+                return
+            try:
+                if candidate.is_symlink() or not candidate.is_file():
+                    continue
+                metadata = candidate.stat(follow_symlinks=False)
+                if metadata.st_size > 2 * 1024 * 1024:
+                    continue
+                contents = candidate.read_bytes()
+            except OSError:
+                continue
+            scanned_files += 1
+            scanned_bytes += len(contents)
+            text = contents.decode("utf-8", errors="ignore")
+            for relative in paths:
+                if relative in text:
+                    print(
+                        f"wrkslots: warning: gitignored path {relative} is "
+                        f"referenced by {candidate}",
+                        file=sys.stderr,
+                    )
+
+
+def _ignored_archive_path(
+    archive_root: Path,
+    machine: str,
+    slot: str,
+    generation: int | None,
+    checkout: Checkout,
+    files: Sequence[_IgnoredFile],
+) -> Path:
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", checkout.name).strip("-.") or "checkout"
+    name_digest = hashlib.sha256(checkout.name.encode("utf-8")).hexdigest()[:12]
+    listing = hashlib.sha256()
+    for item in files:
+        listing.update(item.path.encode("utf-8"))
+        listing.update(b"\x00")
+        listing.update(str(item.size).encode("ascii"))
+        listing.update(b"\x00")
+        listing.update(item.sha256.encode("ascii"))
+        listing.update(b"\x00")
+        listing.update((item.link_target or "").encode("utf-8"))
+        listing.update(b"\x00")
+    epoch = "ownerless" if generation is None else str(generation)
+    return (
+        archive_root
+        / _LOCAL_SALVAGE_DIRECTORY
+        / machine
+        / slot
+        / epoch
+        / f"ignored-{safe_name}-{name_digest}-{listing.hexdigest()[:12]}.tar"
+    )
+
+
+def _verify_ignored_archive(
+    tar_path: Path, checkout: Checkout, files: Sequence[_IgnoredFile]
+) -> None:
+    """Read an ignored-files tar back and check every member (#1302)."""
+
+    expected = [f"{checkout.name}/{item.path}" for item in files]
+    try:
+        with tarfile.open(tar_path, "r:") as archive:
+            members = archive.getmembers()
+            if [member.name for member in members] != expected:
+                raise Refusal(
+                    f"ignored-files archive does not list the expected files: {tar_path}"
+                )
+            for member, item in zip(members, files, strict=True):
+                if item.link_target is not None:
+                    if not member.issym() or member.linkname != item.link_target:
+                        raise Refusal(
+                            f"ignored-files archive member is not the expected "
+                            f"symlink {member.name}: {tar_path}"
+                        )
+                    continue
+                if not member.isfile():
+                    raise Refusal(
+                        f"ignored-files archive member is not a regular file: "
+                        f"{member.name} in {tar_path}"
+                    )
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    raise Refusal(
+                        f"ignored-files archive member cannot be read: "
+                        f"{member.name} in {tar_path}"
+                    )
+                digest = hashlib.sha256()
+                while True:
+                    chunk = extracted.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                if digest.hexdigest() != item.sha256:
+                    raise Refusal(
+                        f"ignored-files archive member {member.name} does not "
+                        f"match its recorded sha256: {tar_path}"
+                    )
+    except (tarfile.TarError, OSError) as exc:
+        raise Refusal(f"cannot verify ignored-files archive {tar_path}: {exc}") from exc
+
+
+def _archive_ignored_files(
+    config: Config,
+    archive_root: Path,
+    machine: str,
+    slot: str,
+    generation: int | None,
+    checkout: Checkout,
+    path: Path,
+    files: Sequence[_IgnoredFile],
+) -> dict[str, object]:
+    """Write, verify and receipt one checkout's ignored-files tar (#1302).
+
+    The tar is deterministic (USTAR, sorted members, zeroed ownership
+    and timestamps) so the Python and Rust editions write identical
+    bytes for identical files; it sits beside the slot's salvage
+    bundles under the archive root and nothing deletes it.
+    """
+
+    checked_root = _local_salvage_archive_root(config, str(archive_root))
+    assert checked_root is not None
+    tar_path = _ignored_archive_path(
+        checked_root, machine, slot, generation, checkout, files
+    )
+    _prepare_local_salvage_directory(checked_root, tar_path.parent)
+    _ensure_no_symlink_components(checked_root, tar_path.parent, "local salvage archive")
+    if tar_path.exists() or tar_path.is_symlink():
+        _verify_ignored_archive(tar_path, checkout, files)
+    else:
+        temporary = tar_path.parent / (
+            f".{tar_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+        )
+        try:
+            with tarfile.open(temporary, "w", format=tarfile.USTAR_FORMAT) as archive:
+                for item in files:
+                    info = tarfile.TarInfo(f"{checkout.name}/{item.path}")
+                    info.mtime = 0
+                    info.uid = 0
+                    info.gid = 0
+                    info.uname = ""
+                    info.gname = ""
+                    if item.link_target is not None:
+                        info.type = tarfile.SYMTYPE
+                        info.linkname = item.link_target
+                        info.mode = 0o777
+                        info.size = 0
+                        archive.addfile(info)
+                    else:
+                        info.mode = 0o755 if item.executable else 0o644
+                        info.size = item.size
+                        source = path.joinpath(*item.path.split("/"))
+                        with source.open("rb") as handle:
+                            archive.addfile(info, handle)
+            with temporary.open("rb") as handle:
+                os.fsync(handle.fileno())
+            os.replace(temporary, tar_path)
+            _fsync_directory(tar_path.parent)
+        except BaseException:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+            raise
+        _verify_ignored_archive(tar_path, checkout, files)
+    digest, size = _sha256_regular_file(tar_path, "ignored-files archive")
+    return {
+        "archive_root": str(checked_root),
+        "path": tar_path.relative_to(checked_root).as_posix(),
+        "bytes": size,
+        "sha256": digest,
+    }
+
+
+def _assert_receipt_ignored_files(
+    config: Config,
+    checkout: Checkout,
+    path: Path,
+    receipt: Mapping[str, object],
+    vcs: _GitVcs,
+) -> None:
+    """Recheck a receipt's ignored files and archive before deletion."""
+
+    recorded = receipt.get("ignored_files")
+    if recorded is None:
+        return
+    expected_entries = _as_list(recorded, "salvage receipt.ignored_files")
+    current = _ignored_files_outside_caches(config, checkout, path, vcs)
+    observed: list[dict[str, object]] = []
+    archive = receipt.get("ignored_archive")
+    for entry in expected_entries:
+        item = _as_mapping(entry, "salvage receipt.ignored_files entry")
+        observed.append(
+            {
+                "path": _as_str(item.get("path"), "salvage receipt.ignored_files.path"),
+                "bytes": _as_int(
+                    item.get("bytes"), "salvage receipt.ignored_files.bytes"
+                ),
+                "sha256": _as_str(
+                    item.get("sha256"), "salvage receipt.ignored_files.sha256"
+                ),
+                "disposition": _as_str(
+                    item.get("disposition"),
+                    "salvage receipt.ignored_files.disposition",
+                ),
+            }
+        )
+    disposition = observed[0]["disposition"] if observed else None
+    current_entries = [
+        item.receipt_entry(_as_str(disposition, "salvage receipt disposition"))
+        for item in current
+    ]
+    if current_entries != observed:
+        raise Refusal(
+            f"checkout {checkout.name} gitignored files changed after salvage; "
+            "preserve it and rerun remove so the changed files are judged again"
+        )
+    if disposition == "archived":
+        archive_item = _as_mapping(archive, "salvage receipt.ignored_archive")
+        root = _local_salvage_archive_root(
+            config,
+            _as_str(
+                archive_item.get("archive_root"),
+                "salvage receipt.ignored_archive.archive_root",
+            ),
+        )
+        assert root is not None
+        relative, tar_path = _relative_inside(
+            root,
+            _as_str(archive_item.get("path"), "salvage receipt.ignored_archive.path"),
+            "ignored-files archive",
+        )
+        del relative
+        digest, size = _sha256_regular_file(tar_path, "ignored-files archive")
+        if digest != _as_str(
+            archive_item.get("sha256"), "salvage receipt.ignored_archive.sha256"
+        ) or size != _as_int(
+            archive_item.get("bytes"), "salvage receipt.ignored_archive.bytes"
+        ):
+            raise Refusal(f"ignored-files archive changed after salvage: {tar_path}")
+        _verify_ignored_archive(tar_path, checkout, current)
+    elif disposition != "discarded":
+        raise StateError(f"unknown ignored-file disposition {disposition!r}")
+
+
 def _salvage_agent_slot(
     config: Config,
     record: ActiveRecord,
@@ -32003,6 +32553,7 @@ def _salvage_agent_slot(
     drift_refusal: str | None = None,
     owner_proven_dead: bool = False,
     archive_private_history: bool = False,
+    ignored_mode: _IgnoredMode = "refuse",
 ) -> tuple[dict[str, object], ...]:
     """Salvage every checkout and initialized submodule of an agent slot.
 
@@ -32025,6 +32576,12 @@ def _salvage_agent_slot(
     (_declared_submodule_private_history) refuses the same way before
     anything is salvaged, or with ``archive_private_history`` is kept, with
     its private state, in a verified local bundle and never pushed (#1257).
+
+    Gitignored files outside the regenerable caches are judged before any
+    candidate is derived (#1302): ``ignored_mode`` refuses removal for
+    them by default, archives them into a verified tar beside the salvage
+    bundles, or discards them explicitly; the salvage receipts list them
+    either way it proceeds.
     """
 
     _set_item_phase("salvage")
@@ -32083,6 +32640,43 @@ def _salvage_agent_slot(
                     candidates.append(
                         (nested_repo, nested_repo_path, True, None, True)
                     )
+    ignored_by_checkout: dict[str, tuple[_IgnoredFile, ...]] = {}
+    for checkout, path, _detached, _drift, _never_push in candidates:
+        files = _ignored_files_outside_caches(config, checkout, path, vcs)
+        if files:
+            ignored_by_checkout[checkout.name] = files
+    ignored_archives: dict[str, dict[str, object]] = {}
+    if ignored_by_checkout:
+        if ignored_mode == "refuse":
+            _warn_ignored_paths_referenced(config, ignored_by_checkout)
+            raise _ignored_refusal(ignored_by_checkout)
+        total_ignored = sum(
+            item.size for files in ignored_by_checkout.values() for item in files
+        )
+        if ignored_mode == "archive":
+            if total_ignored > _IGNORED_ARCHIVE_LIMIT_BYTES:
+                raise Refusal(
+                    f"gitignored files outside the known regenerable caches total "
+                    f"{total_ignored} bytes, above the {_IGNORED_ARCHIVE_LIMIT_BYTES}-byte "
+                    "--archive-ignored limit; preserve them by hand or rerun with "
+                    "--discard-ignored. state: REFUSED -- no checkout was salvaged or removed"
+                )
+            resolved_archive_root = archive_root or _default_salvage_archive_root(config)
+            candidate_paths = {
+                checkout.name: path for checkout, path, *_rest in candidates
+            }
+            for name in sorted(ignored_by_checkout):
+                checkout = next(item for item, *_rest in candidates if item.name == name)
+                ignored_archives[name] = _archive_ignored_files(
+                    config,
+                    resolved_archive_root,
+                    record.machine,
+                    record.slot,
+                    record.generation,
+                    checkout,
+                    candidate_paths[name],
+                    ignored_by_checkout[name],
+                )
     prepared: list[
         tuple[Checkout, Path, bool, _CheckoutDrift | None, bool, _SalvageCandidate]
     ] = []
@@ -32225,6 +32819,17 @@ def _salvage_agent_slot(
     candidates_by_name = {
         checkout.name: (checkout, path) for checkout, path, *_rest in prepared
     }
+    if ignored_by_checkout:
+        disposition = "archived" if ignored_mode == "archive" else "discarded"
+        for receipt in receipts:
+            name = _as_str(receipt.get("checkout"), "salvage receipt.checkout")
+            ignored_files = ignored_by_checkout.get(name)
+            if ignored_files:
+                receipt["ignored_files"] = [
+                    item.receipt_entry(disposition) for item in ignored_files
+                ]
+                if name in ignored_archives:
+                    receipt["ignored_archive"] = ignored_archives[name]
     for receipt in receipts:
         inventoried, inventoried_path = candidates_by_name[
             _as_str(receipt.get("checkout"), "salvage receipt.checkout")
@@ -32625,6 +33230,7 @@ def _assert_salvage_still_matches(
                 f"checkout {checkout.name} changed after salvage; preserve it and rerun remove "
                 "so the changed state is published before deletion"
             )
+        _assert_receipt_ignored_files(config, checkout, path, receipt, vcs)
         disposition = _as_str(
             receipt.get("disposition"), "salvage receipt.disposition"
         )
@@ -55092,6 +55698,29 @@ def _cmd_remove_in_scope(
     salvage_archive_root = _local_salvage_archive_root(
         config, getattr(args, "salvage_archive_root", None)
     )
+    archive_ignored = bool(getattr(args, "archive_ignored", False))
+    discard_ignored = bool(getattr(args, "discard_ignored", False))
+    if archive_ignored and discard_ignored:
+        raise Refusal(
+            "--archive-ignored and --discard-ignored cannot be supplied together. "
+            "state: REFUSED -- no checkout was salvaged or removed"
+        )
+    if (archive_ignored or discard_ignored) and (
+        agent_batch is not None
+        or private_cleanup is not None
+        or validation_removal_proof is not None
+        or bool(args.validate_complete)
+        or getattr(args, "_retirement_candidate", None) is not None
+    ):
+        raise Refusal(
+            "--archive-ignored and --discard-ignored apply only to one explicit "
+            "remove of an agent slot; retire-pending, remove-agent-batch and "
+            "validation removal never accept them. "
+            "state: REFUSED -- no checkout was salvaged or removed"
+        )
+    ignored_mode: _IgnoredMode = (
+        "archive" if archive_ignored else "discard" if discard_ignored else "refuse"
+    )
     proof_manifest = getattr(args, "validation_proof_manifest", None)
     completed_record = getattr(args, "completed_record", None)
     attest_agent: str | None = getattr(args, "attest_agent_stopped", None)
@@ -55795,6 +56424,7 @@ def _cmd_remove_in_scope(
                 archive_private_history=bool(
                     getattr(args, "archive_private_history", False)
                 ),
+                ignored_mode=ignored_mode,
             )
             evidence_write = _reclaim_evidence_write(
                 record,
@@ -82854,6 +83484,27 @@ _ARCHIVE_NESTED_CACHE_REPOSITORIES_HELP = (
     "or verified. Its ignored files are kept too, since an ignore rule can itself be "
     "unpublished work (default: off, such a repository refuses)"
 )
+_ARCHIVE_IGNORED_HELP = (
+    "for an agent slot, do not refuse removal for gitignored files outside the known "
+    "regenerable caches (the cache globs clean-caches uses, a checkout's own cargo "
+    "target, and marker-proven nested cargo targets): first keep every such file in a "
+    "deterministic tar beside the slot's salvage bundles under the control directory's "
+    "wrkslots-salvage/ (or --salvage-archive-root), read it back and check every file's "
+    "sha256 before anything is deleted, and list every archived file with its size and "
+    f"sha256 in the salvage receipt. The archive refuses above {_IGNORED_ARCHIVE_LIMIT_BYTES} "
+    "bytes of ignored files in total. Gitignored content inside the caches is deleted "
+    "with the checkout as before and is not listed (default: off, ignored files "
+    "outside the caches refuse removal)"
+)
+_DISCARD_IGNORED_HELP = (
+    "for an agent slot, delete gitignored files outside the known regenerable caches "
+    "(the cache globs clean-caches uses, a checkout's own cargo target, and "
+    "marker-proven nested cargo targets) with the checkout instead of refusing "
+    "removal for them; the salvage receipt still lists every discarded file with its "
+    "size and sha256. Nothing is archived. This is the explicit statement that those "
+    "files are disposable (default: off, ignored files outside the caches refuse "
+    "removal)"
+)
 
 
 def _cmd_socket_census(args: argparse.Namespace) -> int:
@@ -85045,6 +85696,16 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--archive-private-history",
         action="store_true",
         help=_ARCHIVE_PRIVATE_HISTORY_HELP,
+    )
+    remove.add_argument(
+        "--archive-ignored",
+        action="store_true",
+        help=_ARCHIVE_IGNORED_HELP,
+    )
+    remove.add_argument(
+        "--discard-ignored",
+        action="store_true",
+        help=_DISCARD_IGNORED_HELP,
     )
     remove.set_defaults(handler=_cmd_remove)
 

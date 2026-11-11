@@ -6,7 +6,12 @@
 //! artifact/read checks, salvage of already-published clean
 //! checkouts, reclaim evidence, the FINISH journal and path fence,
 //! physical worktree removal, and the archive + slot-removed state
-//! updates. Corners that stay with the Python edition for now and
+//! updates. Gitignored files outside the regenerable caches refuse
+//! removal by default; `--archive-ignored` keeps them in a verified
+//! deterministic tar beside the salvage bundles and
+//! `--discard-ignored` deletes them explicitly, both listed with
+//! size and sha256 in the salvage receipt (#1302). Corners that stay
+//! with the Python edition for now and
 //! refuse explicitly here: host-context removal (runner/proof
 //! environment), validate slots, owner consent and attestation,
 //! salvage needing a push or local bundle (dirty, unpublished, or
@@ -15,7 +20,7 @@
 //! HANDOFF.md quarantine, and slot images. Fixture registries only
 //! until the edition cutover (see `ensure_states::require_fixture`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -1504,8 +1509,8 @@ fn salvage_checkout(cfg: &Cfg, checkout: &Value, repository: &Path) -> Result<Va
     // and index-flag checks, then publication = the HEAD is contained
     // in at least one remote ref after a scratch-namespace fetch.
     // Unlike finish, salvage needs neither landed-ref ancestry nor
-    // an ignored-file-free status (the caller checked cleanliness
-    // without --ignored).
+    // an ignored-file-free status (the gate judged ignored files
+    // outside the caches separately, without --ignored).
     let name = checkout
         .get("name")
         .and_then(Value::as_str)
@@ -1708,7 +1713,862 @@ fn judge_cache_directories(checkout_path: &Path, globs: &[String]) -> Result<()>
     Ok(())
 }
 
-fn salvage_gate(cfg: &Cfg, config: &Value, checkout: &Value, repository: &Path) -> Result<Value> {
+/// What removal does with ignored files outside the caches (#1302),
+/// mirroring the Python edition's ``_IgnoredMode``.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IgnoredMode {
+    Refuse,
+    Archive,
+    Discard,
+}
+
+/// One gitignored regular file or symlink removal would otherwise lose.
+#[derive(Clone)]
+struct IgnoredFile {
+    path: String,
+    size: u64,
+    sha256: String,
+    link_target: Option<String>,
+    executable: bool,
+}
+
+struct IgnoredContext<'a> {
+    machine: &'a str,
+    slot: &'a str,
+    generation: i64,
+    archive_root: &'a Path,
+}
+
+const IGNORED_ARCHIVE_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
+
+fn is_cargo_target_dir(path: &Path) -> bool {
+    // The Python edition's `_is_cargo_target_dir` (#1042).
+    if path.join("CACHEDIR.TAG").is_file() && path.join(".fingerprint").is_dir() {
+        return true;
+    }
+    let profiles = ["debug", "release", "dev", "test", "bench", "check", "doc"];
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let child = entry.path();
+        profiles.contains(&entry.file_name().to_string_lossy().as_ref())
+            && child.is_dir()
+            && !child.is_symlink()
+            && child.join(".fingerprint").is_dir()
+    })
+}
+
+fn ignored_path_is_cache(
+    config: &Value,
+    checkout_name: &str,
+    checkout_path: &Path,
+    relative: &str,
+    cargo_targets: &mut HashMap<String, bool>,
+) -> bool {
+    // The Python edition's `_ignored_path_is_cache`: the cache
+    // definition `clean-caches` shares.
+    if crate::finish_write::cache_globs_for(config, checkout_name)
+        .iter()
+        .any(|pattern| crate::finish_write::cache_glob_contains_path(pattern, relative))
+    {
+        return true;
+    }
+    let parts: Vec<&str> = relative
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let repo_policy_empty = config
+        .get("repo_cache_globs")
+        .and_then(Value::as_array)
+        .is_some_and(|groups| groups.is_empty());
+    if parts.first() == Some(&"target") && repo_policy_empty {
+        return true;
+    }
+    for end in 1..parts.len() {
+        let ancestor = parts[..end].join("/");
+        let cached = *cargo_targets
+            .entry(ancestor)
+            .or_insert_with(|| is_cargo_target_dir(&checkout_path.join(parts[..end].join("/"))));
+        if cached {
+            return true;
+        }
+    }
+    false
+}
+
+fn hash_regular_file(path: &Path, relative: &str, checkout_name: &str) -> Result<(String, u64)> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        format!("cannot open gitignored file {relative} in checkout {checkout_name}: {error}")
+    })?;
+    let mut digest = Sha256::new();
+    let mut size: u64 = 0;
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            format!("cannot read gitignored file {relative} in checkout {checkout_name}: {error}")
+        })?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+        size += read as u64;
+    }
+    Ok((format!("{:x}", digest.finalize()), size))
+}
+
+fn record_ignored_file(
+    checkout_name: &str,
+    checkout_path: &Path,
+    relative: &str,
+    found: &mut BTreeMap<String, IgnoredFile>,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let full = checkout_path.join(relative);
+    let mut cursor = checkout_path.to_path_buf();
+    let components: Vec<&str> = relative.split('/').collect();
+    for part in &components[..components.len().saturating_sub(1)] {
+        cursor.push(part);
+        let metadata = std::fs::symlink_metadata(&cursor).map_err(|error| {
+            format!(
+                "cannot inspect gitignored path {relative} in checkout {checkout_name}: {error}"
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "gitignored path crosses a symlink in checkout {checkout_name}: {relative}"
+            ));
+        }
+    }
+    let metadata = std::fs::symlink_metadata(&full).map_err(|error| {
+        format!("cannot inspect gitignored path {relative} in checkout {checkout_name}: {error}")
+    })?;
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(&full).map_err(|error| {
+            format!(
+                "cannot read gitignored symlink {relative} in checkout {checkout_name}: {error}"
+            )
+        })?;
+        let target_text = target.to_str().ok_or_else(|| {
+            format!("gitignored symlink target is not valid UTF-8 in checkout {checkout_name}: {relative}")
+        })?;
+        found.insert(
+            relative.to_string(),
+            IgnoredFile {
+                path: relative.to_string(),
+                size: target_text.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(target_text.as_bytes())),
+                link_target: Some(target_text.to_string()),
+                executable: false,
+            },
+        );
+        return Ok(());
+    }
+    if !metadata.is_file() {
+        return Err(format!(
+            "checkout {checkout_name} holds gitignored path {relative} that is not a regular file or symlink; remove it by hand before removal"
+        ));
+    }
+    let (sha256, size) = hash_regular_file(&full, relative, checkout_name)?;
+    found.insert(
+        relative.to_string(),
+        IgnoredFile {
+            path: relative.to_string(),
+            size,
+            sha256,
+            link_target: None,
+            executable: metadata.permissions().mode() & 0o111 != 0,
+        },
+    );
+    Ok(())
+}
+
+fn collect_ignored_directory(
+    config: &Value,
+    checkout_name: &str,
+    checkout_path: &Path,
+    relative: &str,
+    cargo_targets: &mut HashMap<String, bool>,
+    found: &mut BTreeMap<String, IgnoredFile>,
+) -> Result<()> {
+    let directory = checkout_path.join(relative);
+    let git_marker = directory.join(".git");
+    if git_marker.exists() || git_marker.is_symlink() {
+        return collect_ignored_files(
+            config,
+            checkout_name,
+            checkout_path,
+            &directory,
+            &format!("{relative}/"),
+            cargo_targets,
+            found,
+        );
+    }
+    let mut entries: Vec<_> = std::fs::read_dir(&directory)
+        .map_err(|error| {
+            format!(
+                "cannot read gitignored directory {relative} in checkout {checkout_name}: {error}"
+            )
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| {
+            format!(
+                "cannot read gitignored directory {relative} in checkout {checkout_name}: {error}"
+            )
+        })?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == ".git" {
+            continue;
+        }
+        let child = format!("{relative}/{name}");
+        if ignored_path_is_cache(config, checkout_name, checkout_path, &child, cargo_targets) {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|error| {
+            format!("cannot inspect gitignored path {child} in checkout {checkout_name}: {error}")
+        })?;
+        if file_type.is_dir() {
+            collect_ignored_directory(
+                config,
+                checkout_name,
+                checkout_path,
+                &child,
+                cargo_targets,
+                found,
+            )?;
+        } else {
+            record_ignored_file(checkout_name, checkout_path, &child, found)?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_ignored_files(
+    config: &Value,
+    checkout_name: &str,
+    checkout_path: &Path,
+    repository: &Path,
+    prefix: &str,
+    cargo_targets: &mut HashMap<String, bool>,
+    found: &mut BTreeMap<String, IgnoredFile>,
+) -> Result<()> {
+    let raw = git(
+        repository,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+            "--",
+            ".",
+        ],
+    )?;
+    for name in raw.split('\0') {
+        if name.is_empty() {
+            continue;
+        }
+        let relative = format!("{prefix}{name}");
+        if ignored_path_is_cache(
+            config,
+            checkout_name,
+            checkout_path,
+            &relative,
+            cargo_targets,
+        ) {
+            continue;
+        }
+        let full = checkout_path.join(&relative);
+        let metadata = std::fs::symlink_metadata(&full).map_err(|error| {
+            format!(
+                "cannot inspect gitignored path {relative} in checkout {checkout_name}: {error}"
+            )
+        })?;
+        if metadata.is_dir() {
+            collect_ignored_directory(
+                config,
+                checkout_name,
+                checkout_path,
+                &relative,
+                cargo_targets,
+                found,
+            )?;
+        } else {
+            record_ignored_file(checkout_name, checkout_path, &relative, found)?;
+        }
+    }
+    Ok(())
+}
+
+fn ignored_files_outside_caches(
+    config: &Value,
+    checkout_name: &str,
+    checkout_path: &Path,
+) -> Result<Vec<IgnoredFile>> {
+    let mut found = BTreeMap::new();
+    collect_ignored_files(
+        config,
+        checkout_name,
+        checkout_path,
+        checkout_path,
+        "",
+        &mut HashMap::new(),
+        &mut found,
+    )?;
+    Ok(found.into_values().collect())
+}
+
+fn ignored_refusal(checkout_name: &str, files: &[IgnoredFile]) -> String {
+    let total: u64 = files.iter().map(|item| item.size).sum();
+    let mut shown = files
+        .iter()
+        .take(10)
+        .map(|item| format!("{} ({} bytes)", item.path, item.size))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if files.len() > 10 {
+        shown += &format!(" and {} more", files.len() - 10);
+    }
+    format!(
+        "checkout {checkout_name} holds {} gitignored file(s) outside the known regenerable caches ({total} bytes) that removal would delete: {shown}; rerun with --archive-ignored to keep them in the salvage archive or --discard-ignored to delete them explicitly. state: REFUSED -- no checkout was salvaged or removed",
+        files.len()
+    )
+}
+
+fn sanitize_archive_name(name: &str) -> String {
+    let mapped: String = name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = mapped.trim_matches(['-', '.']);
+    if trimmed.is_empty() {
+        "checkout".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn ignored_archive_path(
+    archive_root: &Path,
+    context: &IgnoredContext<'_>,
+    checkout_name: &str,
+    files: &[IgnoredFile],
+) -> PathBuf {
+    let name_digest = format!("{:x}", Sha256::digest(checkout_name.as_bytes()));
+    let mut listing = Sha256::new();
+    for item in files {
+        listing.update(item.path.as_bytes());
+        listing.update(b"\x00");
+        listing.update(item.size.to_string().as_bytes());
+        listing.update(b"\x00");
+        listing.update(item.sha256.as_bytes());
+        listing.update(b"\x00");
+        listing.update(item.link_target.as_deref().unwrap_or("").as_bytes());
+        listing.update(b"\x00");
+    }
+    let listing_digest = format!("{:x}", listing.finalize());
+    archive_root
+        .join("wrkslots-salvage")
+        .join(context.machine)
+        .join(context.slot)
+        .join(context.generation.to_string())
+        .join(format!(
+            "ignored-{}-{}-{}.tar",
+            sanitize_archive_name(checkout_name),
+            &name_digest[..12],
+            &listing_digest[..12]
+        ))
+}
+
+fn prepare_local_salvage_directory(root: &Path, directory: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let euid = std::fs::metadata("/proc/self")
+        .map(|meta| meta.uid())
+        .unwrap_or(0);
+    let relative = directory.strip_prefix(root).map_err(|_| {
+        format!(
+            "local salvage archive directory escapes its root: {}",
+            directory.display()
+        )
+    })?;
+    let mut current = root.to_path_buf();
+    for part in relative.components() {
+        current.push(part.as_os_str());
+        match std::fs::create_dir(&current) {
+            Ok(()) => {
+                let _ = std::fs::set_permissions(&current, std::fs::Permissions::from_mode(0o700));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot create local salvage archive directory {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+        let metadata = std::fs::symlink_metadata(&current).map_err(|error| {
+            format!(
+                "cannot inspect local salvage archive directory {}: {error}",
+                current.display()
+            )
+        })?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != euid
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(format!(
+                "local salvage archive directory is not private current-user storage: {}",
+                current.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn assert_no_symlink_components(root: &Path, path: &Path) -> Result<()> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        format!(
+            "local salvage archive path escapes its root: {}",
+            path.display()
+        )
+    })?;
+    let mut current = root.to_path_buf();
+    for part in relative.components() {
+        current.push(part.as_os_str());
+        let metadata = std::fs::symlink_metadata(&current).map_err(|error| {
+            format!(
+                "cannot inspect local salvage archive path {}: {error}",
+                current.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "local salvage archive path crosses a symlink: {}",
+                current.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_octal(field: &[u8]) -> Result<u64> {
+    let text: String = field
+        .iter()
+        .take_while(|byte| **byte != 0)
+        .map(|byte| *byte as char)
+        .collect();
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(0);
+    }
+    u64::from_str_radix(trimmed, 8)
+        .map_err(|error| format!("invalid octal field in ignored-files archive: {error}"))
+}
+
+fn ustar_header(
+    name: &str,
+    size: u64,
+    mode: u32,
+    typeflag: u8,
+    linkname: &str,
+) -> Result<[u8; 512]> {
+    if linkname.len() > 100 {
+        return Err("ignored-files archive link target is too long".to_string());
+    }
+    let (prefix, short_name): (String, String) = if name.len() <= 100 {
+        (String::new(), name.to_string())
+    } else {
+        let components: Vec<&str> = name.split('/').collect();
+        let mut split = None;
+        for index in 1..components.len() {
+            let candidate_prefix = components[..index].join("/");
+            let candidate_name = components[index..].join("/");
+            if candidate_prefix.len() <= 155 && candidate_name.len() <= 100 {
+                split = Some((candidate_prefix, candidate_name));
+                break;
+            }
+        }
+        split.ok_or_else(|| "ignored-files archive path is too long".to_string())?
+    };
+    let mut header = [0u8; 512];
+    let write_field = |header: &mut [u8; 512], start: usize, width: usize, bytes: &[u8]| {
+        header[start..start + bytes.len()].copy_from_slice(bytes);
+        let _ = width;
+    };
+    write_field(&mut header, 0, 100, short_name.as_bytes());
+    write_field(
+        &mut header,
+        100,
+        8,
+        format!("{:07o}\0", mode & 0o7777).as_bytes(),
+    );
+    write_field(&mut header, 108, 8, b"0000000\0");
+    write_field(&mut header, 116, 8, b"0000000\0");
+    write_field(&mut header, 124, 12, format!("{size:011o}\0").as_bytes());
+    write_field(&mut header, 136, 12, b"00000000000\0");
+    header[148..156].copy_from_slice(b"        ");
+    header[156] = typeflag;
+    write_field(&mut header, 157, 100, linkname.as_bytes());
+    header[257..265].copy_from_slice(b"ustar\x0000");
+    write_field(&mut header, 345, 155, prefix.as_bytes());
+    let checksum: u32 = header.iter().map(|byte| u32::from(*byte)).sum();
+    header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+    Ok(header)
+}
+
+fn verify_ignored_archive(
+    tar_path: &Path,
+    checkout_name: &str,
+    files: &[IgnoredFile],
+) -> Result<()> {
+    use std::io::Read as _;
+    let mut reader = std::fs::File::open(tar_path).map_err(|error| {
+        format!(
+            "cannot verify ignored-files archive {}: {error}",
+            tar_path.display()
+        )
+    })?;
+    let expected: Vec<String> = files
+        .iter()
+        .map(|item| format!("{checkout_name}/{}", item.path))
+        .collect();
+    let mut index = 0usize;
+    let mut zero_blocks = 0usize;
+    loop {
+        let mut header = [0u8; 512];
+        match reader.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(format!(
+                    "ignored-files archive is truncated: {}",
+                    tar_path.display()
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot verify ignored-files archive {}: {error}",
+                    tar_path.display()
+                ));
+            }
+        }
+        if header.iter().all(|byte| *byte == 0) {
+            zero_blocks += 1;
+            if zero_blocks == 2 {
+                break;
+            }
+            continue;
+        }
+        if zero_blocks != 0 {
+            return Err(format!(
+                "ignored-files archive has data after its end blocks: {}",
+                tar_path.display()
+            ));
+        }
+        let stored_checksum = parse_octal(&header[148..156])?;
+        let mut checksum_header = header;
+        checksum_header[148..156].copy_from_slice(b"        ");
+        let checksum: u64 = checksum_header.iter().map(|byte| u64::from(*byte)).sum();
+        if checksum != stored_checksum {
+            return Err(format!(
+                "ignored-files archive header checksum does not match: {}",
+                tar_path.display()
+            ));
+        }
+        let name_field = &header[0..100];
+        let name_end = name_field.iter().position(|byte| *byte == 0).unwrap_or(100);
+        let short_name = String::from_utf8_lossy(&name_field[..name_end]).into_owned();
+        let prefix_field = &header[345..500];
+        let prefix_end = prefix_field
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(155);
+        let prefix = String::from_utf8_lossy(&prefix_field[..prefix_end]).into_owned();
+        let member_name = if prefix.is_empty() {
+            short_name
+        } else {
+            format!("{prefix}/{short_name}")
+        };
+        if index >= expected.len() || member_name != expected[index] {
+            return Err(format!(
+                "ignored-files archive does not list the expected files: {}",
+                tar_path.display()
+            ));
+        }
+        let item = &files[index];
+        let size = parse_octal(&header[124..136])?;
+        let typeflag = header[156];
+        if let Some(target) = &item.link_target {
+            let link_field = &header[157..257];
+            let link_end = link_field.iter().position(|byte| *byte == 0).unwrap_or(100);
+            let linkname = String::from_utf8_lossy(&link_field[..link_end]).into_owned();
+            if typeflag != b'2' || linkname != *target || size != 0 {
+                return Err(format!(
+                    "ignored-files archive member is not the expected symlink {member_name}: {}",
+                    tar_path.display()
+                ));
+            }
+        } else {
+            if typeflag != b'0' && typeflag != 0 {
+                return Err(format!(
+                    "ignored-files archive member is not a regular file: {member_name} in {}",
+                    tar_path.display()
+                ));
+            }
+            let mut digest = Sha256::new();
+            let mut remaining = size;
+            let mut buffer = [0u8; 1024 * 1024];
+            while remaining > 0 {
+                let wanted =
+                    usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+                let read = reader.read(&mut buffer[..wanted]).map_err(|error| {
+                    format!(
+                        "cannot verify ignored-files archive {}: {error}",
+                        tar_path.display()
+                    )
+                })?;
+                if read == 0 {
+                    return Err(format!(
+                        "ignored-files archive is truncated: {}",
+                        tar_path.display()
+                    ));
+                }
+                digest.update(&buffer[..read]);
+                remaining -= read as u64;
+            }
+            if format!("{:x}", digest.finalize()) != item.sha256 {
+                return Err(format!(
+                    "ignored-files archive member {member_name} does not match its recorded sha256: {}",
+                    tar_path.display()
+                ));
+            }
+        }
+        let padding = (512 - (size % 512)) % 512;
+        let mut remaining = padding;
+        let mut buffer = [0u8; 512];
+        while remaining > 0 {
+            let wanted =
+                usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+            let read = reader.read(&mut buffer[..wanted]).map_err(|error| {
+                format!(
+                    "cannot verify ignored-files archive {}: {error}",
+                    tar_path.display()
+                )
+            })?;
+            if read == 0 {
+                return Err(format!(
+                    "ignored-files archive is truncated: {}",
+                    tar_path.display()
+                ));
+            }
+            remaining -= read as u64;
+        }
+        index += 1;
+    }
+    if index != expected.len() {
+        return Err(format!(
+            "ignored-files archive does not list the expected files: {}",
+            tar_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn archive_ignored_files(
+    context: &IgnoredContext<'_>,
+    checkout_name: &str,
+    checkout_path: &Path,
+    files: &[IgnoredFile],
+) -> Result<Value> {
+    use std::io::{Read as _, Seek as _, Write as _};
+    let tar_path = ignored_archive_path(context.archive_root, context, checkout_name, files);
+    let parent = tar_path.parent().ok_or_else(|| {
+        format!(
+            "ignored-files archive has no parent: {}",
+            tar_path.display()
+        )
+    })?;
+    prepare_local_salvage_directory(context.archive_root, parent)?;
+    assert_no_symlink_components(context.archive_root, parent)?;
+    if tar_path.exists() || tar_path.is_symlink() {
+        verify_ignored_archive(&tar_path, checkout_name, files)?;
+    } else {
+        let temporary = parent.join(format!(
+            ".{}.tmp.{}.{}",
+            tar_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let write_result = (|| -> Result<()> {
+            let mut output = std::fs::File::create(&temporary).map_err(|error| {
+                format!(
+                    "cannot create ignored-files archive {}: {error}",
+                    temporary.display()
+                )
+            })?;
+            let mut written: u64 = 0;
+            for item in files {
+                let member_name = format!("{checkout_name}/{}", item.path);
+                if let Some(target) = &item.link_target {
+                    let header = ustar_header(&member_name, 0, 0o777, b'2', target)?;
+                    output.write_all(&header).map_err(|error| {
+                        format!(
+                            "cannot write ignored-files archive {}: {error}",
+                            temporary.display()
+                        )
+                    })?;
+                    written += 512;
+                } else {
+                    let header = ustar_header(
+                        &member_name,
+                        item.size,
+                        if item.executable { 0o755 } else { 0o644 },
+                        b'0',
+                        "",
+                    )?;
+                    output.write_all(&header).map_err(|error| {
+                        format!(
+                            "cannot write ignored-files archive {}: {error}",
+                            temporary.display()
+                        )
+                    })?;
+                    written += 512;
+                    let source = checkout_path.join(&item.path);
+                    let mut input = std::fs::File::open(&source).map_err(|error| {
+                        format!(
+                            "cannot open gitignored file {} in checkout {checkout_name}: {error}",
+                            item.path
+                        )
+                    })?;
+                    let mut buffer = [0u8; 1024 * 1024];
+                    let mut copied: u64 = 0;
+                    loop {
+                        let read = input.read(&mut buffer).map_err(|error| {
+                            format!(
+                                "cannot read gitignored file {} in checkout {checkout_name}: {error}",
+                                item.path
+                            )
+                        })?;
+                        if read == 0 {
+                            break;
+                        }
+                        output.write_all(&buffer[..read]).map_err(|error| {
+                            format!(
+                                "cannot write ignored-files archive {}: {error}",
+                                temporary.display()
+                            )
+                        })?;
+                        copied += read as u64;
+                    }
+                    if copied != item.size {
+                        return Err(format!(
+                            "gitignored file changed while it was archived in checkout {checkout_name}: {}",
+                            item.path
+                        ));
+                    }
+                    written += copied;
+                    let padding = (512 - (copied % 512)) % 512;
+                    if padding > 0 {
+                        output
+                            .write_all(&vec![0u8; padding as usize])
+                            .map_err(|error| {
+                                format!(
+                                    "cannot write ignored-files archive {}: {error}",
+                                    temporary.display()
+                                )
+                            })?;
+                        written += padding;
+                    }
+                }
+            }
+            output.write_all(&[0u8; 1024]).map_err(|error| {
+                format!(
+                    "cannot write ignored-files archive {}: {error}",
+                    temporary.display()
+                )
+            })?;
+            written += 1024;
+            let record_padding = (10240 - (written % 10240)) % 10240;
+            if record_padding > 0 {
+                output
+                    .write_all(&vec![0u8; record_padding as usize])
+                    .map_err(|error| {
+                        format!(
+                            "cannot write ignored-files archive {}: {error}",
+                            temporary.display()
+                        )
+                    })?;
+            }
+            output.sync_all().map_err(|error| {
+                format!(
+                    "cannot fsync ignored-files archive {}: {error}",
+                    temporary.display()
+                )
+            })?;
+            let _ = output.seek(std::io::SeekFrom::Start(0));
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+        if let Err(error) = std::fs::rename(&temporary, &tar_path) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(format!(
+                "cannot publish ignored-files archive {}: {error}",
+                tar_path.display()
+            ));
+        }
+        let directory_file = std::fs::File::open(parent)
+            .map_err(|error| format!("cannot fsync directory {}: {error}", parent.display()))?;
+        directory_file
+            .sync_all()
+            .map_err(|error| format!("cannot fsync directory {}: {error}", parent.display()))?;
+        verify_ignored_archive(&tar_path, checkout_name, files)?;
+    }
+    let (sha256, size) =
+        hash_regular_file(&tar_path, &tar_path.display().to_string(), checkout_name)?;
+    let relative = tar_path
+        .strip_prefix(context.archive_root)
+        .map_err(|_| {
+            format!(
+                "ignored-files archive escapes its root: {}",
+                tar_path.display()
+            )
+        })?
+        .to_string_lossy()
+        .replace('\\', "/");
+    Ok(json!({
+        "archive_root": context.archive_root.display().to_string(),
+        "path": relative,
+        "bytes": size,
+        "sha256": sha256,
+    }))
+}
+
+fn salvage_gate(
+    cfg: &Cfg,
+    config: &Value,
+    checkout: &Value,
+    repository: &Path,
+    ignored_mode: IgnoredMode,
+    ignored_context: &IgnoredContext<'_>,
+) -> Result<Value> {
     let name = checkout
         .get("name")
         .and_then(Value::as_str)
@@ -1719,6 +2579,28 @@ fn salvage_gate(cfg: &Cfg, config: &Value, checkout: &Value, repository: &Path) 
         .and_then(Value::as_str)
         .unwrap_or_default();
     let path = cfg.root.join(raw_path);
+    // Gitignored files outside the regenerable caches are judged before
+    // anything else (#1302): refuse, archive, or explicitly discard.
+    let ignored_files = ignored_files_outside_caches(config, &name, &path)?;
+    let mut ignored_archive = Value::Null;
+    if !ignored_files.is_empty() {
+        match ignored_mode {
+            IgnoredMode::Refuse => {
+                return Err(ignored_refusal(&name, &ignored_files));
+            }
+            IgnoredMode::Archive => {
+                let total: u64 = ignored_files.iter().map(|item| item.size).sum();
+                if total > IGNORED_ARCHIVE_LIMIT_BYTES {
+                    return Err(format!(
+                        "gitignored files outside the known regenerable caches total {total} bytes, above the {IGNORED_ARCHIVE_LIMIT_BYTES}-byte --archive-ignored limit; preserve them by hand or rerun with --discard-ignored. state: REFUSED -- no checkout was salvaged or removed"
+                    ));
+                }
+                ignored_archive =
+                    archive_ignored_files(ignored_context, &name, &path, &ignored_files)?;
+            }
+            IgnoredMode::Discard => {}
+        }
+    }
     // Cleanliness by salvage semantics: tracked and untracked entries,
     // ignored files do not dirty a checkout.
     let globs = cache_globs_for(config, &name);
@@ -1760,7 +2642,7 @@ fn salvage_gate(cfg: &Cfg, config: &Value, checkout: &Value, repository: &Path) 
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    Ok(json!({
+    let mut receipt = json!({
         "checkout": name,
         "source_head": head,
         "salvage_commit": head,
@@ -1782,7 +2664,32 @@ fn salvage_gate(cfg: &Cfg, config: &Value, checkout: &Value, repository: &Path) 
             .cloned()
             .unwrap_or(json!([])),
         "ref_inventory": ref_inventory(&path, &name)?,
-    }))
+    });
+    if !ignored_files.is_empty() {
+        let disposition = match ignored_mode {
+            IgnoredMode::Archive => "archived",
+            IgnoredMode::Discard => "discarded",
+            IgnoredMode::Refuse => unreachable!(),
+        };
+        if let Some(object) = receipt.as_object_mut() {
+            object.insert(
+                "ignored_files".to_string(),
+                json!(ignored_files
+                    .iter()
+                    .map(|item| json!({
+                        "path": item.path,
+                        "bytes": item.size,
+                        "sha256": item.sha256,
+                        "disposition": disposition,
+                    }))
+                    .collect::<Vec<_>>()),
+            );
+            if ignored_mode == IgnoredMode::Archive {
+                object.insert("ignored_archive".to_string(), ignored_archive);
+            }
+        }
+    }
+    Ok(receipt)
 }
 
 fn checkout_registration_gone(repository: &Path, path: &Path) -> bool {
@@ -2295,6 +3202,7 @@ fn prepare_remove(
     slot: &str,
     expected_generation: i64,
     coordinator_pid: i64,
+    ignored_mode: IgnoredMode,
 ) -> Result<PreparedRemove> {
     validate_global(root, cfg)?;
     let active = active_document(root, cfg, selected)?;
@@ -2457,7 +3365,20 @@ fn prepare_remove(
             .and_then(Value::as_str)
             .unwrap_or_default();
         let (_stored, repository) = stored_repository_path(cfg, repository_raw)?;
-        salvage.push(salvage_gate(cfg, config, &checkout, &repository)?);
+        let ignored_context = IgnoredContext {
+            machine: selected,
+            slot,
+            generation,
+            archive_root: &cfg.control,
+        };
+        salvage.push(salvage_gate(
+            cfg,
+            config,
+            &checkout,
+            &repository,
+            ignored_mode,
+            &ignored_context,
+        )?);
     }
     assert_slot_unused(&slot_path, coordinator_pid)?;
     let agent = record
@@ -2486,6 +3407,7 @@ pub(crate) fn remove_slot(
     slot: &str,
     coordinator_pid: i64,
     expected_generation: i64,
+    ignored_mode: IgnoredMode,
 ) -> Result<Value> {
     require_fixture()?;
     let host_context = [
@@ -2522,6 +3444,7 @@ pub(crate) fn remove_slot(
         slot,
         expected_generation,
         coordinator_pid,
+        ignored_mode,
     )?;
     let locks = acquire_mutation_locks(root, machine_override, &cfg, &selected)?;
     refuse_partial_state(&cfg.control)?;

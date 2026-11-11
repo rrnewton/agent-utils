@@ -176,18 +176,29 @@ def _own_fs(tmp_path: Path) -> Iterator[Path]:
         shutil.rmtree(base, ignore_errors=True)
 
 
-def _rust_remove(root: Path, *, fixture: bool = True) -> subprocess.CompletedProcess[str]:
+def _rust_remove(
+    root: Path,
+    *,
+    fixture: bool = True,
+    archive_ignored: bool = False,
+    discard_ignored: bool = False,
+) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     if fixture:
         env["WRKSLOTSD_FIXTURE_WRITER"] = "1"
     else:
         env.pop("WRKSLOTSD_FIXTURE_WRITER", None)
+    argv = [
+        str(rust_wrkslotsd()), "remove", "slot-a",
+        "--coordinator-pid", str(os.getpid()), "--expected-generation", "1",
+        "--root", str(root),
+    ]
+    if archive_ignored:
+        argv.append("--archive-ignored")
+    if discard_ignored:
+        argv.append("--discard-ignored")
     return subprocess.run(
-        [
-            str(rust_wrkslotsd()), "remove", "slot-a",
-            "--coordinator-pid", str(os.getpid()), "--expected-generation", "1",
-            "--root", str(root),
-        ],
+        argv,
         cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env
     )
 
@@ -205,6 +216,8 @@ def _python_remove(
     *,
     no_lock_budget: bool = False,
     budget_seconds: float | None = _TEST_REMOVE_ITEM_SECONDS,
+    archive_ignored: bool = False,
+    discard_ignored: bool = False,
 ) -> int:
     args = argparse.Namespace(
         project_root=str(root), machine=None, slot="slot-a",
@@ -215,6 +228,7 @@ def _python_remove(
         attest_agent_never_started=None, attest_note=None,
         archive_drifted_checkouts=False, adopt_legacy_change=False, wait_lock=0.0,
         no_lock_budget=no_lock_budget,
+        archive_ignored=archive_ignored, discard_ignored=discard_ignored,
     )
     if budget_seconds is None:
         return wrkslots_cli._cmd_remove(args)
@@ -253,6 +267,9 @@ def _scrub_doc(doc: dict[str, object]) -> dict[str, object]:
         for item in cast(list[dict[str, object]], record.get("salvage", [])):
             item["source_head"] = "HEAD"
             item["salvage_commit"] = "HEAD"
+            archive = item.get("ignored_archive")
+            if isinstance(archive, dict):
+                archive["archive_root"] = "ARCHIVE_ROOT"
     return doc
 
 
@@ -709,22 +726,85 @@ def test_remove_invalid_sidecar_refuses(tmp_path: Path) -> None:
     assert (rust_root / "worktrees" / "slot-a").exists()
 
 
-def test_remove_ignored_file_still_removes(tmp_path: Path) -> None:
-    with _own_fs(tmp_path) as base:
-        _ignored_file_still_removes(base)
-
-
-def _ignored_file_still_removes(tmp_path: Path) -> None:
-    rust_root = _fixture(tmp_path / "rust")
-    checkout = rust_root / "worktrees" / "slot-a" / "repo"
-    (checkout / ".gitignore").write_text("ignored.log\n")
+def _add_ignored_file(root: Path, relative: str = "ignored.log", content: bytes = b"scratch\n") -> None:
+    checkout = root / "worktrees" / "slot-a" / "repo"
+    (checkout / ".gitignore").write_text("ignored.log\ntarget/\n")
     _git(checkout, "add", ".gitignore")
     _git(checkout, "commit", "-q", "-m", "ignore")
     _git(checkout, "push", "-q", "origin", "HEAD:suite/work")
-    (checkout / "ignored.log").write_text("scratch\n")
-    result = _rust_remove(rust_root)
-    assert result.returncode == 0, result.stderr
-    assert not (rust_root / "worktrees" / "slot-a").exists()
+    target = checkout / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(content)
+
+
+def test_remove_ignored_file_refuses_in_both_editions(tmp_path: Path) -> None:
+    with _own_fs(tmp_path) as base:
+        rust_root, oracle_root = _pair(base)
+        for root in (rust_root, oracle_root):
+            _add_ignored_file(root)
+        with pytest.raises(wrkslots_cli.Refusal) as caught:
+            _python_remove(oracle_root)
+        assert "checkout repo holds 1 gitignored file(s)" in str(caught.value)
+        assert "ignored.log (8 bytes)" in str(caught.value)
+        result = _rust_remove(rust_root)
+        assert result.returncode == 1, result.stderr
+        assert "checkout repo holds 1 gitignored file(s)" in result.stderr
+        assert "ignored.log (8 bytes)" in result.stderr
+        for root in (rust_root, oracle_root):
+            assert (root / "worktrees" / "slot-a" / "repo" / "ignored.log").exists()
+
+
+def test_remove_ignored_file_discards_in_both_editions(tmp_path: Path) -> None:
+    with _own_fs(tmp_path) as base:
+        rust_root, oracle_root = _pair(base)
+        for root in (rust_root, oracle_root):
+            _add_ignored_file(root)
+        assert _python_remove(oracle_root, discard_ignored=True) == 0
+        result = _rust_remove(rust_root, discard_ignored=True)
+        assert result.returncode == 0, result.stderr
+        assert _doc(rust_root, "ARCHIVED.node-a.json") == _doc(
+            oracle_root, "ARCHIVED.node-a.json"
+        )
+        for root in (rust_root, oracle_root):
+            assert not (root / "worktrees" / "slot-a").exists()
+            assert not list(root.rglob("ignored-*.tar"))
+
+
+def test_remove_ignored_file_archives_in_both_editions(tmp_path: Path) -> None:
+    with _own_fs(tmp_path) as base:
+        rust_root, oracle_root = _pair(base)
+        for root in (rust_root, oracle_root):
+            _add_ignored_file(root)
+        assert _python_remove(oracle_root, archive_ignored=True) == 0
+        result = _rust_remove(rust_root, archive_ignored=True)
+        assert result.returncode == 0, result.stderr
+        assert _doc(rust_root, "ARCHIVED.node-a.json") == _doc(
+            oracle_root, "ARCHIVED.node-a.json"
+        )
+        archives = []
+        for root in (rust_root, oracle_root):
+            found = list(root.rglob("ignored-*.tar"))
+            assert len(found) == 1
+            archives.append(found[0].read_bytes())
+        assert archives[0] == archives[1]
+
+
+def test_remove_ignored_cache_target_still_removes_in_both_editions(tmp_path: Path) -> None:
+    with _own_fs(tmp_path) as base:
+        rust_root, oracle_root = _pair(base)
+        for root in (rust_root, oracle_root):
+            _add_ignored_file(root, "target/build.bin", b"cache\n")
+        assert _python_remove(oracle_root) == 0
+        result = _rust_remove(rust_root)
+        assert result.returncode == 0, result.stderr
+        assert _doc(rust_root, "ARCHIVED.node-a.json") == _doc(
+            oracle_root, "ARCHIVED.node-a.json"
+        )
+        for root in (rust_root, oracle_root):
+            archived = _doc(root, "ARCHIVED.node-a.json")
+            records = cast(list[dict[str, object]], archived["records"])
+            salvage = cast(list[dict[str, object]], records[0]["salvage"])
+            assert "ignored_files" not in salvage[0]
 
 
 @pytest.mark.load_quarantine  # #1267 wrkslots-load-robust

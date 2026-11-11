@@ -94,7 +94,10 @@ type, task and purpose, owner process identity, coordinator history, heartbeat t
    agent was never registered" below. Every other check still runs.
 10. Before removing an agent slot, `remove` publishes unpushed commits and tracked and ordinary
    untracked files outside configured regenerable cache paths to the recorded remote. It never
-   uploads gitignored content. It records and rechecks the exact remote ref and commit before
+   uploads gitignored content. Gitignored files outside those caches refuse removal unless
+   `--archive-ignored` keeps them in a verified tar in the salvage archive or
+   `--discard-ignored` deletes them explicitly; the salvage receipt lists them either way. It
+   records and rechecks the exact remote ref and commit before
    deletion. A validate slot skips this step.
 11. `recover` lets any later participant complete an interrupted create or removal from the durable
    history. It is not tied to the participant that began the operation.
@@ -1734,9 +1737,17 @@ wrkslots remove slot01 \
 ```
 
 Gitignored content is excluded by repository policy, not by size. It is never added with `--force`,
-never included in the salvage status digest, and never uploaded to the recorded remote. Authored work
-that must survive belongs in tracked or ordinary untracked paths, or in a separately recorded
-artifact store; an ignored build tree is not remote preservation evidence.
+never included in the salvage status digest, and never uploaded to the recorded remote. Removal
+refuses when a checkout holds gitignored files outside the known regenerable caches — the cache
+globs `clean-caches` uses, a checkout's own cargo `target`, and marker-proven nested cargo
+targets — naming each file with its size. `--archive-ignored` first keeps those files in a
+deterministic tar beside the salvage bundles under `wrkslots-salvage/` (at most
+536870912 bytes in total), reads it back, checks every file's sha256, and lists each file with
+its size and sha256 in the salvage receipt; `--discard-ignored` deletes them explicitly and the
+receipt still lists them. Ignored content inside the caches is deleted with the checkout and is
+not listed. Authored work that must survive belongs in tracked or ordinary untracked paths, or
+in a separately recorded artifact store; an ignored build tree is not remote preservation
+evidence.
 
 Initialized Git submodules are checked separately against the corresponding source repository's
 remote URL. Each nested repository gets its own salvage commit and remote readback, so an
