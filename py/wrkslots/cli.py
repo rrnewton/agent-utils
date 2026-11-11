@@ -43287,14 +43287,25 @@ def _apply_scan_memory_limit(args: argparse.Namespace) -> None:
 def _registry_read_identity(config: Config) -> tuple[object, ...]:
     """Content identity of everything a registry reader reports from.
 
-    Every regular control file except lock files is read and hashed -- ACTIVE and ARCHIVED shards,
-    journals, handoff and hold records, and any partial write left beside them -- and so are
-    the quarantine directory's journals and every slot image record. An append-only event
-    directory is identified by its complete-event count (the registry-wide sequence), the last
-    event's digest, which chains every earlier event, and any partial event write. Contents,
-    not file times or inode numbers, so a replaced file whose metadata happens to match still
-    reads as changed.
+    Only registry files are read and hashed -- ACTIVE and ARCHIVED shards,
+    journals, handoff and hold records, and any partial write left beside
+    them -- and so are the quarantine directory's journals and every slot
+    image record. An append-only event directory is identified by its
+    complete-event count (the registry-wide sequence), the last event's
+    digest, which chains every earlier event, and any partial event write.
+    Contents, not file times or inode numbers, so a replaced file whose
+    metadata happens to match still reads as changed.
+
+    Nothing else in the control directory is opened (#1247): the configured
+    worktrees image lives there too, and hashing every regular file read a
+    640 GiB btrfs image into memory twice per status run. A file the
+    registry did not name is not registry state, whatever its size.
     """
+
+    def is_registry_file(name: str) -> bool:
+        return name.startswith(
+            ("ACTIVE.", "ARCHIVED.", "HOLD.", "HANDOFF.")
+        ) or name.endswith(".journal")
 
     def digest(path: Path) -> str:
         try:
@@ -43307,11 +43318,18 @@ def _registry_read_identity(config: Config) -> tuple[object, ...]:
         entries = sorted(os.scandir(config.control), key=lambda entry: entry.name)
     except OSError as exc:
         raise Refusal(f"cannot list control directory {config.control}: {exc}") from exc
+    image_path = (
+        None
+        if config.worktrees_image is None
+        else config.worktrees_image.image_file(config.root)
+    )
     for entry in entries:
         name = entry.name
         if name.endswith(".lock"):
             continue
         path = Path(entry.path)
+        if image_path is not None and path == image_path:
+            continue
         if entry.is_symlink():
             parts.append((name, "symlink", os.readlink(path)))
         elif name.startswith("EVENTS.") and entry.is_dir():
@@ -43342,6 +43360,8 @@ def _registry_read_identity(config: Config) -> tuple[object, ...]:
                 )
             )
         elif entry.is_file(follow_symlinks=False):
+            if not is_registry_file(name):
+                continue
             parts.append((name, digest(path)))
     return tuple(parts)
 

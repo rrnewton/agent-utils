@@ -238,6 +238,35 @@ def test_storage_scan_git_calls_grow_per_checkout_not_per_finding(
     assert counts[7] == 7 + 2
 
 
+def test_registry_identity_never_reads_a_large_non_registry_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _registry(tmp_path / "case", 1)
+    control = root / "worktrees"
+    image = control / "worktrees.img"
+    with open(image, "wb") as handle:
+        handle.truncate(10 * (1 << 30))  # 10 GiB apparent, sparse
+    (control / "notes.txt").write_text("not registry state\n")
+    config = wrkslots_cli._load_config(str(root), None)
+    read_names: list[str] = []
+    original_read_bytes = Path.read_bytes
+
+    def counting_read_bytes(self: Path) -> bytes:
+        read_names.append(self.name)
+        return original_read_bytes(self)
+
+    monkeypatch.setattr(Path, "read_bytes", counting_read_bytes)
+    before = wrkslots_cli._registry_read_identity(config)
+    assert "worktrees.img" not in read_names, read_names
+    assert "notes.txt" not in read_names, read_names
+    # Registry content still identifies the identity: changing ACTIVE moves it.
+    active = control / "ACTIVE.node-a.json"
+    document = json.loads(active.read_text())
+    document["revision"] = 8
+    active.write_text(json.dumps(document))
+    assert wrkslots_cli._registry_read_identity(config) != before
+
+
 def test_event_retention_stays_flat_as_the_log_grows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
