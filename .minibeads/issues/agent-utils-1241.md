@@ -1,6 +1,6 @@
 ---
 title: 'paced-edges: align pacing classification and keep pacing out of the job strike limit'
-status: open
+status: closed
 priority: 1
 issue_type: task
 created_at: 2026-11-10T18:15:00.000000000+00:00

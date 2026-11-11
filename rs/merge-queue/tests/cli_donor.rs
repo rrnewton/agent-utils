@@ -1669,7 +1669,10 @@ fn a_paced_refusal_is_transient_and_faults_no_donor() {
     assert!(report["ejected"].as_array().unwrap().is_empty(), "{report}");
     assert_eq!(item_status(&fx, 1), "queued");
     let job = &jobs(&fx)[0];
-    assert!(job["could_not_run"].as_array().map_or(true, |a| a.is_empty()), "{job}");
+    assert!(
+        job["could_not_run"].as_array().is_none_or(|a| a.is_empty()),
+        "{job}"
+    );
     assert!(
         job["history"]
             .to_string()
@@ -1725,7 +1728,10 @@ fn a_host_scoped_census_pacing_refusal_pauses_no_donor() {
     assert!(report["ejected"].as_array().unwrap().is_empty(), "{report}");
     assert_eq!(item_status(&fx, 1), "queued");
     let job = &jobs(&fx)[0];
-    assert!(job["could_not_run"].as_array().map_or(true, |a| a.is_empty()), "{job}");
+    assert!(
+        job["could_not_run"].as_array().is_none_or(|a| a.is_empty()),
+        "{job}"
+    );
     assert!(
         host_faults(&fx).get("d1").is_none(),
         "no host fault: {}",
