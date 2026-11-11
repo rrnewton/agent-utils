@@ -1245,6 +1245,10 @@ const { showHelp } = helpScreen;
  * @type {import("./src/core/navigation/index.ts").ViewPlaces<string>}
  */
 const viewScroll = createViewPlaces();
+// `#1251 scroll-single-owner`: the owner's mark for the channel place a view switch took,
+// per view left. Restoring the saved number alone throws the reader by whatever grew or
+// shrank above them while they were away, as native anchoring used to absorb silently.
+const viewMarks = new Map();
 
 /**
  * What the selected channel's chat service can do — threads, its own read cursor, how its live updates are
@@ -2001,6 +2005,7 @@ function showView(name) {
   if (leaving && leaving !== name) {
     const area = el("scroll-area");
     viewScroll.leave(leaving, { top: area.scrollTop, atNewest: atBottom(area) });
+    if (leaving === "discord") viewMarks.set(leaving, captureScroll());
     // ...and, leaving the channel, the message the reader was on, for a reopen. `#189 restore-ui-state`.
     if (leaving === "discord") holdChannelPlace();
   }
@@ -2038,7 +2043,9 @@ function showView(name) {
   const top = viewScroll.enter(name);
   const returning = top !== null;
   if (returning) {
-    el("scroll-area").scrollTop = top;
+    const mark = name === "discord" ? viewMarks.get(name) : undefined;
+    if (mark) restoreScroll(mark);
+    else el("scroll-area").scrollTop = top;
   } else {
     scrollToNewest();
   }
