@@ -4047,35 +4047,17 @@ const openingViewOwner = createOpeningView({
   upsertThreadSummary: (canon, summary) => upsertThreadSummary(canon, summary),
   viewKey: (view, thread) => viewKey(view, thread), visibleList: () => visibleList(),
   windowStorage: () => windowStorage(), deepLinks: () => deepLinks, sideColumnUp: () => sideColumnUp(),
+  documentsQueryValue: (name) => documentsQueryValue(name),
+  documentsDeepLinkKey: () => documentsDeepLinkKey(),
+  showView: (name) => showView(name),
+  showDocuments: (key) => { void documentsView.show(key); },
+  reopenReadOwed: () => reopenReadOwed,
+  replayStarted: () => replayLedger.started(),
+  readEnteredChannel: (fresh) => readEnteredChannel(fresh),
+  freshAt: () => loadState().freshAt,
+  whenLiveAttached: (pay) => whenLiveAttached(pay),
 });
-const { windowItem, keepWindowItem, defaultChannelView, threadStillKnown, openingChannelView, openChannelView, holdChannelPlace, savedThreadSummary, viewOnScreen, saveUiState, returnToSavedPlace } = openingViewOwner;
-/**
- * Reopen on the channel when that is where the reader left the page — once, as soon as there is a
- * channel to show: at load from the saved shell, or after sign-in when there was none. Its view was
- * decided already, by `openChannelView`; this enters it and puts the reader back on their message.
- * The view's one newest page is owed from here, and `payReopenRead` reads it.
- */
-function reopenSavedView() {
-  // `?v=docs` (with `&d=KEY` for one document) opens Documents (`documents-view-client`).
-  // Before the settled guard: an explicit address outranks a saved place.
-  if (documentsQueryValue("v") === "docs") {
-    uiState.settle();
-    showView("docs");
-    void documentsView.show(documentsDeepLinkKey());
-    saveUiState();
-    return;
-  }
-  if (uiState.settled()) return;
-  uiState.settle();
-  const saved = uiState.saved();
-  if (saved && saved.view === "discord" && selectedChannelId() && screens.view() !== "discord") {
-    showView("discord");
-    returnToSavedPlace();
-    holdChannelPlace();
-    reopenReadOwed.owe(replayLedger.started());
-  }
-  saveUiState();
-}
+const { windowItem, keepWindowItem, defaultChannelView, threadStillKnown, openingChannelView, openChannelView, holdChannelPlace, savedThreadSummary, viewOnScreen, saveUiState, returnToSavedPlace, reopenSavedView, payReopenRead } = openingViewOwner;
 
 /**
  * The read a reopen owes the channel it put on screen: one owner in web/src/core/sync/reopen.ts (`#624
@@ -4090,28 +4072,6 @@ function reopenSavedView() {
  */
 const reopenReadOwed = createReopenRead();
 
-/**
- * Read what the reopen put on screen, once sign-in has answered: at once on a channel without
- * threads, whose replay is not accounted for by read, and on one with threads when the live stream
- * has attached. A refusal reads nothing, and leaves it owed to the token that replaces this one.
- */
-function payReopenRead() {
-  const owed = reopenReadOwed.take();
-  if (!owed) return;
-  const pay = () => {
-    // Signed out while it waited: owed to the next sign-in, as after a refusal.
-    if (!token()) {
-      reopenReadOwed.keep(owed);
-      return;
-    }
-    if (screens.view() !== "discord" || replayLedger.started() !== owed.after) return;
-    // Merged into the rows the snapshot drew, keeping the reader's message, as a channel change
-    // does; with nothing drawn it is a first visit and settles on the newest.
-    readEnteredChannel(loadState().freshAt > 0);
-  };
-  if (providerFacts.threading()) whenLiveAttached(pay);
-  else pay();
-}
 
 // --- channel views, threads and the channel composer ------------------------------------------
 // Which view of the channel is shown, and how the switch is drawn, are web/src/view/channel's

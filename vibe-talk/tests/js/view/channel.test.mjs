@@ -2926,6 +2926,62 @@ test("`#624 voice-page-modularity`: which view a channel opens in and the saved 
   assert.equal(owner.defaultChannelView(), "flat");
 });
 
+test("`#624 voice-page-modularity`: a reopen enters the saved view and pays its one read, from the module alone", () => {
+  const { createOpeningView } = CHANNEL_VIEW;
+  const record = [];
+  const store = new Map();
+  const state = { settled: false, owed: null, view: "voice", token: "t", freshAt: 5 };
+  const canon = { channel: "c1", scope: null, messages: [], dismissals: [], dismissed: new Set(),
+    views: new Map(), threads: [], hasThreads: false,
+    unplaced: new Set(), unplacedSince: new Map(), unplacedAnswered: new Set(),
+    removed: new Map(), complete: null, replyGaps: new Map(), settledByDone: new Map() };
+  const owner = createOpeningView({
+    uiState: () => ({
+      chosenView: () => undefined, chosenViewsHeld: () => [], forgetChosen: () => {},
+      setChosen: () => {}, remember: () => record.push("remember"), heldPlace: () => null,
+      holdPlace: () => {}, settled: () => state.settled,
+      settle: () => { state.settled = true; record.push("settle"); },
+      saved: () => ({ channel: "c1", view: "discord", place: null }),
+    }),
+    providerFacts: { threading: () => false },
+    reopenedViews: ["main", "flat", "thread"], uiStateKey: "k", uiStateVersion: 1, uiStateChars: 100000,
+    channelStore: () => ({ current: () => canon }), threadPresence: () => ({ forget: () => {} }),
+    columns: () => ({ main: null, side: null }), readModes: () => ({ hiding: () => false, mode: () => "show" }),
+    screens: () => ({ screen: () => "main", view: () => state.view }), columnWork: () => ({ side: () => false }),
+    messageCache: () => ({ storedExactly: (k, v) => store.set(k, v) }),
+    captureScroll: () => ({ pinned: false, anchor: null, top: 0 }), channelContextKey: () => "c1",
+    deepLinkFromAddress: () => null, deepLinkReaderMoved: () => false,
+    el: () => ({ }), idsOf: () => [], inColumn: (_c, fn) => fn(), listPlaceTop: () => 0,
+    loadCanon: () => {}, renderColumns: () => {}, restoreChannelComposer: () => {},
+    restoreScroll: () => {}, scheduleBackSync: () => {}, selectedChannelId: () => "c1",
+    selection: () => ({ view: "flat", thread: null, threadId: null, origin: "main" }),
+    token: () => state.token, tokenFingerprint: () => "f", upsertThreadSummary: () => {},
+    viewKey: (view, threadId) => (view === "thread" ? `thread:${threadId}` : view),
+    visibleList: () => ({ children: [] }),
+    windowStorage: () => ({ getItem: (k) => store.get(k) ?? null, setItem: (k, v) => store.set(k, v), removeItem: (k) => store.delete(k) }),
+    deepLinks: () => ({ applied: () => true }), sideColumnUp: () => false,
+    documentsQueryValue: () => null, documentsDeepLinkKey: () => "key",
+    showView: (name) => { state.view = name; record.push(`show=${name}`); },
+    showDocuments: (key) => record.push(`docs=${key}`),
+    reopenReadOwed: () => ({
+      owe: (after) => { state.owed = { after }; record.push("owe"); },
+      take: () => { const owed = state.owed; state.owed = null; return owed; },
+      keep: (owed) => { state.owed = owed; record.push("keep"); },
+    }),
+    replayStarted: () => 7,
+    readEnteredChannel: (fresh) => record.push(`read=${fresh}`),
+    freshAt: () => state.freshAt,
+    whenLiveAttached: (pay) => pay(),
+  });
+  owner.reopenSavedView();
+  assert.deepStrictEqual(record, ["settle", "show=discord", "owe"],
+    "the reopen did not enter and owe its read, in order");
+  owner.payReopenRead();
+  assert.deepStrictEqual(record.slice(3), ["read=true"], "the owed read was not paid once");
+  owner.payReopenRead();
+  assert.equal(record.length, 4, "the owed read was paid twice");
+});
+
 test("`#624 voice-page-modularity`: the card refresh notes a changed page build once, steps collapsed lines off fields, and re-reads for a landed summary", async () => {
   const { createCardRefresh } = CHANNEL_VIEW;
   const log = [];

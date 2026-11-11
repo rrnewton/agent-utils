@@ -19,7 +19,8 @@ export interface OpeningRecord {
   heldPlace(): { key: string; place: { view: string; atNewest: boolean; anchor: string | null; offset: number } } | null;
   holdPlace(held: { key: string; place: { view: string; atNewest: boolean; anchor: string | null; offset: number } }): void;
   settled(): boolean;
-  saved(): { channel: string; place: { view: string; atNewest: boolean; anchor: string | null; offset: number } | null } | null;
+  settle(): void;
+  saved(): { channel: string; view: string; place: { view: string; atNewest: boolean; anchor: string | null; offset: number } | null } | null;
 }
 
 /** What opening a channel's view asks of the page. */
@@ -58,6 +59,15 @@ export interface OpeningViewDependencies {
   columns(): { main: unknown };
   readModes(): { hiding(): boolean; mode(): string };
   screens(): { screen(): string; view(): string };
+  documentsQueryValue(name: string): string | null;
+  documentsDeepLinkKey(): string;
+  showView(name: string): void;
+  showDocuments(key: string): void;
+  reopenReadOwed(): { owe(after: unknown): void; take(): { after: unknown } | null; keep(owed: { after: unknown }): void };
+  replayStarted(): unknown;
+  readEnteredChannel(fresh: boolean): void;
+  freshAt(): number;
+  whenLiveAttached(pay: () => void): void;
   columnWork(): { side(): boolean };
   messageCache(): { storedExactly(key: string, value: string): void };
 }
@@ -75,6 +85,8 @@ export interface OpeningView {
   viewOnScreen(): { channel: string; channelView: string; thread: { id: string; origin: string; summary: ThreadSummary | null } | null } | null;
   saveUiState(): void;
   returnToSavedPlace(): void;
+  reopenSavedView(): void;
+  payReopenRead(): void;
 }
 
 /** Which view a channel opens in, over `deps`. */
@@ -358,7 +370,59 @@ export function createOpeningView(deps: OpeningViewDependencies): OpeningView {
     deps.restoreScroll({ pinned: false, anchor: row, top: deps.listPlaceTop(deps.el("scroll-area")) + place.offset });
   }
 
+  /**
+   * Reopen on the channel when that is where the reader left the page — once, as soon as there is a
+   * channel to show: at load from the saved shell, or after sign-in when there was none. Its view was
+   * decided already, by `openChannelView`; this enters it and puts the reader back on their message.
+   * The view's one newest page is owed from here, and `payReopenRead` reads it.
+   */
+  function reopenSavedView(): void {
+    // `?v=docs` (with `&d=KEY` for one document) opens Documents (`documents-view-client`).
+    // Before the settled guard: an explicit address outranks a saved place.
+    if (deps.documentsQueryValue("v") === "docs") {
+      deps.uiState().settle();
+      deps.showView("docs");
+      deps.showDocuments(deps.documentsDeepLinkKey());
+      saveUiState();
+      return;
+    }
+    if (deps.uiState().settled()) return;
+    deps.uiState().settle();
+    const saved = deps.uiState().saved();
+    if (saved && saved.view === "discord" && deps.selectedChannelId() && deps.screens().view() !== "discord") {
+      deps.showView("discord");
+      returnToSavedPlace();
+      holdChannelPlace();
+      deps.reopenReadOwed().owe(deps.replayStarted());
+    }
+    saveUiState();
+  }
+
+  /**
+   * Read what the reopen put on screen, once sign-in has answered: at once on a channel without
+   * threads, whose replay is not accounted for by read, and on one with threads when the live stream
+   * has attached. A refusal reads nothing, and leaves it owed to the token that replaces this one.
+   */
+  function payReopenRead(): void {
+    const owed = deps.reopenReadOwed().take();
+    if (!owed) return;
+    const pay = () => {
+      // Signed out while it waited: owed to the next sign-in, as after a refusal.
+      if (!deps.token()) {
+        deps.reopenReadOwed().keep(owed);
+        return;
+      }
+      if (deps.screens().view() !== "discord" || deps.replayStarted() !== owed.after) return;
+      // Merged into the rows the snapshot drew, keeping the reader's message, as a channel change
+      // does; with nothing drawn it is a first visit and settles on the newest.
+      deps.readEnteredChannel(deps.freshAt() > 0);
+    };
+    if (deps.providerFacts.threading()) deps.whenLiveAttached(pay);
+    else pay();
+  }
+
   return {
+    reopenSavedView, payReopenRead,
     windowItem, keepWindowItem, defaultChannelView, threadStillKnown, openingChannelView,
     openChannelView, holdChannelPlace, savedThreadSummary, viewOnScreen, saveUiState, returnToSavedPlace,
   };
