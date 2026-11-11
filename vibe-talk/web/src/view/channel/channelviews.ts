@@ -100,6 +100,13 @@ export interface ChannelViewsDependencies {
   putRepliesBack(): void;
   dropReplyArrowTap(): void;
   rememberChannelDraft(): void;
+  /**
+   * Make Main's foot note in the list keepers stale, to be re-taken on the foot
+   * keeper's next report, because this switch leaves it seeded from the other list
+   * standing in the same scroller (`ListKeepers.invalidateDock`). Noted from this
+   * switch's own context-remembering.
+   */
+  invalidateDock(): void;
   setPinnedOnly(only: boolean, kept: boolean): void;
   viewOnScreen(): { view: string; thread: string | null; summary: unknown; origin: string | null } | null;
   saveUiState(): void;
@@ -381,6 +388,7 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
 
 
   function rememberChannelContext(): void {
+    deps.invalidateDock();
     deps.syncCanonDismissed();
     deps.channelContexts().set(channelContextKey(), {
       messages: deps.timelineRows().messages,

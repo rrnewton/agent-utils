@@ -30,8 +30,8 @@ export interface ListKeepersDependencies<Column> extends SizeWatching {
   readonly cardsDrawn: { opening(): boolean };
   /** The two columns. */
   readonly columns: { readonly main: Column; readonly side: Column & { readonly mode: string } };
-  /** Whether two columns are drawn. */
-  readonly layoutShown: { columns(): boolean };
+  /** Whether two columns are drawn, and whether the thread list stands over Main's list. */
+  readonly layoutShown: { columns(): boolean; threadList(): boolean };
   /** A reader within this many px of a list's foot is on its newest line. */
   readonly bottomSlackPx: number;
   /** How much stands under the main screen's lists: the dock, and the send card docked under the thread list. */
@@ -91,6 +91,14 @@ export interface ListKeepers {
   /** Take the right column's scroll listener down and stop every watcher. */
   unmount(): void;
   /**
+   * Main's foot note is stale: it was seeded as the reader stood, possibly with the
+   * other list in this scroller, and says nothing about where they stand in the list
+   * now shown. Until the foot keeper re-takes it on its next report of Main's list,
+   * `followingMain` reads false and no scroll of the scroller seeds follow again.
+   * A view switch says so itself (`rememberChannelContext`).
+   */
+  invalidateDock(): void;
+  /**
    * Whether Main's reader is following its foot (`#1185 chip-height-snap`): the one follow state,
    * noted from the reader's own scrolls and landings, never from a programmatic scroll. False
    * where sizes cannot be watched.
@@ -145,6 +153,20 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
   // at Main's foot is the one who was within the slack of it before (`cardCameUnderLists`): the box at
   // the list's foot shrinks to one line in the same layout, which leaves a reader up the list nearer the
   // foot than the slack plus the growth, and they are not pulled down to it.
+  /**
+   * How many times the view has switched under these keepers (`invalidateDock`): the
+   * foot keeper re-takes its reading on the first report it sees under a new count,
+   * rather than acting on one taken while the other list stood in the same scroller.
+   */
+  let switchCount = 0;
+  /** The count the foot keeper has last re-taken its reading under. */
+  let footSwitches = 0;
+  /**
+   * Whether Main's foot note stands from before the last switch: seeded as the reader
+   * stood, possibly with the other list in this scroller, it says nothing about where
+   * they stand in the list now shown until the foot keeper re-takes it.
+   */
+  let footStale = false;
   if (deps.canWatchSizes()) {
     watch(() => {
       const area = el("scroll-area");
@@ -311,7 +333,10 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
     let footing: Footing | null = null;
     let readerScrolled = false;
     let typedAt = -Infinity;
-    const contextOf = () => `${screens.screen()}|${screens.view()}|${channelContextKey()}|${pinsView().only}`;
+    // The layout is part of what the list shows: the thread list over Main, or two columns,
+    // leaves Main's reader clamped at a foot that is only that layout's geometry, and a
+    // note taken there is not a note of the list that comes back (`#1251 scroll-single-owner`).
+    const contextOf = () => `${screens.screen()}|${screens.view()}|${channelContextKey()}|${pinsView().only}|${layoutShown.columns()}|${layoutShown.threadList()}`;
     const note = (foot: boolean, context: string): void => {
       footing = { foot, width: area.clientWidth, height: area.clientHeight, context };
     };
@@ -339,13 +364,27 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
       lastTop = area.scrollTop;
       if (reveal && footing && !footing.foot) return;
       if (anchored && footing && footing.foot && !atBottom(area, FOLLOW_REST_PX)) return;
+      // While a switch's re-take is owed (`invalidateDock`), a scroll of the scroller —
+      // the other list's, or the browser clamping this one as its rows go and come — does
+      // not seed Main's follow: the foot keeper's re-take below is the first word on it.
+      if (footStale) return;
       note(area.scrollTop > 0 && atBottom(area, FOLLOW_REST_PX), footing ? footing.context : contextOf());
     }, { passive: true });
-    mainFollowNow = () => footing !== null && footing.foot;
+    mainFollowNow = () => !footStale && footing !== null && footing.foot && footing.context === contextOf();
     const free = () => screens.screen() === "main" && screens.view() === "discord" && writingIn(area)
       && !entryLandingHolds() && heldFilterRow() === null && !searchWalkAnchored() && !quickReplyHolds(area)
       && !(deps.jumpAnchorHolds && deps.jumpAnchorHolds());
     const mainFootKeeper = watch(() => {
+      // The view switched since this note was seeded: re-take it from where the reader
+      // stands in the list now shown, and follow nothing on this pass (`invalidateDock`).
+      // A report while the other list stands (these rows hidden) does not spend it.
+      if (footSwitches !== switchCount && el("discord-log").hidden) return;
+      if (footSwitches !== switchCount) {
+        footSwitches = switchCount;
+        footStale = false;
+        note(area.scrollTop > 0 && atBottom(area, FOLLOW_REST_PX), contextOf());
+        return;
+      }
       const was = footing;
       const context = contextOf();
       if (was && was.foot && was.width === area.clientWidth && was.height === area.clientHeight
@@ -394,5 +433,9 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
       for (const watcher of watchers.splice(0)) watcher.disconnect();
     },
     followingMain: () => mainFollowNow(),
+    invalidateDock() {
+      switchCount++;
+      footStale = true;
+    },
   };
 }

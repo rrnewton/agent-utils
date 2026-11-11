@@ -1193,7 +1193,7 @@ test("`#624 voice-page-modularity`: the keepers hold a reader on the newest line
   const watchers = [];
   const timers = [];
   const state = { sizes: true, screen: "main", view: "discord", dock: 50, bottom: new Set(), quick: false, landing: false, filter: false,
-    writing: false, written: false, writingIn: false, sideUp: true, showing: true, mode: "thread", opening: false, columns: true, walk: false, held: null };
+    writing: false, written: false, writingIn: false, sideUp: true, showing: true, mode: "thread", opening: false, columns: true, threadList: false, walk: false, held: null };
   const columns = { main: { name: "main", mode: "main" }, side: { name: "side", get mode() { return state.mode; } } };
   const was = globalThis.setTimeout;
   globalThis.setTimeout = (act) => { timers.push(act); return timers.length; };
@@ -1208,7 +1208,7 @@ test("`#624 voice-page-modularity`: the keepers hold a reader on the newest line
       underLists,
       cardsDrawn: { opening: () => state.opening },
       columns,
-      layoutShown: { columns: () => state.columns },
+      layoutShown: { columns: () => state.columns, threadList: () => state.threadList },
       bottomSlackPx: 24,
       heightUnderLists: () => state.dock,
       quickReplyHolds: () => state.quick,
@@ -1360,6 +1360,39 @@ test("`#624 voice-page-modularity`: the keepers hold a reader on the newest line
     assert.ok(!run(() => mainFootKeeper.report()).includes("follow scroll-area"),
       "a caret reveal in the instant after typing turned follow on");
     state.writingIn = false;
+    // `#1251 scroll-single-owner`: the first report after a view switch may only
+    // re-note (`invalidateDock`): neither keeper makes a decision from a reading
+    // taken while the other list stood in the same scroller, dock growth included.
+    keepers.invalidateDock();
+    assert.equal(keepers.followingMain(), false, "a pre-switch foot note still read as following");
+    // A scroll of the scroller, and a report while the other list stands (these rows
+    // hidden), spend nothing: the re-take is still owed when Main's list comes back.
+    state.bottom = new Set(["scroll-area"]);
+    fireMain("scroll");
+    assert.equal(keepers.followingMain(), false, "a scroll under the other list seeded Main's follow");
+    log2.hidden = true;
+    assert.deepStrictEqual(run(() => mainFootKeeper.report()), []);
+    assert.equal(keepers.followingMain(), false, "a report under the other list spent the re-take");
+    log2.hidden = false;
+    state.bottom = new Set(["scroll-area"]);
+    main.scrollTop = 100;
+    assert.deepStrictEqual(run(() => mainFootKeeper.report()), ["at bottom? scroll-area 12"]);
+    assert.equal(main.scrollTop, 100, "the foot report after a switch followed a stale note");
+    // The next report judges by the same rules again.
+    state.bottom = new Set();
+    state.writingIn = true;
+    assert.ok(run(() => mainFootKeeper.report()).includes("follow scroll-area"),
+      "the foot keeper stopped keeping after the invalidation");
+    state.writingIn = false;
+    // A change of layout is a change of what the list shows too: a foot note from the
+    // other layout does not read as following until the keeper re-seeds it in this one.
+    state.threadList = true;
+    assert.equal(keepers.followingMain(), false, "a foot note from the other layout still read as following");
+    state.bottom = new Set(["scroll-area"]);
+    assert.deepStrictEqual(run(() => mainFootKeeper.report()), ["at bottom? scroll-area 12"]);
+    assert.equal(keepers.followingMain(), true, "the re-seeded foot note did not read as following");
+    state.threadList = false;
+    state.bottom = new Set();
     // The arrows: one measure per burst, after the task; the right column's only while it shows, in its column.
     arrows.report();
     arrows.report();
