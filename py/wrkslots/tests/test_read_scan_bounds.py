@@ -15,6 +15,7 @@ import contextlib
 import hashlib
 import io
 import json
+import resource
 import subprocess
 import threading
 from pathlib import Path
@@ -291,12 +292,12 @@ def test_scan_memory_limit_applies_an_address_space_cap(
 ) -> None:
     applied: list[tuple[int, tuple[int, int]]] = []
     monkeypatch.setattr(
-        wrkslots_cli.resource,
+        resource,
         "getrlimit",
-        lambda which: (0, wrkslots_cli.resource.RLIM_INFINITY),
+        lambda which: (0, resource.RLIM_INFINITY),
     )
     monkeypatch.setattr(
-        wrkslots_cli.resource,
+        resource,
         "setrlimit",
         lambda which, limits: applied.append((which, limits)),
     )
@@ -304,7 +305,7 @@ def test_scan_memory_limit_applies_an_address_space_cap(
         argparse.Namespace(scan_memory_limit=2.0)
     )
     assert applied == [
-        (wrkslots_cli.resource.RLIMIT_AS, (2 * (1 << 30), wrkslots_cli.resource.RLIM_INFINITY))
+        (resource.RLIMIT_AS, (2 * (1 << 30), resource.RLIM_INFINITY))
     ]
     applied.clear()
     wrkslots_cli._apply_scan_memory_limit(
