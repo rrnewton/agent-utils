@@ -177,6 +177,20 @@ def test_summary_models_follow_backend_defaults(
     assert timeline_cli._summary_models(backend, model, rollup) == expected
 
 
+def test_muse_model_for_kind_defaults_and_overrides() -> None:
+    # #1324 per-kind-summarizer-model: phrase/paragraph share the phase call.
+    from wrkviz.muse_backend import muse_model_for_kind
+
+    assert muse_model_for_kind("phrase") == "muse-spark-1.4-internal"
+    assert muse_model_for_kind("paragraph") == "muse-spark-1.4-internal"
+    assert muse_model_for_kind("daily") == "watermelon-full-preview"
+    assert muse_model_for_kind("phrase", phase_model="small-elk-internal") == "small-elk-internal"
+    assert muse_model_for_kind("paragraph", phase_model="small-elk-internal") == "small-elk-internal"
+    assert muse_model_for_kind("daily", rollup_model="small-elk-internal") == "small-elk-internal"
+    with pytest.raises(ValueError, match="unknown summary kind"):
+        muse_model_for_kind("weekly")
+
+
 def test_summary_models_reject_missing_claude_model_and_blank_names() -> None:
     with pytest.raises(ValueError, match="--model is required"):
         timeline_cli._summary_models("claude", None, None)

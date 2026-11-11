@@ -21,6 +21,33 @@ pub const DEFAULT_MUSE_MODEL: &str = "muse-spark-1.4-internal";
 /// The model the muse backend uses for calendar rollups, which gain most from a larger model.
 pub const DEFAULT_MUSE_ROLLUP_MODEL: &str = "watermelon-full-preview";
 
+/// Per-kind defaults (#1324 per-kind-summarizer-model). Phrase and paragraph are written
+/// by the same phase call, so they share the phase default; the daily rollup uses the
+/// rollup default. Per run, --model overrides phrase/paragraph and --rollup-model daily.
+pub const DEFAULT_MUSE_PHRASE_MODEL: &str = DEFAULT_MUSE_MODEL;
+/// The per-kind default for paragraph summaries: the phase default (see above).
+pub const DEFAULT_MUSE_PARAGRAPH_MODEL: &str = DEFAULT_MUSE_MODEL;
+/// The per-kind default for daily rollups: the rollup default (see above).
+pub const DEFAULT_MUSE_DAILY_MODEL: &str = DEFAULT_MUSE_ROLLUP_MODEL;
+
+/// The muse model for one summary kind ("phrase", "paragraph" or "daily"): the CLI
+/// override for the kind's call wins over the per-kind default.
+pub fn muse_model_for_kind(
+    kind: &str,
+    phase_model: Option<&str>,
+    rollup_model: Option<&str>,
+) -> Result<String, String> {
+    match kind {
+        "phrase" | "paragraph" => Ok(phase_model.unwrap_or(DEFAULT_MUSE_MODEL).to_string()),
+        "daily" => Ok(rollup_model
+            .unwrap_or(DEFAULT_MUSE_ROLLUP_MODEL)
+            .to_string()),
+        other => Err(format!(
+            "unknown summary kind {other:?}: use 'phrase', 'paragraph' or 'daily'"
+        )),
+    }
+}
+
 /// The muse reasoning effort when the run names none.
 pub const DEFAULT_MUSE_REASONING_EFFORT: &str = "medium";
 
@@ -275,6 +302,32 @@ mod tests {
             events.usage,
             Some(TokenUsage::new(120, 40, 0, 10, 5).unwrap())
         );
+    }
+
+    #[test]
+    fn model_for_kind_defaults_and_overrides() {
+        // #1324 per-kind-summarizer-model: phrase/paragraph share the phase call.
+        assert_eq!(
+            muse_model_for_kind("phrase", None, None).unwrap(),
+            DEFAULT_MUSE_MODEL
+        );
+        assert_eq!(
+            muse_model_for_kind("paragraph", None, None).unwrap(),
+            DEFAULT_MUSE_MODEL
+        );
+        assert_eq!(
+            muse_model_for_kind("daily", None, None).unwrap(),
+            DEFAULT_MUSE_ROLLUP_MODEL
+        );
+        assert_eq!(
+            muse_model_for_kind("phrase", Some("small-elk-internal"), None).unwrap(),
+            "small-elk-internal"
+        );
+        assert_eq!(
+            muse_model_for_kind("daily", None, Some("small-elk-internal")).unwrap(),
+            "small-elk-internal"
+        );
+        assert!(muse_model_for_kind("weekly", None, None).is_err());
     }
 
     #[test]

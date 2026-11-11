@@ -25,6 +25,33 @@ DEFAULT_MUSE_MODEL = "muse-spark-1.4-internal"
 #: The model the muse backend uses for calendar rollups, which gain most from a larger model.
 DEFAULT_MUSE_ROLLUP_MODEL = "watermelon-full-preview"
 
+#: Per-kind defaults (#1324 per-kind-summarizer-model). Phrase and paragraph are written
+#: by the same phase call, so they share the phase default; the daily rollup uses the
+#: rollup default. Per run, --model overrides phrase/paragraph and --rollup-model daily.
+DEFAULT_MUSE_PHRASE_MODEL = DEFAULT_MUSE_MODEL
+DEFAULT_MUSE_PARAGRAPH_MODEL = DEFAULT_MUSE_MODEL
+DEFAULT_MUSE_DAILY_MODEL = DEFAULT_MUSE_ROLLUP_MODEL
+
+
+def muse_model_for_kind(
+    kind: str,
+    *,
+    phase_model: str | None = None,
+    rollup_model: str | None = None,
+) -> str:
+    """Return the muse model for one summary *kind*.
+
+    *kind* is "phrase", "paragraph" or "daily". The CLI override for the kind's call
+    (``--model`` for phrase/paragraph, ``--rollup-model`` for daily) wins over the
+    per-kind default.
+    """
+
+    if kind in ("phrase", "paragraph"):
+        return phase_model or DEFAULT_MUSE_MODEL
+    if kind == "daily":
+        return rollup_model or DEFAULT_MUSE_ROLLUP_MODEL
+    raise ValueError(f"unknown summary kind {kind!r}: use 'phrase', 'paragraph' or 'daily'")
+
 #: The muse reasoning effort when the run names none.
 DEFAULT_MUSE_REASONING_EFFORT = "medium"
 
@@ -219,9 +246,13 @@ def run_muse_json(
 
 
 __all__ = [
+    "DEFAULT_MUSE_DAILY_MODEL",
     "DEFAULT_MUSE_MODEL",
+    "DEFAULT_MUSE_PARAGRAPH_MODEL",
+    "DEFAULT_MUSE_PHRASE_MODEL",
     "DEFAULT_MUSE_REASONING_EFFORT",
     "DEFAULT_MUSE_ROLLUP_MODEL",
+    "muse_model_for_kind",
     "MuseBackendError",
     "MuseBackendResult",
     "MuseRunEvents",
