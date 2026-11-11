@@ -38184,21 +38184,6 @@ def _cmd_retire_pending(args: argparse.Namespace) -> int:
             # target needs recovery, and the batch goes on only when the
             # registry shows that this attempt changed nothing.
             reason = str(exc) + (f"; remedy: {exc.remedy}" if exc.remedy else "")
-            if getattr(exc, "_lock_free_prepare", False):
-                # Raised by the lock-free validation (#1287): the slot is
-                # unchanged by construction, so no confirmation under the
-                # lock is needed before the batch goes on.
-                could_not_determine.append(
-                    _could_not_determine_row(
-                        identity,
-                        (
-                            f"{reason}; the slot is unchanged, so the batch "
-                            "continued with its next candidate"
-                        ),
-                        "target-storage-drift",
-                    )
-                )
-                continue
             try:
                 _confirm_unchanged_after_target_storage_drift(
                     config, candidate, exc, deadline
@@ -51754,8 +51739,7 @@ def _prepare_retirement_removal(
         )
     except (_LockBusy, _RetirementDeferred):
         raise
-    except _TargetStorageDrift as exc:
-        exc._lock_free_prepare = True  # type: ignore[attr-defined]
+    except _TargetStorageDrift:
         raise
     except Refusal as exc:
         raise _PreparedRemovalRefused(str(exc)) from exc
