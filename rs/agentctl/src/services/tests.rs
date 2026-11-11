@@ -1615,6 +1615,18 @@ fn turnover_apply_tidies_an_empty_pin_directory() {
     options.report_only = false;
     turnover(&world.fake, &Tables, &options).unwrap();
     assert!(!registry.join("turnover-pins").exists());
+    // A no-change apply run sends no notify at all (#1220, coord7's
+    // question): the wrapper is only invoked inside the refresh block
+    // and for a run-failed alert, so an all-current host is silent,
+    // never sent a blank or partial template.
+    options.notify = Some(vec!["/bin/notify".to_owned()]);
+    let report = turnover(&world.fake, &Tables, &options).unwrap();
+    assert_eq!(report.exit_code, 0, "{}", report.text);
+    assert!(
+        world.fake.notify_calls.borrow().is_empty(),
+        "{:?}",
+        world.fake.notify_calls.borrow()
+    );
 }
 
 #[test]
