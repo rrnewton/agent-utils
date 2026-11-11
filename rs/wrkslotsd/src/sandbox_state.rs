@@ -1481,6 +1481,89 @@ pub(crate) fn build_spec(
     Ok(spec)
 }
 
+/// Every place a command in the view can write, mirroring
+/// Python `writable_set`. Bind sources that do not exist are
+/// left out, except `created_sources` (directories
+/// `prepare_state` will create).
+pub(crate) fn writable_set(spec: &Value, created_sources: &[PathBuf]) -> Value {
+    let created: Vec<String> = created_sources
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    let protect = spec
+        .get("protect_system")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let mut binds = Vec::new();
+    if let Some(raw) = spec.get("binds").and_then(Value::as_array) {
+        for pair in raw {
+            let Some(pair) = pair.as_array() else {
+                continue;
+            };
+            if pair.len() != 2 {
+                continue;
+            }
+            let (Some(source), Some(target)) = (pair[0].as_str(), pair[1].as_str()) else {
+                continue;
+            };
+            if Path::new(source).exists() || created.iter().any(|item| item == source) {
+                binds.push(json!({"source": source, "target": target}));
+            }
+        }
+    }
+    json!({
+        "home_layer": {
+            "source": spec.get("home_layer").cloned().unwrap_or(Value::Null),
+            "target": spec.get("home").cloned().unwrap_or(Value::Null),
+        },
+        "binds": binds,
+        "tmp": {
+            "target": "/tmp",
+            "size": spec.get("tmp_size").cloned().unwrap_or_else(|| json!("16G")),
+        },
+        "protect_system": protect,
+        "always_writable": if protect {
+            json!(["/proc", "/sys", "/dev", "/run/user"])
+        } else {
+            json!(["/"])
+        },
+    })
+}
+
+/// The masks a view applies, as `--print` reports them,
+/// mirroring Python `mask_report`.
+pub(crate) fn mask_report(spec: &Value) -> Value {
+    let strings = |key: &str| -> Vec<String> {
+        spec.get(key)
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    json!({
+        "masks": strings("masks"),
+        "git_config_policy": spec
+            .get("git_config_policy")
+            .and_then(Value::as_str)
+            .unwrap_or("inherit"),
+        "git_config_masks": strings("git_config_masks"),
+    })
+}
+
+/// The bind sources `prepare_state` creates, mirroring Python
+/// `planned_private_sources`.
+pub(crate) fn planned_private_sources(view: &SlotView, settings: &SandboxSettings) -> Vec<PathBuf> {
+    settings
+        .home_private
+        .iter()
+        .map(|relative| home_layer(view).join(relative))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     const DRIVER: &str = r####"import argparse, io, json, os, sys

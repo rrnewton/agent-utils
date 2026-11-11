@@ -474,6 +474,309 @@ pub(crate) fn root_helper_argv(
     argv
 }
 
+/// Python `!r` for the short name strings the in-scope
+/// refusals quote.
+fn py_repr(value: &str) -> String {
+    if value.contains('\'') && !value.contains('"') {
+        return format!("\"{}\"", value.replace('\\', "\\\\"));
+    }
+    let mut out = String::from("\'");
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch => out.push(ch),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn slice_chain(slice_unit: &str) -> Vec<String> {
+    let base = slice_unit.strip_suffix(".slice").unwrap_or(slice_unit);
+    let parts: Vec<&str> = base.split('-').collect();
+    (0..parts.len())
+        .map(|index| format!("{}.slice", parts[..=index].join("-")))
+        .collect()
+}
+
+/// Refuse unless this process is in `unit` under exactly the
+/// expected slices, mirroring Python `verify_in_scope`. The
+/// cgroup file is read at the given path (fixture in tests).
+pub(crate) fn verify_in_scope(
+    view: &crate::sandbox_state::SlotView,
+    unit: &str,
+    expected: &SlicePlacement,
+    cgroup_path: &Path,
+) -> Result<(), String> {
+    if !unit.ends_with(".scope") || unit.contains('/') || unit == ".scope" {
+        return Err(format!(
+            "--in-scope needs a scope unit name such as run-1.scope, not {}",
+            py_repr(unit)
+        ));
+    }
+    if let Some(enclosing) = &expected.enclosing {
+        if !enclosing.ends_with(".slice") || enclosing.contains('/') {
+            return Err(format!(
+                "the expected enclosing slice {} is not a slice name",
+                py_repr(enclosing)
+            ));
+        }
+    }
+    let parent = expected.enclosing.as_deref().unwrap_or("");
+    let derived = (
+        root_slice(Some(parent), None),
+        slice_name(&view.slot_type, &view.slot, Some(parent), None),
+    );
+    if (expected.all_slots.as_str(), expected.slot.as_str())
+        != (derived.0.as_str(), derived.1.as_str())
+    {
+        return Err(format!(
+            "the expected slices {}, {} are not slot {}'s under {} ({}, {})",
+            expected.all_slots,
+            expected.slot,
+            view.slot,
+            expected
+                .enclosing
+                .as_deref()
+                .unwrap_or("no enclosing slice"),
+            derived.0,
+            derived.1,
+        ));
+    }
+    let text = std::fs::read_to_string(cgroup_path)
+        .map_err(|error| format!("cannot read {}: {error}", cgroup_path.display()))?;
+    let path = text
+        .lines()
+        .find(|line| line.starts_with("0::"))
+        .map(|line| &line[3..]);
+    let Some(path) = path else {
+        return Err(format!(
+            "{} has no unified (0::) cgroup line",
+            cgroup_path.display()
+        ));
+    };
+    let parts: Vec<&str> = path.split('/').collect();
+    let manager = parts.iter().position(|part| part.starts_with("user@"));
+    let below: Vec<&str> = match manager {
+        Some(index) => parts[index + 1..].to_vec(),
+        None => Vec::new(),
+    };
+    let mut wanted = slice_chain(&expected.slot);
+    wanted.push(unit.to_string());
+    let below: Vec<String> = below.iter().map(|part| part.to_string()).collect();
+    if manager.is_none() || below != wanted {
+        return Err(format!(
+            "this process is in {path}, not in {unit} directly under {} ({} below the user manager); refusing to enter the box",
+            expected.slot,
+            wanted.join("/"),
+        ));
+    }
+    Ok(())
+}
+
+/// Inputs for `run --in-scope ... --print`, as the glue parsed
+/// them (texts unparsed: their refusals are the handler's).
+pub(crate) struct InScopeGiven {
+    pub(crate) unit: Option<String>,
+    pub(crate) expect_slices: Option<String>,
+    pub(crate) expect_writable: Option<String>,
+    pub(crate) expect_masks: Option<String>,
+    pub(crate) git_config_policy: String,
+    pub(crate) closed_set: bool,
+    pub(crate) no_protect_system: bool,
+}
+
+/// Host facts for the in-scope plan.
+pub(crate) struct InScopeFacts {
+    pub(crate) home: PathBuf,
+    pub(crate) cgroup_path: PathBuf,
+    pub(crate) spec: crate::sandbox_state::SpecFacts,
+    pub(crate) helper_interpreter: String,
+    pub(crate) helper_module: String,
+    pub(crate) dont_write_bytecode: bool,
+}
+
+fn expected_slices(text: &str) -> Result<SlicePlacement, String> {
+    let loaded: Value = serde_json::from_str(text).map_err(|error| {
+        format!("--expect-slices must be the JSON object --place-only printed: {error}")
+    })?;
+    let Some(map) = loaded.as_object() else {
+        return Err(
+            "--expect-slices must be an object with exactly enclosing, all_slots and slot"
+                .to_string(),
+        );
+    };
+    if map.len() != 3
+        || !map.contains_key("enclosing")
+        || !map.contains_key("all_slots")
+        || !map.contains_key("slot")
+    {
+        return Err(
+            "--expect-slices must be an object with exactly enclosing, all_slots and slot"
+                .to_string(),
+        );
+    }
+    let enclosing = match &map["enclosing"] {
+        Value::Null => None,
+        Value::String(name) if !name.is_empty() => Some(name.clone()),
+        _ => return Err("--expect-slices enclosing must be a slice name or null".to_string()),
+    };
+    let (Some(all_slots), Some(slot)) = (
+        map["all_slots"].as_str().filter(|name| !name.is_empty()),
+        map["slot"].as_str().filter(|name| !name.is_empty()),
+    ) else {
+        return Err("--expect-slices all_slots and slot must be slice names".to_string());
+    };
+    Ok(SlicePlacement {
+        enclosing,
+        all_slots: all_slots.to_string(),
+        slot: slot.to_string(),
+    })
+}
+
+fn expected_object(text: &str, what: &str) -> Result<Value, String> {
+    let loaded: Value = serde_json::from_str(text).map_err(|error| {
+        format!("--expect-{what} must be the JSON object --print reported as {what}: {error}")
+    })?;
+    if !loaded.is_object() {
+        return Err(format!(
+            "--expect-{what} must be the JSON object --print reported as {what}"
+        ));
+    }
+    Ok(loaded)
+}
+
+/// `wrkslots run --in-scope UNIT --expect-slices ... --print`:
+/// verify the caller's placement and print what entering the
+/// box would do, mirroring Python `_in_scope`'s print branch
+/// and `sandbox.in_scope_plan`. Nothing is entered or written.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_in_scope_print(
+    view: &crate::sandbox_state::SlotView,
+    settings: &crate::sandbox_state::SandboxSettings,
+    command: &[String],
+    cwd: Option<&Path>,
+    given: &InScopeGiven,
+    facts: &InScopeFacts,
+) -> (i32, String, String) {
+    use crate::sandbox_state::{build_spec, mask_report, planned_private_sources, writable_set};
+    if given.unit.is_none() || given.expect_slices.is_none() {
+        return refusal_for("--in-scope and --expect-slices are given together", "run");
+    }
+    if given.closed_set && given.no_protect_system {
+        return refusal_for(
+            "--closed-set refuses --no-protect-system: every other mount must stay read-only",
+            "run",
+        );
+    }
+    let unit = given.unit.as_deref().unwrap_or("");
+    let expected = match expected_slices(given.expect_slices.as_deref().unwrap_or("")) {
+        Ok(expected) => expected,
+        Err(message) => return refusal_for(&message, "run"),
+    };
+    let expected_writable = match &given.expect_writable {
+        Some(text) => match expected_object(text, "writable") {
+            Ok(value) => Some(value),
+            Err(message) => return refusal_for(&message, "run"),
+        },
+        None => None,
+    };
+    let expected_masks = match &given.expect_masks {
+        Some(text) => match expected_object(text, "masks") {
+            Ok(value) => Some(value),
+            Err(message) => return refusal_for(&message, "run"),
+        },
+        None => None,
+    };
+    if settings.isolation != "root" {
+        return refusal_for(
+            &format!(
+                "--in-scope builds the view through the root helper and needs isolation root, not {}",
+                settings.isolation
+            ),
+            "run",
+        );
+    }
+    if view.coordinator {
+        return refusal_for(
+            "--in-scope enters one slot's box, not a coordinator box",
+            "run",
+        );
+    }
+    if command.is_empty() {
+        return refusal_for("no command to run", "run");
+    }
+    if let Err(message) = verify_in_scope(view, unit, &expected, &facts.cgroup_path) {
+        return refusal_for(&message, "run");
+    }
+    let workdir: &Path = cwd.unwrap_or(&view.slot_path);
+    let spec = match build_spec(
+        view,
+        settings,
+        &facts.home,
+        workdir,
+        !given.closed_set,
+        if given.git_config_policy.is_empty() {
+            "inherit"
+        } else {
+            &given.git_config_policy
+        },
+        &facts.spec,
+    ) {
+        Ok(spec) => spec,
+        Err(message) => return refusal_for(&message, "run"),
+    };
+    let writable = writable_set(&spec, &planned_private_sources(view, settings));
+    if let Some(want) = &expected_writable {
+        if writable != *want {
+            return refusal_for(
+                &format!(
+                    "the writable set this entry would have differs from the expected one: {} is not {}; refusing to enter the box",
+                    crate::sandbox_state::py_json_compact_sorted(&writable),
+                    crate::sandbox_state::py_json_compact_sorted(want),
+                ),
+                "run",
+            );
+        }
+    }
+    let masks = mask_report(&spec);
+    if let Some(want) = &expected_masks {
+        if masks != *want {
+            return refusal_for(
+                &format!(
+                    "the masks this entry would apply differ from the expected ones: {} is not {}; refusing to enter the box",
+                    crate::sandbox_state::py_json_compact_sorted(&masks),
+                    crate::sandbox_state::py_json_compact_sorted(want),
+                ),
+                "run",
+            );
+        }
+    }
+    let plan = json!({
+        "unit": unit,
+        "slices": expected.to_obj(),
+        "writable": writable,
+        "masks": masks,
+        "helper": root_helper_argv(
+            &facts.helper_interpreter,
+            &facts.helper_module,
+            "SPEC-FILE",
+            facts.dont_write_bytecode,
+        ),
+        "command": command,
+        "view": spec,
+    });
+    (
+        0,
+        format!("{}\n", crate::sandbox_state::py_json_indented_sorted(&plan)),
+        String::new(),
+    )
+}
+
 /// `wrkslots limits {show,apply,clear}`: the dispatch-shaped
 /// handler. Host facts (uid, physical bytes, cpu count) and the
 /// runner are injected; the properties and outputs mirror Python
@@ -1078,6 +1381,241 @@ sys.stdout.write(f"{rc}\n{out.getvalue()}---STDERR---\n{err.getvalue()}")
                 &facts,
                 if coordinator { "box" } else { "run" },
             );
+            assert_eq!(
+                outcome,
+                (
+                    head.trim().parse::<i32>().expect("exit"),
+                    stdout.to_string(),
+                    stderr.to_string()
+                ),
+                "case {case}"
+            );
+        }
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    const IN_SCOPE_DRIVER: &str = r####"import argparse, io, json, os, sys
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+sys.path.insert(0, os.environ["WRKSLOTS_PY_ROOT"])
+from wrkslots import cli, imagecmd, sandbox
+
+case, base = sys.argv[1], Path(sys.argv[2])
+os.environ.pop("GATE_ADMISSION_DIR", None)
+os.environ.pop("XDG_RUNTIME_DIR", None)
+os.environ["USER"] = "fixture-user"
+home = base / "home"
+os.environ["HOME"] = str(home)
+sandbox._interpreter = lambda: "/usr/bin/python3"
+SLOT = "wrkslots-slot\\x2da.slice"
+SLICES = json.dumps({"enclosing": None, "all_slots": "wrkslots.slice", "slot": SLOT})
+cgroup = base / "cgroup"
+cgroup.write_text("0::/user.slice/user@1000.service/wrkslots.slice/" + SLOT + "/run-1.scope\n" if case != "wrong-process" else "0::/user.slice/user@1000.service/app.slice/run-9.scope\n")
+view = sandbox.SlotView(slot="slot-a", slot_type="agent", slot_path=base / "slot-a", state_directory=base / "state" / "slot-a", git_directories=(base / "gitcommon",), control_directory=base / "control", representation="worktrees", project_root=base / "project", coordinator=False, writable=(), propagate=())
+settings = sandbox.settings_from_obj({"isolation": "cgroup" if case == "wrong-isolation" else "root", "limits": {"memory_max": "32G"}})
+expected = sandbox.SlicePlacement(enclosing=None, all_slots="wrkslots.slice", slot=SLOT)
+out, err = io.StringIO(), io.StringIO()
+def render(rc):
+    return f"{rc}\n{out.getvalue()}---STDERR---\n{err.getvalue()}"
+try:
+    with redirect_stdout(out), redirect_stderr(err):
+        if case in ("missing-expect", "closed-noprotect"):
+            args = argparse.Namespace(no_protect_system=(case == "closed-noprotect"), expect_writable=None, expect_masks=None, git_config_policy=None, command=["/bin/true"], cwd=None, print_only=True)
+            rc = imagecmd._in_scope(args, view, settings, "run-1.scope", None if case == "missing-expect" else SLICES, case == "closed-noprotect", None)
+        else:
+            plan = sandbox.in_scope_plan(view, settings, ["/bin/true"], unit="run-1.scope", expected=expected, cgroup_file=cgroup)
+            if case == "expect-ok":
+                plan = sandbox.in_scope_plan(view, settings, ["/bin/true"], unit="run-1.scope", expected=expected, cgroup_file=cgroup, expected_writable=plan["writable"], expected_masks=plan["masks"])
+            if case == "expect-wrong":
+                bad = dict(plan["writable"]); bad["tmp"] = {"target": "/tmp", "size": "1G"}
+                plan = sandbox.in_scope_plan(view, settings, ["/bin/true"], unit="run-1.scope", expected=expected, cgroup_file=cgroup, expected_writable=bad)
+            print(json.dumps(plan, indent=2, sort_keys=True))
+            rc = 0
+except (cli.Refusal, sandbox.SandboxError) as exc:
+    if not isinstance(exc, cli.Refusal):
+        exc = cli.Refusal(str(exc))
+    remedy = cli._refusal_remedy(argparse.Namespace(command="run"), exc)
+    sys.stdout.write(f"3\n{out.getvalue()}---STDERR---\nREFUSED: {exc}\nREMEDY: {remedy}\n")
+    sys.exit(0)
+sys.stdout.write(render(rc))
+"####;
+
+    /// Oracle differential: Python `in_scope_plan` (and
+    /// `_in_scope` for its early refusals) vs
+    /// `run_in_scope_print` on the same fixture.
+    #[test]
+    fn in_scope_print_matches_python_oracle() {
+        use crate::sandbox_state::{settings_from_obj, SlotView, SpecFacts};
+        let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("repo root")
+            .to_path_buf();
+        let root = std::env::temp_dir().join(format!("wrkslotsd-in-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        for dir in [
+            home.join(".claude"),
+            home.join(".cache"),
+            root.join("slot-a"),
+            root.join("state/slot-a"),
+            root.join("gitcommon"),
+            root.join("control"),
+            root.join("project/ai_docs"),
+        ] {
+            std::fs::create_dir_all(&dir).expect("fixture dir");
+        }
+        std::fs::write(home.join("plain.txt"), "x").expect("file");
+        let driver_path = root.join("in_scope_driver.py");
+        std::fs::write(&driver_path, IN_SCOPE_DRIVER).expect("driver");
+        let cgroup_path = root.join("cgroup");
+        let slot_slice = "wrkslots-slot\\x2da.slice";
+        let slices_text = json!({
+            "enclosing": Value::Null,
+            "all_slots": "wrkslots.slice",
+            "slot": slot_slice,
+        })
+        .to_string();
+        let uid = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&root).expect("meta").uid()
+        };
+        let module = repo
+            .join("py/wrkslots/sandbox.py")
+            .canonicalize()
+            .expect("module path");
+        for case in [
+            "plan",
+            "expect-ok",
+            "expect-wrong",
+            "wrong-process",
+            "wrong-isolation",
+            "missing-expect",
+            "closed-noprotect",
+        ] {
+            let cgroup_text = if case == "wrong-process" {
+                "0::/user.slice/user@1000.service/app.slice/run-9.scope\n"
+            } else {
+                "0::/user.slice/user@1000.service/wrkslots.slice/wrkslots-slot\\x2da.slice/run-1.scope\n"
+            };
+            // The Python driver writes the same text itself.
+            std::fs::write(&cgroup_path, cgroup_text).expect("cgroup");
+            let output = std::process::Command::new("python3")
+                .arg(&driver_path)
+                .arg(case)
+                .arg(&root)
+                .env("WRKSLOTS_PY_ROOT", repo.join("py"))
+                .output()
+                .expect("python oracle runs");
+            assert!(output.status.success(), "case {case}: {:?}", output.stderr);
+            let text = String::from_utf8(output.stdout).expect("utf8");
+            let (head, rest) = text.split_once('\n').expect("exit line");
+            let (stdout, stderr) = rest.split_once("---STDERR---\n").expect("marker");
+            let view = SlotView {
+                slot: "slot-a".to_string(),
+                slot_type: "agent".to_string(),
+                slot_path: root.join("slot-a"),
+                state_directory: root.join("state/slot-a"),
+                git_directories: vec![root.join("gitcommon")],
+                control_directory: root.join("control"),
+                representation: "worktrees".to_string(),
+                project_root: Some(root.join("project")),
+                coordinator: false,
+                writable: Vec::new(),
+                propagate: Vec::new(),
+            };
+            let settings = settings_from_obj(&json!({
+                "isolation": if case == "wrong-isolation" { "cgroup" } else { "root" },
+                "limits": {"memory_max": "32G"}
+            }))
+            .expect("settings");
+            let facts = InScopeFacts {
+                home: home.clone(),
+                cgroup_path: cgroup_path.clone(),
+                spec: SpecFacts {
+                    user: "fixture-user".to_string(),
+                    uid,
+                    mountinfo: None,
+                    gate_dir: None,
+                    xdg_runtime_dir: None,
+                },
+                helper_interpreter: "/usr/bin/python3".to_string(),
+                helper_module: module.to_string_lossy().into_owned(),
+                dont_write_bytecode: false,
+            };
+            let clean = InScopeGiven {
+                unit: Some("run-1.scope".to_string()),
+                expect_slices: Some(slices_text.clone()),
+                expect_writable: None,
+                expect_masks: None,
+                git_config_policy: "inherit".to_string(),
+                closed_set: false,
+                no_protect_system: false,
+            };
+            let outcome = match case {
+                "missing-expect" => run_in_scope_print(
+                    &view,
+                    &settings,
+                    &["/bin/true".to_string()],
+                    None,
+                    &InScopeGiven {
+                        expect_slices: None,
+                        ..clean
+                    },
+                    &facts,
+                ),
+                "closed-noprotect" => run_in_scope_print(
+                    &view,
+                    &settings,
+                    &["/bin/true".to_string()],
+                    None,
+                    &InScopeGiven {
+                        closed_set: true,
+                        no_protect_system: true,
+                        ..clean
+                    },
+                    &facts,
+                ),
+                "expect-ok" | "expect-wrong" => {
+                    let first = run_in_scope_print(
+                        &view,
+                        &settings,
+                        &["/bin/true".to_string()],
+                        None,
+                        &clean,
+                        &facts,
+                    );
+                    assert_eq!(first.0, 0, "first pass {case}: {}", first.2);
+                    let plan: Value = serde_json::from_str(first.1.trim_end()).expect("plan json");
+                    let (writable, masks) = if case == "expect-ok" {
+                        (plan["writable"].to_string(), plan["masks"].to_string())
+                    } else {
+                        let mut bad = plan["writable"].clone();
+                        bad["tmp"] = json!({"target": "/tmp", "size": "1G"});
+                        (bad.to_string(), plan["masks"].to_string())
+                    };
+                    run_in_scope_print(
+                        &view,
+                        &settings,
+                        &["/bin/true".to_string()],
+                        None,
+                        &InScopeGiven {
+                            expect_writable: Some(writable),
+                            expect_masks: Some(masks),
+                            ..clean
+                        },
+                        &facts,
+                    )
+                }
+                _ => run_in_scope_print(
+                    &view,
+                    &settings,
+                    &["/bin/true".to_string()],
+                    None,
+                    &clean,
+                    &facts,
+                ),
+            };
             assert_eq!(
                 outcome,
                 (
