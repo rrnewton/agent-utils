@@ -219,3 +219,11 @@ a related waiter gets busy (75) naming the creator; creator killed mid-hook
 classifies interrupted and recovers as today; legacy journals without a
 creator classify exactly as today; hook failure mid-provision leaves
 today's journal and recovery behavior.
+
+## Update 2026-11-11 (#1287 retire-lock-narrow)
+
+[watermelon-full-preview] Coverage of this issue after #1276 and #1287, measured with the counted lock ledger of `py/wrkslots/tests/test_prevalidated_mutation.py` plus plan/fetch/hook instrumentation on a fixture create (2 existing rows, one trivial post-provision hook):
+
+- (1) The 2026-11-09 incident path -- classification passes folding 76,008 events per pass under the lock -- is the path #1276 fixed: a plain create now runs its fleet validation, slot/agent check and fleet storage report lock-free (each counted once, never held), takes one exclusive round, and under it reads only the verified tip plus the events it wrote (9 event reads for this fixture's create), with no event-log load or listing held. Create's lock hold on this path no longer grows with the event-log length beyond the registry-identity lstat scan #1276 already accepted.
+- (2) #1287: a create beside an outstanding journal previously deferred to the locked path and recomputed the fleet storage report under the flock; every round now computes that report lock-free and the locked classification path reuses it (`py/wrkslots/tests/test_create_lock_scope.py`). The journal classification itself still runs under the lock, as its recovery semantics require.
+- Still open here, unchanged by #1287: inside create's one locked round sit `_create_plan` (including `fetch_remote`), `git worktree add`, and `_run_post_provision_hooks` -- each counted held exactly once in the ledger above. On a host whose provision hook runs a multi-GB `git submodule update --init`, that hook time is spent under the root flock (two creates measured at 2 min 9 s and 2 min 35 s on 2026-11-11). Moving fetch and hooks out is the reservation/provisioning/record design above; it remains unimplemented, and the persistent incremental classification cache and compaction proposals remain deferred pending lead approval.
