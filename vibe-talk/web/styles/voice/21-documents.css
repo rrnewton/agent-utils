@@ -221,15 +221,34 @@
   cursor: pointer;
 }
 /* Star, Hide and hidden cards (`#1265 documents-star-hide`). */
+/* The card star and the reader's header star (`#doc-star`, sized below) share
+   one dress (`#1306 doc-star-gold`): their own ground and ink, never the
+   generic `button` ground. That rule (`style.css`) fills every button with
+   `--accent`, and the pressed rule that was here coloured the glyph with
+   `--accent` too, so a starred star drew blue on blue and the button looked
+   blank. Off is the outline star in muted ink on the panel ground; on is
+   the filled star in the pin gold on its ground (`--pin-*` in
+   `00-frame.css`, both schemes), so the glyph's colour is never its own
+   background. The literal fallbacks are a pair for the same reason: without
+   the tokens they still draw a gold star on a dark ground. */
+.doc-star,
+#doc-star {
+  background: var(--panel, Canvas);
+  color: var(--muted, CanvasText);
+  border: 1px solid var(--edge, currentColor);
+}
+.doc-star[aria-pressed="true"],
+#doc-star[aria-pressed="true"] {
+  background: var(--pin-bg, #3a3017);
+  color: var(--pin-ink, #f0c75e);
+  border-color: var(--pin-edge, #d4a63a);
+}
 .doc-star {
   flex: none;
   min-width: 36px;
   min-height: 36px;
   cursor: pointer;
   font-size: 1.1em;
-}
-.doc-star[aria-pressed="true"] {
-  color: var(--accent, Highlight);
 }
 .doc-hide,
 .doc-unhide {
@@ -260,15 +279,13 @@
   cursor: pointer;
   touch-action: manipulation;
 }
+/* Its ground and gold are the shared star dress with `.doc-star` above. */
 #doc-star {
   flex: none;
   min-width: 40px;
   min-height: 36px;
   cursor: pointer;
   font-size: 1.2em;
-}
-#doc-star[aria-pressed="true"] {
-  color: var(--accent, Highlight);
 }
 
 .doc-list-head {

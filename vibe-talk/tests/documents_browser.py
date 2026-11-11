@@ -23,7 +23,10 @@ The last steps cover `#1265 documents-star-hide`: starring from a card and
 the reader header, persistence across reload and through the server's
 synced settings to a fresh device, the Starred chip, a real touch swipe to
 hide with its Undo chip, the hamburger's Show hidden with dimmed cards and
-Unhide, and the desktop Hide button.
+Unhide, and the desktop Hide button. At phone and desktop sizes they also
+check `#1306 doc-star-gold`: the starred star is visibly different — its
+glyph fills and its computed colour is neither its own background (the old
+accent-blue-on-accent-blue blank button) nor the unstarred colour.
 """
 
 import json
@@ -38,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
 
-from playwright.sync_api import Page, Route, sync_playwright
+from playwright.sync_api import Locator, Page, Route, sync_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
 CHANNEL = "100000000000000001"
@@ -174,6 +177,34 @@ def tap_card(page: object, card: object) -> None:
         page.wait_for_timeout(200)  # type: ignore[attr-defined]
     assert box is not None
     page.touchscreen.tap(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)  # type: ignore[attr-defined]
+
+
+def star_appearance(star: Locator) -> dict[str, str]:
+    """One star button's glyph, pressed state, and computed ink and ground."""
+    found = star.evaluate(
+        """(el) => {
+          const s = getComputedStyle(el);
+          return {text: el.textContent, pressed: el.getAttribute('aria-pressed'),
+                  color: s.color, background: s.backgroundColor};
+        }""")
+    return cast(dict[str, str], found)
+
+
+def check_star_gold(label: str, off: dict[str, str], on: dict[str, str]) -> None:
+    """A starred star reads as one (`#1306 doc-star-gold`): the glyph fills,
+    and each state's ink differs from its own ground — on the old CSS the
+    pressed colour was the generic button's accent ground itself, so the
+    starred check here failed with the two equal."""
+    check(off["text"] == "☆" and off["pressed"] == "false",
+          f"the {label} is not an unpressed outline star: {off}")
+    check(on["text"] == "★" and on["pressed"] == "true",
+          f"the {label} is not a pressed filled star: {on}")
+    check(off["color"] != off["background"],
+          f"the unstarred {label} is its own background colour: {off}")
+    check(on["color"] != on["background"],
+          f"the starred {label} is its own background colour (a blank button): {on}")
+    check(on["color"] != off["color"],
+          f"the {label}'s starred and unstarred colours are the same: off {off}, on {on}")
 
 
 def check_doc_search(page: Page, width: int, height: int) -> None:
@@ -562,14 +593,19 @@ def main() -> int:
                 paste_key = str(by_file["demo-doc"]["key"])
 
                 # Star the paste document from its card; the star fills and
-                # the state reaches the server's synced settings.
+                # the state reaches the server's synced settings. Filled has
+                # to be visible (`#1306 doc-star-gold`): the gold check reads
+                # the card star's appearance on both sides of the tap.
                 paste_card = spage.locator("#documents-list .doc-card", has_text="demo-doc")
+                phone_card_off = star_appearance(paste_card.locator(".doc-star"))
                 paste_card.locator(".doc-star").tap()
                 spage.wait_for_function(
                     "() => [...document.querySelectorAll('#documents-list .doc-card')]"
                     ".some((c) => c.textContent.includes('demo-doc')"
                     " && c.querySelector('.doc-star')?.getAttribute('aria-pressed') === 'true')",
                     timeout=20_000)
+                check_star_gold("phone card star", phone_card_off,
+                                star_appearance(paste_card.locator(".doc-star")))
                 deadline = time.time() + 30
                 held_states: dict[str, object] = {}
                 while time.time() < deadline:
@@ -598,11 +634,26 @@ def main() -> int:
                 check(starred.get_attribute("aria-pressed") == "true",
                       "the star did not persist across reload")
 
-                # The reader header carries the same star.
+                # The reader header carries the same star, visibly: read it
+                # starred, tap it off and read the outline, then tap the
+                # star back on for the steps below (`#1306`).
                 tap_card(spage, spage.locator("#documents-list .doc-card", has_text="demo-doc"))
                 spage.wait_for_selector("#doc-body h1", timeout=20_000)
                 check(spage.locator("#doc-star").get_attribute("aria-pressed") == "true",
                       "the reader header does not show the card's star")
+                phone_header_on = star_appearance(spage.locator("#doc-star"))
+                spage.tap("#doc-star")
+                spage.wait_for_function(
+                    "() => document.getElementById('doc-star')"
+                    "?.getAttribute('aria-pressed') === 'false'",
+                    timeout=20_000)
+                check_star_gold("phone reader star",
+                                star_appearance(spage.locator("#doc-star")), phone_header_on)
+                spage.tap("#doc-star")
+                spage.wait_for_function(
+                    "() => document.getElementById('doc-star')"
+                    "?.getAttribute('aria-pressed') === 'true'",
+                    timeout=20_000)
                 spage.tap("#doc-back")
                 spage.wait_for_selector("#documents-list .doc-card", timeout=20_000)
 
@@ -684,6 +735,43 @@ def main() -> int:
                 hpage.add_init_script(
                     f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
                 hpage.goto(base + "/?v=docs", wait_until="load")
+                hpage.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+
+                # The gold star at desktop size (`#1306 doc-star-gold`), on
+                # the guide's card and then in its reader header, restored
+                # to unstarred for the Hide walk below. Convergence first —
+                # the paste's star arriving from the server — so the guide's
+                # toggle is not racing this fresh device's first sync.
+                hpage.wait_for_function(
+                    "() => [...document.querySelectorAll('#documents-list .doc-card')]"
+                    ".some((c) => c.textContent.includes('demo-doc')"
+                    " && c.querySelector('.doc-star')?.getAttribute('aria-pressed') === 'true')",
+                    timeout=30_000)
+                guide_star = hpage.locator(
+                    "#documents-list .doc-card", has_text="guide.md").locator(".doc-star")
+                desk_card_off = star_appearance(guide_star)
+                guide_star.click()
+                hpage.wait_for_function(
+                    "() => [...document.querySelectorAll('#documents-list .doc-card')]"
+                    ".some((c) => c.textContent.includes('guide.md')"
+                    " && c.querySelector('.doc-star')?.getAttribute('aria-pressed') === 'true')",
+                    timeout=20_000)
+                check_star_gold("desktop card star", desk_card_off, star_appearance(guide_star))
+                hpage.locator("#documents-list .doc-card", has_text="guide.md").click()
+                hpage.wait_for_selector("#doc-body h1", timeout=20_000)
+                hpage.wait_for_function(
+                    "() => document.getElementById('doc-star')"
+                    "?.getAttribute('aria-pressed') === 'true'",
+                    timeout=20_000)
+                desk_header_on = star_appearance(hpage.locator("#doc-star"))
+                hpage.click("#doc-star")
+                hpage.wait_for_function(
+                    "() => document.getElementById('doc-star')"
+                    "?.getAttribute('aria-pressed') === 'false'",
+                    timeout=20_000)
+                check_star_gold("desktop reader star",
+                                star_appearance(hpage.locator("#doc-star")), desk_header_on)
+                hpage.click("#doc-back")
                 hpage.wait_for_selector("#documents-list .doc-card", timeout=20_000)
                 hpage.locator("#documents-list .doc-card", has_text="guide.md") \
                     .locator(".doc-hide").click()

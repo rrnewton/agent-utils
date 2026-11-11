@@ -1688,11 +1688,17 @@ test("documents list: the card star toggles, writes the synced value, and the St
     const star = buttonIn(cardOf("md-doc"), "doc-star");
     assert.ok(star, "the card has no star");
     assert.equal(star.getAttribute("aria-pressed"), "false");
+    // The glyph contract the gold dress draws (`#1306 doc-star-gold`): an
+    // outline star off, the filled star on. The visible colours are the
+    // browser walk's to check; this fake-DOM suite holds no stylesheet.
+    assert.equal(star.textContent, "☆", "the unstarred card star is not the outline glyph");
     fire(star, "click", { stopPropagation() {} });
     const held = JSON.parse(storage.held.get("vibe-talk.voice.doc-states"));
     assert.deepEqual(held, { "md-doc": { s: 1 } }, "the star did not write the synced value");
     assert.equal(cardOf("md-doc").className.includes("doc-starred"), true, "the starred card is not marked");
     assert.equal(buttonIn(cardOf("md-doc"), "doc-star").getAttribute("aria-pressed"), "true");
+    assert.equal(buttonIn(cardOf("md-doc"), "doc-star").textContent, "★",
+      "the starred card star is not the filled glyph");
     fire(chip("starred"), "click", {});
     assert.deepEqual(cards().map((kid) => kid.getAttribute("data-key")), ["md-doc"],
       "the Starred chip did not show only the starred document");
@@ -1764,6 +1770,7 @@ test("documents reader: the header star toggles the open document's star", async
     assert.equal(star.textContent, "★");
     dispatchClick(star);
     assert.equal(star.getAttribute("aria-pressed"), "false", "the header star did not toggle off");
+    assert.equal(star.textContent, "☆", "the unstarred header star is not the outline glyph");
     // Show hidden is the view's to drive, as the hamburger drives it.
     assert.equal(view.showHidden(), false);
     view.setShowHidden(true);
