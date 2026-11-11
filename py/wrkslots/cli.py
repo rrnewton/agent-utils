@@ -24482,6 +24482,53 @@ def _ttl_rescue_ref(slot: str, date_str: str, name: str) -> str:
     return f"refs/heads/rescue/{slot}/{date_str}/{name}"
 
 
+class _TtlRescueHookRequest(TypedDict):
+    slot: str
+    date: str
+    branches: list[str]
+    worktrees: list[str]
+
+
+class _TtlRescueHookDecision(TypedDict, total=False):
+    ref_names: dict[str, str]
+    wip_message: str
+    priority: list[str]
+
+
+# The optional Muse hook (slice 5): it may rename rescue refs, word the
+# WIP commit and order the pushes. It has no field that can veto rescue or
+# teardown; a hook that raises, times out or answers nonsense is ignored
+# and the deterministic names below are used instead.
+TtlRescueHook = Callable[[_TtlRescueHookRequest], "_TtlRescueHookDecision | None"]
+
+
+def _call_ttl_rescue_hook(
+    hook: TtlRescueHook | None, request: _TtlRescueHookRequest
+) -> _TtlRescueHookDecision:
+    if hook is None:
+        return {}
+    try:
+        decision = hook(request)
+    except Exception:
+        return {}
+    return decision if isinstance(decision, dict) else {}
+
+
+def _ttl_hook_ref_name(
+    decision: _TtlRescueHookDecision, branch: str, slot: str, date_str: str
+) -> str:
+    """The rescue ref for ``branch``: the hook's valid rename, else the default."""
+    names = decision.get("ref_names") or {}
+    candidate = names.get(branch)
+    if isinstance(candidate, str) and candidate:
+        ref = _ttl_rescue_ref(slot, date_str, candidate)
+        try:
+            return _validate_full_ref(ref, "ttl rescue ref")
+        except Refusal:
+            return _ttl_rescue_ref(slot, date_str, branch)
+    return _ttl_rescue_ref(slot, date_str, branch)
+
+
 def _execute_ttl_rescue(
     checkout_dir: Path,
     *,
@@ -24489,16 +24536,19 @@ def _execute_ttl_rescue(
     date_str: str,
     remote: str,
     bundle_path: Path,
+    hook: TtlRescueHook | None = None,
 ) -> _TtlRescueReceipt:
     """Deterministic code-based rescue for one checkout (#1293 slice 3).
 
     Every worktree of the checkout is rescued: uncommitted changes become
-    a WIP commit, then HEAD is pushed to the dated rescue ref on
-    ``remote``; a stash, when present, is pushed the same way. When any
-    push fails, a verified bundle holding every ref is written to
-    ``bundle_path`` instead. Heuristics are deliberate here: rescue never
-    refuses, it only reports what it could not push. The caller decides
-    teardown; this function only preserves.
+    a WIP commit, then its branch (or detached HEAD) is pushed to the
+    dated rescue ref on ``remote``; every other local branch and a stash,
+    when present, are pushed the same way. When any push fails, a
+    verified bundle holding every ref is written to ``bundle_path``
+    instead. Heuristics are deliberate here: rescue never refuses, it
+    only reports what it could not push. The caller decides teardown;
+    this function only preserves. ``hook`` may rename refs and word the
+    WIP commit (slice 5); it cannot veto anything.
     """
 
     def git(path: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -24510,8 +24560,28 @@ def _execute_ttl_rescue(
         for line in listing.splitlines()
         if line.startswith("worktree ")
     ] or [checkout_dir]
+    branches = [
+        line
+        for line in git(
+            checkout_dir, "for-each-ref", "--format=%(refname:short)", "refs/heads"
+        ).stdout.splitlines()
+        if line
+    ]
+    decision = _call_ttl_rescue_hook(
+        hook,
+        {
+            "slot": slot,
+            "date": date_str,
+            "branches": branches,
+            "worktrees": [str(worktree) for worktree in worktrees],
+        },
+    )
+    wip_message = decision.get("wip_message") or (
+        f"wrkslots ttl rescue WIP {slot} {date_str}"
+    )
     rescued: list[_TtlRescueEntry] = []
     operations = 0
+    checked_out: set[str] = set()
     for worktree in worktrees:
         dirty = bool(git(worktree, "status", "--porcelain").stdout.strip())
         operations += 1
@@ -24522,7 +24592,7 @@ def _execute_ttl_rescue(
                 worktree,
                 "-c", "user.name=wrkslots-rescue",
                 "-c", "user.email=wrkslots-rescue@localhost",
-                "commit", "-q", "-m", f"wrkslots ttl rescue WIP {slot} {date_str}",
+                "commit", "-q", "-m", wip_message,
             )
             operations += 2
             wip_commit = git(worktree, "rev-parse", "HEAD").stdout.strip()
@@ -24533,7 +24603,9 @@ def _execute_ttl_rescue(
         if branch_proc.returncode != 0 or not branch:
             short = git(worktree, "rev-parse", "--short", "HEAD").stdout.strip()
             branch = f"detached-{short}"
-        ref = _ttl_rescue_ref(slot, date_str, branch)
+        else:
+            checked_out.add(branch)
+        ref = _ttl_hook_ref_name(decision, branch, slot, date_str)
         push = git(worktree, "push", remote, f"HEAD:{ref}", check=False)
         operations += 1
         rescued.append(
@@ -24545,9 +24617,30 @@ def _execute_ttl_rescue(
                 "wip_commit": wip_commit,
             }
         )
+    for branch in branches:
+        if branch in checked_out:
+            continue
+        ref = _ttl_hook_ref_name(decision, branch, slot, date_str)
+        push = git(
+            checkout_dir, "push", remote, f"refs/heads/{branch}:{ref}", check=False
+        )
+        operations += 1
+        rescued.append(
+            {
+                "worktree": str(checkout_dir),
+                "branch": branch,
+                "rescue_ref": ref,
+                "pushed": push.returncode == 0,
+                "wip_commit": None,
+            }
+        )
+    priority = decision.get("priority") or []
+    if priority:
+        order = {name: index for index, name in enumerate(priority)}
+        rescued.sort(key=lambda entry: order.get(entry["branch"], len(order)))
     stash = git(checkout_dir, "rev-parse", "-q", "--verify", "refs/stash", check=False)
     if stash.returncode == 0 and stash.stdout.strip():
-        ref = _ttl_rescue_ref(slot, date_str, "stash")
+        ref = _ttl_hook_ref_name(decision, "stash", slot, date_str)
         push = git(checkout_dir, "push", remote, f"refs/stash:{ref}", check=False)
         operations += 1
         rescued.append(
@@ -24601,6 +24694,109 @@ def _execute_ttl_teardown(
     )
     shutil.rmtree(checkout_dir)
     return {"slot": slot, "rescue": rescue, "removed": True, "path": str(checkout_dir)}
+
+
+class _TtlSlotRescueReceipt(TypedDict):
+    slot: str
+    stage: str
+    expired_at: str
+    teardown_at: str
+    checkouts: list[_TtlRescueReceipt]
+
+
+class _TtlSlotTeardownReceipt(TypedDict):
+    slot: str
+    removed: bool
+    path: str
+    rescue: _TtlSlotRescueReceipt
+
+
+def _ttl_slot_stage(
+    record: ActiveRecord, now: dt.datetime, thresholds: TtlThresholds
+) -> tuple[str, dt.datetime, dt.datetime]:
+    heartbeat = _parse_timestamp(record.heartbeat_at, f"slot {record.slot} heartbeat")
+    expired_at = heartbeat + dt.timedelta(seconds=record.heartbeat_ttl_seconds)
+    teardown_at = expired_at + dt.timedelta(seconds=thresholds.teardown_after_seconds)
+    return _ttl_stage(expired_at, now, thresholds), expired_at, teardown_at
+
+
+def _execute_ttl_slot_rescue(
+    config: Config,
+    record: ActiveRecord,
+    *,
+    now: dt.datetime,
+    thresholds: TtlThresholds,
+    hook: TtlRescueHook | None = None,
+) -> _TtlSlotRescueReceipt:
+    """Rescue every recorded checkout of an overdue slot (#1293 wiring).
+
+    Refuses only while the slot is still current: rescue is the warn-rung
+    action onward, never something done to a live slot by accident. Each
+    checkout keeps its own bundle file under ``ttl-rescue/`` in the
+    control directory. Registry and removal machinery are untouched;
+    this is the slow work a teardown runs before taking any lock.
+    """
+    stage, expired_at, teardown_at = _ttl_slot_stage(record, now, thresholds)
+    if stage == "current":
+        raise Refusal(
+            f"slot {record.slot} is not past its TTL; ttl rescue does nothing"
+        )
+    date_str = now.astimezone(dt.timezone.utc).strftime("%Y%m%d")
+    receipts: list[_TtlRescueReceipt] = []
+    for checkout in record.checkouts:
+        path = _stored_path(config, checkout.path, "checkout path")
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", checkout.name).strip("-.") or "checkout"
+        receipts.append(
+            _execute_ttl_rescue(
+                path,
+                slot=record.slot,
+                date_str=date_str,
+                remote=checkout.remote,
+                bundle_path=(
+                    config.control / "ttl-rescue" / f"{record.slot}-{safe_name}.bundle"
+                ),
+                hook=hook,
+            )
+        )
+    return {
+        "slot": record.slot,
+        "stage": stage,
+        "expired_at": expired_at.isoformat(),
+        "teardown_at": teardown_at.isoformat(),
+        "checkouts": receipts,
+    }
+
+
+def _execute_ttl_slot_teardown(
+    config: Config,
+    record: ActiveRecord,
+    *,
+    now: dt.datetime,
+    thresholds: TtlThresholds,
+    hook: TtlRescueHook | None = None,
+) -> _TtlSlotTeardownReceipt:
+    """Deterministic teardown of one slot at the teardown rung (#1293).
+
+    Past T+3 d there is no refusal left: rescue runs first (outside any
+    registry lock, as the lock-narrowing pattern requires of slow work),
+    then the slot tree is removed. A failed rescue is held by its
+    verified bundle and reported in the receipt; it never keeps the
+    slot. Archiving the registry row stays with the removal machinery;
+    this core is proven on fixture projects only.
+    """
+    stage, _expired_at, _teardown_at = _ttl_slot_stage(record, now, thresholds)
+    if stage != "teardown":
+        raise Refusal(
+            f"slot {record.slot} is at TTL stage {stage}, not teardown; "
+            "deterministic teardown runs only past the teardown rung"
+        )
+    rescue = _execute_ttl_slot_rescue(
+        config, record, now=now, thresholds=thresholds, hook=hook
+    )
+    slot_path = _slot_directory(config, record.slot, record.slot_type)
+    if slot_path.exists():
+        shutil.rmtree(slot_path)
+    return {"slot": record.slot, "removed": True, "path": str(slot_path), "rescue": rescue}
 
 
 def _ttl_health_lines(
