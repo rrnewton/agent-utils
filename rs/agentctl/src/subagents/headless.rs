@@ -792,7 +792,15 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         let (queue_root, enqueued) = {
             let _lock = self.lock(agent_name)?;
             let record = self.load(agent_name)?;
-            self.enqueue_for(&record, text, message_id, urgent, not_after, false, supersede_key)?
+            self.enqueue_for(
+                &record,
+                text,
+                message_id,
+                urgent,
+                not_after,
+                false,
+                supersede_key,
+            )?
         };
         let id = enqueued.id;
         let blocked = self.wake(agent_name);
