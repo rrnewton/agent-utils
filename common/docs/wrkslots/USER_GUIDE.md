@@ -98,7 +98,10 @@ type, task and purpose, owner process identity, coordinator history, heartbeat t
    `--archive-ignored` keeps them in a verified tar in the salvage archive or
    `--discard-ignored` deletes them explicitly; the salvage receipt lists them either way. It
    records and rechecks the exact remote ref and commit before
-   deletion. A validate slot skips this step.
+   deletion. A validate slot skips this step: validate checkouts are throwaway run checkouts,
+   deleted only behind a terminal run record and removal proof, so the ignored-file refusal
+   above does not apply to them (their retained and ownerless recovery still preserves ignored
+   residue outside `reclaimable_ignored_paths`).
 11. `recover` lets any later participant complete an interrupted create or removal from the durable
    history. It is not tied to the participant that began the operation.
 
@@ -1745,7 +1748,9 @@ deterministic tar beside the salvage bundles under `wrkslots-salvage/` (at most
 536870912 bytes in total), reads it back, checks every file's sha256, and lists each file with
 its size and sha256 in the salvage receipt; `--discard-ignored` deletes them explicitly and the
 receipt still lists them. Ignored content inside the caches is deleted with the checkout and is
-not listed. Authored work that must survive belongs in tracked or ordinary untracked paths, or
+not listed. This guard covers agent slots and ownerless agent worktree recovery; validate slots
+are deleted as throwaway run checkouts behind their terminal-record and removal-proof gate and
+are not refused for ignored residue (retained validation recovery preserves it instead). Authored work that must survive belongs in tracked or ordinary untracked paths, or
 in a separately recorded artifact store; an ignored build tree is not remote preservation
 evidence.
 
