@@ -1,11 +1,12 @@
 ---
 title: 'bridge-raw-headless: a bridge raw message loses its raw mark for headless agents'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 assignee: mu-rsctl
-created_at: 2026-11-10T16:40:00.000000000+00:00
-updated_at: 2026-11-10T16:40:00.000000000+00:00
+created_at: 2026-11-10T16:40:00+00:00
+updated_at: 2026-11-11T16:01:23.159294471+00:00
+closed_at: 2026-11-11T16:01:23.159293499+00:00
 ---
 
 # Description
