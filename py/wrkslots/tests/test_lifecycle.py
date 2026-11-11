@@ -59444,6 +59444,7 @@ def test_remove_agent_batch_refuses_before_fencing_an_image_slot_whose_budget_ra
 
 @pytest.mark.ordinary_environment
 @pytest.mark.parametrize("point", ["after-path-fence-before-journal", "after-path-fence"])
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_recover_finishes_an_image_slot_removal_interrupted_at_its_fence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, point: str,
 ) -> None:

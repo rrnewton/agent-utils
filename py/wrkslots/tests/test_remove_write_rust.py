@@ -276,6 +276,7 @@ def _kinds_and_actions(root: Path) -> list[tuple[str, str]]:
     return found
 
 
+@pytest.mark.load_quarantine  # #1267 wrkslots-load-robust
 def test_remove_matches_python(tmp_path: Path) -> None:
     with _own_fs(tmp_path) as base:
         _remove_matches_python(base)
