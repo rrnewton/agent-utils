@@ -1867,6 +1867,64 @@ mod tests {
     }
 
     #[test]
+    fn unbind_drops_record_only_after_successful_unmount() {
+        use crate::image_ops::RunOutcome;
+        struct Fake {
+            returncode: i32,
+        }
+        impl crate::image_ops::PrivilegedRunner for Fake {
+            fn run(&self, _spec: &CommandSpec) -> Result<RunOutcome, String> {
+                Ok(RunOutcome {
+                    returncode: self.returncode,
+                    stdout: String::new(),
+                    stderr: "unmount failed".to_string(),
+                })
+            }
+        }
+        let root = temp_root("unbind");
+        let control = root.join("control");
+        let worktrees = root.join("worktrees");
+        std::fs::create_dir_all(&control).expect("control");
+        std::fs::create_dir_all(&worktrees).expect("worktrees");
+        let slot_path = worktrees.join("slot-a");
+        std::fs::create_dir_all(&slot_path).expect("slot");
+        let mut records = BTreeMap::new();
+        records.insert(
+            "slot-a".to_string(),
+            BindRecord {
+                subvolume: "slot-a".to_string(),
+                mount_id: Some(9),
+                target: Some(slot_path.to_string_lossy().into_owned()),
+            },
+        );
+        save_bind_records(&control, &records).expect("seed record");
+        let ctx = WtCtx {
+            root: &root,
+            control: &control,
+            worktrees: &worktrees,
+            entries: &[],
+            skipped: None,
+        };
+        let failed = unbind_slot(&ctx, "slot-a", &slot_path, &Fake { returncode: 1 });
+        assert_eq!(failed.exit, 3);
+        assert!(
+            load_bind_records(&control)
+                .expect("records after failed unmount")
+                .contains_key("slot-a"),
+            "failed unmount must keep the bind record"
+        );
+        let done = unbind_slot(&ctx, "slot-a", &slot_path, &Fake { returncode: 0 });
+        assert_eq!(done.exit, 0, "{}", done.stderr);
+        assert!(
+            !load_bind_records(&control)
+                .expect("records after unmount")
+                .contains_key("slot-a"),
+            "successful unmount must drop the bind record"
+        );
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
     fn migrate_handlers_match_contract() {
         use crate::image_ops::RunOutcome;
         use std::cell::RefCell;
