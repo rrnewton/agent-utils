@@ -453,12 +453,34 @@ pub(crate) fn save_bind_records(
     Ok(())
 }
 
-/// Sorted `(relative path, kind, size)` for every migratable entry
-/// under a temp/fixture tree, mirroring Python `listing_signature`.
-/// Special files are skipped, as in the oracle.
-pub(crate) fn listing_signature(root: &Path) -> Vec<(String, String, u64)> {
+/// Sorted `(path, kind, size, mode, proof)` for every migratable
+/// entry under a temp/fixture tree, mirroring Python
+/// `listing_signature`: proof is the link target for a symlink and
+/// the SHA-256 of the contents for a file. Special files skipped.
+pub(crate) fn listing_signature(root: &Path) -> Vec<(String, String, u64, u32, String)> {
+    use std::os::unix::fs::MetadataExt as _;
     let mut signature = Vec::new();
-    fn walk(root: &Path, current: &Path, out: &mut Vec<(String, String, u64)>) {
+    fn content_hash(path: &Path) -> String {
+        use sha2::{Digest, Sha256};
+        use std::io::Read as _;
+        let mut digest = Sha256::new();
+        if let Ok(mut file) = std::fs::File::open(path) {
+            let mut buffer = vec![0_u8; 1024 * 1024];
+            loop {
+                match file.read(&mut buffer) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => digest.update(&buffer[..count]),
+                }
+            }
+        }
+        format!("{:x}", digest.finalize())
+    }
+    fn walk(
+        root: &Path,
+        current: &Path,
+        out: &mut Vec<(String, String, u64, u32, String)>,
+        hash: &dyn Fn(&Path) -> String,
+    ) {
         let Ok(entries) = std::fs::read_dir(current) else {
             return;
         };
@@ -470,29 +492,104 @@ pub(crate) fn listing_signature(root: &Path) -> Vec<(String, String, u64)> {
                 .unwrap_or(&entry)
                 .to_string_lossy()
                 .replace('\\', "/");
-            let file_type = entry.symlink_metadata().map(|meta| meta.file_type());
-            match file_type {
-                Ok(kind) if kind.is_symlink() => {
-                    let size = std::fs::read_link(&entry)
-                        .map(|target| target.as_os_str().len() as u64)
-                        .unwrap_or(0);
-                    out.push((relative, "link".to_string(), size));
-                }
-                Ok(kind) if kind.is_dir() => {
-                    out.push((relative.clone(), "dir".to_string(), 0));
-                    walk(root, &entry, out);
-                }
-                Ok(kind) if kind.is_file() => {
-                    let size = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
-                    out.push((relative, "file".to_string(), size));
-                }
-                _ => {}
+            let Ok(meta) = entry.symlink_metadata() else {
+                continue;
+            };
+            let mode = meta.mode() & 0o7777;
+            let kind = meta.file_type();
+            if kind.is_symlink() {
+                let proof = std::fs::read_link(&entry)
+                    .map(|target| target.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                out.push((relative, "link".to_string(), 0, mode, proof));
+            } else if kind.is_dir() {
+                out.push((relative.clone(), "dir".to_string(), 0, mode, String::new()));
+                walk(root, &entry, out, hash);
+            } else if kind.is_file() {
+                out.push((relative, "file".to_string(), meta.len(), mode, hash(&entry)));
             }
         }
     }
-    walk(root, root, &mut signature);
+    walk(root, root, &mut signature, &content_hash);
     signature.sort();
     signature
+}
+
+/// Sorted `(checkout, HEAD, status)` per Git checkout under root,
+/// mirroring Python `git_state_signature` (status with
+/// `--untracked-files=no`, both reads `--no-optional-locks`).
+pub(crate) fn git_state_signature(root: &Path) -> Vec<(String, String, String)> {
+    let mut states = Vec::new();
+    fn git_value(directory: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("--no-optional-locks")
+            .arg("-C")
+            .arg(directory)
+            .args(args)
+            .output();
+        match output {
+            Ok(out) if out.status.success() => {
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            }
+            Ok(out) => {
+                let text = if out.stderr.is_empty() {
+                    String::from_utf8_lossy(&out.stdout).trim().to_string()
+                } else {
+                    String::from_utf8_lossy(&out.stderr).trim().to_string()
+                };
+                format!("unreadable: {text}")
+            }
+            Err(error) => format!("unreadable: {error}"),
+        }
+    }
+    fn walk(root: &Path, current: &Path, out: &mut Vec<(String, String, String)>) {
+        let Ok(entries) = std::fs::read_dir(current) else {
+            return;
+        };
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+        paths.sort();
+        let has_git = paths
+            .iter()
+            .any(|path| path.file_name().map(|name| name == ".git").unwrap_or(false));
+        if has_git {
+            let relative = current
+                .strip_prefix(root)
+                .unwrap_or(current)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let relative = if relative.is_empty() {
+                ".".to_string()
+            } else {
+                relative
+            };
+            out.push((
+                relative,
+                git_value(current, &["rev-parse", "HEAD"]),
+                git_value(
+                    current,
+                    &["status", "--porcelain=v1", "--untracked-files=no"],
+                ),
+            ));
+        }
+        for entry in paths {
+            let is_git = entry
+                .file_name()
+                .map(|name| name == ".git")
+                .unwrap_or(false);
+            if !is_git
+                && entry.is_dir()
+                && !entry
+                    .symlink_metadata()
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false)
+            {
+                walk(root, &entry, out);
+            }
+        }
+    }
+    walk(root, root, &mut states);
+    states.sort();
+    states
 }
 
 // ------------------------------------------------------------- ops (S6)
@@ -1309,6 +1406,36 @@ fn copy_tree_skip_special(source: &Path, destination: &Path) -> Result<(), Strin
 /// injected mount classification of the image mount directory;
 /// `mount_id` records a bind's live id. The registry/lock side
 /// stays with the dispatch glue, as in the other handlers.
+/// Unbind one slot, mirroring Python `unbind_slot`: unmount
+/// first, then drop the record under the records flock, so an
+/// interrupted remove retries from the bound state.
+pub(crate) fn unbind_slot(
+    ctx: &WtCtx<'_>,
+    slot: &str,
+    slot_path: &Path,
+    runner: &dyn crate::image_ops::PrivilegedRunner,
+) -> HandlerOutcome {
+    let spec = spec(sudo_argv(&[
+        "umount".to_string(),
+        slot_path.to_string_lossy().into_owned(),
+    ]));
+    if let Err(outcome) = run_one(runner, &spec) {
+        return outcome;
+    }
+    let slot_name = slot.to_string();
+    if let Err(message) = update_bind_records(ctx.control, move |mut records| {
+        records.remove(&slot_name);
+        records
+    }) {
+        return wt_refusal(&message);
+    }
+    HandlerOutcome {
+        exit: 0,
+        stdout: String::new(),
+        stderr: String::new(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn wt_migrate(
     ctx: &WtCtx<'_>,
@@ -1318,6 +1445,8 @@ pub(crate) fn wt_migrate(
     state: &str,
     process_in_use: bool,
     owner_ids: (u32, u32),
+    aside_suffix: &str,
+    displaced_unused: &dyn Fn(&Path) -> Result<(), String>,
     mount_id: &dyn Fn(&Path) -> Option<i64>,
     runner: &dyn crate::image_ops::PrivilegedRunner,
 ) -> HandlerOutcome {
@@ -1394,18 +1523,53 @@ pub(crate) fn wt_migrate(
             stderr: format!("{message}\n"),
         };
     }
-    if listing_signature(&subvolume) != before {
+    let before_git = git_state_signature(slot_path);
+    if listing_signature(&subvolume) != before || git_state_signature(&subvolume) != before_git {
+        let delete = spec(sudo_argv(&[
+            "btrfs".to_string(),
+            "subvolume".to_string(),
+            "delete".to_string(),
+            subvolume.to_string_lossy().into_owned(),
+        ]));
+        let _ = runner.run(&delete);
         return wt_refusal_for(
             "migrated copy does not match the slot file by file; original kept",
             "migrate",
         );
     }
-    // bind_slot: bind at the original path, then record it.
-    let source = mount_dir.join(slot);
-    for spec in bind_plan(&source, slot_path) {
-        if let Err(outcome) = run_one_for(runner, &spec, "migrate") {
-            return outcome;
+    // Reclaim (#1149): move the verified original aside, bind at
+    // the original path, prove the displaced tree unused, delete.
+    let displaced = slot_path
+        .parent()
+        .map(|parent| parent.join(format!(".{slot}.premigrate-{aside_suffix}")))
+        .unwrap_or_default();
+    if let Err(error) = std::fs::rename(slot_path, &displaced) {
+        return HandlerOutcome {
+            exit: 1,
+            stdout: String::new(),
+            stderr: format!("{error}\n"),
+        };
+    }
+    let bind_result = bind_plan(&mount_dir.join(slot), slot_path)
+        .iter()
+        .try_for_each(|item| run_one_for(runner, item, "migrate").map(|_| ()));
+    if let Err(outcome) = bind_result {
+        if slot_path.is_dir()
+            && std::fs::read_dir(slot_path)
+                .map(|mut it| it.next().is_none())
+                .unwrap_or(false)
+        {
+            let _ = std::fs::remove_dir(slot_path);
         }
+        let _ = std::fs::rename(&displaced, slot_path);
+        let delete = spec(sudo_argv(&[
+            "btrfs".to_string(),
+            "subvolume".to_string(),
+            "delete".to_string(),
+            subvolume.to_string_lossy().into_owned(),
+        ]));
+        let _ = runner.run(&delete);
+        return outcome;
     }
     let recorded = BindRecord {
         subvolume: slot.to_string(),
@@ -1417,10 +1581,30 @@ pub(crate) fn wt_migrate(
         current.insert(slot_name, recorded);
         current
     });
+    if let Err(reason) = displaced_unused(&displaced) {
+        return wt_refusal_for(
+            &format!(
+                "migrated {slot} into the worktrees image, bound at {}, but the verified original at {} could not be proven unused for reclaim: {reason}; delete it once inspected",
+                slot_path.display(),
+                displaced.display()
+            ),
+            "migrate",
+        );
+    }
+    if let Err(error) = std::fs::remove_dir_all(&displaced) {
+        return wt_refusal_for(
+            &format!(
+                "migrated {slot} into the worktrees image, bound at {}, but the verified original remains at {}: {error}; delete it once inspected",
+                slot_path.display(),
+                displaced.display()
+            ),
+            "migrate",
+        );
+    }
     HandlerOutcome {
         exit: 0,
         stdout: format!(
-            "migrated {slot} into the worktrees image, bound at {} (original kept beneath)\n",
+            "migrated {slot} into the worktrees image, bound at {} (original reclaimed)\n",
             slot_path.display()
         ),
         stderr: String::new(),
@@ -1514,8 +1698,11 @@ mod tests {
         std::fs::create_dir_all(root.join("tree/sub")).expect("tree");
         std::fs::write(root.join("tree/sub/file.txt"), "abc").expect("file");
         let signature = listing_signature(&root.join("tree"));
-        assert!(signature.contains(&("sub".to_string(), "dir".to_string(), 0)));
-        assert!(signature.contains(&("sub/file.txt".to_string(), "file".to_string(), 3)));
+        assert!(signature.iter().any(|row| row.0 == "sub" && row.1 == "dir"));
+        assert!(signature.iter().any(|row| row.0 == "sub/file.txt"
+            && row.1 == "file"
+            && row.2 == 3
+            && row.4.len() == 64));
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 
@@ -1732,12 +1919,18 @@ mod tests {
             MOUNTED,
             false,
             (1000, 1000),
+            "0123abcd0123abcd",
+            &|_: &Path| Ok(()),
             &|_| Some(9),
             &fake,
         );
         assert_eq!(outcome.exit, 0, "{}", outcome.stderr);
-        assert!(outcome.stdout.contains("original kept beneath"));
+        assert!(outcome.stdout.contains("original reclaimed"));
+        assert!(!worktrees
+            .join(".slot-a.premigrate-0123abcd0123abcd")
+            .exists());
         assert!(mount_dir.join("slot-a/sub/file.txt").exists());
+        std::fs::create_dir_all(&slot_path).expect("bound slot dir");
         let again = wt_migrate(
             &ctx,
             Some(settings.clone()),
@@ -1746,6 +1939,8 @@ mod tests {
             MOUNTED,
             false,
             (1000, 1000),
+            "0123abcd0123abcd",
+            &|_: &Path| Ok(()),
             &|_| Some(9),
             &fake,
         );
@@ -1758,6 +1953,8 @@ mod tests {
             NOT_MOUNTED,
             false,
             (1000, 1000),
+            "0123abcd0123abcd",
+            &|_: &Path| Ok(()),
             &|_| None,
             &fake,
         );
