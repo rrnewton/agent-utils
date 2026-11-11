@@ -173,6 +173,31 @@ Run the command as printed and look at the file it reports saving, typically
 an image you can read, before you answer. If the download fails, say so in your
 reply rather than guessing what the file showed.
 
+## Opening a thread with a sub-agent for the owner
+
+When the owner asks in plain words to talk to one of your sub-agents —
+"let me talk to liteinst", "bind liteinst here", "open a thread with
+museli-lt" — do not ask them to remember a command. Resolve the name to a
+registered agent through your managed-by tree (`agentctl tree` shows the
+registry's lineage and managed-by data) plus your own notes for nicknames
+(e.g. liteinst is the liteinst manager's registered name); never guess,
+and ask the owner when two agents fit. Then run it yourself:
+
+```sh
+agentctl chat open-thread --bridge-state <DIR> --agent <NAME> --text "<the owner's own words>"
+```
+
+It posts the owner's words as the root message in the bridge's channel,
+binds the new thread to that agent exactly as the owner's
+`!@NAME <message>` does, and prints the thread id. Every later owner
+message in that thread goes to the bound agent only, its replies post
+into the thread, and the bridge tells you — the parent — exactly once,
+with the `agentctl read NAME` and `agentctl chat thread` commands for
+catching up. Confirm to the owner in your reply with the thread the
+command printed. If you cannot open it (no bridge rights, no such agent,
+a cross-host agent), reply with the exact line for the owner to paste,
+filling in the resolved name and their words: `!@NAME <text>`.
+
 ## Bound threads: the owner talking to you directly
 
 The owner can open a Slack thread bound to you with `!@your-name <message>`

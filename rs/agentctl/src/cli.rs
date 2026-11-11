@@ -1879,6 +1879,12 @@ enum ChatCommand {
         after_help = "Examples:\n  agentctl chat publish --bridge-state ~/.local/state/agentctl/chat \\\n    --channel-id spaces/example --request-id \"$(uuidgen | tr A-F a-f)\" --file status.md\n  agentctl chat publish --bridge-state ~/.local/state/agentctl/chat \\\n    --channel-id spaces/example --thread-id spaces/example/threads/one \\\n    --request-id \"$(uuidgen | tr A-F a-f)\" --file check.md\n\nWithout --thread-id the message starts a new thread. With it, the message is a reply in that\nthread, which must be named under the channel (<channel>/threads/<id>); it may be a thread\nthe operator started with an earlier publish. Use the provider's thread name for the root\nmessage: in Slack the thread of <channel>/messages/<ts> is <channel>/threads/<ts>.\n\nOn success it prints one JSON object: version, id (the request UUID), action (send), ok, and\nreceipt.message_id, the provider's name for the posted message; a threaded publish adds\nthread_id. Retry an uncertain outcome only with the identical UUID, channel, thread and text.\nEach accepted post is recorded in the state's publishes.json: the same UUID answers from that record and posts nothing again, and a new UUID matching a post in the same channel and thread from the last 30 minutes is refused unless --allow-duplicates is given. With --file the file is removed once the post is accepted (--keep-file keeps it; --file - reads standard input). It creates no reply route."
     )]
     Publish(ChatPublish),
+    /// Open a new thread bound to a sub-agent (#1334 chat-thread-bind): the
+    /// coordinator-side equivalent of the owner's `!@NAME <message>`
+    #[command(
+        after_help = "Examples:\n  agentctl chat open-thread --bridge-state ~/.local/state/agentctl/chat --agent museli-lt --text \"please check the gate\"\n  agentctl chat open-thread --bridge-state DIR --agent NAME --file ask.md\n\nPosts the text as a root message in the bridge's first configured channel (or --channel-id), binds the thread it opens to the agent exactly as the owner's !@NAME does, and admits the text as that agent's first request, in the owner's own words. Later owner messages in the thread go to the agent only, its replies post into the thread, and the bridge tells the agent's parent exactly once, as for a !@ thread. Prints one JSON object (schema agentctl-chat-open-thread/v1): agent, channel_id, thread_id, root_message_id, request and service_woken. Exit status: 0 on success; 1 when the agent is unknown or not running (the error prints the exact !@NAME line the owner can paste), the channel is outside the bridge's authority, or the state cannot be read or written; 2 for a usage error."
+    )]
+    OpenThread(ChatOpenThread),
     /// Run one bounded delivery, terminal-capture, and outbound recovery pass; its sends wait for
     /// the agent's lifecycle lock as priority senders, ahead of ordinary agentctl sends
     Tick(ChatOperate),
@@ -2322,6 +2328,40 @@ struct ChatAcceptCheckpointBoundary {
     /// Exact current opaque cursor; this command cannot select another
     #[arg(long, value_name = "CURSOR")]
     keep_cursor: String,
+}
+
+#[derive(Args)]
+struct ChatOpenThread {
+    #[command(flatten)]
+    state: ChatState,
+    /// Registered name of the agent to bind the new thread to
+    #[arg(long, value_name = "NAME")]
+    agent: String,
+    /// Configured provider channel (default: the bridge's first configured channel)
+    #[arg(long, value_name = "CHANNEL")]
+    channel_id: Option<String>,
+    /// The owner's message, posted as the root and sent to the agent; use --file for multiline input
+    #[arg(
+        long,
+        value_name = "TEXT",
+        required_unless_present = "file",
+        conflicts_with = "file"
+    )]
+    text: Option<String>,
+    /// UTF-8 file containing the owner's message, read with a 30,000-byte bound
+    #[arg(long, value_name = "PATH", required_unless_present = "text")]
+    file: Option<PathBuf>,
+}
+
+impl ChatOpenThread {
+    fn read_message(&self) -> Result<String, String> {
+        Prompt {
+            text: self.text.clone(),
+            file: self.file.clone(),
+        }
+        .read_bounded(MAX_CHAT_PUBLISH_BYTES, "chat open-thread message")?
+        .ok_or_else(|| "chat open-thread requires message text or --file".to_owned())
+    }
 }
 
 #[derive(Args)]
@@ -6098,6 +6138,19 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             }
             Ok(0)
         }
+        ChatCommand::OpenThread(value) => {
+            let body = value.read_message().map_err(Failure::Usage)?;
+            let result = crate::chat_service::open_thread(
+                &value.state.dir(&registry),
+                &registry,
+                value.channel_id.as_deref(),
+                &value.agent,
+                &body,
+            )
+            .map_err(Failure::Chat)?;
+            write_json(&result).map_err(Failure::Output)?;
+            Ok(0)
+        }
         ChatCommand::Reply(value) => {
             let removal = removable_chat_file(&value.file, value.keep_file)?;
             let body = value.read_reply()?;
@@ -8005,6 +8058,47 @@ mod tests {
                 "embedded Chat guide retained stale prescription {stale:?}"
             );
         }
+    }
+
+    #[test]
+    fn chat_open_thread_parses_agent_and_exactly_one_input_shape() {
+        let parsed = Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "open-thread",
+            "--bridge-state",
+            "/tmp/chat-state",
+            "--agent",
+            "museli-lt",
+            "--text",
+            "please check the gate",
+        ])
+        .expect("open-thread with text");
+        let Some(Commands::Chat(Chat {
+            command: ChatCommand::OpenThread(open),
+        })) = parsed.command
+        else {
+            panic!("expected open-thread command");
+        };
+        assert_eq!(open.agent, "museli-lt");
+        assert_eq!(open.text.as_deref(), Some("please check the gate"));
+        assert!(open.file.is_none());
+        assert!(open.channel_id.is_none());
+        // Both input shapes at once are refused.
+        assert!(Cli::try_parse_from([
+            "agentctl",
+            "chat",
+            "open-thread",
+            "--bridge-state",
+            "/tmp/chat-state",
+            "--agent",
+            "museli-lt",
+            "--text",
+            "hello",
+            "--file",
+            "ask.md",
+        ])
+        .is_err());
     }
 
     #[test]

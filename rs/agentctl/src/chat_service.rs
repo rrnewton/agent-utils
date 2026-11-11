@@ -874,6 +874,100 @@ pub fn publish_tagged(
     Ok(receipt)
 }
 
+/// Open a fresh thread bound to `agent_name` (#1334 chat-thread-bind): the
+/// coordinator-side equivalent of the owner's `!@NAME <text>`. Posts the
+/// owner's `text` as the root message, binds the new thread as `!@` does,
+/// and leaves the parent notice pending so it is sent exactly once.
+pub fn open_thread(
+    state_root: &Path,
+    registry: &Path,
+    channel_id: Option<&str>,
+    agent_name: &str,
+    text: &str,
+) -> Result<Value, ChatServiceError> {
+    let state = BridgeState::inspect(state_root)?;
+    let configuration = state.config();
+    if !configuration.outbound_enabled {
+        return Err(ChatServiceError::Generation(
+            "chat open-thread requires outbound_enabled=true".to_owned(),
+        ));
+    }
+    if configuration.outbound_command.is_none() {
+        return Err(ChatServiceError::Generation(
+            "chat open-thread requires an explicit outbound_command helper".to_owned(),
+        ));
+    }
+    let channel_id = match channel_id {
+        Some(channel) => {
+            if !configuration
+                .channel_ids
+                .iter()
+                .any(|configured| configured == channel)
+            {
+                return Err(ChatServiceError::Generation(
+                    "chat open-thread channel is outside the configured channel_ids authority"
+                        .to_owned(),
+                ));
+            }
+            channel.to_owned()
+        }
+        None => configuration.channel_ids.first().cloned().ok_or_else(|| {
+            ChatServiceError::Generation("chat open-thread needs a configured channel".to_owned())
+        })?,
+    };
+    let sender_id = configuration
+        .allowed_senders
+        .first()
+        .cloned()
+        .ok_or_else(|| {
+            ChatServiceError::Generation(
+                "chat open-thread needs a permanent owner in allowed_senders".to_owned(),
+            )
+        })?;
+    let snapshot = chat_runtime::bang::snapshot(registry);
+    let Some(agent) = snapshot
+        .agents
+        .iter()
+        .find(|agent| agent.name == agent_name)
+    else {
+        return Err(ChatServiceError::Generation(format!(
+            "no agent named {agent_name:?} is registered here; the owner can paste: !@{agent_name} {text}"
+        )));
+    };
+    if !matches!(agent.lifecycle.as_str(), "running" | "starting") {
+        return Err(ChatServiceError::Generation(format!(
+            "{agent_name} is {} and cannot be bound; start or revive it, then try again. The owner can paste once it runs: !@{agent_name} {text}",
+            agent.lifecycle
+        )));
+    }
+    let mut transport = state.outbound_transport()?.ok_or_else(|| {
+        ChatServiceError::Generation(
+            "chat open-thread requires an explicit outbound_command helper".to_owned(),
+        )
+    })?;
+    let request_id = chat_runtime::random_operation_uuid()
+        .map_err(|error| ChatServiceError::Generation(error.to_string()))?;
+    let opened = state.open_bound_thread(
+        &channel_id,
+        &agent.name,
+        &agent.token,
+        &sender_id,
+        text,
+        &request_id,
+        &mut transport,
+    )?;
+    let service_woken = wake_service(state_root, &opened.request_key);
+    Ok(json!({
+        "schema": "agentctl-chat-open-thread/v1",
+        "agent": agent.name,
+        "channel_id": channel_id,
+        "thread_id": opened.thread_id,
+        "root_message_id": opened.root_message_id,
+        "request": opened.request_key,
+        "service_woken": service_woken,
+    }))
+}
+
 /// The trace driver (#714 chat-transcript-primary): read the agent's
 /// transcript, and post its non-reply text to one trace thread per ET day.
 /// The root's thread id lives in `<state>/trace/trace-thread.json`, and

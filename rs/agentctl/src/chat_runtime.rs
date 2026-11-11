@@ -5860,6 +5860,19 @@ pub struct RelayDispatch {
     pub receipt_posted: bool,
 }
 
+/// What [`BridgeState::open_bound_thread`] opened (#1334 chat-thread-bind).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpenedBoundThread {
+    /// The new thread, `<channel>/threads/<root id>`.
+    pub thread_id: String,
+    /// The root message the bridge posted to open it.
+    pub root_message_id: String,
+    /// The first request's key: the owner's text, for the bound agent.
+    pub request_key: String,
+    /// The binding that routes later thread messages to the agent.
+    pub binding: bang::ThreadBinding,
+}
+
 /// One deterministic `!` answer waiting to be posted (#917 chat-bang-commands).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BangPost {
@@ -15055,6 +15068,102 @@ stay held until an operator repairs or deletes it, and deleting it releases ever
         Ok(ended)
     }
 
+    /// Open a fresh thread bound to `agent_name` (#1334 chat-thread-bind), the
+    /// coordinator-side equivalent of `!@NAME <text>`: post `text` as a root
+    /// message through `transport`, bind the thread it opens exactly as a
+    /// `!@` opener binds, and admit `text` as the bound agent's first request
+    /// (the owner's own words). The parent notice stays pending, so the
+    /// service tells the parent exactly once, as for a `!@` thread.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_bound_thread(
+        &self,
+        channel_id: &str,
+        agent_name: &str,
+        agent_token: &str,
+        sender_id: &str,
+        text: &str,
+        request_id: &str,
+        transport: &mut dyn RootMessageTransport,
+    ) -> Result<OpenedBoundThread> {
+        let root_message_id = transport
+            .publish_root(RootMessageSubmission {
+                channel_id,
+                body: text,
+                request_id,
+            })
+            .map_err(|error| ChatRuntimeError::invalid(error.to_string()))?;
+        let thread_id = thread_id_for_root(channel_id, &root_message_id).ok_or_else(|| {
+            ChatRuntimeError::invalid(format!(
+                "the provider's root message {root_message_id:?} names no thread of {channel_id:?}"
+            ))
+        })?;
+        let state_lock =
+            agent::open_private_lock(&self.root.join(".state.lock"), "chat state lock")?;
+        state_lock.lock_exclusive().map_err(ChatRuntimeError::Io)?;
+        let _state_lock = agent_queue::fsio::HeldLock::new(state_lock);
+        let now = unix_millis();
+        let binding = bang::ThreadBinding {
+            channel_id: channel_id.to_owned(),
+            thread_id: thread_id.clone(),
+            agent_name: agent_name.to_owned(),
+            agent_token: agent_token.to_owned(),
+            root_message_id: root_message_id.clone(),
+            opened_at_millis: now,
+            state: "active".to_owned(),
+            ended_reason: None,
+            parent_notice_id: bang::parent_notice_id(&thread_id),
+            parent_notified: false,
+        };
+        let mut bindings = self.thread_bindings()?;
+        bindings.push(binding.clone());
+        self.save_thread_bindings(&bindings)?;
+        let source = SavedMessage {
+            channel_id: channel_id.to_owned(),
+            message_id: root_message_id.clone(),
+            thread_id: thread_id.clone(),
+            sender_id: sender_id.to_owned(),
+            text: text.to_owned(),
+            created_at: rfc3339_from_millis(now),
+            thread_reply: true,
+            provider_payload: None,
+        };
+        let mut checkpoint = self.read_checkpoint()?;
+        let mut record = RequestRecord::from_saved_message(source, self.config.ack_emoji())?;
+        record.target_agent = Some(agent_name.to_owned());
+        record.target_token = Some(agent_token.to_owned());
+        // Replay authority: the current provider cursor, or a local one on a
+        // bridge that has admitted nothing yet (never a provider cursor, so
+        // no provider replay can collide with it).
+        record.admitted_cursor = Some(
+            checkpoint
+                .cursor
+                .clone()
+                .unwrap_or_else(|| "local-open-thread".to_owned()),
+        );
+        record.admitted_at_millis = now;
+        let encoded = encoded_document_bytes(&record)?;
+        write_document(&self.request_path(&record.key), &record)?;
+        agent::sync_directory(&self.root.join("requests"))?;
+        checkpoint.request_count = checkpoint
+            .request_count
+            .checked_add(1)
+            .ok_or_else(|| ChatRuntimeError::invalid("request count overflow"))?;
+        checkpoint.request_bytes = checkpoint
+            .request_bytes
+            .checked_add(u64::try_from(encoded).unwrap_or(u64::MAX))
+            .ok_or_else(|| ChatRuntimeError::invalid("request byte count overflow"))?;
+        checkpoint.updated_at_millis = now;
+        validate_checkpoint(&checkpoint)?;
+        write_document(&self.root.join("checkpoint.json"), &checkpoint)?;
+        agent::sync_directory(&self.root)?;
+        Ok(OpenedBoundThread {
+            thread_id,
+            root_message_id,
+            request_key: record.key.clone(),
+            binding,
+        })
+    }
+
     /// Bindings whose parent has not been told yet.
     pub fn pending_parent_notices(&self) -> Result<Vec<bang::ThreadBinding>> {
         Ok(self
@@ -20577,6 +20686,34 @@ fn civil_from_days(days: u64) -> (u64, u64, u64) {
     (era * 400 + year_of_era + u64::from(month <= 2), month, day)
 }
 
+/// One instant as an RFC 3339 UTC string, for a locally synthesized message
+/// (#1334 chat-thread-bind): the inverse of [`parse_rfc3339_millis`] at second
+/// precision, with any sub-second remainder kept as milliseconds.
+pub(crate) fn rfc3339_from_millis(millis: u64) -> String {
+    let seconds = millis / 1_000;
+    let (year, month, day) = civil_from_days(seconds / 86_400);
+    let second_of_day = seconds % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+        second_of_day / 3_600,
+        second_of_day % 3_600 / 60,
+        second_of_day % 60,
+        millis % 1_000
+    )
+}
+
+/// The thread a root message opens (#1334): `<channel>/messages/<id>` roots
+/// `<channel>/threads/<id>`, as the provider thread naming states. `None` when
+/// the provider's root message ID names no message of this channel.
+pub(crate) fn thread_id_for_root(channel_id: &str, message_id: &str) -> Option<String> {
+    let rest = message_id.strip_prefix(channel_id)?.strip_prefix('/')?;
+    let id = rest.strip_prefix("messages/")?;
+    if id.is_empty() {
+        return None;
+    }
+    Some(format!("{channel_id}/threads/{id}"))
+}
+
 /// How long before `now` the time `then` was, in whole seconds, minutes, hours, or days.
 fn format_age(now: u64, then: u64) -> String {
     let seconds = now.saturating_sub(then) / 1_000;
@@ -21136,6 +21273,28 @@ pub(crate) mod tests {
                 });
             }
             Ok(format!("messages/reply-{}", self.submissions.len()))
+        }
+    }
+
+    impl RootMessageTransport for FakeReplyTransport {
+        fn publish_root(
+            &mut self,
+            submission: RootMessageSubmission<'_>,
+        ) -> std::result::Result<String, OutboundFailure> {
+            // Recorded with an empty thread, as a top-level post; the returned
+            // ID follows the provider's `<channel>/messages/<id>` naming.
+            let message_id = format!(
+                "{}/messages/root{}",
+                submission.channel_id,
+                self.submissions.len() + 1
+            );
+            self.submissions.push((
+                submission.channel_id.to_owned(),
+                String::new(),
+                submission.body.to_owned(),
+                submission.request_id.to_owned(),
+            ));
+            Ok(message_id)
         }
     }
 
@@ -22653,6 +22812,91 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(admission.new_bindings.len(), 1);
         assert!(admission.new_request_keys.is_empty());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(registry).unwrap();
+    }
+
+    #[test]
+    fn open_thread_binds_and_delivers_the_owners_words_to_the_agent() {
+        // The plain-words walk (#1334): a fake bridge plus registry; the
+        // coordinator resolved the ask to `worker` and opens the thread with
+        // the owner's own text as the first message.
+        let registry = bang_registry("open-thread-registry");
+        let root = temporary("open-thread");
+        let state = BridgeState::initialize(&root, config())
+            .unwrap()
+            .with_latency_profile(Some(registry.clone()), false);
+        let snapshot = bang::snapshot(&registry);
+        let agent = snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.name == "worker")
+            .expect("worker registered");
+        let mut transport = FakeReplyTransport::default();
+        let opened = state
+            .open_bound_thread(
+                "spaces/example",
+                &agent.name,
+                &agent.token,
+                "users/owner",
+                "please check the gate",
+                "00000000-0000-4000-8000-000000000001",
+                &mut transport,
+            )
+            .unwrap();
+        // The root post carries the owner's words, at top level.
+        assert_eq!(transport.submissions.len(), 1);
+        assert_eq!(transport.submissions[0].2, "please check the gate");
+        assert_eq!(opened.thread_id, "spaces/example/threads/root1");
+        // One active binding, parent notice pending exactly once.
+        let bindings = state.thread_bindings().unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert!(bindings[0].is_active());
+        assert_eq!(state.pending_parent_notices().unwrap().len(), 1);
+        // The first request is the owner's text, for the bound agent only.
+        let record = state.read_request(&opened.request_key).unwrap();
+        assert_eq!(record.target_agent.as_deref(), Some("worker"));
+        assert_eq!(record.message.text, "please check the gate");
+        assert_eq!(record.message.thread_id, opened.thread_id);
+        let delivery = FakeDelivery::default();
+        assert_eq!(
+            deliver_request_with(&state, &delivery, &record.key, DrainOptions::default()).unwrap(),
+            CoordinatorDeliveryResult::Delivered
+        );
+        assert_eq!(
+            *delivery.submitted_agents.lock().unwrap(),
+            ["worker".to_owned()]
+        );
+        // The agent's reply lands in the opened thread.
+        let route = state
+            .next_reply_route(&record.key)
+            .unwrap()
+            .expect("open route");
+        state
+            .submit_reply(&record.key, &route.identifier, "the gate is green")
+            .unwrap();
+        let mut transport = FakeReplyTransport::default();
+        state.publish_one(&record.key, &mut transport).unwrap();
+        assert_eq!(transport.submissions.len(), 1);
+        assert_eq!(transport.submissions[0].1, opened.thread_id);
+        assert!(transport.submissions[0].2.contains("the gate is green"));
+        // A later owner message in the thread routes to the same agent.
+        let follow = state
+            .admit_batch(&bang_batch_at(
+                2,
+                "bang2",
+                "root1",
+                "and the other gate?",
+                "users/owner",
+                true,
+            ))
+            .unwrap();
+        assert_eq!(follow.new_request_keys.len(), 1);
+        let record = state.read_request(&follow.new_request_keys[0]).unwrap();
+        assert_eq!(record.target_agent.as_deref(), Some("worker"));
+        // Recovery accepts the locally admitted request (cursor + counts).
+        let reopened = BridgeState::open(&root).unwrap();
+        assert_eq!(reopened.thread_bindings().unwrap().len(), 1);
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(registry).unwrap();
     }

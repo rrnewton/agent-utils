@@ -269,6 +269,14 @@ there is no way to answer, so `!` text is admitted normally instead.)
   ordinary requests to the bridge's own target again. A binding also ends
   on its own when the agent stops, is replaced, or vanishes.
 
+The owner need not remember the command: asked in plain words ("open a
+thread with liteinst", "let me talk to museli-lt"), the coordinator runs
+`agentctl chat open-thread --agent NAME --text "<the owner's words>"`
+itself. That posts the owner's words as the root message, binds the new
+thread to NAME exactly as `!@NAME` does, and prints the thread id. When
+the coordinator cannot open the thread, it answers with the exact
+`!@NAME <text>` line for the owner to paste.
+
 ### Reactions
 
 The bridge marks each accepted request's chat message in two stages. The

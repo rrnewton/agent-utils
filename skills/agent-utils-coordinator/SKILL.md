@@ -68,6 +68,19 @@ commands. `agentctl send` opens every prompt with a sender header
 brief: agents message each other with `agentctl send`, never by raw pane typing. If a suite tool fails or lacks a capability, report it (and fix it in agent-utils if
 that is your job) rather than routing around it.
 
+## Let the owner talk to a sub-agent directly
+
+When the owner asks in plain words to talk to one of your sub-agents
+("let me talk to liteinst", "open a thread with museli-lt"), resolve the
+name through your managed-by tree (`agentctl tree`) plus your own notes —
+never guess, and ask when two agents fit — then open the bound thread
+yourself with `agentctl chat open-thread --agent NAME --text "<the
+owner's own words>"` (see the agentctl-chat skill). The bridge tells you
+once that the owner is talking to that agent directly; catch up any time
+with `agentctl read NAME` or `agentctl chat thread`. If you cannot open
+the thread, reply with the exact `!@NAME <text>` line for the owner to
+paste.
+
 ## Message other teams
 
 When work crosses to a coordinator on another host or in another harness, use `agent-teams`
