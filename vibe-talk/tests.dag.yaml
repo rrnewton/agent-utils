@@ -621,8 +621,10 @@ steps:
     cmd: cd vibe-talk && python3 tests/read_pause_reply_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
-    timeout: 480
-    cpu_timeout: 60
+    # Failure bounds, not a performance verdict (#1250): solo under dagrun accounting this takes
+    # 26.8 s CPU / 102 s wall, so keep more than five times that headroom under hot-host load.
+    timeout: 960
+    cpu_timeout: 180
     hint:
       resources: {browser: 1}
       est_duration_s: 55
