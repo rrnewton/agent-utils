@@ -1,9 +1,10 @@
 ---
 title: 'gate-admission-fairness: bound every gate ticket wait with aging, keeping the owner fast track'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: mu-gatefair
+closed_at: 2026-11-11T08:30:00.000000000+00:00
 created_at: 2026-11-10T15:15:00.000000000+00:00
 updated_at: 2026-11-10T15:15:00.000000000+00:00
 ---
@@ -86,3 +87,16 @@ design is the interleave rule above (owner decision, reply 344). A
 stopgap on the gate host promotes the oldest normal ticket after two
 owner admissions until this lands; its interleave:-marked tickets are
 normal tickets here.
+
+[watermelon-full-preview] Closed by mu-gatefair 2026-11-11. Landed
+8e1beccd on github/main: interleave in scripts/gate.py (after 2
+consecutive owner admissions, host setting default 2, the oldest
+waiting non-owner goes next, from runs plus history by started_at,
+nothing rewritten or promoted; interleave:-marked tickets count as
+normal), cwd in tickets, queue view with position/class/priority/age/
+cwd and the over-2h normal-wait warning. Focused suite 54 passed;
+combined tree with main verified 62 passed; full gate only red was
+vibe-talk.check.approval-card-phone-help-browser, untouched, solo
+green locally (owner reply 346). Earlier aging and credit builds were
+withdrawn unlanded and their promoted live tickets were demoted by
+the coordinator.
