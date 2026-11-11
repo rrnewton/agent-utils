@@ -756,6 +756,233 @@ test("documents list: fetchSince still scopes by cutoff and reports progress (#1
   });
 });
 
+// ---- 3d. Refresh fetched (`#1309 doc-refresh-progress`) --------------------------------------
+//
+// The freshness checks are deferred by hand (no timers): progress must count
+// completions, at most four checks may be in flight, and a row checked a
+// moment ago is skipped until the window passes.
+
+function deferredCheck() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
+function freshnessKey(path) {
+  const match = /^\/api\/v1\/documents\/(.+)\/freshness$/.exec(String(path));
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+test("documents list: refreshFetched says its scope, progress counts completions, an update refetches and patches (#1309)", async () => {
+  const rows = [docRow("a", 100), docRow("b", 200), docRow("c", 300)];
+  const gates = new Map(rows.map((row) => [row.key, deferredCheck()]));
+  const fetches = [];
+  await withList((path, options) => {
+    if (path.startsWith("/api/v1/documents?")) return { documents: rows, total: 3 };
+    const key = freshnessKey(path);
+    if (key) return gates.get(key).promise;
+    if (path === "/api/v1/documents/fetch") {
+      fetches.push(options);
+      return { fetched: [{ key: "a", title: "A renewed", version: "v2", fetched_ms: 9999 }] };
+    }
+    throw new Error(`unexpected api ${path}`);
+  }, async ({ list, listEl, paths, statuses }) => {
+    await list.refresh();
+    const listReads = () => paths.filter((path) => path.startsWith("/api/v1/documents?")).length;
+    const progress = [];
+    const run = list.refreshFetched((done, total) => progress.push([done, total]));
+    await flush([]);
+    assert.deepEqual(progress, [], "progress fired before any check completed");
+    assert.ok(statuses.includes("Checking 3 fetched documents for updates."),
+      `the run did not say its scope (statuses: ${statuses.join(" | ")})`);
+    gates.get("c").resolve({ update_available: false });
+    await flush([]);
+    assert.deepEqual(progress, [[1, 3]], "the first completion did not report 1/3");
+    gates.get("a").resolve({ update_available: true });
+    await flush([]);
+    assert.deepEqual(progress, [[1, 3], [2, 3]], "the update's progress did not wait for its refetch");
+    assert.deepEqual(fetches.map((one) => one.body), [{ key: "a", refresh: true }], "the update was not refetched");
+    gates.get("b").resolve({ update_available: false });
+    const result = await run;
+    assert.deepEqual(result, { updated: 1, current: 2, skipped: 0 });
+    assert.deepEqual(progress, [[1, 3], [2, 3], [3, 3]]);
+    assert.equal(listReads(), 1, "a patched update still re-read the whole list");
+    assert.ok(listEl.textContent.includes("A renewed"), "the updated card does not wear its new title");
+  });
+});
+
+test("documents list: refreshFetched runs at most four checks in flight (#1309)", async () => {
+  const rows = [1, 2, 3, 4, 5, 6].map((n) => docRow(`k${n}`, n * 100));
+  const pending = new Map();
+  const started = [];
+  let inFlight = 0;
+  let maxInFlight = 0;
+  await withList((path) => {
+    if (path.startsWith("/api/v1/documents?")) return { documents: rows, total: 6 };
+    const key = freshnessKey(path);
+    if (key) {
+      started.push(key);
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      const gate = deferredCheck();
+      pending.set(key, gate);
+      return gate.promise.then((value) => { inFlight -= 1; return value; });
+    }
+    throw new Error(`unexpected api ${path}`);
+  }, async ({ list, paths }) => {
+    await list.refresh();
+    const progress = [];
+    const run = list.refreshFetched((done, total) => progress.push([done, total]));
+    await flush([]);
+    assert.equal(started.length, 4, `checks did not start four-wide (${started.length} started)`);
+    assert.deepEqual(progress, [], "progress fired for checks only started");
+    pending.get(started[0]).resolve({ update_available: false });
+    await flush([]);
+    assert.equal(started.length, 5, "a completed check did not free its pool slot");
+    assert.deepEqual(progress, [[1, 6]]);
+    const resolved = new Set([started[0]]);
+    while (resolved.size < rows.length) {
+      for (const key of [...pending.keys()]) {
+        if (!resolved.has(key)) { pending.get(key).resolve({ update_available: false }); resolved.add(key); }
+      }
+      await flush([]);
+    }
+    const result = await run;
+    assert.deepEqual(result, { updated: 0, current: 6, skipped: 0 });
+    assert.equal(maxInFlight, 4, `the pool ran ${maxInFlight} wide, not four`);
+    assert.deepEqual(progress, [[1, 6], [2, 6], [3, 6], [4, 6], [5, 6], [6, 6]]);
+    assert.equal(paths.filter((path) => path.startsWith("/api/v1/documents?")).length, 1,
+      "nothing updated, yet the whole list was re-read");
+  });
+});
+
+test("documents list: refreshFetched skips just-checked rows and checks them again at the window (#1309)", async () => {
+  const mod = requireModule(LIST, "src/view/documents/list.ts");
+  assert.equal(mod.FRESH_CHECK_SKIP_MS, 5 * 60_000, "the just-checked window is not five minutes");
+  const rows = [docRow("a", 100), docRow("b", 200)];
+  let freshnessCalls = 0;
+  await withList((path) => {
+    if (path.startsWith("/api/v1/documents?")) return { documents: rows, total: 2 };
+    if (freshnessKey(path)) { freshnessCalls += 1; return { update_available: false }; }
+    throw new Error(`unexpected api ${path}`);
+  }, async ({ list }) => {
+    const realNow = Date.now;
+    let fakeNow = 1_000_000;
+    Date.now = () => fakeNow;
+    try {
+      await list.refresh();
+      assert.deepEqual(await list.refreshFetched(), { updated: 0, current: 2, skipped: 0 });
+      assert.equal(freshnessCalls, 2);
+      const secondProgress = [];
+      assert.deepEqual(
+        await list.refreshFetched((done, total) => secondProgress.push([done, total])),
+        { updated: 0, current: 0, skipped: 2 },
+        "an immediate second run did not skip both rows",
+      );
+      assert.equal(freshnessCalls, 2, "the second run re-checked just-checked rows");
+      assert.deepEqual(secondProgress, [], "an all-skipped run reported progress over a 0 total");
+      fakeNow += mod.FRESH_CHECK_SKIP_MS - 1;
+      assert.deepEqual(await list.refreshFetched(), { updated: 0, current: 0, skipped: 2 },
+        "rows inside the window were checked again");
+      assert.equal(freshnessCalls, 2);
+      fakeNow += 1;
+      assert.deepEqual(await list.refreshFetched(), { updated: 0, current: 2, skipped: 0 },
+        "rows at the window's edge were still skipped");
+      assert.equal(freshnessCalls, 4);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+});
+
+test("documents list: a failed freshness or refetch counts current and is retried, not skipped (#1309)", async () => {
+  const rows = [docRow("a", 100), docRow("b", 200), docRow("c", 300)];
+  const freshnessByKey = new Map();
+  let fetchAttempts = 0;
+  await withList((path) => {
+    if (path.startsWith("/api/v1/documents?")) return { documents: rows, total: 3 };
+    const key = freshnessKey(path);
+    if (key) {
+      freshnessByKey.set(key, (freshnessByKey.get(key) || 0) + 1);
+      if (key === "a") throw new Error("freshness down");
+      return { update_available: key === "c" };
+    }
+    if (path === "/api/v1/documents/fetch") { fetchAttempts += 1; throw new Error("fetch down"); }
+    throw new Error(`unexpected api ${path}`);
+  }, async ({ list }) => {
+    await list.refresh();
+    assert.deepEqual(await list.refreshFetched(), { updated: 0, current: 3, skipped: 0 },
+      "a failed check or refetch did not count current");
+    assert.deepEqual(await list.refreshFetched(), { updated: 0, current: 2, skipped: 1 },
+      "the second run did not retry only the failed rows");
+    assert.deepEqual(
+      [freshnessByKey.get("a"), freshnessByKey.get("b"), freshnessByKey.get("c")],
+      [2, 1, 2],
+      "the answered row was re-checked or a failed row was skipped",
+    );
+    assert.equal(fetchAttempts, 2, "the failed refetch was not attempted again");
+  });
+});
+
+test("documents view: Refresh names fetched documents on its button and in its status (#1309)", async () => {
+  const rows = [docRow("a", 100), docRow("b", 200)];
+  const checks = [];
+  const onApi = (path) => {
+    const key = freshnessKey(path);
+    if (!key) return undefined;
+    const gate = deferredCheck();
+    checks.push({ key, gate, settled: false });
+    return gate.promise;
+  };
+  await withDocumentsView({ listRows: rows, onApi }, async ({ view, byId, statuses }) => {
+    const refreshItem = byId("docs-fetch-refresh");
+    refreshItem.setAttribute("data-act", "refresh");
+    await view.show();
+    const button = byId("docs-fetch");
+    const lastStatus = () => statuses[statuses.length - 1];
+    const settle = (key, how) => {
+      const check = checks.find((one) => one.key === key && !one.settled);
+      assert.ok(check, `no pending freshness check for ${key}`);
+      check.settled = true;
+      if (how instanceof Error) check.gate.reject(how);
+      else check.gate.resolve(how);
+    };
+    dispatchClick(refreshItem);
+    await flush([]);
+    assert.equal(button.textContent, "Checking fetched…", "the button does not name what it checks");
+    assert.equal(button.disabled, true, "the button stayed enabled while checking");
+    assert.ok(statuses.includes("Checking 2 fetched documents for updates."),
+      `the run did not say its scope (statuses: ${statuses.join(" | ")})`);
+    settle("a", { update_available: false });
+    await flush([]);
+    assert.equal(button.textContent, "Checking 1/2 fetched…",
+      "the button's count is a bare fraction without its scope");
+    settle("b", new Error("freshness down"));
+    await flush([]);
+    assert.equal(lastStatus(), "0 updated, 2 current.", "the old completion sentence changed shape");
+    assert.equal(button.textContent, "Fetch");
+    assert.equal(button.disabled, false);
+    // A second Refresh: a is just-checked, the failed b is the only check.
+    dispatchClick(refreshItem);
+    await flush([]);
+    assert.ok(statuses.includes("Checking 1 fetched document for updates."),
+      "the second run's scope is not the rows it actually checks");
+    assert.equal(checks.filter((one) => one.key === "a").length, 1, "the just-checked row was checked again");
+    settle("b", { update_available: false });
+    await flush([]);
+    assert.equal(lastStatus(), "0 updated, 1 current, 1 checked just now.",
+      "the completion did not say how many were skipped as just-checked");
+    // A third, at once: everything is just-checked and it says so.
+    const before = checks.length;
+    dispatchClick(refreshItem);
+    await flush([]);
+    assert.equal(checks.length, before, "an all-just-checked Refresh checked something");
+    assert.equal(lastStatus(), "All 2 fetched documents were checked just now.");
+    assert.equal(button.textContent, "Fetch", "an all-skipped run left a 0/0-style label behind");
+  });
+});
+
 // ---- 4. reader: the outline pop-up and the source-linked title --------------------------------
 
 // A fakeElement with the few box/focus surfaces the reader measures: focus and
@@ -1480,7 +1707,9 @@ async function withDocumentsView(options, run) {
     "doc-b": { title: "Doc B", content: "# Doc B\n\nBeta.\n" },
   };
   const opened = [];
+  const statuses = [];
   const api = async (path, callOptions) => {
+    // A test's own routes first (freshness, fetch): answering `undefined` falls through.
     if (options.onApi) {
       const answered = await options.onApi(path, callOptions);
       if (answered !== undefined) return answered;
@@ -1505,8 +1734,8 @@ async function withDocumentsView(options, run) {
     api, byId,
     readDocument: (doc) => { reads.push(doc); },
     stopSpeaking: (key) => { stops.push(key); },
+    onStatus: (text) => { statuses.push(text); options.onStatus?.(text); },
     ...(options.onBack ? { onBack: options.onBack } : {}),
-    ...(options.onStatus ? { onStatus: options.onStatus } : {}),
   });
   const savedDocument = globalThis.document;
   globalThis.document = {
@@ -1516,7 +1745,7 @@ async function withDocumentsView(options, run) {
     querySelector: () => null,
   };
   try {
-    await run({ view, els, byId, opened, reads, stops });
+    await run({ view, els, byId, opened, reads, stops, statuses });
   } finally {
     view.unmount();
     if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;

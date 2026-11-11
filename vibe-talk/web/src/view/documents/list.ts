@@ -44,8 +44,8 @@ export interface DocumentsList {
   fetchSince(cutoffMs: number, progress?: (done: number, total: number) => unknown): Promise<number>;
   /** Fetch the most recent unfetched documents, then redraw. */
   fetchRecent(): Promise<number>;
-  /** Check fetched rows for newer versions, updating them; progress by key. */
-  refreshFetched(progress?: (done: number, total: number) => unknown): Promise<{ updated: number; current: number }>;
+  /** Check fetched rows for newer versions, updating them; progress as each check completes. Just-checked rows are skipped and counted. */
+  refreshFetched(progress?: (done: number, total: number) => unknown): Promise<{ updated: number; current: number; skipped: number }>;
   /** Drop every cached copy and redraw; how many were held. */
   clearCached(): Promise<number>;
   /** Whether hidden documents are being shown (dimmed, with Unhide). */
@@ -71,6 +71,10 @@ const FETCH_PATH = "/api/v1/documents/fetch";
 const FETCH_RECENT_PATH = "/api/v1/documents/fetch-recent";
 const FRESHNESS_PATH = (key: string) => `/api/v1/documents/${encodeURIComponent(key)}/freshness`;
 const FETCH_RECENT_LIMIT = 10;
+/** How many freshness checks (each with its refetch, where one is due) Refresh runs at once (`#1309 doc-refresh-progress`). */
+const REFRESH_CHECK_CONCURRENCY = 4;
+/** How long a completed freshness check counts as just-checked and is skipped, in ms (`#1309`). */
+export const FRESH_CHECK_SKIP_MS = 5 * 60_000;
 
 /** How many documents a bulk fetch holds in flight at once (`#1307 doc-fetch-visible-viewport`). */
 const FETCH_CONCURRENCY = 4;
@@ -288,6 +292,9 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
   const listening = createListening();
   const busy = new Set<string>();
   const errors = new Map<string, string>();
+  // When each fetched row last completed a freshness check, in ms (`#1309`):
+  // this page session only, so a repeated Refresh skips the just-checked.
+  const freshCheckedAt = new Map<string, number>();
   const states: DocStatesStore = deps.docStates ?? createDocStatesStore(null);
   let rowsNow: readonly DocumentRow[] = [];
   // The type filter's state lives with the list's other view state (no new
@@ -956,33 +963,104 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
       return fetched;
     },
     async refreshFetched(progress) {
+      // Say the scope (`#1309`): fetched rows only, and among them only the
+      // ones not checked within FRESH_CHECK_SKIP_MS. `total` is that checked
+      // set, so progress never reads as a bare fraction of something unnamed.
       const fetchedRows = rowsNow.filter((row) => row.fetched);
+      const now = Date.now();
+      const toCheck: DocumentRow[] = [];
+      let skipped = 0;
+      for (const row of fetchedRows) {
+        const checkedAt = freshCheckedAt.get(row.key);
+        if (checkedAt !== undefined && now - checkedAt < FRESH_CHECK_SKIP_MS) {
+          skipped += 1;
+        } else {
+          if (checkedAt !== undefined) freshCheckedAt.delete(row.key);
+          toCheck.push(row);
+        }
+      }
+      const total = toCheck.length;
+      if (total === 0) return { updated: 0, current: 0, skipped };
+      deps.onStatus?.(`Checking ${total} fetched document${total === 1 ? "" : "s"} for updates.`);
       let updated = 0;
       let current = 0;
-      for (let i = 0; i < fetchedRows.length; i += 1) {
-        const row = fetchedRows[i]!;
-        progress?.(i, fetchedRows.length);
+      let done = 0;
+      // What a refetch answered for its row, patched in below instead of a
+      // full redraw from the server where every update carried one.
+      const patches = new Map<string, { title?: string; version?: string | null; fetched_ms?: number }>();
+      // One row's whole check as a unit: the freshness read and, where it
+      // reports an update, the refetch after it. A failed check or refetch
+      // counts current (as it always did) but leaves the row unmarked, so
+      // the next Refresh retries it while skipping the rows that answered.
+      async function checkOne(row: DocumentRow): Promise<void> {
         let fresh: { update_available?: unknown } | null = null;
         try {
           fresh = (await deps.api(FRESHNESS_PATH(row.key))) as { update_available?: unknown } | null;
         } catch {
           current += 1;
-          continue;
+          return;
         }
-        if (fresh?.update_available === true) {
-          try {
-            await deps.api(FETCH_PATH, { method: "POST", body: { key: row.key, refresh: true } });
-            updated += 1;
-          } catch {
-            current += 1;
+        if (fresh?.update_available !== true) {
+          freshCheckedAt.set(row.key, Date.now());
+          current += 1;
+          return;
+        }
+        try {
+          const answer = (await deps.api(FETCH_PATH, {
+            method: "POST",
+            body: { key: row.key, refresh: true },
+          })) as { fetched?: unknown } | null;
+          const raw = Array.isArray(answer?.fetched) ? answer.fetched[0] : null;
+          if (raw && typeof raw === "object") {
+            const one = raw as { title?: unknown; version?: unknown; fetched_ms?: unknown };
+            const patch: { title?: string; version?: string | null; fetched_ms?: number } = {};
+            if (typeof one.title === "string") patch.title = one.title;
+            const version = one.version;
+            if (typeof version === "string") patch.version = version;
+            else if (version === null) patch.version = null;
+            if (typeof one.fetched_ms === "number") patch.fetched_ms = one.fetched_ms;
+            if (patch.title !== undefined || patch.fetched_ms !== undefined) patches.set(row.key, patch);
           }
-        } else {
+          freshCheckedAt.set(row.key, Date.now());
+          updated += 1;
+        } catch {
           current += 1;
         }
       }
-      progress?.(fetchedRows.length, fetchedRows.length);
-      await refresh();
-      return { updated, current };
+      // A small pool over the checks; progress fires as each one completes.
+      let nextIndex = 0;
+      async function worker(): Promise<void> {
+        while (nextIndex < toCheck.length) {
+          const row = toCheck[nextIndex]!;
+          nextIndex += 1;
+          await checkOne(row);
+          done += 1;
+          progress?.(done, total);
+        }
+      }
+      await Promise.all(
+        Array.from({ length: Math.min(REFRESH_CHECK_CONCURRENCY, total) }, () => worker()),
+      );
+      if (updated > 0) {
+        if (patches.size >= updated) {
+          render(rowsNow.map((row) => {
+            const patch = patches.get(row.key);
+            if (!patch) return row;
+            return {
+              ...row,
+              fetched: true,
+              ...(patch.title !== undefined ? { title: patch.title } : {}),
+              ...(patch.version !== undefined ? { version: patch.version } : {}),
+              ...(patch.fetched_ms !== undefined ? { fetched_ms: patch.fetched_ms } : {}),
+            };
+          }));
+        } else {
+          // An update answered without its new title/version: read the rows
+          // back rather than leave a stale card wearing a fresh check mark.
+          await refresh();
+        }
+      }
+      return { updated, current, skipped };
     },
     async clearCached(): Promise<number> {
       const answer = (await deps.api("/api/v1/documents/cache", { method: "DELETE" })) as {

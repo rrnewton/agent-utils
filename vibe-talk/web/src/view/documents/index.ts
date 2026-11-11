@@ -370,14 +370,22 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
           }
         }
         else if (act === "refresh") {
-          setBusy(true, "Refreshing…");
+          // The button names what the count counts (`#1309`); the list says
+          // the full scope in a status sentence as the run starts.
+          setBusy(true, "Checking fetched…");
           list
             .refreshFetched((doneCount, total) => {
-              if (total > 0) button.textContent = `Refreshing ${doneCount}/${total}…`;
+              if (total > 0) button.textContent = `Checking ${doneCount}/${total} fetched…`;
             })
             .then(
-              ({ updated, current }) =>
-                deps.onStatus?.(`${updated} updated, ${current} current.`),
+              ({ updated, current, skipped }) =>
+                deps.onStatus?.(
+                  skipped > 0 && updated === 0 && current === 0
+                    ? `All ${skipped} fetched document${skipped === 1 ? " was" : "s were"} checked just now.`
+                    : skipped > 0
+                      ? `${updated} updated, ${current} current, ${skipped} checked just now.`
+                      : `${updated} updated, ${current} current.`,
+                ),
               (error: unknown) => deps.onStatus?.(error instanceof Error ? error.message : String(error)),
             )
             .finally(() => setBusy(false));
