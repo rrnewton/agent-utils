@@ -238,6 +238,8 @@ fn console_delivers_typed_lines_as_plain_turns() {
         "headless",
         "--harness",
         "claude",
+        "--effort",
+        "high",
         "--cwd",
         &work,
     ]);
