@@ -5271,6 +5271,11 @@ const TUNING_BANDS = {
   FETCH_RECENT_LIMIT: [1, 20,
     "how many recent unfetched documents one Fetch-recent press fetches (documents-view-client): " +
     "0 would fetch nothing, and the server's fetch-recent refuses more than 20"],
+  FETCH_CONCURRENCY: [2, 8,
+    "documents one bulk Fetch run holds in flight at once (#1307 doc-fetch-visible-viewport): " +
+    "one is the serial crawl through every visible document this replaces; far more spends the " +
+    "deployment's credentials and a phone's connections on fetches whose progress is read one " +
+    "count at a time"],
   MAX_INLINE_DEPTH: [1, 32,
     "how deep a document's inline formatting may nest before the rest is plain text " +
     "(documents-view-client): 0 would render no emphasis at all, and no cap would let a crafted " +
