@@ -723,6 +723,13 @@ GATE_EXCLUSIVE_LABEL = "gate-exclusive"
 #: a step whose component was not selected runs in neither phase.
 CROSS_MAIN_PHASE_ENV = "AGENT_UTILS_CROSS_IN_MAIN_PHASE"
 
+#: Marker set on the gate.py exclusive-phase invocation when this run
+#: deliberately selected its gate-exclusive steps (the disabled five only
+#: reach the phase via `--cross-differentials`): gate.py records it on
+#: the ticket, so a deliberate phase is never reaped as a stale phase
+#: from a tree that predates the disable (#1249).
+CROSS_DIFFERENTIALS_ENV = "AGENT_UTILS_CROSS_DIFFERENTIALS"
+
 
 def cross_in_main_phase(environ: Mapping[str, str] | None = None) -> bool:
     """Whether the caller opted the gate-exclusive differentials into the main phase."""
@@ -1107,7 +1114,11 @@ def run(
             f"\n=== gate-exclusive phase ({len(exclusive_tags)} step(s), one admission, serial) ===",
             flush=True,
         )
-        done = subprocess.run(command, cwd=REPO_ROOT, check=False, env=env)
+        # This run deliberately selected these steps (the disabled five
+        # only reach here via --cross-differentials): mark the phase so
+        # gate.py never reaps it as stale (#1249).
+        phase_env = {**env, CROSS_DIFFERENTIALS_ENV: "1"}
+        done = subprocess.run(command, cwd=REPO_ROOT, check=False, env=phase_env)
         if done.returncode != 0 and result == 0:
             result = done.returncode
     if result != 0:

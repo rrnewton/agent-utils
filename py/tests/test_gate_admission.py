@@ -989,6 +989,84 @@ def test_legacy_clients_see_an_owner_ticket_as_an_ordinary_one(tmp_path: Path) -
         "200-rerun", "050-ordinary", "100-owner", "150-legacy"]
 
 
+DISABLED_PHASE_COMMAND = [
+    "dagrun", "run", "--max-steps", "1", "--selected",
+    "cross.agentctl.differential-0,cross.herdr-run.differential",
+]
+
+
+def _phase_ticket(root: Path, run_id: str, command: list[str], **extra: object) -> None:
+    _write_ticket(root, "queue", run_id, {
+        "id": run_id, "pid": os.getpid(), "class": "exclusive",
+        "queued_at": 0, "command": command, "rerun": True,
+        "nested_phase": True, "phase_priority": "env GATE_PHASE_PRIORITY=1",
+        **extra})
+
+
+def test_stale_disabled_cross_phases_are_reaped_not_run(tmp_path: Path) -> None:
+    """Owner reply 346 / #1249: a queued, unstarted exclusive phase over
+    only the five disabled cross differentials is dropped by reaping, so
+    it never runs and never stands ahead of an owner ticket. A phase over
+    other steps, an explicit --rerun, and a marked --cross-differentials
+    opt-in phase all survive."""
+    gate = _gate_module()
+    root = tmp_path / "admission"
+    adm = gate.Admission(root, 2)
+    _phase_ticket(root, "100-stale", DISABLED_PHASE_COMMAND)
+    _phase_ticket(root, "200-other", ["dagrun", "--selected", "cross.tick-hub.differential"])
+    _phase_ticket(root, "300-optin", DISABLED_PHASE_COMMAND,
+                  cross_differentials_opt_in=True)
+    _write_ticket(root, "queue", "400-rerun", {
+        "id": "400-rerun", "pid": os.getpid(), "class": "exclusive",
+        "queued_at": 0, "command": DISABLED_PHASE_COMMAND, "rerun": True,
+        "nested_phase": False})
+    adm._reap()
+    remaining = sorted(path.name for path in (root / "queue").glob("*.json"))
+    assert remaining == ["200-other.json", "300-optin.json", "400-rerun.json"]
+    history = [json.loads(line) for line in (root / "history.jsonl").read_text().splitlines()]
+    assert any(row.get("kind") == "stale-disabled-phase" and row.get("id") == "100-stale"
+               for row in history)
+
+
+def test_an_owner_ticket_outranks_an_unstarted_marked_phase(tmp_path: Path) -> None:
+    """Owner tier (owner reply 344) beats a phase-priority-marked exclusive
+    phase that has not started, even when the phase queued first."""
+    gate = _gate_module()
+    root = tmp_path / "admission"
+    adm = gate.Admission(root, 2)
+    _phase_ticket(root, "100-phase", ["dagrun", "--selected", "cross.tick-hub.differential"])
+    _write_ticket(root, "queue", "200-owner", {
+        "id": "200-owner", "pid": os.getpid(), "class": "shared",
+        "queued_at": 0, "command": [], "rerun": False,
+        "priority": "owner", "priority_reason": "owner reply 344"})
+    tickets = adm.tickets()
+    assert [str(data["id"]) for _, data in tickets] == ["200-owner", "100-phase"]
+    assert adm.grant_blockers("200-owner", "shared", tickets, []) == []
+    blockers = adm.grant_blockers("100-phase", "exclusive", tickets, [])
+    assert [str(data["id"]) for _, data, _ in blockers] == ["200-owner"]
+
+
+def test_a_fresh_disabled_phase_is_not_queued_without_opt_in(tmp_path: Path) -> None:
+    """A nested gate over only disabled differentials, without the
+    --cross-differentials marker validate.py sets, exits 0 without
+    queueing or running its command."""
+    runs = tmp_path / "admission" / "runs"
+    runs.mkdir(parents=True)
+    (runs / "parent-live.json").write_text(json.dumps(
+        {"id": "parent-live", "pid": os.getpid(), "class": "shared", "queued_at": 0}))
+    marker = tmp_path / "ran.txt"
+    result = subprocess.run(
+        [PY, str(GATE), "--exclusive", "--", PY, "-c",
+         f"open({str(marker)!r}, 'w').write('ran')",
+         "--selected", "cross.agentctl.differential-1"],
+        env={**_env(tmp_path), "GATE_ADMISSION_RUN_ID": "parent-live"},
+        capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout
+    assert "disabled" in result.stdout
+    assert not marker.exists()
+    assert not list((tmp_path / "admission" / "queue").glob("*.json"))
+
+
 def test_concurrent_admission_mixed_versions_never_exceeds_the_cap(tmp_path: Path) -> None:
     """Mixed versions: one Admission ordering by the new tiers and one by
     the legacy rerun-only sort grant against the same state dir; the flock

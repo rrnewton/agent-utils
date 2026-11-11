@@ -487,7 +487,7 @@ steps:
       rss_baseline_bytes: 4563402752
 
   # Shard count 4 (was 2): at 2 shards each ran ~700 s median in gate logs
-  # (2026-11-10 measurement, #1253 validate-10min), so one shard alone
+  # (2026-11-10 measurement, #1258 validate-10min), so one shard alone
   # exceeded a 10-minute wall. The family-weighted assignment in
   # run_pytest_shard balances the four; their union is the old selection.
   - group: wrkviz

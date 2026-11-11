@@ -134,6 +134,17 @@ counting, never owner tier. Tickets also record their cwd (a field
 older code ignores); `gate queue` prints position, class, priority,
 age and cwd, and a warning names the oldest normal wait over two
 hours, in the queue view and in a waiting gate's own output.
+Stale exclusive phases (owner reply 346, 2026-11-10): the owner tier
+already sorts ahead of a phase-priority-marked phase, but a waiter from
+a tree that predates the owner tier sorts by the rerun mark alone and
+can grant its own phase first. A queued, unstarted exclusive phase over
+only the five cross differentials disabled by default (#1249
+cross-differentials-robust) is therefore stale: reaping drops it (and
+records `stale-disabled-phase` in history), and a fresh one is not
+queued at all. An explicit --rerun, and a phase validate.py marks as a
+deliberate `--cross-differentials` opt-in
+($AGENT_UTILS_CROSS_DIFFERENTIALS=1, recorded on the ticket), are never
+stale. Running phases are never touched.
 
 Mixed versions: every slot runs its own checkout's gate.py, and older
 waiters ignore the priority fields entirely. The slot cap is unaffected:
@@ -242,6 +253,21 @@ BLACKOUT_EXIT = 78
 
 #: A --rerun ticket may name at most this many `--selected` steps.
 RERUN_MAX_STEPS = 4
+
+#: The five cross differentials disabled by default (owner reply 346,
+#: 2026-11-10; #1249 cross-differentials-robust). A queued exclusive phase
+#: over only these steps, from a tree that predates the disable, is stale:
+#: it must not run or stand ahead of an owner ticket. validate.py sets
+#: this env var for a deliberate `--cross-differentials` phase, and the
+#: ticket records it, so an opt-in phase is never stale.
+CROSS_DIFFERENTIALS_OPT_IN_ENV = "AGENT_UTILS_CROSS_DIFFERENTIALS"
+DISABLED_CROSS_DIFFERENTIAL_STEPS = frozenset({
+    "cross.agentctl.differential-0",
+    "cross.agentctl.differential-1",
+    "cross.agentctl.differential-2",
+    "cross.herdr-run.differential",
+    "cross.agentctl.herdr-agent-differential",
+})
 
 #: The validation steps a top-level run passes before it may queue: checks of
 #: the tree's content that fail identically on every run, so a failure can never
@@ -707,6 +733,17 @@ class Admission:
                 data = self._read(path)
                 if data is None or not _alive(data.get("pid")):
                     path.unlink(missing_ok=True)
+                elif folder == "queue" and _is_stale_disabled_phase(data):
+                    # A stale phase must not run (owner reply 346), and
+                    # dropping it here is what stops a legacy waiter —
+                    # whose sort knows no owner tier — from granting it
+                    # ahead of an owner ticket.
+                    path.unlink(missing_ok=True)
+                    self.record({
+                        "kind": "stale-disabled-phase", "id": data.get("id"),
+                        "selected": _selected_steps(_command_list(data)),
+                        "reaped_at": time.time(),
+                    })
 
     def _trailing_owner_admissions(self) -> int:
         """Consecutive genuine-owner admissions at the tail of the
@@ -774,6 +811,7 @@ class Admission:
         phase_priority_source: str | None = None,
         priority: str | None = None,
         priority_reason: str | None = None,
+        cross_differentials_opt_in: bool = False,
     ) -> tuple[str, Path]:
         run_id = f"{time.time_ns()}-{uuid.uuid4().hex[:8]}"
         ticket: dict[str, object] = {
@@ -782,6 +820,7 @@ class Admission:
             "nested_phase": nested_phase, "phase_priority": phase_priority_source,
             "priority": priority, "priority_reason": priority_reason,
             "cwd": os.getcwd(),
+            "cross_differentials_opt_in": cross_differentials_opt_in,
         }
         self._locked()
         try:
@@ -1228,6 +1267,18 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     if priority == "owner":
         print(f"gate: owner priority ({priority_reason}): this ticket sorts ahead of every "
               "queued ticket; running gates are not preempted", flush=True)
+    cross_opt_in = os.environ.get(CROSS_DIFFERENTIALS_OPT_IN_ENV) == "1"
+    if nested_phase and not cross_opt_in:
+        selected = _selected_steps(command)
+        if selected and all(step in DISABLED_CROSS_DIFFERENTIAL_STEPS for step in selected):
+            print(
+                "gate: nested exclusive phase names only cross differentials "
+                "disabled by default (owner reply 346, 2026-11-10; #1249 "
+                "cross-differentials-robust); not queued or run — rerun "
+                "validate with --cross-differentials to run them on demand",
+                flush=True,
+            )
+            return 0
     # A gate invoked from inside an admitted gate (validate.py running its
     # gate-exclusive steps) must not queue behind its own parent: the parent
     # process is blocked waiting for this call and will never finish. Release
@@ -1240,6 +1291,7 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
         args.cls, command, rerun or phase_marked,
         nested_phase=nested_phase, phase_priority_source=phase_mark_source,
         priority=priority, priority_reason=priority_reason,
+        cross_differentials_opt_in=cross_opt_in and nested_phase,
     )
     queued_at = time.time()
     starvation = _starvation_warning(adm.tickets(), queued_at)
@@ -1551,6 +1603,21 @@ def _command_summary(data: dict[str, object]) -> str:
     else:
         summary = "(no command recorded)"
     return summary if len(summary) <= 160 else summary[:157] + "..."
+
+
+def _is_stale_disabled_phase(data: dict[str, object]) -> bool:
+    """A queued, unstarted exclusive phase over only the five cross
+    differentials disabled by default (#1249): a marked nested phase, or
+    an inferred pre-mark phase (never an explicit --rerun, which keeps
+    `rerun` set with no phase mark). A ticket validate.py marked as a
+    deliberate `--cross-differentials` opt-in is never stale."""
+    if data.get("class") != "exclusive" or data.get("cross_differentials_opt_in"):
+        return False
+    if not data.get("nested_phase") and (data.get("rerun") or not _is_inferred_phase(data)):
+        return False
+    selected = _selected_steps(_command_list(data))
+    return bool(selected) and all(
+        step in DISABLED_CROSS_DIFFERENTIAL_STEPS for step in selected)
 
 
 def _is_inferred_phase(data: dict[str, object]) -> bool:
