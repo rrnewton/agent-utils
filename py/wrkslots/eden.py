@@ -208,6 +208,46 @@ def salvage_commands(mount: str, dest: Path) -> tuple[tuple[str, ...], ...]:
     )
 
 
+def is_inside(path: str, root: str) -> bool:
+    """Whether ``path`` is ``root`` or lives beneath it."""
+
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def provision_checkout(
+    runner: Runner,
+    config_dir: str,
+    backing: str,
+    mount: str,
+    rev: str | None,
+) -> tuple[CheckoutInfo, tuple[Redirection, ...]]:
+    """Clone one checkout and prove its redirections stay in bounds.
+
+    The caller owns the mount's parent directory and cleanup on
+    failure; this only runs the daemon commands and verifies.
+    """
+
+    argv = ["eden", "--config-dir", config_dir, "clone", backing, mount]
+    if rev is not None:
+        argv += ["--rev", rev]
+    rc, stdout, stderr = runner(argv)
+    if rc != 0:
+        raise EdenError(f"eden clone failed: {stderr.strip() or stdout.strip()}")
+    rc, stdout, stderr = runner(
+        ["eden", "--config-dir", config_dir, "info", mount]
+    )
+    if rc != 0:
+        raise EdenError(f"eden info failed after clone: {stderr.strip()}")
+    info = parse_info(stdout)
+    rc, stdout, stderr = runner(
+        ["eden", "--config-dir", config_dir, "redirect", "list",
+         "--mount", mount, "--json"]
+    )
+    if rc != 0:
+        raise EdenError(f"eden redirect list failed: {stderr.strip()}")
+    return info, parse_redirections(stdout)
+
+
 def verify_removed(
     mounts_after: Sequence[str],
     mount: str,

@@ -99,6 +99,31 @@ def test_salvage_and_remove_verification() -> None:
     assert len(problems) == 3
 
 
+def test_provision_clone_info_redirects() -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def runner(argv: Sequence[str]) -> tuple[int, str, str]:
+        calls.append(tuple(argv))
+        if "clone" in argv:
+            return (0, "", "")
+        if "info" in argv:
+            return (
+                0,
+                '{"mount": "/slot/checkout", "state_dir": "/slot/.eden-state/c",'
+                f' "backing_repo": "/backing/repo", "checked_out_revision": "{REV}"}}',
+                "",
+            )
+        return (0, '[{"repo_path": "buck-out", "type": "bind", "target": "/slot/buck"}]', "")
+
+    info, redirects = eden.provision_checkout(
+        runner, "/slot/.eden-state", "/backing/repo", "/slot/checkout", None
+    )
+    assert info.revision == REV and redirects[0].repo_path == "buck-out"
+    assert eden.is_inside("/slot/buck", "/slot")
+    assert not eden.is_inside("/data/scratch/buck", "/slot")
+    assert calls[0][3] == "clone"
+
+
 def test_parse_daemon_facts() -> None:
     info = eden.parse_info(
         '{"mount": "/m/one", "state_dir": "/s/one",'

@@ -48,7 +48,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set
 from pathlib import Path, PurePosixPath
 from typing import IO, NoReturn, Protocol, TextIO, TypedDict, TypeVar, cast, overload
 
-from wrkslots import __version__, imagecmd, sandbox, slotimage, sockdiag, worktreesimage, yamlconfig
+from wrkslots import __version__, eden, imagecmd, sandbox, slotimage, sockdiag, worktreesimage, yamlconfig
 
 VERSION = __version__
 SCHEMA = 2
@@ -550,6 +550,7 @@ OPTIONAL_CONFIG_KEYS = frozenset(
         "machine",
         "liveness_batch_command",
         "max_active_slots",
+        "eden_host_cap",
         "layout",
         "cache_globs",
         "repo_cache_globs",
@@ -644,6 +645,7 @@ CONFIG_KEY_DOCS: dict[str, str] = {
         "request for many agents), used by audit on large registries."
     ),
     "max_active_slots": "Cap on active slots. Absent means uncapped.",
+    "eden_host_cap": "Host-wide Eden checkout cap, counted across every daemon config dir.",
     "cache_globs": "Slot-relative globs of regenerable caches that `clean-caches` may delete.",
     "repo_cache_globs": "Per-repository cache globs: repository name to a list of globs.",
     "post_provision_hooks": (
@@ -1214,6 +1216,9 @@ class Config:
     liveness_command: Path
     liveness_batch_command: Path | None = None
     max_active_slots: int | None = None
+    #: Host-wide Eden checkout cap for Eden slots (#1204); counted across
+    #: every daemon config dir, never just wrkslots rows.
+    eden_host_cap: int = 3
     layout: str = "nested"
     cache_globs: tuple[str, ...] = ()
     repo_cache_globs: tuple[tuple[str, tuple[str, ...]], ...] = ()
@@ -4476,6 +4481,11 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
             None
             if cap is None
             else _as_int(cap, "configuration.max_active_slots", minimum=0)
+        ),
+        eden_host_cap=(
+            3
+            if "eden_host_cap" not in raw
+            else _as_int(raw["eden_host_cap"], "configuration.eden_host_cap", minimum=1)
         ),
         layout=layout,
         cache_globs=cache_globs,
@@ -34218,6 +34228,83 @@ def _require_worktrees_image_mounted(config: Config, action: str) -> None:
     )
 
 
+def _eden_runner(argv: Sequence[str]) -> tuple[int, str, str]:
+    done = subprocess.run(
+        list(argv), capture_output=True, text=True, check=False
+    )
+    return done.returncode, done.stdout, done.stderr
+
+
+def _eden_known_config_dirs(config: Config) -> tuple[str, ...]:
+    known = [str(Path.home() / "local" / ".eden")]
+    for state_dir in sorted(config.worktrees.glob("*/.eden-state")):
+        known.append(str(state_dir))
+    return tuple(known)
+
+
+def _provision_eden_slot(
+    config: Config,
+    args: argparse.Namespace,
+    slot_path: Path,
+) -> Checkout:
+    """Clone the Eden checkout for a create; refuse on any bad proof."""
+
+    eden_map = _assignments(args.eden, "Eden checkout")
+    rev_map = _assignments(args.eden_rev, "Eden revision")
+    if len(eden_map) != 1:
+        raise Refusal("create --eden requires exactly one NAME=BACKING checkout")
+    name, backing = next(iter(eden_map.items()))
+    _validate_name(name, "checkout name")
+    unknown = sorted(set(rev_map) - set(eden_map))
+    if unknown:
+        raise Refusal(f"Eden revision supplied for unknown checkout: {', '.join(unknown)}")
+    cmdlines: list[str] = []
+    for cmdline in Path("/proc").glob("*/cmdline"):
+        try:
+            cmdlines.append(cmdline.read_bytes().replace(b"\0", b" ").decode("utf-8", "replace"))
+        except OSError:
+            continue
+    dirs = eden.discover_config_dirs(cmdlines, _eden_known_config_dirs(config))
+    try:
+        mounts = eden.count_checkouts(_eden_runner, dirs)
+        eden.assert_under_cap(mounts, config.eden_host_cap)
+    except eden.EdenError as exc:
+        raise Refusal(str(exc)) from exc
+    slot_path.parent.mkdir(parents=True, exist_ok=True)
+    if config.worktrees_image is not None:
+        worktreesimage.create_slot_subvolume(
+            slot_path, config.worktrees_image.slot_quota_bytes
+        )
+    else:
+        slot_path.mkdir()
+    config_dir = slot_path / ".eden-state"
+    mount = slot_path / "checkout"
+    try:
+        info, redirections = eden.provision_checkout(
+            _eden_runner, str(config_dir), backing, str(mount), rev_map.get(name)
+        )
+        for item in redirections:
+            if not eden.is_inside(item.target, str(slot_path)):
+                raise Refusal(
+                    f"redirection {item.repo_path} target escapes the slot: {item.target}"
+                )
+    except eden.EdenError as exc:
+        raise Refusal(str(exc)) from exc
+    return Checkout(
+        name=name,
+        path="checkout",
+        repository=backing,
+        branch=eden.EDEN_BRANCH,
+        start_point=info.revision,
+        remote=eden.EDEN_REMOTE,
+        remote_url_sha256=hashlib.sha256(backing.encode("utf-8")).hexdigest(),
+        landed_ref=eden.EDEN_LANDED_REF,
+        head=info.revision,
+        containing_remote_refs=(),
+        vcs="eden",
+    )
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     _require_coordinator_authorized(args, "worktree creation")
     args.slot_type = _require_slot_type(args, "worktree creation")
@@ -34327,6 +34414,48 @@ def _cmd_create(args: argparse.Namespace) -> int:
         slot_path = _slot_directory(config, args.slot, args.slot_type)
         if slot_path.exists() or slot_path.is_symlink():
             raise Refusal(f"slot path already exists: {slot_path}")
+        if getattr(args, "eden", None):
+            if getattr(args, "repo", None) or getattr(args, "branch", None):
+                raise Refusal("create --eden cannot combine with --repo/--branch")
+            checkout = _provision_eden_slot(config, args, slot_path)
+            created_at = _utc_now()
+            record = ActiveRecord(
+                slot=args.slot,
+                agent=args.agent,
+                task=args.task,
+                purpose=args.purpose,
+                slot_type=args.slot_type,
+                machine=config.machine,
+                generation=1,
+                created_at=created_at,
+                heartbeat_at=created_at,
+                heartbeat_ttl_seconds=config.heartbeat_ttl_seconds,
+                owner=owner,
+                coordinator_lease=coordinator_lease,
+                coordinator_recovery_note=None,
+                handoff=None,
+                checkouts=(checkout,),
+                task_scope=task_scope,
+            )
+            event_writer = (
+                _event_writer(config, config.machine)
+                if local is None
+                else local.writer(config)
+            )
+            _write_active_state(
+                config,
+                _append_record(state, record),
+                action="slot-created",
+                slot=record.slot,
+                evidence={
+                    "slot_type": record.slot_type,
+                    "coordinator_authorized": True,
+                    "coordinator": _identity_to_obj(coordinator_lease),
+                },
+                event_writer=event_writer,
+                previous=None if local is None else local.active,
+            )
+            return record, _registry_storage_inconsistencies(config, states)
         plan = _create_plan(config, args, vcs)
         _assert_validate_batch_seals_disjoint_from_create(
             config,
@@ -79072,6 +79201,25 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "not changed (default: configuration.image.state_ceiling_bytes, else "
             f"{slotimage.DEFAULT_STATE_CEILING_BYTES // GIB})"
         ),
+    )
+    create.add_argument(
+        "--eden",
+        action="append",
+        default=[],
+        metavar="NAME=BACKING",
+        help=(
+            "create one Eden checkout instead of git worktrees: NAME labels it and "
+            "BACKING is the backing repository path passed to eden clone. Mutually "
+            "exclusive with --repo/--branch; the mount lands at <slot>/checkout with "
+            "its daemon state inside the slot"
+        ),
+    )
+    create.add_argument(
+        "--eden-rev",
+        action="append",
+        default=[],
+        metavar="NAME=REV",
+        help="initial revision for one --eden checkout (default: the clone default)",
     )
     create.add_argument("--format", choices=("human", "json"), default="human")
     create.set_defaults(handler=_cmd_create)
