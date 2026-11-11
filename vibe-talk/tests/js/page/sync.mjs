@@ -223,6 +223,13 @@ test("live updates and deletes re-read the authoritative channel without losing 
   const topBeforeEdit = anchor.getBoundingClientRect().top;
   assert.ok(!atBottomOf(area), "the reader is not parked in older messages");
   const readsBeforeUpdate = page.pageReads;
+  // `#1229 keyed-row-patching`: the re-read patches in place — a row whose messages are the
+  // very objects it was drawn from keeps its node (its height, its fold, any selection in it);
+  // only the edited row is rebuilt.
+  const nodesBefore = new Map(
+    [...page.el("discord-log").children].map((row) => [row.getAttribute("data-ids"), row])
+  );
+  assert.ok(nodesBefore.size > 2, "the fixture drew too few rows to tell patching from rebuilding");
 
   const edited = { ...original[0], content: longMessage("after edit, much taller") };
   page.messages = [edited, ...original.slice(1)];
@@ -237,6 +244,11 @@ test("live updates and deletes re-read the authoritative channel without losing 
     topBeforeEdit,
     "an edit above the viewport changed which row the reader was looking at"
   );
+  for (const row of page.el("discord-log").children) {
+    const key = row.getAttribute("data-ids");
+    if ((key || "").split(" ").includes(String(edited.id))) continue;
+    assert.equal(row, nodesBefore.get(key), `the re-read rebuilt the unchanged row ${key} instead of patching in place`);
+  }
 
   const readsBeforeDelete = page.pageReads;
   const topBeforeDelete = anchor.getBoundingClientRect().top;

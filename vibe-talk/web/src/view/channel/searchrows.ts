@@ -708,12 +708,16 @@ export function createSearchRows(deps: SearchRowsDependencies): SearchRows {
   }
 
   const seamsDrawnOn = new WeakMap<object, number>();
-  const timesWordedOn = new WeakMap<object, number>();
+  const timesWordedOn = new WeakMap<object, string>();
 
   function rewordRowTimes(list: HTMLElement, rows: SearchRow[], today: number): void {
+    // A row's words are reworded when the day turns, and when the device's zone moves under
+    // them (`#1229 keyed-row-patching`: a kept row is not redrawn, so its time would otherwise
+    // keep the zone it was drawn in).
+    const wording = `${today}|${new Date().getTimezoneOffset()}`;
     const was = timesWordedOn.get(list);
-    timesWordedOn.set(list, today);
-    if (was === undefined || was === today) return;
+    timesWordedOn.set(list, wording);
+    if (was === undefined || was === wording) return;
     for (const row of rows) {
       const node = rowTime(row as never) as HTMLElement | null;
       if (node) setTextIfChanged(node as never, messageTimeLabel({ timestamp: node.getAttribute("datetime") } as never));

@@ -88,6 +88,8 @@ export interface PointerSelectionDependencies<Pane extends PointedPane, Column, 
   inColumn(column: Column, act: () => void): void;
   /** The reader acted in a list (`#243 filter-keeps-selection`). */
   readerActed(): void;
+  /** Note the reader's pointer act in `pane`'s list, for the selection keeper (`#1229`). */
+  notePointerAct(pane: Pane): void;
   /** Whether `row` of `pane` is in sight, and the first row in sight. */
   rowInView(pane: Pane, row: HTMLElement): boolean;
   firstRowInView(pane: Pane): HTMLElement | null;
@@ -308,7 +310,10 @@ export function createPointerSelection<Pane extends PointedPane, Column, Mark ex
       const target = event && event.target;
       if (deps.screen() !== "main" || !target) return;
       const pane = deps.keyPanes().find((each) => { const list = each.list(); return list !== null && nodeWithin(list, target); });
-      if (pane) deps.inColumn(deps.paneColumn(pane), () => deps.readerActed());
+      if (pane) {
+        deps.notePointerAct(pane);
+        deps.inColumn(deps.paneColumn(pane), () => deps.readerActed());
+      }
       // The call's transcript, which no key moves through, is a list of messages a filter keeps a place in too.
       else if (deps.view() !== "discord" && nodeWithin(deps.byId("transcript"), target)) deps.inColumn(deps.mainColumn(), () => deps.readerActed());
     },

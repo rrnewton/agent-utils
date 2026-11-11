@@ -2498,19 +2498,19 @@ test("...and ONE failure still reads as one, rather than as a count", async () =
   assert.match(page.el("status").textContent, /^one message could not be summarised: /);
 });
 
-test("A FAILED ROW STAYS RED THROUGH MORE, LESS, AND THE POLL THAT REBUILDS IT", async () => {
+test("A FAILED ROW STAYS RED THROUGH MORE, LESS, AND THE POLL", async () => {
   // The mark cannot live in `setFolded` or in the failure handler itself. The channel re-reads
-  // every DISCORD_POLL_MS and throws every `<li>` away, so anything written outside the function
-  // the REBUILD runs survives until the next poll and then quietly disappears — which for a
-  // failure is the worst behaviour available: the reader sees a red row, looks away, and finds an
-  // ordinary one when they look back.
+  // every DISCORD_POLL_MS, so anything written outside the state the dress pass reads survives
+  // until the next poll and then quietly disappears — which for a failure is the worst
+  // behaviour available: the reader sees a red row, looks away, and finds an ordinary one when
+  // they look back. Since `#1229 keyed-row-patching` the poll keeps the row itself; a change
+  // to the message still rebuilds it, and the rebuilt row must be marked again from that state.
   const page = newPage();
   await signIn(page);
   page.summaryResponse = async () =>
     json(503, { error: "summarizer_error", detail: "the model host is down" });
-  const rows = await showDiscord(page, [
-    message({ id: "7000000000000000053", content: longMessage("persisted") }),
-  ]);
+  const words = message({ id: "7000000000000000053", content: longMessage("persisted") });
+  const rows = await showDiscord(page, [words]);
   await turnSummariesOn(page);
   await reportFailures(page);
   assert.equal(rows[0].getAttribute("data-summary-failed"), "true", "the fixture never failed");
@@ -2525,15 +2525,20 @@ test("A FAILED ROW STAYS RED THROUGH MORE, LESS, AND THE POLL THAT REBUILDS IT",
   await foldButton(rows[0]).click();
   assert.equal(rows[0].getAttribute("data-summary-failed"), "true");
 
-  // ...and neither may the poll. These are BRAND NEW elements; the id is all that survived.
+  // ...and neither may the poll: the same words keep the very row (`#1229`), still red.
+  const drawnRow = page.el("discord-log").children[0];
+  const kept = await refreshDiscord(page, [words]);
+  assert.equal(kept[0], drawnRow, "the poll rebuilt a row whose words did not change");
+  assert.equal(kept[0].getAttribute("data-summary-failed"), "true", "the poll cleared the failure");
+  // A change to the message rebuilds the row, and the new row is marked from the state again.
   const rebuilt = await refreshDiscord(page, [
-    message({ id: "7000000000000000053", content: longMessage("persisted") }),
+    message({ id: "7000000000000000053", content: longMessage("persisted, and then some") }),
   ]);
-  assert.notEqual(rebuilt[0], rows[0], "the fixture reused the row, so the rebuild is not exercised");
+  assert.notEqual(rebuilt[0], drawnRow, "the fixture reused the row, so the rebuild is not exercised");
   assert.equal(
     rebuilt[0].getAttribute("data-summary-failed"),
     "true",
-    "the rebuilt row lost the failure, so the red survives only until the next poll"
+    "the rebuilt row lost the failure, so the red survives only until the next change"
   );
   assert.equal(summaryMark(rebuilt[0]), "summary failed", "the rebuilt row lost the words");
   assert.equal(summaryLine(rebuilt[0]).hidden, false, "the rebuilt row hid the words");

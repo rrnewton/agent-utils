@@ -317,13 +317,25 @@ export function mountListKeepers<Column>(deps: ListKeepersDependencies<Column>):
       listen(area, type, () => { readerScrolled = true; }, { capture: true, passive: true });
     }
     listen(area, "input", () => { typedAt = Date.now(); }, { passive: true });
+    let lastHeight: number | null = null;
+    let lastTop = 0;
     listen(area, "scroll", () => {
       // A scroll in the instant after text went in, with no reader's hand in it, is the browser
       // revealing the caret: it never turns follow on. The reader's own scrolls, and the page's
       // landings at the foot (a list opening, the Newest chip), note where the reader stands.
       const reveal = !readerScrolled && Date.now() - typedAt < 150;
+      const wasReader = readerScrolled;
       readerScrolled = false;
+      // A scroll the browser made to keep the reader's rows still while the list changed size
+      // under them (its scroll anchoring, as a row at the foot is laid out taller) is not the
+      // reader moving either: their place is the keeper's size pass to decide, below.
+      const heightNow = area.scrollHeight;
+      const anchored = !wasReader && lastHeight !== null && heightNow !== lastHeight &&
+        Math.abs(area.scrollTop - lastTop) <= Math.abs(heightNow - lastHeight);
+      lastHeight = heightNow;
+      lastTop = area.scrollTop;
       if (reveal && footing && !footing.foot) return;
+      if (anchored && footing && footing.foot && !atBottom(area, FOLLOW_REST_PX)) return;
       note(area.scrollTop > 0 && atBottom(area, FOLLOW_REST_PX), footing ? footing.context : contextOf());
     }, { passive: true });
     mainFollowNow = () => footing !== null && footing.foot;

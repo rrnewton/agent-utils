@@ -1729,15 +1729,15 @@ test("`#890 voice-page-linked-highlight`: the message a page opens on stays mark
   await page.settle();
   assert.deepStrictEqual(linkedIds(page), ["204"], "a scroll took the mark away");
   // The list drawn again from nothing: All, and back to the thread; and the poll's re-read.
-  const drawn = rowWithId(page, "204");
   page.el("thread-select").value = "flat";
   await page.el("thread-select").dispatch("change");
   await page.settle();
+  assert.equal(page.el("discord-log").getAttribute("data-view"), "flat", "fixture: All was not drawn, so this proves nothing");
   page.el("thread-select").value = "thread:spaces/A/threads/another";
   await page.el("thread-select").dispatch("change");
   await page.settle();
   await reReadChannel(page);
-  assert.notEqual(rowWithId(page, "204"), drawn, "fixture: the row was not drawn again");
+  assert.ok(rowWithId(page, "204"), "fixture: the thread was not drawn again, so this proves nothing");
   assert.deepStrictEqual(linkedIds(page), ["204"], "the list drawn again lost the mark");
   assert.equal(page.el("discord-log").children.filter((row) => linkedNote(row)).length, 1, "the note is not on one row only");
 
@@ -1753,9 +1753,10 @@ test("`#890 voice-page-linked-highlight`: the message a page opens on stays mark
   const escEntry = page.el("keyboard-keys").descendants().find((node) => node.tagName === "kbd" && node.textContent === "Esc");
   assert.match(escEntry.parentNode.text(), /takes the mark off a linked message/, "the ? list does not say Esc puts the mark out");
 
-  // NEGATIVE CONTROL: with the rows drawn without the mark, the list drawn again loses it.
-  const bare = await openedOnLink({ script: await brokenModule([{ file: "src/view/channel/channelrows.ts", find: "    deps.drawLinkedOn(li, messages.map((one) => String(one.id)));\n", replace: "" }]) });
-  assert.deepStrictEqual(linkedIds(bare), ["204"], "the control lost the mark before any drawing");
+  // NEGATIVE CONTROL: with the mark itself never drawn (every draw of it — as a row is built,
+  // in the pass over the rows, at a landing — goes through the one `drawOn`), no list shows it.
+  const bare = await openedOnLink({ script: await brokenModule([{ file: "src/view/channel/linkedmark.ts", find: "      row.setAttribute(\"data-linked\", \"true\");\n", replace: "" }]) });
+  assert.deepStrictEqual(linkedIds(bare), [], "the control has the mark without any draw of it, so this proves nothing");
   bare.el("thread-select").value = "flat";
   await bare.el("thread-select").dispatch("change");
   await bare.settle();

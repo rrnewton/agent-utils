@@ -2829,7 +2829,9 @@ test("`#284 redraw-keeps-pane`: in two columns, with the focus lost while the re
       // A live message in Main, which draws Main again.
       await deliver(page, page.stream(), sseMessage(server.post(message({ id: "209", content: "a new message in Main" }))));
       assert.ok(rowWithId(page, "209"), "the premise: the live message was not drawn in Main");
-      assert.notEqual(rowWithId(page, "200"), before, "the premise: Main was not drawn again, so this proves nothing");
+      // Since `#1229 keyed-row-patching` the draw keeps the rows it has no change for, so the
+      // arrival itself, not a new node for 200, is what says Main was drawn again.
+      assert.equal(rowWithId(page, "200"), before, "the premise: Main's draw replaced a row it had no change for");
     }
     const held = focused(page);
     const where = held === null ? "nothing" : nodeWithinFixture(page.el("scroll-area"), held) ? "Main" : "elsewhere";
@@ -2864,7 +2866,10 @@ test("`#284 redraw-keeps-pane`: in two columns, with the focus lost while the re
   const old = sideRow(page, "202");
   await page.loseFocus();
   await deliver(page, page.stream(), sseMessage(server.post(message({ id: "205", content: "a second answer", thread: { ...thread, is_root: false } }))));
-  assert.notEqual(sideRow(page, "202"), old, "the premise: the right column was not drawn again, so this proves nothing");
+  assert.ok(sideRow(page, "205"), "the premise: the live reply was not drawn on the right");
+  // Since `#1229 keyed-row-patching` the draw keeps the rows it has no change for, so the
+  // arrival itself, not a new node for 202, is what says the right column was drawn again.
+  assert.equal(sideRow(page, "202"), old, "the premise: the right column's draw replaced a row it had no change for");
   assert.equal(focused(page), sideRow(page, "202"), `a redraw of the right column under its reader left the focus on ${focusName(page)}`);
 });
 

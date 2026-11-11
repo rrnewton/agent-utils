@@ -15,6 +15,7 @@ import { editedTitle, messageDate, messageTimeLabel, shortLocalTime } from "../.
 import { createRowMenus } from "./rowmenu.ts";
 import type { RowMenus } from "./rowmenu.ts";
 import { renderedText } from "./text.ts";
+import { patchRows } from "./rows.ts";
 import { EDITED_MARK, timeNode } from "./time.ts";
 
 /** Most ids one dismissal request carries; the server refuses a larger batch. */
@@ -104,7 +105,7 @@ export interface ChannelRows {
   mayLeadToReplies(message: Message): boolean;
   hiddenEmpty(message: Message): boolean;
   glom(messages: Message[]): Message[][];
-  regroupChannelRows(): void;
+  regroupChannelRows(rebuild?: boolean): void;
   channelRowFrame(messages: Message[]): { li: ChannelRow; meta: HTMLElement; body: HTMLElement; content: string; text: string; reactions: HTMLElement | null };
   editedMark(messages: Message[]): HTMLElement | null;
   reactionStrip(messages: Message[]): HTMLElement | null;
@@ -162,11 +163,14 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
     return groups;
   }
 
-  function regroupChannelRows(): void {
+  function regroupChannelRows(rebuild = false): void {
     const list = el("discord-log");
     const messages = deps.listedMessages();
     deps.preservingScroll(() => {
-      list.replaceChildren(...glom(messages).map(discordNode));
+      // `rebuild`: every row is built again, as when the links switch rewires each body as it
+      // is built (`#543`); a kept row would keep what the old switch gave it.
+      patchRows(list, glom(messages), (group) => discordNode(group), [],
+        rebuild ? () => false : (drawn, incoming) => drawn === incoming);
       deps.renderChannelRows();
     });
     deps.renderScrollTools();

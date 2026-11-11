@@ -111,14 +111,91 @@ function rowIn(list: Element, id: unknown): HTMLElement | null {
   return ([...list.children].find((row) => idsOf(row).includes(String(id))) as HTMLElement | undefined) || null;
 }
 
+/** The view each row was built for, noted as it is built (`noteRowBuilt`). */
+const rowBuiltFor = new WeakMap<Element, string>();
+
+/**
+ * What a build puts on a row, and what the dress paints on it, is the view's: a thread's tag
+ * and gather button in Main and in All, neither in the thread's own list; its strip in All
+ * alone; its unread count in Main alone. So a row is noted by the view it was built for, and
+ * a draw for another view builds it again, as a fresh draw would.
+ */
+const builtForView = (view: string): string => view;
+
+/** Note the view `row` is being built for, as its draw begins. */
+const noteRowBuilt = (row: Element, view: string): void => {
+  rowBuiltFor.set(row, builtForView(view));
+};
+
+/**
+ * Put `groups` on `list`, patching in place (`#1229 keyed-row-patching`): a row whose messages
+ * are the very objects it was drawn from keeps its node — its height, its fold, and any
+ * selection in it — changed and new groups are built by `build`, gone ones removed, and the
+ * rest moved to order. `kept` rows stand above the patched part, untouched, in their order.
+ * What a row shows that lives outside its messages (a Done, a fold, a summary) is the dress
+ * pass's, which runs after every redraw as it always did. `unchanged` says when a drawn
+ * message and an incoming one are the same message: the very object, where the store holds
+ * the copies a row was drawn from; word for word (`sameMessage`), where a redraw is handed
+ * fresh copies of the same page and no store stands behind it. `view`, when given, is the
+ * view being drawn: a row built for another view is built again, as a fresh draw would.
+ */
+const patchRows = (
+  list: Element,
+  groups: readonly (readonly Message[])[],
+  build: (group: Message[]) => Element,
+  kept: readonly Element[] = [],
+  unchanged: (drawn: Message, incoming: Message) => boolean = (drawn, incoming) => drawn === incoming,
+  view?: string,
+): void => {
+  const byKey = new Map<string, Element[]>();
+  for (const row of [...list.children].slice(kept.length)) {
+    const key = idsOf(row).join(" ");
+    const held = byKey.get(key);
+    if (held) held.push(row);
+    else byKey.set(key, [row]);
+  }
+  const next: Element[] = [...kept];
+  for (const group of groups) {
+    const key = group.map((message) => String(message.id)).join(" ");
+    let row = byKey.get(key)?.shift();
+    if (row) {
+      const drawn = rowMessages(row);
+      // A build puts on a row what the view it is built for has (a thread's tag, in Main and
+      // All; not in the thread's own list), so a row built for another view is built again.
+      const builtFor = rowBuiltFor.get(row);
+      if (drawn.length !== group.length || group.some((message, at) => !unchanged(drawn[at] as Message, message)) ||
+        (view !== undefined && builtFor !== undefined && builtFor !== builtForView(view))) {
+        row = undefined;
+      }
+    }
+    next.push(row ?? build(group as Message[]));
+  }
+  const keep = new Set(next);
+  for (const row of [...list.children]) if (!keep.has(row) && row.parentNode === list) list.removeChild(row);
+  for (let at = 0; at < next.length; at += 1) {
+    const wanted = next[at] as Element;
+    if (list.children[at] !== wanted) list.insertBefore(wanted, list.children[at] ?? null);
+  }
+  listDraws.set(list, (listDraws.get(list) ?? 0) + 1);
+};
+
+/** How many times a list has been drawn (`patchRows`), by list. */
+const listDraws = new WeakMap<Element, number>();
+
+/** How many times `list` has been drawn (`patchRows`). */
+const listDrawCount = (list: Element): number => listDraws.get(list) ?? 0;
+
 export {
   anchorOfRow,
   authorLabel,
   doneButtonOf,
   idsOf,
   isMessageRow,
+  listDrawCount,
   messageTop,
   notNoiseButtonOf,
+  noteRowBuilt,
+  patchRows,
   rowIn,
   rowMessages,
   rowNewestMs,

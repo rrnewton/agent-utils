@@ -1109,9 +1109,17 @@ test("ON A THREADED CHANNEL a Done dresses the rows where they stand, and a row 
   assert.equal(channelRow(page, "3"), pressed, "a Done drew every row again: the whole-list redraw is back");
   page.pure("renderCachedTimeline()");
   const drawn = channelRow(page, "3");
-  assert.notEqual(drawn, pressed, "the fixture did not redraw the row, so this proves nothing new");
+  // Since `#1229 keyed-row-patching` the redraw keeps the row it has no change for, and the
+  // kept row carries the moment where it stands.
+  assert.equal(drawn, pressed, "the redraw replaced a row it had no change for");
   assert.equal(drawn.getAttribute("data-archived"), "true");
-  assert.equal(drawn.getAttribute("data-done-flash"), "marking", "the redrawn row lost the moment of marking");
+  assert.equal(drawn.getAttribute("data-done-flash"), "marking", "the kept row lost the moment of marking");
+  // A row built again — another view's draw — carries it too: the moment is kept by message.
+  await pickThread(page, "flat");
+  await pickThread(page, "main");
+  const rebuilt = channelRow(page, "3");
+  assert.notEqual(rebuilt, pressed, "the fixture did not redraw the row, so this proves nothing new");
+  assert.equal(rebuilt.getAttribute("data-done-flash"), "marking", "the redrawn row lost the moment of marking");
   assert.equal(page.expireTimers(DONE_FLASH_HOLD_MS), 1);
   assert.equal(channelRow(page, "3").getAttribute("data-done-flash"), "fading");
   assert.equal(page.expireTimers(DONE_FLASH_FADE_MS), 1);

@@ -25,6 +25,7 @@ import {
   placeFromPageIn as placeFromPage,
   projectionOf,
   restoreCanon,
+  sameMessage,
   threadOf,
   timeOf,
 } from "../../core/channels/index.ts";
@@ -43,7 +44,7 @@ export interface TimelineReaderLike {
 }
 import { READ_MODE_LABELS, READ_MODE_TITLES, READ_MODE_VERBS, allNoticeWords, nextReadMode } from "../../present/rows/index.ts";
 import { createOlderPager } from "../../core/channels/index.ts";
-import { isMessageRow, rowShown, shownRowFor } from "./rows.ts";
+import { isMessageRow, patchRows, rowShown, shownRowFor } from "./rows.ts";
 import { cardRunIds, threadCardId } from "./cards.ts";
 import { childByClass } from "../dom/index.ts";
 import { neighbourStayed, rowNeighbours } from "./cardplace.ts";
@@ -1016,7 +1017,7 @@ function applyTimelinePage(payload: TimelineResponse, older = false, saved = fal
     // The reader's text selection is kept across the rebuild, as at a landing (`#1209`).
     const list = el("discord-log");
     const keptSelection = deps.selectionIn ? deps.selectionIn(list) : null;
-    list.replaceChildren(...glom(shown).map(discordNode));
+    patchRows(list, glom(shown), (group) => discordNode(group), [], (drawn, incoming) => drawn === incoming, selection().view);
     el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
     if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
   }
@@ -1056,12 +1057,11 @@ function renderCachedTimeline(): void {
   const keeps = readFilterKeeps();
   const shown = timelineRows().messages.filter((message) => !hiddenEmpty(message) && (!hidingRead() || keeps(message)));
   const redraw = () => {
-    // The selection is kept across the rebuild (`#1209 selection-survives-updates`); removing
-    // the rebuild itself for unchanged rows is the keyed patching of #1229, since what a row
-    // shows also stands in state outside its messages (a Done, a fold, a summary).
+    // The selection is kept across the rebuild (`#1209 selection-survives-updates`), and the
+    // rebuild itself patches in place (`#1229 keyed-row-patching`).
     const list = el("discord-log");
     const keptSelection = deps.selectionIn ? deps.selectionIn(list) : null;
-    list.replaceChildren(...glom(shown).map(discordNode));
+    patchRows(list, glom(shown), (group) => discordNode(group), [], (drawn, incoming) => drawn === incoming, selection().view);
     if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
     holdingReplyArrows(renderChannelRows);
     listState().backlog = shown.length;
@@ -1568,7 +1568,8 @@ function applyNewestPage(payload: TimelineResponse, saved = false): number {
     messages.length > 0 ? (messages[0] as Message).timestamp : undefined);
   // The reader's text selection is kept across the rebuild, as at a landing (`#1209`).
   const keptSelection = deps.selectionIn ? deps.selectionIn(list) : null;
-  list.replaceChildren(...kept, ...glom(messages).map(discordNode));
+  patchRows(list, glom(messages), (group) => discordNode(group), kept,
+    (drawn, incoming) => drawn === incoming || sameMessage(drawn, incoming), selection().view);
   if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
   // The archive BEFORE the derivation that reads it. `kept` rows were already on screen and their
   // ids are still in the set from the read that brought them, so a reset here would un-grey them.
@@ -2213,7 +2214,7 @@ async function loadTodo(options?: TimelineReadOptions): Promise<void> {
     // The rebuild takes the reader's text selection with the rows: kept, and put back after
     // (`#1209 selection-survives-updates`).
     const keptSelection = deps.selectionIn ? deps.selectionIn(list) : null;
-    list.replaceChildren(...glom(messages).map(discordNode));
+    patchRows(list, glom(messages), (group) => discordNode(group), [], (drawn, incoming) => drawn === incoming, selection().view);
     renderChannelRows();
     if (keptSelection && deps.restoreSelectionIn) deps.restoreSelectionIn(list, keptSelection);
     // The walk back belongs to the UNFILTERED channel. Leaving a cursor armed here would let a

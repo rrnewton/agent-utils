@@ -60,7 +60,7 @@ import type {
   ViewKeys,
   WriteKeys,
 } from "../view/shell/index.ts";
-import { createInputKinds, createLastPane } from "../view/channel/index.ts";
+import { createInputKinds, createLastPane, listDrawCount } from "../view/channel/index.ts";
 import type { InputKinds, LastPane } from "../view/channel/index.ts";
 import { createSingleKeys } from "../core/settings/index.ts";
 import type { DeviceSettings, SingleKeys } from "../core/settings/index.ts";
@@ -441,6 +441,7 @@ export function createKeyboardComposition<
     putOutLanding: (row) => deps.putOutLanding(row),
     noteLinkedSelection: () => deps.noteLinkedSelection(),
     focusLost: () => deps.focusLost(),
+    listDrawCount,
     landingGap: () => deps.replyLandingGapPx(),
   });
   const {
@@ -477,6 +478,7 @@ export function createKeyboardComposition<
     paneColumn: (pane) => paneColumn(pane),
     inColumn: (column, act) => deps.inColumn(column, act),
     readerActed: () => deps.readerActed(),
+    notePointerAct: (pane) => keySelection.notePointerAct(pane),
     rowInView: (pane, row) => rowInView(pane, row),
     firstRowInView: (pane) => firstRowInView(pane),
     selectRow: (pane, row, bring) => selectRow(pane, row, bring),

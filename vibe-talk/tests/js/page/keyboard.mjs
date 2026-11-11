@@ -2900,10 +2900,12 @@ test("`#301 semicolon-expand-cycle` x `#226 page-energy-profile`: NOTHING THE PA
   assert.ok(real.long >= 12, `the channel drew ${real.long} long messages`);
   assert.deepStrictEqual(real.grew, [], "something the page keeps grew with every poll of a channel that did not change");
   // Neither a fixture too small to see it nor a list this test does not read: THE CONTROL keeps a list of
-  // folds beside the rows again, never pruned, and the test names it.
+  // rows beside the rows again, never pruned, and the test names it. Since `#1229
+  // keyed-row-patching` an unchanged channel's rows are kept rather than rebuilt, so the list
+  // is fed from the pass over the rows every draw makes, where the fold list once was.
   const kept = brokenScript("const folding = createFolding({", "const foldsKept = [];\nconst folding = createFolding({")
-    .replace("  foldable,\n  tapRow,", "  foldable: (li, meta, body, text, id, also) => { foldsKept.push(li); return foldable(li, meta, body, text, id, also); },\n  tapRow,");
-  assert.ok(kept.includes("foldsKept.push(li)"), "the control no longer finds where a fold is made");
+    .replace("function renderChannelRows() {", "function renderChannelRows() {\n  for (const keptRow of el(\"discord-log\").children) if (keptRow.getAttribute(\"data-collapsed\") !== null) foldsKept.push(keptRow);");
+  assert.ok(kept.includes("foldsKept.push(keptRow)"), "the control no longer finds the pass over the rows");
   const leaky = await run(kept);
   assert.equal(leaky.grew.length, 1, `the control grew ${leaky.grew.join(", ")}`);
   assert.match(leaky.grew[0], /^foldsKept \d+ -> \d+$/);

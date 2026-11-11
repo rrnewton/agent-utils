@@ -9,6 +9,7 @@ import type { Message } from "../../contract/index.ts";
 import { namedRecord, threadOf } from "../../core/channels/index.ts";
 import { firstLineOf, threadChoice, threadFacts } from "../../present/rows/index.ts";
 import type { ThreadChoice } from "../../present/rows/index.ts";
+import { noteRowBuilt } from "./rows.ts";
 
 
 /** How long a background read of one channel's thread list is reused by the selector. */
@@ -497,6 +498,9 @@ export function createThreadList(deps: ThreadListDependencies): ThreadList {
   }
 
   function addThreadDecoration(meta: HTMLElement, message: Message, row: HTMLElement, everyThread: boolean = false): void {
+    // Every row's build passes through here: note the view it is built for, so a redraw for
+    // another view builds it again rather than keep what this view put on it (`patchRows`).
+    noteRowBuilt(row, deps.selection().view);
     const id = threadOf(message as never);
     if (!deps.threading() || !id || (deps.selection().view === "thread" && !everyThread) || id === deps.currentCanon().scope) return;
     const badge = document.createElement("button");

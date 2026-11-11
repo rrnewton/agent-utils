@@ -992,14 +992,19 @@ const messagePreferences = mountMessagePreferences({
  * column's rows, the thread list's cards and the right column's.
  */
 function redrawMessageLinks() {
+  // The links are wired as each body is built, so the rows are drawn again from nothing:
+  // a kept row (`#1229 keyed-row-patching`) would keep the links the old switch gave it.
   if (providerFacts.threading()) {
-    eachColumn(renderCachedTimeline);
+    eachColumn(() => {
+      el("discord-log").replaceChildren();
+      renderCachedTimeline();
+    });
     eachColumn(() => {
       if (selection().view === "threads") el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
     });
     renderSideColumn();
   } else {
-    eachColumn(regroupChannelRows);
+    eachColumn(() => regroupChannelRows(true));
   }
 }
 
@@ -5049,6 +5054,9 @@ function renderChannelRows() {
   for (const row of [...rows, ...el("pinned-log").children]) {
     dressChannelRow(/** @type {any} */ (row), { tally, answered, viewing,
       inMain: selection().view === "main" && mainList.has(row), inAll: inAll && mainList.has(row) });
+    // The linked message's mark is drawn as a row is built; a row kept or put back by a view
+    // (`#1229 keyed-row-patching`) is not built again, so the pass draws the mark on it here.
+    linkedMark.drawOn(/** @type {any} */ (row));
   }
   // `#214 reply-arrow` and `#215 reply-coalesce`. Each reply's gutter, from the rows now around it
   // and the speakers just decided for them.

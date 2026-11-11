@@ -547,6 +547,66 @@ test("`#624 voice-page-modularity`: the reader is left on the message their eye 
   assert.equal(calls.at(-1), "newest");
 });
 
+test("`#1229 keyed-row-patching`: a redraw keeps the node of every row whose messages are the very objects it was drawn from", () => {
+  const { patchRows } = CHANNEL_VIEW;
+  const list = {
+    children: [],
+    insertBefore(row, ref) {
+      const at = this.children.indexOf(row);
+      if (at >= 0) this.children.splice(at, 1);
+      const to = ref ? this.children.indexOf(ref) : this.children.length;
+      this.children.splice(to < 0 ? this.children.length : to, 0, row);
+      row.parentNode = this;
+      return row;
+    },
+    removeChild(row) {
+      const at = this.children.indexOf(row);
+      if (at >= 0) this.children.splice(at, 1);
+      row.parentNode = null;
+      return row;
+    },
+  };
+  const rowFor = (messages) => ({
+    messages,
+    parentNode: null,
+    getAttribute: (name) => (name === "data-ids" ? messages.map((m) => String(m.id)).join(" ") : null),
+  });
+  const build = (group) => rowFor(group);
+  const a = { id: "1" }, b = { id: "2" }, c = { id: "3" }, d = { id: "4" };
+  patchRows(list, [[a], [b], [c]], build);
+  const [rowA, rowB, rowC] = list.children;
+  // The same objects, regrouped and joined by a new one: only the new group is built.
+  patchRows(list, [[a, b], [c], [d]], build);
+  assert.equal(list.children.length, 3);
+  assert.equal(list.children[1], rowC, "an unchanged row was rebuilt instead of kept");
+  assert.notEqual(list.children[0], rowA, "a regrouped row kept a node drawn for another grouping");
+  assert.equal(list.children[0].messages[0], a);
+  // A new object for the same id is a changed row: rebuilt, and the gone one removed.
+  const c2 = { id: "3", edited: true };
+  patchRows(list, [[a, b], [c2]], build);
+  assert.equal(list.children.length, 2, "a row that left the list stayed in it");
+  assert.notEqual(list.children[1], rowC, "a changed row kept its old node");
+  assert.equal(list.children[1].messages[0], c2);
+  // `kept` rows stand above the patched part, untouched.
+  const head = list.children[0];
+  patchRows(list, [[c2]], build, [head]);
+  assert.deepStrictEqual(list.children, [head, list.children[1]]);
+  assert.equal(list.children[0], head, "a kept row above the patch was moved or rebuilt");
+  // A row built for one view is built again for another: what a build puts on a row is the
+  // view's (a thread's tag in Main, not in the thread's own list).
+  const { noteRowBuilt } = CHANNEL_VIEW;
+  const forMain = list.children[1];
+  noteRowBuilt(forMain, "main"); // as its build in Main noted it (`addThreadDecoration`)
+  patchRows(list, [[c2]], build, [head], (drawn, incoming) => drawn === incoming, "thread");
+  assert.equal(list.children[0], head, "a kept row above the patch was moved or rebuilt");
+  assert.equal(list.children.length, 2);
+  const forThread = list.children[1];
+  assert.notEqual(forThread, forMain, "a row built for Main was kept for the thread's list");
+  noteRowBuilt(forThread, "thread"); // as a build in that view notes it (`addThreadDecoration`)
+  patchRows(list, [[c2]], build, [head], (drawn, incoming) => drawn === incoming, "thread");
+  assert.equal(list.children[1], forThread, "a row built for the view it is drawn in was rebuilt");
+});
+
 test("`#1057 newest-count-chip`: the rows below the reading position, from the last row wholly on screen", () => {
   const { rowsBelowReadingPosition } = CHANNEL_VIEW;
   const row = (top, bottom) => ({ getBoundingClientRect: () => ({ top, bottom }) });

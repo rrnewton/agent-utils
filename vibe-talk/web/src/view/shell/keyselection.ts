@@ -78,6 +78,8 @@ export interface KeySelectionDependencies<Pane extends KeyPane> {
   noteLinkedSelection(): void;
   /** Whether nothing holds the focus. */
   focusLost(): boolean;
+  /** How many times `list` has been drawn (`#1229 keyed-row-patching`). */
+  listDrawCount(list: Element): number;
   /** The room left above and below a row brought into view, in px. */
   landingGap(): number;
 }
@@ -176,9 +178,20 @@ export interface KeySelectionModel<Pane> {
    * right column's thread. The other pane keeps its selection, unfocused, for when the reader goes back.
    */
   keepSelection(): void;
+  /**
+   * Note the reader's pointer act in `pane`'s list, for `keepSelection`: the draw that act
+   * itself brings (a tap opening what it tapped) is the reader's own doing, not a redraw
+   * to hand the selection back through.
+   */
+  notePointerAct(pane: Pane): void;
 }
 
 export function createKeySelection<Pane extends KeyPane>(deps: KeySelectionDependencies<Pane>): KeySelectionModel<Pane> {
+  /** Each list's draw count when `keepSelection` last looked at it (`#1229`). */
+  const drawSeen = new WeakMap<Element, number>();
+  /** Panes the reader's pointer just acted in, for `keepSelection` (`notePointerAct`). */
+  const actedPanes = new Set<Pane>();
+
   function paneFor(node: unknown): Pane | null {
     const channel = deps.channelPane();
     const side = deps.sidePane();
@@ -366,7 +379,19 @@ export function createKeySelection<Pane extends KeyPane>(deps: KeySelectionDepen
         const held = pane.row;
         const list = pane.list();
         if (held === null || list === null) continue;
-        if (held.parentNode === list && deps.rowShown(held)) continue;
+        // `#1229 keyed-row-patching`: a redraw keeps the rows it has no change for, so a row's
+        // survival no longer says its pane was drawn. The draw is counted instead (the rows'
+        // `listDrawCount`): a pane drawn since this pass last looked is handed its selection
+        // again below, as a rebuilding redraw always did.
+        const drawn = deps.listDrawCount(list);
+        const seen = drawSeen.get(list);
+        const drew = seen !== undefined && seen !== drawn;
+        drawSeen.set(list, drawn);
+        // The draw the reader's own tap in this pane brought (opening the run it tapped) is
+        // their doing, not a redraw to hand the selection back through: it is left as the
+        // tap left it, as a rebuilding redraw found it.
+        const acted = actedPanes.delete(pane);
+        if ((held.parentNode === list && deps.rowShown(held) && !drew) || acted) continue;
         releaseRow(pane);
         const mark = markOf(pane);
         if (!mark || !mark.drawn) continue;
@@ -385,6 +410,9 @@ export function createKeySelection<Pane extends KeyPane>(deps: KeySelectionDepen
       // handed on here was nobody's choice, and scrolls nothing (`#1144`: only an explicit keyboard
       // selection move scrolls, minimally, through `bringIntoView`).
       drawSelection();
+    },
+    notePointerAct(pane) {
+      actedPanes.add(pane);
     },
   };
 }

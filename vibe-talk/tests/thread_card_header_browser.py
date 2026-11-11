@@ -821,12 +821,14 @@ def redraw_walk(desk: Desk, api: ColumnsApi) -> None:
         with api.lock:
             api.messages.append(said(24 + index, f"Message {224 + index}, new in the channel. {FILLER}", "human"))
         page.clock.fast_forward(POLL_PAST_MS)
-        desk.wait_for(f"() => Boolean(document.querySelector(\"#discord-log > li[data-id='{224 + index}']\"))"
-                      f" && document.querySelector(\"{row}\")?.dataset.beforeRedraw !== 'yes'",
+        desk.wait_for(f"() => Boolean(document.querySelector(\"#discord-log > li[data-id='{224 + index}']\"))",
                       f"{where}: the channel's re-read did not draw the new message in Main")
         desk.settled()
-        desk.check(bool(page.evaluate(f'() => document.querySelector("{row}").dataset.beforeRedraw !== "yes"')),
-                   f"{where}: Main's selected row was not drawn again, so this proves nothing")
+        # Since `#1229 keyed-row-patching` the re-read keeps the rows it has no change for, so
+        # the arrival itself, not a new node, is what says Main was drawn again: the selected
+        # row standing from before the redraw is the keeping, proved by the mark on it.
+        desk.check(bool(page.evaluate(f'() => document.querySelector("{row}").dataset.beforeRedraw === "yes"')),
+                   f"{where}: Main's selected row was replaced by the redraw, so this proves nothing")
         after = str(page.evaluate(FOCUS_JS))
         desk.check(not after.startswith("discord-log:"), f"{where}: a redraw of Main gave the focus to {after}, from {before}")
         page.keyboard.press("Escape")

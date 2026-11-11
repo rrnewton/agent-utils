@@ -1621,6 +1621,7 @@ test("`#624 voice-page-modularity`: the mouse and the keys move one selection, t
     paneColumn: (pane) => (pane === side ? "side" : "main"),
     inColumn: (column, act) => { log.push(`in ${column}`); act(); },
     readerActed: () => log.push("acted"),
+    notePointerAct: (pane) => log.push(`pointer act ${pane.name}`),
     rowInView: (_pane, row) => state.inView.has(row.id),
     firstRowInView: () => [one, two].find((row) => state.inView.has(row.id)) || null,
     selectRow: (pane, row, ...rest) => log.push(["select", pane.name, row.id, ...rest].join(" ")),
@@ -1676,7 +1677,7 @@ test("`#624 voice-page-modularity`: the mouse and the keys move one selection, t
     assert.deepStrictEqual(run(() => selection.onPointerMove({ target: one })), ["mouse"], "a move off the main screen selected");
     state.screen = "main";
     // A press says the pointer's kind, and one in a list or the transcript is the reader acting there.
-    assert.deepStrictEqual(run(() => selection.onPointerDown({ pointerType: "mouse", target: sideRow })), ["mouse", "in side", "acted"]);
+    assert.deepStrictEqual(run(() => selection.onPointerDown({ pointerType: "mouse", target: sideRow })), ["mouse", "pointer act side", "in side", "acted"]);
     state.view = "voice";
     assert.deepStrictEqual(run(() => selection.onPointerDown({ pointerType: "pen", target: node("line", transcript) })), ["touch", "in main", "acted"]);
     assert.deepStrictEqual(run(() => selection.onPointerDown({ pointerType: "", target: node("line", transcript) })), ["in main", "acted"]);
@@ -1822,6 +1823,7 @@ test("`#624 voice-page-modularity`: the selection is kept per list by message id
     putOutLanding: (row) => log.push(`landing out ${row.id}`),
     noteLinkedSelection: () => log.push("links"),
     focusLost: () => state.lost,
+    listDrawCount: () => 0,
     landingGap: () => 10,
   });
   const run = (act) => { log.length = 0; const result = act(); return result === undefined ? [...log] : [result, ...log]; };
