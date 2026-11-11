@@ -36,3 +36,5 @@ This issue delivers the single scroll owner end to end, together with the D4 ren
 # Notes
 
 Filed by the devbig030 coordinator at the lead's request (owner reply 352). Lane: mu-renderloop.
+
+[watermelon-full-preview] (b) is per-scroller, on A/B evidence (2026-11-10): 10 runs per step per tree in one CPU scope (AllowedCPUs=240-243, burners in-scope), base = github/main, ours = both-scrollers-off plus (c). keyboard_hides_bar 10/10 vs 0/10; reply_continuity 10/10 vs 0/10; approval_card small-phones 10/10 vs 1/10. Native anchoring was silently correcting #scroll-area foot/place holders (keepers, composer keyboard, reply send) that the owner does not route yet, so #scroll-area keeps anchoring until P1+P7 land; #side-scroll is off now, and (c) the collapse anchor choice is in the owner. Re-adding #scroll-area is its own landing with those three steps as proof.
