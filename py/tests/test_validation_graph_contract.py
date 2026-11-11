@@ -1487,3 +1487,24 @@ def test_every_package_build_declares_a_cpu_budget_above_the_small_step_default(
     assert len(packages) == 9
     for step in packages:
         assert step.cpu_timeout > DEFAULT_SMALL_CPU_TIMEOUT, step.tag
+
+
+def test_per_component_selection_is_narrow() -> None:
+    """#1253: a sample change for one component selects that component's
+    steps and no step owned by an unrelated component."""
+
+    agentctl = _selected_tags_for_paths(["py/agentctl/agent.py"])
+    assert any(tag.startswith("python.agentctl") for tag in agentctl)
+    assert not any(tag.startswith("python.wrkslots") for tag in agentctl)
+
+    wrkslots = _selected_tags_for_paths(["py/wrkslots/cli.py"])
+    assert any(tag.startswith("python.wrkslots") for tag in wrkslots)
+    assert not any(tag.startswith("python.agentctl") for tag in wrkslots)
+
+    timeline = _selected_tags_for_paths(["py/tests/js/browser/fixture-server.cjs"])
+    assert "timeline.browser.functional" in timeline
+    assert not any(tag.startswith("vibe-talk.") for tag in timeline)
+
+    page = _selected_tags_for_paths(["vibe-talk/web/index.html"])
+    assert any(tag.startswith("vibe-talk.") for tag in page)
+    assert "timeline.browser.functional" not in page
