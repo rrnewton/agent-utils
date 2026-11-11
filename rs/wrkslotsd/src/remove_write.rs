@@ -1589,6 +1589,15 @@ fn salvage_gate(cfg: &Cfg, config: &Value, checkout: &Value, repository: &Path) 
         "disposition": "already-published",
         "remote_ref": Value::Null,
         "excluded_incomplete_history": [],
+        "private_history_counts": {
+            "named refs": 0,
+            "stale pushed": 0,
+            "stale fetched recent": 0,
+            "stale fetched past prune expiry": 0,
+            "dangling, held by source store": 0,
+            "dangling, slot-only, kept": 0,
+            "dangling, slot-only, past prune expiry": 0,
+        },
         "containing_remote_refs": updated
             .get("containing_remote_refs")
             .cloned()

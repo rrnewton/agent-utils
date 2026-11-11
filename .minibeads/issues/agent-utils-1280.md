@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-kept-set-over-collection: private-history salvage skips published salvage, expired dangling commits and expired fetched-only stale tips'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -52,3 +52,9 @@ updated_at: 2026-11-11T09:02:44+00:00
 # Notes
 
 Lead rulings 2026-11-11: keep #1278 narrow and handle the over-collection paths (a), (b), (c) and (e) here.
+
+## Resolution
+
+[watermelon-full-preview] The private-history scan now classifies every tip by root type before anything is kept. The remote cover also asks for advertised `refs/salvage/*`, so salvage wrkslots itself published is never re-kept. A stale remote-tracking tip is kept when its reflog shows an update by push (`stale pushed`, any age) or, fetched-only, while its ref last changed within the effective `gc.pruneExpire` (`stale fetched recent`); after that it is reported (`stale fetched past prune expiry`) and not kept, and remote-tracking reflog endpoints root the scan only on the same terms. A dangling commit (no ref, reflog entry, or pseudoref) is not kept when a durable source store holds the commit and its root tree, checked in one batch per store from that store's own object directory and alternates with lazy fetching off (`dangling, held by source store` — that store holds those objects already, and its own gc is its business), nor when its object is older than the prune expiry (`dangling, slot-only, past prune expiry`); otherwise it stays kept (`dangling, slot-only, kept`). Age is object mtime exactly as git prune measures it: the loose file's mtime, a cruft pack's per-object `.mtimes` entry, or an ordinary pack file's mtime — never the committer date, and tests pass a fixed clock (`now=`) and set mtimes explicitly. Every salvage receipt carries `private_history_counts` with all seven categories, removal prints the not-kept counts before deletion, and the Rust `salvage_gate` writes the same field, keeping the differential exact.
+
+In the fixtures the categorised scan went from every tip kept (named refs 2, dangling 3 of 3 in the root-type fixture; stale tracking 3 of 3) to named refs 2 kept, `dangling, slot-only, kept` 1, `dangling, held by source store` 1 and `dangling, slot-only, past prune expiry` 1 reported, and `stale pushed` 1 plus `stale fetched recent` 1 kept with 1 fetched-only tip reported past expiry. A read-only per-root-type rerun on the consumer's real slot is still owed by the coordinator route after landing; the shipped scan prints and receipts those counts itself.

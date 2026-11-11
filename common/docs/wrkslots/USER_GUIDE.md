@@ -1785,7 +1785,7 @@ the slot's copy is judged by its own recorded remote: a published HEAD is record
 it refuse ("submodule NAME has uncommitted changes and its source no longer declares it"). Its own
 repository is the only copy of everything else it holds, and removal deletes that repository, so
 none of its own refs count as kept. As for every submodule, removal asks the recorded remote which
-branches and tags it advertises now (`git ls-remote` with the recorded URL, your global Git configuration ignored). A
+branches, tags and salvage refs it advertises now (`git ls-remote` with the recorded URL, your global Git configuration ignored). A
 commit counts as kept when one of those reaches it. An advertised commit already in the submodule
 counts directly, and so does an annotated tag whose exact tag object is there, through the commit
 it names. When commits remain, the advertised tips missing locally are fetched, commits only, into
@@ -1813,6 +1813,19 @@ is read back with a fresh bare clone, the exact ref, and a full fsck, as for eve
 Its receipt records `archive_reason: private-history-kept`, and the warning line names the kept refs
 and commits. Nothing is pushed: removal never pushes this history on its own. Uncommitted changes
 in such a submodule still refuse with or without the flag.
+
+Not everything the scan finds is kept. The remote is also asked for its `refs/salvage/*`, and
+what those reach is already published. A stale remote-tracking tip that its reflog shows was
+pushed from this slot is kept at any age; one that was only fetched is kept only while the
+tracking ref last changed within the repository's effective `gc.pruneExpire` (two weeks by
+default). A commit no ref, reflog entry, or pseudoref names (a dangling commit) is not kept
+when the source store already holds the commit and its root tree, nor when its object is
+older than that expiry — age is measured by object mtime, as `git prune` measures it, never
+by committer date. Every salvage receipt counts the tips in
+`private_history_counts` by category (`named refs`, `stale pushed`, `stale fetched recent`,
+`stale fetched past prune expiry`, `dangling, held by source store`, `dangling, slot-only,
+kept`, `dangling, slot-only, past prune expiry`), and removal prints how many it is not
+keeping before anything is deleted.
 
 To restore the kept history, fetch the archive ref that the receipt (`archive_bundle`,
 `archive_ref`) names from the bundle into any clone of the submodule's repository. The salvage

@@ -62294,6 +62294,327 @@ def test_archive_private_history_refuses_a_blob_missing_from_every_store(
     assert len(active_slots(project)) == 1
 
 
+_KEPT_SET_FIXED_NOW = 1_800_000_000.0
+_KEPT_SET_OLD = 978_307_200.0
+
+
+def _kept_set_repos(tmp_path: Path) -> tuple[Path, Path, Path, str]:
+    """An origin, its parent clone, and a slot clone, all at one base commit (#1280)."""
+
+    origin = tmp_path / "kept-origin.git"
+    parent = tmp_path / "kept-parent"
+    slot = tmp_path / "kept-slot"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", "--initial-branch=main", str(origin)],
+        check=True, capture_output=True, text=True,
+    )
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(parent)],
+        check=True, capture_output=True, text=True,
+    )
+    for repo in (parent,):
+        git(repo, "config", "user.name", "Wrkslots Test")
+        git(repo, "config", "user.email", "wrkslots@example.invalid")
+    (parent / "base.txt").write_text("base\n", encoding="utf-8")
+    git(parent, "add", "base.txt")
+    git(parent, "commit", "-q", "-m", "base")
+    git(parent, "push", "-q", "-u", "origin", "main")
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(slot)],
+        check=True, capture_output=True, text=True,
+    )
+    git(slot, "config", "user.name", "Wrkslots Test")
+    git(slot, "config", "user.email", "wrkslots@example.invalid")
+    git(slot, "config", "core.logAllRefUpdates", "always")
+    base = git(slot, "rev-parse", "HEAD").stdout.strip()
+    return origin, parent, slot, base
+
+
+def _dangling_commit(slot: Path, base: str, name: str, content: str) -> str:
+    """A commit on a temporary branch, then unreferenced with no reflog left."""
+
+    git(slot, "checkout", "-q", "-b", f"tmp-{name}")
+    commit = commit_local(slot, f"{name}.txt", content, name)
+    git(slot, "checkout", "-q", "--detach", base)
+    git(slot, "branch", "-q", "-D", f"tmp-{name}")
+    git(slot, "reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all")
+    fetch_head = Path(git(slot, "rev-parse", "--absolute-git-dir").stdout.strip()) / "FETCH_HEAD"
+    if fetch_head.exists():
+        fetch_head.write_text("", encoding="utf-8")
+    return commit
+
+
+def _loose_object(slot: Path, oid: str) -> Path:
+    gitdir = Path(git(slot, "rev-parse", "--absolute-git-dir").stdout.strip())
+    return gitdir / "objects" / oid[:2] / oid[2:]
+
+
+def _set_loose_mtime(slot: Path, oid: str, when: float) -> None:
+    loose = _loose_object(slot, oid)
+    assert loose.is_file()
+    os.utime(loose, (when, when))
+
+
+def _private_history(
+    slot: Path, base: str, parent: Path, *, branches: bool = True
+) -> wrkslots._PrivateHistory | None:
+    """_submodule_private_history of ``slot`` against a fixed clock (#1280)."""
+
+    return wrkslots._submodule_private_history(
+        wrkslots._GitVcs(),
+        slot,
+        base,
+        (parent,),
+        remote_cover=lambda tips: wrkslots._RemoteCoverage(
+            "origin",
+            frozenset(),
+            frozenset({"refs/heads/main"}) if branches else None,
+        ),
+        now=_KEPT_SET_FIXED_NOW,
+    )
+
+
+def test_private_history_counts_kept_commits_by_category(tmp_path: Path) -> None:
+    """#1280: kept tips are counted per root type; old and source-held dangling are not kept."""
+
+    _origin, parent, slot, base = _kept_set_repos(tmp_path)
+    git(slot, "checkout", "-q", "-b", "side")
+    named_branch = commit_local(slot, "branch.txt", "branch\n", "named branch")
+    git(slot, "checkout", "-q", "--detach", base)
+    named_tag = commit_local(slot, "tag.txt", "tag\n", "named tag")
+    git(slot, "tag", "kept-tag")
+    git(slot, "checkout", "-q", "--detach", base)
+    fresh = _dangling_commit(slot, base, "fresh", "fresh\n")
+    _set_loose_mtime(slot, fresh, _KEPT_SET_FIXED_NOW - 3600)
+    old = _dangling_commit(slot, base, "old", "old\n")
+    _set_loose_mtime(slot, old, _KEPT_SET_OLD)
+    held = _dangling_commit(slot, base, "held", "held\n")
+    # Seed the parent (source) store with the held commit's objects, as a
+    # store copied from the parent at slot creation would hold them.
+    parent_objects = (
+        Path(git(parent, "rev-parse", "--absolute-git-dir").stdout.strip()) / "objects"
+    )
+    for oid in (
+        held,
+        git(slot, "rev-parse", f"{held}^{{tree}}").stdout.strip(),
+        git(slot, "rev-parse", f"{held}:held.txt").stdout.strip(),
+    ):
+        target = parent_objects / oid[:2] / oid[2:]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(_loose_object(slot, oid), target)
+
+    history = _private_history(slot, base, parent)
+
+    assert history is not None
+    counts = dict(history.counts)
+    assert counts["named refs"] == 2
+    assert counts["dangling, slot-only, kept"] == 1
+    assert counts["dangling, slot-only, past prune expiry"] == 1
+    assert counts["dangling, held by source store"] == 1
+    assert set(history.tips) == {named_branch, named_tag, fresh}
+
+
+def test_private_history_keeps_a_fresh_object_with_an_old_committer_date(
+    tmp_path: Path,
+) -> None:
+    """#1280: age is the object mtime, never the committer date."""
+
+    _origin, parent, slot, base = _kept_set_repos(tmp_path)
+    tree = git(slot, "rev-parse", "HEAD^{tree}").stdout.strip()
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_DATE": "978307200 +0000",
+        "GIT_COMMITTER_DATE": "978307200 +0000",
+    }
+    made = subprocess.run(
+        ["git", "-C", str(slot), "commit-tree", tree, "-p", base],
+        input="ancient committer, fresh object\n",
+        check=True, capture_output=True, text=True, env=env,
+    )
+    commit = made.stdout.strip()
+    git(slot, "reflog", "expire", "--expire=now", "--expire-unreachable=now", "--all")
+    _set_loose_mtime(slot, commit, _KEPT_SET_FIXED_NOW - 60)
+
+    history = _private_history(slot, base, parent)
+
+    assert history is not None
+    assert dict(history.counts)["dangling, slot-only, kept"] == 1
+    assert history.tips == (commit,)
+
+
+def test_private_history_ages_objects_in_an_ordinary_pack_by_pack_mtime(
+    tmp_path: Path,
+) -> None:
+    """#1280: a packed dangling commit ages by its pack file's mtime."""
+
+    _origin, parent, slot, base = _kept_set_repos(tmp_path)
+    commit = _dangling_commit(slot, base, "packed", "packed\n")
+    objects = [line.split(" ", 1)[0] for line in git(slot, "rev-list", "--objects", commit).stdout.splitlines()]
+    pack_dir = _loose_object(slot, commit).parent.parent / "pack"
+    listing = "\n".join(objects) + "\n"
+    subprocess.run(
+        ["git", "-C", str(slot), "pack-objects", str(pack_dir / "pack")],
+        input=listing, check=True, capture_output=True, text=True,
+    )
+    for oid in objects:
+        _loose_object(slot, oid).unlink()
+    pack = next(pack_dir.glob("*.pack"))
+    assert not (pack_dir / f"{pack.stem}.mtimes").exists()
+    os.utime(pack, (_KEPT_SET_OLD, _KEPT_SET_OLD))
+
+    history = _private_history(slot, base, parent)
+
+    assert history is not None
+    assert dict(history.counts)["dangling, slot-only, past prune expiry"] == 1
+    assert history.tips == ()
+
+
+def test_private_history_ages_objects_in_a_cruft_pack_by_mtimes_entry(
+    tmp_path: Path,
+) -> None:
+    """#1280: a cruft-packed dangling commit ages by its own .mtimes entry."""
+
+    _origin, parent, slot, base = _kept_set_repos(tmp_path)
+    commit = _dangling_commit(slot, base, "cruft", "cruft\n")
+    _set_loose_mtime(slot, commit, _KEPT_SET_OLD)
+    git(slot, "repack", "--cruft", "-d")
+    gitdir = Path(git(slot, "rev-parse", "--absolute-git-dir").stdout.strip())
+    assert list((gitdir / "objects" / "pack").glob("*.mtimes"))
+    # Fresh pack files: only the per-object entry can make this old.
+    for pack in (gitdir / "objects" / "pack").glob("*.pack"):
+        os.utime(pack, (_KEPT_SET_FIXED_NOW, _KEPT_SET_FIXED_NOW))
+
+    history = _private_history(slot, base, parent)
+
+    assert history is not None
+    assert dict(history.counts)["dangling, slot-only, past prune expiry"] == 1
+    assert history.tips == ()
+
+
+def _rewrite_reflog_times(slot: Path, ref: str, when: float) -> None:
+    gitdir = Path(git(slot, "rev-parse", "--absolute-git-dir").stdout.strip())
+    log = gitdir / "logs" / ref
+    assert log.is_file(), f"no reflog for {ref}"
+    lines = []
+    for line in log.read_text(encoding="utf-8").splitlines():
+        head, _, message = line.partition("\t")
+        fields = head.split(" ")
+        fields[-2] = str(int(when))
+        lines.append(" ".join(fields) + "\t" + message)
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def test_private_history_splits_stale_tracking_tips_by_push_and_age(
+    tmp_path: Path,
+) -> None:
+    """#1280 (c): pushed tracking tips keep at any age; fetched-only keep while recent."""
+
+    origin, parent, slot, base = _kept_set_repos(tmp_path)
+    source = tmp_path / "kept-stale-source"
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(source)],
+        check=True, capture_output=True, text=True,
+    )
+    git(source, "config", "user.name", "Wrkslots Test")
+    git(source, "config", "user.email", "wrkslots@example.invalid")
+    fetched: dict[str, str] = {}
+    for name in ("recent", "stale"):
+        git(source, "checkout", "-q", "-b", name, base)
+        fetched[name] = commit_local(source, f"{name}.txt", f"{name}\n", name)
+        git(source, "push", "-q", "origin", name)
+        git(source, "checkout", "-q", "main")
+        git(slot, "fetch", "-q", "origin", name)
+        git(source, "push", "-q", "origin", "--delete", name)
+    git(slot, "checkout", "-q", "-b", "pushed-work")
+    pushed = commit_local(slot, "pushed.txt", "pushed\n", "pushed")
+    git(slot, "push", "-q", "origin", "pushed-work")
+    git(slot, "checkout", "-q", "--detach", base)
+    git(slot, "branch", "-q", "-D", "pushed-work")
+    git(source, "push", "-q", "origin", "--delete", "pushed-work")
+    _rewrite_reflog_times(slot, "refs/remotes/origin/recent", _KEPT_SET_FIXED_NOW - 3600)
+    _rewrite_reflog_times(slot, "refs/remotes/origin/stale", _KEPT_SET_OLD)
+    _rewrite_reflog_times(slot, "refs/remotes/origin/pushed-work", _KEPT_SET_OLD)
+
+    history = _private_history(slot, base, parent)
+
+    assert history is not None
+    counts = dict(history.counts)
+    assert counts["stale pushed"] == 1
+    assert counts["stale fetched recent"] == 1
+    assert counts["stale fetched past prune expiry"] == 1
+    assert set(history.tips) == {fetched["recent"], pushed}
+
+
+def test_remote_cover_recognises_advertised_salvage_refs(tmp_path: Path) -> None:
+    """#1280 (a): a commit the remote advertises under refs/salvage/* is covered."""
+
+    origin, _parent, slot, base = _kept_set_repos(tmp_path)
+    source = tmp_path / "kept-salvage-source"
+    subprocess.run(
+        ["git", "clone", "-q", str(origin), str(source)],
+        check=True, capture_output=True, text=True,
+    )
+    git(source, "config", "user.name", "Wrkslots Test")
+    git(source, "config", "user.email", "wrkslots@example.invalid")
+    git(source, "checkout", "-q", "-b", "work", base)
+    commit = commit_local(source, "salvaged.txt", "salvaged\n", "salvaged work")
+    git(source, "push", "-q", "origin", "HEAD:refs/salvage/testhost/slot01/work")
+    git(slot, "fetch", "-q", "origin", "refs/salvage/testhost/slot01/work:refs/remotes/origin/salvage/testhost/slot01/work")
+    vcs = wrkslots._GitVcs()
+    authority = vcs.remote_authority(slot, "origin")
+    covering, _branches = vcs.remote_advertised_covering(slot, "origin", (commit,), authority)
+    assert commit in covering
+
+
+def test_remove_does_not_keep_a_commit_the_remote_advertises_under_a_salvage_ref(
+    tmp_path: Path,
+) -> None:
+    """#1280 (a): advertised refs/salvage/* cover like branches and tags."""
+
+    project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)
+    source = tmp_path / "component-source"
+    git(source, "checkout", "-q", "-b", "salvage-work")
+    commit_local(source, "salvaged.txt", "salvaged\n", "salvaged work")
+    git(source, "push", "-q", "origin", "HEAD:refs/salvage/testhost/slot01/work")
+    git(source, "checkout", "-q", "main")
+    git(
+        component,
+        "fetch",
+        "-q",
+        "origin",
+        "refs/salvage/testhost/slot01/work:refs/remotes/origin/salvage/testhost/slot01/work",
+    )
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    receipt = _drift_receipts(project)["product/component"]
+    assert receipt["disposition"] == "already-published"
+    counts = cast(Mapping[str, object], receipt["private_history_counts"])
+    assert counts["dangling, slot-only, kept"] == 0
+
+
+def test_remove_does_not_keep_a_dangling_commit_past_the_prune_expiry(
+    tmp_path: Path,
+) -> None:
+    """#1280 (b): an expired dangling commit is reported in the receipt, not kept."""
+
+    project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)
+    base = git(component, "rev-parse", "HEAD").stdout.strip()
+    old = _dangling_commit(component, base, "e2eold", "expired\n")
+    _set_loose_mtime(component, old, _KEPT_SET_OLD)
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    receipt = _drift_receipts(project)["product/component"]
+    counts = cast(Mapping[str, object], receipt["private_history_counts"])
+    assert counts["dangling, slot-only, past prune expiry"] == 1
+    assert counts["dangling, slot-only, kept"] == 0
+
+
 def test_remove_counts_declared_submodule_history_the_source_holds(tmp_path: Path) -> None:
     """#1257: a commit the source submodule repository holds needs no remote and no salvage."""
     project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)

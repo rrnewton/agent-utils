@@ -33,6 +33,7 @@ import signal
 import secrets
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -19341,7 +19342,9 @@ class _GitVcs:
         hashes, so a present object is the advertised one), and each of
         ``tips`` that those do not reach but that a commits-only fetch of the
         advertised tips missing locally brings into an empty store
-        (_fetched_proof_store).  Only refs/heads/* and refs/tags/* count; a
+        (_fetched_proof_store).  Only refs/heads/*, refs/tags/* and
+        refs/salvage/* count (#1280: salvage refs are where wrkslots itself
+        publishes, so what they reach is durable); a
         local refs/remotes/* or tag ref may name what the remote has since
         deleted.  Also returns the full names of the branches it advertises.
         The answer shares remote_heads_containing's memo, under a key no
@@ -19403,7 +19406,7 @@ class _GitVcs:
     ) -> tuple[frozenset[str], frozenset[str]]:
         """Ask the remote at ``target``; see remote_advertised_covering."""
 
-        prefixes = ("refs/heads/", "refs/tags/")
+        prefixes = ("refs/heads/", "refs/tags/", "refs/salvage/")
         objects = common / "objects"
         with self._isolated_repository(objects) as (isolated, object_env):
             advertised = {
@@ -24936,6 +24939,8 @@ def _local_salvage_receipt_payload(
     excluded_entries = _excluded_incomplete_history_entries(facts)
     if excluded_entries:
         extra["excluded_incomplete_history"] = excluded_entries
+    if any(count for _key, count in facts.history_counts):
+        extra["private_history_counts"] = _facts_history_counts_obj(facts)
     return {
         **extra,
         "schema": _LOCAL_SALVAGE_RECEIPT_SCHEMA,
@@ -25350,6 +25355,7 @@ def _archive_salvage_locally(
         "archive_ref": archive_ref,
         "complete_history": True,
         "excluded_incomplete_history": _excluded_incomplete_history_entries(facts),
+        "private_history_counts": _facts_history_counts_obj(facts),
         "remote_failure": None if remote_failure is None else str(remote_failure),
         "archive_reason": archive_reason,
         "destination": str(bundle),
@@ -25474,6 +25480,10 @@ class _SalvageCandidate:
     # already incomplete in every store removal may read, so the bundle
     # keeps everything complete without pretending to keep them.
     excluded_incomplete_history: tuple[tuple[str, str], ...] = ()
+    # Kept-commit counts by root type from the private-history scan that
+    # produced this candidate (#1280), kept and reported-not-kept, as
+    # (category, count) in _PRIVATE_HISTORY_COUNT_KEYS order.
+    history_counts: tuple[tuple[str, int], ...] = ()
 
     @property
     def aliased(self) -> bool:
@@ -25514,6 +25524,10 @@ class _PrivateHistory:
     # and how many of the commits only they reach (#1257).
     stale_remote_refs: tuple[tuple[str, str], ...] = ()
     stale_only: int = 0
+    # Every tip classified by root type (#1280), kept and not kept, as
+    # (category, count) in _PRIVATE_HISTORY_COUNT_KEYS order. The not-kept
+    # categories are reported, never silently dropped.
+    counts: tuple[tuple[str, int], ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -26212,6 +26226,248 @@ def _worktree_private_orphan_tips(vcs: _GitVcs, path: Path, kept: str) -> tuple[
     return _commit_tips(vcs, path, positives, negatives)
 
 
+#: Kept-commit categories counted in every salvage receipt (#1280), in
+#: receipt order. The first three stale categories and the last three
+#: dangling ones are the #1255/#1257 publication proof split by root type.
+_PRIVATE_HISTORY_COUNT_KEYS: tuple[str, ...] = (
+    "named refs",
+    "stale pushed",
+    "stale fetched recent",
+    "stale fetched past prune expiry",
+    "dangling, held by source store",
+    "dangling, slot-only, kept",
+    "dangling, slot-only, past prune expiry",
+)
+
+_NOT_KEPT_COUNT_KEYS: tuple[str, ...] = (
+    "stale fetched past prune expiry",
+    "dangling, held by source store",
+    "dangling, slot-only, past prune expiry",
+)
+
+
+def _private_history_counts_obj(
+    counts: Sequence[tuple[str, int]],
+) -> dict[str, object]:
+    """The receipt object for kept-commit ``counts``: every category, zero-filled."""
+
+    by_key = dict(counts)
+    return {key: int(by_key.get(key, 0)) for key in _PRIVATE_HISTORY_COUNT_KEYS}
+
+
+def _facts_history_counts_obj(facts: _SalvageCandidate) -> dict[str, object]:
+    return _private_history_counts_obj(facts.history_counts)
+
+
+_PRUNE_EXPIRE_UNIT_SECONDS: Mapping[str, float] = {
+    "second": 1.0,
+    "minute": 60.0,
+    "hour": 3600.0,
+    "day": 86400.0,
+    "week": 604800.0,
+    "month": 2592000.0,
+    "year": 31536000.0,
+}
+
+
+def _prune_expire_cutoff(vcs: _GitVcs, path: Path, now: float) -> float | None:
+    """The epoch before which a dangling object is past the prune expiry.
+
+    Reads the repository's effective ``gc.pruneExpire`` (Git's default is
+    two weeks), as an absolute epoch cutoff. None means never expires
+    (``gc.pruneExpire=never``). Age is always measured by object mtime,
+    as ``git prune`` measures it, never by committer date (#1280).
+    """
+
+    result = vcs._run(path, ["config", "--get", "gc.pruneExpire"], check=False)
+    value = result.stdout.strip().lower() if result.returncode == 0 else ""
+    if not value:
+        value = "2 weeks ago"
+    if value == "never":
+        return None
+    if value == "now":
+        return now
+    match = re.fullmatch(
+        r"(\d+(?:\.\d+)?)(?:\s*\.?\s*|\s+)(second|minute|hour|day|week|month|year)s?"
+        r"(?:\s*\.?\s*ago)?",
+        value,
+    )
+    if match:
+        amount = float(match.group(1)) * _PRUNE_EXPIRE_UNIT_SECONDS[match.group(2)]
+        return now - amount
+    if re.fullmatch(r"\d+", value):
+        epoch = float(value)
+        # A large bare number is an absolute epoch; a small one is seconds.
+        return epoch if epoch > 100_000_000 else now - epoch
+    # An unparseable value (a date string Git accepts): ask Git itself is
+    # not possible without pruning, so fall back to the default expiry.
+    return now - 2 * _PRUNE_EXPIRE_UNIT_SECONDS["week"]
+
+
+@dataclasses.dataclass(frozen=True)
+class _ReflogEntry:
+    old: str
+    new: str
+    timestamp: float
+    message: str
+
+
+def _reflog_entries_by_ref(
+    directories: Sequence[Path],
+) -> dict[str, tuple[_ReflogEntry, ...]]:
+    """Every reflog entry by the ref its log file names, oldest file order kept."""
+
+    by_ref: dict[str, list[_ReflogEntry]] = {}
+    for directory in dict.fromkeys(directories):
+        logs = directory / "logs"
+        for file in _reflog_files_under(logs):
+            ref = file.relative_to(logs).as_posix()
+            entries = by_ref.setdefault(ref, [])
+            try:
+                contents = file.read_bytes()
+            except OSError:
+                continue
+            for line in contents.decode("utf-8", "replace").splitlines():
+                head, _tab, message = line.partition("\t")
+                fields = head.split(" ")
+                if len(fields) < 4 or not SHA_RE.fullmatch(fields[0]):
+                    continue
+                try:
+                    timestamp = float(fields[-2])
+                except ValueError:
+                    continue
+                entries.append(
+                    _ReflogEntry(fields[0], fields[1], timestamp, message)
+                )
+    return {ref: tuple(entries) for ref, entries in by_ref.items()}
+
+
+def _pack_object_mtimes(objects: Path, wanted: AbstractSet[str]) -> dict[str, float]:
+    """Object mtimes for the ``wanted`` objects held in packs under ``objects``.
+
+    A cruft pack (one with a ``.mtimes`` file) ages each object by its own
+    entry there, in pack-index order; any other pack ages every object it
+    holds by the pack file's mtime (#1280).
+    """
+
+    found: dict[str, float] = {}
+    pack_directory = objects / "pack"
+    if not pack_directory.is_dir():
+        return found
+    for index_path in sorted(pack_directory.glob("*.idx")):
+        try:
+            data = index_path.read_bytes()
+        except OSError:
+            continue
+        if len(data) < 8 + 256 * 4 or data[:4] != b"\xfftOc":
+            continue
+        count = struct.unpack(">I", data[8 + 255 * 4 : 12 + 255 * 4])[0]
+        hash_bytes = 20 if all(len(oid) == 40 for oid in wanted) else 32
+        start = 8 + 256 * 4
+        oids = [
+            data[start + i * hash_bytes : start + (i + 1) * hash_bytes].hex()
+            for i in range(count)
+        ]
+        hits = [(position, oid) for position, oid in enumerate(oids) if oid in wanted]
+        if not hits:
+            continue
+        pack_path = index_path.with_suffix(".pack")
+        mtimes_path = index_path.with_suffix(".mtimes")
+        entries: list[int] | None = None
+        if mtimes_path.is_file():
+            try:
+                raw = mtimes_path.read_bytes()
+                entries = [
+                    struct.unpack(">I", raw[12 + i * 4 : 16 + i * 4])[0]
+                    for i in range(count)
+                ]
+            except (OSError, struct.error):
+                entries = None
+        try:
+            pack_mtime = pack_path.stat().st_mtime
+        except OSError:
+            continue
+        for position, oid in hits:
+            found[oid] = (
+                float(entries[position])
+                if entries is not None and position < len(entries)
+                else pack_mtime
+            )
+    return found
+
+
+def _object_mtime(objects: Path, oid: str, pack_mtimes: Mapping[str, float]) -> float | None:
+    """The mtime Git's prune rule would use for ``oid``, or None if not found."""
+
+    loose = objects / oid[:2] / oid[2:]
+    try:
+        return loose.stat().st_mtime
+    except OSError:
+        pass
+    return pack_mtimes.get(oid)
+
+
+def _held_by_source_store(
+    vcs: _GitVcs,
+    durable: Sequence[Path],
+    candidates: Sequence[str],
+) -> set[str]:
+    """Candidate commits a durable store holds with their root tree (#1280).
+
+    One batch check per durable repository, reading that store's own
+    object directory and its alternates with lazy fetching off. A commit
+    counts only when both the commit and ``<commit>^{tree}`` are present:
+    the source store then holds the objects the commit names, and whether
+    that store later prunes them is its own business. An unreadable store
+    proves nothing and those commits fall back to the age rule.
+    """
+
+    held: set[str] = set()
+    remaining = set(candidates)
+    for repository in durable:
+        if not remaining:
+            break
+        try:
+            objects = vcs.common_directory(repository) / "objects"
+            alternates = _alternate_object_directories(
+                objects, f"durable repository {repository}"
+            )
+            env: dict[str, str] = {
+                "GIT_OBJECT_DIRECTORY": str(objects),
+                "GIT_NO_LAZY_FETCH": "1",
+            }
+            if alternates:
+                env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = os.pathsep.join(
+                    str(item) for item in alternates
+                )
+            listed = vcs._run(
+                repository,
+                ["cat-file", "--batch-check=%(objectname) %(objecttype)"],
+                input_text="".join(
+                    f"{commit}\n{commit}^{{tree}}\n" for commit in sorted(remaining)
+                ),
+                check=False,
+                env_overrides=env,
+            )
+        except Refusal:
+            continue
+        if listed.returncode != 0:
+            continue
+        # The batch answers in input order: commit, then its root tree.
+        ordered = sorted(remaining)
+        lines = listed.stdout.splitlines()
+        if len(lines) != 2 * len(ordered):
+            continue
+        for position, commit in enumerate(ordered):
+            if lines[2 * position].endswith(" missing"):
+                continue
+            if lines[2 * position + 1].endswith(" missing"):
+                continue
+            held.add(commit)
+            remaining.discard(commit)
+    return held
+
+
 def _submodule_private_history(
     vcs: _GitVcs,
     path: Path,
@@ -26219,6 +26475,7 @@ def _submodule_private_history(
     durable: Sequence[Path],
     *,
     remote_cover: Callable[[tuple[str, ...]], _RemoteCoverage] | None = None,
+    now: float | None = None,
 ) -> _PrivateHistory | None:
     """Return the commits that only a slot submodule's own repository holds, if any.
 
@@ -26246,17 +26503,47 @@ def _submodule_private_history(
     git_directory = Path(
         vcs._run(path, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
     )
-    files = _reflog_files_under(common / "logs")
-    if git_directory != common:
-        files.extend(_reflog_files_under(git_directory / "logs"))
-    positives = _reflog_endpoints(files)
-    positives |= _private_pseudoref_commits(vcs, path)
-    positives.update(
-        line.split(" ", 1)[0]
-        for line in vcs._run(path, ["for-each-ref", "--format=%(objectname) %(refname)"])
-        .stdout.splitlines()
-        if line
-    )
+    now_ts = time.time() if now is None else now
+    cutoff = _prune_expire_cutoff(vcs, path, now_ts)
+    reflog_by_ref = _reflog_entries_by_ref((common, git_directory))
+    all_reflog_endpoints: set[str] = set()
+    for entries in reflog_by_ref.values():
+        for entry in entries:
+            all_reflog_endpoints.update(
+                value for value in (entry.old, entry.new) if set(value) != {"0"}
+            )
+    # Roots from reflogs: every ref's entries count, except that a
+    # remote-tracking ref's fetch-recorded endpoints count only while
+    # recent (or when that ref was ever pushed from here), as (e) rules.
+    positives: set[str] = set()
+    for ref, entries in reflog_by_ref.items():
+        if ref.startswith("refs/remotes/"):
+            pushed = any("update by push" in entry.message for entry in entries)
+            for entry in entries:
+                if pushed or cutoff is None or entry.timestamp >= cutoff:
+                    positives.update(
+                        value
+                        for value in (entry.old, entry.new)
+                        if set(value) != {"0"}
+                    )
+        else:
+            for entry in entries:
+                positives.update(
+                    value for value in (entry.old, entry.new) if set(value) != {"0"}
+                )
+    pseudorefs = _private_pseudoref_commits(vcs, path)
+    positives |= pseudorefs
+    ref_commits: dict[str, str] = {}
+    for line in vcs._run(
+        path, ["for-each-ref", "--format=%(objectname) %(*objectname) %(refname)"]
+    ).stdout.splitlines():
+        fields = line.split(" ", 2)
+        if len(fields) != 3:
+            continue
+        direct, peeled, refname = fields
+        positives.add(direct)
+        if SHA_RE.fullmatch(peeled or direct):
+            ref_commits[refname] = peeled or direct
     # Every commit object, named or not (a dropped stash, for one): the whole
     # repository is deleted, so an unreferenced commit is kept too.  The
     # commits salvage itself writes here (committer wrkslots@localhost) are
@@ -26311,7 +26598,96 @@ def _submodule_private_history(
             tips = _commit_tips(vcs, path, positives, negatives, env_overrides=environment)
     if not tips:
         return None
-    return _private_history_summary(vcs, path, tips, negatives, environment, coverage)
+    # Classify every tip by root type (#1280). Only the kept categories
+    # stay tips; the rest are counted and reported, never silently dropped.
+    objects = common / "objects"
+    naming: dict[str, list[str]] = {}
+    for refname, commit in ref_commits.items():
+        naming.setdefault(commit, []).append(refname)
+    dangling = [
+        tip
+        for tip in tips
+        if tip not in naming
+        and tip not in all_reflog_endpoints
+        and tip not in pseudorefs
+    ]
+    held = _held_by_source_store(vcs, durable, dangling) if dangling else set()
+    pack_mtimes = (
+        _pack_object_mtimes(objects, set(dangling)) if dangling else {}
+    )
+    remote_name = None if coverage is None else coverage.remote
+    counts_by_key: dict[str, int] = {key: 0 for key in _PRIVATE_HISTORY_COUNT_KEYS}
+
+    def classify(tip: str) -> tuple[str, bool]:
+        names = naming.get(tip, [])
+        if any(
+            name.startswith(("refs/heads/", "refs/tags/")) or name == "refs/stash"
+            for name in names
+        ):
+            return "named refs", True
+        tracking = [
+            name
+            for name in names
+            if remote_name is not None
+            and name.startswith(f"refs/remotes/{remote_name}/")
+            and name != f"refs/remotes/{remote_name}/HEAD"
+        ]
+        if tracking:
+            if coverage is None or coverage.unchecked is not None or coverage.branches is None:
+                return "named refs", True
+            entries = reflog_by_ref.get(tracking[0], ())
+            if any("update by push" in entry.message for entry in entries):
+                return "stale pushed", True
+            last = max((entry.timestamp for entry in entries), default=None)
+            age_at = (
+                float(last)
+                if last is not None
+                else _object_mtime(objects, tip, pack_mtimes)
+            )
+            if cutoff is None or (age_at is not None and age_at >= cutoff):
+                return "stale fetched recent", True
+            return "stale fetched past prune expiry", False
+        if names or tip in all_reflog_endpoints or tip in pseudorefs:
+            return "named refs", True
+        if tip in held:
+            return "dangling, held by source store", False
+        mtime = _object_mtime(objects, tip, pack_mtimes)
+        if cutoff is not None and mtime is not None and mtime < cutoff:
+            return "dangling, slot-only, past prune expiry", False
+        return "dangling, slot-only, kept", True
+
+    kept_tips: list[str] = []
+    for tip in tips:
+        category, keep = classify(tip)
+        counts_by_key[category] += 1
+        if keep:
+            kept_tips.append(tip)
+    counts = tuple((key, counts_by_key[key]) for key in _PRIVATE_HISTORY_COUNT_KEYS)
+    not_kept = sum(counts_by_key[key] for key in _NOT_KEPT_COUNT_KEYS)
+    if not_kept:
+        detail = ", ".join(
+            f"{key}={counts_by_key[key]}"
+            for key in _NOT_KEPT_COUNT_KEYS
+            if counts_by_key[key]
+        )
+        print(
+            f"wrkslots: private history at {path}: not keeping "
+            f"{not_kept} commit(s) ({detail}); counted in the salvage receipt",
+            file=sys.stderr,
+        )
+    if kept_tips:
+        summary = _private_history_summary(
+            vcs, path, tuple(kept_tips), negatives, environment, coverage
+        )
+        return dataclasses.replace(summary, tips=tuple(kept_tips), counts=counts)
+    return _PrivateHistory(
+        tips=(),
+        commits=0,
+        refs=(),
+        unreferenced=0,
+        remote_unchecked=None if coverage is None else coverage.unchecked,
+        counts=counts,
+    )
 
 
 def _private_history_summary(
@@ -26686,13 +27062,16 @@ def _salvage_candidate_uncached(
         tips = _worktree_private_orphan_tips(vcs, path, facts.commit)
     kept_tips, excluded = _partition_kept_commits(vcs, path, checkout.name, tips)
     extra.extend(tip for tip in kept_tips if tip not in extra)
+    history_counts = () if history is None else history.counts
+    kept_history = history if history is not None and history.tips else None
     if not extra:
-        if not excluded:
+        if not excluded and not history_counts:
             return facts
         return dataclasses.replace(
             facts,
-            private_history=history,
+            private_history=kept_history,
             excluded_incomplete_history=excluded,
+            history_counts=history_counts,
         )
     if facts.shallow is not None:
         raise Refusal(
@@ -26711,8 +27090,9 @@ def _salvage_candidate_uncached(
         commit=commit,
         dirty=True,
         uncommitted_work=uncommitted,
-        private_history=history,
+        private_history=kept_history,
         excluded_incomplete_history=excluded,
+        history_counts=history_counts,
     )
 
 
@@ -28043,6 +28423,7 @@ def _salvage_one_checkout(
             "remote_ref": None,
             "containing_remote_refs": list(containing),
             "excluded_incomplete_history": _excluded_incomplete_history_entries(facts),
+            "private_history_counts": _facts_history_counts_obj(facts),
             **proof,
         }
         if _checkout_is_self_sourced(config, checkout, path, vcs):
@@ -28113,6 +28494,7 @@ def _salvage_one_checkout(
         "remote_ref": salvage_ref,
         "containing_remote_refs": [],
         "excluded_incomplete_history": _excluded_incomplete_history_entries(facts),
+        "private_history_counts": _facts_history_counts_obj(facts),
         "destination": f"{checkout.remote}:{salvage_ref}",
     }
 
@@ -28377,6 +28759,9 @@ def _salvage_agent_slot(
     ] = []
     # Candidates kept with their private history (#1255, #1257).
     private_history_kept: set[str] = set()
+    # Declared submodules whose scan found only reported, not-kept commits
+    # (#1280): their counts still belong in the salvage receipt.
+    reported_history_counts: dict[str, tuple[tuple[str, int], ...]] = {}
     for checkout, path, detached, drift, never_push in candidates:
 
         def derive(keep_private_state: bool) -> _SalvageCandidate:
@@ -28405,7 +28790,7 @@ def _salvage_agent_slot(
             history = _declared_submodule_private_history(
                 config, record, checkout, path, vcs, facts
             )
-            if history is not None:
+            if history is not None and history.tips:
                 if not archive_private_history:
                     raise _private_history_refusal(
                         record.slot, checkout, history, declared=True
@@ -28413,6 +28798,8 @@ def _salvage_agent_slot(
                 never_push = True
                 facts = derive(True)
                 private_history_kept.add(checkout.name)
+            elif history is not None:
+                reported_history_counts[checkout.name] = history.counts
         prepared.append((checkout, path, detached, drift, never_push, facts))
     receipts: list[dict[str, object]] = []
     # Every initialized submodule of this removal, for the proof that a
@@ -28475,30 +28862,35 @@ def _salvage_agent_slot(
             ):
                 receipts.append(dict(stored_receipt))
                 continue
-        receipts.append(
-            _salvage_one_checkout(
-                config,
-                record,
-                checkout,
-                vcs,
-                path_override=path,
-                allow_detached=detached,
-                prepared=facts,
-                archive_root=archive_root,
-                never_push=never_push,
-                gitlink_sources={
-                    source_path.relative_to(path).as_posix(): (source, source_path, source_facts)
-                    for source, source_path, source_facts in submodule_sources
-                    if source_path != path and source_path.is_relative_to(path)
-                },
-                tag_proof=detached,
-                never_push_reason=(
-                    _PRIVATE_HISTORY_ARCHIVE_REASON
-                    if checkout.name in private_history_kept
-                    else _CHECKOUT_DRIFT_ARCHIVE_REASON
-                ),
-            )
+        receipt = _salvage_one_checkout(
+            config,
+            record,
+            checkout,
+            vcs,
+            path_override=path,
+            allow_detached=detached,
+            prepared=facts,
+            archive_root=archive_root,
+            never_push=never_push,
+            gitlink_sources={
+                source_path.relative_to(path).as_posix(): (source, source_path, source_facts)
+                for source, source_path, source_facts in submodule_sources
+                if source_path != path and source_path.is_relative_to(path)
+            },
+            tag_proof=detached,
+            never_push_reason=(
+                _PRIVATE_HISTORY_ARCHIVE_REASON
+                if checkout.name in private_history_kept
+                else _CHECKOUT_DRIFT_ARCHIVE_REASON
+            ),
         )
+        if checkout.name in reported_history_counts and not any(
+            count for _key, count in facts.history_counts
+        ):
+            receipt["private_history_counts"] = _private_history_counts_obj(
+                reported_history_counts[checkout.name]
+            )
+        receipts.append(receipt)
     # Evidence of what refs removal is about to delete, for a later audit
     # (#1256); gathered before the path fence, never a refusal.
     candidates_by_name = {
@@ -28668,6 +29060,7 @@ def _salvage_ownerless_checkout(
             "remote_ref": None,
             "containing_remote_refs": list(containing),
             "excluded_incomplete_history": _excluded_incomplete_history_entries(facts),
+            "private_history_counts": _facts_history_counts_obj(facts),
         }
     if facts.aliased or not _salvage_push_allowed(config, facts.remote_authority):
         return _archive_salvage_locally(
@@ -28700,6 +29093,7 @@ def _salvage_ownerless_checkout(
         "remote_ref": ref,
         "containing_remote_refs": [],
         "excluded_incomplete_history": _excluded_incomplete_history_entries(facts),
+        "private_history_counts": _facts_history_counts_obj(facts),
         "destination": f"{checkout.remote}:{ref}",
     }
 
@@ -48868,7 +49262,7 @@ def _prefetch_remote_containment(
                         )
                     except Refusal:
                         history = None
-                    if history is not None:
+                    if history is not None and history.tips:
                         if not archive_private_history:
                             refusing_names.add(candidate.name)
                         else:
