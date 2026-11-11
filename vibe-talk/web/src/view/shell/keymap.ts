@@ -103,6 +103,7 @@ export interface KeymapActs<Target> {
   copyChordFromKeyboard(): unknown;
   copyFromKeyboard(): unknown;
   nextUnreadFromKeyboard(target: Target): unknown;
+  stepUnreadFromKeyboard(target: Target, direction: number): unknown;
   doneFromKeyboard(target: Target): unknown;
   readCollapseFromKeyboard(target: Target): unknown;
   foldOneFromKeyboard(target: Target): unknown;
@@ -139,7 +140,7 @@ export function createKeymap<Target>(acts: KeymapActs<Target>): KeymapBinding<Ta
     settingsFromKeyboard, keysFromKeyboard, stepFromKeyboard, stepChannel, pickChannel, openFromKeyboard,
     threadFromKeyboard, threadOutFromKeyboard, threadStripFromKeyboard, columnFromKeyboard, replyFromKeyboard, quoteFromKeyboard,
     menuFromKeyboard, readFromKeyboard, detailsFromKeyboard, copyLinkFromKeyboard, deepLinkFromKeyboard, standalone,
-    copyChordFromKeyboard, copyFromKeyboard, nextUnreadFromKeyboard, doneFromKeyboard, readCollapseFromKeyboard, foldOneFromKeyboard,
+    copyChordFromKeyboard, copyFromKeyboard, nextUnreadFromKeyboard, stepUnreadFromKeyboard, doneFromKeyboard, readCollapseFromKeyboard, foldOneFromKeyboard,
     foldStepFromKeyboard, collapsedLinesFromKeyboard, packFromKeyboard, unpackFromKeyboard, bookmarkFromKeyboard,
     bookmarkJumpFromKeyboard, viewFromKeyboard, voiceFromKeyboard, readModeFromKeyboard, filterFromKeyboard,
     undoFromKeyboard, orderFromKeyboard, mainRowsFromKeyboard, columnsFromKeyboard, outlineFromKeyboard, composeFromKeyboard,
@@ -238,6 +239,16 @@ export function createKeymap<Target>(acts: KeymapActs<Target>): KeymapBinding<Ta
       group: KEYS_MOVING, chords: [{ key: "ArrowUp" }, { key: "k" }], repeats: true,
       does: "The previous message",
       run: (_event, target) => stepFromKeyboard(target, -1),
+    },
+    {
+      group: KEYS_MOVING, chords: [{ key: "ArrowDown", shift: true }], repeats: true,
+      does: "The next unread message, skipping read ones",
+      run: (_event, target) => stepUnreadFromKeyboard(target, 1),
+    },
+    {
+      group: KEYS_MOVING, chords: [{ key: "ArrowUp", shift: true }], repeats: true,
+      does: "The previous unread message, skipping read ones",
+      run: (_event, target) => stepUnreadFromKeyboard(target, -1),
     },
     {
       group: KEYS_MOVING, chords: [{ key: "n" }], repeats: true,

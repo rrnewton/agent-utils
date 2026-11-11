@@ -316,6 +316,7 @@ export interface KeyboardComposition<Column extends KeyboardColumn = KeyboardCol
   readonly rowForAct: SelectionKeys<KeyPane>["rowForAct"];
   readonly doneKeys: DoneKeys;
   readonly nextUnreadFromKeyboard: DoneKeys["nextUnreadFromKeyboard"];
+  readonly stepUnreadFromKeyboard: DoneKeys["stepUnreadFromKeyboard"];
   readonly doneFromKeyboard: DoneKeys["doneFromKeyboard"];
   readonly readCollapse: ReadCollapse<KeyPane>;
   readonly readCollapseFromKeyboard: ReadCollapse<KeyPane>["readCollapseFromKeyboard"];
@@ -548,7 +549,7 @@ export function createKeyboardComposition<
     isDone: (id) => deps.isDone(id),
     toggleDone: (ids, row) => deps.guardQuietly(() => deps.toggleArchived(ids, row))(),
   });
-  const { nextUnreadFromKeyboard, doneFromKeyboard } = doneKeys;
+  const { nextUnreadFromKeyboard, stepUnreadFromKeyboard, doneFromKeyboard } = doneKeys;
 
   const readCollapse = createReadCollapse<KeyPane, ReadMark>({
     rowForAct: (target) => rowForAct(target),
@@ -808,6 +809,7 @@ export function createKeyboardComposition<
     copyChordFromKeyboard: () => highlightCopy.copyChordFromKeyboard(),
     copyFromKeyboard: () => highlightCopy.copyFromKeyboard(),
     nextUnreadFromKeyboard: (target) => nextUnreadFromKeyboard(target),
+    stepUnreadFromKeyboard: (target, direction) => stepUnreadFromKeyboard(target, direction),
     doneFromKeyboard: (target) => doneFromKeyboard(target),
     readCollapseFromKeyboard: (target) => readCollapseFromKeyboard(target),
     foldOneFromKeyboard: (target) => foldOneFromKeyboard(target),
@@ -893,7 +895,7 @@ export function createKeyboardComposition<
     keepSelection, inputKinds, pointerSelection,
     drawnBy, keysInUse, onPointerMove, onPointerDown, noteClickedRow, onPaneFocus, selectLanded, followPageScroll,
     focusList, settleFocus, behindThreadList, inColumnGone, scrollKeys, selectionKeys,
-    menuItems, stepFromKeyboard, keyContext, rowForAct, doneKeys, nextUnreadFromKeyboard, doneFromKeyboard,
+    menuItems, stepFromKeyboard, keyContext, rowForAct, doneKeys, nextUnreadFromKeyboard, stepUnreadFromKeyboard, doneFromKeyboard,
     readCollapse, readCollapseFromKeyboard, foldKeys, foldForRead, foldOneFromKeyboard, rowKeys,
     openFromKeyboard, pressRowButton, threadFromKeyboard, leaveThread, threadOutFromKeyboard, columnFromKeyboard,
     replyFromKeyboard, menuFromKeyboard, readFromKeyboard, detailsFromKeyboard, copyLinkFromKeyboard, deepLinkFromKeyboard,

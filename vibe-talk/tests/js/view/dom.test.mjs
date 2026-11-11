@@ -1346,6 +1346,45 @@ test("`#624 voice-page-modularity`: n goes to the next unread row below the sele
   assert.deepStrictEqual(run(() => keys.nextUnreadFromKeyboard({})), [false]);
 });
 
+test("`#1314 unread-step-keys`: Shift+arrows step the selection through unread rows only, and stay with a hint at either end", () => {
+  const { createDoneKeys } = VIEW_SHELL;
+  const log = [];
+  const rowOf = (id, attributes = {}) => ({ id, attributes, getAttribute(name) { return name === "data-id" ? id : this.attributes[name] ?? null; }, hasAttribute(name) { return name in this.attributes; } });
+  const rows = [rowOf("1"), rowOf("2"), rowOf("3"), rowOf("4"), rowOf("5")];
+  const state = { read: new Set(["1", "3", "4"]), row: rows[0] };
+  const keys = createDoneKeys({
+    keyContext: () => ({ pane: "pane", row: state.row }),
+    rowForAct: () => ({ pane: null, row: null, took: false }),
+    paneRows: () => rows,
+    rowInView: () => true,
+    rowIsRead: (row) => state.read.has(row.id),
+    selectRow: (_pane, row) => { state.row = row; log.push(`select ${row.id}`); },
+    setStatus: (text) => log.push(`say ${text}`),
+    paneRowFor: () => null,
+    nearRow: () => null,
+    takeRow: () => {},
+    bringIntoView: () => {},
+    idsOf: (row) => [row.id],
+    isDone: () => false,
+    toggleDone: () => {},
+  });
+  const run = (act) => { log.length = 0; return [act(), ...log]; };
+  // Down: only the unread rows, in order (2, then 5), then the end stop.
+  assert.deepStrictEqual(run(() => keys.stepUnreadFromKeyboard({}, 1)), [true, "select 2"], "Shift+Down did not skip the read rows below");
+  assert.deepStrictEqual(run(() => keys.stepUnreadFromKeyboard({}, 1)), [true, "select 5"], "Shift+Down stopped on a read row");
+  assert.deepStrictEqual(run(() => keys.stepUnreadFromKeyboard({}, 1)), [true, "say No more unread below."], "Shift+Down at the last unread did not stay with the hint");
+  assert.equal(state.row.id, "5", "the selection moved at the end");
+  // Up: back the same way (2), then the end stop above.
+  assert.deepStrictEqual(run(() => keys.stepUnreadFromKeyboard({}, -1)), [true, "select 2"], "Shift+Up did not skip the read rows above");
+  assert.deepStrictEqual(run(() => keys.stepUnreadFromKeyboard({}, -1)), [true, "say No more unread above."], "Shift+Up at the first unread did not stay with the hint");
+  assert.equal(state.row.id, "2");
+  // No selection: down starts below the screen's top; up finds nothing above it and says so.
+  state.row = null;
+  assert.deepStrictEqual(run(() => keys.stepUnreadFromKeyboard({}, 1)), [true, "select 2"]);
+  state.row = null;
+  assert.deepStrictEqual(run(() => keys.stepUnreadFromKeyboard({}, -1)), [true, "say No more unread above."], "Shift+Up with nothing selected went somewhere");
+});
+
 test("`#624 voice-page-modularity`: Shift+E's fold keeps the reader's place, and Shift+O folds a message away, marks it Done and steps above it", () => {
   const { createFoldKeys } = VIEW_SHELL;
   const log = [];
@@ -2060,7 +2099,7 @@ test("`#624 voice-page-modularity`: the keymap lists every key in a group, hands
     "nextUnreadFromKeyboard", "onEscape", "openFromKeyboard", "orderFromKeyboard", "outlineFromKeyboard", "packFromKeyboard", "pickChannel",
     "placeFromKeyboard", "pressRowButton", "readCollapseFromKeyboard", "readFromKeyboard", "readModeFromKeyboard",
     "quoteFromKeyboard",
-    "replyFromKeyboard", "searchFromAnywhere", "searchFromKeyboard", "settingsFromKeyboard", "stepChannel", "stepFromKeyboard",
+    "replyFromKeyboard", "searchFromAnywhere", "searchFromKeyboard", "settingsFromKeyboard", "stepChannel", "stepFromKeyboard", "stepUnreadFromKeyboard",
     "threadFromKeyboard", "threadOutFromKeyboard", "threadStripFromKeyboard", "undoFromKeyboard", "unpackFromKeyboard",
     "viewFromKeyboard", "voiceFromKeyboard", "writeFromKeyboard"];
   const wording = ["chatServiceName", "manyChatServices", "maxCollapsedLines", "minCollapsedLines", "modKeyName", "standalone",
@@ -2069,6 +2108,9 @@ test("`#624 voice-page-modularity`: the keymap lists every key in a group, hands
   // What the list says asks the page for the reader's words.
   assert.ok(words.includes("Cmd+[ goes back") && words.includes("Copy its link in Chat:") && words.includes("in turn: Newest, Oldest.") &&
     words.includes("everywhere: 0 to 8 lines"), "the list of keys does not say the chords, the service, the orders or the bounds from the page");
+  // `#1314 unread-step-keys`. The shortcuts help lists the unread steps.
+  assert.ok(words.includes("The next unread message, skipping read ones") && words.includes("The previous unread message, skipping read ones"),
+    "the list of keys does not say the Shift+arrow unread steps");
   answers.manyChatServices = true;
   assert.ok(keymap.map((binding) => (typeof binding.does === "function" ? binding.does() : "")).join("\n").includes("Copy its link in its chat service:"));
 });

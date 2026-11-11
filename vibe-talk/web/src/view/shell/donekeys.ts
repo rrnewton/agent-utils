@@ -48,6 +48,11 @@ export interface DoneKeys {
   /** n: the next unread message below the selected one, or below the top of the screen. */
   nextUnreadFromKeyboard(target: HTMLElement): boolean;
   /**
+   * Shift+ArrowDown / Shift+ArrowUp (`#1314 unread-step-keys`): the next or previous unread message
+   * in the view, skipping read ones; at either end the selection stays and a hint says so.
+   */
+  stepUnreadFromKeyboard(target: HTMLElement, direction: number): boolean;
+  /**
    * e, and Ctrl+E (Cmd+E): Done or not Done, the act of the row's Done button; marked Done, on to the
    * next unread below (question 2).
    *
@@ -66,6 +71,10 @@ export function createDoneKeys<Pane>(deps: DoneKeysDependencies<Pane>): DoneKeys
    * unpack-row-parity`: its messages unpacked under it are rows of their own, read by the same rule).
    */
   const unreadAfter = (rows: HTMLElement[], at: number): HTMLElement | null => rows.slice(at + 1).find((row) =>
+    (row.hasAttribute("data-card") ? !row.hasAttribute("data-thread-read") : !deps.rowIsRead(row))) || null;
+
+  /** The last unread message before `at` in `rows`, by the same rule as `unreadAfter`. */
+  const unreadBefore = (rows: HTMLElement[], at: number): HTMLElement | null => rows.slice(0, Math.max(at, 0)).reverse().find((row) =>
     (row.hasAttribute("data-card") ? !row.hasAttribute("data-thread-read") : !deps.rowIsRead(row))) || null;
 
   /**
@@ -96,6 +105,22 @@ export function createDoneKeys<Pane>(deps: DoneKeysDependencies<Pane>): DoneKeys
       const next = unreadAfter(rows, from);
       if (next) deps.selectRow(pane, next);
       else deps.setStatus("Nothing unread below.");
+      return true;
+    },
+    stepUnreadFromKeyboard(target, direction) {
+      const { pane, row } = deps.keyContext(target);
+      const rows = pane ? deps.paneRows(pane) : [];
+      if (!pane || rows.length === 0) return false;
+      let from = row && deps.rowInView(pane, row) ? rows.indexOf(row) : -1;
+      let upTo = from;
+      if (from < 0) {
+        const seen = rows.findIndex((one) => deps.rowInView(pane, one));
+        from = seen < 0 ? -1 : seen - 1;
+        upTo = seen < 0 ? rows.length : seen;
+      }
+      const next = direction > 0 ? unreadAfter(rows, from) : unreadBefore(rows, upTo);
+      if (next) deps.selectRow(pane, next);
+      else deps.setStatus(direction > 0 ? "No more unread below." : "No more unread above.");
       return true;
     },
     doneFromKeyboard(target) {
