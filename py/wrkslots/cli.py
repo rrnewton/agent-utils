@@ -564,6 +564,7 @@ OPTIONAL_CONFIG_KEYS = frozenset(
         "disk_emergency_bytes",
         "slot_representation",
         "retire_freeze",
+        "proc_scan_bound_seconds",
         "image",
         "sandbox",
         "worktrees_image",
@@ -667,6 +668,12 @@ CONFIG_KEY_DOCS: dict[str, str] = {
     "retire_freeze": (
         "When set, every retirement and removal on this host refuses with code retire-freeze "
         "and this reason. Managed by `wrkslots freeze`; absent means unfrozen."
+    ),
+    "proc_scan_bound_seconds": (
+        "CPU-time bound in seconds for one in-process /proc process-use census during "
+        "removal. Absent means a host-scaled default (30 s plus 10 s per 1,000 live "
+        "processes); the WRKSLOTS_PROC_SCAN_BOUND_SECONDS environment variable overrides "
+        "both. An exceeded bound still refuses as indeterminate."
     ),
     "salvage_push_remotes": (
         "Remote URLs that removal may push salvage commits to. Absent or empty allows none: "
@@ -885,6 +892,51 @@ def _absent_census_stderr_bytes(process_count: int) -> int:
     )
 
 
+def _as_bound_seconds(value: object, label: str) -> float:
+    """One positive finite seconds bound from configuration or the environment."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise Refusal(f"{label} must be a number of seconds")
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise Refusal(f"{label} must be a positive finite number of seconds")
+    return seconds
+
+
+#: Floor and per-thousand-processes allowance of one /proc census bound.
+#: The allowance follows the measured same-UID census costs recorded with
+#: the validate-batch bounds above: 1.1-1.3 s at about 4,000 processes
+#: idle, 11 s at load 42-68, and 32 to over 52 s at load 170-222 with
+#: 4,700-5,000 processes -- about 10 ms of CPU per process at the worst
+#: measured load. At 6,723 processes the default bound is about 97 s.
+_PROC_SCAN_FLOOR_SECONDS = 30.0
+_PROC_SCAN_PER_THOUSAND_PROCESSES_SECONDS = 10.0
+
+
+def _proc_scan_bound_seconds(config: Config | None = None) -> float:
+    """CPU-time bound for one in-process /proc process-use census (#1332).
+
+    Resolution: the WRKSLOTS_PROC_SCAN_BOUND_SECONDS environment override,
+    then the proc_scan_bound_seconds configuration key, then the
+    host-scaled default (the floor plus the per-thousand allowance over
+    the live process count). An exceeded bound still refuses as
+    indeterminate; only its size resolves here.
+    """
+
+    raw = os.environ.get("WRKSLOTS_PROC_SCAN_BOUND_SECONDS")
+    if raw is not None:
+        try:
+            value: object = float(raw)
+        except ValueError:
+            value = raw
+        return _as_bound_seconds(value, "WRKSLOTS_PROC_SCAN_BOUND_SECONDS")
+    if config is not None and config.proc_scan_bound_seconds is not None:
+        return config.proc_scan_bound_seconds
+    return _PROC_SCAN_FLOOR_SECONDS + _PROC_SCAN_PER_THOUSAND_PROCESSES_SECONDS * (
+        _host_process_count() / 1000.0
+    )
+
+
 def _host_process_count() -> int:
     """Live process count, the scale factor for host-wide census output."""
 
@@ -1074,9 +1126,8 @@ _CREDENTIAL_PACING_POLL_SECONDS = 5.0
 # Bounds on the ls-remote and on the commits-only fetch of that check.
 _REMOTE_CONTAINMENT_LIST_SECONDS = 60.0
 _REMOTE_CONTAINMENT_FETCH_SECONDS = 300.0
-# The bound on one in-process /proc scan, which is also held to the remaining
-# item budget.
-_AGENT_REMOVE_BATCH_SCAN_SECONDS = 30.0
+# The bound on one in-process /proc scan is the host-scaled, configurable
+# _proc_scan_bound_seconds (#1332), also held to the remaining item budget.
 _AGENT_REMOVE_BATCH_TERM_GRACE_SECONDS = 5.0
 _AGENT_REMOVE_BATCH_REAP_SECONDS = 5.0
 _READ_ONLY_COMMAND_REAP_SECONDS = 1.0
@@ -1247,6 +1298,7 @@ class Config:
     #: slot). Existing slots keep whatever representation they were created
     #: with; see slotimage.py.
     retire_freeze: str | None = None
+    proc_scan_bound_seconds: float | None = None
     slot_representation: str = "worktree"
     image_settings: slotimage.ImageSettings = slotimage.ImageSettings()
     sandbox_settings: sandbox.SandboxSettings = sandbox.SandboxSettings()
@@ -4529,6 +4581,13 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
             None
             if raw.get("retire_freeze") is None
             else _as_str(raw["retire_freeze"], "configuration.retire_freeze")
+        ),
+        proc_scan_bound_seconds=(
+            None
+            if raw.get("proc_scan_bound_seconds") is None
+            else _as_bound_seconds(
+                raw["proc_scan_bound_seconds"], "configuration.proc_scan_bound_seconds"
+            )
         ),
         slot_representation=_parse_slot_representation(raw),
         image_settings=_parse_image_settings(raw),
@@ -54499,13 +54558,14 @@ def _run_item_scan(
 ) -> _ScanResult:
     """Run one process-use scan of a remove-agent-batch item within its bounds.
 
-    The scan receives ``seconds`` (by default _AGENT_REMOVE_BATCH_SCAN_SECONDS),
+    The scan receives ``seconds`` (by default the resolved census bound,
+    _proc_scan_bound_seconds),
     or the item budget that remains when that is less, plus ``grace``.  When
     the item budget is what runs out, the item is refused for its budget.
     """
 
     if seconds is None:
-        seconds = _AGENT_REMOVE_BATCH_SCAN_SECONDS
+        seconds = _proc_scan_bound_seconds()
     item_left = _item_seconds_left(what)
     limited_by_item = item_left is not None and item_left < seconds
     wait = (item_left if limited_by_item and item_left is not None else seconds) + grace
@@ -54641,6 +54701,9 @@ class _AgentRemoveBatchContext:
     item_seconds: float = dataclasses.field(
         default_factory=lambda: _AGENT_REMOVE_BATCH_ITEM_SECONDS
     )
+    proc_scan_seconds: float = dataclasses.field(
+        default_factory=_proc_scan_bound_seconds
+    )
     last_seconds_before_deletion: float | None = None
     # The item's budget, created on its first deadline entry and resumed
     # when its removal continues outside the registry lock (#894), so the
@@ -54747,10 +54810,10 @@ class _AgentRemoveBatchContext:
         try:
             verdicts = _run_bounded_scan(
                 lambda cancel: _agent_batch_group_fenced_uses(members, cancel=cancel),
-                seconds=_AGENT_REMOVE_BATCH_SCAN_SECONDS,
+                seconds=self.proc_scan_seconds,
                 on_timeout=lambda: Refusal(
                     "the group's /proc scan after the fences exceeded its "
-                    f"{_AGENT_REMOVE_BATCH_SCAN_SECONDS:g}-second bound"
+                    f"{self.proc_scan_seconds:g}-second bound"
                 ),
             )
         except Refusal as exc:
@@ -54875,10 +54938,10 @@ class _AgentRemoveBatchContext:
         try:
             self.fresh = _run_bounded_scan(
                 lambda _cancel: _agent_batch_fresh_uses(targets),
-                seconds=_AGENT_REMOVE_BATCH_SCAN_SECONDS,
+                seconds=self.proc_scan_seconds,
                 on_timeout=lambda: Refusal(
                     "the shared /proc walk exceeded its "
-                    f"{_AGENT_REMOVE_BATCH_SCAN_SECONDS:g}-second bound"
+                    f"{self.proc_scan_seconds:g}-second bound"
                 ),
             )
             self.fresh_walk_error = None
@@ -54947,6 +55010,7 @@ class _AgentRemoveBatchContext:
                     check_path, record, capture_generation=capture_generation
                 ),
                 "the /proc scan before the path fence",
+                seconds=self.proc_scan_seconds,
             )
         finally:
             self.fresh_scan_seconds += time.monotonic() - started
@@ -55038,6 +55102,7 @@ class _AgentRemoveBatchContext:
                         whole_device=image_file is not None,
                     ),
                     "the /proc scan after the path fence",
+                    seconds=self.proc_scan_seconds,
                 )
             finally:
                 self.fenced_scan_seconds += time.monotonic() - started
@@ -55154,6 +55219,7 @@ def _single_remove_agent_batch(
             len(record.checkouts),
             _salvage_submodule_count(config, record, _GitVcs()),
         ),
+        proc_scan_seconds=_proc_scan_bound_seconds(config),
     )
     context.capture([slot_path])
     return context
@@ -55455,7 +55521,9 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
         identities[slot_path] = identity
         eligible.append((slot, generation, slot_path))
     context = _AgentRemoveBatchContext(
-        identities, image_targets=image_targets
+        identities,
+        image_targets=image_targets,
+        proc_scan_seconds=_proc_scan_bound_seconds(config),
     )
     remaining_targets = [slot_path for _slot, _generation, slot_path in eligible]
     error: str | None = None

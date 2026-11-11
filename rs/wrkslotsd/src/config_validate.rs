@@ -31,7 +31,7 @@ const REQUIRED: [&str; 6] = [
     "heartbeat_ttl_seconds",
     "liveness_command",
 ];
-const OPTIONAL: [&str; 21] = [
+const OPTIONAL: [&str; 22] = [
     "machine",
     "liveness_batch_command",
     "max_active_slots",
@@ -48,6 +48,7 @@ const OPTIONAL: [&str; 21] = [
     "disk_emergency_bytes",
     "slot_representation",
     "retire_freeze",
+    "proc_scan_bound_seconds",
     "image",
     "sandbox",
     "worktrees_image",
