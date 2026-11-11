@@ -1,6 +1,6 @@
 ---
 title: 'documents-list-cards: one-line card meta, bottom filter chips, no duplicate documents'
-status: open
+status: closed
 priority: 1
 issue_type: task
 assignee: mu-doclist
@@ -69,3 +69,7 @@ lane keeps its change to list-card layout, chips placement and dedupe.
   same-document-different-URL).
 - Selected validation passes locally before the owner-tier gate; the gate
   passes or pre-existing reds are proven on a clean github/main checkout.
+
+## Resolution
+
+Landed 3935b9df on github/main. (A) Card meta is one ellipsising line with mentions as linked text opening the same pop-up. (B) Filter chips are the list's last row, visible on open at the bottom (no sticky: the scroller containment guard forbids positioned escapes). (C) Client dedupe by document identity (owner/repo+path, ref ignored) with unioned mentions; the server key still carries the ref, filed here as the deeper canonicalisation follow-up if wanted server-side. Chips API: one `.doc-buckets` bar from bucketBar() for the star lane to extend.
