@@ -173,9 +173,11 @@ export interface ElementById {
   "docs-show-hidden": HTMLButtonElement;
   "docs-show-hidden-label": HTMLSpanElement;
   "docs-since": HTMLDivElement;
+  "docs-since-cancel": HTMLButtonElement;
   "docs-since-days": HTMLInputElement;
   "docs-since-go": HTMLButtonElement;
   "docs-since-hours": HTMLInputElement;
+  "docs-since-title": HTMLParagraphElement;
   "documents-list": HTMLDivElement;
   "draft-chip": HTMLButtonElement;
   "draft-chip-label": HTMLSpanElement;

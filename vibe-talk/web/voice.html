@@ -778,11 +778,6 @@
                  its DOM from this file. -->
             <div id="pane-docs" hidden>
               <div id="docs-list-view">
-                <div id="docs-since" class="docs-since" hidden>
-            <label>Days <input id="docs-since-days" type="number" value="1" min="0" max="365" autocomplete="off" data-form-type="other" data-lpignore="true" data-1p-ignore="true"></label>
-            <label>Hours <input id="docs-since-hours" type="number" value="0" min="0" max="23" autocomplete="off" data-form-type="other" data-lpignore="true" data-1p-ignore="true"></label>
-            <button id="docs-since-go" type="button">Fetch</button>
-          </div>
                 <div id="docs-mentions" class="docs-mentions" hidden></div>
                 <!-- `#1266 documents-search`: search only the fetched documents,
                      through the server's documents scope; the note states how
@@ -4355,6 +4350,22 @@
             <button id="docs-fetch-since" type="button" data-act="since">Fetch since…</button>
             <button id="docs-fetch-refresh" type="button" data-act="refresh">Refresh</button>
             <button id="docs-fetch-clear" type="button" data-act="clear">Clear cached documents</button>
+          </div>
+          <!-- Fetch since… (`#1308 doc-fetch-since-prompt`): the since-when prompt lives with
+               the Fetch menu in the bar, NOT at the top of the list in the scroller, so it is
+               on screen and focused wherever the list is scrolled. Its card is fixed to the
+               viewport (`21-documents.css`); the view unhides and focuses it, Cancel or a
+               Fetch press puts it away fetching nothing. -->
+          <div id="docs-since" class="docs-since" role="dialog" aria-labelledby="docs-since-title" hidden>
+            <p id="docs-since-title" class="docs-since-title">Fetch documents mentioned since…</p>
+            <div class="docs-since-fields">
+              <label>Days <input id="docs-since-days" type="number" value="1" min="0" max="365" autocomplete="off" data-form-type="other" data-lpignore="true" data-1p-ignore="true"></label>
+              <label>Hours <input id="docs-since-hours" type="number" value="0" min="0" max="23" autocomplete="off" data-form-type="other" data-lpignore="true" data-1p-ignore="true"></label>
+            </div>
+            <div class="docs-since-actions">
+              <button id="docs-since-go" type="button">Fetch</button>
+              <button id="docs-since-cancel" type="button">Cancel</button>
+            </div>
           </div>
         </div>
       </div>

@@ -310,9 +310,8 @@
   cursor: pointer;
 }
 
-/* The Fetch drop-up and its Fetch since… panel, above the bar at its right end. */
-.docs-menu,
-.docs-since {
+/* The Fetch drop-up, above the bar at its right end. */
+.docs-menu {
   position: absolute;
   bottom: calc(100% + 6px);
   right: 8px;
@@ -334,14 +333,50 @@
   top: calc(100% + 6px);
   bottom: auto;
 }
+/* The Fetch since… prompt (`#1308 doc-fetch-since-prompt`): a framed card fixed
+   to the viewport above the bar's right end, in the popovers' dress (the tab
+   row's opaque dock ground, edge and lift). It used to be a plain row at the
+   top of the list inside the scroller — off-screen wherever the list was
+   scrolled to its newest end, so choosing the menu item visibly did nothing.
+   Fixed here it is where the thumb already is, on a phone and a desk alike,
+   however far the list has scrolled; the bottom room clears the bar row, and
+   with the bar moved to the header the card stays at this same corner. */
 .docs-since {
-  position: static;
-  flex-direction: row;
+  position: fixed;
+  right: calc(8px + env(safe-area-inset-right));
+  bottom: calc(5.5rem + env(safe-area-inset-bottom));
+  width: min(22rem, calc(100vw - 16px));
+  z-index: var(--z-modal);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  background: var(--dock);
+  border: 1px solid var(--edge);
+  border-radius: 12px;
+  box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 35%);
+}
+.docs-since-title {
+  margin: 0;
+  font-weight: 600;
+}
+.docs-since-fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
   align-items: center;
-  margin: 0 0 8px;
 }
 .docs-since input {
   width: 4em;
+}
+.docs-since-actions {
+  display: flex;
+  gap: 8px;
+}
+.docs-since-actions button {
+  min-height: 36px;
+  padding: 6px 14px;
+  cursor: pointer;
 }
 .doc-empty {
   padding: 12px;

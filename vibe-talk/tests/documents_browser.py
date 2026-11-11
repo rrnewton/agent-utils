@@ -19,6 +19,11 @@ at 1280x800 (mouse) the Outline button opens the pop-up, an entry tap/click
 jumps to its heading, the HERE mark follows scrolling, and the title links
 to the document's original source in a new tab.
 
+The Fetch since… steps cover `#1308 doc-fetch-since-prompt`: scrolled to
+the bottom at both sizes, the prompt card is fixed inside the viewport and
+focused, Cancel fetches nothing, a 0d/0h confirmation matches nothing, and
+a confirmation spanning the seeded mentions fetches them.
+
 The last steps cover `#1265 documents-star-hide`: starring from a card and
 the reader header, persistence across reload and through the server's
 synced settings to a fresh device, the Starred chip, a real touch swipe to
@@ -207,6 +212,35 @@ def check_star_gold(label: str, off: dict[str, str], on: dict[str, str]) -> None
           f"the {label}'s starred and unstarred colours are the same: off {off}, on {on}")
 
 
+def check_fetch_since_prompt(page: Page, width: int, height: int, use_touch: bool) -> None:
+    """Fetch since… presents its since-when prompt in the viewport
+    (`#1308 doc-fetch-since-prompt`): with the list scrolled to its newest
+    (bottom) end the card is fixed on screen, asks since when, holds the
+    focus, and Cancel puts it away."""
+    press = page.tap if use_touch else page.click
+    page.evaluate(
+        "() => { const root = document.getElementById('scroll-area');"
+        " root.scrollTop = root.scrollHeight; }")
+    press("#docs-fetch")
+    page.wait_for_selector("#docs-fetch-menu", state="visible", timeout=20_000)
+    press("#docs-fetch-since")
+    page.wait_for_selector("#docs-since", state="visible", timeout=20_000)
+    check("Fetch documents mentioned since" in (page.locator("#docs-since-title").text_content() or ""),
+          "the prompt does not ask since when")
+    position = page.evaluate(
+        "() => getComputedStyle(document.getElementById('docs-since')).position")
+    check(position == "fixed", f"the prompt is not fixed to the viewport (position: {position})")
+    box = page.locator("#docs-since").bounding_box()
+    check(box is not None and box["x"] >= 0 and box["y"] >= 0
+          and box["x"] + box["width"] <= width and box["y"] + box["height"] <= height,
+          f"the prompt is not inside the {width}x{height} viewport: {box}")
+    page.wait_for_function(
+        "() => document.activeElement && document.activeElement.id === 'docs-since-days'",
+        timeout=20_000)
+    press("#docs-since-cancel")
+    page.wait_for_selector("#docs-since", state="hidden", timeout=20_000)
+
+
 def check_doc_search(page: Page, width: int, height: int) -> None:
     """Fetched-documents search (`#1266 documents-search`): a result, the
     stated reach, and the reader opened at the highlighted match."""
@@ -293,6 +327,45 @@ def main() -> int:
                 check(page.locator("#documents-list .doc-card").count() == 3, "the list did not draw every row")
                 check("demo-doc" in (page.locator("#documents-list").text_content() or ""),
                       "the list does not name its document")
+
+                # Fetch since… (`#1308`): the prompt is in view at the
+                # bottom of the list; Cancel fetched nothing (every row
+                # still unfetched below). Confirming 0d/0h matches nothing;
+                # confirming a span covering the seeded mentions (the fake
+                # message's snowflake dates them years back, so the span is
+                # measured from their own mention time) fetches the paste
+                # and the guide, while the broken row's fetch fails alone.
+                check_fetch_since_prompt(page, 393, 852, use_touch=True)
+                still = {d["file_name"]: d for d in cast(
+                    list[dict[str, object]],
+                    call(base, "GET", "/api/v1/documents?limit=10", READ_TOKEN)["documents"])}
+                check(all(d["fetched"] is False for d in still.values()),
+                      f"cancelling the since prompt fetched a document: {still}")
+                mentioned_ms = by_file["demo-doc"]["last_mentioned_ms"]
+                assert isinstance(mentioned_ms, (int, float))
+                cover_days = str(int((time.time() * 1000 - mentioned_ms) // 86_400_000) + 1)
+                for days, hours in (("0", "0"), (cover_days, "0")):
+                    page.tap("#docs-fetch")
+                    page.wait_for_selector("#docs-fetch-menu", state="visible", timeout=20_000)
+                    page.tap("#docs-fetch-since")
+                    page.wait_for_selector("#docs-since", state="visible", timeout=20_000)
+                    page.fill("#docs-since-days", days)
+                    page.fill("#docs-since-hours", hours)
+                    page.tap("#docs-since-go")
+                    page.wait_for_selector("#docs-since", state="hidden", timeout=20_000)
+                    page.wait_for_function(
+                        "() => !document.getElementById('docs-fetch').disabled", timeout=20_000)
+                    landed = {d["file_name"]: d for d in cast(
+                        list[dict[str, object]],
+                        call(base, "GET", "/api/v1/documents?limit=10", READ_TOKEN)["documents"])}
+                    if days == "0":
+                        check(all(d["fetched"] is False for d in landed.values()),
+                              f"a 0d/0h since fetch fetched a document: {landed}")
+                    else:
+                        check(landed["demo-doc"]["fetched"] is True
+                              and landed["guide.md"]["fetched"] is True
+                              and landed["broken.md"]["fetched"] is False,
+                              f"the covering since fetch landed the wrong documents: {landed}")
 
                 # The bar's Fetch drop-up: Fetch visible, with a result said.
                 page.tap("#docs-fetch")
@@ -517,6 +590,8 @@ def main() -> int:
                     f"try {{ localStorage.setItem('vibe-talk.token', {json.dumps(WRITE_TOKEN)}); }} catch (e) {{}}")
                 dpage.goto(base + "/?v=docs", wait_until="load")
                 dpage.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                # The since prompt at desktop size too (`#1308`).
+                check_fetch_since_prompt(dpage, 1280, 800, use_touch=False)
                 dpage.locator("#documents-list .doc-card", has_text="demo-doc").click()
                 dpage.wait_for_selector("#doc-body h1", timeout=20_000)
                 check(dpage.locator("#doc-title a").get_attribute("href")

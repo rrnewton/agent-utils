@@ -342,7 +342,8 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
       const open = menu.hidden;
       menu.hidden = !open;
       button.setAttribute("aria-expanded", String(open));
-      if (!open) since.hidden = true;
+      // A Fetch press puts the since prompt away, fetching nothing (`#1308`).
+      since.hidden = true;
     });
     for (const item of ["docs-fetch-visible", "docs-fetch-since", "docs-fetch-refresh", "docs-fetch-clear"].map(
       (id) => deps.byId(id),
@@ -355,7 +356,19 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
           clearArmed = false;
         }
         if (act === "visible") reportFetching((progress) => list.fetchVisible(progress));
-        else if (act === "since") since.hidden = false;
+        else if (act === "since") {
+          // Ask since when where the owner is looking (`#1308`): the prompt
+          // card is fixed to the viewport, and its first field takes the
+          // focus (its value selected, ready to overtype).
+          since.hidden = false;
+          try {
+            const days = deps.byId("docs-since-days") as HTMLInputElement;
+            days.focus();
+            if (typeof days.select === "function") days.select();
+          } catch {
+            // A host whose field cannot take the focus still shows the prompt.
+          }
+        }
         else if (act === "refresh") {
           setBusy(true, "Refreshing…");
           list
@@ -401,6 +414,10 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     } catch {
       // A host without the hamburger item keeps the list as it was.
     }
+    // Cancel puts the prompt away and fetches nothing (`#1308`).
+    listening.listen(deps.byId("docs-since-cancel"), "click", () => {
+      since.hidden = true;
+    });
     listening.listen(deps.byId("docs-since-go"), "click", () => {
       const days = Number((deps.byId("docs-since-days") as HTMLInputElement).value) || 0;
       const hours = Number((deps.byId("docs-since-hours") as HTMLInputElement).value) || 0;

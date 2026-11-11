@@ -1480,7 +1480,11 @@ async function withDocumentsView(options, run) {
     "doc-b": { title: "Doc B", content: "# Doc B\n\nBeta.\n" },
   };
   const opened = [];
-  const api = async (path) => {
+  const api = async (path, callOptions) => {
+    if (options.onApi) {
+      const answered = await options.onApi(path, callOptions);
+      if (answered !== undefined) return answered;
+    }
     if (String(path).startsWith("/api/v1/documents?")) {
       if (options.listGate) await options.listGate;
       return { documents: options.listRows ?? [], total: (options.listRows ?? []).length, revision: 1 };
@@ -1502,6 +1506,7 @@ async function withDocumentsView(options, run) {
     readDocument: (doc) => { reads.push(doc); },
     stopSpeaking: (key) => { stops.push(key); },
     ...(options.onBack ? { onBack: options.onBack } : {}),
+    ...(options.onStatus ? { onStatus: options.onStatus } : {}),
   });
   const savedDocument = globalThis.document;
   globalThis.document = {
@@ -2080,5 +2085,146 @@ test("documents reader: the header star toggles the open document's star", async
     assert.equal(view.showHidden(), false);
     view.setShowHidden(true);
     assert.equal(view.showHidden(), true);
+  });
+});
+
+// ---- 9. Fetch since: cutoff, pooled progress, the prompt (`#1308 doc-fetch-since-prompt`) ----
+//
+// The fetch half is the `#1307` shape shared with Fetch visible: a pool of
+// four, each card patched from its own POST's answer as it lands, progress
+// per landing, and no full refresh at the end. The prompt half is the view's
+// wiring: the menu item unhides the (viewport-fixed) card and focuses its
+// first field; Cancel — or a Fetch press — puts it away fetching nothing.
+
+test("documents list: fetchSince fetches only at/after the cutoff, four at a time, patching rows as they land (#1308)", async () => {
+  const unfetched = (key, ms) => ({ ...docRow(key, ms), fetched: false, fetched_ms: null });
+  const rows = [
+    unfetched("too-old", 999),
+    unfetched("at-cutoff", 1000),
+    unfetched("recent-a", 2000),
+    unfetched("recent-b", 3000),
+    unfetched("recent-c", 4000),
+    unfetched("recent-d", 5000),
+    unfetched("recent-e", 6000),
+    docRow("already", 7000),
+  ];
+  const gates = new Map();
+  const posted = [];
+  let peak = 0;
+  await withList((path, options) => {
+    if (path === "/api/v1/documents/fetch") {
+      const key = options.body.key;
+      posted.push(key);
+      peak = Math.max(peak, gates.size + 1);
+      return new Promise((resolve) => gates.set(key, () => {
+        gates.delete(key);
+        resolve({ fetched: [{ key, title: `${key} landed`, version: "v1", fetched_ms: 9999 }] });
+      }));
+    }
+    return { documents: rows, total: rows.length };
+  }, async ({ list, listEl, paths }) => {
+    await list.refresh();
+    const cardOf = (key) => listEl.children.find(
+      (kid) => String(kid.className).includes("doc-card") && kid.getAttribute("data-key") === key);
+    const progress = [];
+    const run = list.fetchSince(1000, (done, total) => progress.push([done, total]));
+    await flush([]);
+    // The pool opens four wide and no wider; the rest wait their turn.
+    assert.equal(gates.size, 4, `the pool did not open four wide (${[...gates.keys()].join(",")})`);
+    assert.deepEqual(progress, [[0, 6]], "progress did not open at 0 of the six at/after the cutoff");
+    // One landing patches its own card from the POST's answer and starts the next.
+    const [firstKey, releaseFirst] = [...gates.entries()][0];
+    releaseFirst();
+    await flush([]);
+    assert.equal(gates.size, 4, "a landing did not start the next fetch");
+    assert.ok(!cardOf(firstKey).className.includes("doc-unfetched"),
+      "the landed card did not flip to fetched as its fetch landed");
+    assert.ok(cardOf(firstKey).textContent.includes(`${firstKey} landed`),
+      "the landed card does not carry the POST answer's title");
+    while (gates.size) {
+      for (const release of [...gates.values()]) release();
+      await flush([]);
+    }
+    assert.equal(await run, 6, "fetchSince did not land every document at/after the cutoff");
+    assert.equal(peak, 4, `the pool ran ${peak} wide, not four`);
+    assert.deepEqual([...posted].sort(),
+      ["at-cutoff", "recent-a", "recent-b", "recent-c", "recent-d", "recent-e"],
+      "fetchSince fetched a document outside the cutoff (or one already fetched)");
+    assert.deepEqual(progress.map(([done]) => done), [0, 1, 2, 3, 4, 5, 6],
+      "progress did not count every landing");
+    assert.ok(progress.every(([, total]) => total === 6), "progress lost the run's total");
+    assert.equal(paths.filter((path) => path.startsWith("/api/v1/documents?")).length, 1,
+      "the run ended in a full list refresh instead of patching its rows");
+    assert.ok(cardOf("too-old").className.includes("doc-unfetched"),
+      "the document older than the cutoff was fetched");
+  });
+});
+
+test("documents view: Fetch since shows its prompt focused; Cancel fetches nothing; Fetch runs it with the count on the button (#1308)", async () => {
+  const now = Date.now();
+  const day = 24 * 3_600_000;
+  const unfetched = (key, ms) => ({ ...docRow(key, ms), fetched: false, fetched_ms: null });
+  const gates = new Map();
+  const posted = [];
+  const statuses = [];
+  await withDocumentsView({
+    listRows: [unfetched("stale-doc", now - 10 * day), unfetched("fresh-a", now - 1000), unfetched("fresh-b", now)],
+    onStatus: (text) => statuses.push(text),
+    onApi: (path, options) => {
+      if (path !== "/api/v1/documents/fetch") return undefined;
+      const key = options.body.key;
+      posted.push(key);
+      return new Promise((resolve) => gates.set(key, () => {
+        gates.delete(key);
+        resolve({ fetched: [{ key, title: `${key} landed`, version: "v1", fetched_ms: now }] });
+      }));
+    },
+  }, async ({ view, byId }) => {
+    await view.show();
+    const since = byId("docs-since");
+    const days = byId("docs-since-days");
+    const hours = byId("docs-since-hours");
+    const button = byId("docs-fetch");
+    let selected = false;
+    days.select = () => { selected = true; };
+    since.hidden = true;
+    const sinceItem = byId("docs-fetch-since");
+    sinceItem.setAttribute("data-act", "since");
+    // The menu item presents the prompt and focuses its first field.
+    dispatchClick(sinceItem);
+    assert.equal(since.hidden, false, "Fetch since did not present its prompt");
+    assert.equal(byId("docs-fetch-menu").hidden, true, "the menu stayed up over the prompt");
+    assert.ok(days.focused >= 1, "the prompt's first field did not take the focus");
+    assert.equal(selected, true, "the prompt's first field value was not selected");
+    // Cancel puts it away and fetches nothing.
+    dispatchClick(byId("docs-since-cancel"));
+    assert.equal(since.hidden, true, "Cancel left the prompt up");
+    assert.deepEqual(posted, [], "Cancel fetched a document");
+    // A Fetch press puts it away too, fetching nothing.
+    dispatchClick(sinceItem);
+    assert.equal(since.hidden, false, "Fetch since did not present its prompt again");
+    dispatchClick(button);
+    assert.equal(since.hidden, true, "a Fetch press left the prompt up");
+    assert.deepEqual(posted, [], "a Fetch press fetched a document");
+    // Confirming fetches only the unfetched mentioned within the chosen day,
+    // with the count on the button while the run is in flight.
+    dispatchClick(sinceItem);
+    days.value = "1";
+    hours.value = "0";
+    dispatchClick(byId("docs-since-go"));
+    assert.equal(since.hidden, true, "confirming left the prompt up");
+    await flush([]);
+    assert.deepEqual([...posted].sort(), ["fresh-a", "fresh-b"],
+      "the confirmed fetch was not scoped to the chosen cutoff");
+    assert.equal(button.textContent, "Fetching 0/2", `the button did not open its count (${button.textContent})`);
+    const releaseOne = [...gates.values()][0];
+    releaseOne();
+    await flush([]);
+    assert.equal(button.textContent, "Fetching 1/2", `the button's count did not advance (${button.textContent})`);
+    for (const release of [...gates.values()]) release();
+    await flush([]);
+    assert.equal(button.textContent, "Fetch", "the button did not come back after the run");
+    assert.equal(button.disabled, false, "the button stayed disabled after the run");
+    assert.deepEqual(statuses, ["Fetched 2 documents."]);
   });
 });
