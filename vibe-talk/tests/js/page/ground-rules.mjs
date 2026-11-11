@@ -115,7 +115,7 @@ test("`#624 voice-page-modularity`: no top-level name of the legacy script or it
       }
     }
   }
-  assert.ok(names.size > 700 && DOM_GLOBALS.size > 500 && DOM_GLOBALS.has("navigation") && names.has("selectedChannelId"),
+  assert.ok(names.size > 700 && DOM_GLOBALS.size > 500 && DOM_GLOBALS.has("navigation") && names.has("takePairingCode"),
     "the scan found too few names to mean anything");
   // The call's `stop` now belongs to its owner and no longer hides window.stop.
   const KNOWN = new Set();
@@ -200,14 +200,14 @@ test("`#624 voice-page-modularity`: each column keeps its own records of its old
     { rowsGathered: false, outgoingKey: "", newestId: null, runRows: 0, backlog: 0 });
   // And the rows its list was drawn from: a fresh pair of lists for each column.
   assert.equal(same("columns.side.rows.messages !== columns.main.rows.messages"), true, "the columns shared one list of rows");
-  assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshTimelineRows())")), { messages: [], threads: [] });
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(page.preludeBinding("freshTimelineRows")())), { messages: [], threads: [] });
   // And what it shows: the right column starts on a thread, as its swapped fields did.
   assert.equal(same("inColumn(columns.side, () => selection()) === columns.side.selection && selection() === columns.main.selection"), true);
-  assert.deepStrictEqual(JSON.parse(same("JSON.stringify(freshSelection())")), { view: "thread", threadId: null, thread: null, origin: "main" });
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(page.preludeBinding("freshSelection")())), { view: "thread", threadId: null, thread: null, origin: "main" });
   // And its message box and what it shows as Done: a fresh empty set for each column.
   assert.equal(same("columns.side.done.archived !== columns.main.done.archived && doneState() === columns.main.done"), true);
   assert.equal(same("inColumn(columns.side, () => composerState()) === columns.side.composer"), true);
-  assert.deepStrictEqual(JSON.parse(same("JSON.stringify([freshComposerState(), 0])")), [{ key: "" }, page.preludeBinding("freshDoneState")().archived.size]);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify([page.preludeBinding("freshComposerState")(), 0])), [{ key: "" }, page.preludeBinding("freshDoneState")().archived.size]);
   // And where its list stands: the channel list's entries of the shared lookups are the column's, the voice list's the page's.
   same("inColumn(columns.side, () => { jumpNewestWanted.discord = 3; inScrollback.discord = true; }); jumpNewestWanted.voice = 2");
   assert.deepStrictEqual(JSON.parse(same("JSON.stringify([columns.side.place, jumpNewestWanted.discord, inScrollback.discord, jumpNewestWanted.voice, inColumn(columns.side, () => jumpNewestWanted.voice)])")),

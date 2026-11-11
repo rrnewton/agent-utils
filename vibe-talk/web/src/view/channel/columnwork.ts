@@ -4,6 +4,8 @@
 // pointing at the right column between one event and the next. Each column says whether it has been worked
 // on and left since it was last made afresh (`left`). The columns and their records are the page's.
 
+import type { Message, ThreadSummary } from "../../contract/index.ts";
+
 /** A column, as far as working on it reads it. */
 export interface WorkedColumn {
   /** Whether it has been worked on and left since it was last made afresh. */
@@ -251,11 +253,18 @@ export interface ColumnStateAccess {
   loadState(): LoadState;
   scrollPlace(): ColumnListPlace;
   scrollTools(): ScrollToolsState;
+  selection(): SelectionRecord;
+  timelineRows(): TimelineRowsRecord;
+  composerState(): ComposerRecord;
+  viewKey(view?: string, thread?: unknown): string;
 }
 
 /** The column state access over the working column (`columnWork`). */
 export function createColumnStateAccess(
-  columnWork: ColumnWorkReader<{ load: LoadState; place: ColumnListPlace; tools: ScrollToolsState } & WorkedColumn>,
+  columnWork: ColumnWorkReader<{
+    load: LoadState; place: ColumnListPlace; tools: ScrollToolsState;
+    selection: SelectionRecord; rows: TimelineRowsRecord; composer: ComposerRecord;
+  } & WorkedColumn>,
 ): ColumnStateAccess {
   /** The column being worked on's record of where its list stands (`freshScrollPlace`). */
   function scrollPlace(): ColumnListPlace {
@@ -272,5 +281,75 @@ export function createColumnStateAccess(
     return columnWork.active().load;
   }
 
-  return { loadState, scrollPlace, scrollTools };
+  /** The column being worked on's record of what it is showing (`freshSelection`). */
+  function selection(): SelectionRecord {
+    return columnWork.active().selection;
+  }
+
+  /** The column being worked on's record of the rows its list was last drawn from (`freshTimelineRows`). */
+  function timelineRows(): TimelineRowsRecord {
+    return columnWork.active().rows;
+  }
+
+  /** The column being worked on's record of its message box (`freshComposerState`). */
+  function composerState(): ComposerRecord {
+    return columnWork.active().composer;
+  }
+  /** The key of a view of the column being worked on, the thread's for a thread (`viewKey`). */
+  function viewKey(view: string = selection().view, thread: unknown = selection().threadId): string {
+    return view === "thread" ? `thread:${thread}` : view;
+  }
+
+  return { loadState, scrollPlace, scrollTools, selection, timelineRows, composerState, viewKey };
+}
+
+/** A column's record of what it is showing (`freshSelection`). */
+export interface SelectionRecord {
+  view: string;
+  threadId: string | null;
+  thread: ThreadSummary | null;
+  origin: string;
+}
+
+/** A column's record of the rows its list was last drawn from (`freshTimelineRows`). */
+export interface TimelineRowsRecord {
+  messages: Message[];
+  threads: ThreadSummary[];
+}
+
+/** A column's record of its message box (`freshComposerState`). */
+export interface ComposerRecord {
+  key: string;
+}
+
+/**
+ * A column's own record of what it is showing (`#624 voice-page-modularity`, plan step 15, as
+ * `freshOlderPages`): `view`, which list (main, threads, flat or thread); `threadId` and `thread`, the
+ * thread selected and its summary; `origin`, the list a thread was opened from. The left column starts
+ * on Main only until the channel's provider is known (`openChannelView` decides it from then on); the
+ * right column starts on a thread.
+ *
+ */
+export function freshSelection(view = "thread"): SelectionRecord {
+  return { view, threadId: null, thread: null, origin: "main" };
+}
+
+/**
+ * A column's own record of the rows its list was last drawn from (`#624 voice-page-modularity`, plan
+ * step 15, as `freshOlderPages`): `messages`, the messages of a Main, All or thread list; `threads`,
+ * the thread summaries of the Threads list.
+ *
+ */
+export function freshTimelineRows(): TimelineRowsRecord {
+  return { messages: [], threads: [] };
+}
+
+/**
+ * A column's own record of its message box (`#624 voice-page-modularity`, plan step 15, as
+ * `freshOlderPages`): `key`, the box the column is composing in (`channelComposerKey`), whose draft
+ * `channelDrafts` holds.
+ *
+ */
+export function freshComposerState(): ComposerRecord {
+  return { key: "" };
 }

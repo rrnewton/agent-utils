@@ -48,6 +48,7 @@ const SUITES: &[&str] = &[
     "tests/js/view/dom.test.mjs",
     "tests/js/view/settings.test.mjs",
     "tests/js/view/shell-navigation.test.mjs",
+    "tests/js/view/shell-channelselection.test.mjs",
     "tests/js/view/shell-channeldirectory.test.mjs",
     "tests/js/view/settings-editors.test.mjs",
     "tests/js/view/voice.test.mjs",

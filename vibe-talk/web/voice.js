@@ -166,7 +166,7 @@ const columns = createColumns({
  */
 const columnWork = createColumnWork(columns);
 const { useColumn, inColumn } = columnWork;
-const { loadState, scrollPlace, scrollTools } = createColumnStateAccess(columnWork);
+const { loadState, scrollPlace, scrollTools, selection, timelineRows, composerState, viewKey } = createColumnStateAccess(columnWork);
 
 /**
  * The page's way to the browser and the server: web/src/app's now (`createServerAccess`, `#624`),
@@ -203,48 +203,14 @@ function el(id) {
   return /** @type {any} */ (elementIn(id, columnWork.side(), COLUMN_IDS));
 }
 
-/**
- * The selection's one owner (web/src/core/navigation, `#624 voice-page-modularity`): the channel
- * chosen to read. Made on first use, when the bar's picker is subscribed to it as its projection. A
- * `var` with no initialiser, so a use before this line has run finds it undefined rather than in its
- * dead zone, and this line, when it runs, does not throw away an owner already made.
- *
- * @type {import("./src/core/navigation/index.ts").Navigation | undefined}
- */
-var pageNavigation;
+/** The channel chosen to read: web/src/view/shell's now (`createChannelSelection`, `#624`). */
+const channelSelection = createChannelSelection({
+  createNavigation,
+  picker: () => el("discord-channel"),
+  channels: () => channelDirectory.channels(),
+});
+const { selectionOwner, selectedChannelId, chooseChannel } = channelSelection;
 
-/** {@link pageNavigation}, made if it is not yet. */
-function selectionOwner() {
-  if (!pageNavigation) {
-    pageNavigation = createNavigation();
-    // The bar's picker shows the selection, and nothing else: no reader asks the picker which
-    // channel is chosen. It has no right-column stand-in, so `el` always finds the bar's.
-    pageNavigation.subscribe((snapshot) => {
-      el("discord-channel").value = snapshot.channelId;
-    });
-  }
-  return pageNavigation;
-}
-
-/**
- * The id of the channel chosen to read ("" for none). Page-wide: both columns read one channel.
- *
- * @returns {string}
- */
-function selectedChannelId() {
-  return selectionOwner().snapshot().channelId;
-}
-
-/**
- * Choose channel `id` to read, as the bar's picker takes a value: one it does not list chooses no
- * channel at all, as setting a `<select>` to a value it has no option for leaves it on none. The
- * caller says what the choice means (`changeSelectedChannel`); this only records it.
- *
- * @param {string} id
- */
-function chooseChannel(id) {
-  selectionOwner().selectChannel(channelDirectory.channels().some((channel) => String(channel.id) === String(id)) ? String(id) : "");
-}
 
 /**
  * The element with this id in the LEFT column whichever column is being worked on: for the few
@@ -1321,39 +1287,8 @@ const { NO_CHANNEL_TO_READ, UNDESCRIBED_SERVICE, channelName, chatServiceName, l
  * @type {import("./src/core/channels/index.ts").ThreadPresence}
  */
 const threadPresence = createThreadPresence();
-/**
- * A column's own record of what it is showing (`#624 voice-page-modularity`, plan step 15, as
- * `freshOlderPages`): `view`, which list (main, threads, flat or thread); `threadId` and `thread`, the
- * thread selected and its summary; `origin`, the list a thread was opened from. The left column starts
- * on Main only until the channel's provider is known (`openChannelView` decides it from then on); the
- * right column starts on a thread.
- *
- * @param {string} [view]
- * @returns {{view: string, threadId: any, thread: any, origin: string}}
- */
-function freshSelection(view = "thread") {
-  return { view, threadId: null, thread: null, origin: "main" };
-}
 
-/** The column being worked on's record of what it is showing (`freshSelection`). */
-function selection() {
-  return columnWork.active().selection;
-}
-/**
- * A column's own record of the rows its list was last drawn from (`#624 voice-page-modularity`, plan
- * step 15, as `freshOlderPages`): `messages`, the messages of a Main, All or thread list; `threads`,
- * the thread summaries of the Threads list.
- *
- * @returns {{messages: any[], threads: any[]}}
- */
-function freshTimelineRows() {
-  return { messages: [], threads: [] };
-}
 
-/** The column being worked on's record of the rows its list was last drawn from (`freshTimelineRows`). */
-function timelineRows() {
-  return columnWork.active().rows;
-}
 const channelContexts = new Map();
 /**
  * What the reader has typed in each message box, by box key, and the device's copy (web/src/core/outbox
@@ -1380,21 +1315,7 @@ const quickDrafts = createChannelDrafts({ storage: deviceStorageOnUse(), makeRoo
  */
 const draftLedger = createDraftLedger({ storage: deviceStorageOnUse(), makeRoom: () => messageCache.dropMessageCache(), now: () => Date.now() });
 
-/**
- * A column's own record of its message box (`#624 voice-page-modularity`, plan step 15, as
- * `freshOlderPages`): `key`, the box the column is composing in (`channelComposerKey`), whose draft
- * `channelDrafts` holds.
- *
- * @returns {{key: string}}
- */
-function freshComposerState() {
-  return { key: "" };
-}
 
-/** The column being worked on's record of its message box (`freshComposerState`). */
-function composerState() {
-  return columnWork.active().composer;
-}
 
 // Local send records never enter the provider message list or its read/archive/reply machinery.
 // How long one attempt may run, how long a lost answer is asked after, and how often a slow
@@ -4213,7 +4134,6 @@ const channelStore = createChannelStore();
 // `emptyCanon`, `viewOfKey`, `timeOf`, `inTimeOrder`, `threadOf` and `sameMessage` are
 // web/src/core/channels's (`#624 voice-page-modularity`), with the store's shape (`ChannelCanon`).
 
-const viewKey = (view = selection().view, thread = selection().threadId) => (view === "thread" ? `thread:${thread}` : view);
 
 
 // `mergeIntoCanon` and `upsertThreadSummary` are web/src/core/channels's, and take the store they

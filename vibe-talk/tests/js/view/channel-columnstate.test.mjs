@@ -25,8 +25,8 @@ test("the access reads the working column's records, and follows a switch", () =
   const makers = {
     older: () => ({}), arrows: () => ({}), load: () => CHANNEL.freshLoadState(),
     entry: () => ({}), pins: () => ({}), tools: () => CHANNEL.freshScrollTools(),
-    filter: () => ({}), list: () => ({}), rows: () => ({}),
-    selection: (view) => ({ view: view ?? "thread" }), composer: () => ({}),
+    filter: () => ({}), list: () => ({}), rows: () => CHANNEL.freshTimelineRows(),
+    selection: (view) => CHANNEL.freshSelection(view), composer: () => CHANNEL.freshComposerState(),
     done: () => ({}), place: () => CHANNEL.freshScrollPlace(), gather: () => ({}),
   };
   const columns = CHANNEL.createColumns(makers);
@@ -42,4 +42,39 @@ test("the access reads the working column's records, and follows a switch", () =
   });
   assert.deepEqual(inSide, [9, false, 0]);
   assert.equal(access.loadState().freshAt, 7, "the switch back is restored");
+});
+
+test("fresh selection, rows and composer records start as they always did", () => {
+  assert.deepEqual(CHANNEL.freshSelection(), { view: "thread", threadId: null, thread: null, origin: "main" });
+  assert.deepEqual(CHANNEL.freshSelection("main"), { view: "main", threadId: null, thread: null, origin: "main" });
+  assert.deepEqual(CHANNEL.freshTimelineRows(), { messages: [], threads: [] });
+  assert.deepEqual(CHANNEL.freshComposerState(), { key: "" });
+  const rows = CHANNEL.freshTimelineRows();
+  rows.messages.push({ id: "m1" });
+  assert.deepEqual(CHANNEL.freshTimelineRows(), { messages: [], threads: [] }, "each record is its own");
+});
+
+test("selection, rows, composer and the view key follow the working column", () => {
+  const makers = {
+    older: () => ({}), arrows: () => ({}), load: () => CHANNEL.freshLoadState(),
+    entry: () => ({}), pins: () => ({}), tools: () => CHANNEL.freshScrollTools(),
+    filter: () => ({}), list: () => ({}), rows: () => CHANNEL.freshTimelineRows(),
+    selection: (view) => CHANNEL.freshSelection(view), composer: () => CHANNEL.freshComposerState(),
+    done: () => ({}), place: () => CHANNEL.freshScrollPlace(), gather: () => ({}),
+  };
+  const columns = CHANNEL.createColumns(makers);
+  const work = CHANNEL.createColumnWork(columns);
+  const access = CHANNEL.createColumnStateAccess(work);
+  assert.equal(access.selection().view, "main", "the left column starts on Main");
+  assert.equal(columns.side.selection.view, "thread", "the right column starts on a thread");
+  access.selection().threadId = "t9";
+  assert.equal(access.viewKey("thread"), "thread:t9");
+  assert.equal(access.viewKey(), "main", "no view named is the working column's");
+  access.timelineRows().messages.push({ id: "m1" });
+  access.composerState().key = "box";
+  const inSide = work.inColumn(columns.side, () => [
+    access.selection().view, access.timelineRows().messages.length, access.composerState().key,
+  ]);
+  assert.deepEqual(inSide, ["thread", 0, ""], "the side column's records are its own");
+  assert.equal(access.timelineRows().messages.length, 1);
 });

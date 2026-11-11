@@ -75,3 +75,5 @@ export { READER_WORDS, createReaderRow } from "./readerrow.ts";
 export type { ReaderRow, ReaderRowDependencies } from "./readerrow.ts";
 export { createPageVisibility } from "./visibility.ts";
 export type { PageVisibility, PageVisibilityDependencies } from "./visibility.ts";
+export { createChannelSelection } from "./channelselection.ts";
+export type { ChannelSelection, ChannelSelectionDependencies, NavigationLike } from "./channelselection.ts";
