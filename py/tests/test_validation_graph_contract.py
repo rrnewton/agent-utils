@@ -1064,7 +1064,6 @@ def test_all_list_names_skipped_timing_steps_and_optin_plans_them(
         validate, "changed_paths", lambda _base: ["vibe-talk/web/index.html"]
     )
     disabled = (
-        "vibe-talk.check.fold-steps-browser",
         "vibe-talk.check.scroll-stability-browser",
         "vibe-talk.check.typing-scroll-browser",
         "vibe-talk.check.read-pause-reply-browser",

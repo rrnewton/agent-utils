@@ -7,9 +7,14 @@ press goes on from the step it last applied in that view. The fake-DOM suite (te
 holds the rotation, each list's own step and the place-keeping in a model that lays out heights; it has no
 line clamp, no frames and no observers. This presses the real keys in the engine and reads what it draws:
 whether each message's text overflows its box (folded) or is drawn whole (open), the status line, and the
-row the reader is on, sampled at every frame for 0.8 s after each press, which must not move by more than a
-pixel -- the chips under the list changing height, and the right column's keeper of a reader at its foot
-(`#280 scroll-stability`), both act a frame or more after the key.
+row the reader is on, sampled at every frame from each press until the step is drawn and the row has
+stood still across further frames (`#1250 vibe-talk-timing-robust`): it must not move by more than a
+pixel at any sampled frame -- the chips under the list changing height, and the right column's keeper
+of a reader at its foot (`#280 scroll-stability`), both act a frame or more after the key. No fixed
+watch window decides it: the old 0.8 s of frames are now at least `SETTLE_FRAMES` frames observed
+after the step is drawn, however long a loaded host takes to paint them, with the whole observation
+bounded only as a failure (`STATE_S`). The geometry judgement is unchanged — within a pixel at every
+sampled frame, and drawn as the step says.
 
 It serves the checked-out page and a small fake API through Playwright's request routing, so no port is
 opened: a channel of fourteen long messages, every other one read, one of the unread ones the first message
@@ -27,8 +32,8 @@ At 1280x800, with the keys:
   channel's message box at the list's foot, with "half a thought;" typed into it -> the ; is the draft's
   and steps nothing; Ctrl+; -> Expanded all, Cmd+; -> Expanded unread, collapsed read, Ctrl+:
   (Ctrl+Shift+;) -> Expanded all again, each from the box, which keeps the focus and the draft and is
-  itself what holds still: shown whole and within a pixel of where it was at every frame for 0.8 s after
-  each press, the list still at its foot, the messages opening and folding above it. Held by the
+  itself what holds still: shown whole and within a pixel of where it was at every sampled frame,
+  the list still at its foot, the messages opening and folding above it. Held by the
   selected message instead, as a press from the list is, the box went below the screen.
 
   in two columns, the thread opened on the right by its card's replies button, ] to the right column, End
@@ -56,6 +61,7 @@ import argparse
 import json
 import mimetypes
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -90,8 +96,15 @@ ROOT = 2
 READ_REPLIES = 3
 # How far a row may move and still be said to have stood still: sub-pixel layout, never a jump.
 STILL_PX = 1.0
-# How long after each press the reader's row is watched, frame by frame.
-WATCH_MS = 800
+# The most a walk waits for a state it expects the page to reach (#998's STATE_S precedent in
+# read_aloud_views_browser.py). Every wait polls for drawn state, so a pass takes as long as the
+# page does and this only bounds a failure.
+STATE_S = 30.0
+# Frames to keep watching after a step is first drawn as said (~0.8 s at sixty frames a second,
+# the old watch window): the delayed actors this watch exists to catch — chips changing height,
+# a column's foot-keeper — act frames after the step draws, and the evidence is frames observed
+# after it, however long a loaded host takes to paint them, never a wall-clock window.
+SETTLE_FRAMES = 48
 
 SAID = {"expand": "Long messages: all expanded", "unread": "Long messages: unread expanded, read collapsed",
         "collapse": "Long messages: all collapsed"}
@@ -231,6 +244,7 @@ WATCH_JS = """([list, id]) => {
   tick();
 }"""
 UNWATCH_JS = "() => { const watch = window.__foldWatch; watch.on = false; return watch.samples; }"
+PEEK_JS = "() => window.__foldWatch ? window.__foldWatch.samples.length : 0"
 
 # The status line: whether it is drawn, and what it says, and how.
 STATUS_JS = """() => {
@@ -262,6 +276,7 @@ WATCH_BOX_JS = """([box, area]) => {
   tick();
 }"""
 UNWATCH_BOX_JS = "() => { const watch = window.__boxWatch; watch.on = false; return watch.samples; }"
+PEEK_BOX_JS = "() => window.__boxWatch ? window.__boxWatch.samples.length : 0"
 
 # Where the focus is, and what the message box holds.
 FOCUS_JS = """(box) => ({focused: document.activeElement ? document.activeElement.id : null,
@@ -322,6 +337,59 @@ class Desk:
         """Each long message of the list by id: True where Chromium draws it folded."""
         return {str(row["id"]): bool(row["folded"]) for row in self.folds(list_id)}
 
+    def wait_for(self, condition: str, why: str) -> None:
+        """Poll a page state to STATE_S: a pass takes as long as the page does."""
+        deadline = time.monotonic() + STATE_S
+        while time.monotonic() < deadline and not self.page.evaluate(condition):
+            self.page.wait_for_timeout(25)
+        check(bool(self.page.evaluate(condition)), f"{self.label}: {why}")
+
+    def drawn_as(self, list_id: str, step: str) -> bool:
+        """Whether every long message of `list_id` is already drawn as `step` leaves it, said so."""
+        try:
+            rows = self.folds(list_id)
+        except AssertionError:
+            return False
+        if len(rows) < 6:
+            return False
+        for row in rows:
+            want = step == "collapse" or (step == "unread" and bool(row["read"]))
+            if bool(row["folded"]) != want or row["attribute"] != ("true" if want else "false"):
+                return False
+        said = self.status()
+        return said["shown"] is True and said["text"] == SAID[step]
+
+    def wait_drawn(self, list_id: str, step: str, what: str) -> None:
+        """Wait until the step is drawn as said (STATE_S failure bound)."""
+        deadline = time.monotonic() + STATE_S
+        while time.monotonic() < deadline:
+            if self.drawn_as(list_id, step):
+                return
+            self.page.wait_for_timeout(25)
+        check(False, f"{self.label} {what}: the step to {step} was never drawn as said")
+
+    def wait_frames(self, peek_js: str, at_least: int, what: str) -> None:
+        """Wait until the running watch holds at least `at_least` samples (STATE_S failure bound)."""
+        deadline = time.monotonic() + STATE_S
+        while time.monotonic() < deadline:
+            if int(self.page.evaluate(peek_js)) >= at_least:
+                return
+            self.page.wait_for_timeout(25)
+        check(False, f"{self.label} {what}: only {int(self.page.evaluate(peek_js))} frames were sampled")
+
+    def wait_selected(self, list_id: str, row_id: str | None = None) -> None:
+        """Wait until `list_id` has a selected row (the row `row_id`, when one is named)."""
+        wanted = "true" if row_id is None else f"row.getAttribute('data-id') === '{row_id}'"
+        self.wait_for(f"() => {{ const row = document.querySelector('#{list_id} > li[data-selected]');"
+                      f" return !!row && ({wanted}); }}",
+                      f"no row selected in #{list_id}" if row_id is None else f"{row_id} never selected in #{list_id}")
+
+    def wait_gap(self, area: str, at_most: float) -> None:
+        """Wait until scroller `area` is within `at_most` px of its foot."""
+        self.wait_for(f"() => {{ const a = document.getElementById('{area}');"
+                      f" return a.scrollHeight - a.scrollTop - a.clientHeight <= {at_most}; }}",
+                      f"#{area} never reached its foot")
+
     def selected(self, list_id: str) -> tuple[str, float]:
         found: object = self.page.evaluate(SELECTED_JS, list_id)
         check(isinstance(found, dict), f"{self.label}: nothing is selected in #{list_id}")
@@ -349,9 +417,11 @@ class Desk:
         """Focus message box `box_id` and type `draft`, ; and all: typed into the box, stepping nothing in `list_id`."""
         before = self.state(list_id)
         self.page.focus(f"#{box_id}")
-        self.page.wait_for_timeout(300)
+        self.wait_for(f"() => document.activeElement && document.activeElement.id === '{box_id}'",
+                      f"{what}: #{box_id} never took the focus")
         self.page.keyboard.type(draft)
-        self.page.wait_for_timeout(300)
+        self.wait_for(f"() => document.getElementById('{box_id}').value === {draft!r}",
+                      f"{what}: the draft never landed in #{box_id}")
         check(self.box(box_id) == (box_id, draft), f"{self.label} {what}: the box holds {self.box(box_id)}, not {draft!r}")
         check(self.state(list_id) == before, f"{self.label} {what}: a ; typed in the box stepped #{list_id}")
 
@@ -368,7 +438,9 @@ class Desk:
         row, _row_top = self.selected(list_id)
         self.page.evaluate(WATCH_BOX_JS, [box_id, area])
         self.key(chord)
-        self.page.wait_for_timeout(WATCH_MS)
+        self.wait_drawn(list_id, step, what)
+        drawn_at = int(self.page.evaluate(PEEK_BOX_JS))
+        self.wait_frames(PEEK_BOX_JS, drawn_at + SETTLE_FRAMES, what)
         found: object = self.page.evaluate(UNWATCH_BOX_JS)
         assert isinstance(found, list)
         samples: list[Json] = []
@@ -402,7 +474,9 @@ class Desk:
         row, top = self.selected(list_id)
         self.page.evaluate(WATCH_JS, [list_id, row])
         self.key(chord)
-        self.page.wait_for_timeout(WATCH_MS)
+        self.wait_drawn(list_id, step, what)
+        drawn_at = int(self.page.evaluate(PEEK_JS))
+        self.wait_frames(PEEK_JS, drawn_at + SETTLE_FRAMES, what)
         samples: object = self.page.evaluate(UNWATCH_JS)
         assert isinstance(samples, list)
         check(len(samples) >= 10, f"{self.label} {what}: only {len(samples)} frames were sampled")
@@ -455,10 +529,12 @@ def open_desk(browser: Browser, api: FakeApi, storage: dict[str, str]) -> tuple[
     page.goto(f"{ORIGIN}/", wait_until="load")
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
-    page.wait_for_selector("#view-switch", state="visible", timeout=10_000)
+    page.wait_for_selector("#view-switch", state="visible", timeout=int(STATE_S * 1000))
     page.click("#view-switch")
-    page.wait_for_selector(f'#discord-log > li[data-id="{message_id(ROOT)}"]', timeout=10_000)
-    page.wait_for_timeout(400)
+    page.wait_for_selector(f'#discord-log > li[data-id="{message_id(ROOT)}"]', timeout=int(STATE_S * 1000))
+    page.wait_for_function(
+        f"() => document.querySelectorAll('#discord-log > li[data-collapsed]').length >= {POSTS}",
+        timeout=int(STATE_S * 1000))
     return page, errors
 
 
@@ -472,12 +548,13 @@ def one_column(desk: Desk) -> None:
           f"{desk.label}: not every long message arrived folded: {before}")
     page.evaluate("() => { const area = document.getElementById('scroll-area'); "
                   "area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) / 2); }")
-    page.wait_for_timeout(300)
+    desk.wait_for("() => { const a = document.getElementById('scroll-area');"
+                  " return Math.abs(a.scrollTop - Math.round((a.scrollHeight - a.clientHeight) / 2)) <= 2; }",
+                  "the list never reached its middle")
     page.evaluate("() => document.getElementById('scroll-area').focus()")
     for chord in ("ArrowDown", "j", "j"):
         desk.key(chord)
-        page.wait_for_timeout(150)
-    page.wait_for_timeout(300)
+        desk.wait_selected("discord-log")
     desk.selected("discord-log")
     for chord, step in ((";", "expand"), (";", "unread"), (";", "collapse"), (";", "expand"),
                         ("Shift+Semicolon", "collapse"), ("Shift+Semicolon", "unread"), ("Shift+Semicolon", "expand")):
@@ -485,14 +562,13 @@ def one_column(desk: Desk) -> None:
     # At the newest line, everything folded: ; opens it all above and below the selected message, which
     # holds still. Following the newest line, as a redraw does for a reader on it, would move it.
     desk.key("Shift+Semicolon")
-    page.wait_for_timeout(400)
+    desk.wait_drawn("discord-log", "collapse", "one column, : to collapse before the newest line")
     desk.judge("discord-log", "collapse", "one column, : to collapse before the newest line")
     desk.key("End")
-    page.wait_for_timeout(600)
+    desk.wait_gap("scroll-area", 24)
     for chord in ("k", "k"):
         desk.key(chord)
-        page.wait_for_timeout(200)
-    page.wait_for_timeout(400)
+        desk.wait_selected("discord-log")
     _top, gap = desk.scroll("scroll-area")
     check(gap <= 24, f"{desk.label}: End did not bring the list to its newest line ({gap}px above it)")
     desk.held_step(";", "discord-log", "expand", "one column at the newest line, ; to expand")
@@ -503,14 +579,13 @@ def one_column(desk: Desk) -> None:
     # the focus then put in the box. Each chord keeps the box where it is, not the selected message: held
     # by that message, everything opening between the two took the box off the screen.
     desk.key("Shift+Semicolon")
-    page.wait_for_timeout(400)
+    desk.wait_drawn("discord-log", "collapse", "one column, : to collapse before the box")
     desk.judge("discord-log", "collapse", "one column, : to collapse before the box")
     desk.key("End")
-    page.wait_for_timeout(600)
+    desk.wait_gap("scroll-area", 24)
     for chord in ("k", "k"):
         desk.key(chord)
-        page.wait_for_timeout(200)
-    page.wait_for_timeout(400)
+        desk.wait_selected("discord-log")
     desk.typed_in_box("channel-compose-text", "discord-log", "half a thought;", "one column, ; typed in the box")
     desk.box_step("Control+Semicolon", "channel-compose-text", "scroll-area", "discord-log", "expand",
                   "one column, Ctrl+; in the box at the foot to expand")
@@ -525,10 +600,11 @@ def two_columns(desk: Desk) -> None:
     page = desk.page
     check(page.evaluate("() => document.getElementById('screen-main').getAttribute('data-columns')") == "two",
           f"{desk.label}: the page did not go into two columns")
-    page.wait_for_selector(f"#side-cards > li[data-id='{THREAD_ID}'] .side-card-open", timeout=10_000)
+    page.wait_for_selector(f"#side-cards > li[data-id='{THREAD_ID}'] .side-card-open", timeout=int(STATE_S * 1000))
     page.click(f"#side-cards > li[data-id='{THREAD_ID}'] .side-card-open")
-    page.wait_for_selector("#side-log > li[data-collapsed]", timeout=10_000)
-    page.wait_for_timeout(600)
+    page.wait_for_selector("#side-log > li[data-collapsed]", timeout=int(STATE_S * 1000))
+    desk.wait_for(f"() => document.querySelectorAll('#side-log > li[data-collapsed]').length >= {REPLIES + 1}",
+                  "the thread on the right never drew its replies")
     # Folded but for the first unread, the thread's first message, which entering it opened to land on
     # (`#221 read-modes`).
     side_before = desk.state("side-log")
@@ -539,11 +615,15 @@ def two_columns(desk: Desk) -> None:
 
     def to_first_read(what: str) -> None:
         desk.key("End")
-        page.wait_for_timeout(600)
+        desk.wait_gap("side-scroll", 24)
+        desk.wait_selected("side-log")
         for _ in range(READ_REPLIES - 1):
+            before_key = desk.selected("side-log")[0]
             desk.key("k")
-            page.wait_for_timeout(200)
-        page.wait_for_timeout(300)
+            desk.wait_for("() => { const row = document.querySelector('#side-log > li[data-selected]');"
+                          f" return !!row && row.getAttribute('data-id') !== '{before_key}'; }}",
+                          f"{what}: k never moved the selection in the right column")
+        desk.wait_selected("side-log", first_read)
         check(desk.selected("side-log")[0] == first_read, f"{desk.label} {what}: the keys did not select the first read reply")
         # The thread's card heads the right column (`#298 thread-card-header`), and at 1280x800 that leaves
         # room above the thread's message box for two of the folded read replies whole, not three: k
@@ -552,14 +632,15 @@ def two_columns(desk: Desk) -> None:
         # first read reply still selected and its head under the card, so the steps below start where
         # that keeper would take a reader down.
         page.evaluate("() => { const area = document.getElementById('side-scroll'); area.scrollTop = area.scrollHeight; }")
-        page.wait_for_timeout(300)
+        desk.wait_gap("side-scroll", 24)
+        desk.wait_selected("side-log", first_read)
         check(desk.selected("side-log")[0] == first_read,
               f"{desk.label} {what}: going back to the foot moved the selection off the first read reply")
         _top, gap = desk.scroll("side-scroll")
         check(gap <= 24, f"{desk.label} {what}: the right column is not at its foot ({gap}px above it)")
 
     desk.key("]")
-    page.wait_for_timeout(300)
+    desk.wait_selected("side-log")
     to_first_read("before the first ;")
     main = desk.state("discord-log")
     main_scroll = desk.scroll("scroll-area")[0]
@@ -580,18 +661,17 @@ def two_columns(desk: Desk) -> None:
     check(gap > 200, f"{desk.label}: the right column followed its foot after : ({gap}px above it)")
     side = desk.state("side-log")
     desk.key("[")
-    page.wait_for_timeout(300)
     desk.key("k")
-    page.wait_for_timeout(400)
+    desk.wait_selected("discord-log")
     desk.held_step(";", "discord-log", "expand", "Main beside it, its own first ; to expand")
     check(desk.state("side-log") == side, f"{desk.label}: ; in Main folded the right column")
     # The chord in the right column's message box steps the right column's thread, the box's own list,
     # and leaves Main as it is, the box held where it is. The thread folded again by : from the right
     # column's keys, then at its foot, its box under its last reply.
     desk.key("]")
-    page.wait_for_timeout(300)
+    desk.wait_selected("side-log")
     desk.key("Shift+Semicolon")
-    page.wait_for_timeout(400)
+    desk.wait_drawn("side-log", "collapse", "right column, : to collapse before its box")
     desk.judge("side-log", "collapse", "right column, : to collapse before its box")
     to_first_read("before its box")
     main = desk.state("discord-log")
