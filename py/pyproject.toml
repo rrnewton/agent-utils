@@ -22,7 +22,7 @@ markers = [
     "mapped_root_namespace: requires uid 0 in a nonidentity user namespace",
     "validation_run_evidence: supplies its own validation-run process and user-systemd evidence instead of the idle-host default",
     "real_process_evidence: keeps the real host-wide process/path census instead of the pinned_process_evidence fixture's pinned answer",
-    "load_quarantine: load-sensitive case quarantined under #1267 wrkslots-load-robust; excluded by default, run with WRKSLOTS_INCLUDE_QUARANTINED=1 or -m load_quarantine",
+    "load_quarantine: load-sensitive case quarantined under #1267 wrkslots-load-robust / #1403 restore-drill-load-flake; excluded by default, run with WRKSLOTS_INCLUDE_QUARANTINED=1, AGENTCTL_INCLUDE_QUARANTINED=1 or -m load_quarantine",
 ]
 
 # The test suite imports pytest, whose pytest.approx support pulls in numpy's

@@ -147,3 +147,52 @@ def _no_ambient_cross_coverage_directory(monkeypatch: pytest.MonkeyPatch) -> Non
 import os as _os  # noqa: E402
 
 _os.environ.setdefault("WRKSLOTS_INIT_REPRESENTATION", "worktree")
+
+
+#: Opt-in for load-quarantined cases (#1403 restore-drill-load-flake).
+_QUARANTINE_ENV = "AGENTCTL_INCLUDE_QUARANTINED"
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    """Exclude load-quarantined cases by default (#1403).
+
+    Cases marked ``load_quarantine`` failed in gates under host load and
+    passed solo; they stay runnable on demand with
+    ``AGENTCTL_INCLUDE_QUARANTINED=1`` or ``-m load_quarantine``. This
+    runs before the shard plugin partitions the collection, so shards
+    stay disjoint and complete over the cases that remain, and every
+    excluded case is named below and in the terminal summary.
+    """
+
+    if _os.environ.get(_QUARANTINE_ENV) == "1":
+        return
+    markexpr = config.getoption("markexpr", default="") or ""
+    if "load_quarantine" in markexpr:
+        return
+    kept: list[pytest.Item] = []
+    quarantined: list[pytest.Item] = []
+    for item in items:
+        if item.get_closest_marker("load_quarantine") is not None:
+            quarantined.append(item)
+        else:
+            kept.append(item)
+    if quarantined:
+        config.hook.pytest_deselected(items=quarantined)
+        items[:] = kept
+    config._quarantined_nodeids = [item.nodeid for item in quarantined]  # type: ignore[attr-defined]
+
+
+def pytest_terminal_summary(terminalreporter: pytest.TerminalReporter) -> None:
+    nodeids = getattr(terminalreporter.config, "_quarantined_nodeids", [])
+    if nodeids:
+        terminalreporter.write_sep(
+            "=", "load-quarantined cases excluded by default (#1403 restore-drill-load-flake)"
+        )
+        for nodeid in nodeids:
+            terminalreporter.write_line(f"  quarantined: {nodeid}")
+        terminalreporter.write_line(
+            "  run them with AGENTCTL_INCLUDE_QUARANTINED=1 or -m load_quarantine"
+        )

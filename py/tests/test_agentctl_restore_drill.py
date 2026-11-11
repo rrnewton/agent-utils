@@ -62,6 +62,12 @@ import pytest
 from tests.rust_binary import rust_agentctl
 
 
+# Quarantined from gating shards under #1403 restore-drill-load-flake:
+# these end-to-end cases fail in rotation under host load. Runnable on
+# demand with AGENTCTL_INCLUDE_QUARANTINED=1 or -m load_quarantine.
+pytestmark = pytest.mark.load_quarantine
+
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WRKSLOTS_BIN = REPO_ROOT / "common/bin/wrkslots"
 PREVIOUS_BOOT = "00000000-1111-2222-3333-444444444444"

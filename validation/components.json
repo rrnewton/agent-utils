@@ -98,6 +98,7 @@
         "py/tests/test_herdr_chat_transport.py",
         "py/tests/test_herdr_codex_goal.py",
         "py/tests/test_herdr_subagents.py",
+        "py/tests/test_load_quarantine_agentctl.py",
         "py/tests/test_rust_binary.py"
       ]
     },
