@@ -170,6 +170,29 @@ def tap_card(page: object, card: object) -> None:
     page.touchscreen.tap(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)  # type: ignore[attr-defined]
 
 
+def check_doc_search(page: Page, width: int, height: int) -> None:
+    """Fetched-documents search (`#1266 documents-search`): a result, the
+    stated reach, and the reader opened at the highlighted match."""
+    page.click("#docs-search-toggle")
+    page.wait_for_selector("#docs-search-field", state="visible", timeout=20_000)
+    page.fill("#docs-search-field", "final")
+    page.click("#docs-search-go")
+    page.wait_for_selector(".doc-search-hit", timeout=20_000)
+    note = page.locator("#docs-search-note").text_content() or ""
+    check("match" in note and "fetched document" in note and "searched" in note,
+          f"the search note does not state its reach: {note!r}")
+    page.click(".doc-search-hit")
+    page.wait_for_selector("#doc-body mark.search-hit", timeout=20_000)
+    marks = page.locator("#doc-body mark.search-hit")
+    check("final" in (marks.first.text_content() or "").lower(),
+          "the reader's first mark is not the searched word")
+    box = marks.first.bounding_box()
+    check(box is not None and 0 <= box["y"] and box["y"] + box["height"] <= height,
+          f"the highlighted match is not in the {width}x{height} viewport: {box}")
+    check("Demo deployment report" in (page.locator("#doc-body").text_content() or ""),
+          "the search result opened the wrong document")
+
+
 def main() -> int:
     port = free_port()
     base = f"http://127.0.0.1:{port}"
@@ -348,6 +371,11 @@ def main() -> int:
                 page.tap("#doc-back")
                 page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
 
+                # Fetched-documents search at phone size (`#1266`).
+                check_doc_search(page, 393, 852)
+                page.tap("#doc-back")
+                page.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+
                 # The system Back gesture: list -> document -> back to the list.
                 tap_card(page, paste_card)
                 page.wait_for_selector("#doc-body h1", timeout=20_000)
@@ -510,6 +538,10 @@ def main() -> int:
                 # what matters is being back in the app, in Documents.
                 dpage.wait_for_function(
                     "() => !document.getElementById('pane-docs').hidden", timeout=20_000)
+                # Fetched-documents search at desktop size (`#1266`).
+                dpage.goto(base + "/?v=docs", wait_until="load")
+                dpage.wait_for_selector("#documents-list .doc-card", timeout=20_000)
+                check_doc_search(dpage, 1280, 800)
                 dctx.close()
                 browser.close()
             print("documents browser check: real-server list, touch fetch, reader, outline pop-up, "

@@ -2113,7 +2113,11 @@ impl Service {
                 .then_with(|| a.key.cmp(&b.key))
         });
         hits.truncate(limit);
-        DocSearch { hits, searched }
+        DocSearch {
+            hits,
+            searched,
+            terms,
+        }
     }
 
     /// Whether the source now holds a newer version than the cached one.
@@ -2175,6 +2179,8 @@ pub struct DocSearch {
     pub hits: Vec<DocSearchHit>,
     /// How many fetched documents were searched.
     pub searched: usize,
+    /// The query's positive terms, folded: what a reader marks.
+    pub terms: Vec<String>,
 }
 
 /// The excerpt of `content` around the earliest of `terms`: `(text, start)`.

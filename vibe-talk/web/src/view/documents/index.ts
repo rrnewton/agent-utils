@@ -4,7 +4,9 @@
 
 export { createDocumentsList, dedupeDocumentRows, documentIdentity } from "./list.ts";
 export type { DocumentsList, DocumentsListDependencies, DocumentsListPlace } from "./list.ts";
-export { createDocumentsReader, currentOutlineIndex, openDocumentNotice } from "./reader.ts";
+export { createDocumentsReader, currentOutlineIndex, highlightSearchTerms, openDocumentNotice } from "./reader.ts";
+export { createDocumentsSearch } from "./search.ts";
+export type { DocumentsSearch, DocumentsSearchDependencies, DocumentSearchHit } from "./search.ts";
 export type { DocumentsReader, DocumentsReaderDependencies, OpenDocument } from "./reader.ts";
 export { renderDocumentMarkdown, documentHeadingId } from "./render.ts";
 export { createViewSelector, nextView, otherViews, VIEW_CARDS_SETTLE_MS, VIEW_LABELS, VIEW_ORDER } from "./selector.ts";
@@ -15,6 +17,7 @@ import { createListening } from "../dom/index.ts";
 import { createDocumentsList, FOLLOW_SLACK_PX } from "./list.ts";
 import type { DocumentsListPlace } from "./list.ts";
 import { createDocumentsReader, openDocumentNotice } from "./reader.ts";
+import { createDocumentsSearch } from "./search.ts";
 import type { OpenDocument } from "./reader.ts";
 
 /** What the Documents view needs from the page. */
@@ -159,6 +162,14 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     onMentions: (row) => showMentions(row),
     onStatus: deps.onStatus,
   });
+  const search = createDocumentsSearch({
+    api: deps.api,
+    byId: deps.byId,
+    onOpen: (key, terms) => {
+      void openDocument(key, terms);
+    },
+    onStatus: deps.onStatus,
+  });
 
   /** The mentioning messages of `row`: straight to one, a choice for several. */
   function showMentions(row: import("./types.ts").DocumentRow): void {
@@ -228,7 +239,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     })();
   }
 
-  async function openDocument(key: string): Promise<void> {
+  async function openDocument(key: string, highlightTerms?: readonly string[]): Promise<void> {
     const current = readingNow ? chain[chain.length - 1] : undefined;
     // A new chain entry is a first open of that document in this chain
     // (`#1264`): it lands at the document's top once drawn. Reopening the
@@ -251,7 +262,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     deps.onLevelChange?.();
     let opened = false;
     try {
-      await reader.open(key);
+      await reader.open(key, highlightTerms);
       opened = true;
     } catch {
       // The reader already said what happened; stay on the reader so Back works.
@@ -261,7 +272,8 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     // A `#fragment` open scrolls on to its heading after this (the reader's
     // click path awaits this open first), and Back to a previous document
     // restores its own saved place the same way.
-    if (opened && firstOpen) restoreScrollTop(0);
+    // A search open lands at its match instead (`#1266 documents-search`).
+    if (opened && firstOpen && highlightTerms === undefined) restoreScrollTop(0);
   }
 
   function wire(): void {
@@ -385,6 +397,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
       wired = false;
       listening.unmount();
       list.unmount();
+      search.unmount();
       reader.unmount();
     },
   };

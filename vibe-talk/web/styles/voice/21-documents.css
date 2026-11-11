@@ -83,6 +83,51 @@
   outline-offset: 2px;
 }
 
+/* Fetched-documents search (`#1266 documents-search`): the message search's
+   shape over the list — a toggle, a bar, a reach line, and result rows. */
+.docs-search {
+  margin: 0 0 8px;
+}
+#docs-search-bar {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+#docs-search-bar[hidden] {
+  display: none;
+}
+#docs-search-field {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.docs-search-results {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+}
+.doc-search-hit {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  margin: 0 0 6px;
+  border: 1px solid;
+  border-radius: 10px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+.doc-search-hit-title {
+  display: block;
+  font-weight: 600;
+}
+.doc-search-hit-snippet {
+  display: block;
+  opacity: 0.75;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* One card per document, newest last as the server sends them: a bordered card
    with its kind's icon, its words, and a fetch-only button on the right. */
 .doc-card {

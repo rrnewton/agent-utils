@@ -757,6 +757,18 @@
             <button id="docs-since-go" type="button">Fetch</button>
           </div>
                 <div id="docs-mentions" class="docs-mentions" hidden></div>
+                <!-- `#1266 documents-search`: search only the fetched documents,
+                     through the server's documents scope; the note states how
+                     many fetched copies were searched. -->
+                <div class="docs-search">
+                  <button id="docs-search-toggle" type="button" aria-expanded="false" aria-controls="docs-search-bar">Search fetched documents</button>
+                  <div id="docs-search-bar" hidden>
+                    <input id="docs-search-field" type="search" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" placeholder="Search fetched documents" aria-label="Search fetched documents" />
+                    <button id="docs-search-go" type="button">Search</button>
+                  </div>
+                  <p id="docs-search-note" class="hint" role="status" hidden></p>
+                  <ol id="docs-search-results" class="docs-search-results"></ol>
+                </div>
                 <div id="documents-list"></div>
               </div>
               <div id="docs-reader" hidden>

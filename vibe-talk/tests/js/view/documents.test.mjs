@@ -35,6 +35,7 @@ const RENDER = await load("src/view/documents/render.ts");
 const LIST = await load("src/view/documents/list.ts");
 const READER = await load("src/view/documents/reader.ts");
 const VIEW = await load("src/view/documents/index.ts");
+const SEARCH = await load("src/view/documents/search.ts");
 
 function requireModule(loaded, entry) {
   assert.ok(loaded.mod, `${entry} did not load: ${loaded.error ? loaded.error.message : "unknown error"}`);
@@ -1513,6 +1514,73 @@ test("documents list: card meta is one line with a text mentions link; chips sit
     list.unmount();
   } finally {
     if (savedDocument === undefined) delete globalThis.document; else globalThis.document = savedDocument;
+  }
+});
+
+test("documents search: hits render with the searched count; a result opens at its query (#1266)", async () => {
+  const { createDocumentsSearch } = requireModule(SEARCH, "src/view/documents/search.ts");
+  const toggle = fakeElement("button");
+  const bar = fakeElement("div"); bar.hidden = true;
+  const field = fakeElement("input"); field.value = "final";
+  const go = fakeElement("button");
+  const note = fakeElement("p");
+  const results = fakeElement("ol");
+  const byId = (id) => ({ "docs-search-toggle": toggle, "docs-search-bar": bar, "docs-search-field": field, "docs-search-go": go, "docs-search-note": note, "docs-search-results": results })[id];
+  const opened = [];
+  const paths = [];
+  const savedDocument = globalThis.document;
+  globalThis.document = { createElement: (tag) => fakeElement(tag), createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }) };
+  try {
+    const search = createDocumentsSearch({
+      api: async (path) => { paths.push(path); return { searched: 2, terms: ["final"], hits: [{ key: "doc-a", title: "Alpha", kind: "paste", fetched_ms: 5, title_match: false, snippet: "the final line", snippet_start: 40 }] }; },
+      byId,
+      onOpen: (key, query) => opened.push([key, query]),
+    });
+    dispatchClick(toggle);
+    assert.equal(bar.hidden, false, "the toggle did not open the search bar");
+    dispatchClick(go);
+    await flush([]);
+    assert.ok(paths[0].startsWith("/api/v1/documents/search?q=final"), `the search asked ${paths[0]}`);
+    assert.ok(note.textContent.includes("2 fetched documents searched"), `the note does not state its reach: ${note.textContent}`);
+    const hit = results.children[0]?.children[0];
+    assert.ok(hit, "no result row was drawn");
+    assert.ok(hit.textContent.includes("Alpha"), "the result does not name its document");
+    dispatchClick(hit);
+    assert.deepEqual(opened, [["doc-a", ["final"]]], "the result did not open its document at the match");
+    search.unmount();
+  } finally {
+    globalThis.document = savedDocument;
+  }
+});
+
+test("documents reader highlight: terms are marked and the first mark is returned (#1266)", () => {
+  const { highlightSearchTerms } = requireModule(READER, "src/view/documents/reader.ts");
+  assert.equal(typeof highlightSearchTerms, "function", "reader does not export highlightSearchTerms");
+  const mkText = (text) => ({ nodeType: 3, textContent: text, parentNode: null });
+  const mkEl = (tag) => {
+    const el = { nodeType: 1, tagName: tag.toUpperCase(), className: "", textContent: "", childNodes: [], parentNode: null,
+      appendChild(kid) { el.childNodes.push(kid); kid.parentNode = el; return kid; },
+      insertBefore(kid, before) { const at = el.childNodes.indexOf(before); el.childNodes.splice(at < 0 ? el.childNodes.length : at, 0, kid); kid.parentNode = el; return kid; },
+      removeChild(kid) { el.childNodes = el.childNodes.filter((one) => one !== kid); kid.parentNode = null; return kid; } };
+    return el;
+  };
+  const para = mkEl("p");
+  para.appendChild(mkText("the Final line and another final one"));
+  const body = mkEl("div");
+  body.appendChild(para);
+  const savedDocument = globalThis.document;
+  globalThis.document = { createElement: (tag) => mkEl(tag), createTextNode: (text) => mkText(text) };
+  try {
+    const first = highlightSearchTerms(body, ["final"]);
+    assert.ok(first, "no mark was made");
+    assert.equal(first.tagName, "MARK");
+    assert.equal(first.className, "search-hit");
+    assert.equal(first.textContent, "Final", "the first mark keeps the document's own casing");
+    const marks = para.childNodes.filter((kid) => kid.tagName === "MARK");
+    assert.equal(marks.length, 2, "every occurrence is marked");
+    assert.equal(highlightSearchTerms(body, []), null, "no terms, no marks");
+  } finally {
+    globalThis.document = savedDocument;
   }
 });
 

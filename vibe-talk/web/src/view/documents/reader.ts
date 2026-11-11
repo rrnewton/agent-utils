@@ -59,10 +59,65 @@ export interface OpenDocument {
   markdown: string;
 }
 
+/**
+ * Wrap every occurrence of `terms` (folded, as `searchPositiveTerms` gives
+ * them) in the body's text in `<mark class="search-hit">`, as the message
+ * search marks its hits (`#1266 documents-search`); returns the first mark.
+ * Matching here is the folded terms against lower-cased text: the server's
+ * folded match is the authority, this only paints it.
+ */
+export function highlightSearchTerms(body: HTMLElement, terms: readonly string[]): HTMLElement | null {
+  const wanted = terms.filter((term) => term !== "");
+  if (wanted.length === 0) return null;
+  const texts: Text[] = [];
+  const walk = (node: Node): void => {
+    if (node.nodeType === 3) {
+      texts.push(node as Text);
+      return;
+    }
+    for (const child of Array.from(node.childNodes ?? [])) walk(child as Node);
+  };
+  walk(body as unknown as Node);
+  let first: HTMLElement | null = null;
+  for (const node of texts) {
+    const text = node.textContent ?? "";
+    const lower = text.toLowerCase();
+    const ranges: Array<[number, number]> = [];
+    for (const term of wanted) {
+      let at = lower.indexOf(term);
+      while (at !== -1) {
+        ranges.push([at, at + term.length]);
+        at = lower.indexOf(term, at + Math.max(1, term.length));
+      }
+    }
+    if (ranges.length === 0 || node.parentNode === null) continue;
+    ranges.sort((a, b) => a[0] - b[0]);
+    const parent = node.parentNode as Node;
+    let cursor = 0;
+    for (const [start, end] of ranges) {
+      if (start < cursor) continue;
+      if (start > cursor) parent.insertBefore(document.createTextNode(text.slice(cursor, start)), node);
+      const mark = document.createElement("mark");
+      mark.className = "search-hit";
+      mark.textContent = text.slice(start, end);
+      parent.insertBefore(mark, node);
+      first ??= mark as unknown as HTMLElement;
+      cursor = end;
+    }
+    if (cursor < text.length) parent.insertBefore(document.createTextNode(text.slice(cursor)), node);
+    parent.removeChild(node);
+  }
+  return first;
+}
+
 /** The reader's commands. */
 export interface DocumentsReader {
-  /** Fetch the document `key` (fetching its content first if uncached) and draw it. */
-  open(key: string): Promise<void>;
+  /**
+   * Fetch the document `key` (fetching its content first if uncached) and
+   * draw it. With `highlightTerms` (the search answer's folded terms), mark
+   * its search hits and scroll the first into view (`#1266 documents-search`).
+   */
+  open(key: string, highlightTerms?: readonly string[]): Promise<void>;
   /** The last successfully opened document, or null where none is open. */
   current(): OpenDocument | null;
   /** Whether the outline pop-up is open (its back level, `menu:outline`). */
@@ -541,7 +596,7 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
   }
 
   /** Fetch the document `key` (fetching its content first if uncached) and draw it. */
-  async function open(key: string): Promise<void> {
+  async function open(key: string, highlightTerms?: readonly string[]): Promise<void> {
     wire();
     currentDoc = null;
     setOutlineOpen(false);
@@ -616,6 +671,12 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     if (typeof movedTo === "string" && movedTo !== "") deps.onStatus?.(`Moved to ${movedTo}`);
     if (markdown !== null) currentDoc = { key, title: titleText, outline, markdown };
     startWatching();
+    if (highlightTerms !== undefined && markdown !== null) {
+      const first = highlightSearchTerms(body, highlightTerms);
+      if (first !== null && typeof first.scrollIntoView === "function") {
+        first.scrollIntoView({ block: "center" });
+      }
+    }
   }
 
   /** Add the Back, Read and Outline listeners, the first time the reader is opened. */

@@ -1042,6 +1042,7 @@ async fn search_finds_only_fetched_documents_by_title_and_body() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["searched"], 1, "one fetched document searched: {body}");
     assert_eq!(body["hits"][0]["key"], KEY);
+    assert_eq!(body["terms"], serde_json::json!(["body"]));
     assert_eq!(body["hits"][0]["title_match"], false);
     assert!(body["hits"][0]["snippet"]
         .as_str()

@@ -7521,6 +7521,7 @@ pub async fn search_documents(
             "snippet_start": hit.snippet_start,
         })).collect::<Vec<_>>(),
         "searched": found.searched,
+        "terms": found.terms,
         "untrusted_content_notice": crate::untrusted::NOTICE,
     }))
     .into_response())

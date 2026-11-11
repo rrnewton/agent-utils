@@ -147,6 +147,12 @@ export interface ElementById {
   "docs-list-view": HTMLDivElement;
   "docs-mentions": HTMLDivElement;
   "docs-reader": HTMLDivElement;
+  "docs-search-bar": HTMLDivElement;
+  "docs-search-field": HTMLInputElement;
+  "docs-search-go": HTMLButtonElement;
+  "docs-search-note": HTMLParagraphElement;
+  "docs-search-results": HTMLOListElement;
+  "docs-search-toggle": HTMLButtonElement;
   "docs-since": HTMLDivElement;
   "docs-since-days": HTMLInputElement;
   "docs-since-go": HTMLButtonElement;
