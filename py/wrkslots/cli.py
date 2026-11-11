@@ -26613,7 +26613,7 @@ def _submodule_private_history(
         now_ts = time.time() if now is None else now
         cutoff = _prune_expire_cutoff(vcs, path, now_ts)
         reflog_by_ref = _reflog_entries_by_ref((common, git_directory))
-        all_reflog_endpoints: set[str] = set()
+        all_reflog_endpoints = set()
         for entries in reflog_by_ref.values():
             for entry in entries:
                 all_reflog_endpoints.update(
@@ -26622,7 +26622,7 @@ def _submodule_private_history(
         # Roots from reflogs: every ref's entries count, except that a
         # remote-tracking ref's fetch-recorded endpoints count only while
         # recent (or when that ref was ever pushed from here), as (e) rules.
-        positives: set[str] = set()
+        positives = set()
         for ref, entries in reflog_by_ref.items():
             if ref.startswith("refs/remotes/"):
                 pushed = any("update by push" in entry.message for entry in entries)
@@ -26640,7 +26640,7 @@ def _submodule_private_history(
                     )
         pseudorefs = _private_pseudoref_commits(vcs, path)
         positives |= pseudorefs
-        ref_commits: dict[str, str] = {}
+        ref_commits = {}
         for line in vcs._run(
             path, ["for-each-ref", "--format=%(objectname) %(*objectname) %(refname)"]
         ).stdout.splitlines():

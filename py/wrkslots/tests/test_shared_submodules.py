@@ -153,14 +153,15 @@ def test_shared_private_tips_are_scoped_to_their_own_worktree(
 
     vcs = wrkslots._GitVcs()
     kept = component_head
-    tips = wrkslots._submodule_private_tips(
+    history = wrkslots._submodule_private_history(
         vcs,
         checkout(project) / "component",
         kept,
         (repository / "component",),
     )
-    assert heads["slot01"] in tips
-    assert heads["slot02"] not in tips
+    assert history is not None
+    assert heads["slot01"] in history.tips
+    assert heads["slot02"] not in history.tips
 
 
 def test_remove_shared_slot_keeps_shared_store_and_drops_registration(
