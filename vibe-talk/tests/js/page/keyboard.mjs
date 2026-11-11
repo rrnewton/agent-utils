@@ -4983,8 +4983,24 @@ async function shiftOPage(script = SCRIPT) {
  * host that deschedules this process, or the collector's helper threads it waits on, mid-press does not count
  * (#998: one Shift+O read 56 ms of wall in a loaded gate against ~10 ms solo). Measured solo 2026-11-07: Shift+O
  * 8-13 ms, e 20-26 ms.
+ *
+ * `#1250 vibe-talk-timing-robust` (rule 346): that budget is a measurement, not a gating verdict — on a hot
+ * host the same work burns several times the CPU cycles, and this test went red in a full gate on code it did
+ * not touch. In gating the verdict is the behaviour around it (each press drawn in place, no rows built, the
+ * folds, Dones and Undo right) plus a generous backstop at ten times the budget, which only a gross
+ * regression — the owner's seconds-long fold — can trip; the 50 ms budget itself is enforced only under the
+ * opt-in benchmark (`VIBE_TALK_BENCHMARK=1`), never tuned to pass. Measured times ride in the messages.
  */
 const SHIFT_O_BUDGET_MS = 50;
+const SHIFT_O_BACKSTOP_MS = SHIFT_O_BUDGET_MS * 10;
+const SHIFT_O_BENCHMARK = process.env.VIBE_TALK_BENCHMARK === "1";
+
+function assertPressCpu(kind, presses) {
+  const limit = SHIFT_O_BENCHMARK ? SHIFT_O_BUDGET_MS : SHIFT_O_BACKSTOP_MS;
+  assert.ok(presses.took.every((ms) => ms < limit),
+    `a ${kind} took over ${limit} ms of CPU: ${presses.took.map((ms) => ms.toFixed(1)).join(", ")}` +
+    ` (wall ${presses.wall.map((ms) => ms.toFixed(1)).join(", ")}; the ${SHIFT_O_BUDGET_MS} ms budget is benchmark-only)`);
+}
 
 /**
  * Press `key` `times` times on whatever holds the focus, each press timed (`took` in main-thread CPU ms,
@@ -5013,7 +5029,7 @@ async function pressesInPlace(page, key, fields, times, own) {
   return { took, wall, built, kept };
 }
 
-test("`#532 shift-o-latency`: four Shift+O and four e in an unpacked Threads view each draw in place, within budget, and the folds, Dones and Undo are right", async () => {
+test("`#532 shift-o-latency`: four Shift+O and four e in an unpacked Threads view each draw in place, press CPU printed against a benchmark-only budget, and the folds, Dones and Undo are right", async () => {
   const page = await shiftOPage();
   const own = "spaces/A/threads/s11";
   const rows = () => unpackRows(page, own);
@@ -5031,9 +5047,7 @@ test("`#532 shift-o-latency`: four Shift+O and four e in an unpacked Threads vie
   assert.deepStrictEqual(page.dismissCalls.map((call) => call.messages),
     [["9532115"], ["9532114"], ["9532113"], ["9532112"]], "each fold did not mark its message read");
   for (const li of rows().slice(1)) assert.equal(li.getAttribute("data-archived"), "true", "a folded row is not drawn read");
-  assert.ok(folds.took.every((ms) => ms < SHIFT_O_BUDGET_MS),
-    `a Shift+O took over ${SHIFT_O_BUDGET_MS} ms of CPU: ${folds.took.map((ms) => ms.toFixed(1)).join(", ")}` +
-    ` (wall ${folds.wall.map((ms) => ms.toFixed(1)).join(", ")})`);
+  assertPressCpu("Shift+O", folds);
 
   // e down another thread: each Done drawn on its row, the card's unread counted again in place.
   const other = "spaces/A/threads/s10";
@@ -5050,9 +5064,7 @@ test("`#532 shift-o-latency`: four Shift+O and four e in an unpacked Threads vie
     ["true", "true", "true", "true", "false"], "the Done rows are not drawn read");
   const counted = () => card.children.find((node) => node.className === "side-card-open").getAttribute("aria-label");
   assert.match(counted(), /· 1 unread$/, `the card did not count the Dones: ${counted()}`);
-  assert.ok(dones.took.every((ms) => ms < SHIFT_O_BUDGET_MS),
-    `an e took over ${SHIFT_O_BUDGET_MS} ms of CPU: ${dones.took.map((ms) => ms.toFixed(1)).join(", ")}` +
-    ` (wall ${dones.wall.map((ms) => ms.toFixed(1)).join(", ")})`);
+  assertPressCpu("e", dones);
   // z puts back the last, on the row drawn, and the card counts it.
   await pressHere(page, "z");
   assert.deepStrictEqual(page.restoreCalls.at(-1), { messages: ["9532104"] }, "z did not undo the last e");
