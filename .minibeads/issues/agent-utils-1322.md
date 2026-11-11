@@ -1,13 +1,14 @@
 ---
 title: 'slot-bind-status-parse: agentctl start and rebind-slot cannot bind slot owners; the status JSON parse fails'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agentctl
 - wrkslots
 created_at: 2026-11-11T16:41:05+00:00
-updated_at: 2026-11-11T16:41:05+00:00
+updated_at: 2026-11-11T19:04:35+00:00
+closed_at: 2026-11-11T19:04:35+00:00
 ---
 
 # Description
@@ -46,3 +47,7 @@ Every slot created that day shows `owner=indeterminate` in `wrkslots status` (fo
 # Notes
 
 Workaround until fixed: the slots run fine unbound, but none of them is removed or retired until its owner is bound (lead, 2026-11-11). The Rust wrkslots lane takes this.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as 358d06d5. Cause verified: `SystemHost::run` in rs/agentctl/src/restore.rs kept only the last 16 KiB of each captured stream (`bounded_text`), so a 17,881-byte status document lost its head and `serde_json::from_str` failed at line 1; the same runner never drained the pipes while polling, so output past the 64 KiB pipe buffer deadlocked until the timeout. The runner now drains stdout and stderr concurrently, keeps each stream complete to an 8 MiB cap that fails loudly past it, and the status parse error names the first bytes seen. Regression test `bind_reads_a_large_status_document_with_stderr_noise` drives `bind_slot_owner` through a fake wrkslots printing 20 KiB and 200 KiB pretty JSON documents plus soak banners on stderr (observed failing pre-fix, passing post-fix). The Python edition already captures whole via `subprocess.run` and needed no parity change. Gate: `GATE_SLOTS=3 python3 scripts/gate.py -- python3 scripts/validate.py --base github/main --keep-going` passed (`validate: OK`) with a recorded `--no-local-preflight` reason (untouched, solo-green load flakes in client/chat-subscription/restore-drill suites; rust.agentctl 2543/2543 green). Not verified against a live devbig030 slot; the four unbound slots there still need `agentctl rebind-slot` on a build containing 358d06d5.
