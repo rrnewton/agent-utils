@@ -1,6 +1,6 @@
 ---
 title: 'refusal-cause-cleanup-line: a could-not-run cause must name the validate-lock refusal, not a later teardown line, and a fleet-wide quarantine is a host fault'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-11-11T13:30:00.000000000+00:00
@@ -29,3 +29,7 @@ In `rs/merge-queue`:
 # Notes
 
 P0 under the same-hour rule for merge-queue bugs. Reported 2026-11-11. Sequenced right after #1294 donor-probe-pacing-bound lands.
+
+## Resolution
+
+[watermelon-full-preview] Delivered in this branch. `validate::validate_quarantine` finds the fleet-wide validate-quarantine line and `refusal_cause` prefers it over any later teardown line; `Store::report` records a host fault at once for a quarantine receipt and the donor pauses claiming (quarantine outranks pacing). Tests cover the quarantine-over-`RETIRE-RETAINED` cause and the host-fault mapping.
