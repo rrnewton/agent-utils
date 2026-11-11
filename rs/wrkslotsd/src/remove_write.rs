@@ -139,13 +139,22 @@ fn fence_slot_path(cfg: &Cfg, slot: &str, slot_path: &Path, fenced_path: &Path) 
                 current
             })
             .map_err(|error| {
-                format!("cannot unmount image mount at {} before the path fence: {error}", slot_path.display())
+                format!(
+                    "cannot unmount image mount at {} before the path fence: {error}",
+                    slot_path.display()
+                )
             })?;
         }
-        run_mount_command(&["umount".to_string(), slot_path.to_string_lossy().into_owned()])
-            .map_err(|error| {
-                format!("cannot unmount image mount at {} before the path fence: {error}", slot_path.display())
-            })?;
+        run_mount_command(&[
+            "umount".to_string(),
+            slot_path.to_string_lossy().into_owned(),
+        ])
+        .map_err(|error| {
+            format!(
+                "cannot unmount image mount at {} before the path fence: {error}",
+                slot_path.display()
+            )
+        })?;
         if let Err(error) = std::fs::rename(slot_path, fenced_path) {
             let _ = run_mount_command(&[
                 "mount".to_string(),
@@ -162,7 +171,10 @@ fn fence_slot_path(cfg: &Cfg, slot: &str, slot_path: &Path, fenced_path: &Path) 
             fenced_path.to_string_lossy().into_owned(),
         ])
         .map_err(|error| {
-            format!("cannot unmount image mount at {} before the path fence: {error}", slot_path.display())
+            format!(
+                "cannot unmount image mount at {} before the path fence: {error}",
+                slot_path.display()
+            )
         })?;
         let target = fenced_path.to_string_lossy().into_owned();
         let mount_id = mount_id_at(fenced_path);
