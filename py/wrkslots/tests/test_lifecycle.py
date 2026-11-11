@@ -62085,6 +62085,141 @@ def test_archive_private_history_bundles_a_declared_submodule(tmp_path: Path) ->
     assert sorted(parents) == sorted((branch_commit, tag_commit))
 
 
+def _kept_component_commit_with_missing_blob(
+    tmp_path: Path, component: Path, *, plant_in_parent: Path | None
+) -> tuple[str, str, Path]:
+    """A private kept commit in a slot submodule whose blob its own store lacks (#1278).
+
+    The commit is made in the slot's component, then its blob is deleted
+    from the slot's per-worktree module store. With ``plant_in_parent`` the
+    same blob is written into the parent checkout's module store, where a
+    commit made there would have left it. Returns (commit, blob, objects).
+    """
+
+    base = git(component, "rev-parse", "HEAD").stdout.strip()
+    git(component, "checkout", "-q", "-b", "side")
+    commit = commit_local(component, "parent-only.txt", "only in parent\n", "parent only")
+    blob = git(component, "rev-parse", f"{commit}:parent-only.txt").stdout.strip()
+    git(component, "checkout", "-q", "--detach", base)
+    gitdir = Path(git(component, "rev-parse", "--absolute-git-dir").stdout.strip())
+    assert "/worktrees/" in gitdir.as_posix() and "/modules/component" in gitdir.as_posix()
+    loose = gitdir / "objects" / blob[:2] / blob[2:]
+    assert loose.is_file()
+    loose.unlink()
+    assert git(component, "cat-file", "-e", blob, check=False).returncode != 0
+    if plant_in_parent is not None:
+        content = tmp_path / "parent-only-content.txt"
+        content.write_text("only in parent\n", encoding="utf-8")
+        assert git(plant_in_parent, "hash-object", "-w", str(content)).stdout.strip() == blob
+        assert git(plant_in_parent, "cat-file", "-e", blob, check=False).returncode == 0
+    return commit, blob, gitdir / "objects"
+
+
+def test_archive_private_history_bundles_a_blob_only_the_parent_module_store_holds(
+    tmp_path: Path,
+) -> None:
+    """#1278: bundle staging sees the parent module store as an alternate."""
+
+    project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)
+    parent = project / "repo" / "component"
+    commit, blob, _objects = _kept_component_commit_with_missing_blob(
+        tmp_path, component, plant_in_parent=parent
+    )
+
+    removed = _remove_archiving(project, "--archive-private-history")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    receipt = _drift_receipts(project)["product/component"]
+    assert receipt["disposition"] == "archived-local"
+    assert receipt["excluded_incomplete_history"] == []
+    bundle = Path(str(receipt["archive_bundle"]))
+    empty = tmp_path / "empty.git"
+    git(tmp_path, "init", "-q", "--bare", str(empty))
+    assert git(empty, "bundle", "verify", str(bundle), check=False).returncode == 0
+    restored = tmp_path / "restored-parent-blob.git"
+    git(tmp_path, "clone", "-q", "--bare", str(bundle), str(restored))
+    assert git(restored, "show", f"{commit}:parent-only.txt").stdout == "only in parent\n"
+    salvage = str(receipt["salvage_commit"])
+    parents = git(restored, "rev-list", "--parents", "-n", "1", salvage).stdout.split()[1:]
+    assert commit in parents
+    assert git(restored, "cat-file", "-e", blob, check=False).returncode == 0
+
+
+def test_archive_private_history_excludes_a_promisor_gap_kept_commit(
+    tmp_path: Path,
+) -> None:
+    """#1278: a kept commit whose only missing objects are promisor gaps is excluded."""
+
+    project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)
+    source = tmp_path / "component-source"
+    git(source, "checkout", "-q", "-b", "gap-src")
+    gap_commit = commit_local(source, "gap.txt", "gap\n", "gap commit")
+    gap_blob = git(source, "rev-parse", f"{gap_commit}:gap.txt").stdout.strip()
+    git(source, "push", "-q", "origin", "gap-src")
+    git(component, "fetch", "-q", "--filter=blob:none", "origin", "gap-src")
+    git(component, "branch", "-q", "side", "FETCH_HEAD")
+    git(component, "update-ref", "-d", "refs/remotes/origin/gap-src")
+    git(source, "push", "-q", "origin", "--delete", "gap-src")
+    git(source, "checkout", "-q", "main")
+    assert git(component, "rev-parse", "side").stdout.strip() == gap_commit
+    base = git(component, "rev-parse", "HEAD").stdout.strip()
+    git(component, "checkout", "-q", "-b", "complete")
+    complete_commit = commit_local(component, "complete.txt", "complete\n", "complete kept")
+    git(component, "checkout", "-q", "--detach", base)
+
+    removed = _remove_archiving(project, "--archive-private-history")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    assert "excluded 1 already-incomplete" in removed.stderr
+    receipt = _drift_receipts(project)["product/component"]
+    assert receipt["disposition"] == "archived-local"
+    assert receipt["excluded_incomplete_history"] == [
+        {
+            "commit": gap_commit,
+            "missing_object": gap_blob,
+            "reason": "already-incomplete history, promisor gap",
+        }
+    ]
+    bundle = Path(str(receipt["archive_bundle"]))
+    empty = tmp_path / "empty-gap.git"
+    git(tmp_path, "init", "-q", "--bare", str(empty))
+    assert git(empty, "bundle", "verify", str(bundle), check=False).returncode == 0
+    restored = tmp_path / "restored-gap.git"
+    git(tmp_path, "clone", "-q", "--bare", str(bundle), str(restored))
+    salvage = str(receipt["salvage_commit"])
+    parents = git(restored, "rev-list", "--parents", "-n", "1", salvage).stdout.split()[1:]
+    assert gap_commit not in parents
+    assert complete_commit in parents
+    assert git(restored, "show", f"{complete_commit}:complete.txt").stdout == "complete\n"
+
+
+def test_archive_private_history_refuses_a_blob_missing_from_every_store(
+    tmp_path: Path,
+) -> None:
+    """#1278: a non-promisor object missing from every store still refuses, naming it."""
+
+    project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)
+    commit, blob, objects = _kept_component_commit_with_missing_blob(
+        tmp_path, component, plant_in_parent=None
+    )
+    parent_objects = (
+        Path(git(project / "repo" / "component", "rev-parse", "--absolute-git-dir").stdout.strip())
+        / "objects"
+    )
+
+    removed = _remove_archiving(project, "--archive-private-history")
+
+    assert removed.returncode == 3, removed.stdout + removed.stderr
+    assert tree.is_dir()
+    assert commit in removed.stderr
+    assert blob in removed.stderr
+    assert str(objects) in removed.stderr
+    assert str(parent_objects) in removed.stderr
+    assert len(active_slots(project)) == 1
+
+
 def test_remove_counts_declared_submodule_history_the_source_holds(tmp_path: Path) -> None:
     """#1257: a commit the source submodule repository holds needs no remote and no salvage."""
     project, tree, component = _dead_owner_slot_with_declared_component(tmp_path)

@@ -24535,6 +24535,215 @@ def _sha256_regular_file(path: Path, label: str) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+_PROMISOR_GAP_REASON = "already-incomplete history, promisor gap"
+
+
+def _excluded_incomplete_history_entries(
+    facts: _SalvageCandidate,
+) -> list[dict[str, object]]:
+    """The receipt entries for the kept commits ``facts`` left out (#1278)."""
+
+    return [
+        {"commit": commit, "missing_object": missing, "reason": _PROMISOR_GAP_REASON}
+        for commit, missing in facts.excluded_incomplete_history
+    ]
+
+
+def _salvage_bundle_object_env(
+    vcs: _GitVcs, path: Path
+) -> tuple[tuple[Path, ...], dict[str, str]]:
+    """The object stores a salvage bundle of ``path`` may read, and their Git environment.
+
+    The first store is the checkout's own: ``common_directory(path)/objects``,
+    for a submodule in a linked worktree the per-worktree module store
+    (``<common>/worktrees/<slot>/modules/<module>/objects``). The rest are
+    alternates, read-only: the stores its own ``objects/info/alternates``
+    names, and the parent module store at the same modules-relative path in
+    the superproject's common directory (``<common>/modules/<module>``),
+    which is where a commit made in the parent checkout of the same
+    submodule left its objects (#1278). Lazy fetching is always off: a
+    bundle is made only from objects these stores already hold.
+    """
+
+    primary = Path(os.path.realpath(vcs.common_directory(path) / "objects"))
+    stores: list[Path] = [primary]
+
+    def add(candidate: Path) -> None:
+        resolved = Path(os.path.realpath(candidate))
+        if resolved not in stores and resolved.is_dir():
+            stores.append(resolved)
+
+    for alternate in _alternate_object_directories(primary, f"repository {path}"):
+        add(alternate)
+    git_directory = Path(
+        vcs._run(
+            path, ["rev-parse", "--path-format=absolute", "--absolute-git-dir"]
+        ).stdout.strip()
+    ).absolute()
+    parts = git_directory.parts
+    for index in range(len(parts) - 2):
+        if parts[index] != "worktrees" or parts[index + 2] != "modules":
+            continue
+        shared = Path(*parts[:index]).joinpath("modules", *parts[index + 3 :])
+        if (
+            shared != git_directory
+            and not shared.is_symlink()
+            and (shared / "HEAD").is_file()
+            and not (shared / "HEAD").is_symlink()
+            and (shared / "objects").is_dir()
+            and not (shared / "objects").is_symlink()
+        ):
+            add(shared / "objects")
+            for alternate in _alternate_object_directories(
+                shared / "objects", f"shared repository {shared}"
+            ):
+                add(alternate)
+        break
+    env: dict[str, str] = {
+        "GIT_OBJECT_DIRECTORY": str(primary),
+        "GIT_NO_LAZY_FETCH": "1",
+    }
+    if len(stores) > 1:
+        env["GIT_ALTERNATE_OBJECT_DIRECTORIES"] = os.pathsep.join(
+            str(store) for store in stores[1:]
+        )
+    return tuple(stores), env
+
+
+def _missing_objects(
+    vcs: _GitVcs, path: Path, commit: str, env: Mapping[str, str]
+) -> tuple[list[str], int]:
+    """Objects ``commit`` reaches that no store in ``env`` holds, in walk order."""
+
+    listed = vcs._run(
+        path,
+        ["rev-list", "--objects", "--missing=print", commit],
+        check=False,
+        env_overrides=env,
+    )
+    missing: list[str] = []
+    for line in listed.stdout.splitlines():
+        if line.startswith("?"):
+            value = line[1:].split(" ", 1)[0]
+            if SHA_RE.fullmatch(value):
+                missing.append(value)
+    return missing, listed.returncode
+
+
+def _unbundleable_refusal(
+    vcs: _GitVcs,
+    path: Path,
+    commit: str,
+    stores: Sequence[Path],
+    env: Mapping[str, str],
+    label: str,
+) -> Refusal | None:
+    """A precise refusal when ``commit`` cannot be bundled from ``stores``, else None."""
+
+    missing, returncode = _missing_objects(vcs, path, commit, env)
+    if not missing and returncode == 0:
+        return None
+    first = missing[0] if missing else commit
+    searched = ", ".join(str(store) for store in stores)
+    return Refusal(
+        f"cannot bundle salvage commit {commit} for {label}: object {first} "
+        f"is missing from every object store searched: {searched}; "
+        "nothing was removed"
+    )
+
+
+def _partition_kept_commits(
+    vcs: _GitVcs, path: Path, checkout_name: str, tips: Sequence[str]
+) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+    """Split kept private-history ``tips`` into bundleable and promisor-gap commits.
+
+    A tip is bundleable when every object it reaches is held by one of the
+    stores a salvage bundle may read (_salvage_bundle_object_env). A tip
+    whose missing objects are all promisor gaps (Git's
+    ``--missing=allow-promisor`` tolerates every one, with lazy fetching
+    off) was already incomplete in every store, so it is excluded and
+    recorded, never silently dropped. Any other missing object refuses,
+    naming the kept commit, the object, and every store searched (#1278).
+    """
+
+    if not tips:
+        return (), ()
+    stores, env = _salvage_bundle_object_env(vcs, path)
+    # One walk over every tip first: when nothing is missing, which is the
+    # thousands-of-kept-commits case, no per-tip walk is needed at all.
+    collective = vcs._run(
+        path,
+        ["rev-list", "--objects", "--missing=print", "--stdin"],
+        input_text="".join(f"{tip}\n" for tip in tips),
+        check=False,
+        env_overrides=env,
+    )
+    if collective.returncode == 0 and not any(
+        line.startswith("?") for line in collective.stdout.splitlines()
+    ):
+        print(
+            f"wrkslots: checkout {checkout_name}: keeping {len(tips)} kept "
+            "commit(s); excluded 0 already-incomplete kept commit(s) "
+            "(promisor gap); recorded in the salvage receipt",
+            file=sys.stderr,
+        )
+        return tuple(tips), ()
+    kept: list[str] = []
+    excluded: list[tuple[str, str]] = []
+    verified: list[str] = []
+    for tip in tips:
+        stdin = f"{tip}\n" + "".join(f"^{item}\n" for item in verified)
+        listed = vcs._run(
+            path,
+            ["rev-list", "--objects", "--missing=print", "--stdin"],
+            input_text=stdin,
+            check=False,
+            env_overrides=env,
+        )
+        missing: list[str] = []
+        for line in listed.stdout.splitlines():
+            if line.startswith("?"):
+                value = line[1:].split(" ", 1)[0]
+                if SHA_RE.fullmatch(value):
+                    missing.append(value)
+        if not missing and listed.returncode == 0:
+            kept.append(tip)
+            verified.append(tip)
+            continue
+        if missing:
+            tolerated = vcs._run(
+                path,
+                ["rev-list", "--objects", "--missing=allow-promisor", "--stdin"],
+                input_text=stdin,
+                check=False,
+                env_overrides=env,
+            )
+            if tolerated.returncode == 0:
+                excluded.append((tip, missing[0]))
+                continue
+            searched = ", ".join(str(store) for store in stores)
+            raise Refusal(
+                f"salvage of checkout {checkout_name} cannot bundle kept commit "
+                f"{tip}: object {missing[0]} is missing from every object "
+                f"store searched: {searched}; nothing was removed"
+            )
+        # The tip's own commit object is unreadable; the bundle stage would
+        # refuse it, so name it here instead of keeping it blindly.
+        searched = ", ".join(str(store) for store in stores)
+        raise Refusal(
+            f"salvage of checkout {checkout_name} cannot bundle kept commit "
+            f"{tip}: object {tip} is missing from every object store "
+            f"searched: {searched}; nothing was removed"
+        )
+    print(
+        f"wrkslots: checkout {checkout_name}: keeping {len(kept)} kept "
+        f"commit(s); excluded {len(excluded)} already-incomplete kept "
+        "commit(s) (promisor gap); recorded in the salvage receipt",
+        file=sys.stderr,
+    )
+    return tuple(kept), tuple(excluded)
+
+
 def _local_salvage_paths(
     archive_root: Path,
     machine: str,
@@ -24644,6 +24853,9 @@ def _local_salvage_receipt_payload(
     )
     if shared:
         extra["shared_bundle"] = True
+    excluded_entries = _excluded_incomplete_history_entries(facts)
+    if excluded_entries:
+        extra["excluded_incomplete_history"] = excluded_entries
     return {
         **extra,
         "schema": _LOCAL_SALVAGE_RECEIPT_SCHEMA,
@@ -24705,19 +24917,26 @@ def _ensure_local_salvage_bundle(
                 / f".{bundle.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
             )
             vcs._run(stage_root, ["init", "--bare", "--", str(stage)])
-            objects = vcs.common_directory(path) / "objects"
-            object_env = {"GIT_OBJECT_DIRECTORY": str(objects)}
-            vcs._run(
-                stage,
-                ["update-ref", archive_ref, facts.commit],
-                env_overrides=object_env,
-            )
+            stores, object_env = _salvage_bundle_object_env(vcs, path)
             try:
+                vcs._run(
+                    stage,
+                    ["update-ref", archive_ref, facts.commit],
+                    env_overrides=object_env,
+                )
                 vcs._run(
                     stage,
                     ["bundle", "create", str(temp_bundle), archive_ref],
                     env_overrides=object_env,
                 )
+            except Refusal as exc:
+                refusal = _unbundleable_refusal(
+                    vcs, path, facts.commit, stores, object_env, f"checkout {checkout.name}"
+                )
+                if refusal is not None:
+                    raise refusal from exc
+                raise
+            try:
                 descriptor = os.open(temp_bundle, os.O_RDONLY | os.O_CLOEXEC)
                 try:
                     os.fsync(descriptor)
@@ -24852,15 +25071,23 @@ def _ensure_shared_salvage_bundle(
                 with tempfile.TemporaryDirectory(prefix="wrkslots-bundle-stage-") as temporary:
                     stage = Path(temporary) / "stage.git"
                     vcs._run(Path(temporary), ["init", "--bare", "--", str(stage)])
-                    object_env = {
-                        "GIT_OBJECT_DIRECTORY": str(vcs.common_directory(path) / "objects")
-                    }
-                    vcs._run(stage, ["update-ref", archive_ref, commit], env_overrides=object_env)
-                    vcs._run(
-                        stage,
-                        ["bundle", "create", str(temp_bundle), archive_ref],
-                        env_overrides=object_env,
-                    )
+                    stores, object_env = _salvage_bundle_object_env(vcs, path)
+                    try:
+                        vcs._run(
+                            stage, ["update-ref", archive_ref, commit], env_overrides=object_env
+                        )
+                        vcs._run(
+                            stage,
+                            ["bundle", "create", str(temp_bundle), archive_ref],
+                            env_overrides=object_env,
+                        )
+                    except Refusal as exc:
+                        refusal = _unbundleable_refusal(
+                            vcs, path, commit, stores, object_env, "its shared bundle"
+                        )
+                        if refusal is not None:
+                            raise refusal from exc
+                        raise
                 temp_descriptor = os.open(temp_bundle, os.O_RDONLY | os.O_CLOEXEC)
                 try:
                     os.fsync(temp_descriptor)
@@ -25042,6 +25269,7 @@ def _archive_salvage_locally(
         "archive_bundle_bytes": bundle_size,
         "archive_ref": archive_ref,
         "complete_history": True,
+        "excluded_incomplete_history": _excluded_incomplete_history_entries(facts),
         "remote_failure": None if remote_failure is None else str(remote_failure),
         "archive_reason": archive_reason,
         "destination": str(bundle),
@@ -25160,6 +25388,12 @@ class _SalvageCandidate:
     # None means the same as ``dirty``.
     uncommitted_work: bool | None = None
     private_history: _PrivateHistory | None = None
+    # Kept private-history commits left out of the salvage commit because
+    # every object they reach that no searched store holds is a promisor
+    # gap (#1278): each is (commit, first missing object). They were
+    # already incomplete in every store removal may read, so the bundle
+    # keeps everything complete without pretending to keep them.
+    excluded_incomplete_history: tuple[tuple[str, str], ...] = ()
 
     @property
     def aliased(self) -> bool:
@@ -26370,9 +26604,16 @@ def _salvage_candidate_uncached(
         tips = () if history is None else history.tips
     else:
         tips = _worktree_private_orphan_tips(vcs, path, facts.commit)
-    extra.extend(tip for tip in tips if tip not in extra)
+    kept_tips, excluded = _partition_kept_commits(vcs, path, checkout.name, tips)
+    extra.extend(tip for tip in kept_tips if tip not in extra)
     if not extra:
-        return facts
+        if not excluded:
+            return facts
+        return dataclasses.replace(
+            facts,
+            private_history=history,
+            excluded_incomplete_history=excluded,
+        )
     if facts.shallow is not None:
         raise Refusal(
             f"checkout {checkout.name} uses shallow history, so the index or private "
@@ -26391,6 +26632,7 @@ def _salvage_candidate_uncached(
         dirty=True,
         uncommitted_work=uncommitted,
         private_history=history,
+        excluded_incomplete_history=excluded,
     )
 
 
@@ -27720,6 +27962,7 @@ def _salvage_one_checkout(
             "disposition": "already-published",
             "remote_ref": None,
             "containing_remote_refs": list(containing),
+            "excluded_incomplete_history": _excluded_incomplete_history_entries(facts),
             **proof,
         }
         if _checkout_is_self_sourced(config, checkout, path, vcs):
@@ -27789,6 +28032,7 @@ def _salvage_one_checkout(
         "disposition": "salvaged",
         "remote_ref": salvage_ref,
         "containing_remote_refs": [],
+        "excluded_incomplete_history": _excluded_incomplete_history_entries(facts),
         "destination": f"{checkout.remote}:{salvage_ref}",
     }
 
@@ -28343,6 +28587,7 @@ def _salvage_ownerless_checkout(
             "disposition": "already-published",
             "remote_ref": None,
             "containing_remote_refs": list(containing),
+            "excluded_incomplete_history": _excluded_incomplete_history_entries(facts),
         }
     if facts.aliased or not _salvage_push_allowed(config, facts.remote_authority):
         return _archive_salvage_locally(
@@ -28374,6 +28619,7 @@ def _salvage_ownerless_checkout(
         "disposition": "salvaged",
         "remote_ref": ref,
         "containing_remote_refs": [],
+        "excluded_incomplete_history": _excluded_incomplete_history_entries(facts),
         "destination": f"{checkout.remote}:{ref}",
     }
 

@@ -1588,6 +1588,7 @@ fn salvage_gate(cfg: &Cfg, config: &Value, checkout: &Value, repository: &Path) 
         "status_sha256": format!("{:x}", Sha256::digest(b"")),
         "disposition": "already-published",
         "remote_ref": Value::Null,
+        "excluded_incomplete_history": [],
         "containing_remote_refs": updated
             .get("containing_remote_refs")
             .cloned()

@@ -1768,6 +1768,17 @@ With `--archive-private-history`, that submodule is never pushed: its salvage co
 private tips and its index state as extra parents and is kept in a verified local bundle, as
 described below. Its uncommitted work is salvaged as it always was.
 
+Bundling reads the submodule's objects from its own store (for a submodule in a linked
+worktree, the per-worktree module store) with the parent checkout's module store and the
+stores its own alternates name as read-only alternates, never with a lazy fetch, so objects
+only the parent store holds still bundle. A kept commit whose missing objects are all
+promisor gaps — a partial clone legitimately never fetched them — was already incomplete in
+every store: it is left out of the salvage commit, the removal says how many were excluded,
+and the salvage receipt records each one under `excluded_incomplete_history` with its first
+missing object and the reason `already-incomplete history, promisor gap`. A kept commit that
+reaches any other missing object still refuses, naming the commit, the object, and every
+store searched, and nothing is removed.
+
 When the primary repository no longer initialises a submodule that the slot's checkout still holds,
 the slot's copy is judged by its own recorded remote: a published HEAD is recorded as
 `remote-verified`, an unpublished one is kept in a verified local bundle, and uncommitted changes in
