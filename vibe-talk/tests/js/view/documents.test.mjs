@@ -1166,6 +1166,12 @@ async function withDocumentsView(options, run) {
       el.querySelectorAll = () => [];
       el.scrollTop = 0;
       el.value = "";
+      // A measurable shared scroller (`#1264 documents-scroll-landings`): a
+      // tall page in a short viewport, so bottom/exact landings are numbers.
+      if (id === "scroll-area") {
+        el.clientHeight = 100;
+        Object.defineProperty(el, "scrollHeight", { get: () => 2000 });
+      }
       els[id] = el;
     }
     return els[id];
@@ -1176,9 +1182,13 @@ async function withDocumentsView(options, run) {
   };
   const opened = [];
   const api = async (path) => {
-    if (String(path).startsWith("/api/v1/documents?")) return { documents: [], total: 0, revision: 1 };
+    if (String(path).startsWith("/api/v1/documents?")) {
+      if (options.listGate) await options.listGate;
+      return { documents: options.listRows ?? [], total: (options.listRows ?? []).length, revision: 1 };
+    }
     const one = /^\/api\/v1\/documents\/([^/?]+)$/.exec(String(path));
     if (one) {
+      if (options.docGate) await options.docGate;
       const doc = docs[decodeURIComponent(one[1])];
       if (!doc) throw new Error("no such document");
       opened.push(one[1]);
@@ -1195,7 +1205,12 @@ async function withDocumentsView(options, run) {
     ...(options.onBack ? { onBack: options.onBack } : {}),
   });
   const savedDocument = globalThis.document;
-  globalThis.document = { createElement: (tag) => { const el = readerEl(tag); el.querySelectorAll = () => []; return el; } };
+  globalThis.document = {
+    createElement: (tag) => { const el = readerEl(tag); el.querySelectorAll = () => []; return el; },
+    createElementNS: (_ns, tag) => { const el = readerEl(tag); el.querySelectorAll = () => []; return el; },
+    createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }),
+    querySelector: () => null,
+  };
   try {
     await run({ view, els, byId, opened, reads, stops });
   } finally {
@@ -1229,6 +1244,60 @@ test("documents view: opens stack, back() walks them one step at a time, the lis
     assert.equal(view.depth(), 0);
     assert.equal(byId("docs-list-view").hidden, false);
     assert.equal(byId("docs-reader").hidden, true);
+  });
+});
+
+// ---- 6b. scroll landings (`#1264 documents-scroll-landings`) ----------------------------------
+//
+// First open at the top, Back to the bottom (or exactly where the list was
+// left scrolled up), each after the slow fetch that made them intermittent.
+
+function gate() {
+  let release;
+  const promise = new Promise((resolve) => { release = resolve; });
+  return { promise, release };
+}
+
+test("documents view: a first open lands at the top after a slow fetch (#1264)", async () => {
+  const doc = gate();
+  await withDocumentsView({ docGate: doc.promise }, async ({ view, byId }) => {
+    byId("scroll-area").scrollTop = 900;
+    const opening = view.show("doc-a");
+    await flush([]);
+    doc.release();
+    await opening;
+    assert.equal(view.reading(), true);
+    assert.equal(byId("scroll-area").scrollTop, 0, "a first open did not land at the top");
+  });
+});
+
+test("documents view: Back to the list lands at the bottom after slow rows (#1264)", async () => {
+  const rows = gate();
+  await withDocumentsView({ listGate: rows.promise, listRows: [docRow("old", 100), docRow("new", 300)] }, async ({ view, byId }) => {
+    byId("scroll-area").scrollTop = 1900; // parked at the list's bottom (2000 - 100)
+    await view.show("doc-a");
+    byId("scroll-area").scrollTop = 300; // the reader's place when Back is pressed
+    view.showList();
+    await flush([]);
+    rows.release();
+    await flush([]);
+    assert.equal(view.reading(), false);
+    assert.equal(byId("scroll-area").scrollTop, 2000, "Back did not land at the list's bottom");
+  });
+});
+
+test("documents view: Back after scrolling up in the list returns exactly there (#1264)", async () => {
+  const rows = gate();
+  await withDocumentsView({ listGate: rows.promise, listRows: [docRow("old", 100), docRow("new", 300)] }, async ({ view, byId }) => {
+    byId("scroll-area").scrollTop = 150; // deliberately scrolled up before opening
+    await view.show("doc-a");
+    byId("scroll-area").scrollTop = 700;
+    view.showList();
+    await flush([]);
+    rows.release();
+    await flush([]);
+    assert.equal(view.reading(), false);
+    assert.equal(byId("scroll-area").scrollTop, 150, "Back did not return to the scrolled-up list place");
   });
 });
 

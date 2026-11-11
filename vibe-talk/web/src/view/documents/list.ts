@@ -20,9 +20,20 @@ export interface DocumentsListDependencies {
   onStatus?(text: string): unknown;
 }
 
+/** A list place a return lands on (`#1264 documents-scroll-landings`). */
+export interface DocumentsListPlace {
+  top: number;
+  follow: boolean;
+}
+
 /** The Documents list's commands. */
 export interface DocumentsList {
-  refresh(): Promise<void>;
+  /**
+   * Redraw from the server. With `place`, land there after the rows render
+   * (the bottom where `follow`, else exactly `top`); without it, keep the
+   * scroller's current place by the same rule.
+   */
+  refresh(place?: DocumentsListPlace): Promise<void>;
   /** Fetch the unfetched among the rows just drawn; how many arrived. */
   fetchVisible(): Promise<number>;
   /** Fetch unfetched rows last mentioned at or after `cutoffMs`. */
@@ -440,13 +451,16 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     deps.onOpen(row.key);
   }
 
-  async function refresh(): Promise<void> {
+  async function refresh(place?: DocumentsListPlace): Promise<void> {
     // Keep the reader's place across the redraw, as the message views do: a reader parked
     // at the bottom follows newly appended documents there (which is also how entering the
     // list at its newest end lands at the bottom); anyone else stays where they were.
+    // A caller returning to the list (`#1264`) names the place instead: it was
+    // recorded when the document opened, because by return time the shared
+    // scroller holds the reader's place, not the list's.
     const scroller = scrollerOrNull();
-    const follow = scroller !== null && listOnScreen() && atBottom(scroller, FOLLOW_SLACK_PX);
-    const top = scroller ? scroller.scrollTop : 0;
+    const follow = place ? place.follow : scroller !== null && listOnScreen() && atBottom(scroller, FOLLOW_SLACK_PX);
+    const top = place ? place.top : scroller ? scroller.scrollTop : 0;
     const answer = (await deps.api(LIST_PATH)) as DocumentsListAnswer;
     totalNow = typeof answer?.total === "number" ? answer.total : 0;
     render(Array.isArray(answer?.documents) ? answer.documents : []);

@@ -3,7 +3,7 @@
 // public interface; the page mounts it once and shows it as the `docs` view.
 
 export { createDocumentsList } from "./list.ts";
-export type { DocumentsList, DocumentsListDependencies } from "./list.ts";
+export type { DocumentsList, DocumentsListDependencies, DocumentsListPlace } from "./list.ts";
 export { createDocumentsReader, currentOutlineIndex, openDocumentNotice } from "./reader.ts";
 export type { DocumentsReader, DocumentsReaderDependencies, OpenDocument } from "./reader.ts";
 export { renderDocumentMarkdown, documentHeadingId } from "./render.ts";
@@ -13,6 +13,7 @@ export type { DocumentMention, DocumentRow, DocumentsListAnswer } from "./types.
 
 import { createListening } from "../dom/index.ts";
 import { createDocumentsList } from "./list.ts";
+import type { DocumentsListPlace } from "./list.ts";
 import { createDocumentsReader, openDocumentNotice } from "./reader.ts";
 import type { OpenDocument } from "./reader.ts";
 
@@ -84,6 +85,13 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
    * channel, the list — is the page navigation's jump, not the view's.
    */
   let chain: { key: string; scrollTop: number }[] = [];
+  /**
+   * The list's place when a document opened from it (`#1264
+   * documents-scroll-landings`): where Back to the list lands — the bottom
+   * where it was parked there, the exact offset where the reader had
+   * scrolled up. Null where no document was opened from the list.
+   */
+  let listPlace: DocumentsListPlace | null = null;
 
   /** The shared scroller's place now, or 0 where it cannot be read. */
   function scrollTopNow(): number {
@@ -93,6 +101,29 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     } catch {
       return 0;
     }
+  }
+
+  /** How close to the bottom counts as parked there, in px (the list's own slack). */
+  const LIST_FOLLOW_SLACK_PX = 24;
+
+  /** The list's place now, where the list is the pane on screen; else null. */
+  function listPlaceNow(): DocumentsListPlace | null {
+    try {
+      if (deps.byId("pane-docs").hidden || deps.byId("docs-list-view").hidden) return null;
+      const scroller = deps.byId("scroll-area");
+      const top = typeof scroller.scrollTop === "number" && Number.isFinite(scroller.scrollTop) ? scroller.scrollTop : 0;
+      const follow = top + scroller.clientHeight >= scroller.scrollHeight - LIST_FOLLOW_SLACK_PX;
+      return { top, follow };
+    } catch {
+      return null;
+    }
+  }
+
+  /** Take the recorded list place, forgetting it; null where none stands. */
+  function takeListPlace(): DocumentsListPlace | undefined {
+    const place = listPlace;
+    listPlace = null;
+    return place ?? undefined;
   }
 
   /** Put the shared scroller back at `top`, where it can be written. */
@@ -167,8 +198,10 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
     reader.close();
     deps.byId("docs-reader").hidden = true;
     deps.byId("docs-list-view").hidden = false;
-    // Back from a fetch: the rows redraw with their fetched state.
-    if (redraw) void list.refresh().catch(() => undefined);
+    // Back from a fetch: the rows redraw with their fetched state, landing
+    // where the list was left (`#1264`), applied by the refresh after its
+    // rows render however late they arrive.
+    if (redraw) void list.refresh(takeListPlace()).catch(() => undefined);
   }
 
   /**
@@ -200,23 +233,38 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
 
   async function openDocument(key: string): Promise<void> {
     const current = readingNow ? chain[chain.length - 1] : undefined;
+    // A new chain entry is a first open of that document in this chain
+    // (`#1264`): it lands at the document's top once drawn. Reopening the
+    // document already open is not a first open and keeps its place.
+    const firstOpen = !current || current.key !== key;
     if (current) {
       // The place a Back to this document returns to.
       current.scrollTop = scrollTopNow();
       // Reopening the document already open adds no step of its own.
       if (current.key !== key) chain.push({ key, scrollTop: 0 });
     } else {
+      // Opening from the list records the list's place for the return
+      // (`#1264`), before the shared scroller becomes the reader's.
+      listPlace = listPlaceNow() ?? listPlace;
       chain = [{ key, scrollTop: 0 }];
     }
     deps.byId("docs-list-view").hidden = true;
     deps.byId("docs-reader").hidden = false;
     readingNow = true;
     deps.onLevelChange?.();
+    let opened = false;
     try {
       await reader.open(key);
+      opened = true;
     } catch {
       // The reader already said what happened; stay on the reader so Back works.
     }
+    // Land a first open at the top after the content renders, however late
+    // it was fetched (`#1264`), through the view's existing restore surface.
+    // A `#fragment` open scrolls on to its heading after this (the reader's
+    // click path awaits this open first), and Back to a previous document
+    // restores its own saved place the same way.
+    if (opened && firstOpen) restoreScrollTop(0);
   }
 
   function wire(): void {
@@ -308,10 +356,12 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
         return;
       }
       // Shown with no document named — a switch to this view: the list, the
-      // chain forgotten, however the reader was last left.
+      // chain forgotten, however the reader was last left. A recorded list
+      // place (`#1264`) lands the switch's return there too; with none, the
+      // refresh keeps the place the page restored for this view.
       toList(false);
       try {
-        await list.refresh();
+        await list.refresh(takeListPlace());
       } catch (error) {
         deps.onStatus?.(error instanceof Error ? error.message : "Could not load the documents.");
       }
