@@ -199,3 +199,5 @@ export { createLitCards } from "../view/channel/index.ts";
 export { createThreadCardHead } from "../view/channel/index.ts";
 // the main channel's messages among the cards (#624 mu-keyread)
 export { createMainCards } from "../view/channel/index.ts";
+// leaving the thread list and the card-place acts (#624 mu-keyread)
+export { createCardPlaceActs } from "../view/channel/index.ts";

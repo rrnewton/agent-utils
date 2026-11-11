@@ -3583,6 +3583,7 @@ test("`#298 thread-card-header`: from the thread list, the card moves up across 
   await page.settle();
   assert.equal(card.hasAttribute("data-flying"), true, "the card did not move up the second time");
   // The control: with no place taken from the list, nothing moves.
-  const still = await run(brokenScript("  const from = threadListOnScreen() ? cardFlightStart(String(id)) : null;\n", "  const from = null;\n"));
+  const still = await run(await brokenModule([{ file: "src/view/channel/cardplaceacts.ts",
+    find: "    const from = deps.threadListOnScreen() ? deps.cardFlightStart(String(id)) : null;\n", replace: "    const from = null;\n" }]));
   assert.equal(still.page.el("thread-card").hasAttribute("data-flying"), false, "the negative control moved the card anyway");
 });

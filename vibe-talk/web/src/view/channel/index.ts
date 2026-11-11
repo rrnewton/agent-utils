@@ -219,6 +219,8 @@ export { createOfflineCache } from "./offlinecache.ts";
 export type { OfflineCacheDependencies } from "./offlinecache.ts";
 export { createReadRunLines } from "./readrunlines.ts";
 export type { ReadRunLines, ReadRunLinesDependencies } from "./readrunlines.ts";
+export { createCardPlaceActs } from "./cardplaceacts.ts";
+export type { CardPlaceActs, CardPlaceActsDependencies, HeldListPlace } from "./cardplaceacts.ts";
 export { createMainCards } from "./maincards.ts";
 export type { MainCards, MainCardsChoice, MainCardsDependencies, MainCardsMessage, MainCardsStorage } from "./maincards.ts";
 export { createThreadCardHead } from "./threadcardhead.ts";

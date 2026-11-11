@@ -3953,7 +3953,7 @@ const cardLinesOwner = createCardLines({
     if (selection().view === "thread") renderThreadHeading();
     if (selection().view === "threads") el("thread-list").replaceChildren(...threadCards(timelineRows().threads));
   },
-  keepingCardPlace,
+  keepingCardPlace: (change, follow) => keepingCardPlace(change, follow),
   savedLines: (n) => messagePreferences.cardMaxLines.saved(n),
   stepLines: (direction) => messagePreferences.cardMaxLines.step(direction),
   quotePercentChanged: (value) => messagePreferences.quoteReadPercent.changed(value),
@@ -4416,7 +4416,7 @@ const threadList = createThreadList({
   changeChannelView,
   defaultChannelView,
   chooseView,
-  openThreadFromList,
+  openThreadFromList: (id, summary) => openThreadFromList(id, summary),
   selectSideThread,
   closeSideThread,
   setLayout,
@@ -6415,96 +6415,64 @@ const {
 
 // --- two columns on a desk ------------------------------------------------------------------------
 // The layout of the two columns is web/src/view/channel's now (`createTwoColumns`, `#624
-// voice-page-modularity`). Esc on the thread list, opening a thread from it and leaving it
-// (threadListBack, openThreadFromList, leaveThreadList) stay here until entering a thread's
-// move takes them, calling the layout owner's names as they were.
+// voice-page-modularity`).
 
-/**
- * Esc on the thread list, with nothing smaller open: back to what the list was chosen from
- * (`listBefore`). `#281 view-keys`. The owner, of the Threads screen it replaced: "rather ESC works".
- * Two columns, where the window still draws them, their button going back to what it went back to
- * then; else one column, on the view it showed (`oneColumnBeforeList`).
- */
-function threadListBack() {
-  if (columnWork.side()) return inColumn(columns.main, threadListBack);
-  const before = layoutChoice.listBefore();
-  if (before.layout === "two" && layoutShown.fit()) {
-    layoutChoice.restoreBeforeColumns(before.columns);
-    setLayout("two");
-  } else {
-    chooseOneColumn(oneColumnBeforeList(before));
-  }
-  settleFocus();
-  return undefined;
-}
-
-/**
- * Open thread `id` from the thread list: across the window, one column, and Back from it is the list
- * again (`closeThread`). `#281 view-keys`. A card, the picker, and Enter on a card all come here.
- */
-function openThreadFromList(id, summary = null) {
-  const known = summary || channelStore.current().threads.find((held) => String(held.id) === String(id)) || null;
-  // `#298 thread-card-header`. Its card moves up from the list to the top of the window.
-  const from = threadListOnScreen() ? cardFlightStart(String(id)) : null;
-  chooseOneColumn({ view: "thread", thread: String(id), summary: known, origin: "list" });
-  flyThreadCard(leftEl("thread-card"), from, leftEl("pane-discord"));
-}
-
-/**
- * Out of the thread list: to one column — the view asked for, or the one the channel opens in — or to
- * two columns, Main coming in beside the cards as they are. `#281 view-keys`.
- *
- * @param {"one" | "list" | "two"} next
- */
-function leaveThreadList(next = "one") {
-  // `#269 approval-card-inline`. A send card docked under the cards goes back to the foot of the left
-  // column's list, its next message, BEFORE that column's view is decided, so that a view drawn afresh
-  // (All, a thread) is placed with it in. Main kept behind the list, which nothing redraws, is told as a
-  // message arriving tells it (`#280 scroll-stability`): a reader on its newest line follows the card
-  // down, and anyone else stays on their row and is offered the jump to it.
-  //
-  // ...and told BEFORE that view is decided, since a switch between Main and All keeps the place Main's
-  // reader is at (`changeChannelView`). Told only after, and only where the view stayed, a reader at
-  // All's foot was drawn in All on the rows they could see above the card: in Chromium 369px above All's
-  // foot on a phone and 337px at a desk, Send off screen. The place read as the list came up, with the
-  // card still in Main's list, is what is put back, where it still holds (`layoutShown.holdListPlace`): the card's
-  // going moved a reader near the foot.
-  //
-  // ...and a place read in All is put back in All as well, card or no card, once the way out has shown
-  // All, where every row the reader could see is. Main lacks All's replies, so a place near All's foot
-  // put back in Main is at Main's foot, and the switch to All took that for a reader on the newest line
-  // and went to All's foot. A reader up All is offered the jump to a card come back below them, as one
-  // up Main is.
-  const carded = voiceTranscript().postWatch.shown !== null;
-  const follows = carded && liveFollowers().main;
-  const shown = `${selection().view}|${selection().threadId}`;
-  const held = layoutShown.takeListPlace();
-  layoutShown.setThreadList(false);
-  // `#419 threads-view-main-messages`. The main channel's box back under the left column's list.
-  renderMainToggle();
-  renderOrderToggle();
-  placeMainCard();
-  // `#262 search-load-older`. The cards' walk for the search ends with the list, unless two columns
-  // keep the cards beside Main.
-  if (next !== "two") endRepliesWalk();
-  voiceTranscript().placePostCard();
-  const followed = inColumn(columns.main, () => {
-    const holds = held !== null && screens.screen() === "main" && screens.view() === "discord" &&
-      selection().view === "main" && String(selectedChannelId()) === held.channel;
-    if (holds && keepReaderPlace(held.place)) return held.place.pinned;
-    if (follows) scrollToNewest();
-    return follows;
-  });
-  if (next === "one") showOneColumnLeft();
-  const backInAll = next === "one" && held !== null && held.view === "flat" && inColumn(columns.main, () =>
-    screens.screen() === "main" && screens.view() === "discord" && selection().view === "flat" &&
-    String(selectedChannelId()) === held.channel && keepReaderPlace(held.place));
-  if (carded && (backInAll ? !held.place.pinned : !followed && `${selection().view}|${selection().threadId}` === shown)) {
-    inColumn(columns.main, () => followIfPinned(false, 0, "discord"));
-  }
-  renderSearchInAll();
-  refreshSearchCount();
-}
+// Leaving the thread list, and the card the reader was held by, are web/src/view/channel's now
+// (`createCardPlaceActs`, `#624 voice-page-modularity`): Esc on the list, opening a thread from
+// it, leaving it, and the reader's place in the cards. The scroll acts are handed in as the
+// exact calls the script made.
+const cardPlaceActs = createCardPlaceActs({
+  inSideColumn: () => columnWork.side(),
+  inMainColumn: (act) => inColumn(columns.main, act),
+  listBefore: () => layoutChoice.listBefore(),
+  columnsFit: () => layoutShown.fit(),
+  restoreBeforeColumns: (cols) => layoutChoice.restoreBeforeColumns(/** @type {any} */ (cols)),
+  setLayout: (layout) => setLayout(/** @type {any} */ (layout)),
+  chooseOneColumn: (place) => chooseOneColumn(/** @type {any} */ (place)),
+  oneColumnBeforeList: (before) => oneColumnBeforeList(before),
+  settleFocus: () => settleFocus(),
+  threadSummary: (id) => channelStore.current().threads.find((held) => String(held.id) === String(id)) || null,
+  threadListOnScreen: () => threadListOnScreen(),
+  cardFlightStart: (id) => cardFlightStart(id),
+  flyThreadCard: (card, from, pane) => flyThreadCard(card, from, pane),
+  leftById: leftEl,
+  postCardShown: () => voiceTranscript().postWatch.shown !== null,
+  mainFollows: () => liveFollowers().main,
+  selectionKey: () => `${selection().view}|${selection().threadId}`,
+  takeListPlace: () => layoutShown.takeListPlace(),
+  setThreadList: (on) => layoutShown.setThreadList(on),
+  renderMainToggle: () => renderMainToggle(),
+  renderOrderToggle: () => renderOrderToggle(),
+  placeMainCard: () => placeMainCard(),
+  endRepliesWalk: () => endRepliesWalk(),
+  placePostCard: () => voiceTranscript().placePostCard(),
+  placeHolds: (held, view) => screens.screen() === "main" && screens.view() === "discord" && selection().view === view && String(selectedChannelId()) === held.channel,
+  keepReaderPlace: (place) => keepReaderPlace(/** @type {any} */ (place)),
+  scrollToNewest: () => scrollToNewest(),
+  showOneColumnLeft: () => showOneColumnLeft(),
+  followIfPinned: () => followIfPinned(false, 0, "discord"),
+  renderSearchInAll: () => renderSearchInAll(),
+  refreshSearchCount: () => refreshSearchCount(),
+  makeCardPlaces: () => createCardPlaces({
+    lookup: (id) => leftEl(id),
+    readable: () => sideColumnUp() && columns.side.mode === "list" && !cardsDrawn.opening(),
+    atBottom: (area) => atBottom(area),
+    followFoot: (area) => followFoot(area),
+    litCard: () => litCard(),
+    selectedCard: () => {
+      const mark = markOf(sidePane);
+      return mark && mark.card !== false ? mark.id : null;
+    },
+    finishSlide: () => finishPackSlide(),
+  }),
+  selectedChannelId: () => selectedChannelId(),
+  takeListCards: () => layoutShown.takeListCards(),
+  closeOverextend: () => closeOverextend(),
+  setSideListMode: () => { columns.side.mode = "list"; },
+  whileOpeningCards: (act) => cardsDrawn.whileOpening(act),
+  renderSideMode: () => renderSideMode(),
+});
+const { threadListBack, openThreadFromList, leaveThreadList, cardAnchor, placeCardAnchor, keepingCardPlace, rememberCardPlace, openSideCards, placeOpenedCards } = cardPlaceActs;
 
 // The right column's cards are web/src/view/channel's now (`createSideCards`, `#624
 // voice-page-modularity`).
@@ -6539,87 +6507,6 @@ function leaveThreadList(next = "one") {
 // Where the reader is in the cards, and putting them back once the cards are drawn again — held by what kept
 // most of the screen still when the card held has moved — are web/src/view/channel's (`createCardPlaces`,
 // with `rowNeighbours`, `neighbourStayed` and `sameCardPlace`; `#624 voice-page-modularity`).
-
-/** The reader's place in the cards. */
-const cardPlaces = createCardPlaces({
-  lookup: (id) => leftEl(id),
-  readable: () => sideColumnUp() && columns.side.mode === "list" && !cardsDrawn.opening(),
-  atBottom: (area) => atBottom(area),
-  followFoot: (area) => followFoot(area),
-  litCard: () => litCard(),
-  selectedCard: () => {
-    const mark = markOf(sidePane);
-    return mark && mark.card !== false ? mark.id : null;
-  },
-  finishSlide: () => finishPackSlide(),
-});
-
-/**
- * Where the reader is in the cards, or null with the cards not on screen, or being opened.
- *
- * @returns {import("./src/view/channel/index.ts").CardPlace | null}
- */
-function cardAnchor() {
-  return cardPlaces.anchor();
-}
-
-/**
- * Put the reader back on `anchor` in the cards; whether the reader was placed. With `follow`, a place the
- * reader chose to come back to, the card wherever it now is.
- *
- * @param {import("./src/view/channel/index.ts").CardPlace | null} anchor
- * @param {boolean} [follow]
- */
-function placeCardAnchor(anchor, follow = false) {
-  return cardPlaces.place(anchor, follow);
-}
-
-/**
- * Run `change` to the cards, keeping the reader's place in them. With `follow`, a change the reader asked
- * for that re-sorts the cards: the card they are on is kept wherever it goes.
- *
- * @param {() => void} change
- * @param {boolean} [follow]
- */
-function keepingCardPlace(change, follow = false) {
-  cardPlaces.keeping(change, follow);
-}
-
-/**
- * By channel, where the reader was in the cards when a thread was selected from them, for this
- * session: closing the thread comes back there. `#261 two-column-connectors`.
- *
- * @type {Map<string, {newest: boolean, id: string | null, offset: number}>}
- */
-const sideCardPlaces = new Map();
-
-/** Note where the reader is in the cards, before the right column shows something else. */
-function rememberCardPlace() {
-  const anchor = cardAnchor();
-  if (anchor) sideCardPlaces.set(String(selectedChannelId()), anchor);
-}
-
-/** Show the cards in the right column, the reader placed in them as `placeOpenedCards` says. */
-function openSideCards() {
-  // A place held for the way back to the thread list is not one in cards opened afresh (`layoutShown.holdListCards`).
-  layoutShown.takeListCards();
-  // Nor the room past the foot held for a card packed in them (`#459 pack-keeps-card-still`).
-  closeOverextend();
-  columns.side.mode = "list";
-  cardsDrawn.whileOpening(renderSideMode);
-  placeOpenedCards();
-}
-
-/**
- * The cards just opened: at the foot, as a list of messages opens at its newest, unless the reader was
- * up the list when a thread was selected from it — then back on the card they were on.
- */
-function placeOpenedCards() {
-  const anchor = sideCardPlaces.get(String(selectedChannelId()));
-  sideCardPlaces.delete(String(selectedChannelId()));
-  // The foot, too, when the card the reader was on has gone.
-  if (!(anchor && !anchor.newest && placeCardAnchor(anchor, true))) placeCardAnchor({ newest: true, id: null, offset: 0 });
-}
 
 /**
  * The search text over the cards, as over the Threads list's (`#129 message-search`): a card the

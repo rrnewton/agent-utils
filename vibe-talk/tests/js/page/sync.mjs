@@ -34,6 +34,12 @@ import { ALICE, BOTTOM_SLACK_PX, CHANNEL, CHARS_PER_LINE, COUNTS_ALL_READ_MS, CS
 const placingPatch = ([find, replace]) => ({ file: "src/view/channel/placing.ts", find, replace });
 const brokenPlacing = (...patches) => brokenModule(patches.map(placingPatch));
 
+/** The card-place acts in their module (`createCardPlaceActs`, `#624`): a patch there, and a page built with patches. */
+const cardPlaceActsPatch = ([find, replace]) => ({ file: "src/view/channel/cardplaceacts.ts", find, replace });
+const brokenCardPlaceActs = (...patches) => brokenModule(patches.map(cardPlaceActsPatch));
+/** `leaveThreadList`'s followed place, in its module: broken, the reader is followed nowhere. */
+const FOLLOWED_BROKEN = ["      if (holds && held && deps.keepReaderPlace(held.place)) return held.place.pinned;\n      if (follows) deps.scrollToNewest();\n      return follows;", "      return false;"];
+
 test("returning to the channel RE-READS it, instead of showing what was true the first time", async () => {
   const page = newPage();
   await signIn(page);
@@ -6099,9 +6105,7 @@ test("`#269 approval-card-inline` x `#281 view-keys`: CMD-3 AND CMD-4 WHILE A SE
   assert.deepStrictEqual({ listFoot: dockedLate.listFoot, againDocked: dockedLate.againDocked },
     { listFoot: false, againDocked: true }, "docked after the cards were opened, the thread list still opened at its foot");
   // Main told nothing as the card comes back to its foot: its reader is left above the card.
-  const unfollowed = await run(brokenScript(
-    "    if (holds && keepReaderPlace(held.place)) return held.place.pinned;\n    if (follows) scrollToNewest();\n    return follows;",
-    "    return false;"));
+  const unfollowed = await run(await brokenCardPlaceActs(FOLLOWED_BROKEN));
   assert.deepStrictEqual({ mainFollowed: unfollowed.mainFollowed, oneFollowed: unfollowed.oneFollowed },
     { mainFollowed: false, oneFollowed: false }, "the control followed the card down too");
 });
@@ -6247,17 +6251,8 @@ test("`#336 draft-return-thread-list` x `#280 scroll-stability`: A DRAFT ARRIVIN
   assert.deepStrictEqual(hiddenKept, { ...real, settings0: false, help0: false });
 });
 
-/** The place read in All put back in All once the way out of the thread list has shown it, and not. */
-const BACK_IN_ALL = 'const backInAll = next === "one" &&';
-const NOT_BACK_IN_ALL = "const backInAll = false &&";
-
-/** `script`, already a broken copy, broken in one more place, which it must contain. */
-function brokenFurther(page, find, replace) {
-  const script = typeof page === "string" ? page : page.script;
-  assert.ok(script.includes(find), `the negative control patches ${JSON.stringify(find)}, which the copy no longer contains`);
-  const changed = script.replace(find, replace);
-  return typeof page === "string" ? changed : { ...page, script: changed };
-}
+/** The place read in All put back in All once the way out of the thread list has shown it, and not (in its module). */
+const BACK_IN_ALL_OFF = ["    const backInAll = next === \"one\" &&", "    const backInAll = false &&"];
 
 test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: LEAVING THE THREAD LIST FOR ALL with a send card up finds a reader who was at All's foot at its foot, Send on screen — by Esc, where the list was chosen from All, and by Cmd-2", async () => {
   const DOCKED = 60;
@@ -6299,9 +6294,7 @@ test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: 
   // place not put back once it is: All keeps the place Main's reader is at, now above the card, and draws
   // them on the rows they could see, Send below the screen — 369px above All's foot on a phone in
   // Chromium, and 337px at a desk. Either alone puts them back at All's foot.
-  const untold = await run(brokenFurther(brokenScript(
-    "    if (holds && keepReaderPlace(held.place)) return held.place.pinned;\n    if (follows) scrollToNewest();\n    return follows;",
-    "    return false;"), BACK_IN_ALL, NOT_BACK_IN_ALL));
+  const untold = await run(await brokenCardPlaceActs(FOLLOWED_BROKEN, BACK_IN_ALL_OFF));
   assert.deepStrictEqual(untold, { ...real, escape: false, cmd2: false });
 });
 
@@ -6356,13 +6349,14 @@ test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: 
   // THE CONTROLS. Main's keeper not told the card moved: the card's height going from under Main is taken
   // for the dock growing, and a reader within it of the foot is pulled to the foot behind the cards. The
   // place held from Cmd-3 still puts them back on the way out.
-  const unmoved = await brokenModule([{ file: "src/view/voice/transcript.ts", find: "  if (moving) deps.cardMovedUnderLists(deps.heightUnderLists() - under);\n", replace: "" }]);
+  const unmovedPatch = { file: "src/view/voice/transcript.ts", find: "  if (moving) deps.cardMovedUnderLists(deps.heightUnderLists() - under);\n", replace: "" };
+  const unmoved = await brokenModule([unmovedPatch]);
   assert.deepStrictEqual(await run(unmoved), { ...real, keeperBehind: false });
   // No place held from Cmd-3: a reader the card's going moved is followed down to the foot as one on it.
-  const held = "    if (holds && keepReaderPlace(held.place)) return held.place.pinned;\n";
-  assert.deepStrictEqual(await run(brokenScript(held, "")), { ...real, movedOne: false, movedEscape: false, movedTwo: false });
+  const held = ["      if (holds && held && deps.keepReaderPlace(held.place)) return held.place.pinned;\n", ""];
+  assert.deepStrictEqual(await run(await brokenCardPlaceActs(held)), { ...real, movedOne: false, movedEscape: false, movedTwo: false });
   // Neither, as the card's docking first left it: every one of them found at the foot of Main on the way back.
-  assert.deepStrictEqual(await run(brokenFurther(unmoved, held, "")), {
+  assert.deepStrictEqual(await run(await brokenModule([unmovedPatch, cardPlaceActsPatch(held)])), {
     keeperOne: false, keeperEscape: false, keeperTwo: false, keeperBehind: false, movedOne: false, movedEscape: false,
     movedTwo: false, untouched: true,
   });
@@ -6452,9 +6446,10 @@ test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: 
   assert.deepStrictEqual(await run(told), { ...real, behind: every((name) => name === "foot") });
   // As the page was before: no place held from Cmd-3 without a card either, and on the way back they
   // follow the card down from the foot they were pulled to.
-  const before = brokenFurther(await brokenModule([
+  const before = await brokenModule([
     { file: "src/view/voice/transcript.ts", find: "  if (coming) deps.cardCameUnderLists(gap);\n", replace: "" },
-    { file: "src/view/channel/twocolumns.ts", find: HELD_ALWAYS, replace: HELD_WITH_CARD }]), BACK_IN_ALL, NOT_BACK_IN_ALL);
+    { file: "src/view/channel/twocolumns.ts", find: HELD_ALWAYS, replace: HELD_WITH_CARD },
+    cardPlaceActsPatch(BACK_IN_ALL_OFF)]);
   assert.deepStrictEqual(await run(before), {
     behind: every((name) => name === "foot"), back: every((name) => name === "foot"), untouched: true,
   });
@@ -6501,7 +6496,7 @@ test("`#269 approval-card-inline` x `#281 view-keys` x `#280 scroll-stability`: 
   // THE CONTROL. All's place not put back in All: whoever Main's place clamped at Main's foot is taken to
   // All's foot — with a card, every reader but one whose rows Main still holds above its own foot, and
   // without one, every reader.
-  const unkept = brokenScript(BACK_IN_ALL, NOT_BACK_IN_ALL);
+  const unkept = await brokenCardPlaceActs(BACK_IN_ALL_OFF);
   assert.deepStrictEqual({ card: await run(unkept, true), none: await run(unkept, false) },
     { card: all((up) => up === 200), none: all(false) });
 });

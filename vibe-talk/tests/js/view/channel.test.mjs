@@ -3077,3 +3077,61 @@ test("`#624 voice-page-modularity`: Main's messages among the cards and their or
   assert.equal(typeof kept.get("vibe-talk.voice.thread-order"), "string", "the order was not kept under its own key");
   assert.equal(owner.cardOrderOnScreen(), owner.threadOrders.current());
 });
+
+test("`#624 voice-page-modularity`: leaving the thread list and the card place — the held place put back, the cards opened where the reader was — from the module alone", () => {
+  const { createCardPlaceActs } = CHANNEL_VIEW;
+  const log = [];
+  let anchor = { newest: false, id: "t1", offset: 12 };
+  let heldPlace = null;
+  const owner = createCardPlaceActs({
+    inSideColumn: () => false, inMainColumn: (act) => act(),
+    listBefore: () => ({ layout: "one", columns: null }), columnsFit: () => false,
+    restoreBeforeColumns: () => {}, setLayout: () => {}, chooseOneColumn: (place) => log.push(["choose", place]),
+    oneColumnBeforeList: () => "back-place", settleFocus: () => log.push("focus"),
+    threadSummary: () => null, threadListOnScreen: () => false, cardFlightStart: () => null,
+    flyThreadCard: () => {}, leftById: () => ({}),
+    postCardShown: () => false, mainFollows: () => false, selectionKey: () => "flat|null",
+    takeListPlace: () => heldPlace, setThreadList: (on) => log.push(["list", on]),
+    renderMainToggle: () => log.push("main-toggle"), renderOrderToggle: () => log.push("order-toggle"),
+    placeMainCard: () => log.push("main-card"), endRepliesWalk: () => log.push("end-walk"),
+    placePostCard: () => log.push("post-card"), placeHolds: () => true,
+    keepReaderPlace: () => { log.push("keep-place"); return true; },
+    scrollToNewest: () => log.push("newest"), showOneColumnLeft: () => log.push("one-left"),
+    followIfPinned: () => log.push("pinned"), renderSearchInAll: () => log.push("search"),
+    refreshSearchCount: () => log.push("count"),
+    makeCardPlaces: () => ({
+      anchor: () => anchor,
+      place: (place, follow) => { log.push(["place", place && place.id, follow]); return true; },
+      keeping: (change) => change(),
+    }),
+    selectedChannelId: () => "c1", takeListCards: () => log.push("take-cards"),
+    closeOverextend: () => log.push("close-room"), setSideListMode: () => log.push("mode-list"),
+    whileOpeningCards: (act) => act(), renderSideMode: () => log.push("render-side"),
+  });
+  // Esc on the list in one column: back to the place it was chosen from, focus settled.
+  owner.threadListBack();
+  assert.deepStrictEqual(log, [["choose", "back-place"], "focus"]);
+  // Leaving with no held place: the list goes, toggles redrawn, no place put back.
+  log.length = 0;
+  owner.leaveThreadList("one");
+  assert.deepStrictEqual(log, [["list", false], "main-toggle", "order-toggle", "main-card", "end-walk", "post-card", "one-left", "search", "count"]);
+  // A held place that still holds is put back in Main's column.
+  heldPlace = { channel: "c1", view: "main", place: { pinned: false } };
+  log.length = 0;
+  owner.leaveThreadList("two");
+  assert.ok(log.includes("keep-place"), "the held place was not put back");
+  assert.ok(!log.includes("end-walk"), "the search walk ended while two columns keep the cards");
+  // The card place remembered per channel is where the cards open again.
+  log.length = 0;
+  owner.rememberCardPlace();
+  owner.openSideCards();
+  assert.deepStrictEqual(log.slice(-3), ["mode-list", "render-side", ["place", "t1", true]]);
+  // The anchor and keeping pass straight to the places owner; opening from the list chooses the thread.
+  assert.deepStrictEqual(owner.cardAnchor(), { newest: false, id: "t1", offset: 12 });
+  let kept = "";
+  owner.keepingCardPlace(() => { kept = "changed"; });
+  assert.equal(kept, "changed", "keeping did not run the change through the places owner");
+  assert.equal(owner.placeCardAnchor(null), true);
+  owner.openThreadFromList("t9", { id: "t9" });
+  assert.deepStrictEqual(log.at(-1), ["choose", { view: "thread", thread: "t9", summary: { id: "t9" }, origin: "list" }]);
+});
