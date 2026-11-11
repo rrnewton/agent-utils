@@ -117,6 +117,22 @@ def test_report_names_rescue_ref_bundle_and_teardown_time(
     assert checkout["bundle"] == str(config.control / "ttl-rescue" / "stale.bundle")
 
 
+def test_health_lines_follow_tick_hub_grammar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result, _config_used = _report(tmp_path, monkeypatch, "--format", "health")
+    assert result == 0, capsys.readouterr().err
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 2
+    by_slot = {line.split()[1]: line for line in lines}
+    assert by_slot["wrkslots-ttl-fresh"].startswith("HEALTH: wrkslots-ttl-fresh ok ")
+    stale = by_slot["wrkslots-ttl-stale"]
+    assert stale.startswith("HEALTH: wrkslots-ttl-stale stale age_secs=")
+    assert "threshold_secs=86400" in stale
+    assert 'detail="slot stale stage=teardown teardown_at=2026-11-13T01:00:00+00:00"' in stale
+
+
 def test_only_overdue_keeps_expired_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

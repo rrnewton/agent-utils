@@ -24414,6 +24414,7 @@ def _ttl_report_rows(
                 "heartbeat_at": record.heartbeat_at,
                 "heartbeat_ttl_seconds": record.heartbeat_ttl_seconds,
                 "expired_at": expired_at.isoformat(),
+                "overdue_seconds": int(max(0.0, (now - expired_at).total_seconds())),
                 "teardown_at": teardown_at.isoformat(),
                 "checkouts": [
                     {
@@ -24431,6 +24432,30 @@ def _ttl_report_rows(
             }
         )
     return rows
+
+
+def _ttl_health_lines(
+    rows: list[dict[str, object]], thresholds: TtlThresholds
+) -> list[str]:
+    """Tick-hub HEALTH lines for the ladder (#1293 slice 2).
+
+    One line per reported slot: ``current`` reads ``ok``; every rung at or
+    past warn reads ``stale`` with the seconds past TTL expiry as the age
+    and the alarm threshold as the bound, so a tick-hub consumer alarms on
+    exactly the slots the daily report names.
+    """
+    lines: list[str] = []
+    for row in rows:
+        stage = str(row["stage"])
+        status = "ok" if stage == "current" else "stale"
+        lines.append(
+            f"HEALTH: wrkslots-ttl-{row['slot']} {status} "
+            f"age_secs={int(row['overdue_seconds'])} "
+            f"threshold_secs={thresholds.alarm_after_seconds} "
+            f"detail=\"slot {row['slot']} stage={stage} "
+            f"teardown_at={row['teardown_at']}\""
+        )
+    return lines
 
 
 def _cmd_ttl_report(args: argparse.Namespace) -> int:
@@ -24451,6 +24476,10 @@ def _cmd_ttl_report(args: argparse.Namespace) -> int:
         config, state, now, thresholds,
         only_overdue=args.only_overdue, slot=args.slot,
     )
+    if args.format == "health":
+        for line in _ttl_health_lines(rows, thresholds):
+            print(line)
+        return 0
     if args.format == "json":
         print(
             json.dumps(
@@ -78469,8 +78498,8 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="show the TTL escalation dry-run report (acts on nothing)",
     )
     ttl_report.add_argument(
-        "--format", choices=("human", "json"), default="human",
-        help="output format (default: human)",
+        "--format", choices=("human", "json", "health"), default="human",
+        help="output format: human rows, json rows, or tick-hub HEALTH lines (default: human)",
     )
     ttl_report.add_argument(
         "--now", metavar="ISO8601", default=None,
