@@ -210,6 +210,7 @@ def test_rust_package_selectors_resolve_dependency_archive_closure() -> None:
         "term-backend",
         "chat-subscription",
         "chat-subscription-plugin",
+        "claude-stream-session",
         "agentctl",
     ]
     assert reasons == {
@@ -294,6 +295,7 @@ def test_rust_package_main_globally_checks_topology_but_only_smokes_selection(
         ("verify", "term-backend"),
         ("verify", "chat-subscription"),
         ("verify", "chat-subscription-plugin"),
+        ("verify", "claude-stream-session"),
         ("verify", "agentctl"),
         ("smoke", "agentctl"),
     ]
