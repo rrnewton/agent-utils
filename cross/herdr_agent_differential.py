@@ -2378,13 +2378,15 @@ def _cross_process_serialization(harness: Harness, report: Report) -> None:
             time.sleep(0.05)
         serialized = entered and attempted and _submitted(root) == ["from pane"]
         (root / "run-release").write_text("release\n", encoding="utf-8")
+        # Process exit is the condition; the timeout only bounds a hang
+        # (reported as timed_out), never judges speed (#1249).
         timed_out = False
         try:
-            first_out, first_err = first.communicate(timeout=10)
+            first_out, first_err = first.communicate(timeout=TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
             timed_out, first_out, first_err = True, "", "TIMEOUT"
         try:
-            second_out, second_err = second.communicate(timeout=10)
+            second_out, second_err = second.communicate(timeout=TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
             timed_out, second_out, second_err = True, "", "TIMEOUT"
         report.require(
