@@ -2877,7 +2877,8 @@ pub fn restore<A: ManagedApi + ?Sized>(
                 &text,
                 options,
                 Some(&message_id),
-                None,
+                // #1372: a later boot's notice replaces an undelivered earlier one.
+                Some("restore-notice"),
             ) {
                 Ok(result) => {
                     json!({"message_id": message_id, "outcome": json!(result)["outcome"]})

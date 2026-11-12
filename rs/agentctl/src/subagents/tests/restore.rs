@@ -512,13 +512,9 @@ fn restore_queues_a_catch_up_for_each_revived_agent_without_blocking() {
     let queue = fixture.manager().queue("lane").unwrap();
     let prompts = agent::queued_prompts(&queue).unwrap();
     assert_eq!(prompts, ["restore-catchup-11111111-lane"], "{prompts:?}");
+    // #1372: superseded kinds queue in inbox.v2/, which current drainers read.
     let item: Value = serde_json::from_slice(
-        &fs::read(
-            queue
-                .join("inbox")
-                .join("restore-catchup-11111111-lane.json"),
-        )
-        .unwrap(),
+        &fs::read(queue.join("inbox.v2").join("restore-catchup-11111111-lane.json")).unwrap(),
     )
     .unwrap();
     assert!(item["text"].as_str().unwrap().contains("continue where"));
@@ -615,6 +611,50 @@ fn watch_types_a_queued_prompt_and_reports_a_stale_one() {
         1,
         "check-only typed nothing"
     );
+}
+
+#[test]
+fn a_second_boots_catch_up_supersedes_the_first_boots_undelivered_one() {
+    // #1372 chat-stale-prompt-wedges-inbox: a restore prompt left undelivered
+    // must not stack across boots; the newer boot replaces it untyped (#1156).
+    let fixture = Fixture::new();
+    fixture
+        .manager()
+        .start(
+            "lane",
+            &fixture.root,
+            StartOptions {
+                workspace_id: Some("workspace".to_owned()),
+                brief: Some("task".to_owned()),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let registry = fixture.root.join("registry");
+    let config = config(&fixture, None);
+    let report = json!({"agents": [{"name": "lane", "action": "revived"}]});
+    let first = crate::restore_notice::after_restore(
+        &fixture.client,
+        &registry,
+        &config,
+        &report,
+        None,
+        "boot-aaaaaaaa",
+    );
+    assert_eq!(first["catch_up"][0]["action"], "queued", "{first}");
+    assert_eq!(fixture.manager().pending_prompts("lane").unwrap().len(), 1);
+    let second = crate::restore_notice::after_restore(
+        &fixture.client,
+        &registry,
+        &config,
+        &report,
+        None,
+        "boot-bbbbbbbb",
+    );
+    assert_eq!(second["catch_up"][0]["action"], "queued", "{second}");
+    let pending = fixture.manager().pending_prompts("lane").unwrap();
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert_eq!(pending[0].0, "restore-catchup-boot-bbb-lane");
 }
 
 #[test]
@@ -1967,8 +2007,9 @@ const BRIEF_TEMPLATE: &str = "Resume {{agent}}: boot {{boot_id}} at {{boot_time}
 
 fn brief_text(fixture: &Fixture, name: &str, message_id: &str) -> String {
     let queue = fixture.manager().queue(name).unwrap();
+    // #1372: briefs carry a supersede key, so they queue in inbox.v2/.
     let item: Value = serde_json::from_slice(
-        &fs::read(queue.join("inbox").join(format!("{message_id}.json"))).unwrap(),
+        &fs::read(queue.join("inbox.v2").join(format!("{message_id}.json"))).unwrap(),
     )
     .unwrap();
     item["text"].as_str().unwrap().to_owned()

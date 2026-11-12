@@ -133,6 +133,17 @@ pub struct QueueStatus {
     pub cwd: String,
     /// Prompt identifiers waiting safely before injection.
     pub pending: Vec<String>,
+    /// Age in seconds of the oldest pending chat-bridge (owner) prompt, from
+    /// its `queued_at` (#1372): other senders defer behind a pending chat
+    /// prompt at most their own cap, then proceed or alarm, instead of
+    /// deferring forever. Absent when no chat prompt waits or none records
+    /// a queue time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_chat_age_seconds: Option<u64>,
+    /// When the oldest pending chat prompt was queued (Unix milliseconds),
+    /// beside its age so a reader can recompute the age at any later moment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_chat_queued_at_millis: Option<u64>,
     /// Pending prompts whose last refusal was `composer_unreadable`, with the
     /// recorded `delivery_error` detail. Empty for every other session.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -3344,6 +3355,33 @@ fn status_with_binding_mode<A: AgentApi + ?Sized>(
             });
         }
     }
+    // #1372: the oldest pending chat prompt's age, for other senders' caps.
+    let mut oldest_chat_queued: Option<u64> = None;
+    if let Ok(paths) = pending_in_queue_order(&directories) {
+        for path in paths {
+            let Ok(document) = load_message(&path) else {
+                continue;
+            };
+            let Ok(identifier) = message_id_from_path(&path) else {
+                continue;
+            };
+            if !owner_prompt(&identifier, &document) {
+                continue;
+            }
+            let Some(queued) = document
+                .get("queued_at")
+                .and_then(Value::as_f64)
+                .map(|seconds| (seconds.max(0.0) * 1000.0) as u64)
+            else {
+                continue;
+            };
+            oldest_chat_queued = Some(match oldest_chat_queued {
+                Some(oldest) => oldest.min(queued),
+                None => queued,
+            });
+        }
+    }
+    let now_millis = agent_queue::queue::now_millis();
     Ok(QueueStatus {
         pane_id: info.pane_id,
         agent: info.agent,
@@ -3354,6 +3392,9 @@ fn status_with_binding_mode<A: AgentApi + ?Sized>(
         workspace_id: info.workspace_id,
         cwd: info.cwd,
         pending: identifiers_if_directory(&directories.inbox)?,
+        oldest_pending_chat_age_seconds: oldest_chat_queued
+            .map(|queued| now_millis.saturating_sub(queued) / 1000),
+        oldest_pending_chat_queued_at_millis: oldest_chat_queued,
         composer_unreadable,
         input_stalled,
         inflight: identifiers_if_directory(&directories.inflight)?,
@@ -8435,6 +8476,25 @@ mod tests {
                 ["recent-unwrapped", "recent"]
             );
         }
+    }
+
+    // #1372 chat-stale-prompt-wedges-inbox: status names the oldest pending chat
+    // prompt's age so other senders can cap their deferral instead of waiting
+    // forever. queued_at is fixed text, so the age needs no wall clock.
+    #[test]
+    fn status_reports_the_oldest_pending_chat_prompts_age() {
+        let directory = TestDirectory::new("status-chat-age");
+        prepare(directory.path()).unwrap();
+        bind_queue(directory.path(), &target()).unwrap();
+        let chat = chat_request_id('b');
+        queue_at(&directory, "note-1", "900", "agent note");
+        queue_at(&directory, &chat, "100", "owner asks");
+        queue_at(&directory, &chat_request_id('c'), "500", "owner asks again");
+        let fake = FakeAgent::new(&["working"]);
+        let snapshot = status(&fake, &target(), directory.path()).unwrap();
+        assert_eq!(snapshot.oldest_pending_chat_queued_at_millis, Some(100_000));
+        let age = snapshot.oldest_pending_chat_age_seconds.expect("chat age");
+        assert!(age >= 800, "age {age} must reach back to queued_at 100s");
     }
 
     #[test]

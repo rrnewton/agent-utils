@@ -2648,9 +2648,49 @@ def status(
         "inflight": identifiers(inflight),
         "failed": identifiers(failed),
     }
+    # #1372: the oldest pending chat prompt's age, for other senders' caps
+    # (Rust parity: `oldest_pending_chat_age_seconds`).
+    oldest_chat: int | None = None
+    if os.path.lexists(inbox):
+        for identifier in result["pending"]:  # type: ignore[union-attr]
+            try:
+                document = _read_queue_json(
+                    os.path.join(inbox, f"{identifier}.json"),
+                    "queued prompt", require_private=True)
+            except (AgentDeliveryError, OSError):
+                continue
+            if not isinstance(document, dict) or not _is_owner_prompt(identifier, document):
+                continue
+            value = document.get("queued_at")
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                queued = int(max(0.0, float(value)) * 1000)
+                oldest_chat = queued if oldest_chat is None else min(oldest_chat, queued)
+    if oldest_chat is not None:
+        result["oldest_pending_chat_queued_at_millis"] = oldest_chat
+        result["oldest_pending_chat_age_seconds"] = max(
+            0, int(time.time() * 1000) - oldest_chat) // 1000
     if info.reported_status is not None:
         result["herdr_agent_status"] = info.reported_status
     return result
+
+
+def _is_owner_prompt(identifier: str, document: dict[str, object]) -> bool:
+    """Whether a queued prompt came from the owner (Rust `owner_prompt` parity)."""
+
+    def is_request(value: object) -> bool:
+        if not isinstance(value, str) or not value.startswith("chat-"):
+            return False
+        key = value[5:]
+        return len(key) == 64 and all(c in "0123456789abcdef" for c in key)
+
+    if is_request(identifier) or is_request(document.get("id")):
+        return True
+    text = document.get("text")
+    if isinstance(text, str) and text:
+        from agentctl import sender_header
+        header = sender_header.parse(text.splitlines()[0] if text.splitlines() else "")
+        return header is not None and header.sender.startswith("human@")
+    return False
 
 
 def read(client: HerdrClient, target: Target, *, lines: int = 500) -> str:

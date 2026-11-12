@@ -113,6 +113,48 @@ const MAX_SOCKET_PATH_BYTES: usize = 107;
 // them, and how often it logs again a request whose prompt it is still trying to type: see
 // `DeliveryTiming`.
 const DELIVERY_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+/// Default `--stale-prompt-cap` (#1372): a chat prompt pending this long is
+/// delivered while the agent works, or alarmed as wedging the inbox.
+pub const DEFAULT_STALE_PROMPT_CAP: Duration = Duration::from_secs(10 * 60);
+
+/// Age of the oldest still-pending request at `now_millis`, if any (#1372).
+/// Pure in its inputs so tests use fixed times, never a wall clock.
+pub(crate) fn oldest_pending_age_millis(
+    entries: &[chat_runtime::DeliveryEntry],
+    now_millis: u64,
+) -> Option<u64> {
+    entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.phase,
+                chat_runtime::RequestPhase::Pending | chat_runtime::RequestPhase::Submitting
+            )
+        })
+        .map(|entry| now_millis.saturating_sub(entry.admitted_at_millis))
+        .max()
+}
+
+/// Keys of pending requests aged at least `cap` at `now_millis` (#1372),
+/// oldest admission first as `entries` already are.
+pub(crate) fn stale_pending_keys(
+    entries: &[chat_runtime::DeliveryEntry],
+    now_millis: u64,
+    cap: Duration,
+) -> Vec<String> {
+    let cap = u64::try_from(cap.as_millis()).unwrap_or(u64::MAX);
+    entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.phase,
+                chat_runtime::RequestPhase::Pending | chat_runtime::RequestPhase::Submitting
+            )
+        })
+        .filter(|entry| now_millis.saturating_sub(entry.admitted_at_millis) >= cap)
+        .map(|entry| entry.key.clone())
+        .collect()
+}
 // How long `provider-credentials.json` may go unrewritten while the credential files are unchanged,
 // so its observation time shows that the service still inspects them.
 const CREDENTIAL_RECORD_REFRESH: Duration = Duration::from_secs(300);
@@ -232,6 +274,12 @@ pub struct ServiceOptions {
     /// and again every as long until it is delivered; `None` never warns. See
     /// [`owner_alarm`]. `chat run` defaults to [`owner_alarm::DEFAULT_AFTER`].
     pub owner_alarm_after: Option<Duration>,
+    /// Age past which a pending chat prompt no longer wedges the inbox (#1372):
+    /// the bridge retries it with deliver-while-working (the drain still verifies
+    /// the composer and the submission) and the owner alarm fires even when the
+    /// agent is merely busy. `None` never escalates. `chat run` defaults to
+    /// [`DEFAULT_STALE_PROMPT_CAP`].
+    pub stale_prompt_cap: Option<Duration>,
     /// Post non-reply transcript text to a trace thread (#714 chat-transcript-primary).
     pub trace_thread: bool,
     /// Coalescing window for trace text.
@@ -5883,7 +5931,9 @@ fn run_owner_loop_with_health<A: ManagedApi + ?Sized>(
     });
     // Kept across passes, so a pass restarted after a transient failure neither posts the
     // alarm again at once nor forgets a quarantine it has not told (#720).
-    let mut owner_alarm = options.owner_alarm_after.map(owner_alarm::OwnerAlarm::new);
+    let mut owner_alarm = options
+        .owner_alarm_after
+        .map(|after| owner_alarm::OwnerAlarm::with_stale(after, options.stale_prompt_cap));
     // Kept across passes too, so a capture miss is told once (#783 chat-reply-capture-miss).
     let mut reply_watch = reply_source::ReplySourceWatch::default();
     let mut reminders = reminders;
@@ -6413,7 +6463,9 @@ fn owner_loop<A: ManagedApi + ?Sized>(
     });
     // Kept across passes, so a pass restarted after a transient failure neither posts the
     // alarm again at once nor forgets a quarantine it has not told (#720).
-    let mut owner_alarm = options.owner_alarm_after.map(owner_alarm::OwnerAlarm::new);
+    let mut owner_alarm = options
+        .owner_alarm_after
+        .map(|after| owner_alarm::OwnerAlarm::with_stale(after, options.stale_prompt_cap));
     let mut reply_watch = reply_source::ReplySourceWatch::default();
     let mut reminders = reminders;
     let mut health = ServiceHealth::new(manager.registry());
@@ -6759,7 +6811,12 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
                     Err(error) if stop.is_stopped() => return Err(error.into()),
                     Err(error) => watch.lookup_failed(&error),
                 }
-                retry = turn.ready();
+                // #1372: a prompt aged past the stale cap retries even while the
+                // agent works; the retry below then delivers while working.
+                let stale = options.stale_prompt_cap.is_some_and(|cap| {
+                    !stale_pending_keys(&watch.entries, chat_runtime::unix_millis(), cap).is_empty()
+                });
+                retry = turn.ready() || stale;
             }
         }
         if (recover || retry || !direct_keys.is_empty()) && poll_failures == 0 {
@@ -6856,15 +6913,33 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
             // stops too. The passes for the requests after one whose drain typed their prompts
             // find them typed and only record that.
             let _step = SlowStep::new("retry of prompts waiting to be typed");
+            // #1372: stale keys are retried with deliver-while-working; the drain
+            // still verifies the empty composer and the submission at that moment,
+            // and Claude Code queues the prompt behind the current turn.
+            let stale_keys: std::collections::BTreeSet<String> = options
+                .stale_prompt_cap
+                .map(|cap| {
+                    stale_pending_keys(&watch.entries, chat_runtime::unix_millis(), cap)
+                        .into_iter()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut stale_delivery = options.delivery;
+            stale_delivery.deliver_while_working = true;
             let mut report = CycleReport::default();
             for key in &watch.retry_keys {
                 if control.stopped() {
                     break;
                 }
+                let delivery = if stale_keys.contains(key) {
+                    stale_delivery
+                } else {
+                    options.delivery
+                };
                 let pass = process_keys(
                     state,
                     manager,
-                    options.delivery,
+                    delivery,
                     std::slice::from_ref(key),
                     &mut control,
                 )?;
@@ -9130,6 +9205,37 @@ fn already_reported_log_line(suppressed_ids: &[String]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    // #1372 chat-stale-prompt-wedges-inbox: the stale decision is a pure function
+    // of admitted times and a fixed now (fake clock, no wall-clock budget).
+    #[test]
+    fn stale_pending_keys_names_only_prompts_aged_past_the_cap() {
+        let entry =
+            |key: &str, phase: RequestPhase, admitted: u64| crate::chat_runtime::DeliveryEntry {
+                key: key.to_owned(),
+                phase,
+                admitted_at_millis: admitted,
+                delivered_at_millis: None,
+                reason: Some("last status=working".to_owned()),
+                excerpt: format!("message {key}"),
+                settled: false,
+            };
+        let entries = vec![
+            entry("fresh", RequestPhase::Pending, 10 * 60_000),
+            entry("stale", RequestPhase::Pending, 0),
+            entry("done", RequestPhase::Delivered, 0),
+        ];
+        let cap = Duration::from_secs(600);
+        assert_eq!(
+            stale_pending_keys(&entries, 10 * 60_000, cap),
+            vec!["stale".to_owned()]
+        );
+        assert_eq!(
+            oldest_pending_age_millis(&entries, 10 * 60_000),
+            Some(600_000)
+        );
+        assert!(stale_pending_keys(&entries, 9 * 60_000, cap).is_empty());
+    }
+
     #[test]
     fn a_stall_names_the_step_the_owner_loop_is_in_or_finished_last() {
         let now = Instant::now();
@@ -15458,6 +15564,7 @@ esac
                     timing,
                     idle_poll_interval: TEST_IDLE_POLL_INTERVAL.with(Cell::get),
                     owner_alarm_after: None,
+                    stale_prompt_cap: None,
                     trace_thread: false,
                     trace_window: Duration::from_secs(45),
                 },
@@ -18938,6 +19045,7 @@ esac
                     timing: DeliveryTiming::default(),
                     idle_poll_interval: IDLE_SATURATED_POLL_INTERVAL,
                     owner_alarm_after: None,
+                    stale_prompt_cap: None,
                     trace_thread: false,
                     trace_window: Duration::from_secs(45),
                 },
@@ -18964,6 +19072,7 @@ esac
             timing: DeliveryTiming::default(),
             idle_poll_interval: IDLE_SATURATED_POLL_INTERVAL,
             owner_alarm_after: None,
+            stale_prompt_cap: None,
             trace_thread: false,
             trace_window: Duration::from_secs(45),
         }

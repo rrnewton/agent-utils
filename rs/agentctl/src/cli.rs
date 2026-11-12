@@ -2530,6 +2530,9 @@ struct ChatRun {
     /// Warn the owner in the chat once a request has waited undelivered for DURATION, such as 10m (default: 5m; off turns it off). Units: s, m or h; a bare number is seconds; at least 1m. A request that waits only because the agent is working (its last attempt said `last status=working`) does not count. The warning, posted to the first configured channel through the outbound helper as a "[chat-bridge WARNING]", says how many requests wait, how long the oldest has, and the reason the last attempt gave (such as text agentctl did not type in the coordinator's input box, which it never submits or clears). Repeats back off (#830) and coalesce in place (#981): the first warning of an episode is a top-level post and each repeat rewrites that one message, after 1, 3, 6 and 12 times DURATION, then every 36 times it; the backoff starts again when the held requests or the kind of reason change, and when they are delivered the same message is rewritten to a short resolved line naming the ET time. A helper that cannot edit deletes and reposts; one that can do neither keeps the repeats as replies in the warning's thread. `chat alarm` shows, acknowledges or snoozes it. A request quarantined as a PROBABLE MISROUTE (never typed again by itself) is reported at once, with the start of the message and a request to send it again. Without an outbound helper the warnings are only logged; applies only to this run.
     #[arg(long, value_name = "DURATION", default_value = "5m", hide_default_value = true, value_parser = owner_alarm_duration)]
     owner_alarm_after: OwnerAlarmAfter,
+    /// Deliver a chat prompt that has waited undelivered for DURATION even while the coordinator works, and alarm as wedged if it still cannot be typed (default: 10m; off turns the escalation off). Units: s, m or h; a bare number is seconds; at least 1m. Before the cap a prompt that waits only because the agent is working is left alone; at the cap the bridge retries it with the same read-before-typing checks as --deliver-while-working (empty composer, verified submission; Claude Code queues it behind the current turn), and a prompt still pending then raises the owner alarm saying the coordinator inbox is wedged by a chat prompt aged N min. Other senders read the same age from `agentctl status` (oldest_pending_chat_age_seconds) and apply their own cap instead of deferring forever; applies only to this run.
+    #[arg(long, value_name = "DURATION", default_value = "10m", hide_default_value = true, value_parser = stale_prompt_cap_duration)]
+    stale_prompt_cap: StalePromptCap,
     /// Remind a Claude Code coordinator, once, of each chat request whose prompt was typed and that it has not answered, once it has been idle for DURATION since that prompt was typed (default: 60s). Units: s, m or h; a bare number is seconds; at least 10s and at most 12h, and 0 turns reminders off. Idle means Herdr reports the pane idle or done, the pane shows no running turn, and `claude agents --json` reports the pane's session idle. Right before a reminder, the session's transcript (`<session>.jsonl` under the session's CLAUDE_CONFIG_DIR or ~/.claude `projects`) is read, and a request whose reply ID heads a complete reply block in the agent's ordinary text there is left out and never reminded, since that reply was printed though no read of the pane showed it. The reminder names the reply IDs it has received no reply for, says that a reply written only in thinking is not delivered, prints for each the `agentctl chat sent --request` command to check what the bridge holds before sending anything again, and mentions `agentctl chat reply`; it is recorded in reply-reminders.json before it is queued, is typed only into an idle pane and never behind another queued prompt, never through --deliver-while-working, and is taken back out of the queue if it is not typed within 10 seconds (or --ready-timeout if shorter). A reminder taken back holds off the next until the coordinator has been seen working and idle again, or for twice DURATION, doubling with each in a row, up to 60 minutes. Requests delivered before reminders first started for the state directory, or more than 24 hours ago, are never reminded, so DURATION plus the time the coordinator works after a prompt must stay under 24 hours. Needs outbound_enabled; applies only to this run.
     #[arg(long, value_name = "DURATION", default_value = "60s", hide_default_value = true, value_parser = reply_reminder_idle)]
     reply_reminder_idle: ReplyReminderIdle,
@@ -2590,6 +2593,8 @@ impl ChatOperate {
             idle_poll_interval: crate::chat_service::IDLE_SATURATED_POLL_INTERVAL,
             // `chat run` sets this from its own flag.
             owner_alarm_after: None,
+            // `chat run` sets this from its own flag.
+            stale_prompt_cap: None,
             // `chat run` sets these from its own flags.
             trace_thread: false,
             trace_window: Duration::from_secs(45),
@@ -2733,6 +2738,17 @@ fn environment_value(value: &str) -> Result<String, String> {
 }
 fn stale_composer_duration(value: &str) -> Result<Duration, String> {
     crate::stale_composer::parse_duration(value)
+}
+/// `chat run --stale-prompt-cap`: the cap, or `None` when the escalation is off.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StalePromptCap(Option<Duration>);
+fn stale_prompt_cap_duration(value: &str) -> Result<StalePromptCap, String> {
+    if value.trim() == "off" {
+        return Ok(StalePromptCap(None));
+    }
+    crate::stale_composer::parse_duration(value)
+        .map(|duration| StalePromptCap(Some(duration)))
+        .map_err(|error| format!("{error}, or off"))
 }
 /// `chat run --owner-alarm-after`: the wait, or `None` when the alarm is off.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6256,6 +6272,7 @@ fn run_chat(registry: PathBuf, herdr_bin: PathBuf, chat: Chat) -> Result<i32, Fa
             let mut options = value.operate.options();
             options.delivery.deliver_while_working = value.deliver_while_working;
             options.owner_alarm_after = value.owner_alarm_after.0;
+            options.stale_prompt_cap = value.stale_prompt_cap.0;
             options.trace_thread = value.trace_thread;
 
             options.trace_window = Duration::from_secs(value.trace_window);
@@ -7762,6 +7779,18 @@ mod tests {
             OwnerAlarmAfter(None)
         );
         assert!(run(&["--owner-alarm-after", "10s"]).is_err());
+        // #1372: the stale-prompt cap defaults to 10m and can be turned off.
+        assert_eq!(
+            defaults.stale_prompt_cap,
+            StalePromptCap(Some(Duration::from_secs(600)))
+        );
+        assert_eq!(
+            run(&["--stale-prompt-cap", "off"])
+                .unwrap()
+                .stale_prompt_cap,
+            StalePromptCap(None)
+        );
+        assert!(run(&["--stale-prompt-cap", "10s"]).is_err());
         for flag in [
             "--deliver-while-working",
             "--stale-composer-clear-after=30m",

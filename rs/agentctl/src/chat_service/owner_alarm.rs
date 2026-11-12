@@ -178,6 +178,9 @@ impl Silence {
 #[derive(Debug)]
 pub(crate) struct OwnerAlarm {
     after: Duration,
+    /// Age past which a request waiting only because its agent is busy still
+    /// alarms (#1372): it wedges the inbox, since other senders defer behind it.
+    stale_after: Option<Duration>,
     /// The current episode of held requests, if any.
     episode: Option<Episode>,
     /// Whether the saved episode has been read back, once per run.
@@ -287,8 +290,14 @@ fn hint(agent: &str, reason: &str) -> String {
 impl OwnerAlarm {
     /// An alarm for requests held `after` or longer.
     pub(crate) fn new(after: Duration) -> Self {
+        Self::with_stale(after, None)
+    }
+
+    /// An alarm whose busy-agent exemption ends at `stale_after` (#1372).
+    pub(crate) fn with_stale(after: Duration, stale_after: Option<Duration>) -> Self {
         Self {
             after,
+            stale_after,
             episode: None,
             restored: false,
             quarantines_known: BTreeSet::new(),
@@ -360,6 +369,16 @@ impl OwnerAlarm {
         self.quarantines_known
             .retain(|key| entries.iter().any(|entry| entry.key == *key));
         let after = u64::try_from(self.after.as_millis()).unwrap_or(u64::MAX);
+        let stale = self
+            .stale_after
+            .map(|cap| u64::try_from(cap.as_millis()).unwrap_or(u64::MAX));
+        // #1372: past the stale cap a busy-only wait alarms too; it wedges the inbox.
+        let wedged = |entry: &DeliveryEntry| {
+            stale.is_some_and(|cap| {
+                now_millis.saturating_sub(entry.admitted_at_millis) >= cap
+                    && waiting_on_busy_agent(entry.reason.as_deref())
+            })
+        };
         let held: Vec<&DeliveryEntry> = entries
             .iter()
             .filter(|entry| {
@@ -369,7 +388,9 @@ impl OwnerAlarm {
                 )
             })
             .filter(|entry| now_millis.saturating_sub(entry.admitted_at_millis) >= after)
-            .filter(|entry| herdr_idle || !waiting_on_busy_agent(entry.reason.as_deref()))
+            .filter(|entry| {
+                herdr_idle || !waiting_on_busy_agent(entry.reason.as_deref()) || wedged(entry)
+            })
             .collect();
         if held.is_empty() {
             if let Some(episode) = self.episode.take() {
@@ -481,15 +502,29 @@ impl OwnerAlarm {
             .map(|entry| entry.admitted_at_millis)
             .min()
             .unwrap_or(now_millis);
+        // #1372: name the wedge plainly, with the stale prompt's age.
+        let wedged_note = held
+            .iter()
+            .filter(|entry| wedged(entry))
+            .map(|entry| now_millis.saturating_sub(entry.admitted_at_millis))
+            .max()
+            .map(|age| {
+                format!(
+                    "The coordinator inbox is wedged by a chat prompt aged {} min. ",
+                    minutes(age)
+                )
+            })
+            .unwrap_or_default();
         let warning = format!(
             "{WARNING}{count} to {agent} {verb} not reached it, the oldest sent {} min \
-             ago ({}, \"{}\"). Why: {}. {}This notice is updated in place in {} min unless \
+             ago ({}, \"{}\"). Why: {}. {}{}This notice is updated in place in {} min unless \
              they are delivered; `agentctl chat alarm ack` silences it until the held messages \
              or the reason change.",
             minutes(oldest),
             crate::chat_trace::et_clock((oldest_admitted / 1_000) as f64),
             held[0].excerpt,
             cut(reason, REASON_CHARS),
+            wedged_note,
             hint(agent, reason),
             minutes(wait).max(1)
         );
@@ -868,5 +903,29 @@ mod tests {
         );
         assert_eq!(notices[0].place, Place::TopLevel);
         assert!(due(&mut alarm, &entries, minute(13)).is_empty());
+    }
+
+    // #1372 chat-stale-prompt-wedges-inbox: a prompt that waits only because its
+    // agent is busy is no fault while fresh, but past the stale cap it wedges the
+    // inbox (other senders defer behind it), so the busy exemption ends there.
+    #[test]
+    fn a_stale_prompt_waiting_on_a_busy_agent_alarms_as_wedged() {
+        let busy = "pane w1:p2 did not become idle/done within 0s; last status=working";
+        let mut alarm = OwnerAlarm::with_stale(DEFAULT_AFTER, Some(Duration::from_secs(600)));
+        let entries = [entry("a", RequestPhase::Pending, 0, busy)];
+        // Fresh: still exempt, no notice before the cap.
+        assert!(due(&mut alarm, &entries, minute(9)).is_empty());
+        let notices = due(&mut alarm, &entries, minute(10));
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].text.contains("wedged"), "{:?}", notices[0].text);
+        assert!(notices[0].text.contains("10 min"), "{:?}", notices[0].text);
+    }
+
+    #[test]
+    fn without_a_stale_cap_a_busy_agent_still_raises_no_alarm() {
+        let busy = "pane w1:p2 did not become idle/done within 0s; last status=working";
+        let mut alarm = OwnerAlarm::new(DEFAULT_AFTER);
+        let entries = [entry("a", RequestPhase::Pending, 0, busy)];
+        assert!(due(&mut alarm, &entries, minute(400)).is_empty());
     }
 }

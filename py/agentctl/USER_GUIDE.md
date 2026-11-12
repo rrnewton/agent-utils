@@ -2291,7 +2291,47 @@ each interactive agent's queue and reports `queue_drains`, with a prompt past
 `--queue-stale-minutes` keeping the pass not ok; `watch` runs the same drain.
 A stale queue held by a refusal that types nothing (an unreadable composer, a
 refused recipient check, a draft in the editor; not a busy agent) is also
-escalated by `watch-agents`, once per hold, as a priority sender. The
+escalated by `watch-agents`, once per hold, as a priority sender.
+
+A chat-bridge prompt that stays pending wedges every sender behind it, so it
+never waits without bound (#1372 chat-stale-prompt-wedges-inbox). The bridge
+(`chat run --stale-prompt-cap`, 10 minutes by default) retries a prompt aged
+past the cap with the same read-before-typing checks as
+`--deliver-while-working` — empty composer, verified submission, Claude Code
+queuing it behind the current turn — and if it still cannot be typed the
+owner alarm fires saying the coordinator inbox is wedged by a chat prompt
+aged N min, even though the agent is only busy. Before the cap a prompt that
+waits only because its agent works is left alone. Any sender can apply its
+own cap instead of deferring forever: `agentctl status` reports
+`oldest_pending_chat_age_seconds` and `oldest_pending_chat_queued_at_millis`
+for the oldest pending chat-bridge (owner) prompt in the agent's queue; both
+are absent when no chat prompt waits. Defer behind a pending chat prompt at
+most your own cap, then deliver through the bridge's queue or raise your
+alarm — do not wait for the prompt to clear on its own. Restore prompts
+(`restore-notice`, `restore-imback`, `restore-catchup`, `restore-brief`)
+carry supersede keys, so a new boot's prompt replaces an earlier boot's
+still-undelivered one untyped instead of stacking after every restore.
+
+
+A chat-bridge prompt that stays pending wedges every sender behind it, so it
+never waits without bound (#1372 chat-stale-prompt-wedges-inbox). The bridge
+(`chat run --stale-prompt-cap`, 10 minutes by default) retries a prompt aged
+past the cap with the same read-before-typing checks as
+`--deliver-while-working` — empty composer, verified submission, Claude Code
+queuing it behind the current turn — and if it still cannot be typed the
+owner alarm fires saying the coordinator inbox is wedged by a chat prompt
+aged N min, even though the agent is only busy. Before the cap a prompt that
+waits only because its agent works is left alone. Any sender can apply its
+own cap instead of deferring forever: `agentctl status` reports
+`oldest_pending_chat_age_seconds` and `oldest_pending_chat_queued_at_millis`
+for the oldest pending chat-bridge (owner) prompt in the agent's queue; both
+are absent when no chat prompt waits. Defer behind a pending chat prompt at
+most your own cap, then deliver through the bridge's queue or raise your
+alarm — do not wait for the prompt to clear on its own. Restore prompts
+(`restore-notice`, `restore-imback`, `restore-catchup`, `restore-brief`)
+carry supersede keys, so a new boot's prompt replaces an earlier boot's
+still-undelivered one untyped instead of stacking after every restore.
+ The
 coordinator is told about an agent's held queue. When the held queue is the
 coordinator's own, where that notice would wait too, each local agent with a
 message held there is told instead, and agent-teams senders are named in the

@@ -4,6 +4,10 @@
 //! every other registry that names the coordinator (its chat bridges), and each agent
 //! the restore revived gets one standard catch-up prompt. Everything is queued with
 //! `queue_identified`, never drained: a restore must not sit inside a send while a lane
+//! is mid-turn. Each kind carries a supersede key (#1372, on #1156), so a later
+//! boot's prompt replaces an earlier boot's still-undelivered one untyped instead
+//! of stacking in the inbox; the per-boot message ID still makes a same-boot
+//! rerun a no-op.
 //! is mid-turn, and a message that matters arrives with the next drain. Agents are
 //! addressed in the report's own order, which the restore built managers-first.
 
@@ -58,7 +62,13 @@ pub fn after_restore<A: ManagedApi + ?Sized>(
             let id = message_id("imback", boot_id, &other.name);
             let result = (|| -> crate::subagents::Result<crate::agent::QueueResult> {
                 let manager = ManagedAgents::new(client, &other.registry)?;
-                manager.queue_identified(&other.name, summary, None, None, Some(&id))
+                manager.queue_identified(
+                    &other.name,
+                    summary,
+                    None,
+                    Some("restore-imback"),
+                    Some(&id),
+                )
             })();
             bridges.push(queued(&other.name, &id, result));
         }
@@ -86,7 +96,7 @@ pub fn after_restore<A: ManagedApi + ?Sized>(
                 catch_up.push(queued(
                     name,
                     &id,
-                    manager.queue_identified(name, &text, None, None, Some(&id)),
+                    manager.queue_identified(name, &text, None, Some("restore-catchup"), Some(&id)),
                 ));
             }
         }
@@ -133,26 +143,27 @@ pub fn resume_briefs<A: ManagedApi + ?Sized>(
         };
         let id = message_id("brief", boot_id, name);
         let text = render_resume_brief(template, config, report, row);
-        let row_outcome = match manager.queue_identified(name, &text, None, None, Some(&id)) {
-            Ok(result) => json!({
-                "name": name,
-                "action": "queued",
-                "message_id": id,
-                "outcome": json!(result)["outcome"],
-            }),
-            Err(error) if error.to_string().contains("already exists") => json!({
-                "name": name,
-                "action": "already-queued",
-                "message_id": id,
-                "outcome": "already-queued",
-            }),
-            Err(error) => json!({
-                "name": name,
-                "action": "refused",
-                "message_id": id,
-                "reason": error.to_string(),
-            }),
-        };
+        let row_outcome =
+            match manager.queue_identified(name, &text, None, Some("restore-brief"), Some(&id)) {
+                Ok(result) => json!({
+                    "name": name,
+                    "action": "queued",
+                    "message_id": id,
+                    "outcome": json!(result)["outcome"],
+                }),
+                Err(error) if error.to_string().contains("already exists") => json!({
+                    "name": name,
+                    "action": "already-queued",
+                    "message_id": id,
+                    "outcome": "already-queued",
+                }),
+                Err(error) => json!({
+                    "name": name,
+                    "action": "refused",
+                    "message_id": id,
+                    "reason": error.to_string(),
+                }),
+            };
         briefs.push(row_outcome);
     }
     json!(briefs)
