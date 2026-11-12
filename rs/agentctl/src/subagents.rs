@@ -6353,54 +6353,6 @@ pub fn slot_shell_command(
     ))
 }
 
-/// The purpose recorded for `slot` by the slot manager (#1342
-/// agent-purpose-line): `wrkslots status --slot SLOT --format json` run in
-/// the slot's project root, bounded at 10 seconds. Best-effort: any failure
-/// (spawn, timeout, nonzero exit, unexpected JSON, the slot having moved on)
-/// yields `None`, and the start falls back to the brief or records nothing —
-/// a purpose lookup never fails a launch.
-fn slot_recorded_purpose(executable: &Path, project: &Path, slot: &str) -> Option<String> {
-    let mut command = std::process::Command::new(executable);
-    command.args(["status", "--slot", slot, "--format", "json"]);
-    command
-        .current_dir(project)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
-    let mut child = command.spawn().ok()?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20))
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
-    let output = child.wait_with_output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let document: Value = serde_json::from_slice(&output.stdout).ok()?;
-    let rows = document.get("active")?.as_array()?;
-    for row in rows {
-        let record = row.get("row").unwrap_or(row);
-        if record.get("slot").and_then(Value::as_str) == Some(slot) {
-            return record
-                .get("purpose")
-                .and_then(Value::as_str)
-                .filter(|purpose| !purpose.trim().is_empty())
-                .map(str::to_owned);
-        }
-    }
-    None
-}
-
 impl Default for StartOptions {
     fn default() -> Self {
         Self {
@@ -10037,22 +9989,12 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             record.set_pinned(Some(pinned));
         }
         // #1342 agent-purpose-line: what this agent is for, display-only. An
-        // explicit purpose was validated by the caller; the slot's recorded
-        // purpose (best-effort, never a start failure) and the brief follow.
-        let slot_purpose = if options.purpose.is_none() {
-            slot_owner_target
-                .as_ref()
-                .and_then(|(wrkslots, project, slot)| {
-                    slot_recorded_purpose(wrkslots, project, slot)
-                })
-        } else {
-            None
-        };
-        if let Some(purpose) = control::resolve_purpose(
-            options.purpose.as_deref(),
-            slot_purpose.as_deref(),
-            options.brief.as_deref(),
-        ) {
+        // explicit purpose was validated by the caller; a slotted start adds
+        // the slot's recorded purpose from the owner bind below (which
+        // already reads the slot's status row); the brief is the fallback.
+        if let Some(purpose) =
+            control::resolve_purpose(options.purpose.as_deref(), None, options.brief.as_deref())
+        {
             record.set_purpose(Some(&purpose));
         }
         // The spec is durable before Herdr starts anything, so a launch that never reports
@@ -10100,9 +10042,26 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         // it only by its agent name. Bind the harness agentctl just pinned, so ordinary owner
         // death detection covers the slot. A refusal does not undo a running launch; it is
         // reported in the returned status.
-        let slot_owner = slot_owner_target.map(|(wrkslots, project, slot)| {
-            self.bind_launched_slot_owner(&record, &wrkslots, &project, &slot)
-        });
+        let (slot_owner, slot_purpose) = match slot_owner_target {
+            Some((wrkslots, project, slot)) => {
+                let (owner, purpose) =
+                    self.bind_launched_slot_owner(&record, &wrkslots, &project, &slot);
+                (Some(owner), purpose)
+            }
+            None => (None, None),
+        };
+        // #1342: the slot's recorded purpose outranks the brief line the
+        // record was created with, but never an explicit `--purpose`. The
+        // owner bind already read the slot's status row, so this costs no
+        // extra wrkslots call, and a missing purpose changes nothing.
+        if options.purpose.is_none() {
+            if let Some(purpose) = slot_purpose {
+                if record.purpose().as_deref() != Some(purpose.as_str()) {
+                    record.set_purpose(Some(&purpose));
+                    self.save(&record)?;
+                }
+            }
+        }
         // Keep this generation's lifecycle lock through startup delivery and returned status.
         // Sending by name after releasing it can redirect the old brief into a replacement.
         // Without a brief nothing else re-runs capture after launch, so a
@@ -10166,26 +10125,31 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     ///
     /// The process is the relayed program under root isolation, or the harness anchor
     /// otherwise; both run inside the slot's own box, which `wrkslots transfer-owner` requires
-    /// of a process outside its own ancestry. Returns `{"action": "transferred", ...}` or
-    /// `{"action": "refused", "reason": ...}`.
+    /// of a process outside its own ancestry. Returns the outcome
+    /// `{"action": "transferred", ...}` or `{"action": "refused", ...}`, plus
+    /// the slot's recorded purpose from the status row the bind already read
+    /// (#1342; `None` when the bind did not read one or it records none).
     fn bind_launched_slot_owner(
         &self,
         record: &AgentRecord,
         wrkslots: &Path,
         project: &Path,
         slot: &str,
-    ) -> Value {
+    ) -> (Value, Option<String>) {
         let pid = record
             .harness_identity
             .as_ref()
             .or(record.custom_process_identity.as_ref())
             .map(|identity| identity.pid);
         let Some(pid) = pid else {
-            return json!({
-                "slot": slot,
-                "action": "refused",
-                "reason": "the launched harness has no pinned process",
-            });
+            return (
+                json!({
+                    "slot": slot,
+                    "action": "refused",
+                    "reason": "the launched harness has no pinned process",
+                }),
+                None,
+            );
         };
         match crate::restore::bind_slot_owner(
             &crate::restore::SystemHost,
@@ -10195,12 +10159,21 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             &record.name,
             pid,
         ) {
-            Ok(row) => json!({
-                "slot": slot,
-                "action": "transferred",
-                "owner_pid": pid,
-                "generation": row["generation"],
-            }),
+            Ok(row) => {
+                let purpose = row["purpose"]
+                    .as_str()
+                    .filter(|purpose| !purpose.trim().is_empty())
+                    .map(str::to_owned);
+                (
+                    json!({
+                        "slot": slot,
+                        "action": "transferred",
+                        "owner_pid": pid,
+                        "generation": row["generation"],
+                    }),
+                    purpose,
+                )
+            }
             Err(error) => {
                 // Loud, not just a status field a caller can miss (#786).
                 eprintln!(
@@ -10208,12 +10181,15 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
                      the launch keeps running unbound - redo it with `agentctl rebind-slot {}`",
                     record.name, record.name
                 );
-                json!({
-                    "slot": slot,
-                    "action": "refused",
-                    "owner_pid": pid,
-                    "reason": error.to_string(),
-                })
+                (
+                    json!({
+                        "slot": slot,
+                        "action": "refused",
+                        "owner_pid": pid,
+                        "reason": error.to_string(),
+                    }),
+                    None,
+                )
             }
         }
     }
@@ -10230,7 +10206,10 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             fail("no wrkslots found (PATH, AGENTCTL_WRKSLOTS_BIN, or profiles.json)")
         })?;
         let project = PathBuf::from(project);
-        match self.bind_launched_slot_owner(&record, &wrkslots, &project, slot) {
+        match self
+            .bind_launched_slot_owner(&record, &wrkslots, &project, slot)
+            .0
+        {
             value if value["action"] == "transferred" => Ok(value),
             value => Err(fail(format!(
                 "slot rebind refused: {}",
@@ -17647,13 +17626,18 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(set["purpose"], "review the parser change", "{set}");
         assert_eq!(set["previous"], "explicit purpose", "{set}");
-        assert!(manager.purpose("worker", Some("two\nlines"), false).is_err());
+        assert!(manager
+            .purpose("worker", Some("two\nlines"), false)
+            .is_err());
         let cleared = manager.purpose("worker", None, true).unwrap();
         assert_eq!(cleared["purpose"], Value::Null, "{cleared}");
         assert_eq!(cleared["previous"], "review the parser change", "{cleared}");
         let status = manager.status("worker").unwrap();
         assert!(status.get("purpose").is_none(), "{status}");
-        assert!(status["goal"].is_null(), "purpose never touches goal: {status}");
+        assert!(
+            status["goal"].is_null(),
+            "purpose never touches goal: {status}"
+        );
 
         // No brief and no purpose: no key at all.
         let fixture = Fixture::new();
@@ -17994,6 +17978,8 @@ pub(crate) mod tests {
             .expect("harness anchor");
         assert_eq!(status["slot_owner"]["action"], "transferred", "{status}");
         assert_eq!(status["slot_owner"]["owner_pid"], pid);
+        // #1342: the slot's recorded purpose comes from the same status row.
+        assert_eq!(status["purpose"], "the slot purpose", "{status}");
         let calls = owner_calls(&fixture, "ok");
         assert_eq!(calls.len(), 2, "{calls:?}");
         assert!(calls[1].ends_with(&format!(
@@ -18072,7 +18058,7 @@ done
 if [ -n "$owner_call" ]; then
   printf '%s\n' "$*" >> '@CALLS@'
   if [ "$owner_call" = status ]; then
-    printf '{"active": [{"slot": "%s", "generation": 3, "agent": "slot-agent"}]}\n' "$slot"
+    printf '{"active": [{"slot": "%s", "generation": 3, "agent": "slot-agent", "purpose": "the slot purpose"}]}\n' "$slot"
     exit 0
   fi
   if [ -e '@REFUSE@' ]; then echo 'REFUSED: slot s1 owner is live' >&2; exit 3; fi

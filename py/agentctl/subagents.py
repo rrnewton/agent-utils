@@ -3524,14 +3524,10 @@ class ManagedAgents:
                                      environment_names=sorted({entry.partition("=")[0] for entry in environment}),
                                      adapter="herdr-relay" if relay_command is not None
                                      else "herdr-pane" if harness == "muse" else "herdr")
-                # #1342: what this agent is for, display-only (explicit, then
-                # the slot's recorded purpose, then the brief's first line).
-                slot_purpose = None
-                if purpose is None and slot is not None:
-                    slot_purpose = _slot_recorded_purpose(
-                        slot, project=launch_project or root, registry=self.registry,
-                    )
-                resolved_purpose = resolve_purpose(purpose, slot_purpose, brief)
+                # #1342: what this agent is for, display-only. Explicit and
+                # brief-derived purposes are recorded now; the slot's purpose
+                # (from the owner bind below) outranks the brief line.
+                resolved_purpose = resolve_purpose(purpose, None, brief)
                 if resolved_purpose is not None:
                     record.set_purpose(resolved_purpose)
                 # The spec is durable before Herdr starts anything, so a launch that never
@@ -3565,10 +3561,15 @@ class ManagedAgents:
             # A coordinator usually creates the slot with no owner bound, so wrkslots
             # could judge it only by agent name. Bind the harness just pinned, so ordinary
             # owner death detection covers the slot; a refusal is reported, not raised.
-            slot_owner = (
-                None if slot is None or launch_project is None
+            slot_owner, slot_purpose = (
+                (None, None) if slot is None or launch_project is None
                 else _bind_launched_slot_owner(record, slot, launch_project, self.registry)
             )
+            # #1342: the slot's recorded purpose outranks the brief line, but
+            # never an explicit purpose; the bind already read the status row.
+            if purpose is None and slot_purpose is not None and record.purpose != slot_purpose:
+                record.set_purpose(slot_purpose)
+                self._save(record)
             if brief is not None:
                 client = cast(HerdrClient, _WorkspaceClient(
                     self.client, record, queue=self._queue(name),
@@ -7051,25 +7052,27 @@ def wrkslots_executable(registry: str | Path | None = None) -> str | None:
 
 def _bind_launched_slot_owner(
     record: AgentRecord, slot: str, project: str, registry: str | Path | None,
-) -> dict[str, object]:
+) -> tuple[dict[str, object], str | None]:
     """Make a slot launch's pinned harness process the slot's wrkslots owner.
 
     The process is the harness anchor, or the relayed program under root isolation; both
     run inside the slot's own box, which ``wrkslots transfer-owner`` requires of a process
     outside its own ancestry. Mirrors the Rust ``bind_launched_slot_owner``.
+    Returns the outcome plus the slot's recorded purpose from the status row
+    the bind already read (#1342; ``None`` when it records none).
     """
     identity = record.harness_identity or record.custom_process_identity
     if identity is None:
-        return {"slot": slot, "action": "refused",
-                "reason": "the launched harness has no pinned process"}
+        return ({"slot": slot, "action": "refused",
+                 "reason": "the launched harness has no pinned process"}, None)
     pid = identity.pid
     executable = wrkslots_executable(registry)
     if not executable:
-        return {"slot": slot, "action": "refused", "owner_pid": pid,
-                "reason": "wrkslots is no longer available"}
+        return ({"slot": slot, "action": "refused", "owner_pid": pid,
+                 "reason": "wrkslots is no longer available"}, None)
 
-    def refused(reason: str) -> dict[str, object]:
-        return {"slot": slot, "action": "refused", "owner_pid": pid, "reason": reason}
+    def refused(reason: str) -> tuple[dict[str, object], str | None]:
+        return ({"slot": slot, "action": "refused", "owner_pid": pid, "reason": reason}, None)
 
     base = [executable, "--project-root", project]
     try:
@@ -7102,33 +7105,11 @@ def _bind_launched_slot_owner(
         return refused(f"transfer-owner refused: {exc}")
     if moved.returncode != 0:
         return refused(f"transfer-owner refused: {moved.stderr.strip()}")
-    return {"slot": slot, "action": "transferred", "owner_pid": pid, "generation": generation}
-
-
-def _slot_recorded_purpose(
-    slot: str, *, project: str, registry: str | Path | None = None,
-) -> str | None:
-    """The slot's recorded wrkslots purpose, best-effort (#1342): any failure
-    yields ``None`` and the start falls back; this never refuses a launch."""
-    executable = wrkslots_executable(registry)
-    if not executable:
-        return None
-    try:
-        completed = subprocess.run(
-            [executable, "status", "--slot", slot, "--format", "json"],
-            cwd=project, capture_output=True, text=True, timeout=10, check=False,
-        )
-        if completed.returncode != 0:
-            return None
-        document = json.loads(completed.stdout)
-        for row in document["active"]:
-            record = row.get("row", row) if isinstance(row, dict) else row
-            if isinstance(record, dict) and record.get("slot") == slot:
-                purpose = record.get("purpose")
-                return purpose if isinstance(purpose, str) and purpose.strip() else None
-    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, AttributeError):
-        return None
-    return None
+    purpose = row.get("purpose")
+    return (
+        {"slot": slot, "action": "transferred", "owner_pid": pid, "generation": generation},
+        purpose if isinstance(purpose, str) and purpose.strip() else None,
+    )
 
 
 def _slot_shell_command(

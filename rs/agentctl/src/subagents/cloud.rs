@@ -1325,10 +1325,12 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         self.creation_edges(&mut record, options.record_edges);
         // #1342 agent-purpose-line: the cloud launch purpose (explicit
         // `--purpose`, else the profile's) is also the recorded purpose.
-        let cloud_purpose = options
-            .purpose
-            .clone()
-            .or_else(|| options.cloud.as_ref().and_then(|cloud| cloud.purpose.clone()));
+        let cloud_purpose = options.purpose.clone().or_else(|| {
+            options
+                .cloud
+                .as_ref()
+                .and_then(|cloud| cloud.purpose.clone())
+        });
         if let Some(purpose) = super::control::resolve_purpose(
             cloud_purpose.as_deref(),
             None,

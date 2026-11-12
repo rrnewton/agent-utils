@@ -175,6 +175,8 @@ pub(crate) struct BangAgent {
     pub pinned_source: String,
     pub pinned_explicit: Option<bool>,
     pub parent: Option<String>,
+    /// What the agent is for (#1342 agent-purpose-line), detail view only.
+    pub purpose: Option<String>,
 }
 
 /// The registry as one `!who` answer sees it.
@@ -277,6 +279,11 @@ pub(crate) fn snapshot(registry: &Path) -> BangSnapshot {
             pinned_source: "none".to_owned(),
             pinned_explicit: record.get("pinned").and_then(Value::as_bool),
             parent: None,
+            purpose: text(&record, "purpose").or_else(|| {
+                record
+                    .get("extensions")
+                    .and_then(|extensions| text(extensions, "purpose"))
+            }),
         });
     }
     // Parents resolve by token, so a rename or revive keeps the edge (as in control::tree).
@@ -523,6 +530,9 @@ pub(crate) fn render_who_one(snapshot: &BangSnapshot, name: &str) -> String {
     } else {
         out.push_str("- managed by: (none recorded)\n");
     }
+    if let Some(purpose) = &agent.purpose {
+        out.push_str(&format!("- purpose: {purpose}\n"));
+    }
     if let Some(creator) = &agent.created_by {
         out.push_str(&format!("- created by: {creator}\n"));
     }
@@ -632,6 +642,7 @@ mod tests {
             pinned_source: "test".to_owned(),
             pinned_explicit: None,
             parent: parent.map(str::to_owned),
+            purpose: (name == "worker").then(|| "fix the parser".to_owned()),
         };
         let snapshot = BangSnapshot {
             coordinator: Some("coordb".to_owned()),
@@ -658,6 +669,9 @@ mod tests {
         let one = render_who_one(&snapshot, "worker");
         assert!(one.contains("**worker** — claude/opus — running"), "{one}");
         assert!(one.contains("- managed by: lieutenant"), "{one}");
+        // #1342: purpose is a detail-view line only; the tree stays terse.
+        assert!(one.contains("- purpose: fix the parser"), "{one}");
+        assert!(!who.contains("fix the parser"), "{who}");
         assert!(HELP_TEXT.contains("**Owner commands**"));
         assert!(HELP_TEXT.contains("- `!who`"));
     }

@@ -1122,10 +1122,10 @@ def test_root_slot_starts_the_harness_behind_the_relay(tmp_path: Path, monkeypat
     from agentctl.subagents import AgentRecord, _bind_launched_slot_owner
 
     loaded = AgentRecord.load(sessions.registry / "agents" / "worker" / "agent.json", "worker")
-    assert _bind_launched_slot_owner(loaded, "s1", project, sessions.registry) == {
+    assert _bind_launched_slot_owner(loaded, "s1", project, sessions.registry) == ({
         "slot": "s1", "action": "refused", "owner_pid": 4242,
         "reason": "transfer-owner refused: REFUSED: slot s1 owner is live",
-    }
+    }, None)
 
 
 def test_explain_agent_parses_herdr_screen_rule_verdicts() -> None:

@@ -252,8 +252,9 @@ there is no way to answer, so `!` text is admitted normally instead.)
   --pin`, `agentctl start --pinned`, or a profile's `"pinned": true`);
   without that, the designated coordinator, agents listed in
   `restore.json`, and agents that manage others count as pinned.
-  `!who NAME` posts one agent in detail; an unknown name answers with
-  near matches plus the full list.
+  `!who NAME` posts one agent in detail — including its recorded
+  `purpose`, what the agent is for (`agentctl purpose NAME`), when it has
+  one; an unknown name answers with near matches plus the full list.
 - `!@NAME <message>` opens a new thread bound to NAME and sends it
   `<message>`. Later owner messages in that thread are requests for NAME,
   delivered to its pane or queue with the usual admission and receipt

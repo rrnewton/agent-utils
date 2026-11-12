@@ -1781,12 +1781,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     /// Read, set, or clear what `agent_name` is for (#1342 agent-purpose-line).
     /// With neither `text` nor `clear` this only reads. Setting or clearing
     /// writes the record once and never prompts the agent; `goal` is untouched.
-    pub fn purpose(
-        &self,
-        agent_name: &str,
-        text: Option<&str>,
-        clear: bool,
-    ) -> Result<Value> {
+    pub fn purpose(&self, agent_name: &str, text: Option<&str>, clear: bool) -> Result<Value> {
         if !clear && text.is_none() {
             let record = self.load(agent_name)?;
             let purpose = record.purpose();
@@ -2099,7 +2094,10 @@ mod tests {
 
     #[test]
     fn purpose_validation_and_brief_lines() {
-        assert_eq!(validated_purpose("  fix the parser  ").unwrap(), "fix the parser");
+        assert_eq!(
+            validated_purpose("  fix the parser  ").unwrap(),
+            "fix the parser"
+        );
         assert!(validated_purpose("").is_err());
         assert!(validated_purpose("two\nlines").is_err());
         assert!(validated_purpose(&"x".repeat(PURPOSE_MAX_CHARS + 1)).is_err());

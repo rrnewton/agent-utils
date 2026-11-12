@@ -6895,7 +6895,8 @@ mod tests {
             ("--cloud-harness", vec!["--cloud-harness=native"]),
             ("--provision", vec!["--provision"]),
             ("--envspec", vec!["--provision", "--envspec=example"]),
-            ("--purpose", vec!["--provision", "--purpose=example"]),
+            // #1342: --purpose is recorded metadata, not a launch setting, so
+            // it deliberately does not conflict with --profile.
             ("--cloud-workspace", vec!["--cloud-workspace=/work/example"]),
             ("--node-id", vec!["--node-id=example"]),
         ] {
@@ -8416,14 +8417,6 @@ mod tests {
                 "agentcloud",
                 "--envspec",
                 "monorepo",
-            ],
-            vec![
-                "start",
-                "sub-cloud",
-                "--harness",
-                "agentcloud",
-                "--purpose",
-                "label",
             ],
             vec![
                 "start",

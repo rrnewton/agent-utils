@@ -27,7 +27,7 @@ Coordinator-approved after the audit. `goal` is a delivered harness objective: `
 ## Sources at start, in order (never blocks a launch)
 
 1. Explicit: `--purpose TEXT` on `agentctl start`, generalized. Today `--purpose` is agentcloud+`--provision`-only (a provisioned node's roster label, `cli.rs`); keep that passthrough for cloud provisioning and record the same value locally for every harness. It is launch metadata, not a launch setting: it no longer conflicts with `--profile`, and an explicit value overrides a profile's cloud purpose.
-2. Slot: with `--slot NAME` (not a project box), the slot's recorded wrkslots purpose, read best-effort from the same wrkslots executable agentctl already resolves, `wrkslots status --slot NAME --format json`, bounded like other external calls; any failure (no executable, nonzero exit, bad JSON, timeout) falls through and never fails the start.
+2. Slot: with `--slot NAME` (not a project box), the slot's recorded wrkslots purpose, taken from the status row the post-launch owner bind already reads (`wrkslots status --slot NAME --format json` inside `bind_slot_owner`), so it costs no extra wrkslots call; a refused or purposeless bind falls through to the brief and never fails the start. It outranks the brief line recorded at creation, but never an explicit `--purpose`.
 3. Brief: the first meaningful line of `--brief`/`--file` text — first non-empty line with heading/bullet markers stripped and whitespace collapsed, sender-header lines skipped, truncated to 200 characters.
 4. Nothing: no key. A short model summary may come later; it is out of scope here and must never block start.
 

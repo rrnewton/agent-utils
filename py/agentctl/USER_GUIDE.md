@@ -1539,6 +1539,19 @@ verdict, and owner requests left undelivered. `list` and `status` show
 `standing: true` for it, and each pass's report lists standing agents under
 `standing`, so the exemption stays visible.
 
+Every agent may carry a one-line `purpose`: what it is for (#1342
+agent-purpose-line). `agentctl start` records one from `--purpose TEXT`,
+else the slot's recorded wrkslots purpose, else the brief's first meaningful
+line; a start with none of the three records nothing. Read or change it with
+`agentctl purpose NAME`, `agentctl purpose NAME "TEXT"` and
+`agentctl purpose NAME --clear` (Rust edition), which print the agent, the
+purpose now recorded, and the previous one as JSON. `list` and `status` show
+`purpose` when one is recorded, `!who NAME` shows it in its detail view, and
+the headless console banner names it. A purpose is display-only: setting or
+clearing it never prompts, queues, or wakes the agent, and it is not the
+agent's `goal` — a goal set with `agentctl goal` is an instruction delivered
+to the harness, while a purpose only describes the agent to people.
+
 The watcher's own periodic notices expire and replace themselves (#1157
 automated-notice-ttl), so a coordinator that was busy or blocked is typed
 each notice once, in its newest copy, instead of a backlog of stale repeats:
