@@ -15,7 +15,8 @@ reports; the disabled-button state without it is covered by unit tests.
 
 The walk: open the channel, tap Discuss (nothing is asked), press Summarize,
 see "Reading…" give way to the summary with its covered-messages footer, Mark
-read sending exactly the markable ids, a footer link closing the panel, and
+read sending exactly the markable ids, a footer link jumping with the panel
+still open (`#1395 discuss-scope-binding`, `#1345` keep-open), and
 the panel overlaying the list without moving #scroll-area. Condition waits
 only — no fixed sleeps in any assertion.
 """
@@ -311,6 +312,7 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     check(bool(writes) and writes[-1][0].endswith("/dismiss") and writes[-1][1] == {"messages": MARKABLE},
           f"Mark read sent {writes}, not exactly the markable ids")
 
+    # A footer jump stays in its scope: the panel stays open (`#1395`).
     page.click("#discuss-links .discuss-link >> nth=0")
     # The jump keeps the panel open (it overlays the list it jumped).
     page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)

@@ -257,6 +257,16 @@
   color: #8ab8ff;
 }
 
+/* `#1395 discuss-scope-binding` (Slack 017): a citation the server resolved
+ * from the cache outside this summary's window carries `scope=out` in its
+ * address and the ↗ mark in its text; it leaves the scope, so it reads
+ * amber where an in-scope citation (↩) keeps the link blue above. The
+ * address flag is the marker: it survives the sanitizer, which strips
+ * classes the server did not allow. */
+#discuss-answer a[href*="scope=out"] {
+  color: #ffb86b;
+}
+
 #discuss-terms {
   margin-top: 10px;
   color: #aab2c0;

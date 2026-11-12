@@ -454,6 +454,67 @@ async fn the_endpoint_answers_with_the_fake_text_and_the_contract_shape() {
 }
 
 #[tokio::test]
+async fn a_cache_resolved_cite_outside_the_window_links_out_with_no_upstream_read() {
+    // `#1395 discuss-scope-binding` (Slack 017): the window holds the
+    // newest two; the model also cites an older cached message in another
+    // thread and one id that resolves to nothing. The cached one stays a
+    // link with the out-of-scope mark; the hallucinated one is dropped;
+    // no provider read happens (the fake's count is frozen).
+    let text = testing::config_toml() + "\n[summaries]\ncatchup_window_messages = 2\n";
+    let mut messages: Vec<Message> = (0..5).map(|seq| message(seq, None, false)).collect();
+    messages[0] = message(0, Some((THREAD_A, false)), false);
+    let in_id = messages[4].id.as_str().to_owned();
+    let out_id = messages[0].id.as_str().to_owned();
+    let backend = backend_with(messages.clone());
+    let (state, _store, summarizer, _dir) = cached_state(&text, backend.clone()).await;
+    fill(&state, TimelineView::Flat, None).await;
+    let mut state = state;
+    state.catchup_summarizer = Some(summarizer.clone());
+    state.catchup_model = Some(Arc::from("fake-model"));
+    summarizer.answer_with(&format!(
+        "- newest [m:{in_id}]\n- older thread [m:{out_id}]\n- invented [m:hallucinated-1]"
+    ));
+    let app = vibe_talk::http::router(state);
+    let path = format!("/api/v1/channels/{WRITE_CHANNEL}/catchup");
+    let reads = backend.reads();
+    let (status, body) = post(&app, &path, Some(WRITE_TOKEN), &json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(backend.reads(), reads, "resolving cites read upstream");
+    let shaped = body["text"].as_str().unwrap_or_default();
+    assert!(
+        shaped.contains("↩"),
+        "in-window cite lost its arrow: {shaped}"
+    );
+    assert!(
+        shaped.contains("↗"),
+        "out-of-window cite has no mark: {shaped}"
+    );
+    assert!(
+        shaped.contains("scope=out"),
+        "out-of-window cite has no flag: {shaped}"
+    );
+    assert!(
+        shaped.contains("v=thread"),
+        "out cite does not open its thread: {shaped}"
+    );
+    assert!(
+        !shaped.contains("hallucinated-1"),
+        "hallucinated cite survived: {shaped}"
+    );
+    assert!(!shaped.contains("[m:"), "a raw citation survived: {shaped}");
+    assert_eq!(body["cited_ids"], json!([in_id, out_id]), "{body}");
+    // Main is the same global scope: same window as All.
+    summarizer.answer_with("same window again");
+    let (status, main) = post(&app, &path, Some(WRITE_TOKEN), &json!({"view": "main"})).await;
+    assert_eq!(status, StatusCode::OK, "{main}");
+    assert_eq!(
+        main["window"], body["window"],
+        "Main window differs from All: {main}"
+    );
+    assert_eq!(backend.reads(), reads, "the Main read went upstream");
+}
+
+#[tokio::test]
 async fn the_endpoint_answers_a_cache_miss_without_a_model_call() {
     let backend = backend_with(vec![message(0, None, false)]);
     let (state, _store, summarizer, _dir) =

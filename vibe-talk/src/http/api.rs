@@ -2505,6 +2505,11 @@ pub struct CatchupPreviewQuery {
 }
 
 /// The view a Discuss scope names, shared by the preview and the read itself.
+///
+/// `#1395 discuss-scope-binding`: a channel scope is global — All (`flat`)
+/// and Main (`main`) are one scope, fetched the same way, so a Discuss
+/// request's window (and the record keyed by channel alone) agrees from
+/// either view. The requested name is still echoed in the answer.
 fn catchup_view(
     thread_id: Option<&str>,
     view: Option<&str>,
@@ -2515,7 +2520,7 @@ fn catchup_view(
     }
     match view {
         None | Some("flat") => Ok((TimelineView::Flat, "flat")),
-        Some("main") => Ok((TimelineView::Main, "main")),
+        Some("main") => Ok((TimelineView::Flat, "main")),
         Some(other) => Err(ApiError::bad_request(format!(
             "view is \"flat\" (the default) or \"main\", not {other:?}"
         ))),
@@ -2697,30 +2702,79 @@ pub async fn catchup(
         .clone()
         .unwrap_or_else(|| "discord".to_owned());
     let (raw, unknown_terms) = crate::catchup::split_unknown_terms(&raw);
-    let cite = |id: &MessageId| {
-        let message = by_id.get(id.as_str())?;
-        let time = if message.spoken_time.is_empty() {
+    // `#1395` (Slack 017, cache-only per owner rule 414): a citation outside
+    // the window that the cache still resolves stays a link, marked
+    // out-of-scope; only ids that resolve to nothing are dropped. The
+    // lookup is the cache alone — no provider call is made or begun.
+    let outside_ids: Vec<String> = crate::catchup::cited_ids_in(&raw)
+        .into_iter()
+        .filter(|id| !sent.contains(id))
+        .map(|id| id.as_str().to_owned())
+        .collect();
+    let cached: std::collections::HashMap<String, Message> = if outside_ids.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        state
+            .message_cache
+            .held_messages(&fetched.channel.id, None, &outside_ids)
+            .await
+    };
+    let mut allowed: std::collections::HashSet<MessageId> = sent.clone();
+    for id in cached.keys() {
+        allowed.insert(MessageId(id.clone()));
+    }
+    let cite_time = |message: &Message| {
+        if message.spoken_time.is_empty() {
             message.timestamp.clone()
         } else {
             message.spoken_time.clone()
-        };
-        let address = crate::catchup::message_link(
-            &provider,
-            &channel_id,
-            view_name,
-            thread_id,
-            id,
-            message.thread.as_ref().map(|thread| thread.id.as_str()),
-        );
-        Some((time, address))
+        }
     };
-    let (text, cited_ids) = crate::catchup::shape_answer(&raw, &sent, cite);
-    // The addresses `shape_answer` just built, recomputed through the same `cite`: exactly the
-    // citation hrefs the render may keep (`#1392 discuss-citation-links`). A relative link the
-    // model wrote itself is never in this set, so it stays refused.
+    let cite = |id: &MessageId| -> Option<(String, String, bool)> {
+        if let Some(message) = by_id.get(id.as_str()) {
+            let address = crate::catchup::message_link(
+                &provider,
+                &channel_id,
+                view_name,
+                thread_id,
+                id,
+                message.thread.as_ref().map(|thread| thread.id.as_str()),
+            );
+            return Some((cite_time(message), address, true));
+        }
+        let message = cached.get(id.as_str())?;
+        // The link opens the target where it lives: its thread, else Main.
+        let target_thread = message
+            .thread
+            .as_ref()
+            .filter(|thread| !thread.is_root)
+            .map(|thread| thread.id.as_str());
+        let address = match target_thread {
+            Some(thread) => crate::catchup::message_link(
+                &provider,
+                &channel_id,
+                "flat",
+                Some(thread),
+                id,
+                Some(thread),
+            ),
+            None => crate::catchup::message_link(&provider, &channel_id, "main", None, id, None),
+        };
+        Some((cite_time(message), address, false))
+    };
+    let (text, cited_ids) = crate::catchup::shape_answer(&raw, &allowed, cite);
+    // The addresses `shape_answer` just built, recomputed through the same
+    // `cite` (out-of-scope ones with their flag, via
+    // `catchup::trusted_cite_address`): exactly the citation hrefs the
+    // render may keep (`#1392` + `#1395`). A relative link the model wrote
+    // itself is never in this set, so it stays refused.
     let trusted: std::collections::HashSet<String> = cited_ids
         .iter()
-        .filter_map(|id| cite(id).map(|(_, address)| address))
+        .filter_map(|id| {
+            cite(id).map(|(_, address, in_scope)| {
+                crate::catchup::trusted_cite_address(&address, in_scope)
+            })
+        })
         .collect();
     let text_html = crate::render::body_html_catchup(
         &text,

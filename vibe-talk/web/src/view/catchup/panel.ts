@@ -97,6 +97,14 @@ export interface DiscussPanelDependencies {
   /** Jump to the message a footer link names. */
   onJump(ref: MessageLinkRef): unknown;
   /**
+   * `#1395 discuss-scope-binding`. Route one citation tap from the answer:
+   * the ref it names and whether the server marked it out-of-scope
+   * (`scope=out` in its address). When present, `answerTap` — the single
+   * tap-routing function — hands every citation here and the view decides
+   * (binding.ts) whether the panel stays; absent, citations jump as before.
+   */
+  onLinkTap?(ref: MessageLinkRef, outOfScope: boolean): unknown;
+  /**
    * Mark messages read / put them back, through the page's Done acts: those own the
    * ≤1000-id batching (`writeInBatches`), so the panel hands over the whole list.
    */
@@ -142,6 +150,17 @@ export interface DiscussPanel {
   setScopeLabel(label: string): void;
   /** Forget any answer still on its way (the scope changed under it). */
   invalidate(): void;
+  /**
+   * `#1395 discuss-scope-binding`. The answer on screen and its scope, for a
+   * history entry or a same-scope reopen; null before any answer lands.
+   */
+  snapshot(): { scope: DiscussScope; answer: CatchupAnswer } | null;
+  /**
+   * `#1395 discuss-scope-binding`. Show `answer` for `scope` again with no
+   * fetch at all — no preview, no model call (Back-restore, same-scope
+   * reopen). The `#1345` record restore supersedes this where it exists.
+   */
+  restoreAnswer(scope: DiscussScope, answer: CatchupAnswer): void;
   /** `#1344`. The overlay width in force, in CSS pixels (the wider default until dragged). */
   width(): number;
   /** `#1344`. Put a width on the panel and keep it on the device. */
@@ -639,7 +658,14 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     }
   }
 
-  /** A tap inside the answer: an in-app citation link jumps; anything else goes on. */
+  /**
+   * A tap inside the answer (`#1395 discuss-scope-binding`): the single
+   * tap-routing function. An in-app citation link is routed — through the
+   * view's binding decision when wired, as a plain jump otherwise — and
+   * anything else goes on. The server marks a cache-resolved citation
+   * outside the window with `scope=out` in its address; that flag, and
+   * only that, makes the tap out-of-scope.
+   */
   function answerTap(event: Event): void {
     let node: unknown = event.target;
     while (node !== null && node !== undefined) {
@@ -648,15 +674,18 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         const href = el.getAttribute("href") ?? "";
         const queryAt = href.indexOf("?");
         if (!href.startsWith("http") && queryAt >= 0) {
-          const ref = deepLinkRefFrom(new URLSearchParams(href.slice(queryAt + 1)).get("m") ?? "");
+          const params = new URLSearchParams(href.slice(queryAt + 1));
+          const ref = deepLinkRefFrom(params.get("m") ?? "");
           if (ref !== null) {
             event.preventDefault();
-            deps.onJump({
+            const linkRef: MessageLinkRef = {
               service: ref.provider,
               channel: ref.channel,
               message: ref.message,
               thread: ref.thread,
-            });
+            };
+            if (deps.onLinkTap) deps.onLinkTap(linkRef, params.get("scope") === "out");
+            else deps.onJump(linkRef);
           }
         }
         return;
@@ -1096,6 +1125,33 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     },
     invalidate() {
       generation += 1;
+    },
+    snapshot() {
+      if (lastScope === null || lastAnswer === null) return null;
+      return { scope: lastScope, answer: lastAnswer };
+    },
+    restoreAnswer(scope: DiscussScope, answer: CatchupAnswer) {
+      generation += 1;
+      if (pending) setPending(false);
+      lastScope = scope;
+      lastAnswer = answer;
+      try {
+        applyStoredLayout();
+      } catch {
+        // No panel in this host yet: the open below says so, as before.
+      }
+      setOpen(true);
+      deps.byId("discuss-scope").textContent = scope.label;
+      const unread = answer.window?.unread_count ?? answer.unread_ids.length;
+      const count = answer.window?.count ?? answer.unread_ids.length;
+      deps.byId("discuss-status").textContent = `Read ${unread} unread of ${count}`;
+      drawAnswer(answer);
+      drawTerms(answer);
+      drawFooter(answer, scope);
+      const stampLine = formatStampLine(answer.stamp);
+      deps.byId("discuss-stamp").textContent = stampLine;
+      deps.byId("discuss-stamp").hidden = stampLine === "";
+      deps.byId("discuss-retry").hidden = true;
     },
     width: () => width,
     setWidth(px: unknown) {

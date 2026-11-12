@@ -24,7 +24,40 @@ export type {
 import { createListening } from "../dom/index.ts";
 import type { MessageLinkRef } from "../../foundation/index.ts";
 import { DISCUSS_UNAVAILABLE_HINT, createDiscussPanel, isDiscussUnavailable } from "./panel.ts";
-import type { CatchupRequestBody, DiscussScope } from "./panel.ts";
+import type { CatchupAnswer, CatchupRequestBody, DiscussScope } from "./panel.ts";
+import {
+  discussScopeKey,
+  isSameDiscussScope,
+  linkDecision,
+  normalizeDiscussScope,
+  viewChangeDecision,
+} from "./binding.ts";
+import type { NormalizedDiscussScope } from "./binding.ts";
+
+export {
+  DISCUSS_BINDING_RULES,
+  WIDEN_OR_SIDEWAYS_ACTION,
+  discussScopeKey,
+  isSameDiscussScope,
+  linkDecision,
+  normalizeDiscussScope,
+  viewChangeDecision,
+} from "./binding.ts";
+export type { DiscussLinkAction, LinkDecision, NormalizedDiscussScope, ViewChangeDecision } from "./binding.ts";
+
+/**
+ * `#1395 discuss-scope-binding`. What a history entry pushed on a binding
+ * exit carries: Discuss open, its bound scope, the `#1345` record key
+ * (channel + thread, the scope key), and the in-memory answer as the
+ * restore fallback until the record lands. Back restores from this with
+ * no model call.
+ */
+export interface DiscussHistoryState {
+  discussOpen: true;
+  scope: DiscussScope;
+  recordKey: string;
+  snapshot: { scope: DiscussScope; answer: CatchupAnswer } | null;
+}
 
 /** The selection the panel scopes to, as far as Discuss reads it. */
 export interface DiscussSelection {
@@ -64,6 +97,19 @@ export interface DiscussViewDependencies {
   channelLabel?(channelId: string): string;
   /** Jump to the message a footer link names. */
   onJump(ref: MessageLinkRef): unknown;
+  /**
+   * `#1395 discuss-scope-binding`. Show the bound global view, then jump to
+   * `ref` there (rule `out-of-thread-link-returns-to-bound`); the panel
+   * stays open. Absent, a return-to-bound tap jumps as `onJump` does.
+   */
+  navigateToBound?(scope: DiscussScope, ref: MessageLinkRef): unknown;
+  /**
+   * `#1395 discuss-scope-binding`. Push the history entry a binding exit
+   * (widen/sideways close, fallback jump) leaves for Back to restore from.
+   * Absent in hosts without history; Back-restore then keeps the snapshot
+   * in memory only.
+   */
+  pushDiscussState?(state: DiscussHistoryState): unknown;
   /** The Done acts, which own the ≤1000-id batching of dismiss and restore. */
   dismissMessages(body: { messages: readonly string[] }): Promise<unknown>;
   restoreMessages(ids: readonly string[]): Promise<unknown>;
@@ -85,12 +131,27 @@ export interface DiscussViewDependencies {
 export interface DiscussView {
   /** Wire the bar button and the panel's controls; the boot tracks the answer. */
   mountControls(): { unmount(): void };
-  /** Restate the scope line for the selection now, forgetting an answer aimed elsewhere. */
+  /**
+   * Apply the binding to the selection now (`#1395`): same scope and
+   * narrowing keep the panel open under its bound label; widening,
+   * sideways, and a channel change close it behind a history entry.
+   */
   sync(): void;
   /** Open the panel for the selection now and ask at once. */
   open(): void;
+  /** `#1395`. Open the panel bound to `scope` (record restore, tests). */
+  openWith(scope: DiscussScope): void;
   close(): void;
   isOpen(): boolean;
+  /** `#1395`. The scope Discuss is bound to (kept while closed), or null. */
+  boundScope(): NormalizedDiscussScope | null;
+  /** `#1395`. Whether the selection now is the bound scope (All = Main). */
+  isSameScopeAsCurrent(): boolean;
+  /**
+   * `#1395`. Restore Discuss from a history entry pushed on a binding
+   * exit: the same summary, no model call. True when it restored.
+   */
+  restoreFromHistory(state: unknown): boolean;
   /** `#1344`. The overlay width in force, in CSS pixels. */
   width(): number;
   /** `#1344`. Put a width on the panel and keep it on the device. */
@@ -110,7 +171,6 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
   const listening = createListening();
   let mounted = false;
   let panelTeardown: { unmount(): void } | null = null;
-  let syncedScopeKey: string | null = null;
   // The server refused for want of a summarizer after the boot said otherwise:
   // the button is drawn unavailable from then on, as if the boot had said so.
   let refused = false;
@@ -196,6 +256,53 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     if (scope.threadId !== null) query.set("thread_id", scope.threadId);
     query.set("view", scope.view);
     return deps.api(`/api/v1/channels/${encodeURIComponent(channelId)}/catchup/record?${query.toString()}`, { method: "GET" });
+  // `#1395 discuss-scope-binding`. The scope Discuss is bound to, set on
+  // open and kept while closed (a same-scope reopen restores, Back reads
+  // it); `boundRaw` is the same scope as opened, for its label and view.
+  let boundRaw: DiscussScope | null = null;
+  let boundScope: NormalizedDiscussScope | null = null;
+
+  /** Leave the history entry Back restores this binding from, if wired. */
+  function pushRestoreState(): void {
+    if (boundRaw === null || boundScope === null) return;
+    try {
+      deps.pushDiscussState?.({
+        discussOpen: true,
+        scope: boundRaw,
+        recordKey: discussScopeKey(boundScope),
+        snapshot: panel.snapshot(),
+      });
+    } catch {
+      // History refused: the in-memory snapshot still restores this session.
+    }
+  }
+
+  /** Route one citation tap by the binding; the panel stays unless it closes. */
+  function routeLink(ref: MessageLinkRef, outOfScope: boolean): void {
+    let current: NormalizedDiscussScope;
+    try {
+      current = normalizeDiscussScope(scopeNow());
+    } catch {
+      deps.onJump(ref);
+      return;
+    }
+    const decision = linkDecision({
+      bound: boundScope,
+      current,
+      linkChannel: ref.channel,
+      linkThread: ref.thread,
+      outOfScope,
+    });
+    if (decision.action === "jump-in-place") {
+      deps.onJump(ref);
+    } else if (decision.action === "return-to-bound" && boundRaw !== null) {
+      if (deps.navigateToBound) deps.navigateToBound(boundRaw, ref);
+      else deps.onJump(ref);
+    } else {
+      pushRestoreState();
+      panel.close();
+      deps.onJump(ref);
+    }
   }
 
   const panel = createDiscussPanel({
@@ -218,6 +325,7 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     },
     serviceName: (channelId) => deps.serviceName?.(channelId) ?? "discord",
     onJump: deps.onJump,
+    onLinkTap: (ref, outOfScope) => routeLink(ref, outOfScope),
     dismissMessages: deps.dismissMessages,
     restoreMessages: deps.restoreMessages,
     showError: deps.showError,
@@ -250,14 +358,25 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     };
   }
 
-  function scopeKey(scope: DiscussScope): string {
-    return `${scope.channelId}\n${scope.threadId ?? ""}\n${scope.view}`;
-  }
-
   function open(): void {
     if (!available() || busy) return;
     const scope = scopeNow();
-    syncedScopeKey = scopeKey(scope);
+    // A same-scope reopen restores the answer on screen (Mod+8, Back):
+    // no preview read, no model call. Any other scope starts fresh.
+    const held = panel.snapshot();
+    if (boundScope !== null && held !== null && isSameDiscussScope(boundScope, scope)) {
+      panel.restoreAnswer(held.scope, held.answer);
+      return;
+    }
+    boundRaw = scope;
+    boundScope = normalizeDiscussScope(scope);
+    panel.openWith(scope);
+  }
+
+  function openWith(scope: DiscussScope): void {
+    if (!available() || busy) return;
+    boundRaw = scope;
+    boundScope = normalizeDiscussScope(scope);
     panel.openWith(scope);
   }
 
@@ -300,19 +419,55 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     },
     sync() {
       try {
-        const scope = scopeNow();
-        const key = scopeKey(scope);
-        if (syncedScopeKey !== null && key !== syncedScopeKey) panel.invalidate();
-        syncedScopeKey = key;
-        panel.setScopeLabel(scope.label);
+        const currentRaw = scopeNow();
+        if (panel.isOpen() && boundScope !== null && boundRaw !== null) {
+          const decision = viewChangeDecision(boundScope, normalizeDiscussScope(currentRaw));
+          if (decision.action === "stay") {
+            // Same scope, or narrowing under a global binding: the answer
+            // and its bound label stand; nothing is forgotten.
+            panel.setScopeLabel(boundRaw.label);
+          } else {
+            pushRestoreState();
+            panel.close();
+          }
+        } else {
+          panel.setScopeLabel(currentRaw.label);
+        }
         drawAvailability();
       } catch {
         // No panel in this host yet: sync is a label only, and says nothing.
       }
     },
     open,
+    openWith,
     close: () => panel.close(),
     isOpen: () => panel.isOpen(),
+    boundScope: () => boundScope,
+    isSameScopeAsCurrent() {
+      if (boundScope === null) return false;
+      try {
+        return isSameDiscussScope(boundScope, scopeNow());
+      } catch {
+        return false;
+      }
+    },
+    restoreFromHistory(state: unknown) {
+      if (typeof state !== "object" || state === null) return false;
+      const record = state as Partial<DiscussHistoryState>;
+      if (record.discussOpen !== true || typeof record.scope !== "object" || record.scope === null) return false;
+      const scope = record.scope as DiscussScope;
+      boundRaw = scope;
+      boundScope = normalizeDiscussScope(scope);
+        // The in-memory answer first (no fetch at all); without it, the
+      // scope reopen reads the `#1345` record, still with no model call.
+      const snapshot = record.snapshot;
+      if (snapshot && typeof snapshot === "object" && snapshot.answer) {
+        panel.restoreAnswer(snapshot.scope ?? scope, snapshot.answer);
+      } else {
+        panel.openWith(scope);
+      }
+      return true;
+    },
     width: () => panel.width(),
     setWidth: (px: unknown) => panel.setWidth(px),
     sheetFull: () => panel.sheetFull(),

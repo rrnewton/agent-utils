@@ -292,12 +292,69 @@ fn cut_body(body: &str, cap: usize) -> String {
     )
 }
 
-/// Remove every `[m:…]` citation whose id was not sent.
+/// The mark ending an in-window citation's link text: the curved arrow the
+/// page already draws for internal links. An out-of-window citation ends
+/// with [`OUT_OF_SCOPE_MARK`] instead (`#1395 discuss-scope-binding`).
+pub const IN_SCOPE_MARK: &str = "↩";
+
+/// The mark ending a cache-resolved, out-of-window citation's link text,
+/// drawn in its own colour by the page (`#1395`, Slack 017).
+pub const OUT_OF_SCOPE_MARK: &str = "↗";
+
+/// The address flag the page's tap router reads for an out-of-scope cite.
+pub const OUT_OF_SCOPE_FLAG: &str = "scope=out";
+
+/// The address a citation link carries, as the render's trusted set must
+/// hold it (`#1392` + `#1395`): an out-of-scope address gains
+/// [`OUT_OF_SCOPE_FLAG`]; an in-scope one stands as built. Server-built
+/// only — a model-written address is never passed here as trusted.
+#[must_use]
+pub fn trusted_cite_address(address: &str, in_scope: bool) -> String {
+    if in_scope {
+        return address.to_owned();
+    }
+    let separator = if address.contains('?') { "&" } else { "?" };
+    format!("{address}{separator}{OUT_OF_SCOPE_FLAG}")
+}
+
+/// Every citation id `text` names, in first-citation order, deduped: the
+/// set a caller resolves (window, then cache) before shaping.
+#[must_use]
+pub fn cited_ids_in(text: &str) -> Vec<MessageId> {
+    let mut found: Vec<MessageId> = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("[m:") {
+        let after = &rest[start + "[m:".len()..];
+        let Some(end) = after.find(']') else { break };
+        let inner = &after[..end];
+        if inner.contains(['\n', '\r', '[']) {
+            rest = &rest[start + "[m:".len()..];
+            continue;
+        }
+        let candidate = inner
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .split('|')
+            .next()
+            .unwrap_or("");
+        let id = MessageId(candidate.to_owned());
+        if !candidate.is_empty() && !found.contains(&id) {
+            found.push(id);
+        }
+        rest = &rest[start + "[m:".len() + end + "]".len()..];
+    }
+    found
+}
+
+/// Remove every `[m:…]` citation whose id was not allowed.
 ///
 /// A citation is one bracketed token on one line, `[m:<id>]` as the prompt asks for; its id is
-/// the token's first field, so a copied header is judged by the id it opens with. Known citations
-/// and all other text — including the spaces around a removed citation, and a `[m:` with no
-/// closing bracket on its line — are left exactly as written.
+/// the token's first field, so a copied header is judged by the id it opens with. Allowed
+/// citations and all other text — including the spaces around a removed citation, and a `[m:`
+/// with no closing bracket on its line — are left exactly as written. The allowed set is the
+/// window plus every id the caller resolved from the cache (`#1395`): only ids that resolve
+/// to nothing (hallucinated) are removed here.
 #[must_use]
 pub fn validate_cites(text: &str, sent: &HashSet<MessageId>) -> String {
     let mut out = String::with_capacity(text.len());
@@ -396,15 +453,17 @@ pub fn message_link(
 /// Shape one raw model answer for the reader: check its citations, take every raw
 /// id out of the printed text, and say which messages the answer ended up citing.
 ///
-/// Citations the window never contained are dropped by [`validate_cites`], as
-/// before. Each surviving `[m:<id>]` becomes an inline `(HH:MM)` hyperlink —
-/// `[(<time>)](<address>)`, the address from [`message_link`] and the time the
-/// caller's label for that message — so no long message uid is ever printed; a
-/// citation whose message the caller cannot place loses the token rather than
-/// print the id. A bare `#NNNN` — not already a link, and not the tail of a
-/// `repo#N` short label — becomes `[#NNNN](<issue>)` at [`ISSUE_LINK_BASE`].
-/// Everything else, headings and context sentences included, is the model's own
-/// Markdown, untouched.
+/// Citations that resolve to nothing are dropped by [`validate_cites`]. Each
+/// surviving `[m:<id>]` becomes an inline `(HH:MM)` hyperlink —
+/// `[(<time> ↩)](<address>)` in the window, `[(<time> ↗)](<address>&scope=out)`
+/// for a message the caller resolved from the cache outside it (`#1395`) —
+/// the address from [`message_link`] and the time the caller's label for that
+/// message, so no long message uid is ever printed; a citation whose message
+/// the caller cannot place loses the token rather than print the id. A bare
+/// `#NNNN` — not already a link, and not the tail of a `repo#N` short label —
+/// becomes `[#NNNN](<issue>)` at [`ISSUE_LINK_BASE`]. Everything else,
+/// headings and context sentences included, is the model's own Markdown,
+/// untouched.
 ///
 /// The cited set is the surviving citations' ids in first-citation order,
 /// duplicates removed: exactly the messages the shaped text links to, and so the
@@ -413,7 +472,7 @@ pub fn message_link(
 pub fn shape_answer(
     raw: &str,
     sent: &HashSet<MessageId>,
-    cite: impl Fn(&MessageId) -> Option<(String, String)>,
+    cite: impl Fn(&MessageId) -> Option<(String, String, bool)>,
 ) -> (String, Vec<MessageId>) {
     let checked = validate_cites(raw, sent);
     let mut cited: Vec<MessageId> = Vec::new();
@@ -439,8 +498,16 @@ pub fn shape_answer(
         let whole = start + "[m:".len() + end + "]".len();
         out.push_str(&rest[..start]);
         let id = MessageId(candidate.to_owned());
-        if let Some((time, address)) = cite(&id) {
-            out.push_str(&format!("[({time})]({address})"));
+        if let Some((time, address, in_scope)) = cite(&id) {
+            let mark = if in_scope {
+                IN_SCOPE_MARK
+            } else {
+                OUT_OF_SCOPE_MARK
+            };
+            out.push_str(&format!(
+                "[({time} {mark})]({})",
+                trusted_cite_address(&address, in_scope)
+            ));
             if !cited.contains(&id) {
                 cited.push(id);
             }
@@ -868,16 +935,17 @@ mod tests {
             Some((
                 time.to_owned(),
                 message_link("slack", "C9", "flat", None, id, None),
+                true,
             ))
         };
         let raw = "## Widgets\nThe widget line is moving again.\n- Shipped the fix for #1224 [m:111]\n- Filed a follow-up [m:222], again [m:111], and an invented one [m:999]\n- Already linked [#1224](https://example.com/x) and widgets#7 stay";
         let (shaped, cited) = shape_answer(raw, &sent, cite);
         assert!(
-            shaped.contains("[(09:51)](?c=C9&v=all&m=slack:C9:111)"),
+            shaped.contains("[(09:51 ↩)](?c=C9&v=all&m=slack:C9:111)"),
             "{shaped}"
         );
         assert!(
-            shaped.contains("[(09:52)](?c=C9&v=all&m=slack:C9:222)"),
+            shaped.contains("[(09:52 ↩)](?c=C9&v=all&m=slack:C9:222)"),
             "{shaped}"
         );
         assert!(
@@ -924,10 +992,11 @@ mod tests {
                 Some((
                     "09:51".to_owned(),
                     message_link("slack", "C9", "flat", None, id, None),
+                    true,
                 ))
             });
         assert!(
-            shaped.contains("[(09:51)](?c=C9&v=all&m=slack:C9:2001)"),
+            shaped.contains("[(09:51 ↩)](?c=C9&v=all&m=slack:C9:2001)"),
             "{shaped}"
         );
         assert!(cited.contains(&MessageId("2001".to_owned())));
@@ -943,12 +1012,15 @@ mod tests {
             Some((
                 "09:51".to_owned(),
                 message_link("slack", "C9", "flat", None, id, None),
+                true,
             ))
         };
         let (shaped, cited) = shape_answer("- Cache-only is live [m:111]", &sent, cite);
         let trusted: HashSet<String> = cited
             .iter()
-            .filter_map(|id| cite(id).map(|(_, address)| address))
+            .filter_map(|id| {
+                cite(id).map(|(_, address, in_scope)| trusted_cite_address(&address, in_scope))
+            })
             .collect();
         let html =
             crate::render::body_html_catchup(&shaped, crate::render::Markup::Discord, &trusted);
@@ -956,8 +1028,95 @@ mod tests {
             html.contains("<a href=\"?c=C9&amp;v=all&amp;m=slack:C9:111\""),
             "no in-app anchor: {html}"
         );
-        assert!(html.contains("(09:51)"), "no citation label: {html}");
+        assert!(html.contains("(09:51 ↩)"), "no citation label: {html}");
         assert!(!html.contains("(?c="), "citation printed as text: {html}");
+    }
+
+    #[test]
+    fn an_out_of_scope_cite_renders_as_an_anchor_and_a_model_link_is_refused() {
+        // `#1395` over `#1392`: the out-of-window address (with scope=out)
+        // joins the same trusted set, built by the server through the same
+        // `cite`; a relative link the model wrote itself is never in it.
+        let allowed = read_set(&["111", "333"]);
+        let cite = |id: &MessageId| match id.as_str() {
+            "111" => Some((
+                "09:51".to_owned(),
+                message_link("slack", "C9", "flat", None, id, None),
+                true,
+            )),
+            "333" => Some((
+                "09:53".to_owned(),
+                message_link("slack", "C9", "flat", Some("T9"), id, Some("T9")),
+                false,
+            )),
+            _ => None,
+        };
+        let raw = "- in [m:111]\n- out [m:333]\n- [forged](?c=C9&v=all&m=slack:C9:999)";
+        let (shaped, cited) = shape_answer(raw, &allowed, cite);
+        let trusted: HashSet<String> = cited
+            .iter()
+            .filter_map(|id| {
+                cite(id).map(|(_, address, in_scope)| trusted_cite_address(&address, in_scope))
+            })
+            .collect();
+        let html =
+            crate::render::body_html_catchup(&shaped, crate::render::Markup::Discord, &trusted);
+        assert!(
+            html.contains("scope=out"),
+            "out-of-scope anchor lost its flag: {html}"
+        );
+        assert!(
+            html.contains("<a href=\"?c=C9&amp;v=thread"),
+            "out-of-scope cite is no anchor: {html}"
+        );
+        assert!(html.contains("(09:53 ↗)"), "out mark missing: {html}");
+        assert!(
+            !html.contains("<a href=\"?c=C9&amp;v=all&amp;m=slack:C9:999\""),
+            "a model-written relative link became an anchor: {html}"
+        );
+        assert!(
+            html.contains("forged (?c="),
+            "a refused link was not shown as text: {html}"
+        );
+    }
+
+    #[test]
+    fn shape_answer_marks_a_cache_resolved_cite_out_of_scope() {
+        // `#1395`: allowed = window {111} plus cache-resolved {333}; 999
+        // resolves to nothing and is dropped. In-window keeps the arrow,
+        // out-of-window gets its own mark and the scope=out address flag.
+        let allowed = read_set(&["111", "333"]);
+        let cite = |id: &MessageId| match id.as_str() {
+            "111" => Some((
+                "09:51".to_owned(),
+                message_link("slack", "C9", "flat", None, id, None),
+                true,
+            )),
+            "333" => Some((
+                "09:53".to_owned(),
+                message_link("slack", "C9", "flat", Some("T9"), id, Some("T9")),
+                false,
+            )),
+            _ => None,
+        };
+        let raw = "- in [m:111]\n- out [m:333]\n- invented [m:999]";
+        let (shaped, cited) = shape_answer(raw, &allowed, cite);
+        assert!(shaped.contains("[(09:51 ↩)]"), "{shaped}");
+        assert!(shaped.contains("[(09:53 ↗)]"), "{shaped}");
+        assert!(shaped.contains("&scope=out)"), "{shaped}");
+        assert!(!shaped.contains("999"), "{shaped}");
+        assert_eq!(
+            cited,
+            vec![MessageId("111".to_owned()), MessageId("333".to_owned())]
+        );
+        assert_eq!(
+            cited_ids_in(raw),
+            vec![
+                MessageId("111".to_owned()),
+                MessageId("333".to_owned()),
+                MessageId("999".to_owned())
+            ]
+        );
     }
 
     #[test]
