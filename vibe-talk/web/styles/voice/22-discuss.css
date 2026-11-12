@@ -209,11 +209,16 @@
 }
 
 /* The model's words: the server's rendered Markdown (`discuss-markdown-render`),
- * or its shaped text plain (newlines kept) when no render came. */
+ * or its shaped text plain (newlines kept) when no render came. Only the plain
+ * fallback keeps newlines (`discuss-answer--plain`, #1391): with `pre-wrap` on
+ * the rendered HTML, the newlines between block tags drew as blank lines. */
 #discuss-answer {
   margin-top: 8px;
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+#discuss-answer.discuss-answer--plain {
+  white-space: pre-wrap;
 }
 
 #discuss-answer h2,
@@ -222,9 +227,30 @@
   margin: 10px 0 4px;
 }
 
-#discuss-answer p,
-#discuss-answer ul {
+#discuss-answer p {
   margin: 4px 0;
+}
+
+#discuss-answer ul,
+#discuss-answer ol {
+  margin: 2px 0;
+  padding-left: 1.2em;
+}
+
+#discuss-answer li {
+  margin: 0;
+}
+
+#discuss-answer li p {
+  margin: 0;
+}
+
+#discuss-answer > :first-child {
+  margin-top: 0;
+}
+
+#discuss-answer > :last-child {
+  margin-bottom: 0;
 }
 
 #discuss-answer a {

@@ -12,7 +12,7 @@
 // The answer's wire types are the generated contract's (`CatchupResponse` and its
 // parts); the panel narrows the decoded body to the fields it reads.
 
-import { createListening, insertSanitizedHtml } from "../dom/index.ts";
+import { createListening, insertSanitizedHtml, setClassWord } from "../dom/index.ts";
 import { deepLinkRefFrom } from "../../foundation/index.ts";
 import type { MessageLinkRef } from "../../foundation/index.ts";
 import type {
@@ -496,8 +496,10 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     const box = deps.byId("discuss-answer");
     box.replaceChildren();
     if (answer.text_html !== "") {
+      setClassWord(box, "discuss-answer--plain", false);
       insertSanitizedHtml(box, answer.text_html);
     } else {
+      setClassWord(box, "discuss-answer--plain", true);
       box.textContent = answer.text;
     }
   }

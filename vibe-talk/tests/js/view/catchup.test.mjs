@@ -364,6 +364,7 @@ test("catchup: a rendered answer draws as markup; a plain one never reaches inne
     assert.equal(fx.calls.templates.length, 1, "the render did not go through the one parser");
     assert.equal(fx.calls.templates[0]._html, html, "the parser was handed something else");
     assert.equal(fx.els["discuss-answer"].children.length, 1, "the parsed nodes were not drawn");
+    assert.equal(fx.els["discuss-answer"].className.includes("discuss-answer--plain"), false, "rendered HTML kept the plain-text class");
   } finally { fx.restore(); }
 
   const plain = fixture({ respond: () => Promise.resolve(answer({ text: "<b>not markup</b>" })) });
@@ -374,6 +375,7 @@ test("catchup: a rendered answer draws as markup; a plain one never reaches inne
     await flush();
     assert.equal(plain.els["discuss-answer"].innerHTMLSet, false, "plain text reached innerHTML");
     assert.equal(plain.els["discuss-answer"].textContent, "<b>not markup</b>");
+    assert.equal(plain.els["discuss-answer"].className.includes("discuss-answer--plain"), true, "plain fallback lost the pre-wrap class");
   } finally { plain.restore(); }
 });
 
