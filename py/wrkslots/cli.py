@@ -5303,6 +5303,41 @@ def _init_salvage_push_remotes(
     return ()
 
 
+def _refuse_eden_image_combination(config: Config, args: argparse.Namespace) -> None:
+    """Refuse ``--eden`` with a per-slot image before anything is created (#1408).
+
+    The Eden branch returns before the per-slot image branch, so an Eden
+    slot asked to be image-backed would silently become a plain directory
+    (or a project-wide worktrees-image subvolume). Refuse the combination
+    instead of ignoring the flags.
+    """
+
+    if not getattr(args, "eden", None):
+        return
+    offending: list[str] = []
+    if _requested_representation(config, args) == "image":
+        if getattr(args, "representation", None) in (None, "config"):
+            offending.append("--representation image (configuration.slot_representation)")
+        else:
+            offending.append("--representation image")
+    if getattr(args, "image_ceiling_gib", None) is not None:
+        offending.append("--image-ceiling-gib")
+    if getattr(args, "image_state_ceiling_gib", None) is not None:
+        offending.append("--image-state-ceiling-gib")
+    if not offending:
+        return
+    raise Refusal(
+        f"create --eden cannot combine with {', '.join(offending)}: "
+        "Eden checkouts are not stored in a per-slot image",
+        remedy=(
+            "use create --eden without --representation image and without "
+            "--image-ceiling-gib/--image-state-ceiling-gib (a plain directory, "
+            "or a subvolume of the configured project-wide worktrees image), "
+            "or create --representation image without --eden"
+        ),
+    )
+
+
 def _create_image_settings(config: Config, args: argparse.Namespace) -> slotimage.ImageSettings:
     """This create's image settings: the configured ones, with any per-create ceiling applied.
 
@@ -34782,6 +34817,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
     _validate_agent_name(args.agent)
     if not args.task or not args.purpose:
         raise Refusal("task and purpose must be non-empty")
+    _refuse_eden_image_combination(config, args)
     image_settings = _create_image_settings(config, args)
     owner = (
         _capture_registration_owner(args.owner_pid)
@@ -80525,7 +80561,8 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help=(
             "create one Eden checkout instead of git worktrees: NAME labels it and "
             "BACKING is the backing repository path passed to eden clone. Mutually "
-            "exclusive with --repo/--branch; the mount lands at <slot>/checkout with "
+            "exclusive with --repo/--branch and with --representation image and its "
+            "ceiling flags (#1408); the mount lands at <slot>/checkout with "
             "its daemon state inside the slot"
         ),
     )

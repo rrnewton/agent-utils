@@ -1,12 +1,13 @@
 ---
 title: 'eden-image-refuse: create --eden silently ignores --representation image and its ceilings'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
 - wrkslots
 created_at: 2026-11-12T11:21:14+00:00
-updated_at: 2026-11-12T11:21:14+00:00
+updated_at: 2026-11-12T12:23:27+00:00
+closed_at: 2026-11-12T12:23:27+00:00
 ---
 
 # Description
@@ -30,3 +31,9 @@ The host Eden checkout cap is a separate, earlier refusal and is not this issue.
 # Notes
 
 Numbered from devbig030's interim block (1400-1469). Found by a read-only probe of image-backed Eden slots on 2026-11-11.
+
+## Resolution
+
+[watermelon-full-preview] `create --eden` now refuses a per-slot image before anything is created. `_refuse_eden_image_combination` in `py/wrkslots/cli.py` runs in `_cmd_create` before image settings, owner capture, or any provisioning, and refuses when `--eden` meets a resolved image representation (including one from `configuration.slot_representation`) or `--image-ceiling-gib` / `--image-state-ceiling-gib`. The message names the offending flags; the remedy names the supported alternatives: `create --eden` without the image flags, or `create --representation image` without `--eden`. The `--eden` help text says the same. Rust/Python parity: the Rust `create`/`create-text` parsers in `rs/wrkslotsd` have no `--eden` or ceiling flags, so no Rust combination exists to refuse and no Rust change was made.
+
+Evidence: `test_create_refuses_eden_with_per_slot_image_before_writing` in `py/wrkslots/tests/test_cli.py` (fixture only, no real Eden, no sudo; four flag combinations) failed before the fix by proceeding into real Eden provisioning, and passes after. Full `test_cli.py` + `test_eden.py`: 101 passed. Strict mypy on the changed files: clean.

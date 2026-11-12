@@ -298,6 +298,52 @@ def test_create_refuses_a_ceiling_it_cannot_apply_before_writing(
     assert sorted(path.relative_to(root) for path in root.rglob("*")) == before
 
 
+@pytest.mark.parametrize(
+    ("overrides", "named"),
+    [
+        ({"representation": "image"}, "--representation image"),
+        (
+            {"representation": "image", "image_ceiling_gib": 4},
+            "--representation image, --image-ceiling-gib",
+        ),
+        (
+            {"representation": "worktree", "image_ceiling_gib": 4},
+            "--image-ceiling-gib",
+        ),
+        ({"image_state_ceiling_gib": 2}, "--image-state-ceiling-gib"),
+    ],
+)
+def test_create_refuses_eden_with_per_slot_image_before_writing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, object],
+    named: str,
+) -> None:
+    """#1408: --eden ignores the per-slot image branch, so refuse it up front."""
+
+    seen = _record_provisioning(monkeypatch)
+    root = _create_fixture(tmp_path)
+    before = sorted(path.relative_to(root) for path in root.rglob("*"))
+
+    with pytest.raises(cli.Refusal) as refused:
+        cli._cmd_create(
+            _create_args(
+                root,
+                repo=[],
+                branch=[],
+                eden=["main=/backing/repo"],
+                eden_rev=[],
+                **overrides,
+            )
+        )
+
+    assert f"create --eden cannot combine with {named}" in str(refused.value)
+    assert refused.value.remedy is not None
+    assert "without --eden" in refused.value.remedy
+    assert seen == []
+    assert sorted(path.relative_to(root) for path in root.rglob("*")) == before
+
+
 def test_provision_slot_image_uses_the_settings_it_is_given(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
