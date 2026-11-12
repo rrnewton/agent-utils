@@ -86,3 +86,20 @@ def test_compat_status_verbose_refuses(tmp_path: Path) -> None:
     result = _compat(root, "status", "--verbose")
     assert result.returncode == 1
     assert "status --verbose" in result.stderr
+
+
+def test_compat_abandon_prepared_refuses_by_name(tmp_path: Path) -> None:
+    """#1374: abandoning an ownerless journal stays with the Python edition."""
+
+    root = _root(tmp_path)
+    _fixture(root)
+    result = _compat(
+        root, "recover-ownerless-agent-worktree", "worktrees/orphan", "--repository", "repo",
+        "--head", "0" * 40, "--branch", "agent/orphan", "--remote", "origin",
+        "--remote-url-sha256", "0" * 64, "--abandon-prepared",
+    )
+    assert result.returncode == 1
+    assert (
+        "recover-ownerless-agent-worktree --abandon-prepared stays with the Python edition"
+        in result.stderr
+    )

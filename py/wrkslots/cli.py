@@ -1611,7 +1611,9 @@ class OwnerlessAgentAuthorization:
     """Exact facts authorizing removal of one unregistered agent worktree."""
 
     path: str
-    identity: tuple[int, int, int]
+    #: (dev, ino, file-handle type, file handle); journals written before
+    #: #1374 hold (dev, ino, namespace-local mount ID) instead.
+    identity: tuple[int, int, int] | tuple[int, int, int, str]
     actor: ProcessIdentity
     repository: str
     head: str
@@ -4058,6 +4060,70 @@ def _private_cleanup_identity_from_obj(
         _as_int(values[0], f"{label}[0]", minimum=1),
         _as_int(values[1], f"{label}[1]", minimum=1),
         _as_int(values[2], f"{label}[2]", minimum=0),
+        file_handle,
+    )
+
+
+def _stable_directory_identity(path: Path, label: str) -> tuple[int, int, int, str]:
+    """(dev, ino, file-handle type, file handle) of one directory, in any mount namespace.
+
+    The mount ID that _open_directory_identity adds is local to the caller's
+    mount namespace, so a journal that records it can only be resumed from
+    the namespace that wrote it (#1374).  The file handle names the same
+    object from every namespace and changes when the inode is reused.
+    """
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise Refusal(f"cannot safely open {label} {path}: {exc}") from exc
+    try:
+        return _fd_private_cleanup_identity(fd, str(path))
+    finally:
+        os.close(fd)
+
+
+def _ownerless_identity_matches(
+    path: Path, recorded: _PrivateCleanupIdentity, label: str, *, exact: bool = True
+) -> bool:
+    """Whether ``path`` is still the directory an ownerless journal recorded.
+
+    With ``exact`` (every destructive boundary) a four-field identity compares
+    its file handle too.  Without it (journal validation, which both editions
+    run and which never acts) only the device and inode compare.  A legacy
+    three-field identity ends in a namespace-local mount ID, so only its
+    device and inode ever compare; the resume re-proves the worktree's Git
+    facts and upgrades the journal to the stable identity (#1374).
+    """
+
+    if len(recorded) == 3 or not exact:
+        return _open_directory_identity(path, label)[:2] == recorded[:2]
+    return _stable_directory_identity(path, label) == recorded
+
+
+def _ownerless_identity_from_obj(value: object, label: str) -> _PrivateCleanupIdentity:
+    values = _as_list(value, label)
+    if len(values) == 3:
+        return (
+            _as_int(values[0], label),
+            _as_int(values[1], label),
+            _as_int(values[2], label),
+        )
+    if len(values) != 4:
+        raise StateError(f"{label} must have three or four fields")
+    file_handle = _as_str(values[3], f"{label} file handle")
+    if (
+        not file_handle
+        or len(file_handle) > _FILE_HANDLE_BYTES_LIMIT * 2
+        or len(file_handle) % 2
+        or re.fullmatch(r"[0-9a-f]+", file_handle) is None
+    ):
+        raise StateError(f"{label} file handle must be bounded lowercase hexadecimal bytes")
+    return (
+        _as_int(values[0], label),
+        _as_int(values[1], label),
+        _as_int(values[2], label),
         file_handle,
     )
 
@@ -64500,12 +64566,9 @@ def _ownerless_agent_authorization_from_obj(
         set(),
         "ownerless agent authorization",
     )
-    identity = tuple(
-        _as_int(item, "ownerless agent directory identity")
-        for item in _as_list(raw["identity"], "ownerless agent directory identity")
+    identity = _ownerless_identity_from_obj(
+        raw["identity"], "ownerless agent directory identity"
     )
-    if len(identity) != 3:
-        raise StateError("ownerless agent directory identity must have three fields")
     actor = _identity_from_obj(raw["actor"], "ownerless agent recovery actor")
     if actor is None:
         raise StateError("ownerless agent recovery has no actor")
@@ -64618,7 +64681,9 @@ def _ownerless_agent_facts(
         raise Refusal(f"ownerless agent worktree is absent or unsafe: {path}")
     _ensure_no_mount_components(path.parent, path, "ownerless agent worktree")
     _assert_no_mountinfo_crossing(path, path, "ownerless agent worktree")
-    if expected_identity and _open_directory_identity(path, "ownerless agent worktree") != authorization.identity:
+    if expected_identity and not _ownerless_identity_matches(
+        path, authorization.identity, "ownerless agent worktree"
+    ):
         raise Refusal("ownerless agent worktree identity changed")
     handoff = path / "HANDOFF.md"
     if handoff.is_symlink():
@@ -64775,7 +64840,9 @@ def _ownerless_agent_journal_inputs(
     if active is not None and (
         active.is_symlink()
         or not active.is_dir()
-        or _open_directory_identity(active, "ownerless agent worktree") != authorization.identity
+        or not _ownerless_identity_matches(
+            active, authorization.identity, "ownerless agent worktree", exact=False
+        )
     ):
         raise Refusal("ownerless agent worktree identity changed; preserve it")
     _stored, repository = _repository_path(
@@ -64886,6 +64953,23 @@ def _assert_ownerless_salvage_still_matches(
             raise StateError("ownerless salvage receipt has unknown disposition")
 
 
+def _upgrade_legacy_ownerless_identity(
+    authorization: OwnerlessAgentAuthorization, active: Path
+) -> OwnerlessAgentAuthorization:
+    """Replace a legacy (dev, ino, mount ID) identity with the stable one.
+
+    Callers have just re-proved the worktree with _ownerless_agent_facts, as
+    _upgrade_legacy_private_cleanup_identity re-proves a checkout first.
+    """
+
+    if len(authorization.identity) != 3:
+        raise StateError("only a legacy mount-id identity can be upgraded")
+    observed = _stable_directory_identity(active, "ownerless agent worktree")
+    if observed[:2] != authorization.identity[:2]:
+        raise Refusal("ownerless agent worktree identity changed; preserve it")
+    return dataclasses.replace(authorization, identity=observed)
+
+
 def _recover_ownerless_agent(
     config: Config,
     path: Path,
@@ -64911,6 +64995,16 @@ def _recover_ownerless_agent(
         checkout = _ownerless_agent_facts(
             config, authorization, active, repository, expected_identity=True
         )
+        if len(authorization.identity) == 3:
+            # The facts above re-proved the worktree, so a pre-#1374 journal
+            # is enrolled under the namespace-independent identity before
+            # anything destructive relies on it.
+            authorization = _upgrade_legacy_ownerless_identity(authorization, active)
+            journal["authorization"] = _ownerless_agent_authorization_to_obj(
+                authorization
+            )
+            _write_journal(config, journal)
+            _interrupt_for_test("after-ownerless-agent-identity-upgrade")
         _preserve_ownerless_handoff(config, authorization, active)
         if not salvage:
             salvage = _salvage_ownerless_worktree(
@@ -64926,7 +65020,9 @@ def _recover_ownerless_agent(
         if active == target:
             _rename_slot_path(config, target, fenced)
             _fsync_directory(target.parent)
-            if _open_directory_identity(fenced, "fenced ownerless agent worktree") != authorization.identity:
+            if not _ownerless_identity_matches(
+                fenced, authorization.identity, "fenced ownerless agent worktree"
+            ):
                 _rename_slot_path(config, fenced, target)
                 _fsync_directory(target.parent)
                 raise Refusal("ownerless agent worktree identity changed during fencing")
@@ -64976,18 +65072,280 @@ def _recover_ownerless_agent(
     print(f"recovered ownerless agent worktree={target}")
 
 
+def _capture_ownerless_apply_processes(
+    args: argparse.Namespace, label: str
+) -> _RecoveryProcesses:
+    """Capture the coordinator of an ownerless --apply, host-context aware.
+
+    A wrapper that runs the command on the host (systemd-run --user) hands
+    over the same runner/proof evidence remove and recover accept, so the
+    coordinator need not be an ancestor; without that evidence the ordinary
+    direct-ancestry contract applies (#1374).
+    """
+
+    _require_coordinator_authorized(args, label)
+    if args.coordinator_pid is None:
+        raise Refusal("--apply requires --coordinator-pid")
+    return _RecoveryProcesses.capture(args.coordinator_pid)
+
+
+def _assert_ownerless_salvage_reachable(
+    config: Config,
+    authorization: OwnerlessAgentAuthorization,
+    checkout: Checkout,
+    vcs: _GitVcs,
+    path: Path,
+) -> None:
+    """Read, before the journal is written, everything salvage will need (#1374).
+
+    Salvage is the first step after the journal.  When it refuses there (an
+    unreachable remote, a missing credential helper) the journal stays in
+    phase prepared and blocks every mutation, so the same salvage facts and
+    remote listings are read here first and a failure refuses with nothing
+    written.  Salvage repeats every check before it publishes.
+    """
+
+    if not _checkout_remote_unchanged(vcs, path, checkout):
+        raise Refusal(
+            f"checkout {checkout.name} remote {checkout.remote} changed before salvage"
+        )
+    candidates: list[tuple[Checkout, Path, bool]] = [(checkout, path, False)]
+    candidates.extend(
+        (submodule, submodule_path, True)
+        for submodule, submodule_path in _submodule_salvage_checkouts(
+            config, checkout, vcs, path_override=path
+        )
+    )
+    slot = Path(authorization.path).name
+    for candidate, candidate_path, detached in candidates:
+        facts = _salvage_candidate(
+            config,
+            None,
+            candidate,
+            vcs,
+            path_override=candidate_path,
+            allow_detached=detached,
+            verify_repository_membership=not detached,
+            ownerless_slot=slot,
+            ownerless_recorded_at=authorization.recorded_at,
+            detached_root=not detached and authorization.branch is None,
+        )
+        vcs.remote_heads_containing(
+            candidate_path,
+            candidate.remote,
+            facts.head,
+            facts.remote_authority,
+            network_authority=facts.network_authority,
+        )
+        vcs.assert_remote_authority(candidate_path, candidate.remote, facts.remote_authority)
+
+
+@dataclasses.dataclass(frozen=True)
+class _OwnerlessAbandonPlan:
+    path: Path
+    raw: Mapping[str, object]
+    sha256: str
+    target: Path
+    target_present: bool
+    detail: str
+
+
+def _ownerless_abandon_plan(
+    config: Config, args: argparse.Namespace
+) -> _OwnerlessAbandonPlan:
+    """Prove one ownerless-agent-remove journal is safe to set aside (#1374).
+
+    Only a journal that never acted qualifies: phase prepared, no salvage
+    receipt, the fenced path never created, and the worktree either still
+    the recorded directory (device and inode) or gone.  Setting it aside
+    then leaves the registry, the event log and the worktree exactly as
+    before the --apply that wrote it.
+    """
+
+    journals = _outstanding_journals(config)
+    if not journals:
+        raise Refusal("no interrupted mutation is recorded; nothing to abandon")
+    path, raw = _load_journal(config)
+    if raw.get("kind") != "ownerless-agent-remove":
+        raise Refusal(
+            f"--abandon-prepared applies only to an ownerless agent journal; "
+            f"another interrupted mutation is recorded in {path}"
+        )
+    if path.is_symlink() or not path.is_file():
+        raise Refusal(f"ownerless agent journal file is absent or unsafe: {path}")
+    contents = _read_bounded_regular_file(
+        path, "ownerless agent journal", _JOURNAL_BYTES_LIMIT
+    )
+    digest = hashlib.sha256(contents).hexdigest()
+    authorization, target, fenced, active, _repository, salvage = (
+        _ownerless_agent_journal_inputs(config, raw)
+    )
+    if authorization.path != _ownerless_agent_target(config, args.path)[0]:
+        raise Refusal("requested ownerless path differs from the interrupted recovery")
+    repository_relative, _repository_resolved = _repository_path(
+        config, args.repository, allow_managed=True
+    )
+    requested_branch = None if args.detached else args.branch
+    mismatched = [
+        name
+        for name, requested, recorded in (
+            ("--repository", repository_relative, authorization.repository),
+            ("--head", args.head, authorization.head),
+            ("--branch", requested_branch, authorization.branch),
+            ("--remote", args.remote, authorization.remote),
+            ("--remote-url-sha256", args.remote_url_sha256, authorization.remote_url_sha256),
+            ("--handoff-sha256", args.handoff_sha256, authorization.handoff_sha256),
+        )
+        if requested != recorded
+    ]
+    if mismatched:
+        raise Refusal(
+            "the interrupted recovery was authorized with different facts: "
+            f"{', '.join(mismatched)}; pass exactly the values of the --apply that wrote it"
+        )
+    if authorization.actor.host_id != _host_id():
+        raise Refusal("ownerless agent journal belongs to another host identity")
+    phase = _as_str(raw["phase"], "ownerless agent journal.phase")
+    if phase != "prepared":
+        raise Refusal(
+            f"ownerless agent journal is in phase {phase}, not prepared; it has acted, "
+            "so resume it with recover-ownerless-agent-worktree --apply"
+        )
+    if salvage:
+        raise Refusal(
+            "ownerless agent journal records salvage receipts; resume it instead of "
+            "abandoning it"
+        )
+    if fenced.exists() or fenced.is_symlink() or active == fenced:
+        raise Refusal(
+            f"ownerless agent fenced path exists: {fenced}; resume the recovery instead"
+        )
+    target_present = active == target
+    detail = (
+        "phase prepared, salvage empty, fenced path absent, worktree unchanged"
+        if target_present
+        else "phase prepared, salvage empty, fenced path absent, worktree absent"
+    )
+    return _OwnerlessAbandonPlan(path, raw, digest, target, target_present, detail)
+
+
+def _abandon_prepared_ownerless_agent_journal(
+    config: Config, args: argparse.Namespace
+) -> int:
+    if not args.apply:
+        plan = _ownerless_abandon_plan(config, args)
+        print(
+            f"WORKTREE path={plan.target} outcome=planned detail=abandon-prepared "
+            f"journal={plan.path} journal_sha256={plan.sha256} "
+            f"worktree={'present' if plan.target_present else 'absent'}"
+        )
+        print(
+            "NOTE rerun with --apply --coordinator-authorized --coordinator-pid PID "
+            f"--journal-sha256 {plan.sha256} to set the journal aside"
+        )
+        return 0
+    processes = _capture_ownerless_apply_processes(
+        args, "abandoning an ownerless agent journal"
+    )
+    if args.journal_sha256 is None or not DIGEST_RE.fullmatch(args.journal_sha256):
+        raise Refusal(
+            "--abandon-prepared --apply requires --journal-sha256 with the digest the "
+            "dry run printed"
+        )
+    reason = (args.reason or "").strip() or (
+        "abandoned a prepared ownerless agent removal that never acted"
+    )
+    if len(reason) > _QUARANTINE_REASON_LIMIT or "\x00" in reason:
+        raise Refusal(
+            f"--reason must be at most {_QUARANTINE_REASON_LIMIT} characters "
+            "without NUL bytes"
+        )
+    coordinator = processes.coordinator
+    with _mutation_locks(config, args.wait_lock):
+        processes.assert_current(coordinator)
+        _refuse_partial_state(config)
+        plan = _ownerless_abandon_plan(config, args)
+        if plan.sha256 != args.journal_sha256:
+            raise Refusal(
+                f"the journal changed since the dry run: sha256 is now {plan.sha256}; "
+                "rerun the dry run"
+            )
+        directory = _quarantine_directory(config)
+        # A run interrupted between its tombstone and the move left the journal
+        # in place; finish that move instead of appending a second tombstone.
+        event: Mapping[str, object] | None = _quarantine_event_for(
+            config, plan.path, plan.sha256
+        )
+        if event is not None:
+            recorded = _as_mapping(event.get("payload"), "quarantine event payload")
+            destination = Path(
+                _as_str(recorded.get("quarantine_path"), "quarantine event path")
+            )
+            if destination.parent not in (directory, directory.absolute()):
+                raise Refusal(
+                    "the journaled quarantine destination is outside the "
+                    f"quarantine directory: {destination}"
+                )
+        else:
+            timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+            destination = directory / f"{timestamp}-{plan.path.name}"
+        if destination.exists() or destination.is_symlink():
+            raise Refusal(f"quarantine destination already exists: {destination}")
+        created = not directory.exists()
+        directory.mkdir(mode=0o755, parents=True, exist_ok=True)
+        if created:
+            _fsync_directory(directory.parent)
+        if event is None:
+            _ensure_event_log(config)
+            event = _write_event_file(
+                config,
+                config.machine,
+                "operation-quarantined",
+                {
+                    "slot": plan.raw["slot"],
+                    "operation": "ownerless-agent-remove",
+                    "journal_path": plan.path.name,
+                    "original_path": str(plan.path.absolute()),
+                    "quarantine_path": str(destination.absolute()),
+                    "journal_sha256": plan.sha256,
+                    "reason": reason,
+                    "actor": _identity_to_obj(coordinator),
+                    "coordinator_authorized": True,
+                    "recover_refusal": plan.detail,
+                    "artifacts": [],
+                },
+            )
+            _interrupt_for_test("after-ownerless-agent-journal-abandoned-event")
+        plan.path.rename(destination)
+        _fsync_directory(config.control)
+        _fsync_directory(directory)
+    print(
+        f"WORKTREE path={plan.target} outcome=abandoned journal={destination} "
+        f"event_sequence={event['sequence']} "
+        f"worktree={'kept' if plan.target_present else 'absent'}"
+    )
+    return 0
+
+
 def _cmd_recover_ownerless_agent_worktree(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     if config.machine != _short_hostname():
         raise Refusal("ownerless agent recovery must run on the worktree's machine")
+    if getattr(args, "abandon_prepared", False):
+        return _abandon_prepared_ownerless_agent_journal(config, args)
+    if getattr(args, "journal_sha256", None) is not None:
+        raise Refusal("--journal-sha256 applies only with --abandon-prepared")
+    processes: _RecoveryProcesses | None = None
     if args.apply:
-        _require_coordinator_authorized(args, "ownerless agent worktree recovery")
-        if args.coordinator_pid is None:
-            raise Refusal("--apply requires --coordinator-pid")
-        coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
+        processes = _capture_ownerless_apply_processes(
+            args, "ownerless agent worktree recovery"
+        )
+        coordinator = processes.coordinator
     else:
         coordinator = _read_process_identity(os.getpid())
     with _mutation_locks(config, args.wait_lock):
+        if processes is not None:
+            processes.assert_current(coordinator)
         _refuse_partial_state(config)
         journals = _outstanding_journals(config)
         if journals:
@@ -65002,7 +65360,9 @@ def _cmd_recover_ownerless_agent_worktree(args: argparse.Namespace) -> int:
             if not args.apply:
                 print(f"WORKTREE path={target} outcome=planned detail=resume")
                 return 0
-            _recover_ownerless_agent(config, path, raw, coordinator)
+            _recover_ownerless_agent(
+                config, path, raw, coordinator, processes=processes
+            )
             return 0
         states, archives = _validate_global_state(config)
         relative, target = _ownerless_agent_target(config, args.path)
@@ -65021,7 +65381,7 @@ def _cmd_recover_ownerless_agent_worktree(args: argparse.Namespace) -> int:
             raise Refusal("--handoff-sha256 must be one lowercase SHA-256 digest")
         authorization = OwnerlessAgentAuthorization(
             path=relative,
-            identity=_open_directory_identity(target, "ownerless agent worktree"),
+            identity=_stable_directory_identity(target, "ownerless agent worktree"),
             actor=coordinator,
             repository=repository_relative,
             head=head,
@@ -65031,13 +65391,20 @@ def _cmd_recover_ownerless_agent_worktree(args: argparse.Namespace) -> int:
             handoff_sha256=handoff_digest,
             recorded_at=_utc_now(),
         )
-        _ownerless_agent_facts(
+        checkout = _ownerless_agent_facts(
             config, authorization, target, repository, expected_identity=True
         )
         if not args.apply:
             detail = "ownerless-agent" if authorization.branch else "ownerless-agent-detached"
             print(f"WORKTREE path={target} outcome=planned detail={detail}")
             return 0
+        _assert_ownerless_salvage_reachable(
+            config, authorization, checkout, _GitVcs(), target
+        )
+        if not _ownerless_identity_matches(
+            target, authorization.identity, "ownerless agent worktree"
+        ):
+            raise Refusal("ownerless agent worktree identity changed during inspection")
         journal = {
             "schema": SCHEMA,
             "kind": "ownerless-agent-remove",
@@ -65055,7 +65422,9 @@ def _cmd_recover_ownerless_agent_worktree(args: argparse.Namespace) -> int:
         _write_journal(config, journal)
         _interrupt_for_test("after-ownerless-agent-journal")
         before = _global_rows(states, archives)
-        _recover_ownerless_agent(config, _journal_path(config), journal, coordinator)
+        _recover_ownerless_agent(
+            config, _journal_path(config), journal, coordinator, processes=processes
+        )
         after_states, after_archives = _validate_global_state(config)
         if _global_rows(after_states, after_archives) != before:
             raise StateError("ownerless agent recovery changed registered slot state")
@@ -66979,6 +67348,8 @@ def _recover_ownerless_clone(
     path: Path,
     raw: Mapping[str, object],
     coordinator: ProcessIdentity,
+    *,
+    processes: _RecoveryProcesses | None = None,
 ) -> None:
     """Resume or finish one ownerless clone removal.
 
@@ -66990,7 +67361,9 @@ def _recover_ownerless_clone(
 
     journal = dict(raw)
     try:
-        _recover_ownerless_clone_steps(config, path, journal, coordinator)
+        _recover_ownerless_clone_steps(
+            config, path, journal, coordinator, processes=processes
+        )
     except Refusal as exc:
         if journal.get("phase") not in {"prepared", "rescued"}:
             raise
@@ -67031,11 +67404,13 @@ def _recover_ownerless_clone_steps(
     path: Path,
     journal: dict[str, object],
     coordinator: ProcessIdentity,
+    *,
+    processes: _RecoveryProcesses | None = None,
 ) -> None:
     raw: Mapping[str, object] = dict(journal)
     if path != _journal_path(config):
         raise StateError("ownerless clone journal filename is invalid")
-    _assert_caller_process(coordinator, "coordinator")
+    _assert_recovery_processes(coordinator, processes)
     authorization, target, fenced, active, phase = _ownerless_clone_journal_inputs(config, raw)
     if authorization.actor.host_id != _host_id():
         raise Refusal("ownerless clone journal belongs to another host identity")
@@ -67369,11 +67744,12 @@ def _cmd_recover_ownerless_agent_clone_checked(args: argparse.Namespace) -> int:
         return _ownerless_clone_dry_run(
             config, args.path, remote_urls, handoff_digests, args.discard_ignored
         )
-    _require_coordinator_authorized(args, "ownerless agent clone recovery")
-    if args.coordinator_pid is None:
-        raise Refusal("--apply requires --coordinator-pid")
-    coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
+    processes = _capture_ownerless_apply_processes(
+        args, "ownerless agent clone recovery"
+    )
+    coordinator = processes.coordinator
     with _mutation_locks(config, args.wait_lock):
+        processes.assert_current(coordinator)
         _refuse_partial_state(config)
         journals = _outstanding_journals(config)
         if journals:
@@ -67385,7 +67761,7 @@ def _cmd_recover_ownerless_agent_clone_checked(args: argparse.Namespace) -> int:
             )
             if authorization.path != _ownerless_agent_target(config, args.path)[0]:
                 raise Refusal("requested ownerless path differs from the interrupted recovery")
-            _recover_ownerless_clone(config, path, raw, coordinator)
+            _recover_ownerless_clone(config, path, raw, coordinator, processes=processes)
             return 0
         if args.inventory_sha256 is None or not DIGEST_RE.fullmatch(args.inventory_sha256):
             raise Refusal(
@@ -67436,7 +67812,9 @@ def _cmd_recover_ownerless_agent_clone_checked(args: argparse.Namespace) -> int:
         _write_journal(config, journal)
         _interrupt_for_test("after-ownerless-clone-journal")
         before = _global_rows(states, archives)
-        _recover_ownerless_clone(config, _journal_path(config), journal, coordinator)
+        _recover_ownerless_clone(
+            config, _journal_path(config), journal, coordinator, processes=processes
+        )
         after_states, after_archives = _validate_global_state(config)
         if _global_rows(after_states, after_archives) != before:
             raise StateError("ownerless clone recovery changed registered slot state")
@@ -67566,10 +67944,12 @@ def _recover_ownerless_agent_cache(
     path: Path,
     raw: Mapping[str, object],
     coordinator: ProcessIdentity,
+    *,
+    processes: _RecoveryProcesses | None = None,
 ) -> None:
     if path != _journal_path(config):
         raise StateError("ownerless agent cache journal filename is invalid")
-    _assert_caller_process(coordinator, "coordinator")
+    _assert_recovery_processes(coordinator, processes)
     source, destination, fenced, active, _identity = (
         _ownerless_agent_cache_journal_inputs(config, raw)
     )
@@ -67633,14 +68013,17 @@ def _cmd_recover_ownerless_agent_cache(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     if config.machine != _short_hostname():
         raise Refusal("ownerless agent cache recovery must run on the cache's machine")
+    processes: _RecoveryProcesses | None = None
     if args.apply:
-        _require_coordinator_authorized(args, "ownerless agent cache recovery")
-        if args.coordinator_pid is None:
-            raise Refusal("--apply requires --coordinator-pid")
-        coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
+        processes = _capture_ownerless_apply_processes(
+            args, "ownerless agent cache recovery"
+        )
+        coordinator = processes.coordinator
     else:
         coordinator = _read_process_identity(os.getpid())
     with _mutation_locks(config, args.wait_lock):
+        if processes is not None:
+            processes.assert_current(coordinator)
         _refuse_partial_state(config)
         journals = _outstanding_journals(config)
         if journals:
@@ -67650,7 +68033,9 @@ def _cmd_recover_ownerless_agent_cache(args: argparse.Namespace) -> int:
             if not args.apply:
                 print("CACHE slot=ignored outcome=planned detail=resume")
                 return 0
-            _recover_ownerless_agent_cache(config, path, raw, coordinator)
+            _recover_ownerless_agent_cache(
+                config, path, raw, coordinator, processes=processes
+            )
             return 0
         states, archives = _validate_global_state(config)
         source, destination = _ownerless_agent_cache_paths(config)
@@ -67679,7 +68064,9 @@ def _cmd_recover_ownerless_agent_cache(args: argparse.Namespace) -> int:
         _write_journal(config, journal)
         _interrupt_for_test("after-ownerless-agent-cache-journal")
         before = _global_rows(states, archives)
-        _recover_ownerless_agent_cache(config, _journal_path(config), journal, coordinator)
+        _recover_ownerless_agent_cache(
+            config, _journal_path(config), journal, coordinator, processes=processes
+        )
         after_states, after_archives = _validate_global_state(config)
         if _global_rows(after_states, after_archives) != before:
             raise StateError("ownerless agent cache recovery changed registered slot state")
@@ -79816,13 +80203,15 @@ def _cmd_recover(
                 raise Refusal(
                     "--retry-running-hook and --abort-create apply only to create journals"
                 )
-            _recover_ownerless_clone(config, path, raw, coordinator)
+            _recover_ownerless_clone(config, path, raw, coordinator, processes=processes)
         elif kind == "ownerless-agent-cache-relocate":
             if args.retry_running_hook or args.abort_create:
                 raise Refusal(
                     "--retry-running-hook and --abort-create apply only to create journals"
                 )
-            _recover_ownerless_agent_cache(config, path, raw, coordinator)
+            _recover_ownerless_agent_cache(
+                config, path, raw, coordinator, processes=processes
+            )
         elif kind == "recover-absent-validate-rows":
             if args.retry_running_hook or args.abort_create:
                 raise Refusal(
@@ -82764,7 +83153,12 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "Bind an exact direct child of the managed agent directory to its filesystem "
             "and Git identities without assigning an owner, task, or handoff. The default "
             "is read-only. --apply salvages authored work and initialized nested repositories "
-            "to verified remote refs before fencing and removing only that worktree."
+            "to verified remote refs before fencing and removing only that worktree. Every "
+            "remote salvage needs is read before the journal is written, so an unreachable "
+            "remote refuses with nothing recorded. --abandon-prepared sets aside a journal "
+            "that never acted (phase prepared, no salvage receipt, no fenced path, worktree "
+            "unchanged or gone) with an operation-quarantined event, keeping the worktree; "
+            "pass the same facts as the --apply that wrote it."
         ),
         formatter_class=_HelpFormatter,
     )
@@ -82803,6 +83197,25 @@ usage or audit gate unknown, 3 fail-closed refusal.
     )
     recover_ownerless_agent.add_argument(
         "--coordinator-pid", type=int, metavar="PID"
+    )
+    recover_ownerless_agent.add_argument(
+        "--abandon-prepared",
+        action="store_true",
+        help=(
+            "set aside this worktree's interrupted journal instead of resuming it; only "
+            "a journal in phase prepared with no salvage receipt and no fenced path "
+            "qualifies, and the worktree is kept"
+        ),
+    )
+    recover_ownerless_agent.add_argument(
+        "--journal-sha256",
+        metavar="SHA256",
+        help="with --abandon-prepared --apply: the journal digest the dry run printed",
+    )
+    recover_ownerless_agent.add_argument(
+        "--reason",
+        metavar="TEXT",
+        help="with --abandon-prepared --apply: why the journal is set aside (recorded)",
     )
     recover_ownerless_agent.set_defaults(
         handler=_cmd_recover_ownerless_agent_worktree

@@ -1805,6 +1805,15 @@ fn translate_python_argv_routed(
     if cmd == "status" && py_flag_present(head, "--verbose") {
         return Err("status --verbose stays with the Python edition in this slice".to_string());
     }
+    if cmd == "recover-ownerless-agent-worktree" {
+        for flag in ["--abandon-prepared", "--journal-sha256", "--reason"] {
+            if py_flag_present(head, flag) {
+                return Err(format!(
+                    "recover-ownerless-agent-worktree {flag} stays with the Python edition in this slice"
+                ));
+            }
+        }
+    }
     for flag in ["--image-ceiling-gib", "--image-state-ceiling-gib"] {
         if cmd == "create" && py_flag_present(head, flag) {
             return Err(format!(

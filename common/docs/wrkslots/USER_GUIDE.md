@@ -2532,6 +2532,23 @@ configured cache paths, and initialized nested repositories are committed to ver
 before the exact inode is fenced and removed. Any later participant can resume the journal with
 ordinary `recover`.
 
+The journal names the worktree by device, inode and file handle. These name the same directory
+from every mount namespace, so a journal written inside a sandbox can be resumed from the host.
+Journals written before that (device, inode, mount ID) resume on their device and inode, and are
+upgraded once the worktree's Git facts are proven again. Before `--apply` writes the journal, it
+reads every remote that salvage will need. A missing credential helper or an unreachable remote
+therefore refuses with nothing recorded. The `--apply` commands for ownerless worktrees, clones
+and caches accept the same host-context handoff that `remove` and `recover` accept.
+
+A journal that never acted can be set aside without resuming it. That means it is still in phase
+`prepared`, has no salvage receipt, has no fenced path, and its worktree has the same device and
+inode or is gone. Add `--abandon-prepared` to the same command line as the `--apply` that wrote
+the journal. The dry run prints the journal's `journal_sha256`. Then run it again with
+`--apply --coordinator-authorized --coordinator-pid "$COORDINATOR_PID" --journal-sha256 SHA256
+[--reason TEXT]`. The journal moves into the control directory's `quarantine/` folder, an
+`operation-quarantined` event records it, and the worktree stays where it is. Any other shape is
+refused, because that journal has acted and must be resumed.
+
 ### Ownerless standalone clones
 
 A leaked directory may hold its own Git directory instead of being a linked worktree of a source

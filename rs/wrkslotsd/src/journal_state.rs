@@ -939,8 +939,52 @@ fn exclusion_from_obj(cfg: &Cfg, fenced: &Path, value: &Value) -> Result<()> {
 
 struct AgentAuthorization {
     path: String,
-    identity: (i64, i64, i64),
+    /// Device and inode of the recorded directory identity (#1374).
+    identity: (i64, i64),
     repository: String,
+}
+
+const FILE_HANDLE_BYTES_LIMIT: usize = 128;
+
+/// Mirror of Python `_ownerless_identity_from_obj`: (dev, ino, mount ID)
+/// before #1374, (dev, ino, file-handle type, file handle) since.  Returns
+/// the device and inode, the part journal validation compares.
+fn ownerless_identity_from_obj(value: &Value, label: &str) -> Result<(i64, i64)> {
+    let values = as_list(value, label)?;
+    if values.len() == 3 {
+        let dev = as_int(&values[0], label, 0)?;
+        let ino = as_int(&values[1], label, 0)?;
+        as_int(&values[2], label, 0)?;
+        return Ok((dev, ino));
+    }
+    if values.len() != 4 {
+        return Err(format!("{label} must have three or four fields"));
+    }
+    let handle = as_str(&values[3], &format!("{label} file handle"))?;
+    if handle.is_empty()
+        || handle.len() > FILE_HANDLE_BYTES_LIMIT * 2
+        || handle.len() % 2 != 0
+        || !handle
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "{label} file handle must be bounded lowercase hexadecimal bytes"
+        ));
+    }
+    let dev = as_int(&values[0], label, 0)?;
+    let ino = as_int(&values[1], label, 0)?;
+    as_int(&values[2], label, 0)?;
+    Ok((dev, ino))
+}
+
+/// Mirror of Python `_ownerless_identity_matches(..., exact=False)`, the
+/// journal-validation form: only the device and inode compare.  The file
+/// handle of a stable identity is compared at the destructive boundaries,
+/// which stay with the Python edition.
+fn ownerless_identity_matches(path: &Path, recorded: (i64, i64), label: &str) -> Result<bool> {
+    let (observed_dev, observed_ino, _observed_mount) = open_directory_identity(path, label)?;
+    Ok((observed_dev, observed_ino) == recorded)
 }
 
 fn ownerless_agent_authorization(value: &Value) -> Result<AgentAuthorization> {
@@ -975,13 +1019,8 @@ fn ownerless_agent_authorization(value: &Value) -> Result<AgentAuthorization> {
         raw
     };
     exact_keys(raw, &REQUIRED, &[], label)?;
-    let mut identity = Vec::new();
-    for item in as_list(&raw["identity"], "ownerless agent directory identity")? {
-        identity.push(as_int(item, "ownerless agent directory identity", 0)?);
-    }
-    if identity.len() != 3 {
-        return Err("ownerless agent directory identity must have three fields".to_owned());
-    }
+    let identity =
+        ownerless_identity_from_obj(&raw["identity"], "ownerless agent directory identity")?;
     if identity_from_obj(&raw["actor"], "ownerless agent recovery actor")?.is_none() {
         return Err("ownerless agent recovery has no actor".to_owned());
     }
@@ -1006,7 +1045,7 @@ fn ownerless_agent_authorization(value: &Value) -> Result<AgentAuthorization> {
     validate_remote(as_str(&raw["remote"], "ownerless agent remote")?)?;
     Ok(AgentAuthorization {
         path,
-        identity: (identity[0], identity[1], identity[2]),
+        identity,
         repository,
     })
 }
@@ -1183,8 +1222,11 @@ fn ownerless_agent_shape(cfg: &Cfg, raw: &Map<String, Value>, journal_machine: &
     if let Some(active) = &active {
         if active.is_symlink()
             || !active.is_dir()
-            || open_directory_identity(active, "ownerless agent worktree")?
-                != authorization.identity
+            || !ownerless_identity_matches(
+                active,
+                authorization.identity,
+                "ownerless agent worktree",
+            )?
         {
             return Err("ownerless agent worktree identity changed; preserve it".to_owned());
         }

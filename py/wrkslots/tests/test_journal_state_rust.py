@@ -320,14 +320,22 @@ def test_parse_journal_absent_rows_refusals(tmp_path: Path, mutate: str, fragmen
     assert fragment in result.stderr
 
 
-def _ownerless_agent_journal(root: Path, present: bool) -> dict[str, object]:
+def _ownerless_agent_journal(
+    root: Path, present: bool, *, stable: bool = False
+) -> dict[str, object]:
     (root.parent / "upstream-repo").mkdir(exist_ok=True)
-    identity: list[int] = [1, 2, 3]
+    identity: list[object] = [1, 2, 3, "00ff"] if stable else [1, 2, 3]
     if present:
         target = root / "worktrees" / "slot-a"
         target.mkdir(exist_ok=True)
         config = wrkslots_cli._load_config(str(root), None)
-        identity = list(wrkslots_cli._open_directory_identity(target, "ownerless agent worktree"))
+        # Since #1374 new journals record (dev, ino, file-handle type, file
+        # handle); older ones (dev, ino, namespace-local mount ID).
+        identity = list(
+            wrkslots_cli._stable_directory_identity(target, "ownerless agent worktree")
+            if stable
+            else wrkslots_cli._open_directory_identity(target, "ownerless agent worktree")
+        )
     return {
         "schema": 2,
         "kind": "ownerless-agent-remove",
@@ -351,29 +359,65 @@ def _ownerless_agent_journal(root: Path, present: bool) -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize("stable", [False, True])
 @pytest.mark.parametrize("present", [False, True])
-def test_parse_journal_ownerless_agent_matches_python(tmp_path: Path, present: bool) -> None:
+def test_parse_journal_ownerless_agent_matches_python(
+    tmp_path: Path, present: bool, stable: bool
+) -> None:
     root = _root(tmp_path)
     name = "ACTIVE.node-a.journal"
-    path = _write(root, name, _ownerless_agent_journal(root, present))
+    path = _write(root, name, _ownerless_agent_journal(root, present, stable=stable))
     result = _rust(root, name)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == _expected(root, path)
 
 
-@pytest.mark.parametrize("mutate", ["both", "identity"])
-def test_parse_journal_ownerless_agent_refusals(tmp_path: Path, mutate: str) -> None:
+def test_parse_journal_ownerless_agent_ignores_a_foreign_mount_id(tmp_path: Path) -> None:
+    """#1374: a legacy identity's mount ID is namespace-local; validation compares dev+ino."""
+
     root = _root(tmp_path)
     name = "ACTIVE.node-a.journal"
     journal = _ownerless_agent_journal(root, present=True)
+    authorization = journal["authorization"]
+    assert isinstance(authorization, dict)
+    identity = authorization["identity"]
+    assert isinstance(identity, list)
+    authorization["identity"] = [identity[0], identity[1], identity[2] + 5000]
+    path = _write(root, name, journal)
+    result = _rust(root, name)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == _expected(root, path)
+
+
+@pytest.mark.parametrize(
+    "mutate", ["both", "identity", "stable-inode", "handle", "five", "handle-type"]
+)
+def test_parse_journal_ownerless_agent_refusals(tmp_path: Path, mutate: str) -> None:
+    root = _root(tmp_path)
+    name = "ACTIVE.node-a.journal"
+    journal = _ownerless_agent_journal(root, present=True, stable=mutate == "stable-inode")
+    authorization = journal["authorization"]
+    assert isinstance(authorization, dict)
     if mutate == "both":
         (root / "worktrees" / f".slot-a.ownerless-agent.{'c' * 32}").mkdir()
         fragment = "canonical and fenced ownerless agent paths both exist"
-    else:
-        authorization = journal["authorization"]
-        assert isinstance(authorization, dict)
+    elif mutate == "identity":
         authorization["identity"] = [9, 9, 9]
         fragment = "ownerless agent worktree identity changed; preserve it"
+    elif mutate == "stable-inode":
+        identity = authorization["identity"]
+        assert isinstance(identity, list)
+        authorization["identity"] = [identity[0], identity[1] + 1, *identity[2:]]
+        fragment = "ownerless agent worktree identity changed; preserve it"
+    elif mutate == "handle":
+        authorization["identity"] = [1, 2, 3, "00FF"]
+        fragment = "file handle must be bounded lowercase hexadecimal bytes"
+    elif mutate == "five":
+        authorization["identity"] = [1, 2, 3, "00", 5]
+        fragment = "ownerless agent directory identity must have three or four fields"
+    else:
+        authorization["identity"] = [1, 2, -1, "00ff"]
+        fragment = "ownerless agent directory identity must be an integer >= 0"
     path = _write(root, name, journal)
     with pytest.raises(Exception) as caught:
         _expected(root, path)

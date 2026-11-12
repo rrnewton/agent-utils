@@ -269,10 +269,26 @@ pub(crate) fn recover_ownerless_agent_worktree(
                     .as_object()
                     .map(|object| object.keys().collect())
                     .unwrap_or_default();
+                // (dev, ino, mount ID) before #1374, (dev, ino, file-handle
+                // type, file handle) since; Python accepts both.
                 let identity_ok = authorization
                     .get("identity")
                     .and_then(Value::as_array)
-                    .is_some_and(|items| items.len() == 3 && items.iter().all(Value::is_i64));
+                    .is_some_and(|items| match items.len() {
+                        3 => items.iter().all(Value::is_i64),
+                        4 => {
+                            items[..3].iter().all(Value::is_i64)
+                                && items[3].as_str().is_some_and(|handle| {
+                                    !handle.is_empty()
+                                        && handle.len() <= 256
+                                        && handle.len() % 2 == 0
+                                        && handle.bytes().all(|byte| {
+                                            byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                                        })
+                                })
+                        }
+                        _ => false,
+                    });
                 let fenced = raw
                     .get("fenced")
                     .and_then(Value::as_str)

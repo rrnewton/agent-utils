@@ -14,11 +14,14 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -1530,3 +1533,629 @@ def test_a_submodule_initialised_in_a_linked_worktree_is_ready(
     allow_test_host(monkeypatch)
     digest, output = dry_run_digest(project, clone, remote, capsys, *extra)
     assert "blockers=0" in output
+
+
+# ---------------------------------------------------------------------------
+# #1374 wrkslots-prepared-journal-abandon: ownerless journals across mount namespaces.
+#
+# An ownerless-agent-remove journal used to record (st_dev, st_ino, mnt_id). The
+# mount ID is local to the caller's mount namespace, so a journal written from a
+# private namespace (a consumer wrapper ran the prepare step in a sandbox) could
+# not be resumed from any other one: recover refused "identity changed" for the
+# very same directory, and the journal blocked every mutation. These tests check
+# that new journals record the namespace-independent file-handle identity and
+# resume from another namespace, that a legacy three-field journal resumes on its
+# device and inode and is upgraded first, that a remote salvage cannot reach
+# refuses before any journal exists, that --abandon-prepared sets aside exactly
+# the journal that never acted and refuses every other shape, and that the
+# ownerless --apply handlers and bare recover accept a host-context coordinator.
+# ---------------------------------------------------------------------------
+
+REPO_PY = Path(__file__).resolve().parents[2]
+
+
+def crash_at(monkeypatch: pytest.MonkeyPatch, point: str) -> None:
+    def interrupt(seen: str) -> None:
+        if seen == point:
+            raise Crash(seen)
+
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", interrupt)
+
+
+def no_crash(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(wrkslots, "_interrupt_for_test", lambda _point: None)
+
+
+def journal_path(project: Path) -> Path:
+    config = wrkslots._load_config(str(project), "testhost")
+    return config.control / "ACTIVE.testhost.journal"
+
+
+def read_journal(project: Path) -> dict[str, object]:
+    raw: object = json.loads(journal_path(project).read_text(encoding="utf-8"))
+    assert isinstance(raw, dict)
+    return raw
+
+
+def identity_of(journal: dict[str, object]) -> list[object]:
+    authorization = journal["authorization"]
+    assert isinstance(authorization, dict)
+    identity = authorization["identity"]
+    assert isinstance(identity, list)
+    return identity
+
+
+def events_of_kind(project: Path, kind: str) -> list[dict[str, object]]:
+    config = wrkslots._load_config(str(project), "testhost")
+    return [dict(event) for event in wrkslots._load_events(config) if event["kind"] == kind]
+
+
+def outstanding(project: Path) -> list[Path]:
+    config = wrkslots._load_config(str(project), "testhost")
+    return list(wrkslots._outstanding_journals(config))
+
+
+def ownerless_args(
+    project: Path, target: Path, head: str, digest: str, *extra: str
+) -> list[str]:
+    return [
+        "--project-root",
+        str(project),
+        "recover-ownerless-agent-worktree",
+        target.relative_to(project).as_posix(),
+        "--repository",
+        "repo",
+        "--head",
+        head,
+        "--branch",
+        f"agent/{target.name}",
+        "--remote",
+        "origin",
+        "--remote-url-sha256",
+        digest,
+        *extra,
+    ]
+
+
+def apply_flags(pid: int | None = None) -> tuple[str, ...]:
+    return (
+        "--apply",
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid() if pid is None else pid),
+    )
+
+
+Prepared = tuple[Path, Path, Path, Path, str, str]
+
+
+@pytest.fixture
+def prepared(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Prepared]:
+    """A project whose ownerless removal died right after writing its journal."""
+
+    project, repository, remote = lifecycle.make_project(tmp_path)
+    target, head, digest = lifecycle.prepare_ownerless_agent_worktree(project, repository)
+    lifecycle.allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    crash_at(monkeypatch, "after-ownerless-agent-journal")
+    with pytest.raises(Crash):
+        lifecycle.run_ownerless_agent_recovery(project, target, head, digest, apply=True)
+    no_crash(monkeypatch)
+    journal = read_journal(project)
+    assert journal["phase"] == "prepared" and journal["salvage"] == []
+    yield project, repository, remote, target, head, digest
+
+
+# --- identity ------------------------------------------------------------------
+
+
+def test_new_journal_records_the_namespace_independent_identity(prepared: Prepared) -> None:
+    project, _repository, _remote, target, _head, _digest = prepared
+    identity = identity_of(read_journal(project))
+    assert len(identity) == 4
+    assert identity == list(
+        wrkslots._stable_directory_identity(target, "ownerless agent worktree")
+    )
+    metadata = os.stat(target)
+    assert identity[:2] == [metadata.st_dev, metadata.st_ino]
+
+
+def test_journal_resumes_when_the_mount_id_differs(
+    prepared: Prepared, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every mount ID the resume reads differs from the one the prepare saw."""
+
+    project, repository, _remote, target, head, digest = prepared
+    real = wrkslots._open_directory_identity
+
+    def foreign(path: Path, label: str) -> tuple[int, int, int]:
+        device, inode, mount = real(path, label)
+        return device, inode, mount + 4242
+
+    monkeypatch.setattr(wrkslots, "_open_directory_identity", foreign)
+    assert lifecycle.run_ownerless_agent_recovery(
+        project, target, head, digest, apply=True
+    ) == 0
+    assert not target.exists()
+    assert target.absolute() not in wrkslots._GitVcs().listed_worktrees(repository)
+    assert not journal_path(project).exists()
+    removed = events_of_kind(project, "ownerless-agent-worktree-removed")
+    payload = removed[-1]["payload"]
+    assert isinstance(payload, dict)
+    assert len(payload["authorization"]["identity"]) == 4
+
+
+def _unshare_works() -> bool:
+    if shutil.which("unshare") is None:
+        return False
+    probe = subprocess.run(
+        ["unshare", "--user", "--map-root-user", "--mount", "true"],
+        capture_output=True,
+        check=False,
+    )
+    return probe.returncode == 0
+
+
+RESUME_SCRIPT = """
+import os, sys
+from wrkslots import cli
+cli._short_hostname = lambda: "testhost"
+cli._assert_slot_unused = lambda *_a, **_k: None
+cli._user_systemd_snapshot = lambda: ()
+print("NS", os.readlink("/proc/self/ns/mnt"), flush=True)
+raise SystemExit(cli.main(sys.argv[1:] + ["--coordinator-pid", str(os.getpid())]))
+"""
+
+
+@pytest.mark.skipif(not _unshare_works(), reason="unprivileged mount namespaces unavailable")
+def test_journal_prepared_here_resumes_from_a_new_mount_namespace(prepared: Prepared) -> None:
+    project, repository, _remote, target, head, digest = prepared
+    env = dict(lifecycle.source_environment())
+    env["PYTHONPATH"] = str(REPO_PY)
+    result = subprocess.run(
+        [
+            "unshare", "--user", "--map-root-user", "--mount",
+            sys.executable, "-c", RESUME_SCRIPT,
+            *ownerless_args(project, target, head, digest),
+            "--apply", "--coordinator-authorized",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=600,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    namespace = result.stdout.splitlines()[0].split()[1]
+    assert namespace != os.readlink("/proc/self/ns/mnt")
+    assert not target.exists()
+    assert not journal_path(project).exists()
+    assert target.absolute() not in wrkslots._GitVcs().listed_worktrees(repository)
+
+
+def _legacy_journal_from_another_namespace(project: Path, target: Path, head: str, digest: str) -> None:
+    journal = lifecycle.write_pre_handoff_ownerless_agent_journal(project, target, head, digest)
+    config = wrkslots._load_config(str(project), "testhost")
+    authorization = journal["authorization"]
+    assert isinstance(authorization, dict)
+    device, inode, mount = authorization["identity"]
+    authorization["identity"] = [device, inode, mount + 5000]
+    wrkslots._write_journal(config, journal)
+
+
+def test_legacy_journal_from_another_namespace_resumes_after_upgrade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project, repository, _remote = lifecycle.make_project(tmp_path)
+    target, head, digest = lifecycle.prepare_ownerless_agent_worktree(project, repository)
+    lifecycle.allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    _legacy_journal_from_another_namespace(project, target, head, digest)
+    assert len(identity_of(read_journal(project))) == 3
+
+    crash_at(monkeypatch, "after-ownerless-agent-identity-upgrade")
+    with pytest.raises(Crash):
+        lifecycle.run_ownerless_agent_recovery(project, target, head, digest, apply=True)
+    upgraded = read_journal(project)
+    assert upgraded["phase"] == "prepared"
+    assert identity_of(upgraded) == list(
+        wrkslots._stable_directory_identity(target, "ownerless agent worktree")
+    )
+
+    no_crash(monkeypatch)
+    assert lifecycle.run_ownerless_agent_recovery(
+        project, target, head, digest, apply=True
+    ) == 0
+    assert not target.exists()
+    assert not journal_path(project).exists()
+
+
+def test_legacy_journal_with_a_different_inode_still_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote = lifecycle.make_project(tmp_path)
+    target, head, digest = lifecycle.prepare_ownerless_agent_worktree(project, repository)
+    lifecycle.allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    journal = lifecycle.write_pre_handoff_ownerless_agent_journal(project, target, head, digest)
+    config = wrkslots._load_config(str(project), "testhost")
+    authorization = journal["authorization"]
+    assert isinstance(authorization, dict)
+    device, inode, mount = authorization["identity"]
+    authorization["identity"] = [device, inode + 1, mount]
+    wrkslots._write_journal(config, journal)
+    assert lifecycle.run_ownerless_agent_recovery(
+        project, target, head, digest, apply=True
+    ) == 3
+    assert "identity changed" in capsys.readouterr().err
+    assert target.is_dir()
+    assert journal_path(project).exists()
+
+
+# --- preconditions before the journal ------------------------------------------
+
+
+def test_unreachable_remote_refuses_before_any_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, remote = lifecycle.make_project(tmp_path)
+    target, head, digest = lifecycle.prepare_ownerless_agent_worktree(project, repository)
+    (target / "dirty.txt").write_text("keep me\n", encoding="utf-8")
+    lifecycle.allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    away = remote.with_name("remote-away.git")
+    remote.rename(away)
+    progress_before = len(events_of_kind(project, "operation-progress-recorded"))
+
+    assert lifecycle.run_ownerless_agent_recovery(
+        project, target, head, digest, apply=True
+    ) == 3
+    assert capsys.readouterr().err
+    assert not journal_path(project).exists()
+    assert outstanding(project) == []
+    assert len(events_of_kind(project, "operation-progress-recorded")) == progress_before
+    assert (target / "dirty.txt").read_text(encoding="utf-8") == "keep me\n"
+
+    away.rename(remote)
+    assert lifecycle.run_ownerless_agent_recovery(
+        project, target, head, digest, apply=True
+    ) == 0
+    assert not target.exists()
+
+
+# --- abandon --------------------------------------------------------------------
+
+
+def abandon_dry_run(
+    project: Path, target: Path, head: str, digest: str, capsys: pytest.CaptureFixture[str]
+) -> str:
+    capsys.readouterr()
+    assert wrkslots.main(ownerless_args(project, target, head, digest, "--abandon-prepared")) == 0
+    output = combined(capsys)
+    assert "detail=abandon-prepared" in output
+    return output.split("journal_sha256=")[1].split()[0]
+
+
+def test_abandon_sets_aside_a_journal_that_never_acted(
+    prepared: Prepared, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote, target, head, digest = prepared
+    original = journal_path(project).read_bytes()
+    sha = abandon_dry_run(project, target, head, digest, capsys)
+    assert sha == hashlib.sha256(original).hexdigest()
+    assert journal_path(project).exists()
+
+    assert wrkslots.main(
+        ownerless_args(
+            project, target, head, digest, "--abandon-prepared",
+            "--journal-sha256", sha, "--reason", "prepared in another namespace",
+            *apply_flags(),
+        )
+    ) == 0
+    assert "outcome=abandoned" in combined(capsys)
+    assert not journal_path(project).exists()
+    assert outstanding(project) == []
+    assert target.is_dir()
+    assert target.absolute() in wrkslots._GitVcs().listed_worktrees(repository)
+    config = wrkslots._load_config(str(project), "testhost")
+    kept = list(wrkslots._quarantine_directory(config).glob("*-ACTIVE.testhost.journal"))
+    assert len(kept) == 1 and kept[0].read_bytes() == original
+    event = events_of_kind(project, "operation-quarantined")[-1]
+    payload = event["payload"]
+    assert isinstance(payload, dict)
+    assert payload["operation"] == "ownerless-agent-remove"
+    assert payload["slot"] == target.name
+    assert payload["journal_sha256"] == sha
+    assert payload["quarantine_path"] == str(kept[0].absolute())
+    assert payload["reason"] == "prepared in another namespace"
+    assert "worktree unchanged" in str(payload["recover_refusal"])
+
+    # Nothing blocks the registry any more: the removal runs from the start.
+    assert lifecycle.run_ownerless_agent_recovery(
+        project, target, head, digest, apply=True
+    ) == 0
+    assert not target.exists()
+
+
+def test_abandon_interrupted_after_its_tombstone_finishes_without_a_second(
+    prepared: Prepared, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _repository, _remote, target, head, digest = prepared
+    original = journal_path(project).read_bytes()
+    sha = abandon_dry_run(project, target, head, digest, capsys)
+    args = ownerless_args(
+        project, target, head, digest, "--abandon-prepared", "--journal-sha256", sha,
+        *apply_flags(),
+    )
+    crash_at(monkeypatch, "after-ownerless-agent-journal-abandoned-event")
+    with pytest.raises(Crash):
+        wrkslots.main(args)
+    assert journal_path(project).read_bytes() == original
+    assert len(events_of_kind(project, "operation-quarantined")) == 1
+
+    no_crash(monkeypatch)
+    assert wrkslots.main(args) == 0
+    assert "outcome=abandoned" in combined(capsys)
+    assert not journal_path(project).exists()
+    assert outstanding(project) == []
+    tombstones = events_of_kind(project, "operation-quarantined")
+    assert len(tombstones) == 1
+    payload = tombstones[0]["payload"]
+    assert isinstance(payload, dict)
+    assert Path(str(payload["quarantine_path"])).read_bytes() == original
+
+
+def test_abandon_accepts_a_worktree_that_is_gone(
+    prepared: Prepared, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, repository, _remote, target, head, digest = prepared
+    git(repository, "worktree", "remove", "--force", str(target))
+    sha = abandon_dry_run(project, target, head, digest, capsys)
+    assert wrkslots.main(
+        ownerless_args(
+            project, target, head, digest, "--abandon-prepared", "--journal-sha256", sha,
+            *apply_flags(),
+        )
+    ) == 0
+    assert outstanding(project) == []
+
+
+def _expect_abandon_refused(
+    project: Path, target: Path, head: str, digest: str,
+    capsys: pytest.CaptureFixture[str], fragment: str, *extra: str,
+) -> None:
+    before = journal_path(project).read_bytes() if journal_path(project).exists() else None
+    events_before = len(events_of_kind(project, "operation-quarantined"))
+    capsys.readouterr()
+    assert wrkslots.main(
+        ownerless_args(project, target, head, digest, "--abandon-prepared", *extra)
+    ) == 3
+    assert fragment in combined(capsys)
+    if before is not None:
+        assert journal_path(project).read_bytes() == before
+    assert len(events_of_kind(project, "operation-quarantined")) == events_before
+
+
+@pytest.mark.parametrize(
+    ("point", "fragment"),
+    (
+        ("after-ownerless-agent-salvage", "phase preserved, not prepared"),
+        ("after-ownerless-agent-fence", "phase fenced, not prepared"),
+    ),
+)
+def test_abandon_refuses_a_journal_that_acted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    point: str,
+    fragment: str,
+) -> None:
+    project, repository, _remote = lifecycle.make_project(tmp_path)
+    target, head, digest = lifecycle.prepare_ownerless_agent_worktree(project, repository)
+    (target / "dirty.txt").write_text("salvage me\n", encoding="utf-8")
+    lifecycle.allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    crash_at(monkeypatch, point)
+    with pytest.raises(Crash):
+        lifecycle.run_ownerless_agent_recovery(project, target, head, digest, apply=True)
+    no_crash(monkeypatch)
+    _expect_abandon_refused(project, target, head, digest, capsys, fragment)
+
+
+def test_abandon_refuses_salvage_receipts_in_phase_prepared(
+    prepared: Prepared, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _repository, _remote, target, head, digest = prepared
+    journal = read_journal(project)
+    journal["salvage"] = [{"checkout": "worktree", "disposition": "salvaged"}]
+    wrkslots._write_journal(wrkslots._load_config(str(project), "testhost"), journal)
+    _expect_abandon_refused(project, target, head, digest, capsys, "salvage receipts")
+
+
+def test_abandon_refuses_a_present_fenced_path(
+    prepared: Prepared, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _repository, _remote, target, head, digest = prepared
+    fenced = project / str(read_journal(project)["fenced"])
+    target.rename(fenced)
+    _expect_abandon_refused(project, target, head, digest, capsys, "fenced path exists")
+
+
+def test_abandon_refuses_a_replaced_worktree(
+    prepared: Prepared, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _repository, _remote, target, head, digest = prepared
+    target.rename(target.with_name("moved-away"))
+    target.mkdir()
+    _expect_abandon_refused(project, target, head, digest, capsys, "identity changed")
+
+
+def test_abandon_refuses_different_facts_digest_and_authority(
+    prepared: Prepared, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _repository, _remote, target, head, digest = prepared
+    sha = abandon_dry_run(project, target, head, digest, capsys)
+    _expect_abandon_refused(
+        project, target, "0" * 40, digest, capsys, "--head", "--journal-sha256", sha,
+        *apply_flags(),
+    )
+    _expect_abandon_refused(
+        project, target, head, digest, capsys, "journal changed since the dry run",
+        "--journal-sha256", "f" * 64, *apply_flags(),
+    )
+    _expect_abandon_refused(
+        project, target, head, digest, capsys, "--coordinator-authorized",
+        "--journal-sha256", sha, "--apply", "--coordinator-pid", str(os.getpid()),
+    )
+    _expect_abandon_refused(
+        project, target, head, digest, capsys, "--journal-sha256 with the digest",
+        *apply_flags(),
+    )
+    assert journal_path(project).exists()
+
+
+def test_journal_sha256_without_abandon_refuses(
+    prepared: Prepared, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project, _repository, _remote, target, head, digest = prepared
+    assert wrkslots.main(
+        ownerless_args(project, target, head, digest, "--journal-sha256", "a" * 64)
+    ) == 3
+    assert "only with --abandon-prepared" in capsys.readouterr().err
+
+
+# --- host-context coordinators ---------------------------------------------------
+
+
+def run_with_host_coordinator(
+    monkeypatch: pytest.MonkeyPatch, command: Callable[[int], int], *, handoff: bool
+) -> int:
+    coordinator_process, proof_fd = lifecycle.start_host_context_coordinator()
+    try:
+        coordinator = wrkslots._read_process_identity(coordinator_process.pid)
+        if handoff:
+            lifecycle.set_host_context_handoff(monkeypatch, coordinator, proof_fd)
+        return command(coordinator_process.pid)
+    finally:
+        for name in (
+            "WRKSLOTS_REMOVE_RUNNER_PID",
+            "WRKSLOTS_REMOVE_COORDINATOR_START_TICKS",
+            "WRKSLOTS_REMOVE_PROOF_FD",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        coordinator_process.terminate()
+        coordinator_process.wait(timeout=10)
+        os.close(proof_fd)
+
+
+@pytest.mark.parametrize("handoff", (True, False))
+def test_worktree_apply_accepts_a_host_context_coordinator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    handoff: bool,
+) -> None:
+    project, repository, _remote = lifecycle.make_project(tmp_path)
+    target, head, digest = lifecycle.prepare_ownerless_agent_worktree(project, repository)
+    lifecycle.allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    rc = run_with_host_coordinator(
+        monkeypatch,
+        lambda pid: wrkslots.main(ownerless_args(project, target, head, digest, *apply_flags(pid))),
+        handoff=handoff,
+    )
+    if handoff:
+        assert rc == 0
+        assert not target.exists()
+    else:
+        assert rc == 3
+        assert "is not in the invoking process ancestry" in capsys.readouterr().err
+        assert target.is_dir() and not journal_path(project).exists()
+
+
+@pytest.mark.parametrize("handoff", (True, False))
+def test_cache_apply_accepts_a_host_context_coordinator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    handoff: bool,
+) -> None:
+    project, _repository, _remote = lifecycle.make_project(tmp_path)
+    source = lifecycle.prepare_ownerless_agent_cache(project)
+    lifecycle.allow_test_host_for_ownerless_agent_recovery(monkeypatch)
+    rc = run_with_host_coordinator(
+        monkeypatch,
+        lambda pid: wrkslots.main(
+            ["--project-root", str(project), "recover-ownerless-agent-cache", *apply_flags(pid)]
+        ),
+        handoff=handoff,
+    )
+    if handoff:
+        assert rc == 0
+        assert not source.exists()
+    else:
+        assert rc == 3
+        assert "is not in the invoking process ancestry" in capsys.readouterr().err
+        assert source.is_dir()
+
+
+@pytest.mark.parametrize("handoff", (True, False))
+def test_clone_apply_accepts_a_host_context_coordinator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    handoff: bool,
+) -> None:
+    project, remote, clone = make_clone(tmp_path)
+    allow_test_host(monkeypatch)
+    digest, _output = dry_run_digest(project, clone, remote, capsys)
+    rc = run_with_host_coordinator(
+        monkeypatch,
+        lambda pid: wrkslots.main(
+            [
+                "--project-root", str(project), "recover-ownerless-agent-clone",
+                clone.relative_to(project).as_posix(), "--remote-url", f".git={remote}",
+                "--inventory-sha256", digest, *apply_flags(pid),
+            ]
+        ),
+        handoff=handoff,
+    )
+    if handoff:
+        assert rc == 0
+        assert not clone.exists()
+    else:
+        assert rc == 3
+        assert "is not in the invoking process ancestry" in capsys.readouterr().err
+        assert clone.is_dir()
+
+
+def test_bare_recover_resumes_clone_and_cache_journals_through_host_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "clone").mkdir()
+    (tmp_path / "cache").mkdir()
+    project, remote, clone = make_clone(tmp_path / "clone")
+    allow_test_host(monkeypatch)
+    digest, _output = dry_run_digest(project, clone, remote, capsys)
+    crash_at(monkeypatch, "after-ownerless-clone-journal")
+    with pytest.raises(Crash):
+        run_clone(project, clone, remote, apply=True, digest=digest)
+    no_crash(monkeypatch)
+
+    def recover(pid: int, root: Path) -> int:
+        return wrkslots.main(
+            [
+                "--project-root", str(root), "recover", "--coordinator-authorized",
+                "--coordinator-pid", str(pid),
+            ]
+        )
+
+    assert run_with_host_coordinator(
+        monkeypatch, lambda pid: recover(pid, project), handoff=True
+    ) == 0
+    assert not clone.exists()
+
+    cache_project, _repository, _remote = lifecycle.make_project(tmp_path / "cache")
+    source = lifecycle.prepare_ownerless_agent_cache(cache_project)
+    crash_at(monkeypatch, "after-ownerless-agent-cache-journal")
+    with pytest.raises(Crash):
+        lifecycle.run_ownerless_agent_cache_recovery(cache_project, apply=True)
+    no_crash(monkeypatch)
+    assert run_with_host_coordinator(
+        monkeypatch, lambda pid: recover(pid, cache_project), handoff=True
+    ) == 0
+    assert not source.exists()

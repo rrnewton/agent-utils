@@ -226,3 +226,61 @@ def test_ownerless_worktree_minimal_journal_refuses(tmp_path: Path) -> None:
     result = _rust(rust_root, rust_orphan, head, digest)
     assert result.returncode == 1
     assert "journal is invalid" in result.stderr
+
+
+def _journal(root: Path, orphan: Path, head: str, digest: str, *, stable: bool) -> None:
+    config = wrkslots_cli._load_config(str(root), None)
+    if stable:
+        identity: list[object] = list(
+            wrkslots_cli._stable_directory_identity(orphan, "ownerless agent worktree")
+        )
+    else:
+        device, inode, mount = wrkslots_cli._open_directory_identity(
+            orphan, "ownerless agent worktree"
+        )
+        # Written from another mount namespace: its mount ID means nothing here.
+        identity = [device, inode, mount + 5000]
+    wrkslots_cli._write_journal(
+        config,
+        {
+            "schema": 2,
+            "kind": "ownerless-agent-remove",
+            "machine": MACHINE,
+            "slot": "orphan",
+            "phase": "prepared",
+            "fenced": f"worktrees/.orphan.ownerless-agent.{'d' * 32}",
+            "authorization": {
+                "path": "worktrees/orphan",
+                "identity": identity,
+                "actor": wrkslots_cli._identity_to_obj(
+                    wrkslots_cli._read_process_identity(os.getpid())
+                ),
+                "repository": "../upstream-repo",
+                "head": head,
+                "branch": "suite/orphan",
+                "remote": "origin",
+                "remote_url_sha256": digest,
+                "handoff_sha256": None,
+                "recorded_at": wrkslots_cli._utc_now(),
+            },
+            "salvage": [],
+        },
+    )
+
+
+@pytest.mark.parametrize("stable", [True, False])
+def test_ownerless_worktree_resume_plan_matches_python_for_both_identities(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], stable: bool
+) -> None:
+    """#1374: (dev, ino, file handle) journals and legacy ones plan a resume in both editions."""
+
+    rust_root, rust_orphan, head, digest = _fixture(tmp_path / "rust")
+    oracle_root, oracle_orphan, oracle_head, oracle_digest = _fixture(tmp_path / "oracle")
+    _journal(rust_root, rust_orphan, head, digest, stable=stable)
+    _journal(oracle_root, oracle_orphan, oracle_head, oracle_digest, stable=stable)
+    assert _python(oracle_root, oracle_orphan, oracle_head, oracle_digest) == 0
+    assert capsys.readouterr().out.strip().endswith("outcome=planned detail=resume")
+    result = _rust(rust_root, rust_orphan, head, digest)
+    assert result.returncode == 0, result.stderr
+    outcome = json.loads(result.stdout)
+    assert (outcome["outcome"], outcome["detail"]) == ("planned", "resume")
