@@ -6,7 +6,7 @@ issue_type: task
 labels:
 - wrkslots
 created_at: 2026-11-12T11:21:14+00:00
-updated_at: 2026-11-12T11:21:14+00:00
+updated_at: 2026-11-12T15:21:52+00:00
 ---
 
 # Description
@@ -28,3 +28,5 @@ updated_at: 2026-11-12T11:21:14+00:00
 # Notes
 
 Numbered from devbig030's interim block (1400-1469). Depends on #1408 eden-image-refuse for the interim refusal.
+
+Design and experiment delivered 2026-11-12 in `ai_docs/reports/research/2026-11-12-eden-fuse-image.md`: fuse2fs with `allow_other` mounts with no sudo, a second FUSE filesystem mounts inside it, and a real Eden clone inside it succeeded (privhelper mount proven in the mount table; `sl status` clean; file read/write round-tripped; `eden remove` and unmount clean). Two implementation facts fall out: fresh images need mkfs `root_owner` (wrkslots already does this), and default Eden redirections escape the image to host scratch, which the existing in-slot guard would refuse. Left open deliberately: the owner's choice between this path and the sudo worktrees-image path, and the five still-unproven items listed in the note (full wrkslots remove sequence, confined redirections, lifecycle survival, performance, multi-slot behaviour).
