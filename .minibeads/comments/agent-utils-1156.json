@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-1156-c2b8a9975be",
+    "issue_id": "agent-utils-1156",
+    "author": "mu-inbox",
+    "body": "[watermelon-full-preview] Landed 2026-11-12 in 77f7d761 (series tip 323fcc6b on main). send --supersede-key in both editions: enqueue sets aside every still-pending prompt with the same key into cancelled/ as superseded with superseded_by (listed in the send output's superseded); settled history and composer-stranded prompts untouched; replacement takes its own fresh queue place. Rust routes keyed prompts to inbox.v2 like --ttl; Python honours the key in its classic inbox. Schema regenerated. Tests: queue replace/order/stranded cases, drain types newest only, CLI parse, py supersede + schema, cross differential queue-supersede both editions (294+248+357+104 paired checks locally; gate herdr-agent differential green). Gates: full --all (gate9, 245 PASS; reds only wrkslots/lifecycle quarantine class plus solo-passed load flakes) and path-selected (gate15) with every non-quarantine red solo-passed on its gated tree. Deploy to live watchers/services is the coordinators' step.",
+    "created_at": "2026-11-12T12:49:52.740120388Z",
+    "updated_at": "2026-11-12T12:49:52.740120388Z"
+  }
+]

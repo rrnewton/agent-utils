@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-1158-c7f0cb0d4df",
+    "issue_id": "agent-utils-1158",
+    "author": "mu-inbox",
+    "body": "[watermelon-full-preview] Landed 2026-11-12 in 77f7d761 (tip 323fcc6b). (1) watch-agents now reads the designated coordinator's own screen (approval table plus each harness's question forms: AskUserQuestion, Muse request_user_input, Codex approvals) and pages the --notice-fallback, else the owner alarm, within a pass - never the coordinator's own queue; pass report carries coordinator_blocked. This is the alert that could not fire on 2026-11-09 (coordinator exempt as a subject; chat alarm posted 08:36 ET, rewritten 11x, self-erased to Resolved 11:41 ET - full timeline in harness ai_docs/2026-11-09-coordinator-inbox-telemetry.md). (2) Muse launches without --disable-request-user-input warn at start and in profiles output (both editions, same words); userguide + embedded skill carry the per-harness disable table and the ask-over-chat rule. Local mitigations (Claude deny, Muse profile flags, Codex tools.experimental_request_user_input host switch) were applied by the lead 2026-11-09 and verified. Deploy to live watchers is the coordinators' step.",
+    "created_at": "2026-11-12T12:50:32.644613673Z",
+    "updated_at": "2026-11-12T12:50:32.644613673Z"
+  }
+]

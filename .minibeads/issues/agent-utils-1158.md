@@ -1,13 +1,14 @@
 ---
 title: 'coordinator-never-blocks: chat-driven coordinators cannot park on an in-TUI question, and a blocked coordinator pages the owner'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: mu-inbox
 labels:
 - agentctl
 created_at: 2026-11-09T17:05:54.257430709+00:00
-updated_at: 2026-11-09T17:14:33.006142934+00:00
+updated_at: 2026-11-12T12:51:21.900078164+00:00
+closed_at: 2026-11-12T12:51:21.900078093+00:00
 ---
 
 # Description

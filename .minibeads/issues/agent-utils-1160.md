@@ -1,13 +1,14 @@
 ---
 title: 'owner-alarm-says-why: the chat delivery alarm names the blocked prompt and keeps the warning after resolution'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: mu-inbox
 labels:
 - agentctl
 created_at: 2026-11-09T17:14:39.075325205+00:00
-updated_at: 2026-11-09T17:14:39.075325205+00:00
+updated_at: 2026-11-12T12:51:21.900192184+00:00
+closed_at: 2026-11-12T12:51:21.900192114+00:00
 ---
 
 # Description

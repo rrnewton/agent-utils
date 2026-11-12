@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-1157-c8aa1a286fe",
+    "issue_id": "agent-utils-1157",
+    "author": "mu-inbox",
+    "body": "[watermelon-full-preview] Landed 2026-11-12 in 77f7d761 (tip 323fcc6b). Every periodic watch-agents notice carries a TTL of about its period; copies that can repeat carry one supersede key per request, lane or check: status pages use repage_minutes as TTL with key per request, child-done/delivery-jam/held-queue/agent-teams/recovery notices and the failed-prompt digest carry ~1h (digest its own cadence) with per-subject keys. Episode batches expire after 2x --min-notice-interval (floor 1h) but never supersede: a batch carries distinct once-only notices, so a per-recipient key would silently discard other lanes' notices. tick-deliver template sends with --ttl 900 and one tick key. Owner-stuck notices unchanged (existing withdraw supersede). Live harness ops scripts intentionally not edited: they run against the deployed binary, which needs this build first.",
+    "created_at": "2026-11-12T12:49:52.742943673Z",
+    "updated_at": "2026-11-12T12:49:52.742943673Z"
+  }
+]

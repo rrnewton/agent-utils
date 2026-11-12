@@ -1,6 +1,6 @@
 ---
 title: 'automated-notice-ttl: every periodic automated notice sets a TTL about its period and a supersede key'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: mu-inbox
@@ -9,7 +9,8 @@ labels:
 depends_on:
   agent-utils-1156: blocks
 created_at: 2026-11-09T17:05:54.251680112+00:00
-updated_at: 2026-11-09T17:14:33.411573092+00:00
+updated_at: 2026-11-12T12:51:21.899979616+00:00
+closed_at: 2026-11-12T12:51:21.899979485+00:00
 ---
 
 # Description

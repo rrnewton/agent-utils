@@ -1,0 +1,10 @@
+[
+  {
+    "id": "agent-utils-1159-c4c8f54a719",
+    "issue_id": "agent-utils-1159",
+    "author": "mu-inbox",
+    "body": "[watermelon-full-preview] Design recorded, awaiting owner/lead approval (no code, per the issue). Telemetry (harness ai_docs/2026-11-09-coordinator-inbox-telemetry.md, 14 days, both devbig014 coordinator teams): lane bursts above 3 unanswered in 10 min are rare and mostly automation identities. Design: refuse an upward lane-to-coordinator send when the sender already has 3+ undelivered prompts to the designated coordinator in a rolling 10 min, with one-line refusal (coordinator may be busy/blocked; keep working autonomously; retry after 10 min or once one is processed). Exempt: owner/bridge messages, TTL+supersede automated notices (#1157, self-limiting), and always the first message from a sender, so a genuine first BLOCKED always passes. Per-registry config, default off. devbig030 numbers await that coordinator running hosts/devbig014/tools/inbox-telemetry/.",
+    "created_at": "2026-11-12T12:50:32.650484298Z",
+    "updated_at": "2026-11-12T12:50:32.650484298Z"
+  }
+]

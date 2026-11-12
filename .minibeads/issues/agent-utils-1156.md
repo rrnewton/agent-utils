@@ -1,13 +1,14 @@
 ---
 title: 'queue-supersede-key: a newer queued message with the same key replaces the older undelivered one'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: mu-inbox
 labels:
 - agentctl
 created_at: 2026-11-09T17:05:46.099746999+00:00
-updated_at: 2026-11-09T17:14:33.279258850+00:00
+updated_at: 2026-11-12T12:51:21.899776461+00:00
+closed_at: 2026-11-12T12:51:21.899776321+00:00
 ---
 
 # Description
