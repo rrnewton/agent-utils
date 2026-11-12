@@ -1,7 +1,7 @@
-//! Persistent Claude Code stream-json sessions, shared by agentctl and vibe-talk.
+//! Persistent Claude Code stream-json sessions, shared by the tools in this repository.
 //!
-//! Factored out of agentctl's headless driver (`#1331 claude-session-summarizer`) with no
-//! behaviour change for agentctl: agentctl's `headless::claude` module re-exports the
+//! Factored out of the headless driver (`#1331 claude-session-summarizer`) with no
+//! behaviour change for its existing callers: the driver's protocol module re-exports the
 //! [`protocol`] helpers from here, so every existing call site keeps its path and meaning.
 //!
 //! - [`protocol`]: the stateless stream-json framing — protocol arguments, permission-prompt

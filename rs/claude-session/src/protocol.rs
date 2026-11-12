@@ -1,7 +1,8 @@
 //! Claude Code's stream-json protocol framing, as the headless wrapper speaks it.
 //!
-//! Moved verbatim from `agentctl::headless::claude` (`#1331 claude-session-summarizer`);
-//! agentctl re-exports these names, so its behaviour is unchanged. This module only frames:
+//! Moved verbatim from the headless driver's protocol module
+//! (`#1331 claude-session-summarizer`); the driver re-exports these names, so its
+//! behaviour is unchanged. This module only frames:
 //! it holds no state and does no I/O except reading `/dev/urandom` for [`random_uuid`].
 
 use std::fs::File;
