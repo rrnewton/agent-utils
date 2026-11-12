@@ -15,3 +15,4 @@ export type { PendingCopy, TextClipboard } from "./clipboard.ts";
 export { createListening } from "./listening.ts";
 export { insertSanitizedHtml } from "./html.ts";
 export type { Listening, SizeWatcher, SizeWatching } from "./listening.ts";
+export { foldSectionsByHeading, setAllSections } from "./collapse.ts";

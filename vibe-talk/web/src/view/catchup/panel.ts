@@ -12,8 +12,7 @@
 // The answer's wire types are the generated contract's (`CatchupResponse` and its
 // parts); the panel narrows the decoded body to the fields it reads.
 
-import { createListening, insertSanitizedHtml, setClassWord } from "../dom/index.ts";
-import { foldSectionsByHeading, setAllSections } from "../dom/collapse.ts";
+import { createListening, foldSectionsByHeading, insertSanitizedHtml, setAllSections, setClassWord } from "../dom/index.ts";
 import { createComposerKeys } from "../composer/index.ts";
 import { deepLinkRefFrom } from "../../foundation/index.ts";
 import type { MessageLinkRef } from "../../foundation/index.ts";
