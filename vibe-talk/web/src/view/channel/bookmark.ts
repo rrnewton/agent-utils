@@ -145,7 +145,6 @@ export interface ReadingBookmarkDependencies {
   selectionView(): string;
   selectionThreadId(): unknown;
   hidingRead(): boolean;
-  todoHoldsFrom(at: number, channel: string | null): boolean;
   fromGatheredThread(row: Element): boolean;
   preservingScroll(fn: () => void): void;
   /** Move the list by a measured delta, through the scroll owner (`#1251 scroll-single-owner`). */
@@ -304,9 +303,6 @@ export function createReadingBookmark(deps: ReadingBookmarkDependencies): Readin
     return "The bookmark is in Main and All.";
   }
 
-  function todoWindowHolds(at: number): boolean {
-    return deps.hidingRead() && !deps.threading() && deps.todoHoldsFrom(at, deps.currentChannelId());
-  }
 
   function bookmarkTarget(): { row: BookmarkedRow; place: string } | null {
     const anchor = bookmarkAnchor();
@@ -315,7 +311,7 @@ export function createReadingBookmark(deps: ReadingBookmarkDependencies): Readin
       .filter((row) => row.hasAttribute("data-id") && !row.hasAttribute("data-card") && !deps.fromGatheredThread(row));
     const spot = bookmarkSpot(rows.map((row) => ({
       ids: idsOf(row), sentMs: rowSentMs(row), newestMs: rowNewestMs(row), shown: rowShown(row),
-    })) as never, anchor as never, todoWindowHolds as never) as { index: number; place: string } | null;
+    })) as never, anchor as never, (() => false) as never) as { index: number; place: string } | null;
     return spot ? { row: rows[spot.index] as BookmarkedRow, place: spot.place } : null;
   }
 

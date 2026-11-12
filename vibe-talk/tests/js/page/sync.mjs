@@ -1559,24 +1559,6 @@ test("an edit or removal out of the tail costs no read once a read has begun aft
   assert.equal(page.timelineCalls.length, 2, "a catch-up edit lost its read");
 });
 
-test("a held replay the to-do filter hides stays hidden", async () => {
-  // A replayed frame for a message the store holds appends nothing: the view drawn from the store
-  // left it out on purpose, and no read follows to take a stray row away again.
-  const { page } = await warmThreadReload((p) => {
-    p.dealtWith = new Set(["200"]);
-  });
-  await page.el("view-switch").click();
-  await page.settle();
-  await turnTodoOn(page);
-  const shown = shownIds(page);
-  assert.ok(!shown.includes("200"), "the to-do filter showed a dealt-with message");
-  const reads = page.timelineCalls.length;
-  await deliver(page, page.stream(), replayedFrames(page.messages.filter((m) => !m.thread || m.thread.is_root)));
-  await page.settle();
-  assert.deepStrictEqual(shownIds(page), shown, "a held replay put a hidden message back on the list");
-  assert.equal(page.timelineCalls.length, reads, "a held replay read the channel");
-});
-
 test("a read that failed answers for no replay, and the next read does", async () => {
   let timeline = null;
   let healthy = null;
@@ -2895,7 +2877,7 @@ test("`remote-ops-audit`: in two columns the right column's read beside Main say
   assertEveryReadSaysWhy(page);
 });
 
-test("`remote-ops-audit`: a channel without threads says why it reads its page and its to-do list", async () => {
+test("`remote-ops-audit`: a channel without threads says why it reads its page", async () => {
   const page = newPage();
   await signIn(page);
   await showDiscord(page, backlog(5));
@@ -2903,9 +2885,8 @@ test("`remote-ops-audit`: a channel without threads says why it reads its page a
   assert.equal(reads()[0], "enter", "entering the channel");
   await reReadChannel(page);
   assert.equal(reads().at(-1), "poll", "the poll");
-  await turnTodoOn(page);
-  assert.ok(page.todoReadPaths.length > 0, "turning Hide read on did not read the to-do list");
-  assert.equal(readReasonIn(page.todoReadPaths.at(-1)), "enter", "the to-do list is a view entered");
+  await chooseReadMode(page, "Fold read");
+  assert.equal(page.todoReadPaths.length, 0, "turning Fold read on read the to-do list");
   assertEveryReadSaysWhy(page);
 });
 
@@ -5945,7 +5926,7 @@ test("`#269 approval-card-inline` x `#280 scroll-stability`: a draft arriving un
     await startTalking(page);
     await page.settle();
     await showDiscord(page, messages);
-    await chooseReadMode(page, "Hide read");
+    await chooseReadMode(page, "Fold read");
     // The list as tall as the dock leaves it at a desk once the thread's name wraps it: the landing's
     // foot within the slack, as "...and the dock and the chips changing as the thread opens" has it
     // (456px there too since `#324 live-pill-covers-row` lands the answer's day rule with it).

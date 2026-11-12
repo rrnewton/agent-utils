@@ -2018,8 +2018,8 @@ test("`#419 threads-view-main-messages` x `#432 read-mode-unify`: Hide read keep
   const shownMain = () => page.el("side-cards").children.filter((li) => li.hasAttribute("data-main-row") && !li.hidden
     && !li.hasClass("search-hidden")).map((li) => li.getAttribute("data-id"));
   assert.deepStrictEqual(shownMain(), ["200", "210"], "the premise is both on the list");
-  await readModeTo(page, "Hide read");
-  assert.deepStrictEqual(shownMain(), ["210"], "Hide read kept a read main-channel message");
+  await readModeTo(page, "Fold read");
+  assert.deepStrictEqual(shownMain(), ["200", "210"], "Fold read took a read main-channel message out");
   await readModeTo(page, "Show read");
   await search(page, "brand-new");
   assert.deepStrictEqual(shownMain(), ["210"], "the search did not find the main-channel message by its words");
@@ -2299,7 +2299,7 @@ const mainRowsSaying = (page, words) => page.el("side-cards").children
   .filter((li) => li.hasAttribute("data-main-row") && !li.hidden && li.text().includes(words)).map((li) => li.getAttribute("data-id"));
 
 test("`#430 threads-main-own-sent`: under Hide read, the message just sent from the box at the foot of the cards is among Main channel's rows at once, and stays through a redraw", async () => {
-  for (const mode of ["Hide read", "Show read"]) {
+  for (const mode of ["Fold read", "Show read"]) {
     const { page } = await mainMessagesPage(new Map([[THREADS_MAIN_STORAGE, "on"]]));
     await readModeTo(page, mode);
     await page.el("channel-compose-text").setValue("just said to everyone");
@@ -2317,7 +2317,7 @@ test("`#430 threads-main-own-sent`: under Hide read, the message just sent from 
 
 test("`#430 threads-main-own-sent`: sent from Main under Hide read, it is among the Threads view's main rows, and still in Main after leaving and coming back", async () => {
   const { page } = await mainMessagesPage(new Map([[THREADS_MAIN_STORAGE, "on"]]));
-  await readModeTo(page, "Hide read");
+  await readModeTo(page, "Fold read");
   await pickThread(page, "main");
   await page.el("channel-compose-text").setValue("said from Main");
   await page.el("channel-send").click();
@@ -3162,34 +3162,15 @@ test("`#404 threads-unpack-all` x `#221 read-modes`: Fold read folds runs onto t
       "the run line does not say what it holds");
     assert.ok(runs[0].descendants().some((n) => n.className === "reply-bridge"), "the run line hangs off no bridge");
   }
-  await page.el("todo-filter").click(); // Collapse -> Hide
+  await page.el("todo-filter").click(); // Collapse -> Show
   await page.settle();
-  assert.equal(page.el("todo-filter").getAttribute("data-read-mode"), "hide");
+  assert.equal(page.el("todo-filter").getAttribute("data-read-mode"), "show");
   assert.deepStrictEqual(unpackRows(page, "spaces/A/threads/sum")
-    .flatMap((li) => (li.getAttribute("data-ids") || "").split(" ")), ["700", "703"],
-    "Hide read did not leave exactly the summarized root and the unread reply");
+    .flatMap((li) => (li.getAttribute("data-ids") || "").split(" ")), ["700", "701", "702", "703"],
+    "Show read did not draw every reply again");
   assert.deepStrictEqual(unpackRows(page, "spaces/A/threads/raw")
-    .flatMap((li) => (li.getAttribute("data-ids") || "").split(" ")), ["707"],
-    "Hide read kept a read reply under the raw card");
-});
-
-test("`#405 root-under-summary`: in a thread headed by a summarized card the read root stays as first child under Hide read; under a raw card it does not (negative control)", async () => {
-  const { page } = await unpackPage();
-  await page.el("todo-filter").click();
-  await page.el("todo-filter").click(); // Hide read
-  await page.settle();
-  await pickThread(page, "thread:spaces/A/threads/sum");
-  await page.settle();
-  const rows = [...page.el("discord-log").children];
-  assert.ok(rows.length > 0 && (rows[0].getAttribute("data-ids") || "").split(" ").includes("700"),
-    "the summarized thread does not start with its root under Hide read");
-  assert.ok(rows[0].hasAttribute("data-root-child"), "the root is not drawn as the card's child");
-  await pickThread(page, "thread:spaces/A/threads/raw");
-  await page.settle();
-  const rawRows = [...page.el("discord-log").children];
-  assert.ok(!rawRows.some((li) => li.hasAttribute("data-root-child")), "a raw card's thread grew a root child");
-  assert.ok(!rawRows.flatMap((li) => (li.getAttribute("data-ids") || "").split(" ")).includes("704"),
-    "the raw thread kept its read root under Hide read, so the summarized check proves nothing");
+    .flatMap((li) => (li.getAttribute("data-ids") || "").split(" ")), ["705", "706", "707"],
+    "Show read did not draw every reply under the raw card again");
 });
 
 // --- a thread card never shows more than K lines of its root (#522 thread-card-max-lines) -------------
@@ -3277,10 +3258,6 @@ test("`#522 thread-card-max-lines`: a split root's continuation is kept by Hide 
   await page.el("todo-filter").click(); // Show -> Collapse
   await page.settle();
   assert.equal(unpackRows(page, BIG)[0].getAttribute("data-read-run"), null, "the continuation was folded into a run");
-  await page.el("todo-filter").click(); // Collapse -> Hide
-  await page.settle();
-  assert.deepStrictEqual(unpackRows(page, BIG).map((li) => li.getAttribute("data-ids")), ["800"],
-    "Hide read did not keep the read continuation and leave out the read reply");
   assert.ok(unpackRows(page, BIG)[0].hasAttribute("data-root-continuation"));
 });
 

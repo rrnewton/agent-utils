@@ -84,11 +84,11 @@ function makeNoise() {
   return { acts, calls, canon, state };
 }
 
-test("the tally counts the loaded verdicts, or the to-do window's own numbers", () => {
+test("the tally counts the loaded verdicts", () => {
   const { acts, state } = makeNoise();
   assert.deepEqual(acts.noiseTally(), { matched: 1, total: 2 });
   state.threading = false; state.hiding = true;
-  assert.deepEqual(acts.noiseTally(), { matched: 3, total: 9 }, "the to-do list's own count, as the server left them out");
+  assert.deepEqual(acts.noiseTally(), { matched: 1, total: 2 }, "without threads the tally still counts the loaded rows");
 });
 
 test("a rescue is not optimistic: the server first, then every copy told", async () => {

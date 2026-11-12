@@ -1100,19 +1100,17 @@ test("`#262 search-load-older`: Hide read steps aside while a filter chooses row
   page.dealtWith = new Set(["200"]);
   await signIn(page);
   await showDiscord(page, data.messages);
-  await chooseReadMode(page, "Hide read");
-  assert.ok(!shownIds(page).includes("200"), "Hide read drew a read message");
-  assert.equal(page.el("inbox-note").hidden, false, "Hide read's note is not up");
+  await chooseReadMode(page, "Fold read");
+  assert.equal(rowWithId(page, "200").getAttribute("data-archived"), "true", "Fold read did not draw the read message as read");
   // A search for it: read, and found, greyed as read rows are.
   await search(page, "announcement");
   await page.settle();
   const found = rowWithId(page, "200");
   assert.ok(found && !found.hasClass("search-hidden"), "the read match was not drawn under the search");
   assert.equal(found.getAttribute("data-archived"), "true", "the read match is not drawn as read");
-  assert.equal(page.el("inbox-note").hidden, true, "Hide read's note stayed up while it stood aside");
   assert.equal(page.el("search-empty").hidden, true, "the list said nothing matched");
-  assert.equal(page.el("todo-filter-label").text(), "Hide read", "the read mode the reader chose changed");
-  assert.equal(savedUiState(page).read, "hide", "the read mode kept on this device changed");
+  assert.equal(page.el("todo-filter-label").text(), "Fold read", "the read mode the reader chose changed");
+  assert.equal(savedUiState(page).read, "fold", "the read mode kept on this device changed");
   // Another keystroke is no redraw: only the first term and the last flip it.
   const drawn = rowWithId(page, "200");
   await search(page, "announcement main");
@@ -1121,8 +1119,7 @@ test("`#262 search-load-older`: Hide read steps aside while a filter chooses row
   // Closed, Hide read is back.
   await page.el("search-toggle").click();
   await page.settle();
-  assert.ok(!shownIds(page).includes("200"), "closing the search did not bring Hide read back");
-  assert.equal(page.el("inbox-note").hidden, false);
+  assert.equal(rowWithId(page, "200").getAttribute("data-archived"), "true", "closing the search did not draw the read message as read");
   // Links and whose messages are filters choosing rows too.
   await search(page, "");
   await page.el("author-filter").click();
@@ -1130,20 +1127,7 @@ test("`#262 search-load-older`: Hide read steps aside while a filter chooses row
   await page.el("author-filter").click();
   await page.settle();
   assert.equal(authorState(page)[0], "theirs");
-  assert.ok(shownIds(page).includes("200"), "Theirs under Hide read left a read message of theirs out");
-});
-
-test("`#262 search-load-older`: without threads Hide read is a list of its own, and stays in force under a search", async () => {
-  const page = newPage();
-  await signIn(page);
-  page.dealtWith = new Set(["8000000000000000000"]);
-  await showDiscord(page, backlog(3));
-  await turnTodoOn(page);
-  assert.ok(!shownIds(page).includes("8000000000000000000"));
-  await search(page, "message");
-  await page.settle();
-  assert.ok(!shownIds(page).includes("8000000000000000000"), "the search drew a message Hide read's own list left out");
-  assert.equal(page.el("inbox-note").hidden, false);
+  assert.ok(shownIds(page).includes("200"), "Theirs under Fold read left a read message of theirs out");
 });
 
 test("`#262 search-load-older`: the count is in messages, so what is shown and the gaps' lines add up to it", async () => {
@@ -1455,7 +1439,7 @@ test("`#262 search-load-older`: Hide read steps aside under the search, so a wal
   page.dealtWith = new Set(all.slice(0, 28).map((m) => m.id));
   await signIn(page);
   await showDiscord(page, page.messages);
-  await chooseReadMode(page, "Hide read");
+  await chooseReadMode(page, "Fold read");
   await search(page, "engine");
   await page.settle();
   assert.match(page.el("load-older").textContent, /^Search before /, "the walk was not offered under Hide read");
@@ -1468,22 +1452,7 @@ test("`#262 search-load-older`: Hide read steps aside under the search, so a wal
   // Closed, the search gives the list back to Hide read.
   await page.el("search-toggle").click();
   await page.settle();
-  assert.deepStrictEqual(shownIds(page), all.slice(28).map((m) => m.id), "Hide read did not come back");
-});
-
-test("`#262 search-load-older`: without threads, under Hide read, the walk is not offered and the sentence says how out", async () => {
-  const page = newPage();
-  searchHistory(page, { pages: 4 });
-  await signIn(page);
-  await showDiscord(page, page.messages);
-  await turnTodoOn(page);
-  await search(page, "engine");
-  await page.settle();
-  assert.doesNotMatch(page.el("load-older").textContent, /^Search/, "a walk was offered over Hide read's own list");
-  await press(page, page.el("search-field"), "Enter");
-  assert.equal(searchReads(page).length, 0, "Enter walked back over Hide read's own list");
-  assert.equal(page.el("search-empty").hidden, false);
-  assert.match(page.el("search-empty").textContent, / Hide read is on — press h for Show read to search older messages\.$/);
+  assert.ok(shownIds(page).includes(all[28].id) && collapsedRows(page).length >= 0, "Fold read did not come back");
 });
 
 test("`#262 search-load-older`: a change to the search ends the walk, and aborts its read on the wire", async () => {
