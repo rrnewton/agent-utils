@@ -815,6 +815,40 @@ impl RestoreEpoch {
     }
 }
 
+/// A one-shot re-entry wake for a team-driver deadline: run `argv` (an absolute
+/// agentctl kick) at `deadline_unix` on the [`Host::now`] clock.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WakeRequest {
+    /// Opaque per-team key (a hash prefix); names no team, host, or person.
+    pub team_key: String,
+    /// The team's canonical registry directory.
+    pub registry: PathBuf,
+    /// When the wake must fire, in Unix seconds.
+    pub deadline_unix: f64,
+    /// The command the wake runs, first element absolute.
+    pub argv: Vec<String>,
+}
+
+/// How arming a [`WakeRequest`] ended. Anything but `Armed` means the caller
+/// must wait resident instead of exiting (team-restore liveness).
+#[derive(Clone, Debug, PartialEq)]
+pub enum WakeOutcome {
+    /// A timer will fire, including one already armed for this deadline.
+    Armed {
+        /// The transient timer unit that will fire.
+        unit: String,
+    },
+    /// No user manager answers, so no timer can be armed against it.
+    NoManager,
+    /// This host cannot arm timers (the trait default, used by fakes).
+    Unsupported,
+    /// Arming was attempted and failed; says why.
+    Failed {
+        /// Why arming failed.
+        detail: String,
+    },
+}
+
 /// The host facts and effects restore and watch use, injectable for tests.
 pub trait Host {
     /// `/proc/sys/kernel/random/boot_id`.
@@ -824,6 +858,15 @@ pub trait Host {
     /// alone, exactly as builds before #1405 did.
     fn user_manager_id(&self) -> Option<String> {
         None
+    }
+    /// The current restore epoch: this boot under its current user manager.
+    /// The team driver records it with [`RestoreEpoch::as_json`] and compares
+    /// by equality only.
+    fn epoch(&self) -> Result<RestoreEpoch> {
+        Ok(RestoreEpoch {
+            boot_id: self.boot_id()?,
+            user_manager: self.user_manager_id(),
+        })
     }
     /// The kernel boot time in Unix seconds (`btime` in `/proc/stat`).
     fn boot_time(&self) -> Option<u64>;
@@ -838,6 +881,28 @@ pub trait Host {
     }
     /// Run a program with a deadline, never through a shell.
     fn run(&self, argv: &[String], cwd: Option<&Path>, timeout: Duration) -> CommandOutcome;
+    /// Run a program with `stdin` piped to it (escalation commands read the
+    /// incident that way; plain [`Host::run`] gives a null stdin). The default
+    /// fails closed, so a fake must opt in before its escalation cases mean
+    /// anything.
+    fn run_stdin(
+        &self,
+        _argv: &[String],
+        _cwd: Option<&Path>,
+        _timeout: Duration,
+        _stdin: &str,
+    ) -> CommandOutcome {
+        CommandOutcome {
+            stderr: "this host cannot run a command with stdin".to_owned(),
+            ..CommandOutcome::default()
+        }
+    }
+    /// Arm a one-shot timer that runs `request.argv` at its deadline, so a
+    /// driver that exits with a pending deadline is woken at it. Arming the
+    /// same team and deadline twice is still `Armed`. Default: unsupported.
+    fn arm_wake(&self, _request: &WakeRequest) -> WakeOutcome {
+        WakeOutcome::Unsupported
+    }
 }
 
 /// The real host.
@@ -911,79 +976,186 @@ impl Host for SystemHost {
     }
 
     fn run(&self, argv: &[String], cwd: Option<&Path>, timeout: Duration) -> CommandOutcome {
-        let Some((program, arguments)) = argv.split_first() else {
-            return CommandOutcome {
-                stderr: "empty command".to_owned(),
-                ..CommandOutcome::default()
+        run_captured(argv, cwd, timeout, None)
+    }
+
+    fn run_stdin(
+        &self,
+        argv: &[String],
+        cwd: Option<&Path>,
+        timeout: Duration,
+        stdin: &str,
+    ) -> CommandOutcome {
+        run_captured(argv, cwd, timeout, Some(stdin))
+    }
+
+    fn arm_wake(&self, request: &WakeRequest) -> WakeOutcome {
+        if request.team_key.is_empty()
+            || !request
+                .team_key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return WakeOutcome::Failed {
+                detail: "team key is not a plain unit suffix".to_owned(),
             };
-        };
-        let mut command = Command::new(program);
-        command
-            .args(arguments)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some(cwd) = cwd {
-            command.current_dir(cwd);
         }
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                return CommandOutcome {
-                    stderr: format!("cannot run {program}: {error}"),
-                    ..CommandOutcome::default()
-                }
-            }
+        // No answering bus means no timer can be armed; the caller waits
+        // resident, which is always safe, instead of exiting unwoken.
+        let probe = self.run(
+            &strings(&["systemctl", "--user", "show-environment"]),
+            None,
+            Duration::from_secs(15),
+        );
+        if probe.status != Some(0) {
+            return WakeOutcome::NoManager;
+        }
+        let stem = wake_unit_stem(&request.team_key);
+        let timer = format!("{stem}.timer");
+        let service = format!("{stem}.service");
+        // One wake per team: retiring any previous deadline first is what
+        // makes re-arming idempotent instead of cumulative.
+        let _ = self.run(
+            &strings(&["systemctl", "--user", "stop", &timer]),
+            None,
+            Duration::from_secs(30),
+        );
+        let _ = self.run(
+            &strings(&["systemctl", "--user", "reset-failed", &timer, &service]),
+            None,
+            Duration::from_secs(30),
+        );
+        let outcome = self.run(
+            &wake_argv(request, self.now()),
+            None,
+            Duration::from_secs(30),
+        );
+        match outcome.status {
+            Some(0) => WakeOutcome::Armed { unit: timer },
+            _ => WakeOutcome::Failed {
+                detail: first_error_lines(&outcome.stderr),
+            },
+        }
+    }
+}
+
+/// The transient wake unit stem for one team key; the timer is `{stem}.timer`.
+pub(crate) fn wake_unit_stem(team_key: &str) -> String {
+    format!("agentctl-team-wake@{team_key}")
+}
+
+/// The `systemd-run` argv that arms `request`, pure so tests pin it exactly.
+/// The delay is whole seconds from `now`, at least one: a past deadline
+/// still wakes promptly instead of never.
+pub(crate) fn wake_argv(request: &WakeRequest, now: f64) -> Vec<String> {
+    let delay = ((request.deadline_unix - now).ceil() as i64).max(1);
+    let mut argv = vec![
+        "systemd-run".to_owned(),
+        "--user".to_owned(),
+        format!("--on-active={delay}s"),
+        "--unit".to_owned(),
+        wake_unit_stem(&request.team_key),
+    ];
+    argv.extend(request.argv.iter().cloned());
+    argv
+}
+
+fn run_captured(
+    argv: &[String],
+    cwd: Option<&Path>,
+    timeout: Duration,
+    stdin: Option<&str>,
+) -> CommandOutcome {
+    let Some((program, arguments)) = argv.split_first() else {
+        return CommandOutcome {
+            stderr: "empty command".to_owned(),
+            ..CommandOutcome::default()
         };
-        // Drain both pipes while the child runs. Reading only after exit
-        // deadlocks a child that fills a pipe buffer, and keeping only a
-        // tail of the capture corrupts the documents callers parse from
-        // stdout (#1322 slot-bind-status-parse).
-        let stdout_reader = child
-            .stdout
-            .take()
-            .map(|mut pipe| std::thread::spawn(move || drain_capped(&mut pipe)));
-        let stderr_reader = child
-            .stderr
-            .take()
-            .map(|mut pipe| std::thread::spawn(move || drain_capped(&mut pipe)));
-        let deadline = Instant::now() + timeout;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = stdout_reader.map(|reader| reader.join());
-                    let _ = stderr_reader.map(|reader| reader.join());
-                    return CommandOutcome {
-                        stderr: format!("{program} did not finish within {}s", timeout.as_secs()),
-                        ..CommandOutcome::default()
-                    };
-                }
-            }
-        };
-        let stdout = stdout_reader.and_then(|reader| reader.join().ok());
-        let stderr = stderr_reader.and_then(|reader| reader.join().ok());
-        let (stdout, stdout_overflow) = stdout.unwrap_or_default();
-        let (stderr, stderr_overflow) = stderr.unwrap_or_default();
-        if stdout_overflow || stderr_overflow {
-            let stream = if stdout_overflow { "stdout" } else { "stderr" };
+    };
+    let mut command = Command::new(program);
+    command
+        .args(arguments)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
             return CommandOutcome {
+                stderr: format!("cannot run {program}: {error}"),
+                ..CommandOutcome::default()
+            }
+        }
+    };
+    // Feed stdin from its own thread for the same reason both outputs
+    // are drained below: a child that fills a pipe before reading must
+    // never deadlock the writer. A broken pipe just ends the feed.
+    let stdin_writer = match (stdin, child.stdin.take()) {
+        (Some(text), Some(mut pipe)) => {
+            let owned = text.to_owned();
+            Some(std::thread::spawn(move || {
+                let _ = pipe.write_all(owned.as_bytes());
+            }))
+        }
+        _ => None,
+    };
+    // Drain both pipes while the child runs. Reading only after exit
+    // deadlocks a child that fills a pipe buffer, and keeping only a
+    // tail of the capture corrupts the documents callers parse from
+    // stdout (#1322 slot-bind-status-parse).
+    let stdout_reader = child
+        .stdout
+        .take()
+        .map(|mut pipe| std::thread::spawn(move || drain_capped(&mut pipe)));
+    let stderr_reader = child
+        .stderr
+        .take()
+        .map(|mut pipe| std::thread::spawn(move || drain_capped(&mut pipe)));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdin_writer.map(|writer| writer.join());
+                let _ = stdout_reader.map(|reader| reader.join());
+                let _ = stderr_reader.map(|reader| reader.join());
+                return CommandOutcome {
+                    stderr: format!("{program} did not finish within {}s", timeout.as_secs()),
+                    ..CommandOutcome::default()
+                };
+            }
+        }
+    };
+    let _ = stdin_writer.map(|writer| writer.join());
+    let stdout = stdout_reader.and_then(|reader| reader.join().ok());
+    let stderr = stderr_reader.and_then(|reader| reader.join().ok());
+    let (stdout, stdout_overflow) = stdout.unwrap_or_default();
+    let (stderr, stderr_overflow) = stderr.unwrap_or_default();
+    if stdout_overflow || stderr_overflow {
+        let stream = if stdout_overflow { "stdout" } else { "stderr" };
+        return CommandOutcome {
                 stderr: format!(
                     "{program} printed more than {MAX_CAPTURED_OUTPUT} bytes on {stream}; output not captured"
                 ),
                 ..CommandOutcome::default()
             };
-        }
-        CommandOutcome {
-            status: status.code(),
-            stdout: String::from_utf8_lossy(&stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&stderr).into_owned(),
-        }
+    }
+    CommandOutcome {
+        status: status.code(),
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
     }
 }
 
@@ -1116,6 +1288,30 @@ pub fn default_report_dir() -> Option<PathBuf> {
                 .map(|home| PathBuf::from(home).join(".local/state"))
         })
         .map(|state| state.join("agentctl/restore"))
+}
+
+/// The per-team driver key: first 16 hex of the canonical registry path's
+/// SHA-256. It names state directories and wake units without naming any
+/// team, host, or person.
+pub fn team_key(registry: &Path) -> String {
+    let canonical = fs::canonicalize(registry).unwrap_or_else(|_| registry.to_path_buf());
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(canonical.to_string_lossy().as_bytes())
+    );
+    digest[..16].to_owned()
+}
+
+/// One team's driver state directory, `<state>/agentctl/team-drivers/<key>`,
+/// a collection directory of its own. `state_dir` overrides the XDG state
+/// home (fixtures and the driver's `--state-dir`); `None` derives it the
+/// same way as the report directory.
+pub fn team_driver_dir(registry: &Path, state_dir: Option<&Path>) -> Option<PathBuf> {
+    let base = match state_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => default_report_dir()?.parent()?.to_path_buf(),
+    };
+    Some(base.join("team-drivers").join(team_key(registry)))
 }
 
 fn report_path(registry: &Path, config: &RestoreConfig, boot_id: &str) -> PathBuf {
@@ -2219,7 +2415,7 @@ fn systemctl(host: &dyn Host, verb: &str, unit: &str) -> CommandOutcome {
 
 /// The registered names, in either registry layout, sorted; restore's own files never look like
 /// names.
-fn registered_names(registry: &Path) -> Result<Vec<String>> {
+pub(crate) fn registered_names(registry: &Path) -> Result<Vec<String>> {
     let mut names = agent_queue::registry::names(registry)
         .map_err(|error| fail(format!("cannot list {}: {error}", registry.display())))?;
     names.retain(|name| record_path(registry, name).is_some_and(|path| path.is_file()));
@@ -2259,7 +2455,10 @@ fn anchored_boots(registry: &Path, names: &[String]) -> Vec<String> {
 /// An unreadable, unparseable, or lifecycle-less record is undecidable: the caller refuses
 /// it with this evidence instead of silently excluding it, because derivation cannot tell
 /// whether it was running at shutdown.
-fn derived_lifecycle(registry: &Path, name: &str) -> std::result::Result<String, String> {
+pub(crate) fn derived_lifecycle(
+    registry: &Path,
+    name: &str,
+) -> std::result::Result<String, String> {
     let path = record_path(registry, name)
         .ok_or_else(|| format!("{name} has no readable record path in either layout"))?;
     let bytes =

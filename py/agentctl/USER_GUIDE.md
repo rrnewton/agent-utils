@@ -1274,6 +1274,27 @@ certificate fetch itself stays a host step before this command: a thin host
 shim may refresh the certificate and then run `restore-teams`, but holds no
 restore logic of its own.
 
+`agentctl team verify` says whether a restored team really came back, for any
+human or agent to run after an outage:
+
+```sh
+agentctl --registry ~/project/.agentctl team verify
+agentctl --registry ~/project/.agentctl team verify --check-only
+```
+
+It prints schema `agentctl-team-verify/v1` and exits 0 only when no check
+failed. The checks, each with subject, evidence, and fix: `desired-live`
+(every restore-desired agent live, no profile drift), `units-bridges` (each
+`restore.json` unit active; each bridge under `REGISTRY/bridges` passing
+`chat health` with its target present), `queued-not-archived` (no desired
+agent's inbox archived this boot), `watcher-dead-agents` (watch health fresh
+this boot and ok), `pane-at-prompt` (no revived pane stuck behind a dialog;
+the one allowlisted dialog is dismissed and re-read, `--check-only` only
+reports it), and `coordinator-ack` (this boot's restore notice processed in
+the coordinator's queue). A check that cannot apply is `skipped` and says
+why; missing evidence fails. Apart from that one dialog dismiss it writes
+nothing. The team driver runs the same checks as its VERIFY state.
+
 `agentctl watch` runs as a service and, every `--interval` seconds (default 60),
 checks and repairs:
 
