@@ -1827,7 +1827,7 @@ steps:
   # `#1251 scroll-single-owner`: every direct scroll write outside the loop owner (scrollkeep),
   # grouped by adoption path; enforcing for the paths already adopted (P1 keepers/footroom,
   # P2 placement, P3 collapse/fold, P5 shell keys, P6 user jumps, P7 composer/keyboard,
-  # P8 legacy script, P9 reaction overlay); P4 documents and P2N navigation held.
+  # P8 legacy script, P9 reaction overlay); P4 documents held in part (reader adopted).
   - group: check
     job: scroll-writer-guard
     desc: direct scrollTop/scrollTo/scrollBy/scrollIntoView writes outside scrollkeep, enforcing for adopted paths P1, P2, P3, P5, P6, P7, P8 and P9

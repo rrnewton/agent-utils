@@ -271,6 +271,8 @@ export interface PageNavigationDependencies<Column, ThreadLike, Pane> {
   setSearchOpen(open: boolean): void;
   finishPackSlide(): void;
   headOfList(area: HTMLElement, row: HTMLElement): number;
+  /** Put a scroller at a measured position, through the scroll owner (`#1251 scroll-single-owner`). */
+  toPosition(area: HTMLElement, top: number): void;
   renderScrollTools(): void;
   revealRow(row: HTMLElement, center: boolean): void;
   /**
@@ -922,7 +924,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
       }
       const area = deps.leftEl("side-scroll");
       deps.finishPackSlide();
-      area.scrollTop = deps.headOfList(area, card);
+      deps.toPosition(area, deps.headOfList(area, card));
       deps.renderScrollTools();
       deps.setStatus("Here is the linked message's card.");
       return true;

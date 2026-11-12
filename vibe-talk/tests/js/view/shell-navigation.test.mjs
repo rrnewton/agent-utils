@@ -63,6 +63,7 @@ function makeNavigation(state) {
     setLinkedMark: () => {}, cardsCycle: () => false, rowShown: () => true, visibleList: () => ({ children: [] }),
     rowOnScreen: () => true, eachColumn: (act) => act(), openReadRun: () => {}, setSearchOpen: () => {},
     finishPackSlide: () => {}, headOfList: () => 0, renderScrollTools: () => {}, revealRow: () => {},
+    toPosition: (area, top) => { area.scrollTop = top; },
     idsOf: () => [], inAppLinksOn: () => true, channelLabel: (channel) => channel, renderedText: () => "x",
     inThisColumn: (act) => act, captureScroll: () => ({ pinned: true, anchor: null, top: 0 }),
     listPlaceTop: () => 0, sideShowing: () => false, restoreScroll: () => {}, scrollToNewest: () => {},

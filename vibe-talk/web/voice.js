@@ -791,6 +791,7 @@ const shellNavigation = createPageNavigation({
   setSearchOpen: (open) => setSearchOpen(open),
   finishPackSlide: () => finishPackSlide(),
   headOfList: (area, row) => headOfList(area, row),
+  toPosition: (area, top) => scrollKeeping.toPosition(area, top),
   renderScrollTools: () => renderScrollTools(),
   revealRow: (row, center) => revealRow(row, center),
   idsOf: (row) => idsOf(/** @type {any} */ (row)),
