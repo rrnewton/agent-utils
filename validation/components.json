@@ -432,6 +432,7 @@
         "py/wrkslots/tests/test_eden.py",
         "py/wrkslots/tests/test_ensure_states_rust.py",
         "py/wrkslots/tests/test_event_memo.py",
+        "py/wrkslots/tests/test_finish_accounting.py",
         "py/wrkslots/tests/test_finish_write_rust.py",
         "py/wrkslots/tests/test_freeze_rust.py",
         "py/wrkslots/tests/test_frozen_parser_closure.py",

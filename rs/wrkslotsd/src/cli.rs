@@ -1249,6 +1249,9 @@ pub(crate) enum Lifecycle {
         /// Known limitation to retain (repeatable)
         #[arg(long, value_name = "TEXT")]
         limitation: Vec<String>,
+        /// Finish despite unaccounted commits: bundle and record them (#1364)
+        #[arg(long)]
+        discard_unaccounted: bool,
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
         #[arg(long, value_name = "DIR")]
         root: Option<PathBuf>,
@@ -1450,7 +1453,7 @@ const QUICKSTART: &str = r##"wrkslots manages durable agent and validation workt
      wrkslots heartbeat slot01 \
        --agent codex-1 --owner-pid "$OWNER_PID" --expected-generation 1
 
-4. Before exiting, the owner may record a clean, published handoff. This retains the slot.
+4. Before exiting, the owner may record a clean handoff. Finish accounts for every branch commit (landed, open, or unaccounted) and refuses while any is unaccounted. This retains the slot.
 
      wrkslots write-handoff slot01 \
        --agent codex-1 --owner-pid "$OWNER_PID" --expected-generation 1 \
@@ -3577,6 +3580,7 @@ pub fn run() -> u8 {
                 expected_generation,
                 validation,
                 limitation,
+                discard_unaccounted,
                 root,
                 machine,
             } => {
@@ -3589,6 +3593,7 @@ pub fn run() -> u8 {
                     expected_generation,
                     &validation,
                     &limitation,
+                    discard_unaccounted,
                 ) {
                     Ok(value) => {
                         println!(

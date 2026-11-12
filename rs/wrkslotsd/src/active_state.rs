@@ -248,9 +248,22 @@ fn handoff_from_obj(value: &Value, label: &str) -> Result<()> {
     exact_keys(
         raw,
         &["recorded_at", "validation", "limitations", "continuation"],
-        &[],
+        &["discarded_unaccounted"],
         label,
     )?;
+    if let Some(discarded) = raw.get("discarded_unaccounted") {
+        for (index, item) in as_list(discarded, &format!("{label}.discarded_unaccounted"))?
+            .iter()
+            .enumerate()
+        {
+            let sha = as_str(item, &format!("{label}.discarded_unaccounted[{index}]"))?;
+            if !is_sha(sha) {
+                return Err(format!(
+                    "{label}.discarded_unaccounted holds an invalid commit: {sha:?}"
+                ));
+            }
+        }
+    }
     let recorded_at = as_str(&raw["recorded_at"], &format!("{label}.recorded_at"))?;
     parse_timestamp(recorded_at, &format!("{label}.recorded_at"))?;
     let validation = as_list(&raw["validation"], &format!("{label}.validation"))?;

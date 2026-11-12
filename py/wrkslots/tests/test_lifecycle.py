@@ -15073,7 +15073,8 @@ def test_finish_refuses_local_only_commit_without_deleting(tmp_path: Path) -> No
     refused = finish(project)
 
     assert refused.returncode == 3
-    assert "not reachable from any refs/remotes/origin" in refused.stderr
+    assert "has unaccounted commits" in refused.stderr
+    assert "unaccounted=1" in refused.stderr
     assert tree.is_dir()
     assert len(active_slots(project)) == 1
 
@@ -15097,12 +15098,12 @@ def test_forged_local_remote_tracking_refs_do_not_prove_publication(
     refused = finish(project)
 
     assert refused.returncode == 3
-    assert "not reachable from any refs/remotes/origin" in refused.stderr
+    assert "has unaccounted commits" in refused.stderr
     assert tree.is_dir()
     assert len(active_slots(project)) == 1
 
 
-def test_pushed_but_unmerged_branch_is_not_landed(tmp_path: Path) -> None:
+def test_pushed_but_unmerged_branch_is_open(tmp_path: Path) -> None:
     project, _repository, _remote = make_project(tmp_path)
     made = create(project)
     assert made.returncode == 0, made.stderr
@@ -15114,10 +15115,11 @@ def test_pushed_but_unmerged_branch_is_not_landed(tmp_path: Path) -> None:
     git(tree, "commit", "-m", "pushed only")
     git(tree, "push", "-u", "origin", "codex/task")
 
-    refused = finish(project)
+    finished = finish(project)
 
-    assert refused.returncode == 3
-    assert "not an ancestor of configured landed ref" in refused.stderr
+    # Published but unmerged work is open, hence accounted (#1364).
+    assert finished.returncode == 0, finished.stderr
+    assert "accounting landed=0 open=1 unaccounted=0" in finished.stdout
     assert tree.is_dir()
     assert len(active_slots(project)) == 1
 
@@ -15142,10 +15144,13 @@ def test_active_state_cannot_redirect_landed_authority_to_task_branch(
     )
     active_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 
-    refused = finish(project)
+    finished = finish(project)
 
-    assert refused.returncode == 3
-    assert "not an ancestor of configured landed ref refs/remotes/origin/main" in refused.stderr
+    # The tampered row cannot redirect authority: the replayed record
+    # still names refs/remotes/origin/main, so the pushed commit counts
+    # as open, never landed (#1364).
+    assert finished.returncode == 0, finished.stderr
+    assert "accounting landed=0 open=1 unaccounted=0" in finished.stdout
     assert tree.is_dir()
     assert len(active_slots(project)) == 1
 

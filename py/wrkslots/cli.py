@@ -1385,6 +1385,8 @@ class Handoff:
     validation: tuple[str, ...]
     limitations: tuple[str, ...]
     continuation: str
+    #: Commits finish discarded under --discard-unaccounted (#1364), full SHAs.
+    discarded_unaccounted: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -7114,12 +7116,15 @@ def _identity_from_obj(value: object, label: str) -> ProcessIdentity | None:
 def _handoff_to_obj(handoff: Handoff | None) -> object:
     if handoff is None:
         return None
-    return {
+    value: dict[str, object] = {
         "recorded_at": handoff.recorded_at,
         "validation": list(handoff.validation),
         "limitations": list(handoff.limitations),
         "continuation": handoff.continuation,
     }
+    if handoff.discarded_unaccounted:
+        value["discarded_unaccounted"] = list(handoff.discarded_unaccounted)
+    return value
 
 
 def _handoff_from_obj(value: object, label: str) -> Handoff | None:
@@ -7129,7 +7134,7 @@ def _handoff_from_obj(value: object, label: str) -> Handoff | None:
     _exact_keys(
         raw,
         {"recorded_at", "validation", "limitations", "continuation"},
-        set(),
+        {"discarded_unaccounted"},
         label,
     )
     recorded_at = _as_str(raw["recorded_at"], f"{label}.recorded_at")
@@ -7145,7 +7150,16 @@ def _handoff_from_obj(value: object, label: str) -> Handoff | None:
     continuation = _as_str(raw["continuation"], f"{label}.continuation")
     if not validation or not continuation:
         raise StateError(f"{label} requires validation evidence and an exact continuation")
-    return Handoff(recorded_at, validation, limitations, continuation)
+    discarded = tuple(
+        _as_str(item, f"{label}.discarded_unaccounted[{index}]")
+        for index, item in enumerate(
+            _as_list(raw.get("discarded_unaccounted", []), f"{label}.discarded_unaccounted")
+        )
+    )
+    for sha in discarded:
+        if not SHA_RE.fullmatch(sha):
+            raise StateError(f"{label}.discarded_unaccounted holds an invalid commit: {sha!r}")
+    return Handoff(recorded_at, validation, limitations, continuation, discarded)
 
 
 def _handoff_artifact_to_obj(artifact: _HandoffArtifact) -> dict[str, object]:
@@ -20351,6 +20365,49 @@ class _GitVcs:
         )
         return tuple(dict.fromkeys(path for path in result.stdout.split("\x00") if path))
 
+    def rev_list(self, checkout: Path, *revisions: str) -> tuple[str, ...]:
+        result = self._run(checkout, ["rev-list", *revisions])
+        return tuple(line for line in result.stdout.splitlines() if line)
+
+    def commit_subject(self, checkout: Path, commit: str) -> str:
+        if not SHA_RE.fullmatch(commit):
+            raise Refusal(f"cannot read subject for invalid commit {commit!r}")
+        result = self._run(
+            checkout, ["show", "-s", "--format=%s", commit]
+        )
+        return result.stdout.strip()
+
+    def merge_base(self, checkout: Path, first: str, second: str) -> str | None:
+        result = self._run(
+            checkout, ["merge-base", first, second], check=False
+        )
+        if result.returncode not in (0, 1):
+            raise Refusal(
+                f"cannot find a merge base in {checkout}" + _git_failure_detail(result)
+            )
+        value = result.stdout.strip()
+        return value if SHA_RE.fullmatch(value) else None
+
+    def patch_equivalents(
+        self, checkout: Path, upstream: str, head: str
+    ) -> frozenset[str]:
+        """Commits in ``head`` whose patch-id already appears in ``upstream``.
+
+        This is Git's own patch-id equivalence (``git cherry``): a commit
+        replayed under another SHA, by cherry-pick, rebase, or squash, is
+        reported equivalent, while a commit with no counterpart is not.
+        """
+        self.verify_ref(checkout, upstream, "upstream ref")
+        self.verify_ref(checkout, head, "head ref")
+        result = self._run(checkout, ["cherry", upstream, head])
+        equivalents: set[str] = set()
+        for line in result.stdout.splitlines():
+            sign, _, sha = line.partition(" ")
+            sha = sha.strip()
+            if sign == "-" and SHA_RE.fullmatch(sha):
+                equivalents.add(sha)
+        return frozenset(equivalents)
+
     def is_ancestor(self, checkout: Path, ancestor: str, descendant: str) -> bool:
         self.verify_ref(checkout, descendant, "landed ref")
         result = self._run(
@@ -26025,6 +26082,142 @@ def _unpushed_evidence(
     }
 
 
+def _classify_checkout_commits(
+    checkout: Checkout,
+    path: Path,
+    head: str,
+    vcs: _GitVcs,
+    *,
+    base: str | None,
+) -> dict[str, object]:
+    """Classify every branch commit of one checkout (#1364).
+
+    Candidates are the commits on the checkout's branch since ``base``
+    (the recorded start point, or the merge base with the landed ref).
+    Each candidate is landed when its exact SHA is an ancestor of the
+    configured landed ref or its patch-id already appears there
+    (``patch_equivalents``; a replay under another SHA), open when its
+    exact SHA is contained in a published remote-tracking ref (the same
+    containment ``unpushed`` reports) or its patch-id appears on one,
+    and unaccounted otherwise.
+    """
+    landed_ref = checkout.landed_ref
+    if base is not None and SHA_RE.fullmatch(base) and vcs.is_ancestor(path, base, head):
+        candidates = vcs.rev_list(path, f"{base}..{head}")
+    else:
+        merge_base = vcs.merge_base(path, head, landed_ref)
+        candidates = (
+            vcs.rev_list(path, f"{merge_base}..{head}")
+            if merge_base is not None
+            else vcs.rev_list(path, head)
+        )
+    landed_equivalents = vcs.patch_equivalents(path, landed_ref, head)
+    published = vcs._run(
+        path,
+        ["for-each-ref", "--format=%(refname)", f"refs/remotes/{checkout.remote}/"],
+    ).stdout.splitlines()
+    open_equivalents: set[str] = set()
+    for ref in published:
+        ref = ref.strip()
+        if ref:
+            open_equivalents |= vcs.patch_equivalents(path, ref, head)
+    landed: list[tuple[str, str]] = []
+    opened: list[tuple[str, str]] = []
+    unaccounted: list[tuple[str, str]] = []
+    subjects: dict[str, str] = {}
+    for commit in candidates:
+        subject = subjects.setdefault(commit, vcs.commit_subject(path, commit))
+        if vcs.is_ancestor(path, commit, landed_ref) or commit in landed_equivalents:
+            landed.append((commit, subject))
+        elif vcs.remote_refs_containing(path, checkout.remote, commit) or (
+            commit in open_equivalents
+        ):
+            opened.append((commit, subject))
+        else:
+            unaccounted.append((commit, subject))
+    return {
+        "checkout": checkout.name,
+        "head": head,
+        "landed": landed,
+        "open": opened,
+        "unaccounted": unaccounted,
+    }
+
+
+def _accounting_totals(
+    entries: Sequence[Mapping[str, object]],
+) -> tuple[int, int, list[tuple[str, str]]]:
+    """Deduplicated (landed, open, unaccounted) totals over accounting entries."""
+    landed: set[str] = set()
+    opened: set[str] = set()
+    unaccounted: dict[str, str] = {}
+    for entry in entries:
+        for sha, _subject in _as_commit_pairs(entry["landed"]):
+            landed.add(sha)
+        for sha, _subject in _as_commit_pairs(entry["open"]):
+            opened.add(sha)
+        for sha, subject in _as_commit_pairs(entry["unaccounted"]):
+            unaccounted.setdefault(sha, subject)
+    # A commit counted landed or open anywhere is accounted everywhere.
+    opened -= landed
+    for sha in landed | opened:
+        unaccounted.pop(sha, None)
+    return len(landed), len(opened), sorted(unaccounted.items())
+
+
+def _as_commit_pairs(value: object) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                pairs.append((str(item[0]), str(item[1])))
+    return pairs
+
+
+def _status_outside_paths(status: str, prefixes: Sequence[str]) -> str:
+    """Drop porcelain-v2 status lines whose path lies under a prefix.
+
+    Used to keep a nested linked worktree (itself a checkout boundary)
+    from reading as dirt in its enclosing checkout (#1364).
+    """
+    kept: list[str] = []
+    for line in status.splitlines():
+        path: str | None = None
+        if line.startswith(("? ", "! ")):
+            path = line[2:]
+        elif line.startswith(("1 ", "2 ")):
+            parts = line.split(" ", 8)
+            if len(parts) == 9:
+                path = parts[8].split("\t")[0]
+        elif line.startswith("u "):
+            parts = line.split(" ", 10)
+            if len(parts) == 11:
+                path = parts[10].split("\t")[0]
+        if path is not None and any(
+            path == prefix or path.startswith(prefix.rstrip("/") + "/")
+            for prefix in prefixes
+        ):
+            continue
+        kept.append(line)
+    return "\n".join(kept) + ("\n" if kept else "")
+
+
+def _accounting_refusal(slot: str, entries: Sequence[Mapping[str, object]]) -> str:
+    landed_count, open_count, unaccounted = _accounting_totals(entries)
+    lines = [
+        f"slot {slot} has unaccounted commits: "
+        f"accounting landed={landed_count} open={open_count} "
+        f"unaccounted={len(unaccounted)}"
+    ]
+    for sha, subject in unaccounted:
+        lines.append(f"unaccounted {sha} {subject}")
+    lines.append(
+        "publish or land every commit, or rerun finish with "
+        "--discard-unaccounted to record and discard them"
+    )
+    return "\n".join(lines)
+
+
 def _unpushed_refusal(checkout: Checkout, path: Path, head: str, vcs: _GitVcs) -> str:
     evidence = _unpushed_evidence(checkout, path, head, vcs)
     same_named_ref = evidence["same_named_remote_ref"]
@@ -26140,6 +26333,8 @@ def _assert_checkout_safe(
     vcs: _GitVcs,
     *,
     refresh_remote: bool = True,
+    accounting: bool = False,
+    accounting_sink: list[dict[str, object]] | None = None,
 ) -> Checkout:
     if checkout.vcs == "eden":
         return _assert_eden_checkout_safe(config, checkout)
@@ -26166,6 +26361,17 @@ def _assert_checkout_safe(
         _cache_globs_for(config, checkout.name),
     )
     status = vcs.status(path, _cache_globs_for(config, checkout.name))
+    if status and accounting:
+        # A nested linked worktree is a checkout boundary, not dirt: its
+        # own commits are accounted separately (#1364).
+        nested_prefixes = [
+            listed.absolute().relative_to(path.absolute()).as_posix()
+            for listed in vcs.listed_worktrees(repository)
+            if listed.absolute() != path.absolute()
+            and _path_is_within(listed.absolute(), path.absolute())
+        ]
+        if nested_prefixes:
+            status = _status_outside_paths(status, nested_prefixes)
     if status:
         first = status.splitlines()[0]
         raise Refusal(
@@ -26187,6 +26393,21 @@ def _assert_checkout_safe(
         )
         vcs.assert_remote_authority(path, checkout.remote, remote_authority)
     remote_refs = vcs.remote_refs_containing(path, checkout.remote, head)
+    if accounting:
+        # Per-commit accounting (#1364) replaces the HEAD-only gates: every
+        # branch commit must be landed, open, or explicitly discarded by
+        # the caller, who judges the collected entries. The unpushed
+        # containment above is reused verbatim for the open class.
+        entry = _classify_checkout_commits(
+            checkout, path, head, vcs, base=checkout.start_point
+        )
+        if accounting_sink is not None:
+            accounting_sink.append(entry)
+        return dataclasses.replace(
+            checkout,
+            head=head,
+            containing_remote_refs=remote_refs,
+        )
     if not remote_refs:
         raise Refusal(_unpushed_refusal(checkout, path, head, vcs))
     if not vcs.is_ancestor(path, head, checkout.landed_ref):
@@ -32797,21 +33018,72 @@ def _owner_release_states(
     return found
 
 
+def _nested_worktree_accounting(
+    config: Config,
+    record: ActiveRecord,
+    slot_path: Path,
+    vcs: _GitVcs,
+    sink: list[dict[str, object]],
+) -> None:
+    """Classify commits of linked worktrees nested in the slot (#1364).
+
+    Wrkslots knows a nested worktree exactly when Git lists it for one of
+    the slot's recorded repositories and its path lies inside the slot.
+    Each such tip is classified against that repository's landed ref.
+    """
+    recorded = {
+        _stored_path(config, item.path, "checkout path").absolute()
+        for item in record.checkouts
+    }
+    for checkout in record.checkouts:
+        _relative, repository = _stored_repository_path(config, checkout.repository)
+        for listed in sorted(vcs.listed_worktrees(repository)):
+            if listed.absolute() in recorded:
+                continue
+            if not _path_is_within(listed.absolute(), slot_path.absolute()):
+                continue
+            head = vcs.head(listed)
+            try:
+                branch = vcs.branch(listed)
+            except Refusal:
+                branch = "HEAD"
+            nested = dataclasses.replace(
+                checkout,
+                name=f"{checkout.name}+nested:{listed.name}",
+                branch=branch,
+                head=head,
+            )
+            entry = _classify_checkout_commits(nested, listed, head, vcs, base=None)
+            entry["bundle_ref"] = (
+                "HEAD" if branch == "HEAD" else f"refs/heads/{branch}"
+            )
+            sink.append(entry)
+
+
 def _handoff_preconditions(
     config: Config,
     record: ActiveRecord,
     vcs: _GitVcs,
     *,
     refresh_remote: bool = True,
+    accounting: bool = False,
+    accounting_sink: list[dict[str, object]] | None = None,
 ) -> tuple[Path, tuple[Checkout, ...]]:
     _assert_record_paths(config, record)
     slot_path = _assert_slot_contents(config, record)
     final_checkouts = tuple(
         _assert_checkout_safe(
-            config, item, vcs, refresh_remote=refresh_remote
+            config,
+            item,
+            vcs,
+            refresh_remote=refresh_remote,
+            accounting=accounting,
+            accounting_sink=accounting_sink,
         )
         for item in record.checkouts
     )
+    if accounting and accounting_sink is not None:
+        _nested_worktree_accounting(config, record, slot_path, vcs, accounting_sink)
     return slot_path, final_checkouts
 
 
@@ -32828,8 +33100,28 @@ def _remove_preconditions(
         raise Refusal(
             f"slot {record.slot} has no owner-alive handoff; preserve it and record one before removal"
         )
-    slot_path, final_checkouts = _handoff_preconditions(config, record, vcs)
-    if final_checkouts != record.checkouts:
+    # Recheck with finish's per-commit accounting (#1364): commits the
+    # handoff discarded stay discarded; every other branch commit must
+    # still be landed or open. Containing remote refs legitimately move
+    # as pull requests land and branches are deleted, so identity is the
+    # checkout heads, not the recorded containment.
+    accounting_sink: list[dict[str, object]] = []
+    slot_path, final_checkouts = _handoff_preconditions(
+        config, record, vcs, accounting=True, accounting_sink=accounting_sink
+    )
+    _landed, _opened, unaccounted = _accounting_totals(accounting_sink)
+    allowed = frozenset(record.handoff.discarded_unaccounted)
+    remaining = [(sha, subject) for sha, subject in unaccounted if sha not in allowed]
+    if remaining:
+        raise Refusal(
+            _accounting_refusal(record.slot, accounting_sink)
+            + "\nstate: REFUSED -- no checkout was salvaged or removed. "
+            "remedy: land or publish the named commits, or record a fresh "
+            "handoff whose accounting discards them"
+        )
+    if [item.head for item in final_checkouts] != [
+        item.head for item in record.checkouts
+    ]:
         raise Refusal(
             f"slot {record.slot} changed after its handoff was recorded; preserve it for inspection"
         )
@@ -51873,13 +52165,79 @@ def _cmd_finish(args: argparse.Namespace) -> int:
             record,
             action="finish",
         )
-        _assert_command_registry_storage(config, states, args)
+        # Nested linked worktrees of this slot are finish's business: it
+        # accounts for their commits below instead of refusing (#1364).
+        _assert_command_registry_storage(
+            config, states, args, tolerate_target_git_registrations=True
+        )
         before = _global_rows(states, archives)
         if record.handoff is not None:
             raise Refusal(f"slot {record.slot} already has a recorded handoff")
+        discard = bool(getattr(args, "discard_unaccounted", False))
+        accounting_sink: list[dict[str, object]] = []
+        vcs = _GitVcs()
         _slot_path, final_checkouts = _handoff_preconditions(
-            config, record, _GitVcs()
+            config, record, vcs, accounting=True, accounting_sink=accounting_sink
         )
+        landed_count, open_count, unaccounted = _accounting_totals(accounting_sink)
+        discarded: tuple[str, ...] = ()
+        bundle_paths: list[str] = []
+        if unaccounted and not discard:
+            message = _accounting_refusal(record.slot, accounting_sink)
+            # Keep the unpushed two-readings diagnostic for an unaccounted
+            # HEAD, exactly as `wrkslots unpushed` phrases it.
+            bad_heads = {sha for sha, _subject in unaccounted}
+            for final in final_checkouts:
+                if final.head in bad_heads:
+                    path = _stored_path(config, final.path, "checkout path")
+                    message += "\n" + _unpushed_refusal(final, path, final.head, vcs)
+            raise Refusal(message)
+        if unaccounted and discard:
+            # Preserve the discarded history before recording the discard,
+            # in the same local salvage archive removal uses (#1364).
+            discarded = tuple(sha for sha, _subject in unaccounted)
+            unaccounted_shas = frozenset(discarded)
+            archive_dir = config.control / _LOCAL_SALVAGE_DIRECTORY
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            for final in final_checkouts:
+                entries = [
+                    item
+                    for item in accounting_sink
+                    if item["checkout"] == final.name
+                    or str(item["checkout"]).startswith(f"{final.name}+nested:")
+                ]
+                bad = [
+                    sha
+                    for item in entries
+                    for sha, _subject in _as_commit_pairs(item["unaccounted"])
+                    if sha in unaccounted_shas
+                ]
+                if not bad:
+                    continue
+                path = _stored_path(config, final.path, "checkout path")
+                bundle = (
+                    archive_dir
+                    / f"finish-{record.slot}-{final.name}-{record.generation}.bundle"
+                )
+                if bundle.exists():
+                    bundle.unlink()
+                positives = ["HEAD"] + [
+                    str(item["bundle_ref"])
+                    for item in entries
+                    if "bundle_ref" in item
+                ]
+                vcs._run(
+                    path,
+                    [
+                        "bundle",
+                        "create",
+                        str(bundle),
+                        *positives,
+                        f"^{final.landed_ref}",
+                    ],
+                )
+                vcs._run(path, ["bundle", "verify", str(bundle)])
+                bundle_paths.append(str(bundle))
         continuation = (
             f"wrkslots remove {record.slot} --coordinator-pid "
             f"<current-coordinator-pid> --expected-generation {record.generation}"
@@ -51892,6 +52250,7 @@ def _cmd_finish(args: argparse.Namespace) -> int:
                 validation=validation,
                 limitations=limitations,
                 continuation=continuation,
+                discarded_unaccounted=discarded,
             ),
         )
         _write_active_state(
@@ -51899,7 +52258,16 @@ def _cmd_finish(args: argparse.Namespace) -> int:
             _replace_record(state, updated),
             action="handoff-recorded",
             slot=updated.slot,
-            evidence={"validation": list(validation)},
+            evidence={
+                "validation": list(validation),
+                "accounting": {
+                    "landed": landed_count,
+                    "open": open_count,
+                    "unaccounted": len(unaccounted),
+                    "discarded_unaccounted": list(discarded),
+                    "discard_bundles": bundle_paths,
+                },
+            },
         )
         _interrupt_for_test("after-handoff-write")
         after_states, after_archives = _validate_global_state(config)
@@ -51908,6 +52276,14 @@ def _cmd_finish(args: argparse.Namespace) -> int:
             _global_rows(after_states, after_archives),
             args.slot,
         )
+    print(
+        f"accounting landed={landed_count} open={open_count} "
+        f"unaccounted={len(unaccounted)}"
+    )
+    for sha, subject in unaccounted:
+        print(f"unaccounted {sha} {subject}")
+    for bundle_path in bundle_paths:
+        print(f"discard_bundle={bundle_path}")
     print(
         f"recorded handoff slot={record.slot} generation={record.generation}; "
         "physical storage retained"
@@ -80538,7 +80914,7 @@ wrkslots manages durable agent and validation worktree slots.
      wrkslots heartbeat slot01 \\
        --agent codex-1 --owner-pid "$OWNER_PID" --expected-generation 1
 
-4. Before exiting, the owner may record a clean, published handoff. This retains the slot.
+4. Before exiting, the owner may record a clean handoff. Finish accounts for every branch commit (landed, open, or unaccounted) and refuses while any is unaccounted. This retains the slot.
 
      wrkslots write-handoff slot01 \\
        --agent codex-1 --owner-pid "$OWNER_PID" --expected-generation 1 \\
@@ -82577,9 +82953,13 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "finish",
         help="record a clean, published owner handoff",
         description=(
-            "Run while the recorded owner is still alive. Verify every checkout is clean, has no "
-            "unfinished Git operation, is published to its recorded remote, and is contained by "
-            "the landed ref; then retain the slot and record the handoff. finish never deletes."
+            "Run while the recorded owner is still alive. Verify every checkout is clean and has "
+            "no unfinished Git operation, then account for every commit on the slot's branches "
+            "and nested worktrees: landed (exact SHA or same patch-id on the landed ref), open "
+            "(published to a remote-tracking ref), or unaccounted. Finish refuses while anything "
+            "is unaccounted unless --discard-unaccounted records the discarded SHAs in the "
+            "handoff and bundles their history into the local salvage archive; then retain the "
+            "slot and record the handoff. finish never deletes."
         ),
         formatter_class=_HelpFormatter,
     )
@@ -82611,6 +82991,14 @@ usage or audit gate unknown, 3 fail-closed refusal.
         action="append",
         metavar="TEXT",
         help="known limitation to retain (repeatable)",
+    )
+    finish.add_argument(
+        "--discard-unaccounted",
+        action="store_true",
+        help=(
+            "finish even though commits are neither landed nor published: bundle their "
+            "history into the local salvage archive and record their SHAs in the handoff"
+        ),
     )
     finish.set_defaults(handler=_cmd_finish)
 

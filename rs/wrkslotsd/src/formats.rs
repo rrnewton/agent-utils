@@ -84,6 +84,9 @@ pub struct HandoffSummary {
     pub limitations: Vec<String>,
     /// Exact continuation instructions.
     pub continuation: String,
+    /// Commits finish discarded under --discard-unaccounted (#1364).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discarded_unaccounted: Vec<String>,
 }
 
 /// Where an imported record came from.

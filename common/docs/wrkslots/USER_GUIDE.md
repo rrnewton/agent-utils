@@ -32,9 +32,13 @@ type, task and purpose, owner process identity, coordinator history, heartbeat t
    agent supplies its own `--owner-pid`. The flag is a reminder and recorded provenance, not a
    permission boundary between same-user processes.
 3. The exact owner runs `heartbeat` to renew the slot while work continues.
-4. An owner that has clean, published work may run `finish` to record validation and continuation
-   evidence. A departed owner is not required to return: later reclaim can salvage from the recorded
-   checkout state.
+4. An owner that has clean work may run `finish` to record validation and continuation
+   evidence. Finish accounts for every commit on the slot's branches and nested worktrees:
+   landed (exact SHA or same patch-id on the landed ref), open (published to a remote-tracking
+   ref), or unaccounted, printing the counts and any unaccounted SHAs. It refuses while anything
+   is unaccounted unless `--discard-unaccounted` bundles the discarded history into the local
+   salvage archive and records the SHAs in the handoff. A departed owner is not required to
+   return: later reclaim can salvage from the recorded checkout state.
 5. Any later participant may run `remove`. Reclaim proceeds only when the heartbeat time-to-live is
    expired, the row's liveness authority reports dead (the registered running command for an agent
    slot, the validation run's own evidence for a validation slot; see "Time-to-live and process

@@ -207,6 +207,13 @@
           "description": "Exact continuation instructions.",
           "type": "string"
         },
+        "discarded_unaccounted": {
+          "description": "Commits finish discarded under --discard-unaccounted (#1364).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "limitations": {
           "description": "Known limitations.",
           "items": {

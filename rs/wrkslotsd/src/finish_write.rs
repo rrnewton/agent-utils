@@ -945,6 +945,217 @@ pub(crate) fn fetch_remote(
     Ok(())
 }
 
+/// One checkout's (or nested worktree's) commit accounting (#1364).
+pub(crate) struct AccountingEntry {
+    pub(crate) checkout: String,
+    pub(crate) landed: Vec<(String, String)>,
+    pub(crate) opened: Vec<(String, String)>,
+    pub(crate) unaccounted: Vec<(String, String)>,
+    pub(crate) bundle_ref: Option<String>,
+}
+
+fn listed_worktrees(repository: &Path) -> Result<Vec<PathBuf>> {
+    let listing = git(repository, &["worktree", "list", "--porcelain"])?;
+    let mut paths = Vec::new();
+    for line in listing.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            paths.push(PathBuf::from(path.trim()));
+        }
+    }
+    Ok(paths)
+}
+
+fn is_ancestor(path: &Path, ancestor: &str, descendant: &str) -> Result<bool> {
+    let result = git_run(
+        path,
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+        false,
+    )?;
+    if result.code != 0 && result.code != 1 {
+        return Err(format!(
+            "cannot compare {ancestor} with {descendant}: {}",
+            result.stderr.trim()
+        ));
+    }
+    Ok(result.code == 0)
+}
+
+fn patch_equivalents(
+    path: &Path,
+    upstream: &str,
+    head: &str,
+) -> Result<std::collections::HashSet<String>> {
+    // Git's own patch-id equivalence (`git cherry`), as in the Python edition.
+    let output = git(path, &["cherry", upstream, head])?;
+    let mut found = std::collections::HashSet::new();
+    for line in output.lines() {
+        if let Some(sha) = line.strip_prefix("- ") {
+            let sha = sha.trim();
+            if is_sha(sha) {
+                found.insert(sha.to_string());
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn classify_commits(
+    name: &str,
+    path: &Path,
+    remote: &str,
+    landed_ref: &str,
+    head: &str,
+    base: Option<&str>,
+) -> Result<AccountingEntry> {
+    let candidates: Vec<String> = match base {
+        Some(start) if is_sha(start) && is_ancestor(path, start, head)? => {
+            git(path, &["rev-list", &format!("{start}..{head}")])?
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect()
+        }
+        _ => {
+            let merge_base = git_run(path, &["merge-base", head, landed_ref], false)?;
+            let base_sha = merge_base.stdout.trim().to_string();
+            if merge_base.code == 0 && is_sha(&base_sha) {
+                git(path, &["rev-list", &format!("{base_sha}..{head}")])?
+                    .lines()
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            } else {
+                git(path, &["rev-list", head])?
+                    .lines()
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            }
+        }
+    };
+    let landed_eq = patch_equivalents(path, landed_ref, head)?;
+    let published = git(
+        path,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            &format!("refs/remotes/{remote}/"),
+        ],
+    )?;
+    let mut open_eq = std::collections::HashSet::new();
+    for reference in published.lines().filter(|line| !line.is_empty()) {
+        open_eq.extend(patch_equivalents(path, reference.trim(), head)?);
+    }
+    let mut entry = AccountingEntry {
+        checkout: name.to_string(),
+        landed: Vec::new(),
+        opened: Vec::new(),
+        unaccounted: Vec::new(),
+        bundle_ref: None,
+    };
+    for commit in candidates {
+        let subject = git(path, &["show", "-s", "--format=%s", &commit])?
+            .trim()
+            .to_string();
+        let containing = git(
+            path,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "--contains",
+                &commit,
+                &format!("refs/remotes/{remote}/"),
+            ],
+        )?;
+        if is_ancestor(path, &commit, landed_ref)? || landed_eq.contains(&commit) {
+            entry.landed.push((commit, subject));
+        } else if containing.lines().any(|line| !line.is_empty()) || open_eq.contains(&commit) {
+            entry.opened.push((commit, subject));
+        } else {
+            entry.unaccounted.push((commit, subject));
+        }
+    }
+    Ok(entry)
+}
+
+/// Deduplicated (landed, open, unaccounted) totals, as in the Python edition.
+pub(crate) fn accounting_totals(
+    entries: &[AccountingEntry],
+) -> (usize, usize, Vec<(String, String)>) {
+    let mut landed = std::collections::HashSet::new();
+    let mut opened = std::collections::HashSet::new();
+    let mut unaccounted: Vec<(String, String)> = Vec::new();
+    for entry in entries {
+        for (sha, _) in &entry.landed {
+            landed.insert(sha.clone());
+        }
+        for (sha, _) in &entry.opened {
+            opened.insert(sha.clone());
+        }
+        for pair in &entry.unaccounted {
+            if !unaccounted.iter().any(|(sha, _)| sha == &pair.0) {
+                unaccounted.push(pair.clone());
+            }
+        }
+    }
+    for sha in landed.union(&opened).collect::<Vec<_>>() {
+        unaccounted.retain(|(item, _)| item != sha);
+    }
+    let opened_only = opened.difference(&landed).count();
+    unaccounted.sort();
+    (landed.len(), opened_only, unaccounted)
+}
+
+pub(crate) fn accounting_refusal(slot: &str, entries: &[AccountingEntry]) -> String {
+    let (landed, opened, unaccounted) = accounting_totals(entries);
+    let mut text = format!(
+        "slot {slot} has unaccounted commits: accounting landed={landed} open={opened} unaccounted={}",
+        unaccounted.len()
+    );
+    for (sha, subject) in &unaccounted {
+        text.push_str(&format!("\nunaccounted {sha} {subject}"));
+    }
+    text.push_str("\npublish or land every commit, or rerun finish with --discard-unaccounted to record and discard them");
+    text
+}
+
+fn status_outside_paths(status: &str, prefixes: &[String]) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    for line in status.lines() {
+        let path: Option<String> =
+            if let Some(rest) = line.strip_prefix("? ").or_else(|| line.strip_prefix("! ")) {
+                Some(rest.to_string())
+            } else if line.starts_with("1 ") || line.starts_with("2 ") {
+                line.splitn(9, ' ')
+                    .nth(8)
+                    .map(|value| value.split('\t').next().unwrap_or_default().to_string())
+            } else if line.starts_with("u ") {
+                line.splitn(11, ' ')
+                    .nth(10)
+                    .map(|value| value.split('\t').next().unwrap_or_default().to_string())
+            } else {
+                None
+            };
+        let inside = path
+            .as_deref()
+            .map(|candidate| {
+                prefixes.iter().any(|prefix| {
+                    candidate == prefix
+                        || candidate.starts_with(&format!("{}/", prefix.trim_end_matches('/')))
+                })
+            })
+            .unwrap_or(false);
+        if !inside {
+            kept.push(line);
+        }
+    }
+    if kept.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", kept.join("\n"))
+    }
+}
+
 fn unpushed_refusal(checkout_path: &Path, checkout: &Value, head: &str) -> Result<String> {
     let name = checkout
         .get("name")
@@ -1029,6 +1240,16 @@ pub(crate) fn assert_checkout_safe(
     config: &Value,
     checkout: &Value,
     repository: &Path,
+) -> Result<Value> {
+    assert_checkout_safe_accounting(cfg, config, checkout, repository, None)
+}
+
+pub(crate) fn assert_checkout_safe_accounting(
+    cfg: &Cfg,
+    config: &Value,
+    checkout: &Value,
+    repository: &Path,
+    accounting: Option<&mut Vec<AccountingEntry>>,
 ) -> Result<Value> {
     let name = checkout
         .get("name")
@@ -1134,7 +1355,21 @@ pub(crate) fn assert_checkout_safe(
         status_args.push(format!(":(exclude,glob){pattern}/**"));
     }
     let status_refs: Vec<&str> = status_args.iter().map(String::as_str).collect();
-    let status = git(&path, &status_refs)?;
+    let mut status = git(&path, &status_refs)?;
+    if accounting.is_some() && !status.is_empty() {
+        // A nested linked worktree is a checkout boundary, not dirt (#1364).
+        let mut prefixes: Vec<String> = Vec::new();
+        for listed in listed_worktrees(repository)? {
+            if listed != path {
+                if let Ok(relative) = listed.strip_prefix(&path) {
+                    prefixes.push(relative.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        if !prefixes.is_empty() {
+            status = status_outside_paths(&status, &prefixes);
+        }
+    }
     if !status.is_empty() {
         let first = status.lines().next().unwrap_or_default();
         return Err(format!(
@@ -1183,6 +1418,28 @@ pub(crate) fn assert_checkout_safe(
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect();
+    if let Some(sink) = accounting {
+        // Per-commit accounting (#1364) replaces the HEAD-only gates.
+        let start_point = checkout
+            .get("start_point")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        sink.push(classify_commits(
+            &name,
+            &path,
+            &remote,
+            &landed_ref,
+            &head,
+            Some(&start_point),
+        )?);
+        let mut updated = checkout.clone();
+        if let Some(object) = updated.as_object_mut() {
+            object.insert("head".to_string(), json!(head));
+            object.insert("containing_remote_refs".to_string(), json!(remote_refs));
+        }
+        return Ok(updated);
+    }
     if remote_refs.is_empty() {
         return Err(unpushed_refusal(&path, checkout, &head)?);
     }
@@ -1445,6 +1702,7 @@ pub(crate) fn finish_slot(
     expected_generation: i64,
     validation: &[String],
     limitations: &[String],
+    discard_unaccounted: bool,
 ) -> Result<Value> {
     require_fixture()?;
     let (cfg, selected) = load_cfg(root, machine_override)?;
@@ -1564,20 +1822,143 @@ pub(crate) fn finish_slot(
         return Err(format!("slot {slot} already has a recorded handoff"));
     }
     assert_record_paths(&cfg, &record)?;
-    assert_slot_contents(&cfg, &record)?;
+    let slot_path = assert_slot_contents(&cfg, &record)?;
+    let mut entries: Vec<AccountingEntry> = Vec::new();
     let mut final_checkouts: Vec<Value> = Vec::new();
-    for checkout in record
+    let checkouts_now = record
         .get("checkouts")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default()
-    {
+        .unwrap_or_default();
+    let recorded_paths: Vec<PathBuf> = checkouts_now
+        .iter()
+        .map(|checkout| {
+            stored_path(
+                &cfg,
+                checkout
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                "checkout path",
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for checkout in &checkouts_now {
         let repository_raw = checkout
             .get("repository")
             .and_then(Value::as_str)
             .unwrap_or_default();
         let (_stored, repository) = stored_repository_path(&cfg, repository_raw)?;
-        final_checkouts.push(assert_checkout_safe(&cfg, &config, &checkout, &repository)?);
+        final_checkouts.push(assert_checkout_safe_accounting(
+            &cfg,
+            &config,
+            checkout,
+            &repository,
+            Some(&mut entries),
+        )?);
+        // Nested linked worktrees inside the slot (#1364).
+        let remote = checkout
+            .get("remote")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let landed_ref = checkout
+            .get("landed_ref")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let checkout_name = checkout
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        for listed in listed_worktrees(&repository)? {
+            if recorded_paths.contains(&listed) {
+                continue;
+            }
+            if !listed.starts_with(&slot_path) {
+                continue;
+            }
+            let head = git(&listed, &["rev-parse", "--verify", "HEAD^{commit}"])?
+                .trim()
+                .to_string();
+            let branch = checkout_branch(&listed).unwrap_or_else(|_| "HEAD".to_string());
+            let mut entry = classify_commits(
+                &format!(
+                    "{}+nested:{}",
+                    checkout_name,
+                    listed.file_name().unwrap_or_default().to_string_lossy()
+                ),
+                &listed,
+                &remote,
+                &landed_ref,
+                &head,
+                None,
+            )?;
+            entry.bundle_ref = Some(if branch == "HEAD" {
+                "HEAD".to_string()
+            } else {
+                format!("refs/heads/{branch}")
+            });
+            entries.push(entry);
+        }
+    }
+    let (landed_count, open_count, unaccounted) = accounting_totals(&entries);
+    if !unaccounted.is_empty() && !discard_unaccounted {
+        return Err(accounting_refusal(slot, &entries));
+    }
+    let mut discarded: Vec<String> = Vec::new();
+    let mut bundle_paths: Vec<String> = Vec::new();
+    if !unaccounted.is_empty() && discard_unaccounted {
+        discarded = unaccounted.iter().map(|(sha, _)| sha.clone()).collect();
+        let archive_dir = cfg.control.join("wrkslots-salvage");
+        std::fs::create_dir_all(&archive_dir)
+            .map_err(|error| format!("cannot create salvage archive: {error}"))?;
+        for (index, checkout) in checkouts_now.iter().enumerate() {
+            let name = checkout
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let related: Vec<&AccountingEntry> = entries
+                .iter()
+                .filter(|entry| {
+                    entry.checkout == name || entry.checkout.starts_with(&format!("{name}+nested:"))
+                })
+                .collect();
+            let bad = related
+                .iter()
+                .flat_map(|entry| entry.unaccounted.iter())
+                .any(|(sha, _)| discarded.contains(sha));
+            if !bad {
+                continue;
+            }
+            let path = &recorded_paths[index];
+            let landed_ref = checkout
+                .get("landed_ref")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let bundle = archive_dir.join(format!("finish-{slot}-{name}-{generation}.bundle"));
+            if bundle.exists() {
+                std::fs::remove_file(&bundle)
+                    .map_err(|error| format!("cannot replace discard bundle: {error}"))?;
+            }
+            let mut args: Vec<String> = vec![
+                "bundle".to_string(),
+                "create".to_string(),
+                bundle.to_string_lossy().into_owned(),
+                "HEAD".to_string(),
+            ];
+            for entry in &related {
+                if let Some(reference) = &entry.bundle_ref {
+                    args.push(reference.clone());
+                }
+            }
+            args.push(format!("^{landed_ref}"));
+            let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            git(path, &arg_refs)?;
+            git(path, &["bundle", "verify", &bundle.to_string_lossy()])?;
+            bundle_paths.push(bundle.to_string_lossy().into_owned());
+        }
     }
     let continuation = format!(
         "wrkslots remove {slot} --coordinator-pid <current-coordinator-pid> --expected-generation {generation}"
@@ -1585,15 +1966,16 @@ pub(crate) fn finish_slot(
     let mut updated = record.clone();
     if let Some(object) = updated.as_object_mut() {
         object.insert("checkouts".to_string(), json!(final_checkouts));
-        object.insert(
-            "handoff".to_string(),
-            json!({
-                "recorded_at": utc_now(),
-                "validation": validation,
-                "limitations": limitations,
-                "continuation": continuation,
-            }),
-        );
+        let mut handoff = json!({
+            "recorded_at": utc_now(),
+            "validation": validation,
+            "limitations": limitations,
+            "continuation": continuation,
+        });
+        if !discarded.is_empty() {
+            handoff["discarded_unaccounted"] = json!(discarded);
+        }
+        object.insert("handoff".to_string(), handoff);
     }
     ensure_event_log(root, &cfg, &selected)?;
     let previous_revision = active.get("revision").and_then(Value::as_i64).unwrap_or(0);
@@ -1632,7 +2014,16 @@ pub(crate) fn finish_slot(
             "revision": previous_revision + 1,
             "previous_record_sha256": previous_digest,
             "record": updated,
-            "evidence": {"validation": validation},
+            "evidence": {
+                "validation": validation,
+                "accounting": {
+                    "landed": landed_count,
+                    "open": open_count,
+                    "unaccounted": unaccounted.len(),
+                    "discarded_unaccounted": discarded,
+                    "discard_bundles": bundle_paths,
+                },
+            },
         }),
     )?;
     let mut slots: Vec<Value> = active
@@ -1683,5 +2074,12 @@ pub(crate) fn finish_slot(
         "generation": generation,
         "outcome": "handoff recorded",
         "continuation": continuation,
+        "accounting": {
+            "landed": landed_count,
+            "open": open_count,
+            "unaccounted": unaccounted.len(),
+            "discarded_unaccounted": discarded,
+            "discard_bundles": bundle_paths,
+        },
     }))
 }

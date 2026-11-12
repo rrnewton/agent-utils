@@ -148,6 +148,7 @@ def _rust_finish(
     validation: list[str] | None = None,
     generation: int = 1,
     fixture: bool = True,
+    discard: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     env = dict(os.environ)
     if fixture:
@@ -161,18 +162,25 @@ def _rust_finish(
     ]
     for entry in VALIDATION if validation is None else validation:
         args.extend(["--validation", entry])
+    if discard:
+        args.append("--discard-unaccounted")
     return subprocess.run(
         args, cwd=AU_ROOT, capture_output=True, text=True, check=False, timeout=900, env=env
     )
 
 
 def _python_finish(
-    root: Path, *, validation: list[str] | None = None, generation: int = 1
+    root: Path,
+    *,
+    validation: list[str] | None = None,
+    generation: int = 1,
+    discard: bool = False,
 ) -> int:
     args = argparse.Namespace(
         project_root=str(root), machine=None, slot="slot-a", agent="agent-slot-a",
         owner_pid=os.getpid(), expected_generation=generation,
         validation=VALIDATION if validation is None else validation,
+        discard_unaccounted=discard,
         limitation=[], wait_lock=0.0,
     )
     return wrkslots_cli._cmd_finish(args)
@@ -250,18 +258,17 @@ def test_finish_dirty_checkout_refuses(tmp_path: Path) -> None:
 
 
 def test_finish_unlanded_commit_refuses(tmp_path: Path) -> None:
-    rust_root, oracle_root = _pair(tmp_path)
-    for root in (rust_root, oracle_root):
-        checkout = root / "worktrees" / "slot-a" / "repo"
+    (rust_root, _rust_up, rust_co), (oracle_root, _oracle_up, oracle_co) = _bare_pair(tmp_path)
+    for checkout in (rust_co, oracle_co):
         (checkout / "file.txt").write_text("two\n")
         _git(checkout, "add", "file.txt")
         _git(checkout, "commit", "-q", "-m", "two")
     with pytest.raises(Exception) as caught:
         _python_finish(oracle_root)
-    assert "is not an ancestor of configured landed ref" in str(caught.value)
+    assert "has unaccounted commits" in str(caught.value)
     result = _rust_finish(rust_root)
     assert result.returncode == 1
-    assert "is not an ancestor of configured landed ref" in result.stderr
+    assert "has unaccounted commits" in result.stderr
 
 
 def test_finish_blank_validation_refuses(tmp_path: Path) -> None:
@@ -345,3 +352,148 @@ def test_finish_refuses_without_fixture_attestation(tmp_path: Path) -> None:
     )
     record = cast(list[dict[str, object]], doc["slots"])[0]
     assert record["handoff"] is None
+
+
+def _fixture_bare(base: Path) -> tuple[Path, Path, Path]:
+    """Fixture whose origin is a bare repo separate from the source."""
+    root = base / "project"
+    (root / "worktrees").mkdir(parents=True)
+    (root / "live.py").write_text("# probe\n")
+    (root / ".wrkslots.yml").write_text(
+        "schema: 2\n"
+        "machine: node-a\n"
+        "worktrees_dir: worktrees\n"
+        "default_remote: origin\n"
+        "default_landed_ref: refs/remotes/origin/main\n"
+        "heartbeat_ttl_seconds: 60\n"
+        "liveness_command: live.py\n"
+    )
+    upstream = base / "upstream-repo"
+    head = _repo(upstream)
+    bare = base / "origin.git"
+    _git(base, "clone", "-q", "--bare", str(upstream), str(bare))
+    _git(upstream, "remote", "add", "origin", str(bare))
+    _git(upstream, "fetch", "-q", "origin", "+refs/heads/*:refs/remotes/origin/*")
+    checkout = root / "worktrees" / "slot-a" / "repo"
+    _git(upstream, "worktree", "add", "-q", "-b", "suite/work", str(checkout), "HEAD")
+    identity = _live_identity()
+    record: dict[str, object] = {
+        "slot": "slot-a",
+        "agent": "agent-slot-a",
+        "task": "do work",
+        "purpose": "testing",
+        "machine": "node-a",
+        "generation": 1,
+        "created_at": "2026-10-26T00:00:00Z",
+        "heartbeat_at": "2026-10-26T01:00:00Z",
+        "heartbeat_ttl_seconds": 60,
+        "owner": identity,
+        "coordinator_lease": identity,
+        "coordinator_recovery_note": None,
+        "handoff": None,
+        "checkouts": [
+            {
+                "name": "repo",
+                "path": "worktrees/slot-a/repo",
+                "repository": "../upstream-repo",
+                "branch": "suite/work",
+                "start_point": head,
+                "remote": "origin",
+                "remote_url_sha256": hashlib.sha256(str(bare).encode()).hexdigest(),
+                "landed_ref": "refs/remotes/origin/main",
+                "head": head,
+                "containing_remote_refs": ["refs/remotes/origin/main"],
+                "vcs": "git",
+            }
+        ],
+    }
+    (root / "worktrees" / "ACTIVE.node-a.json").write_text(
+        json.dumps({"schema": 2, "machine": "node-a", "revision": 7, "slots": [record]})
+    )
+    (root / "worktrees" / "ARCHIVED.node-a.json").write_text(
+        json.dumps({"schema": 2, "machine": "node-a", "revision": 3, "records": []})
+    )
+    return root, upstream, checkout
+
+
+def _bare_pair(tmp_path: Path) -> tuple[tuple[Path, Path, Path], tuple[Path, Path, Path]]:
+    return _fixture_bare(tmp_path / "rust"), _fixture_bare(tmp_path / "oracle")
+
+
+def _commit_in(checkout: Path, message: str) -> str:
+    (checkout / "a.txt").write_text(f"{message}\n")
+    _git(checkout, "add", "a.txt")
+    _git(checkout, "commit", "-q", "-m", message)
+    return _git(checkout, "rev-parse", "HEAD")
+
+
+def _accounting_of(outcome: dict[str, object]) -> dict[str, object]:
+    return cast(dict[str, object], outcome["accounting"])
+
+
+def test_finish_accounting_landed_exact_both_editions(tmp_path: Path) -> None:
+    (rust_root, rust_up, rust_co), (oracle_root, oracle_up, oracle_co) = _bare_pair(tmp_path)
+    for upstream, checkout in ((rust_up, rust_co), (oracle_up, oracle_co)):
+        commit = _commit_in(checkout, "landed exact")
+        _git(upstream, "merge", "-q", "--ff-only", commit)
+        _git(upstream, "push", "-q", "origin", "main")
+    assert _python_finish(oracle_root) == 0
+    result = _rust_finish(rust_root)
+    assert result.returncode == 0, result.stderr
+    assert _accounting_of(json.loads(result.stdout))["landed"] == 1
+
+
+def test_finish_accounting_landed_replay_both_editions(tmp_path: Path) -> None:
+    (rust_root, rust_up, rust_co), (oracle_root, oracle_up, oracle_co) = _bare_pair(tmp_path)
+    for upstream, checkout in ((rust_up, rust_co), (oracle_up, oracle_co)):
+        commit = _commit_in(checkout, "landed replay")
+        _git(upstream, "cherry-pick", commit)
+        _git(upstream, "commit", "-q", "--amend", "-m", "landed replay (replayed)")
+        _git(upstream, "push", "-q", "origin", "main")
+    assert _python_finish(oracle_root) == 0
+    result = _rust_finish(rust_root)
+    assert result.returncode == 0, result.stderr
+    assert _accounting_of(json.loads(result.stdout))["landed"] == 1
+
+
+def test_finish_accounting_open_both_editions(tmp_path: Path) -> None:
+    (rust_root, _rust_up, rust_co), (oracle_root, _oracle_up, oracle_co) = _bare_pair(tmp_path)
+    for checkout in (rust_co, oracle_co):
+        _commit_in(checkout, "open change")
+        _git(checkout, "push", "-q", "origin", "HEAD:refs/heads/pr/suite-work")
+    assert _python_finish(oracle_root) == 0
+    result = _rust_finish(rust_root)
+    assert result.returncode == 0, result.stderr
+    assert _accounting_of(json.loads(result.stdout))["open"] == 1
+
+
+def test_finish_accounting_unaccounted_both_editions(tmp_path: Path) -> None:
+    (rust_root, _rust_up, rust_co), (oracle_root, _oracle_up, oracle_co) = _bare_pair(tmp_path)
+    for checkout in (rust_co, oracle_co):
+        _commit_in(checkout, "secret wip")
+    with pytest.raises(Exception) as caught:
+        _python_finish(oracle_root)
+    assert "unaccounted=1" in str(caught.value)
+    result = _rust_finish(rust_root)
+    assert result.returncode == 1
+    assert "unaccounted=1" in result.stderr
+
+
+def test_finish_accounting_discard_both_editions(tmp_path: Path) -> None:
+    (rust_root, _rust_up, rust_co), (oracle_root, _oracle_up, oracle_co) = _bare_pair(tmp_path)
+    commits = {}
+    for label, checkout in (("rust", rust_co), ("oracle", oracle_co)):
+        commits[label] = _commit_in(checkout, "throwaway")
+    assert _python_finish(oracle_root, discard=True) == 0
+    result = _rust_finish(rust_root, discard=True)
+    assert result.returncode == 0, result.stderr
+    for root, label in ((rust_root, "rust"), (oracle_root, "oracle")):
+        doc: dict[str, object] = json.loads(
+            (root / "worktrees" / "ACTIVE.node-a.json").read_text()
+        )
+        handoff = cast(
+            dict[str, object],
+            cast(list[dict[str, object]], doc["slots"])[0]["handoff"],
+        )
+        assert handoff["discarded_unaccounted"] == [commits[label]]
+        assert list((root / "worktrees" / "wrkslots-salvage").glob("*.bundle"))
