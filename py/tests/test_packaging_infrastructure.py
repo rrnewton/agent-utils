@@ -206,11 +206,11 @@ def test_rust_package_selectors_resolve_dependency_archive_closure() -> None:
     assert [crate.name for crate in selected] == ["agentctl"]
     assert [crate.name for crate in work] == [
         "agent-queue",
+        "claude-stream-session",
         "agent-harness",
         "term-backend",
         "chat-subscription",
         "chat-subscription-plugin",
-        "claude-stream-session",
         "agentctl",
     ]
     assert reasons == {
@@ -291,11 +291,11 @@ def test_rust_package_main_globally_checks_topology_but_only_smokes_selection(
         ("rustdoc", "agentctl"),
         ("missing-docs", "agentctl"),
         ("verify", "agent-queue"),
+        ("verify", "claude-stream-session"),
         ("verify", "agent-harness"),
         ("verify", "term-backend"),
         ("verify", "chat-subscription"),
         ("verify", "chat-subscription-plugin"),
-        ("verify", "claude-stream-session"),
         ("verify", "agentctl"),
         ("smoke", "agentctl"),
     ]
