@@ -680,7 +680,20 @@ def active_hold(now: float | None = None) -> dict[str, object] | None:
     if hold is None:
         return None
     if float(hold["until"]) <= (hold_now() if now is None else now):
-        hold_path().unlink(missing_ok=True)
+        # Reap under the admission lock, re-reading first, so a hold set in
+        # the meantime is never deleted as if it were the expired one.
+        try:
+            with (state_dir() / "admission.lock").open("a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                try:
+                    fresh = _read_hold()
+                    if fresh is not None and float(fresh["until"]) <= (
+                            hold_now() if now is None else now):
+                        hold_path().unlink(missing_ok=True)
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+        except OSError:
+            pass
         return None
     return hold
 
