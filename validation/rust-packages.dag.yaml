@@ -14,6 +14,7 @@ steps:
       --crate term-backend
       --crate chat-subscription
       --crate chat-subscription-plugin
+      --crate claude-stream-session
       --crate agentctl
     jobs_flag: ""
     jobs_env: CARGO_BUILD_JOBS
