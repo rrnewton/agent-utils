@@ -5,12 +5,14 @@
 // Construction is inert: no element is looked up, no listener is added and nothing is
 // fetched until the controls are mounted and the panel opened.
 
-export { DISCUSS_UNAVAILABLE_HINT, asCatchupAnswer, createDiscussPanel, formatStampLine, isDiscussUnavailable } from "./panel.ts";
+export { DISCUSS_UNAVAILABLE_HINT, asCatchupAnswer, asCatchupPreview, boundForCount, countSince, createDiscussPanel, formatStampLine, hhmm, isDiscussUnavailable } from "./panel.ts";
 export type {
   CatchupAnswer,
   CatchupFooterLink,
+  CatchupPreview,
   CatchupRequestBody,
   CatchupStamp,
+  CatchupUnreadRef,
   CatchupWindow,
   DiscussLayoutMode,
   DiscussPanel,
@@ -37,6 +39,8 @@ export interface DiscussViewDependencies {
   api?(path: string, options?: { method?: string; body?: unknown }): Promise<unknown>;
   /** POST one catch-up for `channelId`, where the page (or a test) injects its own. */
   catchupPost?(channelId: string, body: CatchupRequestBody): Promise<unknown>;
+  /** GET one scope's unread preview, where the page (or a test) injects its own. */
+  catchupPreview?(channelId: string, scope: DiscussScope): Promise<unknown>;
   /** The channel on screen: the parent channel even in a thread. */
   selectedChannelId(): string;
   /** Which list the left column shows, and its thread where it shows one. */
@@ -116,28 +120,32 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
    * itself is enforced in the click and in `open`, never by appearance alone.
    */
   function drawAvailability(): void {
+    // Busy draws like unavailable (`discuss-summarize-button`): while one request is
+    // in flight no entry point starts another, and the reason shows on hover.
+    const off = !available() || busy;
+    const why = busy && available() ? "Summarizing…" : DISCUSS_UNAVAILABLE_HINT;
     const button = deps.byId("discuss-open");
-    if (available()) {
+    if (!off) {
       button.removeAttribute("aria-disabled");
       button.setAttribute("title", "Catch up on this channel or thread");
       button.removeAttribute("aria-label");
     } else {
       button.setAttribute("aria-disabled", "true");
-      button.setAttribute("title", DISCUSS_UNAVAILABLE_HINT);
-      button.setAttribute("aria-label", DISCUSS_UNAVAILABLE_HINT);
+      button.setAttribute("title", why);
+      if (why === DISCUSS_UNAVAILABLE_HINT) button.setAttribute("aria-label", why);
       button.setAttribute("aria-expanded", "false");
     }
     // The menu's Discuss (the phone's way in) says the same, in its own dress.
     try {
       const item = deps.byId("discuss-menu-open");
-      if (available()) {
+      if (!off) {
         item.removeAttribute("aria-disabled");
         item.setAttribute("title", "Catch up on this channel or thread");
         item.removeAttribute("aria-label");
       } else {
         item.setAttribute("aria-disabled", "true");
-        item.setAttribute("title", DISCUSS_UNAVAILABLE_HINT);
-        item.setAttribute("aria-label", DISCUSS_UNAVAILABLE_HINT);
+        item.setAttribute("title", why);
+        if (why === DISCUSS_UNAVAILABLE_HINT) item.setAttribute("aria-label", why);
       }
     } catch {
       // A host without the menu item: the bar button already says it.
@@ -163,9 +171,25 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     });
   }
 
+  let busy = false;
+
+  function catchupPreview(channelId: string, scope: DiscussScope): Promise<unknown> {
+    if (deps.catchupPreview) return deps.catchupPreview(channelId, scope);
+    if (!deps.api) return Promise.reject(new Error("Discuss has no way to reach the server."));
+    const query = new URLSearchParams();
+    if (scope.threadId !== null) query.set("thread_id", scope.threadId);
+    query.set("view", scope.view);
+    return deps.api(`/api/v1/channels/${encodeURIComponent(channelId)}/catchup/preview?${query.toString()}`, { method: "GET" });
+  }
+
   const panel = createDiscussPanel({
     byId: deps.byId,
     catchupPost,
+    catchupPreview,
+    onBusy(on) {
+      busy = on;
+      drawAvailability();
+    },
     serviceName: (channelId) => deps.serviceName?.(channelId) ?? "discord",
     onJump: deps.onJump,
     dismissMessages: deps.dismissMessages,
@@ -205,7 +229,7 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
   }
 
   function open(): void {
-    if (!available()) return;
+    if (!available() || busy) return;
     const scope = scopeNow();
     syncedScopeKey = scopeKey(scope);
     panel.openWith(scope);
@@ -217,6 +241,7 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
         mounted = true;
         panelTeardown = panel.mount();
         listening.listen(deps.byId("discuss-open"), "click", () => {
+          if (busy) return;
           if (panel.isOpen()) panel.close();
           else if (available()) open();
           // Unavailable: the click does nothing — no panel, no POST — and the
@@ -226,7 +251,7 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
         // controls' standing act for its items) and opens the same panel.
         try {
           listening.listen(deps.byId("discuss-menu-open"), "click", () => {
-            if (available()) open();
+            if (!busy && available()) open();
           });
         } catch {
           // A host without the menu item keeps the bar button's way in.

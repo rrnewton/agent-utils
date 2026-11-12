@@ -2612,7 +2612,6 @@ pub async fn catchup(
     Path(channel_id): Path<String>,
     Json(body): Json<crate::contract::CatchupRequest>,
 ) -> Result<Response, ApiError> {
-    use crate::threads::TimelineView;
     let began = std::time::Instant::now();
     // The allowlist before the backend question, so an unknown channel is a 404 whatever is
     // configured — the handler order every channel route here keeps.

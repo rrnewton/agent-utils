@@ -66,6 +66,18 @@ function click(el) {
   for (const listener of [...(el.listeners.click || [])]) listener(ev);
 }
 
+function fireInput(el) {
+  const ev = { target: el, preventDefault() {}, stopPropagation() {} };
+  for (const listener of [...(el.listeners.input || [])]) listener(ev);
+}
+
+// Open, let the preview land, then press Summarize: the only way anything is asked.
+async function openAndSummarize(view, fx) {
+  view.open();
+  await flush();
+  click(fx.els["discuss-summarize"]);
+}
+
 async function flush() {
   for (let i = 0; i < 10; i += 1) await Promise.resolve();
 }
@@ -83,12 +95,28 @@ const IDS = [
   "discuss-mark-read", "discuss-mark-unread", "discuss-unmarkable",
   "discuss-stamp", "discuss-retry", "discuss-actions", "discuss-resize", "discuss-sheet-toggle",
   "discuss-mode-overlay", "discuss-mode-docked", "discuss-mode-maximized", "screen-main",
+  "discuss-summarize", "discuss-count", "discuss-since",
 ];
 
 /** Fire a non-click listener with a plain event carrying `props`. */
 function fire(el, type, props = {}) {
   const ev = { target: el, preventDefault() {}, stopPropagation() {}, ...props };
   for (const listener of [...(el.listeners[type] || [])]) listener(ev);
+}
+
+// The preview's unread times: two local clock times the bound links over.
+const T1 = new Date(2026, 8, 20, 9, 51).getTime();
+const T2 = new Date(2026, 8, 20, 9, 52).getTime();
+
+function preview(overrides = {}) {
+  return {
+    window: { count: 12, unread_count: 2 },
+    unread: [
+      { id: "m1", at_ms: T1, label: "09:51 · Ada" },
+      { id: "m2", at_ms: T2, label: "09:52 · Ben" },
+    ],
+    ...overrides,
+  };
 }
 
 function answer(overrides = {}) {
@@ -117,7 +145,7 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
   els["discuss-panel"].hidden = true;
   els["discuss-footer"].hidden = true;
   els["discuss-retry"].hidden = true;
-  const calls = { posts: [], dismiss: [], restore: [], jumps: [], errors: [], statuses: [] };
+  const calls = { posts: [], previews: [], dismiss: [], restore: [], jumps: [], errors: [], statuses: [] };
   // `#1344`: the device's kept layout, in memory; the clamp mirrors the device setting's.
   const kept = { width: null, keeps: [], sheetFull: false, sheetKeeps: [], mode: "overlay", modeKeeps: [] };
   const clampW = (value) => {
@@ -134,6 +162,10 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
     catchupPost: (channelId, body) => {
       calls.posts.push({ channelId, body });
       return respond ? respond(channelId, body) : Promise.resolve(answer());
+    },
+    catchupPreview: (channelId, scope) => {
+      calls.previews.push({ channelId, scope });
+      return Promise.resolve(preview());
     },
     selectedChannelId: () => "chan-1",
     selection: () => currentSelection,
@@ -181,7 +213,7 @@ test("catchup: construction is inert (nothing looked up, nothing posted)", () =>
   assert.equal(typeof view.open, "function");
 });
 
-test("catchup: open posts {thread_id:null, view} for the channel and says Reading… first", async () => {
+test("catchup: open asks nothing; Summarize posts the bound and says Reading… first", async () => {
   const pending = deferred();
   const fx = fixture({ respond: () => pending.promise });
   try {
@@ -190,13 +222,63 @@ test("catchup: open posts {thread_id:null, view} for the channel and says Readin
     view.open();
     assert.equal(fx.els["discuss-panel"].hidden, false, "the panel did not open");
     assert.equal(view.isOpen(), true);
-    assert.equal(fx.els["discuss-status"].textContent, "Reading…", "no Reading line before the answer");
+    await flush();
+    assert.equal(fx.calls.previews.length, 1, "open did not read the preview");
+    assert.deepEqual(fx.calls.posts, [], "open asked the model");
+    assert.equal(fx.els["discuss-status"].textContent, "2 unread ready.");
+    assert.equal(fx.els["discuss-summarize"].textContent, "Summarize last 2 unread since 09:51");
     assert.equal(fx.els["discuss-scope"].textContent, "Channel chan-1");
-    assert.deepEqual(fx.calls.posts, [{ channelId: "chan-1", body: { thread_id: null, view: "flat" } }]);
+    click(fx.els["discuss-summarize"]);
+    assert.equal(fx.els["discuss-status"].textContent, "Reading…", "no Reading line before the answer");
+    assert.deepEqual(fx.calls.posts, [{ channelId: "chan-1", body: { thread_id: null, view: "flat", since_ms: T1 } }]);
     pending.resolve(answer());
     await flush();
     assert.equal(fx.els["discuss-status"].textContent, "Read 2 unread of 12");
     mounted.unmount();
+  } finally { fx.restore(); }
+});
+
+test("catchup: the bound's ends move together (N to time, time to N)", async () => {
+  const fx = fixture();
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    const count = fx.els["discuss-count"];
+    const since = fx.els["discuss-since"];
+    count.value = "1";
+    fireInput(count);
+    assert.equal(since.value, "09:52", "N=1 did not move the time to the newest unread");
+    assert.equal(fx.els["discuss-summarize"].textContent, "Summarize last 1 unread since 09:52");
+    since.value = "09:51";
+    fireInput(since);
+    assert.equal(count.value, "2", "the time did not move N back over both unread");
+    click(fx.els["discuss-summarize"]);
+    await flush();
+    assert.deepEqual(fx.calls.posts.at(-1).body, { thread_id: null, view: "flat", since_ms: T1 });
+  } finally { fx.restore(); }
+});
+
+test("catchup: while a request is in flight nothing starts another", async () => {
+  const pending = deferred();
+  const fx = fixture({ respond: () => pending.promise });
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    await openAndSummarize(view, fx);
+    assert.equal(fx.calls.posts.length, 1);
+    assert.equal(fx.els["discuss-summarize"].disabled, true, "Summarize stayed live while pending");
+    assert.equal(fx.els["discuss-open"].getAttribute("aria-disabled"), "true", "the bar button stayed live while pending");
+    click(fx.els["discuss-summarize"]);
+    click(fx.els["discuss-open"]);
+    click(fx.els["discuss-menu-open"]);
+    assert.equal(fx.calls.posts.length, 1, "a second request started while one was in flight");
+    assert.equal(view.isOpen(), true, "a press closed the panel mid-request");
+    pending.resolve(answer());
+    await flush();
+    assert.equal(fx.els["discuss-summarize"].disabled, false, "Summarize did not come back");
+    assert.equal(fx.els["discuss-open"].getAttribute("aria-disabled"), null);
   } finally { fx.restore(); }
 });
 
@@ -205,13 +287,13 @@ test("catchup: Main posts view main; a thread posts its thread_id", async () => 
   try {
     const view = createDiscussView(fx.deps);
     view.mountControls();
-    view.open();
+    await openAndSummarize(view, fx);
     await flush();
-    assert.deepEqual(fx.calls.posts.at(-1).body, { thread_id: null, view: "main" });
+    assert.deepEqual(fx.calls.posts.at(-1).body, { thread_id: null, view: "main", since_ms: T1 });
     fx.setSelection({ view: "thread", threadId: "t1", thread: { title: "Deploy thread" } });
-    view.open();
+    await openAndSummarize(view, fx);
     await flush();
-    assert.deepEqual(fx.calls.posts.at(-1).body, { thread_id: "t1", view: "flat" });
+    assert.deepEqual(fx.calls.posts.at(-1).body, { thread_id: "t1", view: "flat", since_ms: T1 });
     assert.equal(fx.els["discuss-scope"].textContent, "Deploy thread");
   } finally { fx.restore(); }
 });
@@ -223,7 +305,7 @@ test("catchup: the bar button opens and closes; sync restates the scope label", 
     view.mountControls();
     click(fx.els["discuss-open"]);
     assert.equal(view.isOpen(), true);
-    assert.equal(fx.calls.posts.length, 1, "the button did not ask at once");
+    assert.equal(fx.calls.posts.length, 0, "opening asked the model");
     await flush();
     fx.setSelection({ view: "thread", threadId: "t2", thread: { title: "Other thread" } });
     view.sync();
@@ -242,7 +324,7 @@ test("catchup: model text renders as text only, markup in it inert", async () =>
   try {
     const view = createDiscussView(fx.deps);
     view.mountControls();
-    view.open();
+    await openAndSummarize(view, fx);
     await flush();
     assert.equal(fx.els["discuss-answer"].textContent, evil, "the text was not set as text");
     assert.equal(fx.els["discuss-answer"].innerHTMLSet, false, "the answer was assigned as markup");
@@ -255,7 +337,7 @@ test("catchup: the footer covers N and each link jumps with its ref", async () =
   try {
     const view = createDiscussView(fx.deps);
     view.mountControls();
-    view.open();
+    await openAndSummarize(view, fx);
     await flush();
     assert.equal(fx.els["discuss-footer"].hidden, false);
     assert.equal(fx.els["discuss-covers"].textContent, "This summary covers 2 unread messages:");
@@ -277,7 +359,7 @@ test("catchup: Mark read dismisses exactly markable_ids; Mark unread restores th
   try {
     const view = createDiscussView(fx.deps);
     view.mountControls();
-    view.open();
+    await openAndSummarize(view, fx);
     await flush();
     assert.equal(fx.els["discuss-unmarkable"].hidden, false, "the unmarkable remainder was not footnoted");
     assert.equal(fx.els["discuss-unmarkable"].textContent, "1 can't be marked here");
@@ -298,7 +380,7 @@ test("catchup: no covered messages hides the footer and its buttons", async () =
   try {
     const view = createDiscussView(fx.deps);
     view.mountControls();
-    view.open();
+    await openAndSummarize(view, fx);
     await flush();
     assert.equal(fx.els["discuss-status"].textContent, "Read 0 unread of 5");
     assert.equal(fx.els["discuss-footer"].hidden, true, "the footer showed with nothing covered");
@@ -324,7 +406,7 @@ test("catchup: the stamp line names chars without tokens and tokens with them", 
   try {
     const view = createDiscussView(fx.deps);
     view.mountControls();
-    view.open();
+    await openAndSummarize(view, fx);
     await flush();
     assert.equal(fx.els["discuss-stamp"].hidden, false);
     assert.match(fx.els["discuss-stamp"].textContent, /in 51234 chars/);
@@ -339,7 +421,7 @@ test("catchup: a late answer after a scope change is ignored", async () => {
   try {
     const view = createDiscussView(fx.deps);
     view.mountControls();
-    view.open();
+    await openAndSummarize(view, fx);
     fx.setSelection({ view: "thread", threadId: "t7", thread: { title: "Elsewhere" } });
     view.sync();
     pending.resolve(answer());
@@ -356,7 +438,7 @@ test("catchup: a late answer after close is ignored", async () => {
   try {
     const view = createDiscussView(fx.deps);
     view.mountControls();
-    view.open();
+    await openAndSummarize(view, fx);
     view.close();
     pending.resolve(answer());
     await flush();
@@ -374,7 +456,7 @@ test("catchup: an error is shown and Retry asks again", async () => {
   try {
     const view = createDiscussView(fx.deps);
     view.mountControls();
-    view.open();
+    await openAndSummarize(view, fx);
     await flush();
     assert.deepEqual(fx.calls.errors, ["HTTP 502 chat_error: upstream slow"]);
     assert.equal(fx.els["discuss-retry"].hidden, false, "no retry was offered");
@@ -399,7 +481,7 @@ test("catchup: unavailable draws the button disabled with the hint and a click p
     assert.equal(button.getAttribute("title"), DISCUSS_UNAVAILABLE_HINT);
     assert.equal(button.getAttribute("aria-label"), DISCUSS_UNAVAILABLE_HINT);
     click(button);
-    view.open();
+    await openAndSummarize(view, fx);
     await flush();
     assert.deepEqual(fx.calls.posts, [], "an unavailable Discuss still posted");
     assert.equal(fx.els["discuss-panel"].hidden, true, "an unavailable Discuss opened the panel");
@@ -415,7 +497,7 @@ test("catchup: a 503 summarizer refusal says the hint in the panel, with no retr
   try {
     const view = createDiscussView(fx.deps);
     view.mountControls();
-    view.open();
+    await openAndSummarize(view, fx);
     await flush();
     assert.deepEqual(fx.calls.errors, [DISCUSS_UNAVAILABLE_HINT]);
     assert.equal(fx.els["discuss-status"].textContent, DISCUSS_UNAVAILABLE_HINT);
@@ -434,8 +516,11 @@ test("catchup: the menu item opens the same panel and posts the same body", asyn
     view.mountControls();
     click(fx.els["discuss-menu-open"]);
     await flush();
-    assert.equal(fx.calls.posts.length, 1, "the menu item did not ask");
     assert.equal(fx.els["discuss-panel"].hidden, false, "the menu item did not open the panel");
+    assert.equal(fx.calls.posts.length, 0, "opening from the menu asked the model");
+    click(fx.els["discuss-summarize"]);
+    await flush();
+    assert.equal(fx.calls.posts.length, 1, "Summarize did not ask");
     assert.equal(fx.els["discuss-answer"].textContent, "Two things happened.");
   } finally { fx.restore(); }
 });

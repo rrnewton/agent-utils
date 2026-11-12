@@ -1,10 +1,13 @@
-// The Discuss panel's DOM (`catchup-side-agent`, slice 1): one-shot catch-up over the
-// channel or thread on screen. On open it says "Reading…" at once and POSTs in the same
-// moment; the answer's model text is set as text only, never as markup, and the footer —
-// which unread messages the summary covers, a jump link for each, and Mark read / Mark
-// unread over exactly the server's markable ids — is drawn from the structured fields,
-// never parsed out of the model's words. Construction does nothing: no element is looked
-// up and nothing is fetched until `mount` wires the controls and `openWith` is called.
+// The Discuss panel's DOM (`catchup-side-agent`): catch-up over the channel or thread
+// on screen. Opening asks nothing of the model (`discuss-summarize-button`): it reads
+// the scope's unread preview from the cache and offers "Summarize last [N] unread
+// since [HH:MM]" — one bound with two linked ends — and only that press POSTs. While
+// a request is in flight nothing starts another. The answer's model text is set as
+// text only, never as markup, and the footer — which unread messages the summary
+// covers, a jump link for each, and Mark read / Mark unread over exactly the
+// server's markable ids — is drawn from the structured fields, never parsed out of
+// the model's words. Construction does nothing: no element is looked up and nothing
+// is fetched until `mount` wires the controls and `openWith` is called.
 //
 // The answer's wire types are the generated contract's (`CatchupResponse` and its
 // parts); the panel narrows the decoded body to the fields it reads.
@@ -21,6 +24,21 @@ import type {
 export interface CatchupRequestBody {
   thread_id: string | null;
   view: "flat" | "main";
+  /** The bound's start (Unix ms): only messages at/after it are covered. */
+  since_ms: number | null;
+}
+
+/** One unread message in a preview, oldest first in its list. */
+export interface CatchupUnreadRef {
+  id: string;
+  at_ms: number | null;
+  label: string;
+}
+
+/** A scope's shape before any model is asked, narrowed to what the bound needs. */
+export interface CatchupPreview {
+  window: CatchupWindow | null;
+  unread: CatchupUnreadRef[];
 }
 
 /** The window the server read, as far as the panel reports it. */
@@ -55,6 +73,10 @@ export interface DiscussPanelDependencies {
   byId(id: string): HTMLElement;
   /** POST one catch-up for `channelId`; answers the decoded body as `unknown`. */
   catchupPost(channelId: string, body: CatchupRequestBody): Promise<unknown>;
+  /** GET the scope's unread preview for `channelId`; spends no model call. */
+  catchupPreview(channelId: string, scope: DiscussScope): Promise<unknown>;
+  /** A request started or settled, so the page can disable its entry points too. */
+  onBusy?(busy: boolean): unknown;
   /** The chat service `channelId` is read through, for a footer's jump refs. */
   serviceName(channelId: string): string;
   /** Jump to the message a footer link names. */
@@ -96,7 +118,7 @@ export type DiscussLayoutMode = "overlay" | "docked" | "maximized";
 export interface DiscussPanel {
   /** Wire the panel's own controls (close, retry, the mark buttons); idempotent. */
   mount(): { unmount(): void };
-  /** Show the panel for `scope`, say "Reading…" and POST at once. */
+  /** Show the panel for `scope` and read its preview; no model is asked. */
   openWith(scope: DiscussScope): void;
   /** Hide the panel; a late answer for it is then ignored. */
   close(): void;
@@ -187,6 +209,68 @@ export function asCatchupAnswer(value: unknown): CatchupAnswer {
       unknown_term_count: numberOrNull(rawStamp.unknown_term_count) ?? 0,
     },
   };
+}
+
+/** Narrow a preview body to the unread set the bound chooses over. */
+export function asCatchupPreview(value: unknown): CatchupPreview {
+  const empty: CatchupPreview = { window: null, unread: [] };
+  if (typeof value !== "object" || value === null) return empty;
+  const record = value as Record<string, unknown>;
+  const rawWindow = typeof record.window === "object" && record.window !== null ? (record.window as Record<string, unknown>) : null;
+  const unread: CatchupUnreadRef[] = [];
+  if (Array.isArray(record.unread)) {
+    for (const entry of record.unread) {
+      if (typeof entry !== "object" || entry === null) continue;
+      const ref = entry as Record<string, unknown>;
+      if (typeof ref.id !== "string" || ref.id === "") continue;
+      unread.push({
+        id: ref.id,
+        at_ms: numberOrNull(ref.at_ms),
+        label: typeof ref.label === "string" ? ref.label : ref.id,
+      });
+    }
+  }
+  return {
+    window: rawWindow === null ? null : {
+      count: numberOrNull(rawWindow.count) ?? 0,
+      unread_count: numberOrNull(rawWindow.unread_count) ?? 0,
+    },
+    unread,
+  };
+}
+
+/** The local "HH:MM" of an instant, for the bound's time end. */
+export function hhmm(atMs: number): string {
+  const date = new Date(atMs);
+  const pad = (part: number): string => String(part).padStart(2, "0");
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+/**
+ * The bound for "last `n` unread": how many, and the instant the POST bounds at
+ * (the Nth-newest unread's own time, so the server covers exactly those N).
+ */
+export function boundForCount(unread: readonly CatchupUnreadRef[], n: number): { count: number; sinceMs: number | null } {
+  if (unread.length === 0) return { count: 0, sinceMs: null };
+  const count = Math.min(Math.max(Math.trunc(n) || 1, 1), unread.length);
+  return { count, sinceMs: unread.at(-count)?.at_ms ?? null };
+}
+
+/** How many unread a "since HH:MM" covers: those whose local time-of-day is at/after it. */
+export function countSince(unread: readonly CatchupUnreadRef[], time: string): number {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(time.trim());
+  if (match === null) return unread.length;
+  const wanted = Number(match[1]) * 60 + Number(match[2]);
+  let count = 0;
+  for (const ref of unread) {
+    if (ref.at_ms === null) {
+      count += 1;
+      continue;
+    }
+    const date = new Date(ref.at_ms);
+    if (date.getHours() * 60 + date.getMinutes() >= wanted) count += 1;
+  }
+  return count;
 }
 
 /**
@@ -403,8 +487,72 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     }
   }
 
-  /** One catch-up for `scope`: the Reading line first, the answer only if it is still wanted. */
-  function fetchFor(scope: DiscussScope): void {
+  let previewUnread: CatchupUnreadRef[] = [];
+  let boundCount = 0;
+  let lastSinceMs: number | null = null;
+  let pending = false;
+
+  /** Say whether a request is in flight, here and on the page's entry points. */
+  function setPending(on: boolean): void {
+    pending = on;
+    deps.onBusy?.(on);
+    drawBound();
+  }
+
+  /** Draw the Summarize bound: its button, and the two linked ends of it. */
+  function drawBound(): void {
+    const button = deps.byId("discuss-summarize") as HTMLButtonElement;
+    const count = deps.byId("discuss-count") as HTMLInputElement;
+    const since = deps.byId("discuss-since") as HTMLInputElement;
+    const none = previewUnread.length === 0;
+    button.disabled = pending || none;
+    count.disabled = pending || none;
+    since.disabled = pending || none;
+    if (none) {
+      button.textContent = "Summarize";
+      return;
+    }
+    const bound = boundForCount(previewUnread, boundCount || previewUnread.length);
+    boundCount = bound.count;
+    count.value = String(bound.count);
+    count.max = String(previewUnread.length);
+    since.value = bound.sinceMs === null ? "" : hhmm(bound.sinceMs);
+    button.textContent = `Summarize last ${bound.count} unread since ${since.value || "—"}`;
+  }
+
+  /** Read the scope's preview and offer its bound; no model is asked. */
+  function previewFor(scope: DiscussScope): void {
+    generation += 1;
+    const asked = generation;
+    lastScope = scope;
+    deps.byId("discuss-scope").textContent = scope.label;
+    deps.byId("discuss-status").textContent = "Checking what to summarize…";
+    void deps.catchupPreview(scope.channelId, scope).then(
+      (value) => {
+        if (asked !== generation || !isOpen()) return;
+        const preview = asCatchupPreview(value);
+        previewUnread = preview.unread;
+        boundCount = preview.unread.length;
+        if (previewUnread.length === 0) {
+          deps.byId("discuss-status").textContent = "Nothing unread here.";
+        } else {
+          deps.byId("discuss-status").textContent = `${previewUnread.length} unread ready.`;
+        }
+        drawBound();
+      },
+      (error: unknown) => {
+        if (asked !== generation || !isOpen()) return;
+        previewUnread = [];
+        drawBound();
+        deps.byId("discuss-status").textContent = error instanceof Error ? error.message : String(error);
+      },
+    );
+  }
+
+  /** One catch-up for `scope` at the chosen bound; nothing starts another meanwhile. */
+  function fetchFor(scope: DiscussScope, sinceMs: number | null): void {
+    if (pending) return;
+    lastSinceMs = sinceMs;
     generation += 1;
     const asked = generation;
     lastScope = scope;
@@ -416,9 +564,11 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     deps.byId("discuss-stamp").textContent = "";
     deps.byId("discuss-stamp").hidden = true;
     deps.byId("discuss-retry").hidden = true;
-    const body: CatchupRequestBody = { thread_id: scope.threadId, view: scope.view };
+    setPending(true);
+    const body: CatchupRequestBody = { thread_id: scope.threadId, view: scope.view, since_ms: sinceMs };
     void deps.catchupPost(scope.channelId, body).then(
       (value) => {
+        setPending(false);
         if (asked !== generation || !isOpen()) return;
         const answer = asCatchupAnswer(value);
         lastAnswer = answer;
@@ -432,6 +582,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         deps.byId("discuss-stamp").hidden = stampLine === "";
       },
       (error: unknown) => {
+        setPending(false);
         if (asked !== generation || !isOpen()) return;
         // A deployment with no summarizer refuses the same way every time: say the
         // hint and offer no retry, where a failed attempt gets its error and one.
@@ -492,10 +643,25 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         }
         listening.listen(deps.byId("discuss-close"), "click", () => {
           generation += 1;
+          if (pending) setPending(false);
           setOpen(false);
         });
         listening.listen(deps.byId("discuss-retry"), "click", () => {
-          if (lastScope !== null) fetchFor(lastScope);
+          if (lastScope !== null) fetchFor(lastScope, lastSinceMs);
+        });
+        listening.listen(deps.byId("discuss-summarize"), "click", () => {
+          if (pending || lastScope === null || previewUnread.length === 0) return;
+          fetchFor(lastScope, boundForCount(previewUnread, boundCount).sinceMs);
+        });
+        const countInput = deps.byId("discuss-count") as HTMLInputElement;
+        listening.listen(countInput, "input", () => {
+          boundCount = boundForCount(previewUnread, Number(countInput.value)).count;
+          drawBound();
+        });
+        const sinceInput = deps.byId("discuss-since") as HTMLInputElement;
+        listening.listen(sinceInput, "input", () => {
+          boundCount = countSince(previewUnread, sinceInput.value);
+          drawBound();
         });
         listening.listen(deps.byId("discuss-mark-read"), "click", () => mark(true));
         listening.listen(deps.byId("discuss-mark-unread"), "click", () => mark(false));
@@ -570,10 +736,11 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       // Focus home on open, as the other panels put it: Close, without scrolling.
       const closer = maybe("discuss-close") as (HTMLElement & { focus?: (options?: unknown) => void }) | null;
       if (closer && typeof closer.focus === "function") closer.focus({ preventScroll: true });
-      fetchFor(scope);
+      previewFor(scope);
     },
     close() {
       generation += 1;
+      if (pending) setPending(false);
       setOpen(false);
     },
     isOpen,

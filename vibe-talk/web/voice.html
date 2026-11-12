@@ -404,9 +404,15 @@
                   <button id="discuss-mode-docked" type="button" aria-pressed="false">Dock</button>
                   <button id="discuss-mode-maximized" type="button" aria-pressed="false">Full</button>
                 </span>
+                <button id="discuss-summarize" type="button">Summarize</button>
                 <button id="discuss-sheet-toggle" type="button" aria-expanded="false" aria-controls="discuss-panel">Maximize</button>
                 <button id="discuss-close" type="button">Close</button>
               </div>
+            </div>
+            <!-- `discuss-summarize-button`: nothing runs until Summarize (in the
+                 actions above, beside Close) is pressed; this row is its bound. -->
+            <div class="discuss-ask">
+              <span class="discuss-bound">last <input id="discuss-count" type="number" min="1" step="1" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" aria-label="Number of unread messages"> unread since <input id="discuss-since" type="time" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" aria-label="Since time"></span>
             </div>
             <p id="discuss-scope"></p>
             <p id="discuss-status" role="status"></p>

@@ -13,11 +13,11 @@ walk server has no [summaries.llm], so client-config is answered with
 `discuss_available` added — the capability a real Discuss deployment
 reports; the disabled-button state without it is covered by unit tests.
 
-The walk: open the channel, tap Discuss, see "Reading…" give way to the
-summary with its covered-messages footer, Mark read sending exactly the
-markable ids, a footer link closing the panel, and the panel overlaying the
-list without moving #scroll-area. Condition waits only — no fixed sleeps in
-any assertion.
+The walk: open the channel, tap Discuss (nothing is asked), press Summarize,
+see "Reading…" give way to the summary with its covered-messages footer, Mark
+read sending exactly the markable ids, a footer link closing the panel, and
+the panel overlaying the list without moving #scroll-area. Condition waits
+only — no fixed sleeps in any assertion.
 """
 
 import json
@@ -93,6 +93,19 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
         route.fulfill(status=200, content_type="application/json",
                       body=json.dumps(CATCHUP_ANSWER))
 
+    def preview(route: Route) -> None:
+        route.fulfill(status=200, content_type="application/json", body=json.dumps({
+            "channel": {"id": CHANNEL, "label": "lead team"},
+            "thread_id": None, "view": "flat",
+            "window": {"count": 12, "unread_count": 2, "read_count": 10,
+                       "from_id": MARKABLE[0], "through_id": MARKABLE[1],
+                       "truncated": False, "noise_hidden": 0},
+            "unread": [
+                {"id": MARKABLE[0], "at_ms": 1760000000000, "label": "09:51 · Ada"},
+                {"id": MARKABLE[1], "at_ms": 1760000060000, "label": "09:52 · Ben"},
+            ],
+        }))
+
     def dismiss(route: Route) -> None:
         writes.append((route.request.url, route.request.post_data_json or {}))
         route.fulfill(status=200, content_type="application/json", body="{}")
@@ -104,6 +117,7 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
                       body=json.dumps(body))
 
     page.route("**/api/v1/client-config", client_config)
+    page.route(f"**/api/v1/channels/{CHANNEL}/catchup/preview*", preview)
     page.route(f"**/api/v1/channels/{CHANNEL}/catchup", catchup)
     page.route(f"**/api/v1/channels/{CHANNEL}/dismiss", dismiss)
     page.route(f"**/api/v1/channels/{CHANNEL}/restore", dismiss)
@@ -135,11 +149,19 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
 
     page.click("#discuss-open")
     page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+    # Opening asks nothing: the bound is offered first, and only its press posts.
+    page.wait_for_function(
+        "() => document.getElementById('discuss-summarize').textContent.includes('Summarize last 2 unread')",
+        timeout=20_000)
+    check(posts == [], f"opening posted {posts}, not nothing")
+    page.click("#discuss-summarize")
     page.wait_for_function(
         "() => document.getElementById('discuss-answer').textContent.includes('Ada shipped')",
         timeout=20_000)
-    check(posts == [{"thread_id": None, "view": "flat"}] or posts == [{"thread_id": None, "view": "main"}],
-          f"the panel posted {posts}, not one channel catch-up")
+    check(len(posts) == 1 and posts[0].get("thread_id") is None
+          and posts[0].get("view") in ("flat", "main")
+          and posts[0].get("since_ms") == 1760000000000,
+          f"the panel posted {posts}, not one bounded channel catch-up")
     status = page.locator("#discuss-status").text_content() or ""
     check(status == "Read 2 unread of 12", f"the status says {status!r}")
     covers = page.locator("#discuss-covers").text_content() or ""

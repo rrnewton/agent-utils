@@ -122,6 +122,44 @@
   }
 }
 
+/* The one ask (`discuss-summarize-button`): its press, and the bound's two ends. */
+.discuss-ask {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+#discuss-summarize {
+  padding: 4px 10px;
+  cursor: pointer;
+  background: #262c36;
+  color: #e7e9ee;
+  border: 1px solid #3d4452;
+  border-radius: 6px;
+  font: inherit;
+}
+
+#discuss-summarize[disabled] {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.discuss-bound {
+  color: #aab2c0;
+  font-size: 0.85rem;
+}
+
+.discuss-bound input {
+  width: 4.5rem;
+  background: #262c36;
+  color: #e7e9ee;
+  border: 1px solid #3d4452;
+  border-radius: 6px;
+  font: inherit;
+}
+
 #discuss-scope {
   margin: 2px 0 0;
   color: #aab2c0;

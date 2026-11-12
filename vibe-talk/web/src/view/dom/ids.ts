@@ -121,6 +121,7 @@ export interface ElementById {
   "discuss-actions": HTMLDivElement;
   "discuss-answer": HTMLDivElement;
   "discuss-close": HTMLButtonElement;
+  "discuss-count": HTMLInputElement;
   "discuss-covers": HTMLParagraphElement;
   "discuss-footer": HTMLDivElement;
   "discuss-links": HTMLUListElement;
@@ -136,8 +137,10 @@ export interface ElementById {
   "discuss-retry": HTMLButtonElement;
   "discuss-scope": HTMLParagraphElement;
   "discuss-sheet-toggle": HTMLButtonElement;
+  "discuss-since": HTMLInputElement;
   "discuss-stamp": HTMLParagraphElement;
   "discuss-status": HTMLParagraphElement;
+  "discuss-summarize": HTMLButtonElement;
   "discuss-unmarkable": HTMLParagraphElement;
   "dismiss-banner": HTMLButtonElement;
   "dismiss-error": HTMLButtonElement;
