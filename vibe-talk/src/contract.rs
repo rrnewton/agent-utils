@@ -1544,6 +1544,9 @@ pub struct CatchupStamp {
     pub input_chars: usize,
     /// Characters in the answer.
     pub output_chars: usize,
+    /// Terms the answer's debugging section said it did not understand, counted by
+    /// the server; the terms themselves are the response's `unknown_terms`.
+    pub unknown_term_count: usize,
 }
 
 /// One Discuss answer: the model text, and exactly what it covers. `catchup-side-agent`.
@@ -1577,6 +1580,11 @@ pub struct CatchupResponse {
     /// that draws markup; empty when drawing `text` plain is the same thing.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text_html: String,
+    /// The terms the answer's debugging section said it did not understand, parsed
+    /// and counted by the server (`stamp.unknown_term_count`); the panel draws
+    /// them collapsed. Absent from an older server, and when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unknown_terms: Vec<String>,
     /// Which backend answered, said out loud so a page can never imply a model it did not get.
     pub backend: String,
     /// The model it asked.

@@ -1282,6 +1282,7 @@ fn samples() -> Value {
                 cited_ids: vec![MessageId("1010".into())],
                 text: "one point worth knowing".into(),
                 text_html: "<p>one point worth knowing</p>".into(),
+                unknown_terms: vec!["step 3A".into(), "wave Q".into()],
                 backend: "meta-gateway".into(),
                 model: "some-model".into(),
                 stamp: CatchupStamp {
@@ -1293,6 +1294,7 @@ fn samples() -> Value {
                     output_tokens: Some(200),
                     input_chars: 51_234,
                     output_chars: 812,
+                    unknown_term_count: 2,
                 },
             }),
             to(&CatchupResponse {
@@ -1314,6 +1316,7 @@ fn samples() -> Value {
                 cited_ids: Vec::new(),
                 text: String::new(),
                 text_html: String::new(),
+                unknown_terms: Vec::new(),
                 backend: "messages-api".into(),
                 model: "some-model".into(),
                 stamp: CatchupStamp {
@@ -1325,6 +1328,7 @@ fn samples() -> Value {
                     output_tokens: None,
                     input_chars: 40,
                     output_chars: 0,
+                    unknown_term_count: 0,
                 },
             }),
         ],

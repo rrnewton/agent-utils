@@ -224,6 +224,13 @@
             "null"
           ]
         },
+        "unknown_terms": {
+          "description": "The terms the answer's debugging section said it did not understand, parsed\nand counted by the server (`stamp.unknown_term_count`); the panel draws\nthem collapsed. Absent from an older server, and when there are none.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "unread_ids": {
           "description": "Exactly the unread ids the model was shown, oldest first.",
           "items": {
@@ -314,6 +321,12 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "unknown_term_count": {
+          "description": "Terms the answer's debugging section said it did not understand, counted by\nthe server; the terms themselves are the response's `unknown_terms`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
@@ -324,7 +337,8 @@
         "input_tokens",
         "output_tokens",
         "input_chars",
-        "output_chars"
+        "output_chars",
+        "unknown_term_count"
       ],
       "type": "object"
     },

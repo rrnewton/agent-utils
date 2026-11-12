@@ -182,6 +182,12 @@ export interface CatchupResponse {
    */
   thread_id: string | null;
   /**
+   * The terms the answer's debugging section said it did not understand, parsed
+   * and counted by the server (`stamp.unknown_term_count`); the panel draws
+   * them collapsed. Absent from an older server, and when there are none.
+   */
+  unknown_terms?: string[];
+  /**
    * Exactly the unread ids the model was shown, oldest first.
    */
   unread_ids: MessageId[];
@@ -234,6 +240,11 @@ export interface CatchupStamp {
    * The whole request, in milliseconds.
    */
   total_ms: number;
+  /**
+   * Terms the answer's debugging section said it did not understand, counted by
+   * the server; the terms themselves are the response's `unknown_terms`.
+   */
+  unknown_term_count: number;
 }
 
 /**

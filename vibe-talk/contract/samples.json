@@ -107,11 +107,16 @@
         "model_ms": 3900,
         "output_chars": 812,
         "output_tokens": 200,
-        "total_ms": 4050
+        "total_ms": 4050,
+        "unknown_term_count": 2
       },
       "text": "one point worth knowing",
       "text_html": "<p>one point worth knowing</p>",
       "thread_id": "thread-1",
+      "unknown_terms": [
+        "step 3A",
+        "wave Q"
+      ],
       "unread_ids": [
         "1010",
         "1011"
@@ -148,7 +153,8 @@
         "model_ms": 10,
         "output_chars": 0,
         "output_tokens": null,
-        "total_ms": 13
+        "total_ms": 13,
+        "unknown_term_count": 0
       },
       "text": "",
       "thread_id": null,

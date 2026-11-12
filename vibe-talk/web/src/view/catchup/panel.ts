@@ -184,6 +184,7 @@ export function asCatchupAnswer(value: unknown): CatchupAnswer {
       output_tokens: numberOrNull(rawStamp.output_tokens),
       input_chars: numberOrNull(rawStamp.input_chars) ?? 0,
       output_chars: numberOrNull(rawStamp.output_chars) ?? 0,
+      unknown_term_count: numberOrNull(rawStamp.unknown_term_count) ?? 0,
     },
   };
 }

@@ -2591,6 +2591,7 @@ pub async fn catchup(
         .provider
         .clone()
         .unwrap_or_else(|| "discord".to_owned());
+    let (raw, unknown_terms) = crate::catchup::split_unknown_terms(&raw);
     let (text, cited_ids) = crate::catchup::shape_answer(&raw, &sent, |id| {
         let message = by_id.get(id.as_str())?;
         let time = if message.spoken_time.is_empty() {
@@ -2647,6 +2648,7 @@ pub async fn catchup(
             system.chars().count() + built.prompt.chars().count()
         },
         output_chars: text.chars().count(),
+        unknown_term_count: unknown_terms.len(),
     };
     tracing::info!(
         channel = %channel_id,
@@ -2659,6 +2661,8 @@ pub async fn catchup(
         output_chars = stamp.output_chars,
         window = fetched.messages.len(),
         unread = built.unread_ids.len(),
+        unknown_term_count = stamp.unknown_term_count,
+        unknown_terms = %unknown_terms.join(", "),
         "discuss catch-up answered"
     );
     Ok(no_store(Json(crate::contract::CatchupResponse {
@@ -2683,6 +2687,7 @@ pub async fn catchup(
         cited_ids,
         text,
         text_html,
+        unknown_terms,
         backend: agent.backend().to_owned(),
         model: state
             .catchup_model
