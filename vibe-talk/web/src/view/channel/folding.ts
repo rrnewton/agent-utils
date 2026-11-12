@@ -81,6 +81,8 @@ export interface FoldingDependencies {
   eachColumn(fn: () => void): void;
   readerActed(): void;
   preservingScroll(fn: () => void): void;
+  /** Move a scroller by a measured delta, through the scroll owner (`#1251 scroll-single-owner`). */
+  nudge(area: HTMLElement, delta: number): void;
   /** Collapse or expand `row` in `area` under the scroll owner's per-act anchor choice (`#1215`). */
   preservingCollapse(area: HTMLElement, row: HTMLElement, head: number, foot: number, fn: () => void): void;
   threadHue(thread: string): number;
@@ -786,7 +788,7 @@ export function createFolding(deps: FoldingDependencies): Folding {
       const area = (deps.side() ? deps.sidePane() : deps.channelPane()).scroller();
       const top = field.getBoundingClientRect().top;
       for (const entry of folds) setFolded(entry, !openAtStep(step, entry));
-      area.scrollTop += field.getBoundingClientRect().top - top;
+      deps.nudge(area, field.getBoundingClientRect().top - top);
       renderScrollTools();
       return;
     }
@@ -799,7 +801,7 @@ export function createFolding(deps: FoldingDependencies): Folding {
       const hold = deps.filterHold();
       if (hold !== null && hold.row === row && row.getBoundingClientRect().bottom <= head) {
         const area = el("scroll-area");
-        area.scrollTop += row.getBoundingClientRect().top - head;
+        deps.nudge(area, row.getBoundingClientRect().top - head);
         deps.setFilterHold({
           ...hold, at: area.scrollTop,
           offset: row.getBoundingClientRect().top - deps.listPlaceTop(area),

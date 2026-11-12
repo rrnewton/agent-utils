@@ -2481,6 +2481,7 @@ const folding = createFolding({
   eachColumn,
   readerActed,
   preservingScroll,
+  nudge: (area, delta) => scrollKeeping.nudge(area, delta),
   preservingCollapse,
   threadHue: (id) => Number(threadHue(String(id))),
   threadOf,
