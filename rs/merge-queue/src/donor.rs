@@ -390,10 +390,13 @@ impl Receipt {
 }
 
 /// `match` or a one-line description of how two verdicts for one commit differ.
+///
+/// The decision is the outcome class (green / refused / red) plus the
+/// failed list. `failure_line` is detail for a mismatch message only: it
+/// never decides a match on its own, and it is ignored when both verdicts
+/// are green — a green run's carried line can differ by nothing but a
+/// duration in a description (#1343).
 pub fn compare(local: &Verdict, donor: &Verdict) -> String {
-    if local == donor {
-        return "match".to_owned();
-    }
     let word = |v: &Verdict| {
         if v.refused {
             "refused"
@@ -403,6 +406,9 @@ pub fn compare(local: &Verdict, donor: &Verdict) -> String {
             "red"
         }
     };
+    if word(local) == word(donor) && local.failed == donor.failed {
+        return "match".to_owned();
+    }
     let failed = |v: &Verdict| {
         if v.failed.is_empty() {
             String::new()
@@ -5345,6 +5351,58 @@ mod unit {
             &red.verdict(),
         );
         assert!(detail.contains("first failure: FAILED node-1"), "{detail}");
+    }
+
+    #[test]
+    fn green_verdicts_match_when_failure_lines_differ_only_by_duration() {
+        // #1343 mq-compare-green-false-mismatch: two green receipts whose
+        // carried lines differ only by duration (and name FAILED only in a
+        // description) are the same verdict.
+        let line = |secs: u32| {
+            format!(
+                "[check.check_outcome_consumers] ✓ PASS   Run the consumer regression \
+                 and the policy lint ({secs}s)  [gate.sh: OK - PASSED/FAILED/NO_RESULT \
+                 gate wiring enforced]"
+            )
+        };
+        let green = |failure_line: String| Verdict {
+            green: true,
+            refused: false,
+            failed: Vec::new(),
+            failure_line,
+        };
+        assert_eq!(compare(&green(line(19)), &green(line(10))), "match");
+        // A failure line never decides a match on its own: same class and
+        // same failed list match whatever either line says.
+        let red = |failure_line: &str| Verdict {
+            green: false,
+            refused: false,
+            failed: vec!["check.a".to_owned()],
+            failure_line: failure_line.to_owned(),
+        };
+        assert_eq!(
+            compare(&red("FAILED a (1s)"), &red("FAILED a (9s)")),
+            "match"
+        );
+        // Class or failed-list differences still mismatch.
+        assert!(compare(&green(String::new()), &red("FAILED a")).starts_with("mismatch:"));
+        assert!(compare(
+            &red("FAILED a"),
+            &Verdict {
+                failed: vec!["check.b".to_owned()],
+                failure_line: "FAILED b".to_owned(),
+                ..Verdict::default()
+            },
+        )
+        .starts_with("mismatch:"));
+        assert!(compare(
+            &Verdict {
+                refused: true,
+                ..Verdict::default()
+            },
+            &green(String::new()),
+        )
+        .starts_with("mismatch:"));
     }
 
     fn refused_receipt(job: &Job, donor: &str, log_tail: &str) -> Receipt {

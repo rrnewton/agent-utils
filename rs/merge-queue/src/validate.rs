@@ -183,9 +183,10 @@ pub fn refusal_line(log_text: &str) -> Option<&str> {
 
 /// Patterns naming a failure in a runner's log, beyond the tail: a suite
 /// or test failure line can scroll far above the bounded tail a receipt
-/// carries (#1198).
-pub const FAILURE_LINE_PATTERNS: [&str; 4] =
-    ["FAILED", "panicked at", "test result: FAILED", "error["];
+/// carries (#1198). `FAILED` is not in this list: it names a failure only
+/// as a standalone status token (see [`names_failure`]), never as a
+/// substring of a description.
+pub const FAILURE_LINE_PATTERNS: [&str; 2] = ["panicked at", "error["];
 
 /// Most failure lines one receipt carries.
 pub const MAX_FAILURE_LINES: usize = 40;
@@ -195,10 +196,29 @@ pub const MAX_FAILURE_BYTES: usize = 8 * 1024;
 
 /// Whether `line` names a failure under the built-in patterns or a
 /// configured extra (`validator.failure_patterns`, matched as substrings).
+///
+/// `FAIL`/`FAILED` name a failure only as a standalone status token (a
+/// whole whitespace-delimited word, ignoring surrounding punctuation), so
+/// a description that merely mentions the word — `PASSED/FAILED/NO_RESULT`
+/// in a passing step's prose, say — is not captured (#1343). A line that
+/// carries a PASS marker (`✓ PASS`) never names a failure at all.
 pub fn names_failure(line: &str, extra: &[String]) -> bool {
-    FAILURE_LINE_PATTERNS
-        .iter()
-        .any(|pattern| line.contains(pattern))
+    if line.contains("✓ PASS") {
+        return false;
+    }
+    let has_status_token = line.split_whitespace().any(|token| {
+        let token = token.trim_matches(|c: char| {
+            matches!(
+                c,
+                '.' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '|'
+            )
+        });
+        token == "FAIL" || token == "FAILED"
+    });
+    has_status_token
+        || FAILURE_LINE_PATTERNS
+            .iter()
+            .any(|pattern| line.contains(pattern))
         || extra
             .iter()
             .any(|pattern| !pattern.is_empty() && line.contains(pattern.as_str()))
@@ -2144,6 +2164,36 @@ mod unit {
         );
         // Without it, the suite name alone (no pattern) is not picked.
         assert!(failure_lines("suite-9 exploded quietly\n", &[]).is_empty());
+    }
+
+    #[test]
+    fn a_pass_line_with_failed_in_its_description_is_never_captured() {
+        // #1343 mq-compare-green-false-mismatch: a green step's line names
+        // the gate outcomes it enforces (PASSED/FAILED/NO_RESULT) in prose.
+        let pass_line = "[check.check_outcome_consumers] ✓ PASS   Run the check-outcome \
+                         consumer regression and the merge-gate policy lint (10s)  \
+                         [check-merge-gate-policy.sh: OK - PASSED/FAILED/NO_RESULT gate \
+                         wiring enforced]";
+        assert!(!names_failure(pass_line, &[]), "{pass_line}");
+        assert!(failure_lines(pass_line, &[]).is_empty());
+        assert_eq!(first_failure_line(pass_line, &[]), None);
+        // FAILED glued to other words is a description, not a status token,
+        // even without a PASS marker on the line.
+        assert!(!names_failure(
+            "gate wiring PASSED/FAILED/NO_RESULT enforced",
+            &[]
+        ));
+        assert!(!names_failure("the FAILEDCOUNT rose", &[]));
+        // A FAIL/FAILED status token still names a failure.
+        for line in [
+            "FAILED node-1",
+            "test x FAILED",
+            "test result: FAILED. 1 passed; 1 failed",
+            "[a.b] ✗ FAIL   b (2s, exit 1)",
+            "run-script-tests: FAILED suite-9 (status 3)",
+        ] {
+            assert!(names_failure(line, &[]), "{line}");
+        }
     }
 
     #[test]

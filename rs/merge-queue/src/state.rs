@@ -121,8 +121,8 @@ pub struct ValidatorConfig {
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub tool_refresh: std::collections::BTreeMap<String, String>,
     /// Extra substrings naming a failure in a runner's log, beyond the
-    /// built-in patterns (`FAILED`, `panicked at`, `test result: FAILED`,
-    /// `error[`): the matching lines ride the donor receipt so an ejection
+    /// built-in capture (a `FAIL`/`FAILED` status token, `panicked at`,
+    /// `error[`; a `✓ PASS` line is never captured): the matching lines ride the donor receipt so an ejection
     /// names the failing test or suite even when that line scrolled out of
     /// the log tail (#1198).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
