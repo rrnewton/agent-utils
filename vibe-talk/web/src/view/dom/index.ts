@@ -2,7 +2,8 @@
 // interface. `#624 voice-page-modularity`, plan step 16.
 
 export { childByClass, nodeWithin, shownNode } from "./tree.ts";
-export { elementIn, focusLost, focusMinimally } from "./shell.ts";
+export { elementIn, focusLost, focusMinimally, setFocusReveal } from "./shell.ts";
+export type { FocusReveal } from "./shell.ts";
 export type { ElementById } from "./ids.ts";
 export { classWords, setClassWord } from "./classes.ts";
 export { sayingNodes, setAttributeIfChanged, setClassNameIfChanged, setHiddenIfChanged, setTextIfChanged, tagNameOf } from "./changes.ts";

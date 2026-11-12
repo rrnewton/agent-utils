@@ -24,7 +24,24 @@ export function focusLost(): boolean {
  * browser's own `focus()` scrolls a control it cannot show whole to the MIDDLE of the list, which on a
  * list being read is a jump of half a screen for the sake of one control.
  */
+/** A focus reveal, as the scroll owner offers it (`intoView`). */
+export type FocusReveal = (element: Element, block: string, inline?: string) => void;
+
+/**
+ * The page's focus reveal, handed in once at boot (`setFocusReveal`): the scroll
+ * owner's own write, so even this layer's reveal is the owner's (`#1251
+ * scroll-single-owner`). Until it is handed in — a fixture, a test that never
+ * boots the page — `focusMinimally` reveals as it always did.
+ */
+let focusReveal: FocusReveal | null = null;
+
+/** Hand the dom layer its focus reveal. Called once, at the page's boot. */
+export function setFocusReveal(reveal: FocusReveal): void {
+  focusReveal = reveal;
+}
+
 export function focusMinimally(node: HTMLElement): void {
   node.focus({ preventScroll: true });
-  if (typeof node.scrollIntoView === "function") node.scrollIntoView({ block: "nearest", inline: "nearest" });
+  if (focusReveal) focusReveal(node, "nearest", "nearest");
+  else if (typeof node.scrollIntoView === "function") node.scrollIntoView({ block: "nearest", inline: "nearest" });
 }

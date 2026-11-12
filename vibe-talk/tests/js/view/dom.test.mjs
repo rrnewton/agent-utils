@@ -2612,3 +2612,21 @@ test("`#624 voice-page-modularity`: the page hidden pauses and notes a call; bac
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepStrictEqual(log, ["wakeLock", "visibleAt 1000", "retries", "quiet", "loadDiscord", "poll fresh", "side visible since", "resumeStream"]);
 });
+
+test("`#1251 scroll-single-owner`: the dom focus reveal is the owner's write once the page hands it in, and its own before that", () => {
+  // Last in this file: registration is the page's boot act and cannot be taken back.
+  const { focusMinimally, setFocusReveal } = VIEW_DOM;
+  const calls = [];
+  const node = {
+    focus: (options) => calls.push(["focus", options]),
+    scrollIntoView: (options) => calls.push(["own", options]),
+  };
+  focusMinimally(node);
+  assert.deepStrictEqual(calls, [["focus", { preventScroll: true }], ["own", { block: "nearest", inline: "nearest" }]],
+    "before the page boots, the reveal is the dom layer's own, as it always was");
+  calls.length = 0;
+  setFocusReveal((element, block, inline) => calls.push(["owner", element === node, block, inline]));
+  focusMinimally(node);
+  assert.deepStrictEqual(calls, [["focus", { preventScroll: true }], ["owner", true, "nearest", "nearest"]],
+    "once handed in, the reveal is the owner's write and the node's own is not used");
+});

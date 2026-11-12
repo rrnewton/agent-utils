@@ -46,6 +46,7 @@ declare const createOncePerFrame: LegacyImports["createOncePerFrame"];
 declare const shownNode: LegacyImports["shownNode"];
 declare const focusLost: LegacyImports["focusLost"];
 declare const focusMinimally: LegacyImports["focusMinimally"];
+declare const setFocusReveal: LegacyImports["setFocusReveal"];
 declare const focusAtEnd: LegacyImports["focusAtEnd"];
 declare const isComposer: LegacyImports["isComposer"];
 declare const createComposerBoxes: LegacyImports["createComposerBoxes"];

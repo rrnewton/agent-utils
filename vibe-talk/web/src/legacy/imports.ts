@@ -75,6 +75,7 @@ export {
   createOncePerFrame,
   focusLost,
   focusMinimally,
+  setFocusReveal,
   isTextField,
   keepsOwnKeys,
   nodeWithin,

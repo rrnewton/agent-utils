@@ -312,7 +312,7 @@ if (typeof window.ResizeObserver === "function") {
     const screen = leftEl("screen-main");
     if (!screen.hidden) screen.style.setProperty("--scroll-tools-clearance", room);
     if (landed) placeEntryLanding(entryState().landing.row, entryState().landing.first);
-    if (pinned) area.scrollTop = area.scrollHeight;
+    if (pinned) scrollKeeping.toFoot(area);
     // The room the channel's box keeps for them is above it, so it moved with them.
     placeChipsOverComposer();
     // `#451 read-strip-followups`: and the strip docked on this row moved with it, so a place a
@@ -352,7 +352,7 @@ if (typeof window.ResizeObserver === "function") {
     if (!screen.hidden) screen.style.setProperty("--read-steer-height", `${height}px`);
     if (!screen.hidden) screen.style.setProperty("--read-steer-clearance", room);
     if (landed) placeEntryLanding(entryState().landing.row, entryState().landing.first);
-    if (pinned) area.scrollTop = area.scrollHeight;
+    if (pinned) scrollKeeping.toFoot(area);
     // The strip floats in the same band as the chips over the channel's box, so it moved with it.
     placeChipsOverComposer();
     // `#442 read-strip-order`: a strip moved on a desk that grew is held inside the window again.
@@ -2060,7 +2060,7 @@ function showView(name) {
   if (returning) {
     const mark = name === "discord" ? viewMarks.get(name) : undefined;
     if (mark && mark.anchor) restoreScroll(mark);
-    else el("scroll-area").scrollTop = top;
+    else scrollKeeping.toPosition(el("scroll-area"), top);
   } else {
     scrollToNewest();
   }
@@ -2338,7 +2338,7 @@ function keepingCardStill(id, change, slide = false) {
   // schedule, either of which would move the card; this room stands in for it.
   closeOverscroll();
   sizeOverextend(area, top);
-  area.scrollTop = top;
+  scrollKeeping.toPosition(area, top);
   if (was) slideIntoPlace(now, was);
   return true;
 }
@@ -2412,6 +2412,8 @@ const scrollKeeping = createScrollKeeping({
 const {
   visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, holdingReader, captureScroll, restoreScroll, followIfPinned,
 } = scrollKeeping;
+// The dom layer's focus reveal is the owner's write too, handed in now the owner stands (`#1251`).
+setFocusReveal((element, block, inline) => scrollKeeping.intoView(element, block, inline));
 
 /** The invitation only makes sense while there is nothing else in the transcript. */
 const renderEmptyState = () => {
@@ -2814,7 +2816,7 @@ function keepBoxInView(box, area) {
   const bottom = top + rect.height;
   const view = area.clientHeight || 0;
   if (top >= area.scrollTop && bottom <= area.scrollTop + view) return;
-  area.scrollTop = rect.height <= view ? bottom - view : top;
+  scrollKeeping.toPosition(area, rect.height <= view ? bottom - view : top);
 }
 
 /**
