@@ -1057,15 +1057,18 @@ def test_all_list_names_skipped_timing_steps_and_optin_plans_them(
 ) -> None:
     """#1250: `--all --list` names every disabled-optin step as skipped and
     plans none of them; only `--include-disabled` plans them. Steps handled
-    by #1248 (fold-latency, keyboard) are planned either way."""
+    by #1248 (fold-latency, keyboard) are planned either way. Since #1251
+    (naming #1250) scroll-stability is behaviour-only and planned either
+    way too; the timeline benchmarks remain the disabled set."""
     validate = _validate_module()
     monkeypatch.delenv(validate.INCLUDE_DISABLED_ENV, raising=False)
     monkeypatch.setattr(
         validate, "changed_paths", lambda _base: ["vibe-talk/web/index.html"]
     )
-    disabled = ("vibe-talk.check.scroll-stability-browser",)
+    disabled: tuple[str, ...] = ()
     assert validate.main(["--all", "--list"]) == 0
     listed = capsys.readouterr().out
+    assert "STEP  vibe-talk.check.scroll-stability-browser" in listed
     assert "timing-sensitive steps disabled by default" in listed
     for tag in disabled:
         assert listed.count(tag) == 1, tag  # named once, as skipped

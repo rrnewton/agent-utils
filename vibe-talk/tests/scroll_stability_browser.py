@@ -90,8 +90,6 @@ from offline_cache_browser import CHANNEL, TOKEN, FakeApi, Json, check, handler_
 import page_sources
 
 if TYPE_CHECKING:
-    from typing import Any
-
     from playwright.sync_api import BrowserType, Page
 
 # (label, width, height, touch): a desk in two columns with a mouse, and a phone in one by touch.
@@ -584,7 +582,7 @@ class Reader:
         """Start sampling the first row on screen of `list_id` (Main's by default) and its offset at every frame."""
         self.page.evaluate(WATCH_JS, list_id)
 
-    def watch_settled(self, why: str) -> list[Any]:
+    def watch_settled(self, why: str) -> list[object]:
         """Stop the frame watch once the batch it samples has settled, and return its samples.
 
         Settled is drawn state, not a clock (`#1250 vibe-talk-timing-robust`): the last
@@ -615,12 +613,17 @@ class Reader:
         assert isinstance(samples, list)
         return samples
 
-    def held(self, before: tuple[str, float], why: str, list_id: str = "discord-log", foot: bool = False) -> None:
+    def held(self, before: tuple[str, float], why: str, list_id: str = "discord-log", foot: bool = False,
+             hold_ms: int | None = None) -> None:
         """At every frame since `watch`, the row the reader was on was the first on screen of
         `list_id`, within a pixel of where it was -- and with `foot`, the list was at its foot.
-        Judged when the batch settles (`watch_settled`), never by a held window or a count."""
+        Judged when the batch settles (`watch_settled`), never by a held window or a count.
+        `hold_ms` is accepted for older callers (the overscroll walk) and judges nothing."""
         samples = self.watch_settled(why)
-        for row, offset, gap in samples:
+        for sample in samples:
+            assert isinstance(sample, list) and len(sample) == 3
+            row, offset, gap = sample
+            assert isinstance(row, str) and isinstance(offset, (int, float)) and isinstance(gap, (int, float))
             self.check(row == before[0] and abs(float(offset) - before[1]) <= STILL_PX,
                        f"{why} moved the reader: row {before[0]} at {before[1]:.1f}px became row {row} at "
                        f"{float(offset):.1f}px")
@@ -1311,6 +1314,7 @@ def resort_walk(reader: Reader) -> None:
         samples = reader.watch_settled(why)
         before = dict((card, at) for card, at, _ in cards)
         for at in samples:
+            assert isinstance(at, (int, float))
             reader.check(abs(float(at) - before[watched]) <= STILL_PX,
                          f"{why} moved the card the reader was on, {watched}, from {before[watched]:.1f}px to {float(at):.1f}px")
         now = dict((card, at) for card, at, _ in page.evaluate(CARDS_ON_SCREEN_JS))
