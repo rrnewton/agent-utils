@@ -333,3 +333,16 @@ steps:
     timeout: 3600
     cpu_timeout: 2400
     hint: *rust_test_hint
+
+  - group: local-ci-hub
+    job: test
+    desc: local-ci-hub Rust tests (synthetic ledger fixtures)
+    cmd: >-
+      host_target="$(rustc -vV | sed -n 's/^host: //p')" && test -n "$host_target" &&
+      RUST_TEST_THREADS=1 python3 scripts/case_timings.py run-cargo -- cargo test --release --no-fail-fast --manifest-path rs/Cargo.toml
+      --target "$host_target" --target-dir rs/target/validation-tests -p local-ci-hub ${DAGRUN_EXTRA_ARGS}
+    cmdtype: cargo-test
+    labels: [validation-workspace, validation-rust-workspace-tests, component-local-ci-hub]
+    timeout: 9600
+    cpu_timeout: 1200
+    hint: *rust_test_hint

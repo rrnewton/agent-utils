@@ -1,0 +1,5 @@
+{"dir":"req","id":"1","op":"hello","protocol":"ci-hub-store-wire/v1","role":"record","client":"local-ci-hub/0.1.0"}
+{"dir":"res","id":"1","ok":true,"protocol":"ci-hub-store-wire/v1","role":"record","connector":"example-store/1.0","limits":{"max_events_per_append":1000,"max_append_bytes":67108864,"max_events_per_read":1000,"max_read_bytes":20,"max_line_bytes":67108864,"max_event_line_bytes":67108864,"max_object_bytes":50331648}}
+{"dir":"req","id":"2","op":"read_from","cursor":{"authority":"example-store","head":"head-1","shards":{}},"limit":1000}
+{"dir":"res","id":"2","ok":true,"events":[{"shard":"ledger/team-a/host-1/2026-11.jsonl","offset":0,"line":"{\"event_id\":\"evt-1\"}"}],"next_cursor":{"authority":"example-store","head":"head-1","shards":{"ledger/team-a/host-1/2026-11.jsonl":{"offset":19,"prefix_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}},"more":true}
+{"dir":"note","text":"page ended on the 20-byte budget, not the 1000-event limit; more stays true"}

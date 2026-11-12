@@ -1,0 +1,27 @@
+[package]
+name = "local-ci-hub"
+version = "0.1.0"
+description = "Rust CI hub ledger core: typed events, one fold, one verdict predicate, one canonical digest, with fan-out storage"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[[bin]]
+name = "local-ci-hub"
+path = "src/main.rs"
+
+[lib]
+name = "local_ci_hub"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

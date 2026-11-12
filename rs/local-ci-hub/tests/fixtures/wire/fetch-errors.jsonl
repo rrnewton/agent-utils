@@ -1,0 +1,11 @@
+{"dir":"req","id":"1","op":"hello","protocol":"ci-hub-store-wire/v1","role":"record","client":"local-ci-hub/0.1.0"}
+{"dir":"res","id":"1","ok":true,"protocol":"ci-hub-store-wire/v1","role":"record","connector":"example-store/1.0","limits":{"max_events_per_append":1000,"max_append_bytes":67108864,"max_events_per_read":1000,"max_read_bytes":16777216,"max_line_bytes":67108864,"max_event_line_bytes":67108864,"max_object_bytes":50331648}}
+{"dir":"req","id":"2","op":"fetch","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","max_bytes":10}
+{"dir":"res","id":"2","ok":false,"class":"object-too-large","message":"declared length 1590000 exceeds max_bytes 10; refused unread"}
+{"dir":"req","id":"3","op":"fetch","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","max_bytes":50331648}
+{"dir":"res","id":"3","ok":false,"class":"object-missing","message":"no object for this digest"}
+{"dir":"req","id":"4","op":"fetch","sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","max_bytes":50331648}
+{"dir":"res","id":"4","ok":true,"phase":"begin","declared_len":5,"sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"}
+{"dir":"res","id":"4","phase":"chunk","data_b64":"d3Jvbmc="}
+{"dir":"res","id":"4","phase":"end","bytes":5}
+{"dir":"note","text":"receiver checks sha256 at end of stream and refuses object-digest-mismatch; wrong bytes never become evidence"}

@@ -22,6 +22,7 @@ members = [
     "agent-teams",
     "merge-queue",
     "change-classifier",
+    "local-ci-hub",
 ]
 
 [workspace.package]

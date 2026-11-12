@@ -251,7 +251,8 @@
         "common/bin/local-ci-hub",
         "common/docs/local-ci-hub/",
         "py/bin/local-ci-hub",
-        "py/local_ci_hub/"
+        "py/local_ci_hub/",
+        "rs/local-ci-hub/"
       ],
       "reverse_dependencies": [],
       "test_files": [

@@ -1,0 +1,4 @@
+{"dir":"req","id":"1","op":"hello","protocol":"ci-hub-store-wire/v1","role":"record","client":"local-ci-hub/0.1.0"}
+{"dir":"res","id":"1","ok":true,"protocol":"ci-hub-store-wire/v1","role":"record","connector":"example-store/1.0","limits":{"max_events_per_append":1000,"max_append_bytes":67108864,"max_events_per_read":1000,"max_read_bytes":16777216,"max_line_bytes":67108864,"max_event_line_bytes":32,"max_object_bytes":50331648}}
+{"dir":"req","id":"2","op":"append","events":[{"event_id":"evt-fat","line":"{\"event_id\":\"evt-fat\",\"event_type\":\"run.result\",\"payload\":\"this line exceeds the negotiated event line bound\"}"}]}
+{"dir":"res","id":"2","ok":true,"acks":[{"event_id":"evt-fat","status":"refused","class":"bad-request","message":"event line exceeds max_event_line_bytes; fat lines move through the evidence path"}]}

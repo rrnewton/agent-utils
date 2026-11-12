@@ -1,0 +1,2 @@
+{"dir":"req","id":"1","op":"hello","protocol":"ci-hub-store-wire/v99","role":"record","client":"local-ci-hub/0.1.0"}
+{"dir":"res","id":"1","ok":false,"class":"version-unsupported","message":"unknown protocol major version"}

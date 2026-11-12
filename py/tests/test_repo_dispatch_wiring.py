@@ -38,6 +38,7 @@ NON_PUBLISHED_RUST_BINARIES = (
     "change-classify",
     "chat-subscription-fake-plugin",
     "gh-paced",
+    "local-ci-hub",
     "merge-queue",
     "wrkslotsd",
     "wrkvizd",

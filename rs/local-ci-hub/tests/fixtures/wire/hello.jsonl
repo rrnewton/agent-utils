@@ -1,0 +1,2 @@
+{"dir":"req","id":"1","op":"hello","protocol":"ci-hub-store-wire/v1","role":"record","client":"local-ci-hub/0.1.0"}
+{"dir":"res","id":"1","ok":true,"protocol":"ci-hub-store-wire/v1","role":"record","connector":"example-store/1.0","limits":{"max_events_per_append":1000,"max_append_bytes":67108864,"max_events_per_read":1000,"max_read_bytes":16777216,"max_line_bytes":67108864,"max_event_line_bytes":67108864,"max_object_bytes":50331648}}
