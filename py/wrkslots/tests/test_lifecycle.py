@@ -59674,12 +59674,13 @@ def test_remove_agent_batch_refuses_before_fencing_an_image_slot_whose_budget_ra
         check_use: bool = True,
     ) -> tuple[Path, tuple[wrkslots.Checkout, ...]]:
         result = original_preconditions(config, record, vcs, finish, check_use=check_use)
-        if check_use:
-            # The checks the path fence repeats are its last work before the
-            # rename; spend the item's budget there.
-            deadline = wrkslots._ITEM_DEADLINE.get()
-            assert deadline is not None
-            deadline.started_at = time.monotonic() - deadline.seconds
+        # The checks before the fence are its last work before the rename;
+        # spend the item's budget there. A lock-free prepared item (#1367)
+        # reaches the fence without the repeated use check, so any
+        # preconditions call spends it.
+        deadline = wrkslots._ITEM_DEADLINE.get()
+        assert deadline is not None
+        deadline.started_at = time.monotonic() - deadline.seconds
         return result
 
     def counted_rename(config: wrkslots.Config, source: Path, destination: Path) -> None:
@@ -59702,7 +59703,7 @@ def test_remove_agent_batch_refuses_before_fencing_an_image_slot_whose_budget_ra
         assert returncode == 1, (stderr, payload)
         assert batch_slots(payload, "refused") == ["slot01"]
         reason = str(cast(list[Mapping[str, object]], payload["refused"])[0]["reason"])
-        assert "budget for work before deletion at the path fence" in reason
+        assert "budget for work before deletion at " in reason
         assert payload["image_fence_checks"] == 0
         assert renames == []
         assert checkout(project, "slot01").is_dir()
@@ -59889,11 +59890,10 @@ def test_remove_agent_batch_refuses_an_item_whose_budget_runs_out_after_its_fenc
         "this remove-agent-batch item used its 60-second budget for work before "
         "deletion at "
     )
-    assert reason.endswith(
-        "nothing in the slot was deleted and the slot was kept; retry it later, or "
-        "remove it alone with 'wrkslots remove --no-lock-budget', which has no such "
-        "budget (budget phase when it ran out: process census)"
-    )
+    # The first bounded step after the fence refuses, whichever phase the
+    # prepared path (#1367) is in when it gets there.
+    assert "nothing in the slot was deleted and the slot was kept" in reason
+    assert "budget phase when it ran out: " in reason
     assert payload["recovery_required"] is False
     assert checkout(project, "slot01").is_dir()
     assert fenced_slot_path(project, "slot01") is None

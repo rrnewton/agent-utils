@@ -405,6 +405,7 @@
         "py/wrkslots/tests/test_archive_state_rust.py",
         "py/wrkslots/tests/test_audit_lock_free.py",
         "py/wrkslots/tests/test_audit_state_rust.py",
+        "py/wrkslots/tests/test_batch_lock_scope.py",
         "py/wrkslots/tests/test_cache_plan_budget.py",
         "py/wrkslots/tests/test_census_binding_deadline.py",
         "py/wrkslots/tests/test_census_cost.py",

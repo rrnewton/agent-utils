@@ -36,3 +36,8 @@ Landing order (coordinator ruling 2026-11-12): (3) single census, then (2) lock 
 # Notes
 
 Reported 2026-11-12 by a consumer's lead (blocking slot teardown). That consumer pins agent-utils 14bdac8225 (2026-11-11): it already has #1278 and #1280 but not #1287 retire-lock-narrow, so its remove-agent-batch still holds the lock across salvage. #1153 deferred (c) after (b) deduped bundles per commit; the 15 GB nested-checkout history makes the full bundle itself the cost now. See #1153, #1213, #1278, #1280, #1287.
+
+## Update
+
+[watermelon-full-preview] Piece (2) folds in #1213 wrkslots-state-lock-deletion for the remove-agent-batch path; #1213 stays open for its other removal shapes. Piece (3) landed as 191aa5cc.
+[watermelon-full-preview] Satellite landed: the live-journal busy fix (removal journals record their actor; concurrent mutations report busy/live instead of interrupted) landed separately as d980adb453a5ee6d9185423dd68a620a50de5586 on github/main (mu-wsjournal lane). Removal changes here rebase on it.

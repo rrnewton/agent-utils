@@ -25,3 +25,7 @@ A fake slow fence repair, storage deletion, synchronization, file removal, or sa
 # Notes
 
 Start with `_mutation_locks`, `_begin_finish`, `_finish_fenced_slot`, `_finish_remove_paths`, and every caller that retains the registry locks across those calls in `py/wrkslots/cli.py`. Ordinary deferred deletion is the useful precedent: its journal and fence transition are recorded under the locks, the fenced tree is then deleted unlocked, and the locks are taken again for completion. The follow-up should inventory where that boundary does not yet hold, especially fence repair, private cleanup, scoped validation finish, batch removal, and interrupted-operation recovery. The reported nine-minute hold, creation failure, and audit timeout are report evidence to reproduce on scratch state, not measurements made while filing this issue.
+
+## Update (#1367)
+
+[watermelon-full-preview] The remove-agent-batch shape of this issue is folded into #1367 wrkslots-salvage-thin-bundle-fast piece (2): batch items are validated and planned lock-free and commit one record at a time under the ACTIVE locks, following #1287. The remaining shapes named here (fence repair, private cleanup, scoped validation finish, interrupted-operation recovery) stay open on this issue.

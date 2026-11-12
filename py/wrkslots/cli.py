@@ -1836,6 +1836,15 @@ class _OwnerRelease:
 
 
 @dataclasses.dataclass(frozen=True)
+class _BatchRemovalCandidate:
+    """One exact remove-agent-batch item identity (#1367)."""
+
+    machine: str
+    slot: str
+    generation: int
+
+
+@dataclasses.dataclass(frozen=True)
 class _RetirementCandidate:
     """One exact handoff read whose current slot awaits safe retirement."""
 
@@ -52915,7 +52924,7 @@ class _PreparedRemoval:
     identity: _RegistryIdentity
     fingerprint: _LockScopeFingerprint
     journals: tuple[tuple[str, int, int], ...]
-    writer: _EventWriter
+    writer: _EventWriter | None
     admission: _RemovalAdmission
     salvage: tuple[dict[str, object], ...]
     evidence_record: ActiveRecord | None
@@ -52991,13 +53000,34 @@ def _prepare_retirement_removal(
     """
 
     retirement_candidate = getattr(args, "_retirement_candidate", None)
-    if retirement_candidate is None or not isinstance(
+    batch_candidate = getattr(args, "_batch_candidate", None)
+    if retirement_candidate is not None and not isinstance(
         retirement_candidate, _RetirementCandidate
     ):
         return None
-    if agent_batch is not None and agent_batch.group is not None:
+    if batch_candidate is not None and not isinstance(
+        batch_candidate, _BatchRemovalCandidate
+    ):
         return None
-    if _outstanding_journals(config):
+    if retirement_candidate is None and batch_candidate is None:
+        return None
+    if (
+        retirement_candidate is not None
+        and agent_batch is not None
+        and agent_batch.group is not None
+    ):
+        return None
+    if batch_candidate is not None and agent_batch is not None:
+        # A grouped batch's earlier members hold scoped FINISH journals
+        # this batch itself wrote (#1201); only other journals defer to
+        # the locked path.
+        if [
+            path
+            for path in _outstanding_journals(config)
+            if path not in agent_batch.group_journals
+        ]:
+            return None
+    elif _outstanding_journals(config):
         return None
     try:
         states, _archives = _validate_global_state(
@@ -53017,67 +53047,26 @@ def _prepare_retirement_removal(
         _prepare_state_home_reclaim(
             config, record.slot_type, record.slot, _GitVcs()
         )
+        writer: _EventWriter | None = None
+        candidate_identity = (
+            retirement_candidate if retirement_candidate is not None else batch_candidate
+        )
+        assert candidate_identity is not None
         expected_identity = (
-            retirement_candidate.machine,
-            retirement_candidate.slot,
-            retirement_candidate.generation,
+            candidate_identity.machine,
+            candidate_identity.slot,
+            candidate_identity.generation,
         )
         if expected_identity != (record.machine, record.slot, record.generation):
             raise _RetirementDeferred(
                 "retirement candidate generation changed before its guarded attempt"
             )
-        latest = _latest_handoff_read(record, _load_events(config, record.machine))
-        if latest is None or (
-            latest.sha256,
-            latest.retirement_enqueued,
-            latest.sequence,
-        ) != (
-            retirement_candidate.sha256,
-            True,
-            retirement_candidate.event_sequence,
-        ):
-            raise _RetirementDeferred(
-                "retirement candidate was superseded before its guarded attempt"
-            )
-        # The attempt is durable before any further check, as it was when
-        # the whole removal ran under the lock: a refusal below still
-        # leaves the attempt in the log for the queue's rotation. This
-        # append is the one record-sized lock hold of the lock-free
-        # validation; the commit below re-checks the identity it leaves.
-        attempt_scope = (
-            _mutation_locks(config, float(args.wait_lock))
-            if wait_deadline is None
-            else _mutation_locks(
-                config, float(args.wait_lock), deadline=wait_deadline
-            )
-        )
-        with attempt_scope:
-            _refuse_partial_state(config)
-            _assert_no_journal(config)
-            try:
-                current = _find_record(
-                    _load_active_snapshot(config, require_repository=False),
-                    record.slot,
-                )
-            except Refusal as exc:
-                raise _RetirementDeferred(
-                    "retirement candidate was superseded before its guarded attempt"
-                ) from exc
-            if (current.machine, current.slot, current.generation) != (
-                record.machine,
-                record.slot,
-                record.generation,
-            ):
-                raise _RetirementDeferred(
-                    "retirement candidate generation changed before its guarded attempt"
-                )
-            current_latest = _latest_handoff_read(
-                current, _load_events(config, current.machine)
-            )
-            if current_latest is None or (
-                current_latest.sha256,
-                current_latest.retirement_enqueued,
-                current_latest.sequence,
+        if retirement_candidate is not None:
+            latest = _latest_handoff_read(record, _load_events(config, record.machine))
+            if latest is None or (
+                latest.sha256,
+                latest.retirement_enqueued,
+                latest.sequence,
             ) != (
                 retirement_candidate.sha256,
                 True,
@@ -53086,24 +53075,71 @@ def _prepare_retirement_removal(
                 raise _RetirementDeferred(
                     "retirement candidate was superseded before its guarded attempt"
                 )
-            sequence, tip = _chain_tip(config, record.machine)
-            writer = _EventWriter(
-                directory=_event_write_directory(config, record.machine),
-                machine=record.machine,
-                sequence=sequence,
-                previous_sha256="0" * 64 if tip is None else tip,
+            # The attempt is durable before any further check, as it was when
+            # the whole removal ran under the lock: a refusal below still
+            # leaves the attempt in the log for the queue's rotation. This
+            # append is the one record-sized lock hold of the lock-free
+            # validation; the commit below re-checks the identity it leaves.
+            attempt_scope = (
+                _mutation_locks(config, float(args.wait_lock))
+                if wait_deadline is None
+                else _mutation_locks(
+                    config, float(args.wait_lock), deadline=wait_deadline
+                )
             )
-            writer.append(
-                "retirement-attempted",
-                {
-                    "slot": record.slot,
-                    "generation": record.generation,
-                    "sha256": retirement_candidate.sha256,
-                    "handoff_read_sequence": retirement_candidate.event_sequence,
-                    "reason": "selected by bounded retirement queue",
-                },
-            )
-            _interrupt_for_test("after-retirement-attempt")
+            with attempt_scope:
+                _refuse_partial_state(config)
+                _assert_no_journal(config)
+                try:
+                    current = _find_record(
+                        _load_active_snapshot(config, require_repository=False),
+                        record.slot,
+                    )
+                except Refusal as exc:
+                    raise _RetirementDeferred(
+                        "retirement candidate was superseded before its guarded attempt"
+                    ) from exc
+                if (current.machine, current.slot, current.generation) != (
+                    record.machine,
+                    record.slot,
+                    record.generation,
+                ):
+                    raise _RetirementDeferred(
+                        "retirement candidate generation changed before its guarded attempt"
+                    )
+                current_latest = _latest_handoff_read(
+                    current, _load_events(config, current.machine)
+                )
+                if current_latest is None or (
+                    current_latest.sha256,
+                    current_latest.retirement_enqueued,
+                    current_latest.sequence,
+                ) != (
+                    retirement_candidate.sha256,
+                    True,
+                    retirement_candidate.event_sequence,
+                ):
+                    raise _RetirementDeferred(
+                        "retirement candidate was superseded before its guarded attempt"
+                    )
+                sequence, tip = _chain_tip(config, record.machine)
+                writer = _EventWriter(
+                    directory=_event_write_directory(config, record.machine),
+                    machine=record.machine,
+                    sequence=sequence,
+                    previous_sha256="0" * 64 if tip is None else tip,
+                )
+                writer.append(
+                    "retirement-attempted",
+                    {
+                        "slot": record.slot,
+                        "generation": record.generation,
+                        "sha256": retirement_candidate.sha256,
+                        "handoff_read_sequence": retirement_candidate.event_sequence,
+                        "reason": "selected by bounded retirement queue",
+                    },
+                )
+                _interrupt_for_test("after-retirement-attempt")
         _assert_target_record_storage_consistent(
             config, states, record, before_any_change=True
         )
@@ -53697,7 +53733,10 @@ def _cmd_remove_in_scope(
         )
     prepared_removal: _PreparedRemoval | None = None
     if (
-        getattr(args, "_retirement_candidate", None) is not None
+        (
+            getattr(args, "_retirement_candidate", None) is not None
+            or getattr(args, "_batch_candidate", None) is not None
+        )
         and private_cleanup is None
         and validation_removal_proof is None
         and not bool(args.validate_complete)
@@ -53706,20 +53745,23 @@ def _cmd_remove_in_scope(
         and never_started_agent is None
         and not discard_stale
     ):
-        prepared_removal = _prepare_retirement_removal(
-            config,
-            args,
-            coordinator=coordinator,
-            runner=runner,
-            handoff_writer=handoff_writer,
-            proof_fd=proof_fd,
-            agent_batch=agent_batch,
-            single_refusal=single_refusal,
-            unlocked_refusal=unlocked_refusal,
-            live_use_recheck=live_use_recheck,
-            salvage_archive_root=salvage_archive_root,
-            wait_deadline=getattr(args, "_wait_deadline", None),
-        )
+        # The item budget bounds the lock-free validation too (#1367):
+        # re-entry under the lock resumes the same deadline.
+        with _agent_batch_item_deadline(agent_batch):
+            prepared_removal = _prepare_retirement_removal(
+                config,
+                args,
+                coordinator=coordinator,
+                runner=runner,
+                handoff_writer=handoff_writer,
+                proof_fd=proof_fd,
+                agent_batch=agent_batch,
+                single_refusal=single_refusal,
+                unlocked_refusal=unlocked_refusal,
+                live_use_recheck=live_use_recheck,
+                salvage_archive_root=salvage_archive_root,
+                wait_deadline=getattr(args, "_wait_deadline", None),
+            )
     wait_deadline = getattr(args, "_wait_deadline", None)
     lock_scope = (
         _mutation_locks(config, args.wait_lock)
@@ -53738,10 +53780,27 @@ def _cmd_remove_in_scope(
             # deciding census run after this lock is released.
             _refuse_partial_state(config)
             _assert_prepared_removal_current(config, prepared_removal)
-            _assert_no_journal(config)
+            _assert_no_journal(
+                config,
+                allowed=(
+                    frozenset()
+                    if agent_batch is None
+                    else frozenset(agent_batch.group_journals)
+                ),
+            )
             record = prepared_removal.record
             state = prepared_removal.state
             writer = prepared_removal.writer
+            if writer is None:
+                # A batch item has no attempt append (#1367): its event
+                # writer is built here, under the lock it appends in.
+                sequence, tip = _chain_tip(config, record.machine)
+                writer = _EventWriter(
+                    directory=_event_write_directory(config, record.machine),
+                    machine=record.machine,
+                    sequence=sequence,
+                    previous_sha256="0" * 64 if tip is None else tip,
+                )
             admission = prepared_removal.admission
             basis = _removal_basis(
                 admission,
@@ -53833,14 +53892,21 @@ def _cmd_remove_in_scope(
                 state,
                 record,
                 finish_context,
-                journal_path=_journal_path(config),
+                journal_path=(
+                    _finish_journal_path(config, record.slot)
+                    if agent_batch is not None and agent_batch.group is not None
+                    else _journal_path(config)
+                ),
                 defer_deletion=True,
                 event_writer=writer,
                 previous_state=state,
             )
-            if not isinstance(prepared_finish, _PreparedDeferredFinish):
+            if isinstance(prepared_finish, _PreparedDeferredFinish):
+                prepared_deferred_finish = prepared_finish
+            elif prepared_finish is not None:
                 raise StateError("prepared retirement removal did not defer its deletion")
-            prepared_deferred_finish = prepared_finish
+            # None: a grouped batch member (#1201) is registered for the
+            # group's scan and finish, exactly as on the locked path.
         else:
             _refuse_partial_state(
                 config,
@@ -57683,6 +57749,9 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
                 item_args.validation_proof_manifest = None
                 item_args.completed_record = None
                 item_args.wait_lock = wait_seconds
+                item_args._batch_candidate = _BatchRemovalCandidate(
+                    config.machine, slot, generation
+                )
                 item_started = time.monotonic()
                 current = (slot, generation, item_started)
                 context.nested_git_evidence.clear()
