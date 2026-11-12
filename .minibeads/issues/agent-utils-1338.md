@@ -1,6 +1,6 @@
 ---
 title: 'vibe-talk-search-cli: a searchable CLI for the conversation history'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
@@ -42,3 +42,5 @@ Owner reply 409 (2026-11-11): the CLI should be a multi-subcommand client exposi
 
 - Slice 1 (today): `vibe-talk search` as designed above, `search` added to the MCP tool manifest (`mcp/mod.rs`, the same source as `tools/list` and `/api/v1/agent-tools`) with an MCP handler, and READ-scope search. Own path-selected gate and landing.
 - Slice 2: a `vibe-talk` client CLI with one subcommand per MCP tool, GENERATED from the `mcp/mod.rs` tool manifest so CLI and MCP cannot drift: same argument schema, same read/write split (write tools such as `post_reply` and `mark_read` need the write token; posting asks for confirmation unless `--yes`), every subcommand takes `--json` and prints Slack and vibe-talk links where a message is involved. One test asserts every manifest tool has a subcommand and vice versa. Own path-selected gate and landing.
+
+Resolution (mu-vtsearch, 2026-11-12): landed on main in two gated slices. Slice 1, 733b8eeb: `vibe-talk search` (READ token from config or `--token-file`, deep links on the configured public base, cached-window coverage lines, clear auth errors), `search` in the MCP manifest with its handler, and READ-scope server search — the audit found one write in the path (rendering recorded paren tags in the shared heading record), split out as `render::fill_readonly` for READ callers with the write path byte-identical; `scope_first` now proves a read session including search leaves the cache unchanged. Slice 2, 6be84aa5: generated subcommands for every offered MCP tool from the same manifest, write-token split by `mutates`, confirmation unless `--yes`, `--json` everywhere, drift test. Skills (agentctl-chat, coordinator) and README teach search-and-link with the cached-window caveat. Not verified live: no production deploy from this lane (the coordinator deploys the server change); the CLI was smoke-tested against a local fake-discord server (hits rendering needs a filled cache, which the fake backend's timeline limits prevented — server-side hits are covered by the integration suites). Full-history backfill/retention remains the owner's open decision (reply 363); until then search covers only the cached window and says so.
