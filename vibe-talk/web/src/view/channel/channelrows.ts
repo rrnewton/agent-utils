@@ -322,7 +322,7 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
    * fit in it belongs in the card's bottom padding below, never over the clamped text above. The
    * pin is redone at every measuring, so a width or fold change that moves the line moves it.
    */
-  function settleReactionOverlay(li: ChannelRow, strip: HTMLElement, elided: HTMLElement): void {
+  function settleReactionOverlay(li: ChannelRow, strip: HTMLElement, elided: HTMLElement, compensate = false): void {
     if (!wears(strip, "reactions-overlay")) return;
     if (li.getAttribute("data-collapsed") !== "true" || elided.hidden) return;
     strip.style.top = `${elided.offsetTop}px`;
@@ -356,10 +356,18 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
       }
     }
     if (covered) {
-      setClassWord(strip, "reactions-overlay", false);
-      strip.style.top = "";
-      strip.style.bottom = "";
-      if (reactionOverlayWatch) reactionOverlayWatch.unobserve(li);
+      // A later un-overlay (a width or fold change, through the watcher below) grows the
+      // card after paint: the growth goes through the owner's hold, so the reader the
+      // growth would have shifted is put back (`#1251 scroll-single-owner`). Only in
+      // Main's scroller: the side column's growth shifts no reader of this list.
+      const unoverlay = (): void => {
+        setClassWord(strip, "reactions-overlay", false);
+        strip.style.top = "";
+        strip.style.bottom = "";
+        if (reactionOverlayWatch) reactionOverlayWatch.unobserve(li);
+      };
+      if (compensate && li.closest("#side-scroll") === null) deps.preservingScroll(unoverlay);
+      else unoverlay();
     }
   }
 
@@ -369,8 +377,32 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
    * changes, let `settleReactionOverlay` measure it. A browser with no frames settles nothing
    * and keeps the overlay only where the stylesheet's own guards allow it.
    */
+  /**
+   * Overlays drawn in a batch, settled together before the first paint (`#1251
+   * scroll-single-owner`, decide-before-paint): a row is built detached, so the
+   * decision waits for the task that puts it on the page — one shared microtask,
+   * never one layout per row. A row still off the page keeps the frame-later path.
+   */
+  let overlayBatch: Array<{ li: ChannelRow; strip: HTMLElement; elided: HTMLElement }> = [];
+  let overlayBatchScheduled = false;
+
+  function queueOverlaySettle(li: ChannelRow, strip: HTMLElement, elided: HTMLElement): void {
+    overlayBatch.push({ li, strip, elided });
+    if (overlayBatchScheduled || typeof queueMicrotask !== "function") return;
+    overlayBatchScheduled = true;
+    queueMicrotask(() => {
+      overlayBatchScheduled = false;
+      const batch = overlayBatch;
+      overlayBatch = [];
+      for (const one of batch) {
+        if (one.li.isConnected) settleReactionOverlay(one.li, one.strip, one.elided);
+      }
+    });
+  }
+
   function overlayReactions(li: ChannelRow, strip: HTMLElement, elided: HTMLElement): void {
     setClassWord(strip, "reactions-overlay", true);
+    queueOverlaySettle(li, strip, elided);
     if (typeof requestAnimationFrame === "function") {
       requestAnimationFrame(() => settleReactionOverlay(li, strip, elided));
     }
@@ -381,7 +413,7 @@ export function createChannelRows(deps: ChannelRowsDependencies): ChannelRows {
             const row = target as ChannelRow;
             const held = [...row.children].find((kid) => wears(kid, "reactions-overlay")) as HTMLElement | undefined;
             const line = [...row.children].find((kid) => wears(kid, "elided")) as HTMLElement | undefined;
-            if (held && line) settleReactionOverlay(row, held, line);
+            if (held && line) settleReactionOverlay(row, held, line, true);
             else if (reactionOverlayWatch) reactionOverlayWatch.unobserve(row);
           }
         });
