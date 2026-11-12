@@ -20936,18 +20936,29 @@ def _checkout_path(
     )
 
 
+def _checkout_destination(
+    slot_path: Path, layout: str, name: str, vcs: str = "git"
+) -> Path:
+    """The one rule for where a checkout lives inside its slot (#1204)."""
+
+    if vcs == "eden" and layout == "flat":
+        return slot_path / "checkout"
+    return slot_path if layout == "flat" else slot_path / name
+
+
 def _checkout_path_for_layout(
     config: Config,
     slot: str,
     name: str,
     slot_type: str,
     layout: str,
+    vcs: str = "git",
 ) -> tuple[str, Path]:
     _validate_name(slot, "slot")
     _validate_name(name, "checkout name")
     _validate_layout(layout)
     slot_path = _slot_directory(config, slot, slot_type)
-    destination = slot_path if layout == "flat" else slot_path / name
+    destination = _checkout_destination(slot_path, layout, name, vcs)
     _ensure_no_symlink_components(config.root, destination, "checkout")
     relative = destination.relative_to(config.root).as_posix()
     return relative, destination
@@ -25377,9 +25388,9 @@ def _assert_record_paths(
             candidates = _historical_slot_candidates(config, record.slot, record.slot_type)
             matched: Path | None = None
             for candidate in candidates:
-                absolute = candidate if layout == "flat" else candidate / checkout.name
-                if checkout.vcs == "eden" and layout == "flat":
-                    absolute = candidate / "checkout"
+                absolute = _checkout_destination(
+                    candidate, layout, checkout.name, checkout.vcs
+                )
                 if checkout.path == absolute.relative_to(config.root).as_posix():
                     matched = absolute
                     break
@@ -25395,18 +25406,13 @@ def _assert_record_paths(
             expected_relative = expected_absolute.relative_to(config.root).as_posix()
         elif require_repository:
             expected_relative, expected_absolute = _checkout_path_for_layout(
-                config, record.slot, checkout.name, record.slot_type, layout
+                config, record.slot, checkout.name, record.slot_type, layout,
+                vcs=checkout.vcs,
             )
-            if checkout.vcs == "eden" and layout == "flat":
-                expected_absolute = expected_slot / "checkout"
-                expected_relative = expected_absolute.relative_to(config.root).as_posix()
         else:
-            expected_absolute = (
-                expected_slot if layout == "flat" else expected_slot / checkout.name
+            expected_absolute = _checkout_destination(
+                expected_slot, layout, checkout.name, checkout.vcs
             )
-            if checkout.vcs == "eden" and layout == "flat":
-                # Eden mounts as a child of the slot subvolume (#1204).
-                expected_absolute = expected_slot / "checkout"
             expected_relative = expected_absolute.relative_to(config.root).as_posix()
         if checkout.path != expected_relative:
             raise StateError(
@@ -34893,7 +34899,9 @@ def _provision_eden_slot(
         raise Refusal(str(exc)) from exc
     return Checkout(
         name=name,
-        path=Path(os.path.relpath(mount, config.root)).as_posix(),
+        path=_checkout_path_for_layout(
+            config, args.slot, name, args.slot_type, config.layout, vcs="eden"
+        )[0],
         repository=backing,
         branch=eden.EDEN_BRANCH,
         start_point=info.revision,
@@ -35056,6 +35064,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 checkouts=(checkout,),
                 task_scope=task_scope,
             )
+            # Never append an event the replay would reject (#1204).
+            try:
+                _assert_record_paths(
+                    config, record, require_repository=False, historical=True
+                )
+            except StateError as exc:
+                raise Refusal(str(exc)) from exc
             event_writer = (
                 _event_writer(config, config.machine)
                 if local is None
