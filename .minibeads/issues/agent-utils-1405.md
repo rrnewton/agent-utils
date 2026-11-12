@@ -1,6 +1,6 @@
 ---
 title: 'restore-epoch-manager-restart: a systemd user-manager restart without a reboot replays the old boot report and revives nothing'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -32,3 +32,9 @@ Cause (partial evidence from the host's restore agent, which itself died on rate
 # Notes
 
 Evidence still to attach: this boot's report from the affected host's registry restore-reports/ (boot_id, path, replayed, action, refused_lanes, and the Nov 9 report it replayed). An opt-in `--force` passthrough in the shared restore wrapper is a separate, reviewed change; it must not become the default. Numbered from devbig030's interim block (1400-1469).
+
+## Resolution
+
+[watermelon-full-preview] The restore epoch is now the kernel boot id plus the user manager's identity (`RestoreEpoch` in `rs/agentctl/src/restore.rs`: the `InvocationID` of `user@UID.service`, falling back to the `systemd --user` PID plus its `/proc` start ticks). Replay happens only when a completed report's recorded epoch equals the current epoch; a report from an earlier epoch of the same boot (including a pre-epoch report, which cannot prove its manager) runs a real restore. `restart_detected` is true after a manager restart (`manager_restart_detected`, with the superseded epoch under `previous_epoch`), the report records its epoch under `epoch`, and a replay names what it replayed under `replayed_report`/`replayed_epoch`. The watch restore check counts only a completed report from the current epoch. The Python edition's `restore` is Rust-only (it refuses), so there is no Python guard to keep in parity. `--force` is unchanged and remains opt-in only.
+
+Tests (fixture registry, scripted host, no wall-clock budgets): `restore_manager_restart_same_boot_runs_for_real_and_then_replays_the_new_epoch`, `restore_report_without_an_epoch_is_not_replayed_under_a_known_manager`, and `epoch_matching_requires_the_same_boot_and_manager`, alongside the existing restore suite.

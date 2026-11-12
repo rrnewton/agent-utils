@@ -14,6 +14,7 @@ struct ScriptedHost {
     boot: String,
     now: Cell<f64>,
     boot_time: u64,
+    manager: RefCell<Option<String>>,
     calls: RefCell<Vec<Vec<String>>>,
     answers: RefCell<Vec<(String, CommandOutcome)>>,
 }
@@ -24,9 +25,15 @@ impl ScriptedHost {
             boot: BOOT.to_owned(),
             now: Cell::new(2_000_000_000.0),
             boot_time: 2_000_000_000 - 3600,
+            manager: RefCell::new(Some("invocation:manager-a".to_owned())),
             calls: RefCell::new(Vec::new()),
             answers: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Simulate a user-manager restart in the same boot (#1405).
+    fn restart_manager(&self, identity: &str) {
+        *self.manager.borrow_mut() = Some(identity.to_owned());
     }
 
     /// The next command whose joined argv contains `needle` gets `outcome` (first match wins,
@@ -54,6 +61,9 @@ impl ScriptedHost {
 impl Host for ScriptedHost {
     fn boot_id(&self) -> crate::subagents::Result<String> {
         Ok(self.boot.clone())
+    }
+    fn user_manager_id(&self) -> Option<String> {
+        self.manager.borrow().clone()
     }
     fn boot_time(&self) -> Option<u64> {
         Some(self.boot_time)
@@ -288,6 +298,90 @@ fn restore_default_report_lives_under_the_registry_in_its_own_subdirectory() {
     );
     let again = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
     assert_eq!(again["action"], "already-restored");
+}
+
+/// Kill the revived `lane` again, as a user-manager restart would (#1405).
+fn kill_lane_again(fixture: &Fixture) {
+    let record = fixture.manager().load("lane").unwrap();
+    fixture
+        .client
+        .dead_panes
+        .lock()
+        .unwrap()
+        .insert(record.pane_id.clone().unwrap());
+    fixture.client.started.store(false, Ordering::Relaxed);
+}
+
+#[test]
+fn restore_manager_restart_same_boot_runs_for_real_and_then_replays_the_new_epoch() {
+    // #1405 restore-epoch-manager-restart: same boot id, new user-manager
+    // identity, completed report from the earlier epoch. The rerun must
+    // restore for real, and only a rerun in the new epoch may replay.
+    let fixture = Fixture::new();
+    let _old = dead_agent(&fixture);
+    let host = ScriptedHost::new();
+    let config = config(&fixture, None);
+    let registry = fixture.root.join("registry");
+    let first = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(first["complete"], true, "{first}");
+    assert_eq!(first["epoch"]["boot_id"], BOOT, "{first}");
+    assert_eq!(
+        first["epoch"]["user_manager"], "invocation:manager-a",
+        "{first}"
+    );
+    assert_eq!(agent_row(&first, "lane")["action"], "revived", "{first}");
+
+    kill_lane_again(&fixture);
+    host.restart_manager("invocation:manager-b");
+    let second = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_ne!(second["action"], "already-restored", "{second}");
+    assert_ne!(second["replayed"], true, "{second}");
+    assert_eq!(second["restart_detected"], true, "{second}");
+    assert_eq!(second["manager_restart_detected"], true, "{second}");
+    assert_eq!(
+        second["epoch"]["user_manager"], "invocation:manager-b",
+        "{second}"
+    );
+    assert_eq!(
+        second["previous_epoch"]["user_manager"], "invocation:manager-a",
+        "{second}"
+    );
+    assert_eq!(agent_row(&second, "lane")["action"], "revived", "{second}");
+    assert_eq!(second["complete"], true, "{second}");
+
+    let third = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(third["action"], "already-restored", "{third}");
+    assert_eq!(third["replayed"], true, "{third}");
+    assert_eq!(
+        third["replayed_epoch"]["user_manager"], "invocation:manager-b",
+        "{third}"
+    );
+    assert_eq!(third["replayed_report"], second["report"], "{third}");
+    assert_eq!(third["agents"], second["agents"], "{third}");
+}
+
+#[test]
+fn restore_report_without_an_epoch_is_not_replayed_under_a_known_manager() {
+    // #1405: a report recorded before epochs were written (the incident
+    // shape) cannot prove it belongs to this manager, so it is not
+    // replayed; the run restores for real and records the epoch.
+    let fixture = Fixture::new();
+    let _old = dead_agent(&fixture);
+    let host = ScriptedHost::new();
+    let config = config(&fixture, None);
+    let registry = fixture.root.join("registry");
+    let first = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(first["complete"], true, "{first}");
+    let path = fixture.root.join("reports").join(format!("{BOOT}.json"));
+    let mut recorded = crate::restore::read_report(&path).unwrap();
+    recorded.as_object_mut().unwrap().remove("epoch");
+    fs::write(&path, recorded.to_string()).unwrap();
+
+    kill_lane_again(&fixture);
+    let second = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_ne!(second["action"], "already-restored", "{second}");
+    assert_eq!(second["manager_restart_detected"], true, "{second}");
+    assert_eq!(agent_row(&second, "lane")["action"], "revived", "{second}");
 }
 
 #[test]

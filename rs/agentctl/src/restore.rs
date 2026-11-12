@@ -5,7 +5,9 @@
 //!
 //! 1. Hold `<registry>/.restore.lock`, so a boot unit and a manual run never overlap: the
 //!    second waits for the first, then finds its completed report.
-//! 2. Replay this boot's recorded report when it already says the restore completed.
+//! 2. Replay this epoch's recorded report when it already says the restore completed. The
+//!    epoch is the kernel boot plus the user manager's identity (#1405), so a user-manager
+//!    restart in the same boot runs a real restore instead of replaying the old report.
 //! 3. Run the project's slot manager once (`wrkslots image status`), which remounts every
 //!    image-backed slot before any agent starts in one.
 //! 4. Wait for the Herdr server to answer.
@@ -768,10 +770,61 @@ pub struct CommandOutcome {
     pub stderr: String,
 }
 
+/// One restore epoch (#1405 restore-epoch-manager-restart): the kernel boot
+/// plus the systemd user manager running in it. A user-manager restart stops
+/// every user unit without changing the boot id, so the boot id alone replays
+/// a report recorded before the restart and revives nothing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestoreEpoch {
+    /// `/proc/sys/kernel/random/boot_id`.
+    pub boot_id: String,
+    /// The user manager's identity in this boot (`invocation:<id>` from
+    /// `user@UID.service`, else `pid:<pid>:<start-ticks>`); `None` when no
+    /// manager identity can be read (no systemd, or a test host).
+    pub user_manager: Option<String>,
+}
+
+impl RestoreEpoch {
+    /// The epoch as recorded in a report under `epoch`.
+    pub fn as_json(&self) -> Value {
+        json!({"boot_id": self.boot_id, "user_manager": self.user_manager})
+    }
+
+    /// The epoch a report records. A report written before epochs were
+    /// recorded has only its top-level `boot_id`, so its manager identity
+    /// reads as unknown rather than as any current manager.
+    pub fn from_report(report: &Value) -> Option<Self> {
+        if let Some(epoch) = report.get("epoch").filter(|epoch| epoch.is_object()) {
+            return Some(Self {
+                boot_id: epoch["boot_id"].as_str()?.to_owned(),
+                user_manager: epoch["user_manager"].as_str().map(str::to_owned),
+            });
+        }
+        Some(Self {
+            boot_id: report["boot_id"].as_str()?.to_owned(),
+            user_manager: None,
+        })
+    }
+
+    /// Whether a recorded report belongs to this epoch and may be replayed.
+    /// An unknown manager identity on either side matches only an unknown
+    /// one on the other, so a report that cannot prove it was recorded
+    /// under this manager is never replayed under a known one.
+    pub fn matches_report(&self, report: &Value) -> bool {
+        Self::from_report(report).is_some_and(|recorded| recorded == *self)
+    }
+}
+
 /// The host facts and effects restore and watch use, injectable for tests.
 pub trait Host {
     /// `/proc/sys/kernel/random/boot_id`.
     fn boot_id(&self) -> Result<String>;
+    /// The current user manager's identity (see [`RestoreEpoch`]), when one
+    /// can be read. Defaults to unknown, which keys the epoch on the boot
+    /// alone, exactly as builds before #1405 did.
+    fn user_manager_id(&self) -> Option<String> {
+        None
+    }
     /// The kernel boot time in Unix seconds (`btime` in `/proc/stat`).
     fn boot_time(&self) -> Option<u64>;
     /// Seconds since the Unix epoch.
@@ -814,6 +867,30 @@ impl Host for SystemHost {
                 line.strip_prefix("btime ")
                     .and_then(|value| value.trim().parse().ok())
             })
+    }
+
+    fn user_manager_id(&self) -> Option<String> {
+        // The manager's own unit in the system instance carries a fresh
+        // invocation id at every manager start.
+        let uid = unsafe { libc::getuid() };
+        let outcome = self.run(
+            &strings(&[
+                "systemctl",
+                "show",
+                &format!("user@{uid}.service"),
+                "--property=InvocationID",
+                "--value",
+            ]),
+            None,
+            Duration::from_secs(10),
+        );
+        if outcome.status == Some(0) {
+            let value = outcome.stdout.trim();
+            if value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Some(format!("invocation:{value}"));
+            }
+        }
+        manager_pid_start(uid)
     }
 
     fn now(&self) -> f64 {
@@ -908,6 +985,44 @@ impl Host for SystemHost {
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
         }
     }
+}
+
+/// Fallback user-manager identity (#1405): the `systemd --user` process
+/// owned by `uid`, as `pid:<pid>:<start-ticks>` from `/proc/<pid>/stat`, so
+/// a restarted manager reads differently even if its PID is reused.
+fn manager_pid_start(uid: u32) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    for entry in fs::read_dir("/proc").ok()?.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u64>() else {
+            continue;
+        };
+        let path = entry.path();
+        if path.metadata().map(|meta| meta.uid()).ok() != Some(uid) {
+            continue;
+        }
+        let Ok(cmdline) = fs::read(path.join("cmdline")) else {
+            continue;
+        };
+        let mut argv = cmdline.split(|byte| *byte == 0);
+        let program = argv.next().unwrap_or_default();
+        if !program.ends_with(b"systemd") || argv.next() != Some(b"--user".as_slice()) {
+            continue;
+        }
+        // Field 22 of the stat line; the comm in parentheses may itself
+        // hold spaces or parentheses, so count from the last ')': the
+        // remainder starts at field 3, making start time index 19.
+        let Ok(stat) = fs::read_to_string(path.join("stat")) else {
+            continue;
+        };
+        let Some(start) = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().nth(19).map(str::to_owned))
+        else {
+            continue;
+        };
+        return Some(format!("pid:{pid}:{start}"));
+    }
+    None
 }
 
 /// Most bytes one captured stream may hold. Past it the run fails loudly
@@ -2098,8 +2213,14 @@ fn notice_text(report: &Value, boot_time: Option<u64>, path: &Path) -> String {
         })
         .collect::<Vec<_>>();
     let restarted = report["restart_detected"] == true;
+    let manager_restarted = report["manager_restart_detected"] == true;
     let mut lines = vec![
-        if restarted {
+        if manager_restarted {
+            format!(
+                "[agentctl restore] The user manager restarted on boot {}; every user unit stopped, so this run restored for real instead of replaying the earlier epoch's report.",
+                report["boot_id"].as_str().unwrap_or("?")
+            )
+        } else if restarted {
             format!(
                 "[agentctl restore] The host restarted: boot {}{}.",
                 report["boot_id"].as_str().unwrap_or("?"),
@@ -2380,15 +2501,28 @@ pub fn restore<A: ManagedApi + ?Sized>(
     lock.lock_exclusive()
         .map_err(|error| fail(format!("cannot take the restore lock: {error}")))?;
     let boot_id = host.boot_id()?;
+    let epoch = RestoreEpoch {
+        boot_id: boot_id.clone(),
+        user_manager: host.user_manager_id(),
+    };
     let path = report_path(registry, config, &boot_id);
+    let previous = read_boot_report(registry, config, &boot_id);
+    // #1405: a recorded report from an earlier epoch (same boot, restarted
+    // user manager) is evidence of the restart, never a replay candidate.
+    let previous_epoch = previous
+        .as_ref()
+        .and_then(|(_, report)| RestoreEpoch::from_report(report));
+    let epoch_changed = previous_epoch
+        .as_ref()
+        .is_some_and(|recorded| *recorded != epoch);
     if !options.force && !options.dry_run {
-        if let Some((previous_path, previous)) = read_boot_report(registry, config, &boot_id) {
-            if previous["complete"] == true {
+        if let Some((previous_path, previous)) = &previous {
+            if previous["complete"] == true && epoch.matches_report(previous) {
                 // #1132: replay the recorded outcomes (rows, refusals and
                 // completion fields) labelled as a replay, so a rerun can
                 // never read as a fresh success for a boot that refused
                 // lanes. The caller maps this to the recorded exit class.
-                let mut replayed = previous;
+                let mut replayed = previous.clone();
                 if let Some(object) = replayed.as_object_mut() {
                     object.entry("coordinator").or_insert(Value::Null);
                     object.entry("agents").or_insert_with(|| json!([]));
@@ -2418,9 +2552,18 @@ pub fn restore<A: ManagedApi + ?Sized>(
                         .entry("schema")
                         .or_insert_with(|| json!(REPORT_SCHEMA));
                     object.insert("boot_id".to_owned(), json!(boot_id));
+                    object.insert("epoch".to_owned(), epoch.as_json());
                     object.insert("action".to_owned(), json!("already-restored"));
                     object.insert("replayed".to_owned(), json!(true));
                     object.insert("report".to_owned(), json!(previous_path));
+                    // #1405: a replay names the report and epoch it replayed.
+                    object.insert(
+                        "replayed_report".to_owned(),
+                        json!(previous_path.display().to_string()),
+                    );
+                    if let Some(recorded) = &previous_epoch {
+                        object.insert("replayed_epoch".to_owned(), recorded.as_json());
+                    }
                 }
                 return Ok(replayed);
             }
@@ -2435,6 +2578,7 @@ pub fn restore<A: ManagedApi + ?Sized>(
                     &json!({
                         "schema": REPORT_SCHEMA,
                         "boot_id": boot_id,
+                        "epoch": epoch.as_json(),
                         "started_at": host.now(),
                         "dry_run": false,
                         "report": path,
@@ -2450,9 +2594,14 @@ pub fn restore<A: ManagedApi + ?Sized>(
     let mut report = json!({
         "schema": REPORT_SCHEMA,
         "boot_id": boot_id,
+        "epoch": epoch.as_json(),
+        // #1405: the recorded report this run supersedes belonged to an
+        // earlier epoch of the same boot (a restarted user manager).
+        "previous_epoch": if epoch_changed { previous_epoch.as_ref().map(RestoreEpoch::as_json).unwrap_or(Value::Null) } else { Value::Null },
+        "manager_restart_detected": epoch_changed,
         "boot_time": host.boot_time(),
         "previous_boots": boots.iter().filter(|boot| **boot != boot_id).collect::<Vec<_>>(),
-        "restart_detected": boots.iter().any(|boot| *boot != boot_id),
+        "restart_detected": boots.iter().any(|boot| *boot != boot_id) || epoch_changed,
         "started_at": host.now(),
         "dry_run": options.dry_run,
         // #1129: why each lane was in or out of the desired set.
@@ -3600,8 +3749,16 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
     if !duties.restore_check {
         findings.push(skipped("restore_check"));
     } else if let Ok(boot_id) = host.boot_id() {
-        let complete = read_boot_report(registry, config, &boot_id)
-            .is_some_and(|(_path, report)| report["complete"] == true);
+        // #1405: a completed report from an earlier epoch of this boot
+        // (before a user-manager restart) does not count as restored.
+        let epoch = RestoreEpoch {
+            boot_id: boot_id.clone(),
+            user_manager: host.user_manager_id(),
+        };
+        let complete =
+            read_boot_report(registry, config, &boot_id).is_some_and(|(_path, report)| {
+                report["complete"] == true && epoch.matches_report(&report)
+            });
         let early = host
             .boot_time()
             .is_some_and(|boot| host.now() - (boot as f64) < RESTORE_GRACE_SECONDS as f64);
@@ -4202,6 +4359,39 @@ pub fn watch<A: ManagedApi + ?Sized>(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn epoch_matching_requires_the_same_boot_and_manager() {
+        // #1405: replay is per epoch, not per boot.
+        let epoch = RestoreEpoch {
+            boot_id: "boot-a".to_owned(),
+            user_manager: Some("invocation:m1".to_owned()),
+        };
+        let recorded = json!({"boot_id": "boot-a", "epoch": epoch.as_json(), "complete": true});
+        assert!(epoch.matches_report(&recorded));
+        let restarted = RestoreEpoch {
+            user_manager: Some("invocation:m2".to_owned()),
+            ..epoch.clone()
+        };
+        assert!(!restarted.matches_report(&recorded));
+        let rebooted = RestoreEpoch {
+            boot_id: "boot-b".to_owned(),
+            ..epoch.clone()
+        };
+        assert!(!rebooted.matches_report(&recorded));
+        // A pre-epoch report matches only an epoch whose manager is also
+        // unknown; a manager-less epoch still matches its own reports.
+        let legacy = json!({"boot_id": "boot-a", "complete": true});
+        assert!(!epoch.matches_report(&legacy));
+        let managerless = RestoreEpoch {
+            boot_id: "boot-a".to_owned(),
+            user_manager: None,
+        };
+        assert!(managerless.matches_report(&legacy));
+        assert!(managerless.matches_report(&json!({
+            "boot_id": "boot-a", "epoch": managerless.as_json(), "complete": true
+        })));
+    }
 
     #[test]
     fn boot_report_read_prefers_the_registry_location_and_falls_back_to_legacy() {

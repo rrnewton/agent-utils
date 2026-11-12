@@ -1040,8 +1040,10 @@ In order, it:
 
 1. holds `REGISTRY/.restore.lock`, so a boot unit and a manual run never overlap:
    the second waits for the first, then finds its completed report;
-2. exits 0 at once when this boot's report already says the restore completed
-   (`--force` runs it again);
+2. exits 0 at once when this epoch's report already says the restore completed
+   (`--force` runs it again) — the epoch is the kernel boot plus the user
+   manager's identity, so a user-manager restart in the same boot runs a real
+   restore instead of replaying the earlier epoch's report;
 3. runs `wrkslots image status` once, before any agent starts, because every
    wrkslots command remounts image-backed slots; a mount failure is only a
    warning with exit status 0, so the report records the warning lines. After a
@@ -1167,10 +1169,14 @@ a newer `agentctl` does not stop an older one:
 }
 ```
 
+The report records its epoch under `epoch` (`boot_id` plus the user manager's
+identity, also shown by a replay as `replayed_epoch` beside `replayed_report`).
 The report's `restart_detected` is true when a running agent's pinned process
-belongs to an earlier boot. Only then does the notice say the host restarted and
-warn that session-scoped crons and background shells did not survive; a run on
-the boot the agents were pinned on says "no restart detected" instead, so a
+belongs to an earlier boot, or when the recorded report it supersedes belongs
+to an earlier epoch of the same boot (`manager_restart_detected`). Only then
+does the notice say the host (or the user manager) restarted and warn that
+session-scoped crons and background shells did not survive; a run on the boot
+the agents were pinned on says "no restart detected" instead, so a
 coordinator does not rebuild crons that are still running.
 
 `agentctl install-units --dest ~/.config/systemd/user` writes the units that run
