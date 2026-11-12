@@ -112,6 +112,12 @@ ALLOW_LIST: tuple[tuple[str, str, str], ...] = (
         "current.scrollTop = scrollTopNow()",
         "a stored reading-chain record field, not a scroller write",
     ),
+    (
+        "web/src/view/dom/shell.ts",
+        "else if (typeof node.scrollIntoView",
+        "the dom layer's reveal before the page hands it the owner's write at boot "
+        "(`setFocusReveal`); until then focusMinimally reveals as it always did",
+    ),
 )
 
 SCROLLTOP_WRITE = re.compile(r"\.scrollTop\s*(?:\+=|-=|=(?!=))")

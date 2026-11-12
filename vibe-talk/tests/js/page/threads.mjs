@@ -2889,8 +2889,8 @@ test("`#459 pack-keeps-card-still`: a card packed at the foot of the Threads vie
     assert.deepStrictEqual(await run(SCRIPT, way), want, `packed by ${way}`);
   }
   // THE CONTROL. No room past the foot: the browser's clamp takes the card down the screen, as the owner saw.
-  const clamped = await run(brokenScript("  closeOverscroll();\n  sizeOverextend(area, top);\n  area.scrollTop = top;\n",
-    "  closeOverscroll();\n  area.scrollTop = top;\n"));
+  const clamped = await run(brokenScript("  closeOverscroll();\n  sizeOverextend(area, top);\n  scrollKeeping.toPosition(area, top);\n",
+    "  closeOverscroll();\n  scrollKeeping.toPosition(area, top);\n"));
   assert.ok(clamped.moved > 0, `the control: without the room the packed card did not move (${clamped.moved})`);
   assert.equal(clamped.room, false);
 });
