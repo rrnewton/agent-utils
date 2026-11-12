@@ -58,10 +58,9 @@ export interface CatchupAnswer {
   window: CatchupWindow | null;
   unread_ids: string[];
   markable_ids: string[];
+  /** The cited subset (`#1350`), narrowed here for the record's restore. */
   cited_ids: string[];
   footer_links: CatchupFooterLink[];
-  /** The cited subset (`#1350`), narrowed here for the record's restore. */
-  cited_ids?: string[];
   text: string;
   /** The answer as the server's sanitized render (`#1349`); empty draws `text` plain. */
   text_html: string;

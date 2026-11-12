@@ -7,7 +7,7 @@ created_at: 2026-11-12T20:32:00.000000000+00:00
 updated_at: 2026-11-12T20:32:00.000000000+00:00
 ---
 
-# Summary
+# Description
 
 Owner request (Slack 030, 2026-11-12): Discuss is listed twice, in the
 hamburger menu and on the toolbar. No action should be listed twice.
@@ -85,7 +85,7 @@ it moves, then onto main once it lands. Batch: no gate alone; the
 coordinator names the integrator when this lane reports its branch,
 head and base.
 
-## Resolution
+### Resolution
 
 Delivered on branch `mu-toolbarpromo/1470`, stacked on
 `mu-readtoggle/read-toggle-two-way` (its work was still uncommitted
