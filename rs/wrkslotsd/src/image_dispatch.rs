@@ -492,6 +492,245 @@ pub(crate) fn image_trim_cli(
     ))
 }
 
+/// Whether the root launcher's spec directory is a mount point
+/// here (true only in a box), mirroring Python
+/// `_spec_directory_is_mounted`.
+fn spec_directory_is_mounted(entries: &[MountEntry]) -> bool {
+    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return false;
+    };
+    let directory = PathBuf::from(runtime).join("wrkslots");
+    if !directory.is_dir() {
+        return false;
+    }
+    entries.iter().any(|entry| {
+        crate::image_mounts::normalize_absolute(&entry.mount_point)
+            == crate::image_mounts::normalize_absolute(&directory)
+    })
+}
+
+/// Python `box_kind`: which wrkslots box this process runs in.
+fn box_kind(entries: &[MountEntry]) -> crate::image_ops::BoxKind {
+    use crate::image_ops::BoxKind;
+    match std::env::var("WRKSLOTS_SANDBOX").ok().as_deref() {
+        Some("cgroup") => BoxKind::None,
+        Some("userns" | "root") => {
+            if std::env::var_os("WRKSLOTS_BOX").is_some() {
+                BoxKind::Coordinator
+            } else {
+                BoxKind::Slot
+            }
+        }
+        _ if spec_directory_is_mounted(entries) => {
+            if std::env::var_os("WRKSLOTS_BOX").is_some() {
+                BoxKind::Coordinator
+            } else {
+                BoxKind::Slot
+            }
+        }
+        _ => BoxKind::None,
+    }
+}
+
+/// Whether `sudo -n true` works, mirroring Python `sudo_available`
+/// (host-routed from a coordinator box).
+fn sudo_available(tools: &crate::image_ops::ToolPaths, kind: crate::image_ops::BoxKind) -> bool {
+    let argv = vec![tools.sudo.clone(), "-n".to_string(), "true".to_string()];
+    let Ok(argv) = crate::image_ops::host_argv(tools, &argv, kind, true) else {
+        return false;
+    };
+    matches!(
+        SubprocessRunner.run(&CommandSpec::new(argv, Duration::from_secs(30))),
+        Ok(outcome) if outcome.returncode == 0
+    )
+}
+
+fn fuse_available() -> bool {
+    if which("fuse2fs").is_none() {
+        return false;
+    }
+    use std::os::unix::fs::PermissionsExt as _;
+    let Ok(meta) = std::fs::metadata("/dev/fuse") else {
+        return false;
+    };
+    let mode = meta.permissions().mode();
+    let uid = rustix::process::getuid().as_raw();
+    use std::os::unix::fs::MetadataExt as _;
+    let (read, write) = if meta.uid() == uid {
+        (mode & 0o400 != 0, mode & 0o200 != 0)
+    } else if meta.gid() == rustix::process::getgid().as_raw() {
+        (mode & 0o040 != 0, mode & 0o020 != 0)
+    } else {
+        (mode & 0o004 != 0, mode & 0o002 != 0)
+    };
+    read && write
+}
+
+/// Python `resolve_backend` for one record's preference.
+fn resolve_backend(
+    preference: &str,
+    tools: &crate::image_ops::ToolPaths,
+    kind: crate::image_ops::BoxKind,
+) -> Result<String> {
+    use crate::image_ops::BoxKind;
+    if kind == BoxKind::Slot {
+        return Err(crate::image_ops::SLOT_BOX_REFUSAL.to_string());
+    }
+    let preference = std::env::var("WRKSLOTS_IMAGE_BACKEND")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| preference.to_string());
+    if !matches!(preference.as_str(), "auto" | "kernel" | "fuse") {
+        return Err(format!(
+            "image backend must be one of auto, kernel, fuse, not '{preference}'"
+        ));
+    }
+    if matches!(preference.as_str(), "auto" | "kernel") && sudo_available(tools, kind) {
+        return Ok("kernel".to_string());
+    }
+    if preference == "kernel" {
+        return Err(
+            "kernel image backend needs passwordless sudo (sudo -n true failed)".to_string(),
+        );
+    }
+    if fuse_available() {
+        return Ok("fuse".to_string());
+    }
+    Err(
+        "no image backend is usable: sudo -n is unavailable and fuse2fs or /dev/fuse is missing"
+            .to_string(),
+    )
+}
+
+/// The FUSE unit and slice for one image file, mirroring Python
+/// `_fuse_mount`'s naming.
+fn fuse_unit(image_file: &Path) -> (String, String) {
+    use sha2::Digest as _;
+    let absolute = if image_file.is_absolute() {
+        image_file.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(image_file))
+            .unwrap_or_else(|_| image_file.to_path_buf())
+    };
+    let digest = sha2::Sha256::digest(absolute.to_string_lossy().as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok();
+    let root = crate::sandbox_state::root_slice(None, cgroup.as_deref());
+    (
+        format!("wrkslots-fuse-{}", &hex[..12]),
+        format!("{}-images.slice", root.trim_end_matches(".slice")),
+    )
+}
+
+/// (state, detail, backend) for the mount handlers.
+fn mount_state3(image_file: &Path, mount_point: &Path) -> (String, String, Option<String>) {
+    let (state, detail) = crate::storage_state::mount_state(image_file, mount_point);
+    let backend = crate::image_mounts::mounted_backend(&state).map(str::to_string);
+    (state, detail, backend)
+}
+
+/// `wrkslots image mount`: fixture-gated writer holding the
+/// mutation locks. (Stray Git-pointer clearing stays Python for
+/// now; see #1116.)
+pub(crate) fn image_mount_cli(
+    root: Option<&Path>,
+    machine: Option<&str>,
+    coordinator_authorized: bool,
+) -> Result<HandlerOutcome> {
+    crate::ensure_states::require_fixture()?;
+    let (control, worktrees, tools) = mount_ctx(root, machine)?;
+    let (cfg, selected) = crate::active_state::load_cfg(root, machine)?;
+    let _locks = crate::hold_write::acquire_mutation_locks(root, machine, &cfg, &selected)?;
+    let entries = mount_entries();
+    let kind = box_kind(&entries);
+    let slot_path = |_: &str, slot: &str| worktrees.join(slot);
+    let ctx = crate::imagecmd::MountCtx {
+        control: &control,
+        slot_path: &slot_path,
+        tools: &tools,
+    };
+    let backend_for =
+        |record: &crate::image_record::ImageRecord| resolve_backend(&record.backend, &tools, kind);
+    Ok(crate::imagecmd::image_mount(
+        &ctx,
+        coordinator_authorized,
+        &mount_state3,
+        &crate::storage_state::still_attached_labels,
+        &backend_for,
+        &fuse_unit,
+        &SubprocessRunner,
+    ))
+}
+
+/// `wrkslots image unmount`: fixture-gated writer; prove the slot
+/// unused under the mutation locks before unmounting.
+pub(crate) fn image_unmount_cli(
+    root: Option<&Path>,
+    machine: Option<&str>,
+    slot_type: &str,
+    slot: &str,
+) -> Result<HandlerOutcome> {
+    crate::ensure_states::require_fixture()?;
+    let (control, worktrees, tools) = mount_ctx(root, machine)?;
+    let (cfg, selected) = crate::active_state::load_cfg(root, machine)?;
+    let _locks = crate::hold_write::acquire_mutation_locks(root, machine, &cfg, &selected)?;
+    // Python loads the image first (a non-image slot refuses in
+    // the handler) and asserts use of its location, which may not
+    // exist as a directory for a slot that was never mounted.
+    if worktrees.join(slot).is_dir() {
+        crate::remove_write::assert_slot_unused(
+            &worktrees.join(slot),
+            i64::from(std::process::id()),
+        )?;
+    }
+    let slot_path = |_: &str, slot: &str| worktrees.join(slot);
+    let ctx = crate::imagecmd::MountCtx {
+        control: &control,
+        slot_path: &slot_path,
+        tools: &tools,
+    };
+    Ok(crate::imagecmd::image_unmount(
+        &ctx,
+        slot_type,
+        slot,
+        false,
+        &mount_state3,
+        &crate::storage_state::still_attached_labels,
+        &SubprocessRunner,
+    ))
+}
+
+/// `wrkslots image grow`: fixture-gated writer holding the
+/// mutation locks. (Python mounts an unmounted kernel image
+/// before resizing; that ensure step is not wired yet, see #1116.)
+pub(crate) fn image_grow_cli(
+    root: Option<&Path>,
+    machine: Option<&str>,
+    slot_type: &str,
+    slot: &str,
+    ceiling_gib: i64,
+) -> Result<HandlerOutcome> {
+    crate::ensure_states::require_fixture()?;
+    let (control, worktrees, tools) = mount_ctx(root, machine)?;
+    let (cfg, selected) = crate::active_state::load_cfg(root, machine)?;
+    let _locks = crate::hold_write::acquire_mutation_locks(root, machine, &cfg, &selected)?;
+    let slot_path = |_: &str, slot: &str| worktrees.join(slot);
+    let ctx = crate::imagecmd::MountCtx {
+        control: &control,
+        slot_path: &slot_path,
+        tools: &tools,
+    };
+    Ok(crate::imagecmd::image_grow(
+        &ctx,
+        slot_type,
+        slot,
+        ceiling_gib,
+        &mount_fact,
+        &SubprocessRunner,
+    ))
+}
+
 /// `wrkslots image set-default`: fixture-gated writer. Validate,
 /// then under the config lock hand the raw document to the pure
 /// handler and write its update in the file's own format.

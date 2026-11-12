@@ -67,6 +67,49 @@ pub(crate) enum Writers {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Mount every image-backed slot that is not mounted (Python `image mount`; writer, fixture registries only until cutover)
+    ImageMount {
+        /// Mount a discarding image from the image file only (coordinator decision)
+        #[arg(long)]
+        coordinator_authorized: bool,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Override the machine shard (else WRKSLOTS_MACHINE, else the configured machine, where an absent key or the value auto means the short host name)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
+    /// Unmount one slot's images while nothing uses the slot (Python `image unmount`; writer, fixture registries only until cutover)
+    ImageUnmount {
+        /// Registered slot name
+        slot: String,
+        /// Slot type (default: agent)
+        #[arg(long, value_name = "TYPE", default_value = "agent", value_parser = ["agent", "validate"])]
+        slot_type: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Override the machine shard (else WRKSLOTS_MACHINE, else the configured machine, where an absent key or the value auto means the short host name)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
+    /// Raise a slot image's ceiling (Python `image grow`; writer, fixture registries only until cutover)
+    ImageGrow {
+        /// Registered slot name
+        slot: String,
+        /// Slot type (default: agent)
+        #[arg(long, value_name = "TYPE", default_value = "agent", value_parser = ["agent", "validate"])]
+        slot_type: String,
+        /// New apparent size in GiB
+        #[arg(long, value_name = "GIB", required = true)]
+        ceiling_gib: i64,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Override the machine shard (else WRKSLOTS_MACHINE, else the configured machine, where an absent key or the value auto means the short host name)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Remove and archive one slot (writer; fixture registries only until cutover)
     Remove {
         /// Active slot to remove
@@ -1732,7 +1775,7 @@ fn translate_python_argv_routed(
     // `image status` runs here; the other actions refuse by name.
     if cmd == "image" {
         return match rest.get(1).map(String::as_str) {
-            Some(action @ ("set-default" | "trim")) => {
+            Some(action @ ("set-default" | "trim" | "grow" | "mount" | "unmount")) => {
                 let mut out: Vec<String> = vec![args[0].clone(), format!("image-{action}")];
                 out.extend(rest[2..].iter().cloned());
                 if let Some(root) = project_root {
@@ -2092,6 +2135,69 @@ pub fn run() -> u8 {
                 root.as_deref(),
                 machine.as_deref(),
                 &representation,
+            ) {
+                Ok(outcome) => {
+                    print!("{}", outcome.stdout);
+                    eprint!("{}", outcome.stderr);
+                    return u8::try_from(outcome.exit).unwrap_or(1);
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
+            Writers::ImageMount {
+                coordinator_authorized,
+                root,
+                machine,
+            } => match crate::image_dispatch::image_mount_cli(
+                root.as_deref(),
+                machine.as_deref(),
+                coordinator_authorized,
+            ) {
+                Ok(outcome) => {
+                    print!("{}", outcome.stdout);
+                    eprint!("{}", outcome.stderr);
+                    return u8::try_from(outcome.exit).unwrap_or(1);
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
+            Writers::ImageUnmount {
+                slot,
+                slot_type,
+                root,
+                machine,
+            } => match crate::image_dispatch::image_unmount_cli(
+                root.as_deref(),
+                machine.as_deref(),
+                &slot_type,
+                &slot,
+            ) {
+                Ok(outcome) => {
+                    print!("{}", outcome.stdout);
+                    eprint!("{}", outcome.stderr);
+                    return u8::try_from(outcome.exit).unwrap_or(1);
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
+            Writers::ImageGrow {
+                slot,
+                slot_type,
+                ceiling_gib,
+                root,
+                machine,
+            } => match crate::image_dispatch::image_grow_cli(
+                root.as_deref(),
+                machine.as_deref(),
+                &slot_type,
+                &slot,
+                ceiling_gib,
             ) {
                 Ok(outcome) => {
                     print!("{}", outcome.stdout);

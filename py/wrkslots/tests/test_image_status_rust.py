@@ -167,7 +167,7 @@ def test_image_status_worktrees_image_matches_python_stdout(
 def test_image_other_actions_stay_refused(tmp_path: Path) -> None:
     root = _root(tmp_path)
     result = subprocess.run(
-        [str(rust_wrkslotsd()), "image", "mount"],
+        [str(rust_wrkslotsd()), "image", "convert", "slot-a", "--to", "worktree"],
         cwd=root, capture_output=True, text=True, check=False, timeout=900,
         env={**os.environ, "WRKSLOTS_PYCOMPAT": "1"},
     )

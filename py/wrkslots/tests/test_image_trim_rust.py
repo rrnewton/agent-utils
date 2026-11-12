@@ -119,13 +119,12 @@ def test_image_trim_not_image_backed_matches_python(
     assert (result.returncode, result.stdout, result.stderr) == expected
 
 
-def test_image_mount_and_grow_stay_refused(tmp_path: Path) -> None:
+def test_image_convert_stays_refused(tmp_path: Path) -> None:
     root = _root(tmp_path)
-    for argv in (["image", "mount"], ["image", "grow", "slot-a", "--ceiling-gib", "4"]):
-        result = subprocess.run(
-            [str(rust_wrkslotsd()), *argv],
-            cwd=root, capture_output=True, text=True, check=False, timeout=900,
-            env={**os.environ, "WRKSLOTS_PYCOMPAT": "1"},
-        )
-        assert result.returncode == 1
-        assert "'image' stays with the Python edition in this slice" in result.stderr
+    result = subprocess.run(
+        [str(rust_wrkslotsd()), "image", "convert", "slot-a", "--to", "worktree"],
+        cwd=root, capture_output=True, text=True, check=False, timeout=900,
+        env={**os.environ, "WRKSLOTS_PYCOMPAT": "1"},
+    )
+    assert result.returncode == 1
+    assert "'image' stays with the Python edition in this slice" in result.stderr

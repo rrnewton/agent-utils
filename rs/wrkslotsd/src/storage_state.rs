@@ -538,7 +538,7 @@ fn carries(
     None
 }
 
-fn still_attached_labels(image_file: &Path) -> Vec<String> {
+pub(crate) fn still_attached_labels(image_file: &Path) -> Vec<String> {
     let Ok(entries) = mount_entries() else {
         return Vec::new();
     };
