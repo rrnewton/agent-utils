@@ -20,7 +20,7 @@ import { brokenModule, ALIAS_NOTICE, CHANNEL, CSS_CODE, DISCORD_POLL_MS, HTML, H
   settingsOptions, settingsSection, showDiscord, shownIds, sideIds, sideRow, signIn, sourceConstant,
   sseDelete, sseMessage, sseUpdate, startTalking, tallChannel, test, threadBadge, threadButton,
   threadData, threadOptions, threadPage, timelineAnswer, turnTodoOn, twoColumns, twoServices,
-  viewOf, wideCard, withLiveChannel, withReplies } from "./fixture.mjs";
+  viewOf, wideCard, withLiveChannel, withReplies, chooseReadMode} from "./fixture.mjs";
 
 const archiveButton = (li) =>
   li.descendants().find((node) => node.className === "archive-button");
@@ -945,20 +945,6 @@ test("A NAME THE SERVER REFUSES LEAVES THE OLD ONE STANDING AND SAYS WHY", async
   );
 });
 
-test("the head of the to-do list is named the same way the channel is", async () => {
-  const page = newPage();
-  page.channels = [{ ...ALIASED }];
-  await signIn(page);
-  await showDiscord(page, backlog());
-  await turnTodoOn(page);
-  assert.match(
-    page.el("channel-summary").text(),
-    /the build channel/,
-    "the to-do head renders a channel name too, and it is the same name"
-  );
-  assert.doesNotMatch(page.el("channel-summary").text(), /lead team/);
-});
-
 test("the field cannot hold more than the server will store", async () => {
   // Sixty, written out, matching `vibe_talk::store::MAX_ALIAS_CHARS`. Named literally on both
   // sides on purpose: a test that read the number out of the markup would pass for any ceiling,
@@ -1476,9 +1462,9 @@ test("Hide read reprojects a cached threaded timeline without fetching", async (
   await showDiscord(page, [first, second]);
   const fetched = page.timelineCalls.length;
   assert.equal(page.el("discord-log").children.length, 2);
-  await turnTodoOn(page);
-  assert.equal(page.el("discord-log").children.length, 1);
-  assert.equal(page.el("discord-log").children[0].getAttribute("data-id"), "302");
+  await chooseReadMode(page, "Fold read");
+  assert.equal(page.el("discord-log").children.length, 2);
+  assert.equal(page.el("discord-log").children[0].getAttribute("data-id"), "301");
   assert.equal(page.timelineCalls.length, fetched, "Hide read refetched an already cached timeline");
   await page.el("todo-filter").click();
   assert.equal(page.el("discord-log").children.length, 2);
@@ -2066,7 +2052,7 @@ test("a reload reopens the channel, the thread and Hide read as the reader left 
   await first.settle();
   const id = data.threads[0].id;
   await pickThread(first, `thread:${id}`);
-  await turnTodoOn(first);
+  await chooseReadMode(first, "Fold read");
   assert.deepStrictEqual(shownIds(first), ["201", "202"]);
   await first.setVisibility("hidden");
 
@@ -2085,7 +2071,7 @@ test("a reload reopens the channel, the thread and Hide read as the reader left 
   assert.equal(page.el("thread-heading").hidden, false);
   assert.equal(wideCard(page).text, "first thread root", "the reopened thread has no card");
   assert.deepStrictEqual(shownIds(page), ["201", "202"], "the thread was not drawn from the device first");
-  assert.equal(page.el("todo-filter").getAttribute("aria-pressed"), "true", "Hide read came back off");
+  assert.equal(page.el("todo-filter").getAttribute("aria-pressed"), "true", "Fold read came back off");
   assert.deepStrictEqual(readKinds(page), [], "the reopen read before sign-in had answered");
 
   // Sign-in answers and the stream attaches: the first read is the thread on screen.
@@ -2243,19 +2229,6 @@ test("Main drawn before threads were known gives way to All once the provider sa
   await page.settle();
   assert.equal(page.el("thread-select").value, "flat", "the view changed again");
   assert.deepStrictEqual(readKinds(page), ["flat", "flat"]);
-});
-
-test("Hide read on a channel without threads reopens on the to-do list, read once", async () => {
-  const first = newPage();
-  await signIn(first);
-  await showDiscord(first, backlog());
-  await turnTodoOn(first);
-  assert.ok(first.todoReads > 0, "Hide read never read the to-do list");
-  const page = reloadWith(first.storage, backlog());
-  await reopenedChannel(page);
-  assert.equal(page.el("todo-filter").getAttribute("aria-pressed"), "true");
-  assert.equal(page.todoReads, 1, "the reopen did not read the to-do list once");
-  assert.equal(page.pageReads, 0, "the reopen read the whole channel under Hide read");
 });
 
 test("a reload left on the call view reopens there, and reads no channel", async () => {
@@ -2836,7 +2809,7 @@ test("two windows on one channel each reopen in their own view, with the device'
     await changeChannelTo(two, OTHER_CHANNEL.id);
     await pickThread(two, "main");
     await changeChannelTo(two, CHANNEL.id);
-    await turnTodoOn(two);
+    await chooseReadMode(two, "Fold read");
     await one.setVisibility("hidden");
     await two.setVisibility("hidden");
     const oneAgain = windowOnTwoChannels(one.storage, one.session, script);

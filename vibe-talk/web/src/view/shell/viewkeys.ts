@@ -35,9 +35,9 @@ export interface ViewKeysDependencies<Column> {
   chooseView(which: ViewChoice): void;
   /** Settle the focus after the view changes. */
   settleFocus(): void;
-  /** Whether the Hide read button is hidden. */
+  /** Whether the read toggle button is hidden. */
   readModeHidden(): boolean;
-  /** The Hide read button's own act. */
+  /** The read toggle button's own act. */
   cycleReadMode(): void;
   /** What the status line says of the read mode now. */
   readModeSaid(): string;
@@ -108,7 +108,7 @@ export interface ViewKeys {
    */
   viewFromKeyboard(which: ViewChoice, repeat: boolean): boolean;
   /**
-   * h: the cycle of the Hide read button: Show read, Fold read, Hide read. The button's own act
+   * h: the cycle of the read toggle: Show read and Fold read in turn (`#1168 read-toggle-two-way`). The button's own act
    * (`cycleReadMode`), so the key, the button's words and the list are one state; and said on the status
    * line, as the button is not where the reader's eyes are. `#432 read-mode-unify`.
    */
