@@ -117,10 +117,42 @@ declare namespace VibeTalk {
   }
 
   /**
+   * The shape of one Discuss scope before any model is asked: what a Summarize press
+   * would cover. `discuss-summarize-button`.
+   */
+  interface CatchupPreview {
+    /**
+     * The channel read, as configured here.
+     */
+    channel: ChannelInfo;
+    /**
+     * The thread covered, or null for a channel read.
+     */
+    thread_id: string | null;
+    /**
+     * Every unread message in the window, oldest first: the set N and HH:MM choose over.
+     */
+    unread: CatchupUnreadRef[];
+    /**
+     * The view covered: `"flat"` or `"main"` for a channel read, `"thread"` for one.
+     */
+    view: string;
+    /**
+     * What the cached window holds.
+     */
+    window: CatchupWindow;
+  }
+
+  /**
    * The body of `POST /api/v1/channels/{channel_id}/catchup`: one Discuss read.
    * `catchup-side-agent`.
    */
   interface CatchupRequest {
+    /**
+     * Only messages at or after this instant (Unix milliseconds) are covered: the
+     * panel's "last N unread since HH:MM" bound. Absent covers the whole window.
+     */
+    since_ms: number | null;
     /**
      * The thread to cover, whole; absent or null covers the channel itself.
      */
@@ -247,6 +279,25 @@ declare namespace VibeTalk {
      * the server; the terms themselves are the response's `unknown_terms`.
      */
     unknown_term_count: number;
+  }
+
+  /**
+   * One unread message in a Discuss preview, for the panel's N/since choice.
+   * `discuss-summarize-button`.
+   */
+  interface CatchupUnreadRef {
+    /**
+     * When it was created, in Unix milliseconds, when that can be read.
+     */
+    at_ms: number | null;
+    /**
+     * The message.
+     */
+    id: MessageId;
+    /**
+     * `"HH:MM · author"`, as the message itself carries it.
+     */
+    label: string;
   }
 
   /**
@@ -2943,6 +2994,7 @@ declare namespace VibeTalk {
     SearchResponse: SearchResponse;
     CatchupRequest: CatchupRequest;
     CatchupResponse: CatchupResponse;
+    CatchupPreview: CatchupPreview;
   }
 
   /** A contract type a peer may extend with new `type` tags. */

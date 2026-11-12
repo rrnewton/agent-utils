@@ -2495,6 +2495,110 @@ fn discuss_not_available() -> ApiError {
     )
 }
 
+/// Query of `GET …/catchup/preview`: the scope, as the POST body's fields name it.
+#[derive(Debug, Default, Deserialize)]
+pub struct CatchupPreviewQuery {
+    /// The thread to cover, whole; absent covers the channel itself.
+    pub thread_id: Option<String>,
+    /// Which channel view a channel read covers: `"flat"` (the default) or `"main"`.
+    pub view: Option<String>,
+}
+
+/// The view a Discuss scope names, shared by the preview and the read itself.
+fn catchup_view(
+    thread_id: Option<&str>,
+    view: Option<&str>,
+) -> Result<(crate::threads::TimelineView, &'static str), ApiError> {
+    use crate::threads::TimelineView;
+    if thread_id.is_some() {
+        return Ok((TimelineView::Thread, "thread"));
+    }
+    match view {
+        None | Some("flat") => Ok((TimelineView::Flat, "flat")),
+        Some("main") => Ok((TimelineView::Main, "main")),
+        Some(other) => Err(ApiError::bad_request(format!(
+            "view is \"flat\" (the default) or \"main\", not {other:?}"
+        ))),
+    }
+}
+
+/// One message's footer-style label, as the catch-up answers carry it.
+fn catchup_label(message: &Message) -> String {
+    format!(
+        "{} · {}",
+        if message.spoken_time.is_empty() {
+            message.timestamp.as_str()
+        } else {
+            message.spoken_time.as_str()
+        },
+        message.author
+    )
+}
+
+/// `GET /api/v1/channels/{channel_id}/catchup/preview` — the shape of one Discuss scope
+/// before any model is asked (`discuss-summarize-button`): the cached window and its
+/// unread set, for the panel's "last N unread since HH:MM" choice. Cache-only, like the
+/// read itself; it spends no model call. WRITE scope, as the read's own scope: it settles
+/// the owner's own read state on the way through [`ops::dismissed_within`].
+pub async fn catchup_preview(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(channel_id): Path<String>,
+    Query(query): Query<CatchupPreviewQuery>,
+) -> Result<Response, ApiError> {
+    if state.channel(&channel_id).is_none() {
+        return Err(OpError::UnknownChannel.into());
+    }
+    let thread_id = query
+        .thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let (view, view_name) = catchup_view(thread_id, query.view.as_deref())?;
+    let fetched = crate::read_reason::ReadReason::Discuss
+        .scope(ops::catchup_fetch(
+            &state,
+            Scope::Write,
+            &channel_id,
+            view,
+            thread_id,
+            state.config.summaries.catchup_window_messages,
+        ))
+        .await?;
+    let owner = crate::owner::Owner::of(&state);
+    let built = crate::catchup::build_context(&fetched.messages, &fetched.read, &owner);
+    let by_id: std::collections::HashMap<&str, &Message> = fetched
+        .messages
+        .iter()
+        .map(|message| (message.id.as_str(), message))
+        .collect();
+    let unread: Vec<crate::contract::CatchupUnreadRef> = built
+        .unread_ids
+        .iter()
+        .filter_map(|id| by_id.get(id.as_str()))
+        .map(|message| crate::contract::CatchupUnreadRef {
+            id: message.id.clone(),
+            at_ms: message.created_ms(),
+            label: catchup_label(message),
+        })
+        .collect();
+    Ok(no_store(Json(crate::contract::CatchupPreview {
+        channel: fetched.channel,
+        thread_id: thread_id.map(str::to_owned),
+        view: view_name.to_owned(),
+        window: crate::contract::CatchupWindow {
+            count: fetched.messages.len(),
+            unread_count: unread.len(),
+            read_count: fetched.messages.len().saturating_sub(unread.len()),
+            from_id: fetched.messages.first().map(|message| message.id.clone()),
+            through_id: fetched.messages.last().map(|message| message.id.clone()),
+            truncated: fetched.truncated,
+            noise_hidden: fetched.noise_hidden,
+        },
+        unread,
+    })))
+}
+
 /// `POST /api/v1/channels/{channel_id}/catchup` — one Discuss read: the side agent over the
 /// channel's newest window (or one whole thread), in one model call. `catchup-side-agent`.
 ///
@@ -2523,21 +2627,9 @@ pub async fn catchup(
         .as_deref()
         .map(str::trim)
         .filter(|id| !id.is_empty());
-    let (view, view_name) = if thread_id.is_some() {
-        (TimelineView::Thread, "thread")
-    } else {
-        match body.view.as_deref() {
-            None | Some("flat") => (TimelineView::Flat, "flat"),
-            Some("main") => (TimelineView::Main, "main"),
-            Some(other) => {
-                return Err(ApiError::bad_request(format!(
-                    "view is \"flat\" (the default) or \"main\", not {other:?}"
-                )))
-            }
-        }
-    };
+    let (view, view_name) = catchup_view(thread_id, body.view.as_deref())?;
     let context_began = std::time::Instant::now();
-    let fetched = crate::read_reason::ReadReason::Discuss
+    let mut fetched = crate::read_reason::ReadReason::Discuss
         .scope(ops::catchup_fetch(
             &state,
             Scope::Write,
@@ -2547,6 +2639,12 @@ pub async fn catchup(
             state.config.summaries.catchup_window_messages,
         ))
         .await?;
+    // The panel's bound (`discuss-summarize-button`): only what the chosen time covers.
+    if let Some(since_ms) = body.since_ms {
+        fetched
+            .messages
+            .retain(|message| message.created_ms().is_none_or(|at_ms| at_ms >= since_ms));
+    }
     let owner = crate::owner::Owner::of(&state);
     let mut built = crate::catchup::build_context(&fetched.messages, &fetched.read, &owner);
     let (warmup, warmup_fingerprint) = crate::catchup::load_warmup(
@@ -2627,15 +2725,7 @@ pub async fn catchup(
         .filter_map(|id| by_id.get(id.as_str()).map(|message| (id, message)))
         .map(|(id, message)| crate::contract::CatchupFooterLink {
             id: id.clone(),
-            label: format!(
-                "{} · {}",
-                if message.spoken_time.is_empty() {
-                    message.timestamp.as_str()
-                } else {
-                    message.spoken_time.as_str()
-                },
-                message.author
-            ),
+            label: catchup_label(message),
             thread_id: message
                 .thread
                 .as_ref()

@@ -143,9 +143,57 @@
       ],
       "type": "object"
     },
+    "CatchupPreview": {
+      "description": "The shape of one Discuss scope before any model is asked: what a Summarize press\nwould cover. `discuss-summarize-button`.",
+      "properties": {
+        "channel": {
+          "$ref": "#/$defs/ChannelInfo",
+          "description": "The channel read, as configured here."
+        },
+        "thread_id": {
+          "description": "The thread covered, or null for a channel read.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "unread": {
+          "description": "Every unread message in the window, oldest first: the set N and HH:MM choose over.",
+          "items": {
+            "$ref": "#/$defs/CatchupUnreadRef"
+          },
+          "type": "array"
+        },
+        "view": {
+          "description": "The view covered: `\"flat\"` or `\"main\"` for a channel read, `\"thread\"` for one.",
+          "type": "string"
+        },
+        "window": {
+          "$ref": "#/$defs/CatchupWindow",
+          "description": "What the cached window holds."
+        }
+      },
+      "required": [
+        "channel",
+        "thread_id",
+        "view",
+        "window",
+        "unread"
+      ],
+      "type": "object"
+    },
     "CatchupRequest": {
       "description": "The body of `POST /api/v1/channels/{channel_id}/catchup`: one Discuss read.\n`catchup-side-agent`.",
       "properties": {
+        "since_ms": {
+          "default": null,
+          "description": "Only messages at or after this instant (Unix milliseconds) are covered: the\npanel's \"last N unread since HH:MM\" bound. Absent covers the whole window.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "thread_id": {
           "default": null,
           "description": "The thread to cover, whole; absent or null covers the channel itself.",
@@ -165,7 +213,8 @@
       },
       "required": [
         "thread_id",
-        "view"
+        "view",
+        "since_ms"
       ],
       "type": "object"
     },
@@ -339,6 +388,33 @@
         "input_chars",
         "output_chars",
         "unknown_term_count"
+      ],
+      "type": "object"
+    },
+    "CatchupUnreadRef": {
+      "description": "One unread message in a Discuss preview, for the panel's N/since choice.\n`discuss-summarize-button`.",
+      "properties": {
+        "at_ms": {
+          "description": "When it was created, in Unix milliseconds, when that can be read.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "id": {
+          "$ref": "#/$defs/MessageId",
+          "description": "The message."
+        },
+        "label": {
+          "description": "`\"HH:MM · author\"`, as the message itself carries it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "at_ms",
+        "label"
       ],
       "type": "object"
     },
@@ -3920,6 +3996,9 @@
     },
     {
       "$ref": "#/$defs/CatchupResponse"
+    },
+    {
+      "$ref": "#/$defs/CatchupPreview"
     }
   ],
   "description": "Generated from vibe-talk/src/contract.rs by `make -C vibe-talk contract`. Do not edit.",

@@ -311,6 +311,11 @@ fn routes(state: AppState) -> Router {
         .route("/api/v1/channels/{channel_id}/recap", get(api::recap))
         // `catchup-side-agent`. WRITE scope: one Discuss read — it spends a model call.
         .route("/api/v1/channels/{channel_id}/catchup", post(api::catchup))
+        // `discuss-summarize-button`. WRITE scope, as the read's: its unread preview.
+        .route(
+            "/api/v1/channels/{channel_id}/catchup/preview",
+            get(api::catchup_preview),
+        )
         .route("/api/v1/channels/{channel_id}/digest", get(api::digest))
         .route("/api/v1/channels/{channel_id}/resolve", post(api::resolve))
         .route("/api/v1/channels/{channel_id}/reply", post(api::reply))

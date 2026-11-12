@@ -274,6 +274,13 @@ fn inventory() -> Vec<Route> {
             Write,
             Json(r#"{"thread_id":null,"view":"flat"}"#),
         ),
+        // `discuss-summarize-button`: the unread preview settles read state, so write scope.
+        route(
+            "GET",
+            "/api/v1/channels/{channel_id}/catchup/preview",
+            Write,
+            Query("?view=flat", "?view=threads"),
+        ),
         route(
             "POST",
             "/api/v1/channels/{channel_id}/resolve",

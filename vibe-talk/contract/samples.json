@@ -64,12 +64,49 @@
       }
     }
   ],
+  "CatchupPreview": [
+    {
+      "channel": {
+        "added": false,
+        "alias": null,
+        "id": "100",
+        "label": "general",
+        "provider": "discord",
+        "writable": true
+      },
+      "thread_id": null,
+      "unread": [
+        {
+          "at_ms": 1700000000000,
+          "id": "1010",
+          "label": "09:51 · Ada"
+        },
+        {
+          "at_ms": null,
+          "id": "1011",
+          "label": "09:52 · Ben"
+        }
+      ],
+      "view": "flat",
+      "window": {
+        "count": 12,
+        "from_id": "1000",
+        "noise_hidden": 1,
+        "read_count": 10,
+        "through_id": "1011",
+        "truncated": false,
+        "unread_count": 2
+      }
+    }
+  ],
   "CatchupRequest": [
     {
+      "since_ms": 1700000000000,
       "thread_id": "thread-1",
       "view": "main"
     },
     {
+      "since_ms": null,
       "thread_id": null,
       "view": null
     }

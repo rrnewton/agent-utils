@@ -485,6 +485,59 @@ async fn the_endpoint_answers_a_cache_miss_without_a_model_call() {
 }
 
 #[tokio::test]
+async fn the_preview_names_the_unread_set_and_the_since_bound_trims_the_read() {
+    let messages: Vec<Message> = (0..5).map(|seq| message(seq, None, false)).collect();
+    let backend = backend_with(messages.clone());
+    let (state, _store, summarizer, _dir) =
+        cached_state(&testing::config_toml(), backend.clone()).await;
+    fill(&state, TimelineView::Flat, None).await;
+    let mut state = state;
+    state.catchup_summarizer = Some(summarizer.clone());
+    state.catchup_model = Some(Arc::from("fake-model"));
+    summarizer.answer_with("bounded point");
+    let app = vibe_talk::http::router(state);
+    let channel_path = format!("/api/v1/channels/{WRITE_CHANNEL}/catchup");
+
+    // The preview: the whole unread set with its times, no model call, no new upstream read.
+    let reads = backend.reads();
+    let (status, preview) = get(
+        &app,
+        &format!("{channel_path}/preview?view=flat"),
+        WRITE_TOKEN,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert_eq!(backend.reads(), reads, "the preview read upstream");
+    assert!(
+        summarizer.prompt_calls().is_empty(),
+        "the preview asked the model"
+    );
+    assert_eq!(preview["window"]["count"], json!(5), "{preview}");
+    assert_eq!(preview["window"]["unread_count"], json!(5), "{preview}");
+    let unread = preview["unread"].as_array().expect("unread list");
+    assert_eq!(unread.len(), 5);
+    assert_eq!(unread[0]["id"], json!(messages[0].id.as_str()));
+    let since = unread[3]["at_ms"].as_i64().expect("a creation time");
+
+    // The bounded read covers exactly the unread at/after the bound.
+    let (status, body) = post(
+        &app,
+        &channel_path,
+        Some(WRITE_TOKEN),
+        &json!({"since_ms": since}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["window"]["count"], json!(2), "{body}");
+    assert_eq!(
+        body["unread_ids"],
+        json!([messages[3].id.as_str(), messages[4].id.as_str()]),
+        "{body}"
+    );
+    assert_eq!(summarizer.prompt_calls().len(), 1);
+}
+
+#[tokio::test]
 async fn on_an_elevenlabs_only_deployment_discuss_refuses_by_backend_name() {
     // The test configuration names an [elevenlabs] agent and no [summaries.llm]: summaries
     // are fully configured (through the agent), so Discuss must refuse saying it is not

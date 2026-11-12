@@ -14,15 +14,15 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 use vibe_talk::contract::{
-    ApiErrorBody, BookmarkResponse, CatchupFooterLink, CatchupRequest, CatchupResponse,
-    CatchupStamp, CatchupWindow, ClientConfigResponse, ClientSettings, CommittedPostResponse,
-    LiveDeleteEvent, LiveDelivery, LiveMessageEvent, LiveResetEvent, MessageCacheHistory,
-    MessageCacheRequest, MessageCacheStatus, MessagesResponse, NoiseRules, PendingPost,
-    PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled, ProviderDescription,
-    ReplayUnavailable, ReplyDismissals, SearchResponse, SearchScope, TimelineResponse, TokenScope,
-    TranscriptRole, UpstreamClearAttemptView, UpstreamClearNowOutcome, UpstreamClearNowResponse,
-    UpstreamClearState, VibeTalkV1ClientFrame, VibeTalkV1ServerFrame, VoicePostPrefix,
-    VoicePromptSettings, VoiceSend, VoiceSettings,
+    ApiErrorBody, BookmarkResponse, CatchupFooterLink, CatchupPreview, CatchupRequest,
+    CatchupResponse, CatchupStamp, CatchupUnreadRef, CatchupWindow, ClientConfigResponse,
+    ClientSettings, CommittedPostResponse, LiveDeleteEvent, LiveDelivery, LiveMessageEvent,
+    LiveResetEvent, MessageCacheHistory, MessageCacheRequest, MessageCacheStatus, MessagesResponse,
+    NoiseRules, PendingPost, PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled,
+    ProviderDescription, ReplayUnavailable, ReplyDismissals, SearchResponse, SearchScope,
+    TimelineResponse, TokenScope, TranscriptRole, UpstreamClearAttemptView,
+    UpstreamClearNowOutcome, UpstreamClearNowResponse, UpstreamClearState, VibeTalkV1ClientFrame,
+    VibeTalkV1ServerFrame, VoicePostPrefix, VoicePromptSettings, VoiceSend, VoiceSettings,
 };
 use vibe_talk::contract::{ChannelHistoryState, HistoryModeChoice, HistoryModeRequest};
 use vibe_talk::contract::{PromptDelivery, PromptTransport, SessionPrompt};
@@ -1255,6 +1255,7 @@ fn samples() -> Value {
             to(&CatchupRequest {
                 thread_id: Some("thread-1".into()),
                 view: Some("main".into()),
+                since_ms: Some(1_700_000_000_000),
             }),
             to(&CatchupRequest::default()),
         ],
@@ -1330,6 +1331,34 @@ fn samples() -> Value {
                     output_chars: 0,
                     unknown_term_count: 0,
                 },
+            }),
+        ],
+        "CatchupPreview": [
+            to(&CatchupPreview {
+                channel: channel(),
+                thread_id: None,
+                view: "flat".into(),
+                window: CatchupWindow {
+                    count: 12,
+                    unread_count: 2,
+                    read_count: 10,
+                    from_id: Some(MessageId("1000".into())),
+                    through_id: Some(MessageId("1011".into())),
+                    truncated: false,
+                    noise_hidden: 1,
+                },
+                unread: vec![
+                    CatchupUnreadRef {
+                        id: MessageId("1010".into()),
+                        at_ms: Some(1_700_000_000_000),
+                        label: "09:51 · Ada".into(),
+                    },
+                    CatchupUnreadRef {
+                        id: MessageId("1011".into()),
+                        at_ms: None,
+                        label: "09:52 · Ben".into(),
+                    },
+                ],
             }),
         ],
         "VibeTalkV1ClientFrame": [

@@ -1489,6 +1489,38 @@ pub struct CatchupRequest {
     /// caller's choice.
     #[serde(default)]
     pub view: Option<String>,
+    /// Only messages at or after this instant (Unix milliseconds) are covered: the
+    /// panel's "last N unread since HH:MM" bound. Absent covers the whole window.
+    #[serde(default)]
+    pub since_ms: Option<i64>,
+}
+
+/// One unread message in a Discuss preview, for the panel's N/since choice.
+/// `discuss-summarize-button`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CatchupUnreadRef {
+    /// The message.
+    pub id: MessageId,
+    /// When it was created, in Unix milliseconds, when that can be read.
+    pub at_ms: Option<i64>,
+    /// `"HH:MM · author"`, as the message itself carries it.
+    pub label: String,
+}
+
+/// The shape of one Discuss scope before any model is asked: what a Summarize press
+/// would cover. `discuss-summarize-button`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CatchupPreview {
+    /// The channel read, as configured here.
+    pub channel: ChannelInfo,
+    /// The thread covered, or null for a channel read.
+    pub thread_id: Option<String>,
+    /// The view covered: `"flat"` or `"main"` for a channel read, `"thread"` for one.
+    pub view: String,
+    /// What the cached window holds.
+    pub window: CatchupWindow,
+    /// Every unread message in the window, oldest first: the set N and HH:MM choose over.
+    pub unread: Vec<CatchupUnreadRef>,
 }
 
 /// What one Discuss read covered. `catchup-side-agent`.
@@ -1646,6 +1678,7 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         // `catchup-side-agent`. Appended, for the same reason.
         generator.subschema_for::<CatchupRequest>(),
         generator.subschema_for::<CatchupResponse>(),
+        generator.subschema_for::<CatchupPreview>(),
     ]
 }
 
