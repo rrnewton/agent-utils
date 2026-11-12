@@ -193,9 +193,13 @@ pub(crate) fn desired_live_rows(
                     let probe_error = value["probe_error"].as_str().unwrap_or_default();
                     let lifecycle = value["lifecycle"].as_str().unwrap_or("unknown");
                     let agent_status = value["agent_status"].as_str().unwrap_or("unknown");
+                    // Cloud rows carry no Herdr status vocabulary: the probe
+                    // and the lifecycle are their whole liveness evidence.
+                    let cloud = value["adapter"].as_str() == Some("agentcloud");
                     if !probe_error.is_empty()
                         || lifecycle != "running"
-                        || matches!(agent_status, "unknown" | "dead" | "missing" | "stopped")
+                        || (!cloud
+                            && matches!(agent_status, "unknown" | "dead" | "missing" | "stopped"))
                     {
                         let detail = if probe_error.is_empty() {
                             format!("lifecycle {lifecycle}, status {agent_status}")
@@ -215,7 +219,14 @@ pub(crate) fn desired_live_rows(
                             "desired-live",
                             "pass",
                             Some(name),
-                            format!("{name} live ({agent_status}) as {profile}, no profile drift"),
+                            format!(
+                                "{name} live ({}) as {profile}, no profile drift",
+                                if cloud {
+                                    "agentcloud session"
+                                } else {
+                                    agent_status
+                                }
+                            ),
                             None,
                         )
                     }
@@ -225,15 +236,85 @@ pub(crate) fn desired_live_rows(
         .collect()
 }
 
-/// One `units-bridges` row from a `systemctl is-active` outcome (pure).
-pub(crate) fn unit_row(unit: &str, outcome: &CommandOutcome) -> Value {
+/// Turnover pins for one registry, read exactly as turnover reads them:
+/// trimmed contents are the reason, an empty pin names no reason.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Pins {
+    registry: Option<String>,
+    units: std::collections::BTreeMap<String, String>,
+    global: Option<String>,
+}
+impl Pins {
+    /// The hold reason for one unit: its own pin, else the registry pin.
+    pub(crate) fn reason_for(&self, unit: &str) -> Option<&str> {
+        self.units
+            .get(unit)
+            .map(String::as_str)
+            .or(self.registry.as_deref())
+    }
+}
+
+fn pin_reason(path: &Path) -> std::result::Result<Option<String>, String> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot read pin {}: {error}", path.display())),
+    };
+    let reason = String::from_utf8_lossy(&bytes).trim().to_owned();
+    if reason.is_empty() {
+        return Err(format!(
+            "pin {} names no reason; write why it is pinned or remove it",
+            path.display()
+        ));
+    }
+    Ok(Some(reason))
+}
+
+/// Every pin verify honours: registry, per-unit for `units`, and the global
+/// binary pin under the services root (`<state root>/services` by default).
+pub(crate) fn read_pins(
+    registry: &Path,
+    units: &[String],
+    state_dir: Option<&Path>,
+) -> std::result::Result<Pins, String> {
+    let mut pins = Pins {
+        registry: pin_reason(&registry.join("turnover.pin"))?,
+        ..Pins::default()
+    };
+    for unit in units {
+        if let Some(reason) =
+            pin_reason(&registry.join("turnover-pins").join(format!("{unit}.pin")))?
+        {
+            pins.units.insert(unit.clone(), reason);
+        }
+    }
+    let services_root = match state_dir {
+        Some(root) => Some(root.join("services")),
+        None => crate::restore::default_report_dir()
+            .and_then(|dir| dir.parent().map(|parent| parent.join("services"))),
+    };
+    if let Some(root) = services_root {
+        pins.global = pin_reason(&root.join("global.pin"))?;
+    }
+    Ok(pins)
+}
+
+/// One `units-bridges` row from a `systemctl is-active` outcome (pure). A
+/// pinned unit is deliberately held, never unhealthy.
+pub(crate) fn unit_row(unit: &str, outcome: &CommandOutcome, pin: Option<&str>) -> Value {
     let printed = outcome.stdout.trim();
     if outcome.status == Some(0) && printed == "active" {
+        let evidence = match pin {
+            Some(reason) => format!("{unit} active; pinned: {reason}"),
+            None => format!("{unit} active"),
+        };
+        row("units-bridges", "pass", Some(unit), evidence, None)
+    } else if let Some(reason) = pin {
         row(
             "units-bridges",
-            "pass",
+            "held",
             Some(unit),
-            format!("{unit} active"),
+            format!("held (pin: {reason})"),
             None,
         )
     } else {
@@ -263,6 +344,28 @@ pub(crate) enum PaneVerdict {
     Dismiss(String),
     Fail(String),
     Skipped(String),
+}
+
+/// Why `pane-at-prompt` does not apply, by record backend first: a cloud
+/// agent's viewer pane shows agentterm, not a harness prompt, so backend
+/// wins over pane presence. `None` means read and judge the pane.
+pub(crate) fn pane_skip_reason(
+    name: &str,
+    cloud: bool,
+    headless: bool,
+    has_pane: bool,
+) -> Option<String> {
+    if cloud {
+        Some(format!(
+            "{name} is an agentcloud agent: no Herdr pane prompt to judge"
+        ))
+    } else if headless {
+        Some(format!("{name} is headless: no pane prompt to judge"))
+    } else if !has_pane {
+        Some(format!("{name} has no interactive pane to read"))
+    } else {
+        None
+    }
 }
 
 /// One `pane-at-prompt` row from a verdict that needed no dismiss.
@@ -544,7 +647,7 @@ fn read_alarm(registry: &Path, state_dir: Option<&Path>) -> Value {
 
 /// Bridge rows: every state directory under `REGISTRY/bridges`, through the
 /// same library `chat health` prints, target presence included.
-fn bridge_rows<A: ManagedApi + ?Sized>(client: &A, registry: &Path) -> Vec<Value> {
+fn bridge_rows<A: ManagedApi + ?Sized>(client: &A, registry: &Path, pins: &Pins) -> Vec<Value> {
     let bridges = registry.join("bridges");
     let mut dirs: Vec<PathBuf> = match fs::read_dir(&bridges) {
         Ok(entries) => entries
@@ -578,6 +681,17 @@ fn bridge_rows<A: ManagedApi + ?Sized>(client: &A, registry: &Path) -> Vec<Value
                 .and_then(|found| found.to_str())
                 .unwrap_or("bridge");
             let subject = format!("bridge {name}");
+            // A held bridge is not probed: its health would only report the
+            // deliberate stop back as down.
+            if let Some(reason) = pins.reason_for(&format!("agentctl-bridge-{name}.service")) {
+                return row(
+                    "units-bridges",
+                    "held",
+                    Some(&subject),
+                    format!("held (pin: {reason})"),
+                    None,
+                );
+            }
             let choice = crate::chat_service::health::choose_registry(
                 registry,
                 crate::chat_service::health::bridge_registry(dir),
@@ -658,6 +772,19 @@ pub fn verify_team<A: ManagedApi + ?Sized>(
     let mut checks: Vec<Value> = Vec::new();
     checks.extend(desired.undecidable.iter().cloned());
     checks.extend(desired_live_rows(&desired.names, &statuses));
+    let pins = match read_pins(registry, &config.units, options.state_dir.as_deref()) {
+        Ok(pins) => pins,
+        Err(error) => {
+            checks.push(row(
+                "units-bridges",
+                "fail",
+                None,
+                error,
+                Some("write the pin's reason or remove the pin".to_owned()),
+            ));
+            Pins::default()
+        }
+    };
     for unit in &config.units {
         let outcome = host.run(
             &[
@@ -669,7 +796,16 @@ pub fn verify_team<A: ManagedApi + ?Sized>(
             None,
             Duration::from_secs(30),
         );
-        checks.push(unit_row(unit, &outcome));
+        checks.push(unit_row(unit, &outcome, pins.reason_for(unit)));
+    }
+    if let Some(reason) = pins.global.as_deref() {
+        checks.push(row(
+            "units-bridges",
+            "held",
+            Some("global binary"),
+            format!("held (pin: {reason})"),
+            None,
+        ));
     }
     if config.units.is_empty() {
         checks.push(row(
@@ -680,7 +816,7 @@ pub fn verify_team<A: ManagedApi + ?Sized>(
             None,
         ));
     }
-    checks.extend(bridge_rows(client, registry));
+    checks.extend(bridge_rows(client, registry, &pins));
     checks.extend(archived_rows(registry, &desired.names, host.boot_time()));
     let health_path = watch_health_path(options.state_dir.as_deref());
     let health = health_path.as_deref().and_then(crate::restore::read_report);
@@ -697,19 +833,17 @@ pub fn verify_team<A: ManagedApi + ?Sized>(
             .iter()
             .find(|(known, _)| known == name)
             .and_then(|(_, found)| found.as_ref().ok());
-        let interactive = status.is_some_and(|value| {
+        let has_pane = status.is_some_and(|value| {
             value["pane_id"]
                 .as_str()
                 .is_some_and(|pane| !pane.is_empty())
         });
-        if !interactive {
-            checks.push(row(
-                "pane-at-prompt",
-                "skipped",
-                Some(name),
-                format!("{name} has no interactive pane to read"),
-                None,
-            ));
+        // Backend from the record, never from pane presence: a cloud
+        // agent's viewer pane must not be judged as a harness prompt.
+        let cloud = manager.is_cloud(name).unwrap_or(false);
+        let headless = manager.is_headless(name).unwrap_or(false);
+        if let Some(reason) = pane_skip_reason(name, cloud, headless, has_pane) {
+            checks.push(row("pane-at-prompt", "skipped", Some(name), reason, None));
             continue;
         }
         let harness = status.and_then(|value| value["harness"].as_str());
@@ -904,16 +1038,77 @@ mod tests {
             stdout: "active\n".to_owned(),
             stderr: String::new(),
         };
-        assert_eq!(unit_row("bridge.service", &active)["status"], "pass");
+        assert_eq!(unit_row("bridge.service", &active, None)["status"], "pass");
         // A bridge whose target is missing restart-loops: never active.
         let looping = CommandOutcome {
             status: Some(3),
             stdout: "activating\n".to_owned(),
             stderr: String::new(),
         };
-        let found = unit_row("bridge.service", &looping);
+        let found = unit_row("bridge.service", &looping, None);
         assert_eq!(found["status"], "fail");
         assert!(found["fix"].as_str().unwrap().contains("reset-failed"));
+    }
+
+    #[test]
+    fn pinned_units_are_held_never_unhealthy() {
+        let down = CommandOutcome {
+            status: Some(3),
+            stdout: "inactive\n".to_owned(),
+            stderr: String::new(),
+        };
+        let held = unit_row("bridge.service", &down, Some("window until Friday"));
+        assert_eq!(held["status"], "held");
+        assert_eq!(held["evidence"], "held (pin: window until Friday)");
+        // An active pinned unit passes, with the hold still visible.
+        let up = CommandOutcome {
+            status: Some(0),
+            stdout: "active\n".to_owned(),
+            stderr: String::new(),
+        };
+        let noted = unit_row("bridge.service", &up, Some("window until Friday"));
+        assert_eq!(noted["status"], "pass");
+        assert!(noted["evidence"].as_str().unwrap().contains("pinned"));
+        // Pins read from disk: per-unit wins, empty refuses, global rides.
+        let registry = temp_registry("pins");
+        let state = temp_registry("pin-state");
+        fs::create_dir_all(registry.join("turnover-pins")).unwrap();
+        fs::write(
+            registry.join("turnover-pins/bridge.service.pin"),
+            "  held for the window\n",
+        )
+        .unwrap();
+        fs::create_dir_all(state.join("services")).unwrap();
+        fs::write(state.join("services/global.pin"), "binary frozen").unwrap();
+        let pins = read_pins(&registry, &["bridge.service".to_owned()], Some(&state)).unwrap();
+        assert_eq!(
+            pins.reason_for("bridge.service"),
+            Some("held for the window")
+        );
+        assert_eq!(pins.global.as_deref(), Some("binary frozen"));
+        fs::write(registry.join("turnover-pins/bridge.service.pin"), "  \n").unwrap();
+        assert!(read_pins(&registry, &["bridge.service".to_owned()], Some(&state)).is_err());
+        let _ = fs::remove_dir_all(&registry);
+        let _ = fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn cloud_coordinator_passes_live_and_skips_pane() {
+        // No Herdr status words and no probe error: live by lifecycle alone,
+        // where the same row without the cloud adapter fails above.
+        let desired = vec!["coord".to_owned()];
+        let statuses = vec![(
+            "coord".to_owned(),
+            Ok(json!({"adapter": "agentcloud", "lifecycle": "running", "pane_id": "w1:p1"})),
+        )];
+        let rows = desired_live_rows(&desired, &statuses);
+        assert_eq!(rows[0]["status"], "pass");
+        // The viewer pane exists, but backend wins: never judged as a prompt.
+        let skip = pane_skip_reason("coord", true, false, true).unwrap();
+        assert!(skip.contains("agentcloud"));
+        assert!(pane_skip_reason("lane", false, true, true).is_some());
+        assert!(pane_skip_reason("lane", false, false, false).is_some());
+        assert_eq!(pane_skip_reason("lane", false, false, true), None);
     }
 
     #[test]

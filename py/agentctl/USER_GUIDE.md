@@ -1286,11 +1286,13 @@ It prints schema `agentctl-team-verify/v1` and exits 0 only when no check
 failed. The checks, each with subject, evidence, and fix: `desired-live`
 (every restore-desired agent live, no profile drift), `units-bridges` (each
 `restore.json` unit active; each bridge under `REGISTRY/bridges` passing
-`chat health` with its target present), `queued-not-archived` (no desired
-agent's inbox archived this boot), `watcher-dead-agents` (watch health fresh
-this boot and ok), `pane-at-prompt` (no revived pane stuck behind a dialog;
-the one allowlisted dialog is dismissed and re-read, `--check-only` only
-reports it), and `coordinator-ack` (this boot's restore notice processed in
+`chat health` with its target present; a unit held by a turnover pin reports
+`held` with the pin's reason, never unhealthy), `queued-not-archived` (no
+desired agent's inbox archived this boot), `watcher-dead-agents` (watch
+health fresh this boot and ok), `pane-at-prompt` (no revived pane stuck
+behind a dialog; the one allowlisted dialog is dismissed and re-read,
+`--check-only` only reports it; agentcloud and headless agents are skipped
+by record backend, viewer pane or not), and `coordinator-ack` (this boot's restore notice processed in
 the coordinator's queue). A check that cannot apply is `skipped` and says
 why; missing evidence fails. Apart from that one dialog dismiss it writes
 nothing. The team driver runs the same checks as its VERIFY state.
