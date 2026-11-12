@@ -49,6 +49,6 @@ owner prompts first and never batched).
 Rust edition is primary; the Python edition stays consistent where it has
 the path (queue status). No consumer names in files.
 
-# Resolution
+## Resolution
 
 Pending: see the landing commit for this issue.

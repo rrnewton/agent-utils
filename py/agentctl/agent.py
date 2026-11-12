@@ -2640,11 +2640,12 @@ def status(
         _validate_private_directory(path, "queue state directory")
         return sorted(name[:-5] for name in os.listdir(path) if name.endswith(".json"))
 
+    pending_ids = identifiers(inbox)
     result: dict[str, object] = {
         "pane_id": info.pane_id, "agent": info.agent, "agent_status": info.status,
         "session_agent": info.session_agent, "session_value": info.session_value,
         "workspace_id": info.workspace_id, "cwd": info.cwd,
-        "pending": identifiers(inbox),
+        "pending": pending_ids,
         "inflight": identifiers(inflight),
         "failed": identifiers(failed),
     }
@@ -2652,7 +2653,7 @@ def status(
     # (Rust parity: `oldest_pending_chat_age_seconds`).
     oldest_chat: int | None = None
     if os.path.lexists(inbox):
-        for identifier in result["pending"]:  # type: ignore[union-attr]
+        for identifier in pending_ids:
             try:
                 document = _read_queue_json(
                     os.path.join(inbox, f"{identifier}.json"),

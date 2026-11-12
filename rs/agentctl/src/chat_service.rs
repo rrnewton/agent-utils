@@ -6814,7 +6814,8 @@ fn owner_loop_pass<A: ManagedApi + ?Sized>(
                 // #1372: a prompt aged past the stale cap retries even while the
                 // agent works; the retry below then delivers while working.
                 let stale = options.stale_prompt_cap.is_some_and(|cap| {
-                    !stale_pending_keys(&watch.entries, chat_runtime::unix_millis(), cap).is_empty()
+                    oldest_pending_age_millis(&watch.entries, chat_runtime::unix_millis())
+                        .is_some_and(|age| age >= cap.as_millis() as u64)
                 });
                 retry = turn.ready() || stale;
             }

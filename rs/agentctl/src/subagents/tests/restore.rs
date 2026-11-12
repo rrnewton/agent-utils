@@ -514,7 +514,12 @@ fn restore_queues_a_catch_up_for_each_revived_agent_without_blocking() {
     assert_eq!(prompts, ["restore-catchup-11111111-lane"], "{prompts:?}");
     // #1372: superseded kinds queue in inbox.v2/, which current drainers read.
     let item: Value = serde_json::from_slice(
-        &fs::read(queue.join("inbox.v2").join("restore-catchup-11111111-lane.json")).unwrap(),
+        &fs::read(
+            queue
+                .join("inbox.v2")
+                .join("restore-catchup-11111111-lane.json"),
+        )
+        .unwrap(),
     )
     .unwrap();
     assert!(item["text"].as_str().unwrap().contains("continue where"));

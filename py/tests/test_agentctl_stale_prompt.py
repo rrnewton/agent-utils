@@ -13,17 +13,20 @@ CHAT_ID = "chat-" + "a" * 64
 
 
 def test_chat_request_ids_are_owner_prompts() -> None:
-    assert _is_owner_prompt(CHAT_ID, {"id": CHAT_ID, "text": "hi"})
-    assert _is_owner_prompt("note-1", {"id": CHAT_ID, "text": "hi"})
+    document: dict[str, object] = {"id": CHAT_ID, "text": "hi"}
+    assert _is_owner_prompt(CHAT_ID, document)
+    assert _is_owner_prompt("note-1", document)
 
 
 def test_agent_notes_and_short_ids_are_not_owner_prompts() -> None:
-    assert not _is_owner_prompt("note-1", {"id": "note-1", "text": "status"})
-    assert not _is_owner_prompt("chat-short", {"id": "chat-short", "text": "hi"})
-    assert not _is_owner_prompt(
-        "chat-" + "A" * 64, {"id": "chat-" + "A" * 64, "text": "hi"})
+    note: dict[str, object] = {"id": "note-1", "text": "status"}
+    assert not _is_owner_prompt("note-1", note)
+    short: dict[str, object] = {"id": "chat-short", "text": "hi"}
+    assert not _is_owner_prompt("chat-short", short)
+    upper: dict[str, object] = {"id": "chat-" + "A" * 64, "text": "hi"}
+    assert not _is_owner_prompt("chat-" + "A" * 64, upper)
 
 
 def test_console_input_is_an_owner_prompt() -> None:
-    document = {"id": "console", "text": "[from human@host-a via agentctl]\nhello"}
+    document: dict[str, object] = {"id": "console", "text": "[from human@host-a via agentctl]\nhello"}
     assert _is_owner_prompt("console", document)

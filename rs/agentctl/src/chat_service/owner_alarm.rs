@@ -289,6 +289,7 @@ fn hint(agent: &str, reason: &str) -> String {
 
 impl OwnerAlarm {
     /// An alarm for requests held `after` or longer.
+    #[cfg(test)]
     pub(crate) fn new(after: Duration) -> Self {
         Self::with_stale(after, None)
     }
