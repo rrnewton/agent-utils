@@ -4284,14 +4284,19 @@
               the list takes the row's room. On the channel's view only: the call's row is Talk. While a call
               can be hung up or a read is on, the row stays, so the sound is a tap from stopping.
             -->
-            <button id="reader-toggle" class="tray-button" type="button" hidden>
-              <span id="reader-toggle-label" class="tray-label">Hide reader</span>
-            </button>
+            <!-- `#1399 toggle-labels-active-style`: the reader toggles in their own boxed
+                 section. Fixed labels; aria-pressed and the shared active style say on/off. -->
+            <div class="reader-box" role="group" aria-label="Reader">
+              <span class="reader-box-label">Reader</span>
+              <button id="reader-toggle" class="tray-button" type="button" aria-pressed="false" hidden>
+                <span id="reader-toggle-label" class="tray-label">Hide reader</span>
+              </button>
+              <button id="autoplay-toggle" class="tray-button" type="button" aria-pressed="false" hidden>
+                <span id="autoplay-toggle-label" class="tray-label">Autoplay</span>
+              </button>
+            </div>
             <!-- `#886 voice-page-autoplay`. The read strip's Autoplay, here too, so it can be turned on before a read and
                  with the reader's row hidden. On the channel's view only, as reading is. -->
-            <button id="autoplay-toggle" class="tray-button" type="button" hidden>
-              <span id="autoplay-toggle-label" class="tray-label">Autoplay: off</span>
-            </button>
             <!-- `#1265 documents-star-hide`. Hidden documents, shown dimmed with an
                  Unhide on each card. On the Documents view only; its word is what a
                  press does, as Hide reader's is. -->

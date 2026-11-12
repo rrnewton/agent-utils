@@ -579,7 +579,8 @@ test("`#880 voice-page-menu-placement`: Hide reader takes the channel's row of b
   await page.settle();
   assert.equal(said(), "hidden", "Hide reader hid nothing");
   assert.equal(page.el("speed-popover").hidden, true, "the pace popover stayed open with its row hidden");
-  assert.equal(word(), "Show reader", "the item's word does not follow the row");
+  assert.equal(word(), "Hide reader", "the fixed label followed the row (#1399)");
+  assert.equal(item.getAttribute("aria-pressed"), "true", "Hide reader does not say it is on");
   assert.equal(page.el("action-menu").hidden, true, "choosing Hide reader left the menu open");
   assert.equal(page.storage.get("vibe-talk.voice.reader-hidden"), "1", "the choice is not kept");
   // The stylesheet takes the row away on the channel's view and leaves no band: the bar keeps the inset. But
@@ -608,15 +609,29 @@ test("`#880 voice-page-menu-placement`: Hide reader takes the channel's row of b
   const again = newPage(page.storage);
   await signIn(again);
   assert.equal(again.documentElement.getAttribute("data-reader"), "hidden", "a reload forgot Hide reader");
-  assert.equal(again.el("reader-toggle-label").text(), "Show reader");
+  assert.equal(again.el("reader-toggle-label").text(), "Hide reader");
+  assert.equal(again.el("reader-toggle").getAttribute("aria-pressed"), "true", "Hide reader does not say it is on after a reload");
   assert.equal(again.tab(), "discord", "the premise: a reload opens on the view it was left on");
-  assert.equal(again.el("reader-toggle").hidden, false, "Show reader is not offered after a reload");
+  assert.equal(again.el("reader-toggle").hidden, false, "Hide reader is not offered after a reload");
   await again.el("action-menu-open").click();
   await again.el("reader-toggle").click();
   await again.settle();
-  assert.equal(again.documentElement.getAttribute("data-reader"), null, "Show reader showed nothing");
+  assert.equal(again.documentElement.getAttribute("data-reader"), null, "Hide reader off showed nothing");
   assert.equal(again.el("reader-toggle-label").text(), "Hide reader");
   assert.equal(again.storage.get("vibe-talk.voice.reader-hidden"), "0");
+});
+
+test("`#1399 toggle-labels-active-style`: the reader toggles are boxed, fixed-labelled and active-styled; a desk draws no Hide reader", () => {
+  const menu = HTML.slice(HTML.indexOf('id="action-menu"'), HTML.indexOf('id="prompts-tray"'));
+  const box = menu.slice(menu.indexOf('class="reader-box"'), menu.indexOf('id="docs-show-hidden"'));
+  assert.ok(box.includes('id="reader-toggle"') && box.includes('id="autoplay-toggle"'),
+    "the Reader box does not hold Hide and Autoplay together");
+  assert.match(box, />Reader</, "the box is not named Reader");
+  const desk = "(min-width: 900px) and (pointer: fine)";
+  assert.match(cssBlockIn(desk, "#reader-toggle"), /display:\s*none/, "a desk still draws Hide reader");
+  const active = cssBlock("#action-menu .tray-button[aria-pressed=\"true\"]");
+  assert.match(active, /border-color:\s*var\(--accent\)/, "an active toggle is not outlined in blue");
+  assert.match(active, /color:\s*var\(--accent\)/, "an active toggle's words are not blue");
 });
 
 test("settings is a gear, not the word Settings", () => {

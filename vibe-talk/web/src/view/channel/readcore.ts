@@ -2366,7 +2366,8 @@ function openReadRun(row: Element): void {
 
 function renderReadModeControl() {
   const button = el("todo-filter");
-  const label = READ_MODE_LABELS[readModes.mode()];
+  // `#1399 toggle-labels-active-style`: the label is fixed ("Fold read"); on/off is aria-pressed and the shared active style.
+  const label = READ_MODE_LABELS.fold;
   // Two words in two spans, so a desk can stack them; made here when the markup's are absent.
   const words = el("todo-filter-label");
   let verb = childByClass(words, "read-mode-verb");
@@ -2378,7 +2379,7 @@ function renderReadModeControl() {
     noun.textContent = " read";
     words.replaceChildren(verb, noun);
   }
-  if (verb.textContent !== READ_MODE_VERBS[readModes.mode()]) verb.textContent = READ_MODE_VERBS[readModes.mode()] as string;
+  if (verb.textContent !== READ_MODE_VERBS.fold) verb.textContent = READ_MODE_VERBS.fold as string;
   // The mode's own icon, and only it, by `hidden`: an icon is something a test of the dock can ask
   // for by that attribute, as it asks of every other control's.
   for (const icon of [...button.children]) {
@@ -2389,8 +2390,8 @@ function renderReadModeControl() {
   // Written only when they change: this runs with every redraw of the controls.
   const said = {
     "data-read-mode": readModes.mode(),
-    "aria-pressed": readModes.mode() === "hide" ? "true" : readModes.mode() === "fold" ? "mixed" : "false",
-    "aria-label": `${label}. Tap for ${READ_MODE_LABELS[nextReadMode(readModes.mode())]}`,
+    "aria-pressed": readModes.mode() === "fold" ? "true" : "false",
+    "aria-label": label,
     title: READ_MODE_TITLES[readModes.mode()],
   };
   for (const [name, value] of Object.entries(said)) {

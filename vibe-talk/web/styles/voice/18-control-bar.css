@@ -336,11 +336,29 @@ textarea {
   display: none;
 }
 
-/* A pressed item says so, as Summaries' chip did: the mode is on. */
+/* A pressed item says so, as Summaries' chip did: the mode is on. `#1399
+   toggle-labels-active-style`: one shared ACTIVE style for every on/off toggle —
+   blue outline plus blue text; inactive is plain. */
 #action-menu .tray-button[aria-pressed="true"] {
   border-color: var(--accent);
   color: var(--accent);
 }
+
+/* `#1399 toggle-labels-active-style`: the reader toggles boxed together. */
+.reader-box {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.35rem 0.45rem;
+  border: 1px solid var(--edge);
+  border-radius: 0.85rem;
+}
+
+.reader-box-label {
+  font-size: 0.85rem;
+  color: var(--ink);
+}
+
 
 #action-menu-empty {
   margin: 0.3rem 0.4rem;
