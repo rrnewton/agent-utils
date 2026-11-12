@@ -8737,11 +8737,13 @@ async function enterRunThread(page, messages, before = async () => {}) {
 
 /** Tap the Hide read button until it names `label`, at most once round the cycle. */
 async function chooseReadMode(page, label) {
-  for (let taps = 0; taps < 3 && page.el("todo-filter-label").text() !== label; taps += 1) {
+  // `#1399 toggle-labels-active-style`: the label is fixed ("Fold read"), so the mode is the button's own attribute.
+  const mode = label === "Fold read" ? "fold" : "show";
+  for (let taps = 0; taps < 3 && page.el("todo-filter").getAttribute("data-read-mode") !== mode; taps += 1) {
     await page.el("todo-filter").click();
     await page.settle();
   }
-  assert.equal(page.el("todo-filter-label").text(), label, `the cycle never reached ${label}`);
+  assert.equal(page.el("todo-filter").getAttribute("data-read-mode"), mode, `the cycle never reached ${label}`);
 }
 
 /** What follows the agent's answer in most of these threads: enough that it can reach the head. */

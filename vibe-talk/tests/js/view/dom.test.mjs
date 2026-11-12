@@ -280,19 +280,21 @@ test("`#880 voice-page-menu-placement`: the reader's row, hidden or shown, on th
   const attributes = new Map();
   const root = { setAttribute: (name, value) => attributes.set(name, value), removeAttribute: (name) => attributes.delete(name) };
   const label = { textContent: "" };
+  const toggleAttrs = new Map();
+  const toggle = { getAttribute: (name) => toggleAttrs.get(name) ?? null, setAttribute: (name, value) => toggleAttrs.set(name, value) };
   const kept = [];
   let stored = true;
   let reads = 0;
   const row = createReaderRow({
-    byId: (id) => { assert.equal(id, "reader-toggle-label"); return label; },
+    byId: (id) => (id === "reader-toggle" ? toggle : label),
     root: () => root,
     stored: () => { reads += 1; return stored; },
     keep: (hidden) => kept.push(hidden),
   });
   assert.equal(reads, 0, "made, it read the storage before its first use");
   row.render();
-  assert.deepStrictEqual([attributes.get("data-reader"), label.textContent, row.hidden()], ["hidden", READER_WORDS.hidden, true]);
-  assert.equal(READER_WORDS.hidden, "Show reader", "the word is not what a press does");
+  assert.deepStrictEqual([attributes.get("data-reader"), label.textContent, row.hidden(), toggleAttrs.get("aria-pressed")], ["hidden", READER_WORDS.hidden, true, "true"]);
+  assert.equal(READER_WORDS.hidden, "Hide reader", "the fixed label changed with state (#1399)");
   row.setHidden(false);
   assert.deepStrictEqual([attributes.has("data-reader"), label.textContent, row.hidden(), kept], [false, "Hide reader", false, [false]]);
   // A browser that will not keep it: the page still holds the choice it was given.

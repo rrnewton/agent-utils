@@ -86,7 +86,7 @@ test("`#886 voice-page-autoplay`: off by default and kept; on, a read heard to i
   assert.deepStrictEqual([autoplay.on(), toggle.attributes["aria-pressed"], label.textContent], [false, "false", AUTOPLAY_WORDS.off]);
   assert.equal(autoplay.nextAfter(["1"]), null, "off, a read went on");
   autoplay.setOn(true);
-  assert.deepStrictEqual([kept, toggle.attributes["aria-pressed"], label.textContent], [[true], "true", "Autoplay: on"]);
+  assert.deepStrictEqual([kept, toggle.attributes["aria-pressed"], label.textContent], [[true], "true", "Autoplay"]);
   stored = false;
   assert.equal(autoplay.on(), true, "the choice made here was lost to the storage's answer");
   // Below the read, skipping what is read: 1 goes on to 3, past the read 2.
@@ -130,7 +130,7 @@ test("`#886 voice-page-autoplay`: off by default and kept; on, a read heard to i
   assert.equal(gone(archived), false, "a row gone from the page was read, or the caller was told a read started");
   assert.equal(read.length, 7, "a row gone from the page was read");
   autoplay.setOn(false);
-  assert.deepStrictEqual([kept, toggle.attributes["aria-pressed"], label.textContent], [[true, false], "false", "Autoplay: off"]);
+  assert.deepStrictEqual([kept, toggle.attributes["aria-pressed"], label.textContent], [[true, false], "false", "Autoplay"]);
 });
 
 test("`#624 voice-page-modularity`: the read-aloud controls reach the act each names in the page's order, Read is Pause, Stop or the mode by the read's state, and come down again", () => {

@@ -1659,7 +1659,7 @@ test("`#432 read-mode-unify`: h is the button's own act in All, Main, a thread a
   for (const view of ["flat", "main", "thread", "threads"]) {
     const page = await readModePage(view);
     const target = view === "threads" ? page.el("side-scroll") : page.el("scroll-area");
-    for (const [mode, label, pressed] of [["fold", "Fold read", "mixed"], ["show", "Show read", "false"], ["fold", "Fold read", "mixed"]]) {
+    for (const [mode, label, pressed] of [["fold", "Fold read", "true"], ["show", "Fold read", "false"], ["fold", "Fold read", "true"]]) {
       await press(page, target, "h");
       assert.deepStrictEqual(readModeSaid(page), [label, pressed, mode], `${view}: h did not move the button to ${label}`);
       assert.equal(page.el("status").textContent, READ_MODE_STATUS[mode], `${view}: h did not say ${label}`);
@@ -1777,7 +1777,7 @@ test("`#432 read-mode-unify`: a record that says Collapse read, from before Fold
   page.storage.set(UI_STATE_KEY, JSON.stringify({ ...savedUiState(page), read: "collapse" }));
   const older = reloadWith(page.storage, backlog());
   await reopenedChannel(older);
-  assert.deepStrictEqual(readModeSaid(older), ["Fold read", "mixed", "fold"], "a saved Collapse read did not open as Fold read");
+  assert.deepStrictEqual(readModeSaid(older), ["Fold read", "true", "fold"], "a saved Collapse read did not open as Fold read");
   assert.equal(savedUiState(older).read, "fold", "the record was not saved again under the new name");
 });
 
