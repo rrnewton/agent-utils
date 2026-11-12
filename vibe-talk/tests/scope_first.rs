@@ -281,6 +281,20 @@ fn inventory() -> Vec<Route> {
             Write,
             Query("?view=flat", "?view=threads"),
         ),
+        // `discuss-transcript-persist`: the saved record is the owner's own, so write scope.
+        route(
+            "GET",
+            "/api/v1/channels/{channel_id}/catchup/record",
+            Write,
+            Query("", "?view=threads"),
+        ),
+        // `discuss-followup-composer`: a follow-up spends a model call, so write scope.
+        route(
+            "POST",
+            "/api/v1/channels/{channel_id}/catchup/messages",
+            Write,
+            Json(r#"{"text":"and the deploy?"}"#),
+        ),
         route(
             "POST",
             "/api/v1/channels/{channel_id}/resolve",

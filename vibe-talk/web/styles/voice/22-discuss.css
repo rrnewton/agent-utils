@@ -267,6 +267,69 @@
   cursor: pointer;
 }
 
+#discuss-stale {
+  margin: 8px 0 0;
+  color: #ffd479;
+  font-size: 0.85rem;
+}
+
+#discuss-update {
+  padding: 2px 8px;
+  cursor: pointer;
+  background: #262c36;
+  color: #e7e9ee;
+  border: 1px solid #3d4452;
+  border-radius: 6px;
+  font: inherit;
+}
+
+.discuss-turn {
+  margin: 8px 0 0;
+}
+
+.discuss-you {
+  color: #aab2c0;
+}
+
+.discuss-old {
+  margin-top: 10px;
+  color: #aab2c0;
+  font-size: 0.9rem;
+}
+
+.discuss-old summary {
+  cursor: pointer;
+}
+
+/* The follow-up composer (`discuss-followup-composer`). */
+.discuss-compose {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+#discuss-followup {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: #262c36;
+  color: #e7e9ee;
+  border: 1px solid #3d4452;
+  border-radius: 6px;
+  font: inherit;
+  padding: 6px 8px;
+}
+
+#discuss-send {
+  padding: 4px 10px;
+  cursor: pointer;
+  background: #262c36;
+  color: #e7e9ee;
+  border: 1px solid #3d4452;
+  border-radius: 6px;
+  font: inherit;
+}
+
 #discuss-covers {
   margin: 12px 0 4px;
   font-size: 0.9rem;

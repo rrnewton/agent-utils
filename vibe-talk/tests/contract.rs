@@ -14,11 +14,12 @@ use std::path::PathBuf;
 
 use serde_json::{json, Value};
 use vibe_talk::contract::{
-    ApiErrorBody, BookmarkResponse, CatchupFooterLink, CatchupPreview, CatchupRequest,
-    CatchupResponse, CatchupStamp, CatchupUnreadRef, CatchupWindow, ClientConfigResponse,
-    ClientSettings, CommittedPostResponse, LiveDeleteEvent, LiveDelivery, LiveMessageEvent,
-    LiveResetEvent, MessageCacheHistory, MessageCacheRequest, MessageCacheStatus, MessagesResponse,
-    NoiseRules, PendingPost, PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled,
+    ApiErrorBody, BookmarkResponse, CatchupFollowupRequest, CatchupFollowupResponse,
+    CatchupFooterLink, CatchupPreview, CatchupRecordResponse, CatchupRequest, CatchupResponse,
+    CatchupStamp, CatchupUnreadRef, CatchupWindow, ClientConfigResponse, ClientSettings,
+    CommittedPostResponse, LiveDeleteEvent, LiveDelivery, LiveMessageEvent, LiveResetEvent,
+    MessageCacheHistory, MessageCacheRequest, MessageCacheStatus, MessagesResponse, NoiseRules,
+    PendingPost, PendingPostResponse, PinChangeResponse, PinsResponse, ProposalSettled,
     ProviderDescription, ReplayUnavailable, ReplyDismissals, SearchResponse, SearchScope,
     TimelineResponse, TokenScope, TranscriptRole, UpstreamClearAttemptView,
     UpstreamClearNowOutcome, UpstreamClearNowResponse, UpstreamClearState, VibeTalkV1ClientFrame,
@@ -1359,6 +1360,113 @@ fn samples() -> Value {
                         label: "09:52 · Ben".into(),
                     },
                 ],
+            }),
+        ],
+        "CatchupRecordResponse": [
+            to(&CatchupRecordResponse {
+                exists: true,
+                thread_id: None,
+                current_summary: Some(vibe_talk::contract::DiscussSummary {
+                    view: "flat".into(),
+                    since_ms: Some(1_700_000_000_000),
+                    window: CatchupWindow {
+                        count: 12,
+                        unread_count: 2,
+                        read_count: 10,
+                        from_id: Some(MessageId("1000".into())),
+                        through_id: Some(MessageId("1011".into())),
+                        truncated: false,
+                        noise_hidden: 1,
+                    },
+                    covered_ids: vec![MessageId("1010".into())],
+                    cited_ids: vec![MessageId("1010".into())],
+                    markable_ids: vec![MessageId("1010".into())],
+                    footer_links: vec![CatchupFooterLink {
+                        id: MessageId("1010".into()),
+                        label: "09:51 · Ada".into(),
+                        thread_id: None,
+                    }],
+                    text: "one point".into(),
+                    text_html: "<p>one point</p>".into(),
+                    unknown_terms: vec!["small-elk".into()],
+                    backend: "meta-gateway".into(),
+                    model: "some-model".into(),
+                    stamp: CatchupStamp {
+                        context_ms: 3,
+                        model_ms: 10,
+                        first_token_ms: None,
+                        total_ms: 13,
+                        input_tokens: None,
+                        output_tokens: None,
+                        input_chars: 40,
+                        output_chars: 10,
+                        unknown_term_count: 1,
+                    },
+                    created_ms: 1_700_000_000_000,
+                }),
+                timeline: vec![
+                    vibe_talk::contract::DiscussEntry::Turn {
+                        turn: vibe_talk::contract::DiscussTurn {
+                            speaker: "you".into(),
+                            text: "and the deploy?".into(),
+                            text_html: String::new(),
+                            at_ms: 1_700_000_100_000,
+                        },
+                    },
+                    vibe_talk::contract::DiscussEntry::Summary {
+                        summary: Box::new(vibe_talk::contract::DiscussSummary {
+                            view: "flat".into(),
+                            text: "an earlier point".into(),
+                            created_ms: 1_699_999_000_000,
+                            ..Default::default()
+                        }),
+                    },
+                ],
+                staleness: Some(vibe_talk::contract::CatchupStaleness {
+                    new_unread: 3,
+                    marked_read: 1,
+                }),
+            }),
+            to(&CatchupRecordResponse {
+                exists: false,
+                thread_id: Some("thread-1".into()),
+                current_summary: None,
+                timeline: Vec::new(),
+                staleness: None,
+            }),
+        ],
+        "CatchupFollowupRequest": [
+            to(&CatchupFollowupRequest {
+                thread_id: Some("thread-1".into()),
+                text: "and the deploy?".into(),
+            }),
+            to(&CatchupFollowupRequest::default()),
+        ],
+        "CatchupFollowupResponse": [
+            to(&CatchupFollowupResponse {
+                you: vibe_talk::contract::DiscussTurn {
+                    speaker: "you".into(),
+                    text: "and the deploy?".into(),
+                    text_html: String::new(),
+                    at_ms: 1_700_000_100_000,
+                },
+                agent: vibe_talk::contract::DiscussTurn {
+                    speaker: "agent".into(),
+                    text: "it shipped".into(),
+                    text_html: "<p>it shipped</p>".into(),
+                    at_ms: 1_700_000_100_000,
+                },
+                stamp: CatchupStamp {
+                    context_ms: 3,
+                    model_ms: 10,
+                    first_token_ms: None,
+                    total_ms: 13,
+                    input_tokens: None,
+                    output_tokens: None,
+                    input_chars: 40,
+                    output_chars: 10,
+                    unknown_term_count: 0,
+                },
             }),
         ],
         "VibeTalkV1ClientFrame": [

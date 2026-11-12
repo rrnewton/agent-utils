@@ -13,6 +13,7 @@
 // parts); the panel narrows the decoded body to the fields it reads.
 
 import { createListening, insertSanitizedHtml, setClassWord } from "../dom/index.ts";
+import { createComposerKeys } from "../composer/index.ts";
 import { deepLinkRefFrom } from "../../foundation/index.ts";
 import type { MessageLinkRef } from "../../foundation/index.ts";
 import type {
@@ -58,6 +59,8 @@ export interface CatchupAnswer {
   markable_ids: string[];
   cited_ids: string[];
   footer_links: CatchupFooterLink[];
+  /** The cited subset (`#1350`), narrowed here for the record's restore. */
+  cited_ids?: string[];
   text: string;
   /** The answer as the server's sanitized render (`#1349`); empty draws `text` plain. */
   text_html: string;
@@ -81,6 +84,12 @@ export interface DiscussPanelDependencies {
   catchupPost(channelId: string, body: CatchupRequestBody): Promise<unknown>;
   /** GET the scope's unread preview for `channelId`; spends no model call. */
   catchupPreview(channelId: string, scope: DiscussScope): Promise<unknown>;
+  /** GET the scope's saved Discuss record for `channelId`; spends no model call. */
+  catchupRecord(channelId: string, scope: DiscussScope): Promise<unknown>;
+  /** POST one follow-up for `channelId`; answers the appended turns as `unknown`. */
+  catchupFollowup(channelId: string, scope: DiscussScope, text: string): Promise<unknown>;
+  /** Whether a bare Enter sends (the reader's "Enter to send"), for the composer keys. */
+  enterSends?(): boolean;
   /** A request started or settled, so the page can disable its entry points too. */
   onBusy?(busy: boolean): unknown;
   /** The chat service `channelId` is read through, for a footer's jump refs. */
@@ -216,6 +225,107 @@ export function asCatchupAnswer(value: unknown): CatchupAnswer {
       input_chars: numberOrNull(rawStamp.input_chars) ?? 0,
       output_chars: numberOrNull(rawStamp.output_chars) ?? 0,
       unknown_term_count: numberOrNull(rawStamp.unknown_term_count) ?? 0,
+    },
+  };
+}
+
+/** One timeline entry under a saved summary, narrowed for drawing. */
+export type DiscussEntryShape =
+  | { kind: "turn"; speaker: string; text: string; text_html: string; at_ms: number }
+  | { kind: "summary"; answer: CatchupAnswer; created_ms: number };
+
+/** A saved Discuss record, narrowed to what reopening draws. */
+export interface CatchupRecordShape {
+  exists: boolean;
+  summary: CatchupAnswer | null;
+  created_ms: number;
+  timeline: DiscussEntryShape[];
+  staleness: { new_unread: number; marked_read: number } | null;
+}
+
+/** Narrow one saved summary (record fields) to an answer the panel draws. */
+function asSavedAnswer(value: unknown): { answer: CatchupAnswer; created_ms: number } | null {
+  if (typeof value !== "object" || value === null) return null;
+  const record = value as Record<string, unknown>;
+  const rawWindow = typeof record.window === "object" && record.window !== null ? (record.window as Record<string, unknown>) : null;
+  const links: CatchupFooterLink[] = [];
+  if (Array.isArray(record.footer_links)) {
+    for (const entry of record.footer_links) {
+      if (typeof entry !== "object" || entry === null) continue;
+      const link = entry as Record<string, unknown>;
+      if (typeof link.id !== "string" || link.id === "") continue;
+      links.push({
+        id: link.id,
+        label: typeof link.label === "string" ? link.label : link.id,
+        thread_id: typeof link.thread_id === "string" ? link.thread_id : null,
+      });
+    }
+  }
+  const rawStamp = typeof record.stamp === "object" && record.stamp !== null ? (record.stamp as Record<string, unknown>) : null;
+  return {
+    answer: {
+      window: rawWindow === null ? null : {
+        count: numberOrNull(rawWindow.count) ?? 0,
+        unread_count: numberOrNull(rawWindow.unread_count) ?? 0,
+      },
+      unread_ids: stringsOf(record.covered_ids),
+      markable_ids: stringsOf(record.markable_ids),
+      footer_links: links,
+      cited_ids: stringsOf(record.cited_ids),
+      text: typeof record.text === "string" ? record.text : "",
+      text_html: typeof record.text_html === "string" ? record.text_html : "",
+      unknown_terms: stringsOf(record.unknown_terms),
+      stamp: rawStamp === null ? null : {
+        context_ms: numberOrNull(rawStamp.context_ms) ?? 0,
+        model_ms: numberOrNull(rawStamp.model_ms) ?? 0,
+        first_token_ms: numberOrNull(rawStamp.first_token_ms),
+        total_ms: numberOrNull(rawStamp.total_ms) ?? 0,
+        input_tokens: numberOrNull(rawStamp.input_tokens),
+        output_tokens: numberOrNull(rawStamp.output_tokens),
+        input_chars: numberOrNull(rawStamp.input_chars) ?? 0,
+        output_chars: numberOrNull(rawStamp.output_chars) ?? 0,
+        unknown_term_count: numberOrNull(rawStamp.unknown_term_count) ?? 0,
+      },
+    },
+    created_ms: numberOrNull(record.created_ms) ?? 0,
+  };
+}
+
+/** Narrow a record body to what reopening draws. */
+export function asCatchupRecord(value: unknown): CatchupRecordShape {
+  const empty: CatchupRecordShape = { exists: false, summary: null, created_ms: 0, timeline: [], staleness: null };
+  if (typeof value !== "object" || value === null) return empty;
+  const record = value as Record<string, unknown>;
+  const saved = asSavedAnswer(record.current_summary);
+  const timeline: DiscussEntryShape[] = [];
+  if (Array.isArray(record.timeline)) {
+    for (const entry of record.timeline) {
+      if (typeof entry !== "object" || entry === null) continue;
+      const item = entry as Record<string, unknown>;
+      if (item.kind === "summary") {
+        const old = asSavedAnswer(item.summary);
+        if (old !== null) timeline.push({ kind: "summary", answer: old.answer, created_ms: old.created_ms });
+      } else if (item.kind === "turn" && typeof item.turn === "object" && item.turn !== null) {
+        const turn = item.turn as Record<string, unknown>;
+        timeline.push({
+          kind: "turn",
+          speaker: typeof turn.speaker === "string" ? turn.speaker : "agent",
+          text: typeof turn.text === "string" ? turn.text : "",
+          text_html: typeof turn.text_html === "string" ? turn.text_html : "",
+          at_ms: numberOrNull(turn.at_ms) ?? 0,
+        });
+      }
+    }
+  }
+  const rawStale = typeof record.staleness === "object" && record.staleness !== null ? (record.staleness as Record<string, unknown>) : null;
+  return {
+    exists: record.exists === true,
+    summary: saved?.answer ?? null,
+    created_ms: saved?.created_ms ?? 0,
+    timeline,
+    staleness: rawStale === null ? null : {
+      new_unread: numberOrNull(rawStale.new_unread) ?? 0,
+      marked_read: numberOrNull(rawStale.marked_read) ?? 0,
     },
   };
 }
@@ -556,6 +666,102 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     }
   }
 
+  /** The staleness banner over a saved summary (`discuss-summary-staleness-update`). */
+  function drawStale(shape: CatchupRecordShape): void {
+    const stale = shape.staleness;
+    const box = deps.byId("discuss-stale");
+    const staleNow = stale !== null && (stale.new_unread > 0 || stale.marked_read > 0);
+    box.hidden = !staleNow || shape.summary === null;
+    if (!staleNow || stale === null) return;
+    deps.byId("discuss-stale-text").textContent =
+      `${stale.new_unread} new unread · ${stale.marked_read} marked read since summary`;
+  }
+
+  /** The timeline under a saved summary: turns, and superseded summaries collapsed. */
+  function drawTimeline(entries: DiscussEntryShape[], scope: DiscussScope): void {
+    const box = deps.byId("discuss-timeline");
+    box.replaceChildren();
+    for (const entry of entries) {
+      if (entry.kind === "turn") {
+        const line = document.createElement("p");
+        line.className = entry.speaker === "you" ? "discuss-turn discuss-you" : "discuss-turn discuss-agent";
+        if (entry.text_html !== "") insertSanitizedHtml(line, entry.text_html);
+        else line.textContent = entry.text;
+        box.appendChild(line);
+      } else {
+        const details = document.createElement("details");
+        details.className = "discuss-old";
+        const summary = document.createElement("summary");
+        const count = entry.answer.window?.unread_count ?? entry.answer.unread_ids.length;
+        summary.textContent = `Earlier summary · ${entry.created_ms > 0 ? hhmm(entry.created_ms) : "—"} · ${count} unread`;
+        details.appendChild(summary);
+        const body = document.createElement("div");
+        if (entry.answer.text_html !== "") insertSanitizedHtml(body, entry.answer.text_html);
+        else body.textContent = entry.answer.text;
+        details.appendChild(body);
+        box.appendChild(details);
+      }
+    }
+    void scope;
+  }
+
+  /** Send the composer's question: one follow-up, appended to the timeline. */
+  function sendFollowup(): void {
+    if (pending || lastScope === null || lastAnswer === null) return;
+    const box = deps.byId("discuss-followup") as HTMLTextAreaElement;
+    const text = box.value.trim();
+    if (text === "") return;
+    generation += 1;
+    const asked = generation;
+    const scope = lastScope;
+    setPending(true);
+    deps.byId("discuss-status").textContent = "Reading…";
+    void deps.catchupFollowup(scope.channelId, scope, text).then(
+      () => {
+        setPending(false);
+        if (asked !== generation || !isOpen()) return;
+        box.value = "";
+        deps.byId("discuss-status").textContent = "Answered below.";
+        recordFor(scope, true);
+      },
+      (error: unknown) => {
+        setPending(false);
+        if (asked !== generation || !isOpen()) return;
+        deps.byId("discuss-status").textContent = error instanceof Error ? error.message : String(error);
+        deps.byId("discuss-retry").hidden = true;
+      },
+    );
+  }
+
+  /** Read the saved record and draw it; reopening asks nothing of the model. */
+  function recordFor(scope: DiscussScope, quiet = false): void {
+    const asked = generation;
+    void deps.catchupRecord(scope.channelId, scope).then(
+      (value) => {
+        if (asked !== generation || !isOpen()) return;
+        const shape = asCatchupRecord(value);
+        if (shape.summary !== null) {
+          lastAnswer = shape.summary;
+          drawAnswer(shape.summary);
+          drawTerms(shape.summary);
+          drawFooter(shape.summary, scope);
+          const stampLine = formatStampLine(shape.summary.stamp);
+          deps.byId("discuss-stamp").textContent = stampLine;
+          deps.byId("discuss-stamp").hidden = stampLine === "";
+          if (!quiet) {
+            deps.byId("discuss-status").textContent =
+              `Saved summary · ${shape.created_ms > 0 ? hhmm(shape.created_ms) : "—"}`;
+          }
+        }
+        drawStale(shape);
+        drawTimeline(shape.timeline, scope);
+      },
+      () => {
+        // No record to draw (or none readable): the preview's offer stands.
+      },
+    );
+  }
+
   /** Draw the footer's covered list and its mark buttons from one answer. */
   function drawFooter(answer: CatchupAnswer, scope: DiscussScope): void {
     const covered = answer.unread_ids.length;
@@ -689,6 +895,8 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         const stampLine = formatStampLine(answer.stamp);
         deps.byId("discuss-stamp").textContent = stampLine;
         deps.byId("discuss-stamp").hidden = stampLine === "";
+        deps.byId("discuss-stale").hidden = true;
+        recordFor(scope, true);
       },
       (error: unknown) => {
         setPending(false);
@@ -754,6 +962,22 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
           generation += 1;
           if (pending) setPending(false);
           setOpen(false);
+        });
+        // The main composer's keys (`discuss-followup-composer`): the same Enter.
+        const composerKeys = createComposerKeys({
+          now: () => Date.now(),
+          enterSends: () => deps.enterSends?.() ?? true,
+        });
+        const followupBox = deps.byId("discuss-followup");
+        listening.listen(followupBox, "keydown", (event) => {
+          composerKeys.onKey(event as never, () => sendFollowup(), followupBox);
+        });
+        listening.listen(followupBox, "beforeinput", (event) => composerKeys.noteInsertion(followupBox, event));
+        listening.listen(followupBox, "input", (event) => composerKeys.noteInsertion(followupBox, event));
+        listening.listen(deps.byId("discuss-send"), "click", () => sendFollowup());
+        listening.listen(deps.byId("discuss-update"), "click", () => {
+          if (pending || lastScope === null) return;
+          fetchFor(lastScope, null);
         });
         listening.listen(deps.byId("discuss-retry"), "click", () => {
           if (lastScope !== null) fetchFor(lastScope, lastSinceMs);
@@ -859,6 +1083,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       const closer = maybe("discuss-close") as (HTMLElement & { focus?: (options?: unknown) => void }) | null;
       if (closer && typeof closer.focus === "function") closer.focus({ preventScroll: true });
       previewFor(scope);
+      recordFor(scope);
     },
     close() {
       generation += 1;

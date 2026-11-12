@@ -1524,7 +1524,7 @@ pub struct CatchupPreview {
 }
 
 /// What one Discuss read covered. `catchup-side-agent`.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CatchupWindow {
     /// Messages in the window the model was shown.
     pub count: usize,
@@ -1544,7 +1544,7 @@ pub struct CatchupWindow {
 
 /// One unread message a Discuss answer covers, for the panel's footer list.
 /// `catchup-side-agent`.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct CatchupFooterLink {
     /// The message.
     pub id: MessageId,
@@ -1558,7 +1558,7 @@ pub struct CatchupFooterLink {
 ///
 /// Token counts and a first-token time are null unless a backend really reports them; they
 /// are never estimated.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct CatchupStamp {
     /// Fetching the window and building the context, in milliseconds.
     pub context_ms: u64,
@@ -1625,6 +1625,127 @@ pub struct CatchupResponse {
     pub stamp: CatchupStamp,
 }
 
+/// One saved Discuss summary: the top of a record (`discuss-transcript-persist`).
+/// Kept whole so a reopen draws exactly what was answered, with no model call.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DiscussSummary {
+    /// The view covered: `"flat"`, `"main"` or `"thread"`.
+    pub view: String,
+    /// The read's bound, when the panel chose one (Unix milliseconds).
+    pub since_ms: Option<i64>,
+    /// What the read covered.
+    pub window: CatchupWindow,
+    /// Every processed unread id, oldest first (the summary's covered set).
+    pub covered_ids: Vec<MessageId>,
+    /// The cited subset of `covered_ids`, first-citation order.
+    pub cited_ids: Vec<MessageId>,
+    /// The subset of `covered_ids` a dismissal can name.
+    pub markable_ids: Vec<MessageId>,
+    /// One link per covered message, oldest first.
+    pub footer_links: Vec<CatchupFooterLink>,
+    /// The answer's shaped text.
+    pub text: String,
+    /// The answer's sanitized render; empty when plain is the same.
+    pub text_html: String,
+    /// Terms the answer said it did not understand.
+    pub unknown_terms: Vec<String>,
+    /// Which backend answered.
+    pub backend: String,
+    /// The model it asked.
+    pub model: String,
+    /// How the read spent its time.
+    pub stamp: CatchupStamp,
+    /// When the summary was made, in Unix milliseconds.
+    pub created_ms: i64,
+}
+
+/// One follow-up turn in a Discuss timeline (`discuss-transcript-persist`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DiscussTurn {
+    /// Who spoke: `"you"` or `"agent"`.
+    pub speaker: String,
+    /// The turn's text.
+    pub text: String,
+    /// The turn's sanitized render; empty when plain is the same.
+    pub text_html: String,
+    /// When it was said, in Unix milliseconds.
+    pub at_ms: i64,
+}
+
+/// One entry under a record's current summary: a follow-up turn, or a superseded
+/// summary kept collapsed. `discuss-transcript-persist`.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DiscussEntry {
+    /// A summary a newer one replaced.
+    Summary {
+        /// The superseded summary, whole.
+        summary: Box<DiscussSummary>,
+    },
+    /// One follow-up turn.
+    Turn {
+        /// The turn.
+        turn: DiscussTurn,
+    },
+}
+
+/// A channel/thread's whole Discuss record (`discuss-transcript-persist`): the
+/// most recent summary on top, the discussion timeline under it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DiscussRecord {
+    /// The most recent summary, when one has been made.
+    pub current_summary: Option<DiscussSummary>,
+    /// Follow-up turns and superseded summaries, oldest first.
+    pub timeline: Vec<DiscussEntry>,
+}
+
+/// How a saved summary has gone stale (`discuss-summary-staleness-update`, banner
+/// only): computed from its covered ids against the cache's current read state.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CatchupStaleness {
+    /// Unread now that the summary did not cover.
+    pub new_unread: usize,
+    /// Covered messages read since the summary was made.
+    pub marked_read: usize,
+}
+
+/// What `GET …/catchup/record` answers: whether a record exists, and it when so.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CatchupRecordResponse {
+    /// Whether this scope has a saved record.
+    pub exists: bool,
+    /// The thread covered, or null for a channel record.
+    pub thread_id: Option<String>,
+    /// The current summary, when one has been made.
+    pub current_summary: Option<DiscussSummary>,
+    /// The timeline under it, oldest first.
+    pub timeline: Vec<DiscussEntry>,
+    /// The summary's staleness, when one is saved (banner only; no model spent).
+    pub staleness: Option<CatchupStaleness>,
+}
+
+/// The body of `POST /api/v1/channels/{id}/catchup/messages`: one follow-up question.
+/// `discuss-followup-composer`.
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+pub struct CatchupFollowupRequest {
+    /// The thread whose record this continues; absent continues the channel's.
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    /// The question, as typed.
+    pub text: String,
+}
+
+/// What a follow-up answers: the two turns it appended. `discuss-followup-composer`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub struct CatchupFollowupResponse {
+    /// The owner's turn, as saved.
+    pub you: DiscussTurn,
+    /// The agent's turn, as saved.
+    pub agent: DiscussTurn,
+    /// How the call spent its time.
+    pub stamp: CatchupStamp,
+}
+
 /// Every root of the contract: each value that crosses a boundary on its own, by the name the
 /// generated code gives it.
 ///
@@ -1679,6 +1800,9 @@ fn roots(generator: &mut schemars::SchemaGenerator) -> Vec<schemars::Schema> {
         generator.subschema_for::<CatchupRequest>(),
         generator.subschema_for::<CatchupResponse>(),
         generator.subschema_for::<CatchupPreview>(),
+        generator.subschema_for::<CatchupRecordResponse>(),
+        generator.subschema_for::<CatchupFollowupRequest>(),
+        generator.subschema_for::<CatchupFollowupResponse>(),
     ]
 }
 

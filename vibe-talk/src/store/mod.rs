@@ -2356,6 +2356,32 @@ pub trait StateStore: Send + Sync {
         prompt: &crate::voice_agent::OwnerPrompt,
     ) -> Result<crate::voice_agent::OwnerPrompt, StoreError>;
 
+    /// One channel/thread's Discuss record (`discuss-transcript-persist`), or `None`
+    /// when none has been saved. `thread` is `""` for the channel itself.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
+    /// failure.
+    async fn discuss_record(
+        &self,
+        channel: &ChannelId,
+        thread: &str,
+    ) -> Result<Option<crate::contract::DiscussRecord>, StoreError>;
+
+    /// Replace one channel/thread's Discuss record, whole.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn put_discuss_record(
+        &self,
+        channel: &ChannelId,
+        thread: &str,
+        record: &crate::contract::DiscussRecord,
+    ) -> Result<(), StoreError>;
+
     /// The owner's own tag for what the voice agent posts, or `None` when he has never saved one.
     /// `#303 voice-post-prefix`.
     ///

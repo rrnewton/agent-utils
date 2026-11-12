@@ -1050,12 +1050,14 @@ const discussView = createDiscussView({
   // No direct LLM summarizer, no Discuss: client-config's `discuss_available`,
   // held with the other server facts and read here only when drawn or pressed.
   discussAvailable: () => serverFacts.discussAvailable(),
+  enterSends: () => enterSends.current(),
   selectedChannelId: () => String(selectedChannelId() ?? ""),
   selection: () => selection(),
   serviceName: (channel) => chatServiceOf(channel),
   channelLabel: (id) => channelLabel(id),
+  // `discuss-transcript-persist`: a jump keeps the panel open (it overlays the
+  // list); the list moves behind it, and the panel's state is untouched.
   onJump: (ref) => {
-    discussView.close();
     void shellNavigation.jumpToMessageLink(ref);
   },
   dismissMessages: (body) => dismissMessages(body),

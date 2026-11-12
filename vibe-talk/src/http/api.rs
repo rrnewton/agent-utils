@@ -2727,7 +2727,7 @@ pub async fn catchup(
         crate::render::markup_for(&state.config, &fetched.channel),
         &trusted,
     );
-    let footer_links = built
+    let footer_links: Vec<crate::contract::CatchupFooterLink> = built
         .unread_ids
         .iter()
         .filter_map(|id| by_id.get(id.as_str()).map(|message| (id, message)))
@@ -2801,6 +2801,68 @@ pub async fn catchup(
                 crate::unknown_terms_log::DEFAULT_MAX_BYTES,
             ) {
                 tracing::warn!(error = %error, path = %path.display(), "unknown-terms log append failed");
+        }
+    }
+    let window = crate::contract::CatchupWindow {
+        count: fetched.messages.len(),
+        unread_count: built.unread_ids.len(),
+        read_count: fetched
+            .messages
+            .len()
+            .saturating_sub(built.unread_ids.len()),
+        from_id: fetched.messages.first().map(|message| message.id.clone()),
+        through_id: fetched.messages.last().map(|message| message.id.clone()),
+        truncated: fetched.truncated,
+        noise_hidden: fetched.noise_hidden,
+    };
+    let model = state
+        .catchup_model
+        .as_deref()
+        .unwrap_or_else(|| agent.backend())
+        .to_owned();
+    // Save the record (`discuss-transcript-persist`): this summary becomes the top,
+    // the one it replaces collapses into the timeline. Best-effort beside the answer —
+    // a deployment without a store still gets its summary, and says so in the log.
+    if !held_nothing {
+        let summary = crate::contract::DiscussSummary {
+            view: view_name.to_owned(),
+            since_ms: body.since_ms,
+            window: window.clone(),
+            covered_ids: built.unread_ids.clone(),
+            cited_ids: cited_ids.clone(),
+            markable_ids: built.markable_ids.clone(),
+            footer_links: footer_links.clone(),
+            text: text.clone(),
+            text_html: text_html.clone(),
+            unknown_terms: unknown_terms.clone(),
+            backend: agent.backend().to_owned(),
+            model: model.clone(),
+            stamp: stamp.clone(),
+            created_ms: crate::store::now_ms(),
+        };
+        let channel_key = crate::model::ChannelId(channel_id.clone());
+        let thread_key = thread_id.unwrap_or("");
+        match state.store.discuss_record(&channel_key, thread_key).await {
+            Ok(mut record) => {
+                let record = record.get_or_insert_with(Default::default);
+                if let Some(old) = record.current_summary.take() {
+                    record
+                        .timeline
+                        .push(crate::contract::DiscussEntry::Summary {
+                            summary: Box::new(old),
+                        });
+                }
+                record.current_summary = Some(summary);
+                if let Err(error) = state
+                    .store
+                    .put_discuss_record(&channel_key, thread_key, record)
+                    .await
+                {
+                    tracing::warn!(%error, "discuss record not saved (put)");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "discuss record not saved (read)");
             }
         }
     }
@@ -2808,18 +2870,7 @@ pub async fn catchup(
         channel: fetched.channel,
         thread_id: thread_id.map(str::to_owned),
         view: view_name.to_owned(),
-        window: crate::contract::CatchupWindow {
-            count: fetched.messages.len(),
-            unread_count: built.unread_ids.len(),
-            read_count: fetched
-                .messages
-                .len()
-                .saturating_sub(built.unread_ids.len()),
-            from_id: fetched.messages.first().map(|message| message.id.clone()),
-            through_id: fetched.messages.last().map(|message| message.id.clone()),
-            truncated: fetched.truncated,
-            noise_hidden: fetched.noise_hidden,
-        },
+        window,
         unread_ids: built.unread_ids,
         markable_ids: built.markable_ids,
         footer_links,
@@ -2828,12 +2879,262 @@ pub async fn catchup(
         text_html,
         unknown_terms,
         backend: agent.backend().to_owned(),
-        model: state
-            .catchup_model
-            .as_deref()
-            .unwrap_or_else(|| agent.backend())
-            .to_owned(),
+        model,
         stamp,
+    })))
+}
+
+/// `GET /api/v1/channels/{channel_id}/catchup/record` — the saved Discuss record
+/// (`discuss-transcript-persist`): reopening draws it and asks nothing. WRITE scope,
+/// as the read's: transcripts are the owner's own words and answers.
+pub async fn catchup_record(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(channel_id): Path<String>,
+    Query(query): Query<CatchupPreviewQuery>,
+) -> Result<Response, ApiError> {
+    if state.channel(&channel_id).is_none() {
+        return Err(OpError::UnknownChannel.into());
+    }
+    let thread_id = query
+        .thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    // The view is validated as the read's is, though the record is keyed by scope alone.
+    let _ = catchup_view(thread_id, query.view.as_deref())?;
+    let channel_key = crate::model::ChannelId(channel_id.clone());
+    let record = state
+        .store
+        .discuss_record(&channel_key, thread_id.unwrap_or(""))
+        .await
+        .map_err(|error| match error {
+            crate::store::StoreError::Unavailable(_) => ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage_not_configured",
+                "Discuss records need a configured store".to_owned(),
+            ),
+            other => ApiError::from(OpError::Store(other)),
+        })?;
+    // The banner's counts (`discuss-summary-staleness-update`, owner go on the banner
+    // alone): the saved covered set against the cache's current unread/read, cache-only.
+    let staleness = match record
+        .as_ref()
+        .and_then(|held| held.current_summary.as_ref())
+    {
+        Some(summary) => {
+            let (view, _name) = catchup_view(thread_id, query.view.as_deref())?;
+            let fetched = crate::read_reason::ReadReason::Discuss
+                .scope(ops::catchup_fetch(
+                    &state,
+                    Scope::Write,
+                    &channel_id,
+                    view,
+                    thread_id,
+                    state.config.summaries.catchup_window_messages,
+                ))
+                .await?;
+            let owner = crate::owner::Owner::of(&state);
+            let built = crate::catchup::build_context(&fetched.messages, &fetched.read, &owner);
+            let covered: std::collections::HashSet<&str> =
+                summary.covered_ids.iter().map(|id| id.as_str()).collect();
+            Some(crate::contract::CatchupStaleness {
+                new_unread: built
+                    .unread_ids
+                    .iter()
+                    .filter(|id| !covered.contains(id.as_str()))
+                    .count(),
+                marked_read: summary
+                    .covered_ids
+                    .iter()
+                    .filter(|id| fetched.read.contains(id))
+                    .count(),
+            })
+        }
+        None => None,
+    };
+    Ok(no_store(Json(crate::contract::CatchupRecordResponse {
+        exists: record.is_some(),
+        thread_id: thread_id.map(str::to_owned),
+        current_summary: record.clone().and_then(|held| held.current_summary),
+        timeline: record.map(|held| held.timeline).unwrap_or_default(),
+        staleness,
+    })))
+}
+
+/// `POST /api/v1/channels/{channel_id}/catchup/messages` — one follow-up
+/// (`discuss-followup-composer`): the side agent answers with the cached window plus
+/// the transcript so far, and both turns join the record's timeline. Cache-only, one
+/// model call, WRITE scope (it spends one and writes the record).
+pub async fn catchup_followup(
+    State(state): State<AppState>,
+    _scope: WriteScope,
+    Path(channel_id): Path<String>,
+    Json(body): Json<crate::contract::CatchupFollowupRequest>,
+) -> Result<Response, ApiError> {
+    if state.channel(&channel_id).is_none() {
+        return Err(OpError::UnknownChannel.into());
+    }
+    let Some(agent) = state.catchup_summarizer.clone() else {
+        return Err(discuss_not_available());
+    };
+    let question = body.text.trim().to_owned();
+    if question.is_empty() {
+        return Err(ApiError::bad_request(
+            "a follow-up question is empty".to_owned(),
+        ));
+    }
+    if question.chars().count() > 4_000 {
+        return Err(ApiError::bad_request(
+            "a follow-up question is over 4,000 characters".to_owned(),
+        ));
+    }
+    let thread_id = body
+        .thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let channel_key = crate::model::ChannelId(channel_id.clone());
+    let thread_key = thread_id.unwrap_or("");
+    let mut record = state
+        .store
+        .discuss_record(&channel_key, thread_key)
+        .await
+        .map_err(|error| match error {
+            crate::store::StoreError::Unavailable(_) => ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage_not_configured",
+                "Discuss records need a configured store".to_owned(),
+            ),
+            other => ApiError::from(OpError::Store(other)),
+        })?
+        .unwrap_or_default();
+    let Some(summary) = record.current_summary.clone() else {
+        return Err(ApiError::bad_request(
+            "nothing to continue yet: Summarize first, then ask".to_owned(),
+        ));
+    };
+    let began = std::time::Instant::now();
+    let (view, _name) = catchup_view(thread_id, Some(summary.view.as_str()))?;
+    let context_began = std::time::Instant::now();
+    let fetched = crate::read_reason::ReadReason::Discuss
+        .scope(ops::catchup_fetch(
+            &state,
+            Scope::Write,
+            &channel_id,
+            view,
+            thread_id,
+            state.config.summaries.catchup_window_messages,
+        ))
+        .await?;
+    let owner = crate::owner::Owner::of(&state);
+    let built = crate::catchup::build_context(&fetched.messages, &fetched.read, &owner);
+    let context_ms = u64::try_from(context_began.elapsed().as_millis()).unwrap_or(u64::MAX);
+    // The transcript after the window: the current summary, then the turns so far.
+    let mut prompt = built.prompt;
+    prompt.push_str("\n\nThe summary you gave most recently:\n");
+    prompt.push_str(&summary.text);
+    for entry in &record.timeline {
+        if let crate::contract::DiscussEntry::Turn { turn } = entry {
+            prompt.push_str(if turn.speaker == "you" {
+                "\n\nThe owner then asked:\n"
+            } else {
+                "\n\nYou answered:\n"
+            });
+            prompt.push_str(&turn.text);
+        }
+    }
+    prompt.push_str("\n\nThe owner's new question:\n");
+    prompt.push_str(&question);
+    let system = crate::catchup::effective_system_prompt(None);
+    let model_began = std::time::Instant::now();
+    let raw = agent
+        .complete_prompt(&system, &prompt)
+        .await
+        .map_err(|error| match error {
+            crate::summarize::SummaryError::NotConfigured(_) => discuss_not_available(),
+            other => ApiError::from(OpError::Summarizer(other)),
+        })?;
+    let model_ms = u64::try_from(model_began.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let (raw, _terms) = crate::catchup::split_unknown_terms(&raw);
+    let sent: std::collections::HashSet<crate::model::MessageId> = fetched
+        .messages
+        .iter()
+        .map(|held| held.id.clone())
+        .collect();
+    let by_id: std::collections::HashMap<&str, &Message> = fetched
+        .messages
+        .iter()
+        .map(|held| (held.id.as_str(), held))
+        .collect();
+    let provider = fetched
+        .channel
+        .provider
+        .clone()
+        .unwrap_or_else(|| "discord".to_owned());
+    let (text, _cited) = crate::catchup::shape_answer(&raw, &sent, |id| {
+        let message = by_id.get(id.as_str())?;
+        let time = if message.spoken_time.is_empty() {
+            message.timestamp.clone()
+        } else {
+            message.spoken_time.clone()
+        };
+        let address = crate::catchup::message_link(
+            &provider,
+            &channel_id,
+            if thread_id.is_some() {
+                "thread"
+            } else {
+                summary.view.as_str()
+            },
+            thread_id,
+            id,
+            message.thread.as_ref().map(|thread| thread.id.as_str()),
+        );
+        Some((time, address))
+    });
+    let text_html = crate::render::body_html(
+        &text,
+        crate::render::markup_for(&state.config, &fetched.channel),
+    );
+    let now = crate::store::now_ms();
+    let you = crate::contract::DiscussTurn {
+        speaker: "you".to_owned(),
+        text: question,
+        text_html: String::new(),
+        at_ms: now,
+    };
+    let agent_turn = crate::contract::DiscussTurn {
+        speaker: "agent".to_owned(),
+        text: text.clone(),
+        text_html: text_html.clone(),
+        at_ms: now,
+    };
+    record
+        .timeline
+        .push(crate::contract::DiscussEntry::Turn { turn: you.clone() });
+    record.timeline.push(crate::contract::DiscussEntry::Turn {
+        turn: agent_turn.clone(),
+    });
+    state
+        .store
+        .put_discuss_record(&channel_key, thread_key, &record)
+        .await
+        .map_err(|error| ApiError::from(OpError::Store(error)))?;
+    Ok(no_store(Json(crate::contract::CatchupFollowupResponse {
+        you,
+        agent: agent_turn,
+        stamp: crate::contract::CatchupStamp {
+            context_ms,
+            model_ms,
+            first_token_ms: None,
+            total_ms: u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
+            input_tokens: None,
+            output_tokens: None,
+            input_chars: system.chars().count() + prompt.chars().count(),
+            output_chars: text.chars().count(),
+            unknown_term_count: 0,
+        },
     })))
 }
 

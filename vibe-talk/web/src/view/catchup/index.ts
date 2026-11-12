@@ -5,11 +5,12 @@
 // Construction is inert: no element is looked up, no listener is added and nothing is
 // fetched until the controls are mounted and the panel opened.
 
-export { DISCUSS_UNAVAILABLE_HINT, asCatchupAnswer, asCatchupPreview, boundForCount, countSince, createDiscussPanel, formatStampLine, hhmm, isDiscussUnavailable } from "./panel.ts";
+export { DISCUSS_UNAVAILABLE_HINT, asCatchupAnswer, asCatchupPreview, asCatchupRecord, boundForCount, countSince, createDiscussPanel, formatStampLine, hhmm, isDiscussUnavailable } from "./panel.ts";
 export type {
   CatchupAnswer,
   CatchupFooterLink,
   CatchupPreview,
+  CatchupRecordShape,
   CatchupRequestBody,
   CatchupStamp,
   CatchupUnreadRef,
@@ -41,6 +42,12 @@ export interface DiscussViewDependencies {
   catchupPost?(channelId: string, body: CatchupRequestBody): Promise<unknown>;
   /** GET one scope's unread preview, where the page (or a test) injects its own. */
   catchupPreview?(channelId: string, scope: DiscussScope): Promise<unknown>;
+  /** GET one scope's saved record, where the page (or a test) injects its own. */
+  catchupRecord?(channelId: string, scope: DiscussScope): Promise<unknown>;
+  /** POST one follow-up, where the page (or a test) injects its own. */
+  catchupFollowup?(channelId: string, scope: DiscussScope, text: string): Promise<unknown>;
+  /** Whether a bare Enter sends, handed to the panel's composer keys. */
+  enterSends?(): boolean;
   /** The channel on screen: the parent channel even in a thread. */
   selectedChannelId(): string;
   /** Which list the left column shows, and its thread where it shows one. */
@@ -182,10 +189,29 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     return deps.api(`/api/v1/channels/${encodeURIComponent(channelId)}/catchup/preview?${query.toString()}`, { method: "GET" });
   }
 
+  function catchupRecord(channelId: string, scope: DiscussScope): Promise<unknown> {
+    if (deps.catchupRecord) return deps.catchupRecord(channelId, scope);
+    if (!deps.api) return Promise.reject(new Error("Discuss has no way to reach the server."));
+    const query = new URLSearchParams();
+    if (scope.threadId !== null) query.set("thread_id", scope.threadId);
+    query.set("view", scope.view);
+    return deps.api(`/api/v1/channels/${encodeURIComponent(channelId)}/catchup/record?${query.toString()}`, { method: "GET" });
+  }
+
   const panel = createDiscussPanel({
     byId: deps.byId,
     catchupPost,
     catchupPreview,
+    catchupRecord,
+    catchupFollowup(channelId: string, scope: DiscussScope, text: string): Promise<unknown> {
+      if (deps.catchupFollowup) return deps.catchupFollowup(channelId, scope, text);
+      if (!deps.api) return Promise.reject(new Error("Discuss has no way to reach the server."));
+      return deps.api(`/api/v1/channels/${encodeURIComponent(channelId)}/catchup/messages`, {
+        method: "POST",
+        body: JSON.stringify({ thread_id: scope.threadId, text }),
+      });
+    },
+    enterSends: () => deps.enterSends?.() ?? true,
     onBusy(on) {
       busy = on;
       drawAvailability();

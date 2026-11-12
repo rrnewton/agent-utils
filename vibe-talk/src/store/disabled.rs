@@ -260,6 +260,23 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
+    async fn discuss_record(
+        &self,
+        _: &ChannelId,
+        _: &str,
+    ) -> Result<Option<crate::contract::DiscussRecord>, StoreError> {
+        refuse()
+    }
+
+    async fn put_discuss_record(
+        &self,
+        _: &ChannelId,
+        _: &str,
+        _: &crate::contract::DiscussRecord,
+    ) -> Result<(), StoreError> {
+        refuse()
+    }
+
     async fn post_prefix(&self) -> Result<Option<String>, StoreError> {
         // A refusal, not `Ok(None)`, for the noise rules' reason: Settings must not believe it
         // could save. `post_prefix::current` applies the shipped tag by name.

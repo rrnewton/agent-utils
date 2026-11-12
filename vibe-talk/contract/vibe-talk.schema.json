@@ -117,6 +117,51 @@
       ],
       "type": "object"
     },
+    "CatchupFollowupRequest": {
+      "description": "The body of `POST /api/v1/channels/{id}/catchup/messages`: one follow-up question.\n`discuss-followup-composer`.",
+      "properties": {
+        "text": {
+          "description": "The question, as typed.",
+          "type": "string"
+        },
+        "thread_id": {
+          "default": null,
+          "description": "The thread whose record this continues; absent continues the channel's.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "thread_id",
+        "text"
+      ],
+      "type": "object"
+    },
+    "CatchupFollowupResponse": {
+      "description": "What a follow-up answers: the two turns it appended. `discuss-followup-composer`.",
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/DiscussTurn",
+          "description": "The agent's turn, as saved."
+        },
+        "stamp": {
+          "$ref": "#/$defs/CatchupStamp",
+          "description": "How the call spent its time."
+        },
+        "you": {
+          "$ref": "#/$defs/DiscussTurn",
+          "description": "The owner's turn, as saved."
+        }
+      },
+      "required": [
+        "you",
+        "agent",
+        "stamp"
+      ],
+      "type": "object"
+    },
     "CatchupFooterLink": {
       "description": "One unread message a Discuss answer covers, for the panel's footer list.\n`catchup-side-agent`.",
       "properties": {
@@ -179,6 +224,59 @@
         "view",
         "window",
         "unread"
+      ],
+      "type": "object"
+    },
+    "CatchupRecordResponse": {
+      "description": "What `GET …/catchup/record` answers: whether a record exists, and it when so.",
+      "properties": {
+        "current_summary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DiscussSummary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The current summary, when one has been made."
+        },
+        "exists": {
+          "description": "Whether this scope has a saved record.",
+          "type": "boolean"
+        },
+        "staleness": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CatchupStaleness"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The summary's staleness, when one is saved (banner only; no model spent)."
+        },
+        "thread_id": {
+          "description": "The thread covered, or null for a channel record.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeline": {
+          "description": "The timeline under it, oldest first.",
+          "items": {
+            "$ref": "#/$defs/DiscussEntry"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "exists",
+        "thread_id",
+        "current_summary",
+        "timeline",
+        "staleness"
       ],
       "type": "object"
     },
@@ -308,6 +406,28 @@
         "backend",
         "model",
         "stamp"
+      ],
+      "type": "object"
+    },
+    "CatchupStaleness": {
+      "description": "How a saved summary has gone stale (`discuss-summary-staleness-update`, banner\nonly): computed from its covered ids against the cache's current read state.",
+      "properties": {
+        "marked_read": {
+          "description": "Covered messages read since the summary was made.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "new_unread": {
+          "description": "Unread now that the summary did not cover.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "new_unread",
+        "marked_read"
       ],
       "type": "object"
     },
@@ -1057,6 +1177,174 @@
         "label",
         "playback",
         "local_only"
+      ],
+      "type": "object"
+    },
+    "DiscussEntry": {
+      "description": "One entry under a record's current summary: a follow-up turn, or a superseded\nsummary kept collapsed. `discuss-transcript-persist`.",
+      "oneOf": [
+        {
+          "description": "A summary a newer one replaced.",
+          "properties": {
+            "kind": {
+              "const": "summary",
+              "type": "string"
+            },
+            "summary": {
+              "$ref": "#/$defs/DiscussSummary",
+              "description": "The superseded summary, whole."
+            }
+          },
+          "required": [
+            "kind",
+            "summary"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "One follow-up turn.",
+          "properties": {
+            "kind": {
+              "const": "turn",
+              "type": "string"
+            },
+            "turn": {
+              "$ref": "#/$defs/DiscussTurn",
+              "description": "The turn."
+            }
+          },
+          "required": [
+            "kind",
+            "turn"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "DiscussSummary": {
+      "description": "One saved Discuss summary: the top of a record (`discuss-transcript-persist`).\nKept whole so a reopen draws exactly what was answered, with no model call.",
+      "properties": {
+        "backend": {
+          "description": "Which backend answered.",
+          "type": "string"
+        },
+        "cited_ids": {
+          "description": "The cited subset of `covered_ids`, first-citation order.",
+          "items": {
+            "$ref": "#/$defs/MessageId"
+          },
+          "type": "array"
+        },
+        "covered_ids": {
+          "description": "Every processed unread id, oldest first (the summary's covered set).",
+          "items": {
+            "$ref": "#/$defs/MessageId"
+          },
+          "type": "array"
+        },
+        "created_ms": {
+          "description": "When the summary was made, in Unix milliseconds.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "footer_links": {
+          "description": "One link per covered message, oldest first.",
+          "items": {
+            "$ref": "#/$defs/CatchupFooterLink"
+          },
+          "type": "array"
+        },
+        "markable_ids": {
+          "description": "The subset of `covered_ids` a dismissal can name.",
+          "items": {
+            "$ref": "#/$defs/MessageId"
+          },
+          "type": "array"
+        },
+        "model": {
+          "description": "The model it asked.",
+          "type": "string"
+        },
+        "since_ms": {
+          "description": "The read's bound, when the panel chose one (Unix milliseconds).",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "stamp": {
+          "$ref": "#/$defs/CatchupStamp",
+          "description": "How the read spent its time."
+        },
+        "text": {
+          "description": "The answer's shaped text.",
+          "type": "string"
+        },
+        "text_html": {
+          "description": "The answer's sanitized render; empty when plain is the same.",
+          "type": "string"
+        },
+        "unknown_terms": {
+          "description": "Terms the answer said it did not understand.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "view": {
+          "description": "The view covered: `\"flat\"`, `\"main\"` or `\"thread\"`.",
+          "type": "string"
+        },
+        "window": {
+          "$ref": "#/$defs/CatchupWindow",
+          "description": "What the read covered."
+        }
+      },
+      "required": [
+        "view",
+        "since_ms",
+        "window",
+        "covered_ids",
+        "cited_ids",
+        "markable_ids",
+        "footer_links",
+        "text",
+        "text_html",
+        "unknown_terms",
+        "backend",
+        "model",
+        "stamp",
+        "created_ms"
+      ],
+      "type": "object"
+    },
+    "DiscussTurn": {
+      "description": "One follow-up turn in a Discuss timeline (`discuss-transcript-persist`).",
+      "properties": {
+        "at_ms": {
+          "description": "When it was said, in Unix milliseconds.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "speaker": {
+          "description": "Who spoke: `\"you\"` or `\"agent\"`.",
+          "type": "string"
+        },
+        "text": {
+          "description": "The turn's text.",
+          "type": "string"
+        },
+        "text_html": {
+          "description": "The turn's sanitized render; empty when plain is the same.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "speaker",
+        "text",
+        "text_html",
+        "at_ms"
       ],
       "type": "object"
     },
@@ -3999,6 +4287,15 @@
     },
     {
       "$ref": "#/$defs/CatchupPreview"
+    },
+    {
+      "$ref": "#/$defs/CatchupRecordResponse"
+    },
+    {
+      "$ref": "#/$defs/CatchupFollowupRequest"
+    },
+    {
+      "$ref": "#/$defs/CatchupFollowupResponse"
     }
   ],
   "description": "Generated from vibe-talk/src/contract.rs by `make -C vibe-talk contract`. Do not edit.",

@@ -95,6 +95,8 @@ const IDS = [
   "discuss-answer", "discuss-footer", "discuss-covers", "discuss-links",
   "discuss-mark-read", "discuss-mark-unread", "discuss-unmarkable",
   "discuss-stamp", "discuss-retry", "discuss-terms", "discuss-terms-summary", "discuss-terms-list",
+  "discuss-stale", "discuss-stale-text", "discuss-update", "discuss-timeline",
+  "discuss-followup", "discuss-send",
   "discuss-actions", "discuss-resize",
   "discuss-dock-toggle", "discuss-full-toggle", "screen-main",
   "discuss-summarize", "discuss-count", "discuss-since",
@@ -147,7 +149,7 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
   els["discuss-panel"].hidden = true;
   els["discuss-footer"].hidden = true;
   els["discuss-retry"].hidden = true;
-  const calls = { posts: [], previews: [], dismiss: [], restore: [], jumps: [], errors: [], statuses: [], templates: [] };
+  const calls = { posts: [], previews: [], records: [], followups: [], dismiss: [], restore: [], jumps: [], errors: [], statuses: [], templates: [] };
   // `#1344`: the device's kept layout, in memory; the clamp mirrors the device setting's.
   const kept = { width: null, keeps: [], sheetFull: false, sheetKeeps: [], mode: "overlay", modeKeeps: [] };
   const clampW = (value) => {
@@ -168,6 +170,14 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
     catchupPreview: (channelId, scope) => {
       calls.previews.push({ channelId, scope });
       return Promise.resolve(preview());
+    },
+    catchupRecord: (channelId, scope) => {
+      calls.records.push({ channelId, scope });
+      return Promise.resolve({ exists: false, current_summary: null, timeline: [], staleness: null });
+    },
+    catchupFollowup: (channelId, scope, text) => {
+      calls.followups.push({ channelId, scope, text });
+      return Promise.resolve({ you: { speaker: "you", text, text_html: "", at_ms: T2 }, agent: { speaker: "agent", text: "followed up", text_html: "", at_ms: T2 }, stamp: null });
     },
     selectedChannelId: () => "chan-1",
     selection: () => currentSelection,
@@ -593,6 +603,88 @@ test("catchup: a 503 summarizer refusal says the hint in the panel, with no retr
     assert.equal(fx.els["discuss-retry"].hidden, true, "a refusal offered a retry");
     // From then on the button is drawn unavailable too.
     assert.equal(fx.els["discuss-open"].getAttribute("aria-disabled"), "true");
+  } finally { fx.restore(); }
+});
+
+// ---- 8. the saved record (discuss-transcript-persist) -------------------------------------------
+
+function savedRecord(overrides = {}) {
+  return {
+    exists: true,
+    current_summary: {
+      view: "flat", since_ms: null,
+      window: { count: 12, unread_count: 2, read_count: 10 },
+      covered_ids: ["m1", "m2"], cited_ids: [], markable_ids: ["m1", "m2"],
+      footer_links: [
+        { id: "m1", label: "09:51 · Ada", thread_id: null },
+        { id: "m2", label: "09:52 · Ben", thread_id: "t9" },
+      ],
+      text: "saved point", text_html: "", unknown_terms: [],
+      backend: "meta-gateway", model: "fake",
+      stamp: { context_ms: 5, model_ms: 900, first_token_ms: null, total_ms: 920, input_tokens: null, output_tokens: null, input_chars: 100, output_chars: 10, unknown_term_count: 0 },
+      created_ms: T2,
+    },
+    timeline: [
+      { kind: "summary", summary: { view: "flat", window: { count: 9, unread_count: 1 }, covered_ids: ["m0"], markable_ids: ["m0"], footer_links: [], text: "older point", text_html: "", unknown_terms: [], stamp: null, created_ms: T1 } },
+      { kind: "turn", turn: { speaker: "you", text: "and the deploy?", text_html: "", at_ms: T2 } },
+    ],
+    staleness: { new_unread: 3, marked_read: 1 },
+    ...overrides,
+  };
+}
+
+test("catchup: reopening draws the saved record and asks nothing", async () => {
+  const fx = fixture();
+  fx.deps.catchupRecord = (channelId, scope) => {
+    fx.calls.records.push({ channelId, scope });
+    return Promise.resolve(savedRecord());
+  };
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    assert.equal(fx.calls.records.length, 1);
+    assert.deepEqual(fx.calls.posts, [], "reopening asked the model");
+    assert.equal(fx.els["discuss-answer"].textContent, "saved point");
+    assert.match(fx.els["discuss-status"].textContent, /Saved summary/);
+    assert.equal(fx.els["discuss-footer"].hidden, false);
+    assert.equal(fx.els["discuss-stale"].hidden, false, "the staleness banner did not show");
+    assert.equal(fx.els["discuss-stale-text"].textContent, "3 new unread · 1 marked read since summary");
+    const timeline = fx.els["discuss-timeline"].children;
+    assert.equal(timeline.length, 2, "the timeline did not draw");
+    assert.equal(timeline[1].textContent, "and the deploy?");
+    // [Update] is the plain re-summarize: one POST, unbounded.
+    click(fx.els["discuss-update"]);
+    await flush();
+    assert.equal(fx.calls.posts.length, 1);
+    assert.equal(fx.calls.posts[0].body.since_ms, null);
+  } finally { fx.restore(); }
+});
+
+test("catchup: a follow-up sends from the composer and joins the timeline", async () => {
+  const fx = fixture();
+  fx.deps.catchupRecord = (channelId, scope) => {
+    fx.calls.records.push({ channelId, scope });
+    return Promise.resolve(savedRecord());
+  };
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    const box = fx.els["discuss-followup"];
+    box.value = "and the deploy?";
+    click(fx.els["discuss-send"]);
+    await flush();
+    assert.deepEqual(fx.calls.followups.map((call) => call.text), ["and the deploy?"]);
+    assert.equal(box.value, "", "the box did not clear after sending");
+    // Enter sends too (the composer's own keys, Enter-to-send on).
+    box.value = "second question";
+    const enter = { key: "Enter", target: box, preventDefault() {}, stopPropagation() {} };
+    for (const listener of [...(box.listeners.keydown || [])]) listener(enter);
+    await flush();
+    assert.deepEqual(fx.calls.followups.map((call) => call.text), ["and the deploy?", "second question"]);
   } finally { fx.restore(); }
 });
 

@@ -316,6 +316,16 @@ fn routes(state: AppState) -> Router {
             "/api/v1/channels/{channel_id}/catchup/preview",
             get(api::catchup_preview),
         )
+        // `discuss-transcript-persist`. WRITE scope, as the read's.
+        .route(
+            "/api/v1/channels/{channel_id}/catchup/record",
+            get(api::catchup_record),
+        )
+        // `discuss-followup-composer`. WRITE scope: one follow-up spends a model call.
+        .route(
+            "/api/v1/channels/{channel_id}/catchup/messages",
+            post(api::catchup_followup),
+        )
         .route("/api/v1/channels/{channel_id}/digest", get(api::digest))
         .route("/api/v1/channels/{channel_id}/resolve", post(api::resolve))
         .route("/api/v1/channels/{channel_id}/reply", post(api::reply))

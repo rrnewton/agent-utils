@@ -96,6 +96,39 @@ export interface BookmarkResponse {
 }
 
 /**
+ * The body of `POST /api/v1/channels/{id}/catchup/messages`: one follow-up question.
+ * `discuss-followup-composer`.
+ */
+export interface CatchupFollowupRequest {
+  /**
+   * The question, as typed.
+   */
+  text: string;
+  /**
+   * The thread whose record this continues; absent continues the channel's.
+   */
+  thread_id: string | null;
+}
+
+/**
+ * What a follow-up answers: the two turns it appended. `discuss-followup-composer`.
+ */
+export interface CatchupFollowupResponse {
+  /**
+   * The agent's turn, as saved.
+   */
+  agent: DiscussTurn;
+  /**
+   * How the call spent its time.
+   */
+  stamp: CatchupStamp;
+  /**
+   * The owner's turn, as saved.
+   */
+  you: DiscussTurn;
+}
+
+/**
  * One unread message a Discuss answer covers, for the panel's footer list.
  * `catchup-side-agent`.
  */
@@ -139,6 +172,32 @@ export interface CatchupPreview {
    * What the cached window holds.
    */
   window: CatchupWindow;
+}
+
+/**
+ * What `GET …/catchup/record` answers: whether a record exists, and it when so.
+ */
+export interface CatchupRecordResponse {
+  /**
+   * The current summary, when one has been made.
+   */
+  current_summary: DiscussSummary | null;
+  /**
+   * Whether this scope has a saved record.
+   */
+  exists: boolean;
+  /**
+   * The summary's staleness, when one is saved (banner only; no model spent).
+   */
+  staleness: CatchupStaleness | null;
+  /**
+   * The thread covered, or null for a channel record.
+   */
+  thread_id: string | null;
+  /**
+   * The timeline under it, oldest first.
+   */
+  timeline: DiscussEntry[];
 }
 
 /**
@@ -231,6 +290,21 @@ export interface CatchupResponse {
    * What the read covered.
    */
   window: CatchupWindow;
+}
+
+/**
+ * How a saved summary has gone stale (`discuss-summary-staleness-update`, banner
+ * only): computed from its covered ids against the cache's current read state.
+ */
+export interface CatchupStaleness {
+  /**
+   * Covered messages read since the summary was made.
+   */
+  marked_read: number;
+  /**
+   * Unread now that the summary did not cover.
+   */
+  new_unread: number;
 }
 
 /**
@@ -895,6 +969,109 @@ export interface Description {
    * Which playback interface the browser should use.
    */
   playback: Playback;
+}
+
+/**
+ * One entry under a record's current summary: a follow-up turn, or a superseded
+ * summary kept collapsed. `discuss-transcript-persist`.
+ */
+export type DiscussEntry = {
+  kind: "summary";
+  /**
+   * The superseded summary, whole.
+   */
+  summary: DiscussSummary;
+} | {
+  kind: "turn";
+  /**
+   * The turn.
+   */
+  turn: DiscussTurn;
+};
+
+/**
+ * One saved Discuss summary: the top of a record (`discuss-transcript-persist`).
+ * Kept whole so a reopen draws exactly what was answered, with no model call.
+ */
+export interface DiscussSummary {
+  /**
+   * Which backend answered.
+   */
+  backend: string;
+  /**
+   * The cited subset of `covered_ids`, first-citation order.
+   */
+  cited_ids: MessageId[];
+  /**
+   * Every processed unread id, oldest first (the summary's covered set).
+   */
+  covered_ids: MessageId[];
+  /**
+   * When the summary was made, in Unix milliseconds.
+   */
+  created_ms: number;
+  /**
+   * One link per covered message, oldest first.
+   */
+  footer_links: CatchupFooterLink[];
+  /**
+   * The subset of `covered_ids` a dismissal can name.
+   */
+  markable_ids: MessageId[];
+  /**
+   * The model it asked.
+   */
+  model: string;
+  /**
+   * The read's bound, when the panel chose one (Unix milliseconds).
+   */
+  since_ms: number | null;
+  /**
+   * How the read spent its time.
+   */
+  stamp: CatchupStamp;
+  /**
+   * The answer's shaped text.
+   */
+  text: string;
+  /**
+   * The answer's sanitized render; empty when plain is the same.
+   */
+  text_html: string;
+  /**
+   * Terms the answer said it did not understand.
+   */
+  unknown_terms: string[];
+  /**
+   * The view covered: `"flat"`, `"main"` or `"thread"`.
+   */
+  view: string;
+  /**
+   * What the read covered.
+   */
+  window: CatchupWindow;
+}
+
+/**
+ * One follow-up turn in a Discuss timeline (`discuss-transcript-persist`).
+ */
+export interface DiscussTurn {
+  /**
+   * When it was said, in Unix milliseconds.
+   */
+  at_ms: number;
+  /**
+   * Who spoke: `"you"` or `"agent"`.
+   */
+  speaker: string;
+  /**
+   * The turn's text.
+   */
+  text: string;
+  /**
+   * The turn's sanitized render; empty when plain is the same.
+   */
+  text_html: string;
 }
 
 /**
@@ -2993,6 +3170,9 @@ export interface Contract {
   CatchupRequest: CatchupRequest;
   CatchupResponse: CatchupResponse;
   CatchupPreview: CatchupPreview;
+  CatchupRecordResponse: CatchupRecordResponse;
+  CatchupFollowupRequest: CatchupFollowupRequest;
+  CatchupFollowupResponse: CatchupFollowupResponse;
 }
 
 /** A contract type a peer may extend with new `type` tags. */

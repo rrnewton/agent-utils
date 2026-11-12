@@ -503,6 +503,16 @@ pub const MIGRATIONS: &[&str] = &[
 
     CREATE INDEX reply_pointers_by_age ON reply_pointers (at_ms);
     ",
+    // v25 — Discuss records, one JSON row per channel/thread. `discuss-transcript-persist`.
+    "
+    CREATE TABLE discuss_records (
+        channel_id TEXT    NOT NULL,
+        thread_id  TEXT    NOT NULL,
+        record     TEXT    NOT NULL,
+        updated_ms INTEGER NOT NULL,
+        PRIMARY KEY (channel_id, thread_id)
+    ) STRICT;
+    ",
 ];
 
 /// A [`StateStore`] backed by one SQLite file.
@@ -2316,6 +2326,57 @@ impl StateStore for SqliteStore {
         .await
     }
 
+    async fn discuss_record(
+        &self,
+        channel: &ChannelId,
+        thread: &str,
+    ) -> Result<Option<crate::contract::DiscussRecord>, StoreError> {
+        let (channel, thread) = (channel.clone(), thread.to_owned());
+        self.with_connection(move |connection| {
+            let held: Option<String> = connection
+                .query_row(
+                    "SELECT record FROM discuss_records WHERE channel_id = ?1 AND thread_id = ?2",
+                    rusqlite::params![channel.as_str(), thread],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(backend)?;
+            held.map(|text| {
+                serde_json::from_str(&text).map_err(|error| {
+                    StoreError::Backend(format!("a Discuss record does not read back: {error}"))
+                })
+            })
+            .transpose()
+        })
+        .await
+    }
+
+    async fn put_discuss_record(
+        &self,
+        channel: &ChannelId,
+        thread: &str,
+        record: &crate::contract::DiscussRecord,
+    ) -> Result<(), StoreError> {
+        let (channel, thread, record) = (channel.clone(), thread.to_owned(), record.clone());
+        self.with_connection(move |connection| {
+            let text = serde_json::to_string(&record).map_err(|error| {
+                StoreError::Backend(format!("a Discuss record does not write: {error}"))
+            })?;
+            connection
+                .execute(
+                    "INSERT INTO discuss_records (channel_id, thread_id, record, updated_ms)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(channel_id, thread_id) DO UPDATE SET
+                        record     = excluded.record,
+                        updated_ms = excluded.updated_ms",
+                    rusqlite::params![channel.as_str(), thread, text, now_ms()],
+                )
+                .map_err(backend)?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn post_prefix(&self) -> Result<Option<String>, StoreError> {
         self.with_connection(|connection| {
             connection
@@ -3215,6 +3276,9 @@ impl StateStore for SqliteStore {
             let transaction = connection.transaction().map_err(backend)?;
             // The threads' colours with everything else: a thread read afterwards is coloured
             // afresh, by the same policy in the order threads arrive. `#427 server-thread-hues`.
+            transaction
+                .execute("DELETE FROM discuss_records", [])
+                .map_err(backend)?;
             transaction
                 .execute("DELETE FROM thread_hues", [])
                 .map_err(backend)?;

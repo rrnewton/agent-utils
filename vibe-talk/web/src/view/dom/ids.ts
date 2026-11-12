@@ -124,6 +124,7 @@ export interface ElementById {
   "discuss-count": HTMLInputElement;
   "discuss-covers": HTMLParagraphElement;
   "discuss-dock-toggle": HTMLButtonElement;
+  "discuss-followup": HTMLTextAreaElement;
   "discuss-footer": HTMLDivElement;
   "discuss-full-toggle": HTMLButtonElement;
   "discuss-links": HTMLUListElement;
@@ -135,14 +136,20 @@ export interface ElementById {
   "discuss-resize": HTMLDivElement;
   "discuss-retry": HTMLButtonElement;
   "discuss-scope": HTMLParagraphElement;
+  "discuss-send": HTMLButtonElement;
+  "discuss-sheet-toggle": HTMLButtonElement;
   "discuss-since": HTMLInputElement;
+  "discuss-stale": HTMLParagraphElement;
+  "discuss-stale-text": HTMLSpanElement;
   "discuss-stamp": HTMLParagraphElement;
   "discuss-status": HTMLParagraphElement;
   "discuss-summarize": HTMLButtonElement;
   "discuss-terms": HTMLDetailsElement;
   "discuss-terms-list": HTMLUListElement;
   "discuss-terms-summary": HTMLElement;
+  "discuss-timeline": HTMLDivElement;
   "discuss-unmarkable": HTMLParagraphElement;
+  "discuss-update": HTMLButtonElement;
   "dismiss-banner": HTMLButtonElement;
   "dismiss-error": HTMLButtonElement;
   "dismiss-status": HTMLButtonElement;

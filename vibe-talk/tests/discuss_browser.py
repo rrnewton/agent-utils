@@ -312,6 +312,9 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
           f"Mark read sent {writes}, not exactly the markable ids")
 
     page.click("#discuss-links .discuss-link >> nth=0")
+    # The jump keeps the panel open (it overlays the list it jumped).
+    page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+    page.click("#discuss-close")
     page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
 
 

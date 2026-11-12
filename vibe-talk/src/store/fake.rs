@@ -86,6 +86,8 @@ struct State {
     /// The owner's words for the voice agent; `None` until he saves any.
     /// `#272 voice-agent-instructions`.
     owner_prompt: Option<OwnerPrompt>,
+    /// Discuss records by (channel, thread): `discuss-transcript-persist`.
+    discuss_records: std::collections::HashMap<(String, String), crate::contract::DiscussRecord>,
     /// The owner's tag for what the voice agent posts; `None` until he saves one, `Some("")` for
     /// none at all. `#303 voice-post-prefix`.
     post_prefix: Option<String>,
@@ -1105,6 +1107,34 @@ impl StateStore for FakeStore {
         armed(&mut state)?;
         state.owner_prompt = Some(prompt.clone());
         Ok(prompt.clone())
+    }
+
+    async fn discuss_record(
+        &self,
+        channel: &ChannelId,
+        thread: &str,
+    ) -> Result<Option<crate::contract::DiscussRecord>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        Ok(state
+            .discuss_records
+            .get(&(channel.as_str().to_owned(), thread.to_owned()))
+            .cloned())
+    }
+
+    async fn put_discuss_record(
+        &self,
+        channel: &ChannelId,
+        thread: &str,
+        record: &crate::contract::DiscussRecord,
+    ) -> Result<(), StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        state.discuss_records.insert(
+            (channel.as_str().to_owned(), thread.to_owned()),
+            record.clone(),
+        );
+        Ok(())
     }
 
     async fn post_prefix(&self) -> Result<Option<String>, StoreError> {

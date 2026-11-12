@@ -64,6 +64,43 @@
       }
     }
   ],
+  "CatchupFollowupRequest": [
+    {
+      "text": "and the deploy?",
+      "thread_id": "thread-1"
+    },
+    {
+      "text": "",
+      "thread_id": null
+    }
+  ],
+  "CatchupFollowupResponse": [
+    {
+      "agent": {
+        "at_ms": 1700000100000,
+        "speaker": "agent",
+        "text": "it shipped",
+        "text_html": "<p>it shipped</p>"
+      },
+      "stamp": {
+        "context_ms": 3,
+        "first_token_ms": null,
+        "input_chars": 40,
+        "input_tokens": null,
+        "model_ms": 10,
+        "output_chars": 10,
+        "output_tokens": null,
+        "total_ms": 13,
+        "unknown_term_count": 0
+      },
+      "you": {
+        "at_ms": 1700000100000,
+        "speaker": "you",
+        "text": "and the deploy?",
+        "text_html": ""
+      }
+    }
+  ],
   "CatchupPreview": [
     {
       "channel": {
@@ -97,6 +134,119 @@
         "truncated": false,
         "unread_count": 2
       }
+    }
+  ],
+  "CatchupRecordResponse": [
+    {
+      "current_summary": {
+        "backend": "meta-gateway",
+        "cited_ids": [
+          "1010"
+        ],
+        "covered_ids": [
+          "1010"
+        ],
+        "created_ms": 1700000000000,
+        "footer_links": [
+          {
+            "id": "1010",
+            "label": "09:51 · Ada",
+            "thread_id": null
+          }
+        ],
+        "markable_ids": [
+          "1010"
+        ],
+        "model": "some-model",
+        "since_ms": 1700000000000,
+        "stamp": {
+          "context_ms": 3,
+          "first_token_ms": null,
+          "input_chars": 40,
+          "input_tokens": null,
+          "model_ms": 10,
+          "output_chars": 10,
+          "output_tokens": null,
+          "total_ms": 13,
+          "unknown_term_count": 1
+        },
+        "text": "one point",
+        "text_html": "<p>one point</p>",
+        "unknown_terms": [
+          "small-elk"
+        ],
+        "view": "flat",
+        "window": {
+          "count": 12,
+          "from_id": "1000",
+          "noise_hidden": 1,
+          "read_count": 10,
+          "through_id": "1011",
+          "truncated": false,
+          "unread_count": 2
+        }
+      },
+      "exists": true,
+      "staleness": {
+        "marked_read": 1,
+        "new_unread": 3
+      },
+      "thread_id": null,
+      "timeline": [
+        {
+          "kind": "turn",
+          "turn": {
+            "at_ms": 1700000100000,
+            "speaker": "you",
+            "text": "and the deploy?",
+            "text_html": ""
+          }
+        },
+        {
+          "kind": "summary",
+          "summary": {
+            "backend": "",
+            "cited_ids": [],
+            "covered_ids": [],
+            "created_ms": 1699999000000,
+            "footer_links": [],
+            "markable_ids": [],
+            "model": "",
+            "since_ms": null,
+            "stamp": {
+              "context_ms": 0,
+              "first_token_ms": null,
+              "input_chars": 0,
+              "input_tokens": null,
+              "model_ms": 0,
+              "output_chars": 0,
+              "output_tokens": null,
+              "total_ms": 0,
+              "unknown_term_count": 0
+            },
+            "text": "an earlier point",
+            "text_html": "",
+            "unknown_terms": [],
+            "view": "flat",
+            "window": {
+              "count": 0,
+              "from_id": null,
+              "noise_hidden": 0,
+              "read_count": 0,
+              "through_id": null,
+              "truncated": false,
+              "unread_count": 0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "current_summary": null,
+      "exists": false,
+      "staleness": null,
+      "thread_id": "thread-1",
+      "timeline": []
     }
   ],
   "CatchupRequest": [

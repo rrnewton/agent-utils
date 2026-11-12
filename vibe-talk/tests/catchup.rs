@@ -538,6 +538,100 @@ async fn the_preview_names_the_unread_set_and_the_since_bound_trims_the_read() {
 }
 
 #[tokio::test]
+async fn a_summary_is_saved_and_a_second_supersedes_it() {
+    let messages: Vec<Message> = (0..5).map(|seq| message(seq, None, false)).collect();
+    let backend = backend_with(messages);
+    let (state, _store, summarizer, _dir) =
+        cached_state(&testing::config_toml(), backend.clone()).await;
+    fill(&state, TimelineView::Flat, None).await;
+    let mut state = state;
+    state.catchup_summarizer = Some(summarizer.clone());
+    state.catchup_model = Some(Arc::from("fake-model"));
+    let app = vibe_talk::http::router(state);
+    let channel_path = format!("/api/v1/channels/{WRITE_CHANNEL}/catchup");
+
+    summarizer.answer_with("first point");
+    let (status, _body) = post(&app, &channel_path, Some(WRITE_TOKEN), &json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, record) = get(&app, &format!("{channel_path}/record"), WRITE_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{record}");
+    assert_eq!(record["exists"], json!(true), "{record}");
+    assert_eq!(record["current_summary"]["text"], json!("first point"));
+    assert_eq!(
+        record["current_summary"]["covered_ids"]
+            .as_array()
+            .map(Vec::len),
+        Some(5)
+    );
+    assert_eq!(record["timeline"], json!([]));
+
+    summarizer.answer_with("second point");
+    let (status, _body) = post(&app, &channel_path, Some(WRITE_TOKEN), &json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, record) = get(&app, &format!("{channel_path}/record"), WRITE_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{record}");
+    assert_eq!(record["current_summary"]["text"], json!("second point"));
+    let timeline = record["timeline"].as_array().expect("timeline");
+    assert_eq!(timeline.len(), 1, "{record}");
+    assert_eq!(timeline[0]["kind"], json!("summary"));
+    assert_eq!(timeline[0]["summary"]["text"], json!("first point"));
+    // Two model calls total; the record reads spent none.
+    assert_eq!(summarizer.prompt_calls().len(), 2);
+}
+
+#[tokio::test]
+async fn a_followup_appends_both_turns_and_carries_the_transcript() {
+    let messages: Vec<Message> = (0..5).map(|seq| message(seq, None, false)).collect();
+    let backend = backend_with(messages);
+    let (state, _store, summarizer, _dir) =
+        cached_state(&testing::config_toml(), backend.clone()).await;
+    fill(&state, TimelineView::Flat, None).await;
+    let mut state = state;
+    state.catchup_summarizer = Some(summarizer.clone());
+    state.catchup_model = Some(Arc::from("fake-model"));
+    let app = vibe_talk::http::router(state);
+    let channel_path = format!("/api/v1/channels/{WRITE_CHANNEL}/catchup");
+
+    // Before any summary there is nothing to continue.
+    let (status, _body) = post(
+        &app,
+        &format!("{channel_path}/messages"),
+        Some(WRITE_TOKEN),
+        &json!({"text": "and the deploy?"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    summarizer.answer_with("first point");
+    let (status, _body) = post(&app, &channel_path, Some(WRITE_TOKEN), &json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    summarizer.answer_with("it shipped at noon");
+    let (status, body) = post(
+        &app,
+        &format!("{channel_path}/messages"),
+        Some(WRITE_TOKEN),
+        &json!({"text": "and the deploy?"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["you"]["text"], json!("and the deploy?"));
+    assert_eq!(body["agent"]["text"], json!("it shipped at noon"));
+    let calls = summarizer.prompt_calls();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls[1].1.contains("and the deploy?") && calls[1].1.contains("first point"),
+        "the follow-up carried the transcript: {}",
+        calls[1].1
+    );
+    let (status, record) = get(&app, &format!("{channel_path}/record"), WRITE_TOKEN).await;
+    assert_eq!(status, StatusCode::OK, "{record}");
+    let timeline = record["timeline"].as_array().expect("timeline");
+    assert_eq!(timeline.len(), 2, "{record}");
+    assert_eq!(timeline[0]["turn"]["speaker"], json!("you"));
+    assert_eq!(timeline[1]["turn"]["speaker"], json!("agent"));
+}
+
+#[tokio::test]
 async fn on_an_elevenlabs_only_deployment_discuss_refuses_by_backend_name() {
     // The test configuration names an [elevenlabs] agent and no [summaries.llm]: summaries
     // are fully configured (through the agent), so Discuss must refuse saying it is not
