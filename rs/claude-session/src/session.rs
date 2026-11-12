@@ -185,7 +185,8 @@ impl Session {
             };
             match value.get("type").and_then(Value::as_str) {
                 Some("assistant") => {
-                    if let Some(blocks) = value.pointer("/message/content").and_then(Value::as_array)
+                    if let Some(blocks) =
+                        value.pointer("/message/content").and_then(Value::as_array)
                     {
                         for block in blocks {
                             if block.get("type").and_then(Value::as_str) == Some("text") {

@@ -46,6 +46,7 @@ class Crate:
 
 CRATES: tuple[Crate, ...] = (
     Crate("agent-queue", (), "agent_queue", ()),
+    Crate("claude-session", (), "claude_session", ()),
     Crate("agent-harness", (), "agent_harness", ()),
     Crate("term-backend", (), "term_backend", ()),
     Crate("chat-subscription", (), "chat_subscription", ()),
@@ -87,7 +88,7 @@ LOCAL_PACKAGE_PATCHES: dict[str, tuple[str, ...]] = {
     "chat-subscription-plugin": ("chat-subscription",),
     "agentctl": (
         "agent-harness", "agent-queue", "chat-subscription", "chat-subscription-plugin",
-        "term-backend",
+        "term-backend", "claude-session",
     ),
 }
 

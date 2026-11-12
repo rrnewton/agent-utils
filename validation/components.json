@@ -37,6 +37,7 @@
         "rs/agent-harness/",
         "rs/agent-queue/",
         "rs/agentctl/",
+        "rs/claude-session/",
         "rs/bin/agentctl",
         "rs/bin/herdr-agent",
         "rs/bin/herdr-subagents",

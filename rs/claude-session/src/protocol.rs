@@ -231,7 +231,12 @@ mod tests {
     fn effective_arguments_default_to_host_prompts() {
         assert_eq!(
             effective_arguments(&[], true),
-            vec!["--permission-prompts", "host", "--permission-prompt-tool", "stdio"]
+            vec![
+                "--permission-prompts",
+                "host",
+                "--permission-prompt-tool",
+                "stdio"
+            ]
         );
         assert_eq!(
             effective_arguments(&[], false),

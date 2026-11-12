@@ -196,9 +196,9 @@ pub struct PermissionRequest {
 /// (`#1331 claude-session-summarizer`); re-exported so every existing call site keeps
 /// its path and meaning.
 pub use claude_session::protocol::{
-    asks_wrapper, control_error_line, effective_arguments, input_line, interrupt_line,
-    is_uuid, permission_answer_line, prompts_target, protocol_arguments, random_uuid,
-    validate_arguments, RESERVED_ARGUMENTS,
+    asks_wrapper, control_error_line, effective_arguments, input_line, interrupt_line, is_uuid,
+    permission_answer_line, prompts_target, protocol_arguments, random_uuid, validate_arguments,
+    RESERVED_ARGUMENTS,
 };
 
 /// Replace values that look like credentials in `text`: the word after `Bearer `, and the value
