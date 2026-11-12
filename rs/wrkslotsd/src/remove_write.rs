@@ -945,8 +945,8 @@ fn is_terminal_state(state: char) -> bool {
 /// each thread is read in its place at /proc/PID/task/TID. A leader
 /// that still runs, or a group that is gone, has none. A thread
 /// listing that cannot be read refuses, as in the Python census.
-fn surviving_threads(pid: i64) -> Result<Vec<(i64, u64)>> {
-    let base = PathBuf::from("/proc").join(pid.to_string());
+fn surviving_threads(proc_root: &Path, pid: i64) -> Result<Vec<(i64, u64)>> {
+    let base = proc_root.join(pid.to_string());
     match process_stat(&base) {
         Some((_start, state)) if is_terminal_state(state) => {}
         _ => return Ok(Vec::new()),
@@ -989,13 +989,20 @@ fn surviving_threads(pid: i64) -> Result<Vec<(i64, u64)>> {
     Ok(threads)
 }
 
-fn list_proc() -> Result<Vec<String>> {
-    let entries = std::fs::read_dir("/proc")
-        .map_err(|error| format!("process use is indeterminate because /proc failed: {error}"))?;
+fn list_proc(proc_root: &Path) -> Result<Vec<String>> {
+    let entries = std::fs::read_dir(proc_root).map_err(|error| {
+        format!(
+            "process use is indeterminate because {} failed: {error}",
+            proc_root.display()
+        )
+    })?;
     let mut names: Vec<String> = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| {
-            format!("process use is indeterminate because /proc failed: {error}")
+            format!(
+                "process use is indeterminate because {} failed: {error}",
+                proc_root.display()
+            )
         })?;
         names.push(entry.file_name().to_string_lossy().into_owned());
     }
@@ -1005,10 +1012,18 @@ fn list_proc() -> Result<Vec<String>> {
 /// Read one process (or a surviving thread of `leader`). Every process
 /// one snapshot reads shares its `wait`, so their exits share one
 /// deadline (#1174).
-fn read_process_links(pid: i64, leader: Option<i64>, wait: &proc_reads::ExitWait) -> ProcessLinks {
+fn read_process_links(
+    proc_root: &Path,
+    pid: i64,
+    leader: Option<i64>,
+    wait: &proc_reads::ExitWait,
+) -> ProcessLinks {
     let base = match leader {
-        None => PathBuf::from("/proc").join(pid.to_string()),
-        Some(leader) => PathBuf::from(format!("/proc/{leader}/task/{pid}")),
+        None => proc_root.join(pid.to_string()),
+        Some(leader) => proc_root
+            .join(leader.to_string())
+            .join("task")
+            .join(pid.to_string()),
     };
     let holder = ProcessLinks {
         pid,
@@ -1110,6 +1125,7 @@ fn mapped_paths(maps: &[u8]) -> std::collections::BTreeSet<PathBuf> {
 
 /// What one snapshot has read so far, across its listings of /proc.
 struct SnapshotReads<'a> {
+    proc_root: &'a Path,
     targets: &'a [PathBuf],
     exit_wait: proc_reads::ExitWait,
     devices: Vec<Option<u64>>,
@@ -1156,17 +1172,17 @@ impl SnapshotReads<'_> {
     /// one stat read, and also catches an execve that came before the
     /// thread listing (#1102).
     fn admit_threads(&mut self, leader: i64) -> Result<()> {
-        for (tid, start) in surviving_threads(leader)? {
+        for (tid, start) in surviving_threads(self.proc_root, leader)? {
             if self.read.get(&tid) == Some(&start) {
                 continue;
             }
-            let thread = read_process_links(tid, Some(leader), &self.exit_wait);
+            let thread = read_process_links(self.proc_root, tid, Some(leader), &self.exit_wait);
             self.admit(thread, start);
         }
-        let base = PathBuf::from("/proc").join(leader.to_string());
+        let base = self.proc_root.join(leader.to_string());
         if let Some((start, state)) = process_stat(&base) {
             if !is_terminal_state(state) && self.read.get(&leader) != Some(&start) {
-                let process = read_process_links(leader, None, &self.exit_wait);
+                let process = read_process_links(self.proc_root, leader, None, &self.exit_wait);
                 self.admit(process, start);
             }
         }
@@ -1196,6 +1212,17 @@ pub(crate) fn capture_process_snapshot(
     coordinator_pid: i64,
     targets: &[PathBuf],
 ) -> Result<ProcessSnapshot> {
+    capture_process_snapshot_at(Path::new("/proc"), coordinator_pid, targets)
+}
+
+/// One snapshot over `proc_root` instead of the host `/proc`; a test seam
+/// so a census test lists only its own fixture processes and can never
+/// trip over an unrelated host process mid-exit (#1249).
+pub(crate) fn capture_process_snapshot_at(
+    proc_root: &Path,
+    coordinator_pid: i64,
+    targets: &[PathBuf],
+) -> Result<ProcessSnapshot> {
     use std::os::unix::fs::MetadataExt as _;
     let ignored = own_ancestry();
     // A target that cannot be inspected is judged (and refused) by
@@ -1209,6 +1236,7 @@ pub(crate) fn capture_process_snapshot(
         })
         .collect();
     let mut reads = SnapshotReads {
+        proc_root,
         targets,
         exit_wait: proc_reads::ExitWait::new(),
         devices,
@@ -1220,7 +1248,7 @@ pub(crate) fn capture_process_snapshot(
     };
     let mut proven_rounds = 0;
     for round in 0..SNAPSHOT_LISTING_ROUNDS {
-        let names = list_proc()?;
+        let names = list_proc(proc_root)?;
         if round == 0 {
             // Test seam (#1084, #1102 wrkslots-census-churn-tolerant): the
             // forced-churn differential makes a listed process vanish and a
@@ -1244,7 +1272,7 @@ pub(crate) fn capture_process_snapshot(
             if ignored.contains(&pid) || pid == coordinator_pid {
                 continue;
             }
-            let base = PathBuf::from("/proc").join(pid.to_string());
+            let base = proc_root.join(pid.to_string());
             let Some((start, state)) = process_stat(&base) else {
                 continue;
             };
@@ -1257,7 +1285,7 @@ pub(crate) fn capture_process_snapshot(
             if reads.read.get(&pid) == Some(&start) {
                 continue;
             }
-            let process = read_process_links(pid, None, &reads.exit_wait);
+            let process = read_process_links(proc_root, pid, None, &reads.exit_wait);
             reads.admit(process, start);
             // A leader that exited while it was read showed nothing; its
             // threads still hold what it held, so they are read now, in
@@ -3294,17 +3322,44 @@ mod mapped_paths_tests {
 mod census_gone_tests {
     //! #1173 census-vanished-process: a snapshot read that finds the
     //! process exited is no evidence, and the snapshot completes.
-    use super::{assert_slot_unused_snapshot, capture_process_snapshot};
-    use crate::proc_reads::test_support::{
-        holding_fd, in_cwd, mapping_only, proc_path, stop, Slot,
+    use super::{
+        assert_slot_unused_snapshot, capture_process_snapshot, capture_process_snapshot_at,
     };
+    use crate::proc_reads::test_support::{holding_fd, in_cwd, mapping_only, stop, Slot};
     use crate::proc_reads::{inject, reset};
 
     const ENOENT: i32 = 2;
     const ESRCH: i32 = 3;
     const EACCES: i32 = 13;
 
+    /// A fake /proc listing only the fixture children, each an alias of
+    /// its real entry: the census reads them and no unrelated host
+    /// process mid-exit can enter the snapshot (#1249).
+    fn fake_proc_root(children: &[(std::process::Child, Vec<&str>)]) -> std::path::PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("wrkslots-census-gone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for (child, _entries) in children.iter() {
+            std::os::unix::fs::symlink(
+                format!("/proc/{}", child.id()),
+                root.join(child.id().to_string()),
+            )
+            .unwrap();
+        }
+        root
+    }
+
+    fn fake_path(
+        root: &std::path::Path,
+        child: &std::process::Child,
+        entry: &str,
+    ) -> std::path::PathBuf {
+        root.join(child.id().to_string()).join(entry)
+    }
+
     fn snapshot_with(
+        proc_root: &std::path::Path,
         child: &std::process::Child,
         slot: &Slot,
         entries: &[&str],
@@ -3312,11 +3367,14 @@ mod census_gone_tests {
     ) -> (Result<(), String>, Vec<String>) {
         reset();
         for entry in entries {
-            inject(&proc_path(child, entry), errno);
+            inject(&fake_path(proc_root, child, entry), errno);
         }
-        let verdict =
-            capture_process_snapshot(std::process::id() as i64, std::slice::from_ref(&slot.slot))
-                .and_then(|snapshot| assert_slot_unused_snapshot(&snapshot, &slot.slot));
+        let verdict = capture_process_snapshot_at(
+            proc_root,
+            std::process::id() as i64,
+            std::slice::from_ref(&slot.slot),
+        )
+        .and_then(|snapshot| assert_slot_unused_snapshot(&snapshot, &slot.slot));
         let prefix = format!("census: process {} ", child.id());
         let notes = reset()
             .into_iter()
@@ -3333,8 +3391,9 @@ mod census_gone_tests {
             (holding_fd(&slot), vec!["fd/3"]),
             (holding_fd(&slot), vec!["fd"]),
         ];
+        let proc_root = fake_proc_root(&children);
         for (child, entries) in &children {
-            let (verdict, notes) = snapshot_with(child, &slot, &[], ESRCH);
+            let (verdict, notes) = snapshot_with(&proc_root, child, &slot, &[], ESRCH);
             let error = verdict.unwrap_err();
             assert!(error.contains("uses slot"), "{entries:?}: {error}");
             assert!(notes.is_empty(), "{notes:?}");
@@ -3346,10 +3405,11 @@ mod census_gone_tests {
                 // unused exactly when this child's gone reads are skipped.
                 for (other, other_entries) in &children {
                     for entry in other_entries {
-                        inject(&proc_path(other, entry), errno);
+                        inject(&fake_path(&proc_root, other, entry), errno);
                     }
                 }
-                let verdict = capture_process_snapshot(
+                let verdict = capture_process_snapshot_at(
+                    &proc_root,
                     std::process::id() as i64,
                     std::slice::from_ref(&slot.slot),
                 )
@@ -3366,7 +3426,7 @@ mod census_gone_tests {
                         [format!(
                             "census: process {} exited during the census ({}: ESRCH); skipped",
                             child.id(),
-                            proc_path(child, entries[0]).display()
+                            fake_path(&proc_root, child, entries[0]).display()
                         )]
                     );
                 } else {
@@ -3377,9 +3437,10 @@ mod census_gone_tests {
         // A gone executable read still completes, with the other evidence.
         let (child, _entries) = &children[0];
         for errno in [ENOENT, ESRCH] {
-            let (verdict, _notes) = snapshot_with(child, &slot, &["exe"], errno);
+            let (verdict, _notes) = snapshot_with(&proc_root, child, &slot, &["exe"], errno);
             assert!(verdict.unwrap_err().contains("uses slot"));
         }
+        let _ = std::fs::remove_dir_all(&proc_root);
         for (child, _entries) in children {
             stop(child);
         }
@@ -3471,8 +3532,12 @@ mod census_gone_tests {
             &base.join("stat"),
             &exiting_stat(&std::fs::read(base.join("stat")).unwrap()),
         );
-        let process =
-            super::read_process_links(child.id() as i64, None, &crate::proc_reads::ExitWait::new());
+        let process = super::read_process_links(
+            std::path::Path::new("/proc"),
+            child.id() as i64,
+            None,
+            &crate::proc_reads::ExitWait::new(),
+        );
         let notes = reset();
         child.wait().unwrap();
         assert!(
