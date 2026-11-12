@@ -261,7 +261,10 @@ pub fn log_line(state: &Path, line: &Value) {
         .append(true)
         .open(state.join("hooks.jsonl"))
     {
-        let _ = writeln!(file, "{line}");
+        // One formatted buffer, one write: concurrent hook workers
+        // appending at once must never interleave inside a line (#1357).
+        let text = format!("{line}\n");
+        let _ = file.write_all(text.as_bytes());
     }
 }
 
@@ -393,6 +396,44 @@ mod tests {
             "on_land",
             "lane"
         ));
+    }
+
+    #[test]
+    fn concurrent_log_lines_never_interleave() {
+        // #1357 mq-hooks-log-interleave: many hook workers finish at once;
+        // every appended line must stay whole and parse.
+        let state = temp_state("interleave");
+        let threads = 8;
+        let per_thread = 50;
+        let mut handles = Vec::new();
+        for t in 0..threads {
+            let state = state.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..per_thread {
+                    log_line(
+                        &state,
+                        &json!({"thread": t, "i": i, "pad": "x".repeat(4096)}),
+                    );
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        let text = std::fs::read_to_string(state.join("hooks.jsonl")).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), threads * per_thread, "{} lines", lines.len());
+        let mut seen = std::collections::BTreeSet::new();
+        for line in lines {
+            let value: Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("unparseable line: {e}: {:.80}", line));
+            seen.insert((
+                value["thread"].as_u64().unwrap(),
+                value["i"].as_u64().unwrap(),
+            ));
+        }
+        assert_eq!(seen.len(), threads * per_thread);
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]
