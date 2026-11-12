@@ -210,10 +210,7 @@
 #bar-pack .promoted-action {
   flex: 0 0 auto;
   white-space: nowrap;
-  /* Height-neutral in the pack: the tray's 2.4rem must not grow the bar (it made the
-     dock 2.4px taller while promoted, moving the list across a search fold and a reload). */
-  min-height: 0;
-  align-self: stretch;
+  min-height: 2.4rem;
 }
 
 /* The same argument as `.bar-button[aria-disabled="true"]` above, and deliberately the same

@@ -32,7 +32,14 @@ export function createActionMenu(deps: ActionMenuDependencies): ActionMenu {
   let actionMenuOpen = false;
 
   function render(): void {
-    const none = ACTION_MENU_ITEMS.every((id) => deps.byId(id).hidden);
+    // `#1470 toolbar-dynamic-promotion`. An item promoted to the toolbar still has
+    // `hidden` false (it is available, just standing elsewhere); it counts as in
+    // this menu only while the menu is actually its parent.
+    const menu = deps.byId("action-menu");
+    const none = ACTION_MENU_ITEMS.every((id) => {
+      const item = deps.byId(id);
+      return item.hidden || (item.parentNode != null && item.parentNode !== menu);
+    });
     const empty = deps.byId("action-menu-empty");
     if (empty.hidden !== !none) empty.hidden = !none;
   }

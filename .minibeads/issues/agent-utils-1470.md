@@ -7,7 +7,7 @@ created_at: 2026-11-12T20:32:00.000000000+00:00
 updated_at: 2026-11-12T20:32:00.000000000+00:00
 ---
 
-# Description
+# Summary
 
 Owner request (Slack 030, 2026-11-12): Discuss is listed twice, in the
 hamburger menu and on the toolbar. No action should be listed twice.
@@ -22,7 +22,7 @@ This lane stacks on the read-toggle lane (#1168 binary Fold read,
 #1399 fixed labels and shared active style): it consumes that lane's
 fixed labels and `aria-pressed` active style and does not redo them.
 
-# Acceptance Criteria
+# Acceptance
 
 - No item is listed twice in any state: an action on the toolbar is
   not in the hamburger menu, and an action in the menu is not on the
