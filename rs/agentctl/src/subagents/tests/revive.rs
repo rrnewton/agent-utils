@@ -3503,3 +3503,150 @@ fn a_failed_launch_whose_harness_never_came_up_in_its_own_pane_is_abandoned_and_
     );
     assert_ne!(new.pane_id.as_deref(), Some(pane.as_str()));
 }
+
+/// Write one launch profile into the fixture's project and return its directory.
+fn write_profile(fixture: &Fixture, name: &str, profile: Value) {
+    let output = std::process::Command::new("/usr/bin/git")
+        .args(["init", "--quiet"])
+        .current_dir(&fixture.root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    fs::write(fixture.root.join(".gitignore"), ".agentctl/\n").unwrap();
+    let directory = fixture.root.join(".agentctl");
+    agent::create_private_directory(&directory, "test profile config", false, false).unwrap();
+    agent::atomic_json(
+        &directory.join("profiles.json"),
+        &json!({"schema": "agentctl-profiles/v1", "profiles": {name: profile}}),
+    )
+    .unwrap();
+}
+
+#[test]
+fn revive_replays_the_synthesized_ultra_gate_from_the_recorded_effort() {
+    // #1412: start synthesizes the Muse ultra gate from the effort, not from the
+    // profile's env; a revive that only replayed the profile's env would launch
+    // ultra without its gate and Muse would fall back to xhigh.
+    let fixture = Fixture::new();
+    fixture
+        .client
+        .fresh_presentations
+        .store(true, Ordering::Relaxed);
+    fixture.client.report_session.store(true, Ordering::Relaxed);
+    write_profile(
+        &fixture,
+        "muse-ultra",
+        json!({"harness": "muse", "mode": "interactive", "reasoning_effort": "ultra",
+               "env": {"RECOVERY_MODE": "on"}}),
+    );
+    fixture
+        .manager()
+        .start_with_reasoning_effort(
+            "worker",
+            &fixture.root,
+            "ultra",
+            StartOptions {
+                harness: "muse".to_owned(),
+                profile: Some("muse-ultra".to_owned()),
+                environment: vec!["RECOVERY_MODE=on".to_owned()],
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let old = fixture.manager().load("worker").unwrap();
+    assert_eq!(
+        old.environment_names,
+        ["MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT", "RECOVERY_MODE"]
+    );
+    let status = fixture.manager().status("worker").unwrap();
+    assert_eq!(
+        status["launch_env_keys"],
+        json!(["MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT", "RECOVERY_MODE"]),
+        "{status}"
+    );
+    kill_owned(&fixture, &old);
+    let result = fixture
+        .manager()
+        .revive("worker", false, None, TIMEOUT)
+        .unwrap();
+    assert_eq!(result["revived"], true, "{result}");
+    let environments = fixture.client.environments.lock().unwrap();
+    assert_eq!(environments.len(), 2);
+    assert!(
+        environments[1].contains(&"RECOVERY_MODE=on".to_owned()),
+        "{environments:?}"
+    );
+    assert!(
+        environments[1].contains(&"MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT=on".to_owned()),
+        "{environments:?}"
+    );
+}
+
+#[test]
+fn restart_with_profile_environment_relaunches_in_a_fresh_tab_with_it() {
+    // #1412: restart goes through revive; an env-carrying lane takes a fresh tab
+    // that receives the recorded profile environment, never the old pane.
+    let fixture = Fixture::new();
+    fixture
+        .client
+        .fresh_presentations
+        .store(true, Ordering::Relaxed);
+    fixture.client.report_session.store(true, Ordering::Relaxed);
+    write_profile(
+        &fixture,
+        "muse-env",
+        json!({"harness": "muse", "mode": "interactive", "env": {"RECOVERY_MODE": "on"}}),
+    );
+    fixture
+        .manager()
+        .start(
+            "worker",
+            &fixture.root,
+            StartOptions {
+                harness: "muse".to_owned(),
+                profile: Some("muse-env".to_owned()),
+                environment: vec!["RECOVERY_MODE=on".to_owned()],
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let old = fixture.manager().load("worker").unwrap();
+    let pane = old.pane_id.clone().unwrap();
+    fixture.client.dead_panes.lock().unwrap().remove(&pane);
+    fixture.client.started.store(true, Ordering::Relaxed);
+    fixture.client.custom_alive.store(true, Ordering::Relaxed);
+    fixture.client.exit_to_shell.store(true, Ordering::Relaxed);
+    let result = fixture
+        .manager()
+        .restart("worker", false, Duration::from_secs(30), TIMEOUT)
+        .unwrap();
+    assert_eq!(result["action"], "restarted", "{result}");
+    let new = fixture.manager().load("worker").unwrap();
+    assert_ne!(new.pane_id.as_deref(), Some(pane.as_str()));
+    let environments = fixture.client.environments.lock().unwrap();
+    assert_eq!(environments.len(), 2);
+    assert_eq!(environments[1], ["RECOVERY_MODE=on"]);
+}
+
+#[test]
+fn restart_with_resume_refuses_a_recorded_launch_environment_before_ending_anything() {
+    // #1412: a same-pane relaunch cannot re-apply a recorded launch environment,
+    // so it refuses with the fresh-tab remedy and ends nothing.
+    let (fixture, old) = recoverable("muse", true);
+    let mut record = old.clone();
+    record.environment_names = vec!["RECOVERY_MODE".to_owned()];
+    fixture.manager().save(&record).unwrap();
+    let error = fixture.manager().restart_with_resume("worker").unwrap_err();
+    assert!(
+        error.to_string().contains("recorded launch environment"),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("agentctl restart worker"),
+        "{error}"
+    );
+    assert!(
+        fixture.client.ended.lock().unwrap().is_empty(),
+        "a refused same-pane restart must not end the harness"
+    );
+}

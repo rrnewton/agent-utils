@@ -554,6 +554,20 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         if let Some(effort) = record.reasoning_effort.as_deref() {
             config.arguments = with_effort_argument(&config.arguments, effort);
         }
+        // The recorded launch environment, re-read from the launch profile by name
+        // (#1412 revive-profile-env); a headless record that names no profile and
+        // recorded no names carries none, as its first launch did.
+        if let Some(profile_name) = record.profile.as_deref() {
+            if let Ok(root) =
+                crate::profiles::configuration_root(Path::new(&record.cwd), &self.registry, false)
+            {
+                if let Ok((_, profiles)) = crate::profiles::load_profiles(&root, false) {
+                    if let Some(profile) = profiles.get(profile_name) {
+                        config.environment = Self::relaunch_environment(&record, profile);
+                    }
+                }
+            }
+        }
         if let Some(lines) = tool_preview_lines {
             config.tool_preview_lines = lines;
         }
@@ -1078,6 +1092,7 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
     /// the last event.
     pub(super) fn headless_status_record(&self, record: &AgentRecord) -> Result<Value> {
         let mut result = self.record_row(record)?;
+        result["launch_env_keys"] = json!(self.launch_env_keys(record));
         let directory = self.directory(&record.name)?;
         let socket = hcontrol::socket_path(&directory);
         let (agent_status, wrapper) = if record.lifecycle != "running" {

@@ -4317,10 +4317,28 @@ class ManagedAgents:
             })
             return result
 
+    def _launch_env_keys(self, record: AgentRecord) -> list[str]:
+        """Names only, never values: the effective launch environment keys a relaunch
+        of ``record`` would apply (#1412 revive-profile-env)."""
+        keys = set(record.environment_names)
+        if record.harness == "muse" and record.reasoning_effort == "ultra":
+            keys.add("MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT")
+        try:
+            launch_env = self._project_launch_env()
+        except (AgentDeliveryError, HerdrUnavailable):
+            launch_env = None
+        if launch_env is not None:
+            if launch_env.env_file is not None:
+                keys.add("BASH_ENV")
+            if launch_env.path_prepend:
+                keys.add("PATH")
+        return sorted(keys)
+
     def _status_record(self, record: AgentRecord) -> dict[str, object]:
         """Probe one pinned record without resolving its name a second time."""
         name = record.name
         result: dict[str, object] = record.to_document()
+        result["launch_env_keys"] = self._launch_env_keys(record)
         result["queue"] = self._queue(name)
         result["output"] = str(self._directory(name) / "output.json")
         result["goal_source"] = "requested" if record.goal is not None else None

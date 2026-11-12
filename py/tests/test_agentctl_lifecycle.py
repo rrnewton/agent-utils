@@ -2219,6 +2219,32 @@ def test_revive_literal_environment_without_profile_is_unrecoverable(
     assert len(fake.launched) == 1 and fake.closed == []
 
 
+def test_revive_replays_the_synthesized_ultra_gate_from_the_recorded_effort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #1412: start synthesizes the Muse ultra gate from the effort, not from the
+    # profile's env; revive replays it or Muse falls back from ultra to xhigh.
+    from .test_agentctl_sessions import _write_profiles
+    _write_profiles(tmp_path, {"muse-ultra": {
+        "harness": "muse", "mode": "interactive", "reasoning_effort": "ultra",
+        "env": {"RECOVERY_MODE": "on"}}})
+    manager, fake, old = prepare_revive(
+        tmp_path, monkeypatch, harness="muse", profile="muse-ultra",
+        environment=("RECOVERY_MODE=on",))
+    gate = "MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT"
+    old.reasoning_effort = "ultra"
+    old.environment_names = [gate, "RECOVERY_MODE"]
+    spec = old.launch_spec
+    assert spec is not None
+    old.set_launch_spec({**spec, "environment_names": [gate, "RECOVERY_MODE"]})
+    manager._save(old)
+    status = manager.status("worker")
+    assert status["launch_env_keys"] == [gate, "RECOVERY_MODE"]
+    result = manager.revive("worker")
+    assert result["revived"] is True, result
+    assert fake.environments[-1] == ("RECOVERY_MODE=on", f"{gate}=on")
+
+
 @pytest.mark.parametrize("changed", [False, True])
 def test_revive_rechecks_slot_mapping_and_reuses_recorded_boxing(
     changed: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

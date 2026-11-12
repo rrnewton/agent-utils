@@ -1370,3 +1370,32 @@ fn an_answer_from_the_harnesss_control_group_is_refused() {
     }
     fixture.stop(handle);
 }
+
+#[test]
+fn the_harness_is_spawned_with_the_configured_launch_environment() {
+    // #1412: a wrapper relaunch (turnover, handback, unit restart) spawns its
+    // harness with the recorded launch environment in its config, not only
+    // with AGENTCTL_AGENT.
+    let mut fixture = Fixture::new("launch-env", "normal");
+    let log = fixture.root.join("env.log");
+    let script = fixture.root.join("env_harness.py");
+    fs::write(
+        &script,
+        "import os, sys\n\
+         open(os.environ['ENV_LOG'], 'w').write(os.environ.get('RECOVERY_MODE', 'missing'))\n\
+         sys.stdin.read()\n",
+    )
+    .unwrap();
+    fixture.config.command = vec![
+        "env".to_owned(),
+        format!("ENV_LOG={}", log.display()),
+        "python3".to_owned(),
+        script.display().to_string(),
+    ];
+    fixture.config.environment = vec!["RECOVERY_MODE=on".to_owned()];
+    let handle = fixture.start();
+    fixture.wait("launch environment recorded", || {
+        fs::read_to_string(&log).is_ok_and(|value| value == "on")
+    });
+    fixture.stop(handle);
+}

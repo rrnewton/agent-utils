@@ -1,12 +1,13 @@
 ---
 title: 'revive-profile-env: a profile launch environment is lost on relaunch paths that bypass the recorded launch'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agentctl
 created_at: 2026-11-12T12:20:00+00:00
-updated_at: 2026-11-12T12:20:00+00:00
+updated_at: 2026-11-12T13:30:00+00:00
+closed_at: 2026-11-12T13:30:00+00:00
 ---
 
 # Description
@@ -42,3 +43,9 @@ Chosen rule: the RECORDED launch environment wins on every ordinary relaunch. A 
 # Notes
 
 Numbered from devbig030's interim block (1400-1469). The devbig014 lead asked for it to be filed (2026-11-12). Related: #1023 agentctl-restart-profile-refresh, #1139 (env-carrying revive never reuses the pane), #1216 agentctl-effort-option (declared vs effective effort on every launch path).
+
+## Resolution
+
+[watermelon-full-preview] Delivered in the commit carrying this note. Recorded launch environment wins on every relaunch (values re-read from the private launch profile by recorded name; the profile's current env only via `--refresh-profile`, per #1216 declared vs effective). Rust: revive (spec and policy paths) and the profile refresh now synthesize the Muse ultra gate from the recorded ultra effort exactly as start does, so an ultra lane whose gate came from its effort no longer refuses or falls back to xhigh; restore (through revive), restart (through revive, fresh tab for env-carrying lanes), and the headless wrapper all apply the recorded environment, the wrapper through a new `WrapperConfig.environment` its spawns carry, populated in `run-headless` from the launch profile so turnover, handback and unit restarts see it. `restart_with_resume` refuses a record carrying a recorded launch environment before ending anything, naming `agentctl restart`, and types the registry `launch_env` line before a same-pane relaunch as start does. `agentctl status` shows `launch_env_keys` (recorded names, the synthesized ultra gate, and the registry launch_env's BASH_ENV/PATH), names only. Python parity: the same gate synthesis on revive (spec and policy paths) and `launch_env_keys` in status (start gate synthesis was already mirrored on main); Python still refuses restore, has no same-pane restart_with_resume and no headless turnover, so those remain Rust-only. Tests: per-path fixture-profile env tests in Rust (revive ultra gate, restart, restore, same-pane refusal, headless wrapper spawn) and a Python revive ultra-gate/status test, all with stubbed herdr/harness.
+
+Gate record (lead ruling, 2026-11-12): the full contained gate on the gated tree (59 passed, 1 failed) had as its only red `python.agentctl.shard-1`'s known chat-launch sigterm load flake, which passed on its solo rerun; all 2577 agentctl Rust cases passed. On the combined tree after rebasing onto the moved main, the recorded cross check's three cross steps (`cross.agentctl.herdr-agent-differential`, `cross.agentctl.differential-1`, `cross.agentctl.differential-2`) failed only as CPU-TIMEOUT (rc -15, no test-level attribution, no divergence) under contention with other teams' gates, and in a second run the herdr differential passed solo (104 paired checks) while shards 1 and 2 again CPU-timed out under overlapping scopes; this is the known waivable differential budget defect, not a divergence. Focused combined-tree checks were green: Python revive tests 95 passed, the ultra-gate test passed, and strict mypy was clean.

@@ -3494,3 +3494,63 @@ fn watch_notify_off_and_tab_hygiene_off_report_skipped_in_health() {
         .unwrap();
     assert!(sq["detail"].as_str().unwrap().contains("notifier"), "{sq}");
 }
+
+#[test]
+fn restore_revives_with_the_recorded_profile_environment() {
+    // #1412: restore brings a dead lane back through revive, so the relaunched
+    // tab receives the recorded profile environment, not just the argv.
+    let fixture = Fixture::new();
+    fixture
+        .client
+        .fresh_presentations
+        .store(true, Ordering::Relaxed);
+    fixture.client.report_session.store(true, Ordering::Relaxed);
+    let output = std::process::Command::new("/usr/bin/git")
+        .args(["init", "--quiet"])
+        .current_dir(&fixture.root)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    fs::write(fixture.root.join(".gitignore"), ".agentctl/\n").unwrap();
+    let directory = fixture.root.join(".agentctl");
+    agent::create_private_directory(&directory, "test profile config", false, false).unwrap();
+    agent::atomic_json(
+        &directory.join("profiles.json"),
+        &json!({"schema": "agentctl-profiles/v1", "profiles": {
+            "muse-env": {"harness": "muse", "mode": "interactive", "env": {"RECOVERY_MODE": "on"}}
+        }}),
+    )
+    .unwrap();
+    fixture
+        .manager()
+        .start(
+            "lane",
+            &fixture.root,
+            StartOptions {
+                harness: "muse".to_owned(),
+                profile: Some("muse-env".to_owned()),
+                environment: vec!["RECOVERY_MODE=on".to_owned()],
+                resume: Some("lane-conversation".to_owned()),
+                ..StartOptions::default()
+            },
+        )
+        .unwrap();
+    let old = fixture.manager().load("lane").unwrap();
+    fixture
+        .client
+        .dead_panes
+        .lock()
+        .unwrap()
+        .insert(old.pane_id.clone().unwrap());
+    fixture.client.started.store(false, Ordering::Relaxed);
+    fixture.client.custom_alive.store(false, Ordering::Relaxed);
+    let host = ScriptedHost::new();
+    let config = config(&fixture, None);
+    let registry = fixture.root.join("registry");
+    let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(report["agents"][0]["name"], "lane");
+    assert_eq!(report["agents"][0]["action"], "revived", "{report}");
+    let environments = fixture.client.environments.lock().unwrap();
+    assert_eq!(environments.len(), 2);
+    assert_eq!(environments[1], ["RECOVERY_MODE=on"]);
+}

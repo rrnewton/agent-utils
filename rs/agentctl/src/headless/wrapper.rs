@@ -107,6 +107,9 @@ pub struct WrapperConfig {
     /// process tree ([`approval::peer_refusal`]). Off only where everything shares one group,
     /// as in tests.
     pub approval_cgroup_check: bool,
+    /// Launch environment entries (`KEY=VALUE`) the harness is spawned with, beyond
+    /// `AGENTCTL_AGENT` (#1412 revive-profile-env); empty for most agents.
+    pub environment: Vec<String>,
 }
 
 impl WrapperConfig {
@@ -130,6 +133,7 @@ impl WrapperConfig {
             approvals: true,
             approval_timeout: approval::DEFAULT_TIMEOUT,
             approval_cgroup_check: true,
+            environment: Vec::new(),
         }
     }
 
@@ -386,6 +390,11 @@ impl Wrapper {
             .stderr(Stdio::inherit())
             .env("AGENTCTL_AGENT", &self.config.agent)
             .process_group(0);
+        for entry in &self.config.environment {
+            if let Some((name, value)) = entry.split_once('=') {
+                command.env(name, value);
+            }
+        }
         let mut child = command
             .spawn()
             .map_err(|error| io_fail(&format!("start {}", self.config.command[0]), error))?;

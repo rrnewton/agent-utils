@@ -1479,6 +1479,42 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         Ok(())
     }
 
+    /// The environment a relaunch applies for `record` from its launch `profile`: the
+    /// profile's entries, plus the Muse ultra gate agentctl synthesizes at start for an
+    /// ultra effort (#1216), which the recorded names may carry without the profile's env.
+    pub(super) fn relaunch_environment(
+        record: &AgentRecord,
+        profile: &crate::profiles::LaunchProfile,
+    ) -> Vec<String> {
+        let mut entries = profile.environment.clone();
+        if record.harness == "muse"
+            && record.reasoning_effort.as_deref() == Some("ultra")
+            && !entries
+                .iter()
+                .any(|entry| entry.starts_with("MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT="))
+        {
+            entries.push("MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT=on".to_owned());
+        }
+        entries
+    }
+
+    /// Whether `entries` reconstruct `recorded` names: every recorded name is supplied,
+    /// and the only extra name allowed is the synthesized Muse ultra gate.
+    fn environment_reconstructs(
+        record: &AgentRecord,
+        entries: &[String],
+        recorded: &[String],
+    ) -> bool {
+        let have: BTreeSet<String> = environment_names(entries).into_iter().collect();
+        let want: BTreeSet<String> = recorded.iter().cloned().collect();
+        want.is_subset(&have)
+            && have.difference(&want).all(|name| {
+                record.harness == "muse"
+                    && record.reasoning_effort.as_deref() == Some("ultra")
+                    && name == "MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT"
+            })
+    }
+
     fn revive_launch_plan(
         &self,
         record: &AgentRecord,
@@ -1594,17 +1630,18 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             let profile = profiles
                 .get(profile_name)
                 .ok_or_else(|| fail("recorded launch profile is unavailable"))?;
+            let entries = Self::relaunch_environment(record, profile);
             if profile.harness != record.harness
                 || profile.mode != record.mode
                 || profile.model != record.model
                 || profile.reasoning_effort != record.reasoning_effort
                 || profile.argv != extras
-                || environment_names(&profile.environment) != record.environment_names
+                || !Self::environment_reconstructs(record, &entries, &record.environment_names)
                 || profile.cloud.is_some()
             {
                 return Err(fail("recorded launch profile changed (harness, mode, model, effort, argv, or environment names)"));
             }
-            options.environment = profile.environment.clone();
+            options.environment = entries;
             options.harness_args = profile.argv.clone();
         } else {
             if !record.environment_names.is_empty() {
@@ -1702,12 +1739,13 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             let profile = profiles
                 .get(profile_name)
                 .ok_or_else(|| fail("recorded launch profile is unavailable"))?;
-            if environment_names(&profile.environment) != names {
+            let entries = Self::relaunch_environment(record, profile);
+            if !Self::environment_reconstructs(record, &entries, &names) {
                 return Err(fail(
                     "recorded environment names cannot be reconstructed from the private launch profile",
                 ));
             }
-            options.environment = profile.environment.clone();
+            options.environment = entries;
         }
         let argv = spec_arguments(record).unwrap_or_default();
         let arguments = if fresh_revive(record).is_some() {
@@ -4476,7 +4514,18 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             structured.extend(["-c".to_owned(), "allow_login_shell=false".to_owned()]);
         }
         let argv = harness_arguments(&record.harness, profile.model.as_deref(), None, &structured)?;
-        let names = environment_names(&profile.environment);
+        let mut names = environment_names(&profile.environment);
+        // As `start` does (#1216): an ultra Muse profile carries its synthesized gate
+        // name, even when the profile's env does not declare it.
+        if record.harness == "muse"
+            && profile.reasoning_effort.as_deref() == Some("ultra")
+            && !names
+                .iter()
+                .any(|name| name == "MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT")
+        {
+            names.push("MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT".to_owned());
+            names.sort();
+        }
         let old_spec = record.launch_spec.as_ref();
         let session = old_spec
             .and_then(|spec| spec["native_session"]["value"].as_str().map(str::to_owned))

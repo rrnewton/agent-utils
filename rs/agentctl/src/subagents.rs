@@ -11188,6 +11188,24 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }))
     }
 
+    /// Names only, never values: the effective launch environment keys a relaunch of
+    /// `record` would apply (#1412 revive-profile-env).
+    fn launch_env_keys(&self, record: &AgentRecord) -> Vec<String> {
+        let mut keys: BTreeSet<String> = record.environment_names.iter().cloned().collect();
+        if record.harness == "muse" && record.reasoning_effort.as_deref() == Some("ultra") {
+            keys.insert("MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT".to_owned());
+        }
+        if let Ok(Some(launch_env)) = self.project_launch_env() {
+            if launch_env.env_file.is_some() {
+                keys.insert("BASH_ENV".to_owned());
+            }
+            if !launch_env.path_prepend.is_empty() {
+                keys.insert("PATH".to_owned());
+            }
+        }
+        keys.into_iter().collect()
+    }
+
     /// Report live state or an explicit probe error without reaping durable records.
     pub fn status(&self, agent_name: &str) -> Result<Value> {
         let record = self.load(agent_name)?;
@@ -11584,6 +11602,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         let agent_name = &record.name;
         let mut result = self.record_row(record)?;
+        result["launch_env_keys"] = json!(self.launch_env_keys(record));
         match self.pending_move_destination(record) {
             Ok(Some(destination)) => {
                 result["agent_status"] = json!("unknown");
@@ -12414,6 +12433,17 @@ its drain would also type, so it was not queued",
     pub fn restart_with_resume(&self, agent_name: &str) -> Result<String> {
         let _lock = self.lock(agent_name)?;
         let record = self.load(agent_name)?;
+        // A same-pane relaunch cannot re-apply a recorded launch environment: the tab's
+        // environment died with its original shell, and typing the values would put them
+        // in scrollback (#1139, #1412). Refuse before anything is ended, naming the
+        // fresh-tab relaunch that does apply it.
+        if !record.environment_names.is_empty() {
+            return Err(fail(format!(
+                "agent {agent_name} carries a recorded launch environment ({}), which a same-pane restart cannot re-apply; use `agentctl restart {agent_name}` so it relaunches in a fresh tab with that environment",
+                record.environment_names.join(", ")
+            )));
+        }
+        let launch_env = self.project_launch_env()?;
         let pane_id = record
             .pane_id
             .clone()
@@ -12449,6 +12479,16 @@ its drain would also type, so it was not queued",
         let mut arguments = before;
         arguments.extend(record.arguments.iter().cloned());
         arguments.extend(after);
+        // The registry launch environment goes into the pane shell before the harness
+        // line, as at start (#1412); a no-environment record in a no-launch-env
+        // registry types nothing.
+        if let Some(launch_env) = launch_env.as_ref() {
+            self.client.prepare_launch_shell(
+                &pane_id,
+                &launch_env.shell_line(),
+                Duration::from_secs(60),
+            )?;
+        }
         let mut pinned: Option<crate::client::CustomProcessIdentity> = None;
         self.client.start_pane_agent(
             agent_name,
@@ -17453,6 +17493,7 @@ pub(crate) mod tests {
             _: Duration,
         ) -> AdapterResult<bool> {
             self.ended.lock().unwrap().push(identity.pid);
+            self.started.store(false, Ordering::Relaxed);
             if self.linger_after_exit.load(Ordering::Relaxed) {
                 let panes: Vec<String> = self
                     .custom_processes

@@ -19,7 +19,7 @@ from typing import cast
 from agentctl import agent, launch_spec, registry_layout, sender_header
 from agentctl.client import AgentPaneInfo, CustomProcessIdentity, HerdrClient, Pane, herdr_error_code
 from agentctl.errors import AgentDeliveryError, HerdrRunError, HerdrUnavailable, RecoveryAction, _with_recovery
-from agentctl.profiles import configuration_root, load_profiles, reasoning_arguments, validate_structured_harness_argument_conflicts
+from agentctl.profiles import LaunchProfile, configuration_root, load_profiles, reasoning_arguments, validate_structured_harness_argument_conflicts
 from agentctl.subagents import (
     AgentRecord, ManagedAgents, _MAX_AGENT_RECORD_BYTES, _NAME, _SHA256,
     _PinnedAgentDirectory, _missing_target, _name, _native_session,
@@ -286,6 +286,29 @@ def _expected_arguments(record: AgentRecord) -> tuple[str, ...]:
         extra=(*reasoning_arguments(record.harness, record.reasoning_effort), *_extras(record)))
 
 
+_ULTRA_GATE = "MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT"
+
+
+def _relaunch_environment(record: AgentRecord, selected: LaunchProfile) -> tuple[str, ...]:
+    """The profile's entries plus the Muse ultra gate agentctl synthesizes at start
+    for an ultra effort (#1216), which the recorded names may carry without it."""
+    entries = list(selected.environment)
+    if (record.harness == "muse" and record.reasoning_effort == "ultra"
+            and not any(entry.startswith(_ULTRA_GATE + "=") for entry in entries)):
+        entries.append(f"{_ULTRA_GATE}=on")
+    return tuple(entries)
+
+
+def _environment_reconstructs(record: AgentRecord, entries: tuple[str, ...], recorded: list[str]) -> bool:
+    """Every recorded name is supplied; the only extra name is the synthesized gate."""
+    have = {entry.partition("=")[0] for entry in entries}
+    want = set(recorded)
+    return want <= have and all(
+        name == _ULTRA_GATE and record.harness == "muse" and record.reasoning_effort == "ultra"
+        for name in have - want
+    )
+
+
 def _spec_environment(manager: ManagedAgents, record: AgentRecord, spec: dict[str, object]) -> tuple[str, ...]:
     """Literal environment entries for the spec's names, read again from its private profile."""
     names = cast(list[str], spec["environment_names"])
@@ -299,9 +322,10 @@ def _spec_environment(manager: ManagedAgents, record: AgentRecord, spec: dict[st
     selected = profiles.get(profile)
     if selected is None:
         raise AgentDeliveryError("recorded launch profile is missing")
-    if sorted({entry.partition("=")[0] for entry in selected.environment}) != names:
+    entries = _relaunch_environment(record, selected)
+    if not _environment_reconstructs(record, entries, names):
         raise AgentDeliveryError("recorded environment names cannot be reconstructed from the private launch profile")
-    return selected.environment
+    return entries
 
 
 @dataclass(frozen=True)
@@ -359,8 +383,8 @@ def _policy(manager: ManagedAgents, record: AgentRecord) -> _LaunchPolicy:
                     or selected.model != record.model or selected.reasoning_effort != record.reasoning_effort
                     or selected.argv != extra):
                 raise AgentDeliveryError("recorded launch profile policy changed (harness, mode, model, effort, or arguments)")
-            environment = selected.environment
-        if sorted({entry.partition("=")[0] for entry in environment}) != sorted(record.environment_names):
+            environment = _relaunch_environment(record, selected)
+        if not _environment_reconstructs(record, environment, sorted(record.environment_names)):
             raise AgentDeliveryError("recorded environment names cannot be reconstructed from the private launch profile")
     arguments = _expected_arguments(record)
     slot_command = relay_command = relay_executable = healed_slot_project = None
