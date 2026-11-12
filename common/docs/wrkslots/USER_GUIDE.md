@@ -37,8 +37,11 @@ type, task and purpose, owner process identity, coordinator history, heartbeat t
    landed (exact SHA or same patch-id on the landed ref), open (published to a remote-tracking
    ref), or unaccounted, printing the counts and any unaccounted SHAs. It refuses while anything
    is unaccounted unless `--discard-unaccounted` bundles the discarded history into the local
-   salvage archive and records the SHAs in the handoff. A departed owner is not required to
-   return: later reclaim can salvage from the recorded checkout state.
+   salvage archive and records the SHAs in the handoff. Untracked or ignored output the
+   create hooks made is not dirty work: create records it (paths in submodule checkouts
+   included; large trees by fingerprint, not per-file hashes), finish tolerates it while
+   unchanged, and `provisioned_allowlist` covers output with no snapshot. A departed owner
+   is not required to return: later reclaim can salvage from the recorded checkout state.
 5. Any later participant may run `remove`. Reclaim proceeds only when the heartbeat time-to-live is
    expired, the row's liveness authority reports dead (the registered running command for an agent
    slot, the validation run's own evidence for a validation slot; see "Time-to-live and process

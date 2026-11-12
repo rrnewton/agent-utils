@@ -1279,6 +1279,22 @@ fn create_slot_inner(
     if let Some(author) = &author {
         apply_author(&cfg.root, &created, author, &journal_path)?;
     }
+    // Record what provisioning made, so finish can tell build output
+    // from dirty work (#1369).
+    for checkout in created.iter_mut() {
+        let path = cfg.root.join(
+            checkout
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+        let entries = crate::finish_write::snapshot_provisioned(&path)?;
+        if !entries.is_empty() {
+            if let Some(object) = checkout.as_object_mut() {
+                object.insert("provisioned".to_string(), Value::Array(entries));
+            }
+        }
+    }
     heartbeat_at = utc_now();
     write_journal(
         &cfg,

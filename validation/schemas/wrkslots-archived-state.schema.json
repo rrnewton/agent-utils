@@ -180,6 +180,13 @@
           "description": "Path relative to the slot directory.",
           "type": "string"
         },
+        "provisioned": {
+          "description": "Untracked/ignored paths the create hooks made (#1369).",
+          "items": {
+            "$ref": "#/$defs/ProvisionedPath"
+          },
+          "type": "array"
+        },
         "remote": {
           "description": "Remote name.",
           "type": "string"
@@ -323,6 +330,65 @@
           "type": "string"
         }
       ]
+    },
+    "ProvisionedPath": {
+      "additionalProperties": false,
+      "description": "One path provisioning made in a checkout, recorded at create (#1369).",
+      "properties": {
+        "file_count": {
+          "description": "Large-directory fingerprint: file count.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "file, symlink, or directory.",
+          "type": "string"
+        },
+        "max_mtime_ns": {
+          "description": "Large-directory fingerprint: newest mtime (ns).",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "Path relative to the checkout root.",
+          "type": "string"
+        },
+        "sha256": {
+          "description": "Content or manifest hash (small paths only).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "target": {
+          "description": "Symlink target.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "total_bytes": {
+          "description": "Large-directory fingerprint: total bytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "kind"
+      ],
+      "type": "object"
     },
     "SlotType": {
       "description": "Slot kind.",

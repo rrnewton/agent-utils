@@ -479,6 +479,43 @@ def test_finish_accounting_unaccounted_both_editions(tmp_path: Path) -> None:
     assert "unaccounted=1" in result.stderr
 
 
+def _add_provisioned_symlink(root: Path) -> None:
+    checkout = root / "worktrees" / "slot-a" / "repo"
+    (checkout / "provisioned-link").symlink_to("file.txt")
+    entry = wrkslots_cli._describe_provisioned(checkout, "provisioned-link")
+    active = root / "worktrees" / "ACTIVE.node-a.json"
+    doc: dict[str, object] = json.loads(active.read_text())
+    record = cast(list[dict[str, object]], doc["slots"])[0]
+    cast(list[dict[str, object]], record["checkouts"])[0]["provisioned"] = [
+        wrkslots_cli._provisioned_to_obj(entry)
+    ]
+    active.write_text(json.dumps(doc))
+
+
+def test_finish_provisioned_symlink_both_editions(tmp_path: Path) -> None:
+    rust_root, oracle_root = _pair(tmp_path)
+    for root in (rust_root, oracle_root):
+        _add_provisioned_symlink(root)
+    assert _python_finish(oracle_root) == 0
+    result = _rust_finish(rust_root)
+    assert result.returncode == 0, result.stderr
+
+
+def test_finish_provisioned_changed_both_editions(tmp_path: Path) -> None:
+    rust_root, oracle_root = _pair(tmp_path)
+    for root in (rust_root, oracle_root):
+        _add_provisioned_symlink(root)
+        link = root / "worktrees" / "slot-a" / "repo" / "provisioned-link"
+        link.unlink()
+        link.symlink_to("other.txt")
+    with pytest.raises(Exception) as caught:
+        _python_finish(oracle_root)
+    assert "provisioned path changed" in str(caught.value)
+    result = _rust_finish(rust_root)
+    assert result.returncode == 1
+    assert "provisioned path changed" in result.stderr
+
+
 def test_finish_accounting_discard_both_editions(tmp_path: Path) -> None:
     (rust_root, _rust_up, rust_co), (oracle_root, _oracle_up, oracle_co) = _bare_pair(tmp_path)
     commits = {}

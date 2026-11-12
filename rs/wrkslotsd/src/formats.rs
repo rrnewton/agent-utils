@@ -41,6 +41,31 @@ pub struct ProcessIdentity {
     pub cgroup_path: String,
 }
 
+/// One path provisioning made in a checkout, recorded at create (#1369).
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvisionedPath {
+    /// Path relative to the checkout root.
+    pub path: String,
+    /// file, symlink, or directory.
+    pub kind: String,
+    /// Content or manifest hash (small paths only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// Symlink target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Large-directory fingerprint: file count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_count: Option<u64>,
+    /// Large-directory fingerprint: total bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    /// Large-directory fingerprint: newest mtime (ns).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_mtime_ns: Option<i64>,
+}
+
 /// One checkout of a slot.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -70,6 +95,9 @@ pub struct Checkout {
     pub containing_remote_refs: Vec<String>,
     /// Version-control system; currently always `git`.
     pub vcs: Vcs,
+    /// Untracked/ignored paths the create hooks made (#1369).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provisioned: Vec<ProvisionedPath>,
 }
 
 /// The handoff summary embedded in an active record.

@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-finish-commit-accounting: finish accounts for every branch commit'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-11-12T12:15:00.000000000+00:00
@@ -54,3 +54,8 @@ nested worktrees inside a slot were invisible until removal tripped over them.
 
 [watermelon-full-preview] Number reserved by coordb. No pre-existing finish-accounting
 issue existed in `.minibeads/issues` when filed (title search, 2026-11-12).
+
+## Resolution
+
+[watermelon-full-preview] Landed as c88e65a5 on github/main. Gate: every wrkslots step
+passed; the sole red was an unrelated agentctl tmux /proc race, green on solo rerun.

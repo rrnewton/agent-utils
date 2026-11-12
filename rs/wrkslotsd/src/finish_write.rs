@@ -1156,6 +1156,267 @@ fn status_outside_paths(status: &str, prefixes: &[String]) -> String {
     }
 }
 
+const PROVISIONED_EXACT_BYTES: u64 = 16 * 1024 * 1024;
+const PROVISIONED_EXACT_FILES: u64 = 512;
+
+fn sha256_regular(path: &Path) -> Result<String> {
+    let bytes =
+        std::fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let mut digest = Sha256::new();
+    digest.update(&bytes);
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn mtime_ns(metadata: &std::fs::Metadata) -> i64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos() as i64)
+        .unwrap_or(0)
+}
+
+/// Describe one provisioned path exactly as the record stores it (#1369).
+pub(crate) fn describe_provisioned(base: &Path, relative: &str) -> Result<Value> {
+    let target = base.join(relative);
+    let metadata = std::fs::symlink_metadata(&target)
+        .map_err(|error| format!("cannot inspect {}: {error}", target.display()))?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        let dest = std::fs::read_link(&target)
+            .map_err(|error| format!("cannot read link {}: {error}", target.display()))?;
+        return Ok(json!({"path": relative, "kind": "symlink", "target": dest.to_string_lossy()}));
+    }
+    if file_type.is_dir() {
+        let mut lines: Vec<String> = Vec::new();
+        let mut file_count: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        let mut max_mtime: i64 = 0;
+        // Match the Python walk: each directory's sorted entries in
+        // walk (breadth) order, directories queued in sorted order.
+        let mut queue: std::collections::VecDeque<PathBuf> =
+            std::collections::VecDeque::from([target.clone()]);
+        while let Some(directory) = queue.pop_front() {
+            let mut names: Vec<PathBuf> = Vec::new();
+            for entry in std::fs::read_dir(&directory)
+                .map_err(|error| format!("cannot list {}: {error}", directory.display()))?
+            {
+                names.push(entry.map_err(|error| error.to_string())?.path());
+            }
+            names.sort();
+            for child in names {
+                let child_meta = std::fs::symlink_metadata(&child)
+                    .map_err(|error| format!("cannot inspect {}: {error}", child.display()))?;
+                max_mtime = max_mtime.max(mtime_ns(&child_meta));
+                let rel = child
+                    .strip_prefix(base)
+                    .map(|path| path.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_default();
+                let kind = child_meta.file_type();
+                if kind.is_symlink() {
+                    let dest = std::fs::read_link(&child).map_err(|error| {
+                        format!("cannot read link {}: {error}", child.display())
+                    })?;
+                    lines.push(format!("{rel}\nsymlink\n{}", dest.to_string_lossy()));
+                } else if kind.is_dir() {
+                    lines.push(format!("{rel}\ndirectory"));
+                    queue.push_back(child);
+                } else if kind.is_file() {
+                    file_count += 1;
+                    total_bytes += child_meta.len();
+                    lines.push(format!("{rel}\nfile\n{}", sha256_regular(&child)?));
+                } else {
+                    lines.push(format!("{rel}\nother"));
+                }
+            }
+        }
+        let mut digest = Sha256::new();
+        digest.update(lines.join("\n").as_bytes());
+        if file_count <= PROVISIONED_EXACT_FILES && total_bytes <= PROVISIONED_EXACT_BYTES {
+            return Ok(
+                json!({"path": relative, "kind": "directory", "sha256": format!("{:x}", digest.finalize())}),
+            );
+        }
+        return Ok(json!({
+            "path": relative,
+            "kind": "directory",
+            "file_count": file_count,
+            "total_bytes": total_bytes,
+            "max_mtime_ns": max_mtime,
+        }));
+    }
+    if file_type.is_file() {
+        return Ok(json!({"path": relative, "kind": "file", "sha256": sha256_regular(&target)?}));
+    }
+    Ok(json!({"path": relative, "kind": "file", "sha256": "other"}))
+}
+
+fn gitlink_paths(path: &Path) -> Result<Vec<String>> {
+    let mut found: Vec<String> = Vec::new();
+    for args in [
+        vec!["ls-files", "--stage", "-z"],
+        vec!["ls-tree", "-r", "-z", "HEAD"],
+    ] {
+        let output = git(path, &args)?;
+        for record in output.split('\0') {
+            if record.is_empty() {
+                continue;
+            }
+            if let Some((metadata, sub_path)) = record.split_once('\t') {
+                if metadata.starts_with("160000 ") && !found.iter().any(|item| item == sub_path) {
+                    found.push(sub_path.to_string());
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+pub(crate) fn initialized_submodules(path: &Path) -> Result<Vec<String>> {
+    let mut result: Vec<String> = Vec::new();
+    let mut queue: Vec<String> = gitlink_paths(path)?;
+    let mut index = 0;
+    while index < queue.len() {
+        let relative = queue[index].clone();
+        index += 1;
+        let nested = path.join(&relative);
+        if !nested.join(".git").exists() {
+            continue;
+        }
+        result.push(relative.clone());
+        for child in gitlink_paths(&nested)? {
+            queue.push(format!("{relative}/{child}"));
+        }
+    }
+    Ok(result)
+}
+
+/// Record every untracked/ignored path provisioning made (#1369).
+pub(crate) fn snapshot_provisioned(path: &Path) -> Result<Vec<Value>> {
+    let mut roots: Vec<(String, PathBuf)> = vec![(String::new(), path.to_path_buf())];
+    for submodule in initialized_submodules(path)? {
+        roots.push((submodule.clone(), path.join(submodule)));
+    }
+    let mut entries: Vec<Value> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for (prefix, root) in roots {
+        let status = git(
+            &root,
+            &[
+                "status",
+                "--porcelain=v2",
+                "--untracked-files=all",
+                "--ignored=matching",
+                "--",
+                ".",
+            ],
+        )?;
+        for line in status.lines() {
+            if !line.starts_with("? ") && !line.starts_with("! ") {
+                continue;
+            }
+            let Some(found) = status_line_path(line) else {
+                continue;
+            };
+            let relative = if prefix.is_empty() {
+                found.trim_end_matches('/').to_string()
+            } else {
+                format!("{prefix}/{}", found.trim_end_matches('/'))
+            };
+            if seen.contains(&relative) {
+                continue;
+            }
+            if let Ok(entry) = describe_provisioned(path, &relative) {
+                seen.push(relative);
+                entries.push(entry);
+            }
+        }
+    }
+    entries.sort_by(|left, right| {
+        left.get("path")
+            .and_then(Value::as_str)
+            .cmp(&right.get("path").and_then(Value::as_str))
+    });
+    Ok(entries)
+}
+
+pub(crate) fn provisioned_unchanged(path: &Path, entry: &Value) -> bool {
+    let Some(relative) = entry.get("path").and_then(Value::as_str) else {
+        return false;
+    };
+    describe_provisioned(path, relative)
+        .map(|current| current == *entry)
+        .unwrap_or(false)
+}
+
+fn status_line_path(line: &str) -> Option<String> {
+    if let Some(rest) = line.strip_prefix("? ").or_else(|| line.strip_prefix("! ")) {
+        return Some(rest.to_string());
+    }
+    if line.starts_with("1 ") || line.starts_with("2 ") {
+        return line
+            .splitn(9, ' ')
+            .nth(8)
+            .map(|value| value.split('\t').next().unwrap_or_default().to_string());
+    }
+    if line.starts_with("u ") {
+        return line
+            .splitn(11, ' ')
+            .nth(10)
+            .map(|value| value.split('\t').next().unwrap_or_default().to_string());
+    }
+    None
+}
+
+/// Drop status lines covered by tolerated provisioned paths (#1369).
+pub(crate) fn status_outside_provisioned(
+    status: &str,
+    tolerated: &[String],
+    allowlist: &[String],
+) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    for line in status.lines() {
+        let Some(found) = status_line_path(line) else {
+            kept.push(line);
+            continue;
+        };
+        let clean = found.trim_end_matches('/');
+        let mut covered = tolerated.iter().any(|item| {
+            clean == item
+                || clean.starts_with(&format!("{}/", item.trim_end_matches('/')))
+                || item.starts_with(&format!("{clean}/"))
+        });
+        if !covered {
+            let parts: Vec<String> = clean
+                .split('/')
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect();
+            'patterns: for pattern in allowlist {
+                let pattern_parts: Vec<String> = pattern
+                    .split('/')
+                    .filter(|part| !part.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                for end in 1..=parts.len() {
+                    if glob_parts_match(&pattern_parts, &parts[..end]) {
+                        covered = true;
+                        break 'patterns;
+                    }
+                }
+            }
+        }
+        if !covered {
+            kept.push(line);
+        }
+    }
+    if kept.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", kept.join("\n"))
+    }
+}
+
 fn unpushed_refusal(checkout_path: &Path, checkout: &Value, head: &str) -> Result<String> {
     let name = checkout
         .get("name")
@@ -1368,6 +1629,42 @@ pub(crate) fn assert_checkout_safe_accounting(
         }
         if !prefixes.is_empty() {
             status = status_outside_paths(&status, &prefixes);
+        }
+    }
+    let provisioned: Vec<Value> = checkout
+        .get("provisioned")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let allowlist: Vec<String> = config
+        .get("provisioned_allowlist")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !status.is_empty() && (!provisioned.is_empty() || !allowlist.is_empty()) {
+        let tolerated: Vec<String> = provisioned
+            .iter()
+            .filter(|entry| provisioned_unchanged(&path, entry))
+            .filter_map(|entry| {
+                entry
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        status = status_outside_provisioned(&status, &tolerated, &allowlist);
+    }
+    for entry in &provisioned {
+        if !provisioned_unchanged(&path, entry) {
+            return Err(format!(
+                "checkout {name} provisioned path changed: {}; restore the provisioning output or remove it before finishing",
+                entry.get("path").and_then(Value::as_str).unwrap_or_default()
+            ));
         }
     }
     if !status.is_empty() {

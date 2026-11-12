@@ -302,7 +302,7 @@ pub(crate) fn checkout_from_obj(value: &Value, label: &str) -> Result<CheckoutRe
             "containing_remote_refs",
             "vcs",
         ],
-        &[],
+        &["provisioned"],
         label,
     )?;
     let name = as_str(&raw["name"], &format!("{label}.name"))?.to_owned();

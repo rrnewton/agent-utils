@@ -31,7 +31,7 @@ const REQUIRED: [&str; 6] = [
     "heartbeat_ttl_seconds",
     "liveness_command",
 ];
-const OPTIONAL: [&str; 23] = [
+const OPTIONAL: [&str; 24] = [
     "machine",
     "liveness_batch_command",
     "max_active_slots",
@@ -44,6 +44,7 @@ const OPTIONAL: [&str; 23] = [
     "salvage_push_remotes",
     "ttl_rescue_ref_root",
     "reclaimable_ignored_paths",
+    "provisioned_allowlist",
     "disk_advisory_bytes",
     "disk_provisioning_floor_bytes",
     "disk_emergency_bytes",
@@ -1489,6 +1490,16 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
             true,
         )?,
     };
+    let provisioned_allowlist = match raw.get("provisioned_allowlist") {
+        None => Vec::new(),
+        Some(value) => string_tuple(
+            value,
+            "configuration.provisioned_allowlist",
+            validate_cache_glob,
+            true,
+        )
+        .map_err(|error| format!("configuration.provisioned_allowlist: {error}"))?,
+    };
     let reclaimable = match raw.get("reclaimable_ignored_paths") {
         None => Vec::new(),
         Some(value) => string_tuple(
@@ -1630,6 +1641,7 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
         "post_provision_hooks": hooks,
         "post_provision_hook_slot_types": hook_slot_types,
         "reclaimable_ignored_paths": reclaimable,
+        "provisioned_allowlist": provisioned_allowlist,
         "repo_cache_globs": repo_cache_globs.iter().map(|(name, globs)| json!([name, globs])).collect::<Vec<_>>(),
         "retire_freeze": raw.get("retire_freeze").cloned().unwrap_or(Value::Null),
         "root": root.to_string_lossy(),

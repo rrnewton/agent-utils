@@ -560,6 +560,7 @@ OPTIONAL_CONFIG_KEYS = frozenset(
         "salvage_push_remotes",
         "ttl_rescue_ref_root",
         "reclaimable_ignored_paths",
+        "provisioned_allowlist",
         "disk_advisory_bytes",
         "disk_provisioning_floor_bytes",
         "disk_emergency_bytes",
@@ -692,6 +693,13 @@ CONFIG_KEY_DOCS: dict[str, str] = {
         "validation checkout whose only residue is ignored regular files inside these "
         "subtrees still counts as pristine; any other ignored file, a symlink, or nested "
         "Git data keeps it preserved. Absent or empty: any ignored file keeps it preserved."
+    ),
+    "provisioned_allowlist": (
+        "Checkout-relative paths or globs of provisioning output that finish tolerates "
+        "without a create-time snapshot: removable build output, never dirty work. This "
+        "is the escape hatch and the only fallback for slots created before create "
+        "recorded a provisioning snapshot; it is weaker than the snapshot because no "
+        "content is compared. Absent or empty: only the recorded snapshot is tolerated."
     ),
     "disk_advisory_bytes": (
         "Free-space level (bytes) below which create warns. The three disk_* keys are set "
@@ -1305,6 +1313,8 @@ class Config:
     ttl_rescue_ref_root: str = "refs/rescue"
     #: Checkout-relative build-output subtrees that leave a frozen clone pristine.
     reclaimable_ignored_paths: tuple[str, ...] = ()
+    #: Provisioning output finish tolerates without a snapshot (#1369).
+    provisioned_allowlist: tuple[str, ...] = ()
     disk_advisory_bytes: int | None = None
     disk_provisioning_floor_bytes: int | None = None
     disk_emergency_bytes: int | None = None
@@ -1366,6 +1376,26 @@ class TaskScopeIdentity:
 
 
 @dataclasses.dataclass(frozen=True)
+class ProvisionedPath:
+    """One path provisioning made in a checkout, recorded at create (#1369).
+
+    ``kind`` is file, symlink, or directory. Files and small directories
+    carry ``sha256`` (for a directory, a hash of its exact recursive
+    manifest); a large directory carries only its fingerprint
+    (``file_count``, ``total_bytes``, ``max_mtime_ns``). A symlink
+    carries ``target``.
+    """
+
+    path: str
+    kind: str
+    sha256: str | None = None
+    target: str | None = None
+    file_count: int | None = None
+    total_bytes: int | None = None
+    max_mtime_ns: int | None = None
+
+
+@dataclasses.dataclass(frozen=True)
 class Checkout:
     """Durable Git identity and publication evidence for one checkout."""
 
@@ -1380,6 +1410,8 @@ class Checkout:
     head: str
     containing_remote_refs: tuple[str, ...] = ()
     vcs: str = "git"
+    #: Untracked/ignored paths the create hooks made (#1369).
+    provisioned: tuple[ProvisionedPath, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4220,6 +4252,8 @@ def _canonical_config_payload(value: Mapping[str, object]) -> dict[str, object]:
         canonical.pop("salvage_push_remotes")
     if canonical.get("reclaimable_ignored_paths") == []:
         canonical.pop("reclaimable_ignored_paths")
+    if canonical.get("provisioned_allowlist") == []:
+        canonical.pop("provisioned_allowlist")
     if canonical.get("slot_representation") == "worktree":
         canonical.pop("slot_representation")
     return canonical
@@ -4605,6 +4639,15 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
             _validate_reclaimable_ignored_path,
         )
     )
+    provisioned_allowlist = (
+        ()
+        if "provisioned_allowlist" not in raw
+        else _string_tuple(
+            raw["provisioned_allowlist"],
+            "configuration.provisioned_allowlist",
+            _validate_reclaimable_ignored_path,
+        )
+    )
     disk_keys = (
         "disk_advisory_bytes",
         "disk_provisioning_floor_bytes",
@@ -4673,6 +4716,7 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
             else "refs/rescue"
         ),
         reclaimable_ignored_paths=reclaimable_ignored_paths,
+        provisioned_allowlist=provisioned_allowlist,
         disk_advisory_bytes=disk_values[0],
         disk_provisioning_floor_bytes=disk_values[1],
         disk_emergency_bytes=disk_values[2],
@@ -7672,8 +7716,60 @@ def _import_source_from_obj(value: object, label: str) -> _ImportSource | None:
     return _ImportSource(source_format, path, file_sha256, row_sha256, status, row)
 
 
+def _provisioned_to_obj(entry: ProvisionedPath) -> dict[str, object]:
+    value: dict[str, object] = {"path": entry.path, "kind": entry.kind}
+    if entry.sha256 is not None:
+        value["sha256"] = entry.sha256
+    if entry.target is not None:
+        value["target"] = entry.target
+    if entry.file_count is not None:
+        value["file_count"] = entry.file_count
+    if entry.total_bytes is not None:
+        value["total_bytes"] = entry.total_bytes
+    if entry.max_mtime_ns is not None:
+        value["max_mtime_ns"] = entry.max_mtime_ns
+    return value
+
+
+def _provisioned_from_obj(value: object, label: str) -> ProvisionedPath:
+    raw = _as_mapping(value, label)
+    _exact_keys(
+        raw,
+        {"path", "kind"},
+        {"sha256", "target", "file_count", "total_bytes", "max_mtime_ns"},
+        label,
+    )
+    kind = _as_str(raw["kind"], f"{label}.kind")
+    if kind not in {"file", "symlink", "directory"}:
+        raise StateError(f"{label}.kind is invalid: {kind!r}")
+    sha256 = None if "sha256" not in raw else _as_str(raw["sha256"], f"{label}.sha256")
+    if sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        raise StateError(f"{label}.sha256 must be a lowercase SHA-256")
+    return ProvisionedPath(
+        path=_as_str(raw["path"], f"{label}.path"),
+        kind=kind,
+        sha256=sha256,
+        target=None if "target" not in raw else _as_str(raw["target"], f"{label}.target"),
+        file_count=(
+            None
+            if "file_count" not in raw
+            else _as_int(raw["file_count"], f"{label}.file_count", minimum=0)
+        ),
+        total_bytes=(
+            None
+            if "total_bytes" not in raw
+            else _as_int(raw["total_bytes"], f"{label}.total_bytes", minimum=0)
+        ),
+        max_mtime_ns=(
+            None
+            if "max_mtime_ns" not in raw
+            else _as_int(raw["max_mtime_ns"], f"{label}.max_mtime_ns", minimum=0)
+        ),
+    )
+
+
 def _checkout_to_obj(checkout: Checkout) -> dict[str, object]:
-    return {
+    value: dict[str, object] = {
         "name": checkout.name,
         "path": checkout.path,
         "repository": checkout.repository,
@@ -7686,6 +7782,11 @@ def _checkout_to_obj(checkout: Checkout) -> dict[str, object]:
         "containing_remote_refs": list(checkout.containing_remote_refs),
         "vcs": checkout.vcs,
     }
+    if checkout.provisioned:
+        value["provisioned"] = [
+            _provisioned_to_obj(item) for item in checkout.provisioned
+        ]
+    return value
 
 
 def _checkout_from_obj(value: object, label: str) -> Checkout:
@@ -7703,7 +7804,7 @@ def _checkout_from_obj(value: object, label: str) -> Checkout:
         "containing_remote_refs",
         "vcs",
     }
-    _exact_keys(raw, fields, set(), label)
+    _exact_keys(raw, fields, {"provisioned"}, label)
     checkout = Checkout(
         name=_as_str(raw["name"], f"{label}.name"),
         path=_as_str(raw["path"], f"{label}.path"),
@@ -7726,6 +7827,12 @@ def _checkout_from_obj(value: object, label: str) -> Checkout:
             )
         ),
         vcs=_as_str(raw["vcs"], f"{label}.vcs"),
+        provisioned=tuple(
+            _provisioned_from_obj(item, f"{label}.provisioned[{index}]")
+            for index, item in enumerate(
+                _as_list(raw.get("provisioned", []), f"{label}.provisioned")
+            )
+        ),
     )
     _validate_name(checkout.name, "checkout name")
     if checkout.vcs not in ("git", "eden"):
@@ -26203,6 +26310,19 @@ def _as_commit_pairs(value: object) -> list[tuple[str, str]]:
     return pairs
 
 
+def _status_line_path(line: str) -> str | None:
+    """The path of one porcelain-v2 status line, when it carries one."""
+    if line.startswith(("? ", "! ")):
+        return line[2:]
+    if line.startswith(("1 ", "2 ")):
+        parts = line.split(" ", 8)
+        return parts[8].split("\t")[0] if len(parts) == 9 else None
+    if line.startswith("u "):
+        parts = line.split(" ", 10)
+        return parts[10].split("\t")[0] if len(parts) == 11 else None
+    return None
+
+
 def _status_outside_paths(status: str, prefixes: Sequence[str]) -> str:
     """Drop porcelain-v2 status lines whose path lies under a prefix.
 
@@ -26211,23 +26331,152 @@ def _status_outside_paths(status: str, prefixes: Sequence[str]) -> str:
     """
     kept: list[str] = []
     for line in status.splitlines():
-        path: str | None = None
-        if line.startswith(("? ", "! ")):
-            path = line[2:]
-        elif line.startswith(("1 ", "2 ")):
-            parts = line.split(" ", 8)
-            if len(parts) == 9:
-                path = parts[8].split("\t")[0]
-        elif line.startswith("u "):
-            parts = line.split(" ", 10)
-            if len(parts) == 11:
-                path = parts[10].split("\t")[0]
+        path = _status_line_path(line)
         if path is not None and any(
             path == prefix or path.startswith(prefix.rstrip("/") + "/")
             for prefix in prefixes
         ):
             continue
         kept.append(line)
+    return "\n".join(kept) + ("\n" if kept else "")
+
+
+#: Above this size or file count a provisioned directory is fingerprinted,
+#: not hashed file by file (#1369): an exact manifest of a several-hundred-
+#: megabyte vendor tree at create and again at finish is too costly.
+_PROVISIONED_EXACT_BYTES = 16 * 1024 * 1024
+_PROVISIONED_EXACT_FILES = 512
+
+
+def _sha256_regular(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _describe_provisioned(base: Path, relative: str) -> ProvisionedPath:
+    """Describe one provisioned path exactly as the record stores it."""
+    target_path = base / relative
+    mode = os.lstat(target_path)
+    if stat.S_ISLNK(mode.st_mode):
+        return ProvisionedPath(
+            path=relative, kind="symlink", target=os.readlink(target_path)
+        )
+    if stat.S_ISDIR(mode.st_mode):
+        lines: list[str] = []
+        file_count = 0
+        total_bytes = 0
+        max_mtime = 0
+        for root, directories, files in os.walk(target_path):
+            directories.sort()
+            for name in sorted(directories + files):
+                child = Path(root) / name
+                child_mode = os.lstat(child)
+                child_rel = child.relative_to(base).as_posix()
+                max_mtime = max(max_mtime, child_mode.st_mtime_ns)
+                if stat.S_ISLNK(child_mode.st_mode):
+                    lines.append(f"{child_rel}\nsymlink\n{os.readlink(child)}")
+                elif stat.S_ISDIR(child_mode.st_mode):
+                    lines.append(f"{child_rel}\ndirectory")
+                elif stat.S_ISREG(child_mode.st_mode):
+                    file_count += 1
+                    total_bytes += child_mode.st_size
+                    lines.append(
+                        f"{child_rel}\nfile\n{_sha256_regular(child)}"
+                    )
+                else:
+                    lines.append(f"{child_rel}\nother")
+        if (
+            file_count <= _PROVISIONED_EXACT_FILES
+            and total_bytes <= _PROVISIONED_EXACT_BYTES
+        ):
+            digest = hashlib.sha256("\n".join(lines).encode()).hexdigest()
+            return ProvisionedPath(path=relative, kind="directory", sha256=digest)
+        return ProvisionedPath(
+            path=relative,
+            kind="directory",
+            file_count=file_count,
+            total_bytes=total_bytes,
+            max_mtime_ns=max_mtime,
+        )
+    if stat.S_ISREG(mode.st_mode):
+        return ProvisionedPath(
+            path=relative, kind="file", sha256=_sha256_regular(target_path)
+        )
+    return ProvisionedPath(path=relative, kind="file", sha256="other")
+
+
+def _snapshot_provisioned(
+    checkout: Checkout, path: Path, vcs: _GitVcs
+) -> tuple[ProvisionedPath, ...]:
+    """Record every untracked/ignored path provisioning made (#1369)."""
+    roots: list[tuple[str, Path]] = [("", path)]
+    for submodule in vcs.initialized_submodules(path):
+        roots.append((submodule, path / submodule))
+    entries: dict[str, ProvisionedPath] = {}
+    for prefix, root in roots:
+        status = vcs.status(root, ())
+        for line in status.splitlines():
+            if not line.startswith(("? ", "! ")):
+                continue
+            found = _status_line_path(line)
+            if not found:
+                continue
+            relative = f"{prefix}/{found}" if prefix else found
+            relative = relative.rstrip("/")
+            if relative in entries:
+                continue
+            try:
+                entries[relative] = _describe_provisioned(path, relative)
+            except OSError:
+                continue
+    return tuple(entries[key] for key in sorted(entries))
+
+
+def _provisioned_unchanged(path: Path, entry: ProvisionedPath) -> bool:
+    """Whether one recorded provisioned path is exactly as recorded."""
+    try:
+        current = _describe_provisioned(path, entry.path)
+    except OSError:
+        return False
+    return current == entry
+
+
+def _status_outside_provisioned(
+    status: str, tolerated: Sequence[str], allowlist: Sequence[str]
+) -> str:
+    """Drop status lines covered by tolerated provisioned paths (#1369).
+
+    A line is covered when its path equals or lies under a tolerated
+    recorded path, when it is a parent directory of one (a dirty
+    submodule marker), or when it matches a configured allowlist glob.
+    """
+    kept: list[str] = []
+    for line in status.splitlines():
+        found = _status_line_path(line)
+        if found is None:
+            kept.append(line)
+            continue
+        clean = found.rstrip("/")
+        covered = any(
+            clean == item or clean.startswith(item.rstrip("/") + "/")
+            or item.startswith(clean + "/")
+            for item in tolerated
+        )
+        if not covered:
+            parts = tuple(part for part in clean.split("/") if part)
+            for pattern in allowlist:
+                pattern_parts = _glob_pattern_parts(pattern)
+                if any(
+                    _glob_parts_match(pattern_parts, parts[:end])
+                    for end in range(1, len(parts) + 1)
+                ):
+                    covered = True
+                    break
+        if not covered:
+            kept.append(line)
     return "\n".join(kept) + ("\n" if kept else "")
 
 
@@ -26401,6 +26650,23 @@ def _assert_checkout_safe(
         ]
         if nested_prefixes:
             status = _status_outside_paths(status, nested_prefixes)
+    if status and (checkout.provisioned or config.provisioned_allowlist):
+        # Provisioning output is removable build output, not dirty work,
+        # while it is exactly as create recorded it (#1369).
+        tolerated = [
+            entry.path
+            for entry in checkout.provisioned
+            if _provisioned_unchanged(path, entry)
+        ]
+        status = _status_outside_provisioned(
+            status, tolerated, config.provisioned_allowlist
+        )
+    for entry in checkout.provisioned:
+        if not _provisioned_unchanged(path, entry):
+            raise Refusal(
+                f"checkout {checkout.name} provisioned path changed: {entry.path}; "
+                "restore the provisioning output or remove it before finishing"
+            )
     if status:
         first = status.splitlines()[0]
         raise Refusal(
@@ -26427,11 +26693,11 @@ def _assert_checkout_safe(
         # branch commit must be landed, open, or explicitly discarded by
         # the caller, who judges the collected entries. The unpushed
         # containment above is reused verbatim for the open class.
-        entry = _classify_checkout_commits(
+        acct_entry = _classify_checkout_commits(
             checkout, path, head, vcs, base=checkout.start_point
         )
         if accounting_sink is not None:
-            accounting_sink.append(entry)
+            accounting_sink.append(acct_entry)
         return dataclasses.replace(
             checkout,
             head=head,
@@ -36241,6 +36507,17 @@ def _cmd_create(args: argparse.Namespace) -> int:
             config, created, journal_path, hook_journal, event_writer=event_writer
         )
         _apply_slot_git_identity(config, created, journal_path)
+        # Record what provisioning made, so finish can tell build output
+        # from dirty work (#1369).
+        created = [
+            dataclasses.replace(
+                item,
+                provisioned=_snapshot_provisioned(
+                    item, _stored_path(config, item.path, "checkout path"), vcs
+                ),
+            )
+            for item in created
+        ]
         for checkout in created:
             _assert_checkout_identity_unchanged(config, checkout, vcs)
         _assert_create_processes(
@@ -59140,7 +59417,9 @@ def _verify_created_checkouts(
     never reported for an unverified slot.
     """
 
-    def check(name: str, path: Path) -> None:
+    untracked_only: set[str] = set()
+
+    def check(name: str, path: Path, checkout_root: Path) -> None:
         try:
             vcs.head(path)
         except Refusal as exc:
@@ -59153,12 +59432,28 @@ def _verify_created_checkouts(
         )
         # Untracked files are a provisioning outcome (a post-provision
         # hook may write them); only changes to tracked files can mean
-        # an unpopulated checkout or authored work at risk.
-        lines = [
+        # an unpopulated checkout or authored work at risk. A submodule
+        # whose own content is only such provisioning output is the same
+        # outcome in its parent, not a tracked change (#1369).
+        raw_lines = [
             line
             for line in status.splitlines()
             if line and "HANDOFF" not in line and not line.startswith("? ")
         ]
+        lines = [
+            line
+            for line in raw_lines
+            if _status_line_path(line) not in untracked_only
+        ]
+        if not raw_lines:
+            try:
+                relative = path.relative_to(checkout_root).as_posix()
+                parts = relative.split("/")
+                for start in range(len(parts)):
+                    untracked_only.add("/".join(parts[start:]))
+            except ValueError:
+                pass
+            return
         if not lines:
             return
         tracked = [
@@ -59210,7 +59505,7 @@ def _verify_created_checkouts(
         for name, repository_path in sorted(
             repositories, key=lambda item: len(item[1].parts), reverse=True
         ):
-            check(name, repository_path)
+            check(name, repository_path, path)
 
 
 def _recover_create(
@@ -59573,6 +59868,15 @@ def _recover_create(
     if hook_progress != total_hook_steps:
         raise StateError("create recovery did not complete its post-provision hooks")
     _apply_slot_git_identity(config, created, path)
+    created = [
+        dataclasses.replace(
+            item,
+            provisioned=_snapshot_provisioned(
+                item, _stored_path(config, item.path, "checkout path"), vcs
+            ),
+        )
+        for item in created
+    ]
     for checkout in created:
         _assert_checkout_identity_unchanged(config, checkout, vcs)
     record = ActiveRecord(
