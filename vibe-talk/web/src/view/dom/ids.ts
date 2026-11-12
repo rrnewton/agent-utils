@@ -118,6 +118,7 @@ export interface ElementById {
   "control-pane": HTMLDivElement;
   "discord-channel": HTMLSelectElement;
   "discord-log": HTMLOListElement;
+  "discuss-actions": HTMLDivElement;
   "discuss-answer": HTMLDivElement;
   "discuss-close": HTMLButtonElement;
   "discuss-covers": HTMLParagraphElement;
@@ -128,8 +129,10 @@ export interface ElementById {
   "discuss-menu-open": HTMLButtonElement;
   "discuss-open": HTMLButtonElement;
   "discuss-panel": HTMLDivElement;
+  "discuss-resize": HTMLDivElement;
   "discuss-retry": HTMLButtonElement;
   "discuss-scope": HTMLParagraphElement;
+  "discuss-sheet-toggle": HTMLButtonElement;
   "discuss-stamp": HTMLParagraphElement;
   "discuss-status": HTMLParagraphElement;
   "discuss-unmarkable": HTMLParagraphElement;

@@ -57,6 +57,13 @@ export interface DiscussViewDependencies {
   restoreMessages(ids: readonly string[]): Promise<unknown>;
   showError?(text: string): unknown;
   setStatus?(text: string): unknown;
+  /** `#1344 discuss-panel-resize`. The panel layout kept on this device, forwarded to the panel. */
+  storedWidth?(): number;
+  keepWidth?(px: number): void;
+  clampWidth?(value: unknown): number;
+  defaultWidth?: number;
+  storedSheetFull?(): boolean;
+  keepSheetFull?(full: boolean): void;
 }
 
 /** The Discuss view, as the page calls it. */
@@ -69,6 +76,14 @@ export interface DiscussView {
   open(): void;
   close(): void;
   isOpen(): boolean;
+  /** `#1344`. The overlay width in force, in CSS pixels. */
+  width(): number;
+  /** `#1344`. Put a width on the panel and keep it on the device. */
+  setWidth(px: unknown): void;
+  /** `#1344`. Whether the phone sheet stands at full height. */
+  sheetFull(): boolean;
+  /** `#1344`. Stand the phone sheet at full or half height and keep the choice. */
+  setSheetFull(full: boolean): void;
 }
 
 /** Make the Discuss view from the page's thunks. Nothing is looked up yet. */
@@ -149,6 +164,12 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     restoreMessages: deps.restoreMessages,
     showError: deps.showError,
     setStatus: deps.setStatus,
+    storedWidth: deps.storedWidth,
+    keepWidth: deps.keepWidth,
+    clampWidth: deps.clampWidth,
+    defaultWidth: deps.defaultWidth,
+    storedSheetFull: deps.storedSheetFull,
+    keepSheetFull: deps.keepSheetFull,
   });
 
   /** Where Discuss is aimed now: the open thread, else the channel in its current view. */
@@ -231,5 +252,9 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     open,
     close: () => panel.close(),
     isOpen: () => panel.isOpen(),
+    width: () => panel.width(),
+    setWidth: (px: unknown) => panel.setWidth(px),
+    sheetFull: () => panel.sheetFull(),
+    setSheetFull: (full: boolean) => panel.setSheetFull(full),
   };
 }

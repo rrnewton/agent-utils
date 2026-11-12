@@ -8,12 +8,14 @@ import {
   DEFAULT_CARD_MAX_LINES,
   DEFAULT_QUOTE_READ_PERCENT,
   DEFAULT_COLLAPSED_LINES,
+  DEFAULT_DISCUSS_WIDTH,
   DEFAULT_MSG_SCALE,
   DEFAULT_READING_CH,
   DEFAULT_TWO_COLUMN_SPLIT,
   clampCardMaxLines,
   clampQuoteReadPercent,
   clampCollapsedLines,
+  clampDiscussWidth,
   clampMsgScale,
   clampReadSpeed,
   clampReadingWidth,
@@ -181,6 +183,24 @@ export const DEVICE_SETTINGS = Object.freeze({
     read: (raw: string | null) => clampTwoColumnSplit(raw === null ? DEFAULT_TWO_COLUMN_SPLIT : raw),
     write: (pct: number) => String(pct),
   } satisfies DeviceSetting<number>,
+  /** `#1344 discuss-panel-resize`. The Discuss overlay's width on a desk, in CSS pixels, clamped
+   * (`clampDiscussWidth`). Per device, as the split is: a width chosen on this screen says nothing
+   * about another. A refused read is the wider default. */
+  discussWidth: {
+    key: "vibe-talk.voice.discuss-width",
+    read: (raw: string | null) => clampDiscussWidth(raw === null ? DEFAULT_DISCUSS_WIDTH : raw),
+    write: (px: number) => String(px),
+    refused: { value: DEFAULT_DISCUSS_WIDTH },
+  } satisfies DeviceSetting<number>,
+  /** `#1344 discuss-panel-resize` (owner reply 417). Whether the phone's Discuss sheet stands at
+   * full height: half until the reader maximizes it, and the choice sticks across close/reopen.
+   * Per device; a refused read is half. */
+  discussSheetFull: {
+    key: "vibe-talk.voice.discuss-sheet-full",
+    read: (raw: string | null) => raw === "1",
+    write: (full: boolean) => (full ? "1" : null),
+    refused: { value: false },
+  } satisfies DeviceSetting<boolean>,
   /** `#425 collapsed-lines`. The lines a fold shows, clamped. Synced. */
   collapsedLines: {
     key: "vibe-talk.voice.collapsed-lines",

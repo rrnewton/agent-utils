@@ -2,30 +2,38 @@
  *
  * An overlay in the outline pop-up's dress and values (21-documents.css): outside
  * #scroll-area, so it never scrolls away, never reflows the list and never resizes
- * the scroller; its own overflow carries a long answer. A bottom sheet on a phone;
- * on a desk (wide enough, with a fine pointer) a pop-out at the right. ALWAYS DARK,
- * in either colour scheme, for the outline pop-up's reason: it reads as an overlay,
- * a step away from the window under it. */
+ * the scroller; its own overflow carries a long answer. ALWAYS DARK, in either
+ * colour scheme, for the outline pop-up's reason: it reads as an overlay, a step
+ * away from the window under it.
+ *
+ * `#1344 discuss-panel-resize`. On a desk the overlay stands at the reader's kept
+ * width (`--discuss-width`, per device; wider by default than slice 1's 24rem),
+ * dragged by its left edge. On a phone it is a FULL-width bottom sheet at HALF
+ * height by default, so messages stay visible above it (owner reply 417: no
+ * decorations poking through around the edges); the header's Maximize stands it
+ * at full height, and that choice sticks (`data-sheet`, kept per device). */
 
 #discuss-panel {
   position: absolute;
-  left: calc(8px + env(safe-area-inset-left));
-  right: calc(8px + env(safe-area-inset-right));
-  bottom: 8px;
-  max-height: 70vh;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 50dvh;
   overflow-y: auto;
-  padding: 10px;
+  padding: 10px calc(10px + env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) calc(10px + env(safe-area-inset-left));
   border: 1px solid #3d4452;
-  border-radius: 8px;
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
   background: #1f232b;
   color: #e7e9ee;
-  box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 35%);
+  box-shadow: 0 -0.5rem 1.5rem rgb(0 0 0 / 35%);
   z-index: var(--z-modal);
 }
 
-body:has(#control-bar[data-placement="top"]) #discuss-panel {
-  top: calc(4.5rem + env(safe-area-inset-top));
-  bottom: auto;
+#discuss-panel[data-sheet="full"] {
+  /* The whole main area: the header stays on screen under the bar, which a
+   * viewport-tall box bottom-anchored inside the screen could not promise. */
+  height: 100%;
 }
 
 #discuss-panel[hidden] {
@@ -34,9 +42,46 @@ body:has(#control-bar[data-placement="top"]) #discuss-panel {
 
 @media (min-width: 900px) and (pointer: fine) {
   #discuss-panel {
+    position: absolute;
     left: auto;
-    width: min(24rem, calc(100vw - 16px));
+    right: calc(8px + env(safe-area-inset-right));
+    bottom: 8px;
+    width: min(var(--discuss-width, 560px), calc(100vw - 16px));
+    height: auto;
     max-height: calc(100vh - 6rem);
+    border-bottom: 1px solid #3d4452;
+    border-radius: 8px;
+    box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 35%);
+  }
+
+  body:has(#control-bar[data-placement="top"]) #discuss-panel {
+    top: calc(4.5rem + env(safe-area-inset-top));
+    bottom: auto;
+  }
+}
+
+/* The drag edge: a grip on the overlay's left edge (desk only; the phone sheet
+ * is full-width and has nothing to drag). It only draws the line and takes the
+ * focus; the drag itself is the panel's pointer handling in view/catchup. */
+#discuss-resize {
+  display: none;
+}
+
+@media (min-width: 900px) and (pointer: fine) {
+  #discuss-resize {
+    display: block;
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: 10px;
+    cursor: col-resize;
+    touch-action: none;
+  }
+
+  #discuss-resize:focus-visible {
+    outline: 2px solid #7ab3e3;
+    outline-offset: -2px;
   }
 }
 
@@ -51,8 +96,16 @@ body:has(#control-bar[data-placement="top"]) #discuss-panel {
   font-size: 1rem;
 }
 
-#discuss-close {
+/* Panel actions next to the title: sheet toggle, `#1346`'s Summarize, layout
+ * modes (`#1354`), then Close — one slot, so each joins without moving Close. */
+.discuss-actions {
   margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+
+#discuss-close,
+#discuss-sheet-toggle {
   padding: 4px 8px;
   cursor: pointer;
   background: #262c36;
@@ -60,6 +113,13 @@ body:has(#control-bar[data-placement="top"]) #discuss-panel {
   border: 1px solid #3d4452;
   border-radius: 6px;
   font: inherit;
+}
+
+/* The sheet toggle is the phone's control; a desk has the drag edge instead. */
+@media (min-width: 900px) and (pointer: fine) {
+  #discuss-sheet-toggle {
+    display: none;
+  }
 }
 
 #discuss-scope {
@@ -114,6 +174,7 @@ body:has(#control-bar[data-placement="top"]) #discuss-panel {
 
 .discuss-link:focus-visible,
 #discuss-close:focus-visible,
+#discuss-sheet-toggle:focus-visible,
 #discuss-mark-read:focus-visible,
 #discuss-mark-unread:focus-visible,
 #discuss-retry:focus-visible {
@@ -165,7 +226,8 @@ body:has(#control-bar[data-placement="top"]) #discuss-panel {
 /* On a phone the bar's strip is priced to its edge — the channel's name keeps
  * its room (the view picker's bargain in 18-control-bar.css) — so the bar
  * button gives way there and Discuss is carried by the action menu's item
- * instead. The panel itself is one, however it was opened. */
+ * instead. The panel itself is one, however it was opened. (`#1355
+ * phone-bar-discuss-slot` owns this rule's next shape; left as landed here.) */
 @media not ((min-width: 900px) and (pointer: fine)) {
   #discuss-open {
     display: none;

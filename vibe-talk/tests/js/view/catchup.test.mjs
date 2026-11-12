@@ -21,11 +21,16 @@ const { createDiscussView, formatStampLine, DISCUSS_UNAVAILABLE_HINT } = VIEW;
 // ---- fakes -----------------------------------------------------------------------------------
 
 function fakeElement(tagName = "div") {
+  const styleProps = {};
   const el = {
     tagName: tagName.toUpperCase(),
     children: [],
     listeners: {},
     attributes: {},
+    style: {
+      props: styleProps,
+      setProperty(name, value) { styleProps[name] = String(value); },
+    },
     hidden: false,
     disabled: false,
     className: "",
@@ -74,8 +79,14 @@ const IDS = [
   "discuss-open", "discuss-menu-open", "discuss-panel", "discuss-scope", "discuss-close", "discuss-status",
   "discuss-answer", "discuss-footer", "discuss-covers", "discuss-links",
   "discuss-mark-read", "discuss-mark-unread", "discuss-unmarkable",
-  "discuss-stamp", "discuss-retry",
+  "discuss-stamp", "discuss-retry", "discuss-actions", "discuss-resize", "discuss-sheet-toggle",
 ];
+
+/** Fire a non-click listener with a plain event carrying `props`. */
+function fire(el, type, props = {}) {
+  const ev = { target: el, preventDefault() {}, stopPropagation() {}, ...props };
+  for (const listener of [...(el.listeners[type] || [])]) listener(ev);
+}
 
 function answer(overrides = {}) {
   return {
@@ -104,6 +115,12 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
   els["discuss-footer"].hidden = true;
   els["discuss-retry"].hidden = true;
   const calls = { posts: [], dismiss: [], restore: [], jumps: [], errors: [], statuses: [] };
+  // `#1344`: the device's kept layout, in memory; the clamp mirrors the device setting's.
+  const kept = { width: null, keeps: [], sheetFull: false, sheetKeeps: [] };
+  const clampW = (value) => {
+    const px = Math.round(Number(value));
+    return Number.isFinite(px) ? Math.min(960, Math.max(320, px)) : 560;
+  };
   let currentSelection = selection;
   const deps = {
     byId: (id) => {
@@ -124,11 +141,17 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
     restoreMessages: async (ids) => { calls.restore.push(ids); },
     showError: (text) => calls.errors.push(text),
     setStatus: (text) => calls.statuses.push(text),
+    storedWidth: () => (kept.width === null ? 560 : kept.width),
+    keepWidth: (px) => { kept.width = px; kept.keeps.push(px); },
+    clampWidth: clampW,
+    defaultWidth: 560,
+    storedSheetFull: () => kept.sheetFull,
+    keepSheetFull: (full) => { kept.sheetFull = full; kept.sheetKeeps.push(full); },
   };
   const savedDocument = globalThis.document;
   globalThis.document = { createElement: (tag) => fakeElement(tag) };
   return {
-    els, calls, deps,
+    els, calls, deps, kept,
     setSelection(next) { currentSelection = next; },
     restore() {
       if (savedDocument === undefined) delete globalThis.document;
@@ -424,5 +447,79 @@ test("catchup: unavailable draws the menu item disabled too, and its click posts
     await flush();
     assert.deepEqual(fx.calls.posts, [], "an unavailable menu Discuss still posted");
     assert.equal(fx.els["discuss-panel"].hidden, true);
+  } finally { fx.restore(); }
+});
+
+// ---- 8. layout: kept width and sheet height (`#1344 discuss-panel-resize`) ----------------------
+
+test("catchup layout: the wider default stands until dragged; a kept width wins on reopen", async () => {
+  const fx = fixture();
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    assert.equal(view.width(), 560, "the wider default did not stand");
+    assert.equal(fx.els["discuss-panel"].style.props["--discuss-width"], "560px");
+    view.setWidth(700);
+    assert.equal(view.width(), 700);
+    assert.deepEqual(fx.kept.keeps, [700], "the chosen width was not kept");
+    view.close();
+    view.open();
+    await flush();
+    assert.equal(view.width(), 700, "the kept width did not survive close/reopen");
+    assert.equal(fx.els["discuss-panel"].style.props["--discuss-width"], "700px");
+    view.setWidth(10);
+    assert.equal(view.width(), 320, "a width under the floor was not clamped");
+    view.setWidth(5000);
+    assert.equal(view.width(), 960, "a width over the ceiling was not clamped");
+  } finally { fx.restore(); }
+});
+
+test("catchup layout: dragging the edge widens live and keeps once, at the end", async () => {
+  const fx = fixture();
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    const handle = fx.els["discuss-resize"];
+    fire(handle, "pointerdown", { clientX: 800, pointerId: 1 });
+    fire(handle, "pointermove", { clientX: 700, pointerId: 1 });
+    assert.equal(view.width(), 660, "dragging left did not widen the panel");
+    assert.deepEqual(fx.kept.keeps, [], "the width was kept mid-drag");
+    fire(handle, "pointerup", { pointerId: 1 });
+    assert.deepEqual(fx.kept.keeps, [660], "the dragged width was not kept at the end");
+    assert.equal(handle.getAttribute("aria-valuenow"), "660");
+    fire(handle, "keydown", { key: "ArrowRight" });
+    assert.equal(view.width(), 644, "ArrowRight did not narrow the panel");
+    assert.equal(fx.kept.keeps.at(-1), 644, "the keyed width was not kept");
+    fire(handle, "dblclick", {});
+    assert.equal(view.width(), 560, "a double-click did not restore the default");
+  } finally { fx.restore(); }
+});
+
+test("catchup layout: the sheet starts at half, Maximize sticks across close/reopen", async () => {
+  const fx = fixture();
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    assert.equal(view.sheetFull(), false, "the sheet did not start at half");
+    assert.equal(fx.els["discuss-panel"].getAttribute("data-sheet"), "half");
+    assert.equal(fx.els["discuss-sheet-toggle"].textContent, "Maximize");
+    click(fx.els["discuss-sheet-toggle"]);
+    assert.equal(view.sheetFull(), true, "Maximize did not stand the sheet full");
+    assert.equal(fx.els["discuss-panel"].getAttribute("data-sheet"), "full");
+    assert.equal(fx.els["discuss-sheet-toggle"].textContent, "Restore");
+    assert.deepEqual(fx.kept.sheetKeeps, [true], "the full height was not kept");
+    view.close();
+    view.open();
+    await flush();
+    assert.equal(view.sheetFull(), true, "the full height did not stick across close/reopen");
+    assert.equal(fx.els["discuss-panel"].getAttribute("data-sheet"), "full");
+    click(fx.els["discuss-sheet-toggle"]);
+    assert.equal(view.sheetFull(), false, "Restore did not return the sheet to half");
   } finally { fx.restore(); }
 });

@@ -5552,6 +5552,24 @@ const TUNING_BANDS = {
   DEFAULT_TWO_COLUMN_SPLIT: [40, 60,
     "half and half until the reader drags the separator (#1186 two-column-splitter), and it has " +
     "to be a split the drag is allowed to reach"],
+  MIN_DISCUSS_WIDTH: [240, 400,
+    "the narrowest the Discuss overlay may be dragged to (#1344 discuss-panel-resize): under a " +
+    "reading column the answer wraps to nothing, past it the floor leaves no desk to drag on"],
+  MAX_DISCUSS_WIDTH: [700, 1200,
+    "the widest the Discuss overlay may be dragged to (#1344 discuss-panel-resize): past it the " +
+    "panel stops being beside the list and becomes the page, and the stylesheet caps it at the window"],
+  DEFAULT_DISCUSS_WIDTH: [480, 640,
+    "wider than slice 1's 24rem until the reader drags the edge (#1344 discuss-panel-resize), " +
+    "and it has to be a width the drag is allowed to reach"],
+  FALLBACK_MIN_WIDTH: [240, 400,
+    "the panel's own floor where a host hands it no clamp (#1344 discuss-panel-resize): mirrors " +
+    "the device setting's, and a drift between them is a width one host allows and another refuses"],
+  FALLBACK_MAX_WIDTH: [700, 1200,
+    "the panel's own ceiling where a host hands it no clamp (#1344 discuss-panel-resize): " +
+    "mirrors the device setting's, for the same reason"],
+  FALLBACK_DEFAULT_WIDTH: [480, 640,
+    "the panel's own width where a host hands it no choice (#1344 discuss-panel-resize): " +
+    "mirrors the device setting's default"],
   MIN_COLUMN_PX: [200, 450,
     "the narrowest either column may be dragged to (#1186 two-column-splitter): under a couple " +
     "of hundred pixels no column holds a readable line, and past half the narrowest two-column " +

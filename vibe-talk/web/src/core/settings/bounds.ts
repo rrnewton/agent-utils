@@ -140,6 +140,30 @@ function clampTwoColumnSplit(value: unknown): number {
 }
 
 /**
+ * `#1344 discuss-panel-resize`. The Discuss overlay's width on a desk, in CSS pixels. Wider by
+ * default than slice 1's 24rem (the owner: "too narrow"); the reader drags the panel's left edge
+ * to change it and the choice is kept per device. The ends keep the panel usable: never narrower
+ * than a reading column, never wider than a desk can show beside the list; the stylesheet still
+ * caps it at the viewport, and a phone never reads it (full-width sheet there).
+ */
+const MIN_DISCUSS_WIDTH = 320;
+const MAX_DISCUSS_WIDTH = 960;
+const DEFAULT_DISCUSS_WIDTH = 560;
+
+/** A Discuss width this page will actually apply, read as `clampTwoColumnSplit` reads its split. */
+function clampDiscussWidth(value: unknown): number {
+  const text = typeof value === "string" ? value.trim() : value;
+  if (text === "" || text === null || text === undefined) {
+    return DEFAULT_DISCUSS_WIDTH;
+  }
+  const px = Number(text);
+  if (!Number.isFinite(px)) {
+    return DEFAULT_DISCUSS_WIDTH;
+  }
+  return Math.min(MAX_DISCUSS_WIDTH, Math.max(MIN_DISCUSS_WIDTH, Math.round(px)));
+}
+
+/**
  * How fast a message is read, as a PERCENTAGE, or null for "however the agent speaks".
  *
  * The bounds match the server's own clamp: below half the words stop being words, above double the
@@ -157,12 +181,14 @@ const clampReadSpeed = (value: unknown): number | null => {
 export {
   DEFAULT_CARD_MAX_LINES,
   DEFAULT_COLLAPSED_LINES,
+  DEFAULT_DISCUSS_WIDTH,
   DEFAULT_MSG_SCALE,
   DEFAULT_QUOTE_READ_PERCENT,
   DEFAULT_READING_CH,
   DEFAULT_TWO_COLUMN_SPLIT,
   MAX_CARD_MAX_LINES,
   MAX_COLLAPSED_LINES,
+  MAX_DISCUSS_WIDTH,
   MAX_MSG_SCALE,
   MAX_QUOTE_READ_PERCENT,
   MAX_READING_CH,
@@ -170,6 +196,7 @@ export {
   MAX_TWO_COLUMN_SPLIT,
   MIN_CARD_MAX_LINES,
   MIN_COLLAPSED_LINES,
+  MIN_DISCUSS_WIDTH,
   MIN_MSG_SCALE,
   MIN_QUOTE_READ_PERCENT,
   MIN_READING_CH,
@@ -177,6 +204,7 @@ export {
   MIN_TWO_COLUMN_SPLIT,
   clampCardMaxLines,
   clampCollapsedLines,
+  clampDiscussWidth,
   clampMsgScale,
   clampQuoteReadPercent,
   clampReadSpeed,

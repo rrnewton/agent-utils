@@ -135,6 +135,8 @@ test("`#624 voice-page-modularity`: each device setting reads, keeps and refuses
     ["quoteReadPercent", "vibe-talk.voice.quote-read-percent", 5, [[0, "0"], [100, "100"]], 5],
     ["readSpeed", "vibe-talk.voice.read-speed", null, [[150, "150"], [null, null]], THROWN],
     ["twoColumnSplit", "vibe-talk.voice.two-column-split", 50, [[30, "30"], [70, "70"]], THROWN],
+    ["discussWidth", "vibe-talk.voice.discuss-width", 560, [[700, "700"], [320, "320"]], 560],
+    ["discussSheetFull", "vibe-talk.voice.discuss-sheet-full", false, [[true, "1"], [false, null]], false],
   ];
   const refused = () => { throw new Error("SecurityError"); };
   const off = createDeviceSettings({ getItem: refused, setItem: refused, removeItem: refused });

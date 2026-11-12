@@ -67,6 +67,22 @@ export interface DiscussPanelDependencies {
   restoreMessages(ids: readonly string[]): Promise<unknown>;
   showError?(text: string): unknown;
   setStatus?(text: string): unknown;
+  /**
+   * `#1344 discuss-panel-resize`. The layout choices kept on this device, handed in where
+   * the page keeps them (the device settings, as the two-column splitter is handed its
+   * split); absent in a host that keeps nothing, where the wider default stands for the
+   * session. Every one is read on use, and a refused keep leaves the choice standing
+   * until a reload.
+   */
+  storedWidth?(): number;
+  keepWidth?(px: number): void;
+  /** A width this page will apply: the device setting's clamp, handed in. */
+  clampWidth?(value: unknown): number;
+  /** The width a double-click (and no choice yet) restores. */
+  defaultWidth?: number;
+  /** Whether the phone sheet stands at full height, as last left on this device. */
+  storedSheetFull?(): boolean;
+  keepSheetFull?(full: boolean): void;
 }
 
 /** The panel, once created. */
@@ -82,6 +98,14 @@ export interface DiscussPanel {
   setScopeLabel(label: string): void;
   /** Forget any answer still on its way (the scope changed under it). */
   invalidate(): void;
+  /** `#1344`. The overlay width in force, in CSS pixels (the wider default until dragged). */
+  width(): number;
+  /** `#1344`. Put a width on the panel and keep it on the device. */
+  setWidth(px: unknown): void;
+  /** `#1344`. Whether the phone sheet stands at full height. */
+  sheetFull(): boolean;
+  /** `#1344`. Stand the phone sheet at full or half height and keep the choice. */
+  setSheetFull(full: boolean): void;
 }
 
 /** Why Discuss cannot work on a deployment with no direct LLM summarizer, said once. */
@@ -179,9 +203,96 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   let lastScope: DiscussScope | null = null;
   let lastAnswer: CatchupAnswer | null = null;
   let marking = false;
+  // `#1344 discuss-panel-resize`. The layout in force, kept here rather than read back out
+  // of the DOM (a drag would otherwise parse its own output on every move, as the column
+  // splitter's split is kept). The stylesheet decides where each applies — the width only
+  // on a desk, the sheet height only on a phone — and this code only ever sets the choice.
+  // Resizing the overlay never reflows the list and never touches a scroll position: the
+  // panel floats outside #scroll-area, so no reader place needs keeping here (#1251).
+  const FALLBACK_DEFAULT_WIDTH = 560;
+  const FALLBACK_MIN_WIDTH = 320;
+  const FALLBACK_MAX_WIDTH = 960;
+  let width = FALLBACK_DEFAULT_WIDTH;
+  let sheetFull = false;
+  let drag: { startX: number; startWidth: number } | null = null;
 
   function panel(): HTMLElement {
     return deps.byId("discuss-panel");
+  }
+
+  function maybe(id: string): HTMLElement | null {
+    try {
+      return deps.byId(id);
+    } catch {
+      return null;
+    }
+  }
+
+  function clampWidth(value: unknown): number {
+    if (deps.clampWidth) return deps.clampWidth(value);
+    const px = Math.round(Number(value));
+    return Number.isFinite(px) ? Math.min(FALLBACK_MAX_WIDTH, Math.max(FALLBACK_MIN_WIDTH, px)) : FALLBACK_DEFAULT_WIDTH;
+  }
+
+  function defaultWidth(): number {
+    return deps.defaultWidth ?? FALLBACK_DEFAULT_WIDTH;
+  }
+
+  /** Put `px` on the panel as `--discuss-width`; kept on the device only when `keep`. */
+  function applyWidth(px: unknown, keep: boolean): number {
+    width = clampWidth(px);
+    const style = (panel() as HTMLElement).style as { setProperty?: (name: string, value: string) => void } | undefined;
+    if (style && typeof style.setProperty === "function") style.setProperty("--discuss-width", `${width}px`);
+    const handle = maybe("discuss-resize");
+    if (handle) {
+      handle.setAttribute("aria-valuenow", String(width));
+      handle.setAttribute("aria-valuetext", `Discuss panel ${width} pixels wide`);
+    }
+    if (keep) {
+      try {
+        deps.keepWidth?.(width);
+      } catch {
+        // Storage refused: the width holds until a reload, as a refused split does.
+      }
+    }
+    return width;
+  }
+
+  /** Stand the phone sheet at full or half height; kept on the device only when `keep`. */
+  function applySheet(full: boolean, keep: boolean): boolean {
+    sheetFull = full;
+    panel().setAttribute("data-sheet", full ? "full" : "half");
+    const toggle = maybe("discuss-sheet-toggle");
+    if (toggle) {
+      toggle.textContent = full ? "Restore" : "Maximize";
+      toggle.setAttribute("aria-expanded", full ? "true" : "false");
+    }
+    if (keep) {
+      try {
+        deps.keepSheetFull?.(full);
+      } catch {
+        // Storage refused: the height holds until a reload.
+      }
+    }
+    return sheetFull;
+  }
+
+  /** Restate the kept layout on the panel: the stored choices, else the defaults. */
+  function applyStoredLayout(): void {
+    let storedWidth: number | undefined;
+    try {
+      storedWidth = deps.storedWidth?.();
+    } catch {
+      storedWidth = undefined;
+    }
+    applyWidth(storedWidth === undefined ? defaultWidth() : storedWidth, false);
+    let storedFull = false;
+    try {
+      storedFull = deps.storedSheetFull?.() ?? false;
+    } catch {
+      storedFull = false;
+    }
+    applySheet(storedFull, false);
   }
 
   function isOpen(): boolean {
@@ -304,10 +415,26 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     });
   }
 
+  /** The resize handle's keys: Left widens (the panel stands on the right), Right narrows. */
+  const widthKeys: { readonly [key: string]: (() => number) | undefined } = {
+    ArrowLeft: () => width + 16,
+    ArrowRight: () => width - 16,
+    PageUp: () => width + 64,
+    PageDown: () => width - 64,
+    Home: () => clampWidth(0),
+    End: () => clampWidth(100000),
+  };
+
   return {
     mount() {
       if (!mounted) {
         mounted = true;
+        // The kept layout stands before anything opens, so a reopen is where it was left.
+        try {
+          applyStoredLayout();
+        } catch {
+          // A host without the panel yet draws it at the first open.
+        }
         listening.listen(deps.byId("discuss-close"), "click", () => {
           generation += 1;
           setOpen(false);
@@ -317,15 +444,59 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         });
         listening.listen(deps.byId("discuss-mark-read"), "click", () => mark(true));
         listening.listen(deps.byId("discuss-mark-unread"), "click", () => mark(false));
+        const toggle = maybe("discuss-sheet-toggle");
+        if (toggle) {
+          listening.listen(toggle, "click", () => applySheet(!sheetFull, true));
+        }
+        const handle = maybe("discuss-resize");
+        if (handle) {
+          listening.listen(handle, "pointerdown", (event: PointerEvent) => {
+            drag = { startX: event.clientX, startWidth: width };
+            const holder = handle as HTMLElement & { setPointerCapture?: (id: number) => void };
+            if (typeof holder.setPointerCapture === "function" && event.pointerId !== undefined) {
+              try {
+                holder.setPointerCapture(event.pointerId);
+              } catch {
+                // No pointer to hold: the move/up on the handle still follow a short drag.
+              }
+            }
+            if (typeof event.preventDefault === "function") event.preventDefault();
+          });
+          listening.listen(handle, "pointermove", (event: PointerEvent) => {
+            if (!drag) return;
+            // Anchored right: dragging left widens, stored once at the end (up), as the split is.
+            applyWidth(drag.startWidth + (drag.startX - event.clientX), false);
+          });
+          const endDrag = (): void => {
+            if (!drag) return;
+            drag = null;
+            applyWidth(width, true);
+          };
+          listening.listen(handle, "pointerup", endDrag);
+          listening.listen(handle, "pointercancel", endDrag);
+          listening.listen(handle, "keydown", (event: KeyboardEvent) => {
+            const next = widthKeys[event.key];
+            if (!next) return;
+            if (typeof event.preventDefault === "function") event.preventDefault();
+            applyWidth(next(), true);
+          });
+          listening.listen(handle, "dblclick", () => applyWidth(defaultWidth(), true));
+        }
       }
       return {
         unmount() {
           mounted = false;
+          drag = null;
           listening.unmount();
         },
       };
     },
     openWith(scope: DiscussScope) {
+      try {
+        applyStoredLayout();
+      } catch {
+        // No panel in this host yet: the open below says so, as before.
+      }
       setOpen(true);
       fetchFor(scope);
     },
@@ -339,6 +510,14 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     },
     invalidate() {
       generation += 1;
+    },
+    width: () => width,
+    setWidth(px: unknown) {
+      applyWidth(px, true);
+    },
+    sheetFull: () => sheetFull,
+    setSheetFull(full: boolean) {
+      applySheet(full, true);
     },
   };
 }

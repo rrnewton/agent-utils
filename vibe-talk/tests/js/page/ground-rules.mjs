@@ -61,6 +61,21 @@ test("every number this page is tuned by stays inside a band that says what woul
     "the default reading width is not one the reader is allowed to choose"
   );
   assert.ok(
+    sourceConstant("MIN_DISCUSS_WIDTH") < sourceConstant("MAX_DISCUSS_WIDTH"),
+    "the narrowest Discuss width the reader may drag to is not narrower than the widest"
+  );
+  assert.ok(
+    sourceConstant("DEFAULT_DISCUSS_WIDTH") >= sourceConstant("MIN_DISCUSS_WIDTH") &&
+      sourceConstant("DEFAULT_DISCUSS_WIDTH") <= sourceConstant("MAX_DISCUSS_WIDTH"),
+    "the default Discuss width is not one the reader is allowed to drag to"
+  );
+  assert.ok(
+    sourceConstant("FALLBACK_MIN_WIDTH") === sourceConstant("MIN_DISCUSS_WIDTH") &&
+      sourceConstant("FALLBACK_MAX_WIDTH") === sourceConstant("MAX_DISCUSS_WIDTH") &&
+      sourceConstant("FALLBACK_DEFAULT_WIDTH") === sourceConstant("DEFAULT_DISCUSS_WIDTH"),
+    "the panel's fallback widths have drifted from the device setting's"
+  );
+  assert.ok(
     sourceConstant("MIN_TWO_COLUMN_SPLIT") < sourceConstant("MAX_TWO_COLUMN_SPLIT"),
     "the least split the reader may drag to is not less than the most"
   );

@@ -1062,6 +1062,14 @@ const discussView = createDiscussView({
   restoreMessages: (ids) => restoreMessages(ids),
   showError: (text) => showError(text),
   setStatus: (text) => setStatus(text),
+  // `#1344 discuss-panel-resize`. The panel's kept layout, on this device as the
+  // two-column split is kept; the stylesheet decides where each applies.
+  storedWidth: () => deviceSettings().get(DEVICE_SETTINGS.discussWidth),
+  keepWidth: (px) => deviceSettings().keep(DEVICE_SETTINGS.discussWidth, px),
+  clampWidth: (value) => clampDiscussWidth(value),
+  defaultWidth: DEFAULT_DISCUSS_WIDTH,
+  storedSheetFull: () => deviceSettings().get(DEVICE_SETTINGS.discussSheetFull),
+  keepSheetFull: (full) => deviceSettings().keep(DEVICE_SETTINGS.discussSheetFull, full),
 });
 
 /** The three-way selector over `#view-switch`; its press is `pressViewSwitch`. */

@@ -165,6 +165,66 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     check(scroller_after == scroller_before,
           f"opening Discuss moved #scroll-area: {scroller_before} -> {scroller_after}")
 
+    # `#1344 discuss-panel-resize`: the kept layout, at this size. A desk gets the
+    # wider default, drag-resizable, kept per device; a phone gets a full-width
+    # sheet at half height with messages above, Maximize to full, sticking.
+    if width >= 900:
+        check(panel_box is not None and abs(panel_box["width"] - 560) <= 2,
+              f"the desk overlay is not at the wider default: {panel_box}")
+        handle = page.locator("#discuss-resize").bounding_box()
+        if handle is None:
+            raise AssertionError("the desk panel has no resize edge")
+        cx = handle["x"] + handle["width"] / 2
+        cy = handle["y"] + handle["height"] / 2
+        page.mouse.move(cx, cy)
+        page.mouse.down()
+        page.mouse.move(cx - 120, cy, steps=5)
+        page.mouse.up()
+        page.wait_for_function(
+            "() => document.getElementById('discuss-panel').getBoundingClientRect().width >= 660",
+            timeout=20_000)
+        kept = page.evaluate("() => localStorage.getItem('vibe-talk.voice.discuss-width')")
+        check(kept is not None and int(kept) >= 660, f"the dragged width was not kept: {kept!r}")
+        page.click("#discuss-close")
+        page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+        page.click("#discuss-open")
+        page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+        page.wait_for_function(
+            "() => document.getElementById('discuss-answer').textContent.includes('Ada shipped')",
+            timeout=20_000)
+        reopened = page.locator("#discuss-panel").bounding_box()
+        check(reopened is not None and reopened["width"] >= 660,
+              f"the kept width did not survive close/reopen: {reopened}")
+    else:
+        check(panel_box is not None and panel_box["width"] >= width - 2,
+              f"the phone sheet is not full width: {panel_box} in {width}x{height}")
+        check(panel_box is not None and height * 0.4 <= panel_box["height"] <= height * 0.6,
+              f"the phone sheet is not at half height: {panel_box} in {width}x{height}")
+        check(panel_box is not None and panel_box["y"] >= height * 0.2,
+              f"no messages show above the half sheet: {panel_box} in {width}x{height}")
+        page.click("#discuss-sheet-toggle")
+        page.wait_for_function(
+            "() => document.getElementById('discuss-panel').getBoundingClientRect().height >= innerHeight * 0.75",
+            timeout=20_000)
+        close_box = page.locator("#discuss-close").bounding_box()
+        check(close_box is not None and close_box["y"] >= 0,
+              f"the full sheet's header is off screen: {close_box}")
+        kept = page.evaluate("() => localStorage.getItem('vibe-talk.voice.discuss-sheet-full')")
+        check(kept == "1", f"the full height was not kept: {kept!r}")
+        page.click("#discuss-close")
+        page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+        page.click("#action-menu-open")
+        page.wait_for_selector("#discuss-menu-open", state="visible", timeout=20_000)
+        page.click("#discuss-menu-open")
+        page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+        page.wait_for_function(
+            "() => document.getElementById('discuss-panel').getBoundingClientRect().height >= innerHeight * 0.75",
+            timeout=20_000)
+        page.click("#discuss-sheet-toggle")
+        page.wait_for_function(
+            "() => document.getElementById('discuss-panel').getBoundingClientRect().height <= innerHeight * 0.6",
+            timeout=20_000)
+
     page.click("#discuss-mark-read")
     page.wait_for_function(
         "() => !document.getElementById('discuss-mark-read').disabled", timeout=20_000)
@@ -212,10 +272,13 @@ def main() -> int:
                 phone = browser.new_context(
                     viewport={"width": 393, "height": 852}, has_touch=True, is_mobile=True)
                 walk(phone.new_page(), base, 393, 852)
+                phone_small = browser.new_context(
+                    viewport={"width": 390, "height": 844}, has_touch=True, is_mobile=True)
+                walk(phone_small.new_page(), base, 390, 844)
                 desk = browser.new_context(viewport={"width": 1280, "height": 800})
                 walk(desk.new_page(), base, 1280, 800)
                 browser.close()
-            print("discuss browser: phone and desk walks passed")
+            print("discuss browser: phone (393x852, 390x844) and desk walks passed")
             return 0
         finally:
             server.terminate()
