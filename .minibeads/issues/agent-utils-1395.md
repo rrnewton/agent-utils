@@ -14,7 +14,7 @@ updated_at: 2026-11-12T19:30:00+00:00
 
 Owner (Slack 014/017/018): a Discuss pane goes with the view it was opened in. Today `sync()` invalidates and relabels on any view change, so an answer already shown stays on screen under the new scope's label. This issue binds Discuss to its open scope (global = All + Main as one scope, or one thread), routes citation taps by that binding, and makes cache-resolvable citations outside the window link out-of-scope instead of dropping.
 
-# Acceptance
+# Acceptance Criteria
 
 - Rule 1: Discuss opened in global (All/Main) or in one thread is bound to that scope; Main and All are one global scope on page and server (scope and cache key agree).
 - Rule 2: narrowing All/Main -> thread keeps the panel open, still bound to global, label still global, answer intact, no new model call.

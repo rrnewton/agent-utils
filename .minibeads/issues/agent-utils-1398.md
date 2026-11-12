@@ -15,7 +15,7 @@ Owner (Slack 020, 3:10 PM ET): "the vertical bar that is supposed to control the
 
 The handle (`#width-grip`, `mountReadingWidth`) was positioned against the screen (`left: 50%` of `#screen-main` plus half the reading width), so docking Discuss — which gives the panel its own grid column inside `#screen-main` — left it standing over the panel. It was also hidden by a blanket rule in two columns, whatever the column's actual width.
 
-# Acceptance
+# Acceptance Criteria
 
 - The handle stands on the message column's own right edge in every layout; it never overlaps a docked Discuss panel or the second column.
 - It shows only when the message column's actual rendered width exceeds the threshold (see Design), re-evaluated on resize, on docking/undocking/maximizing Discuss, and on switching between one and two columns. Below the threshold there is no handle and the text is full width; a remembered narrower width is kept on the device but not applied, and returns when the column widens again.

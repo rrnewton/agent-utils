@@ -13,7 +13,7 @@
 // parts); the panel narrows the decoded body to the fields it reads.
 
 import { createListening, insertSanitizedHtml, setClassWord } from "../dom/index.ts";
-import { foldSectionsByHeading, setAllSections } from "../collapse.ts";
+import { foldSectionsByHeading, setAllSections } from "../dom/collapse.ts";
 import { createComposerKeys } from "../composer/index.ts";
 import { deepLinkRefFrom } from "../../foundation/index.ts";
 import type { MessageLinkRef } from "../../foundation/index.ts";

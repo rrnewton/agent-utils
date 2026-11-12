@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { moduleForTests } from "../../../web/build.mjs";
 
-const { foldSectionsByHeading, setAllSections } = await moduleForTests("src/view/collapse.ts");
+const { foldSectionsByHeading, setAllSections } = await moduleForTests("src/view/dom/collapse.ts");
 
 function el(tag) {
   return {
