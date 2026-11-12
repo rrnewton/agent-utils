@@ -327,6 +327,22 @@ fn submit_resolved(
             submission.pr, submission.head_ref, submission.head
         ));
     }
+    // The approval gate runs on every direct submission, before anything
+    // is queued and never from a cached verdict (#1381). Sync submissions
+    // are exempt: they answer to `require_approval_at_head` instead.
+    let mut approval_granted = false;
+    if submission.source.is_empty() {
+        match crate::approve::check(config, &state.root, submission.pr, &current, &submission.by) {
+            Some(crate::approve::Verdict::Approved) => approval_granted = true,
+            Some(crate::approve::Verdict::Refused(reason)) => {
+                return Err(format!(
+                    "#{}: submit refused by the approval command: {reason}",
+                    submission.pr
+                ));
+            }
+            None => {}
+        }
+    }
     let existing = state.item(submission.pr)?;
     // An exact merge the branch rules forbid is refused here, before any
     // validation is spent on it; unreadable rules only warn (in the detail).
@@ -516,6 +532,9 @@ fn submit_resolved(
             "; recorded at {} while another writer held the queue",
             submission.recorded_at
         ));
+    }
+    if approval_granted {
+        detail.push_str("; approval granted (submit approval command)");
     }
     // The effective mode is part of the submission record, so the history
     // (and, through the item record, `list --json`) shows which channel

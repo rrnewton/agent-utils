@@ -1172,6 +1172,25 @@ enum Command {
         /// ejected and the rest go back as one batch instead of one batch each.
         #[arg(long = "precheck-covers", value_name = "STEP")]
         precheck_covers: Vec<String>,
+        /// Submit approval command: shell command run on every direct submit (not on sync)
+        /// with MQ_PR, MQ_HEAD and MQ_BY set; exit 0 approves, any other exit refuses the
+        /// submission with the command's first output line. Never cached. A command that
+        /// cannot run also refuses. Empty: no approval gate. This is a cooperative guard,
+        /// not a security boundary.
+        #[arg(
+            long = "submit-approval-command",
+            default_value = "",
+            value_name = "COMMAND"
+        )]
+        submit_approval_command: String,
+        /// Seconds one submit approval command may run before it is killed and the
+        /// submission is refused; 0 means 60.
+        #[arg(
+            long = "submit-approval-timeout-secs",
+            default_value_t = 0,
+            value_name = "SECS"
+        )]
+        submit_approval_timeout_secs: u64,
         /// Validator kind: `command` (shell template with a JSON-lines results file) or `dagrun`.
         #[arg(long, default_value = "")]
         validator: String,
@@ -2143,6 +2162,8 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             precheck_background,
             precheck_background_timeout_secs,
             precheck_covers,
+            submit_approval_command,
+            submit_approval_timeout_secs,
             validator,
             validator_run,
             select,
@@ -2218,6 +2239,10 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     background: precheck_background,
                     background_timeout_secs: precheck_background_timeout_secs,
                     covers: precheck_covers,
+                },
+                submit: crate::state::SubmitConfig {
+                    approval_command: submit_approval_command,
+                    approval_timeout_secs: submit_approval_timeout_secs,
                 },
                 combine,
                 max_batch: max_batch.max(1),

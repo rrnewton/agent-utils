@@ -579,6 +579,38 @@ fn is_default_precheck(value: &PrecheckConfig) -> bool {
     *value == PrecheckConfig::default()
 }
 
+fn is_default_submit(value: &SubmitConfig) -> bool {
+    *value == SubmitConfig::default()
+}
+
+/// Default deadline of one submit approval command, in seconds.
+pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 60;
+
+/// The approval gate on direct submissions (see [`crate::approve`]).
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SubmitConfig {
+    /// Shell command run on every direct submit (not on sync submissions)
+    /// with `MQ_PR`, `MQ_HEAD` and `MQ_BY` set; exit 0 approves. Empty
+    /// runs no gate. Its verdict is never cached.
+    pub approval_command: String,
+    /// Deadline of one run in seconds; 0 means
+    /// [`DEFAULT_APPROVAL_TIMEOUT_SECS`].
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub approval_timeout_secs: u64,
+}
+
+impl SubmitConfig {
+    /// Resolved deadline of one approval run.
+    pub fn approval_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(if self.approval_timeout_secs == 0 {
+            DEFAULT_APPROVAL_TIMEOUT_SECS
+        } else {
+            self.approval_timeout_secs
+        })
+    }
+}
+
 /// Default age bound of the decision log, in days.
 pub const DEFAULT_DECISIONS_KEEP_DAYS: u32 = 90;
 /// Default size bound of the decision log, in bytes.
@@ -1371,6 +1403,9 @@ pub struct Config {
     /// The precheck of submitted heads. Omitted from config.json when unset.
     #[serde(skip_serializing_if = "is_default_precheck")]
     pub precheck: PrecheckConfig,
+    /// The approval gate on direct submissions. Omitted when unset.
+    #[serde(default, skip_serializing_if = "is_default_submit")]
+    pub submit: SubmitConfig,
     /// Push-notification configuration (state-change messages via agentctl).
     pub notify: NotifyConfig,
     /// How hooks and built-in notify divide reports queue-wide:
@@ -1435,6 +1470,7 @@ impl Default for Config {
             conflict_prior: ConflictPriorConfig::default(),
             land: LandConfig::default(),
             precheck: PrecheckConfig::default(),
+            submit: SubmitConfig::default(),
             notify: NotifyConfig::default(),
             notify_mode: NotifyMode::default(),
             hooks: HooksConfig::default(),

@@ -1,10 +1,11 @@
 ---
 title: 'mq-submit-approval-gate: gate CLI submit on an approval command'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-11-12T16:54:01.477933042+00:00
-updated_at: 2026-11-12T16:54:01.477933042+00:00
+updated_at: 2026-11-12T21:21:53.200274195+00:00
+closed_at: 2026-11-12T21:21:53.200273925+00:00
 ---
 
 # Description

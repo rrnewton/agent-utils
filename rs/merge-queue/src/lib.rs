@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod approve;
 pub mod bench;
 pub mod bounded;
 pub mod build_info;
