@@ -168,6 +168,13 @@ that window. The same rule is in the agentctl-chat skill for chat requests.
   never `5275` or `#5275` alone. This holds wherever the owner reads: status lists, roll calls,
   cron and nightly posts, chat replies. The link lets renderers find the repository (vibe-talk adds
   the current title on its own); the slug lets the owner read the line without opening anything.
+- Never show the owner an internal label (a lane's shorthand such as "route B", "condition (c)",
+  "A0", "S5b", a phase or window name). Every such term is a hyperlink to where it is defined: the
+  committed plan (markdown under `ai_docs/`, or usually a minibeads epic, which is also linkable
+  markdown) that defines the nomenclature in clear terms, ideally in a standard `## Terms` section,
+  so the link is simply `<doc URL>#terms`; or, when the only source is a chat message, a link to the
+  message that defines the plan and its A/B/C or 1/2/3 phases. Otherwise use plain words. Project
+  communication happens by committing that defining plan first, then referring to it.
 - Say what is unverified. "Done" means delivered and checked.
 - When something you publish leaves the conversation (a commit body, an issue or pull-request
   comment), mark that it came from an agent and which one, unless the repository's rules say
