@@ -241,7 +241,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "claude-session"
+name = "claude-stream-session"
 version = "0.1.0"
 dependencies = [
  "serde_json",
@@ -2236,7 +2236,7 @@ dependencies = [
  "axum",
  "base64",
  "bytes",
- "claude-session",
+ "claude-stream-session",
  "comrak",
  "futures-util",
  "getrandom 0.3.4",
