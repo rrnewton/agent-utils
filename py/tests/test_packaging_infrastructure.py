@@ -219,6 +219,7 @@ def test_rust_package_selectors_resolve_dependency_archive_closure() -> None:
         "term-backend": ("agentctl",),
         "chat-subscription": ("agentctl",),
         "chat-subscription-plugin": ("agentctl",),
+        "claude-stream-session": ("agentctl",),
     }
     assert rust_check._select_crates([]) == rust_check.CRATES
     with pytest.raises(rust_check.CheckError, match="unknown crate 'missing'"):
