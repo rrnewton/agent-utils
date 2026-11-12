@@ -131,6 +131,8 @@ fn render_wt_report(report: &Value) -> String {
         "quota_mode",
         "configured_quota_mode",
         "binds",
+        "validate_dir",
+        "validate_bind",
         "apparent_bytes",
         "allocated_bytes",
     ];
@@ -139,10 +141,8 @@ fn render_wt_report(report: &Value) -> String {
         .filter_map(|key| {
             report.get(key).map(|value| {
                 let rendered = match value {
+                    Value::Object(map) if map.is_empty() => "{}".to_string(),
                     Value::Object(map) => {
-                        if map.is_empty() {
-                            return "{}".to_string();
-                        }
                         let inner: Vec<String> = map
                             .iter()
                             .map(|(name, item)| {

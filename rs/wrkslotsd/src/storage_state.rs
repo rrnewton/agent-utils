@@ -886,7 +886,7 @@ pub(crate) fn image_findings(cfg: &Cfg, machine: &str) -> Vec<Value> {
 /// What is mounted at `mount_point`, judged against `image_file`:
 /// (state, detail) with state absent|kernel|fuse|other|unverifiable,
 /// mirroring `slotimage.mount_state`.
-fn mount_state(image_file: &Path, mount_point: &Path) -> (String, String) {
+pub(crate) fn mount_state(image_file: &Path, mount_point: &Path) -> (String, String) {
     let entries = match mount_entries() {
         Ok(entries) => entries,
         Err(message) => return ("unverifiable".to_string(), message),

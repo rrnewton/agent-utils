@@ -68,6 +68,7 @@ mod handoff_write;
 mod heartbeat_write;
 mod hold_state;
 mod hold_write;
+mod image_dispatch;
 #[allow(dead_code)] // wired into create/finish/remove by the shared core (P7 hooks, mu-rsimg)
 mod image_mounts;
 #[allow(dead_code)] // wired into cli.rs dispatch by the shared core (P8, mu-rsimg)

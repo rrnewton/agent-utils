@@ -217,7 +217,8 @@ pub(crate) fn settings_from_obj(value: &Value) -> Result<WorktreesImageSettings,
     // Validated on every host, named or not: a malformed scope
     // must never silently read as applies-everywhere or nowhere.
     let machines = match map.get("machines") {
-        None => None,
+        // The normalized config spells an absent scope as null.
+        None | Some(Value::Null) => None,
         Some(value) => {
             let Some(names) = value.as_array() else {
                 return Err(
