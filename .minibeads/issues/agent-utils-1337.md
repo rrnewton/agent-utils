@@ -1,6 +1,6 @@
 ---
 title: 'create-abort-hook-partial-submodule: abort-create forgives its own hooks partial submodule init'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 assignee: mu-fence
@@ -35,3 +35,5 @@ The only dirt is the create hook's own half-done `git submodule update --init --
 # Notes
 
 Assigned by the coordinator from the devbig014 ledger block (1330-1399). Evidence preserved in place on its host: nobody touches that tree or checkout. Normal priority; no owner tier needed.
+
+Resolution (mu-fence): landed on main as 6cca45be, gate green at normal priority (GATE_SLOTS=3; the one host-shard red re-passed solo). `_abort_create` now forgives, in the checkout whose hook the journal holds at `running`, dirt made only of unchanged-gitlink submodules holding partial-init clones (clone at its default commit, deletions only, no commit outside remote-tracking refs, no stash/operation). Moved gitlinks, authored files and edited submodule content still refuse and preserve everything. Fixtures: five tests beside the existing abort suite, including a clone left at its default commit, a moved gitlink, authored superproject dirt, and edited submodule content. Parity note: create-journal `--abort-create` stays with the Python edition - the Rust recover writer implements `--abort-import` only (`rs/wrkslotsd/src/recover_main_write.rs`), so there is no second dirty check to keep in agreement until that recovery moves. The optional merge-queue-side "don't cancel inside the create hook" guard remains separately owned hardening, not built here.
