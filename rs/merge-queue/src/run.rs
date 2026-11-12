@@ -1245,6 +1245,14 @@ impl CulpritSearch {
                             crate::validate::NO_RECORDED_RESULT,
                             ran.exit.map_or("none".to_owned(), |code| code.to_string())
                         )
+                    } else if let Some(exit) = ran.all_passed_unqualified_exit() {
+                        // #1380 mq-probe-pass-stop-text: the probe did
+                        // observe passes; its receipt just did not
+                        // qualify, which counts as no evidence.
+                        format!(
+                            "probe at prefix {i} of {} passed every selected test but exited {exit} (the validator's receipt did not qualify), which counts as no evidence",
+                            self.candidate.prs.len()
+                        )
                     } else {
                         format!(
                             "probe at prefix {i} of {} observed only missing/skipped tests (no pass, no reproduced failure)",
@@ -11842,6 +11850,52 @@ mod unit {
         assert_eq!(probe_mq_purpose(1, 3), "probe");
         assert_eq!(probe_mq_purpose(2, 3), "probe");
         assert_eq!(probe_mq_purpose(3, 3), "candidate-probe");
+    }
+
+    #[test]
+    fn inconclusive_texts_name_what_the_probe_observed() {
+        // #1380 mq-probe-pass-stop-text: each inconclusive probe gets
+        // the text for what it actually observed.
+        let candidate = singleton_candidate();
+        let failed: BTreeSet<TestId> = [TestId::step("t")].into_iter().collect();
+        let focus = Selection::of(failed.iter().cloned());
+        let text = |ran: Ran| -> String {
+            let mut search = CulpritSearch::new(
+                &candidate,
+                &focus,
+                &failed,
+                false,
+                false,
+                true,
+                BaseEvidence::default(),
+            );
+            match search.record(&[0], vec![Ok((1, ran))], true).unwrap() {
+                Some(Culprit::Inconclusive(detail)) => detail,
+                _ => panic!("expected an inconclusive verdict"),
+            }
+        };
+        // All selected passed, exit unqualified: never "no pass".
+        let all_pass = text(unqualified_pass_ran(4));
+        assert!(
+            all_pass.contains("passed every selected test but exited 4"),
+            "{all_pass}"
+        );
+        assert!(!all_pass.contains("no pass"), "{all_pass}");
+        // Missing/skipped only.
+        let missing = text(missing_probe_ran());
+        assert!(
+            missing.contains("observed only missing/skipped tests"),
+            "{missing}"
+        );
+        // Empty red: no recorded result at all.
+        let mut empty = probe_ran(None);
+        empty.results = TestResults::default();
+        empty.exit = Some(1);
+        let empty_text = text(empty);
+        assert!(
+            empty_text.contains("no recorded test result"),
+            "{empty_text}"
+        );
     }
 
     #[test]

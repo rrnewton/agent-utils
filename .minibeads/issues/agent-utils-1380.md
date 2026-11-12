@@ -1,10 +1,11 @@
 ---
 title: 'mq-probe-pass-stop-text: name an all-pass probe''s unqualified exit in the inconclusive text'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 created_at: 2026-11-12T16:56:28.991173975+00:00
-updated_at: 2026-11-12T16:56:28.991173975+00:00
+updated_at: 2026-11-12T22:00:14.405735831+00:00
+closed_at: 2026-11-12T22:00:14.405735701+00:00
 ---
 
 # Description
