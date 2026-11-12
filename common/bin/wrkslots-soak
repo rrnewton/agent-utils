@@ -71,9 +71,23 @@ REST=("${ARGS[@]:1}")
 if [[ "${WRKSLOTS_SOAK_READERS_ONLY:-}" == "1" ]]; then
     case "$CMD" in
         status|doctor|unpushed|shell-command|quickstart) ;;
+        # Dispatch-wired readers (#1095/#1101/#1112): exactly one
+        # action per family; the other actions stay Python.
+        image) [[ "${REST[0]:-}" == "status" ]] || run_python "$CMD" "${ORIGINAL[@]}" ;;
+        sandbox) [[ "${REST[0]:-}" == "show-config" ]] || run_python "$CMD" "${ORIGINAL[@]}" ;;
+        limits) [[ "${REST[0]:-}" == "show" ]] || run_python "$CMD" "${ORIGINAL[@]}" ;;
         *) run_python "$CMD" "${ORIGINAL[@]}" ;;
     esac
 fi
+
+# The dispatch-wired image/sandbox/limits actions run in Rust in
+# every soak mode; their other actions stay Python (never map an
+# unwired action onto a wired one).
+case "$CMD" in
+    image) [[ "${REST[0]:-}" == "status" ]] || run_python "$CMD" "${ORIGINAL[@]}" ;;
+    sandbox) [[ "${REST[0]:-}" == "show-config" ]] || run_python "$CMD" "${ORIGINAL[@]}" ;;
+    limits) [[ "${REST[0]:-}" == "show" ]] || run_python "$CMD" "${ORIGINAL[@]}" ;;
+esac
 
 # Python command -> wrkslotsd command. Anything unlisted stays Python.
 RUST_CMD=""
@@ -84,6 +98,9 @@ case "$CMD" in
     shell-command) RUST_CMD="shell-command" ;;
     quickstart) RUST_CMD="quickstart" ;;
     unpushed) RUST_CMD="unpushed-text" ;;
+    image) RUST_CMD="image-status"; REST=("${REST[@]:1}") ;;
+    sandbox) RUST_CMD="sandbox-show-config"; REST=("${REST[@]:1}") ;;
+    limits) RUST_CMD="limits-show"; REST=("${REST[@]:1}") ;;
     create) RUST_CMD="create-text" ;;
     recover-absent-agent-rows) RUST_CMD="recover-absent-agent-rows-text" ;;
     recover-absent-validate-rows) RUST_CMD="recover-absent-validate-rows-text" ;;

@@ -76,6 +76,15 @@ case "$1" in
   quickstart)
     if [ "$2" = "--help" ]; then echo "Usage: quickstart"; exit 0; fi
     echo "RS quickstart $@" ;;
+  image-status)
+    if [ "$2" = "--help" ]; then echo "Usage: --root --machine --format"; exit 0; fi
+    echo "RS image-status $@" ;;
+  sandbox-show-config)
+    if [ "$2" = "--help" ]; then echo "Usage: --root --machine"; exit 0; fi
+    echo "RS sandbox-show-config $@" ;;
+  limits-show)
+    if [ "$2" = "--help" ]; then echo "Usage: --root --machine --memory-fraction --cpu-fraction"; exit 0; fi
+    echo "RS limits-show $@" ;;
   heartbeat)
     if [ "$2" = "--help" ]; then echo "Usage: --agent --owner-pid --expected-generation --root --machine"; exit 0; fi
     echo "RS heartbeat-run $@" ;;
@@ -325,6 +334,44 @@ def test_readers_only_audit_stays_python(tmp_path: Path) -> None:
     result = _run(root, log, "audit", "--gate", readers_only=True)
     assert result.stdout.startswith("PY wrkslots audit")
     assert "cmd=audit edition=python" in log.read_text()
+
+
+def test_readers_only_image_status_runs_in_rust(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    result = _run(root, log, "image", "status", "--format", "json", readers_only=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("RS image-status image-status --format json")
+    assert "cmd=image edition=rust rc=0" in log.read_text()
+
+
+def test_readers_only_sandbox_show_config_runs_in_rust(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    result = _run(root, log, "sandbox", "show-config", readers_only=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("RS sandbox-show-config sandbox-show-config")
+    assert "cmd=sandbox edition=rust rc=0" in log.read_text()
+
+
+def test_readers_only_limits_show_runs_in_rust(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    result = _run(root, log, "limits", "show", readers_only=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("RS limits-show limits-show")
+    assert "cmd=limits edition=rust rc=0" in log.read_text()
+
+
+def test_readers_only_image_set_default_writer_stays_python(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    result = _run(root, log, "image", "set-default", "image", readers_only=True)
+    assert result.stdout.startswith("PY wrkslots image")
+    assert "cmd=image edition=python" in log.read_text()
+
+
+def test_readers_only_limits_apply_writer_stays_python(tmp_path: Path) -> None:
+    root, log = _sandbox(tmp_path)
+    result = _run(root, log, "limits", "apply", readers_only=True)
+    assert result.stdout.startswith("PY wrkslots limits")
+    assert "cmd=limits edition=python" in log.read_text()
 
 
 def test_readers_only_writer_stays_python(tmp_path: Path) -> None:
