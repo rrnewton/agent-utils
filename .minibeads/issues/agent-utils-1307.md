@@ -1,13 +1,14 @@
 ---
 title: 'doc-fetch-visible-viewport: Fetch visible fetches only the rows on screen, with a progress count'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - vibe-talk
 - documents
 created_at: 2026-11-11T15:28:12+00:00
-updated_at: 2026-11-11T15:28:12+00:00
+updated_at: 2026-11-12T12:28:47.777123465+00:00
+closed_at: 2026-11-12T12:28:47.777122764+00:00
 ---
 
 # Description

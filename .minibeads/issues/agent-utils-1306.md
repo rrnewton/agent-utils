@@ -1,13 +1,14 @@
 ---
 title: 'doc-star-gold: a starred document shows a filled gold star, not a blank button'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 labels:
 - vibe-talk
 - documents
 created_at: 2026-11-11T15:28:12+00:00
-updated_at: 2026-11-11T15:28:12+00:00
+updated_at: 2026-11-12T12:22:54.408085326+00:00
+closed_at: 2026-11-12T12:22:54.408085156+00:00
 ---
 
 # Description
