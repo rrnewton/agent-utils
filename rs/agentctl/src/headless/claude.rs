@@ -192,9 +192,8 @@ pub struct PermissionRequest {
     pub tool_use_id: String,
 }
 
-/// Stream-json framing, factored into the shared `claude-stream-session` crate
-/// (`#1331 claude-session-summarizer`); re-exported so every existing call site keeps
-/// its path and meaning.
+/// Stream-json framing, factored into a shared crate (`#1331 claude-session-summarizer`);
+/// re-exported so every existing call site keeps its path and meaning.
 pub use claude_stream_session::protocol::{
     asks_wrapper, control_error_line, effective_arguments, input_line, interrupt_line, is_uuid,
     permission_answer_line, prompts_target, protocol_arguments, random_uuid, validate_arguments,
