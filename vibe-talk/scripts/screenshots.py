@@ -5529,7 +5529,7 @@ SCENES: tuple[Scene, ...] = (
             DESK_SWITCH_CORNER,
             (
                 "Hide read, Pace and Read, left to right as on the phone, and no Sound among them",
-                pane_reads_js("todo-filter,read-speed,read-aloud"),
+                pane_reads_js("audio-source,read-speed,read-aloud"),
             ),
             (
                 # THE other half of the complaint: a picker cut short beside empty space. Measured

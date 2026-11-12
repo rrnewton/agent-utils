@@ -510,7 +510,7 @@ def arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def cycle_read_mode(page) -> None:
+def cycle_read_mode(page: Page) -> None:
     """`#1355 phone-bar-discuss-slot`: Show/Fold read in the hamburger menu."""
     page.click("#action-menu-open")
     page.click("#todo-filter")

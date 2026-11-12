@@ -79,7 +79,7 @@ from two_column_browser import CANARY, REPLICA, RUNNER, Desk
 import page_sources
 
 if TYPE_CHECKING:
-    from playwright.sync_api import BrowserType
+    from playwright.sync_api import BrowserType, Page
 
 SIZES = (("desk", 1280, 800, False), ("phone", 393, 852, True))
 
@@ -151,7 +151,7 @@ def arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def cycle_read_mode(page) -> None:
+def cycle_read_mode(page: Page) -> None:
     """`#1355 phone-bar-discuss-slot`: Show/Fold read in the hamburger menu."""
     page.click("#action-menu-open")
     page.click("#todo-filter")

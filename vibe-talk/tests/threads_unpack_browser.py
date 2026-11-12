@@ -55,7 +55,7 @@ from two_column_browser import CANARY, FILLER, REPLICA, RUNNER, ColumnsApi, Desk
 import page_sources
 
 if TYPE_CHECKING:
-    from playwright.sync_api import BrowserType
+    from playwright.sync_api import BrowserType, Page
 
 SIZES = (
     ("desk-1280-dark", 1280, 800, "dark", False),
@@ -547,7 +547,7 @@ def perf(chromium: BrowserType, args: argparse.Namespace) -> str:
     return f"perf: 40 threads, {rows} unpacked rows drawn in {elapsed:.2f}s from the press"
 
 
-def cycle_read_mode(page) -> None:
+def cycle_read_mode(page: Page) -> None:
     """`#1355 phone-bar-discuss-slot`: Show/Fold read in the hamburger menu."""
     page.click("#action-menu-open")
     page.click("#todo-filter")
