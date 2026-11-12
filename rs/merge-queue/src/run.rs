@@ -4201,8 +4201,12 @@ impl<'a> Runner<'a> {
     /// Base evidence for a culprit search on `candidate`: whether the base
     /// (prefix 0) is a validated queue landing, and whether a recorded green
     /// at the base tree already covers `focus`. A landing is a tip this run
-    /// landed, or a focused landing still owed a complete run (persisted
-    /// across runs); anything else reached the branch outside the queue.
+    /// landed, a focused landing still owed a complete run (persisted
+    /// across runs), or a landing an earlier run recorded on a persisted
+    /// item (#1378 mq-trust-base-across-runs: every focused landing also
+    /// records an obligation, so a landed record is a complete landing
+    /// or one whose obligation has since been discharged); anything else
+    /// reached the branch outside the queue.
     fn base_evidence(&self, candidate: &Candidate, focus: &Selection) -> BaseEvidence {
         let queue_landing = lock(&self.report)
             .landed
@@ -4212,6 +4216,11 @@ impl<'a> Runner<'a> {
                 .state
                 .obligations()
                 .map(|all| all.iter().any(|o| o.landed == candidate.parent))
+                .unwrap_or(false)
+            || self
+                .state
+                .items()
+                .map(|items| persisted_queue_landing(&items, &candidate.parent))
                 .unwrap_or(false);
         BaseEvidence {
             queue_landing,
@@ -10902,6 +10911,14 @@ fn output_tail(output: &std::process::Output, lines: usize) -> String {
 /// Whether green results recorded at exactly `commit` in `validations` cover `selection`:
 /// every selected test passed in the latest run at that commit that selected it, and an `all`
 /// selection needs a complete run there whose failures were all rerun green there.
+/// Whether a persisted item record proves the queue landed `parent`
+/// in an earlier run (#1378 mq-trust-base-across-runs).
+fn persisted_queue_landing(items: &[Item], parent: &str) -> bool {
+    items
+        .iter()
+        .any(|item| item.status == ItemStatus::Landed && item.landed_as == parent)
+}
+
 fn covered_by(validations: &[ValidationRecord], commit: &str, selection: &Selection) -> bool {
     let runs = validations
         .iter()

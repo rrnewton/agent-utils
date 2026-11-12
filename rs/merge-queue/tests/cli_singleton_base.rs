@@ -278,6 +278,44 @@ fn inconclusive_batch_holds_and_disjoint_root_lands() {
 }
 
 #[test]
+fn a_base_landed_by_an_earlier_run_stays_trusted() {
+    // #1378 mq-trust-base-across-runs: the first run lands the good
+    // change completely. In a NEW run, the bad singleton standing on
+    // that landing is ejected on the trusted base with no base probe:
+    // the persisted landed record is the queue-landing evidence.
+    let fx = setup("singleton-base-earlier-run");
+    fx.branch("good", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "good"]);
+    let out = fx.mq(&["run", "--json"]);
+    let r = report(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(r["landed"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(status(&fx, 1), "landed");
+
+    fx.branch("bad", &[("tests/b", "FAIL\n")]);
+    fx.mq_ok(&["submit", "2", "--head", "bad"]);
+    let out = fx.mq(&["run", "--json"]);
+    let r = report(&String::from_utf8_lossy(&out.stdout));
+    let ejected = r["ejected"].as_array().unwrap();
+    assert_eq!(ejected.len(), 1, "{r}");
+    assert_eq!(ejected[0]["pr"], 2, "{r}");
+    assert!(
+        ejected[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("pass without it (assumed: trust_base)"),
+        "the earlier landing is trusted as assumed: {r}"
+    );
+    assert!(
+        r["validations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|v| v["purpose"] != "probe"),
+        "no base probe runs on an earlier queue landing: {r}"
+    );
+}
+
+#[test]
 fn a_queue_landed_base_stays_trusted() {
     // One run lands the good change first: the bad singleton behind it
     // stands on a validated queue landing, so it is ejected on the trusted

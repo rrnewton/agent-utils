@@ -1,10 +1,11 @@
 ---
 title: 'mq-trust-base-across-runs: count a queue landing from an earlier run as base evidence'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-12T16:56:28.986214189+00:00
-updated_at: 2026-11-12T16:56:28.986214189+00:00
+updated_at: 2026-11-12T21:58:37.230328430+00:00
+closed_at: 2026-11-12T21:58:37.230328300+00:00
 ---
 
 # Description
