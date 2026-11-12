@@ -1,10 +1,11 @@
 ---
 title: 'gate-defer-merge-queue: defer gate starts while a host-configured unit pattern is active'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-11-12T11:22:18+00:00
-updated_at: 2026-11-12T11:22:18+00:00
+updated_at: 2026-11-12T12:05:00+00:00
+closed_at: 2026-11-12T12:05:00+00:00
 ---
 
 # Description
@@ -37,3 +38,7 @@ updated_at: 2026-11-12T11:22:18+00:00
 # Notes
 
 Filed by mu-gatedefer, slot gatedefer, branch mu-gatedefer/gate-defer-merge-queue. Number reserved from devbig030's interim block (1400-1469).
+
+## Resolution
+
+[watermelon-full-preview] Landed in `scripts/gate.py`. A gate now defers its start — before its preflight and again before its grant, so its command never runs during a protected validation — while any host-configured signal is in force: a user unit matching `defer_unit_pattern` (`systemctl --user list-units --no-legend '<pattern>' --state=active` on PATH), a measurement hold in `defer_holds_dir` (`<name>.json` naming `marker_file`/`status_file` and `max_hold_seconds`; last `WINDOW-START <UTC>` until a later `WINDOW-END`, capped at the max; relative markers resolve against `defer_holds_root`), or a `defer_quiet_command` exiting non-zero. Configuration is host-only: sibling file `~/.local/etc/agent-utils/gate-defer.toml` (`$GATE_DEFER_CONFIG`; same keys accepted in the gate-slots file as fallback), `GATE_DEFER_*` env hooks win per key, no repo `gate.toml` keys, no unit name hard-coded. Holds and the quiet command fail closed (an unparseable declaration or marker counts as an active hold, and `status` names the file and the problem); a broken systemctl probe warns and proceeds. Waiting is poll-driven (`$GATE_DEFER_POLL_S`) with no wall-clock budget: deferral never counts against `--wait-timeout` (owner rule 346). `gate.py status` and `gate.py queue` show a deferred gate and what it waits on (tickets record `defer_waiting`; pre-queue waits record under `deferred/`). Decisions: a running gate is never paused (freezing the scheduler mid-step could itself cause timeouts; deferral is start-only, like blackout), and owner-priority gates defer too by default — the host file alone exempts them with `owner_defers = false`. A malformed defer file refuses a start (exit 2). Tests: 74 passed in `py/tests/test_gate_admission.py`, with a stubbed systemctl on PATH (bounded call count asserted), hold fixtures for active/ended/expired/unparseable/empty, and `/bin/true` for trivial commands; strict mypy adds no new errors (2 pre-existing in phase-priority/interleave helpers, identical on the untouched base).

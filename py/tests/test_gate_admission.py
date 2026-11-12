@@ -1,6 +1,7 @@
 """Gate admission: the counting cap, the exclusive class, FIFO, and reaping."""
 from __future__ import annotations
 
+import datetime as dt
 import fcntl
 import importlib.util
 import json
@@ -33,7 +34,13 @@ def _hermetic_gate_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setenv("GATE_SLOTS", "2")
     monkeypatch.setenv("GATE_PHASE_PRIORITY_CONFIG", str(tmp_path / "hostless-gate-phase-priority.toml"))
     monkeypatch.setenv("GATE_BLACKOUT_CONFIG", str(tmp_path / "hostless-gate.toml"))
+    monkeypatch.setenv("GATE_DEFER_CONFIG", str(tmp_path / "hostless-gate-defer.toml"))
+    monkeypatch.setenv("GATE_DEFER_POLL_S", "0.05")
     monkeypatch.delenv("GATE_INTERLEAVE_AFTER", raising=False)
+    monkeypatch.delenv("GATE_DEFER_UNIT_PATTERN", raising=False)
+    monkeypatch.delenv("GATE_DEFER_HOLDS_DIR", raising=False)
+    monkeypatch.delenv("GATE_DEFER_QUIET_COMMAND", raising=False)
+    monkeypatch.delenv("GATE_DEFER_NOW", raising=False)
     # Tests run real gate.py subprocesses whose commands wait on files in
     # tmp_path; with CPU containment on, each admitted command becomes a
     # real systemd user scope, and a test that times out leaves its scope
@@ -46,13 +53,17 @@ def _hermetic_gate_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
 def _env(tmp_path: Path) -> dict[str, str]:
     base = {key: value for key, value in os.environ.items()
             if key not in ("GATE_PHASE_PRIORITY", "GATE_PRIORITY", "GATE_PRIORITY_REASON",
-                           "GATE_INTERLEAVE_AFTER", "GATE_INTERLEAVE_CONFIG")}
+                           "GATE_INTERLEAVE_AFTER", "GATE_INTERLEAVE_CONFIG",
+                           "GATE_DEFER_UNIT_PATTERN", "GATE_DEFER_HOLDS_DIR",
+                           "GATE_DEFER_QUIET_COMMAND", "GATE_DEFER_NOW")}
     return {**base, "GATE_ADMISSION_DIR": str(tmp_path / "admission"),
             "GATE_LEDGER": str(tmp_path / "ledger.jsonl"), "GATE_PRUNE_TARGETS": "off",
             "GATE_SLOTS_CONFIG": str(tmp_path / "gate-slots.toml"),
             "GATE_INTERLEAVE_CONFIG": str(tmp_path / "gate-interleave.toml"),
             "GATE_PHASE_PRIORITY_CONFIG": str(tmp_path / "gate-phase-priority.toml"),
             "GATE_BLACKOUT_CONFIG": str(tmp_path / "gate.toml"),
+            "GATE_DEFER_CONFIG": str(tmp_path / "gate-defer.toml"),
+            "GATE_DEFER_POLL_S": "0.05",
             # A lane may run the suite under GATE_SLOTS=1; the tests assume the default.
             "GATE_SLOTS": "2",
             # Admitted test commands never run in real systemd scopes (see
@@ -1841,3 +1852,241 @@ def test_a_stopped_gate_stops_its_whole_command_tree_and_records_the_abort(
                            capture_output=True, text=True, timeout=30)
     assert "1 run(s) aborted by a signal" in stats.stdout
     assert "0 first-run gate(s)" in stats.stdout
+
+
+# ------------------------------------------------- merge-queue deferral (#1406)
+
+_STUB_UNIT = "protected-queue-7.service"
+
+
+def _stub_systemctl(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A stubbed systemctl on PATH (never the real one): it reports the
+    protected unit while the flag file exists, and counts its calls so a
+    test can prove the gate's poll is paced, never an unbounded spawn loop."""
+    bindir = tmp_path / "stubbin"
+    bindir.mkdir(exist_ok=True)
+    flag = tmp_path / "unit-active"
+    calls = tmp_path / "systemctl-calls"
+    stub = bindir / "systemctl"
+    stub.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        f"flag = pathlib.Path({str(flag)!r})\n"
+        f"calls = pathlib.Path({str(calls)!r})\n"
+        "calls.write_text(str(int(calls.read_text()) + 1) if calls.exists() else '1')\n"
+        "if flag.exists():\n"
+        f"    print({_STUB_UNIT!r} + ' loaded active running stub')\n"
+    )
+    stub.chmod(0o755)
+    return bindir, flag, calls
+
+
+def _defer_env(tmp_path: Path, bindir: Path, **overrides: str) -> dict[str, str]:
+    env = _env(tmp_path)
+    env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+    env["GATE_DEFER_UNIT_PATTERN"] = "protected-*"
+    env.update(overrides)
+    return env
+
+
+def _wait_for_deferred(tmp_path: Path) -> None:
+    deferred = tmp_path / "admission" / "deferred"
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if deferred.exists() and list(deferred.glob("*.json")):
+            return
+        time.sleep(0.05)
+    raise AssertionError("gate did not record a deferred wait")
+
+
+def test_a_gate_defers_while_a_protected_unit_is_active_then_starts(tmp_path: Path) -> None:
+    """#1406: the command does not run while the stubbed unit is active,
+    `status` shows the deferred gate and its unit, and the gate starts when
+    the unit finishes — with no deadline that could fail it."""
+    bindir, flag, calls = _stub_systemctl(tmp_path)
+    flag.touch()
+    marker = tmp_path / "ran"
+    gate = subprocess.Popen(
+        [PY, str(GATE), "--", PY, "-c", f"open({str(marker)!r}, 'w').close()"],
+        env=_defer_env(tmp_path, bindir),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        _wait_for_deferred(tmp_path)
+        assert not marker.exists()
+        assert gate.poll() is None
+        status = subprocess.run([PY, str(GATE), "status"], env=_defer_env(tmp_path, bindir),
+                                capture_output=True, text=True, timeout=30)
+        assert status.returncode == 0, status.stdout
+        assert "deferred" in status.stdout and _STUB_UNIT in status.stdout
+    finally:
+        flag.unlink(missing_ok=True)
+    out, _ = gate.communicate(timeout=30)
+    assert gate.returncode == 0, out
+    assert marker.exists()
+    assert f"deferred: waiting on {_STUB_UNIT}" in out
+    assert "deferral cleared" in out
+    # Paced poll (0.05 s in this env over a short wait), never a spawn loop.
+    assert 0 < int(calls.read_text()) < 400
+
+
+def test_an_empty_or_unset_pattern_means_no_deferral(tmp_path: Path) -> None:
+    bindir, flag, _calls = _stub_systemctl(tmp_path)
+    flag.touch()
+    for pattern in ("", None):
+        env = _defer_env(tmp_path, bindir)
+        if pattern is None:
+            del env["GATE_DEFER_UNIT_PATTERN"]
+        else:
+            env["GATE_DEFER_UNIT_PATTERN"] = pattern
+        result = subprocess.run([PY, str(GATE), "--", "/bin/true"], env=env,
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, result.stdout
+        assert "deferred" not in result.stdout
+
+
+def test_owner_priority_defers_unless_the_host_file_exempts_it(tmp_path: Path) -> None:
+    """#1406 choice: owner gates defer too by default; the host file alone
+    can exempt them with owner_defers = false."""
+    bindir, flag, _calls = _stub_systemctl(tmp_path)
+    flag.touch()
+    config = tmp_path / "gate-defer.toml"
+    config.write_text('defer_unit_pattern = "protected-*"\n')
+    env = _defer_env(tmp_path, bindir)
+    del env["GATE_DEFER_UNIT_PATTERN"]  # the host file decides
+    gate = subprocess.Popen(
+        [PY, str(GATE), "--priority", "owner", "--priority-reason", "#1406 test",
+         "--", "/bin/true"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        _wait_for_deferred(tmp_path)
+        assert gate.poll() is None
+    finally:
+        flag.unlink(missing_ok=True)
+    out, _ = gate.communicate(timeout=30)
+    assert gate.returncode == 0, out
+    assert f"deferred: waiting on {_STUB_UNIT}" in out
+    config.write_text('defer_unit_pattern = "protected-*"\nowner_defers = false\n')
+    flag.touch()
+    result = subprocess.run(
+        [PY, str(GATE), "--priority", "owner", "--priority-reason", "#1406 test",
+         "--", "/bin/true"],
+        env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout
+    assert "deferred" not in result.stdout
+
+
+def test_a_running_gate_is_never_paused_by_a_new_deferral(tmp_path: Path) -> None:
+    """#1406: deferral is start-only. A gate already running when the
+    protected unit becomes active runs to completion untouched."""
+    bindir, flag, _calls = _stub_systemctl(tmp_path)
+    marker = tmp_path / "ran"
+    script = (
+        "import pathlib, time\n"
+        f"mark = pathlib.Path({str(flag)!r})\n"
+        "mark.touch()\n"
+        "time.sleep(2)\n"
+        f"open({str(marker)!r}, 'w').close()\n"
+    )
+    result = subprocess.run([PY, str(GATE), "--", PY, "-c", script],
+                            env=_defer_env(tmp_path, bindir),
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout
+    assert marker.exists()
+    assert "deferred: waiting" not in result.stdout
+
+
+def test_a_malformed_defer_file_refuses_the_start(tmp_path: Path) -> None:
+    (tmp_path / "gate-defer.toml").write_text('defer_unit_pattern = 3\n')
+    result = subprocess.run([PY, str(GATE), "--", "/bin/true"], env=_env(tmp_path),
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 2, result.stdout
+    assert "gate defer config" in result.stdout
+
+
+def _hold(tmp_path: Path, name: str, status_text: str, cap: object = 3600,
+          declaration: str | None = None) -> Path:
+    holds = tmp_path / "holds"
+    holds.mkdir(parents=True, exist_ok=True)
+    status = tmp_path / f"{name}-status.txt"
+    status.write_text(status_text)
+    if declaration is None:
+        declaration = json.dumps({"marker_file": str(status), "max_hold_seconds": cap})
+    (holds / f"{name}.json").write_text(declaration)
+    return holds
+
+
+_NOW = dt.datetime(2026, 11, 12, 12, 0, tzinfo=dt.timezone.utc)
+
+
+def test_measurement_hold_fixtures(tmp_path: Path) -> None:
+    """#1406 hold contract: active, ended, expired, unparseable (fails
+    closed) and empty-directory cases."""
+    gate = _gate_module()
+    active = _hold(tmp_path / "a", "w", "WINDOW-START 2026-11-12T11:30:00Z\n")
+    blockers = gate.measurement_hold_blockers(str(active), _NOW)
+    assert len(blockers) == 1 and blockers[0].startswith("hold w ("), blockers
+    ended = _hold(tmp_path / "b", "w",
+                  "WINDOW-START 2026-11-12T11:00:00Z\nWINDOW-END 2026-11-12T11:30:00Z\n")
+    assert gate.measurement_hold_blockers(str(ended), _NOW) == []
+    expired = _hold(tmp_path / "c", "w", "WINDOW-START 2026-11-12T08:00:00Z\n", cap=3600)
+    assert gate.measurement_hold_blockers(str(expired), _NOW) == []
+    bad = _hold(tmp_path / "d", "w", "irrelevant\n", declaration="{not json")
+    blockers = gate.measurement_hold_blockers(str(bad), _NOW)
+    assert len(blockers) == 1 and "hold declaration" in blockers[0], blockers
+    assert str(bad / "w.json") in blockers[0]
+    empty = tmp_path / "empty-holds"
+    empty.mkdir()
+    assert gate.measurement_hold_blockers(str(empty), _NOW) == []
+    assert gate.measurement_hold_blockers(str(tmp_path / "absent-holds"), _NOW) == []
+    # A relative marker path resolves against the host-configured root, and
+    # the status_file spelling names the same file.
+    rel = tmp_path / "rel"
+    (rel / "holds").mkdir(parents=True)
+    (rel / "marker.txt").write_text("WINDOW-START 2026-11-12T11:30:00Z\n")
+    (rel / "holds" / "r.json").write_text(json.dumps(
+        {"marker_file": "marker.txt", "max_hold_seconds": 3600}))
+    assert len(gate.measurement_hold_blockers(str(rel / "holds"), _NOW, str(rel))) == 1
+    (rel / "holds" / "r.json").write_text(json.dumps(
+        {"status_file": "marker.txt", "max_hold_seconds": 3600}))
+    assert len(gate.measurement_hold_blockers(str(rel / "holds"), _NOW, str(rel))) == 1
+
+
+def test_a_measurement_hold_defers_a_gate_until_it_ends(tmp_path: Path) -> None:
+    holds = _hold(tmp_path, "w", "WINDOW-START 2026-11-12T11:30:00Z\n")
+    status = tmp_path / "w-status.txt"
+    env = {**_env(tmp_path), "GATE_DEFER_HOLDS_DIR": str(holds),
+           "GATE_DEFER_NOW": "2026-11-12T12:00:00+00:00"}
+    gate = subprocess.Popen([PY, str(GATE), "--", "/bin/true"], env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        _wait_for_deferred(tmp_path)
+        shown = subprocess.run([PY, str(GATE), "status"], env=env,
+                               capture_output=True, text=True, timeout=30)
+        assert "deferred" in shown.stdout and "hold w" in shown.stdout
+        with status.open("a") as fh:
+            fh.write("WINDOW-END 2026-11-12T12:00:01Z\n")
+        out, _ = gate.communicate(timeout=30)
+    finally:
+        if gate.poll() is None:
+            gate.kill()
+            gate.communicate(timeout=30)
+    assert gate.returncode == 0, out
+    assert "deferred: waiting on hold w" in out
+
+
+def test_the_quiet_command_fails_closed(tmp_path: Path) -> None:
+    gate = _gate_module()
+    assert gate.quiet_command_blocker("") is None
+    assert gate.quiet_command_blocker("/bin/true") is None
+    blocker = gate.quiet_command_blocker("/bin/false")
+    assert blocker is not None and "exited 1" in blocker
+
+
+def test_defer_help_documents_the_host_file(tmp_path: Path) -> None:
+    result = subprocess.run([PY, str(GATE), "--help"], env=_env(tmp_path),
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0
+    assert "~/.local/etc/agent-utils/gate-defer.toml" in result.stdout
+    assert "defer_unit_pattern" in result.stdout
+    assert "owner_defers" in result.stdout
+    assert "never paused" in result.stdout

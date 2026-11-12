@@ -65,6 +65,46 @@ recorded in the ledger. A ticket queued before a window begins likewise keeps
 its place and is granted only when the window ends. Running gates are never
 touched.
 
+Merge-queue deferral (#1406 gate-defer-merge-queue): a gate must not START
+while a host-protected validation outside this repository is running, because
+synthetic or heavy load during it can eject a good change on CPU inflation
+(2026-11-11). The protected units are host configuration, never repository
+configuration: a per-host sibling file (default
+~/.local/etc/agent-utils/gate-defer.toml, override $GATE_DEFER_CONFIG) holding
+`defer_unit_pattern = "<glob>"` and optionally `owner_defers = true/false`;
+$GATE_DEFER_UNIT_PATTERN is the test and override hook and wins. A sibling
+file, not a new key in gate.toml or gate-slots.toml, for the same reason as
+the phase-priority and interleave files: older checkouts refuse or cap on
+unknown keys in the shared files. The other team's unit name never appears in
+this repository, so the tool stays neutral. An empty or unset pattern means
+no deferral. The same host file may name a measurement-holds directory
+(`defer_holds_dir`): it holds `<name>.json` declarations, each naming a
+marker file (`marker_file`, or `status_file`) and a `max_hold_seconds` cap,
+and a hold is in force from the marker file's last `WINDOW-START <UTC>`
+line until a later `WINDOW-END`
+line, capped at `max_hold_seconds` after the start. That small file contract
+is reimplemented here, never imported, and the declaring team's name and
+paths stay in host configuration. Holds fail closed: a declaration or
+status file that cannot be parsed counts as an active hold, and `status`
+names the file and the problem; an empty or absent directory holds no
+holds. A host may also set `defer_quiet_command`: exit 0 means OK to run,
+and any other exit (or a command that cannot run) defers, again failing
+closed. While any signal is in force, a new gate waits before its
+preflight and again before its grant, so its command never runs during the
+protected validation; its ticket records `defer_waiting`, and `gate.py
+status` and `gate.py queue` show the deferred gate and what it waits on.
+Waiting is poll-driven ($GATE_DEFER_POLL_S) with no wall-clock budget that
+can fail the gate (owner rule 346): deferral time never counts against
+--wait-timeout. A gate already running is never paused: freezing the
+validation scheduler mid-step would stall the timers and file-system state
+its steps own and could itself cause the timeouts deferral exists to
+prevent, so deferral is start-only, exactly like blackout windows. Owner
+priority (#1180) defers too by default — CPU inflation harms the protected
+validation whoever asked for the gate — unless the host file sets
+`owner_defers = false`. A malformed defer file refuses a start (exit 2),
+like a malformed blackout file; if systemctl itself cannot be run, the gate
+warns and proceeds rather than wait forever on a broken probe.
+
 Rerun tickets: --rerun marks a short solo rerun of a few already-run steps
 (at most RERUN_MAX_STEPS `--selected` steps). Since #1260 it runs in the
 shared class unless a selected step is declared timing-sensitive in the
@@ -335,7 +375,8 @@ def host_slot_cap(path: Path | None = None) -> tuple[int | None, str | None]:
         return 1, f"gate slots config {path} is not TOML ({exc}); capping at 1"
     value = raw.get("slots")
     if (
-        not set(raw) <= {"slots", "cpu_quota_cpus"}
+        not set(raw) <= {"slots", "cpu_quota_cpus", "defer_unit_pattern", "owner_defers",
+                         "defer_holds_dir", "defer_holds_root", "defer_quiet_command"}
         or isinstance(value, bool) or not isinstance(value, int) or value < 1
     ):
         return 1, f"gate slots config {path} must hold `slots = N` with N >= 1 (and optionally `cpu_quota_cpus = N`); capping at 1"
@@ -904,6 +945,324 @@ def _is_interleave_marked(data: dict[str, object]) -> bool:
     return isinstance(reason, str) and reason.startswith("interleave:")
 
 
+#: Merge-queue deferral host file (#1406): a sibling of the slots file, for
+#: the same reason as the phase-priority and interleave files — an older
+#: gate.py refuses gate.toml holding anything but [[blackout]] tables and
+#: caps at 1 on unknown gate-slots.toml keys.
+DEFAULT_DEFER_CONFIG = Path("~/.local/etc/agent-utils/gate-defer.toml")
+
+#: How often a deferred gate re-checks the protected units (#1406).
+DEFER_POLL_DEFAULT_S = 1.0
+
+
+class DeferConfigError(RuntimeError):
+    """The defer config exists but cannot be used as written."""
+
+
+@dataclasses.dataclass(frozen=True)
+class DeferSettings:
+    """Host deferral settings (#1406): the protected unit glob (empty means
+    no unit deferral), the measurement-holds directory (empty means none),
+    the quiet command (empty means none), whether owner-priority gates
+    defer, and what decided it."""
+
+    pattern: str
+    owner_defers: bool
+    source: str
+    holds_dir: str = ""
+    quiet_command: str = ""
+    holds_root: str = ""
+
+
+def defer_config_path() -> Path:
+    return Path(os.environ.get("GATE_DEFER_CONFIG") or DEFAULT_DEFER_CONFIG).expanduser()
+
+
+_DEFER_KEYS = {"defer_unit_pattern", "owner_defers", "defer_holds_dir", "defer_quiet_command",
+               "defer_holds_root"}
+
+
+def _defer_from_mapping(raw: dict[str, object], source: str) -> DeferSettings:
+    if not set(raw) <= _DEFER_KEYS:
+        raise DeferConfigError(
+            f"gate defer config {source} may only set defer_unit_pattern, owner_defers, "
+            "defer_holds_dir, defer_holds_root and defer_quiet_command"
+        )
+    pattern = raw.get("defer_unit_pattern", "")
+    if not isinstance(pattern, str):
+        raise DeferConfigError(
+            f"gate defer config {source}: defer_unit_pattern must be a string, not {pattern!r}"
+        )
+    owner_defers = raw.get("owner_defers", True)
+    if not isinstance(owner_defers, bool):
+        raise DeferConfigError(
+            f"gate defer config {source}: owner_defers must be true or false, not {owner_defers!r}"
+        )
+    holds_dir = raw.get("defer_holds_dir", "")
+    if not isinstance(holds_dir, str):
+        raise DeferConfigError(
+            f"gate defer config {source}: defer_holds_dir must be a string, not {holds_dir!r}"
+        )
+    quiet_command = raw.get("defer_quiet_command", "")
+    if not isinstance(quiet_command, str):
+        raise DeferConfigError(
+            f"gate defer config {source}: defer_quiet_command must be a string, "
+            f"not {quiet_command!r}"
+        )
+    holds_root = raw.get("defer_holds_root", "")
+    if not isinstance(holds_root, str):
+        raise DeferConfigError(
+            f"gate defer config {source}: defer_holds_root must be a string, "
+            f"not {holds_root!r}"
+        )
+    return DeferSettings(
+        pattern.strip(), owner_defers, source, holds_dir.strip(), quiet_command.strip(),
+        holds_root.strip(),
+    )
+
+
+def defer_settings() -> DeferSettings:
+    """This host's deferral settings (#1406).
+
+    The sibling host file $GATE_DEFER_CONFIG or
+    ~/.local/etc/agent-utils/gate-defer.toml decides; for hosts that already
+    keep their gate settings together, the same keys in the gate-slots file
+    are read as a fallback. The $GATE_DEFER_UNIT_PATTERN,
+    $GATE_DEFER_HOLDS_DIR and $GATE_DEFER_QUIET_COMMAND hooks (tests,
+    one-off overrides) win per key, including an empty value, which disables
+    that signal. No setting anywhere means no deferral. A file that exists
+    but cannot be used as written raises DeferConfigError: it exists only
+    because the host asked for protection, so a typo must not silently
+    remove it."""
+
+    path = defer_config_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = None
+    except OSError as exc:
+        raise DeferConfigError(f"gate defer config {path} is unreadable: {exc}") from exc
+    if text is not None:
+        try:
+            parsed = tomllib.loads(text)
+        except tomllib.TOMLDecodeError as exc:
+            raise DeferConfigError(f"gate defer config {path} is not TOML: {exc}") from exc
+        settings = _defer_from_mapping(parsed, str(path))
+    else:
+        slots = slots_config_path()
+        try:
+            parsed_slots = tomllib.loads(slots.read_text(encoding="utf-8"))
+        except Exception:
+            parsed_slots = {}
+        if set(parsed_slots) & _DEFER_KEYS:
+            subset = {key: parsed_slots[key] for key in _DEFER_KEYS & set(parsed_slots)}
+            settings = _defer_from_mapping(subset, str(slots))
+        else:
+            settings = DeferSettings("", True, f"no defer settings; {path} absent")
+    env_pattern = os.environ.get("GATE_DEFER_UNIT_PATTERN")
+    if env_pattern is not None:
+        settings = dataclasses.replace(
+            settings, pattern=env_pattern.strip(), source="env GATE_DEFER_UNIT_PATTERN"
+        )
+    env_holds = os.environ.get("GATE_DEFER_HOLDS_DIR")
+    if env_holds is not None:
+        settings = dataclasses.replace(settings, holds_dir=env_holds.strip())
+    env_root = os.environ.get("GATE_DEFER_HOLDS_ROOT")
+    if env_root is not None:
+        settings = dataclasses.replace(settings, holds_root=env_root.strip())
+    env_quiet = os.environ.get("GATE_DEFER_QUIET_COMMAND")
+    if env_quiet is not None:
+        settings = dataclasses.replace(settings, quiet_command=env_quiet.strip())
+    return settings
+
+
+def defer_poll_s() -> float:
+    """Seconds between protected-unit checks for a deferred gate (#1406):
+    $GATE_DEFER_POLL_S, else DEFER_POLL_DEFAULT_S. An unusable value means
+    the default; the poll is always paced, never a busy loop."""
+
+    raw = os.environ.get("GATE_DEFER_POLL_S")
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0.0
+        if value > 0:
+            return value
+    return DEFER_POLL_DEFAULT_S
+
+
+def active_defer_units(pattern: str) -> tuple[list[str], str | None]:
+    """User units matching `pattern` that are active right now, and a
+    problem string when the probe itself failed (#1406). The probe is the
+    manual check this feature automates, resolved on PATH so tests stub it:
+    `systemctl --user list-units --no-legend '<pattern>' --state=active`.
+    A failed probe reports no units with the problem, so the caller warns
+    and proceeds rather than wait forever on a broken probe."""
+
+    if not pattern:
+        return [], None
+    systemctl = shutil.which("systemctl")
+    if systemctl is None:
+        return [], "systemctl not found on PATH; cannot check defer units"
+    try:
+        done = subprocess.run(
+            [systemctl, "--user", "list-units", "--no-legend", pattern, "--state=active"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [], f"systemctl defer probe failed: {exc}"
+    if done.returncode != 0:
+        detail = (done.stderr or done.stdout).strip().splitlines()
+        return [], f"systemctl defer probe exited {done.returncode}" + (
+            f": {detail[0]}" if detail else ""
+        )
+    units: list[str] = []
+    for line in done.stdout.splitlines():
+        fields = line.split()
+        if fields:
+            units.append(fields[0].lstrip("●").strip())
+    return sorted(set(units)), None
+
+
+def defer_now() -> dt.datetime:
+    """Now for hold windows, or the $GATE_DEFER_NOW test override (ISO 8601)."""
+
+    raw = os.environ.get("GATE_DEFER_NOW")
+    if not raw:
+        return dt.datetime.now(dt.timezone.utc)
+    try:
+        parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise DeferConfigError(f"GATE_DEFER_NOW is not an ISO 8601 time: {raw!r}") from exc
+    if parsed.tzinfo is None:
+        raise DeferConfigError(f"GATE_DEFER_NOW must carry a time zone: {raw!r}")
+    return parsed
+
+
+def _parse_hold_timestamp(text: str) -> dt.datetime:
+    parsed = dt.datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("timestamp carries no time zone")
+    return parsed
+
+
+def measurement_hold_blockers(
+    holds_dir: str, now: dt.datetime, holds_root: str = ""
+) -> list[str]:
+    """Active measurement-hold blockers in `holds_dir` (#1406), one label
+    per hold in force. The small file contract, reimplemented here: the
+    directory holds `<name>.json` declarations, each naming a marker file
+    (`marker_file`, or `status_file`) and a `max_hold_seconds` cap; the
+    hold is in force from the marker file's last `WINDOW-START <UTC>` line
+    until a later `WINDOW-END` line, capped at `max_hold_seconds` after
+    that start. A relative marker path resolves against `holds_root` when
+    the host sets one, else against the holds directory. Fail closed: a
+    declaration or marker file that cannot be parsed counts as an active
+    hold, and its label names the file and the problem. An empty or absent
+    directory holds no holds."""
+
+    if not holds_dir:
+        return []
+    root = Path(holds_dir).expanduser()
+    if not root.is_dir():
+        return []
+    relative_base = Path(holds_root).expanduser() if holds_root else root
+    blockers: list[str] = []
+    for declaration in sorted(root.glob("*.json")):
+        name = declaration.stem
+        try:
+            raw = json.loads(declaration.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("declaration is not a JSON object")
+            status_raw = raw.get("marker_file", raw.get("status_file"))
+            if not isinstance(status_raw, str) or not status_raw:
+                raise ValueError("marker_file must name a file")
+            cap_raw = raw.get("max_hold_seconds")
+            if isinstance(cap_raw, bool) or not isinstance(cap_raw, (int, float)) or cap_raw <= 0:
+                raise ValueError("max_hold_seconds must be a positive number")
+            cap = float(cap_raw)
+        except (OSError, ValueError) as exc:
+            blockers.append(f"hold declaration {declaration}: {exc}")
+            continue
+        status_path = Path(status_raw).expanduser()
+        if not status_path.is_absolute():
+            status_path = relative_base / status_path
+        try:
+            lines = status_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            blockers.append(f"hold {name}: status file {status_path} unreadable: {exc}")
+            continue
+        started: dt.datetime | None = None
+        in_force = False
+        problem: str | None = None
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("WINDOW-START"):
+                try:
+                    started = _parse_hold_timestamp(stripped[len("WINDOW-START"):])
+                    in_force = True
+                except ValueError as exc:
+                    problem = f"status file {status_path}: bad WINDOW-START line {stripped!r}: {exc}"
+                    break
+            elif stripped.startswith("WINDOW-END"):
+                in_force = False
+        if problem is not None:
+            blockers.append(f"hold {name}: {problem}")
+        elif in_force and started is not None:
+            expiry = started + dt.timedelta(seconds=cap)
+            if started <= now < expiry:
+                blockers.append(
+                    f"hold {name} ({status_path}) until {expiry:%Y-%m-%dT%H:%M:%SZ}"
+                )
+    return blockers
+
+
+def quiet_command_blocker(command: str) -> str | None:
+    """The quiet-command blocker (#1406), or None when it is OK to run:
+    the host-configured command exits 0 only when the host is quiet. Fail
+    closed: any other exit, or a command that cannot run, defers."""
+
+    if not command:
+        return None
+    try:
+        done = subprocess.run(
+            ["/bin/sh", "-c", command], capture_output=True, text=True,
+            timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"quiet command {command!r} could not run: {exc}"
+    if done.returncode == 0:
+        return None
+    return f"quiet command {command!r} exited {done.returncode}"
+
+
+def defer_blockers(
+    settings: DeferSettings, now: dt.datetime
+) -> tuple[list[str], str | None]:
+    """Every deferral blocker in force under `settings` (#1406), and a
+    probe problem when systemctl itself failed (reported, not a blocker:
+    the gate warns and proceeds rather than wait forever on a broken
+    probe). Labels are what `status` and the ticket record."""
+
+    units, problem = active_defer_units(settings.pattern)
+    blockers = list(units)
+    blockers += measurement_hold_blockers(settings.holds_dir, now, settings.holds_root)
+    quiet = quiet_command_blocker(settings.quiet_command)
+    if quiet is not None:
+        blockers.append(quiet)
+    return blockers, problem
+
+
+def _defer_applies(settings: DeferSettings, priority: str | None) -> bool:
+    """Whether a gate with this priority defers under `settings` (#1406):
+    any configured signal applies, and owner priority defers too, unless
+    the host file sets owner_defers = false."""
+
+    configured = bool(settings.pattern or settings.holds_dir or settings.quiet_command)
+    return configured and (priority != "owner" or settings.owner_defers)
+
+
 def _is_owner_ticket(data: dict[str, object]) -> bool:
     return data.get("priority") == "owner" and not _is_interleave_marked(data)
 
@@ -930,6 +1289,7 @@ class Admission:
         self._slots_problem: str | None = None
         (root / "queue").mkdir(parents=True, exist_ok=True)
         (root / "runs").mkdir(parents=True, exist_ok=True)
+        (root / "deferred").mkdir(parents=True, exist_ok=True)
         self._lock = (root / "admission.lock").open("a+")
 
     def _locked(self) -> None:
@@ -955,7 +1315,7 @@ class Admission:
         return self.slots if cap is None else min(self.slots, cap)
 
     def _reap(self) -> None:
-        for folder in ("queue", "runs"):
+        for folder in ("queue", "runs", "deferred"):
             for path in (self.root / folder).glob("*.json"):
                 data = self._read(path)
                 if data is None or not _alive(data.get("pid")):
@@ -1048,6 +1408,7 @@ class Admission:
             "priority": priority, "priority_reason": priority_reason,
             "cwd": os.getcwd(),
             "cross_differentials_opt_in": cross_differentials_opt_in,
+            "defer_waiting": [],
         }
         self._locked()
         try:
@@ -1057,6 +1418,63 @@ class Admission:
         finally:
             self._unlocked()
         return run_id, path
+
+    def note_deferred(
+        self, defer_id: str, cls: str, command: list[str], blockers: list[str],
+        priority: str | None, priority_reason: str | None,
+    ) -> None:
+        """Record (or refresh) a gate deferred before it could queue
+        (#1406), so `gate.py status` from another process can show it and
+        what it waits on. Reaped like a ticket when its pid dies."""
+
+        entry: dict[str, object] = {
+            "id": defer_id, "pid": os.getpid(), "class": cls,
+            "queued_at": time.time(), "command": command,
+            "defer_waiting": list(blockers),
+            "priority": priority, "priority_reason": priority_reason,
+            "cwd": os.getcwd(),
+        }
+        self._locked()
+        try:
+            path = self.root / "deferred" / f"{defer_id}.json"
+            existing = self._read(path)
+            if existing is not None:
+                entry["queued_at"] = existing.get("queued_at", entry["queued_at"])
+                if existing.get("defer_waiting") == entry["defer_waiting"]:
+                    return
+            path.write_text(json.dumps(entry))
+        finally:
+            self._unlocked()
+
+    def clear_deferred(self, defer_id: str) -> None:
+        self._locked()
+        try:
+            (self.root / "deferred" / f"{defer_id}.json").unlink(missing_ok=True)
+        finally:
+            self._unlocked()
+
+    def deferred(self) -> list[dict[str, object]]:
+        out = []
+        for path in sorted((self.root / "deferred").glob("*.json")):
+            data = self._read(path)
+            if data is not None:
+                out.append(data)
+        return out
+
+    def set_defer_waiting(self, run_id: str, blockers: list[str]) -> None:
+        """Record what a queued gate is deferred by (#1406), so `status`
+        and `queue` from another process can name it."""
+
+        self._locked()
+        try:
+            path = self.root / "queue" / f"{run_id}.json"
+            data = self._read(path)
+            if data is None or data.get("defer_waiting") == list(blockers):
+                return
+            data["defer_waiting"] = list(blockers)
+            path.write_text(json.dumps(data))
+        finally:
+            self._unlocked()
 
     def grant_blockers(
         self,
@@ -1427,6 +1845,12 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     if priority_problem:
         print(f"gate: {priority_problem}", flush=True)
         return 2
+    try:
+        defer = defer_settings()
+        defer_now()
+    except DeferConfigError as exc:
+        print(f"gate: {exc}", flush=True)
+        return 2
     rerun = bool(getattr(args, "rerun", False))
     if rerun:
         problem = _rerun_problem(command)
@@ -1443,48 +1867,6 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
             args.cls = "shared"
             print("gate: rerun names no timing-sensitive step; "
                   "runs in the shared class (#1260 rerun-shared-class)", flush=True)
-    if nested:
-        preflight = "skipped: nested gate"
-    elif rerun:
-        preflight = "skipped: rerun"
-    elif getattr(args, "skip_preflight", False):
-        preflight = "skipped: --skip-preflight"
-    else:
-        passed, seconds, failed, shown = run_preflight()
-        if not passed:
-            print(f"gate: preflight FAILED in {seconds:.0f}s, so this run was not queued; "
-                  "fix these and run the gate again (--skip-preflight overrides, recorded):",
-                  flush=True)
-            for line in shown:
-                print(line, flush=True)
-            now_s = time.time()
-            _record_ledger(args, command, now_s, now_s, PREFLIGHT_EXIT, set(), set(failed),
-                           "FAILED", kind="preflight-refused", preflight="failed")
-            return PREFLIGHT_EXIT
-        print(f"gate: preflight passed in {seconds:.0f}s ({', '.join(PREFLIGHT_STEPS)})", flush=True)
-        preflight = "passed"
-    # #1262: a full gate queues only after the same tree passed locally.
-    local_reason = getattr(args, "no_local_preflight", None)
-    if nested or rerun or not _is_full_gate(command):
-        local_preflight = "not-required"
-    elif local_reason is not None:
-        if not str(local_reason).strip():
-            print("gate: --no-local-preflight needs a reason", flush=True)
-            return 2
-        local_preflight = f"skipped: --no-local-preflight {local_reason}"
-        print(f"gate: local preflight skipped ({local_reason}); recorded in the ledger", flush=True)
-    elif _fresh_local_pass(_repo_root()):
-        local_preflight = "passed"
-        print("gate: local preflight passed (fresh local validate pass for this tree)", flush=True)
-    else:
-        print("gate: local preflight FAILED: no fresh local validate pass for this tree; "
-              "run `python3 scripts/validate.py --base github/main` locally first, "
-              "or pass --no-local-preflight REASON (recorded in the ledger)", flush=True)
-        now_s = time.time()
-        _record_ledger(args, command, now_s, now_s, PREFLIGHT_EXIT, set(), set(),
-                       "FAILED", kind="preflight-refused", preflight="local-preflight-missing",
-                       local_preflight="missing")
-        return PREFLIGHT_EXIT
     adm = Admission(state_dir(), args.slots)
     # #1146: the rerun ordering mark needs a live parent, checked with the
     # same liveness as a grant, before the parent slot is released below. An
@@ -1536,6 +1918,88 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     # blocks new ones, with no deadlock.
     if parent_run:
         adm.finish(parent_run)
+    # #1406: defer before anything expensive runs. The gate waits here,
+    # recorded under deferred/ so `status` can show it, until no protected
+    # unit, measurement hold or quiet-command blocker is in force. There is
+    # no deadline: deferral can never fail a gate (owner rule 346), and the
+    # queue loop below re-checks before the grant, so a signal that starts
+    # during the preflight still defers the start. Running gates — this
+    # gate's parent included — are never paused.
+    defer_id = f"defer-{time.time_ns()}-{uuid.uuid4().hex[:8]}"
+    defer_ever: list[str] = []
+    defer_wait_s = 0.0
+    defer_poll = defer_poll_s()
+    try:
+        defer_noted: tuple[str, ...] = ()
+        defer_problem: str | None = None
+        defer_began = time.time()
+        while _defer_applies(defer, priority):
+            blockers, problem = defer_blockers(defer, defer_now())
+            if problem is not None and problem != defer_problem:
+                print(f"gate: warning: {problem}; proceeding without the unit check",
+                      flush=True)
+                defer_problem = problem
+            if not blockers:
+                break
+            adm.note_deferred(defer_id, args.cls, command, blockers,
+                              priority, priority_reason)
+            key = tuple(blockers)
+            if key != defer_noted:
+                print(f"gate: deferred: waiting on {', '.join(blockers)} "
+                      f"({defer.source}); this gate starts when they finish "
+                      "(#1406 gate-defer-merge-queue)", flush=True)
+                defer_noted = key
+                for blocker in blockers:
+                    if blocker not in defer_ever:
+                        defer_ever.append(blocker)
+            time.sleep(defer_poll)
+        if defer_noted:
+            defer_wait_s += time.time() - defer_began
+            print("gate: deferral cleared; continuing to the preflight", flush=True)
+    finally:
+        adm.clear_deferred(defer_id)
+    if nested:
+        preflight = "skipped: nested gate"
+    elif rerun:
+        preflight = "skipped: rerun"
+    elif getattr(args, "skip_preflight", False):
+        preflight = "skipped: --skip-preflight"
+    else:
+        passed, seconds, failed, shown = run_preflight()
+        if not passed:
+            print(f"gate: preflight FAILED in {seconds:.0f}s, so this run was not queued; "
+                  "fix these and run the gate again (--skip-preflight overrides, recorded):",
+                  flush=True)
+            for line in shown:
+                print(line, flush=True)
+            now_s = time.time()
+            _record_ledger(args, command, now_s, now_s, PREFLIGHT_EXIT, set(), set(failed),
+                           "FAILED", kind="preflight-refused", preflight="failed")
+            return PREFLIGHT_EXIT
+        print(f"gate: preflight passed in {seconds:.0f}s ({', '.join(PREFLIGHT_STEPS)})", flush=True)
+        preflight = "passed"
+    # #1262: a full gate queues only after the same tree passed locally.
+    local_reason = getattr(args, "no_local_preflight", None)
+    if nested or rerun or not _is_full_gate(command):
+        local_preflight = "not-required"
+    elif local_reason is not None:
+        if not str(local_reason).strip():
+            print("gate: --no-local-preflight needs a reason", flush=True)
+            return 2
+        local_preflight = f"skipped: --no-local-preflight {local_reason}"
+        print(f"gate: local preflight skipped ({local_reason}); recorded in the ledger", flush=True)
+    elif _fresh_local_pass(_repo_root()):
+        local_preflight = "passed"
+        print("gate: local preflight passed (fresh local validate pass for this tree)", flush=True)
+    else:
+        print("gate: local preflight FAILED: no fresh local validate pass for this tree; "
+              "run `python3 scripts/validate.py --base github/main` locally first, "
+              "or pass --no-local-preflight REASON (recorded in the ledger)", flush=True)
+        now_s = time.time()
+        _record_ledger(args, command, now_s, now_s, PREFLIGHT_EXIT, set(), set(),
+                       "FAILED", kind="preflight-refused", preflight="local-preflight-missing",
+                       local_preflight="missing")
+        return PREFLIGHT_EXIT
     run_id, _ = adm.enqueue(
         args.cls, command, rerun or phase_marked,
         nested_phase=nested_phase, phase_priority_source=phase_mark_source,
@@ -1548,8 +2012,42 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
         print(f"gate: {starvation}", flush=True)
     last_pos = -1
     blackout_noted: BlackoutWindow | None = None
+    queue_defer_noted: tuple[str, ...] = ()
+    queue_defer_began: float | None = None
     while True:
-        if args.wait_timeout and time.time() - queued_at > args.wait_timeout:
+        # #1406: a signal that began during the preflight still defers the
+        # start — the grant is the start. Deferral time never counts
+        # against --wait-timeout (owner rule 346), so this check runs, and
+        # can wait, before the timeout check below.
+        if _defer_applies(defer, priority):
+            blockers, problem = defer_blockers(defer, defer_now())
+            if problem is not None and problem != defer_problem:
+                print(f"gate: warning: {problem}; proceeding without the unit check",
+                      flush=True)
+                defer_problem = problem
+            if blockers:
+                if queue_defer_began is None:
+                    queue_defer_began = time.time()
+                adm.set_defer_waiting(run_id, blockers)
+                key = tuple(blockers)
+                if key != queue_defer_noted:
+                    print(f"gate: deferred: waiting on {', '.join(blockers)} "
+                          f"({defer.source}); this gate starts when they finish "
+                          "(#1406 gate-defer-merge-queue)", flush=True)
+                    queue_defer_noted = key
+                    for blocker in blockers:
+                        if blocker not in defer_ever:
+                            defer_ever.append(blocker)
+                time.sleep(defer_poll)
+                continue
+            if queue_defer_noted:
+                adm.set_defer_waiting(run_id, [])
+                print("gate: deferral cleared; resuming the admission queue", flush=True)
+                queue_defer_noted = ()
+                if queue_defer_began is not None:
+                    defer_wait_s += time.time() - queue_defer_began
+                    queue_defer_began = None
+        if args.wait_timeout and time.time() - queued_at - defer_wait_s > args.wait_timeout:
             adm.finish(run_id)
             (state_dir() / "queue" / f"{run_id}.json").unlink(missing_ok=True)
             print(f"gate: gave up after {time.time() - queued_at:.0f}s in queue", flush=True)
@@ -1639,7 +2137,8 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
                     "run_s": round(finished - started, 2), "exit_code": rc,
                     "rerun": rerun, "nested_phase": nested_phase,
                     "phase_priority": phase_mark_source,
-                    "priority": priority, "priority_reason": priority_reason})
+                    "priority": priority, "priority_reason": priority_reason,
+                    "defer_waiting": defer_ever, "defer_wait_s": round(defer_wait_s, 2)})
         # After the slot is released, so no other gate waits on it (#940). A
         # nested gate leaves it to its parent, which is still building.
         pruned = None if nested or getattr(args, "no_prune", False) else _prune_after_gate()
@@ -1651,7 +2150,8 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
                        passed_steps, failed_steps, verdict_word, pruned, queued_at,
                        preflight=preflight, aborted=aborted, rerun_flag=rerun, local_preflight=local_preflight,
                        nested_phase=nested_phase, phase_priority_source=phase_mark_source,
-                       priority=priority, priority_reason=priority_reason)
+                       priority=priority, priority_reason=priority_reason,
+                       defer_waiting=defer_ever, defer_wait_s=defer_wait_s)
     return rc
 
 
@@ -1732,6 +2232,8 @@ def _record_ledger(
     phase_priority_source: str | None = None,
     priority: str | None = None,
     priority_reason: str | None = None,
+    defer_waiting: list[str] | None = None,
+    defer_wait_s: float = 0.0,
 ) -> None:
     """Append one durable ledger line for the finished run (#827). Best effort:
     a ledger failure must never change the gate's own result. `queued_utc` and
@@ -1774,6 +2276,8 @@ def _record_ledger(
             "phase_priority": phase_priority_source,
             "priority": priority,
             "priority_reason": priority_reason,
+            "defer_waiting": defer_waiting or [],
+            "defer_wait_s": round(defer_wait_s, 2),
             "log_path": None,
             "target_bytes_before": (pruned or {}).get("target_bytes_before"),
             "target_bytes_after": (pruned or {}).get("target_bytes_after"),
@@ -1789,6 +2293,45 @@ def _record_ledger(
         pass
 
 
+def _defer_waiting(data: dict[str, object]) -> list[str]:
+    value = data.get("defer_waiting")
+    return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def _defer_status_lines(prefix: str) -> list[str]:
+    """What deferral is configured and in force right now (#1406), for
+    `status` and `queue`: fail-closed hold problems ride in the blocker
+    labels, a malformed defer file names itself, and a broken systemctl
+    probe is a warning, never a silent pass."""
+
+    try:
+        settings = defer_settings()
+    except DeferConfigError as exc:
+        return [f"{prefix}: defer config unusable: {exc}; a new gate would refuse (exit 2)"]
+    if not (settings.pattern or settings.holds_dir or settings.quiet_command):
+        return [f"{prefix}: no deferral configured ({settings.source})"]
+    try:
+        blockers, problem = defer_blockers(settings, defer_now())
+    except DeferConfigError as exc:
+        return [f"{prefix}: defer config unusable: {exc}; a new gate would refuse (exit 2)"]
+    signals = []
+    if settings.pattern:
+        signals.append(f"unit pattern {settings.pattern!r}")
+    if settings.holds_dir:
+        signals.append(f"holds dir {settings.holds_dir}")
+    if settings.quiet_command:
+        signals.append(f"quiet command {settings.quiet_command!r}")
+    lines = [
+        f"{prefix}: deferral ({settings.source}): {', '.join(signals)}; "
+        f"owner defers: {settings.owner_defers}; "
+        + (f"{len(blockers)} blocker(s) in force: {', '.join(blockers)}"
+           if blockers else "no blocker in force")
+    ]
+    if problem is not None:
+        lines.append(f"{prefix}: warning: {problem}; gates proceed without the unit check")
+    return lines
+
+
 def show_status(args: argparse.Namespace) -> int:
     adm = Admission(state_dir(), args.slots)
     adm._locked()
@@ -1798,6 +2341,7 @@ def show_status(args: argparse.Namespace) -> int:
         queue = [(str(d["id"]), str(d["class"])) for d in ticket_data]
         run_data = adm.runs()
         runs = [(str(d["id"]), str(d.get("class"))) for d in run_data]
+        deferred_data = adm.deferred()
     finally:
         adm._unlocked()
     rows = adm.history()
@@ -1816,6 +2360,19 @@ def show_status(args: argparse.Namespace) -> int:
             state = "running" if data in run_data else "queued"
             print(f"gate status: owner priority {state} {data.get('id')} "
                   f"({data.get('priority_reason')})")
+    for line in _defer_status_lines("gate status"):
+        print(line)
+    now_s = time.time()
+    for data in deferred_data:
+        print(f"gate status: deferred {data.get('id')} class={data.get('class')} "
+              f"waiting on {', '.join(_defer_waiting(data)) or 'unknown blocker'} "
+              f"for {_age_text(now_s - _float_or(data.get('queued_at'), now_s))}: "
+              f"{_command_summary(data)}")
+    for data in ticket_data:
+        waiting = _defer_waiting(data)
+        if waiting:
+            print(f"gate status: deferred {data.get('id')} queued, waiting on "
+                  f"{', '.join(waiting)}")
     cap, problem = host_slot_cap()
     print(f"gate status: shared slots {adm.effective_slots()}"
           + (f" (host cap {cap} from {slots_config_path()})" if cap is not None else
@@ -1935,6 +2492,7 @@ def show_queue(args: argparse.Namespace) -> int:
         adm._reap()
         tickets = adm.tickets()
         runs = adm.runs()
+        deferred_data = adm.deferred()
     finally:
         adm._unlocked()
     enabled, source = phase_priority()
@@ -1953,7 +2511,15 @@ def show_queue(args: argparse.Namespace) -> int:
         nxt = blackout.next_start_after(now).astimezone(blackout.tz)
         print(f"gate queue: blackout {blackout.describe()}: no gate may start; "
               f"starts resume {nxt:%Y-%m-%d %H:%M %Z}")
+    for line in _defer_status_lines("gate queue"):
+        print(line)
     now_s = time.time()
+    for data in deferred_data:
+        print(f"gate queue: deferred {data.get('id')} class={data.get('class')} "
+              f"waiting on {', '.join(_defer_waiting(data)) or 'unknown blocker'} "
+              f"for {_age_text(now_s - _float_or(data.get('queued_at'), now_s))} "
+              f"cwd={data.get('cwd') or '-'}: "
+              f"{_command_summary(data)}")
     warning = _starvation_warning(tickets, now_s)
     if warning:
         print(f"gate queue: {warning}")
@@ -1969,10 +2535,15 @@ def show_queue(args: argparse.Namespace) -> int:
               f"{_age_text(now_s - _float_or(data.get('queued_at'), now_s))} ago "
               f"cwd={data.get('cwd') or '-'}: "
               f"{_command_summary(data)}")
+        waiting = _defer_waiting(data)
+        if waiting:
+            print(f"gate queue:   deferred: waiting on {', '.join(waiting)}")
         if not getattr(args, "explain", False):
             continue
         if blackout is not None:
             print("gate queue:   blocked by blackout (see above)")
+        elif waiting:
+            print("gate queue:   blocked by deferral (see above); starts when it clears")
         else:
             blockers = adm.grant_blockers(run_id, str(data.get("class")), tickets, runs)
             if not blockers:
@@ -2554,7 +3125,31 @@ def main(argv: list[str] | None = None) -> int:
             "with exit 78 instead, naming the next allowed start); a ticket queued "
             "before a window waits it out too. --ignore-blackout overrides a window "
             "and is recorded in the ledger. $GATE_BLACKOUT_NOW (ISO 8601) overrides "
-            "the clock for tests."
+            "the clock for tests.\n\n"
+            "Deferral (#1406 gate-defer-merge-queue): no gate starts while a "
+            "host-protected validation is running. Host configuration only, in "
+            "~/.local/etc/agent-utils/gate-defer.toml (override $GATE_DEFER_CONFIG; "
+            "the same keys in the gate-slots file are a fallback):\n"
+            '  defer_unit_pattern = "protected-*"   # user units that defer a start\n'
+            '  defer_holds_dir = "/host/path/holds"  # measurement-hold declarations\n'
+            '  defer_quiet_command = "host-quiet"    # exit 0 means OK to run\n'
+            "  owner_defers = true                   # owner priority defers too (default)\n"
+            "$GATE_DEFER_UNIT_PATTERN, $GATE_DEFER_HOLDS_DIR and "
+            "$GATE_DEFER_QUIET_COMMAND override per key (empty disables that "
+            "signal); an empty or unset unit pattern means no unit deferral, and "
+            "no configuration at all means no deferral. While a unit matching the "
+            "pattern is active (`systemctl --user list-units --no-legend "
+            "'<pattern>' --state=active`), a measurement hold is in force (a "
+            "`<name>.json` declaration naming `marker_file` and "
+            "`max_hold_seconds`; in force from the status file's last "
+            "`WINDOW-START <UTC>` until a later `WINDOW-END`, capped at "
+            "max_hold_seconds — an unparseable declaration or status file counts "
+            "as an active hold), or the quiet command exits non-zero, the gate "
+            "waits before its preflight and again before its grant, poll-driven "
+            "($GATE_DEFER_POLL_S) with no deadline, and deferral time never "
+            "counts against --wait-timeout. `gate status` and `gate queue` show "
+            "a deferred gate and what it waits on. A gate already running is "
+            "never paused. A malformed defer file refuses a start (exit 2)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
