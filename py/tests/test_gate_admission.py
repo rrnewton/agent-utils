@@ -1293,6 +1293,151 @@ def test_the_preflight_runs_named_validation_steps() -> None:
     assert set(gate.PREFLIGHT_STEPS) <= steps, sorted(set(gate.PREFLIGHT_STEPS) - steps)
 
 
+def _hold(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    env = _env(tmp_path)
+    env.pop("GATE_HOLD_NOW", None)
+    return subprocess.run([PY, str(GATE), "hold", *args], env=env,
+                          capture_output=True, text=True, timeout=30)
+
+
+def _set_hold(tmp_path: Path, reason: str = "cpu measurement") -> None:
+    done = _hold(tmp_path, "--until", "2999-01-01T00:00:00Z", "--reason", reason)
+    assert done.returncode == 0, done.stdout
+
+
+def test_a_hold_blocks_the_preflight_until_it_is_released(tmp_path: Path) -> None:
+    """#1370: a hold stops a new gate before its preflight, not only before
+    its ticket (2026-11-12: preflight dagrun scopes ran 7:43-7:54 inside a
+    7:26-8:01 hold). Release lets the same invocation proceed in order."""
+    marker = tmp_path / "preflight-ran"
+    env = {**_env(tmp_path), "GATE_PREFLIGHT_COMMAND": f"touch {marker}"}
+    env.pop("GATE_HOLD_NOW", None)
+    _set_hold(tmp_path)
+    output = tmp_path / "gate-output.txt"
+    with output.open("w") as stream:
+        proc = subprocess.Popen([PY, str(GATE), "--", PY, "-c", "pass"], env=env,
+                                stdout=stream, stderr=subprocess.STDOUT, text=True)
+        try:
+            deadline = time.time() + 10
+            text = ""
+            while "admission hold active" not in text:
+                assert time.time() < deadline, "the gate never reported the hold"
+                assert proc.poll() is None, output.read_text()
+                text = output.read_text() if output.exists() else ""
+                time.sleep(0.05)
+            assert not marker.exists(), "the preflight ran while the hold was active"
+            assert not list((tmp_path / "admission" / "queue").glob("*.json"))
+            released = _hold(tmp_path, "--release")
+            assert released.returncode == 0, released.stdout
+            proc.wait(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+    text = output.read_text()
+    assert proc.returncode == 0, text
+    assert marker.exists()
+    assert text.index("admission hold active") < text.index("preflight passed")
+    assert "admission hold lifted" in text
+
+
+def test_no_wait_hold_refuses_before_the_preflight(tmp_path: Path) -> None:
+    """#1370: --no-wait-hold chooses refusal over waiting, with the reason
+    and end time in the message, and the preflight never runs."""
+    marker = tmp_path / "preflight-ran"
+    env = {**_env(tmp_path), "GATE_PREFLIGHT_COMMAND": f"touch {marker}"}
+    env.pop("GATE_HOLD_NOW", None)
+    _set_hold(tmp_path, "quiet please")
+    done = subprocess.run([PY, str(GATE), "--no-wait-hold", "--", PY, "-c", "pass"],
+                          env=env, capture_output=True, text=True, timeout=30)
+    assert done.returncode == 79, done.stdout
+    assert "admission hold" in done.stdout and "quiet please" in done.stdout
+    assert "2999-01-01" in done.stdout
+    assert not marker.exists()
+    assert not list((tmp_path / "admission" / "queue").glob("*.json"))
+
+
+def test_an_expired_hold_is_ignored(tmp_path: Path) -> None:
+    """#1370: a hold whose end has passed blocks nothing and is reaped."""
+    state = tmp_path / "admission"
+    state.mkdir(parents=True)
+    (state / "hold.json").write_text(
+        json.dumps({"until": 1, "reason": "long over", "set_at": 0}))
+    marker = tmp_path / "preflight-ran"
+    env = {**_env(tmp_path), "GATE_PREFLIGHT_COMMAND": f"touch {marker}"}
+    env.pop("GATE_HOLD_NOW", None)
+    done = subprocess.run([PY, str(GATE), "--", PY, "-c", "pass"],
+                          env=env, capture_output=True, text=True, timeout=30)
+    assert done.returncode == 0, done.stdout
+    assert marker.exists()
+    assert "admission hold" not in done.stdout
+    status = subprocess.run([PY, str(GATE), "status"], env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert "no admission hold" in status.stdout, status.stdout
+
+
+def test_status_shows_the_hold(tmp_path: Path) -> None:
+    """#1370: `gate status` (and bare `gate hold`) name the hold's reason
+    and end time; after release both say there is none."""
+    _set_hold(tmp_path, "dev-hermit KVM window")
+    status = subprocess.run([PY, str(GATE), "status"], env=_env(tmp_path),
+                            capture_output=True, text=True, timeout=30)
+    assert status.returncode == 0, status.stdout
+    assert "admission hold active until 2999-01-01T00:00:00Z" in status.stdout
+    assert "dev-hermit KVM window" in status.stdout
+    shown = _hold(tmp_path)
+    assert shown.returncode == 0 and "dev-hermit KVM window" in shown.stdout
+    assert _hold(tmp_path, "--release").returncode == 0
+    status = subprocess.run([PY, str(GATE), "status"], env=_env(tmp_path),
+                            capture_output=True, text=True, timeout=30)
+    assert "no admission hold" in status.stdout, status.stdout
+
+
+def test_hold_until_accepts_iso_times_and_durations() -> None:
+    """#1370: --until takes an ISO 8601 time or a duration from now."""
+    gate = _gate_module()
+    assert gate.parse_hold_until("30m", now=1000.0) == 1000.0 + 30 * 60
+    assert gate.parse_hold_until("2h", now=1000.0) == 1000.0 + 2 * 3600
+    assert gate.parse_hold_until("2999-01-01T00:00:00Z", now=1000.0) > 1000.0
+    with pytest.raises(gate.HoldError):
+        gate.parse_hold_until("whenever", now=1000.0)
+
+
+def test_contained_command_applies_the_cpu_cap_and_nice_10(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1370: the containment wrapper carries the per-gate CPU cap and
+    nice 10, for gates and for the preflight alike."""
+    gate = _gate_module()
+    monkeypatch.delenv("GATE_CPU_CONTAINMENT", raising=False)
+    wrapped, contained = gate._contained_command(["echo", "hi"], "1370-test", 48)
+    assert contained and "CPUQuota=4800%" in wrapped
+    assert any(word.endswith("nice") for word in wrapped) and "10" in wrapped
+
+
+def test_the_preflight_runs_contained_like_a_gate(tmp_path: Path) -> None:
+    """#1370: the preflight child sees the capped scheduler widths and
+    runs at nice 10 under the per-gate CPU quota."""
+    env_file = tmp_path / "preflight.env"
+    nice_file = tmp_path / "preflight.nice"
+    env = {**_env(tmp_path), "GATE_CPU_QUOTA_CPUS": "7",
+           "GATE_PREFLIGHT_COMMAND": (
+               f"env > {env_file}; {PY} -c \"import os; print(os.nice(0))\" > {nice_file}")}
+    env.pop("GATE_CPU_CONTAINMENT", None)
+    env.pop("GATE_HOLD_NOW", None)
+    env.pop("VALIDATE_MAX_CPUS", None)
+    env.pop("GOMAXPROCS", None)
+    done = subprocess.run([PY, str(GATE), "--", PY, "-c", "pass"],
+                          env=env, capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stdout
+    assert "preflight containment" in done.stdout and "CPUQuota=700%" in done.stdout
+    recorded = dict(line.split("=", 1) for line in env_file.read_text().splitlines() if "=" in line)
+    assert recorded["GATE_CPU_QUOTA_CPUS"] == "7"
+    assert recorded["VALIDATE_MAX_CPUS"] == "7" and recorded["GOMAXPROCS"] == "7"
+    # `nice -n 10` raises this process's niceness by 10 (capped at 19); a
+    # lane starts at 0, so there the preflight runs at exactly nice 10.
+    assert int(nice_file.read_text()) == min(19, os.nice(0) + 10)
+
+
 def test_a_dead_queue_ticket_never_blocks_admission(tmp_path: Path) -> None:
     state = tmp_path / "admission" / "queue"
     state.mkdir(parents=True)

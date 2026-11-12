@@ -177,6 +177,28 @@ violation only after waiting for a ticket and running a full gate. A nested
 gate and a --rerun ticket skip it, because their tree already passed it.
 --skip-preflight skips it too, and the ledger records that it did.
 $GATE_PREFLIGHT_COMMAND (a shell command) replaces the checks, for tests.
+The preflight itself runs contained like a gate (#1370): the same per-gate
+CPU cap (default 48 CPUs) and nice 10, through `_contained_command`, with
+VALIDATE_MAX_CPUS/GOMAXPROCS capped the same way, so a lane's selected
+checks before queueing cannot burn the host either.
+
+Admission hold (#1370 gate-hold-covers-local-preflight): an operator who
+needs the host quiet (a CPU-measured reading, 2026-11-12 7:26-8:01 AM ET,
+when preflight dagrun scopes still ran 7:43-7:54 inside the old
+placeholder-exclusive hold) sets a first-class hold instead:
+
+    scripts/gate.py hold --until 2026-11-12T13:01:00Z --reason "cpu reading"
+    scripts/gate.py hold --release
+
+--until also accepts a duration from now (`45m`, `2h`). The hold lives in
+`hold.json` in the admission directory, beside the tickets it blocks.
+While it is active a new gate waits before its preflight (not merely
+before its ticket), or refuses at once with --no-wait-hold (exit 79);
+--wait-timeout still bounds the wait (exit 75). A nested phase of a live
+parent and every already-running gate are untouched. An expired hold is
+reaped and ignored. `gate status` and bare `gate hold` show the hold with
+its reason and end time. $GATE_HOLD_NOW (ISO 8601) overrides the clock
+for tests.
 """
 from __future__ import annotations
 
@@ -365,27 +387,37 @@ def host_cpu_quota_cpus(path: Path | None = None) -> int:
     return DEFAULT_CPU_QUOTA_CPUS
 
 
+#: Niceness of every contained command, gates and preflight alike (#1370).
+#: A scope cannot take Nice= (systemd-run rejects it for scopes), so the
+#: command itself is niced inside the scope.
+CONTAINMENT_NICE = 10
+
+
 def _contained_command(
     command: list[str], run_id: str, quota_cpus: int
 ) -> tuple[list[str], bool]:
-    """`command` wrapped in a systemd user scope capped at `quota_cpus`.
+    """`command` wrapped in a systemd user scope capped at `quota_cpus`
+    and running at nice CONTAINMENT_NICE.
 
     Returns (command, contained). Uncontained when the caller opted out
     ($GATE_CPU_CONTAINMENT=off) or no user systemd-run is available: the
     gate says which happened and runs either way, because a host without a
-    user manager must not lose its gates (#1254)."""
+    user manager must not lose its gates (#1254). The nice still applies
+    without a scope, via the `nice` binary when one is present."""
     if os.environ.get("GATE_CPU_CONTAINMENT") == "off":
         print("gate: CPU containment off ($GATE_CPU_CONTAINMENT=off)", flush=True)
         return command, False
+    nice = shutil.which("nice")
+    niced = [nice, "-n", str(CONTAINMENT_NICE), *command] if nice else command
     systemd_run = shutil.which("systemd-run")
     if systemd_run is None:
         print("gate: systemd-run not found; running without CPU containment (#1254)", flush=True)
-        return command, False
+        return niced, False
     unit = f"agent-utils-gate-{run_id}"
     wrapped = [
         systemd_run, "--user", "--scope", "--quiet", f"--unit={unit}",
         "-p", f"CPUQuota={quota_cpus * 100}%",
-        "--", *command,
+        "--", *niced,
     ]
     return wrapped, True
 
@@ -576,6 +608,183 @@ def active_blackout(
     windows: tuple[BlackoutWindow, ...], instant: dt.datetime
 ) -> BlackoutWindow | None:
     return next((window for window in windows if window.active_at(instant)), None)
+
+
+#: Exit status for a start refused by an admission hold (#1370).
+HOLD_EXIT = 79
+
+
+class HoldError(RuntimeError):
+    """A hold time or $GATE_HOLD_NOW value cannot be used as written."""
+
+
+def hold_path() -> Path:
+    return state_dir() / "hold.json"
+
+
+def hold_now() -> float:
+    """Now as a unix time, or the $GATE_HOLD_NOW test override (ISO 8601)."""
+
+    raw = os.environ.get("GATE_HOLD_NOW")
+    if not raw:
+        return time.time()
+    try:
+        parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HoldError(f"GATE_HOLD_NOW is not an ISO 8601 time: {raw!r}") from exc
+    if parsed.tzinfo is None:
+        raise HoldError(f"GATE_HOLD_NOW must carry a time zone: {raw!r}")
+    return parsed.timestamp()
+
+
+def parse_hold_until(text: str, now: float | None = None) -> float:
+    """An --until value as a unix time: an ISO 8601 time (a naive time is
+    UTC), or a duration from now such as `45m`, `2h`, `30s`, `1d`."""
+
+    now = hold_now() if now is None else now
+    match = re.fullmatch(r"\+?(\d+(?:\.\d+)?)([smhd])", text.strip())
+    if match:
+        scale = {"s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
+        return now + float(match.group(1)) * scale
+    try:
+        parsed = dt.datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HoldError(
+            f"--until {text!r} is neither an ISO 8601 time nor a duration like 45m/2h"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.timestamp()
+
+
+def _read_hold() -> dict[str, object] | None:
+    try:
+        data = json.loads(hold_path().read_text())
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    until = data.get("until")
+    if isinstance(until, bool) or not isinstance(until, (int, float)):
+        return None
+    reason = data.get("reason")
+    return {"until": float(until), "reason": reason if isinstance(reason, str) else "",
+            "set_at": data.get("set_at")}
+
+
+def active_hold(now: float | None = None) -> dict[str, object] | None:
+    """The live hold, or None: no hold file, an unusable one, or an expired
+    one (reaped here, so an expired hold is simply ignored)."""
+
+    hold = _read_hold()
+    if hold is None:
+        return None
+    if float(hold["until"]) <= (hold_now() if now is None else now):
+        hold_path().unlink(missing_ok=True)
+        return None
+    return hold
+
+
+def _hold_text(hold: dict[str, object]) -> str:
+    return f"until {_utc(float(hold['until']))} ({hold['reason']})"
+
+
+def set_hold(until: float, reason: str) -> None:
+    root = state_dir()
+    root.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"until": until, "reason": reason, "set_at": hold_now()})
+    with (root / "admission.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            tmp = root / "hold.json.tmp"
+            tmp.write_text(payload)
+            os.replace(tmp, root / "hold.json")
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def clear_hold() -> bool:
+    existed = hold_path().exists()
+    hold_path().unlink(missing_ok=True)
+    return existed
+
+
+def _wait_for_hold(args: argparse.Namespace) -> int | None:
+    """None to proceed, or the exit status to return: wait out an active
+    hold before the preflight, or refuse it (--no-wait-hold)."""
+
+    hold = active_hold()
+    if hold is None:
+        return None
+    if getattr(args, "no_wait_hold", False):
+        print(f"gate: admission hold active {_hold_text(hold)}; refusing "
+              "(--no-wait-hold). Release it with `gate.py hold --release` "
+              "or wait for it to expire", flush=True)
+        return HOLD_EXIT
+    print(f"gate: admission hold active {_hold_text(hold)}; waiting before "
+          "the preflight (--no-wait-hold refuses instead)", flush=True)
+    waited_from = time.monotonic()
+    while active_hold() is not None:
+        if args.wait_timeout and time.monotonic() - waited_from > args.wait_timeout:
+            print(f"gate: gave up after {time.monotonic() - waited_from:.0f}s "
+                  "waiting for the admission hold to lift", flush=True)
+            return 75
+        time.sleep(0.25)
+    print("gate: admission hold lifted; proceeding", flush=True)
+    return None
+
+
+def run_hold(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="gate hold",
+        description=(
+            "Set, release, or show the admission hold (#1370): while a hold "
+            "is active, a new gate waits before its local preflight (or "
+            "refuses with --no-wait-hold, exit 79); running gates and a "
+            "nested phase of a live parent are untouched. An expired hold "
+            "is ignored. `gate status` shows the same hold."),
+        epilog=(
+            "Examples:\n"
+            "  scripts/gate.py hold --until 2026-11-12T13:01:00Z --reason \"cpu reading\"\n"
+            "  scripts/gate.py hold --until 45m --reason \"cpu reading\"\n"
+            "  scripts/gate.py hold --release\n"
+            "  scripts/gate.py hold            # show the current hold"),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--until", default=None,
+                        help="when the hold ends: an ISO 8601 time (a naive time is UTC) "
+                             "or a duration from now such as 45m, 2h, 30s, 1d")
+    parser.add_argument("--reason", default=None,
+                        help="why the host must stay quiet; required with --until, "
+                             "recorded in the hold and printed by `gate status`")
+    parser.add_argument("--release", action="store_true",
+                        help="lift the hold now, whatever its end time")
+    args = parser.parse_args(argv)
+    if args.release and args.until is not None:
+        parser.error("--release takes no --until")
+    try:
+        if args.release:
+            print("gate hold: released" if clear_hold() else "gate hold: no hold to release")
+            return 0
+        if args.until is None:
+            hold = active_hold()
+            print(f"gate hold: active {_hold_text(hold)}" if hold else "gate hold: no admission hold")
+            return 0
+        reason = (args.reason or "").strip()
+        if not reason:
+            parser.error("--until needs --reason \"why the host must stay quiet\"")
+        until = parse_hold_until(args.until)
+        set_hold(until, reason)
+        hold = {"until": until, "reason": reason}
+        if active_hold() is None:
+            print(f"gate hold: set {_hold_text(hold)}, already expired; no gate will wait")
+        else:
+            print(f"gate hold: active {_hold_text(hold)}; new gates wait before "
+                  "their preflight (release with `gate.py hold --release`)")
+        return 0
+    except HoldError as exc:
+        print(f"gate: {exc}", flush=True)
+        return 2
 
 
 def ledger_path(explicit: str | None = None) -> Path:
@@ -1138,11 +1347,22 @@ def preflight_command() -> list[str]:
 
 
 def run_preflight() -> tuple[bool, float, list[str], list[str]]:
-    """Run the preflight in this checkout: (passed, seconds, failed steps, lines to show)."""
+    """Run the preflight in this checkout: (passed, seconds, failed steps, lines to show).
+
+    Contained like a gate (#1370): the per-gate CPU cap and nice 10 through
+    `_contained_command`, with the scheduler widths capped the same way."""
 
     started = time.time()
+    quota_cpus = host_cpu_quota_cpus()
+    run_id = f"preflight-{os.getpid()}"
+    command, contained = _contained_command(preflight_command(), run_id, quota_cpus)
+    if contained:
+        print(f"gate: preflight containment: systemd scope agent-utils-gate-{run_id}, "
+              f"CPUQuota={quota_cpus * 100}% ({quota_cpus} CPUs), "
+              f"nice {CONTAINMENT_NICE} (#1370)", flush=True)
     try:
-        proc = subprocess.run(preflight_command(), cwd=_repo_root(), env=_child_environment(),
+        proc = subprocess.run(command, cwd=_repo_root(),
+                              env=_child_environment(**_capped_environment(quota_cpus)),
                               stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True, errors="replace")
         returncode, lines = proc.returncode, proc.stdout.splitlines()
@@ -1171,6 +1391,17 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     # alone also leaks into unrelated children of a running gate (tests,
     # shells), and those are fresh starts the blackout still refuses.
     nested = bool(parent_run) and (state_dir() / "runs" / f"{parent_run}.json").is_file()
+    # #1370: the hold comes before everything a new gate would run, the
+    # preflight included; a nested phase belongs to a gate already running
+    # when the hold was set, and running gates are never touched.
+    if not nested:
+        try:
+            hold_rc = _wait_for_hold(args)
+        except HoldError as exc:
+            print(f"gate: {exc}", flush=True)
+            return 2
+        if hold_rc is not None:
+            return hold_rc
     active = active_blackout(windows, now)
     if active is not None and not ignore and not nested and getattr(args, "no_wait_blackout", False):
         return _refuse_blackout(active, now)
@@ -1332,7 +1563,8 @@ def run_admitted(args: argparse.Namespace, command: list[str]) -> int:
     print(f"gate: admitted after {waited:.0f}s (class={args.cls})", flush=True)
     if contained:
         print(f"gate: CPU containment: systemd scope agent-utils-gate-{run_id}, "
-              f"CPUQuota={quota_cpus * 100}% ({quota_cpus} CPUs, #1254 gate-cpu-containment)",
+              f"CPUQuota={quota_cpus * 100}% ({quota_cpus} CPUs), "
+              f"nice {CONTAINMENT_NICE} (#1254 gate-cpu-containment, #1370)",
               flush=True)
     started = time.time()
     rc = 1
@@ -1555,6 +1787,12 @@ def show_status(args: argparse.Namespace) -> int:
     recent = [r for r in rows if float(str(r.get("finished_at", 0))) >= cutoff]
     waits = sorted(float(str(r["wait_s"])) for r in recent if "wait_s" in r)
     print(f"gate status: {len(runs)} running {runs}, {len(queue)} queued {queue}")
+    try:
+        hold = active_hold()
+    except HoldError:
+        hold = None
+    print(f"gate status: admission hold active {_hold_text(hold)} (#1370)"
+          if hold else "gate status: no admission hold")
     for data in run_data + ticket_data:
         if _is_owner_ticket(data):
             state = "running" if data in run_data else "queued"
@@ -2276,8 +2514,17 @@ def main(argv: list[str] | None = None) -> int:
         description="Gate admission: counting slots plus an exclusive class.",
         epilog=(
             "Subcommands: gate status, gate stats, gate queue [--explain] (why each "
-            "queued ticket waits, and the phase-priority switch state), gate prune. "
+            "queued ticket waits, and the phase-priority switch state), gate prune, "
+            "gate hold [--until TIME --reason TEXT | --release] (the admission "
+            "hold, #1370). "
             "Run each as `gate <name> --help`.\n\n"
+            "Admission hold (#1370): `gate hold --until 2026-11-12T13:01:00Z "
+            "--reason \"cpu reading\"` (or a duration such as 45m) makes every "
+            "new gate wait before its preflight until the hold ends or "
+            "`gate hold --release` lifts it; --no-wait-hold refuses instead "
+            "(exit 79). Running gates are untouched, an expired hold is "
+            "ignored, and `gate status` shows the hold. $GATE_HOLD_NOW "
+            "(ISO 8601) overrides the clock for tests.\n\n"
             "Blackout windows (#907): no gate starts inside a window from the per-host "
             "config (default ~/.local/etc/agent-utils/gate.toml, override with "
             "$GATE_BLACKOUT_CONFIG or --blackout-config). Format, one or more tables:\n"
@@ -2299,7 +2546,9 @@ def main(argv: list[str] | None = None) -> int:
                              "$GATE_SLOTS_CONFIG names) lowers it and is re-read on every poll")
     parser.add_argument("--exclusive", dest="cls", action="store_const", const="exclusive", default="shared",
                         help="run alone: wait for an empty box and block new admissions")
-    parser.add_argument("--wait-timeout", type=float, default=0.0, help="give up queueing after N seconds (0 = wait forever)")
+    parser.add_argument("--wait-timeout", type=float, default=0.0, help="give up queueing after N seconds (0 = wait forever); also bounds the wait for an admission hold to lift")
+    parser.add_argument("--no-wait-hold", action="store_true",
+                        help="refuse a start while an admission hold is active (exit 79, naming its reason and end time) instead of waiting before the preflight for it to lift (#1370; see `gate hold --help`)")
     parser.add_argument("--blackout-config", default=None,
                         help="blackout config path (default $GATE_BLACKOUT_CONFIG or ~/.local/etc/agent-utils/gate.toml)")
     parser.add_argument("--ignore-blackout", action="store_true",
@@ -2345,6 +2594,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-prune", action="store_true",
                         help="skip the cargo target prune a finished run does (also $GATE_PRUNE_TARGETS=off; "
                              "see `gate prune --help`)")
+    if argv[:1] == ["hold"]:
+        return run_hold(argv[1:])
     if argv[:1] == ["status"]:
         return show_status(parser.parse_args([]))
     if argv[:1] == ["queue"]:
