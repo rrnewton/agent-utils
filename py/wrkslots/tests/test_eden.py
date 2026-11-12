@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -259,6 +260,81 @@ def test_provision_clone_info_redirects() -> None:
     assert eden.is_inside("/slot/buck", "/slot")
     assert not eden.is_inside("/data/scratch/buck", "/slot")
     assert calls[0][3] == "clone"
+
+
+def test_storage_consistency_skips_eden_backing(tmp_path: Path) -> None:
+    """An Eden row's external backing is not Git drift (#1409).
+
+    The backing repo lives outside the project by design, so the
+    storage check must not judge it by the Git sibling rule that
+    refused Eden slot removal on devbig030.
+    """
+
+    slot_dir = tmp_path / "worktrees" / "validate" / "edentrial"
+    (slot_dir / "checkout").mkdir(parents=True)
+    config = wrkslots_cli.Config(
+        config_path=tmp_path / ".wrkslots.yml",
+        root=tmp_path,
+        worktrees=tmp_path / "worktrees",
+        control=tmp_path / "worktrees",
+        machine="node-a",
+        default_remote="origin",
+        default_landed_ref="refs/remotes/origin/main",
+        heartbeat_ttl_seconds=60,
+        liveness_command=tmp_path / "live.py",
+        layout="flat",
+    )
+    record = wrkslots_cli.ActiveRecord(
+        slot="edentrial",
+        agent="mu-eden",
+        task="eden-trial",
+        purpose="trial",
+        slot_type="validate",
+        machine="node-a",
+        generation=1,
+        created_at="2026-11-12T00:00:00Z",
+        heartbeat_at="2026-11-12T00:00:00Z",
+        heartbeat_ttl_seconds=60,
+        owner=None,
+        coordinator_lease=wrkslots_cli.ProcessIdentity(
+            pid=1, start_ticks=1, boot_id="boot", host_id="host", cgroup_path="/"
+        ),
+        coordinator_recovery_note=None,
+        handoff=None,
+        checkouts=(
+            wrkslots_cli.Checkout(
+                name="main",
+                path="worktrees/validate/edentrial/checkout",
+                repository="/backing/repo",
+                branch=eden.EDEN_BRANCH,
+                start_point=REV,
+                remote=eden.EDEN_REMOTE,
+                remote_url_sha256=DIGEST,
+                landed_ref=eden.EDEN_LANDED_REF,
+                head=REV,
+                containing_remote_refs=(),
+                vcs="eden",
+            ),
+        ),
+    )
+    # Same proof for a plain-directory (non-image) agent Eden slot:
+    # the Git-sibling rule never depended on image slots.
+    agent_dir = tmp_path / "worktrees" / "edenagent"
+    (agent_dir / "checkout").mkdir(parents=True)
+    agent_record = dataclasses.replace(
+        record,
+        slot="edenagent",
+        slot_type="agent",
+        checkouts=(
+            dataclasses.replace(
+                record.checkouts[0], path="worktrees/edenagent/checkout"
+            ),
+        ),
+    )
+    state = wrkslots_cli.ActiveState(
+        machine="node-a", revision=0, slots=(record, agent_record)
+    )
+    assert wrkslots_cli._registry_storage_inconsistencies(config, (state,)) == ()
 
 
 def test_parse_daemon_facts() -> None:

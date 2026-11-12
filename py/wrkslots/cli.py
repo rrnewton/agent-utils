@@ -11434,6 +11434,11 @@ def _registry_storage_inconsistencies(
                     )
 
         for checkout in record.checkouts:
+            if checkout.vcs == "eden":
+                # Eden backing repos live outside the project by design and
+                # have no Git worktree registration to compare (#1204); the
+                # daemon checks in the Eden paths judge this checkout.
+                continue
             path = _stored_path_reference(config, checkout.path, "checkout path")
             try:
                 _relative, repository = _stored_repository_path(
