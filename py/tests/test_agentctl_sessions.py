@@ -364,6 +364,26 @@ def test_cli_list_reports_every_row_and_exits_nonzero_for_malformed_record(
     assert rows[1]["agent_status"] == "idle"
 
 
+def test_cli_list_skips_a_recordless_directory_under_agents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # #1359 restore-report-under-agents: agents/restore-reports/ holds
+    # report files, not an agent; listing skips it and exits 0.
+    sessions, fake, _calls = setup(tmp_path, monkeypatch)
+    sessions.start_session("worker", cwd=str(tmp_path))
+    reports = sessions.registry / "agents" / "restore-reports"
+    reports.mkdir(mode=0o700)
+    (reports / "11111111-2222-3333-4444-555555555555.json").write_text(
+        '{"complete": true}', encoding="utf-8",
+    )
+    monkeypatch.setattr(cli, "HerdrClient", lambda **_kwargs: cast(HerdrClient, fake))
+
+    assert cli.main(["--registry", str(sessions.registry), "list"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert [row["name"] for row in rows] == ["worker"]
+
+
 @pytest.mark.parametrize("first,second", [("interactive", "headless"), ("headless", "interactive"), ("headless", "headless")])
 def test_modes_share_names_and_preserve_the_original_generation(first: str, second: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     sessions, fake, calls = setup(tmp_path, monkeypatch)

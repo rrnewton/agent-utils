@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::agent::AgentError;
-use crate::restore::{default_report_dir, read_report, Host, RestoreConfig, RestoreOptions};
+use crate::restore::{read_report, Host, RestoreConfig, RestoreOptions};
 use crate::subagents::{ManagedAgents, ManagedApi};
 
 /// Schema of the teams file `--config` reads.
@@ -261,32 +261,18 @@ fn wait_for_certificate(host: &dyn Host, path: &Path, wait: Duration) -> bool {
 }
 
 /// Where a registry's recorded report for `boot_id` may live, in read
-/// order: the per-registry `restore-reports/` subdirectory (the
-/// location holding that registry's reports), then the configured
-/// `report_dir`, then the shared state-directory default. The shared default is
-/// only ever a fallback for one registry's own recorded outcome, never
-/// the basis of a multi-registry decision on its own: it is tried last,
-/// after the registry's own locations.
+/// order (#1359): the configured `report_dir` or the per-registry
+/// `restore/reports/` subdirectory first, then the earlier locations
+/// (`restore-reports/`, `agents/restore-reports/`), then the shared
+/// state-directory default. The shared default is only ever a fallback for
+/// one registry's own recorded outcome, never the basis of a multi-registry
+/// decision on its own: it is tried last, after the registry's own locations.
 pub(crate) fn candidate_report_paths(
     registry: &Path,
     config: &RestoreConfig,
     boot_id: &str,
 ) -> Vec<PathBuf> {
-    let file = format!("{boot_id}.json");
-    let mut paths = vec![registry.join("restore-reports").join(&file)];
-    if let Some(dir) = config.report_dir.as_ref() {
-        let path = dir.join(&file);
-        if !paths.contains(&path) {
-            paths.push(path);
-        }
-    }
-    if let Some(dir) = default_report_dir() {
-        let path = dir.join(&file);
-        if !paths.contains(&path) {
-            paths.push(path);
-        }
-    }
-    paths
+    crate::restore::candidate_report_paths(registry, config, boot_id)
 }
 
 /// The first recorded report for this boot that reads, with its path.
@@ -879,7 +865,9 @@ mod tests {
     }
 
     #[test]
-    fn recorded_report_prefers_the_registry_subdirectory() {
+    fn recorded_report_prefers_the_configured_dir_and_reads_legacy_without_one() {
+        // #1359: one read order for restore and restore-teams — configured
+        // or new default first, legacy locations after.
         let root = scratch("dual-read");
         let registry = root.join("registry");
         let reports = root.join("reports");
@@ -901,7 +889,7 @@ mod tests {
         let (path, report) = read_recorded_report(&registry, &config, BOOT).unwrap();
         assert_eq!(path, reports.join(format!("{BOOT}.json")));
         assert_eq!(report["agents"][0]["name"], "shared");
-        // The per-registry subdirectory wins once it has the report.
+        // A legacy copy never shadows the configured directory.
         fs::write(
             registry
                 .join("restore-reports")
@@ -912,11 +900,34 @@ mod tests {
         )
         .unwrap();
         let (path, report) = read_recorded_report(&registry, &config, BOOT).unwrap();
+        assert_eq!(path, reports.join(format!("{BOOT}.json")));
+        assert_eq!(report["agents"][0]["name"], "shared");
+        // Without a configured directory, the legacy location still reads,
+        // and the new default location wins once it has the report.
+        fs::write(
+            registry.join("restore.json"),
+            json!({"schema": "agentctl-restore/v1"}).to_string(),
+        )
+        .unwrap();
+        let config = RestoreConfig::load(&registry).unwrap();
+        let (path, report) = read_recorded_report(&registry, &config, BOOT).unwrap();
         assert!(
             path.ends_with(format!("restore-reports/{BOOT}.json")),
             "{path:?}"
         );
         assert_eq!(report["agents"][0]["name"], "own");
+        let current = crate::restore::reports_directory(&registry);
+        fs::create_dir_all(&current).unwrap();
+        fs::write(
+            current.join(format!("{BOOT}.json")),
+            json!({"schema": "agentctl-restore-report/v1", "complete": true,
+                   "agents": [{"name": "current", "action": "revived"}]})
+            .to_string(),
+        )
+        .unwrap();
+        let (path, report) = read_recorded_report(&registry, &config, BOOT).unwrap();
+        assert_eq!(path, current.join(format!("{BOOT}.json")));
+        assert_eq!(report["agents"][0]["name"], "current");
         let _ = fs::remove_dir_all(&root);
     }
 

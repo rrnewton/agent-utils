@@ -151,7 +151,7 @@ enum Commands {
     Promote(Promote),
     /// Bring the coordinator team back after the host restarts: remount slot images, wait for Herdr, revive the coordinator and then every dead agent from its launch spec, managers before the agents they manage, register the coordinator's new pane in other registries, start the configured units, and queue one recovery notice. Idempotent; writes a JSON report for the boot
     #[command(
-        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl restore --dry-run\n  agentctl --registry ~/project/.agentctl restore --boot\n\nConfiguration is REGISTRY/restore.json (schema agentctl-restore/v1): coordinator (default: the\nregistry's designated coordinator; when both are set and disagree, restore.json wins and the report\nsays so under designation_problem), also_registered\n([{registry, name}]), units, exclude (names to leave alone), agents (an optional pinned desired-state list: when present, only those agents plus the coordinator are restored; when absent, the desired set is registry-derived — every record that was running at shutdown, stopped records skipped, an undecidable record refused with its evidence; the report names the choice under desired_state_source), resume_brief (an optional template queued once per revived or promoted lane under a per-boot message ID, recorded in resume_briefs; variables only {{boot_id}}, {{boot_time}}, {{finished_at}}, {{agent}}, {{coordinator}}, {{slot}}, {{slot_outcome}}, {{report}} — an unknown variable refuses the config; absent or blank means no briefs. Suggested text: \"[agentctl restore] {{agent}}: the host rebooted (boot {{boot_id}}, kernel boot at Unix time {{boot_time}}; restore finished at {{finished_at}}). Slot {{slot}}: {{slot_outcome}}. Check wrkslots status and your slot tip against your notes, restart only the step the reboot interrupted, and leave pre-boot admission tickets to their reaper — never delete them by hand. Coordinator: {{coordinator}}. Report: {{report}}.\"), startup_delay_seconds (default 20), herdr_wait_seconds (default 300),\nreport_dir (default REGISTRY/restore-reports), herdr_unit, timers (watch settings whose home is REGISTRY/watch.json, read every watch pass; restore reads this file once per boot and ignores watch.json), certificate_file, certificate_fetch and certificate_wait_seconds (default herdr_wait_seconds; restore waits for a usable certificate, then revives nothing and names the fetch), and scheduled ([{name, on_calendar, command}], rendered as persistent timer units by install-units --scheduled).\nThe slot manager is AGENTCTL_WRKSLOTS_BIN, then profiles.json \"wrkslots\", then the team folder's bin/wrkslots (PATH is never consulted); restore runs\n`wrkslots image status` once, before any agent starts, so image-backed slots are mounted.\nA completed restore for this epoch (the kernel boot plus the user manager's identity; a user-manager restart begins a new epoch in the same boot) makes a rerun replay the recorded report (action already-restored, replayed true, naming the replayed report and epoch) and exit by that recorded class, unless --force. Exit 0 when\nthe restore completed with no refusal; 74 when it completed except for refused lanes (named in\nthe report's refused_lanes; not a failure a boot unit should retry); 75 otherwise. Every step\nand refusal is in the report."
+        after_help = "Examples:\n  agentctl --registry ~/project/.agentctl restore --dry-run\n  agentctl --registry ~/project/.agentctl restore --boot\n\nConfiguration is REGISTRY/restore.json (schema agentctl-restore/v1): coordinator (default: the\nregistry's designated coordinator; when both are set and disagree, restore.json wins and the report\nsays so under designation_problem), also_registered\n([{registry, name}]), units, exclude (names to leave alone), agents (an optional pinned desired-state list: when present, only those agents plus the coordinator are restored; when absent, the desired set is registry-derived — every record that was running at shutdown, stopped records skipped, an undecidable record refused with its evidence; the report names the choice under desired_state_source), resume_brief (an optional template queued once per revived or promoted lane under a per-boot message ID, recorded in resume_briefs; variables only {{boot_id}}, {{boot_time}}, {{finished_at}}, {{agent}}, {{coordinator}}, {{slot}}, {{slot_outcome}}, {{report}} — an unknown variable refuses the config; absent or blank means no briefs. Suggested text: \"[agentctl restore] {{agent}}: the host rebooted (boot {{boot_id}}, kernel boot at Unix time {{boot_time}}; restore finished at {{finished_at}}). Slot {{slot}}: {{slot_outcome}}. Check wrkslots status and your slot tip against your notes, restart only the step the reboot interrupted, and leave pre-boot admission tickets to their reaper — never delete them by hand. Coordinator: {{coordinator}}. Report: {{report}}.\"), startup_delay_seconds (default 20), herdr_wait_seconds (default 300),\nreport_dir (default REGISTRY/restore/reports; reports at the old REGISTRY/restore-reports and REGISTRY/agents/restore-reports locations are still read until 2027-02-12, and restore --migrate-reports moves them, previewing unless --apply), herdr_unit, timers (watch settings whose home is REGISTRY/watch.json, read every watch pass; restore reads this file once per boot and ignores watch.json), certificate_file, certificate_fetch and certificate_wait_seconds (default herdr_wait_seconds; restore waits for a usable certificate, then revives nothing and names the fetch), and scheduled ([{name, on_calendar, command}], rendered as persistent timer units by install-units --scheduled).\nThe slot manager is AGENTCTL_WRKSLOTS_BIN, then profiles.json \"wrkslots\", then the team folder's bin/wrkslots (PATH is never consulted); restore runs\n`wrkslots image status` once, before any agent starts, so image-backed slots are mounted.\nA completed restore for this epoch (the kernel boot plus the user manager's identity; a user-manager restart begins a new epoch in the same boot) makes a rerun replay the recorded report (action already-restored, replayed true, naming the replayed report and epoch) and exit by that recorded class, unless --force. Exit 0 when\nthe restore completed with no refusal; 74 when it completed except for refused lanes (named in\nthe report's refused_lanes; not a failure a boot unit should retry); 75 otherwise. Every step\nand refusal is in the report."
     )]
     Restore(Restore),
     /// Restore every team named by a teams file and/or repeated --registry filters, in order, in one deterministic host command: bounded wait for each registry's configured user certificate, then that registry's own `restore`, then one aggregated JSON report and one per-agent table. With no --config and no --registry it is a usage error: there is no host-wide discovery
@@ -513,10 +513,13 @@ struct Restore {
     #[arg(long, default_value = "30", value_parser = startup_seconds, value_name = "SECONDS")]
     startup_timeout: f64,
     /// Write the desired-state agents list in restore.json from the live non-coordinator records: previews the change and writes nothing unless --apply is also given. Example: agentctl restore --write-agents --apply
-    #[arg(long, conflicts_with_all = ["boot", "force", "dry_run"])]
+    #[arg(long, conflicts_with_all = ["boot", "force", "dry_run", "migrate_reports"])]
     write_agents: bool,
-    /// Actually write restore.json (with --write-agents); without it the change is only previewed
-    #[arg(long, requires = "write_agents")]
+    /// Move restore reports from the old registry locations (REGISTRY/restore-reports, REGISTRY/agents/restore-reports) into REGISTRY/restore/reports: previews the move and changes nothing unless --apply is also given. Example: agentctl restore --migrate-reports --apply
+    #[arg(long, conflicts_with_all = ["boot", "force", "dry_run", "write_agents"])]
+    migrate_reports: bool,
+    /// Actually write (with --write-agents) or move the reports (with --migrate-reports); without it the change is only previewed
+    #[arg(long)]
     apply: bool,
 }
 
@@ -3668,7 +3671,7 @@ fn run_tail(registry: &Path, herdr_bin: &Path, value: Tail) -> Result<i32, Failu
 /// are not agents' state (chat, inbox, hold, progress), leaves the registry's layout alone.
 fn writes_registry(command: &Commands) -> bool {
     match command {
-        Commands::Restore(value) => !value.dry_run,
+        Commands::Restore(value) => !value.dry_run && !(value.migrate_reports && !value.apply),
         Commands::Revive(value) => !value.dry_run,
         Commands::RetireStaleRegistration(value) => !value.dry_run,
         Commands::Coordinator(value) => !matches!(value.command, CoordinatorCommand::Show),
@@ -3899,12 +3902,23 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             .map_err(Failure::Inbox);
         }
         Commands::Restore(value) => {
+            if value.apply && !value.write_agents && !value.migrate_reports {
+                return Err(Failure::Usage(
+                    "--apply needs --write-agents or --migrate-reports".to_owned(),
+                ));
+            }
             let herdr_bin = resolve_herdr_bin(&args.registry, &args.herdr_bin);
             let client =
                 HerdrClient::with_executable("direct", &herdr_bin).map_err(AgentError::from)?;
             if value.write_agents {
                 let report =
                     crate::restore::spec_write_agents(&client, &args.registry, value.apply)?;
+                write_json(&report).map_err(Failure::Output)?;
+                return Ok(0);
+            }
+            if value.migrate_reports {
+                let config = crate::restore::RestoreConfig::load(&args.registry)?;
+                let report = crate::restore::migrate_reports(&args.registry, &config, value.apply)?;
                 write_json(&report).map_err(Failure::Output)?;
                 return Ok(0);
             }

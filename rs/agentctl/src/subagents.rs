@@ -11804,6 +11804,22 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         })
     }
 
+    /// The names `list` and the watcher show: registered names that hold a
+    /// record in either layout. A directory under `agents/` with no record
+    /// (restore's old report directory, #1359) is not an agent and is
+    /// skipped, while a record that exists but cannot be read still gets
+    /// its own error row from the caller.
+    fn listed_names(&self) -> Result<Vec<String>> {
+        Ok(self
+            .registered_names()?
+            .into_iter()
+            .filter(|name| {
+                agent_queue::registry::record_directories(&self.registry, name)
+                    .is_ok_and(|directories| !directories.is_empty())
+            })
+            .collect())
+    }
+
     /// List every registered agent, preserving records when Herdr is unavailable.
     pub fn list(&self) -> Result<Vec<Value>> {
         // One non-attaching agentcloud listing serves every cloud agent in this pass.
@@ -11811,7 +11827,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         // Each row stands alone: a record this build cannot read is reported as its own error row
         // instead of hiding every other agent in the registry.
         Ok(self
-            .registered_names()?
+            .listed_names()?
             .iter()
             .map(|name| {
                 self.load(name)
@@ -11826,7 +11842,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     /// [`Self::list`] that come from the record, or the error row of a record that cannot be read.
     pub(crate) fn watch_rows(&self) -> Result<Vec<Value>> {
         Ok(self
-            .registered_names()?
+            .listed_names()?
             .iter()
             .map(|name| {
                 self.load(name)
@@ -21681,6 +21697,29 @@ fi
             .as_str()
             .unwrap()
             .contains("invalid agent record agentctl-session/v3 fields"));
+    }
+
+    #[test]
+    fn list_skips_a_recordless_directory_under_agents() {
+        // #1359 restore-report-under-agents: agents/restore-reports/ holds
+        // report files, not an agent; list and the watch rows skip it
+        // instead of failing the listing on an unreachable "agent".
+        let fixture = Fixture::new();
+        fixture.adopt();
+        let reports = fixture.root.join("registry/agents/restore-reports");
+        fs::create_dir_all(&reports).unwrap();
+        fs::write(
+            reports.join("11111111-2222-3333-4444-555555555555.json"),
+            b"{\"complete\": true}",
+        )
+        .unwrap();
+        let rows = fixture.manager().list().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["name"], "foreign");
+        assert!(rows.iter().all(|row| row.get("record_error").is_none()));
+        let rows = fixture.manager().watch_rows().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["name"], "foreign");
     }
 
     #[test]

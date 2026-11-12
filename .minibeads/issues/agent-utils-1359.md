@@ -1,6 +1,6 @@
 ---
 title: 'restore-report-under-agents: restore reports under agents/ are treated as an unreachable agent'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
@@ -33,3 +33,13 @@ The reports are a growing collection of their own, so under the repository rule 
 # Notes
 
 Numbered by the devbig014 lead (2026-11-12); filed from devbig030's lane for #1405 restore-epoch-manager-restart. Follows the migration shape of #593 registry-agents-subdir.
+
+## Resolution
+
+[watermelon-full-preview] New reports default to `REGISTRY/restore/reports/` (`restore::reports_directory`); a configured `report_dir` is unchanged. Restore, the watch restore check, and `restore-teams` read the current (or configured) location first, then `REGISTRY/restore-reports/`, `REGISTRY/agents/restore-reports/`, and the shared XDG directory, until `LEGACY_REPORT_SUPPORT_ENDS` (2027-02-12). `agentctl restore --migrate-reports` previews the move and `--apply` performs it, never overwriting a report already at the destination and never sourcing from the shared XDG directory (its reports cannot be attributed to one registry). `list` and the watch rows in both editions skip an entry with no agent record in either layout; a record that exists but is unreadable still gets its own error row, so `list` still exits 1 for a genuinely broken record.
+
+Smoke check: with a fixture registry holding `agents/restore-reports/<boot>.json` beside one real agent, `list` now exits 0 listing only the real agent in both editions (Rust `list_skips_a_recordless_directory_under_agents`, Python `test_cli_list_skips_a_recordless_directory_under_agents`). The pre-fix Rust path produced a `record_error` row for `restore-reports` and the CLI maps any such row to exit 1, which matches the 05:30 smoke failure shape (`list (<other registry>) exited 1`) on a registry with that directory.
+
+Gate note (2026-11-12): the full gate's remaining reds are known untouched defects, waived by the lead for this landing. The restore drill (`test_restore_drill_happy_path_fresh_pane_slot_and_rerun`, #1477 restore-drill-happy-path-cpu-capped) fails at `tests/test_agentctl_restore_drill.py:747` (`queued("cheap") == []` after a complete, all-revived restore) in #1359's capped gate, its capped rerun, and its uncapped quiet-host rerun — and identically on a clean `github/main` checkout (8500c1ac38) on this host, so the red is pre-existing here and independent of this change. `test_launch_sigterm_exits_within_a_few_seconds` and the `cross.agentctl.differential-2` CPU-TIMEOUT under the serial memory-capped model are likewise waived as known load defects; differential-2 showed no divergence.
+
+Combined-tree check (2026-11-12, lead's overlap rule): landed as the clean rebase of the gated change onto `github/main` 19faf8a40b (tree 6f34b60fbf before this note; the rebased non-issue diff is content-identical to the gated one). Contained focused tests on the combined tree all passed: `cargo test --lib restore` (104), `list_` (9), `migrate` (5), `revive` (113), `relaunch` (5), clippy clean, `cargo fmt --check`, `pytest py/tests/test_agentctl_sessions.py` (188), and strict mypy on the changed Python files. An uncapped run of `cross.agentctl.differential-1` and `cross.agentctl.differential-2` on the combined tree ended in CPU-TIMEOUT on both with zero DIVERGENCE lines, waived per the lead ruling above.

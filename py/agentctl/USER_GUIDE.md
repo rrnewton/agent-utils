@@ -1140,7 +1140,12 @@ hand. Coordinator: {coordinator}. Report: {report}.
 ```
 
 The report is `REPORT_DIR/BOOT_ID.json` (default
-`REGISTRY/restore-reports`). Exit status is 0 when the restore completed
+`REGISTRY/restore/reports`). Reports recorded at the old locations
+(`REGISTRY/restore-reports`, `REGISTRY/agents/restore-reports`, and the
+shared state directory) are still read until 2027-02-12, and
+`agentctl restore --migrate-reports` moves them into the default location
+(it only previews unless `--apply` is also given, and never overwrites a
+report already there). Exit status is 0 when the restore completed
 with no refusal, 74 when it completed except for refused lanes (named in
 `refused_lanes`; not a failure a boot unit should retry), 75 otherwise.
 `--boot` marks the report as the boot unit's run.
@@ -1249,8 +1254,9 @@ itself: each registry's restore waits for Herdr and starts its configured
 with the per-registry reports, one row per agent, `refused_lanes` and the
 aggregate `complete`/`refused`/`exit_code`; the same rows are printed as a
 human table on stderr, one `agentctl restore-teams:` line per agent. Recorded
-reports are read from each registry's own `restore-reports/` subdirectory
-first, then its configured `report_dir`, then the shared default. An
+reports are read from each registry's configured `report_dir` or its own
+`restore/reports/` subdirectory first, then the old locations
+(`restore-reports/`, `agents/restore-reports/`), then the shared default. An
 immediate rerun in the same boot replays the recorded per-agent outcomes —
 labelled `(replayed)` in the table and `replayed: true` in the rows — at the
 recorded exit class, never as a fresh empty success. Exit status is 0 when

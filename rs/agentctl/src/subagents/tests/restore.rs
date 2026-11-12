@@ -271,9 +271,10 @@ fn restore_remounts_first_revives_then_starts_units_and_is_idempotent() {
 #[test]
 fn restore_default_report_lives_under_the_registry_in_its_own_subdirectory() {
     // #975 boot-restore-retry: with no report_dir configured, the per-boot
-    // report defaults to REGISTRY/restore-reports/, so the boot evidence
+    // report defaults to a registry subdirectory, so the boot evidence
     // sits with the registry it describes and two registries on one host
-    // cannot overwrite each other's same-boot report.
+    // cannot overwrite each other's same-boot report. #1359: that
+    // subdirectory is REGISTRY/restore/reports/, outside agents/.
     let fixture = Fixture::new();
     let _old = dead_agent(&fixture);
     let host = ScriptedHost::new();
@@ -285,7 +286,8 @@ fn restore_default_report_lives_under_the_registry_in_its_own_subdirectory() {
     let report = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
     assert_eq!(report["complete"], true, "{report}");
     let path = registry
-        .join("restore-reports")
+        .join("restore")
+        .join("reports")
         .join(format!("{BOOT}.json"));
     assert_eq!(
         report["report"].as_str().unwrap(),
@@ -385,6 +387,73 @@ fn restore_report_without_an_epoch_is_not_replayed_under_a_known_manager() {
 }
 
 #[test]
+fn restore_replays_a_report_left_under_agents_and_migrates_it_out() {
+    // #1359 restore-report-under-agents: a completed report at either old
+    // location still counts in its epoch, and --migrate-reports moves it
+    // to REGISTRY/restore/reports/ (dry run first, never overwriting).
+    let fixture = Fixture::new();
+    let _old = dead_agent(&fixture);
+    let host = ScriptedHost::new();
+    let registry = fixture.root.join("registry");
+    let document = json!({"schema": "agentctl-restore/v1", "startup_delay_seconds": 0});
+    fs::write(registry.join("restore.json"), document.to_string()).unwrap();
+    let config = RestoreConfig::load(&registry).unwrap();
+    let first = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(first["complete"], true, "{first}");
+    let current = registry
+        .join("restore")
+        .join("reports")
+        .join(format!("{BOOT}.json"));
+    assert!(current.is_file(), "{first}");
+    // An older build's copy of the same report, under agents/.
+    let legacy = registry
+        .join("agents")
+        .join("restore-reports")
+        .join(format!("{BOOT}.json"));
+    fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    fs::rename(&current, &legacy).unwrap();
+
+    let replay = restore(&fixture.client, &registry, &host, &config, &options(None)).unwrap();
+    assert_eq!(replay["action"], "already-restored", "{replay}");
+    assert_eq!(
+        replay["replayed_report"],
+        json!(legacy.display().to_string()),
+        "{replay}"
+    );
+
+    let dry = crate::restore::migrate_reports(&registry, &config, false).unwrap();
+    assert_eq!(
+        dry["would_move"],
+        json!([legacy.display().to_string()]),
+        "{dry}"
+    );
+    assert!(legacy.is_file(), "a dry run moves nothing: {dry}");
+    let applied = crate::restore::migrate_reports(&registry, &config, true).unwrap();
+    assert_eq!(
+        applied["moved"],
+        json!([legacy.display().to_string()]),
+        "{applied}"
+    );
+    assert!(current.is_file() && !legacy.exists(), "{applied}");
+    let again = crate::restore::migrate_reports(&registry, &config, true).unwrap();
+    assert_eq!(again["moved"], json!([]), "{again}");
+    // A same-named legacy report is kept, never overwritten.
+    fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    fs::write(&legacy, "{\"complete\": false}").unwrap();
+    let kept = crate::restore::migrate_reports(&registry, &config, true).unwrap();
+    assert_eq!(kept["moved"], json!([]), "{kept}");
+    assert_eq!(
+        kept["kept"][0]["path"],
+        json!(legacy.display().to_string()),
+        "{kept}"
+    );
+    assert_eq!(
+        crate::restore::read_report(&current).unwrap()["complete"],
+        true
+    );
+}
+
+#[test]
 fn restore_early_failure_still_writes_a_partial_report() {
     // #975: a restore that cannot even list the registry must still leave
     // its evidence in the report file; at boot the journal may be the only
@@ -401,7 +470,8 @@ fn restore_early_failure_still_writes_a_partial_report() {
     let config = RestoreConfig::load(&registry).unwrap();
     assert!(restore(&fixture.client, &registry, &host, &config, &options(None)).is_err());
     let path = registry
-        .join("restore-reports")
+        .join("restore")
+        .join("reports")
         .join(format!("{BOOT}.json"));
     let partial = crate::restore::read_report(&path).expect("a partial report was written");
     assert_eq!(partial["complete"], false, "{partial}");

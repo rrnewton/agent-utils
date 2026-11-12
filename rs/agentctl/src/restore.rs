@@ -335,7 +335,7 @@ pub struct RestoreConfig {
     /// Seconds to wait for the Herdr server (default 300).
     #[serde(default = "default_herdr_wait")]
     pub herdr_wait_seconds: u64,
-    /// Directory for per-boot reports (default `REGISTRY/restore-reports`).
+    /// Directory for per-boot reports (default `REGISTRY/restore/reports`).
     #[serde(default)]
     pub report_dir: Option<PathBuf>,
     /// The unit that runs the Herdr server, which the watch starts when Herdr is down.
@@ -1066,8 +1066,40 @@ pub struct RestoreOptions {
     pub herdr_bin: PathBuf,
 }
 
+/// The last day on which readers accept reports at the pre-#1359 locations
+/// (`REGISTRY/restore-reports/`, `REGISTRY/agents/restore-reports/` and the
+/// shared XDG state directory below).
+pub const LEGACY_REPORT_SUPPORT_ENDS: &str = "2027-02-12";
+
+/// Where new reports live by default (#1359 restore-report-under-agents):
+/// `REGISTRY/restore/reports/`, the reports' own collection directory,
+/// outside `agents/` (the agent collection, whose every entry `list` reads
+/// as an agent) and off the registry's top level.
+pub fn reports_directory(registry: &Path) -> PathBuf {
+    registry.join("restore").join("reports")
+}
+
+/// The report directories older builds wrote to, in read order after the
+/// current one: the #975 registry subdirectory, the directory found inside
+/// `agents/` in the wild (#1359), then the shared XDG state directory.
+/// Readers accept these until [`LEGACY_REPORT_SUPPORT_ENDS`]; an explicit
+/// `report_dir` names the one location, so there are no fallback reads.
+fn legacy_report_directories(registry: &Path, config: &RestoreConfig) -> Vec<PathBuf> {
+    if config.report_dir.is_some() {
+        return Vec::new();
+    }
+    let mut directories = vec![
+        registry.join("restore-reports"),
+        registry.join("agents").join("restore-reports"),
+    ];
+    if let Some(directory) = default_report_dir() {
+        directories.push(directory);
+    }
+    directories
+}
+
 /// The XDG state report directory: `$XDG_STATE_HOME/agentctl/restore`, else under
-/// the home. New reports default to the registry's own `restore-reports/` instead
+/// the home. New reports default to the registry's own `restore/reports/` instead
 /// (#975 boot-restore-retry: one host state directory shared by every registry made
 /// two teams' same-boot reports overwrite each other, and the boot evidence belonged
 /// with the registry it describes); this location is still read so a report written
@@ -1090,39 +1122,112 @@ fn report_path(registry: &Path, config: &RestoreConfig, boot_id: &str) -> PathBu
     let directory = config
         .report_dir
         .clone()
-        .unwrap_or_else(|| registry.join("restore-reports"));
+        .unwrap_or_else(|| reports_directory(registry));
     directory.join(format!("{boot_id}.json"))
 }
 
-/// Where a report for this boot may already live under the pre-#975 default.
-/// An explicit `report_dir` names the one location, so there is no fallback read.
-fn legacy_report_path(config: &RestoreConfig, boot_id: &str) -> Option<PathBuf> {
-    if config.report_dir.is_some() {
-        return None;
+/// Every path a report for this boot may live at, in read order: the
+/// configured or current default location first, then each earlier one
+/// (#1359). `restore-teams` reads the same order.
+pub fn candidate_report_paths(
+    registry: &Path,
+    config: &RestoreConfig,
+    boot_id: &str,
+) -> Vec<PathBuf> {
+    let file = format!("{boot_id}.json");
+    let mut paths = vec![report_path(registry, config, boot_id)];
+    for directory in legacy_report_directories(registry, config) {
+        let path = directory.join(&file);
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
     }
-    default_report_dir().map(|directory| directory.join(format!("{boot_id}.json")))
-}
-
-fn read_boot_report_from(primary: &Path, legacy: Option<&Path>) -> Option<(PathBuf, Value)> {
-    if let Some(report) = read_report(primary) {
-        return Some((primary.to_path_buf(), report));
-    }
-    let legacy = legacy?;
-    read_report(legacy).map(|report| (legacy.to_path_buf(), report))
+    paths
 }
 
 /// This boot's existing report and where it was found: the current location
-/// first, then the XDG state one, so a same-boot report from an older build
+/// first, then the earlier ones, so a same-boot report from an older build
 /// still satisfies the already-restored and watch checks.
 fn read_boot_report(
     registry: &Path,
     config: &RestoreConfig,
     boot_id: &str,
 ) -> Option<(PathBuf, Value)> {
-    read_boot_report_from(
-        &report_path(registry, config, boot_id),
-        legacy_report_path(config, boot_id).as_deref(),
-    )
+    candidate_report_paths(registry, config, boot_id)
+        .into_iter()
+        .find_map(|path| read_report(&path).map(|report| (path, report)))
+}
+
+/// Move every report at an earlier registry location into the current
+/// report directory (#1359): `agentctl restore --migrate-reports`, dry-run
+/// by default. A report already at the destination is never overwritten;
+/// the old copy is left and named under `kept`. Running it again moves
+/// nothing more. The shared XDG directory is never a source: it held
+/// every registry's reports, so none of them can be attributed to this
+/// registry; it stays a read fallback until the deprecation date.
+pub fn migrate_reports(registry: &Path, config: &RestoreConfig, apply: bool) -> Result<Value> {
+    let destination = config
+        .report_dir
+        .clone()
+        .unwrap_or_else(|| reports_directory(registry));
+    let mut sources = vec![
+        registry.join("restore-reports"),
+        registry.join("agents").join("restore-reports"),
+    ];
+    sources.retain(|directory| *directory != destination);
+    let (moved_key, mut moved) = (if apply { "moved" } else { "would_move" }, Vec::new());
+    let mut kept = Vec::new();
+    if apply {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&destination)
+            .map_err(|error| fail(format!("cannot create {}: {error}", destination.display())))?;
+    }
+    for source in &sources {
+        let Ok(entries) = fs::read_dir(source) else {
+            continue;
+        };
+        let mut names: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        names.sort();
+        for path in names {
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            let target = destination.join(name);
+            if target.exists() {
+                kept.push(json!({
+                    "path": path.display().to_string(),
+                    "reason": format!("a report already exists at {}", target.display()),
+                }));
+                continue;
+            }
+            if apply {
+                match fs::rename(&path, &target) {
+                    Ok(()) => moved.push(json!(path.display().to_string())),
+                    Err(error) => kept.push(json!({
+                        "path": path.display().to_string(),
+                        "reason": format!("cannot move it to {}: {error}", target.display()),
+                    })),
+                }
+            } else {
+                moved.push(json!(path.display().to_string()));
+            }
+        }
+    }
+    let mut report = json!({
+        "registry": registry.display().to_string(),
+        "apply": apply,
+        "destination": destination.display().to_string(),
+        "kept": kept,
+        "legacy_support_ends": LEGACY_REPORT_SUPPORT_ENDS,
+    });
+    report[moved_key] = json!(moved);
+    Ok(report)
 }
 
 /// Read a previous report for this boot, if one exists and parses.
@@ -4394,21 +4499,28 @@ mod tests {
     }
 
     #[test]
-    fn boot_report_read_prefers_the_registry_location_and_falls_back_to_legacy() {
-        // #975: a same-boot report written by an older build under the XDG
-        // default still counts, but the registry location wins when both exist.
+    fn boot_report_read_prefers_the_current_location_and_falls_back_to_legacy() {
+        // #975/#1359: a same-boot report written by an older build at a
+        // legacy location still counts, but the current location wins.
         let directory =
             std::env::temp_dir().join(format!("restore-reports-{}", std::process::id()));
-        fs::create_dir_all(&directory).unwrap();
-        let primary = directory.join("primary.json");
-        let legacy = directory.join("legacy.json");
-        assert!(read_boot_report_from(&primary, Some(&legacy)).is_none());
+        let registry = directory.join("registry");
+        fs::create_dir_all(registry.join("restore-reports")).unwrap();
+        let config = RestoreConfig::load(&registry).unwrap();
+        let boot = "11111111-2222-3333-4444-555555555555";
+        assert!(read_boot_report(&registry, &config, boot).is_none());
+        let legacy = registry
+            .join("restore-reports")
+            .join(format!("{boot}.json"));
         fs::write(&legacy, "{\"complete\": true, \"where\": \"legacy\"}").unwrap();
-        let (path, report) = read_boot_report_from(&primary, Some(&legacy)).unwrap();
+        let (path, report) = read_boot_report(&registry, &config, boot).unwrap();
         assert_eq!(path, legacy);
         assert_eq!(report["where"], "legacy");
+        let current = reports_directory(&registry);
+        fs::create_dir_all(&current).unwrap();
+        let primary = current.join(format!("{boot}.json"));
         fs::write(&primary, "{\"complete\": false, \"where\": \"primary\"}").unwrap();
-        let (path, report) = read_boot_report_from(&primary, Some(&legacy)).unwrap();
+        let (path, report) = read_boot_report(&registry, &config, boot).unwrap();
         assert_eq!(path, primary);
         assert_eq!(report["where"], "primary");
         fs::remove_dir_all(&directory).unwrap();

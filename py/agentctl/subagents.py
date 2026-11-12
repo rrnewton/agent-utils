@@ -4404,7 +4404,12 @@ class ManagedAgents:
             return []
         agent._validate_private_directory(str(self.registry), "agent registry")
         rows: list[dict[str, object]] = []
+        # A directory under agents/ with no record (restore's old report
+        # directory, #1359) is not an agent and is skipped; a record that
+        # exists but cannot be read still gets its own error row below.
         for other_name in self._registered_names():
+            if not registry_layout.record_directories(self.registry, other_name):
+                continue
             try:
                 row = self.status(other_name)
                 # The missing-session flag belongs to a single status,
