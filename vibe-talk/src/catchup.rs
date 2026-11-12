@@ -924,6 +924,9 @@ mod tests {
         });
         assert!(shaped.contains("[(09:51)](?c=C9&v=all&m=slack:C9:2001)"), "{shaped}");
         assert!(cited.contains(&MessageId("2001".to_owned())));
+    }
+
+    #[test]
     fn a_cited_answer_renders_its_citations_as_in_app_anchors() {
         // The REAL api render path (`http::api::catchup`): shape, collect the addresses the
         // shaping built through the same `cite`, render with exactly that trusted set.
