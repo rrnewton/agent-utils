@@ -712,6 +712,60 @@ test("catchup modes: overlay stands until chosen; a chosen mode is kept and surv
   } finally { fx.restore(); }
 });
 
+test("catchup modes: closing a docked panel frees the column; reopening docks again", async () => {
+  const fx = fixture();
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    click(fx.els["discuss-mode-docked"]);
+    assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), "docked");
+    // Programmatic close: no reserved column, remembered mode kept.
+    view.close();
+    assert.equal(view.isOpen(), false);
+    assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), null, "close left the docked column reserved");
+    assert.equal(view.mode(), "docked", "close forgot the remembered mode");
+    view.open();
+    await flush();
+    assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), "docked", "reopen did not dock again");
+    // The X icon goes through the same path.
+    click(fx.els["discuss-close"]);
+    assert.equal(view.isOpen(), false);
+    assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), null, "the X left the docked column reserved");
+    view.open();
+    await flush();
+    assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), "docked", "reopen after the X did not dock again");
+    // Escape too.
+    fire(fx.els["discuss-panel"], "keydown", { key: "Escape" });
+    assert.equal(view.isOpen(), false);
+    assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), null, "Escape left the docked column reserved");
+    // The bar button toggles closed through panel.close().
+    view.open();
+    await flush();
+    click(fx.els["discuss-open"]);
+    assert.equal(view.isOpen(), false);
+    assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), null, "the bar toggle left the docked column reserved");
+    // Overlay never marks the screen, open or closed.
+    view.open();
+    await flush();
+    view.setMode("overlay");
+    assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), null);
+    view.close();
+    assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), null, "overlay close marked the screen");
+    // Maximized likewise frees the screen on close and returns on reopen.
+    view.open();
+    await flush();
+    view.setMode("maximized");
+    assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), "maximized");
+    view.close();
+    assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), null, "close left maximized marked on the screen");
+    view.open();
+    await flush();
+    assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), "maximized", "reopen did not maximize again");
+  } finally { fx.restore(); }
+});
+
 test("catchup modes: open puts focus on Close; Escape closes and returns it to the opener", async () => {
   const fx = fixture();
   try {

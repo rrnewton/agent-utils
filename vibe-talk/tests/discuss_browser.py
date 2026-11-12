@@ -232,6 +232,21 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
               f"docked is not a column beside the list: panel={docked} list={list_box}")
         mode_kept = page.evaluate("() => localStorage.getItem('vibe-talk.voice.discuss-mode')")
         check(mode_kept == "docked", f"the docked mode was not kept: {mode_kept!r}")
+        # Docked then closed reserves no column: the screen loses the mark
+        # and the list takes the full width again; reopening docks again.
+        page.click("#discuss-close")
+        page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+        page.wait_for_function(
+            "() => !document.getElementById('screen-main').hasAttribute('data-discuss')",
+            timeout=20_000)
+        freed = page.locator("#scroll-area").bounding_box()
+        check(freed is not None and list_box is not None and freed["width"] > list_box["width"],
+              f"closing docked did not free the column: list={list_box} after={freed}")
+        page.click("#discuss-open")
+        page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+        page.wait_for_function(
+            "() => document.getElementById('screen-main').dataset.discuss === 'docked'",
+            timeout=20_000)
         page.click("#discuss-mode-maximized")
         page.wait_for_function(
             "() => document.getElementById('screen-main').dataset.discuss === 'maximized'",
