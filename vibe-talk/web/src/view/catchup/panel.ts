@@ -390,15 +390,14 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     }
   }
 
-  /** Whether this device draws the desk layouts (the stylesheet's desk media). */
+  /** Whether this device draws the desk layouts (the stylesheet's 900px break). */
   function deskLayout(): boolean {
     try {
-      const query = (globalThis as { matchMedia?: (q: string) => { matches: boolean } }).matchMedia;
-      if (typeof query === "function") return query("(min-width: 900px) and (pointer: fine)").matches;
+      const width = document.documentElement?.clientWidth ?? 0;
+      return width === 0 || width >= 900;
     } catch {
-      // No media to ask: the desk toggles stand.
+      return true;
     }
-    return true;
   }
 
   /** The mode fullscreen restores to, remembered when fullscreen is entered. */

@@ -9,11 +9,11 @@ created_at: 2026-11-12T20:10:00+00:00
 updated_at: 2026-11-12T20:10:00+00:00
 ---
 
-# Summary
+# Description
 
 Docking the Discuss panel and then closing it still reserved the right column: the main interface stayed squeezed to the left beside a blank column. Switching to overlay and then closing restored the normal view. The screen mark that drives the docked grid followed the remembered layout mode alone, not whether the panel was open, and closing never cleared it.
 
-# Acceptance
+# Acceptance Criteria
 
 - Dock, then close by any exit (the panel close act, the X icon, Escape, the bar toggle): `#screen-main` carries no `data-discuss` attribute and the layout returns to one column.
 - Reopening restores the remembered mode: a panel left docked docks again, and maximized likewise.

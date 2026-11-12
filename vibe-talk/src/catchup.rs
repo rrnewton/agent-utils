@@ -723,10 +723,7 @@ mod tests {
         );
         assert_eq!(built.window.from_id, Some(MessageId("1001".to_owned())));
         assert_eq!(built.window.through_id, Some(MessageId("1004".to_owned())));
-        assert_eq!(
-            built.unread_ids,
-            vec![MessageId("1001".to_owned())]
-        );
+        assert_eq!(built.unread_ids, vec![MessageId("1001".to_owned())]);
         assert_eq!(built.markable_ids, built.unread_ids);
         assert!(built.prompt.starts_with(LABELS_LEGEND), "{}", built.prompt);
         assert!(
@@ -917,12 +914,22 @@ mod tests {
         assert_eq!(built.unread_ids, vec![MessageId("2002".to_owned())]);
         assert_eq!(built.markable_ids, vec![MessageId("2002".to_owned())]);
         assert_eq!(built.window.unread_count, 1);
-        assert!(built.prompt.contains("my own direction"), "owner stays as context");
+        assert!(
+            built.prompt.contains("my own direction"),
+            "owner stays as context"
+        );
         let sent: HashSet<MessageId> = messages.iter().map(|m| m.id.clone()).collect();
-        let (shaped, cited) = shape_answer("Per your note [m:2001], progress [m:2002]", &sent, |id| {
-            Some(("09:51".to_owned(), message_link("slack", "C9", "flat", None, id, None)))
-        });
-        assert!(shaped.contains("[(09:51)](?c=C9&v=all&m=slack:C9:2001)"), "{shaped}");
+        let (shaped, cited) =
+            shape_answer("Per your note [m:2001], progress [m:2002]", &sent, |id| {
+                Some((
+                    "09:51".to_owned(),
+                    message_link("slack", "C9", "flat", None, id, None),
+                ))
+            });
+        assert!(
+            shaped.contains("[(09:51)](?c=C9&v=all&m=slack:C9:2001)"),
+            "{shaped}"
+        );
         assert!(cited.contains(&MessageId("2001".to_owned())));
     }
 
@@ -938,7 +945,7 @@ mod tests {
                 message_link("slack", "C9", "flat", None, id, None),
             ))
         };
-        let (shaped, cited) = shape_answer("- Cache-only is live [m:111]", &sent, &cite);
+        let (shaped, cited) = shape_answer("- Cache-only is live [m:111]", &sent, cite);
         let trusted: HashSet<String> = cited
             .iter()
             .filter_map(|id| cite(id).map(|(_, address)| address))
