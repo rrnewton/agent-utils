@@ -91,6 +91,7 @@
         "py/tests/test_agentctl_reset_rust.py",
         "py/tests/test_agentctl_restore_drill.py",
         "py/tests/test_agentctl_sessions.py",
+        "py/tests/test_agentctl_stale_prompt.py",
         "py/tests/test_agentctl_skill_install.py",
         "py/tests/test_agentctl_submission.py",
         "py/tests/test_herdr_agent.py",
