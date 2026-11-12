@@ -108,6 +108,10 @@ impl HarnessAdapter for Muse {
         read_transcript(lines, activity);
     }
 
+    fn transcript_model(&self, lines: &[&[u8]]) -> Option<String> {
+        transcript_model(lines)
+    }
+
     /// The sessions the runtime holds locked, sub-agents' excepted: each one's directory name.
     fn held_sessions(&self, held: &[PathBuf]) -> Vec<String> {
         let mut ids: Vec<String> = Vec::new();
@@ -213,6 +217,31 @@ fn records(line: &[u8]) -> Vec<serde_json::Value> {
         out.push(frame);
     }
     out
+}
+
+/// The model Muse recorded in its session journal: the first `model_id` in
+/// journal order, which the session's own opening records carry before any
+/// provider route id appears (#1340 agent-model-unknown).
+pub(crate) fn transcript_model(lines: &[&[u8]]) -> Option<String> {
+    use serde_json::Value;
+    for line in lines {
+        for record in records(line) {
+            for candidate in [
+                record.pointer("/payload/record/model_id"),
+                record.pointer("/payload/payload/session_metadata/model_id"),
+                record.pointer("/payload/session_metadata/model_id"),
+                record.get("model_id"),
+            ] {
+                if let Some(model) = candidate
+                    .and_then(Value::as_str)
+                    .filter(|model| !model.is_empty())
+                {
+                    return Some(model.to_owned());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Read Muse's journal records (`recorded_at` in microseconds). Run events say what the model
@@ -480,6 +509,18 @@ mod tests {
         let mut activity = Activity::default();
         read_transcript(&all[..lines.min(all.len())], &mut activity);
         activity
+    }
+
+    #[test]
+    fn the_recorded_model_is_the_opening_session_model() {
+        // #1340: the session's opening records carry the friendly model_id;
+        // a later provider record naming a route id never replaces it.
+        let lines: Vec<&[u8]> = vec![
+            br#"{"children":[{"record_json":"{\"payload_type\":\"runtime.session\",\"payload\":{\"record\":{\"model_id\":\"muse-first-1\"}}}"}]}"#,
+            br#"{"payload_type":"runtime.session","payload":{"record":{"model_id":"route-999"}}}"#,
+        ];
+        assert_eq!(transcript_model(&lines).as_deref(), Some("muse-first-1"));
+        assert_eq!(transcript_model(&[]), None);
     }
 
     #[test]

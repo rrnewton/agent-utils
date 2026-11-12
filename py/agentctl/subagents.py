@@ -153,12 +153,112 @@ def _capture_native_session(record: AgentRecord, info: AgentPaneInfo) -> None:
             raise AgentDeliveryError("started agent reported a different native conversation")
     else:
         record.native_session = _native_session(provider, info.session_value, "observed")
+    _capture_resolved_model(record)
+
+
+def _chat_project_name(cwd: str) -> str:
+    """The directory name Claude Code gives the project at ``cwd``."""
+    return "".join(character if character.isascii() and character.isalnum() else "-" for character in cwd)
+
+
+def _transcript_model(harness: str, lines: list[bytes]) -> str | None:
+    """The model a harness recorded in its transcript, first mention wins
+    (#1340 agent-model-unknown), mirroring the Rust `transcript_model`."""
+    for raw in lines:
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        candidates: list[object] = []
+        if harness == "claude":
+            message = entry.get("message")
+            candidates.append(message.get("model") if isinstance(message, dict) else None)
+        elif harness == "codex":
+            payload = entry.get("payload")
+            candidates.append(payload.get("model") if isinstance(payload, dict) else None)
+            candidates.append(entry.get("model"))
+        elif harness == "muse":
+            frames: list[object] = [entry]
+            children = entry.get("children")
+            if isinstance(children, list):
+                for child in children:
+                    if isinstance(child, dict) and isinstance(child.get("record_json"), str):
+                        try:
+                            frames.append(json.loads(child["record_json"]))
+                        except ValueError:
+                            pass
+            for frame in frames:
+                if not isinstance(frame, dict):
+                    continue
+                payload = frame.get("payload")
+                payload = payload if isinstance(payload, dict) else {}
+                inner = payload.get("record")
+                candidates.append(inner.get("model_id") if isinstance(inner, dict) else None)
+                nested = payload.get("payload")
+                metadata = nested.get("session_metadata") if isinstance(nested, dict) else None
+                candidates.append(metadata.get("model_id") if isinstance(metadata, dict) else None)
+                metadata = payload.get("session_metadata")
+                candidates.append(metadata.get("model_id") if isinstance(metadata, dict) else None)
+                candidates.append(frame.get("model_id"))
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate and "\0" not in candidate and len(candidate) <= 256:
+                return candidate
+    return None
+
+
+def _capture_resolved_model(record: AgentRecord) -> None:
+    """Read the model the harness recorded in its own transcript, once
+    (#1340): best-effort, never re-read once held, never a launch refusal."""
+    if record.resolved_model is not None:
+        return
+    session = None
+    if record.native_session is not None:
+        session = record.native_session.get("value")
+    session = session or record.session_value
+    if not session or "/" in session:
+        return
+    home = Path.home()
+    path: Path | None = None
+    try:
+        if record.harness == "claude":
+            config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or home / ".claude")
+            direct = config / "projects" / _chat_project_name(record.cwd) / f"{session}.jsonl"
+            if direct.is_file():
+                path = direct
+            else:
+                for candidate in sorted((config / "projects").glob(f"*/{session}.jsonl")):
+                    path = candidate
+                    break
+        elif record.harness == "codex":
+            base = Path(os.environ.get("CODEX_HOME") or home / ".codex") / "sessions"
+            for candidate in sorted(base.glob(f"*/*/*/*-{session}.jsonl")):
+                path = candidate
+                break
+        elif record.harness == "muse":
+            data = Path(os.environ.get("XDG_DATA_HOME") or home / ".local" / "share")
+            for candidate in sorted((data / "muse" / "sessions").glob("*/*/*/*/session.jsonl")):
+                if candidate.parent.name == session:
+                    path = candidate
+                    break
+        else:
+            return
+        if path is None:
+            return
+        with path.open("rb") as handle:
+            lines = handle.read(1 << 20).split(b"\n")
+    except OSError:
+        return
+    model = _transcript_model(record.harness, lines)
+    if model is not None:
+        record.resolved_model = model
 
 
 _NESTED_COMMON_FIELDS = frozenset({
     "schema", "name", "token", "created_at", "lifecycle", "launch",
     "workspace_id", "tab_id", "pane_id", "startup_warning",
-    "effective_reasoning_effort", "error", "paused",
+    "effective_reasoning_effort", "resolved_model", "error", "paused",
     "pane_reported_by_agentctl", "foreign_shell_identity",
     "runner_identity", "extensions",
 })
@@ -429,6 +529,7 @@ class AgentRecord:
     session_agent: str | None = None
     session_value: str | None = None
     model: str | None = None
+    resolved_model: str | None = None
     resume: str | None = None
     arguments: list[str] = field(default_factory=list)
     startup_warning: str | None = None
@@ -552,6 +653,10 @@ class AgentRecord:
                 else asdict(self.foreign_shell_identity)
             ),
         })
+        # A captured model joins the row; an uncaptured one adds no key, so a
+        # row written before #1340 round-trips byte-identically.
+        if self.resolved_model is not None:
+            document["resolved_model"] = self.resolved_model
         custom_identity = (
             None if self.custom_process_identity is None
             else asdict(self.custom_process_identity)
@@ -628,7 +733,7 @@ class AgentRecord:
         for key in ("name", "token", "harness", "cwd", "lifecycle"):
             if not isinstance(document.get(key), str) or not document[key]:
                 raise AgentDeliveryError(f"invalid agent record field {key}: {path}")
-        for key in ("workspace_id", "tab_id", "pane_id", "session_agent", "session_value", "model", "resume", "startup_warning", "effective_reasoning_effort", "error", "goal", "goal_delivery", "goal_session_id", "goal_message_id", "profile", "reasoning_effort", "slot", "slot_project", "slot_isolation"):
+        for key in ("workspace_id", "tab_id", "pane_id", "session_agent", "session_value", "model", "resolved_model", "resume", "startup_warning", "effective_reasoning_effort", "error", "goal", "goal_delivery", "goal_session_id", "goal_message_id", "profile", "reasoning_effort", "slot", "slot_project", "slot_isolation"):
             if document.get(key) is not None and not isinstance(document[key], str):
                 raise AgentDeliveryError(f"invalid agent record field {key}: {path}")
         created = document.get("created_at")
@@ -660,6 +765,14 @@ class AgentRecord:
         # from the screen, so an effort agentctl does not know never makes the record unreadable.
         if isinstance(effective_effort, str) and not muse_effort_word(effective_effort):
             raise AgentDeliveryError(f"invalid effective reasoning effort in agent record: {path}")
+        # The model the harness recorded (#1340): only its shape is checked,
+        # as when it was captured, so an unknown model never makes the record
+        # unreadable.
+        resolved_model = document.get("resolved_model")
+        if isinstance(resolved_model, str) and (
+            not resolved_model or len(resolved_model) > 256 or "\0" in resolved_model
+        ):
+            raise AgentDeliveryError(f"invalid resolved model in agent record: {path}")
         known = {key for key, field_info in cls.__dataclass_fields__.items() if field_info.init}
         fields = {key: document[key] for key in known if key in document}
         if document.get("adapter", "herdr") not in ("herdr", "herdr-pane", "herdr-foreign", "herdr-relay", "turn-runner"):
@@ -811,7 +924,9 @@ class AgentRecord:
                 | _NESTED_V2_FIELDS | _NESTED_V3_FIELDS
             )
         }
-        if not expected <= set(document) or second_authority:
+        # `resolved_model` (#1340) is the one common key a row written before
+        # it may lack; every other common key is required as before.
+        if not (expected - {"resolved_model"}) <= set(document) or second_authority:
             raise AgentDeliveryError(f"invalid agent record {schema} fields: {path}")
         launch_value = document.get("launch")
         if not isinstance(launch_value, dict):

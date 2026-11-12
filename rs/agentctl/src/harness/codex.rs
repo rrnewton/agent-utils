@@ -170,6 +170,10 @@ impl HarnessAdapter for Codex {
         read_transcript(lines, activity);
     }
 
+    fn transcript_model(&self, lines: &[&[u8]]) -> Option<String> {
+        transcript_model(lines)
+    }
+
     /// The main-thread rollouts the process holds open (sub-agent threads excepted): each
     /// one's thread id.
     fn held_sessions(&self, held: &[PathBuf]) -> Vec<String> {
@@ -627,6 +631,26 @@ fn call_limit(
 }
 
 /// Read Codex rollout entries. `task_started` opens a turn and `task_complete` closes it;
+/// The model Codex recorded in its rollout: the first entry naming one, as a
+/// turn context's `payload.model` (#1340 agent-model-unknown).
+pub(crate) fn transcript_model(lines: &[&[u8]]) -> Option<String> {
+    use serde_json::Value;
+    for line in lines {
+        let Ok(entry) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        for candidate in [entry.pointer("/payload/model"), entry.get("model")] {
+            if let Some(model) = candidate
+                .and_then(Value::as_str)
+                .filter(|model| !model.is_empty())
+            {
+                return Some(model.to_owned());
+            }
+        }
+    }
+    None
+}
+
 /// `reasoning`, `message` from the assistant, and `agent_message` are model output; a
 /// `function_call` or `custom_tool_call` is output and a call in flight until its `*_output`.
 /// Codex writes no entry when it sends a model request, so a prompt, and a tool result that leaves
@@ -724,6 +748,19 @@ mod tests {
         let mut activity = Activity::default();
         read_transcript(&all[..lines.min(all.len())], &mut activity);
         activity
+    }
+
+    #[test]
+    fn the_recorded_model_is_the_first_turn_model() {
+        // #1340: the rollout's turn context names the model; session_meta and
+        // response items name none, and a later turn never replaces the first.
+        let lines: Vec<&[u8]> = vec![
+            br#"{"timestamp":"2026-10-27T10:00:00Z","type":"session_meta","payload":{"id":"t1"}}"#,
+            br#"{"timestamp":"2026-10-27T10:00:01Z","type":"turn_context","payload":{"turn_id":"u1","model":"codex-first-1"}}"#,
+            br#"{"timestamp":"2026-10-27T10:00:02Z","type":"turn_context","payload":{"turn_id":"u2","model":"codex-second-2"}}"#,
+        ];
+        assert_eq!(transcript_model(&lines).as_deref(), Some("codex-first-1"));
+        assert_eq!(transcript_model(&lines[..1]), None);
     }
 
     #[test]

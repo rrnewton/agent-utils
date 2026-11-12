@@ -203,6 +203,11 @@ pub trait HarnessAdapter: Sync {
     }
     /// What the transcript's complete lines `lines`, oldest first, say the agent is doing.
     fn read_transcript(&self, _lines: &[&[u8]], _activity: &mut transcript::Activity) {}
+    /// The model the harness itself recorded in its transcript, first mention wins
+    /// (#1340 agent-model-unknown); `None` when the transcript does not name one.
+    fn transcript_model(&self, _lines: &[&[u8]]) -> Option<String> {
+        None
+    }
     /// The native conversation ids of the agent's own sessions among `held`, the files its
     /// process and their descendants hold open, each once, in the order found (#916
     /// muse-native-session-id). Exactly one names the agent's conversation; several are more

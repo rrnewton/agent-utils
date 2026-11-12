@@ -235,7 +235,15 @@ pub(crate) fn snapshot(registry: &Path) -> BangSnapshot {
             continue;
         };
         let profile = text(&record, "profile");
+        let resolved_model = text(&record, "resolved_model");
+        // Declared first, then what the harness itself recorded (shown as the
+        // default it is, #1340), then the profile, then unknown.
         let model = text(&record, "model")
+            .or_else(|| {
+                resolved_model
+                    .as_ref()
+                    .map(|model| format!("default ({model})"))
+            })
             .or_else(|| {
                 profile
                     .as_ref()
@@ -652,6 +660,58 @@ mod tests {
         assert!(one.contains("- managed by: lieutenant"), "{one}");
         assert!(HELP_TEXT.contains("**Owner commands**"));
         assert!(HELP_TEXT.contains("- `!who`"));
+    }
+
+    #[test]
+    fn who_model_prefers_declared_then_default_resolved_then_profile() {
+        // #1340: declared model, then `default (<resolved>)` from what the
+        // harness recorded, then the profile's model, then unknown.
+        let registry = std::env::temp_dir().join(format!("bang-who-model-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&registry);
+        std::fs::create_dir_all(&registry).unwrap();
+        std::fs::write(
+            registry.join("profiles.json"),
+            r#"{"profiles": {"prof": {"model": "profile-model"}}}"#,
+        )
+        .unwrap();
+        for (name, record) in [
+            (
+                "w-declared",
+                r#"{"token":"t1","lifecycle":"running","harness":"claude","model":"declared-1","resolved_model":"resolved-x","profile":"prof"}"#,
+            ),
+            (
+                "w-resolved",
+                r#"{"token":"t2","lifecycle":"running","harness":"claude","resolved_model":"resolved-1","profile":"prof"}"#,
+            ),
+            (
+                "w-profile",
+                r#"{"token":"t3","lifecycle":"running","harness":"claude","profile":"prof"}"#,
+            ),
+            (
+                "w-bare",
+                r#"{"token":"t4","lifecycle":"running","harness":"claude"}"#,
+            ),
+        ] {
+            let directory = registry.join("agents").join(name);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join("agent.json"), record).unwrap();
+        }
+        let snapshot = snapshot(&registry);
+        let model = |name: &str| {
+            snapshot
+                .agents
+                .iter()
+                .find(|agent| agent.name == name)
+                .unwrap()
+                .model
+                .clone()
+        };
+        assert_eq!(model("w-declared"), "declared-1");
+        assert_eq!(model("w-resolved"), "default (resolved-1)");
+        assert_eq!(model("w-profile"), "profile-model");
+        assert_eq!(model("w-bare"), "unknown");
+        assert!(render_who(&snapshot).contains("claude/default (resolved-1)"));
+        std::fs::remove_dir_all(&registry).unwrap();
     }
 
     #[test]

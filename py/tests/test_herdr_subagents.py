@@ -1269,6 +1269,54 @@ def test_a_record_keeps_any_well_formed_effective_effort(
             manager.get("worker")
 
 
+def test_a_record_keeps_any_well_formed_resolved_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #1340: the model the harness recorded is checked by its shape only: a
+    # model agentctl has never heard of must not make the record unreadable,
+    # and a nested row written before the field existed still loads.
+    manager, _fake = setup(tmp_path, monkeypatch)
+    manager.start("worker", cwd=str(tmp_path), harness="codex")
+    path = manager.registry / "agents" / "worker" / "agent.json"
+    flat = json.loads(path.read_text(encoding="utf-8"))
+    for model in ("codex-future-9", "watermelon-full-preview"):
+        flat["resolved_model"] = model
+        path.write_text(json.dumps(flat), encoding="utf-8")
+        assert manager.get("worker").resolved_model == model
+    for malformed in ("", "x" * 300, "a\0b"):
+        flat["resolved_model"] = malformed
+        path.write_text(json.dumps(flat), encoding="utf-8")
+        with pytest.raises(AgentDeliveryError, match="resolved model"):
+            manager.get("worker")
+    nested = _nested_v2_record(json.loads(path.read_text(encoding="utf-8")))
+    nested.pop("resolved_model", None)
+    path.write_text(json.dumps(nested), encoding="utf-8")
+    assert manager.get("worker").resolved_model is None
+
+
+def test_transcript_model_reads_each_harness_record() -> None:
+    # #1340: first mention wins, mirroring the Rust `transcript_model`.
+    from agentctl.subagents import _transcript_model
+
+    claude = [
+        b'{"type":"user","message":{"role":"user","content":"hi"}}',
+        b'{"type":"assistant","message":{"model":"claude-first-1","content":[]}}',
+        b'{"type":"assistant","message":{"model":"claude-second-2","content":[]}}',
+    ]
+    assert _transcript_model("claude", claude) == "claude-first-1"
+    assert _transcript_model("claude", claude[:1]) is None
+    codex = [
+        b'{"type":"session_meta","payload":{"id":"t1"}}',
+        b'{"type":"turn_context","payload":{"turn_id":"u1","model":"codex-first-1"}}',
+    ]
+    assert _transcript_model("codex", codex) == "codex-first-1"
+    muse = [
+        b'{"children":[{"record_json":"{\\"payload_type\\":\\"runtime.session\\",\\"payload\\":{\\"record\\":{\\"model_id\\":\\"muse-first-1\\"}}}"}]}',
+        b'{"payload_type":"runtime.session","payload":{"record":{"model_id":"route-999"}}}',
+    ]
+    assert _transcript_model("muse", muse) == "muse-first-1"
+
+
 def test_nested_launch_rejects_nonnull_interactive_permission_mode(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

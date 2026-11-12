@@ -127,6 +127,10 @@ impl HarnessAdapter for ClaudeCode {
         read_transcript(lines, activity);
     }
 
+    fn transcript_model(&self, lines: &[&[u8]]) -> Option<String> {
+        transcript_model(lines)
+    }
+
     /// Claude Code writes each sub-agent's conversation to `<session>/subagents/*.jsonl` beside
     /// the session's own transcript.
     fn related_transcripts(
@@ -381,6 +385,25 @@ fn transcript_path(hints: &super::transcript::Hints<'_>) -> Option<PathBuf> {
         }
     }
     crate::inbox::watch::transcript_of_session(&projects, session)
+}
+
+/// The model Claude Code recorded in its JSONL: the first assistant entry's
+/// `message.model` (#1340 agent-model-unknown).
+pub(crate) fn transcript_model(lines: &[&[u8]]) -> Option<String> {
+    use serde_json::Value;
+    for line in lines {
+        let Ok(entry) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        if let Some(model) = entry
+            .pointer("/message/model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+        {
+            return Some(model.to_owned());
+        }
+    }
+    None
 }
 
 /// Read Claude Code's JSONL entries. An `assistant` entry is model output (text, thinking or a
@@ -653,6 +676,19 @@ mod tests {
         let mut activity = Activity::default();
         read_transcript(&all[..lines.min(all.len())], &mut activity);
         activity
+    }
+
+    #[test]
+    fn the_recorded_model_is_the_first_assistant_model() {
+        // #1340: user and bookkeeping entries name no model; the first
+        // assistant entry's does, and a later one never replaces it.
+        let lines: Vec<&[u8]> = vec![
+            br#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+            br#"{"type":"assistant","message":{"model":"claude-first-1","content":[]}}"#,
+            br#"{"type":"assistant","message":{"model":"claude-second-2","content":[]}}"#,
+        ];
+        assert_eq!(transcript_model(&lines).as_deref(), Some("claude-first-1"));
+        assert_eq!(transcript_model(&lines[..1]), None);
     }
 
     #[test]

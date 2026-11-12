@@ -1914,6 +1914,11 @@ struct AgentRecord {
     session_agent: Option<String>,
     session_value: Option<String>,
     model: Option<String>,
+    /// The model the harness itself recorded once its session was captured
+    /// (#1340 agent-model-unknown); shown as `default (<resolved>)` when no
+    /// model was declared.
+    #[serde(default)]
+    resolved_model: Option<String>,
     resume: Option<String>,
     arguments: Vec<String>,
     #[serde(default)]
@@ -2069,7 +2074,68 @@ impl AgentRecord {
         } else {
             self.native_session = Some(NativeSession::new(agent, value, "observed"));
         }
+        self.capture_resolved_model();
         Ok(())
+    }
+
+    /// Read the model the harness recorded in its own transcript, once
+    /// (#1340 agent-model-unknown): best-effort, never re-read once held, and
+    /// never a reason to refuse a launch. The transcript's opening is enough;
+    /// every harness names its model early.
+    fn capture_resolved_model(&mut self) {
+        if self.resolved_model.is_some() {
+            return;
+        }
+        let Some(adapter) = crate::harness::adapter(&self.harness) else {
+            return;
+        };
+        let Some(session) = self
+            .effective_native_session()
+            .map(|native| native.value)
+            .or_else(|| self.session_value.clone())
+        else {
+            return;
+        };
+        #[cfg(test)]
+        let test_home = TEST_HARNESS_HOME.with(|home| home.borrow().clone());
+        #[cfg(not(test))]
+        let test_home: Option<PathBuf> = None;
+        let proc: Option<&dyn crate::work_state::ProcView> = if test_home.is_some() {
+            None
+        } else {
+            Some(&crate::work_state::LinuxProc)
+        };
+        let home = test_home.or_else(crate::harness::home);
+        let hints = crate::harness::transcript::Hints {
+            session: Some(&session),
+            cwd: Some(Path::new(&self.cwd)),
+            home: home.as_deref(),
+            pid: self
+                .harness_anchor()
+                .and_then(|anchor| u32::try_from(anchor.pid).ok()),
+            proc,
+        };
+        let Some(path) = adapter.transcript_path(&hints) else {
+            return;
+        };
+        let Ok(mut file) = File::open(&path) else {
+            return;
+        };
+        let mut bytes = Vec::new();
+        if Read::by_ref(&mut file)
+            .take(1 << 20)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            return;
+        }
+        let lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+        if let Some(model) = adapter
+            .transcript_model(&lines)
+            .filter(|model| valid_metadata_text(model) && model.len() <= 256)
+        {
+            self.resolved_model = Some(model);
+        }
     }
 
     fn validate_loaded(&self, path: &Path, agent_name: &str) -> Result<()> {
@@ -2109,6 +2175,13 @@ impl AgentRecord {
                 // was read from the screen, so an effort agentctl does not know never makes the
                 // record unreadable.
                 .is_some_and(|effort| !crate::client::muse_effort(effort))
+            || self
+                .resolved_model
+                .as_deref()
+                // The model the harness recorded: only its shape is checked, as
+                // when it was captured, so a model agentctl does not know never
+                // makes the record unreadable (#1340).
+                .is_some_and(|model| !valid_metadata_text(model) || model.len() > 256)
             || self
                 .custom_process_identity
                 .as_ref()
@@ -9890,6 +9963,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             session_agent: None,
             session_value: None,
             model: options.model.clone(),
+            resolved_model: None,
             resume: options.resume.clone(),
             arguments,
             startup_warning: None,
@@ -10449,6 +10523,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
             session_agent: info.session_agent,
             session_value: info.session_value,
             model: None,
+            resolved_model: None,
             resume: None,
             arguments: Vec::new(),
             startup_warning: None,
@@ -10683,6 +10758,7 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         self.anchor_fresh(record, terminal_id)?;
         // A harness that names its conversation only by the files it holds (#916).
         let capture_warning = revive::capture_held_session(record);
+        record.capture_resolved_model();
         if let Some(warning) = self.guard_duplicate_capture(record).or(capture_warning) {
             eprintln!("agentctl: warning: {warning}");
         }
@@ -11407,6 +11483,11 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
     fn record_row(&self, record: &AgentRecord) -> Result<Value> {
         let agent_name = &record.name;
         let mut result = record.document()?;
+        // A nested row stores a captured model only; the status row names it
+        // either way, as the flat row and the Python edition do (#1340).
+        if result.get("resolved_model").is_none() {
+            result["resolved_model"] = json!(record.resolved_model);
+        }
         for key in [control::CREATED_BY, control::MANAGED_BY] {
             if let Some(edge) = record.edge(key) {
                 result[key] = json!(edge);
@@ -22843,6 +22924,8 @@ fi
     mod launch_spec;
     /// Priority and visibility of waits for an agent's lifecycle lock.
     mod lock_rank;
+    /// The harness-recorded model captured once at session capture (#1340).
+    mod model;
     /// Follow-ups typed into a running Muse turn: steered, proved, withdrawn or held.
     mod muse_followup;
     /// Muse 1.4 paused, idle, staged and working status, and the input each one admits.

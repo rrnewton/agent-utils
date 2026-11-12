@@ -4830,6 +4830,7 @@ mod discovery_tests {
             session_agent: None,
             session_value: None,
             model: None,
+            resolved_model: None,
             resume: None,
             arguments: vec![],
             startup_warning: None,
