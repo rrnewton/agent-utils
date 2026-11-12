@@ -1279,7 +1279,9 @@ fn samples() -> Value {
                     label: "09:51 · Ada".into(),
                     thread_id: Some("thread-1".into()),
                 }],
+                cited_ids: vec![MessageId("1010".into())],
                 text: "one point worth knowing".into(),
+                text_html: "<p>one point worth knowing</p>".into(),
                 backend: "meta-gateway".into(),
                 model: "some-model".into(),
                 stamp: CatchupStamp {
@@ -1309,7 +1311,9 @@ fn samples() -> Value {
                 unread_ids: Vec::new(),
                 markable_ids: Vec::new(),
                 footer_links: Vec::new(),
+                cited_ids: Vec::new(),
                 text: String::new(),
+                text_html: String::new(),
                 backend: "messages-api".into(),
                 model: "some-model".into(),
                 stamp: CatchupStamp {

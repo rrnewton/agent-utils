@@ -85,6 +85,9 @@
         "provider": "discord",
         "writable": true
       },
+      "cited_ids": [
+        "1010"
+      ],
       "footer_links": [
         {
           "id": "1010",
@@ -107,6 +110,7 @@
         "total_ms": 4050
       },
       "text": "one point worth knowing",
+      "text_html": "<p>one point worth knowing</p>",
       "thread_id": "thread-1",
       "unread_ids": [
         "1010",

@@ -146,6 +146,13 @@ declare namespace VibeTalk {
      */
     channel: ChannelInfo;
     /**
+     * The messages the answer actually cited, in first-citation order: a validated
+     * subset of `unread_ids`, computed by the server from the answer's citations.
+     * The panel's "Other messages processed" footer lists `footer_links` outside
+     * this set; absent from an older server, which cited nothing it could name.
+     */
+    cited_ids?: MessageId[];
+    /**
      * One link per unread message covered, oldest first.
      */
     footer_links: CatchupFooterLink[];
@@ -162,10 +169,16 @@ declare namespace VibeTalk {
      */
     stamp: CatchupStamp;
     /**
-     * The model's answer, its cites checked against the ids it was shown. Model text only:
-     * the footer is structured, above.
+     * The model's answer, shaped by the server: citations checked against the ids
+     * it was shown and replaced inline by `(HH:MM)` deep links, bare issue numbers
+     * linked. Model text only: the footer is structured, above.
      */
     text: string;
+    /**
+     * `text` rendered to sanitized HTML the way a message body is, for a panel
+     * that draws markup; empty when drawing `text` plain is the same thing.
+     */
+    text_html?: string;
     /**
      * The thread covered, or null for a channel read.
      */

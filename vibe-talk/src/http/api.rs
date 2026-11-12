@@ -2581,12 +2581,37 @@ pub async fn catchup(
     };
     let sent: std::collections::HashSet<MessageId> =
         fetched.messages.iter().map(|m| m.id.clone()).collect();
-    let text = crate::catchup::validate_cites(&raw, &sent);
     let by_id: std::collections::HashMap<&str, &Message> = fetched
         .messages
         .iter()
         .map(|message| (message.id.as_str(), message))
         .collect();
+    let provider = fetched
+        .channel
+        .provider
+        .clone()
+        .unwrap_or_else(|| "discord".to_owned());
+    let (text, cited_ids) = crate::catchup::shape_answer(&raw, &sent, |id| {
+        let message = by_id.get(id.as_str())?;
+        let time = if message.spoken_time.is_empty() {
+            message.timestamp.clone()
+        } else {
+            message.spoken_time.clone()
+        };
+        let address = crate::catchup::message_link(
+            &provider,
+            &channel_id,
+            view_name,
+            thread_id,
+            id,
+            message.thread.as_ref().map(|thread| thread.id.as_str()),
+        );
+        Some((time, address))
+    });
+    let text_html = crate::render::body_html(
+        &text,
+        crate::render::markup_for(&state.config, &fetched.channel),
+    );
     let footer_links = built
         .unread_ids
         .iter()
@@ -2655,7 +2680,9 @@ pub async fn catchup(
         unread_ids: built.unread_ids,
         markable_ids: built.markable_ids,
         footer_links,
+        cited_ids,
         text,
+        text_html,
         backend: agent.backend().to_owned(),
         model: state
             .catchup_model

@@ -180,6 +180,13 @@
           "$ref": "#/$defs/ChannelInfo",
           "description": "The channel read, as configured here."
         },
+        "cited_ids": {
+          "description": "The messages the answer actually cited, in first-citation order: a validated\nsubset of `unread_ids`, computed by the server from the answer's citations.\nThe panel's \"Other messages processed\" footer lists `footer_links` outside\nthis set; absent from an older server, which cited nothing it could name.",
+          "items": {
+            "$ref": "#/$defs/MessageId"
+          },
+          "type": "array"
+        },
         "footer_links": {
           "description": "One link per unread message covered, oldest first.",
           "items": {
@@ -203,7 +210,11 @@
           "description": "How the read spent its time."
         },
         "text": {
-          "description": "The model's answer, its cites checked against the ids it was shown. Model text only:\nthe footer is structured, above.",
+          "description": "The model's answer, shaped by the server: citations checked against the ids\nit was shown and replaced inline by `(HH:MM)` deep links, bare issue numbers\nlinked. Model text only: the footer is structured, above.",
+          "type": "string"
+        },
+        "text_html": {
+          "description": "`text` rendered to sanitized HTML the way a message body is, for a panel\nthat draws markup; empty when drawing `text` plain is the same thing.",
           "type": "string"
         },
         "thread_id": {

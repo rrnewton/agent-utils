@@ -1563,9 +1563,20 @@ pub struct CatchupResponse {
     pub markable_ids: Vec<MessageId>,
     /// One link per unread message covered, oldest first.
     pub footer_links: Vec<CatchupFooterLink>,
-    /// The model's answer, its cites checked against the ids it was shown. Model text only:
-    /// the footer is structured, above.
+    /// The messages the answer actually cited, in first-citation order: a validated
+    /// subset of `unread_ids`, computed by the server from the answer's citations.
+    /// The panel's "Other messages processed" footer lists `footer_links` outside
+    /// this set; absent from an older server, which cited nothing it could name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cited_ids: Vec<MessageId>,
+    /// The model's answer, shaped by the server: citations checked against the ids
+    /// it was shown and replaced inline by `(HH:MM)` deep links, bare issue numbers
+    /// linked. Model text only: the footer is structured, above.
     pub text: String,
+    /// `text` rendered to sanitized HTML the way a message body is, for a panel
+    /// that draws markup; empty when drawing `text` plain is the same thing.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text_html: String,
     /// Which backend answered, said out loud so a page can never imply a model it did not get.
     pub backend: String,
     /// The model it asked.
