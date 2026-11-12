@@ -523,7 +523,7 @@ def _cleaned_purpose(text: str) -> str | None:
 
 
 def purpose_from_brief(brief: str) -> str | None:
-    """The brief's first meaningful line, as a purpose (see the Rust twin)."""
+    """The brief's first meaningful line, as a purpose."""
     for line in brief.splitlines():
         candidate = line.strip().lstrip("#-*> ")
         if not candidate or candidate.startswith("```"):
