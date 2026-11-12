@@ -647,6 +647,13 @@ async fn main() -> anyhow::Result<()> {
                 "summaries and thread names come from one Messages API call apiece, with NO tools; the \
                  text of the messages being summarised is sent to this model provider"
             ),
+            vibe_talk::config::LlmBackend::ClaudeSession => tracing::info!(
+                backend = llm.backend.as_str(),
+                model = %llm.model,
+                program = %llm.claude_program,
+                pool_size = llm.pool_size,
+                "summaries and thread names come from a warm persistent Claude session, with NO tools"
+            ),
             vibe_talk::config::LlmBackend::MetaGateway => tracing::info!(
                 backend = llm.backend.as_str(),
                 model = %llm.model,

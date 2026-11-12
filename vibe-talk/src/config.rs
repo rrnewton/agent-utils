@@ -3676,9 +3676,12 @@ fn llm_config(file: FileLlm) -> Result<LlmConfig, ConfigError> {
     let recycle_tokens = file.recycle_tokens.unwrap_or(DEFAULT_CLAUDE_RECYCLE_TOKENS);
     if recycle_turns == 0 || recycle_tokens == 0 {
         return Err(invalid(
-            if recycle_turns == 0 { "recycle_turns" } else { "recycle_tokens" },
-            "must be at least 1; zero would recycle every session before its first turn"
-                .to_owned(),
+            if recycle_turns == 0 {
+                "recycle_turns"
+            } else {
+                "recycle_tokens"
+            },
+            "must be at least 1; zero would recycle every session before its first turn".to_owned(),
         ));
     }
     let effort = text(file.effort);

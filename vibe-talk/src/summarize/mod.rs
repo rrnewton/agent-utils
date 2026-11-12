@@ -70,10 +70,10 @@
 //! site can forget. A summary is still third-party text when it comes back.
 
 pub mod agent;
+pub mod claude_session;
 pub mod counters;
 pub mod fake;
 pub mod messages_api;
-pub mod claude_session;
 pub mod meta_gateway;
 pub mod rate_limit;
 pub mod threads;

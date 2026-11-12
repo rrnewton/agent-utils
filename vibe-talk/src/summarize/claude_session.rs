@@ -86,11 +86,9 @@ impl Pool {
 
 fn map_error(error: SessionError) -> SummaryError {
     match error {
-        SessionError::Spawn(error) => {
-            SummaryError::NotConfigured(Box::leak(
-                format!("summaries.llm.claude_program ({error})").into_boxed_str(),
-            ))
-        }
+        SessionError::Spawn(error) => SummaryError::NotConfigured(Box::leak(
+            format!("summaries.llm.claude_program ({error})").into_boxed_str(),
+        )),
         SessionError::Died => SummaryError::Transport("claude session ended mid-turn".to_owned()),
         SessionError::Refused(message) => SummaryError::Refused(message),
         SessionError::Shape(message) => SummaryError::Shape(message),
@@ -125,11 +123,7 @@ impl ClaudeSessionSummarizer {
         }
     }
 
-    async fn complete(
-        &self,
-        kind: SummaryKind,
-        prompt: &str,
-    ) -> Result<String, SummaryError> {
+    async fn complete(&self, kind: SummaryKind, prompt: &str) -> Result<String, SummaryError> {
         let model = self.config.model_for(kind).to_owned();
         self.pool.complete(&model, prompt).await
     }
@@ -153,10 +147,7 @@ impl Summarizer for ClaudeSessionSummarizer {
         true
     }
 
-    async fn name_thread(
-        &self,
-        request: &ThreadRequest<'_>,
-    ) -> Result<ThreadNaming, SummaryError> {
+    async fn name_thread(&self, request: &ThreadRequest<'_>) -> Result<ThreadNaming, SummaryError> {
         let prompt = format!(
             "{THREAD_RULE}\n{THREAD_STYLE}\nKeep the sentence under {} characters.\n\n{}",
             request.sentence_chars,
@@ -166,10 +157,7 @@ impl Summarizer for ClaudeSessionSummarizer {
         parse_thread_answer(&reply, request.sentence_chars)
     }
 
-    async fn summarize(
-        &self,
-        request: &SummaryRequest<'_>,
-    ) -> Result<Summary, SummaryError> {
+    async fn summarize(&self, request: &SummaryRequest<'_>) -> Result<Summary, SummaryError> {
         let text = self
             .complete(SummaryKind::Message, request.prompt())
             .await?;
