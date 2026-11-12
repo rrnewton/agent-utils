@@ -8908,6 +8908,7 @@ def _record_path_check_key(record: ActiveRecord) -> tuple[object, ...]:
                 checkout.repository,
                 checkout.remote,
                 checkout.landed_ref,
+                checkout.vcs,
             )
             for checkout in record.checkouts
         ),

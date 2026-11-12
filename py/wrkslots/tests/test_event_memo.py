@@ -652,6 +652,7 @@ def test_record_path_check_key_covers_every_field_the_check_reads(
         "checkout.repository",
         "checkout.remote",
         "checkout.landed_ref",
+        "checkout.vcs",
     }
     key = cli._record_path_check_key(record)
     first = record.checkouts[0]
@@ -676,6 +677,10 @@ def test_record_path_check_key_covers_every_field_the_check_reads(
         "checkout.landed_ref": dataclasses.replace(
             record,
             checkouts=(dataclasses.replace(first, landed_ref=f"{first.landed_ref}-x"), *rest),
+        ),
+        "checkout.vcs": dataclasses.replace(
+            record,
+            checkouts=(dataclasses.replace(first, vcs=f"{first.vcs}-x"), *rest),
         ),
     }
     assert set(changed_records) == seen - {"checkouts"}
