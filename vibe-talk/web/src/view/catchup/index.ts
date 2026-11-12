@@ -469,6 +469,7 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
         panel.openWith(scope);
       }
       return true;
+    },
     toggle() {
       if (busy) return;
       if (panel.isOpen()) panel.close();
