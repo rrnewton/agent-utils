@@ -13,6 +13,7 @@
 // parts); the panel narrows the decoded body to the fields it reads.
 
 import { createListening, insertSanitizedHtml, setClassWord } from "../dom/index.ts";
+import { foldSectionsByHeading, setAllSections } from "../collapse.ts";
 import { createComposerKeys } from "../composer/index.ts";
 import { deepLinkRefFrom } from "../../foundation/index.ts";
 import type { MessageLinkRef } from "../../foundation/index.ts";
@@ -636,6 +637,23 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     if (answer.text_html !== "") {
       setClassWord(box, "discuss-answer--plain", false);
       insertSanitizedHtml(box, answer.text_html);
+      // `#1387 discuss-collapsible-sections`: workstream sections fold, all
+      // collapsed, with one Expand/Collapse-all bar at the top of the answer.
+      const folds = foldSectionsByHeading(box as never, (tag) => document.createElement(tag) as never);
+      if (folds > 0) {
+        const bar = document.createElement("div");
+        bar.className = "discuss-collapse-bar";
+        const expand = document.createElement("button");
+        expand.type = "button";
+        expand.textContent = "Expand all";
+        expand.addEventListener("click", () => setAllSections(box as never, true));
+        const collapse = document.createElement("button");
+        collapse.type = "button";
+        collapse.textContent = "Collapse all";
+        collapse.addEventListener("click", () => setAllSections(box as never, false));
+        bar.append(expand, collapse);
+        box.prepend(bar);
+      }
     } else {
       setClassWord(box, "discuss-answer--plain", true);
       box.textContent = answer.text;
