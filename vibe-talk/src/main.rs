@@ -45,6 +45,7 @@ USAGE:
                                           read-page, post-reply, ...); `vibe-talk <tool>
                                           --help` shows its arguments
     vibe-talk cache-stats PATH
+    vibe-talk unknown-terms-report [--days N] [--json] PATH
 
 COMMANDS:
     (none)                run the server
@@ -59,6 +60,10 @@ COMMANDS:
                           per hit (ET time, author, snippet, permalink, vibe-talk deep link),
                           newest first, with a line per channel saying how far back it was
                           searched. Uses the READ token. See `vibe-talk search --help`
+    unknown-terms-report  list the most frequent Discuss unknown terms over the last N days
+                          (default 7) from the debug log at PATH (the .jsonl file, its
+                          directory, or the state directory). See
+                          `vibe-talk unknown-terms-report --help`
     cache-stats PATH      print, as JSON, what the message cache file at PATH holds and what its
                           storage costs: bytes on disk, per table and index, and per message; and
                           for each channel its messages, replies, text bytes, the span of days
@@ -388,6 +393,7 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Some("unknown-terms-report") => return unknown_terms_report(argv),
         Some("cache-stats") => return cache_stats(argv),
         _ => {}
     }
@@ -1230,6 +1236,19 @@ fn check_heads_in_background(
             }
         }
     });
+}
+
+/// `vibe-talk unknown-terms-report`. `discuss-unknown-terms-log`.
+fn unknown_terms_report(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
+    let Some(options) = vibe_talk::unknown_terms_log::parse_report_args(args)? else {
+        return Ok(());
+    };
+    let now = jiff::Timestamp::now().to_string();
+    println!(
+        "{}",
+        vibe_talk::unknown_terms_log::run_report(&options, &now)
+    );
+    Ok(())
 }
 
 /// `vibe-talk cache-stats PATH`. `#595 cache-full-history`.

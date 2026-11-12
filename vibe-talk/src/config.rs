@@ -711,6 +711,10 @@ pub struct SummariesConfig {
     /// The most warm-up text one Discuss read carries, in characters, across all
     /// `catchup_warmup_files` together. `discuss-warmup-context`.
     pub catchup_warmup_max_chars: usize,
+    /// Debug switch: append one JSONL record per Discuss run to
+    /// `<state>/unknown-terms/unknown-terms.jsonl`. `discuss-unknown-terms-log`.
+    /// Default off; changes no word of a summary, so not in the cache key.
+    pub catchup_unknown_terms_log: bool,
     /// A direct Messages API summariser, when `[summaries.llm]` is present. `#233 llm-summarizer`.
     ///
     /// When present it is THE summariser, and it is also the one that names threads; see
@@ -734,6 +738,7 @@ impl Default for SummariesConfig {
             catchup_window_messages: DEFAULT_CATCHUP_WINDOW_MESSAGES,
             catchup_warmup_files: Vec::new(),
             catchup_warmup_max_chars: DEFAULT_CATCHUP_WARMUP_MAX_CHARS,
+            catchup_unknown_terms_log: false,
             llm: None,
         }
     }
@@ -2097,6 +2102,7 @@ struct FileSummaries {
     catchup_window_messages: Option<usize>,
     catchup_warmup_files: Option<Vec<String>>,
     catchup_warmup_max_chars: Option<usize>,
+    catchup_unknown_terms_log: Option<bool>,
     llm: Option<FileLlm>,
 }
 
@@ -3279,6 +3285,9 @@ fn summaries_config(
         catchup_warmup_max_chars: file
             .catchup_warmup_max_chars
             .unwrap_or(defaults.catchup_warmup_max_chars),
+        catchup_unknown_terms_log: file
+            .catchup_unknown_terms_log
+            .unwrap_or(defaults.catchup_unknown_terms_log),
         llm,
     };
     if summaries.catchup_window_messages == 0 {

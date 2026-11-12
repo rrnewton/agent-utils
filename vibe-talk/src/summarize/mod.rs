@@ -727,6 +727,7 @@ mod tests {
             catchup_window_messages: _,
             catchup_warmup_files: _,
             catchup_warmup_max_chars: _,
+            catchup_unknown_terms_log: _,
             llm: _,
         } = config();
         vec![
@@ -772,6 +773,12 @@ mod tests {
                 "catchup_warmup_max_chars",
                 false,
                 moved(|c| c.catchup_warmup_max_chars += 1),
+            ),
+            // Debug logging of unknown terms; no word of a summary.
+            (
+                "catchup_unknown_terms_log",
+                false,
+                moved(|c| c.catchup_unknown_terms_log = !c.catchup_unknown_terms_log),
             ),
         ]
     }

@@ -2764,6 +2764,37 @@ pub async fn catchup(
         warmup_fingerprint = warmup_fingerprint,
         "discuss catch-up answered"
     );
+    if state.config.summaries.catchup_unknown_terms_log {
+        if let Some(state_dir) =
+            crate::unknown_terms_log::state_dir_of(state.config.storage.path.as_deref())
+        {
+            let scope = match thread_id {
+                Some(t) => format!("{channel_id}/thread:{t}"),
+                None => channel_id.clone(),
+            };
+            let model = state
+                .catchup_model
+                .as_deref()
+                .unwrap_or_else(|| agent.backend())
+                .to_owned();
+            let record = crate::unknown_terms_log::UnknownTermsRecord {
+                time: jiff::Timestamp::now().to_string(),
+                scope,
+                model,
+                unknown_terms: unknown_terms.clone(),
+                unknown_term_count: unknown_terms.len(),
+                warmup_fingerprint,
+            };
+            let path = crate::unknown_terms_log::log_path(&state_dir);
+            if let Err(error) = crate::unknown_terms_log::append_record(
+                &path,
+                &record,
+                crate::unknown_terms_log::DEFAULT_MAX_BYTES,
+            ) {
+                tracing::warn!(error = %error, path = %path.display(), "unknown-terms log append failed");
+            }
+        }
+    }
     Ok(no_store(Json(crate::contract::CatchupResponse {
         channel: fetched.channel,
         thread_id: thread_id.map(str::to_owned),
