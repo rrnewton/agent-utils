@@ -924,6 +924,30 @@ mod tests {
         });
         assert!(shaped.contains("[(09:51)](?c=C9&v=all&m=slack:C9:2001)"), "{shaped}");
         assert!(cited.contains(&MessageId("2001".to_owned())));
+    fn a_cited_answer_renders_its_citations_as_in_app_anchors() {
+        // The REAL api render path (`http::api::catchup`): shape, collect the addresses the
+        // shaping built through the same `cite`, render with exactly that trusted set.
+        // `#1392 discuss-citation-links`.
+        let sent = read_set(&["111"]);
+        let cite = |id: &MessageId| {
+            Some((
+                "09:51".to_owned(),
+                message_link("slack", "C9", "flat", None, id, None),
+            ))
+        };
+        let (shaped, cited) = shape_answer("- Cache-only is live [m:111]", &sent, &cite);
+        let trusted: HashSet<String> = cited
+            .iter()
+            .filter_map(|id| cite(id).map(|(_, address)| address))
+            .collect();
+        let html =
+            crate::render::body_html_catchup(&shaped, crate::render::Markup::Discord, &trusted);
+        assert!(
+            html.contains("<a href=\"?c=C9&amp;v=all&amp;m=slack:C9:111\""),
+            "no in-app anchor: {html}"
+        );
+        assert!(html.contains("(09:51)"), "no citation label: {html}");
+        assert!(!html.contains("(?c="), "citation printed as text: {html}");
     }
 
     #[test]

@@ -737,6 +737,28 @@ pub fn body_html(text: &str, markup: Markup) -> String {
     }
 }
 
+/// The sanitized HTML for one Discuss answer (`#1392 discuss-citation-links`), or EMPTY on the
+/// same rule as [`body_html`].
+///
+/// `trusted` is the exact set of in-app addresses the server itself built for this answer
+/// ([`crate::catchup::shape_answer`]'s citation links, `?c=…&m=…`). A link whose address is in
+/// that set keeps its `href`, so the panel's citation tap can jump in-app; every other relative
+/// link — including one the model wrote in that shape — is refused exactly as in [`body_html`],
+/// whose sanitizer (`url_relative(Deny)`) is unchanged. The channel renderer is never given a
+/// trusted set, so this cannot widen what a channel message may link to.
+#[must_use]
+pub fn body_html_catchup(text: &str, markup: Markup, trusted: &HashSet<String>) -> String {
+    if trusted.is_empty() {
+        return body_html(text, markup);
+    }
+    let html = render_named_catchup(text, markup, trusted);
+    if html == plain_html(text) {
+        String::new()
+    } else {
+        html
+    }
+}
+
 /// The sanitized HTML for one body, always: rendered, or, past one of the bounds in the module
 /// note, the [`plain_html`] the page would draw without it.
 #[must_use]
@@ -777,6 +799,13 @@ pub(crate) enum Names {
 /// push the bodies the timeline is reading out of [`RENDERED`] with old ones.
 fn render_named(text: &str, markup: Markup, mentions: &[MentionName]) -> String {
     render_visiting(text, markup, mentions, Names::Page, |_, _| ()).0
+}
+
+/// [`render_named`] for one Discuss answer: `trusted` addresses (see [`body_html_catchup`]) keep
+/// their links. Never cached in [`RENDERED`]: what a body renders to here depends on the trusted
+/// set, which the cache key does not hold, and a Discuss answer is rendered once.
+fn render_named_catchup(text: &str, markup: Markup, trusted: &HashSet<String>) -> String {
+    render_visiting_trusted(text, markup, &[], Names::Page, trusted, |_, _| ()).0
 }
 
 /// [`render_named`] for the search index: drawn as the page draws it but for thread names,
@@ -956,7 +985,16 @@ impl Generations {
 /// [`to_html`] under the single-newline rule `rule`, whatever this process was configured with.
 #[must_use]
 pub fn to_html_as(text: &str, markup: Markup, rule: SingleNewline) -> String {
-    render_visiting_as(text, markup, &[], rule, Names::Page, |_, _| ()).0
+    render_visiting_as(
+        text,
+        markup,
+        &[],
+        rule,
+        Names::Page,
+        &HashSet::new(),
+        |_, _| (),
+    )
+    .0
 }
 
 /// [`to_html_named`], handing the parsed and adjusted tree, and the text it was parsed from, to
@@ -969,12 +1007,25 @@ fn render_visiting<T>(
     names: Names,
     visit: impl for<'a> FnOnce(&'a AstNode<'a>, &str) -> T,
 ) -> (String, Option<T>) {
+    render_visiting_trusted(text, markup, mentions, names, &HashSet::new(), visit)
+}
+
+/// [`render_visiting`] with a trusted-address set (see [`body_html_catchup`]).
+fn render_visiting_trusted<T>(
+    text: &str,
+    markup: Markup,
+    mentions: &[MentionName],
+    names: Names,
+    trusted: &HashSet<String>,
+    visit: impl for<'a> FnOnce(&'a AstNode<'a>, &str) -> T,
+) -> (String, Option<T>) {
     render_visiting_as(
         text,
         markup,
         mentions,
         newline_rule(text, markup),
         names,
+        trusted,
         visit,
     )
 }
@@ -986,6 +1037,7 @@ fn render_visiting_as<T>(
     mentions: &[MentionName],
     rule: SingleNewline,
     names: Names,
+    trusted: &HashSet<String>,
     visit: impl for<'a> FnOnce(&'a AstNode<'a>, &str) -> T,
 ) -> (String, Option<T>) {
     if text.len() > MAX_RENDERED_BYTES {
@@ -1022,7 +1074,9 @@ fn render_visiting_as<T>(
             }
         }
     }
-    let linked = adjust(&arena, root, &source, &inserted, markup, mentions, names);
+    let linked = adjust(
+        &arena, root, &source, &inserted, markup, mentions, names, trusted,
+    );
     // Measured again: nesting the lists the writer indented makes the tree deeper than it parsed.
     if deeper_than(root, MAX_DEPTH) {
         return (plain_html(text), None);
@@ -1037,9 +1091,14 @@ fn render_visiting_as<T>(
     let highlighter = highlight::Highlighter::for_one_body();
     let mut plugins = comrak::options::Plugins::default();
     plugins.render.codefence_syntax_highlighter = Some(&highlighter);
-    let html = write_html(root, &options, &plugins);
+    let html = write_html(root, &options, &plugins, trusted);
     let html = if html.len() > limit && has_code_block(root) {
-        write_html(root, &options, &comrak::options::Plugins::default())
+        write_html(
+            root,
+            &options,
+            &comrak::options::Plugins::default(),
+            trusted,
+        )
     } else {
         html
     };
@@ -1050,15 +1109,39 @@ fn render_visiting_as<T>(
 }
 
 /// The tree written as HTML with `plugins`, then sanitized.
+///
+/// With an empty `trusted` this is the channel sanitizer ([`SANITIZER`], `url_relative(Deny)`).
+/// Otherwise a per-answer sanitizer keeps a relative address only on exact membership in
+/// `trusted` (`#1392 discuss-citation-links`): [`adjust`] has already refused every other
+/// relative link, and this is the second, independent check of the same set.
 fn write_html<'a>(
     root: &'a AstNode<'a>,
     options: &Options,
     plugins: &comrak::options::Plugins<'_>,
+    trusted: &HashSet<String>,
 ) -> String {
     let mut html = String::new();
     comrak::format_html_with_plugins(root, options, &mut html, plugins)
         .expect("formatting into a String cannot fail");
-    mark_message_links(&SANITIZER.clean(&html).to_string())
+    if trusted.is_empty() {
+        return mark_message_links(&SANITIZER.clean(&html).to_string());
+    }
+    let mut builder = sanitizer_builder();
+    builder.url_relative(ammonia::UrlRelative::Custom(Box::new(TrustedRelative(
+        trusted,
+    ))));
+    mark_message_links(&builder.clean(&html).to_string())
+}
+
+/// The relative-address rule for one Discuss answer's sanitizer: an address survives only on
+/// exact membership in the trusted set the server built for that answer (`#1392
+/// discuss-citation-links`); anything else loses its `href`, as under `url_relative(Deny)`.
+struct TrustedRelative<'a>(&'a HashSet<String>);
+
+impl<'a> ammonia::UrlRelativeEvaluate<'a> for TrustedRelative<'a> {
+    fn evaluate<'url>(&self, url: &'url str) -> Option<Cow<'url, str>> {
+        self.0.contains(url).then_some(Cow::Borrowed(url))
+    }
 }
 
 /// `html`, sanitized, with every link to a chat message marked with what it names: the
@@ -2385,6 +2468,15 @@ pub const MENTION_CLASS: &str = "mention";
 /// message wrote and writes one only onto a link it gave a short label: the address the link goes
 /// to, so the hover can never claim an address the link does not have. `#227 github-link-abbrev`.
 static SANITIZER: LazyLock<ammonia::Builder<'static>> = LazyLock::new(|| {
+    let mut builder = sanitizer_builder();
+    builder.url_relative(ammonia::UrlRelative::Deny);
+    builder
+});
+
+/// The sanitizer's shape, before its relative-address rule: [`SANITIZER`] denies every relative
+/// address; a Discuss answer's per-call copy ([`write_html`]) admits only its trusted set. Every
+/// other rule — tags, attributes, classes, schemes — is shared, so the two can never drift.
+fn sanitizer_builder<'a>() -> ammonia::Builder<'a> {
     let alignment = || HashMap::from([("align", HashSet::from(["left", "center", "right"]))]);
     let mut builder = ammonia::Builder::empty();
     builder
@@ -2438,17 +2530,17 @@ static SANITIZER: LazyLock<ammonia::Builder<'static>> = LazyLock::new(|| {
         // reaches here only on a link to a Slack message [`adjust`] kept, which opens Slack's app
         // and nothing else (`#543 in-app-message-links`); every other one is shown as text there.
         .url_schemes(HashSet::from(["http", "https", "slack"]))
-        .url_relative(ammonia::UrlRelative::Deny)
         .link_rel(Some("noopener noreferrer nofollow"))
         .strip_comments(true);
     builder
-});
+}
 
 /// The changes made to the parsed tree before it is written. See the module note, step 3.
 ///
 /// Two walks, because the second reads what the first made: an image is a link by the time links
 /// are checked, and a block of raw HTML is text by the time mentions are looked for. Then reference
 /// ids become links, and what those links may add to the HTML is answered, for the growth bound.
+#[allow(clippy::too_many_arguments)]
 fn adjust<'a>(
     arena: &'a Arena<'a>,
     root: &'a AstNode<'a>,
@@ -2457,6 +2549,7 @@ fn adjust<'a>(
     markup: Markup,
     mentions: &[MentionName],
     names: Names,
+    trusted: &HashSet<String>,
 ) -> usize {
     let lines = line_starts(source);
     nest_lists(
@@ -2526,7 +2619,11 @@ fn adjust<'a>(
     for node in root.descendants().collect::<Vec<_>>() {
         let ast = node.data.borrow();
         match &ast.value {
-            NodeValue::Link(link) if !web_address(&link.url) && !slack_app_link(&link.url) => {
+            NodeValue::Link(link)
+                if !web_address(&link.url)
+                    && !slack_app_link(&link.url)
+                    && !trusted.contains(link.url.as_str()) =>
+            {
                 let url = link.url.clone();
                 drop(ast);
                 refused.extend(node.descendants().skip(1).map(std::ptr::from_ref));
@@ -3517,8 +3614,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        body_html, plain_html, table_cells_bound, to_html, Markup, GROWTH_ALLOWANCE, MAX_DEPTH,
-        MAX_GROWTH, MAX_RENDERED_BYTES, MAX_TABLE_CELLS, SANITIZER,
+        body_html, body_html_catchup, plain_html, table_cells_bound, to_html, Markup,
+        GROWTH_ALLOWANCE, MAX_DEPTH, MAX_GROWTH, MAX_RENDERED_BYTES, MAX_TABLE_CELLS, SANITIZER,
     };
 
     const LINK: &str = r#"target="_blank" rel="noopener noreferrer nofollow""#;
@@ -4011,6 +4108,39 @@ mod tests {
         let read = crate::slack::mrkdwn::to_markdown("see <https://example.com/d|the doc>");
         assert_eq!(to_html(&read, Markup::Slack), expected);
         assert_eq!(to_html(&read, Markup::Discord), expected);
+    }
+
+    #[test]
+    fn a_discuss_answer_keeps_only_its_trusted_citation_links() {
+        // `#1392 discuss-citation-links`: a server-built citation address in the trusted set
+        // renders as an anchor; the same shape written by the model, and every relative link
+        // on the channel path, is still shown as text with its address after it.
+        use std::collections::HashSet;
+        let trusted: HashSet<String> = ["?c=C9&v=all&m=slack:C9:111".to_owned()].into();
+        let text = "- Live [(09:51)](?c=C9&v=all&m=slack:C9:111) and [(10:00)](?c=C9&v=all&m=slack:C9:999)";
+        let html = body_html_catchup(text, Markup::Discord, &trusted);
+        assert!(
+            html.contains("<a href=\"?c=C9&amp;v=all&amp;m=slack:C9:111\""),
+            "trusted citation lost its anchor: {html}"
+        );
+        assert!(html.contains("(09:51)"), "citation label lost: {html}");
+        assert!(
+            !html.contains("href=\"?c=C9&amp;v=all&amp;m=slack:C9:999\""),
+            "model-written citation became an anchor: {html}"
+        );
+        assert!(
+            html.contains("(10:00) (?c=C9&amp;v=all&amp;m=slack:C9:999)"),
+            "model-written citation not shown as text: {html}"
+        );
+        // The channel renderer refuses even a trusted-shaped address.
+        let channel = body_html(text, Markup::Discord);
+        assert!(
+            !channel.contains("<a href=\"?c="),
+            "channel kept a relative link: {channel}"
+        );
+        // No trusted set, no anchors: the Discuss entry point degrades to the channel rule.
+        let none = body_html_catchup(text, Markup::Discord, &HashSet::new());
+        assert_eq!(none, channel);
     }
 
     #[test]

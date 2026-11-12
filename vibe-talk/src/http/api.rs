@@ -2697,7 +2697,7 @@ pub async fn catchup(
         .clone()
         .unwrap_or_else(|| "discord".to_owned());
     let (raw, unknown_terms) = crate::catchup::split_unknown_terms(&raw);
-    let (text, cited_ids) = crate::catchup::shape_answer(&raw, &sent, |id| {
+    let cite = |id: &MessageId| {
         let message = by_id.get(id.as_str())?;
         let time = if message.spoken_time.is_empty() {
             message.timestamp.clone()
@@ -2713,10 +2713,19 @@ pub async fn catchup(
             message.thread.as_ref().map(|thread| thread.id.as_str()),
         );
         Some((time, address))
-    });
-    let text_html = crate::render::body_html(
+    };
+    let (text, cited_ids) = crate::catchup::shape_answer(&raw, &sent, cite);
+    // The addresses `shape_answer` just built, recomputed through the same `cite`: exactly the
+    // citation hrefs the render may keep (`#1392 discuss-citation-links`). A relative link the
+    // model wrote itself is never in this set, so it stays refused.
+    let trusted: std::collections::HashSet<String> = cited_ids
+        .iter()
+        .filter_map(|id| cite(id).map(|(_, address)| address))
+        .collect();
+    let text_html = crate::render::body_html_catchup(
         &text,
         crate::render::markup_for(&state.config, &fetched.channel),
+        &trusted,
     );
     let footer_links = built
         .unread_ids
