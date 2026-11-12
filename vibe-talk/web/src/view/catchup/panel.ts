@@ -366,15 +366,47 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     return width;
   }
 
+  /**
+   * `#1383 discuss-header-icons`. The header's two layout toggles, stated from the
+   * layout in force: dock is pressed while docked, fullscreen while maximized on
+   * a desk or full-height on a phone. Their words name the act a press performs.
+   */
+  function drawHeaderToggles(): void {
+    const dock = maybe("discuss-dock-toggle");
+    if (dock) {
+      const docked = layoutMode === "docked";
+      dock.setAttribute("aria-pressed", docked ? "true" : "false");
+      dock.setAttribute("aria-label", docked ? "Float panel" : "Dock panel");
+      dock.setAttribute("title", docked ? "Float panel" : "Dock panel");
+    }
+    const full = maybe("discuss-full-toggle");
+    if (full) {
+      const deskFull = layoutMode === "maximized";
+      full.setAttribute("aria-pressed", deskFull || sheetFull ? "true" : "false");
+      full.setAttribute("aria-label", deskFull || sheetFull ? "Exit full screen" : "Full screen");
+      full.setAttribute("title", deskFull || sheetFull ? "Exit full screen" : "Full screen");
+    }
+  }
+
+  /** Whether this device draws the desk layouts (the stylesheet's desk media). */
+  function deskLayout(): boolean {
+    try {
+      const query = (globalThis as { matchMedia?: (q: string) => { matches: boolean } }).matchMedia;
+      if (typeof query === "function") return query("(min-width: 900px) and (pointer: fine)").matches;
+    } catch {
+      // No media to ask: the desk toggles stand.
+    }
+    return true;
+  }
+
+  /** The mode fullscreen restores to, remembered when fullscreen is entered. */
+  let beforeFull: DiscussLayoutMode = "overlay";
+
   /** Stand the phone sheet at full or half height; kept on the device only when `keep`. */
   function applySheet(full: boolean, keep: boolean): boolean {
     sheetFull = full;
     panel().setAttribute("data-sheet", full ? "full" : "half");
-    const toggle = maybe("discuss-sheet-toggle");
-    if (toggle) {
-      toggle.textContent = full ? "Restore" : "Maximize";
-      toggle.setAttribute("aria-expanded", full ? "true" : "false");
-    }
+    drawHeaderToggles();
     if (keep) {
       try {
         deps.keepSheetFull?.(full);
@@ -402,10 +434,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       if (mode === "overlay") screen.removeAttribute("data-discuss");
       else screen.setAttribute("data-discuss", mode);
     }
-    for (const each of ["overlay", "docked", "maximized"] as const) {
-      const button = maybe(`discuss-mode-${each}`);
-      if (button) button.setAttribute("aria-pressed", each === mode ? "true" : "false");
-    }
+    drawHeaderToggles();
     if (keep) {
       try {
         deps.keepMode?.(mode);
@@ -582,7 +611,8 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     count.value = String(bound.count);
     count.max = String(previewUnread.length);
     since.value = bound.sinceMs === null ? "" : hhmm(bound.sinceMs);
-    button.textContent = `Summarize last ${bound.count} unread since ${since.value || "—"}`;
+    // `#1382`: the button says only "Summarize"; the line beside it carries the bound.
+    button.textContent = "Summarize";
   }
 
   /** Read the scope's preview and offer its bound; no model is asked. */
@@ -732,15 +762,27 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         listening.listen(deps.byId("discuss-answer"), "click", (event) => answerTap(event));
         listening.listen(deps.byId("discuss-mark-read"), "click", () => mark(true));
         listening.listen(deps.byId("discuss-mark-unread"), "click", () => mark(false));
-        const toggle = maybe("discuss-sheet-toggle");
-        if (toggle) {
-          listening.listen(toggle, "click", () => applySheet(!sheetFull, true));
+        // `#1383`: the header's two layout toggles beside Close. Dock switches
+        // overlay/docked (leaving fullscreen first); fullscreen switches
+        // maximized on a desk and the sheet's full height on a phone.
+        const dockToggle = maybe("discuss-dock-toggle");
+        if (dockToggle) {
+          listening.listen(dockToggle, "click", () => {
+            applyMode(layoutMode === "docked" ? "overlay" : "docked", true);
+          });
         }
-        // `#1354`: the mode control beside Close, and the panel's keys as the
-        // outline panel's are: Escape away, focus home on open (below).
-        for (const each of ["overlay", "docked", "maximized"] as const) {
-          const button = maybe(`discuss-mode-${each}`);
-          if (button) listening.listen(button, "click", () => applyMode(each, true));
+        const fullToggle = maybe("discuss-full-toggle");
+        if (fullToggle) {
+          listening.listen(fullToggle, "click", () => {
+            if (!deskLayout()) {
+              applySheet(!sheetFull, true);
+            } else if (layoutMode === "maximized") {
+              applyMode(beforeFull, true);
+            } else {
+              beforeFull = layoutMode;
+              applyMode("maximized", true);
+            }
+          });
         }
         listening.listen(panel(), "keydown", (event: KeyboardEvent) => {
           if (event.key !== "Escape") return;

@@ -153,7 +153,9 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
     # Opening asks nothing: the bound is offered first, and only its press posts.
     page.wait_for_function(
-        "() => document.getElementById('discuss-summarize').textContent.includes('Summarize last 2 unread')",
+        "() => document.getElementById('discuss-summarize').textContent === 'Summarize'"
+        " && document.getElementById('discuss-count').value === '2'"
+        " && document.getElementById('discuss-since').value !== ''",
         timeout=20_000)
     check(posts == [], f"opening posted {posts}, not nothing")
     # (the rendered answer is asserted after Summarize, below)
@@ -221,7 +223,7 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
               f"the kept width did not survive close/reopen: {reopened}")
         # `#1354 discuss-layout-modes`: docked beside the list, maximized over
         # the main area, the choice kept per device.
-        page.click("#discuss-mode-docked")
+        page.click("#discuss-dock-toggle")
         page.wait_for_function(
             "() => document.getElementById('screen-main').dataset.discuss === 'docked'",
             timeout=20_000)
@@ -233,27 +235,39 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
               f"docked is not a column beside the list: panel={docked} list={list_box}")
         mode_kept = page.evaluate("() => localStorage.getItem('vibe-talk.voice.discuss-mode')")
         check(mode_kept == "docked", f"the docked mode was not kept: {mode_kept!r}")
-        page.click("#discuss-mode-maximized")
+        page.click("#discuss-dock-toggle")
+        page.wait_for_function(
+            "() => !document.getElementById('screen-main').hasAttribute('data-discuss')",
+            timeout=20_000)
+        page.click("#discuss-dock-toggle")
+        page.wait_for_function(
+            "() => document.getElementById('screen-main').dataset.discuss === 'docked'",
+            timeout=20_000)
+        page.click("#discuss-full-toggle")
         page.wait_for_function(
             "() => document.getElementById('screen-main').dataset.discuss === 'maximized'",
             timeout=20_000)
         full = page.locator("#discuss-panel").bounding_box()
         check(full is not None and full["width"] >= width - 100,
               f"maximized does not fill the main area: {full} in {width}x{height}")
-        page.click("#discuss-mode-overlay")
+        page.click("#discuss-full-toggle")
+        page.wait_for_function(
+            "() => document.getElementById('screen-main').dataset.discuss === 'docked'",
+            timeout=20_000)
+        page.click("#discuss-dock-toggle")
         page.wait_for_function(
             "() => !document.getElementById('screen-main').hasAttribute('data-discuss')",
             timeout=20_000)
     else:
-        check(page.locator("#discuss-mode-docked").is_hidden(),
-              "the phone sheet shows the desk mode control")
+        check(page.locator("#discuss-dock-toggle").is_hidden(),
+              "the phone sheet shows the desk dock toggle")
         check(panel_box is not None and panel_box["width"] >= width - 2,
               f"the phone sheet is not full width: {panel_box} in {width}x{height}")
         check(panel_box is not None and height * 0.4 <= panel_box["height"] <= height * 0.6,
               f"the phone sheet is not at half height: {panel_box} in {width}x{height}")
         check(panel_box is not None and panel_box["y"] >= height * 0.2,
               f"no messages show above the half sheet: {panel_box} in {width}x{height}")
-        page.click("#discuss-sheet-toggle")
+        page.click("#discuss-full-toggle")
         page.wait_for_function(
             "() => document.getElementById('discuss-panel').getBoundingClientRect().height >= innerHeight * 0.75",
             timeout=20_000)
@@ -271,7 +285,7 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
         page.wait_for_function(
             "() => document.getElementById('discuss-panel').getBoundingClientRect().height >= innerHeight * 0.75",
             timeout=20_000)
-        page.click("#discuss-sheet-toggle")
+        page.click("#discuss-full-toggle")
         page.wait_for_function(
             "() => document.getElementById('discuss-panel').getBoundingClientRect().height <= innerHeight * 0.6",
             timeout=20_000)

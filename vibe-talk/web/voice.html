@@ -393,26 +393,28 @@
           <div id="discuss-panel" role="dialog" aria-label="Discuss" data-sheet="half" data-mode="overlay" hidden>
             <div id="discuss-resize" role="separator" aria-orientation="vertical" tabindex="0"
                  aria-label="Discuss panel width" aria-valuemin="320" aria-valuemax="960" aria-valuenow="560"></div>
+            <!-- One control row (`#1382 discuss-summarize-control-oneline`,
+                 `#1383 discuss-header-icons`): no title row. The Summarize
+                 control is one line — [Summarize] last [N] unread since
+                 [HH:MM picker] — and three small square icons stand at its
+                 upper right (dock, fullscreen, close), taking no extra
+                 vertical space. Nothing runs until Summarize is pressed. -->
             <div class="discuss-head">
-              <h2 class="discuss-title">Discuss</h2>
-              <!-- Panel actions (`#1344 discuss-panel-resize`): the sheet toggle here, the
-                   Summarize button (`#1346`) beside it next, then Close. Layout modes
-                   (`#1354`) join this slot without moving Close. -->
-              <div id="discuss-actions" class="discuss-actions">
-                <span class="discuss-modes" role="group" aria-label="Panel layout">
-                  <button id="discuss-mode-overlay" type="button" aria-pressed="true">Overlay</button>
-                  <button id="discuss-mode-docked" type="button" aria-pressed="false">Dock</button>
-                  <button id="discuss-mode-maximized" type="button" aria-pressed="false">Full</button>
-                </span>
+              <div class="discuss-ask">
                 <button id="discuss-summarize" type="button">Summarize</button>
-                <button id="discuss-sheet-toggle" type="button" aria-expanded="false" aria-controls="discuss-panel">Maximize</button>
-                <button id="discuss-close" type="button">Close</button>
+                <span class="discuss-bound">last <input id="discuss-count" type="number" min="1" step="1" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" aria-label="Number of unread messages"> unread since <input id="discuss-since" type="time" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" aria-label="Since time"></span>
               </div>
-            </div>
-            <!-- `discuss-summarize-button`: nothing runs until Summarize (in the
-                 actions above, beside Close) is pressed; this row is its bound. -->
-            <div class="discuss-ask">
-              <span class="discuss-bound">last <input id="discuss-count" type="number" min="1" step="1" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" aria-label="Number of unread messages"> unread since <input id="discuss-since" type="time" autocomplete="off" data-lpignore="true" data-1p-ignore="true" data-form-type="other" aria-label="Since time"></span>
+              <div id="discuss-actions" class="discuss-actions">
+                <button id="discuss-dock-toggle" class="discuss-icon-button" type="button" aria-pressed="false" aria-label="Dock panel" title="Dock panel">
+                  <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M15 4v16" /></svg>
+                </button>
+                <button id="discuss-full-toggle" class="discuss-icon-button" type="button" aria-pressed="false" aria-label="Full screen" title="Full screen">
+                  <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V5a1 1 0 0 1 1-1h4M15 4h4a1 1 0 0 1 1 1v4M20 15v4a1 1 0 0 1-1 1h-4M9 20H5a1 1 0 0 1-1-1v-4" /></svg>
+                </button>
+                <button id="discuss-close" class="discuss-icon-button" type="button" aria-label="Close" title="Close">
+                  <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M6 6l12 12M18 6 6 18" /></svg>
+                </button>
+              </div>
             </div>
             <p id="discuss-scope"></p>
             <p id="discuss-status" role="status"></p>

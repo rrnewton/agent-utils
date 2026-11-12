@@ -95,8 +95,8 @@ const IDS = [
   "discuss-answer", "discuss-footer", "discuss-covers", "discuss-links",
   "discuss-mark-read", "discuss-mark-unread", "discuss-unmarkable",
   "discuss-stamp", "discuss-retry", "discuss-terms", "discuss-terms-summary", "discuss-terms-list",
-  "discuss-actions", "discuss-resize", "discuss-sheet-toggle",
-  "discuss-mode-overlay", "discuss-mode-docked", "discuss-mode-maximized", "screen-main",
+  "discuss-actions", "discuss-resize",
+  "discuss-dock-toggle", "discuss-full-toggle", "screen-main",
   "discuss-summarize", "discuss-count", "discuss-since",
 ];
 
@@ -245,7 +245,9 @@ test("catchup: open asks nothing; Summarize posts the bound and says Reading… 
     assert.equal(fx.calls.previews.length, 1, "open did not read the preview");
     assert.deepEqual(fx.calls.posts, [], "open asked the model");
     assert.equal(fx.els["discuss-status"].textContent, "2 unread ready.");
-    assert.equal(fx.els["discuss-summarize"].textContent, "Summarize last 2 unread since 09:51");
+    assert.equal(fx.els["discuss-summarize"].textContent, "Summarize", "the button repeated the bound");
+    assert.equal(fx.els["discuss-count"].value, "2");
+    assert.equal(fx.els["discuss-since"].value, "09:51");
     assert.equal(fx.els["discuss-scope"].textContent, "Channel chan-1");
     click(fx.els["discuss-summarize"]);
     assert.equal(fx.els["discuss-status"].textContent, "Reading…", "no Reading line before the answer");
@@ -269,7 +271,7 @@ test("catchup: the bound's ends move together (N to time, time to N)", async () 
     count.value = "1";
     fireInput(count);
     assert.equal(since.value, "09:52", "N=1 did not move the time to the newest unread");
-    assert.equal(fx.els["discuss-summarize"].textContent, "Summarize last 1 unread since 09:52");
+    assert.equal(fx.els["discuss-summarize"].textContent, "Summarize");
     since.value = "09:51";
     fireInput(since);
     assert.equal(count.value, "2", "the time did not move N back over both unread");
@@ -658,7 +660,7 @@ test("catchup layout: dragging the edge widens live and keeps once, at the end",
   } finally { fx.restore(); }
 });
 
-test("catchup layout: the sheet starts at half, Maximize sticks across close/reopen", async () => {
+test("catchup layout: the sheet starts at half, full height sticks across close/reopen", async () => {
   const fx = fixture();
   try {
     const view = createDiscussView(fx.deps);
@@ -667,19 +669,19 @@ test("catchup layout: the sheet starts at half, Maximize sticks across close/reo
     await flush();
     assert.equal(view.sheetFull(), false, "the sheet did not start at half");
     assert.equal(fx.els["discuss-panel"].getAttribute("data-sheet"), "half");
-    assert.equal(fx.els["discuss-sheet-toggle"].textContent, "Maximize");
-    click(fx.els["discuss-sheet-toggle"]);
-    assert.equal(view.sheetFull(), true, "Maximize did not stand the sheet full");
+    assert.equal(fx.els["discuss-full-toggle"].getAttribute("aria-pressed"), "false");
+    view.setSheetFull(true);
+    assert.equal(view.sheetFull(), true, "full height did not stand the sheet full");
     assert.equal(fx.els["discuss-panel"].getAttribute("data-sheet"), "full");
-    assert.equal(fx.els["discuss-sheet-toggle"].textContent, "Restore");
+    assert.equal(fx.els["discuss-full-toggle"].getAttribute("aria-pressed"), "true");
     assert.deepEqual(fx.kept.sheetKeeps, [true], "the full height was not kept");
     view.close();
     view.open();
     await flush();
     assert.equal(view.sheetFull(), true, "the full height did not stick across close/reopen");
     assert.equal(fx.els["discuss-panel"].getAttribute("data-sheet"), "full");
-    click(fx.els["discuss-sheet-toggle"]);
-    assert.equal(view.sheetFull(), false, "Restore did not return the sheet to half");
+    view.setSheetFull(false);
+    assert.equal(view.sheetFull(), false, "half height did not return the sheet to half");
   } finally { fx.restore(); }
 });
 
@@ -695,18 +697,20 @@ test("catchup modes: overlay stands until chosen; a chosen mode is kept and surv
     assert.equal(view.mode(), "overlay", "the panel did not start as overlay");
     assert.equal(fx.els["discuss-panel"].getAttribute("data-mode"), "overlay");
     assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), null);
-    click(fx.els["discuss-mode-docked"]);
+    click(fx.els["discuss-dock-toggle"]);
     assert.equal(view.mode(), "docked");
     assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), "docked");
-    assert.equal(fx.els["discuss-mode-docked"].getAttribute("aria-pressed"), "true");
-    assert.equal(fx.els["discuss-mode-overlay"].getAttribute("aria-pressed"), "false");
+    assert.equal(fx.els["discuss-dock-toggle"].getAttribute("aria-pressed"), "true");
     assert.deepEqual(fx.kept.modeKeeps, ["docked"], "the docked choice was not kept");
     view.close();
     view.open();
     await flush();
     assert.equal(view.mode(), "docked", "the mode did not survive close/reopen");
-    view.setMode("maximized");
-    assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), "maximized");
+    click(fx.els["discuss-full-toggle"]);
+    assert.equal(view.mode(), "maximized");
+    assert.equal(fx.els["discuss-full-toggle"].getAttribute("aria-pressed"), "true");
+    click(fx.els["discuss-full-toggle"]);
+    assert.equal(view.mode(), "docked", "fullscreen did not restore the mode before it");
     view.setMode("overlay");
     assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), null, "overlay left the screen marked");
   } finally { fx.restore(); }

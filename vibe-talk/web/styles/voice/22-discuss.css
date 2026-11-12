@@ -85,28 +85,29 @@
   }
 }
 
+/* One control row, no title row (`#1382`, `#1383`): the Summarize line and,
+ * at its upper right, three small square icons (dock, fullscreen, close) that
+ * take no vertical space of their own. */
 .discuss-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
 }
 
-.discuss-title {
-  margin: 0;
-  font-size: 1rem;
-}
-
-/* Panel actions next to the title: sheet toggle, `#1346`'s Summarize, layout
- * modes (`#1354`), then Close — one slot, so each joins without moving Close. */
 .discuss-actions {
   margin-left: auto;
   display: flex;
-  gap: 8px;
+  gap: 4px;
+  flex: 0 0 auto;
 }
 
-#discuss-close,
-#discuss-sheet-toggle {
-  padding: 4px 8px;
+.discuss-icon-button {
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   cursor: pointer;
   background: #262c36;
   color: #e7e9ee;
@@ -115,20 +116,30 @@
   font: inherit;
 }
 
-/* The sheet toggle is the phone's control; a desk has the drag edge instead. */
-@media (min-width: 900px) and (pointer: fine) {
-  #discuss-sheet-toggle {
+.discuss-icon-button .icon {
+  width: 1.1rem;
+  height: 1.1rem;
+}
+
+.discuss-icon-button[aria-pressed="true"] {
+  border-color: #7ab3e3;
+  color: #7ab3e3;
+}
+
+/* The dock toggle is a desk layout; a phone's sheet has no column to dock into. */
+@media not ((min-width: 900px) and (pointer: fine)) {
+  #discuss-dock-toggle {
     display: none;
   }
 }
 
-/* The one ask (`discuss-summarize-button`): its press, and the bound's two ends. */
+/* The one ask (`#1382`): [Summarize] last [N] unread since [HH:MM picker]. */
 .discuss-ask {
   display: flex;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 8px;
+  flex-wrap: nowrap;
+  gap: 6px;
+  min-width: 0;
 }
 
 #discuss-summarize {
@@ -139,6 +150,7 @@
   border: 1px solid #3d4452;
   border-radius: 6px;
   font: inherit;
+  flex: 0 0 auto;
 }
 
 #discuss-summarize[disabled] {
@@ -149,15 +161,39 @@
 .discuss-bound {
   color: #aab2c0;
   font-size: 0.85rem;
+  white-space: nowrap;
 }
 
 .discuss-bound input {
-  width: 4.5rem;
+  box-sizing: border-box;
   background: #262c36;
   color: #e7e9ee;
   border: 1px solid #3d4452;
   border-radius: 6px;
   font: inherit;
+}
+
+/* A 3-digit count: wide enough for three digits, no more. */
+#discuss-count {
+  width: 3.4rem;
+  min-width: 0;
+  padding: 2px 4px;
+  text-align: center;
+}
+
+/* The time's picker button gets its own space at the right, so the HH:MM
+ * digits are never underneath it. */
+#discuss-since {
+  width: 6.2rem;
+  min-width: 0;
+  padding: 2px 4px;
+}
+
+#discuss-since::-webkit-calendar-picker-indicator {
+  margin-left: 6px;
+  padding: 2px;
+  cursor: pointer;
+  opacity: 0.85;
 }
 
 #discuss-scope {
@@ -238,7 +274,7 @@
 
 .discuss-link:focus-visible,
 #discuss-close:focus-visible,
-#discuss-sheet-toggle:focus-visible,
+.discuss-icon-button:focus-visible,
 #discuss-mark-read:focus-visible,
 #discuss-mark-unread:focus-visible,
 #discuss-retry:focus-visible {
@@ -285,39 +321,6 @@
   margin: 10px 0 0;
   color: #aab2c0;
   font-size: 0.75rem;
-}
-
-/* `#1354 discuss-layout-modes`. The mode control: three small buttons beside
- * Close (desk only; the phone's sheet toggle is its layout control). */
-.discuss-modes {
-  display: none;
-}
-
-@media (min-width: 900px) and (pointer: fine) {
-  .discuss-modes {
-    display: flex;
-    gap: 4px;
-  }
-}
-
-.discuss-modes button {
-  padding: 4px 8px;
-  cursor: pointer;
-  background: #262c36;
-  color: #e7e9ee;
-  border: 1px solid #3d4452;
-  border-radius: 6px;
-  font: inherit;
-}
-
-.discuss-modes button[aria-pressed="true"] {
-  border-color: #7ab3e3;
-  color: #7ab3e3;
-}
-
-.discuss-modes button:focus-visible {
-  outline: 2px solid #7ab3e3;
-  outline-offset: 1px;
 }
 
 @media (min-width: 900px) and (pointer: fine) {
@@ -400,5 +403,51 @@
 @media (min-width: 900px) and (pointer: fine) {
   #discuss-open .discuss-icon {
     display: none;
+  }
+}
+
+/* Phone compact ends (`#1382`): last, so they win over the base rules above.
+ * Tighter ends, same words; the icons keep the upper right and the control
+ * line takes the full width under them rather than run underneath. */
+@media not ((min-width: 900px) and (pointer: fine)) {
+  .discuss-head {
+    flex-wrap: wrap;
+    gap: 4px;
+  }
+
+  .discuss-actions {
+    order: -1;
+    width: 100%;
+    justify-content: flex-end;
+  }
+
+  .discuss-actions {
+    gap: 2px;
+  }
+
+  .discuss-icon-button {
+    width: 1.85rem;
+    height: 1.85rem;
+  }
+
+  .discuss-ask {
+    gap: 4px;
+  }
+
+  #discuss-summarize {
+    padding: 4px 7px;
+    font-size: 0.82rem;
+  }
+
+  .discuss-bound {
+    font-size: 0.78rem;
+  }
+
+  #discuss-count {
+    width: 2.7rem;
+  }
+
+  #discuss-since {
+    width: 5.6rem;
   }
 }

@@ -127,16 +127,14 @@ export interface ElementById {
   "discuss-links": HTMLUListElement;
   "discuss-mark-read": HTMLButtonElement;
   "discuss-mark-unread": HTMLButtonElement;
+  "discuss-dock-toggle": HTMLButtonElement;
+  "discuss-full-toggle": HTMLButtonElement;
   "discuss-menu-open": HTMLButtonElement;
-  "discuss-mode-docked": HTMLButtonElement;
-  "discuss-mode-maximized": HTMLButtonElement;
-  "discuss-mode-overlay": HTMLButtonElement;
   "discuss-open": HTMLButtonElement;
   "discuss-panel": HTMLDivElement;
   "discuss-resize": HTMLDivElement;
   "discuss-retry": HTMLButtonElement;
   "discuss-scope": HTMLParagraphElement;
-  "discuss-sheet-toggle": HTMLButtonElement;
   "discuss-since": HTMLInputElement;
   "discuss-stamp": HTMLParagraphElement;
   "discuss-status": HTMLParagraphElement;
