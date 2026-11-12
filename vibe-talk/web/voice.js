@@ -3335,6 +3335,11 @@ const keyboard = createKeyboardComposition({
     documentsView.toggleOutline();
     return true;
   },
+  // `#1386 discuss-mod8-toggle`: Mod+8 over the current view; no view changes.
+  toggleDiscuss: () => {
+    discussView.toggle();
+    return true;
+  },
 });
 const {
   channelPane, sidePane, KEY_PANES, paneColumn, lastPane, keySelection,

@@ -262,6 +262,8 @@ export interface KeyboardCompositionDependencies<
   columnsFromKeyboard(): unknown;
   /** Toggle the open document's outline pop-up from the keyboard (`#1038`); whether it did. */
   toggleDocumentOutline?(): unknown;
+  /** Toggle the Discuss panel over the current view (`#1386`); whether it did. */
+  toggleDiscuss?(): unknown;
   /** `#1321 after-done-setting`. What e does after marking Done, as kept in Settings. */
   afterDone(): AfterDone;
   // Dispatch, timing and hints.
@@ -840,6 +842,7 @@ export function createKeyboardComposition<
     mainRowsFromKeyboard: () => deps.mainRowsFromKeyboard(),
     columnsFromKeyboard: () => deps.columnsFromKeyboard(),
     outlineFromKeyboard: () => deps.toggleDocumentOutline?.() ?? false,
+    discussFromKeyboard: () => deps.toggleDiscuss?.() ?? false,
     composeFromKeyboard: () => composeFromKeyboard(),
     writeFromKeyboard: () => writeFromKeyboard(),
     newestFromComposer: (target) => newestFromComposer(target),

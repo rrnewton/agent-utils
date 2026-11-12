@@ -2105,6 +2105,8 @@ test("`#624 voice-page-modularity`: the keymap lists every key in a group, hands
   answers.pressRowButton = null;
   assert.equal(press("p")[0], false, "the pin key took a key it pressed nothing for");
   answers.pressRowButton = "took";
+  // `#1386 discuss-mod8-toggle`. Mod+8 toggles Discuss, from a message box too; no view is chosen.
+  assert.deepStrictEqual(press("8", { metaKey: true }, field, { mod: true }), ["discussFromKeyboard did", "discussFromKeyboard"]);
   const view = (key) => press(key, { metaKey: true, repeat: true }, target, { mod: true }).slice(1)[0];
   assert.deepStrictEqual(["1", "2", "3", "4"].map(view), ["viewFromKeyboard main true", "viewFromKeyboard flat true", "viewFromKeyboard threads true", "viewFromKeyboard columns true"]);
   const link = { tagName: "A" };
@@ -2139,7 +2141,7 @@ test("`#624 voice-page-modularity`: the keymap lists every key in a group, hands
   for (const [name] of calls.splice(0)) reached.add(name);
   const expected = ["bookmarkFromKeyboard", "bookmarkJumpFromKeyboard", "collapsedLinesFromKeyboard", "columnFromKeyboard",
     "columnsFromKeyboard", "composeFromKeyboard", "copyChordFromKeyboard", "copyFromKeyboard", "copyLinkFromKeyboard",
-    "deepLinkFromKeyboard", "detailsFromKeyboard", "doneFromKeyboard", "filterFromKeyboard", "foldOneFromKeyboard", "foldStepFromKeyboard", "jumpList",
+    "deepLinkFromKeyboard", "detailsFromKeyboard", "discussFromKeyboard", "doneFromKeyboard", "filterFromKeyboard", "foldOneFromKeyboard", "foldStepFromKeyboard", "jumpList",
     "keyContext", "keysFromKeyboard", "listEdge", "mainRowsFromKeyboard", "menuFromKeyboard", "newestFromComposer",
     "nextUnreadFromKeyboard", "onEscape", "openFromKeyboard", "orderFromKeyboard", "outlineFromKeyboard", "packFromKeyboard", "pickChannel",
     "placeFromKeyboard", "pressRowButton", "readCollapseFromKeyboard", "readFromKeyboard", "readModeFromKeyboard",

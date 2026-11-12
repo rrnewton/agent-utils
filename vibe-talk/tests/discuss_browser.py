@@ -306,6 +306,12 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
             "() => document.getElementById('discuss-panel').getBoundingClientRect().height <= innerHeight * 0.6",
             timeout=20_000)
 
+    # `#1386 discuss-mod8-toggle`: Mod+8 closes and reopens over this view.
+    page.keyboard.press("Control+8")
+    page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+    page.keyboard.press("Control+8")
+    page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+
     page.click("#discuss-mark-read")
     page.wait_for_function(
         "() => !document.getElementById('discuss-mark-read').disabled", timeout=20_000)

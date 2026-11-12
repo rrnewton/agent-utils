@@ -152,6 +152,8 @@ export interface DiscussView {
    * exit: the same summary, no model call. True when it restored.
    */
   restoreFromHistory(state: unknown): boolean;
+  /** `#1386 discuss-mod8-toggle`. Open when closed, close when open, as the bar button does. */
+  toggle(): void;
   /** `#1344`. The overlay width in force, in CSS pixels. */
   width(): number;
   /** `#1344`. Put a width on the panel and keep it on the device. */
@@ -467,6 +469,10 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
         panel.openWith(scope);
       }
       return true;
+    toggle() {
+      if (busy) return;
+      if (panel.isOpen()) panel.close();
+      else if (available()) open();
     },
     width: () => panel.width(),
     setWidth: (px: unknown) => panel.setWidth(px),

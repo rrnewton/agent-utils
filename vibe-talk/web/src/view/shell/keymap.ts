@@ -126,6 +126,8 @@ export interface KeymapActs<Target> {
   columnsFromKeyboard(): unknown;
   /** Toggle the open document's outline pop-up (`#1038 documents-outline-popup`); whether it did. */
   outlineFromKeyboard(): unknown;
+  /** `#1386 discuss-mod8-toggle`. Toggle the Discuss panel over the current view. */
+  discussFromKeyboard(): unknown;
   composeFromKeyboard(): unknown;
   writeFromKeyboard(): unknown;
   newestFromComposer(target: Target): unknown;
@@ -146,7 +148,7 @@ export function createKeymap<Target>(acts: KeymapActs<Target>): KeymapBinding<Ta
     copyChordFromKeyboard, copyFromKeyboard, nextUnreadFromKeyboard, stepUnreadFromKeyboard, afterDone, doneFromKeyboard, readCollapseFromKeyboard, foldOneFromKeyboard,
     foldStepFromKeyboard, collapsedLinesFromKeyboard, packFromKeyboard, unpackFromKeyboard, bookmarkFromKeyboard,
     bookmarkJumpFromKeyboard, viewFromKeyboard, voiceFromKeyboard, readModeFromKeyboard, filterFromKeyboard,
-    undoFromKeyboard, orderFromKeyboard, mainRowsFromKeyboard, columnsFromKeyboard, outlineFromKeyboard, composeFromKeyboard,
+    undoFromKeyboard, orderFromKeyboard, mainRowsFromKeyboard, columnsFromKeyboard, outlineFromKeyboard, discussFromKeyboard, composeFromKeyboard,
     writeFromKeyboard, newestFromComposer,
   } = acts;
   return [
@@ -322,6 +324,16 @@ export function createKeymap<Target>(acts: KeymapActs<Target>): KeymapBinding<Ta
       does: "Two columns on or off, as the layout button beside the view picker does",
       controls: ["column-toggle"],
       run: () => columnsFromKeyboard(),
+    },
+    {
+      // `#1386 discuss-mod8-toggle`. Not a view: the panel over the view there is. Heard
+      // first, at the window, so it toggles from a message box too, and chooses no view.
+      group: KEYS_VIEW, chords: [{ key: "8", mod: true }], everywhere: true,
+      does: () => `Discuss: the catch-up panel over the view you are in, and again away. ` +
+        `${modKeyName()}+8 from anywhere, a message box included; it never changes the view, ` +
+        `and reopens where you left it — its layout and its transcript`,
+      controls: ["discuss-open"],
+      run: () => discussFromKeyboard(),
     },
     {
       group: KEYS_MOVING, chords: [{ key: "[" }, { key: "]" }],

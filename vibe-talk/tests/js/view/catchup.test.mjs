@@ -1115,3 +1115,22 @@ test("catchup modes: open puts focus on Close; Escape closes and returns it to t
     assert.equal(view.isOpen(), false, "an unrelated key reopened or moved the panel");
   } finally { fx.restore(); }
 });
+
+test("catchup toggle: toggle opens over the scope, closes, and reopens with no model call", async () => {
+  const fx = fixture();
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.toggle();
+    await flush();
+    assert.equal(view.isOpen(), true, "toggle did not open the panel");
+    assert.equal(fx.calls.previews.length, 1, "toggle open did not read the preview");
+    assert.deepEqual(fx.calls.posts, [], "toggle open asked the model");
+    view.toggle();
+    assert.equal(view.isOpen(), false, "toggle did not close the panel");
+    view.toggle();
+    await flush();
+    assert.equal(view.isOpen(), true, "toggle did not reopen the panel");
+    assert.deepEqual(fx.calls.posts, [], "reopen asked the model");
+  } finally { fx.restore(); }
+});
