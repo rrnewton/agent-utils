@@ -317,6 +317,35 @@ pub(crate) fn sandbox_show_config_cli(
     ))
 }
 
+/// `wrkslots limits show` (read-only; `apply`/`clear` are
+/// writers and stay Python in this phase): the caller's uid, the
+/// host's physical memory from /proc/meminfo, and its CPU count.
+pub(crate) fn limits_show_cli(memory_fraction: f64, cpu_fraction: f64) -> (i32, String, String) {
+    let physical_bytes = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                line.strip_prefix("MemTotal:")
+                    .and_then(|rest| rest.trim().strip_suffix("kB"))
+                    .and_then(|kib| kib.trim().parse::<u64>().ok())
+            })
+        })
+        .map(|kib| kib.saturating_mul(1024))
+        .unwrap_or(0);
+    let cpu_count = std::thread::available_parallelism()
+        .map(|count| count.get() as u64)
+        .unwrap_or(1);
+    crate::sandbox_exec::limits(
+        &SubprocessRunner,
+        rustix::process::getuid().as_raw(),
+        "show",
+        memory_fraction,
+        cpu_fraction,
+        physical_bytes,
+        cpu_count,
+    )
+}
+
 /// `wrkslots image status`: load the config, derive live mount
 /// facts, and run the pure handler. Config errors use the native
 /// error form, like the other reader commands.

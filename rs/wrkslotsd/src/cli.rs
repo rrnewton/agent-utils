@@ -215,6 +215,21 @@ pub(crate) enum Readers {
         #[arg(long, value_name = "FORMAT", default_value = "human", value_parser = ["human", "json"])]
         format: String,
     },
+    /// Show the machine-wide guard on everything this user runs (Python `limits show`)
+    LimitsShow {
+        /// Fraction of physical RAM for MemoryMax (default: 0.8)
+        #[arg(long, value_name = "FRACTION", default_value_t = 0.8)]
+        memory_fraction: f64,
+        /// Fraction of all CPUs for CPUQuota (default: 0.9)
+        #[arg(long, value_name = "FRACTION", default_value_t = 0.9)]
+        cpu_fraction: f64,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Override the machine shard (else WRKSLOTS_MACHINE, else the configured machine, where an absent key or the value auto means the short host name)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Print the effective sandbox configuration as JSON (Python `sandbox show-config`)
     SandboxShowConfig {
         /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
@@ -1590,7 +1605,7 @@ fn py_compat_triggered(rest: &[String], leading_globals: bool, routed: bool) -> 
         return false;
     };
     match cmd {
-        "doctor" | "audit" | "image" | "sandbox" => true,
+        "doctor" | "audit" | "image" | "sandbox" | "limits" => true,
         "status" => !py_flag_present(rest, "--index"),
         "create"
         | "unpushed"
@@ -1721,6 +1736,26 @@ fn translate_python_argv_routed(
                 Ok(Some((out, wait_lock)))
             }
             _ => Err("'sandbox' stays with the Python edition in this slice".to_string()),
+        };
+    }
+    // `limits show` is a reader and runs here (#1112); `apply` and
+    // `clear` are writers and refuse by name until the writers phase.
+    if cmd == "limits" {
+        return match rest.get(1).map(String::as_str) {
+            Some("show") => {
+                let mut out: Vec<String> = vec![args[0].clone(), "limits-show".to_string()];
+                out.extend(rest[2..].iter().cloned());
+                if let Some(root) = project_root {
+                    out.push("--root".to_string());
+                    out.push(root);
+                }
+                if let Some(machine) = machine {
+                    out.push("--machine".to_string());
+                    out.push(machine);
+                }
+                Ok(Some((out, wait_lock)))
+            }
+            _ => Err("'limits' stays with the Python edition in this slice".to_string()),
         };
     }
     if PY_ONLY.contains(&cmd.as_str()) {
@@ -2046,6 +2081,17 @@ pub fn run() -> u8 {
                     return 1;
                 }
             },
+            Readers::LimitsShow {
+                memory_fraction,
+                cpu_fraction,
+                ..
+            } => {
+                let (exit, stdout, stderr) =
+                    crate::image_dispatch::limits_show_cli(memory_fraction, cpu_fraction);
+                print!("{stdout}");
+                eprint!("{stderr}");
+                return u8::try_from(exit).unwrap_or(1);
+            }
             Readers::SandboxShowConfig { root, machine } => {
                 match crate::image_dispatch::sandbox_show_config_cli(
                     root.as_deref(),

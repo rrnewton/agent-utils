@@ -442,6 +442,7 @@
         "py/wrkslots/tests/test_image_status_rust.py",
         "py/wrkslots/tests/test_journal_state_rust.py",
         "py/wrkslots/tests/test_journals_state_rust.py",
+        "py/wrkslots/tests/test_limits_show_rust.py",
         "py/wrkslots/tests/test_load_quarantine.py",
         "py/wrkslots/tests/test_lock_scope.py",
         "py/wrkslots/tests/test_nested_worktree_repair.py",
