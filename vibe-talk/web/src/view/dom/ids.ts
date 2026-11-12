@@ -141,6 +141,9 @@ export interface ElementById {
   "discuss-stamp": HTMLParagraphElement;
   "discuss-status": HTMLParagraphElement;
   "discuss-summarize": HTMLButtonElement;
+  "discuss-terms": HTMLDetailsElement;
+  "discuss-terms-list": HTMLUListElement;
+  "discuss-terms-summary": HTMLElement;
   "discuss-unmarkable": HTMLParagraphElement;
   "dismiss-banner": HTMLButtonElement;
   "dismiss-error": HTMLButtonElement;

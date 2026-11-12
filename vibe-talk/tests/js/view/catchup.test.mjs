@@ -39,6 +39,7 @@ function fakeElement(tagName = "div") {
     focusCalls: [],
     focus(options) { el.focusCalls.push(options); },
     appendChild(kid) { el.children.push(kid); kid.parentNode = el; return kid; },
+    append(...kids) { for (const kid of kids) el.appendChild(kid); },
     replaceChildren(...kids) { el.children = []; for (const kid of kids) el.appendChild(kid); },
     addEventListener(type, listener) { (el.listeners[type] ||= []).push(listener); },
     removeEventListener(type, listener) { el.listeners[type] = (el.listeners[type] || []).filter((one) => one !== listener); },
@@ -93,7 +94,8 @@ const IDS = [
   "discuss-open", "discuss-menu-open", "discuss-panel", "discuss-scope", "discuss-close", "discuss-status",
   "discuss-answer", "discuss-footer", "discuss-covers", "discuss-links",
   "discuss-mark-read", "discuss-mark-unread", "discuss-unmarkable",
-  "discuss-stamp", "discuss-retry", "discuss-actions", "discuss-resize", "discuss-sheet-toggle",
+  "discuss-stamp", "discuss-retry", "discuss-terms", "discuss-terms-summary", "discuss-terms-list",
+  "discuss-actions", "discuss-resize", "discuss-sheet-toggle",
   "discuss-mode-overlay", "discuss-mode-docked", "discuss-mode-maximized", "screen-main",
   "discuss-summarize", "discuss-count", "discuss-since",
 ];
@@ -145,7 +147,7 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
   els["discuss-panel"].hidden = true;
   els["discuss-footer"].hidden = true;
   els["discuss-retry"].hidden = true;
-  const calls = { posts: [], previews: [], dismiss: [], restore: [], jumps: [], errors: [], statuses: [] };
+  const calls = { posts: [], previews: [], dismiss: [], restore: [], jumps: [], errors: [], statuses: [], templates: [] };
   // `#1344`: the device's kept layout, in memory; the clamp mirrors the device setting's.
   const kept = { width: null, keeps: [], sheetFull: false, sheetKeeps: [], mode: "overlay", modeKeeps: [] };
   const clampW = (value) => {
@@ -186,7 +188,24 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
     keepMode: (mode) => { kept.mode = mode; kept.modeKeeps.push(mode); },
   };
   const savedDocument = globalThis.document;
-  globalThis.document = { createElement: (tag) => fakeElement(tag) };
+  globalThis.document = {
+    createElement: (tag) => {
+      if (tag !== "template") return fakeElement(tag);
+      // The dom sink's one parser, faked: it records what it was handed and
+      // answers one parsed child for it.
+      const template = {
+        _html: "",
+        content: null,
+        set innerHTML(value) {
+          this._html = String(value);
+          this.content = { childNodes: [fakeElement("span")] };
+        },
+        get innerHTML() { return this._html; },
+      };
+      calls.templates.push(template);
+      return template;
+    },
+  };
   return {
     els, calls, deps, kept,
     setSelection(next) { currentSelection = next; },
@@ -329,6 +348,56 @@ test("catchup: model text renders as text only, markup in it inert", async () =>
     assert.equal(fx.els["discuss-answer"].textContent, evil, "the text was not set as text");
     assert.equal(fx.els["discuss-answer"].innerHTMLSet, false, "the answer was assigned as markup");
     assert.equal(fx.els["discuss-answer"].children.length, 0, "the answer gained live elements");
+  } finally { fx.restore(); }
+});
+
+test("catchup: a rendered answer draws as markup; a plain one never reaches innerHTML", async () => {
+  const html = "<h2>Progress</h2><p>Ada shipped it.</p>";
+  const fx = fixture({ respond: () => Promise.resolve(answer({ text: "## Progress\nAda shipped it.", text_html: html })) });
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    await openAndSummarize(view, fx);
+    await flush();
+    assert.equal(fx.calls.templates.length, 1, "the render did not go through the one parser");
+    assert.equal(fx.calls.templates[0]._html, html, "the parser was handed something else");
+    assert.equal(fx.els["discuss-answer"].children.length, 1, "the parsed nodes were not drawn");
+  } finally { fx.restore(); }
+
+  const plain = fixture({ respond: () => Promise.resolve(answer({ text: "<b>not markup</b>" })) });
+  try {
+    const view = createDiscussView(plain.deps);
+    view.mountControls();
+    await openAndSummarize(view, plain);
+    await flush();
+    assert.equal(plain.els["discuss-answer"].innerHTMLSet, false, "plain text reached innerHTML");
+    assert.equal(plain.els["discuss-answer"].textContent, "<b>not markup</b>");
+  } finally { plain.restore(); }
+});
+
+test("catchup: a citation tap in the answer jumps; unknown terms draw collapsed", async () => {
+  const fx = fixture({
+    respond: () => Promise.resolve(answer({
+      unknown_terms: ["small-elk"],
+      text_html: "<p>Shipped <a href=\"/?c=chan-1&v=flat&m=discord%3Achan-1%3Am1\">(09:51)</a>.</p>",
+    })),
+  });
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    await openAndSummarize(view, fx);
+    await flush();
+    assert.equal(fx.els["discuss-terms"].hidden, false, "the terms block did not show");
+    assert.match(fx.els["discuss-terms-summary"].textContent, /Terms I didn't understand \(1\)/);
+    assert.equal(fx.els["discuss-terms-list"].children[0].textContent, "small-elk");
+    const anchor = fakeElement("a");
+    anchor.setAttribute("href", "/?c=chan-1&v=flat&m=discord%3Achan-1%3Am1");
+    fx.els["discuss-answer"].appendChild(anchor);
+    let prevented = false;
+    const ev = { target: anchor, preventDefault() { prevented = true; }, stopPropagation() {} };
+    for (const listener of [...(fx.els["discuss-answer"].listeners.click || [])]) listener(ev);
+    assert.equal(prevented, true, "the citation tap was not taken in-app");
+    assert.deepEqual(fx.calls.jumps, [{ service: "discord", channel: "chan-1", message: "m1", thread: null }]);
   } finally { fx.restore(); }
 });
 

@@ -172,11 +172,37 @@
   font-size: 0.85rem;
 }
 
-/* The model's words, as text: newlines kept, nothing of markup's. */
+/* The model's words: the server's rendered Markdown (`discuss-markdown-render`),
+ * or its shaped text plain (newlines kept) when no render came. */
 #discuss-answer {
   margin-top: 8px;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+#discuss-answer h2,
+#discuss-answer h3 {
+  font-size: 0.95rem;
+  margin: 10px 0 4px;
+}
+
+#discuss-answer p,
+#discuss-answer ul {
+  margin: 4px 0;
+}
+
+#discuss-answer a {
+  color: #8ab8ff;
+}
+
+#discuss-terms {
+  margin-top: 10px;
+  color: #aab2c0;
+  font-size: 0.85rem;
+}
+
+#discuss-terms summary {
+  cursor: pointer;
 }
 
 #discuss-covers {

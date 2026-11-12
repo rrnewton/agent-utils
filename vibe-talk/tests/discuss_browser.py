@@ -48,7 +48,9 @@ CATCHUP_ANSWER = {
         {"id": MARKABLE[0], "label": "09:51 · Ada", "thread_id": None},
         {"id": MARKABLE[1], "label": "09:52 · Ben", "thread_id": None},
     ],
-    "text": "Ada shipped the fix.\nBen is reviewing it.",
+    "text": "## Progress\nAda shipped the fix. Ben is reviewing it.",
+    "text_html": "<h2>Progress</h2><p>Ada shipped the fix. "
+                 "Ben is reviewing it.</p>",
     "backend": "fake",
     "model": "fake-model",
     "stamp": {"context_ms": 120, "model_ms": 900, "first_token_ms": None,
@@ -154,6 +156,7 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
         "() => document.getElementById('discuss-summarize').textContent.includes('Summarize last 2 unread')",
         timeout=20_000)
     check(posts == [], f"opening posted {posts}, not nothing")
+    # (the rendered answer is asserted after Summarize, below)
     page.click("#discuss-summarize")
     page.wait_for_function(
         "() => document.getElementById('discuss-answer').textContent.includes('Ada shipped')",
@@ -162,6 +165,10 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
           and posts[0].get("view") in ("flat", "main")
           and posts[0].get("since_ms") == 1760000000000,
           f"the panel posted {posts}, not one bounded channel catch-up")
+    heading = page.locator("#discuss-answer h2").text_content() or ""
+    check(heading == "Progress", f"the answer did not render its heading: {heading!r}")
+    raw = page.locator("#discuss-answer").text_content() or ""
+    check("##" not in raw, f"raw Markdown showed in the answer: {raw!r}")
     status = page.locator("#discuss-status").text_content() or ""
     check(status == "Read 2 unread of 12", f"the status says {status!r}")
     covers = page.locator("#discuss-covers").text_content() or ""

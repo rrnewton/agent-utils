@@ -13,4 +13,5 @@ export { createOncePerFrame } from "./frames.ts";
 export type { FrameScheduler, OncePerFrame } from "./frames.ts";
 export type { PendingCopy, TextClipboard } from "./clipboard.ts";
 export { createListening } from "./listening.ts";
+export { insertSanitizedHtml } from "./html.ts";
 export type { Listening, SizeWatcher, SizeWatching } from "./listening.ts";

@@ -12,7 +12,8 @@
 // The answer's wire types are the generated contract's (`CatchupResponse` and its
 // parts); the panel narrows the decoded body to the fields it reads.
 
-import { createListening } from "../dom/index.ts";
+import { createListening, insertSanitizedHtml } from "../dom/index.ts";
+import { deepLinkRefFrom } from "../../foundation/index.ts";
 import type { MessageLinkRef } from "../../foundation/index.ts";
 import type {
   CatchupFooterLink as WireFooterLink,
@@ -57,6 +58,10 @@ export interface CatchupAnswer {
   markable_ids: string[];
   footer_links: CatchupFooterLink[];
   text: string;
+  /** The answer as the server's sanitized render (`#1349`); empty draws `text` plain. */
+  text_html: string;
+  /** Terms the answer said it did not understand (`#1351`), drawn collapsed. */
+  unknown_terms: string[];
   stamp: CatchupStamp | null;
 }
 
@@ -170,7 +175,7 @@ function stringsOf(value: unknown): string[] {
 
 /** Narrow an answer body to the fields the panel reads; an empty answer for any other shape. */
 export function asCatchupAnswer(value: unknown): CatchupAnswer {
-  const empty: CatchupAnswer = { window: null, unread_ids: [], markable_ids: [], footer_links: [], text: "", stamp: null };
+  const empty: CatchupAnswer = { window: null, unread_ids: [], markable_ids: [], footer_links: [], text: "", text_html: "", unknown_terms: [], stamp: null };
   if (typeof value !== "object" || value === null) return empty;
   const record = value as Record<string, unknown>;
   const rawWindow = typeof record.window === "object" && record.window !== null ? (record.window as Record<string, unknown>) : null;
@@ -197,6 +202,8 @@ export function asCatchupAnswer(value: unknown): CatchupAnswer {
     markable_ids: stringsOf(record.markable_ids),
     footer_links: links,
     text: typeof record.text === "string" ? record.text : "",
+    text_html: typeof record.text_html === "string" ? record.text_html : "",
+    unknown_terms: stringsOf(record.unknown_terms),
     stamp: rawStamp === null ? null : {
       context_ms: numberOrNull(rawStamp.context_ms) ?? 0,
       model_ms: numberOrNull(rawStamp.model_ms) ?? 0,
@@ -451,6 +458,64 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     }
   }
 
+  /**
+   * Draw one answer (`discuss-markdown-render`): the server's sanitized render as
+   * markup when it sent one, the shaped text as text otherwise. Model text reaches
+   * innerHTML only through `text_html` — never directly.
+   */
+  function drawAnswer(answer: CatchupAnswer): void {
+    const box = deps.byId("discuss-answer");
+    box.replaceChildren();
+    if (answer.text_html !== "") {
+      insertSanitizedHtml(box, answer.text_html);
+    } else {
+      box.textContent = answer.text;
+    }
+  }
+
+  /** The terms the answer did not understand, collapsed (`#1351`). */
+  function drawTerms(answer: CatchupAnswer): void {
+    const box = deps.byId("discuss-terms");
+    box.hidden = answer.unknown_terms.length === 0;
+    if (answer.unknown_terms.length === 0) return;
+    deps.byId("discuss-terms-summary").textContent =
+      `Terms I didn't understand (${answer.unknown_terms.length})`;
+    const list = deps.byId("discuss-terms-list");
+    list.replaceChildren();
+    for (const term of answer.unknown_terms) {
+      const item = document.createElement("li");
+      item.textContent = term;
+      list.appendChild(item);
+    }
+  }
+
+  /** A tap inside the answer: an in-app citation link jumps; anything else goes on. */
+  function answerTap(event: Event): void {
+    let node: unknown = event.target;
+    while (node !== null && node !== undefined) {
+      const el = node as HTMLElement;
+      if (typeof el.tagName === "string" && el.tagName.toLowerCase() === "a") {
+        const href = el.getAttribute("href") ?? "";
+        const queryAt = href.indexOf("?");
+        if (!href.startsWith("http") && queryAt >= 0) {
+          const ref = deepLinkRefFrom(new URLSearchParams(href.slice(queryAt + 1)).get("m") ?? "");
+          if (ref !== null) {
+            event.preventDefault();
+            deps.onJump({
+              service: ref.provider,
+              channel: ref.channel,
+              message: ref.message,
+              thread: ref.thread,
+            });
+          }
+        }
+        return;
+      }
+      if (el === (deps.byId("discuss-answer") as unknown)) return;
+      node = (el as { parentNode?: unknown }).parentNode;
+    }
+  }
+
   /** Draw the footer's covered list and its mark buttons from one answer. */
   function drawFooter(answer: CatchupAnswer, scope: DiscussScope): void {
     const covered = answer.unread_ids.length;
@@ -575,7 +640,8 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         const unread = answer.window?.unread_count ?? answer.unread_ids.length;
         const count = answer.window?.count ?? answer.unread_ids.length;
         deps.byId("discuss-status").textContent = `Read ${unread} unread of ${count}`;
-        deps.byId("discuss-answer").textContent = answer.text;
+        drawAnswer(answer);
+        drawTerms(answer);
         drawFooter(answer, scope);
         const stampLine = formatStampLine(answer.stamp);
         deps.byId("discuss-stamp").textContent = stampLine;
@@ -663,6 +729,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
           boundCount = countSince(previewUnread, sinceInput.value);
           drawBound();
         });
+        listening.listen(deps.byId("discuss-answer"), "click", (event) => answerTap(event));
         listening.listen(deps.byId("discuss-mark-read"), "click", () => mark(true));
         listening.listen(deps.byId("discuss-mark-unread"), "click", () => mark(false));
         const toggle = maybe("discuss-sheet-toggle");

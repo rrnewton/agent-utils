@@ -1,6 +1,6 @@
 // One message's body as DOM (`#242 rich-headers`, `#129 message-search`; `#624
 // voice-page-modularity`, moved from the legacy script into view/channel; mu-readcore):
-// the server's rendering inserted as nodes (the page's sole template-innerHTML site), plain
+// the server's rendering inserted as nodes (through the dom's one template sink), plain
 // text as paragraphs, the heading's restated mark, and what a body links to. Stateless
 // except the per-message text cache, which holds text only, never nodes.
 
@@ -13,7 +13,7 @@ import { rawTextOf, renderedHtmlOf } from "../../present/rows/index.ts";
 import { renderedText } from "./text.ts";
 import { keepCardUnits } from "./cardtext.ts";
 import { cardMarkTarget } from "./cardtext.ts";
-import { tagNameOf } from "../dom/index.ts";
+import { insertSanitizedHtml, tagNameOf } from "../dom/index.ts";
 
 /** What building bodies asks of the page. */
 export interface MessageBodyDependencies {
@@ -43,12 +43,6 @@ export interface MessageBodies {
 export function createMessageBodies(deps: MessageBodyDependencies): MessageBodies {
   const wireMessageLinks = deps.wireMessageLinks;
   const textByMessage = new WeakMap<Message, string>();
-
-function insertSanitizedHtml(parent: HTMLElement, contentHtml: string): void {
-  const template = document.createElement("template");
-  template.innerHTML = contentHtml;
-  parent.append(...template.content.childNodes);
-}
 
 /**
  * Text as plain paragraphs: each run of lines that are not blank is a paragraph, and the lines in
