@@ -2276,6 +2276,8 @@ def _choose_hide_read(driver: Driver) -> None:
     for _tap in range(3):
         if driver.js("document.getElementById('todo-filter').getAttribute('aria-pressed')") == "true":
             return
+        driver.click("action-menu-open")
+        driver.settle(150)
         driver.click("todo-filter")
         driver.settle(150)
 

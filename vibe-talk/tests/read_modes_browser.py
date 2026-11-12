@@ -501,6 +501,12 @@ def tap(page: Page, selector: str, touch: bool) -> None:
         page.mouse.click(x, y)
 
 
+def tap_read_mode(page: Page, touch: bool) -> None:
+    """`#1355 phone-bar-discuss-slot`: Show/Fold read through the hamburger menu."""
+    tap(page, "#action-menu-open", touch)
+    tap(page, "#todo-filter", touch)
+
+
 def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict[str, float]) -> list[str]:
     """One reader's walk through the three modes; returns what was measured, one line per step.
 
@@ -512,7 +518,7 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
         """The button says the whole name, on the phone tile and on a desk; a desk's dock stays one row."""
         check(m["shownWords"] == name, f"{size}: the button draws {m['shownWords']!r}, not {name!r}")
         if not touch:
-            check(m["labelLines"] == 2, f"{size}: a desk draws {name!r} in {m['labelLines']} lines, not two short ones")
+            # `#1355 phone-bar-discuss-slot`: the name sits on one line in the menu's tray.
             check(m["dockRows"] == 1, f"{size}: under {name} the dock's controls make {m['dockRows']} rows, not 1")
 
     def shot(name: str) -> None:
@@ -553,7 +559,7 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
             if named() == label:
                 return
             was = named()
-            tap(page, "#todo-filter", touch)
+            tap_read_mode(page, touch)
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline and named() == was:
                 page.wait_for_timeout(25)
@@ -572,7 +578,9 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     check(m["mode"] == ["Show read", "false", "show"], f"{size}: the button does not start on Show read: {m['mode']}")
     check(m["icons"] == ["show"], f"{size}: Show read draws icons {m['icons']}")
     dock_holds(m, "Show read")
-    check(m["labelFits"] is True, f"{size}: the words 'Show read' touch or cross the button's sides")
+    tap(page, "#action-menu-open", touch)
+    check(measure(page)["labelFits"] is True and measure(page)["labelLines"] == 1, f"{size}: the words 'Show read' touch or cross the button's sides")
+    page.keyboard.press("Escape")
     m = settled_entry()
     floating = number(m, "floating")
     top = number(m, "answer", "start")
@@ -592,7 +600,9 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     check(m["mode"] == ["Fold read", "mixed", "fold"], f"{size}: Fold read is said as {m['mode']}")
     check(m["icons"] == ["fold"], f"{size}: Fold read draws icons {m['icons']}")
     dock_holds(m, "Fold read")
-    check(m["labelFits"] is True, f"{size}: the words 'Fold read' touch or cross the button's sides")
+    tap(page, "#action-menu-open", touch)
+    check(measure(page)["labelFits"] is True and measure(page)["labelLines"] == 1, f"{size}: the words 'Fold read' touch or cross the button's sides")
+    page.keyboard.press("Escape")
     m = settled_entry()
     floating = number(m, "floating")
     root_top = number(m, "root", "start")
@@ -662,7 +672,9 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     check(m["mode"] == ["Hide read", "true", "hide"], f"{size}: Hide read is said as {m['mode']}")
     check(m["icons"] == ["hide"], f"{size}: Hide read draws icons {m['icons']}")
     dock_holds(m, "Hide read")
-    check(m["labelFits"] is True, f"{size}: the words 'Hide read' touch or cross the button's sides")
+    tap(page, "#action-menu-open", touch)
+    check(measure(page)["labelFits"] is True and measure(page)["labelLines"] == 1, f"{size}: the words 'Hide read' touch or cross the button's sides")
+    page.keyboard.press("Escape")
     m = settled_entry()
     check(m["firstShown"] == ANSWER_ID, f"{size}: Hide read's thread starts at {m['firstShown']}, not the answer")
     check(m["answerFolded"] == "false", f"{size}: Hide read's answer is folded")
@@ -773,7 +785,7 @@ def held_walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed:
     for _tap in range(3):
         if named() == "Fold read":
             break
-        tap(page, "#todo-filter", touch)
+        tap_read_mode(page, touch)
         page.wait_for_timeout(250)
     check(named() == "Fold read", f"{size}: the cycle never reached Fold read")
 

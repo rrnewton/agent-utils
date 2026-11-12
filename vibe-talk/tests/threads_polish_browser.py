@@ -151,6 +151,12 @@ def arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def cycle_read_mode(page) -> None:
+    """`#1355 phone-bar-discuss-slot`: Show/Fold read in the hamburger menu."""
+    page.click("#action-menu-open")
+    page.click("#todo-filter")
+
+
 def main() -> int:
     args = arguments()
     try:
@@ -548,7 +554,7 @@ def sent_walk(desk: Desk) -> None:
     for _ in range(3):
         if page.get_attribute("#todo-filter", "data-read-mode") == "hide":
             break
-        page.click("#todo-filter")
+        cycle_read_mode(page)
         desk.settled()
     desk.check(page.get_attribute("#todo-filter", "data-read-mode") == "hide", "the read mode button never reached Hide read")
     set_chip(desk, "side-main", True)
@@ -615,7 +621,7 @@ def read_mode_walk(desk: Desk, api: PolishApi) -> None:
                   "All's own read, with its replies in it, did not land", seconds=30)
     desk.settled()
     while page.get_attribute("#todo-filter", "data-read-mode") != "show":
-        page.click("#todo-filter")
+        cycle_read_mode(page)
         desk.settled()
     page.focus("#scroll-area")
     page.keyboard.press("h")

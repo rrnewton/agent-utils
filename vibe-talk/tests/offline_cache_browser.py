@@ -2239,7 +2239,7 @@ DOCK_JS = """({desk, order}) => {
             if (r.top < d.top || r.bottom > d.bottom + 0.5) problems.push(`#${id} hangs out of the dock`);
             // The word level with its icon, as a desktop control's is: all but Talk over its note.
             const el = document.getElementById(id);
-            const icon = el.querySelector(':scope > svg:not([hidden])');
+            const icon = [...el.querySelectorAll(':scope > svg')].find((svg) => !svg.hidden && getComputedStyle(svg).display !== 'none');
             const word = el.querySelector(':scope > .control-label, :scope > .mini-label');
             if (icon && word && !(id === 'talk' && shown(note))) {
                 const i = icon.getBoundingClientRect(), w = word.getBoundingClientRect();
@@ -3444,11 +3444,11 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
                 else:
                     check(abs(tall - PHONE_DOCK_PX) <= 1,
                           f"{where}: the phone's dock is {tall:.1f}px tall; it was {PHONE_DOCK_PX:.1f}px")
-                    for big in ("hang-up", "talk", "read-aloud", "read-speed", "todo-filter"):
+                    for big in ("hang-up", "talk", "read-aloud", "read-speed", "audio-source"):
                         if big in boxes:
                             check(abs(boxes[big]["height"] - PHONE_SPAN_PX) <= 1,
                                   f"{where}: #{big} is {boxes[big]['height']:.1f}px tall, not the tile's two rows")
-                    for narrow in ("todo-filter", "speaker", "clear-view"):
+                    for narrow in ("audio-source", "speaker", "clear-view"):
                         if narrow in boxes:
                             check(abs(boxes[narrow]["width"] - PHONE_NARROW_PX) <= 1,
                                   f"{where}: #{narrow} is {boxes[narrow]['width']:.1f}px wide, not the tile's narrow column")
@@ -3546,7 +3546,7 @@ def dock_walk(chromium: BrowserType, args: argparse.Namespace, label: str, width
             check(page.evaluate("() => document.getElementById('discord-channel').selectedOptions[0].textContent")
                   == LONG_CHANNEL["label"] and len(str(LONG_CHANNEL["label"])) >= 30,
                   f"{label}: the channel open is not the thirty-character one")
-            reading = ["todo-filter", "read-speed", "read-aloud"]
+            reading = ["audio-source", "read-speed", "read-aloud"]
             channel = measured("the channel, a long name", reading, rows=1 if desk else None)
             shot("4-channel-long-name")
             if desk:

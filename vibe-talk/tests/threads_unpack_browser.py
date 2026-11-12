@@ -281,7 +281,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                f"the third thread did not unpack its whole first message and its replies: {ids_of(desk, CANARY)}")
     desk.shot("2-unpacked-show")
 
-    page.click("#todo-filter")
+    cycle_read_mode(page)
     desk.wait_for("() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'fold'",
                   "Fold read was not reached")
     desk.settled()
@@ -293,7 +293,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
                    "the run line hangs off no bridge")
     desk.shot("3-unpacked-collapse")
 
-    page.click("#todo-filter")
+    cycle_read_mode(page)
     desk.wait_for("() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'hide'",
                   "Hide read was not reached")
     desk.wait_for("() => { const ids = (t) => [...document.querySelectorAll('#side-cards > li[data-unpack-thread=\"' + t + '\"]')]"
@@ -306,7 +306,7 @@ def walk(chromium: BrowserType, args: argparse.Namespace, label: str, width: int
     desk.check(not set(ids_of(desk, REPLICA)) & {"210", "212"}, "Hide read kept a raw read reply")
     desk.shot("4-unpacked-hide")
 
-    page.click("#todo-filter")
+    cycle_read_mode(page)
     desk.wait_for("() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'show'",
                   "Show read was not reached")
     toggle.click()
@@ -499,7 +499,7 @@ def parity(chromium: BrowserType, args: argparse.Namespace, label: str, width: i
     desk.check(page.locator("#status").text_content() == "Long messages: all collapsed", ": did not say what it did")
 
     # Fold read: the block's run is the run line every list draws, and Enter on it opens it.
-    page.click("#todo-filter")
+    cycle_read_mode(page)
     desk.wait_for("() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'fold'",
                   "Fold read was not reached")
     desk.settled()
@@ -545,6 +545,12 @@ def perf(chromium: BrowserType, args: argparse.Namespace) -> str:
     desk.shot("1-forty-unpacked")
     page.context.close()
     return f"perf: 40 threads, {rows} unpacked rows drawn in {elapsed:.2f}s from the press"
+
+
+def cycle_read_mode(page) -> None:
+    """`#1355 phone-bar-discuss-slot`: Show/Fold read in the hamburger menu."""
+    page.click("#action-menu-open")
+    page.click("#todo-filter")
 
 
 def main() -> int:

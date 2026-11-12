@@ -1280,6 +1280,7 @@ def switches(rig: Rig, opts: argparse.Namespace) -> Json:
     time.sleep(0.5)
     modes = []
     for _ in range(9):
+        rig.tap("#action-menu-open")
         rig.tap("#todo-filter")
         time.sleep(opts.step_pause)
         modes.append(cdp.eval("document.getElementById('todo-filter').dataset.readMode || "
@@ -1289,6 +1290,7 @@ def switches(rig: Rig, opts: argparse.Namespace) -> Json:
     for _ in range(9):
         if cdp.eval("(document.getElementById('todo-filter').getAttribute('aria-pressed') || 'false') === 'false'"):
             break
+        rig.tap("#action-menu-open")
         rig.tap("#todo-filter")
         time.sleep(opts.step_pause)
     menus = 0

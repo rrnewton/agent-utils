@@ -1481,7 +1481,11 @@ def single_selection(walk: Walk, api: FakeApi) -> None:
     keys_row = one_lit(walk, "j off the long message, before the clicks on Show read")
     mode = "() => document.getElementById('todo-filter').getAttribute('aria-pressed')"
     mode_was = walk.page.evaluate(mode)
+    # `#1355 phone-bar-discuss-slot`: Show read lives in the hamburger menu; three menu
+    # choices cycle it back to where it was, and the focus returns to the hamburger.
     for _ in range(3):
+        walk.page.click("#action-menu-open")
+        walk.settled()
         centre = walk.page.evaluate("() => { const r = document.getElementById('todo-filter').getBoundingClientRect();"
                                     " return {x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width}; }")
         check(float(centre["w"]) > 0, f"Show read is not on screen to be clicked: {centre}")
@@ -1490,7 +1494,8 @@ def single_selection(walk: Walk, api: FakeApi) -> None:
         walk.settled()
     check(walk.page.evaluate(mode) == mode_was, f"three clicks on Show read left it {walk.page.evaluate(mode)!r}, not {mode_was!r}")
     held = walk.page.evaluate("() => document.activeElement && (document.activeElement.id || document.activeElement.tagName)")
-    check(held == "todo-filter", f"the clicks left the focus on {held!r}, not on Show read; this step proves nothing")
+    check(held == "action-menu-open", f"the menu clicks left the focus on {held!r}, not on the hamburger; this step proves nothing")
+    walk.page.focus("#scroll-area")
     # The redraws may have moved the list: the long message back into view, by script, which moves no focus.
     box = walk.page.evaluate("(id) => { const li = document.querySelector(`#discord-log > li[data-id='${id}']`);"
                              " li.scrollIntoView({block: 'center'}); const r = li.getBoundingClientRect();"

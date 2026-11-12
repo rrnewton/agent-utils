@@ -454,7 +454,7 @@ def card_fit_walk(walk: Walk) -> None:
     for _ in range(3):
         if mode() == "fold":
             break
-        page.click("#todo-filter")
+        cycle_read_mode(page)
         walk.settled()
     walk.check(mode() == "fold", f"the read mode is {mode()}, not fold")
     walk.wait_for(f"() => document.querySelector('#side-cards > li[data-id=\"{READ_ONE}\"]')?.getAttribute('data-read-run') === 'head'",
@@ -464,7 +464,7 @@ def card_fit_walk(walk: Walk) -> None:
                f"the folded run's line recedes or is drawn on the wrong card: {head}")
     walk.check(member["hidden"], f"the run's second read card still shows under Fold read: {member}")
     walk.shot("5-fold-read")
-    page.click("#todo-filter")
+    cycle_read_mode(page)
     walk.wait_for(f"() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'hide' "
                   f"&& !document.querySelector('#side-cards > li[data-id=\"{READ_ONE}\"]')?.getClientRects().length",
                   "Hide read did not leave the read cards out")
@@ -473,7 +473,7 @@ def card_fit_walk(walk: Walk) -> None:
     walk.check(walk.card(READ_ONE)["hidden"] and walk.card(READ_TWO)["hidden"],
                "a read card still shows under Hide read")
     walk.check(not walk.card(LONG_THREAD)["hidden"], "an unread card went with the read ones")
-    page.click("#todo-filter")
+    cycle_read_mode(page)
     walk.wait_for(f"() => document.getElementById('todo-filter').getAttribute('data-read-mode') === 'show' "
                   f"&& Boolean(document.querySelector('#side-cards > li[data-id=\"{READ_ONE}\"]')?.getClientRects().length)",
                   "Show read did not bring the read cards back")
@@ -508,6 +508,12 @@ def arguments() -> argparse.Namespace:
                         help="print every measure and go on past a failed check, listing the failures "
                              "at the end (exit status 1 if any); for review, not for the gate")
     return parser.parse_args()
+
+
+def cycle_read_mode(page) -> None:
+    """`#1355 phone-bar-discuss-slot`: Show/Fold read in the hamburger menu."""
+    page.click("#action-menu-open")
+    page.click("#todo-filter")
 
 
 def main() -> int:
