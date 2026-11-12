@@ -25,9 +25,9 @@ which must not move it by more than a pixel:
   on the wire, the reader scrolling up while it is out, and the read let go -- before, it threw them back
   to the bottom -> Summaries turned on, each long row's summary answering a moment later, and off again
   -> the focus moved: at the desk the mouse over Main's rows, ] and [ between the columns, Tab and
-  Shift+Tab, each held 2.5 s, and a card's replies button clicked, its thread opening on the right (a
+  Shift+Tab, each held until the drawn batch settles, and a card's replies button clicked, its thread opening on the right (a
   click on the card itself only highlights it, `#277 thread-card-focus`); on the phone Tab and
-  Shift+Tab -> at the desk, sampled at every frame for 2.5 s with the mouse resting or crossing and
+  Shift+Tab -> at the desk, sampled at every frame until the batch settles with the mouse resting or crossing and
   nothing pressed (`#1144 scrollback-typing-jump`: mouse movement or hover never scrolls; the links
   of `#261 two-column-connectors` are drawn, not ridden), with Main scrolled so the card's root is a screen
   off it: THE OWNER'S 19:08, the mouse crossing the cards with nothing pressed on its way to the dock and
@@ -43,8 +43,8 @@ and then, at each size:
   of older replies it reads in keeps the row the reader is on where it was -> the thread whose newest
   reply alone is unread opens at its foot too -> the page reloaded with its read held: the rows this
   device saved are up at once, the reader scrolls up, and the read let go leaves them where they are ->
-  `#281 view-keys`: the view keys, Ctrl at the desk and Cmd on the phone, each followed by 2.5 s sampled at
-  every frame in which nothing may move: at the desk Ctrl+3 from two columns shows their cards across the
+  `#281 view-keys`: the view keys, Ctrl at the desk and Cmd on the phone, each followed by frame sampling until
+  the batch settles, in which nothing may move: at the desk Ctrl+3 from two columns shows their cards across the
   window at their foot, Ctrl+4 keeps them there, and Ctrl+1 leaves Main still; then, at each size, with
   Main scrolled up, the thread list opens at its foot, Main comes back from it on the row and offset the
   reader left it at, All shows and holds, the thread list opens at its foot from All too, and at the desk
@@ -56,7 +56,7 @@ and then, at each size:
   too, the reload left it 43px above its foot for good: in the thread list the dock is only as wide as the
   reading column, and its last button wrapped it about 30 ms after the cards were placed.
 
-and last, at the desk, sampled at every frame for 2.5 s: a card highlighted by a click, whose root is a
+and last, at the desk, sampled at every frame until the batch settles: a card highlighted by a click, whose root is a
 screen off Main, and the mouse going on over another card to the dock leaves Main still; coming back to
 rest on the highlighted card itself also leaves Main still, its root still off screen.
 
@@ -90,6 +90,8 @@ from offline_cache_browser import CHANNEL, TOKEN, FakeApi, Json, check, handler_
 import page_sources
 
 if TYPE_CHECKING:
+    from typing import Any
+
     from playwright.sync_api import BrowserType, Page
 
 # (label, width, height, touch): a desk in two columns with a mouse, and a phone in one by touch.
@@ -124,10 +126,8 @@ FLAT_PAGE = 60
 STILL_PX = 1.0
 # The most the fake server holds a thread's older page for the check (#998); it bounds only a failure.
 HOLD_LIMIT_S = 30.0
-# How long a step is held, the mouse resting or the keys handed over, before it is judged still, in
-# ms: longer than the 1.5 s dwell the page used to wait before scrolling a column for a resting mouse,
-# which `#1144 scrollback-typing-jump` deleted, with room.
-REST_HOLD_MS = 2500
+# A step is held until its drawn batch settles (`Reader.watch_settled`), however long
+# that takes on this host: no held window is a verdict (`#1250 vibe-talk-timing-robust`).
 
 # The first row of a list whose foot is below the top of its scroller: the row the reader is on.
 FIRST_ROW_JS = """(list) => {
@@ -584,31 +584,47 @@ class Reader:
         """Start sampling the first row on screen of `list_id` (Main's by default) and its offset at every frame."""
         self.page.evaluate(WATCH_JS, list_id)
 
-    def held(self, before: tuple[str, float], why: str, hold_ms: int = REST_HOLD_MS,
-             list_id: str = "discord-log", foot: bool = False) -> None:
-        """Wait `hold_ms`, then: at every frame since `watch`, the row the reader was on was the first on
-        screen of `list_id`, within a pixel of where it was -- and with `foot`, the list was at its foot.
+    def watch_settled(self, why: str) -> list[Any]:
+        """Stop the frame watch once the batch it samples has settled, and return its samples.
 
-        The window and the frames are both the evidence (`#1118 browser-fixed-frame-settle`): the
-        glide this outwaits is a wall-clock timer, so the window is never shortened, and the
-        samples are one per painted frame, so under gate load `hold_ms` alone can hold too few
-        of them to judge. Wait for both -- the window out, and more than ten frames sampled,
-        within a forgiving deadline -- so a starved frame rate extends the observation (more
-        frames that could convict) instead of failing the sample count."""
-        self.page.wait_for_timeout(hold_ms)
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and not self.page.evaluate(
-                "() => window.__scrollWatch && window.__scrollWatch.samples.length > 10"):
+        Settled is drawn state, not a clock (`#1250 vibe-talk-timing-robust`): the last
+        two painted frames show the same sample and no timeline read is on the wire
+        (`__timelineReads`). No wall window and no frame count is a verdict; the
+        deadline only bounds a batch that never settles, as in `settled`."""
+        deadline = time.monotonic() + HOLD_LIMIT_S
+        while time.monotonic() < deadline:
+            tail = self.page.evaluate(
+                "() => { const w = window.__scrollWatch; if (!w) return null;"
+                " const s = w.samples; return [s.length, s[s.length - 1], s[s.length - 2],"
+                " window.__timelineReads || 0]; }")
+            if isinstance(tail, list) and int(tail[0]) >= 2 and int(tail[3]) == 0:
+                last, previous = tail[1], tail[2]
+                if isinstance(last, list) and isinstance(previous, list):
+                    same = last[0] == previous[0] and abs(float(last[1]) - float(previous[1])) <= 0.5 \
+                        and abs(float(last[2]) - float(previous[2])) <= 0.5
+                else:
+                    same = isinstance(last, (int, float)) and isinstance(previous, (int, float)) \
+                        and abs(float(last) - float(previous)) <= 0.5
+                if same:
+                    break
             self.page.wait_for_timeout(25)
+        else:
+            self.check(False, f"{why}: the drawn batch never settled")
         self.frames(2)
         samples = self.page.evaluate(UNWATCH_JS)
-        self.check(len(samples) > 10, f"{why}: only {len(samples)} frames were sampled")
+        assert isinstance(samples, list)
+        return samples
+
+    def held(self, before: tuple[str, float], why: str, list_id: str = "discord-log", foot: bool = False) -> None:
+        """At every frame since `watch`, the row the reader was on was the first on screen of
+        `list_id`, within a pixel of where it was -- and with `foot`, the list was at its foot.
+        Judged when the batch settles (`watch_settled`), never by a held window or a count."""
+        samples = self.watch_settled(why)
         for row, offset, gap in samples:
             self.check(row == before[0] and abs(float(offset) - before[1]) <= STILL_PX,
                        f"{why} moved the reader: row {before[0]} at {before[1]:.1f}px became row {row} at "
-                       f"{float(offset):.1f}px within {hold_ms}ms")
-            self.check(not foot or float(gap) <= 1, f"{why}: the list was {float(gap):.0f}px above its foot "
-                       f"within {hold_ms}ms")
+                       f"{float(offset):.1f}px")
+            self.check(not foot or float(gap) <= 1, f"{why}: the list was {float(gap):.0f}px above its foot")
         self.still(before, why, list_id)
 
     def overflow(self) -> None:
@@ -806,7 +822,7 @@ def main_walk(reader: Reader) -> None:
     for key in ("]", "[", "Tab", "Shift+Tab"):
         reader.watch()
         page.keyboard.press(key)
-        reader.held(before, f"{key}, held {REST_HOLD_MS}ms")
+        reader.held(before, f"{key}, held")
     # The card's own replies button is the way into its thread (`#277 thread-card-focus`): a click on the
     # card itself only highlights it.
     card = page.locator(f"#side-cards > li[data-id='spaces/A/threads/t{SMALL_ROOTS[2]}'] .side-card-open")
@@ -869,7 +885,7 @@ def crossing_walk(reader: Reader) -> None:
     side_to_foot(reader)
     cross_card(reader, cards[-1], (300, 300), (width - 180, height - 5),
                "the mouse crossing the cards to the dock, nothing pressed, then resting there")
-    reader.notes.append(f"the mouse crossing the cards to the dock and resting there {REST_HOLD_MS}ms left Main still")
+    reader.notes.append("the mouse crossing the cards to the dock and resting there left Main still")
 
     # Up across them to the top bar, the last card passed the first, the list scrolled to its head.
     page.evaluate("() => { document.getElementById('side-scroll').scrollTop = 0; }")
@@ -888,22 +904,22 @@ def crossing_walk(reader: Reader) -> None:
     page.mouse.move(float(card["x"]), float(card["y"]), steps=2)
     page.mouse.move(5, height - 5)
     reader.check(page.evaluate(LIT_CARD_JS) == cards[-1], "the mouse did not leave the last card selected")
-    reader.quiet(REST_HOLD_MS)
+    reader.settled()
     page.evaluate(ROOT_AWAY_JS, root_of(cards[-1]))
     reader.quiet(250)
     before = reader.first()
     reader.watch()
     page.keyboard.press("[")
-    reader.held(before, f"[ to Main, held {REST_HOLD_MS}ms")
+    reader.held(before, f"[ to Main, held")
     side_to_foot(reader)
     before = reader.first()
     reader.watch()
     page.keyboard.press("]")
-    reader.held(before, f"] to the right column on its own, held {REST_HOLD_MS}ms")
+    reader.held(before, f"] to the right column on its own, held")
     lit = page.evaluate(LIT_CARD_JS)
     reader.check(lit == cards[-1], f"] lit {lit}, not {cards[-1]}, so this proves less")
     reader.check(bool(page.evaluate(ROW_AWAY_JS, root_of(cards[-1]))), "] brought the card's root on screen")
-    reader.notes.append(f"[ and then ] onto a card whose root is off screen, each held {REST_HOLD_MS}ms, left Main still")
+    reader.notes.append("[ and then ] onto a card whose root is off screen, each held, left Main still")
     page.keyboard.press("[")
     side_to_foot(reader)
     reader.quiet(300)
@@ -949,7 +965,7 @@ def highlight_walk(reader: Reader) -> None:
     reader.held(before, "a card highlighted by a click, the mouse going on over another card to the dock")
     reader.check(bool(page.evaluate(ROW_AWAY_JS, root_of(lit_id))), "the highlighted card's root came on screen")
     reader.notes.append(f"a card highlighted by a click, the mouse going on over another card to the dock, "
-                        f"held {REST_HOLD_MS}ms, left Main still")
+                        "held, left Main still")
     # Resting on the highlighted card itself also moves nothing: its root stays off Main's screen.
     card = page.evaluate(CARD_AT_JS, lit_id)
     assert isinstance(card, dict)
@@ -1198,7 +1214,7 @@ def view_keys_walk(reader: Reader) -> None:
     reader.still(kept, f"{key}+1 back from the thread list")
     reader.watch()
     reader.held(kept, f"{key}+1 back from the thread list")
-    reader.notes.append(f"{key}+3 opened the thread list at its foot and held it {REST_HOLD_MS}ms; {key}+1 came "
+    reader.notes.append(f"{key}+3 opened the thread list at its foot and held it; {key}+1 came "
                         "back to Main where the reader had left it, and held it")
     view_key(reader, 2, "flat", None)
     main_held(reader, f"{key}+2 from Main")
@@ -1290,16 +1306,10 @@ def resort_walk(reader: Reader) -> None:
             page.wait_for_timeout(25)
         reader.check(api.timeline_requests() > reads, f"{why}: the page never read the channel behind the message")
         reader.wait_for("() => window.__timelineReads === 0", f"{why}: the read behind the message never came back")
-        reader.quiet(1200)
-        # As in Reader.held: the quiet window and the sampled frames are both the evidence, so
-        # a starved frame rate extends the observation instead of failing the count (`#1118`).
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and not page.evaluate(
-                "() => window.__scrollWatch && window.__scrollWatch.samples.length > 10"):
-            page.wait_for_timeout(25)
-        samples = page.evaluate(UNWATCH_JS)
+        # As in Reader.held: judged when the drawn batch settles, never by a quiet
+        # window or a frame count (`#1250 vibe-talk-timing-robust`).
+        samples = reader.watch_settled(why)
         before = dict((card, at) for card, at, _ in cards)
-        reader.check(len(samples) > 10, f"{why}: only {len(samples)} frames were sampled")
         for at in samples:
             reader.check(abs(float(at) - before[watched]) <= STILL_PX,
                          f"{why} moved the card the reader was on, {watched}, from {before[watched]:.1f}px to {float(at):.1f}px")

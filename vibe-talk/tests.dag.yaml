@@ -51,11 +51,12 @@
 # on demand, and a direct dagrun run of this fragment still runs them (the label is inert
 # here). Disabled at filing: check.fold-steps-browser, check.scroll-stability-browser,
 # check.typing-scroll-browser, check.read-pause-reply-browser, of which fold-steps,
-# typing-scroll and read-pause-reply have since returned behaviour-only.
+# typing-scroll, read-pause-reply and (under #1251, naming #1250) scroll-stability
+# have since returned behaviour-only.
 # check.offline-cache-phone-browser was quarantined under the same label on 2026-11-11 after
 # its second gate red and has since returned on the same proof bar (20/20 saturated runs at
-# the phone and desktop profiles; tracking is #1250's Notes). Only
-# check.scroll-stability-browser remains disabled here, under #1251. Each returns only as a
+# the phone and desktop profiles; tracking is #1250's Notes). No check remains disabled
+# here. Each returns only as a
 # behaviour-only check proved under load (#1248
 # fold-latency-behaviour-verdict is the pattern; fold-latency, keyboard and
 # keyboard-hides-bar stay enabled under it).
@@ -1756,20 +1757,21 @@ steps:
   # nothing unread, and one whose newest reply alone is unread, open at their foot, and older replies
   # coming in keep the row at the head; after a reload the read behind the saved rows leaves the
   # reader where they scrolled; `#281 view-keys`: the view keys show each view where it is read and
-  # nothing moves it for 2.5 s after, the thread list opening at its foot from two columns, Main and All,
+  # nothing moves it after, the thread list opening at its foot from two columns, Main and All,
   # Main coming back from it where the reader left it, a thread opened from it opening at its foot, and a
   # reload in it opening it at its foot with the desk's dock on two rows; and, last, a card highlighted by
   # a click (`#277 thread-card-focus`) with the mouse going on over another card to the dock moves
   # nothing, and the mouse resting on it scrolls nothing either (`#1144 scrollback-typing-jump`).
   # Measured on 2026-10-13: about 110s wall,
-  # most of it the 2.5 s holds, and about 10s CPU. `#612 view-stability`: then, on fresh pages at 393x852 and
+  # most of it what were then 2.5 s holds, and about 10s CPU; the holds have since become
+  # settle-judged (`#1250`), so the wall is whatever this host takes to draw them. `#612 view-stability`: then, on fresh pages at 393x852 and
   # 1280x800, the thread list halfway up holds the card being read, at every frame, while replies move the
   # card above the screen, the card half off its top, one mid-screen and one below it to the foot. Measured
   # on 2026-10-27 on a loaded host: 128s wall for the whole file.
   - group: check
     job: scroll-stability-browser
-    desc: the message lists hold the reader's row through live messages, refreshes, a read landing after a scroll, summaries, focus moves, the view keys and the mouse crossing the cards with or without a card highlighted, follow only a reader on the newest line, and open threads and the thread list at their foot, in current Chromium at 1280x800 and 412x915; and the thread list holds the card being read while replies move other cards to its foot, at 393x852 and 1280x800
-    labels: [validation-vibe-talk, validation-vibe-talk-page, disabled-optin]
+    desc: the message lists hold the reader's row through live messages, refreshes, a read landing after a scroll, summaries, focus moves, the view keys and the mouse crossing the cards with or without a card highlighted, follow only a reader on the newest line, and open threads and the thread list at their foot, in current Chromium at 1280x800 and 412x915; and the thread list holds the card being read while replies move other cards to its foot, at 393x852 and 1280x800; every hold judged when its drawn batch settles, never by a held window or a frame count
+    labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/scroll_stability_browser.py
     jobs_flag: ""
     deps: [setup.contract-tools]
@@ -1792,9 +1794,9 @@ steps:
   # Summaries on (--summaries on): summaries landing shifted 0.22-0.24 at both sizes.
   - group: check
     job: scroll-soak-browser
-    desc: a reader parked mid-Main is sampled every frame for 60 s of background updates (live messages and replies, edits above and below, reactions incl. a folded card, read state, the Newest recount and the poll; summaries off), each update's anchor movement and layout shift reported separately beside the recorded baseline, plus a near-foot slack coda, in current Chromium at 393x852 and 1280x800 (report-only until #1210 part D; --strict asserts)
+    desc: a reader parked mid-Main is sampled every frame for 60 s of background updates (live messages and replies, edits above and below, reactions incl. a folded card, read state, the Newest recount and the poll; summaries off), each update's anchor movement and layout shift reported separately beside the recorded baseline, plus a near-foot slack coda, in current Chromium at 393x852 and 1280x800 (--strict: the anchor within a pixel at every frame, at most one painted correction per act, no writes in an idle act)
     labels: [validation-vibe-talk, validation-vibe-talk-page]
-    cmd: cd vibe-talk && python3 tests/scroll_soak_browser.py
+    cmd: cd vibe-talk && python3 tests/scroll_soak_browser.py --strict
     jobs_flag: ""
     deps: [setup.contract-tools]
     timeout: 720
