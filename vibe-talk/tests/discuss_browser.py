@@ -140,9 +140,13 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
         except Exception:
             continue
     page.wait_for_selector("#discord-channel", state="visible", timeout=20_000)
-    # `#1355 phone-bar-discuss-slot`: a fixed-width bar icon on a phone as on a
-    # desk (the menu item stays as the second way in).
-    page.wait_for_selector("#discuss-open", state="visible", timeout=20_000)
+    # The way in, whichever this build carries: the fixed bar icon (#1355)
+    # where it stands visible, else the action menu's item.
+    via_menu = page.locator("#discuss-open").is_hidden()
+    if via_menu:
+        page.wait_for_selector("#action-menu-open", state="visible", timeout=20_000)
+    else:
+        page.wait_for_selector("#discuss-open", state="visible", timeout=20_000)
 
     scroller_before = page.evaluate("""() => {
       const area = document.getElementById('scroll-area');
@@ -150,7 +154,12 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
       return {top: rect.top, height: rect.height};
     }""")
 
-    page.click("#discuss-open")
+    if via_menu:
+        page.click("#action-menu-open")
+        page.wait_for_selector("#discuss-menu-open", state="visible", timeout=20_000)
+        page.click("#discuss-menu-open")
+    else:
+        page.click("#discuss-open")
     page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
     # Opening asks nothing: the bound is offered first, and only its press posts.
     page.wait_for_function(

@@ -1434,9 +1434,10 @@ test("the page has ONE html sink, and only a message's content_html ever reaches
   assert.ok(sink && /template\.innerHTML = contentHtml;/.test(sink[1]), "innerHTML moved out of insertSanitizedHtml");
   const calls = [...PAGE_CODE.matchAll(/insertSanitizedHtml\(([^)]*)\)/g)].map((m) => m[1]);
   // The signature twice (the bodies' interface, then the dom implementation), then the
-  // two calls: a message's body, and a Discuss answer's `text_html` (`discuss-markdown-render`)
-  // — the same server render through the same one sink, never raw text.
-  assert.deepStrictEqual(calls, ["box, answer.text_html", "parent: HTMLElement, contentHtml: string", "box, html", "parent: HTMLElement, contentHtml: string"], "insertSanitizedHtml gained a caller");
+  // calls: a message's body, a Discuss answer's `text_html` (`discuss-markdown-render`),
+  // and its saved timeline's renders (`discuss-transcript-persist`) — every one the
+  // server's own render through the same one sink, never raw text.
+  assert.deepStrictEqual(calls, ["box, answer.text_html", "line, entry.text_html", "body, entry.answer.text_html", "parent: HTMLElement, contentHtml: string", "box, html", "parent: HTMLElement, contentHtml: string"], "insertSanitizedHtml gained a caller");
   assert.match(PAGE_CODE, /const html = renderedHtmlOf\(message\);\s*if \(html !== ""\) \{\s*insertSanitizedHtml\(box, html\);/,
     "the one caller no longer passes a message's content_html");
   // `renderedHtmlOf` is web/src/present/rows' now (`#624 voice-page-modularity`), typed.
