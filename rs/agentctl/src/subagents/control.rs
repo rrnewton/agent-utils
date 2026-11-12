@@ -69,9 +69,7 @@ fn cleaned_purpose(text: &str) -> Option<String> {
 /// a sender header or a bare fence, with heading/bullet markers stripped.
 pub(crate) fn purpose_from_brief(brief: &str) -> Option<String> {
     for line in brief.lines() {
-        let candidate = line
-            .trim()
-            .trim_start_matches(['#', '-', '*', '>', ' ']);
+        let candidate = line.trim().trim_start_matches(['#', '-', '*', '>', ' ']);
         if candidate.is_empty() || candidate.starts_with("```") {
             continue;
         }

@@ -1731,7 +1731,7 @@ def test_start_records_purpose_from_brief_explicit_and_none(tmp_path: Path, monk
     assert result["purpose"] == "explicit purpose", result
 
     result = sessions.start_session("worker3", cwd=str(tmp_path), harness="claude")
-    assert "purpose" not in result or result["purpose"] is None, result
+    assert result.get("purpose") is None, result
 
 
 def test_registry_discovery_stops_at_a_symlinked_or_slashed_home(tmp_path: Path) -> None:
