@@ -158,6 +158,36 @@ fn landed_sends_exactly_once_across_daemon_restarts() {
 }
 
 #[test]
+fn configured_registry_is_passed_to_the_sender() {
+    // The daemon's working directory is the queue repository, which need not
+    // sit under the agentctl registry: a configured registry is passed as
+    // `--registry <dir>` before `send`.
+    let (fx, log) = setup(
+        "notify-registry",
+        RUNNER,
+        &[
+            "--select",
+            SELECT,
+            "--policy",
+            "path-routing",
+            "--agentctl-registry",
+            "/registry/somewhere",
+        ],
+    );
+    fx.branch("a", &[("tests/a", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "a", "--notify", "lane-fictional"]);
+    serve_once(&fx, &log, "0");
+    assert_eq!(item(&fx, 1)[\"status\"], "landed");
+    let lines = sent_lines(&log);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].starts_with("--registry /registry/somewhere send --deliver-while-working --file "),
+        "{}",
+        lines[0]
+    );
+}
+
+#[test]
 fn ejected_sends_exactly_once_with_failing_tests() {
     let (fx, log) = setup(
         "notify-ejected",

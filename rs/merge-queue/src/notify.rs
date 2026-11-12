@@ -150,6 +150,8 @@ pub fn resolve_agentctl(
 pub struct Notifier {
     /// Command words; the first is the program.
     pub command: Vec<String>,
+    /// Registry directory passed as `--registry <dir>` before `send` (empty: none).
+    pub registry: String,
     /// Deadline for one send; on expiry the send's process group is killed
     /// and the send is a failed attempt.
     pub timeout: Duration,
@@ -175,6 +177,7 @@ impl Notifier {
     pub fn new(command: Vec<String>) -> Self {
         Self {
             command,
+            registry: String::new(),
             timeout: DEFAULT_SEND_TIMEOUT,
         }
     }
@@ -182,7 +185,9 @@ impl Notifier {
     /// Build from the flag override, the environment supplement, and config.
     pub fn resolve(flag: Option<&[String]>, config: &Config) -> Self {
         let env = std::env::var(AGENTCTL_ENV).ok();
-        Self::new(resolve_agentctl(flag, env.as_deref(), config))
+        let mut notifier = Self::new(resolve_agentctl(flag, env.as_deref(), config));
+        notifier.registry = config.notify.agentctl_registry.clone();
+        notifier
     }
 
     /// The same sender with a different per-send deadline.
@@ -198,8 +203,11 @@ impl Notifier {
     /// process group is killed) is a failed send, never a success.
     pub fn send(&self, name: &str, report: &std::path::Path) -> Result<(), String> {
         let mut command = Command::new(&self.command[0]);
+        command.args(&self.command[1..]);
+        if !self.registry.is_empty() {
+            command.arg("--registry").arg(&self.registry);
+        }
         command
-            .args(&self.command[1..])
             .arg("send")
             .arg("--deliver-while-working")
             .arg("--file")

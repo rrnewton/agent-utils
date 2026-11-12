@@ -526,6 +526,12 @@ pub struct NotifyConfig {
     /// test fake or a wrapper. Empty means `agentctl` on `PATH`. The daemon
     /// runs `<command> send <name> --deliver-while-working --file <report>`.
     pub agentctl: Vec<String>,
+    /// agentctl registry directory passed as `--registry <dir>` before `send`.
+    /// The daemon's working directory is the queue's repository, which need
+    /// not sit under any registry, so name it explicitly when notifications
+    /// must reach sessions registered elsewhere. Empty means no flag.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agentctl_registry: String,
 }
 
 /// Identity for commits the queue creates.

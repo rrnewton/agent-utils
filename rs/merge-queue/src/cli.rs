@@ -519,6 +519,10 @@ enum Command {
         /// The daemon runs `<command> send <name> --deliver-while-working --file <report>`.
         #[arg(long, value_name = "WORD", allow_hyphen_values = true)]
         agentctl: Vec<String>,
+        /// agentctl registry directory the daemon passes as `--registry <dir>`
+        /// before `send` (its working directory need not be under a registry).
+        #[arg(long, default_value = "")]
+        agentctl_registry: String,
         /// Overwrite an existing config.json (items and history are kept).
         #[arg(long)]
         force: bool,
@@ -1070,6 +1074,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
             land_command,
             allow_batches,
             agentctl,
+            agentctl_registry,
             force,
         } => {
             if state.exists() && !force {
@@ -1194,7 +1199,10 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     allow_batches,
                     close_prs,
                 },
-                notify: NotifyConfig { agentctl },
+                notify: NotifyConfig {
+                    agentctl,
+                    agentctl_registry,
+                },
                 ..Config::default()
             };
             state.init(&config)?;

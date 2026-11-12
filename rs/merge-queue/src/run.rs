@@ -1341,6 +1341,33 @@ impl<'a> Runner<'a> {
         let slot = self.slots.take();
         let result = (|| -> Result<Result<String, (&'static str, String)>, String> {
             let checkout = self.slots.checkout(slot, tip)?;
+            // A generated path can also be source the generator itself is built
+            // from (a generated Rust table compiled into the generator): the
+            // combined tree then carries conflict markers in exactly the file
+            // the build must compile, and regeneration fails before it can
+            // rewrite anything. Start every generated path from the base side
+            // (the first parent: the tree before this change was combined) and
+            // let the generator rewrite it; count pins are composed on top by
+            // the recount step afterwards.
+            {
+                let mut wt = Git::new(&checkout);
+                wt.identity = self.git.identity.clone();
+                if let Ok(parent) = wt.run(&["rev-parse", &format!("{tip}^")]) {
+                    let parent = parent.trim();
+                    for path in &regen.paths {
+                        if wt.run(&["checkout", parent, "--", path]).is_err() {
+                            // Absent on the base side: drop whatever the
+                            // combination left there.
+                            let target = checkout.join(path);
+                            if target.is_dir() {
+                                let _ = std::fs::remove_dir_all(&target);
+                            } else if target.exists() || target.is_symlink() {
+                                let _ = std::fs::remove_file(&target);
+                            }
+                        }
+                    }
+                }
+            }
             // A generator killed by an outside signal (a service stop, the OOM killer) says
             // nothing about the change: stop the run instead of ejecting it.
             let run_script = |script: &str, what: &str| -> Result<std::process::Output, String> {

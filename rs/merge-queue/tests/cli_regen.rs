@@ -82,6 +82,60 @@ fn landed(r: &Value) -> Vec<Vec<i64>> {
 }
 
 #[test]
+fn generated_file_that_is_also_generator_source_regenerates_from_base_side() {
+    // The regenerated file is also an input the generator is built from:
+    // conflict markers in it make the generator fail before it can rewrite
+    // anything. Regeneration must start the generated paths from the base
+    // side (the tree before the change combined) and let the generator
+    // rewrite them. The script below fails on markers exactly like a build
+    // would.
+    const COMMAND: &str = "if grep -q '<<<<<<<' gen/self.txt; then echo marked; exit 101; fi; cat $(ls src/* | sort) > gen/self.txt; cat $(ls src/* | sort) > gen/all.txt";
+    let fx = Fixture::new("regen-self-source");
+    fx.write("src/a", "a\n");
+    fx.write("gen/self.txt", "a\n");
+    fx.write("gen/all.txt", "a\n");
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        RUNNER,
+        "--max-batch",
+        "4",
+        "--regen-path",
+        "gen/",
+        "--regen-command",
+        COMMAND,
+        "--identity-name",
+        "queue-bot",
+        "--identity-email",
+        "bot@example.com",
+    ]);
+    for (pr, name) in [(1, "b"), (2, "c")] {
+        git(&fx.dev(), &["checkout", "-q", "-B", name, "main"]);
+        fx.write(&format!("src/{name}"), &format!("{name}\n"));
+        fx.write("gen/self.txt", &format!("a\n{name}\n"));
+        fx.write(&format!("tests/{name}"), "ok\n");
+        fx.commit_all(&format!("{name}: add source"));
+        git(
+            &fx.dev(),
+            &["push", "-q", "-f", "origin", &format!("HEAD:{name}")],
+        );
+        git(&fx.dev(), &["checkout", "-q", "main"]);
+        fx.mq_ok(&["submit", &pr.to_string(), "--head", name]);
+    }
+    let r = report(&fx.mq_ok(&["run", "--json"]));
+    assert_eq!(landed(&r), vec![vec![1, 2]], "{r}");
+    let landed_tree = git(&fx.dev(), &["show", "origin/main:gen/self.txt"]);
+    assert_eq!(landed_tree.trim(), "a\nb\nc");
+}
+
+#[test]
 fn conflicts_only_in_generated_files_are_regenerated_not_held() {
     let regen = [
         "--regen-path",
