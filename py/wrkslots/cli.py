@@ -8947,6 +8947,7 @@ def _resume_replay(
         checkout.repository
         for record in fold.path_checks.values()
         for checkout in record.checkouts
+        if checkout.vcs != "eden"
     ):
         _stored_repository_reference(config, repository)
     return count, fold.copy()
@@ -30771,7 +30772,7 @@ def _assert_slot_contents_values(
             raise StateError(f"slot {slot} does not have exactly one checkout under flat layout")
         checkout = checkouts[0]
         expected_path, _destination = _checkout_path_for_layout(
-            config, slot, checkout.name, slot_type, layout
+            config, slot, checkout.name, slot_type, layout, vcs=checkout.vcs
         )
         if checkout.path != expected_path:
             raise StateError(
