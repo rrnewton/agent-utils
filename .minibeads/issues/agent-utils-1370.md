@@ -42,5 +42,5 @@ disturb the measurement.
 
 # Notes
 
-Number reserved in the devbig014 ledger; filed and landed by the
+Number reserved in the host ledger; filed and landed by the
 mu-gatehold lane. [watermelon-full-preview]

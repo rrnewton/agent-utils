@@ -1378,14 +1378,14 @@ def test_an_expired_hold_is_ignored(tmp_path: Path) -> None:
 def test_status_shows_the_hold(tmp_path: Path) -> None:
     """#1370: `gate status` (and bare `gate hold`) name the hold's reason
     and end time; after release both say there is none."""
-    _set_hold(tmp_path, "dev-hermit KVM window")
+    _set_hold(tmp_path, "neighbour KVM window")
     status = subprocess.run([PY, str(GATE), "status"], env=_env(tmp_path),
                             capture_output=True, text=True, timeout=30)
     assert status.returncode == 0, status.stdout
     assert "admission hold active until 2999-01-01T00:00:00Z" in status.stdout
-    assert "dev-hermit KVM window" in status.stdout
+    assert "neighbour KVM window" in status.stdout
     shown = _hold(tmp_path)
-    assert shown.returncode == 0 and "dev-hermit KVM window" in shown.stdout
+    assert shown.returncode == 0 and "neighbour KVM window" in shown.stdout
     assert _hold(tmp_path, "--release").returncode == 0
     status = subprocess.run([PY, str(GATE), "status"], env=_env(tmp_path),
                             capture_output=True, text=True, timeout=30)
