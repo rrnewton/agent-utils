@@ -32123,6 +32123,16 @@ def _record_ignored_file(
     )
 
 
+def _is_git_repository_directory(path: Path) -> bool:
+    """Git's structural test for a repository directory: HEAD, objects/, refs/."""
+
+    return (
+        (path / "HEAD").is_file()
+        and (path / "objects").is_dir()
+        and (path / "refs").is_dir()
+    )
+
+
 def _collect_ignored_directory(
     config: Config,
     checkout: Checkout,
@@ -32136,6 +32146,11 @@ def _collect_ignored_directory(
     """Collect ignored files below a directory Git collapsed into one entry."""
 
     directory = checkout_path.joinpath(*relative.split("/"))
+    if _is_git_repository_directory(directory):
+        # A bare mirror or repository directory inside the checkout: its
+        # own Git checks judge it, and its object store is not a pile of
+        # ignored worktree files.
+        return
     if (directory / ".git").exists() or (directory / ".git").is_symlink():
         _collect_ignored_files(
             config,
@@ -32156,7 +32171,7 @@ def _collect_ignored_directory(
         ) from exc
     for entry in entries:
         child = f"{relative}/{entry.name}"
-        if entry.name == ".git":
+        if entry.name == ".git" or entry.name.startswith("HANDOFF"):
             continue
         if _ignored_path_is_cache(config, checkout, checkout_path, child, cargo_targets):
             continue
@@ -32198,6 +32213,11 @@ def _collect_ignored_files(
         if not name:
             continue
         relative = f"{prefix}{name}"
+        # HANDOFF* files are the handoff contract's, never salvage
+        # evidence: salvage excludes them too (_salvage_pathspecs), and
+        # the handoff guards judge them before removal.
+        if relative.rsplit("/", 1)[-1].startswith("HANDOFF"):
+            continue
         if _ignored_path_is_cache(
             config, checkout, checkout_path, relative, cargo_targets
         ):

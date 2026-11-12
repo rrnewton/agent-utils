@@ -1893,6 +1893,14 @@ fn collect_ignored_directory(
     found: &mut BTreeMap<String, IgnoredFile>,
 ) -> Result<()> {
     let directory = checkout_path.join(relative);
+    // A bare mirror or repository directory: its own Git checks judge
+    // it; its object store is not ignored worktree files.
+    if directory.join("HEAD").is_file()
+        && directory.join("objects").is_dir()
+        && directory.join("refs").is_dir()
+    {
+        return Ok(());
+    }
     let git_marker = directory.join(".git");
     if git_marker.exists() || git_marker.is_symlink() {
         return collect_ignored_files(
@@ -1920,7 +1928,7 @@ fn collect_ignored_directory(
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name == ".git" {
+        if name == ".git" || name.starts_with("HANDOFF") {
             continue;
         }
         let child = format!("{relative}/{name}");
@@ -1969,6 +1977,11 @@ fn collect_ignored_files(
     )?;
     for name in raw.split('\0') {
         if name.is_empty() {
+            continue;
+        }
+        // HANDOFF* files are the handoff contract's, never salvage
+        // evidence (the Python edition's `_collect_ignored_files`).
+        if name.rsplit('/').next().unwrap_or(name).starts_with("HANDOFF") {
             continue;
         }
         let relative = format!("{prefix}{name}");
@@ -3194,6 +3207,7 @@ struct PreparedRemove {
 /// handoff gates, the salvage gates and the process-use census all run
 /// here, before the mutation locks are taken. The locked commit only
 /// re-checks that this slot's record and the event tip are unchanged.
+#[allow(clippy::too_many_arguments)]
 fn prepare_remove(
     root: Option<&Path>,
     cfg: &Cfg,

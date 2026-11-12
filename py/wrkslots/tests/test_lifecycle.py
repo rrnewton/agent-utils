@@ -15992,6 +15992,9 @@ def test_agent_reclaim_pushes_unpushed_commits_and_nonignored_files(
         str(os.getpid()),
         "--expected-generation",
         "1",
+        # #1302: ignored.txt is discarded explicitly; it is still never
+        # salvaged or uploaded.
+        "--discard-ignored",
     )
 
     assert removed.returncode == 0, removed.stderr
@@ -16673,6 +16676,22 @@ def test_agent_reclaim_never_uploads_oversized_ignored_file(
     mark_owner_dead(project)
     set_liveness(project, "dead")
 
+    # #1302: the oversized ignored file is never uploaded because removal
+    # refuses over it first, naming it; discarding it explicitly then
+    # salvages the authored work exactly as before.
+    refused = raw_command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+    assert refused.returncode == 3, refused.stderr
+    assert "oversized.bin" in refused.stderr
+    assert tree.exists()
+
     removed = raw_command(
         project,
         "remove",
@@ -16681,6 +16700,7 @@ def test_agent_reclaim_never_uploads_oversized_ignored_file(
         str(os.getpid()),
         "--expected-generation",
         "1",
+        "--discard-ignored",
     )
 
     assert removed.returncode == 0, removed.stderr
@@ -16721,6 +16741,21 @@ def test_agent_reclaim_does_not_salvage_ignored_only_payload(
             output.truncate(100 * 1024**2)
     mark_owner_dead(project)
     set_liveness(project, "dead")
+    # #1302: nothing is salvaged because removal refuses over the ignored
+    # payload first; discarding it explicitly still salvages nothing.
+    refused = raw_command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+    assert refused.returncode == 3, refused.stderr
+    assert "generated/artifact-00.bin" in refused.stderr
+    assert tree.exists()
+
     removed = raw_command(
         project,
         "remove",
@@ -16729,6 +16764,7 @@ def test_agent_reclaim_does_not_salvage_ignored_only_payload(
         str(os.getpid()),
         "--expected-generation",
         "1",
+        "--discard-ignored",
     )
 
     assert removed.returncode == 0, removed.stderr
