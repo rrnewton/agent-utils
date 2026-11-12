@@ -83,7 +83,14 @@ export interface DiscussPanelDependencies {
   /** Whether the phone sheet stands at full height, as last left on this device. */
   storedSheetFull?(): boolean;
   keepSheetFull?(full: boolean): void;
+  /** `#1354 discuss-layout-modes`. The panel's layout mode, as last left on this device. */
+  storedMode?(): DiscussLayoutMode;
+  keepMode?(mode: DiscussLayoutMode): void;
 }
+
+/** `#1354 discuss-layout-modes`. How the panel stands: the resizable overlay, a docked
+ * column beside the list, or maximized over the main area. */
+export type DiscussLayoutMode = "overlay" | "docked" | "maximized";
 
 /** The panel, once created. */
 export interface DiscussPanel {
@@ -106,6 +113,10 @@ export interface DiscussPanel {
   sheetFull(): boolean;
   /** `#1344`. Stand the phone sheet at full or half height and keep the choice. */
   setSheetFull(full: boolean): void;
+  /** `#1354`. The layout mode in force. */
+  mode(): DiscussLayoutMode;
+  /** `#1354`. Stand the panel in `mode` and keep the choice on the device. */
+  setMode(mode: DiscussLayoutMode): void;
 }
 
 /** Why Discuss cannot work on a deployment with no direct LLM summarizer, said once. */
@@ -214,6 +225,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   const FALLBACK_MAX_WIDTH = 960;
   let width = FALLBACK_DEFAULT_WIDTH;
   let sheetFull = false;
+  let layoutMode: DiscussLayoutMode = "overlay";
   let drag: { startX: number; startWidth: number } | null = null;
 
   function panel(): HTMLElement {
@@ -243,6 +255,10 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     width = clampWidth(px);
     const style = (panel() as HTMLElement).style as { setProperty?: (name: string, value: string) => void } | undefined;
     if (style && typeof style.setProperty === "function") style.setProperty("--discuss-width", `${width}px`);
+    // The docked column is sized by the main screen's grid, which reads the same choice there.
+    const screen = maybe("screen-main");
+    const screenStyle = screen ? (screen as HTMLElement).style as { setProperty?: (name: string, value: string) => void } | undefined : undefined;
+    if (screenStyle && typeof screenStyle.setProperty === "function") screenStyle.setProperty("--discuss-width", `${width}px`);
     const handle = maybe("discuss-resize");
     if (handle) {
       handle.setAttribute("aria-valuenow", String(width));
@@ -277,6 +293,37 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     return sheetFull;
   }
 
+  /**
+   * `#1354 discuss-layout-modes`. Stand the panel in `mode`; kept on the device only when
+   * `keep`. Docked is drawn by the main screen's grid — the desktop two-column machinery
+   * (`#229`): the panel takes the side column's place beside the list, so this only names
+   * the mode on both elements and the stylesheet lays it out; no scroll position is ever
+   * written here, the scroll owner's stability hold keeping the reader's place across
+   * the reflow (#1251). On a phone the stylesheet gives docked no column, so the sheet
+   * stands as it did.
+   */
+  function applyMode(mode: DiscussLayoutMode, keep: boolean): DiscussLayoutMode {
+    layoutMode = mode;
+    panel().setAttribute("data-mode", mode);
+    const screen = maybe("screen-main");
+    if (screen) {
+      if (mode === "overlay") screen.removeAttribute("data-discuss");
+      else screen.setAttribute("data-discuss", mode);
+    }
+    for (const each of ["overlay", "docked", "maximized"] as const) {
+      const button = maybe(`discuss-mode-${each}`);
+      if (button) button.setAttribute("aria-pressed", each === mode ? "true" : "false");
+    }
+    if (keep) {
+      try {
+        deps.keepMode?.(mode);
+      } catch {
+        // Storage refused: the mode holds until a reload.
+      }
+    }
+    return layoutMode;
+  }
+
   /** Restate the kept layout on the panel: the stored choices, else the defaults. */
   function applyStoredLayout(): void {
     let storedWidth: number | undefined;
@@ -293,6 +340,13 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       storedFull = false;
     }
     applySheet(storedFull, false);
+    let storedMode: DiscussLayoutMode = "overlay";
+    try {
+      storedMode = deps.storedMode?.() ?? "overlay";
+    } catch {
+      storedMode = "overlay";
+    }
+    applyMode(storedMode === "docked" || storedMode === "maximized" ? storedMode : "overlay", false);
   }
 
   function isOpen(): boolean {
@@ -448,6 +502,20 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         if (toggle) {
           listening.listen(toggle, "click", () => applySheet(!sheetFull, true));
         }
+        // `#1354`: the mode control beside Close, and the panel's keys as the
+        // outline panel's are: Escape away, focus home on open (below).
+        for (const each of ["overlay", "docked", "maximized"] as const) {
+          const button = maybe(`discuss-mode-${each}`);
+          if (button) listening.listen(button, "click", () => applyMode(each, true));
+        }
+        listening.listen(panel(), "keydown", (event: KeyboardEvent) => {
+          if (event.key !== "Escape") return;
+          if (typeof event.preventDefault === "function") event.preventDefault();
+          generation += 1;
+          setOpen(false);
+          const opener = maybe("discuss-open") as (HTMLElement & { focus?: (options?: unknown) => void }) | null;
+          if (opener && typeof opener.focus === "function") opener.focus({ preventScroll: true });
+        });
         const handle = maybe("discuss-resize");
         if (handle) {
           listening.listen(handle, "pointerdown", (event: PointerEvent) => {
@@ -498,6 +566,9 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
         // No panel in this host yet: the open below says so, as before.
       }
       setOpen(true);
+      // Focus home on open, as the other panels put it: Close, without scrolling.
+      const closer = maybe("discuss-close") as (HTMLElement & { focus?: (options?: unknown) => void }) | null;
+      if (closer && typeof closer.focus === "function") closer.focus({ preventScroll: true });
       fetchFor(scope);
     },
     close() {
@@ -518,6 +589,10 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     sheetFull: () => sheetFull,
     setSheetFull(full: boolean) {
       applySheet(full, true);
+    },
+    mode: () => layoutMode,
+    setMode(mode: DiscussLayoutMode) {
+      applyMode(mode, true);
     },
   };
 }

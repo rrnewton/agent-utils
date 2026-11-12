@@ -36,6 +36,8 @@ function fakeElement(tagName = "div") {
     className: "",
     type: "",
     innerHTMLSet: false,
+    focusCalls: [],
+    focus(options) { el.focusCalls.push(options); },
     appendChild(kid) { el.children.push(kid); kid.parentNode = el; return kid; },
     replaceChildren(...kids) { el.children = []; for (const kid of kids) el.appendChild(kid); },
     addEventListener(type, listener) { (el.listeners[type] ||= []).push(listener); },
@@ -80,6 +82,7 @@ const IDS = [
   "discuss-answer", "discuss-footer", "discuss-covers", "discuss-links",
   "discuss-mark-read", "discuss-mark-unread", "discuss-unmarkable",
   "discuss-stamp", "discuss-retry", "discuss-actions", "discuss-resize", "discuss-sheet-toggle",
+  "discuss-mode-overlay", "discuss-mode-docked", "discuss-mode-maximized", "screen-main",
 ];
 
 /** Fire a non-click listener with a plain event carrying `props`. */
@@ -116,7 +119,7 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
   els["discuss-retry"].hidden = true;
   const calls = { posts: [], dismiss: [], restore: [], jumps: [], errors: [], statuses: [] };
   // `#1344`: the device's kept layout, in memory; the clamp mirrors the device setting's.
-  const kept = { width: null, keeps: [], sheetFull: false, sheetKeeps: [] };
+  const kept = { width: null, keeps: [], sheetFull: false, sheetKeeps: [], mode: "overlay", modeKeeps: [] };
   const clampW = (value) => {
     const px = Math.round(Number(value));
     return Number.isFinite(px) ? Math.min(960, Math.max(320, px)) : 560;
@@ -147,6 +150,8 @@ function fixture({ selection = { view: "flat", threadId: null, thread: null }, r
     defaultWidth: 560,
     storedSheetFull: () => kept.sheetFull,
     keepSheetFull: (full) => { kept.sheetFull = full; kept.sheetKeeps.push(full); },
+    storedMode: () => kept.mode,
+    keepMode: (mode) => { kept.mode = mode; kept.modeKeeps.push(mode); },
   };
   const savedDocument = globalThis.document;
   globalThis.document = { createElement: (tag) => fakeElement(tag) };
@@ -521,5 +526,50 @@ test("catchup layout: the sheet starts at half, Maximize sticks across close/reo
     assert.equal(fx.els["discuss-panel"].getAttribute("data-sheet"), "full");
     click(fx.els["discuss-sheet-toggle"]);
     assert.equal(view.sheetFull(), false, "Restore did not return the sheet to half");
+  } finally { fx.restore(); }
+});
+
+// ---- 9. layout modes (`#1354 discuss-layout-modes`) ---------------------------------------------
+
+test("catchup modes: overlay stands until chosen; a chosen mode is kept and survives reopen", async () => {
+  const fx = fixture();
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    assert.equal(view.mode(), "overlay", "the panel did not start as overlay");
+    assert.equal(fx.els["discuss-panel"].getAttribute("data-mode"), "overlay");
+    assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), null);
+    click(fx.els["discuss-mode-docked"]);
+    assert.equal(view.mode(), "docked");
+    assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), "docked");
+    assert.equal(fx.els["discuss-mode-docked"].getAttribute("aria-pressed"), "true");
+    assert.equal(fx.els["discuss-mode-overlay"].getAttribute("aria-pressed"), "false");
+    assert.deepEqual(fx.kept.modeKeeps, ["docked"], "the docked choice was not kept");
+    view.close();
+    view.open();
+    await flush();
+    assert.equal(view.mode(), "docked", "the mode did not survive close/reopen");
+    view.setMode("maximized");
+    assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), "maximized");
+    view.setMode("overlay");
+    assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), null, "overlay left the screen marked");
+  } finally { fx.restore(); }
+});
+
+test("catchup modes: open puts focus on Close; Escape closes and returns it to the opener", async () => {
+  const fx = fixture();
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    view.open();
+    await flush();
+    assert.equal(fx.els["discuss-close"].focusCalls.length, 1, "open did not put focus on Close");
+    fire(fx.els["discuss-panel"], "keydown", { key: "Escape" });
+    assert.equal(view.isOpen(), false, "Escape did not close the panel");
+    assert.equal(fx.els["discuss-open"].focusCalls.length, 1, "Escape did not return focus to the opener");
+    fire(fx.els["discuss-panel"], "keydown", { key: "x" });
+    assert.equal(view.isOpen(), false, "an unrelated key reopened or moved the panel");
   } finally { fx.restore(); }
 });

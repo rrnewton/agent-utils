@@ -195,7 +195,34 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
         reopened = page.locator("#discuss-panel").bounding_box()
         check(reopened is not None and reopened["width"] >= 660,
               f"the kept width did not survive close/reopen: {reopened}")
+        # `#1354 discuss-layout-modes`: docked beside the list, maximized over
+        # the main area, the choice kept per device.
+        page.click("#discuss-mode-docked")
+        page.wait_for_function(
+            "() => document.getElementById('screen-main').dataset.discuss === 'docked'",
+            timeout=20_000)
+        docked = page.locator("#discuss-panel").bounding_box()
+        list_box = page.locator("#scroll-area").bounding_box()
+        check(docked is not None and list_box is not None
+              and abs(docked["x"] - (list_box["x"] + list_box["width"])) <= 4
+              and docked["width"] >= 640,
+              f"docked is not a column beside the list: panel={docked} list={list_box}")
+        mode_kept = page.evaluate("() => localStorage.getItem('vibe-talk.voice.discuss-mode')")
+        check(mode_kept == "docked", f"the docked mode was not kept: {mode_kept!r}")
+        page.click("#discuss-mode-maximized")
+        page.wait_for_function(
+            "() => document.getElementById('screen-main').dataset.discuss === 'maximized'",
+            timeout=20_000)
+        full = page.locator("#discuss-panel").bounding_box()
+        check(full is not None and full["width"] >= width - 100,
+              f"maximized does not fill the main area: {full} in {width}x{height}")
+        page.click("#discuss-mode-overlay")
+        page.wait_for_function(
+            "() => !document.getElementById('screen-main').hasAttribute('data-discuss')",
+            timeout=20_000)
     else:
+        check(page.locator("#discuss-mode-docked").is_hidden(),
+              "the phone sheet shows the desk mode control")
         check(panel_box is not None and panel_box["width"] >= width - 2,
               f"the phone sheet is not full width: {panel_box} in {width}x{height}")
         check(panel_box is not None and height * 0.4 <= panel_box["height"] <= height * 0.6,

@@ -390,7 +390,7 @@
                over the channel, scrolls itself, and never resizes the list. The
                skeleton is static; web/src/view/catchup fills the scope, status,
                answer, footer and stamp as text. -->
-          <div id="discuss-panel" role="dialog" aria-label="Discuss" data-sheet="half" hidden>
+          <div id="discuss-panel" role="dialog" aria-label="Discuss" data-sheet="half" data-mode="overlay" hidden>
             <div id="discuss-resize" role="separator" aria-orientation="vertical" tabindex="0"
                  aria-label="Discuss panel width" aria-valuemin="320" aria-valuemax="960" aria-valuenow="560"></div>
             <div class="discuss-head">
@@ -399,6 +399,11 @@
                    Summarize button (`#1346`) beside it next, then Close. Layout modes
                    (`#1354`) join this slot without moving Close. -->
               <div id="discuss-actions" class="discuss-actions">
+                <span class="discuss-modes" role="group" aria-label="Panel layout">
+                  <button id="discuss-mode-overlay" type="button" aria-pressed="true">Overlay</button>
+                  <button id="discuss-mode-docked" type="button" aria-pressed="false">Dock</button>
+                  <button id="discuss-mode-maximized" type="button" aria-pressed="false">Full</button>
+                </span>
                 <button id="discuss-sheet-toggle" type="button" aria-expanded="false" aria-controls="discuss-panel">Maximize</button>
                 <button id="discuss-close" type="button">Close</button>
               </div>

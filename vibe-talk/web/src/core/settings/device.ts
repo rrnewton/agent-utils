@@ -201,6 +201,17 @@ export const DEVICE_SETTINGS = Object.freeze({
     write: (full: boolean) => (full ? "1" : null),
     refused: { value: false },
   } satisfies DeviceSetting<boolean>,
+  /** `#1354 discuss-layout-modes`. How the Discuss panel stands on a desk: overlay, docked
+   * beside the list, or maximized over the main area. Per device; anything unknown, and a
+   * refused read, is the overlay it has always been. The stylesheet decides what a mode
+   * means on a phone, where only the overlay sheet and its heights stand. */
+  discussMode: {
+    key: "vibe-talk.voice.discuss-mode",
+    read: (raw: string | null): "overlay" | "docked" | "maximized" =>
+      raw === "docked" || raw === "maximized" ? raw : "overlay",
+    write: (mode: "overlay" | "docked" | "maximized") => mode,
+    refused: { value: "overlay" },
+  } satisfies DeviceSetting<"overlay" | "docked" | "maximized">,
   /** `#425 collapsed-lines`. The lines a fold shows, clamped. Synced. */
   collapsedLines: {
     key: "vibe-talk.voice.collapsed-lines",

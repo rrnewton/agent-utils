@@ -12,6 +12,7 @@ export type {
   CatchupRequestBody,
   CatchupStamp,
   CatchupWindow,
+  DiscussLayoutMode,
   DiscussPanel,
   DiscussPanelDependencies,
   DiscussScope,
@@ -64,6 +65,9 @@ export interface DiscussViewDependencies {
   defaultWidth?: number;
   storedSheetFull?(): boolean;
   keepSheetFull?(full: boolean): void;
+  /** `#1354 discuss-layout-modes`. The panel's layout mode, forwarded to the panel. */
+  storedMode?(): "overlay" | "docked" | "maximized";
+  keepMode?(mode: "overlay" | "docked" | "maximized"): void;
 }
 
 /** The Discuss view, as the page calls it. */
@@ -84,6 +88,10 @@ export interface DiscussView {
   sheetFull(): boolean;
   /** `#1344`. Stand the phone sheet at full or half height and keep the choice. */
   setSheetFull(full: boolean): void;
+  /** `#1354`. The layout mode in force. */
+  mode(): "overlay" | "docked" | "maximized";
+  /** `#1354`. Stand the panel in `mode` and keep the choice on the device. */
+  setMode(mode: "overlay" | "docked" | "maximized"): void;
 }
 
 /** Make the Discuss view from the page's thunks. Nothing is looked up yet. */
@@ -170,6 +178,8 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     defaultWidth: deps.defaultWidth,
     storedSheetFull: deps.storedSheetFull,
     keepSheetFull: deps.keepSheetFull,
+    storedMode: deps.storedMode,
+    keepMode: deps.keepMode,
   });
 
   /** Where Discuss is aimed now: the open thread, else the channel in its current view. */
@@ -256,5 +266,7 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     setWidth: (px: unknown) => panel.setWidth(px),
     sheetFull: () => panel.sheetFull(),
     setSheetFull: (full: boolean) => panel.setSheetFull(full),
+    mode: () => panel.mode(),
+    setMode: (mode: "overlay" | "docked" | "maximized") => panel.setMode(mode),
   };
 }

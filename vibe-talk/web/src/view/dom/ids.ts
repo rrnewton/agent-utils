@@ -127,6 +127,9 @@ export interface ElementById {
   "discuss-mark-read": HTMLButtonElement;
   "discuss-mark-unread": HTMLButtonElement;
   "discuss-menu-open": HTMLButtonElement;
+  "discuss-mode-docked": HTMLButtonElement;
+  "discuss-mode-maximized": HTMLButtonElement;
+  "discuss-mode-overlay": HTMLButtonElement;
   "discuss-open": HTMLButtonElement;
   "discuss-panel": HTMLDivElement;
   "discuss-resize": HTMLDivElement;

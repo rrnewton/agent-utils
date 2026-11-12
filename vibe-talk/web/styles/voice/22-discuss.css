@@ -223,6 +223,98 @@
   font-size: 0.75rem;
 }
 
+/* `#1354 discuss-layout-modes`. The mode control: three small buttons beside
+ * Close (desk only; the phone's sheet toggle is its layout control). */
+.discuss-modes {
+  display: none;
+}
+
+@media (min-width: 900px) and (pointer: fine) {
+  .discuss-modes {
+    display: flex;
+    gap: 4px;
+  }
+}
+
+.discuss-modes button {
+  padding: 4px 8px;
+  cursor: pointer;
+  background: #262c36;
+  color: #e7e9ee;
+  border: 1px solid #3d4452;
+  border-radius: 6px;
+  font: inherit;
+}
+
+.discuss-modes button[aria-pressed="true"] {
+  border-color: #7ab3e3;
+  color: #7ab3e3;
+}
+
+.discuss-modes button:focus-visible {
+  outline: 2px solid #7ab3e3;
+  outline-offset: 1px;
+}
+
+@media (min-width: 900px) and (pointer: fine) {
+  /* Docked: a side-by-side column in the main screen's own grid, where the
+   * two-column machinery (`#229`, 20-desktop-regime.css) puts its side
+   * column: column 2, every row. The list keeps its column and reflows once;
+   * no scroll position is written for it (#1251's hold keeps the place). */
+  #screen-main[data-discuss="docked"] {
+    grid-template-columns: minmax(0, 1fr) minmax(320px, var(--discuss-width, 560px));
+  }
+
+  #screen-main[data-discuss="docked"] > #connection-banner,
+  #screen-main[data-discuss="docked"] > #channel-navigation,
+  #screen-main[data-discuss="docked"] > #channel-freshness-anchor,
+  #screen-main[data-discuss="docked"] > #scroll-area {
+    grid-column: 1;
+  }
+
+  #screen-main[data-discuss="docked"] > #discuss-panel {
+    position: relative;
+    grid-column: 2;
+    grid-row: 1 / -1;
+    left: auto;
+    right: auto;
+    bottom: auto;
+    width: auto;
+    height: auto;
+    max-height: none;
+    border-top: none;
+    border-right: none;
+    border-bottom: none;
+    border-radius: 0;
+    box-shadow: none;
+    z-index: auto;
+  }
+
+  /* Docked beside two columns: Discuss takes a third, the side column keeps its own. */
+  #screen-main[data-discuss="docked"][data-columns="two"] {
+    grid-template-columns: minmax(260px, var(--two-column-split, 50%)) minmax(260px, 1fr) minmax(320px, var(--discuss-width, 560px));
+  }
+
+  #screen-main[data-discuss="docked"][data-columns="two"] > #discuss-panel {
+    grid-column: 3;
+  }
+
+  /* Maximized: the panel fills the main area, to just talk to Discuss. */
+  #screen-main[data-discuss="maximized"] > #discuss-panel {
+    top: 8px;
+    left: 8px;
+    right: calc(8px + env(safe-area-inset-right));
+    bottom: 8px;
+    width: auto;
+    height: auto;
+    max-height: none;
+  }
+
+  #screen-main[data-discuss="maximized"] > #discuss-panel #discuss-resize {
+    display: none;
+  }
+}
+
 /* On a phone the bar's strip is priced to its edge — the channel's name keeps
  * its room (the view picker's bargain in 18-control-bar.css) — so the bar
  * button gives way there and Discuss is carried by the action menu's item

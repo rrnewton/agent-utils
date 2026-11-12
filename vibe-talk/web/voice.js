@@ -1070,6 +1070,9 @@ const discussView = createDiscussView({
   defaultWidth: DEFAULT_DISCUSS_WIDTH,
   storedSheetFull: () => deviceSettings().get(DEVICE_SETTINGS.discussSheetFull),
   keepSheetFull: (full) => deviceSettings().keep(DEVICE_SETTINGS.discussSheetFull, full),
+  // `#1354 discuss-layout-modes`. The panel's mode, on this device with the rest.
+  storedMode: () => deviceSettings().get(DEVICE_SETTINGS.discussMode),
+  keepMode: (mode) => deviceSettings().keep(DEVICE_SETTINGS.discussMode, mode),
 });
 
 /** The three-way selector over `#view-switch`; its press is `pressViewSwitch`. */
