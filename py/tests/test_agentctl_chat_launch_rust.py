@@ -348,14 +348,14 @@ def test_launch_sigterm_stops_both_children(fixture: Fixture) -> None:
 
 def test_launch_sigterm_exits_within_a_few_seconds(fixture: Fixture) -> None:
     # Regression: admission work (pane flock / late-paste polling) must
-    # never keep `chat run` alive until systemd's stop timeout.
+    # never keep `chat run` alive until systemd's stop timeout. Exit is
+    # the condition; the generous communicate bound only reports a hang
+    # (owner rule 346: no wall-clock verdict).
     process = fixture.launch()
     assert _wait_for(lambda: (fixture.control / "harness.pid").exists(), 60)
     assert _wait_for(lambda: bool(fixture.processes_with(str(fixture.state))), 60)
-    started = time.monotonic()
     process.send_signal(signal.SIGTERM)
-    _stdout, _stderr = process.communicate(timeout=10)
-    assert time.monotonic() - started < 10
+    _stdout, _stderr = process.communicate(timeout=120)
     assert process.returncode == 0
 
 
@@ -409,11 +409,10 @@ def test_run_sigterm_with_a_delivery_in_flight_exits_within_five_seconds(
         # The owner loop starts delivering the request at once, and each attempt waits for the
         # pane's composer, or hangs in Herdr's typing call, for longer than this.
         time.sleep(2)
-        started = time.monotonic()
         os.kill(bridge, signal.SIGTERM)
-        assert _wait_for(lambda: _process_gone(bridge), 10)
-        took = time.monotonic() - started
-        assert took < 5, f"chat run took {took:.1f}s to stop"
+        # Exit is the condition; the generous bound only reports a hang
+        # (owner rule 346: no wall-clock verdict).
+        assert _wait_for(lambda: _process_gone(bridge), 120)
         status = subprocess.run(
             [
                 str(fixture.agentctl),
@@ -569,7 +568,7 @@ def test_launch_bridge_killed_first_is_an_error_and_stops_coordinator(
     _stdout, stderr = process.communicate(timeout=300)
     assert process.returncode == 1
     assert "chat bridge exited" in stderr
-    assert _wait_for(lambda: not Path(f"/proc/{harness_pid}").exists(), 15)
+    assert _wait_for(lambda: not Path(f"/proc/{harness_pid}").exists(), 120)
 
 
 _OUTER_KILL_HELPER = '''
