@@ -42,7 +42,6 @@ export function foldSectionsByHeading(root: FoldElement, create: CreateElement):
       details.appendChild(summary);
       body = create("div");
       details.appendChild(body);
-      root.appendChild(details);
       current = details;
       count += 1;
     } else if (current !== null && body !== null) {

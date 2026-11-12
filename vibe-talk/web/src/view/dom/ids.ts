@@ -137,7 +137,6 @@ export interface ElementById {
   "discuss-retry": HTMLButtonElement;
   "discuss-scope": HTMLParagraphElement;
   "discuss-send": HTMLButtonElement;
-  "discuss-sheet-toggle": HTMLButtonElement;
   "discuss-since": HTMLInputElement;
   "discuss-stale": HTMLParagraphElement;
   "discuss-stale-text": HTMLSpanElement;
