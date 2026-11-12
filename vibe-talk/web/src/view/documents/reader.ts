@@ -22,6 +22,8 @@ import { splitIssueHeader } from "./issueheader.ts";
 /** What the reader asks of the page. */
 export interface DocumentsReaderDependencies {
   api(path: string, options?: { method?: string; body?: unknown }): Promise<unknown>;
+  /** Bring an element into view through the scroll owner (`#1251 scroll-single-owner`). */
+  intoView(element: Element, block: string, inline?: string): void;
   byId(id: string): HTMLElement;
   /**
    * Read one document aloud through the page's shared read-aloud owner
@@ -415,11 +417,11 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     const body = deps.byId("doc-body");
     const found = Array.from(body.querySelectorAll("h1, h2, h3, h4, h5, h6")).find((el) => el.id === id);
     const target = found === undefined ? null : (found as HTMLElement);
-    if (target !== null && typeof target.scrollIntoView === "function") {
-      target.scrollIntoView({ block: "start" });
+    if (target !== null) {
+      deps.intoView(target, "start");
       return true;
     }
-    return target !== null;
+    return false;
   }
 
   /**
@@ -497,9 +499,7 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     });
     if (scrollButtonIntoView && outlineOpen && hereIndex >= 0) {
       const here = buttons[hereIndex];
-      if (here !== undefined && typeof here.scrollIntoView === "function") {
-        here.scrollIntoView({ block: "nearest" });
-      }
+      if (here !== undefined) deps.intoView(here, "nearest");
     }
   }
 
@@ -703,7 +703,7 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
       const box = el.getBoundingClientRect();
       if (box.top >= view.top && box.bottom <= view.bottom) return;
     }
-    el.scrollIntoView({ block: "center" });
+    deps.intoView(el, "center");
   }
 
   /**
@@ -933,9 +933,7 @@ export function createDocumentsReader(deps: DocumentsReaderDependencies): Docume
     startWatching();
     if (highlightTerms !== undefined && markdown !== null) {
       const first = highlightSearchTerms(body, highlightTerms);
-      if (first !== null && typeof first.scrollIntoView === "function") {
-        first.scrollIntoView({ block: "center" });
-      }
+      if (first !== null) deps.intoView(first, "center");
     }
   }
 

@@ -1013,6 +1013,7 @@ const screens = createScreens();
 
 /** The mounted Documents view. */
 const documentsView = createDocumentsView({
+  intoView: (element, block, inline) => scrollKeeping.intoView(element, block, inline),
   api: (path, options) => api(path, options),
   byId: (id) => el(id),
   // Per-document starred/hidden state (`#1265 documents-star-hide`): kept in

@@ -26,6 +26,8 @@ import type { OpenDocument } from "./reader.ts";
 /** What the Documents view needs from the page. */
 export interface DocumentsViewDependencies {
   api(path: string, options?: { method?: string; body?: unknown }): Promise<unknown>;
+  /** Bring an element into view through the scroll owner (`#1251 scroll-single-owner`). */
+  intoView(element: Element, block: string, inline?: string): void;
   byId(id: string): HTMLElement;
   /** Read one document aloud through the page's shared read-aloud owner (`#1039`). */
   readDocument(doc: { key: string; title?: string; texts: readonly string[] }): unknown;
@@ -164,6 +166,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
   const reader = createDocumentsReader({
     api: deps.api,
     byId: deps.byId,
+    intoView: deps.intoView,
     readDocument: deps.readDocument,
     stopSpeaking: deps.stopSpeaking,
     star: {

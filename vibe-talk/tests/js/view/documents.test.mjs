@@ -1035,8 +1035,9 @@ async function withReader(options, run) {
   const backs = [];
   const statuses = [];
   const reader = mod.createDocumentsReader({
+    intoView: (element, block, inline) => { if (element && typeof element.scrollIntoView === "function") element.scrollIntoView(inline === undefined ? { block } : { block, inline }); },
     api,
-    byId: (id) => {
+        byId: (id) => {
       assert.ok(id in els, `reader looked up an element the test did not provide: ${id}`);
       return els[id];
     },
@@ -1214,6 +1215,7 @@ test("documents reader: current() is null before any open and when content never
     "doc-back", "doc-read", "doc-body", "scroll-area"]) els[id] = readerEl("div");
   els["doc-body"].querySelectorAll = () => [];
   const reader = mod.createDocumentsReader({
+    intoView: (element, block, inline) => { if (element && typeof element.scrollIntoView === "function") element.scrollIntoView(inline === undefined ? { block } : { block, inline }); },
     api: async () => ({ document: { title: "Gone" }, content: null, outline: [] }),
     byId: (id) => els[id],
     readDocument: () => {},
@@ -1433,6 +1435,7 @@ async function withLinkedReader(options, run) {
   els["doc-body"].querySelectorAll = () => headings;
   const opened = [];
   const reader = mod.createDocumentsReader({
+    intoView: (element, block, inline) => { if (element && typeof element.scrollIntoView === "function") element.scrollIntoView(inline === undefined ? { block } : { block, inline }); },
     api: options.api || (async () => ({
       document: { title: "Intro" },
       content: "# Intro\n\nLinked body.\n",
@@ -1537,6 +1540,7 @@ test("documents reader: an unindexed key falls through to fetch, other failures 
   els["doc-body"].querySelectorAll = () => [];
   const statuses = [];
   const reader = mod.createDocumentsReader({
+    intoView: (element, block, inline) => { if (element && typeof element.scrollIntoView === "function") element.scrollIntoView(inline === undefined ? { block } : { block, inline }); },
     api: failing, byId: (id) => els[id], readDocument: () => {}, onBack: () => {},
     onStatus: (text) => statuses.push(text),
   });
@@ -1642,6 +1646,7 @@ test("documents reader kind: a failed or different open leaves no stale kind", a
   };
   let fail = false;
   const reader = mod.createDocumentsReader({
+    intoView: (element, block, inline) => { if (element && typeof element.scrollIntoView === "function") element.scrollIntoView(inline === undefined ? { block } : { block, inline }); },
     api: async () => {
       if (fail) throw Object.assign(new Error("HTTP 500 boom"), { code: "boom" });
       return answer;
@@ -1732,6 +1737,7 @@ async function withDocumentsView(options, run) {
   const stops = [];
   const view = mod.createDocumentsView({
     api, byId,
+    intoView: (element, block, inline) => { if (element && typeof element.scrollIntoView === "function") element.scrollIntoView(inline === undefined ? { block } : { block, inline }); },
     readDocument: (doc) => { reads.push(doc); },
     stopSpeaking: (key) => { stops.push(key); },
     onStatus: (text) => { statuses.push(text); options.onStatus?.(text); },
