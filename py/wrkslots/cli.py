@@ -13533,6 +13533,8 @@ def _assert_record_storage_consistent(
     _assert_slot_contents(config, record)
     verifier = vcs or _GitVcs()
     for checkout in record.checkouts:
+        if checkout.vcs == "eden":
+            continue
         path = _stored_path(config, checkout.path, "checkout path")
         _relative, repository = _stored_repository_path(config, checkout.repository)
         verifier.verify_existing_worktree(repository, path)
@@ -13555,6 +13557,8 @@ def _assert_record_registered(
 
     _assert_slot_contents(config, record)
     for checkout in record.checkouts:
+        if checkout.vcs == "eden":
+            continue
         path = _stored_path(config, checkout.path, "checkout path")
         _relative, repository = _stored_repository_path(config, checkout.repository)
         if path.is_symlink() or not path.is_dir():
@@ -13651,6 +13655,8 @@ def _assert_no_cross_repository_target_registrations(
     target_slot = _slot_directory(config, record.slot, record.slot_type).absolute()
     expected_common_by_path: dict[Path, Path] = {}
     for checkout in record.checkouts:
+        if checkout.vcs == "eden":
+            continue
         path = _stored_path(config, checkout.path, "checkout path").absolute()
         _relative, repository = _stored_repository_path(config, checkout.repository)
         expected_common_by_path[path] = vcs.common_directory(repository)
@@ -25372,6 +25378,8 @@ def _assert_record_paths(
             matched: Path | None = None
             for candidate in candidates:
                 absolute = candidate if layout == "flat" else candidate / checkout.name
+                if checkout.vcs == "eden" and layout == "flat":
+                    absolute = candidate / "checkout"
                 if checkout.path == absolute.relative_to(config.root).as_posix():
                     matched = absolute
                     break
@@ -25389,10 +25397,16 @@ def _assert_record_paths(
             expected_relative, expected_absolute = _checkout_path_for_layout(
                 config, record.slot, checkout.name, record.slot_type, layout
             )
+            if checkout.vcs == "eden" and layout == "flat":
+                expected_absolute = expected_slot / "checkout"
+                expected_relative = expected_absolute.relative_to(config.root).as_posix()
         else:
             expected_absolute = (
                 expected_slot if layout == "flat" else expected_slot / checkout.name
             )
+            if checkout.vcs == "eden" and layout == "flat":
+                # Eden mounts as a child of the slot subvolume (#1204).
+                expected_absolute = expected_slot / "checkout"
             expected_relative = expected_absolute.relative_to(config.root).as_posix()
         if checkout.path != expected_relative:
             raise StateError(
@@ -25406,7 +25420,10 @@ def _assert_record_paths(
         )
         if actual != expected_absolute:
             raise StateError(f"slot {record.slot} checkout path identity changed")
-        if require_repository:
+        if checkout.vcs == "eden":
+            # Eden backing repos live outside the project by design (#1204).
+            pass
+        elif require_repository:
             _stored_repository_path(config, checkout.repository)
         else:
             _stored_repository_reference(config, checkout.repository)
@@ -34810,9 +34827,20 @@ def _provision_eden_slot(
         raise Refusal(str(exc)) from exc
     slot_path.parent.mkdir(parents=True, exist_ok=True)
     if config.worktrees_image is not None:
-        worktreesimage.create_slot_subvolume(
-            slot_path, config.worktrees_image.slot_quota_bytes
-        )
+        # Mirror born-in-image git provisioning: bind layout creates the
+        # subvolume inside the image and binds it at the slot path.
+        if config.worktrees_image.direct:
+            if args.slot_type == "validate":
+                worktreesimage.ensure_validate_bind(config.worktrees)
+            worktreesimage.create_slot_subvolume(
+                slot_path, config.worktrees_image.slot_quota_bytes
+            )
+        else:
+            mount_dir = worktreesimage.image_mount_dir(config.control)
+            worktreesimage.create_slot_subvolume(
+                mount_dir / args.slot, config.worktrees_image.slot_quota_bytes
+            )
+            worktreesimage.bind_slot(config.control, mount_dir, args.slot, slot_path)
     else:
         slot_path.mkdir()
     config_dir = slot_path / ".eden-state"
@@ -34822,9 +34850,44 @@ def _provision_eden_slot(
             _eden_runner, str(config_dir), backing, str(mount), rev_map.get(name)
         )
         for item in redirections:
-            if not eden.is_inside(item.target, str(slot_path)):
+            if eden.is_inside(item.target, str(slot_path)):
+                continue
+            # The daemon derives targets under host scratch. Retarget by
+            # replacing the fresh derived directory with a symlink into
+            # the slot, then let fixup bind from inside the image.
+            derived = Path(item.target)
+            try:
+                if derived.is_symlink():
+                    derived.unlink()
+                elif derived.exists():
+                    derived.rmdir()
+            except OSError as exc:
+                raise Refusal(
+                    f"redirection {item.repo_path} target escapes the slot and "
+                    f"is not a fresh empty directory: {item.target}"
+                ) from exc
+            in_slot = slot_path / f"{item.repo_path}-target"
+            in_slot.mkdir(exist_ok=True)
+            _eden_runner(
+                ["eden", "--config-dir", str(config_dir), "redirect", "unmount",
+                 "--mount", str(mount)]
+            )
+            derived.symlink_to(in_slot, target_is_directory=True)
+            rc, _out, stderr = _eden_runner(
+                ["eden", "--config-dir", str(config_dir), "redirect", "fixup",
+                 "--mount", str(mount)]
+            )
+            if rc != 0:
+                raise Refusal(f"redirection fixup failed: {stderr.strip()}")
+            resolved = os.path.realpath(item.target)
+            if not eden.is_inside(resolved, str(slot_path)):
                 raise Refusal(
                     f"redirection {item.repo_path} target escapes the slot: {item.target}"
+                )
+            backed = Path(mount) / item.repo_path
+            if os.stat(backed).st_dev != os.stat(slot_path).st_dev:
+                raise Refusal(
+                    f"redirection {item.repo_path} is not backed by the slot image"
                 )
     except eden.EdenError as exc:
         raise Refusal(str(exc)) from exc

@@ -150,6 +150,63 @@ def test_eden_checkout_safe_proofs(tmp_path: Path) -> None:
         wrkslots_cli._assert_eden_checkout_safe(config, checkout, moved)
 
 
+def test_trial_record_shape_replays(tmp_path: Path) -> None:
+    """Replay of the exact edentrial record main rejected (#1204)."""
+
+    slot_dir = tmp_path / "worktrees" / "validate" / "edentrial"
+    (slot_dir / "checkout").mkdir(parents=True)
+    config = wrkslots_cli.Config(
+        config_path=tmp_path / ".wrkslots.yml",
+        root=tmp_path,
+        worktrees=tmp_path / "worktrees",
+        control=tmp_path / "worktrees",
+        machine="node-a",
+        default_remote="origin",
+        default_landed_ref="refs/remotes/origin/main",
+        heartbeat_ttl_seconds=60,
+        liveness_command=tmp_path / "live.py",
+        layout="flat",
+    )
+    record = wrkslots_cli.ActiveRecord(
+        slot="edentrial",
+        agent="mu-eden",
+        task="eden-trial",
+        purpose="trial",
+        slot_type="validate",
+        machine="node-a",
+        generation=1,
+        created_at="2026-11-12T00:00:00Z",
+        heartbeat_at="2026-11-12T00:00:00Z",
+        heartbeat_ttl_seconds=60,
+        owner=None,
+        coordinator_lease=wrkslots_cli.ProcessIdentity(
+            pid=1, start_ticks=1, boot_id="boot", host_id="host", cgroup_path="/"
+        ),
+        coordinator_recovery_note=None,
+        handoff=None,
+        checkouts=(
+            wrkslots_cli.Checkout(
+                name="main",
+                path="worktrees/validate/edentrial/checkout",
+                repository="/home/newton/local/.eden-backing-repos/fbsource",
+                branch=eden.EDEN_BRANCH,
+                start_point=REV,
+                remote=eden.EDEN_REMOTE,
+                remote_url_sha256=DIGEST,
+                landed_ref=eden.EDEN_LANDED_REF,
+                head=REV,
+                containing_remote_refs=(),
+                vcs="eden",
+            ),
+        ),
+    )
+    parsed = wrkslots_cli._record_from_obj(
+        wrkslots_cli._record_to_obj(record), "replay.record"
+    )
+    assert parsed.checkouts[0].vcs == "eden"
+    wrkslots_cli._assert_record_paths(config, parsed)
+
+
 def test_provision_clone_info_redirects() -> None:
     calls: list[tuple[str, ...]] = []
 
