@@ -951,7 +951,17 @@ pub(crate) fn render_settings_json(settings: &SandboxSettings) -> String {
 /// `(exit, stdout, stderr)` byte-identical to the Python edition,
 /// whose settings validation failure is a load refusal (exit 3).
 pub(crate) fn sandbox_show_config(raw_section: Option<&Value>) -> (i32, String, String) {
-    let settings = match raw_section {
+    sandbox_show_config_ordered(raw_section, &[])
+}
+
+/// `sandbox_show_config` with the configuration document's own
+/// `env` key order: the parsed section loses it (sorted maps), but
+/// Python renders env in document order, so the glue supplies it.
+pub(crate) fn sandbox_show_config_ordered(
+    raw_section: Option<&Value>,
+    env_order: &[String],
+) -> (i32, String, String) {
+    let mut settings = match raw_section {
         None => SandboxSettings::default(),
         Some(raw) => match settings_from_obj(raw) {
             Ok(settings) => settings,
@@ -966,6 +976,12 @@ pub(crate) fn sandbox_show_config(raw_section: Option<&Value>) -> (i32, String, 
             }
         },
     };
+    if !env_order.is_empty() {
+        let rank = |name: &str| env_order.iter().position(|seen| seen == name);
+        settings
+            .env
+            .sort_by_key(|(name, _)| rank(name).unwrap_or(usize::MAX));
+    }
     (0, render_settings_json(&settings), String::new())
 }
 

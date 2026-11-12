@@ -1328,6 +1328,22 @@ fn is_executable(path: &Path) -> bool {
 
 /// Validate the project at `root` (or discovered from the cwd) and return
 /// the normalized configuration document.
+/// One top-level section of the raw configuration document,
+/// unvalidated and unnormalized, for dispatch glue that feeds a
+/// handler its raw input (for example the `sandbox` section).
+pub(crate) fn raw_section(root: Option<&Path>, key: &str) -> Result<Option<Value>> {
+    let root = discover_root(root)?;
+    let path = root.join(".wrkslots.yml");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read configuration {}: {error}", path.display()))?;
+    let (document, _format) = yamlconfig::load_document(&text)
+        .map_err(|error| format!("configuration is malformed: {}: {error}", path.display()))?;
+    let raw = document
+        .as_object()
+        .ok_or_else(|| format!("configuration must be a mapping: {}", path.display()))?;
+    Ok(raw.get(key).cloned())
+}
+
 pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -> Result<Value> {
     let root = discover_root(root)?;
     let path = root.join(".wrkslots.yml");

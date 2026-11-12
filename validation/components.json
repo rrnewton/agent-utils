@@ -476,6 +476,7 @@
         "py/wrkslots/tests/test_retire_lock_scope.py",
         "py/wrkslots/tests/test_sandbox_cpu_quotas.py",
         "py/wrkslots/tests/test_sandbox_gate_deny.py",
+        "py/wrkslots/tests/test_sandbox_show_config_rust.py",
         "py/wrkslots/tests/test_scoped_journal_episodes.py",
         "py/wrkslots/tests/test_shared_submodules.py",
         "py/wrkslots/tests/test_shell_command_cli_rust.py",

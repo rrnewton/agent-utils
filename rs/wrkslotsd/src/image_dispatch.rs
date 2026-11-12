@@ -229,6 +229,94 @@ fn wt_report(
     Ok(Some(report))
 }
 
+/// The `env` key order inside the top-level `sandbox` section of
+/// a configuration document, for documents in block style. The
+/// strict YAML subset nests by indentation; only the first mapping
+/// level under `env:` is collected. Flow style yields no order and
+/// the handler's sorted order stands.
+fn sandbox_env_order(text: &str) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut sandbox_indent: Option<usize> = None;
+    let mut env_indent: Option<usize> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        let key = trimmed
+            .split_once(':')
+            .map(|(name, _)| name.trim().trim_matches(['"', '\'']))
+            .unwrap_or_default();
+        match sandbox_indent {
+            None => {
+                if indent == 0 && key == "sandbox" {
+                    sandbox_indent = Some(indent);
+                }
+            }
+            Some(base) => {
+                if indent <= base && key != "sandbox" {
+                    break;
+                }
+                match env_indent {
+                    None => {
+                        if key == "env" && indent > base {
+                            if let Some(flow) = trimmed
+                                .split_once(':')
+                                .map(|(_, rest)| rest.trim())
+                                .filter(|rest| rest.starts_with('{'))
+                            {
+                                for part in flow.trim_matches(['{', '}']).split(',') {
+                                    if let Some((name, _)) = part.split_once(':') {
+                                        let name =
+                                            name.trim().trim_matches(['"', '\'']).to_string();
+                                        if !name.is_empty() {
+                                            order.push(name);
+                                        }
+                                    }
+                                }
+                                return order;
+                            }
+                            env_indent = Some(indent);
+                        }
+                    }
+                    Some(env_base) => {
+                        if indent <= env_base {
+                            break;
+                        }
+                        if !key.is_empty() {
+                            order.push(key.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    order
+}
+
+/// `wrkslots sandbox show-config`: validate through the config
+/// loader, then hand the raw `sandbox` section to the handler
+/// with the document's own env order.
+pub(crate) fn sandbox_show_config_cli(
+    root: Option<&Path>,
+    machine: Option<&str>,
+) -> Result<(i32, String, String)> {
+    let config = crate::config_validate::load_config(root, machine)?;
+    let raw = crate::config_validate::raw_section(root, "sandbox")?;
+    let text = std::fs::read_to_string(PathBuf::from(
+        config
+            .get("config_path")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    ))
+    .unwrap_or_default();
+    Ok(crate::sandbox_state::sandbox_show_config_ordered(
+        raw.as_ref(),
+        &sandbox_env_order(&text),
+    ))
+}
+
 /// `wrkslots image status`: load the config, derive live mount
 /// facts, and run the pure handler. Config errors use the native
 /// error form, like the other reader commands.
