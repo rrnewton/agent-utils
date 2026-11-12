@@ -526,7 +526,7 @@ test("`#886 voice-page-autoplay`: on, a read heard to its end goes on to the nex
   const heard = async () => { await page.players.at(-1).end(); await page.settle(); };
   // Off by default: a read heard to its end reads nothing after it. Message 2 is read now.
   assert.equal(page.el("read-autoplay").getAttribute("aria-pressed"), "false", "Autoplay is on by default");
-  assert.equal(page.el("autoplay-toggle-label").text(), "Autoplay: off");
+  assert.equal(page.el("autoplay-toggle-label").text(), "Autoplay");
   await rows[1].dispatch("click", {});
   await page.settle();
   await heard();
@@ -537,7 +537,7 @@ test("`#886 voice-page-autoplay`: on, a read heard to its end goes on to the nex
   await page.settle();
   assert.equal(page.el("action-menu").hidden, true, "choosing Autoplay left the menu open");
   assert.equal(page.el("read-autoplay").getAttribute("aria-pressed"), "true", "the strip's toggle does not say Autoplay is on");
-  assert.equal(page.el("autoplay-toggle-label").text(), "Autoplay: on");
+  assert.equal(page.el("autoplay-toggle-label").text(), "Autoplay");
   assert.equal(page.storage.get("vibe-talk.voice.autoplay"), "1", "Autoplay on is not kept");
   // 1 goes on past the read 2 to 3, and 3 to 4; after 4 nothing is unread below, and nothing more is read.
   await page.el("discord-log").children[0].dispatch("click", {});
@@ -554,11 +554,11 @@ test("`#886 voice-page-autoplay`: on, a read heard to its end goes on to the nex
   const again = newPage(page.storage);
   await signIn(again);
   assert.equal(again.el("read-autoplay").getAttribute("aria-pressed"), "true", "a reload forgot Autoplay");
-  assert.equal(again.el("autoplay-toggle-label").text(), "Autoplay: on");
+  assert.equal(again.el("autoplay-toggle-label").text(), "Autoplay");
   // Off from the strip's own toggle.
   await again.el("read-autoplay").click();
   assert.equal(again.storage.get("vibe-talk.voice.autoplay"), "0");
-  assert.equal(again.el("autoplay-toggle-label").text(), "Autoplay: off");
+  assert.equal(again.el("autoplay-toggle-label").text(), "Autoplay");
 });
 
 test("`#886 voice-page-autoplay`: Stop ends the going on, and a read the reader starts goes on from where it is", async () => {

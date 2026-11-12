@@ -1148,12 +1148,12 @@ test("the read toggle cycles Show read and Fold read, names each, and keeps it (
   const page = newPage();
   await signIn(page);
   await showDiscord(page, backlog());
-  assert.deepStrictEqual(readModeSaid(page), ["Show read", "false", "show"], "the default is not Show read");
-  assert.equal(page.el("todo-filter").getAttribute("aria-label"), "Show read. Tap for Fold read");
+  assert.deepStrictEqual(readModeSaid(page), ["Fold read", "false", "show"], "the default is not Fold read off");
+  assert.equal(page.el("todo-filter").getAttribute("aria-label"), "Fold read");
   const steps = [
-    [["Fold read", "mixed", "fold"], "fold", false, "Fold read. Tap for Show read"],
-    [["Show read", "false", "show"], "show", false, "Show read. Tap for Fold read"],
-    [["Fold read", "mixed", "fold"], "fold", false, "Fold read. Tap for Show read"],
+    [["Fold read", "true", "fold"], "fold", false, "Fold read"],
+    [["Fold read", "false", "show"], "show", false, "Fold read"],
+    [["Fold read", "true", "fold"], "fold", false, "Fold read"],
   ];
   for (const [said, read, todo, name] of steps) {
     await page.el("todo-filter").click();
@@ -1168,9 +1168,9 @@ test("the read toggle cycles Show read and Fold read, names each, and keeps it (
   // Kept across a reload (the steps above left it on Fold read).
   const reopened = reloadWith(page.storage, backlog());
   await reopenedChannel(reopened);
-  assert.deepStrictEqual(readModeSaid(reopened), ["Fold read", "mixed", "fold"], "a reload lost Fold read");
+  assert.deepStrictEqual(readModeSaid(reopened), ["Fold read", "true", "fold"], "a reload lost Fold read");
   // A record from before the modes says only Hide read or not, and means what it meant.
-  for (const [todo, said] of [[true, ["Fold read", "mixed", "fold"]], [false, ["Show read", "false", "show"]]]) {
+  for (const [todo, said] of [[true, ["Fold read", "true", "fold"]], [false, ["Fold read", "false", "show"]]]) {
     const record = { ...savedUiState(reopened), todo };
     delete record.read;
     reopened.storage.set(UI_STATE_KEY, JSON.stringify(record));

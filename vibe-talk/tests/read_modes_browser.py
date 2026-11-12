@@ -2,8 +2,8 @@
 """Enter a thread with a long read run in real Chromium, in each read mode, at a phone's size and a desk's.
 
 `#221 read-modes`. The owner opens a thread to read the agent's answer. The page lands on the
-thread's first unread message, unfolded, under the floating pill; and the Hide read button cycles
-Show read, Fold read and Hide read. The fake-DOM suite pins every branch. This proves what only a
+thread's first unread message, unfolded, under the floating pill; and the Fold read toggle is binary
+Show read (off) and Fold read (on), its label fixed. The fake-DOM suite pins every branch. This proves what only a
 browser engine can: where the rows really are once laid out, that the "… N read messages …" line is
 a real 44px target drawn in place of a row's tile, and that a real tap on it opens the run without
 moving the reader.
@@ -21,9 +21,9 @@ touch) and 1280x800 (a desk, mouse) the walk is:
   one line "… 45 read messages …" at least 44px tall and every point of it pressing it, the answer
   unfolded below in the upper half of the screen -> tap the line: the run opens where it is, the
   root unmoved, no message given the focus -> enter again and press Enter on the line: the run
-  opens with the keyboard's focus on its first message -> tap the button on to Hide read and enter
+  opens with the keyboard's focus on its first message -> tap the button back to Show read and enter
   again: the first row is the answer, unfolded, under the pill -> `#222 unread-replies`: pick Main,
-  still in Hide read: the owner's question, read as his own words, is kept because four of its
+  in Show read: the owner's question, read as his own words, is kept because four of its
   replies are unread, and says "4 unread" in the accent beside its "52 replies", on one line, over
   the veil its read row is faded under; the longest words the two chips take ("about 52 replies"
   beside "12+ unread", "120 new") keep each chip on one line inside the row, side by side -> tap
@@ -552,34 +552,37 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
                                timeout=10_000)
 
     def cycle_to(label: str) -> None:
+        # `#1399`: the label is fixed ("Fold read"); the mode is the button's own attribute.
+        wanted = {"Show read": "show", "Fold read": "fold"}[label]
+
         def named() -> object:
-            return page.evaluate("() => document.getElementById('todo-filter-label').textContent")
+            return page.evaluate("() => document.getElementById('todo-filter').dataset.readMode")
 
         for _tap in range(3):
-            if named() == label:
+            if named() == wanted:
                 return
             was = named()
             tap_read_mode(page, touch)
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline and named() == was:
                 page.wait_for_timeout(25)
-        check(named() == label, f"the cycle never reached {label}")
+        check(named() == wanted, f"the cycle never reached {label}")
 
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
     page.wait_for_function("() => !document.getElementById('screen-main').hidden", timeout=10_000)
     page.click("#view-switch")
     page.wait_for_function("() => document.querySelectorAll('#discord-log > li').length > 10", timeout=10_000)
-    page.wait_for_function("() => document.getElementById('todo-filter-label').textContent === 'Show read'",
+    page.wait_for_function("() => document.getElementById('todo-filter').dataset.readMode === 'show'",
                            timeout=10_000)
 
     # Show read, the default: the entry lands on the answer, unfolded, under the pill.
     m = measure(page)
-    check(m["mode"] == ["Show read", "false", "show"], f"{size}: the button does not start on Show read: {m['mode']}")
+    check(m["mode"] == ["Fold read", "false", "show"], f"{size}: the button does not start with Fold read off: {m['mode']}")
     check(m["icons"] == ["show"], f"{size}: Show read draws icons {m['icons']}")
-    dock_holds(m, "Show read")
+    dock_holds(m, "Fold read")
     tap(page, "#action-menu-open", touch)
-    check(measure(page)["labelFits"] is True and measure(page)["labelLines"] == 1, f"{size}: the words 'Show read' touch or cross the button's sides")
+    check(measure(page)["labelFits"] is True and measure(page)["labelLines"] == 1, f"{size}: the words 'Fold read' touch or cross the button's sides")
     page.keyboard.press("Escape")
     m = settled_entry()
     floating = number(m, "floating")
@@ -597,7 +600,7 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     back_to_all()
     cycle_to("Fold read")
     m = measure(page)
-    check(m["mode"] == ["Fold read", "mixed", "fold"], f"{size}: Fold read is said as {m['mode']}")
+    check(m["mode"] == ["Fold read", "true", "fold"], f"{size}: Fold read is said as {m['mode']}")
     check(m["icons"] == ["fold"], f"{size}: Fold read draws icons {m['icons']}")
     dock_holds(m, "Fold read")
     tap(page, "#action-menu-open", touch)
@@ -665,28 +668,13 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     check(abs(moved) <= 1, f"{size}: opening the run from the keyboard moved the root by {moved:.1f}px")
     notes.append("Enter on the line opened the run with the focus on its first message")
 
-    # Hide read: the read messages are left out, and the entry lands on the answer.
+    # Back to Show read for Main: every row drawn, the kept question among them.
     back_to_all()
-    cycle_to("Hide read")
+    cycle_to("Show read")
     m = measure(page)
-    check(m["mode"] == ["Hide read", "true", "hide"], f"{size}: Hide read is said as {m['mode']}")
-    check(m["icons"] == ["hide"], f"{size}: Hide read draws icons {m['icons']}")
-    dock_holds(m, "Hide read")
-    tap(page, "#action-menu-open", touch)
-    check(measure(page)["labelFits"] is True and measure(page)["labelLines"] == 1, f"{size}: the words 'Hide read' touch or cross the button's sides")
-    page.keyboard.press("Escape")
-    m = settled_entry()
-    check(m["firstShown"] == ANSWER_ID, f"{size}: Hide read's thread starts at {m['firstShown']}, not the answer")
-    check(m["answerFolded"] == "false", f"{size}: Hide read's answer is folded")
-    floating = number(m, "floating")
-    top = number(m, "answer", "start")
-    check(floating <= top <= floating + 16,
-          f"{size}: Hide read landed the answer at {top:.0f}px, not just under the floating line at {floating:.0f}px"
-          f"{' (the list is at its end)' if m['atEnd'] else ''}")
-    notes.append(f"Hide read: the thread starts at the answer, unfolded at {top:.0f}px under the pill at {floating:.0f}px")
-    shot("4-hide-read-entry")
+    check(m["mode"] == ["Fold read", "false", "show"], f"{size}: Show read is said as {m['mode']}")
 
-    # `#222 unread-replies`: Main, still in Hide read. The owner's question is read, and kept.
+    # `#222 unread-replies`: Main, in Show read. The owner's question is read, and kept.
     page.select_option("#thread-select", "main")
     page.wait_for_function(
         f"() => !!document.querySelector('#discord-log > li[data-id=\"{ROOT_ID}\"] > .thread-unread:not([hidden])')",
@@ -698,8 +686,8 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     check(isinstance(main_js, dict), f"{size}: Main measured nothing: {main_js!r}")
     assert isinstance(main_js, dict)
     mm = {str(key): value for key, value in main_js.items()}
-    check(mm["shown"] == ["7600000000000000001", ROOT_ID],
-          f"{size}: Hide read on Main draws {mm['shown']}, not the agent's update and the kept question")
+    check(mm["shown"] == ["7600000000000000001", "7600000000000000002", ROOT_ID],
+          f"{size}: Show read on Main draws {mm['shown']}, not every Main row")
     check(mm["text"] == "4 unread", f"{size}: the question's unread count says {mm['text']!r}")
     check(mm["label"] == "Open this thread at its first unread reply, 4 unread replies",
           f"{size}: the count's accessible name is {mm['label']!r}")
@@ -720,7 +708,7 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
     check(chip_box["right"] <= row_box["right"], f"{size}: the count runs past its row: {chip_box} in {row_box}")
     check(mm["chipPressable"] is True, f"{size}: the middle of the count does not press it")
     check(number(mm, "overflow") <= 0, f"{size}: Main scrolls sideways by {number(mm, 'overflow'):.0f}px")
-    notes.append(f"Main, Hide read: the read question kept, '4 unread' beside '52 replies' at {chip_box['top']:.0f}px, "
+    notes.append(f"Main, Show read: the read question kept, '4 unread' beside '52 replies' at {chip_box['top']:.0f}px, "
                  f"{chip_box['width']:.0f}x{chip_box['height']:.0f}px, in the accent over the veil")
     shot("4b-main-unread-replies")
     pairs_js: object = page.evaluate(LONG_PAIRS_JS, [ROOT_ID, [list(pair) for pair in LONG_PAIRS]])
@@ -747,7 +735,7 @@ def walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed: dict
         f"() => {{ const row = document.querySelector('#discord-log > li[data-id=\"{ANSWER_ID}\"]');"
         " return row && row.dataset.collapsed === 'false'; }", timeout=10_000)
     m = stable_measure()
-    check(m["firstShown"] == ANSWER_ID, f"{size}: the count opened the thread at {m['firstShown']}, not the answer")
+    check(m["firstShown"] == ROOT_ID, f"{size}: the count opened the thread at {m['firstShown']}, not its root")
     floating = number(m, "floating")
     top = number(m, "answer", "start")
     check(floating <= top <= floating + 16,
@@ -773,7 +761,7 @@ def held_walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed:
             page.screenshot(path=str(shots / f"read-modes-{size}-{name}.png"))
 
     def named() -> object:
-        return page.evaluate("() => document.getElementById('todo-filter-label').textContent")
+        return page.evaluate("() => document.getElementById('todo-filter').dataset.readMode")
 
     page.fill("#api-token", TOKEN)
     page.click("#save-token")
@@ -783,11 +771,11 @@ def held_walk(page: Page, touch: bool, size: str, shots: Path | None, collapsed:
                            timeout=10_000)
     page.wait_for_timeout(300)
     for _tap in range(3):
-        if named() == "Fold read":
+        if named() == "fold":
             break
         tap_read_mode(page, touch)
         page.wait_for_timeout(250)
-    check(named() == "Fold read", f"{size}: the cycle never reached Fold read")
+    check(named() == "fold", f"{size}: the cycle never reached Fold read")
 
     # All's window does not reach the root, so the picker offers the thread once a touch has read the
     # channel's thread list, as it does for a thumb.
