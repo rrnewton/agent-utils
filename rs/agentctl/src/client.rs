@@ -245,8 +245,9 @@ pub(crate) fn live_custom_process(pid: u64) -> Result<LiveCustomProcess> {
     // A process mid-exec (a pane shell entering its slot box, a launcher
     // chain) can yield one incoherent /proc observation, including a
     // truncated stat read; observe stably like the headless callers
-    // (#1221, #1403) instead of refusing on that single look.
-    agent_queue::identity::observe_stable(pid, Duration::from_secs(2)).map_err(identity_error)
+    // (#1221, #1403) instead of refusing on that single look. Five
+    // seconds covers a throttled exec chain inside a CPU-contained gate.
+    agent_queue::identity::observe_stable(pid, Duration::from_secs(5)).map_err(identity_error)
 }
 
 /// Read the argument vector of one pinned process generation, or `None`; see

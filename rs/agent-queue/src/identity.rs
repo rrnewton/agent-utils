@@ -199,10 +199,25 @@ pub fn parse_process_stat(value: &[u8], expected_pid: u64) -> Result<ProcessStat
 }
 
 /// Read and parse `/proc/PID/stat`.
+///
+/// A process exiting or exec'ing during the read can yield one truncated
+/// generation of the file, which parses as malformed; re-read briefly
+/// before reporting that (#1403). A vanished pid keeps its read error.
 pub fn read_process_stat(pid: u64) -> Result<ProcessStat> {
     let path = PathBuf::from(format!("/proc/{pid}/stat"));
-    let value = bounded_file(&path, PROC_STAT_BYTES, "process stat")?;
-    parse_process_stat(&value, pid)
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let value = bounded_file(&path, PROC_STAT_BYTES, "process stat")?;
+        match parse_process_stat(&value, pid) {
+            Ok(stat) => return Ok(stat),
+            Err(error) if attempt < 10 => {
+                let _ = error;
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// The process group and start time of a live, non-zombie `pid`.
