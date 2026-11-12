@@ -1,12 +1,13 @@
 ---
 title: 'agent-purpose-line: a one-line description of what an agent is for'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 labels:
 - agentctl
 created_at: 2026-11-12T11:45:00+00:00
-updated_at: 2026-11-12T11:45:00+00:00
+updated_at: 2026-11-12T23:10:00+00:00
+closed_at: 2026-11-12T23:10:00+00:00
 ---
 
 # Description
