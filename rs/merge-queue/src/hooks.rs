@@ -38,6 +38,161 @@ use serde_json::{json, Value};
 use crate::model::{now, NotifyMode};
 use crate::state::HooksConfig;
 
+/// Seconds after the last consumer heartbeat touch at which the hook
+/// consumer counts as stale when the config names none (#1358).
+pub const DEFAULT_CONSUMER_MAX_AGE_SECS: u64 = 300;
+
+/// Liveness verdict for the declared hook consumer (#1358).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConsumerState {
+    /// No consumer declared (`hooks.consumer_heartbeat` empty).
+    NotDeclared,
+    /// Heartbeat touched within the allowed age.
+    Fresh,
+    /// Heartbeat older than the allowed age, or never touched.
+    Stale,
+}
+
+/// The hook consumer's health, as `status` reports it (#1358).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ConsumerHealth {
+    /// Verdict.
+    pub state: ConsumerState,
+    /// Seconds since the heartbeat was last touched, when it ever was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub age_secs: Option<u64>,
+    /// Hook log lines recorded after the last heartbeat touch.
+    pub events_after: usize,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
+/// The declared consumer's heartbeat file, resolved against the state
+/// directory when relative. `None` when no consumer is declared.
+fn heartbeat_path(state: &Path, config: &HooksConfig) -> Option<PathBuf> {
+    if config.consumer_heartbeat.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(&config.consumer_heartbeat);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        state.join(path)
+    })
+}
+
+/// Hook log lines in `<state>/hooks.jsonl` whose `at` is after `since`
+/// (RFC 3339 UTC strings compare lexicographically), excluding stale
+/// warnings themselves.
+fn events_after(state: &Path, since_rfc3339: &str) -> usize {
+    let Ok(text) = std::fs::read_to_string(state.join("hooks.jsonl")) else {
+        return 0;
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|value| value["event"].as_str() != Some("consumer-stale"))
+        .filter(|value| value["at"].as_str().is_some_and(|at| at > since_rfc3339))
+        .count()
+}
+
+/// The hook consumer's health at `now_unix` (#1358): fresh, stale (with
+/// how many hook events were emitted after the last heartbeat), or not
+/// declared. A declared heartbeat that was never touched is stale with
+/// every logged event counted.
+pub fn consumer_health(state: &Path, config: &HooksConfig, now_unix: u64) -> ConsumerHealth {
+    let Some(path) = heartbeat_path(state, config) else {
+        return ConsumerHealth {
+            state: ConsumerState::NotDeclared,
+            age_secs: None,
+            events_after: 0,
+        };
+    };
+    let max_age = if config.consumer_max_age_seconds == 0 {
+        DEFAULT_CONSUMER_MAX_AGE_SECS
+    } else {
+        config.consumer_max_age_seconds
+    };
+    let touched = std::fs::metadata(&path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    let Some(touched) = touched else {
+        return ConsumerHealth {
+            state: ConsumerState::Stale,
+            age_secs: None,
+            events_after: events_after(state, ""),
+        };
+    };
+    let age = now_unix.saturating_sub(touched);
+    let since = chrono::DateTime::from_timestamp(touched as i64, 0)
+        .map(|at| at.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_default();
+    ConsumerHealth {
+        state: if age <= max_age {
+            ConsumerState::Fresh
+        } else {
+            ConsumerState::Stale
+        },
+        age_secs: Some(age),
+        events_after: events_after(state, &since),
+    }
+}
+
+/// Warn once per stale episode — once per heartbeat value — when a hook
+/// runs while the declared consumer is stale (#1358): one line in
+/// `hooks.jsonl` and one on stderr, not one per event.
+fn warn_consumer_stale_once(state: &Path, config: &HooksConfig) {
+    use std::sync::Mutex;
+    static WARNED: Mutex<std::collections::BTreeSet<(PathBuf, Option<u64>)>> =
+        Mutex::new(std::collections::BTreeSet::new());
+    let health = consumer_health(state, config, unix_now());
+    if health.state != ConsumerState::Stale {
+        return;
+    }
+    let key = heartbeat_path(state, config).map(|path| {
+        let touched = std::fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|mtime| mtime.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        (path, touched)
+    });
+    {
+        let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(key) = key {
+            if !warned.insert(key) {
+                return;
+            }
+        }
+    }
+    let detail = match health.age_secs {
+        Some(age) => format!(
+            "hook consumer stale: heartbeat {age}s old, {} hook event(s) since it",
+            health.events_after
+        ),
+        None => format!(
+            "hook consumer stale: heartbeat never touched, {} hook event(s) logged",
+            health.events_after
+        ),
+    };
+    eprintln!("merge-queue: {detail}");
+    log_line(
+        state,
+        &json!({
+            "schema": HOOK_LOG_SCHEMA, "event": "consumer-stale", "pr": 0,
+            "at": now(), "exit": "warning", "elapsed_ms": 0,
+            "stdout_tail": "", "stderr_tail": detail,
+        }),
+    );
+}
+
 /// Payload schema.
 pub const HOOK_SCHEMA: &str = "merge-queue-hook/v1";
 /// Log schema (one line per finished hook in `<state>/hooks.jsonl`).
@@ -142,6 +297,7 @@ pub fn fire(state: &Path, config: &HooksConfig, event: &str, mut payload: Value)
     let Some(command) = config.command_for(event) else {
         return;
     };
+    warn_consumer_stale_once(state, config);
     payload["schema"] = json!(HOOK_SCHEMA);
     payload["event"] = json!(event);
     if payload.get("at").is_none() {
@@ -396,6 +552,90 @@ mod tests {
             "on_land",
             "lane"
         ));
+    }
+
+    fn consumer_config(heartbeat: &str, max_age: u64) -> HooksConfig {
+        HooksConfig {
+            on_land: "true".to_owned(),
+            consumer_heartbeat: heartbeat.to_owned(),
+            consumer_max_age_seconds: max_age,
+            ..HooksConfig::default()
+        }
+    }
+
+    fn touched_secs(path: &Path) -> u64 {
+        std::fs::metadata(path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[test]
+    fn consumer_health_covers_fresh_stale_and_undeclared() {
+        // #1358 pr-router-stale-drainer (generic status surface).
+        let state = temp_state("consumer-health");
+        // Not declared.
+        let health = consumer_health(&state, &HooksConfig::default(), unix_now());
+        assert_eq!(health.state, ConsumerState::NotDeclared);
+        // Declared, freshly touched: fresh.
+        std::fs::write(state.join("consumer.hb"), "").unwrap();
+        let cfg = consumer_config("consumer.hb", 300);
+        let touched = touched_secs(&state.join("consumer.hb"));
+        let health = consumer_health(&state, &cfg, touched + 10);
+        assert_eq!(health.state, ConsumerState::Fresh, "{health:?}");
+        assert_eq!(health.age_secs, Some(10));
+        // Stale, with events after the heartbeat counted and older ones not.
+        let since = chrono::DateTime::from_timestamp(touched as i64, 0)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        let after = chrono::DateTime::from_timestamp(touched as i64 + 60, 0)
+            .unwrap()
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string();
+        log_line(
+            &state,
+            &json!({"schema": HOOK_LOG_SCHEMA, "event": "on_land", "at": since}),
+        );
+        log_line(
+            &state,
+            &json!({"schema": HOOK_LOG_SCHEMA, "event": "on_land", "at": after}),
+        );
+        let health = consumer_health(&state, &cfg, touched + 10_000);
+        assert_eq!(health.state, ConsumerState::Stale, "{health:?}");
+        assert_eq!(health.age_secs, Some(10_000));
+        assert_eq!(health.events_after, 1, "{health:?}");
+        // Stale with no events after it.
+        let state2 = temp_state("consumer-no-events");
+        std::fs::write(state2.join("consumer.hb"), "").unwrap();
+        let touched2 = touched_secs(&state2.join("consumer.hb"));
+        let health = consumer_health(&state2, &cfg, touched2 + 10_000);
+        assert_eq!(health.state, ConsumerState::Stale);
+        assert_eq!(health.events_after, 0);
+        // Declared but never touched: stale, all events counted.
+        let health = consumer_health(&state2, &consumer_config("missing.hb", 300), touched2);
+        assert_eq!(health.state, ConsumerState::Stale);
+        assert_eq!(health.age_secs, None);
+        let _ = std::fs::remove_dir_all(&state);
+        let _ = std::fs::remove_dir_all(&state2);
+    }
+
+    #[test]
+    fn a_stale_consumer_warns_once_per_episode() {
+        let state = temp_state("consumer-warn");
+        let cfg = consumer_config("missing.hb", 300);
+        fire(&state, &cfg, "on_land", json!({"pr": 1}));
+        fire(&state, &cfg, "on_land", json!({"pr": 2}));
+        let text = std::fs::read_to_string(state.join("hooks.jsonl")).unwrap();
+        let warnings = text
+            .lines()
+            .filter(|line| line.contains("\"consumer-stale\""))
+            .count();
+        assert_eq!(warnings, 1, "{text}");
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]

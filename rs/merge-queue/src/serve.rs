@@ -1823,6 +1823,10 @@ pub struct StatusReport {
     /// Human remedy when the daemon or the queue is not healthy.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub remedy: String,
+    /// Hook consumer liveness, when the hooks config declares one
+    /// (#1358): fresh, stale (with events emitted since the heartbeat),
+    /// or not declared.
+    pub hook_consumer: crate::hooks::ConsumerHealth,
 }
 
 impl StatusReport {
@@ -2005,6 +2009,14 @@ pub fn collect_status(state: &State, stale_after_secs: u64) -> Result<StatusRepo
         waiting: crate::model::waiting_changes(&items),
         items_error,
         remedy,
+        hook_consumer: state
+            .config()
+            .map(|config| crate::hooks::consumer_health(&state.root, &config.hooks, unix_now()))
+            .unwrap_or(crate::hooks::ConsumerHealth {
+                state: crate::hooks::ConsumerState::NotDeclared,
+                age_secs: None,
+                events_after: 0,
+            }),
     })
 }
 
@@ -2160,6 +2172,27 @@ pub fn render_status(report: &StatusReport) -> String {
         "slots: {} in use / {} total\n",
         report.slots_in_use, report.slots_total
     ));
+    match report.hook_consumer.state {
+        crate::hooks::ConsumerState::NotDeclared => {
+            out.push_str("hook consumer: not declared\n");
+        }
+        crate::hooks::ConsumerState::Fresh => {
+            out.push_str(&format!(
+                "hook consumer: fresh (heartbeat {}s ago)\n",
+                report.hook_consumer.age_secs.unwrap_or(0)
+            ));
+        }
+        crate::hooks::ConsumerState::Stale => match report.hook_consumer.age_secs {
+            Some(age) => out.push_str(&format!(
+                "hook consumer: STALE (heartbeat {age}s ago, {} hook event(s) since)\n",
+                report.hook_consumer.events_after
+            )),
+            None => out.push_str(&format!(
+                "hook consumer: STALE (heartbeat never touched, {} hook event(s) logged)\n",
+                report.hook_consumer.events_after
+            )),
+        },
+    }
     let intake = &report.intake;
     if intake.pending > 0 {
         out.push_str(&format!(
@@ -2286,6 +2319,30 @@ mod unit {
         let report = collect_status(&state, 10).unwrap();
         assert!(!report.shadow);
         assert!(render_status(&report).contains("mode: live"));
+        let _ = std::fs::remove_dir_all(&state.root);
+    }
+
+    #[test]
+    fn status_reports_a_stale_hook_consumer() {
+        // #1358: declared consumer, heartbeat never touched, one event logged.
+        let state = temp_state("consumer-status");
+        let mut config = crate::state::Config::default();
+        config.hooks.consumer_heartbeat = "consumer.hb".to_owned();
+        config.hooks.consumer_max_age_seconds = 300;
+        state.init(&config).unwrap();
+        crate::hooks::log_line(
+            &state.root,
+            &serde_json::json!({"schema": "merge-queue-hook-log/v1", "event": "on_land", "at": "2999-01-01T00:00:00Z"}),
+        );
+        let report = collect_status(&state, 10).unwrap();
+        assert_eq!(
+            report.hook_consumer.state,
+            crate::hooks::ConsumerState::Stale,
+            "{report:?}"
+        );
+        assert_eq!(report.hook_consumer.events_after, 1);
+        let text = render_status(&report);
+        assert!(text.contains("hook consumer: STALE"), "{text}");
         let _ = std::fs::remove_dir_all(&state.root);
     }
 

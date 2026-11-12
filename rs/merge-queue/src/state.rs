@@ -1105,6 +1105,16 @@ pub struct HooksConfig {
     /// Seconds one hook may run before it is killed (0 means 30).
     #[serde(default)]
     pub timeout_secs: u64,
+    /// Path of the hook consumer's liveness file, when a consumer
+    /// declares one (#1358): the consumer touches it while it drains
+    /// hook events; the queue only reads it. Relative paths resolve
+    /// against the state directory. Empty: no consumer declared.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub consumer_heartbeat: String,
+    /// Seconds after the last heartbeat touch at which the consumer
+    /// counts as stale (0 means 300).
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub consumer_max_age_seconds: u64,
 }
 
 impl Default for HooksConfig {
@@ -1118,6 +1128,8 @@ impl Default for HooksConfig {
             on_intake_refused: String::new(),
             on_escalated: String::new(),
             timeout_secs: 30,
+            consumer_heartbeat: String::new(),
+            consumer_max_age_seconds: 0,
         }
     }
 }
