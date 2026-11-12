@@ -7653,7 +7653,7 @@ def check_state_controls() -> list[str]:
         # the order the phone shows it, which a desk row laid out in markup order could lose, and the
         # switch in its one corner (`paddingBottom`), which a row that carried it along could lose.
         "39-desktop-dock-channel": ("height <= 100", "r.height <= 40.5", "field-sizing",
-                                    "todo-filter,read-speed,read-aloud", "paddingBottom"),
+                                    "audio-source,read-speed,read-aloud", "paddingBottom"),
         "40-desktop-dock-call": ("height <= 100", "r.height <= 40.5", "speaker,clear-view,hang-up,talk",
                                  "paddingBottom"),
         # `#298 thread-card-header`. Pinned to the card SAYING its card's words (`__cardText`), to its
