@@ -70,7 +70,7 @@ def test_live_removal_journal_reports_busy_not_interrupted(
     # The interrupted remover has exited; put a live actor in its place.
     raw = json.loads(journal.read_text(encoding="utf-8"))
     raw["owner"] = _identity_obj(os.getpid())
-    cli._write_journal(config, raw)  # type: ignore[arg-type]
+    cli._write_journal(config, raw)
 
     with pytest.raises(cli._JournalBusy) as caught:
         cli._assert_no_journal(config)
@@ -116,7 +116,7 @@ def test_legacy_journal_without_actor_generation_gets_legacy_wording(
     # A journal from before the removing process was recorded (#1121).
     raw = json.loads(journal.read_text(encoding="utf-8"))
     del raw["owner"]
-    cli._write_journal(config, raw)  # type: ignore[arg-type]
+    cli._write_journal(config, raw)
 
     with pytest.raises(cli.Refusal) as caught:
         cli._assert_no_journal(config)
@@ -142,7 +142,7 @@ def test_wait_lock_waits_for_a_live_journal_then_proceeds(
         # finish journal, as a removal still deleting its tree would.
         raw = json.loads(journal_path.read_text(encoding="utf-8"))
         raw["owner"] = _identity_obj(sleeper.pid)
-        cli._write_journal(config, raw, journal_path=journal_path)  # type: ignore[arg-type]
+        cli._write_journal(config, raw, journal_path=journal_path)
 
         adopt = [
             "--project-root", str(project), "--wait-lock", "30",
@@ -165,7 +165,7 @@ def test_wait_lock_waits_for_a_live_journal_then_proceeds(
         assert journal_path.exists()
 
         # The journaled mutation finishes and clears its journal.
-        cli._clear_journal(config, raw, journal_path=journal_path)  # type: ignore[arg-type]
+        cli._clear_journal(config, raw, journal_path=journal_path)
 
         worker.join(timeout=30)
         assert not worker.is_alive()

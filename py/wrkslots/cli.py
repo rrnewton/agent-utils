@@ -33659,14 +33659,15 @@ def _journal_actor_identities(raw: Mapping[str, object]) -> list[ProcessIdentity
                 identities.append(identity)
         # A finish journal names the removing process as its owner (#1121,
         # #1367); ownerless journals name theirs inside the authorization.
+        authorization = raw.get("authorization")
+        authorization_actor = (
+            authorization.get("actor")
+            if isinstance(authorization, Mapping)
+            else None
+        )
         for candidate, label in (
             (raw.get("owner"), "journal.owner"),
-            (
-                raw.get("authorization", {}).get("actor")
-                if isinstance(raw.get("authorization"), Mapping)
-                else None,
-                "journal.authorization.actor",
-            ),
+            (authorization_actor, "journal.authorization.actor"),
         ):
             if isinstance(candidate, Mapping):
                 identity = _identity_from_obj(candidate, label)

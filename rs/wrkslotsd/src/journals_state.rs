@@ -207,7 +207,9 @@ fn identity_from_value(value: Option<&Value>) -> Option<crate::status_state::Ide
     })
 }
 
-fn journal_actor_identities(raw: &serde_json::Map<String, Value>) -> Vec<crate::status_state::Identity> {
+fn journal_actor_identities(
+    raw: &serde_json::Map<String, Value>,
+) -> Vec<crate::status_state::Identity> {
     let mut identities: Vec<crate::status_state::Identity> = Vec::new();
     let mut push = |value: Option<&Value>| {
         if let Some(identity) = identity_from_value(value) {
@@ -269,7 +271,11 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let month_prime = (5 * day_of_year + 2) / 153;
     let day = (day_of_year - (153 * month_prime + 2) / 5 + 1) as u32;
-    let month = if month_prime < 10 { month_prime + 3 } else { month_prime - 9 } as u32;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    } as u32;
     if month <= 2 {
         year += 1;
     }
