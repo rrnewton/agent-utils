@@ -725,7 +725,7 @@ test("catchup modes: closing a docked panel frees the column; reopening docks ag
     view.mountControls();
     view.open();
     await flush();
-    click(fx.els["discuss-mode-docked"]);
+    click(fx.els["discuss-dock-toggle"]);
     assert.equal(fx.els["screen-main"].getAttribute("data-discuss"), "docked");
     // Programmatic close: no reserved column, remembered mode kept.
     view.close();
