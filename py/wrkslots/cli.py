@@ -54890,6 +54890,7 @@ def _removal_salvage(
     salvage_archive_root: Path | None,
     archive_drifted: bool,
     archive_private_history: bool,
+    ignored_mode: _IgnoredMode = "refuse",
 ) -> tuple[tuple[dict[str, object], ...], tuple[str, ...]]:
     """Salvage one slot and describe it, lock-free or locked alike (#1287)."""
 
@@ -54962,6 +54963,7 @@ def _removal_salvage(
         drift_refusal=drift_refusal,
         owner_proven_dead=owner_proven_dead,
         archive_private_history=archive_private_history,
+        ignored_mode=ignored_mode,
     )
     evidence = tuple(
         f"checkout {item['checkout']}: {item['disposition']} commit "
