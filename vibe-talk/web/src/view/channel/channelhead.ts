@@ -14,7 +14,6 @@ export interface ChannelHeadDependencies {
   el(id: string): HTMLElement;
   readModes(): { hiding(): boolean };
   renderChannelSeam(summary: string): void;
-  todoSummary(): string;
   channelSummary(loaded: number, whole: boolean, name: string): string;
   olderPager(): { loadedIsWhole(more: unknown): boolean };
   olderPages(): { moreAbove: unknown };
@@ -48,10 +47,6 @@ export function createChannelHead(deps: ChannelHeadDependencies): ChannelHead {
    */
   function restateChannelSeam(): void {
     if (deps.el("channel-summary").children.length === 0) {
-      return;
-    }
-    if (deps.readModes().hiding()) {
-      deps.renderChannelSeam(deps.todoSummary());
       return;
     }
     deps.renderChannelSeam(

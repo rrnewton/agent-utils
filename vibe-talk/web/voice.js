@@ -935,7 +935,7 @@ const messagePreferences = mountMessagePreferences({
       } else if (hideEmptySwitch.on() && !readModes.hiding()) {
         regroupChannelRows();
       } else {
-        guardQuietly(() => (readModes.hiding() ? loadTodo : (options) => timelineView.loadDiscord(options))({ keepPosition: true, ownAct: true, readAs: "mutation" }))();
+        guardQuietly(() => timelineView.loadDiscord({ keepPosition: true, ownAct: true, readAs: "mutation" }))();
       }
   },
   applyCombineMessages: (on) => combineSwitch.apply(on),
@@ -1886,7 +1886,7 @@ const doneAct = createDoneAct({
   guardQuietly: (fn) => guardQuietly(fn), heldDonePart: (held, ids) => heldDonePart(/** @type {any} */ (held), /** @type {any} */ (ids)),
   hidingRead: () => hidingRead(), holdingMessage: (act) => holdingMessage(act), holdingReplyArrows: (act) => holdingReplyArrows(act),
   idsOf: (row) => idsOf(/** @type {any} */ (row)), inColumn: (column, act) => inColumn(/** @type {any} */ (column), act), inOtherColumn: (act) => inOtherColumn(act),
-  listState: () => listState(), listedMessages: () => listedMessages(), loadTodo: (options) => loadTodo(options),
+  listState: () => listState(), listedMessages: () => listedMessages(),
   markHeldDone: (ids, done, settles) => markHeldDone(/** @type {any} */ (ids), done, /** @type {any} */ (settles)), messageText: (m) => messageText(/** @type {any} */ (m)),
   nextUndoAt: () => nextUndoAt(), pinsView: () => pinsView(), readSpeaksFor: (payload, id) => readSpeaksFor(payload, id),
   refreshAfterLiveMutation: () => refreshAfterLiveMutation(), renderCachedTimeline: () => renderCachedTimeline(),
@@ -1898,12 +1898,12 @@ const doneAct = createDoneAct({
   sendBookmark: (staged, opts) => sendBookmark(staged, opts), settleHeldDone: (held, done) => settleHeldDone(/** @type {any} */ (held), done),
   singleDoneBump: (messages) => singleDoneBump(/** @type {any} */ (messages)), stageBookmark: (channel, to) => stageBookmark(/** @type {any} */ (channel), /** @type {any} */ (to)),
   syncUnreadReplies: () => syncUnreadReplies(), threadForMessageId: (id) => threadForMessageId(/** @type {any} */ (id)),
-  timeOf: (m, field) => timeOf(m, field), todoSummary: () => todoSummary(),
+  timeOf: (m, field) => timeOf(m, field),
   token: () => token(), tokenFingerprint: (t) => tokenFingerprint(t),
   undoLabel: (d) => undoLabel(d), undoName: (text) => undoName(text),
   voiceTranscript: () => voiceTranscript(), writeInBatches: (route, ids, landed) => writeInBatches(route, ids, landed),
 });
-const { doneState, noteArchived, dismissalName, drawUndoLabel, renderTodoControls, backlogIsArmed, disarmBacklog, armBacklog, todoView, toggleArchived, markRowDone, forgetDoneFlash, drawDoneFlash, drawDoneFlashes, unflashIds, unflashDone, flashDone, refreshAfterInboxChange, renderDoneChange, putBackRowsOff, queueInboxWrite, inboxWriteOwner, inboxPost, sendLeftOverInboxWrites, noteInboxWrite, settleInboxWrite, noteDoneSaving, doneSaved, dismissMessages, dealtWithWords, markReadUpstream, restoreMessages, mirrorArchived, doneSaving } = doneAct;
+const { doneState, noteArchived, dismissalName, drawUndoLabel, renderTodoControls, backlogIsArmed, disarmBacklog, armBacklog, toggleArchived, markRowDone, forgetDoneFlash, drawDoneFlash, drawDoneFlashes, unflashIds, unflashDone, flashDone, refreshAfterInboxChange, renderDoneChange, putBackRowsOff, queueInboxWrite, inboxWriteOwner, inboxPost, sendLeftOverInboxWrites, noteInboxWrite, settleInboxWrite, noteDoneSaving, doneSaved, dismissMessages, dealtWithWords, markReadUpstream, restoreMessages, mirrorArchived, doneSaving } = doneAct;
 
 /** @typedef {import("./src/core/channels/index.ts").ReplyTally} ReplyTally */
 /** Reply counts and the way down to them: web/src/view/channel's now (`createReplyCounts`, `#624`). */
@@ -4952,7 +4952,6 @@ const readingBookmark = createReadingBookmark({
   selectionView: () => selection().view,
   selectionThreadId: () => selection().threadId,
   hidingRead: () => hidingRead(),
-  todoHoldsFrom: (at, channel) => todoView.holdsFrom(at, channel),
   fromGatheredThread,
   preservingScroll,
   nudge: (area, delta) => scrollKeeping.nudge(area, delta),
@@ -5721,6 +5720,7 @@ const foldedOnes = readRunLines.foldedOnes;
  */
 function setReadMode(mode) {
   if (!READ_MODES.includes(mode)) return;
+  if (mode === "hide") mode = "fold";
   const wasHiding = readModes.hiding();
   const read = keepingFilterPlace(() => {
     readModes.set(mode);
@@ -5750,7 +5750,7 @@ function setReadMode(mode) {
     } else if (readModes.hiding() !== wasHiding) {
       // A read of another route, which keeps the reader's place as a refresh does and is placed again
       // when it lands. What it brings is the reader's own act, not something that arrived.
-      return (readModes.hiding() ? loadTodo : (options) => timelineView.loadDiscord(options))({ keepPosition: true, ownAct: true, readAs: "enter" });
+      return timelineView.loadDiscord({ keepPosition: true, ownAct: true, readAs: "enter" });
     } else {
       // Show read and Fold read are the same read of the channel, drawn two ways.
       applyReadRuns();
@@ -5840,7 +5840,7 @@ const noiseSettings = mountNoiseRules({
 
 /** What the server calls noise, tallied and rescued: web/src/view/channel's now (`createNoiseActs`, `#624`). */
 const noiseActs = createNoiseActs({
-  providerFacts, readModes: () => readModes, todoView: () => todoView,
+  providerFacts, readModes: () => readModes,
   timelineRows: () => timelineRows(), el: (id) => el(id),
   rowMessages: (row) => rowMessages(/** @type {any} */ (row)),
   selectedChannelId: () => selectedChannelId(),
@@ -6971,7 +6971,7 @@ const timelineView = createTimelineView({
   foldReadState, noteReplyGaps, noteServerPageBuild, renderColumns,
   threadPresenceNote: (hasThreads, inThread) => threadPresence.note(hasThreads, inThread),
   screenBelongsToToken, readModes, readLedger, api: /** @type {any} */ (api), currentDiscordLoad: (generation, channel, readingTodo) => currentDiscordLoad(generation, channel, readingTodo),
-  get noChannelWords() { return NO_CHANNEL_TO_READ; }, notePinsRevision, noteBookmark, plainReach, todoView,
+  get noChannelWords() { return NO_CHANNEL_TO_READ; }, notePinsRevision, noteBookmark, plainReach,
   noiseRenderCount: () => noiseSettings.renderCount(), foldedOneIds, foldedOnes, readRuns, setReadMode,
   setJumpNewest, scrollToNewest, keepFilterHold, inThisColumn: (fn) => inThisColumn(fn), pinsView, searchOffered: () => searchOffered(),
   pullToRefresh, heldFilterRow, jumpAnchorRow: () => jumpAnchor.row(), scrollAnchor, followsNewest, visibleList, noiseSettings,
@@ -6985,7 +6985,7 @@ const timelineView = createTimelineView({
   nudge: (area, delta) => scrollKeeping.nudge(area, delta),
   toPosition: (area, top) => scrollKeeping.toPosition(area, top),
 });
-const { loadCanon, drawProjection, walkCursorOwed, heldViewRows, drawHeldRows, queueReadAllForCounts, readAllForCounts, rowsAsDrawn, applyTimelinePage, renderCachedTimeline, mutationAwaitsRead, loadTimeline, foldLateTimelinePage, loadOlderTimeline, foldLiveMessage, inView, projectView, holdingMessage, foldTimelinePage, foldTimelineDelta, loadTodo, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, renderReadModeControl, applyNewestPage, channelReadPosition, settleAfterRead, landedReadPosition, todoSummary } = timelineView;
+const { loadCanon, drawProjection, walkCursorOwed, heldViewRows, drawHeldRows, queueReadAllForCounts, readAllForCounts, rowsAsDrawn, applyTimelinePage, renderCachedTimeline, mutationAwaitsRead, loadTimeline, foldLateTimelinePage, loadOlderTimeline, foldLiveMessage, inView, projectView, holdingMessage, foldTimelinePage, foldTimelineDelta, loadOlder, maybeLoadOlder, takeDeferredOlder, appendChannelRow, appendToColumns, applyReadRuns, readRunPlan, readRunRows, cycleReadMode, readRunsSuspended, rowIsRead, openReadRun, renderReadModeControl, applyNewestPage, channelReadPosition, settleAfterRead, landedReadPosition } = timelineView;
 /**
  * Walking back for older rows, and for a search (web/src/view/channel `mountOlderWalks`,
  * `#624 voice-page-modularity`): the step-back control, the search's bounded walk, the server
@@ -7529,7 +7529,6 @@ const channelHeadOwner = createChannelHead({
   el,
   readModes: () => readModes,
   renderChannelSeam,
-  todoSummary,
   channelSummary,
   olderPager: () => olderPager,
   olderPages: () => olderPages(),

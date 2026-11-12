@@ -62,8 +62,6 @@ export { UNPACK_READS_AT_ONCE, createUnpackReads } from "./unpackreads.ts";
 export { isThreadRoot, readLook, unpackHeldMessages, unpackMessages, unpackReadSignature } from "./unpackheld.ts";
 export type { UnpackChoice, UnpackFilter } from "./unpackheld.ts";
 export type { UnpackReads, UnpackReadsDependencies, UnpackedThread } from "./unpackreads.ts";
-export { createTodoView } from "./todo.ts";
-export type { TodoRead, TodoState, TodoView } from "./todo.ts";
 export { createPlainReach } from "./plainreach.ts";
 export type { PlainReach } from "./plainreach.ts";
 export { channelPostsOnce, createProviderFacts } from "./providerfacts.ts";

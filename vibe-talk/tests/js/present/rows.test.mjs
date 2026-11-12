@@ -266,10 +266,10 @@ test("`#624 voice-page-modularity`: where the bookmark's line stands among the r
 test("`#624 voice-page-modularity`: the read mode, what an old record means, the cycle and the kept copy, from the module alone", () => {
   const { createReadMode, savedReadMode, nextReadMode, READ_MODES, READ_MODE_KEY } = ROWS;
   assert.deepStrictEqual([...READ_MODES], ["show", "fold", "hide"]);
-  assert.deepStrictEqual(READ_MODES.map(nextReadMode), ["fold", "hide", "show"]);
+  assert.deepStrictEqual(READ_MODES.map(nextReadMode), ["fold", "show", "show"], "#1168: the toggle is binary Show/Fold; any other value goes to Show");
   assert.equal(savedReadMode({ read: "collapse" }), "fold", "an older page's Collapse read is not Fold read");
-  assert.equal(savedReadMode({ read: "hide" }), "hide");
-  assert.equal(savedReadMode({ todo: true }), "hide", "a record saying only todo is not Hide read");
+  assert.equal(savedReadMode({ read: "hide" }), "fold", "a saved Hide loads as Fold on (#1168)");
+  assert.equal(savedReadMode({ todo: true }), "fold", "a record saying only todo loads as Fold on (#1168)");
   assert.equal(savedReadMode({}), "show");
   const kept = new Map();
   const modes = createReadMode({ storage: () => ({ getItem: () => null, setItem: (key, value) => kept.set(key, value), removeItem() {} }) });
@@ -316,7 +316,7 @@ test("`#624 voice-page-modularity`: what the author filter says, from the module
   assert.equal(authorEmptyWords("theirs", false, false, hidden), "None of the messages loaded so far are from anyone else.");
   assert.equal(asked, 0, "asked about Hide read for Theirs");
   assert.equal(authorEmptyWords("mine", false, false, hidden),
-    "Your own messages start read, so Hide read leaves them out — press h for Show read.");
+    "Your own messages start read, so they sit in the folded runs — press h for Show read.");
   assert.equal(authorEmptyWords("mine", true, false, () => false), "None of the messages of yours loaded so far match that search.");
   assert.equal(authorEmptyWords("mine", false, true, hidden), "None of this channel's pinned messages are yours.");
   assert.equal(authorEmptyWords("theirs", true, true, hidden),

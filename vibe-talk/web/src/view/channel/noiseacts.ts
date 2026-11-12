@@ -14,7 +14,6 @@ interface NoiseMessage { id: unknown; noise?: boolean }
 export interface NoiseActsDependencies {
   providerFacts: { threading(): boolean };
   readModes(): { hiding(): boolean };
-  todoView(): { state(): { noise?: number; window?: number } };
   timelineRows(): { messages: Message[] };
   el(id: string): { children: Iterable<unknown> };
   rowMessages(row: unknown): Message[];
@@ -42,9 +41,6 @@ export function createNoiseActs(deps: NoiseActsDependencies): NoiseActs {
    * server already left the placeholders out and said how many it left, so that number is the one.
    */
   function noiseTally(): { matched: number; total: number } {
-    if (!deps.providerFacts.threading() && deps.readModes().hiding()) {
-      return { matched: deps.todoView().state().noise || 0, total: deps.todoView().state().window || 0 };
-    }
     const loaded = deps.providerFacts.threading()
       ? deps.timelineRows().messages
       : [...deps.el("discord-log").children].flatMap(deps.rowMessages);
