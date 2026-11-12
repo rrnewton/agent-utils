@@ -2855,6 +2855,7 @@ pub async fn catchup(
                 crate::unknown_terms_log::DEFAULT_MAX_BYTES,
             ) {
                 tracing::warn!(error = %error, path = %path.display(), "unknown-terms log append failed");
+            }
         }
     }
     let window = crate::contract::CatchupWindow {
@@ -3145,7 +3146,7 @@ pub async fn catchup_followup(
             id,
             message.thread.as_ref().map(|thread| thread.id.as_str()),
         );
-        Some((time, address))
+        Some((time, address, true))
     });
     let text_html = crate::render::body_html(
         &text,
