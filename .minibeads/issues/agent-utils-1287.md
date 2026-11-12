@@ -1,6 +1,6 @@
 ---
 title: 'retire-lock-narrow: retire-pending holds the exclusive project lock across whole removals'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -40,3 +40,7 @@ Give `retire-pending` the #1276 adopt-lock-narrow treatment:
 # Notes
 
 Reported 2026-11-11 from a coordinator's lock sampling and a consumer's blocked ledger publications. Priority P0: the blocked consumer's ledger backlog grows while this lock is held. The owner directed counted (not timed) acceptance evidence, as in #1276.
+
+## Resolution
+
+[watermelon-full-preview] Landed on github/main as e6a7129a (final owner gate admitted at b0fee510; its only red was the untouched agentctl restore-drill test, green solo in 120 s). retire-pending validates and plans every candidate lock-free, commits one record at a time under the flock, and the Rust remove writer gathers the same way; create beside an outstanding journal reuses its lock-free storage report. #1332 proc-scan-bound (289cd3a8) removed the census-bound reds that had blocked this landing. The create provisioning remainder is #1361 create-provision-unlocked.
