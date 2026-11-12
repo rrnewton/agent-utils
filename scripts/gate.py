@@ -672,6 +672,11 @@ def _read_hold() -> dict[str, object] | None:
             "set_at": data.get("set_at")}
 
 
+def _hold_until(hold: dict[str, object]) -> float:
+    until = hold.get("until")
+    return float(until) if isinstance(until, (int, float)) and not isinstance(until, bool) else 0.0
+
+
 def active_hold(now: float | None = None) -> dict[str, object] | None:
     """The live hold, or None: no hold file, an unusable one, or an expired
     one (reaped here, so an expired hold is simply ignored)."""
@@ -679,7 +684,7 @@ def active_hold(now: float | None = None) -> dict[str, object] | None:
     hold = _read_hold()
     if hold is None:
         return None
-    if float(hold["until"]) <= (hold_now() if now is None else now):
+    if _hold_until(hold) <= (hold_now() if now is None else now):
         # Reap under the admission lock, re-reading first, so a hold set in
         # the meantime is never deleted as if it were the expired one.
         try:
@@ -687,7 +692,7 @@ def active_hold(now: float | None = None) -> dict[str, object] | None:
                 fcntl.flock(lock, fcntl.LOCK_EX)
                 try:
                     fresh = _read_hold()
-                    if fresh is not None and float(fresh["until"]) <= (
+                    if fresh is not None and _hold_until(fresh) <= (
                             hold_now() if now is None else now):
                         hold_path().unlink(missing_ok=True)
                 finally:
@@ -699,7 +704,7 @@ def active_hold(now: float | None = None) -> dict[str, object] | None:
 
 
 def _hold_text(hold: dict[str, object]) -> str:
-    return f"until {_utc(float(hold['until']))} ({hold['reason']})"
+    return f"until {_utc(_hold_until(hold))} ({hold['reason']})"
 
 
 def set_hold(until: float, reason: str) -> None:
