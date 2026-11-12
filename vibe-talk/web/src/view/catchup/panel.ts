@@ -56,6 +56,7 @@ export interface CatchupAnswer {
   window: CatchupWindow | null;
   unread_ids: string[];
   markable_ids: string[];
+  cited_ids: string[];
   footer_links: CatchupFooterLink[];
   text: string;
   /** The answer as the server's sanitized render (`#1349`); empty draws `text` plain. */
@@ -175,7 +176,7 @@ function stringsOf(value: unknown): string[] {
 
 /** Narrow an answer body to the fields the panel reads; an empty answer for any other shape. */
 export function asCatchupAnswer(value: unknown): CatchupAnswer {
-  const empty: CatchupAnswer = { window: null, unread_ids: [], markable_ids: [], footer_links: [], text: "", text_html: "", unknown_terms: [], stamp: null };
+  const empty: CatchupAnswer = { window: null, unread_ids: [], markable_ids: [], cited_ids: [], footer_links: [], text: "", text_html: "", unknown_terms: [], stamp: null };
   if (typeof value !== "object" || value === null) return empty;
   const record = value as Record<string, unknown>;
   const rawWindow = typeof record.window === "object" && record.window !== null ? (record.window as Record<string, unknown>) : null;
@@ -200,6 +201,7 @@ export function asCatchupAnswer(value: unknown): CatchupAnswer {
     },
     unread_ids: stringsOf(record.unread_ids),
     markable_ids: stringsOf(record.markable_ids),
+    cited_ids: stringsOf(record.cited_ids),
     footer_links: links,
     text: typeof record.text === "string" ? record.text : "",
     text_html: typeof record.text_html === "string" ? record.text_html : "",
@@ -561,15 +563,17 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     const footer = deps.byId("discuss-footer");
     footer.hidden = covered === 0;
     if (covered === 0) return;
-    deps.byId("discuss-covers").textContent = `This summary covers ${covered} unread messages:`;
+    deps.byId("discuss-covers").textContent = "Other messages processed:";
+    const cited = new Set(answer.cited_ids);
     const list = deps.byId("discuss-links");
     list.replaceChildren();
     for (const link of answer.footer_links) {
+      if (cited.has(link.id)) continue;
       const item = document.createElement("li");
       const button = document.createElement("button");
       button.type = "button";
       button.className = "discuss-link";
-      button.textContent = link.label;
+      button.textContent = link.label.split(" · ")[0];
       listening.listen(button, "click", () => {
         deps.onJump({
           service: deps.serviceName(scope.channelId),

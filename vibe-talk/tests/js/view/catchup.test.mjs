@@ -413,12 +413,28 @@ test("catchup: the footer covers N and each link jumps with its ref", async () =
     await openAndSummarize(view, fx);
     await flush();
     assert.equal(fx.els["discuss-footer"].hidden, false);
-    assert.equal(fx.els["discuss-covers"].textContent, "This summary covers 2 unread messages:");
+    assert.equal(fx.els["discuss-covers"].textContent, "Other messages processed:");
     const items = fx.els["discuss-links"].children;
     assert.equal(items.length, 2);
-    assert.equal(items[0].children[0].textContent, "09:51 · Ada");
+    assert.equal(items[0].children[0].textContent, "09:51");
     click(items[1].children[0]);
     assert.deepEqual(fx.calls.jumps, [{ service: "discord", channel: "chan-1", message: "m2", thread: "t9" }]);
+  } finally { fx.restore(); }
+});
+
+test("catchup: cited messages leave the footer; Mark still targets all processed", async () => {
+  const fx = fixture({ respond: () => Promise.resolve(answer({ cited_ids: ["m1"] })) });
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    await openAndSummarize(view, fx);
+    await flush();
+    const items = fx.els["discuss-links"].children;
+    assert.equal(items.length, 1);
+    assert.equal(items[0].children[0].textContent, "09:52");
+    click(fx.els["discuss-mark-read"]);
+    await flush();
+    assert.deepEqual(fx.calls.dismiss, [{ messages: ["m1", "m2"] }]);
   } finally { fx.restore(); }
 });
 
