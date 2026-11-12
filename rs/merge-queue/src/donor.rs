@@ -24,8 +24,9 @@ use serde::{Deserialize, Serialize};
 use crate::state::ValidatorConfig;
 use crate::tests::{Selection, TestId, TestResults};
 
-/// Schema of a job record.
-pub const JOB_SCHEMA: &str = "merge-queue-donor-job/v1";
+/// Schema of a job record. v2 added the job's `purpose` (#1377), so a
+/// queue host and its donors deploy together.
+pub const JOB_SCHEMA: &str = "merge-queue-donor-job/v2";
 /// Schema of a receipt.
 pub const RECEIPT_SCHEMA: &str = "merge-queue-receipt/v1";
 
@@ -202,6 +203,13 @@ pub struct Job {
     /// before the parent was recorded; the donor then falls back to `base`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub parent: String,
+    /// The validation's purpose, handed to the validator as `MQ_PURPOSE`
+    /// exactly as the local launcher sets it (#1377): `batch`,
+    /// `base-probe`, `candidate-probe`, `probe`, `widen` or `remainder`.
+    /// Empty in job files written before purposes were recorded; the
+    /// donor then sets no `MQ_PURPOSE`, as before.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub purpose: String,
     /// Tests to run.
     pub selection: Selection,
     /// Tests to run beyond the complete suite, with an `all` selection (`MQ_EXTRA_TESTS`).
@@ -1307,6 +1315,7 @@ impl Store {
         rooted: bool,
         prioritized: bool,
         plan_index: Option<usize>,
+        purpose: &str,
     ) -> Result<Job, String> {
         let _lock = self.lock()?;
         self.prune()?;
@@ -1323,6 +1332,7 @@ impl Store {
             tree: tree.to_owned(),
             base: base.to_owned(),
             parent: parent.to_owned(),
+            purpose: purpose.to_owned(),
             selection: selection.clone(),
             extra: extra.clone(),
             validator: validator.clone(),
@@ -3917,6 +3927,12 @@ impl Worker<'_> {
                 (crate::validate::BASE_ENV.to_owned(), job.base.clone()),
                 (crate::validate::PARENT_ENV.to_owned(), parent.clone()),
             ];
+            // The validator is told the job's purpose exactly as the
+            // local launcher sets it (#1377); a job written before
+            // purposes were recorded sets none, as before.
+            if !job.purpose.is_empty() {
+                env.push((crate::validate::PURPOSE_ENV.to_owned(), job.purpose.clone()));
+            }
             if !job.extra.is_empty() {
                 env.push((
                     crate::validate::EXTRA_TESTS_ENV.to_owned(),
@@ -4682,6 +4698,7 @@ mod unit {
                 rooted,
                 false,
                 None,
+                "batch",
             )
             .unwrap()
     }
@@ -4698,6 +4715,25 @@ mod unit {
         let old: Job = serde_json::from_value(value).unwrap();
         assert_eq!(old.parent, "");
         assert_eq!(old.base, "base0");
+    }
+
+    #[test]
+    fn a_job_carries_its_purpose_and_an_old_job_reads_with_none() {
+        // #1377 mq-validator-purpose-env: published jobs record the
+        // purpose the donor hands to its validator; a job file written
+        // before purposes were recorded reads with an empty purpose.
+        let store = Store::new(&temp("job-purpose"));
+        let job = publish(&store, "c1");
+        assert_eq!(job.purpose, "batch");
+        let reread = store.read(&job.id).unwrap();
+        assert_eq!(reread.purpose, "batch");
+        assert_eq!(reread.schema, JOB_SCHEMA);
+        let path = store.dir.join("jobs").join(format!("{}.json", job.id));
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(value.as_object_mut().unwrap().remove("purpose").is_some());
+        let old: Job = serde_json::from_value(value).unwrap();
+        assert_eq!(old.purpose, "");
     }
 
     fn receipt(job: &Job, donor: &str) -> Receipt {
@@ -6360,6 +6396,7 @@ mod unit {
                 false,
                 false,
                 None,
+                "batch",
             )
             .unwrap();
         let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
@@ -6402,6 +6439,7 @@ mod unit {
                 false,
                 false,
                 None,
+                "batch",
             )
             .unwrap();
         let claimed = store.claim("d1", "h1", 1).unwrap().expect("a job");
@@ -6459,6 +6497,7 @@ mod unit {
                     false,
                     false,
                     None,
+                    "batch",
                 )
                 .unwrap()
         };
@@ -6589,6 +6628,7 @@ mod unit {
                 false,
                 prioritized,
                 plan_index,
+                "batch",
             )
             .unwrap();
         let old_path = store.job_path(&job.id).unwrap();

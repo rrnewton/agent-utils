@@ -747,6 +747,23 @@ pub struct Chosen {
 /// [`Chosen::extra`]), space separated. Set only when there are some.
 pub const EXTRA_TESTS_ENV: &str = "MQ_EXTRA_TESTS";
 
+/// Environment variable naming a validation's purpose, set for every
+/// validator run, local and donor (#1377 mq-validator-purpose-env):
+/// `batch`, `base-probe`, `candidate-probe`, `probe`, `widen` or
+/// `remainder`. Only the base probe ([`BASE_PROBE_PURPOSE`]) may be
+/// mapped by a validator to a qualifying exit on an otherwise
+/// unqualified pass, because its parent is the validated commit and
+/// its pass can only clear the base; a whole-candidate probe
+/// ([`CANDIDATE_PROBE_PURPOSE`]) can become landing evidence, so it
+/// never carries the base-probe purpose.
+pub const PURPOSE_ENV: &str = "MQ_PURPOSE";
+
+/// [`PURPOSE_ENV`] of a culprit probe of the base alone (prefix 0).
+pub const BASE_PROBE_PURPOSE: &str = "base-probe";
+
+/// [`PURPOSE_ENV`] of a culprit probe of the whole candidate.
+pub const CANDIDATE_PROBE_PURPOSE: &str = "candidate-probe";
+
 /// A configured validator.
 pub trait Validator: Sync {
     /// Ask the selection policy which tests the change from `base` to the checkout's HEAD needs.

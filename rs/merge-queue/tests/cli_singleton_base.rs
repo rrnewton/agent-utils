@@ -175,6 +175,61 @@ fn deterministic_singleton_ejects_on_unqualified_base_probe() {
 }
 
 #[test]
+fn validator_sees_split_probe_purposes() {
+    // #1377 mq-validator-purpose-env: the batch run sees `batch`, the
+    // base probe sees `base-probe`, and the whole-candidate probe sees
+    // `candidate-probe` (never the base-probe purpose, since its pass
+    // can become landing evidence).
+    let fx = Fixture::new("singleton-purpose-env");
+    fx.write("tests/t0", "ok\n");
+    fx.commit_all("seed tests");
+    git(&fx.dev(), &["push", "-q", "origin", "HEAD:main"]);
+    let validator = format!(
+        r#"echo "$MQ_PURPOSE" >> '{root}/purposes'
+if [ "$MQ_SELECTION" = all ]; then set -- $(ls tests); else set -- $MQ_TESTS; fi
+rc=0
+exempt=
+for t in "$@"; do
+  o=pass
+  if [ -f "tests/$t" ] && grep -q FAIL "tests/$t"; then
+    o=fail
+    rc=1
+    case "$t" in check.*) exempt="$exempt,$t" ;; esac
+  fi
+  printf '{{"id":"%s","outcome":"%s"}}\n' "$t" "$o" >> "$MQ_RESULTS"
+done
+[ -n "$exempt" ] && echo "RERUN-EXEMPT: ${{exempt#,}}"
+exit $rc"#,
+        root = fx.root.display()
+    );
+    fx.mq_ok(&[
+        "init",
+        "--remote",
+        "origin",
+        "--validator",
+        "command",
+        "--validator-run",
+        &validator,
+        "--confirm-reruns",
+    ]);
+    fx.branch("one", &[("tests/one", "ok\n")]);
+    fx.mq_ok(&["submit", "1", "--head", "one"]);
+    fx.branch("two", &[("tests/two", "ok\n")]);
+    fx.mq_ok(&["submit", "2", "--head", "two"]);
+    fx.branch("bad", &[("tests/bad", "FAIL\n")]);
+    fx.mq_ok(&["submit", "3", "--head", "bad"]);
+    let out = fx.mq(&["run", "--json"]);
+    let r = report(&String::from_utf8_lossy(&out.stdout));
+    assert_eq!(r["ejected"].as_array().unwrap().len(), 1, "{r}");
+    let seen = std::fs::read_to_string(fx.root.join("purposes")).unwrap();
+    let purposes: std::collections::BTreeSet<&str> = seen.lines().collect();
+    assert!(purposes.contains("batch"), "{seen}");
+    assert!(purposes.contains("base-probe"), "{seen}");
+    assert!(purposes.contains("probe"), "{seen}");
+    assert!(purposes.contains("candidate-probe"), "{seen}");
+}
+
+#[test]
 fn inconclusive_batch_holds_and_disjoint_root_lands() {
     // #1379: change 1's culprit search is inconclusive (its base probe
     // observes nothing). Only change 1 is held; the disjoint green

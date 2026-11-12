@@ -698,9 +698,29 @@ impl Slots {
     }
 }
 
+/// The `MQ_PURPOSE` of a culprit-search probe at `prefix` of a batch of
+/// `len` changes (#1377 mq-validator-purpose-env): only the base probe
+/// may be mapped by a validator to a qualifying exit, because its pass
+/// can only clear the base; a whole-candidate probe carries a different
+/// purpose so its pass is never mistaken for base evidence on the way
+/// to a landing.
+fn probe_mq_purpose(prefix: usize, len: usize) -> &'static str {
+    if prefix == 0 {
+        crate::validate::BASE_PROBE_PURPOSE
+    } else if prefix == len {
+        crate::validate::CANDIDATE_PROBE_PURPOSE
+    } else {
+        "probe"
+    }
+}
+
 /// A validation job.
 struct Job {
     purpose: &'static str,
+    /// The purpose told to the validator as `MQ_PURPOSE` (#1377): finer
+    /// than `purpose` for culprit probes (see [`probe_mq_purpose`]); the
+    /// same as `purpose` for every other job.
+    mq_purpose: &'static str,
     prs: Vec<i64>,
     commit: String,
     /// The commit `prs` were combined onto (the commit itself for `widen`).
@@ -4459,6 +4479,12 @@ impl<'a> Runner<'a> {
         // runner can diff against the job's own base (see MQ_PARENT, crate::validate).
         extra.push((crate::validate::BASE_ENV.to_owned(), job.base.clone()));
         extra.push((crate::validate::PARENT_ENV.to_owned(), job.parent.clone()));
+        // The validator is told the job's purpose (#1377), finer for
+        // culprit probes than the record's purpose (see `mq_purpose`).
+        extra.push((
+            crate::validate::PURPOSE_ENV.to_owned(),
+            job.mq_purpose.to_owned(),
+        ));
         // A candidate validation may stop at its first red step (`validator.fail_fast`). The
         // complete run on the base (`widen`) never does: its record names every failure.
         if self.config.validator.fail_fast && job.purpose != "widen" {
@@ -4669,6 +4695,7 @@ impl<'a> Runner<'a> {
             job.rooted,
             prioritized,
             plan_index,
+            job.mq_purpose,
         )?;
         lock(&donors.published).push((published.id.clone(), job.commit.clone()));
         Ok(published.id)
@@ -9885,6 +9912,7 @@ impl<'a> Runner<'a> {
                     let (rid, rran) = self
                         .validate_all(vec![Job {
                             purpose: "remainder",
+                            mq_purpose: "remainder",
                             prs: rebuilt.prs.clone(),
                             commit: rebuilt.tip.clone(),
                             parent: rebuilt.parent.clone(),
@@ -10150,6 +10178,7 @@ impl<'a> Runner<'a> {
         for i in probes {
             jobs.push(Job {
                 purpose: "probe",
+                mq_purpose: probe_mq_purpose(*i, search.candidate.prs.len()),
                 prs: search.candidate.prs[..*i].to_vec(),
                 commit: self.regenerated_prefix(&search.candidate, *i)?,
                 parent: search.candidate.parent.clone(),
@@ -10183,6 +10212,7 @@ impl<'a> Runner<'a> {
         let (validation_id, ran) = self
             .validate_all(vec![Job {
                 purpose: "widen",
+                mq_purpose: "widen",
                 prs: open.iter().flat_map(|o| o.prs.clone()).collect(),
                 commit: base.clone(),
                 parent: base.clone(),
@@ -10829,6 +10859,7 @@ fn batch_job(
 ) -> Job {
     Job {
         purpose: "batch",
+        mq_purpose: "batch",
         prs: candidate.prs.clone(),
         commit: candidate.tip.clone(),
         parent: candidate.parent.clone(),
@@ -11502,6 +11533,7 @@ mod unit {
         let batches = vec![vec![10, 11, 12], vec![13]];
         let job = |purpose: &'static str, prs: Vec<i64>| Job {
             purpose,
+            mq_purpose: purpose,
             prs,
             commit: "c".repeat(40),
             parent: "b".repeat(40),
@@ -11720,6 +11752,19 @@ mod unit {
             Some(Culprit::Found { index: 0, .. })
         ));
         assert_eq!(search.base_probe_unqualified, Some(4));
+    }
+
+    #[test]
+    fn probe_purposes_split_base_candidate_and_interior() {
+        // #1377 mq-validator-purpose-env: only prefix 0 is the base
+        // probe; the whole candidate is never the base probe, so no
+        // landing-evidence run carries the base-probe purpose.
+        assert_eq!(probe_mq_purpose(0, 1), "base-probe");
+        assert_eq!(probe_mq_purpose(1, 1), "candidate-probe");
+        assert_eq!(probe_mq_purpose(0, 3), "base-probe");
+        assert_eq!(probe_mq_purpose(1, 3), "probe");
+        assert_eq!(probe_mq_purpose(2, 3), "probe");
+        assert_eq!(probe_mq_purpose(3, 3), "candidate-probe");
     }
 
     #[test]

@@ -1253,6 +1253,11 @@ batch's extra tests too.
   main, which can be arbitrarily stale;
 - `$MQ_PARENT`: the candidate's parent commit (full SHA): the base itself for a root batch, the
   stacked-on candidate for a stacked one;
+- `$MQ_PURPOSE`: why this validation runs: `batch`, `base-probe` (a culprit probe of the base
+  alone), `candidate-probe` (a culprit probe of the whole candidate), `probe` (an interior
+  culprit probe), `widen` or `remainder`. Only a `base-probe` pass may be treated as clearing
+  the base; a `candidate-probe` pass can become landing evidence, so it never carries the
+  base-probe purpose. Donor validations see the same value from the job record;
 
 and writes one JSON object per line to `$MQ_RESULTS`:
 `{"id": "step::case", "outcome": "pass|fail|skip|error", "duration_ms": 12}`. A worse outcome

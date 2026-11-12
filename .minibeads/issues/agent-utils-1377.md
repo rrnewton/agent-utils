@@ -1,10 +1,11 @@
 ---
 title: 'mq-validator-purpose-env: pass MQ_PURPOSE to every validator run, local and donor'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-11-12T16:55:36.321022754+00:00
-updated_at: 2026-11-12T16:55:36.321022754+00:00
+updated_at: 2026-11-12T21:55:08.357941600+00:00
+closed_at: 2026-11-12T21:55:08.357941420+00:00
 ---
 
 # Description
