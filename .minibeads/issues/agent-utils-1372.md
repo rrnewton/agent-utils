@@ -1,13 +1,14 @@
 ---
 title: 'chat-stale-prompt-wedges-inbox: a chat prompt pending past a cap delivers while working or alarms as wedged; status reports its age'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
 - agentctl
 - chat
 created_at: 2026-11-12T13:30:00.000000000+00:00
-updated_at: 2026-11-12T13:30:00.000000000+00:00
+updated_at: 2026-11-12T18:00:00.000000000+00:00
+closed_at: 2026-11-12T18:00:00.000000000+00:00
 ---
 
 # Description
@@ -51,4 +52,12 @@ the path (queue status). No consumer names in files.
 
 ## Resolution
 
-Pending: see the landing commit for this issue.
+[watermelon-full-preview] Landed on main as c9282c32 (feature), 4f7132f6 and
+65cfe8ba (validation classification), 97684d2f (gate fixes + this record's
+evidence trailer). chat run --stale-prompt-cap (default 10m) delivers a stale
+prompt while the agent works or alarms it as wedged; status reports
+oldest_pending_chat_age_seconds; restore prompts carry supersede keys.
+Validation: touched checks green; cross herdr-agent differential 5
+consecutive solo passes (its 10s lock case is a wall-clock test defect under
+load, mu-crossrobust de-timing); untouched dagrun/vibe/timeline reds passed
+solo. Deployment of live bridges is the coordinator's step.
