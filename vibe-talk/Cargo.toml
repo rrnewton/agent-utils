@@ -54,7 +54,7 @@ anyhow = "1"
 # `src/render.rs`: comrak writes the HTML, and ammonia decides what of it may exist.
 ammonia = "4"
 async-trait = "0.1"
-claude-session = { version = "0.1.0", path = "../rs/claude-session" }
+claude-stream-session = { version = "0.1.0", path = "../rs/claude-stream-session" }
 axum = { version = "0.8", default-features = false, features = [
     "http1",
     "json",

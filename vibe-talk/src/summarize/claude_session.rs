@@ -1,6 +1,6 @@
 //! A warm persistent Claude session as a summariser. `#1331 claude-session-summarizer`.
 //!
-//! A pool of 1-2 [`claude_session::session::Session`] processes stays started, so a summary
+//! A pool of 1-2 [`claude_stream_session::session::Session`] processes stays started, so a summary
 //! pays no cold startup: measured cold per call at 11.8-14.2 s, warm turns at 1.2-2.1 s
 //! (liaison measurement on the filing of #1331). Tools are off (the driver never enables
 //! them), the model is chosen per summary kind through `[summaries.llm.models]`
@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use claude_session::session::{Error as SessionError, Session, SessionConfig};
+use claude_stream_session::session::{Error as SessionError, Session, SessionConfig};
 use tokio::sync::{Mutex, Semaphore};
 
 use crate::config::{LlmConfig, SummaryKind};
