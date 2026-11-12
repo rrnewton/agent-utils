@@ -985,6 +985,12 @@ pub struct GitHubConfig {
     pub gh: Vec<String>,
     /// Requests allowed per rolling hour (0 = 60).
     pub max_per_hour: u32,
+    /// Extra requests per hour only closing landed pull requests may
+    /// spend, on top of `max_per_hour` (0 = 5, see
+    /// `github::DEFAULT_CLOSE_RESERVE`), so closes never wait behind
+    /// reads (#1360). Serialized only when non-zero.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub close_reserve: u32,
     /// Budget file shared by every queue on the host; empty = `api-budget.json` in the state
     /// directory.
     pub budget_file: String,

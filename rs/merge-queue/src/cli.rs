@@ -2283,6 +2283,7 @@ fn dispatch(cli: Cli) -> Result<i32, String> {
                     repo: github_repo,
                     gh,
                     max_per_hour: api_per_hour,
+                    close_reserve: 0,
                     budget_file: api_budget_file,
                     anonymous_fetch,
                 },

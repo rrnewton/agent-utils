@@ -19,6 +19,13 @@ use crate::state::GitHubConfig;
 /// Default requests per rolling hour when the configuration names none.
 pub const DEFAULT_MAX_PER_HOUR: u32 = 60;
 
+/// Extra requests per rolling hour that only closing landed pull
+/// requests may spend, when the configuration names none (#1360): a
+/// landed change's close never waits behind reads for the next hour's
+/// budget. Pacing, not a hard limit: closes share the same ledger, and
+/// ordinary calls keep the whole configured cap.
+pub const DEFAULT_CLOSE_RESERVE: u32 = 5;
+
 /// Budget charge multiplier for a list call that also carries reviews.
 ///
 /// The list call stays one batched call, but `reviews` and `latestReviews`
@@ -73,6 +80,22 @@ pub struct Budget {
     pub path: PathBuf,
     /// Requests allowed per rolling hour.
     pub max_per_hour: u32,
+    /// Extra requests per hour only closing landed pull requests may
+    /// spend, on top of `max_per_hour` (#1360).
+    pub close_reserve: u32,
+}
+
+impl Budget {
+    /// Hourly cap for ordinary (non-close) calls.
+    fn general_cap(&self) -> u32 {
+        self.max_per_hour
+    }
+
+    /// Hourly cap for the close-after-landing path: the ordinary cap
+    /// plus its own small slice (#1360).
+    fn close_cap(&self) -> u32 {
+        self.max_per_hour.saturating_add(self.close_reserve)
+    }
 }
 
 fn now_secs() -> u64 {
@@ -85,10 +108,26 @@ fn now_secs() -> u64 {
 impl Budget {
     /// Charge `cost` requests, or refuse with when the next one becomes available.
     pub fn charge(&self, cost: u32) -> Result<(), String> {
-        self.charge_at(cost, now_secs())
+        self.charge_capped(cost, self.general_cap(), now_secs())
     }
 
+    /// Charge `cost` requests for closing a landed pull request: closes may
+    /// spend the reserved slice too, up to the full hourly cap (#1360).
+    pub fn charge_close(&self, cost: u32) -> Result<(), String> {
+        self.charge_capped(cost, self.close_cap(), now_secs())
+    }
+
+    #[cfg(test)]
     fn charge_at(&self, cost: u32, now: u64) -> Result<(), String> {
+        self.charge_capped(cost, self.general_cap(), now)
+    }
+
+    #[cfg(test)]
+    fn charge_close_at(&self, cost: u32, now: u64) -> Result<(), String> {
+        self.charge_capped(cost, self.close_cap(), now)
+    }
+
+    fn charge_capped(&self, cost: u32, cap: u32, now: u64) -> Result<(), String> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
@@ -106,7 +145,7 @@ impl Budget {
         let mut ledger: Ledger = serde_json::from_str(&text).unwrap_or_default();
         ledger.requests.retain(|at| now.saturating_sub(*at) < 3600);
         let used = ledger.requests.len() as u32;
-        if used + cost > self.max_per_hour {
+        if used + cost > cap {
             let _ = FileExt::unlock(&file);
             let wait = ledger
                 .requests
@@ -114,7 +153,7 @@ impl Budget {
                 .map_or(0, |oldest| 3600u64.saturating_sub(now - oldest));
             return Err(format!(
                 "API request budget exhausted: {used} of {} used in the last hour, {cost} more needed; retry in about {} min",
-                self.max_per_hour,
+                cap,
                 wait.div_ceil(60)
             ));
         }
@@ -452,15 +491,38 @@ impl Hosting {
         } else {
             config.max_per_hour
         };
+        let close_reserve = if config.close_reserve == 0 {
+            DEFAULT_CLOSE_RESERVE
+        } else {
+            config.close_reserve
+        };
         Ok(Self {
             config: config.clone(),
-            budget: Budget { path, max_per_hour },
+            budget: Budget {
+                path,
+                max_per_hour,
+                close_reserve,
+            },
             timeout,
         })
     }
 
     fn run(&self, cost: u32, args: &[String]) -> Result<String, String> {
-        self.budget.charge(cost)?;
+        self.run_charged(cost, args, false)
+    }
+
+    /// Like [`Self::run`], for the close-after-landing path: may spend the
+    /// reserved slice of the hourly budget (#1360).
+    fn run_close(&self, cost: u32, args: &[String]) -> Result<String, String> {
+        self.run_charged(cost, args, true)
+    }
+
+    fn run_charged(&self, cost: u32, args: &[String], close: bool) -> Result<String, String> {
+        if close {
+            self.budget.charge_close(cost)?;
+        } else {
+            self.budget.charge(cost)?;
+        }
         let fleet_env = std::env::var(FLEET_REAL_GH_ENV).ok();
         let program: Vec<String> = resolve_gh_command(&self.config.gh, fleet_env.as_deref());
         let mut command = Command::new(&program[0]);
@@ -570,7 +632,7 @@ impl Hosting {
         .map(|s| (*s).to_owned())
         .collect();
         let pages = limit.max(1).div_ceil(100);
-        let text = self.run(pages, &args)?;
+        let text = self.run_close(pages, &args)?;
         serde_json::from_str(&text)
             .map_err(|error| format!("unexpected pr state list output: {error}"))
     }
@@ -589,7 +651,7 @@ impl Hosting {
         .iter()
         .map(|s| (*s).to_owned())
         .collect();
-        self.run(1, &args).map(drop)
+        self.run_close(1, &args).map(drop)
     }
 }
 
@@ -833,6 +895,7 @@ mod unit {
         let budget = Budget {
             path: tmp.0.join("b/api-budget.json"),
             max_per_hour: 3,
+            close_reserve: 0,
         };
         budget.charge_at(2, 1_000).unwrap();
         budget.charge_at(1, 1_100).unwrap();
@@ -842,5 +905,34 @@ mod unit {
         // An hour after the first two, they no longer count.
         budget.charge_at(2, 4_600).unwrap();
         assert!(budget.charge_at(1, 4_601).is_err());
+    }
+
+    #[test]
+    fn closes_spend_the_reserved_slice_other_calls_cannot() {
+        // #1360 mq-close-after-land-budget: closes get their own small
+        // slice on top of the cap — ordinary calls stop at 10 while
+        // closes reach 13, and ordinary calls keep the whole cap even
+        // on a tiny budget.
+        let tmp = TempDir::new("budget-reserve");
+        let budget = Budget {
+            path: tmp.0.join("b/api-budget.json"),
+            max_per_hour: 10,
+            close_reserve: 3,
+        };
+        budget.charge_at(10, 1_000).unwrap();
+        let refused = budget.charge_at(1, 1_100).unwrap_err();
+        assert!(refused.contains("10 of 10"), "{refused}");
+        budget.charge_close_at(3, 1_200).unwrap();
+        assert!(budget.charge_close_at(1, 1_300).is_err());
+        assert!(budget.charge_at(1, 1_300).is_err());
+        let tiny = Budget {
+            path: tmp.0.join("c/api-budget.json"),
+            max_per_hour: 2,
+            close_reserve: 5,
+        };
+        tiny.charge_at(2, 1_000).unwrap();
+        assert!(tiny.charge_at(1, 1_100).is_err());
+        tiny.charge_close_at(5, 1_200).unwrap();
+        assert!(tiny.charge_close_at(1, 1_300).is_err());
     }
 }
