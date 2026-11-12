@@ -658,11 +658,18 @@ reclaim fact, never the whole decision.
 `wrkslots ttl-report` is the read-only dry run for the TTL escalation ladder (#1293). Past expiry
 the rungs are warn (at expiry), alarm (after 1 day), stop (after 2 days), and deterministic teardown
 after rescue (after 3 days); each `--*-after-seconds` flag moves its rung. For every slot it prints
-the rung, the dated rescue ref each checkout would get (`refs/heads/rescue/<slot>/<YYYYMMDD>/<branch>`),
+the rung, the dated rescue ref each checkout would get (`refs/rescue/<slot>/<YYYYMMDD>/<branch>`),
 the fallback bundle under the control directory (`ttl-rescue/<slot>.bundle`), and the teardown time.
 `--format health` prints the same rows as `HEALTH:` lines for a scheduled tick to consume.
 It runs no Git, writes nothing, and removes nothing; `--now ISO8601` judges the ladder at a fixed
 time instead of the current UTC time. Example: `wrkslots ttl-report --only-overdue --format json`.
+The rescue namespace root is the `ttl_rescue_ref_root` configuration key (absent means
+`refs/rescue`, outside `refs/heads` so rescues never appear as branches); `--rescue-ref-root`
+overrides it per invocation, e.g. `refs/heads/rescue` keeps rescues as branches. A rescue ref
+that already names a different commit is never overwritten: the push lands on a `-2`, `-3`, ...
+suffix and the receipt names the ref actually used. `wrkslots ttl-teardown SLOT` performs the
+teardown rung itself: rescue lock-free, registry commit under the mutation locks, tree deleted
+after; it refuses at every earlier rung.
 
 The registered running command answers for agent slots only. It receives the agent name as its only
 positional argument and receives `WRKSLOTS_PROJECT_ROOT`, `WRKSLOTS_SLOT`, `WRKSLOTS_SLOT_TYPE`

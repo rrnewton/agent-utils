@@ -50,7 +50,7 @@ def test_dirty_branch_is_wip_committed_and_pushed_to_dated_rescue_ref(tmp_path: 
 
     entries = {entry["branch"]: entry for entry in receipt["rescued"]}
     entry = entries["feat/x"]
-    assert entry["rescue_ref"] == "refs/heads/rescue/slot-a/20261114/feat/x"
+    assert entry["rescue_ref"] == "refs/rescue/slot-a/20261114/feat/x"
     assert entry["pushed"] is True
     assert entry["wip_commit"] == _git(repo, "rev-parse", "HEAD")
     assert _remote_ref(remote, entry["rescue_ref"]) == entry["wip_commit"]
@@ -83,6 +83,67 @@ def test_detached_head_and_failed_push_fall_back_to_verified_bundle(tmp_path: Pa
     assert head in listed
 
 
+def test_override_root_keeps_rescues_as_branches(tmp_path: Path) -> None:
+    repo, remote = _repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feat/x")
+
+    receipt = cli._execute_ttl_rescue(
+        repo, slot="slot-j", date_str="20261114", remote="origin",
+        bundle_path=tmp_path / "bundles" / "slot-j.bundle",
+        rescue_ref_root="refs/heads/rescue",
+    )
+
+    entries = {entry["branch"]: entry for entry in receipt["rescued"]}
+    assert entries["feat/x"]["rescue_ref"] == "refs/heads/rescue/slot-j/20261114/feat/x"
+    assert _remote_ref(remote, "refs/heads/rescue/slot-j/20261114/feat/x")
+
+
+def test_existing_ref_with_the_same_target_is_reused(tmp_path: Path) -> None:
+    repo, remote = _repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feat/x")
+    first = cli._execute_ttl_rescue(
+        repo, slot="slot-k", date_str="20261114", remote="origin",
+        bundle_path=tmp_path / "bundles" / "slot-k.bundle",
+    )
+    second = cli._execute_ttl_rescue(
+        repo, slot="slot-k", date_str="20261114", remote="origin",
+        bundle_path=tmp_path / "bundles" / "slot-k.bundle",
+    )
+    first_refs = {entry["branch"]: entry["rescue_ref"] for entry in first["rescued"]}
+    second_refs = {entry["branch"]: entry["rescue_ref"] for entry in second["rescued"]}
+    assert first_refs == second_refs
+    assert not any(ref.endswith("-2") for ref in second_refs.values())
+    assert _remote_ref(remote, second_refs["feat/x"])
+
+
+def test_existing_ref_with_a_different_target_is_suffixed_not_overwritten(
+    tmp_path: Path,
+) -> None:
+    repo, remote = _repo(tmp_path)
+    _git(repo, "checkout", "-q", "-b", "feat/x")
+    head = _git(repo, "rev-parse", "HEAD")
+    # Someone else already holds the dated rescue ref at another commit.
+    subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=fixture",
+         "-c", "user.email=f@x.invalid", "commit", "-q", "--allow-empty",
+         "-m", "more work"],
+        check=True,
+    )
+    other = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "push", "origin", "HEAD:refs/rescue/slot-l/20261114/feat/x")
+    _git(repo, "reset", "-q", "--hard", head)
+
+    receipt = cli._execute_ttl_rescue(
+        repo, slot="slot-l", date_str="20261114", remote="origin",
+        bundle_path=tmp_path / "bundles" / "slot-l.bundle",
+    )
+
+    entries = {entry["branch"]: entry for entry in receipt["rescued"]}
+    assert entries["feat/x"]["rescue_ref"] == "refs/rescue/slot-l/20261114/feat/x-2"
+    assert _remote_ref(remote, "refs/rescue/slot-l/20261114/feat/x") == other
+    assert _remote_ref(remote, "refs/rescue/slot-l/20261114/feat/x-2") == head
+
+
 def test_hook_renames_refs_and_words_the_wip_commit(tmp_path: Path) -> None:
     repo, remote = _repo(tmp_path)
     _git(repo, "checkout", "-q", "-b", "feat/x")
@@ -98,10 +159,10 @@ def test_hook_renames_refs_and_words_the_wip_commit(tmp_path: Path) -> None:
     )
 
     entries = {entry["branch"]: entry for entry in receipt["rescued"]}
-    assert entries["feat/x"]["rescue_ref"] == "refs/heads/rescue/slot-h/20261114/kept-work"
+    assert entries["feat/x"]["rescue_ref"] == "refs/rescue/slot-h/20261114/kept-work"
     subject = subprocess.run(
         ["git", f"--git-dir={remote}", "log", "-1", "--format=%s",
-         "refs/heads/rescue/slot-h/20261114/kept-work"],
+         "refs/rescue/slot-h/20261114/kept-work"],
         check=True, capture_output=True, text=True,
     ).stdout.strip()
     assert subject == "hook WIP"
@@ -121,4 +182,4 @@ def test_a_failing_hook_falls_back_to_deterministic_names(tmp_path: Path) -> Non
 
     entries = {entry["branch"]: entry for entry in receipt["rescued"]}
     assert entries["feat/x"]["pushed"] is True
-    assert _remote_ref(remote, "refs/heads/rescue/slot-i/20261114/feat/x")
+    assert _remote_ref(remote, "refs/rescue/slot-i/20261114/feat/x")

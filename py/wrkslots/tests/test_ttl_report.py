@@ -113,8 +113,23 @@ def test_report_names_rescue_ref_bundle_and_teardown_time(
     assert stale["expired_at"] == "2026-11-10T01:00:00+00:00"
     assert stale["teardown_at"] == "2026-11-13T01:00:00+00:00"
     (checkout,) = stale["checkouts"]
-    assert checkout["rescue_ref"] == "refs/heads/rescue/stale/20261114/feat/x"
+    assert checkout["rescue_ref"] == "refs/rescue/stale/20261114/feat/x"
     assert checkout["bundle"] == str(config.control / "ttl-rescue" / "stale.bundle")
+
+
+def test_report_honours_the_rescue_ref_root_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result, _config = _report(
+        tmp_path, monkeypatch, "--format", "json",
+        "--rescue-ref-root", "refs/heads/rescue",
+    )
+    assert result == 0, capsys.readouterr().err
+    payload = json.loads(capsys.readouterr().out)
+    rows = {row["slot"]: row for row in payload["slots"]}
+    (checkout,) = rows["stale"]["checkouts"]
+    assert checkout["rescue_ref"] == "refs/heads/rescue/stale/20261114/feat/x"
 
 
 def test_health_lines_follow_tick_hub_grammar(

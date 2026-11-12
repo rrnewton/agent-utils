@@ -31,7 +31,7 @@ const REQUIRED: [&str; 6] = [
     "heartbeat_ttl_seconds",
     "liveness_command",
 ];
-const OPTIONAL: [&str; 22] = [
+const OPTIONAL: [&str; 23] = [
     "machine",
     "liveness_batch_command",
     "max_active_slots",
@@ -42,6 +42,7 @@ const OPTIONAL: [&str; 22] = [
     "post_provision_hooks",
     "identity",
     "salvage_push_remotes",
+    "ttl_rescue_ref_root",
     "reclaimable_ignored_paths",
     "disk_advisory_bytes",
     "disk_provisioning_floor_bytes",
@@ -618,6 +619,18 @@ fn identity_settings(raw: &Map<String, Value>) -> Result<Value> {
         ));
     }
     Ok(json!({"email": email, "name": name}))
+}
+
+fn validate_rescue_ref_root(value: &Value) -> Result<String> {
+    let text = as_str(value, "configuration.ttl_rescue_ref_root")?;
+    let root = text.trim_end_matches('/');
+    if !root.starts_with("refs/") || root == "refs" {
+        return Err(format!(
+            "invalid ttl rescue ref root {}: it must name a namespace under refs/, such as refs/rescue or refs/heads/rescue",
+            crate::storage_state::py_repr(text)
+        ));
+    }
+    Ok(root.to_owned())
 }
 
 fn validate_salvage_remote(value: &str) -> Result<String> {
@@ -1447,6 +1460,10 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
         Some(value) => post_provision_hook_entries(value, "configuration.post_provision_hooks")?,
     };
     let identity = identity_settings(raw)?;
+    let ttl_rescue_ref_root = match raw.get("ttl_rescue_ref_root") {
+        None => "refs/rescue".to_owned(),
+        Some(value) => validate_rescue_ref_root(value)?,
+    };
     let salvage = match raw.get("salvage_push_remotes") {
         None => Vec::new(),
         Some(value) => string_tuple(
@@ -1601,6 +1618,7 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
         "retire_freeze": raw.get("retire_freeze").cloned().unwrap_or(Value::Null),
         "root": root.to_string_lossy(),
         "salvage_push_remotes": salvage,
+        "ttl_rescue_ref_root": ttl_rescue_ref_root,
         "sandbox": sandbox_settings(raw)?,
         "slot_representation": representation,
         "worktrees": worktrees.to_string_lossy(),

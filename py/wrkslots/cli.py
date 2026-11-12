@@ -558,6 +558,7 @@ OPTIONAL_CONFIG_KEYS = frozenset(
         "identity",
         "share_submodules",
         "salvage_push_remotes",
+        "ttl_rescue_ref_root",
         "reclaimable_ignored_paths",
         "disk_advisory_bytes",
         "disk_provisioning_floor_bytes",
@@ -678,6 +679,13 @@ CONFIG_KEY_DOCS: dict[str, str] = {
     "salvage_push_remotes": (
         "Remote URLs that removal may push salvage commits to. Absent or empty allows none: "
         "uncommitted work on any other remote is kept in a verified local bundle instead."
+    ),
+    "ttl_rescue_ref_root": (
+        "Ref namespace root for TTL rescue refs (#1368): dated rescue refs are "
+        "<root>/<slot>/<YYYYMMDD>/<name>. Absent means refs/rescue; set "
+        "refs/heads/rescue to keep rescue refs as branches. The --rescue-ref-root "
+        "flag overrides it. List the key in ignorable_keys so an older wrkslots "
+        "ignores it instead of refusing."
     ),
     "reclaimable_ignored_paths": (
         "Checkout-relative paths or globs of regenerable build output. A retained frozen "
@@ -1288,6 +1296,8 @@ class Config:
     share_submodules: bool = False
     #: Remote URLs salvage may push to; every other remote gets a local bundle.
     salvage_push_remotes: tuple[str, ...] = ()
+    #: Ref namespace root for TTL rescue refs (#1368); absent means refs/rescue.
+    ttl_rescue_ref_root: str = "refs/rescue"
     #: Checkout-relative build-output subtrees that leave a frozen clone pristine.
     reclaimable_ignored_paths: tuple[str, ...] = ()
     disk_advisory_bytes: int | None = None
@@ -4573,6 +4583,13 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         identity=identity,
         share_submodules=share_submodules,
         salvage_push_remotes=salvage_push_remotes,
+        ttl_rescue_ref_root=(
+            _validate_rescue_ref_root(
+                _as_str(raw["ttl_rescue_ref_root"], "configuration.ttl_rescue_ref_root")
+            )
+            if "ttl_rescue_ref_root" in raw
+            else "refs/rescue"
+        ),
         reclaimable_ignored_paths=reclaimable_ignored_paths,
         disk_advisory_bytes=disk_values[0],
         disk_provisioning_floor_bytes=disk_values[1],
@@ -24547,6 +24564,26 @@ def _ttl_thresholds(
     return TtlThresholds(*values)
 
 
+_TTL_RESCUE_REF_ROOT_DEFAULT = "refs/rescue"
+
+
+def _validate_rescue_ref_root(value: str) -> str:
+    """Validate a TTL rescue ref namespace root (#1368).
+
+    A root is a ref prefix such as ``refs/rescue`` (the default, outside
+    ``refs/heads`` so rescues never appear as branches) or
+    ``refs/heads/rescue`` for a project that wants them as branches.
+    """
+    root = value.rstrip("/")
+    if not root.startswith("refs/") or root == "refs":
+        raise Refusal(
+            f"invalid ttl rescue ref root {value!r}: it must name a namespace "
+            "under refs/, such as refs/rescue or refs/heads/rescue"
+        )
+    _validate_full_ref(f"{root}/probe", "ttl rescue ref root")
+    return root
+
+
 def _ttl_stage(
     expired_at: dt.datetime, now: dt.datetime, thresholds: TtlThresholds
 ) -> str:
@@ -24591,6 +24628,7 @@ def _ttl_report_rows(
     *,
     only_overdue: bool = False,
     slot: str | None = None,
+    rescue_ref_root: str = _TTL_RESCUE_REF_ROOT_DEFAULT,
 ) -> list[_TtlReportRow]:
     """One dry-run row per slot: stage, rescue refs, bundle, teardown time.
 
@@ -24630,7 +24668,7 @@ def _ttl_report_rows(
                         "branch": checkout.branch,
                         "remote": checkout.remote,
                         "rescue_ref": (
-                            f"refs/heads/rescue/{record.slot}/{rescue_date}/"
+                            f"{rescue_ref_root}/{record.slot}/{rescue_date}/"
                             f"{checkout.branch}"
                         ),
                         "bundle": bundle,
@@ -24665,8 +24703,10 @@ class _TtlTeardownReceipt(TypedDict):
     path: str
 
 
-def _ttl_rescue_ref(slot: str, date_str: str, name: str) -> str:
-    return f"refs/heads/rescue/{slot}/{date_str}/{name}"
+def _ttl_rescue_ref(
+    slot: str, date_str: str, name: str, root: str = _TTL_RESCUE_REF_ROOT_DEFAULT
+) -> str:
+    return f"{root}/{slot}/{date_str}/{name}"
 
 
 class _TtlRescueHookRequest(TypedDict):
@@ -24702,18 +24742,22 @@ def _call_ttl_rescue_hook(
 
 
 def _ttl_hook_ref_name(
-    decision: _TtlRescueHookDecision, branch: str, slot: str, date_str: str
+    decision: _TtlRescueHookDecision,
+    branch: str,
+    slot: str,
+    date_str: str,
+    root: str = _TTL_RESCUE_REF_ROOT_DEFAULT,
 ) -> str:
     """The rescue ref for ``branch``: the hook's valid rename, else the default."""
     names = decision.get("ref_names") or {}
     candidate = names.get(branch)
     if isinstance(candidate, str) and candidate:
-        ref = _ttl_rescue_ref(slot, date_str, candidate)
+        ref = _ttl_rescue_ref(slot, date_str, candidate, root)
         try:
             return _validate_full_ref(ref, "ttl rescue ref")
         except Refusal:
-            return _ttl_rescue_ref(slot, date_str, branch)
-    return _ttl_rescue_ref(slot, date_str, branch)
+            return _ttl_rescue_ref(slot, date_str, branch, root)
+    return _ttl_rescue_ref(slot, date_str, branch, root)
 
 
 def _execute_ttl_rescue(
@@ -24724,6 +24768,7 @@ def _execute_ttl_rescue(
     remote: str,
     bundle_path: Path,
     hook: TtlRescueHook | None = None,
+    rescue_ref_root: str = _TTL_RESCUE_REF_ROOT_DEFAULT,
 ) -> _TtlRescueReceipt:
     """Deterministic code-based rescue for one checkout (#1293 slice 3).
 
@@ -24740,6 +24785,26 @@ def _execute_ttl_rescue(
 
     def git(path: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         return _GitVcs._run(path, list(args), check=check)
+
+    def available_ref(worktree: Path, ref: str, source: str) -> str:
+        """``ref``, or a suffixed variant the remote does not hold otherwise.
+
+        A rescue ref that already names the source commit is reused; one
+        naming a different commit is never overwritten — the push goes
+        to ``<ref>-2``, ``<ref>-3``, ... and the receipt names the ref
+        actually used (#1368).
+        """
+        target = git(worktree, "rev-parse", source).stdout.strip()
+        candidate, suffix = ref, 1
+        while True:
+            answer = git(worktree, "ls-remote", remote, candidate, check=False)
+            if answer.returncode != 0:
+                return candidate
+            listed = answer.stdout.split()
+            if not listed or listed[0] == target:
+                return candidate
+            suffix += 1
+            candidate = f"{ref}-{suffix}"
 
     listing = git(checkout_dir, "worktree", "list", "--porcelain").stdout
     worktrees = [
@@ -24792,7 +24857,11 @@ def _execute_ttl_rescue(
             branch = f"detached-{short}"
         else:
             checked_out.add(branch)
-        ref = _ttl_hook_ref_name(decision, branch, slot, date_str)
+        ref = available_ref(
+            worktree,
+            _ttl_hook_ref_name(decision, branch, slot, date_str, rescue_ref_root),
+            "HEAD",
+        )
         push = git(worktree, "push", remote, f"HEAD:{ref}", check=False)
         operations += 1
         rescued.append(
@@ -24807,7 +24876,11 @@ def _execute_ttl_rescue(
     for branch in branches:
         if branch in checked_out:
             continue
-        ref = _ttl_hook_ref_name(decision, branch, slot, date_str)
+        ref = available_ref(
+            checkout_dir,
+            _ttl_hook_ref_name(decision, branch, slot, date_str, rescue_ref_root),
+            f"refs/heads/{branch}",
+        )
         push = git(
             checkout_dir, "push", remote, f"refs/heads/{branch}:{ref}", check=False
         )
@@ -24827,7 +24900,11 @@ def _execute_ttl_rescue(
         rescued.sort(key=lambda entry: order.get(entry["branch"], len(order)))
     stash = git(checkout_dir, "rev-parse", "-q", "--verify", "refs/stash", check=False)
     if stash.returncode == 0 and stash.stdout.strip():
-        ref = _ttl_hook_ref_name(decision, "stash", slot, date_str)
+        ref = available_ref(
+            checkout_dir,
+            _ttl_hook_ref_name(decision, "stash", slot, date_str, rescue_ref_root),
+            "refs/stash",
+        )
         push = git(checkout_dir, "push", remote, f"refs/stash:{ref}", check=False)
         operations += 1
         rescued.append(
@@ -24914,6 +24991,7 @@ def _execute_ttl_slot_rescue(
     now: dt.datetime,
     thresholds: TtlThresholds,
     hook: TtlRescueHook | None = None,
+    rescue_ref_root: str = _TTL_RESCUE_REF_ROOT_DEFAULT,
 ) -> _TtlSlotRescueReceipt:
     """Rescue every recorded checkout of an overdue slot (#1293 wiring).
 
@@ -24943,6 +25021,7 @@ def _execute_ttl_slot_rescue(
                     config.control / "ttl-rescue" / f"{record.slot}-{safe_name}.bundle"
                 ),
                 hook=hook,
+                rescue_ref_root=rescue_ref_root,
             )
         )
     return {
@@ -24961,6 +25040,7 @@ def _execute_ttl_slot_teardown(
     now: dt.datetime,
     thresholds: TtlThresholds,
     hook: TtlRescueHook | None = None,
+    rescue_ref_root: str = _TTL_RESCUE_REF_ROOT_DEFAULT,
 ) -> _TtlSlotTeardownReceipt:
     """Deterministic teardown of one slot at the teardown rung (#1293).
 
@@ -24978,7 +25058,8 @@ def _execute_ttl_slot_teardown(
             "deterministic teardown runs only past the teardown rung"
         )
     rescue = _execute_ttl_slot_rescue(
-        config, record, now=now, thresholds=thresholds, hook=hook
+        config, record, now=now, thresholds=thresholds, hook=hook,
+        rescue_ref_root=rescue_ref_root,
     )
     slot_path = _slot_directory(config, record.slot, record.slot_type)
     if slot_path.exists():
@@ -25010,6 +25091,12 @@ def _ttl_health_lines(
     return lines
 
 
+def _rescue_ref_root_arg(args: argparse.Namespace, config: Config) -> str:
+    """The effective rescue ref root: --rescue-ref-root, else the config key."""
+    flag = getattr(args, "rescue_ref_root", None)
+    return _validate_rescue_ref_root(flag) if flag else config.ttl_rescue_ref_root
+
+
 def _cmd_ttl_report(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
     thresholds = _ttl_thresholds(
@@ -25027,6 +25114,7 @@ def _cmd_ttl_report(args: argparse.Namespace) -> int:
     rows = _ttl_report_rows(
         config, state, now, thresholds,
         only_overdue=args.only_overdue, slot=args.slot,
+        rescue_ref_root=_rescue_ref_root_arg(args, config),
     )
     if args.format == "health":
         for line in _ttl_health_lines(rows, thresholds):
@@ -25139,7 +25227,8 @@ def _cmd_ttl_teardown(args: argparse.Namespace) -> int:
         else None
     )
     rescue = _execute_ttl_slot_rescue(
-        config, before, now=now, thresholds=thresholds, hook=hook
+        config, before, now=now, thresholds=thresholds, hook=hook,
+        rescue_ref_root=_rescue_ref_root_arg(args, config),
     )
     finished_at = _utc_now()
     entry: dict[str, object] = {
@@ -80154,6 +80243,13 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help="output format: human rows, json rows, or tick-hub HEALTH lines (default: human)",
     )
     ttl_report.add_argument(
+        "--rescue-ref-root", metavar="ROOT", default=None,
+        help=(
+            "ref namespace root for the planned dated rescue refs "
+            "(default: the ttl_rescue_ref_root config key, else refs/rescue)"
+        ),
+    )
+    ttl_report.add_argument(
         "--now", metavar="ISO8601", default=None,
         help=(
             "timestamp to judge the ladder against, with a time zone "
@@ -80220,6 +80316,13 @@ usage or audit gate unknown, 3 fail-closed refusal.
         help=(
             "timestamp to judge the ladder against, with a time zone "
             "(default: the current UTC time); tests pass a fixed value"
+        ),
+    )
+    ttl_teardown.add_argument(
+        "--rescue-ref-root", metavar="ROOT", default=None,
+        help=(
+            "ref namespace root for the dated rescue refs "
+            "(default: the ttl_rescue_ref_root config key, else refs/rescue)"
         ),
     )
     ttl_teardown.add_argument(

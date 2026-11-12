@@ -77,6 +77,7 @@ def _expected(
         "retire_freeze": config.retire_freeze,
         "root": str(config.root),
         "salvage_push_remotes": list(config.salvage_push_remotes),
+        "ttl_rescue_ref_root": config.ttl_rescue_ref_root,
         "sandbox": sandbox_module.settings_to_obj(config.sandbox_settings),
         "slot_representation": config.slot_representation,
         "worktrees": str(config.worktrees),
