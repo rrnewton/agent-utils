@@ -39,7 +39,9 @@
 //!
 //! Slack goes first only for what the cache holds nothing of, with the fallback as before; and
 //! for the reads that exist to ask the provider what this server does not know: placing a live
-//! message's thread (`place`, `reply-place`).
+//! message's thread (`place`, `reply-place`). One server read is answered cache-first by
+//! design: a Discuss catch-up (`discuss`, `#1316 catchup-side-agent`), which reports this
+//! server's copy and must never wait on upstream rate limits.
 //!
 //! `#650 cache-first-older-reads`: All's counts read (`counts`) is answered the same way; the page
 //! asks once more ten seconds after such an answer, which takes the read that landed behind it, so
@@ -180,7 +182,8 @@ pub const LANDED_KEPT: Duration = Duration::from_secs(15);
 /// Not a step back itself (`before`), which `crate::ops` answers from the file when it can; not
 /// the reads that ask the provider what this server does not know, where to place a live message
 /// (`place`, `reply-place`); not the server's own reads (naming, a tool, the live poller), which
-/// keep their own rules. "Older threads…" (`threads`) only when the cache's answer knows the way
+/// keep their own rules — except a Discuss catch-up (`discuss`), answered from this server's
+/// copy by design. "Older threads…" (`threads`) only when the cache's answer knows the way
 /// back ([`answers`]).
 #[must_use]
 pub fn eligible(request: &TimelineRequest) -> bool {
@@ -202,6 +205,7 @@ pub fn eligible(request: &TimelineRequest) -> bool {
                 | R::Older
                 | R::Search
                 | R::Counts
+                | R::Discuss
         )
 }
 
@@ -523,6 +527,28 @@ mod tests {
             schedule.try_schedule(&view()),
             "success cleared the back-off"
         );
+    }
+
+    #[tokio::test]
+    async fn a_discuss_read_is_answered_from_the_cache_first_and_a_step_back_is_not() {
+        // `#1316 catchup-side-agent`: the newest page of a catch-up comes from this
+        // server's copy; a step back keeps the older-reads rules, and the server's
+        // other reads keep theirs.
+        let newest = TimelineRequest::default();
+        let mut step_back = TimelineRequest::default();
+        step_back.before = Some("cursor".to_owned());
+        let discuss_newest = ReadReason::Discuss
+            .scope(async { eligible(&newest) })
+            .await;
+        let discuss_step = ReadReason::Discuss
+            .scope(async { eligible(&step_back) })
+            .await;
+        let summary_newest = ReadReason::SummaryWindow
+            .scope(async { eligible(&newest) })
+            .await;
+        assert!(discuss_newest, "a catch-up's newest page");
+        assert!(!discuss_step, "a catch-up's step back");
+        assert!(!summary_newest, "a summary's window keeps its own rules");
     }
 
     #[tokio::test]

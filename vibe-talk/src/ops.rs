@@ -6753,15 +6753,19 @@ pub struct CatchupFetch {
 /// (`view` then selects nothing; the caller passes
 /// [`crate::threads::TimelineView::Thread`]).
 ///
-/// The timeline is walked backwards from its newest page inside the recap bounds, so a
-/// window of any age answers and `truncated` says when a bound cut it. Noise is counted and
-/// left out, as in [`recap`]; the read set is [`dismissed_within`]'s, the same source of
-/// truth as the page.
+/// CACHE ONLY (`#1348 discuss-cache-only`, the owner's hard rule): the window comes from
+/// this server's message cache alone — the newest held page
+/// ([`crate::cache::sink::Sink::stale_timeline`]), then steps back from the file
+/// ([`crate::cache::sink::Sink::held_below`]) inside the recap bounds — and no provider
+/// call is made or begun behind the answer. What the cache does not hold is not fetched:
+/// the walk stops there with `truncated` set (or an empty window when it holds nothing of
+/// the view), and the answer says what it covers. Noise is counted and left out, as in
+/// [`recap`]; the read set is [`dismissed_within`]'s, the same source of truth as the page.
 ///
 /// # Errors
 ///
-/// [`OpError::UnknownChannel`] outside the allowlist, [`OpError::Chat`] when a timeline
-/// read fails, or [`OpError::Store`] when the read set cannot be read.
+/// [`OpError::UnknownChannel`] outside the allowlist, or [`OpError::Store`] when the read
+/// set cannot be read. A cache that holds nothing is an empty window, never an error.
 pub async fn catchup_fetch(
     state: &AppState,
     caller: crate::auth::Scope,
@@ -6779,54 +6783,66 @@ pub async fn catchup_fetch(
         window.max(1)
     };
     let mut held: Vec<Message> = Vec::new();
-    let mut before: Option<String> = None;
     let mut truncated = false;
-    let mut finished = false;
-    for _ in 0..MAX_RECAP_PAGES {
-        let request = TimelineRequest {
+    // The cache alone: its newest held page, then steps back from the file. Neither read
+    // calls the provider, and neither begins a refresh behind the answer — what the cache
+    // lacks (an unrouted channel, a thread nobody has opened) is an empty or short window,
+    // never a fetch. Cache serving's own gates are `may_serve`'s, as for every held answer.
+    if may_serve(state, caller) {
+        let ask = Ask::Timeline {
             view: if whole_thread {
                 TimelineView::Thread
             } else {
                 view
             },
-            thread_id: thread_id.map(str::to_owned),
-            before: before.clone(),
-            after: None,
-            limit: MAX_PAGE,
+            thread: thread_id.map(str::to_owned),
+            limit: usize::from(MAX_PAGE),
         };
-        let (_, page) = timeline(state, caller, channel_id, &request).await?;
-        if page.messages.is_empty() {
-            finished = true;
-            break;
-        }
-        let has_more = page.has_more;
-        held.extend(page.messages);
-        if held.len() >= MAX_RECAP_MESSAGES {
-            truncated = has_more;
-            finished = true;
-            break;
-        }
-        if !whole_thread && held.len() >= target {
-            finished = true;
-            break;
-        }
-        if !has_more {
-            finished = true;
-            break;
-        }
-        match page.next_before {
-            Some(next) => before = Some(next),
-            None => {
-                truncated = true;
-                finished = true;
-                break;
+        if let Some(stale) = state.message_cache.stale_timeline(&channel.id, &ask).await {
+            held = stale.messages;
+            for _ in 0..MAX_RECAP_PAGES {
+                if held.len() >= target || held.len() >= MAX_RECAP_MESSAGES {
+                    break;
+                }
+                let Some(oldest) = held
+                    .iter()
+                    .min_by_key(|message| (message.created_ms().unwrap_or(i64::MAX), message.id.clone()))
+                else {
+                    break;
+                };
+                let Some(at_ms) = oldest.created_ms() else {
+                    truncated = true;
+                    break;
+                };
+                let (at_ms, oldest_id) = (at_ms, oldest.id.clone());
+                let Some(below) = state
+                    .message_cache
+                    .held_below(&channel.id, &ask, (at_ms, oldest_id.as_str()), MAX_RECAP_MESSAGES)
+                    .await
+                else {
+                    // The file does not prove more below: what it holds is the answer.
+                    truncated = true;
+                    break;
+                };
+                if below.messages.is_empty() {
+                    break;
+                }
+                let has_more = below.has_more;
+                held.extend(below.messages);
+                // Dedup between steps so `held.len()` stays the window's true size.
+                held.sort_by_key(|message| (message.created_ms().unwrap_or(i64::MAX), message.id.clone()));
+                held.dedup_by(|next, kept| next.id == kept.id);
+                if !has_more {
+                    break;
+                }
             }
         }
     }
-    // The page bound ended the walk short of the window (or of the thread's start): say so.
-    if !finished {
-        truncated = true;
-    }
+    // Held messages arrive unstamped and unmarked, as the cache holds them: stamp and mark
+    // them as every served answer's are, before anything downstream prints their fields.
+    let noise = crate::noise::filter_for(state, &channel.id).await;
+    stamp(state, &mut held);
+    noise.mark(&mut held);
     // Pages arrive newest first, each oldest-first within itself; one sort puts the whole
     // window oldest-first however the walk was paged, as in `recap`.
     held.sort_by_key(|message| (message.created_ms().unwrap_or(i64::MAX), message.id.clone()));

@@ -2536,7 +2536,7 @@ pub async fn catchup(
         }
     };
     let context_began = std::time::Instant::now();
-    let fetched = crate::read_reason::ReadReason::SummaryWindow
+    let fetched = crate::read_reason::ReadReason::Discuss
         .scope(ops::catchup_fetch(
             &state,
             Scope::Write,
@@ -2550,17 +2550,34 @@ pub async fn catchup(
     let built = crate::catchup::build_context(&fetched.messages, &fetched.read, &owner);
     let system = crate::catchup::effective_system_prompt(None);
     let context_ms = u64::try_from(context_began.elapsed().as_millis()).unwrap_or(u64::MAX);
+    // Cache-only (`#1348 discuss-cache-only`): a window the cache holds nothing of is
+    // answered saying so, with no model call — never a fetch to fill it.
+    let held_nothing = fetched.messages.is_empty();
     let model_began = std::time::Instant::now();
-    let raw = agent
-        .complete_prompt(&system, &built.prompt)
-        .await
-        .map_err(|error| match error {
-            // A backend with no free-form prompt in the side-agent seat is the same
-            // deployment fact as no side agent at all, and gets the same clear answer.
-            crate::summarize::SummaryError::NotConfigured(_) => discuss_not_available(),
-            other => ApiError::from(OpError::Summarizer(other)),
-        })?;
-    let model_ms = u64::try_from(model_began.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let raw = if held_nothing {
+        if thread_id.is_some() {
+            "This server's cache holds nothing of this thread yet. Open it once so the \
+             server holds it, then Discuss."
+                .to_owned()
+        } else {
+            "This server's cache holds nothing of this channel yet.".to_owned()
+        }
+    } else {
+        agent
+            .complete_prompt(&system, &built.prompt)
+            .await
+            .map_err(|error| match error {
+                // A backend with no free-form prompt in the side-agent seat is the same
+                // deployment fact as no side agent at all, and gets the same clear answer.
+                crate::summarize::SummaryError::NotConfigured(_) => discuss_not_available(),
+                other => ApiError::from(OpError::Summarizer(other)),
+            })?
+    };
+    let model_ms = if held_nothing {
+        0
+    } else {
+        u64::try_from(model_began.elapsed().as_millis()).unwrap_or(u64::MAX)
+    };
     let sent: std::collections::HashSet<MessageId> =
         fetched.messages.iter().map(|m| m.id.clone()).collect();
     let text = crate::catchup::validate_cites(&raw, &sent);
@@ -2598,7 +2615,11 @@ pub async fn catchup(
         total_ms: u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
         input_tokens: None,
         output_tokens: None,
-        input_chars: system.chars().count() + built.prompt.chars().count(),
+        input_chars: if held_nothing {
+            0
+        } else {
+            system.chars().count() + built.prompt.chars().count()
+        },
         output_chars: text.chars().count(),
     };
     tracing::info!(

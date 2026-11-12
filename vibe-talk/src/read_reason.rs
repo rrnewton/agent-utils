@@ -120,6 +120,10 @@ pub enum ReadReason {
     Probe,
     /// The server: the channel window a summary takes its context from.
     SummaryWindow,
+    /// The server: the window one Discuss catch-up reads. Answered from the cache first
+    /// like a page read (`#1316 catchup-side-agent`): a catch-up reports this server's
+    /// copy, and must never wait on — or drain — the provider's rate-limit buckets.
+    Discuss,
     /// The server: the window, or the thread messages, speech preparation finds its messages in.
     Speech,
     /// The server: the recent-view shadow's check of a window against Flat.
@@ -149,7 +153,7 @@ pub enum ReadReason {
 }
 
 /// Every reason, in declaration order. For tests and documentation.
-pub const ALL: [ReadReason; 30] = [
+pub const ALL: [ReadReason; 31] = [
     ReadReason::Enter,
     ReadReason::Poll,
     ReadReason::Live,
@@ -170,6 +174,7 @@ pub const ALL: [ReadReason; 30] = [
     ReadReason::Recent,
     ReadReason::Probe,
     ReadReason::SummaryWindow,
+    ReadReason::Discuss,
     ReadReason::Speech,
     ReadReason::Shadow,
     ReadReason::Tool,
@@ -207,6 +212,7 @@ impl ReadReason {
             Self::Recent => "recent",
             Self::Probe => "probe",
             Self::SummaryWindow => "summary-window",
+            Self::Discuss => "discuss",
             Self::Speech => "speech",
             Self::Shadow => "shadow",
             Self::Tool => "tool",
