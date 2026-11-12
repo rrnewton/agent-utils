@@ -1,4 +1,4 @@
-"""Guarded kill-pid (#1420): stubbed /proc and systemctl, fake killer only.
+"""Guarded kill-pid (#1420): fixture /proc and systemctl, fake killer only.
 
 No test in this file signals a real process: the process table and the unit
 list are fixtures, and the killer records what it would have sent.
@@ -17,7 +17,7 @@ from agentctl.killpid import (
 
 
 class FakeProc:
-    """A stubbed /proc: one process table, optionally changing on re-read."""
+    """A fixture /proc: one process table, optionally changing on re-read."""
 
     def __init__(self, processes: dict[int, ProcessInfo],
                  changed: ProcessInfo | None = None) -> None:
@@ -33,7 +33,7 @@ class FakeProc:
 
 
 class FakeUnits:
-    """A stubbed systemctl: a fixed unit list."""
+    """A fixture systemctl: a fixed unit list."""
 
     def __init__(self, units: tuple[UnitInfo, ...] = ()) -> None:
         self._units = units

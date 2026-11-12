@@ -13,7 +13,7 @@
 //! team's own registry configuration names. Everything else is refused.
 //!
 //! All system access goes through the [`ProcView`], [`UnitView`] and [`Killer`]
-//! traits, so tests stub `/proc` and `systemctl` and never signal a real process.
+//! traits, so tests replace `/proc` and `systemctl` with fixtures and never signal a real process.
 //! The real killer re-reads the process identity and, on Linux, signals through a
 //! pidfd pinned before the recheck, so the signal can only reach the exact
 //! process that was checked. This is the Rust edition of `py/agentctl/killpid.py`;
@@ -127,19 +127,19 @@ fn refused(reason: &'static str, detail: String) -> KillRefused {
     KillRefused { reason, detail }
 }
 
-/// Read access to one process's identity, stubbed in tests.
+/// Read access to one process's identity, replaced by test doubles.
 pub trait ProcView {
     /// The process, or None when no such process can be read.
     fn process(&self, pid: u64) -> Option<ProcessInfo>;
 }
 
-/// Read access to the user manager's units, stubbed in tests.
+/// Read access to the user manager's units, replaced by test doubles.
 pub trait UnitView {
     /// Every user unit with its main PID.
     fn units(&self) -> Vec<UnitInfo>;
 }
 
-/// The one signal send, stubbed in tests so no real process is signalled.
+/// The one signal send, replaced by test doubles so no real process is signalled.
 pub trait Killer {
     /// Signal `pid`, re-verifying it still is `expected` first.
     ///
@@ -155,7 +155,7 @@ pub trait Killer {
     ) -> Result<(), KillRefused>;
 }
 
-/// The real view, read from a procfs root (`/proc` unless stubbed).
+/// The real view, read from a procfs root (`/proc` unless a fixture root is given).
 pub struct RealProcView {
     root: PathBuf,
 }
