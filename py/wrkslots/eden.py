@@ -248,6 +248,43 @@ def provision_checkout(
     return info, parse_redirections(stdout)
 
 
+def remove_sequence(
+    runner: Runner,
+    config_dir: str,
+    mount: str,
+    targets: Sequence[str],
+    existing_paths: Sequence[str],
+    orphaned_before: int,
+) -> tuple[str, ...]:
+    """Run Eden removal and return orphan problems (empty is clean).
+
+    Stops the per-slot daemon after the mount is gone; the caller
+    owns subvolume deletion and must refuse while problems remain.
+    """
+
+    rc, _out, stderr = runner(
+        ["eden", "--config-dir", config_dir, "remove", "-y", mount]
+    )
+    if rc != 0:
+        return (f"eden remove failed: {stderr.strip()}",)
+    runner(["eden", "--config-dir", config_dir, "stop"])
+    rc, stdout, stderr = runner(["eden", "--config-dir", config_dir, "list"])
+    if rc != 0:
+        return (f"eden list failed after remove: {stderr.strip()}",)
+    mounts_after = parse_mount_list(stdout)
+    rc, stdout, stderr = runner(["eden", "du", "--json", mount])
+    orphaned_after = orphaned_before
+    if rc == 0:
+        try:
+            orphaned_after = parse_orphaned_bytes(stdout)
+        except EdenError:
+            orphaned_after = orphaned_before
+    return verify_removed(
+        mounts_after, mount, targets, existing_paths,
+        orphaned_before, orphaned_after,
+    )
+
+
 def verify_removed(
     mounts_after: Sequence[str],
     mount: str,

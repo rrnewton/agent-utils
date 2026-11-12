@@ -207,6 +207,35 @@ def test_trial_record_shape_replays(tmp_path: Path) -> None:
     wrkslots_cli._assert_record_paths(config, parsed)
 
 
+def test_remove_sequence_cleans_and_stops() -> None:
+    calls: list[tuple[str, ...]] = []
+
+    def runner(argv: Sequence[str]) -> tuple[int, str, str]:
+        calls.append(tuple(argv))
+        if "remove" in argv:
+            return (0, "", "")
+        if "list" in argv:
+            return (0, "/other/mount\n", "")
+        if "du" in argv:
+            return (0, '{"orphaned_redirections": 10}', "")
+        return (0, "", "")
+
+    problems = eden.remove_sequence(
+        runner, "/slot/.eden-state", "/slot/checkout", ("/slot/buck",), (), 10
+    )
+    assert problems == ()
+    assert any("stop" in call for call in calls)
+
+    def failing(argv: Sequence[str]) -> tuple[int, str, str]:
+        if "remove" in argv:
+            return (1, "", "busy")
+        return runner(argv)
+
+    assert eden.remove_sequence(
+        failing, "/slot/.eden-state", "/slot/checkout", (), (), 0
+    ) == ("eden remove failed: busy",)
+
+
 def test_provision_clone_info_redirects() -> None:
     calls: list[tuple[str, ...]] = []
 

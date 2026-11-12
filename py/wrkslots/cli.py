@@ -50147,6 +50147,50 @@ def _finish_remove_paths(
     all_names = {item.name for item in record.checkouts}
     if not removed <= all_names:
         raise StateError("finish journal names a checkout that is not in the active record")
+    if record.checkouts and all(item.vcs == "eden" for item in record.checkouts):
+        # Eden removal sequence (#1204): salvage, eden remove, verified
+        # orphan checks, then slot storage teardown. The git path fence
+        # must never rename a live FUSE mount, so this runs first.
+        slot_path = _slot_directory(config, record.slot, record.slot_type)
+        for checkout in record.checkouts:
+            if checkout.name in removed:
+                continue
+            mount = _stored_path(config, checkout.path, "checkout path")
+            config_dir = str(mount.parent / ".eden-state")
+            if record.slot_type == "agent":
+                rc, status, stderr = _eden_runner(["sl", "-R", str(mount), "status"])
+                if rc != 0:
+                    raise Refusal(f"Eden salvage status failed: {stderr.strip()}")
+                rc2, ident, _e = _eden_runner(["sl", "-R", str(mount), "id"])
+                current = ident.strip().split()[0] if ident.strip() else ""
+                if eden.salvage_needed(status, current, checkout.head):
+                    dest = config.control / "wrkslots-salvage" / f"{record.slot}-{checkout.name}"
+                    dest.mkdir(parents=True, exist_ok=True)
+                    for argv in eden.salvage_commands(str(mount), dest):
+                        rc3, _o, err3 = _eden_runner(list(argv))
+                        if rc3 != 0:
+                            raise Refusal(f"Eden salvage failed: {err3.strip()}")
+            rc, out, stderr = _eden_runner(
+                ["eden", "--config-dir", config_dir, "redirect", "list",
+                 "--mount", str(mount), "--json"]
+            )
+            if rc != 0:
+                raise Refusal(f"Eden redirect list failed: {stderr.strip()}")
+            targets = tuple(item.target for item in eden.parse_redirections(out))
+            rc, out, _e = _eden_runner(["eden", "du", "--json", str(mount)])
+            orphaned_before = eden.parse_orphaned_bytes(out) if rc == 0 else 0
+            problems = eden.remove_sequence(
+                _eden_runner, config_dir, str(mount), targets,
+                tuple(t for t in targets if Path(t).exists() or Path(t).is_symlink()),
+                orphaned_before,
+            )
+            if problems:
+                raise Refusal("Eden removal incomplete: " + "; ".join(problems))
+            removed.add(checkout.name)
+        journal["removed"] = sorted(removed)
+        _write_journal(config, journal, journal_path=journal_path)
+        _remove_slot_directory(config, slot_path)
+        return journal
     # A remove-agent-batch item whose budget is spent stops before its fence.
     _item_seconds_left("the path fence")
     journal, fenced_slot = _begin_or_resume_path_fence(
