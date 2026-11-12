@@ -285,11 +285,11 @@ test("catchup: no covered messages hides the footer and its buttons", async () =
 test("catchup: the stamp line names chars without tokens and tokens with them", async () => {
   assert.equal(
     formatStampLine({ context_ms: 120, model_ms: 3900, first_token_ms: null, total_ms: 4050, input_tokens: null, output_tokens: null, input_chars: 51234, output_chars: 812 }),
-    "context 120 ms · model 3900 ms · total 4050 ms · in 51234 chars · out 812 chars",
+    "cache 120 ms · model 3900 ms · total 4050 ms · in 51234 chars · out 812 chars",
   );
   assert.equal(
     formatStampLine({ context_ms: 9, model_ms: 80, first_token_ms: 12, total_ms: 95, input_tokens: 1400, output_tokens: 210, input_chars: 51234, output_chars: 812 }),
-    "context 9 ms · model 80 ms · total 95 ms · in 1400 tokens · out 210 tokens",
+    "cache 9 ms · model 80 ms · total 95 ms · in 1400 tokens · out 210 tokens",
   );
   assert.equal(formatStampLine(null), "");
   const fx = fixture();

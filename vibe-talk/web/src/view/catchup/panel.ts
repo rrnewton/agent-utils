@@ -154,14 +154,14 @@ export function asCatchupAnswer(value: unknown): CatchupAnswer {
 }
 
 /**
- * The debug line for one answer: `context X ms · model Y ms · total Z ms · in A · out B`.
+ * The debug line for one answer: `cache X ms · model Y ms · total Z ms · in A · out B`.
  * Sizes are tokens where the gateway really reported them and characters where it did
  * not, and the unit is always named, so a char count never reads as a token count.
  */
 export function formatStampLine(stamp: CatchupStamp | null): string {
   if (stamp === null) return "";
   const parts: string[] = [
-    `context ${Math.round(stamp.context_ms)} ms`,
+    `cache ${Math.round(stamp.context_ms)} ms`,
     `model ${Math.round(stamp.model_ms)} ms`,
     `total ${Math.round(stamp.total_ms)} ms`,
   ];

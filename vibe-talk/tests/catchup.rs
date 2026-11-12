@@ -1,10 +1,12 @@
-//! `POST /api/v1/channels/{id}/catchup`: one Discuss read. `catchup-side-agent`, slice 1.
+//! `POST /api/v1/channels/{id}/catchup`: one Discuss read. `catchup-side-agent`, slice 1;
+//! `#1348 discuss-cache-only` for the fetch.
 //!
-//! The window fetch and its read partition are asserted at [`ops::catchup_fetch`], the seam
-//! that does not need the context builder; the endpoint is asserted for its shape, its one
-//! recorded model call (system = the shipped default), and its refusals. What the builder
-//! puts in the prompt — labels, fences, the unread set it reports — is the builder's own
-//! test file's business.
+//! The window fetch is asserted at [`ops::catchup_fetch`] over a channel the message cache
+//! really holds, with the chat fake's sent-request count frozen: a catch-up must make and
+//! begin ZERO provider calls (owner reply 414). The endpoint is asserted for its shape, its
+//! one recorded model call (system = the shipped default), its cache-miss answer, and its
+//! refusals. What the builder puts in the prompt — labels, fences, the unread set it
+//! reports — is the builder's own test file's business.
 
 use std::sync::{Arc, Mutex};
 
@@ -18,7 +20,7 @@ use vibe_talk::chat::{ChatClient, ChatError, ChatIdentity};
 use vibe_talk::model::{ChannelId, Message, MessageId, UserId};
 use vibe_talk::store::StateStore as _;
 use vibe_talk::testing::{self, READ_TOKEN, WRITE_CHANNEL, WRITE_TOKEN};
-use vibe_talk::threads::{MessageThread, TimelinePage, TimelineRequest, TimelineView};
+use vibe_talk::threads::{TimelinePage, TimelineRequest, TimelineView};
 
 const THREAD_A: &str = "thread-A";
 
@@ -40,8 +42,8 @@ fn message(seq: i64, thread: Option<(&str, bool)>, noise: bool) -> Message {
         timestamp: vibe_talk::clock::iso_from_ms(ms),
         spoken_time: String::new(),
         reply_to: None,
-        // A noise fixture carries the default rule's own text: every timeline read re-marks
-        // noise from the rules, so the flag alone would not survive the fetch.
+        // A noise fixture carries the default rule's own text: every read re-marks noise
+        // from the rules, so the flag alone would not survive the fetch.
         content: if noise {
             "Working…".to_owned()
         } else {
@@ -50,7 +52,7 @@ fn message(seq: i64, thread: Option<(&str, bool)>, noise: bool) -> Message {
         spoken_content: String::new(),
         content_html: String::new(),
         noise,
-        thread: thread.map(|(thread_id, is_root)| MessageThread {
+        thread: thread.map(|(thread_id, is_root)| vibe_talk::threads::MessageThread {
             hue: None,
             display_name: None,
             summary: None,
@@ -71,9 +73,18 @@ fn message(seq: i64, thread: Option<(&str, bool)>, noise: bool) -> Message {
     }
 }
 
+/// The upstream stand-in: serves timeline pages from a Vec and counts every timeline read,
+/// so a test can prove a catch-up sent nothing upstream.
 #[derive(Default)]
 struct Backend {
     messages: Mutex<Vec<Message>>,
+    timeline_reads: Mutex<usize>,
+}
+
+impl Backend {
+    fn reads(&self) -> usize {
+        *self.timeline_reads.lock().expect("reads")
+    }
 }
 
 #[async_trait::async_trait]
@@ -108,6 +119,7 @@ impl ChatClient for Backend {
         _channel: &ChannelId,
         request: &TimelineRequest,
     ) -> Result<TimelinePage, ChatError> {
+        *self.timeline_reads.lock().expect("reads") += 1;
         let all = self.messages.lock().expect("messages").clone();
         let source: Vec<Message> = match request.view {
             TimelineView::Flat => all,
@@ -160,13 +172,60 @@ fn backend_with(messages: Vec<Message>) -> Arc<Backend> {
     backend
 }
 
+/// A summarizer state whose chat is `backend` and whose message cache is installed: fill it
+/// with ordinary timeline reads (which offer what they read), then count from there — a
+/// catch-up must not move the count.
+async fn cached_state(
+    text: &str,
+    backend: Arc<Backend>,
+) -> (
+    vibe_talk::state::AppState,
+    Arc<vibe_talk::store::fake::FakeStore>,
+    Arc<vibe_talk::summarize::fake::FakeSummarizer>,
+    testing::TempDir,
+) {
+    let (mut state, _discord, store, summarizer) = testing::state_with_summarizer(text);
+    state.replace_chat(backend);
+    let dir = testing::TempDir::new("catchup-cache");
+    let clock = testing::ManualClock::at(base_ms() + 3_600_000);
+    let state = testing::with_message_cache(state, dir.path(), clock).await;
+    state.message_cache.set_serve(true);
+    (state, store, summarizer, dir)
+}
+
+/// Fill the cache with `request`'s read, as a page's ordinary read would, and wait for the
+/// cache writer to hold it.
+async fn fill(state: &vibe_talk::state::AppState, view: TimelineView, thread_id: Option<&str>) {
+    let mut before: Option<String> = None;
+    loop {
+        let request = TimelineRequest {
+            view,
+            thread_id: thread_id.map(str::to_owned),
+            before: before.clone(),
+            after: None,
+            limit: 99,
+        };
+        let (_, page) = vibe_talk::ops::timeline(state, Scope::Write, WRITE_CHANNEL, &request)
+            .await
+            .expect("fill read");
+        if !page.has_more {
+            break;
+        }
+        before = page.next_before;
+        assert!(before.is_some(), "a page with more names its way back");
+    }
+    let cache = state.message_cache.cache().expect("installed");
+    assert!(cache.quiesce_blocking(std::time::Duration::from_secs(20)));
+}
+
 #[tokio::test]
 async fn fetch_windows_to_the_newest_k_and_partitions_read() {
-    let (mut state, _discord, store, _summarizer) =
-        testing::state_with_summarizer(&testing::config_toml());
-    // 120 messages: more than one 99-message page, so the backward walk really walks.
+    // 120 messages: more than one 99-message page, so the cache walk really steps back.
     let messages: Vec<Message> = (0..120).map(|seq| message(seq, None, seq == 119)).collect();
-    state.replace_chat(backend_with(messages.clone()));
+    let backend = backend_with(messages.clone());
+    let (state, store, _summarizer, _dir) =
+        cached_state(&testing::config_toml(), backend.clone()).await;
+    fill(&state, TimelineView::Flat, None).await;
     let channel = ChannelId(WRITE_CHANNEL.to_owned());
     store
         .dismiss(
@@ -179,6 +238,7 @@ async fn fetch_windows_to_the_newest_k_and_partitions_read() {
         .await
         .expect("dismiss");
 
+    let reads = backend.reads();
     let fetched = vibe_talk::ops::catchup_fetch(
         &state,
         Scope::Write,
@@ -189,8 +249,9 @@ async fn fetch_windows_to_the_newest_k_and_partitions_read() {
     )
     .await
     .expect("fetch");
+    assert_eq!(backend.reads(), reads, "a catch-up read upstream");
     // The newest message is noise: hidden and counted, so the window is the three newest
-    // visible messages the walk held.
+    // visible messages the cache held.
     assert_eq!(fetched.noise_hidden, 1);
     let ids: Vec<&str> = fetched
         .messages
@@ -215,16 +276,18 @@ async fn fetch_windows_to_the_newest_k_and_partitions_read() {
 }
 
 #[tokio::test]
-async fn fetch_of_a_thread_covers_it_whole() {
-    let (mut state, _discord, _store, _summarizer) =
-        testing::state_with_summarizer(&testing::config_toml());
+async fn fetch_of_a_thread_covers_it_whole_from_the_cache() {
     let mut messages: Vec<Message> = (0..10).map(|seq| message(seq, None, false)).collect();
     let threaded: Vec<Message> = (20..25)
         .map(|seq| message(seq, Some((THREAD_A, seq == 20)), false))
         .collect();
     messages.extend(threaded.clone());
-    state.replace_chat(backend_with(messages));
+    let backend = backend_with(messages);
+    let (state, _store, _summarizer, _dir) =
+        cached_state(&testing::config_toml(), backend.clone()).await;
+    fill(&state, TimelineView::Thread, Some(THREAD_A)).await;
 
+    let reads = backend.reads();
     let fetched = vibe_talk::ops::catchup_fetch(
         &state,
         Scope::Write,
@@ -235,6 +298,7 @@ async fn fetch_of_a_thread_covers_it_whole() {
     )
     .await
     .expect("fetch");
+    assert_eq!(backend.reads(), reads, "a thread catch-up read upstream");
     let ids: Vec<&str> = fetched
         .messages
         .iter()
@@ -243,6 +307,26 @@ async fn fetch_of_a_thread_covers_it_whole() {
     let want: Vec<&str> = threaded.iter().map(|held| held.id.as_str()).collect();
     assert_eq!(ids, want, "the whole thread, though the window asked for 2");
     assert!(!fetched.truncated);
+}
+
+#[tokio::test]
+async fn fetch_from_an_empty_cache_holds_nothing_and_reads_nothing() {
+    let backend = backend_with(vec![message(0, None, false)]);
+    let (state, _store, _summarizer, _dir) =
+        cached_state(&testing::config_toml(), backend.clone()).await;
+    // Nothing filled: the provider has a message, the cache holds none of the channel.
+    let fetched = vibe_talk::ops::catchup_fetch(
+        &state,
+        Scope::Write,
+        WRITE_CHANNEL,
+        TimelineView::Flat,
+        None,
+        150,
+    )
+    .await
+    .expect("fetch");
+    assert!(fetched.messages.is_empty(), "the cache holds nothing here");
+    assert_eq!(backend.reads(), 0, "a cache miss went upstream to fill it");
 }
 
 async fn get(app: &axum::Router, path: &str, token: &str) -> (StatusCode, Value) {
@@ -297,9 +381,11 @@ async fn post(
 #[tokio::test]
 async fn the_endpoint_answers_with_the_fake_text_and_the_contract_shape() {
     let text = testing::config_toml() + "\n[summaries]\ncatchup_window_messages = 2\n";
-    let (mut state, _discord, _store, summarizer) = testing::state_with_summarizer(&text);
     let messages: Vec<Message> = (0..5).map(|seq| message(seq, None, false)).collect();
-    state.replace_chat(backend_with(messages.clone()));
+    let backend = backend_with(messages.clone());
+    let (state, _store, summarizer, _dir) = cached_state(&text, backend.clone()).await;
+    fill(&state, TimelineView::Flat, None).await;
+    let mut state = state;
     state.catchup_summarizer = Some(summarizer.clone());
     state.catchup_model = Some(Arc::from("fake-model"));
     summarizer.answer_with("one point worth knowing");
@@ -310,8 +396,10 @@ async fn the_endpoint_answers_with_the_fake_text_and_the_contract_shape() {
     assert_eq!(config["discuss_available"], json!(true), "{config}");
     let path = format!("/api/v1/channels/{WRITE_CHANNEL}/catchup");
 
+    let reads = backend.reads();
     let (status, body) = post(&app, &path, Some(WRITE_TOKEN), &json!({})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(backend.reads(), reads, "the endpoint read upstream");
     assert_eq!(body["text"], json!("one point worth knowing"), "{body}");
     assert_eq!(body["backend"], json!(vibe_talk::summarize::agent::BACKEND));
     assert_eq!(body["model"], json!("fake-model"));
@@ -335,7 +423,7 @@ async fn the_endpoint_answers_with_the_fake_text_and_the_contract_shape() {
     assert_eq!(body["window"]["truncated"], json!(false));
     assert!(body["unread_ids"].is_array() && body["markable_ids"].is_array());
     assert!(body["footer_links"].is_array());
-    // The stamp: fields present and typed, nothing timed.
+    // The stamp: cache and model apart, fields present and typed, nothing timed.
     for field in ["context_ms", "model_ms", "total_ms", "input_chars"] {
         assert!(body["stamp"][field].is_number(), "stamp.{field}: {body}");
     }
@@ -363,6 +451,37 @@ async fn the_endpoint_answers_with_the_fake_text_and_the_contract_shape() {
             .0,
         StatusCode::BAD_REQUEST
     );
+}
+
+#[tokio::test]
+async fn the_endpoint_answers_a_cache_miss_without_a_model_call() {
+    let backend = backend_with(vec![message(0, None, false)]);
+    let (state, _store, summarizer, _dir) =
+        cached_state(&testing::config_toml(), backend.clone()).await;
+    let mut state = state;
+    state.catchup_summarizer = Some(summarizer.clone());
+    state.catchup_model = Some(Arc::from("fake-model"));
+    let app = vibe_talk::http::router(state);
+    let (status, body) = post(
+        &app,
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/catchup"),
+        Some(WRITE_TOKEN),
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(backend.reads(), 0, "a cache miss went upstream");
+    assert!(
+        summarizer.prompt_calls().is_empty(),
+        "a cache miss spent a model call"
+    );
+    let text = body["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("cache holds nothing"),
+        "the answer says what is held: {body}"
+    );
+    assert_eq!(body["window"]["count"], json!(0));
+    assert_eq!(body["stamp"]["model_ms"], json!(0));
 }
 
 #[tokio::test]

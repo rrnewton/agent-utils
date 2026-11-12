@@ -535,11 +535,11 @@ mod tests {
         // server's copy; a step back keeps the older-reads rules, and the server's
         // other reads keep theirs.
         let newest = TimelineRequest::default();
-        let mut step_back = TimelineRequest::default();
-        step_back.before = Some("cursor".to_owned());
-        let discuss_newest = ReadReason::Discuss
-            .scope(async { eligible(&newest) })
-            .await;
+        let step_back = TimelineRequest {
+            before: Some("cursor".to_owned()),
+            ..TimelineRequest::default()
+        };
+        let discuss_newest = ReadReason::Discuss.scope(async { eligible(&newest) }).await;
         let discuss_step = ReadReason::Discuss
             .scope(async { eligible(&step_back) })
             .await;

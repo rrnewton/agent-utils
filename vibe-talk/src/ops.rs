@@ -6774,7 +6774,7 @@ pub async fn catchup_fetch(
     thread_id: Option<&str>,
     window: usize,
 ) -> Result<CatchupFetch, OpError> {
-    use crate::threads::{TimelineRequest, TimelineView};
+    use crate::threads::TimelineView;
     let channel = allowed(state, channel_id).await?;
     let whole_thread = thread_id.is_some();
     let target = if whole_thread {
@@ -6782,62 +6782,44 @@ pub async fn catchup_fetch(
     } else {
         window.max(1)
     };
-    let mut held: Vec<Message> = Vec::new();
-    let mut truncated = false;
-    // The cache alone: its newest held page, then steps back from the file. Neither read
-    // calls the provider, and neither begins a refresh behind the answer — what the cache
-    // lacks (an unrouted channel, a thread nobody has opened) is an empty or short window,
-    // never a fetch. Cache serving's own gates are `may_serve`'s, as for every held answer.
-    if may_serve(state, caller) {
-        let ask = Ask::Timeline {
-            view: if whole_thread {
-                TimelineView::Thread
-            } else {
-                view
-            },
-            thread: thread_id.map(str::to_owned),
-            limit: usize::from(MAX_PAGE),
-        };
-        if let Some(stale) = state.message_cache.stale_timeline(&channel.id, &ask).await {
-            held = stale.messages;
-            for _ in 0..MAX_RECAP_PAGES {
-                if held.len() >= target || held.len() >= MAX_RECAP_MESSAGES {
-                    break;
-                }
-                let Some(oldest) = held
-                    .iter()
-                    .min_by_key(|message| (message.created_ms().unwrap_or(i64::MAX), message.id.clone()))
-                else {
-                    break;
-                };
-                let Some(at_ms) = oldest.created_ms() else {
-                    truncated = true;
-                    break;
-                };
-                let (at_ms, oldest_id) = (at_ms, oldest.id.clone());
-                let Some(below) = state
-                    .message_cache
-                    .held_below(&channel.id, &ask, (at_ms, oldest_id.as_str()), MAX_RECAP_MESSAGES)
-                    .await
-                else {
-                    // The file does not prove more below: what it holds is the answer.
-                    truncated = true;
-                    break;
-                };
-                if below.messages.is_empty() {
-                    break;
-                }
-                let has_more = below.has_more;
-                held.extend(below.messages);
-                // Dedup between steps so `held.len()` stays the window's true size.
-                held.sort_by_key(|message| (message.created_ms().unwrap_or(i64::MAX), message.id.clone()));
-                held.dedup_by(|next, kept| next.id == kept.id);
-                if !has_more {
-                    break;
-                }
-            }
+    // The cache alone: each scope's newest held page, then steps back from the file.
+    // Neither read calls the provider, and neither begins a refresh behind the answer —
+    // what the cache lacks (an unrouted channel, a thread nobody has opened) is an empty
+    // or short window, never a fetch. Cache serving's own gates are `may_serve`'s, as for
+    // every held answer. Flat is composed as the cache holds it: Main's walk, plus the
+    // held replies of every thread rooted in it (the cache has no Flat scope of its own
+    // on most shapes).
+    let (mut held, truncated) = if !may_serve(state, caller) {
+        (Vec::new(), false)
+    } else if whole_thread {
+        catchup_walk_scope(state, &channel.id, TimelineView::Thread, thread_id, target).await
+    } else if view == TimelineView::Main {
+        catchup_walk_scope(state, &channel.id, TimelineView::Main, None, target).await
+    } else {
+        let (mut held, mut truncated) =
+            catchup_walk_scope(state, &channel.id, TimelineView::Main, None, target).await;
+        let roots: Vec<String> = held
+            .iter()
+            .filter_map(|message| message.thread.as_ref())
+            .filter(|thread| thread.is_root)
+            .map(|thread| thread.id.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        for root in roots {
+            let (replies, cut) = catchup_walk_scope(
+                state,
+                &channel.id,
+                TimelineView::Thread,
+                Some(&root),
+                MAX_RECAP_MESSAGES,
+            )
+            .await;
+            truncated |= cut;
+            held.extend(replies);
         }
-    }
+        (held, truncated)
+    };
     // Held messages arrive unstamped and unmarked, as the cache holds them: stamp and mark
     // them as every served answer's are, before anything downstream prints their fields.
     let noise = crate::noise::filter_for(state, &channel.id).await;
@@ -6863,6 +6845,74 @@ pub async fn catchup_fetch(
         truncated,
         noise_hidden,
     })
+}
+
+/// One scope's held window for [`catchup_fetch`]: the cache's newest held page of the
+/// scope, then steps back from the file to `target` messages (or the recap bound).
+/// Cache reads only — when the file proves no more below, the walk stops and says so
+/// (`truncated`); when it holds nothing of the scope, the window is empty.
+async fn catchup_walk_scope(
+    state: &AppState,
+    channel_id: &crate::model::ChannelId,
+    view: crate::threads::TimelineView,
+    thread_id: Option<&str>,
+    target: usize,
+) -> (Vec<Message>, bool) {
+    let ask = Ask::Timeline {
+        view,
+        thread: thread_id.map(str::to_owned),
+        limit: usize::from(MAX_PAGE),
+    };
+    let Some(stale) = state.message_cache.stale_timeline(channel_id, &ask).await else {
+        return (Vec::new(), false);
+    };
+    // A first page the file proves reaches the scope's start is the whole scope:
+    // no step back is owed, and none being provable below it cuts nothing.
+    if stale.reaches_start {
+        return (stale.messages, false);
+    }
+    let mut held = stale.messages;
+    let mut truncated = false;
+    for _ in 0..MAX_RECAP_PAGES {
+        if held.len() >= target || held.len() >= MAX_RECAP_MESSAGES {
+            break;
+        }
+        let Some(oldest) = held
+            .iter()
+            .min_by_key(|message| (message.created_ms().unwrap_or(i64::MAX), message.id.clone()))
+        else {
+            break;
+        };
+        let Some(at_ms) = oldest.created_ms() else {
+            truncated = true;
+            break;
+        };
+        let (at_ms, oldest_id) = (at_ms, oldest.id.clone());
+        let Some(below) = state
+            .message_cache
+            .held_below(
+                channel_id,
+                &ask,
+                (at_ms, oldest_id.as_str()),
+                MAX_RECAP_MESSAGES,
+            )
+            .await
+        else {
+            truncated = true;
+            break;
+        };
+        if below.messages.is_empty() {
+            break;
+        }
+        let has_more = below.has_more;
+        held.extend(below.messages);
+        held.sort_by_key(|message| (message.created_ms().unwrap_or(i64::MAX), message.id.clone()));
+        held.dedup_by(|next, kept| next.id == kept.id);
+        if !has_more {
+            break;
+        }
+    }
+    (held, truncated)
 }
 
 // --- the recap: a window labelled with what the owner has read --------------------------------
