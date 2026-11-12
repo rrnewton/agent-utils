@@ -53,6 +53,20 @@ pub(crate) enum Writers {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Return blocks freed inside a slot image to the host now (Python `image trim`)
+    ImageTrim {
+        /// Registered slot name
+        slot: String,
+        /// Slot type (default: agent)
+        #[arg(long, value_name = "TYPE", default_value = "agent", value_parser = ["agent", "validate"])]
+        slot_type: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Override the machine shard (else WRKSLOTS_MACHINE, else the configured machine, where an absent key or the value auto means the short host name)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Remove and archive one slot (writer; fixture registries only until cutover)
     Remove {
         /// Active slot to remove
@@ -1718,8 +1732,8 @@ fn translate_python_argv_routed(
     // `image status` runs here; the other actions refuse by name.
     if cmd == "image" {
         return match rest.get(1).map(String::as_str) {
-            Some("set-default") => {
-                let mut out: Vec<String> = vec![args[0].clone(), "image-set-default".to_string()];
+            Some(action @ ("set-default" | "trim")) => {
+                let mut out: Vec<String> = vec![args[0].clone(), format!("image-{action}")];
                 out.extend(rest[2..].iter().cloned());
                 if let Some(root) = project_root {
                     out.push("--root".to_string());
@@ -2078,6 +2092,27 @@ pub fn run() -> u8 {
                 root.as_deref(),
                 machine.as_deref(),
                 &representation,
+            ) {
+                Ok(outcome) => {
+                    print!("{}", outcome.stdout);
+                    eprint!("{}", outcome.stderr);
+                    return u8::try_from(outcome.exit).unwrap_or(1);
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
+            Writers::ImageTrim {
+                slot,
+                slot_type,
+                root,
+                machine,
+            } => match crate::image_dispatch::image_trim_cli(
+                root.as_deref(),
+                machine.as_deref(),
+                &slot_type,
+                &slot,
             ) {
                 Ok(outcome) => {
                     print!("{}", outcome.stdout);

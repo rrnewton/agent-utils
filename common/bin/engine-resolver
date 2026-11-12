@@ -99,6 +99,14 @@ fi
 # validation/editions.json, never by this variable becoming common.
 WRKSLOTS_OPTIN=""
 WRKSLOTS_SOAK=""
+if [[ "$TOOL" == "wrkslots" ]]; then
+    # The interpreter this launcher runs the Python edition with, as
+    # an absolute path: wrkslotsd's privileged image helper runs
+    # through exactly this interpreter (never a PATH lookup).
+    if RESOLVED_PYTHON="$(command -v "${CI_HUB_PYTHON:-python3}" 2>/dev/null)"; then
+        export WRKSLOTS_PYTHON_BIN="$(readlink -f "$RESOLVED_PYTHON")"
+    fi
+fi
 if [[ "$TOOL" == "wrkslots" && -n "${WRKSLOTS_ENGINE:-}" ]]; then
     if [[ "$WRKSLOTS_ENGINE" == "rust-soak" ]]; then
         # Soak mode (#562): dispatch through the soak launcher, which

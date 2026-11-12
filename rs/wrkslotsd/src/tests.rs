@@ -5085,6 +5085,7 @@ fn cli_surface_contains_no_executor_or_mutation_subcommand() {
             "doctor-text",
             "image-set-default",
             "image-status",
+            "image-trim",
             "limits-show",
             "sandbox-show-config",
             "shell-command",

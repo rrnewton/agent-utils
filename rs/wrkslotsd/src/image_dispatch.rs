@@ -70,10 +70,119 @@ impl PrivilegedRunner for SubprocessRunner {
     }
 }
 
+/// `shutil.which` semantics for the fixed tool names the image
+/// plans name (sudo, systemd-run, fusermount), mirroring Python.
+fn which(tool: &str) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    use std::os::unix::fs::PermissionsExt as _;
+    std::env::split_paths(&path).find_map(|dir| {
+        let candidate = dir.join(tool);
+        let executable = std::fs::metadata(&candidate)
+            .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+        executable.then(|| candidate.to_string_lossy().into_owned())
+    })
+}
+
+fn check_helper(helper: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::metadata(helper).map_err(|error| {
+        format!(
+            "image helper {} is not readable: {error}; it ships with the Python wrkslots package",
+            helper.display()
+        )
+    })?;
+    if !meta.is_file() {
+        return Err(format!(
+            "image helper {} is not a regular file; refusing to run it privileged",
+            helper.display()
+        ));
+    }
+    if meta.uid() != rustix::process::getuid().as_raw() {
+        return Err(format!(
+            "image helper {} is not owned by this user; refusing to run it privileged",
+            helper.display()
+        ));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(format!(
+            "image helper {} is group- or world-writable; refusing to run it privileged",
+            helper.display()
+        ));
+    }
+    Ok(())
+}
+
+/// The production tool paths for the privileged image plans, per
+/// the resolution recorded in #1116: the interpreter is the one
+/// the launcher exports (`WRKSLOTS_PYTHON_BIN`, absolute), and
+/// `imagehelper.py` resolves through that interpreter's installed
+/// wrkslots package after an ownership/writability check. The
+/// `WRKSLOTS_IMAGEHELPER` override (absolute, tests/operators)
+/// skips the package lookup but not the check.
+pub(crate) fn tool_paths() -> Result<crate::image_ops::ToolPaths> {
+    let python = match std::env::var_os("WRKSLOTS_PYTHON_BIN") {
+        Some(value) if Path::new(&value).is_absolute() => {
+            PathBuf::from(value).to_string_lossy().into_owned()
+        }
+        _ => {
+            return Err(
+                "WRKSLOTS_PYTHON_BIN is not set to an absolute interpreter path; the editions launcher exports it, and the privileged image helper runs through exactly that interpreter"
+                    .to_string(),
+            )
+        }
+    };
+    let helper = match std::env::var_os("WRKSLOTS_IMAGEHELPER") {
+        Some(value) if Path::new(&value).is_absolute() => PathBuf::from(value),
+        Some(_) => return Err("WRKSLOTS_IMAGEHELPER must be an absolute path when set".to_string()),
+        None => {
+            let spec = CommandSpec::new(
+                vec![
+                    python.clone(),
+                    "-I".to_string(),
+                    "-c".to_string(),
+                    "import importlib.util,sys; s=importlib.util.find_spec(\"wrkslots.imagehelper\"); sys.stdout.write(s.origin or \"\")".to_string(),
+                ],
+                Duration::from_secs(30),
+            );
+            let outcome = SubprocessRunner.run(&spec)?;
+            let origin = outcome.stdout.trim();
+            if outcome.returncode != 0 || origin.is_empty() {
+                return Err(format!(
+                    "cannot locate imagehelper.py through {python}'s wrkslots package: {}",
+                    outcome.stderr.trim()
+                ));
+            }
+            PathBuf::from(origin)
+        }
+    };
+    check_helper(&helper)?;
+    Ok(crate::image_ops::ToolPaths {
+        sudo: which("sudo").unwrap_or_else(|| "sudo".to_string()),
+        python,
+        helper,
+        systemd_run: which("systemd-run"),
+        fusermount: which("fusermount").unwrap_or_else(|| "fusermount".to_string()),
+    })
+}
+
 fn mount_entries() -> Vec<MountEntry> {
     std::fs::read_to_string("/proc/self/mountinfo")
         .map(|text| parse_mountinfo(&text))
         .unwrap_or_default()
+}
+
+/// Backend and statvfs facts for one image file and mount point,
+/// from the live mount table, as the handlers inject them.
+fn mount_fact(image_file: &Path, mount_point: &Path) -> (Option<String>, Option<VfsFacts>) {
+    let (state, _detail) = crate::storage_state::mount_state(image_file, mount_point);
+    let backend = crate::image_mounts::mounted_backend(&state).map(str::to_string);
+    let vfs = if backend.is_some() {
+        vfs_facts(mount_point)
+    } else {
+        None
+    };
+    (backend, vfs)
 }
 
 fn vfs_facts(mount_point: &Path) -> Option<VfsFacts> {
@@ -346,6 +455,43 @@ pub(crate) fn limits_show_cli(memory_fraction: f64, cpu_fraction: f64) -> (i32, 
     )
 }
 
+/// Shared mount-family inputs: validated paths plus tool paths.
+fn mount_ctx(
+    root: Option<&Path>,
+    machine: Option<&str>,
+) -> Result<(PathBuf, PathBuf, crate::image_ops::ToolPaths)> {
+    let config = crate::config_validate::load_config(root, machine)?;
+    Ok((
+        config_path(&config, "control"),
+        config_path(&config, "worktrees"),
+        tool_paths()?,
+    ))
+}
+
+/// `wrkslots image trim`: no registry mutation; the plan runs
+/// through the production runner only for mounted images.
+pub(crate) fn image_trim_cli(
+    root: Option<&Path>,
+    machine: Option<&str>,
+    slot_type: &str,
+    slot: &str,
+) -> Result<HandlerOutcome> {
+    let (control, worktrees, tools) = mount_ctx(root, machine)?;
+    let slot_path = |_: &str, slot: &str| worktrees.join(slot);
+    let ctx = crate::imagecmd::MountCtx {
+        control: &control,
+        slot_path: &slot_path,
+        tools: &tools,
+    };
+    Ok(crate::imagecmd::image_trim(
+        &ctx,
+        slot_type,
+        slot,
+        &mount_fact,
+        &SubprocessRunner,
+    ))
+}
+
 /// `wrkslots image set-default`: fixture-gated writer. Validate,
 /// then under the config lock hand the raw document to the pure
 /// handler and write its update in the file's own format.
@@ -393,16 +539,7 @@ pub(crate) fn image_status_cli(
     let entries = mount_entries();
     let runner = SubprocessRunner;
     let report = wt_report(&config, &entries, &runner)?;
-    let facts = |image_file: &Path, mount_point: &Path| {
-        let (state, _detail) = crate::storage_state::mount_state(image_file, mount_point);
-        let backend = crate::image_mounts::mounted_backend(&state).map(str::to_string);
-        let vfs = if backend.is_some() {
-            vfs_facts(mount_point)
-        } else {
-            None
-        };
-        (backend, vfs)
-    };
+    let facts = mount_fact;
     Ok(crate::imagecmd::image_status_wt(
         &control,
         &|_slot_type: &str, slot: &str| worktrees.join(slot),
