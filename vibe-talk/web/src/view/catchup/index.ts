@@ -258,6 +258,8 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     if (scope.threadId !== null) query.set("thread_id", scope.threadId);
     query.set("view", scope.view);
     return deps.api(`/api/v1/channels/${encodeURIComponent(channelId)}/catchup/record?${query.toString()}`, { method: "GET" });
+  }
+
   // `#1395 discuss-scope-binding`. The scope Discuss is bound to, set on
   // open and kept while closed (a same-scope reopen restores, Back reads
   // it); `boundRaw` is the same scope as opened, for its label and view.
