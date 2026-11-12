@@ -28,3 +28,7 @@ Owner replies 005/006 (via coordb): "I don't think we need the word 'Discuss' si
 # Notes
 
 Owner replies 005/006; shape confirmed by coordb (exactly the owner's three icons). Lands with #1382 discuss-summarize-control-oneline as one owner-tier landing. mu-catchup confirmed #discuss-close is the only header id its tests bind.
+
+## Resolution
+
+[watermelon-full-preview] Delivered in e5fc567c (4:30 PM ET Discuss small-fix batch, owner reply 012; integrator mu-discussfoot, gated 851343ad). The Discuss title row is gone; dock, fullscreen and close stand as three small square icons at the upper right of the control row, with the kept per-device layout choices unchanged. Focused tests and the Discuss browser walk passed in the batch gate.

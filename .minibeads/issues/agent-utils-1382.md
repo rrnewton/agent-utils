@@ -30,3 +30,7 @@ Today (#1346 discuss-summarize-button, landed) the control is split over two row
 # Notes
 
 Owner replies 005/006. Lands with #1383 discuss-header-icons as one owner-tier landing (shared header/control row), agreed with mu-catchup (the four ids #discuss-summarize/#discuss-count/#discuss-since/#discuss-close stay stable) and mu-discussfoot (answer/footer untouched).
+
+## Resolution
+
+[watermelon-full-preview] Delivered in e5fc567c (4:30 PM ET Discuss small-fix batch, owner reply 012; integrator mu-discussfoot, gated 851343ad). The Summarize control is one line — [Summarize] last [N] unread since [HH:MM picker] — with a short button, a 3-digit count input, and the time picker given its own space so the digits are never obscured. Focused tests and the Discuss browser walk passed in the batch gate; screenshots at 390x844/375x667/1280x800 were recorded in the lane handoff.
