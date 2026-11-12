@@ -426,14 +426,19 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
    * the reflow (#1251). On a phone the stylesheet gives docked no column, so the sheet
    * stands as it did.
    */
+  /** Name the layout on `#screen-main` only while the panel stands open in it: a
+   * closed panel reserves no column, whatever mode is remembered for reopening. */
+  function syncScreenMode(): void {
+    const screen = maybe("screen-main");
+    if (!screen) return;
+    if (!isOpen() || layoutMode === "overlay") screen.removeAttribute("data-discuss");
+    else screen.setAttribute("data-discuss", layoutMode);
+  }
+
   function applyMode(mode: DiscussLayoutMode, keep: boolean): DiscussLayoutMode {
     layoutMode = mode;
     panel().setAttribute("data-mode", mode);
-    const screen = maybe("screen-main");
-    if (screen) {
-      if (mode === "overlay") screen.removeAttribute("data-discuss");
-      else screen.setAttribute("data-discuss", mode);
-    }
+    syncScreenMode();
     drawHeaderToggles();
     if (keep) {
       try {
@@ -480,6 +485,9 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
 
   function setOpen(open: boolean): void {
     panel().hidden = !open;
+    // Every exit (close(), the X, Escape, the bar toggle) lands here, so the
+    // screen's docked/maximized mark follows openness from this one place.
+    syncScreenMode();
     try {
       deps.byId("discuss-open").setAttribute("aria-expanded", open ? "true" : "false");
     } catch {

@@ -243,6 +243,21 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
         page.wait_for_function(
             "() => document.getElementById('screen-main').dataset.discuss === 'docked'",
             timeout=20_000)
+        # Docked then closed reserves no column (#1397): the screen loses
+        # the mark and the list takes the full width again; reopening docks.
+        page.click("#discuss-close")
+        page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
+        page.wait_for_function(
+            "() => !document.getElementById('screen-main').hasAttribute('data-discuss')",
+            timeout=20_000)
+        freed = page.locator("#scroll-area").bounding_box()
+        check(freed is not None and list_box is not None and freed["width"] > list_box["width"],
+              f"closing docked did not free the column: list={list_box} after={freed}")
+        page.click("#discuss-open")
+        page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
+        page.wait_for_function(
+            "() => document.getElementById('screen-main').dataset.discuss === 'docked'",
+            timeout=20_000)
         page.click("#discuss-full-toggle")
         page.wait_for_function(
             "() => document.getElementById('screen-main').dataset.discuss === 'maximized'",
