@@ -535,6 +535,96 @@ pub fn split_unknown_terms(raw: &str) -> (String, Vec<String>) {
     (raw[..at].trim_end().to_owned(), terms)
 }
 
+/// Assemble the warm-up reference from `(name, text)` files under a whole budget:
+/// a standing header, then each file under its own name, cut in order when the
+/// budget runs out (the cut is marked where it lands). Empty input — or a zero
+/// budget — assembles to empty, which callers print as no warm-up at all.
+#[must_use]
+pub fn assemble_warmup(files: &[(String, String)], max_chars: usize) -> String {
+    if files.is_empty() || max_chars == 0 {
+        return String::new();
+    }
+    let mut out = String::from(
+        "Reference material for the work this channel discusses (background only; \
+         the messages after it are the news):\n",
+    );
+    for (name, text) in files {
+        out.push_str(&format!("\n## Reference: {name}\n{}\n", text.trim_end()));
+    }
+    let out = out.trim_end();
+    if out.chars().count() <= max_chars {
+        return out.to_owned();
+    }
+    let kept: String = out.chars().take(max_chars).collect();
+    format!(
+        "{}\n[warm-up cut here by this server to fit its budget]",
+        kept.trim_end()
+    )
+}
+
+/// A fingerprint of the warm-up files as they stand: path, modification time, and
+/// length per file (an unreadable file fingerprints as absent), hashed so a log
+/// line can name which warm-up a run used without printing it. Zero for no files.
+#[must_use]
+pub fn warmup_fingerprint(paths: &[String]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    for path in paths {
+        path.hash(&mut hasher);
+        match std::fs::metadata(path) {
+            Ok(meta) => {
+                meta.len().hash(&mut hasher);
+                meta.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+                    .hash(&mut hasher);
+            }
+            Err(_) => 0u8.hash(&mut hasher),
+        }
+    }
+    hasher.finish()
+}
+
+/// The warm-up in force for `paths`: the assembled text and its fingerprint,
+/// re-read only when the fingerprint moves. A file that cannot be read is left
+/// out with a warning, never an error: warm-up is an aid, not a gate.
+#[must_use]
+pub fn load_warmup(paths: &[String], max_chars: usize) -> (String, u64) {
+    use std::sync::Mutex;
+    static CACHE: Mutex<Option<(u64, String)>> = Mutex::new(None);
+    let fingerprint = warmup_fingerprint(paths);
+    if let Ok(cache) = CACHE.lock() {
+        if let Some((held, text)) = &*cache {
+            if *held == fingerprint {
+                return (text.clone(), fingerprint);
+            }
+        }
+    }
+    let mut files: Vec<(String, String)> = Vec::new();
+    for path in paths {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                let name = std::path::Path::new(path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
+                files.push((name, text));
+            }
+            Err(error) => {
+                tracing::warn!(path = %path, error = %error, "discuss warm-up file unreadable, left out");
+            }
+        }
+    }
+    let text = assemble_warmup(&files, max_chars);
+    if let Ok(mut cache) = CACHE.lock() {
+        *cache = Some((fingerprint, text.clone()));
+    }
+    (text, fingerprint)
+}
+
 /// The system prompt in force: the owner's override when he has written one, else the shipped one.
 ///
 /// The override is tidied the way a textarea's text needs: line endings made `\n`, NULs taken
@@ -855,6 +945,33 @@ mod tests {
             split_unknown_terms("## A\nText.\n## Terms I didn't understand\n- None");
         assert_eq!(body, "## A\nText.");
         assert!(terms.is_empty());
+    }
+
+    #[test]
+    fn warmup_assembles_under_its_budget_and_fingerprints_its_files() {
+        assert_eq!(assemble_warmup(&[], 6_000), "");
+        assert_eq!(
+            assemble_warmup(&[("a.md".to_owned(), "text".to_owned())], 0),
+            ""
+        );
+        let files = vec![
+            ("README.md".to_owned(), "project readme".to_owned()),
+            ("glossary.md".to_owned(), "x".repeat(500)),
+        ];
+        let whole = assemble_warmup(&files, 6_000);
+        assert!(whole.contains("## Reference: README.md"), "{whole}");
+        assert!(whole.contains("project readme"), "{whole}");
+        let cut = assemble_warmup(&files, 160);
+        assert!(
+            cut.chars().count() <= 220,
+            "{} chars: {cut}",
+            cut.chars().count()
+        );
+        assert!(cut.contains("[warm-up cut here"), "{cut}");
+        assert_ne!(
+            warmup_fingerprint(&["no/such/file.md".to_owned()]),
+            warmup_fingerprint(&["no/such/other.md".to_owned()])
+        );
     }
 
     #[test]

@@ -2548,7 +2548,15 @@ pub async fn catchup(
         ))
         .await?;
     let owner = crate::owner::Owner::of(&state);
-    let built = crate::catchup::build_context(&fetched.messages, &fetched.read, &owner);
+    let mut built = crate::catchup::build_context(&fetched.messages, &fetched.read, &owner);
+    let (warmup, warmup_fingerprint) = crate::catchup::load_warmup(
+        &state.config.summaries.catchup_warmup_files,
+        state.config.summaries.catchup_warmup_max_chars,
+    );
+    let warmup_chars = warmup.chars().count();
+    if !warmup.is_empty() {
+        built.prompt = format!("{warmup}\n\n{}", built.prompt);
+    }
     let system = crate::catchup::effective_system_prompt(None);
     let context_ms = u64::try_from(context_began.elapsed().as_millis()).unwrap_or(u64::MAX);
     // Cache-only (`#1348 discuss-cache-only`): a window the cache holds nothing of is
@@ -2663,6 +2671,8 @@ pub async fn catchup(
         unread = built.unread_ids.len(),
         unknown_term_count = stamp.unknown_term_count,
         unknown_terms = %unknown_terms.join(", "),
+        warmup_chars = warmup_chars,
+        warmup_fingerprint = warmup_fingerprint,
         "discuss catch-up answered"
     );
     Ok(no_store(Json(crate::contract::CatchupResponse {

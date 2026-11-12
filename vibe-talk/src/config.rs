@@ -704,6 +704,13 @@ pub struct SummariesConfig {
     /// `catchup-side-agent`. It decides how much context the side agent is shown, never what a
     /// one-message summary says, so it is not in the summary cache key.
     pub catchup_window_messages: usize,
+    /// Files a Discuss read shows the model as warm-up reference (project READMEs, a
+    /// glossary, the last weekly summary), in order. `discuss-warmup-context`. Empty
+    /// (the default) means no warm-up, exactly as before.
+    pub catchup_warmup_files: Vec<String>,
+    /// The most warm-up text one Discuss read carries, in characters, across all
+    /// `catchup_warmup_files` together. `discuss-warmup-context`.
+    pub catchup_warmup_max_chars: usize,
     /// A direct Messages API summariser, when `[summaries.llm]` is present. `#233 llm-summarizer`.
     ///
     /// When present it is THE summariser, and it is also the one that names threads; see
@@ -725,6 +732,8 @@ impl Default for SummariesConfig {
             thread_naming_interval_seconds:
                 crate::summarize::threads::DEFAULT_NAMING_INTERVAL_SECONDS,
             catchup_window_messages: DEFAULT_CATCHUP_WINDOW_MESSAGES,
+            catchup_warmup_files: Vec::new(),
+            catchup_warmup_max_chars: DEFAULT_CATCHUP_WARMUP_MAX_CHARS,
             llm: None,
         }
     }
@@ -1015,6 +1024,12 @@ impl LlmConfig {
 /// How many of a channel's newest messages one Discuss read covers when `[summaries]` names
 /// no `catchup_window_messages`. `catchup-side-agent`.
 pub const DEFAULT_CATCHUP_WINDOW_MESSAGES: usize = 150;
+
+/// The most warm-up reference one Discuss read carries when `[summaries]` names no
+/// `catchup_warmup_max_chars`: about 1,500 tokens of READMEs and glossary — small
+/// against the window, and the size #1352 discuss-warmup-context measured against
+/// the unknown-terms count.
+pub const DEFAULT_CATCHUP_WARMUP_MAX_CHARS: usize = 6_000;
 
 /// The model `[summaries.llm]` asks when none is named: a small, fast model whose alias is
 /// valid on both the Anthropic API and Google Vertex.
@@ -2080,6 +2095,8 @@ struct FileSummaries {
     reply_timeout_seconds: Option<u64>,
     thread_naming_interval_seconds: Option<u64>,
     catchup_window_messages: Option<usize>,
+    catchup_warmup_files: Option<Vec<String>>,
+    catchup_warmup_max_chars: Option<usize>,
     llm: Option<FileLlm>,
 }
 
@@ -3256,6 +3273,12 @@ fn summaries_config(
         catchup_window_messages: file
             .catchup_window_messages
             .unwrap_or(defaults.catchup_window_messages),
+        catchup_warmup_files: file
+            .catchup_warmup_files
+            .unwrap_or(defaults.catchup_warmup_files),
+        catchup_warmup_max_chars: file
+            .catchup_warmup_max_chars
+            .unwrap_or(defaults.catchup_warmup_max_chars),
         llm,
     };
     if summaries.catchup_window_messages == 0 {

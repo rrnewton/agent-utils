@@ -725,6 +725,8 @@ mod tests {
             reply_timeout_seconds: _,
             thread_naming_interval_seconds: _,
             catchup_window_messages: _,
+            catchup_warmup_files: _,
+            catchup_warmup_max_chars: _,
             llm: _,
         } = config();
         vec![
@@ -759,6 +761,17 @@ mod tests {
                 "catchup_window_messages",
                 false,
                 moved(|c| c.catchup_window_messages += 1),
+            ),
+            // What reference a Discuss read warms up on; again, no word of a summary.
+            (
+                "catchup_warmup_files",
+                false,
+                moved(|c| c.catchup_warmup_files.push("glossary.md".to_owned())),
+            ),
+            (
+                "catchup_warmup_max_chars",
+                false,
+                moved(|c| c.catchup_warmup_max_chars += 1),
             ),
         ]
     }
