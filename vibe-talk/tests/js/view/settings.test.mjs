@@ -59,7 +59,7 @@ function settingsPage() {
     if (slug.startsWith("settings-")) section = body;
   }
   let closed = 0;
-  const folds = VIEW_SETTINGS.mountSettingsFolds({ lookup: (id) => nodes.get(id), closeDismissed: () => { closed += 1; } });
+  const folds = VIEW_SETTINGS.mountSettingsFolds({ intoView: (element, block, inline) => { if (typeof element.scrollIntoView === "function") element.scrollIntoView(inline === undefined ? { block } : { block, inline }); }, lookup: (id) => nodes.get(id), closeDismissed: () => { closed += 1; } });
   return { nodes, folds, closed: () => closed };
 }
 
@@ -104,7 +104,7 @@ test("`#624 voice-page-modularity`: Settings mounts folded, a heading opens and 
 test("`#624 voice-page-modularity`: Help opens at one entry, folds the rest, and its button counts only the entries on the screen", () => {
   const nodes = new Map([["fold-help", new Node("fold-help")]]);
   for (const slug of PRESENT_SETTINGS.helpEntrySlugs()) nodes.set(`help-${slug}`, new Node(`help-${slug}`));
-  const help = VIEW_SETTINGS.mountHelpFolds({ lookup: (id) => nodes.get(id), byId: (id) => nodes.get(id) || null });
+  const help = VIEW_SETTINGS.mountHelpFolds({ intoView: (element, block, inline) => { if (typeof element.scrollIntoView === "function") element.scrollIntoView(inline === undefined ? { block } : { block, inline }); }, lookup: (id) => nodes.get(id), byId: (id) => nodes.get(id) || null });
   const button = nodes.get("fold-help");
   assert.equal(help.entries().length, PRESENT_SETTINGS.HELP_TOPICS.length + 2);
   help.openAt("keyboard");

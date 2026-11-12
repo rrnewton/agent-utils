@@ -43,6 +43,7 @@ function makeAnchor() {
     contextKey: () => state.key,
     rowById: (id) => state.rows.get(id) ?? null,
     listPlaceTop: (el) => el.getBoundingClientRect().top,
+    nudge: (area, delta) => { area.scrollTop += delta; },
     now: () => state.now,
     clock: {
       setTimeout: (run, ms) => {

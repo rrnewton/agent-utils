@@ -97,6 +97,8 @@ function inertAround(node: Element): Element[] {
 
 /** What the list and its pop-out ask of the page. */
 export interface DismissedSendsViewDependencies {
+  /** Bring an element into view through the scroll owner (`#1251 scroll-single-owner`). */
+  intoView(element: Element, block: string, inline?: string): void;
   /** The element with this id (`el`). */
   lookup(id: string): HTMLElement;
   /** The sends dismissed from the outbox, and the device's copy of them (`dismissedSends`). */
@@ -155,7 +157,7 @@ export function mountDismissedSends(deps: DismissedSendsViewDependencies): Dismi
     // What it makes inert beyond the box its shadow is drawn in, and beside that box, is dimmed where it is.
     dismissedPopout = { id, opener, inert: inertAround(popout) };
     // Laid over its group, which may stand partly below the screen's edge: brought on screen whole.
-    if (typeof popout.scrollIntoView === "function") popout.scrollIntoView({ block: "nearest" });
+    deps.intoView(popout, "nearest");
     deps.lookup("dismissed-send-copy").focus({ preventScroll: true });
     deps.scheduleBackSync();
   }

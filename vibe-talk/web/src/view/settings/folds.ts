@@ -16,6 +16,8 @@ import { FOLDS_HOLDING_DISMISSED, SETTINGS_FOLDS, foldAllWords } from "../../pre
 
 /** What the folds ask of the page. */
 export interface SettingsFoldsDependencies {
+  /** Bring an element into view through the scroll owner (`#1251 scroll-single-owner`). */
+  intoView(element: Element, block: string, inline?: string): void;
   /** The element with this id (`el`). */
   lookup(id: string): HTMLElement;
   /** Close the pop-out over Recently dismissed, leaving the focus where it is (`closeDismissedSend(false)`). */
@@ -87,7 +89,7 @@ export function mountSettingsFolds(deps: SettingsFoldsDependencies): SettingsFol
       // and can move to another column: the heading just pressed is brought back on screen, by as
       // little as it takes, so the reader does not lose what they opened.
       const pressed = deps.lookup(`fold-${slug}`);
-      if (typeof pressed.scrollIntoView === "function") pressed.scrollIntoView({ block: "nearest" });
+      deps.intoView(pressed, "nearest");
     });
     // The browser's find (or a link to a text fragment) is opening the body: it removes `hidden`
     // itself, and the button has to say so.

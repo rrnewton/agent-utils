@@ -148,6 +148,8 @@ export interface ReadingBookmarkDependencies {
   todoHoldsFrom(at: number, channel: string | null): boolean;
   fromGatheredThread(row: Element): boolean;
   preservingScroll(fn: () => void): void;
+  /** Move the list by a measured delta, through the scroll owner (`#1251 scroll-single-owner`). */
+  nudge(area: HTMLElement, delta: number): void;
   screen(): string;
   view(): string;
   paneHead(): number;
@@ -391,7 +393,7 @@ export function createReadingBookmark(deps: ReadingBookmarkDependencies): Readin
     if (!target || !target.row.bookmarkLine || target.row.parentNode !== el("discord-log")) return false;
     const area = el("scroll-area");
     const line = target.row.bookmarkLine;
-    area.scrollTop += line.getBoundingClientRect().top - deps.paneHead() - deps.replyLandingGapPx();
+    deps.nudge(area, line.getBoundingClientRect().top - deps.paneHead() - deps.replyLandingGapPx());
     deps.takeRow(deps.channelPane(), target.row, true);
     deps.renderScrollTools();
     deps.setStatus(target.place === "below" ? "Bookmark: below the newest message." : "Back at your bookmark.");

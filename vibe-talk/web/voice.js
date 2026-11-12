@@ -563,6 +563,7 @@ var pageVoiceTranscript;
 /** The call owner; dependency properties stay live across asynchronous callbacks. */
 function voiceTranscript() {
   if (!pageVoiceTranscript) pageVoiceTranscript = createVoiceTranscript({
+  intoView: (element, block, inline) => scrollKeeping.intoView(element, block, inline),
     get session() { return voiceCall().session; },
     get el() { return el; },
     get leftEl() { return leftEl; },
@@ -890,6 +891,7 @@ const jumpAnchor = createJumpAnchor({
     setTimeout: (run, ms) => setTimeout(run, ms),
     clearTimeout: (handle) => clearTimeout(/** @type {any} */ (handle)),
   },
+  nudge: (area, delta) => scrollKeeping.nudge(area, delta),
   noteJumpLost: (id) => scrollTrace.noteJumpLost(id),
 });
 
@@ -1176,6 +1178,7 @@ const { showScreen, closeSettings } = screenShowing;
  * @type {import("./src/view/settings/index.ts").SettingsFolds}
  */
 const settingsFolds = mountSettingsFolds({
+  intoView: (element, block, inline) => scrollKeeping.intoView(element, block, inline),
   lookup: (id) => el(id),
   closeDismissed: () => dismissedSendsView.close(false),
 });
@@ -1195,6 +1198,7 @@ const settingsFolds = mountSettingsFolds({
  * @type {import("./src/view/settings/index.ts").HelpFolds}
  */
 const helpFolds = mountHelpFolds({
+  intoView: (element, block, inline) => scrollKeeping.intoView(element, block, inline),
   lookup: (id) => el(id),
   byId: (id) => document.getElementById(id),
 });
@@ -1337,6 +1341,7 @@ const draftLedger = createDraftLedger({ storage: deviceStorageOnUse(), makeRoom:
  * @type {import("./src/core/outbox/index.ts").OutboxComposition}
  */
 const outboxComposition = createOutboxComposition({
+  intoView: (element, block, inline) => scrollKeeping.intoView(/** @type {any} */ (element), block, inline),
   storage: () => deviceStorageOnUse(),
   makeRoom: () => messageCache.dropMessageCache(),
   keepsOwnPosts: (channel) => storeKeepsOwnPosts(channel),
@@ -2461,6 +2466,7 @@ const collapsedLines = createCollapsedLines({
  * `createReadingJump`), over the main screen only.
  */
 const readingJump = createReadingJump({
+  intoView: (element, block, inline) => scrollKeeping.intoView(element, block, inline),
   chip: () => leftEl("jump-reading"),
   rows: () => {
     if (screens.screen() !== "main" || !pageReadAloud) return [];
@@ -4929,6 +4935,7 @@ const readingBookmark = createReadingBookmark({
   todoHoldsFrom: (at, channel) => todoView.holdsFrom(at, channel),
   fromGatheredThread,
   preservingScroll,
+  nudge: (area, delta) => scrollKeeping.nudge(area, delta),
   screen: () => screens.screen(),
   view: () => screens.view(),
   paneHead: () => channelPane.head(),
@@ -6451,6 +6458,7 @@ const unpackOnScreen = () => cardsCycle() && (cardPacking.mode() !== "packed" ||
 // web/src/view/channel's now (`createMainCards`, `#624 voice-page-modularity`): both kept
 // choices' setting objects and storage handed in untouched.
 const mainCards = createMainCards({
+  intoView: (element, block, inline) => scrollKeeping.intoView(element, block, inline),
   makeMainChoice: () => createKeptSwitch({
     setting: DEVICE_SETTINGS.threadsMain,
     deviceSettings: () => deviceSettings(),
@@ -9018,6 +9026,7 @@ application.track(mountListControls({
 // web/src/view/channel/filterchips.ts (`#624 voice-page-modularity`), mounted here, in the page's order; its
 // `unmount` waits for the ordered boot's teardown.
 application.track(mountFilterChips({
+  intoView: (element, block, inline) => scrollKeeping.intoView(element, block, inline),
   byId: (id) => el(id),
   searchOpen: () => searchField.open(),
   setSearchOpen: (open) => setSearchOpen(open),

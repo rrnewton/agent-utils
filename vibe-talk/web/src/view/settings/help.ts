@@ -22,6 +22,8 @@ import { foldAllWords, helpEntrySlugs } from "../../present/settings/index.ts";
 
 /** What Help's folds ask of the page. */
 export interface HelpFoldsDependencies {
+  /** Bring an element into view through the scroll owner (`#1251 scroll-single-owner`; the owner calls it defensively, as this did). */
+  intoView(element: Element, block: string, inline?: string): void;
   /** The element with this id (`el`). */
   lookup(id: string): HTMLElement;
   /** The element with this id, as the document finds it (`document.getElementById`). */
@@ -86,9 +88,7 @@ export function mountHelpFolds(deps: HelpFoldsDependencies): HelpFolds {
         return;
       }
       const entry = deps.byId(`help-${slug}`);
-      if (entry && entry.scrollIntoView) {
-        entry.scrollIntoView({ block: "start" });
-      }
+      if (entry) deps.intoView(entry, "start");
     },
   };
 }

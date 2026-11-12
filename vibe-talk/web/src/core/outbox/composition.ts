@@ -33,6 +33,8 @@ export interface OutboxCompositionDependencies {
   keepsOwnPosts(channel: string): boolean;
   now(): number;
   lookup(id: string): unknown;
+  /** Bring an element into view through the scroll owner (`#1251 scroll-single-owner`). */
+  intoView(element: unknown, block: string, inline?: string): void;
   channelLabel(id: string): string;
   styled(tag: string, className: string, text: string): unknown;
   writeClipboard(text: string): Promise<boolean>;
@@ -48,6 +50,7 @@ export interface OutboxCompositionDependencies {
     copyRefused(): string;
     putBack(id: string): void;
     scheduleBackSync(): void;
+    intoView(element: unknown, block: string, inline?: string): void;
   }): DismissedViewLike;
   clock: ClockPort;
   sendUndoEnded(): void;
@@ -109,6 +112,7 @@ export function createOutboxComposition(deps: OutboxCompositionDependencies): Ou
     copyRefused: () => deps.copyRefused(),
     putBack: (id) => deps.putBackDismissed(id),
     scheduleBackSync: () => deps.scheduleBackSync(),
+    intoView: (element, block, inline) => deps.intoView(element, block, inline),
   });
 
   /**

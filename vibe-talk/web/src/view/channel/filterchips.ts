@@ -15,6 +15,8 @@ export interface SearchKey {
 }
 
 export interface FilterChipsDependencies {
+  /** Bring an element into view through the scroll owner (`#1251 scroll-single-owner`). */
+  intoView(element: Element, block: string, inline?: string): void;
   /** An element of the page by id, in the column the code is working in. */
   byId(id: string): HTMLElement;
   /** Whether the search is open, and opening or closing it (closing clears it). */
@@ -90,7 +92,7 @@ export function mountFilterChips(deps: FilterChipsDependencies): FilterChips {
   // off under Tab. So the button the focus reaches is brought wholly into the row, by Tab or by a tap.
   listen<FocusEvent>(el("link-kinds"), "focusin", (event) => {
     const target = event.target as HTMLElement | null;
-    if (target && typeof target.scrollIntoView === "function") target.scrollIntoView({ block: "nearest", inline: "nearest" });
+    if (target) deps.intoView(target, "nearest", "nearest");
   });
   // Typed or cleared — by the keyboard, the field's own clear button, or a paste — the text is a filter
   // change, and the reader's message stays where it is on the screen (`#243 filter-keeps-selection`).

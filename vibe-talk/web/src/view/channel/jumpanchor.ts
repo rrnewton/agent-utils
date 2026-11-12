@@ -39,6 +39,8 @@ export interface JumpAnchorDependencies {
     setTimeout(run: () => void, ms: number): unknown;
     clearTimeout(handle: unknown): void;
   };
+  /** Move the list by the measured drift, through the scroll owner (`#1251 scroll-single-owner`). */
+  nudge(area: HTMLElement, delta: number): void;
   /** Tell the scroll trace a jump target was lost (`#1208`): it notes and posts itself. */
   noteJumpLost(id: string): void;
 }
@@ -153,7 +155,7 @@ export function createJumpAnchor(deps: JumpAnchorDependencies): JumpAnchor {
     // flight (a step back whose settle has not landed): its own settle places the reader,
     // and placing here would chase the row's mid-flight stand. Abstain, keeping the hold.
     if (Math.abs(area.scrollTop - held.at) > 1) return false;
-    area.scrollTop += drift;
+    deps.nudge(area, drift);
     hold = { ...held, row: found, at: area.scrollTop };
     return true;
   }

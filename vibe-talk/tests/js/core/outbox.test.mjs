@@ -816,6 +816,7 @@ test("`#624 voice-page-modularity`: the outbox composition makes the store, the 
   const log = [];
   const storage = () => ({ getItem: () => null, setItem: () => {}, removeItem: () => {} });
   const composition = createOutboxComposition({
+    intoView: () => {},
     storage,
     makeRoom: () => log.push("room"),
     keepsOwnPosts: () => false,

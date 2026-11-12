@@ -7,6 +7,8 @@
 
 /** What the chip asks of the page. */
 export interface ReadingJumpDependencies {
+  /** Bring an element into view through the scroll owner (`#1251 scroll-single-owner`). */
+  intoView(element: Element, block: string, inline?: string): void;
   /** The chip. */
   chip(): HTMLElement;
   /** The rows the message being read is drawn in, in lists on screen; none while nothing is read. */
@@ -67,7 +69,7 @@ export function createReadingJump(deps: ReadingJumpDependencies): ReadingJump {
     jump() {
       const row = watched.find((one) => one.getAttribute("data-reading") === "true") || watched[0];
       if (!row) return false;
-      row.scrollIntoView({ block: "center" });
+      deps.intoView(row, "center");
       return true;
     },
   };

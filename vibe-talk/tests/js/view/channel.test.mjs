@@ -1041,6 +1041,7 @@ test("`#624 voice-page-modularity`: the search's and the filter chips' listeners
   const fire = (id, type, event = {}) => { for (const one of el(id).listeners.filter((each) => each.type === type)) one.listener(event); };
   const state = { open: false, pinned: false, links: false, hidden: new Set(["pr"]), raw: false, query: "", typed: true, side: false, older: false };
   const chips = mountFilterChips({
+    intoView: (element, block, inline) => { if (typeof element.scrollIntoView === "function") element.scrollIntoView(inline === undefined ? { block } : { block, inline }); },
     byId: el,
     searchOpen: () => state.open,
     setSearchOpen: (open) => log.push(`search ${open}`),
@@ -1959,7 +1960,7 @@ test("`#624 voice-page-modularity`: the reply session routes, words the destinat
     unansweredThread: () => false, channelRepliesInThread: () => false, removedUpstream: () => false,
     threadReplies: () => ({ count: 2 }), openThreadRootId: () => null,
     knownChannel: () => ({ writable: true }), setStatus: (t) => log.push(`status:${t}`),
-    nudge: (scroller, delta) => { scroller.scrollTop += delta; }, intoView: () => {},
+    nudge: (scroller, delta) => { scroller.scrollTop += delta; }, intoView: (element, block, inline) => { if (typeof element.scrollIntoView === "function") element.scrollIntoView(inline === undefined ? { block } : { block, inline }); },
     setTextIfChanged() {}, setHiddenIfChanged() {},
     replyDrafts: { get: () => "", set() {}, delete() {}, has: () => false, ids: () => [], startsThread: () => false, setStartsThread() {}, save: () => true, load() {} },
     draftLedger: { has: () => false, touch() {}, drop() {}, save() {} },
@@ -3282,6 +3283,7 @@ test("`#624 voice-page-modularity`: Main's messages among the cards and their or
     { id: "m1", thread: null, timestamp: 1 }, { id: "m2", thread: { id: "t-of-m2", is_root: true }, timestamp: 2 }, { id: "m3", thread: null, timestamp: 3 },
   ];
   const owner = createMainCards({
+    intoView: (element, block, inline) => { if (typeof element.scrollIntoView === "function") element.scrollIntoView(inline === undefined ? { block } : { block, inline }); },
     makeMainChoice: () => ({ on: () => mainOn, set: (on) => { mainOn = on; }, keep: (on) => log.push(["keep-main", on]), stored: () => mainOn }),
     threadsMainKey: "vibe-talk.voice.threads-main",
     storage: () => storage,

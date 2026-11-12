@@ -30,6 +30,8 @@ export type MainCardsStorage = StoragePort;
 
 /** What the main cards ask of the page. */
 export interface MainCardsDependencies {
+  /** Bring an element into view through the scroll owner (`#1251 scroll-single-owner`). */
+  intoView(element: Element, block: string, inline?: string): void;
   /** The Main-channel choice, made by core/settings' factory, handed in as a maker (that layer is not this package's to import). */
   makeMainChoice(): MainCardsChoice;
   /** The Main-channel setting's own key (`THREADS_MAIN_KEY`), as the page names it for the settings sync. */
@@ -174,8 +176,8 @@ export function createMainCards(deps: MainCardsDependencies): MainCards {
     if (!row || !deps.rowShown(row)) return;
     const area = deps.leftById("side-scroll").getBoundingClientRect();
     const box = row.getBoundingClientRect();
-    if ((box.top < area.top || box.bottom > area.bottom) && typeof row.scrollIntoView === "function") {
-      row.scrollIntoView({ block: "nearest", inline: "nearest" });
+    if (box.top < area.top || box.bottom > area.bottom) {
+      deps.intoView(row, "nearest", "nearest");
     }
   }
 

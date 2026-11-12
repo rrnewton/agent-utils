@@ -128,8 +128,8 @@ export interface ScrollKeeping {
   wheelBy(area: HTMLElement, px: number): void;
   /** Glide `area` to position `top` with `behavior` (the reader's glide preference), by the plain write where no `scrollTo` stands (`#1251`). */
   glideTo(area: HTMLElement, top: number, behavior: string): void;
-  /** Bring `element` into view at `block`, where the browser offers it: the one `scrollIntoView` write (`#1251`). */
-  intoView(element: Element, block: string): void;
+  /** Bring `element` into view at `block` (and `inline`, where a caller names it), where the browser offers it: the one `scrollIntoView` write (`#1251`). */
+  intoView(element: Element, block: string, inline?: string): void;
   /** `preservingScroll` for a change that resizes the list's window or the room at its head. */
   holdingReader(mutate: () => void): void;
   /** Where the reader is: which message their eye is on, and how far down the viewport it sits. */
@@ -305,8 +305,10 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     else area.scrollTop = top;
   }
 
-  function intoView(element: Element, block: string): void {
-    if (typeof element.scrollIntoView === "function") element.scrollIntoView({ block: block as ScrollLogicalPosition });
+  function intoView(element: Element, block: string, inline?: string): void {
+    if (typeof element.scrollIntoView !== "function") return;
+    if (inline === undefined) element.scrollIntoView({ block: block as ScrollLogicalPosition });
+    else element.scrollIntoView({ block: block as ScrollLogicalPosition, inline: inline as ScrollLogicalPosition });
   }
 
   function holdingRows(mutate: () => void): void {

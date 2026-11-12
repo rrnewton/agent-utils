@@ -24,6 +24,8 @@ export interface YesHold { key: string; li: HTMLElement | null; state: "tentativ
 interface HeardReport { inFlight: boolean; next: string | null; sent: string; }
 type RefusedReason = "ended" | "withdrawn" | "hint" | "earlier_draft" | "replaced_session" | "interrupted" | "mismatch" | "no_question" | "interposed" | "mention" | "symbols" | "early" | "echo" | "echo_cancellation_off" | "typed_call" | "typed_yes" | "expired" | "token" | "busy" | "heard_more" | "said_more" | "changed" | "typed" | "gone";
 export interface VoiceTranscriptDependencies<Column extends object> {
+  /** Bring an element into view through the scroll owner (`#1251 scroll-single-owner`). */
+  intoView(element: Element, block: string, inline?: string): void;
   session: CallSession;
   el<K extends string>(id: K): K extends keyof ElementById ? ElementById[K] : HTMLElement;
   leftEl(id: string): HTMLElement;
@@ -269,7 +271,7 @@ function seam(label: string, detail: string) {
   details.addEventListener("toggle", () => {
     if (details.open) {
       // The least that shows it: never a move for one already on screen. `#280 scroll-stability`.
-      li.scrollIntoView({ block: "nearest" });
+      deps.intoView(li, "nearest");
     }
   });
   details.append(summary, body);
