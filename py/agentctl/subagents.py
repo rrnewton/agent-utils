@@ -4162,6 +4162,10 @@ class ManagedAgents:
         result["output"] = str(self._directory(name) / "output.json")
         result["goal_source"] = "requested" if record.goal is not None else None
         result["goal_delivery"] = self._goal_delivery(record)
+        # A nested row stores a captured model only; the status row names it
+        # either way, as the flat row and the Rust edition do (#1340).
+        if "resolved_model" not in result:
+            result["resolved_model"] = record.resolved_model
         try:
             destination = self._pending_move_destination(record)
             if destination is not None:
