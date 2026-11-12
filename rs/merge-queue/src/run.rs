@@ -953,7 +953,8 @@ enum Culprit {
     /// A probe was refused by admission: no culprit can be named; defer the batch.
     Refused(String),
     /// A probe observed nothing conclusive (`Missing`/`Skip`-only): no
-    /// culprit can be named; the batch stops rather than guessing.
+    /// culprit can be named; the batch stays queued rather than guessing,
+    /// and the run goes on without it (#1379).
     Inconclusive(String),
     /// A probe's donor job was cancelled as stale (the base moved under
     /// the search): the search is abandoned and the batch recomposed on
@@ -994,6 +995,10 @@ struct CulpritSearch {
     base_synthetic: bool,
     /// The base (prefix 0) is a validated queue landing.
     base_queue_landing: bool,
+    /// The prefix-0 probe passed every selected test but exited with this
+    /// status (its receipt did not qualify), counted as base-pass evidence
+    /// for a deterministic singleton (#1379 mq-unknown-probe-singleton).
+    base_probe_unqualified: Option<i32>,
 }
 
 impl CulpritSearch {
@@ -1055,7 +1060,16 @@ impl CulpritSearch {
             probes: Vec::new(),
             base_synthetic,
             base_queue_landing: base.queue_landing,
+            base_probe_unqualified: None,
         }
+    }
+
+    /// Whether the batch's own red was deterministic (confirmed on the
+    /// validator's deterministic marker, so one sighting confirms it).
+    fn batch_deterministic(&self) -> bool {
+        self.obs
+            .get(&self.candidate.prs.len())
+            .is_some_and(|obs| obs.once == Some(DETERMINISTIC_ONCE))
     }
 
     fn seen(&self, i: usize) -> Seen {
@@ -1178,6 +1192,7 @@ impl CulpritSearch {
                     ids(&ran.infra_blocked.clone())
                 ))));
             }
+            let deterministic_singleton = *i == 0 && n == 1 && self.batch_deterministic();
             let entry = self.obs.entry(*i).or_default();
             match ran.probe_observation() {
                 ProbeObservation::Fail => {
@@ -1191,6 +1206,17 @@ impl CulpritSearch {
                 }
                 ProbeObservation::Pass => entry.passes += 1,
                 ProbeObservation::Unknown => {
+                    // A deterministic singleton whose base probe passed
+                    // every selected test but exited unqualified observed
+                    // the base passing: blame the singleton (#1379). Any
+                    // other inconclusive probe stays inconclusive.
+                    if deterministic_singleton {
+                        if let Some(exit) = ran.all_passed_unqualified_exit() {
+                            entry.passes += 1;
+                            self.base_probe_unqualified = Some(exit);
+                            continue;
+                        }
+                    }
                     entry.unknowns += 1;
                     return Ok(Some(Culprit::Inconclusive(if ran.is_empty_red() {
                         format!(
@@ -9645,13 +9671,14 @@ impl<'a> Runner<'a> {
                     )));
                 }
                 Culprit::Inconclusive(detail) => {
-                    return Ok(Some(BatchOutcome::Stop(
-                        format!(
-                            "culprit search inconclusive for {}: {detail}; no culprit named, nothing ejected",
-                            list(&current.prs)
-                        ),
-                        current.prs.clone(),
-                    )));
+                    // Hold only this batch (still queued, nothing ejected)
+                    // and let the run decide the flights behind it (#1379).
+                    let reason = format!(
+                        "culprit search inconclusive for {}: {detail}; no culprit named, nothing ejected; the changes stay queued",
+                        list(&current.prs)
+                    );
+                    self.event("inconclusive", &reason);
+                    return Ok(Some(BatchOutcome::Deferred(reason, current.prs.clone())));
                 }
                 Culprit::Stale => {
                     self.event(
@@ -9774,6 +9801,10 @@ impl<'a> Runner<'a> {
                     }
                     let base_note = if index != 0 {
                         String::new()
+                    } else if let Some(exit) = work.search.base_probe_unqualified {
+                        format!(
+                            "; the base probe passed every selected test but exited {exit} (the validator's receipt did not qualify)"
+                        )
                     } else if work.search.base_synthetic {
                         " (assumed: trust_base)".to_owned()
                     } else if !work.search.base_queue_landing {
@@ -11544,6 +11575,29 @@ mod unit {
         }
     }
 
+    /// A probe that passed every selected test but exited non-zero (its
+    /// receipt did not qualify): inconclusive by observation (#1379).
+    fn unqualified_pass_ran(exit: i32) -> Ran {
+        let mut ran = probe_ran(None);
+        ran.exit = Some(exit);
+        ran
+    }
+
+    /// A probe that observed only a missing test: no pass, no failure.
+    fn missing_probe_ran() -> Ran {
+        let mut ran = probe_ran(None);
+        let mut results = TestResults::default();
+        results.record(TestResult {
+            id: TestId::step("t"),
+            outcome: Outcome::Missing,
+            duration_ms: None,
+            log: None,
+        });
+        ran.results = results;
+        ran.exit = Some(0);
+        ran
+    }
+
     fn probe_ran(failed_test: Option<&str>) -> Ran {
         let mut results = TestResults::default();
         if let Some(test) = failed_test {
@@ -11638,6 +11692,105 @@ mod unit {
         ));
         assert!(!search.base_synthetic);
         assert!(!search.base_queue_landing);
+    }
+
+    #[test]
+    fn deterministic_singleton_ejects_when_base_probe_passed_unqualified() {
+        // #1379 mq-unknown-probe-singleton: the base probe passed every
+        // selected test but exited 4 (receipt unqualified); the singleton's
+        // deterministic red is still blamed on the singleton.
+        let candidate = singleton_candidate();
+        let failed: BTreeSet<TestId> = [TestId::step("t")].into_iter().collect();
+        let focus = Selection::of(failed.iter().cloned());
+        let mut search = CulpritSearch::new(
+            &candidate,
+            &focus,
+            &failed,
+            true,
+            false,
+            true,
+            BaseEvidence::default(),
+        );
+        let verdict = search
+            .record(&[0], vec![Ok((1, unqualified_pass_ran(4)))], true)
+            .unwrap();
+        assert!(verdict.is_none());
+        assert!(matches!(
+            search.verdict(),
+            Some(Culprit::Found { index: 0, .. })
+        ));
+        assert_eq!(search.base_probe_unqualified, Some(4));
+    }
+
+    #[test]
+    fn nondeterministic_singleton_stays_inconclusive_on_unqualified_probe() {
+        // Same probe, but the batch red was not deterministic: no ejection.
+        let candidate = singleton_candidate();
+        let failed: BTreeSet<TestId> = [TestId::step("t")].into_iter().collect();
+        let focus = Selection::of(failed.iter().cloned());
+        let mut search = CulpritSearch::new(
+            &candidate,
+            &focus,
+            &failed,
+            false,
+            false,
+            true,
+            BaseEvidence::default(),
+        );
+        let verdict = search
+            .record(&[0], vec![Ok((1, unqualified_pass_ran(4)))], true)
+            .unwrap();
+        assert!(matches!(verdict, Some(Culprit::Inconclusive(_))));
+        assert_eq!(search.base_probe_unqualified, None);
+    }
+
+    #[test]
+    fn deterministic_singleton_stays_inconclusive_on_missing_only_probe() {
+        // A missing-only probe observed no pass at all: still inconclusive
+        // even for a deterministic singleton.
+        let candidate = singleton_candidate();
+        let failed: BTreeSet<TestId> = [TestId::step("t")].into_iter().collect();
+        let focus = Selection::of(failed.iter().cloned());
+        let mut search = CulpritSearch::new(
+            &candidate,
+            &focus,
+            &failed,
+            true,
+            false,
+            true,
+            BaseEvidence::default(),
+        );
+        let verdict = search
+            .record(&[0], vec![Ok((1, missing_probe_ran()))], true)
+            .unwrap();
+        assert!(matches!(verdict, Some(Culprit::Inconclusive(_))));
+    }
+
+    #[test]
+    fn unqualified_base_probe_does_not_blame_in_a_multi_change_batch() {
+        // The all-pass unqualified shortcut is singleton-only.
+        let candidate = Candidate {
+            prs: vec![7, 8],
+            parent: "b".repeat(40),
+            tip: "d".repeat(40),
+            prefixes: vec!["c".repeat(40), "d".repeat(40)],
+            base: "b".repeat(40),
+        };
+        let failed: BTreeSet<TestId> = [TestId::step("t")].into_iter().collect();
+        let focus = Selection::of(failed.iter().cloned());
+        let mut search = CulpritSearch::new(
+            &candidate,
+            &focus,
+            &failed,
+            true,
+            false,
+            true,
+            BaseEvidence::default(),
+        );
+        let verdict = search
+            .record(&[0], vec![Ok((1, unqualified_pass_ran(4)))], true)
+            .unwrap();
+        assert!(matches!(verdict, Some(Culprit::Inconclusive(_))));
     }
 
     #[test]

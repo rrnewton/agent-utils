@@ -704,6 +704,30 @@ impl Ran {
             ProbeObservation::Unknown
         }
     }
+
+    /// The exit status when every recorded result passed but the run still
+    /// exited non-zero, so its receipt did not qualify (a targeted run can
+    /// never qualify as a full green): the probe observed passes and nothing
+    /// else, which `probe_observation` still counts as no evidence. `None`
+    /// for any other run (no results, a failure or skip among them, a zero
+    /// or missing exit, a cancellation or a refusal).
+    pub fn all_passed_unqualified_exit(&self) -> Option<i32> {
+        if self.cancelled || self.refused || self.results.results.is_empty() {
+            return None;
+        }
+        if !self
+            .results
+            .results
+            .values()
+            .all(|outcome| *outcome == Outcome::Pass)
+        {
+            return None;
+        }
+        match self.exit {
+            Some(0) | None => None,
+            Some(code) => Some(code),
+        }
+    }
 }
 
 /// The selection a policy chose, and the policy's name.

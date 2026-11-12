@@ -1,10 +1,11 @@
 ---
 title: 'mq-unknown-probe-singleton: eject a deterministic singleton on an all-pass base probe and hold only its batch when inconclusive'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 created_at: 2026-11-12T16:53:42.138409162+00:00
-updated_at: 2026-11-12T16:53:42.138409162+00:00
+updated_at: 2026-11-12T18:52:13.951389602+00:00
+closed_at: 2026-11-12T18:52:13.951389341+00:00
 ---
 
 # Description
