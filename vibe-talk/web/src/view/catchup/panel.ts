@@ -573,7 +573,7 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       const button = document.createElement("button");
       button.type = "button";
       button.className = "discuss-link";
-      button.textContent = link.label.split(" · ")[0];
+      button.textContent = link.label.split(" · ")[0] ?? link.label;
       listening.listen(button, "click", () => {
         deps.onJump({
           service: deps.serviceName(scope.channelId),
