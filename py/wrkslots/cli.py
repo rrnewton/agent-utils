@@ -25534,6 +25534,40 @@ def _assert_cache_policy_untracked(
     )
 
 
+def _assert_eden_checkout_safe(
+    config: Config, checkout: Checkout, runner: eden.Runner | None = None
+) -> Checkout:
+    """Eden analogue of the git safety proof: daemon, revision, clean tree."""
+
+    if runner is None:
+        runner = _eden_runner
+
+    path = _stored_path(config, checkout.path, "checkout path")
+    slot_path = path.parent
+    config_dir = str(slot_path / ".eden-state")
+    rc, stdout, stderr = runner(["eden", "--config-dir", config_dir, "info", str(path)])
+    if rc != 0:
+        raise Refusal(f"checkout {checkout.name} Eden daemon does not answer: {stderr.strip()}")
+    try:
+        info = eden.parse_info(stdout)
+    except eden.EdenError as exc:
+        raise Refusal(str(exc)) from exc
+    if info.revision != checkout.head:
+        raise Refusal(
+            f"checkout {checkout.name} revision changed: expected {checkout.head}, found {info.revision}"
+        )
+    rc, stdout, stderr = runner(["sl", "-R", str(path), "status"])
+    if rc != 0:
+        raise Refusal(f"checkout {checkout.name} Sapling status failed: {stderr.strip()}")
+    if stdout.strip():
+        first = stdout.splitlines()[0]
+        raise Refusal(
+            f"checkout {checkout.name} has uncommitted Sapling changes ({first}); "
+            "preserve them (salvage bundle) before finishing"
+        )
+    return checkout
+
+
 def _assert_checkout_safe(
     config: Config,
     checkout: Checkout,
@@ -25541,6 +25575,8 @@ def _assert_checkout_safe(
     *,
     refresh_remote: bool = True,
 ) -> Checkout:
+    if checkout.vcs == "eden":
+        return _assert_eden_checkout_safe(config, checkout)
     path = _stored_path(config, checkout.path, "checkout path")
     _relative, repository = _stored_repository_path(config, checkout.repository)
     head = vcs.verify_existing_worktree(repository, path)
@@ -34794,7 +34830,7 @@ def _provision_eden_slot(
         raise Refusal(str(exc)) from exc
     return Checkout(
         name=name,
-        path="checkout",
+        path=Path(os.path.relpath(mount, config.root)).as_posix(),
         repository=backing,
         branch=eden.EDEN_BRANCH,
         start_point=info.revision,

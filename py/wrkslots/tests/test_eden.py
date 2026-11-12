@@ -99,6 +99,57 @@ def test_salvage_and_remove_verification() -> None:
     assert len(problems) == 3
 
 
+def test_eden_checkout_safe_proofs(tmp_path: Path) -> None:
+    slot = tmp_path / "slot"
+    (slot / "checkout").mkdir(parents=True)
+    config = wrkslots_cli.Config(
+        config_path=tmp_path / ".wrkslots.yml",
+        root=tmp_path,
+        worktrees=tmp_path,
+        control=tmp_path,
+        machine="node-a",
+        default_remote="origin",
+        default_landed_ref="refs/remotes/origin/main",
+        heartbeat_ttl_seconds=60,
+        liveness_command=tmp_path / "live.py",
+    )
+    checkout = wrkslots_cli._checkout_from_obj(_eden_obj(), "row.checkouts[0]")
+
+    def clean(argv: Sequence[str]) -> tuple[int, str, str]:
+        if "info" in argv:
+            return (
+                0,
+                '{"mount": "/slot/checkout", "state_dir": "/slot/.eden-state/c",'
+                f' "backing_repo": "/backing/repo", "checked_out_revision": "{REV}"}}',
+                "",
+            )
+        return (0, "", "")
+
+    assert wrkslots_cli._assert_eden_checkout_safe(config, checkout, clean) == checkout
+
+    def dirty(argv: Sequence[str]) -> tuple[int, str, str]:
+        if "status" in argv:
+            return (0, "M file\n", "")
+        return clean(argv)
+
+    with pytest.raises(wrkslots_cli.Refusal, match="uncommitted Sapling"):
+        wrkslots_cli._assert_eden_checkout_safe(config, checkout, dirty)
+
+    def moved(argv: Sequence[str]) -> tuple[int, str, str]:
+        if "info" in argv:
+            return (
+                0,
+                '{"mount": "/slot/checkout", "state_dir": "/slot/.eden-state/c",'
+                ' "backing_repo": "/backing/repo",'
+                f' "checked_out_revision": "{"c" * 40}"}}',
+                "",
+            )
+        return clean(argv)
+
+    with pytest.raises(wrkslots_cli.Refusal, match="revision changed"):
+        wrkslots_cli._assert_eden_checkout_safe(config, checkout, moved)
+
+
 def test_provision_clone_info_redirects() -> None:
     calls: list[tuple[str, ...]] = []
 
