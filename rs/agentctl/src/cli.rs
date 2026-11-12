@@ -127,6 +127,11 @@ enum Commands {
         after_help = "Examples:\n  agentctl set reviewer-1 --standing\n  agentctl set reviewer-1 --no-standing\n  agentctl set coordinator --viewer-tab w1:t2\n  agentctl set coordinator --no-viewer-tab\n\nA standing agent rests idle between requests by design, such as a standing reviewer. watch-agents\nsends no idle-without-verdict notice about it; it still reports an approval or permission prompt, a\nguardrail refusal, a dead harness, a stall while working, input queued behind a turn, and owner\nrequests left undelivered. The setting is kept in the agent's record, so it follows the agent through\nrename, restore and revive; list and status show `standing: true`, and a watch-agents pass lists\nstanding agents under \"standing\". Prints the agent, the new setting and the previous one as JSON.\n\n--viewer-tab names the Herdr tab viewing a headless agent (its tail --follow or console tab):\nthe watch tab hygiene ranks that tab with the agent, so a designated coordinator's or bridge\ntarget's viewer stays first and a lane's viewer ranks as that lane, where an unnamed viewer tab\nwould sort last as unmanaged. It names a tab only; no pane id is read or changed. tail --follow\nrun inside Herdr records its own tab this way; --no-viewer-tab clears the name."
     )]
     Set(SetArgs),
+    /// Show, set, or clear the one-line purpose recorded for an agent: what it is for, displayed by status and !who but never sent to the harness
+    #[command(
+        after_help = "Examples:\n  agentctl purpose reviewer\n  agentctl purpose reviewer 'Review the parser change'\n  agentctl purpose reviewer --clear\n\nWithout TEXT and without --clear this only reads. Setting or clearing writes the agent's record once and never prompts, queues, or wakes the agent; a harness goal set with `agentctl goal` is a different thing and is untouched. Prints the agent, the purpose now recorded, and the previous one as JSON."
+    )]
+    Purpose(PurposeArgs),
     /// Print the control tree: the designated coordinator at the root and every agent under the agent that manages it, at any depth
     #[command(
         after_help = "Examples:\n  agentctl tree\n  agentctl tree --json\n\nAn agent hangs under the registered agent its managed_by names; one with no manager, a stopped\nmanager, or a manager in another registry hangs under the designated coordinator. created_by is shown\nwhere it differs from managed_by. --json adds tokens, edges and each agent's pinned harness process."
@@ -459,6 +464,18 @@ struct SetArgs {
     /// Clear the agent's named viewer tab, restoring the default unmanaged ranking for it
     #[arg(long)]
     no_viewer_tab: bool,
+}
+
+#[derive(Args)]
+struct PurposeArgs {
+    #[command(flatten)]
+    agent: Named,
+    /// New one-line purpose (at most 200 characters); omit to only read
+    #[arg(value_name = "TEXT", conflicts_with = "clear")]
+    text: Option<String>,
+    /// Clear the recorded purpose; the agent then carries none
+    #[arg(long)]
+    clear: bool,
 }
 
 #[derive(Args)]
@@ -1437,8 +1454,8 @@ struct Start {
     /// agentcloud only: envspec the provisioned node is reserved from, which decides its checkout; requires --provision
     #[arg(long, value_name = "NAME", requires = "provision")]
     envspec: Option<String>,
-    /// agentcloud only: roster label for the provisioned node; requires --provision
-    #[arg(long, value_name = "TEXT", requires = "provision")]
+    /// One-line description of what the agent is for, recorded in its record at start and shown by status, list, !who and the console (default: the slot's recorded purpose, else the brief's first meaningful line); agentcloud with --provision also uses it as the provisioned node's roster label
+    #[arg(long, value_name = "TEXT")]
     purpose: Option<String>,
     /// agentcloud only: absolute session working directory on the node (default: server default); may contain {cwd}, {name}, {host}, or {fqdn}
     #[arg(long, value_name = "PATH")]
@@ -3661,6 +3678,7 @@ fn writes_registry(command: &Commands) -> bool {
         | Commands::AttachSelf(_)
         | Commands::Manage(_)
         | Commands::Set(_)
+        | Commands::Purpose(_)
         | Commands::Move(_)
         | Commands::Rename(_)
         | Commands::Anchor(_)
@@ -4491,7 +4509,6 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                 (value.cloud_harness.is_some(), "--cloud-harness"),
                 (value.provision, "--provision"),
                 (value.envspec.is_some(), "--envspec"),
-                (value.purpose.is_some(), "--purpose"),
                 (value.cloud_workspace.is_some(), "--cloud-workspace"),
                 (value.node_id.is_some(), "--node-id"),
                 (value.cloud_title.is_some(), "--cloud-title"),
@@ -4500,6 +4517,9 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             .filter_map(|(present, flag)| present.then_some(flag))
             .collect::<Vec<_>>();
             let mut record_edges = !value.no_edges;
+            // #1342: --purpose is recorded for every harness; only an
+            // agentcloud provisioning launch also forwards it (below).
+            let start_purpose = value.purpose.clone();
             let (
                 harness,
                 mode,
@@ -4569,7 +4589,11 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         harness: value.cloud_harness,
                         provision: value.provision,
                         envspec: value.envspec,
-                        purpose: value.purpose,
+                        purpose: if value.provision {
+                            value.purpose.clone()
+                        } else {
+                            None
+                        },
                         workspace: value.cloud_workspace,
                         node_id: value.node_id,
                         title: value.cloud_title,
@@ -4644,6 +4668,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                         session: value.resume,
                         launch: !value.no_launch,
                         brief,
+                        purpose: start_purpose.clone(),
                         record_edges,
                     },
                 )?
@@ -4726,6 +4751,7 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
                     harness_args,
                     environment,
                     brief,
+                    purpose: start_purpose,
                     startup_timeout: Duration::from_secs_f64(value.startup_timeout),
                     delivery: value.delivery.options(),
                     cloud,
@@ -4786,6 +4812,9 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
             } else {
                 manager.set_standing(&value.agent.name, value.standing && !value.no_standing)?
             }
+        }
+        Commands::Purpose(value) => {
+            manager.purpose(&value.agent.name, value.text.as_deref(), value.clear)?
         }
         Commands::Manage(value) => manager.manage(
             &value.agent.name,

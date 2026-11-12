@@ -520,6 +520,7 @@ fn run_managed(args: Args) -> Result<i32, CliError> {
                 harness_args: args.harness_args.clone(),
                 environment: Vec::new(),
                 brief,
+                purpose: None,
                 startup_timeout: Duration::from_secs_f64(args.startup_timeout),
                 delivery,
                 cloud: None,

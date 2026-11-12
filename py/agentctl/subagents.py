@@ -494,6 +494,60 @@ def environment_entries(values: Sequence[str]) -> tuple[str, ...]:
 #: which can precede the harness visibly starting its turn.
 DELIVERY_SETTLE_SECONDS = 10.0
 
+#: Record key for the one-line purpose (#1342 agent-purpose-line), an
+#: extension key like ``standing``: display-only, never sent to the harness.
+PURPOSE = "purpose"
+#: Longest purpose line, in characters.
+PURPOSE_MAX_CHARS = 200
+
+
+def validated_purpose(text: str) -> str:
+    """Validate a purpose the caller typed: nonempty, single line, bounded."""
+    text = text.strip()
+    if not text or "\n" in text or "\r" in text:
+        raise AgentDeliveryError("purpose must be a nonempty single line")
+    if len(text) > PURPOSE_MAX_CHARS:
+        raise AgentDeliveryError(f"purpose must be at most {PURPOSE_MAX_CHARS} characters")
+    return text
+
+
+def _cleaned_purpose(text: str) -> str | None:
+    collapsed = " ".join(text.split())
+    try:
+        return validated_purpose(collapsed)
+    except AgentDeliveryError:
+        try:
+            return validated_purpose(collapsed[:PURPOSE_MAX_CHARS])
+        except AgentDeliveryError:
+            return None
+
+
+def purpose_from_brief(brief: str) -> str | None:
+    """The brief's first meaningful line, as a purpose (see the Rust twin)."""
+    for line in brief.splitlines():
+        candidate = line.strip().lstrip("#-*> ")
+        if not candidate or candidate.startswith("```"):
+            continue
+        if candidate.startswith("[from "):
+            continue
+        purpose = _cleaned_purpose(candidate)
+        if purpose is not None:
+            return purpose
+    return None
+
+
+def resolve_purpose(
+    explicit: str | None, slot: str | None, brief: str | None,
+) -> str | None:
+    """Explicit ``--purpose``, then the slot's purpose, then the brief's."""
+    if explicit is not None:
+        return explicit
+    if slot is not None:
+        purpose = _cleaned_purpose(slot)
+        if purpose is not None:
+            return purpose
+    return purpose_from_brief(brief) if brief is not None else None
+
 
 def _latest_confirmed_delivery(queue: Path) -> float | None:
     """Return the newest `confirmed_at` among processed queue entries, or None."""
@@ -589,6 +643,34 @@ class AgentRecord:
             self._unknown[launch_spec.FIELD] = launch_spec.validate(
                 spec, harness=self.harness, label=f"agent {self.name!r}",
             )
+    @property
+    def purpose(self) -> str | None:
+        """What this agent is for (#1342), when a purpose is recorded."""
+        if self._nested_storage is not None:
+            extensions = self._nested_storage.get("extensions")
+            if isinstance(extensions, dict):
+                value = extensions.get(PURPOSE)
+                return value if isinstance(value, str) else None
+            return None
+        value = self._unknown.get(PURPOSE)
+        return value if isinstance(value, str) else None
+
+    def set_purpose(self, purpose: str | None) -> None:
+        """Record or clear the purpose; no purpose carries no key."""
+        if self._nested_storage is not None:
+            extensions = self._nested_storage.get("extensions")
+            if not isinstance(extensions, dict):
+                extensions = {}
+                self._nested_storage["extensions"] = extensions
+            if purpose is None:
+                extensions.pop(PURPOSE, None)
+            else:
+                extensions[PURPOSE] = purpose
+        elif purpose is None:
+            self._unknown.pop(PURPOSE, None)
+        else:
+            self._unknown[PURPOSE] = purpose
+
     _unknown: dict[str, object] = field(default_factory=dict, init=False, repr=False)
     _nested_storage: dict[str, object] | None = field(
         default=None, init=False, repr=False,
@@ -3279,7 +3361,7 @@ class ManagedAgents:
         harness: str = "codex", model: str | None = None, resume: str | None = None,
         reasoning_effort: str | None = None,
         harness_args: Sequence[str] = (), environment: Sequence[str] = (),
-        brief: str | None = None,
+        brief: str | None = None, purpose: str | None = None,
         startup_timeout: float = 30.0, ready_timeout: float = 900.0,
         working_timeout: float = 30.0, max_attempts: int = 3,
         slot: str | None = None, slot_isolation: str | None = None,
@@ -3361,6 +3443,8 @@ class ManagedAgents:
         environment = environment_entries(environment)
         if brief is not None and not brief:
             raise AgentDeliveryError("brief must not be empty")
+        if purpose is not None:
+            purpose = validated_purpose(purpose)
         project_workspace = self._project_workspace()
         if project_workspace is not None and workspace_id is not None:
             actual_label = self.client.workspace_label(workspace_id)
@@ -3440,6 +3524,16 @@ class ManagedAgents:
                                      environment_names=sorted({entry.partition("=")[0] for entry in environment}),
                                      adapter="herdr-relay" if relay_command is not None
                                      else "herdr-pane" if harness == "muse" else "herdr")
+                # #1342: what this agent is for, display-only (explicit, then
+                # the slot's recorded purpose, then the brief's first line).
+                slot_purpose = None
+                if purpose is None and slot is not None:
+                    slot_purpose = _slot_recorded_purpose(
+                        slot, project=launch_project or root, registry=self.registry,
+                    )
+                resolved_purpose = resolve_purpose(purpose, slot_purpose, brief)
+                if resolved_purpose is not None:
+                    record.set_purpose(resolved_purpose)
                 # The spec is durable before Herdr starts anything, so a launch that never
                 # reports back can still be replayed exactly.
                 record.set_launch_spec(launch_spec.build(
@@ -4234,6 +4328,8 @@ class ManagedAgents:
         # either way, as the flat row and the Rust edition do (#1340).
         if "resolved_model" not in result:
             result["resolved_model"] = record.resolved_model
+        if record.purpose is not None:
+            result["purpose"] = record.purpose
         try:
             destination = self._pending_move_destination(record)
             if destination is not None:
@@ -7007,6 +7103,32 @@ def _bind_launched_slot_owner(
     if moved.returncode != 0:
         return refused(f"transfer-owner refused: {moved.stderr.strip()}")
     return {"slot": slot, "action": "transferred", "owner_pid": pid, "generation": generation}
+
+
+def _slot_recorded_purpose(
+    slot: str, *, project: str, registry: str | Path | None = None,
+) -> str | None:
+    """The slot's recorded wrkslots purpose, best-effort (#1342): any failure
+    yields ``None`` and the start falls back; this never refuses a launch."""
+    executable = wrkslots_executable(registry)
+    if not executable:
+        return None
+    try:
+        completed = subprocess.run(
+            [executable, "status", "--slot", slot, "--format", "json"],
+            cwd=project, capture_output=True, text=True, timeout=10, check=False,
+        )
+        if completed.returncode != 0:
+            return None
+        document = json.loads(completed.stdout)
+        for row in document["active"]:
+            record = row.get("row", row) if isinstance(row, dict) else row
+            if isinstance(record, dict) and record.get("slot") == slot:
+                purpose = record.get("purpose")
+                return purpose if isinstance(purpose, str) and purpose.strip() else None
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    return None
 
 
 def _slot_shell_command(

@@ -6087,6 +6087,10 @@ pub struct StartOptions {
     pub environment: Vec<String>,
     /// Initial task to submit after the harness is ready.
     pub brief: Option<String>,
+    /// One-line description of what the agent is for (#1342 agent-purpose-line),
+    /// recorded display-only; `None` falls back to the slot's recorded purpose,
+    /// then the brief's first meaningful line.
+    pub purpose: Option<String>,
     /// Herdr's bounded startup-readiness deadline.
     pub startup_timeout: Duration,
     /// Delivery options for the initial task.
@@ -6349,6 +6353,54 @@ pub fn slot_shell_command(
     ))
 }
 
+/// The purpose recorded for `slot` by the slot manager (#1342
+/// agent-purpose-line): `wrkslots status --slot SLOT --format json` run in
+/// the slot's project root, bounded at 10 seconds. Best-effort: any failure
+/// (spawn, timeout, nonzero exit, unexpected JSON, the slot having moved on)
+/// yields `None`, and the start falls back to the brief or records nothing —
+/// a purpose lookup never fails a launch.
+fn slot_recorded_purpose(executable: &Path, project: &Path, slot: &str) -> Option<String> {
+    let mut command = std::process::Command::new(executable);
+    command.args(["status", "--slot", slot, "--format", "json"]);
+    command
+        .current_dir(project)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = command.spawn().ok()?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let document: Value = serde_json::from_slice(&output.stdout).ok()?;
+    let rows = document.get("active")?.as_array()?;
+    for row in rows {
+        let record = row.get("row").unwrap_or(row);
+        if record.get("slot").and_then(Value::as_str) == Some(slot) {
+            return record
+                .get("purpose")
+                .and_then(Value::as_str)
+                .filter(|purpose| !purpose.trim().is_empty())
+                .map(str::to_owned);
+        }
+    }
+    None
+}
+
 impl Default for StartOptions {
     fn default() -> Self {
         Self {
@@ -6361,6 +6413,7 @@ impl Default for StartOptions {
             harness_args: Vec::new(),
             environment: Vec::new(),
             brief: None,
+            purpose: None,
             startup_timeout: Duration::from_secs(30),
             delivery: DrainOptions::default(),
             cloud: None,
@@ -9651,6 +9704,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         if options.brief.as_deref().is_some_and(str::is_empty) {
             return Err(fail("brief must not be empty"));
         }
+        if let Some(purpose) = options.purpose.as_deref() {
+            control::validated_purpose(purpose)?;
+        }
         if options
             .profile
             .as_deref()
@@ -9979,6 +10035,25 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         self.creation_edges(&mut record, options.record_edges);
         if let Some(pinned) = options.pinned {
             record.set_pinned(Some(pinned));
+        }
+        // #1342 agent-purpose-line: what this agent is for, display-only. An
+        // explicit purpose was validated by the caller; the slot's recorded
+        // purpose (best-effort, never a start failure) and the brief follow.
+        let slot_purpose = if options.purpose.is_none() {
+            slot_owner_target
+                .as_ref()
+                .and_then(|(wrkslots, project, slot)| {
+                    slot_recorded_purpose(wrkslots, project, slot)
+                })
+        } else {
+            None
+        };
+        if let Some(purpose) = control::resolve_purpose(
+            options.purpose.as_deref(),
+            slot_purpose.as_deref(),
+            options.brief.as_deref(),
+        ) {
+            record.set_purpose(Some(&purpose));
         }
         // The spec is durable before Herdr starts anything, so a launch that never reports
         // back can still be replayed exactly.
@@ -11504,6 +11579,9 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         }
         if let Some(viewer) = record.viewer_tab() {
             result[control::VIEWER_TAB] = json!(viewer);
+        }
+        if let Some(purpose) = record.purpose() {
+            result[control::PURPOSE] = json!(purpose);
         }
         result["queue"] = json!(self.queue(agent_name)?);
         result["output"] = json!(self.directory(agent_name)?.join("output.json"));
@@ -17536,6 +17614,51 @@ pub(crate) mod tests {
         let status = fixture.start(Some("initial task".to_owned()));
         assert_eq!(status["lifecycle"], "running");
         assert_eq!(*fixture.client.runs.lock().unwrap(), ["initial task"]);
+    }
+
+    #[test]
+    fn start_records_purpose_and_purpose_command_updates_it() {
+        // Brief-only start: the brief's first meaningful line is the purpose.
+        let fixture = Fixture::new();
+        let status = fixture.start(Some("# Fix the parser\n\nDetails follow.".to_owned()));
+        assert_eq!(status["purpose"], "Fix the parser", "{status}");
+
+        // Explicit purpose beats the brief; the command reads, sets, clears.
+        let fixture = Fixture::new();
+        let status = fixture
+            .manager()
+            .start(
+                "worker",
+                &fixture.root,
+                StartOptions {
+                    workspace_id: Some("workspace".to_owned()),
+                    brief: Some("brief line".to_owned()),
+                    purpose: Some("explicit purpose".to_owned()),
+                    ..StartOptions::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(status["purpose"], "explicit purpose", "{status}");
+        let manager = fixture.manager();
+        let read = manager.purpose("worker", None, false).unwrap();
+        assert_eq!(read["purpose"], "explicit purpose", "{read}");
+        let set = manager
+            .purpose("worker", Some("review the parser change"), false)
+            .unwrap();
+        assert_eq!(set["purpose"], "review the parser change", "{set}");
+        assert_eq!(set["previous"], "explicit purpose", "{set}");
+        assert!(manager.purpose("worker", Some("two\nlines"), false).is_err());
+        let cleared = manager.purpose("worker", None, true).unwrap();
+        assert_eq!(cleared["purpose"], Value::Null, "{cleared}");
+        assert_eq!(cleared["previous"], "review the parser change", "{cleared}");
+        let status = manager.status("worker").unwrap();
+        assert!(status.get("purpose").is_none(), "{status}");
+        assert!(status["goal"].is_null(), "purpose never touches goal: {status}");
+
+        // No brief and no purpose: no key at all.
+        let fixture = Fixture::new();
+        let status = fixture.start(None);
+        assert!(status.get("purpose").is_none(), "{status}");
     }
 
     #[test]

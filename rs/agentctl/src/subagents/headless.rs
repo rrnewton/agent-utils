@@ -53,6 +53,9 @@ pub struct HeadlessStart {
     pub launch: bool,
     /// First input, queued before the wrapper starts.
     pub brief: Option<String>,
+    /// One-line description of what the agent is for (#1342 agent-purpose-line),
+    /// recorded display-only; `None` falls back to the brief's first line.
+    pub purpose: Option<String>,
     /// Record the calling agent as creator and manager.
     pub record_edges: bool,
 }
@@ -244,6 +247,9 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         cwd: &Path,
         options: HeadlessStart,
     ) -> Result<Value> {
+        if let Some(purpose) = options.purpose.as_deref() {
+            super::control::validated_purpose(purpose)?;
+        }
         if !hl::HARNESSES.contains(&options.harness.as_str()) {
             return Err(fail(format!(
                 "headless mode runs {} in this build, not {:?}",
@@ -344,6 +350,13 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
             goal_message_id: None,
         };
         self.creation_edges(&mut record, options.record_edges);
+        if let Some(purpose) = super::control::resolve_purpose(
+            options.purpose.as_deref(),
+            None,
+            options.brief.as_deref(),
+        ) {
+            record.set_purpose(Some(&purpose));
+        }
         self.save(&record)?;
         let queue_root = self.queue(agent_name)?;
         agent_queue::queue::prepare(&queue_root)?;

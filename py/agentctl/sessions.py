@@ -22,7 +22,10 @@ from agentctl.profiles import (
     validate_muse_headless_arguments,
     validate_structured_harness_argument_conflicts,
 )
-from agentctl.subagents import AgentRecord, ManagedAgents, _WorkspaceClient, _name, _native_session
+from agentctl.subagents import (
+    AgentRecord, ManagedAgents, _WorkspaceClient, _name, _native_session,
+    resolve_purpose, validated_purpose,
+)
 
 
 class Sessions(ManagedAgents):
@@ -84,6 +87,7 @@ class Sessions(ManagedAgents):
                       reasoning_effort: str | None = None,
                       resume: str | None = None, harness_args: Sequence[str] = (),
                       environment: Sequence[str] = (), brief: str | None = None,
+                      purpose: str | None = None,
                       workspace_id: str | None = None, startup_timeout: float = 30.0,
                       ready_timeout: float = 900.0, working_timeout: float = 30.0,
                       max_attempts: int = 3, slot: str | None = None,
@@ -102,6 +106,7 @@ class Sessions(ManagedAgents):
                 name, cwd=cwd, harness=harness, model=model,
                 reasoning_effort=reasoning_effort, resume=resume,
                 harness_args=harness_args, environment=environment, brief=brief,
+                purpose=purpose,
                 workspace_id=workspace_id, startup_timeout=startup_timeout,
                 ready_timeout=ready_timeout, working_timeout=working_timeout,
                 max_attempts=max_attempts, slot=slot, slot_isolation=slot_isolation,
@@ -150,6 +155,11 @@ class Sessions(ManagedAgents):
                 record = AgentRecord(name, uuid.uuid4().hex, harness, root, time.time(), model=model,
                     profile=profile, reasoning_effort=reasoning_effort,
                     adapter="turn-runner", mode=mode, backend=backend, runtime_home=str(directory / "runtime"))
+                if purpose is not None:
+                    purpose = validated_purpose(purpose)
+                resolved_purpose = resolve_purpose(purpose, None, brief)
+                if resolved_purpose is not None:
+                    record.set_purpose(resolved_purpose)
                 self._save(record)
                 try:
                     response = self._worker(record, "start", cwd=root, harness=harness,

@@ -1701,6 +1701,39 @@ def test_registry_discovery_without_a_home_checks_only_the_working_directory(
         ".agentctl", cwd=inner, environ={}, home=None) == str(inner / ".agentctl")
 
 
+def test_start_records_purpose_from_brief_explicit_and_none(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#1342: explicit purpose beats the brief's first line; no source, no key."""
+    from agentctl.subagents import purpose_from_brief, resolve_purpose, validated_purpose
+
+    assert validated_purpose("  fix the parser ") == "fix the parser"
+    with pytest.raises(AgentDeliveryError):
+        validated_purpose("two\nlines")
+    assert purpose_from_brief("\n# Fix the parser\n\ndetails") == "Fix the parser"
+    assert resolve_purpose("explicit", "slot", "brief") == "explicit"
+    assert resolve_purpose(None, "slot purpose", "brief") == "slot purpose"
+    assert resolve_purpose(None, None, None) is None
+
+    sessions, _fake, _calls = setup(tmp_path, monkeypatch)
+    result = sessions.start_session(
+        "worker", cwd=str(tmp_path), harness="claude", brief="# Fix the parser\n\ndetails",
+    )
+    assert result["purpose"] == "Fix the parser", result
+    record = sessions.get("worker")
+    assert record.purpose == "Fix the parser"
+    record.set_purpose(None)
+    assert record.purpose is None
+    assert record.to_document().get("purpose") is None
+
+    result = sessions.start_session(
+        "worker2", cwd=str(tmp_path), harness="claude",
+        brief="brief line", purpose="explicit purpose",
+    )
+    assert result["purpose"] == "explicit purpose", result
+
+    result = sessions.start_session("worker3", cwd=str(tmp_path), harness="claude")
+    assert "purpose" not in result or result["purpose"] is None, result
+
+
 def test_registry_discovery_stops_at_a_symlinked_or_slashed_home(tmp_path: Path) -> None:
     """#1169: HOME spelled with a trailing slash, or through a symlink, still stops
     the walk: comparison is by resolved path."""

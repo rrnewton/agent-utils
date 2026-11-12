@@ -172,6 +172,9 @@ def parser() -> argparse.ArgumentParser:
              "the pane after those files have run")
     start.add_argument("--workspace-id", metavar="ID",
         help="interactive only: exact Herdr workspace; default: configured project workspace, else HERDR_WORKSPACE_ID, else shared subagents; an explicit ID must match configured policy")
+    start.add_argument("--purpose", metavar="TEXT",
+        help="one-line description of what the agent is for, recorded at start and shown by status and !who "
+             "(default: the slot's recorded purpose, else the brief's first line)")
     first = start.add_mutually_exclusive_group()
     first.add_argument("--brief", metavar="TEXT", help="initial task, submitted after launch")
     first.add_argument("--file", metavar="PATH", help="UTF-8 file containing the initial task")
@@ -372,6 +375,8 @@ def parser() -> argparse.ArgumentParser:
          "agentctl manage worker-1 --by lieutenant"),
         ("set", "Change a registered agent's durable settings, such as whether it is a standing agent (Rust "
          "edition only; this edition refuses).", "agentctl set reviewer-1 --standing"),
+        ("purpose", "Show, set, or clear the one-line purpose recorded for an agent (Rust edition only; this "
+         "edition refuses).", "agentctl purpose reviewer-1 'Review the parser change'"),
         ("tree", "Print the control tree of coordinator, managers, and workers (Rust edition only; this "
          "edition refuses).", "agentctl tree"),
         ("progress", "Declare what counts as progress for an agent, for watch-agents to judge (Rust edition only; "
@@ -462,7 +467,7 @@ def _goal_command(args: argparse.Namespace) -> list[str] | None:
 
 #: Commands only the Rust edition implements; this edition refuses them with exit status 2.
 _RUST_ONLY = ("restore", "restore-teams", "install-units", "watch", "watch-agents", "hold", "coordinator", "manage", "set",
-              "tree", "progress", "services")
+              "purpose", "tree", "progress", "services")
 
 
 #: Commands that change agents' state, so idle layout-1 agents move to layout 2 first (not before a
@@ -626,7 +631,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             environment = list(profile.environment) if profile else args.env
             brief = Path(args.file).read_text(encoding="utf-8") if args.file else args.brief
             result = sessions.start_session(name, cwd=args.cwd, mode=mode, backend=args.backend,
-                harness=harness, model=model, brief=brief, resume=args.resume,
+                harness=harness, model=model, brief=brief, purpose=args.purpose, resume=args.resume,
                 reasoning_effort=reasoning_effort, harness_args=harness_args,
                 environment=environment,
                 workspace_id=args.workspace_id,

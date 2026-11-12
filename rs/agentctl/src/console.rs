@@ -586,6 +586,18 @@ fn restore_buffer(shared: &Arc<Shared>, line: &str) {
     editor.insert_str(line);
 }
 
+/// The console's opening line; the agent's recorded purpose (#1342
+/// agent-purpose-line) is named when it has one.
+fn console_banner(name: &str, purpose: Option<&str>) -> String {
+    let subject = match purpose {
+        Some(purpose) => format!("{name} ({purpose})"),
+        None => name.to_owned(),
+    };
+    format!(
+        "agentctl console {subject}: Enter sends a plain turn; /help lists the console commands; /interrupt or Ctrl-C twice interrupts the turn; Ctrl-D or /quit leaves; approve aN / deny aN [reason] answers an approval"
+    )
+}
+
 /// Run the console until the owner leaves it; `0` on a clean exit.
 pub fn run<A: ManagedApi + ?Sized>(
     manager: &ManagedAgents<'_, A>,
@@ -622,9 +634,7 @@ pub fn run<A: ManagedApi + ?Sized>(
     options.console = true;
     // The banner goes first, so the transcript that follows cannot be
     // mistaken for it and the owner sees the commands before any event.
-    shared.print_line(&format!(
-        "agentctl console {name}: Enter sends a plain turn; /help lists the console commands; /interrupt or Ctrl-C twice interrupts the turn; Ctrl-D or /quit leaves; approve aN / deny aN [reason] answers an approval"
-    ));
+    shared.print_line(&console_banner(name, manager.purpose_of(name).as_deref()));
     let follower_shared = shared.clone();
     let follower_quit = quit.clone();
     let follower = std::thread::Builder::new()
@@ -767,6 +777,13 @@ mod tests {
         assert!(matches!(editor.feed(b'\n'), Action::Changed));
         feed(&mut editor, b"two");
         assert_eq!(editor.take_text(), "one\ntwo");
+    }
+
+    #[test]
+    fn banner_names_the_purpose_when_one_is_recorded() {
+        assert!(console_banner("worker", None).starts_with("agentctl console worker:"));
+        assert!(console_banner("worker", Some("fix the parser"))
+            .starts_with("agentctl console worker (fix the parser):"));
     }
 
     #[test]

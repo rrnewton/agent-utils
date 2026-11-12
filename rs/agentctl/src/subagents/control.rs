@@ -33,6 +33,73 @@ pub(crate) const STANDING: &str = "standing";
 /// workspace-goal-reconciler, Phase 1). Hygiene ranks that tab with the
 /// agent; it is never the agent's pane.
 pub(crate) const VIEWER_TAB: &str = "viewer_tab_id";
+/// A one-line description of what the agent is for (#1342 agent-purpose-line):
+/// display-only metadata recorded at start. Unlike `goal` it is never sent to
+/// the harness as an instruction.
+pub(crate) const PURPOSE: &str = "purpose";
+/// Longest purpose line, in characters.
+pub(crate) const PURPOSE_MAX_CHARS: usize = 200;
+
+/// Validate a purpose the caller typed: nonempty, single line, bounded.
+pub(crate) fn validated_purpose(text: &str) -> Result<String> {
+    let text = text.trim();
+    if text.is_empty() || text.contains(['\n', '\r']) {
+        return Err(fail("purpose must be a nonempty single line"));
+    }
+    if text.chars().count() > PURPOSE_MAX_CHARS {
+        return Err(fail(format!(
+            "purpose must be at most {PURPOSE_MAX_CHARS} characters"
+        )));
+    }
+    Ok(text.to_owned())
+}
+
+/// A purpose taken from a stored source (a slot record, a brief): cleaned the
+/// same way, but an unusable value yields `None` instead of an error, so the
+/// next source is tried and a start never fails over a purpose.
+fn cleaned_purpose(text: &str) -> Option<String> {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    validated_purpose(&collapsed).ok().or_else(|| {
+        let truncated: String = collapsed.chars().take(PURPOSE_MAX_CHARS).collect();
+        validated_purpose(&truncated).ok()
+    })
+}
+
+/// The first meaningful line of a brief: the first non-empty line that is not
+/// a sender header or a bare fence, with heading/bullet markers stripped.
+pub(crate) fn purpose_from_brief(brief: &str) -> Option<String> {
+    for line in brief.lines() {
+        let candidate = line
+            .trim()
+            .trim_start_matches(|c| c == '#' || c == '-' || c == '*' || c == '>' || c == ' ');
+        if candidate.is_empty() || candidate.starts_with("```") {
+            continue;
+        }
+        if candidate.starts_with("[from ") {
+            continue;
+        }
+        if let Some(purpose) = cleaned_purpose(candidate) {
+            return Some(purpose);
+        }
+    }
+    None
+}
+
+/// Choose the purpose recorded at start: an explicit `--purpose` wins, then
+/// the slot's recorded purpose, then the brief's first meaningful line.
+pub(crate) fn resolve_purpose(
+    explicit: Option<&str>,
+    slot: Option<&str>,
+    brief: Option<&str>,
+) -> Option<String> {
+    if let Some(purpose) = explicit {
+        return Some(purpose.to_owned());
+    }
+    if let Some(purpose) = slot.and_then(cleaned_purpose) {
+        return Some(purpose);
+    }
+    brief.and_then(purpose_from_brief)
+}
 /// Earlier tokens a record keeps; older generations' edges are treated as stale.
 const FORMER_TOKENS_MAX: usize = 32;
 /// The edge was found by walking the caller's process ancestry to a pinned harness.
@@ -714,6 +781,41 @@ impl AgentRecord {
                 }
                 None => {
                     self.extra.remove(VIEWER_TAB);
+                }
+            },
+        }
+    }
+
+    /// What this agent is for ([`PURPOSE`]), when a purpose is recorded.
+    pub(super) fn purpose(&self) -> Option<String> {
+        let value = match &self.nested {
+            Some(nested) => nested.extensions().get(PURPOSE),
+            None => self.extra.get(PURPOSE),
+        }?;
+        value.as_str().map(str::to_owned)
+    }
+
+    /// Record what this agent is for, or clear it; a record with no purpose
+    /// carries no field. Display-only: nothing here prompts the agent.
+    pub(super) fn set_purpose(&mut self, purpose: Option<&str>) {
+        match &mut self.nested {
+            Some(nested) => {
+                let map = nested.extensions_mut();
+                match purpose {
+                    Some(purpose) => {
+                        map.insert(PURPOSE.to_owned(), json!(purpose));
+                    }
+                    None => {
+                        map.remove(PURPOSE);
+                    }
+                }
+            }
+            None => match purpose {
+                Some(purpose) => {
+                    self.extra.insert(PURPOSE.to_owned(), json!(purpose));
+                }
+                None => {
+                    self.extra.remove(PURPOSE);
                 }
             },
         }
@@ -1676,6 +1778,49 @@ impl<A: ManagedApi + ?Sized> ManagedAgents<'_, A> {
         }))
     }
 
+    /// Read, set, or clear what `agent_name` is for (#1342 agent-purpose-line).
+    /// With neither `text` nor `clear` this only reads. Setting or clearing
+    /// writes the record once and never prompts the agent; `goal` is untouched.
+    pub fn purpose(
+        &self,
+        agent_name: &str,
+        text: Option<&str>,
+        clear: bool,
+    ) -> Result<Value> {
+        if !clear && text.is_none() {
+            let record = self.load(agent_name)?;
+            let purpose = record.purpose();
+            return Ok(json!({
+                "name": record.name,
+                "purpose": purpose,
+                "previous": purpose,
+            }));
+        }
+        let new = if clear {
+            None
+        } else {
+            Some(validated_purpose(text.unwrap_or_default())?)
+        };
+        let _lock = self.lock(agent_name)?;
+        let mut record = self.load(agent_name)?;
+        let previous = record.purpose();
+        if previous != new {
+            record.set_purpose(new.as_deref());
+            self.save(&record)?;
+        }
+        Ok(json!({
+            "name": record.name,
+            "purpose": new,
+            "previous": previous,
+        }))
+    }
+
+    /// The recorded purpose of `agent_name`, for display surfaces that hold a
+    /// manager (the headless console banner); `None` when unset or unreadable.
+    pub(crate) fn purpose_of(&self, agent_name: &str) -> Option<String> {
+        self.load(agent_name).ok()?.purpose()
+    }
+
     /// Mark `agent_name` standing or not (#901 watch-standing-agents): `watch-agents` then
     /// reports no idle-without-verdict episode for it, and every other notice stays. The flag is
     /// part of the record, so it follows the agent through rename, restore and revive.
@@ -1950,6 +2095,47 @@ mod tests {
         assert_eq!(to(&nodes, "lieutenant").as_deref(), Some("coord"));
         let undesignated = controller_of(&nodes, registry, None, "orphan");
         assert_eq!(undesignated, None);
+    }
+
+    #[test]
+    fn purpose_validation_and_brief_lines() {
+        assert_eq!(validated_purpose("  fix the parser  ").unwrap(), "fix the parser");
+        assert!(validated_purpose("").is_err());
+        assert!(validated_purpose("two\nlines").is_err());
+        assert!(validated_purpose(&"x".repeat(PURPOSE_MAX_CHARS + 1)).is_err());
+        assert_eq!(
+            purpose_from_brief("\n# Fix the parser\n\nDetails follow.").as_deref(),
+            Some("Fix the parser")
+        );
+        assert_eq!(
+            purpose_from_brief("- [from coord via agentctl] queued\n- Review the diff\n")
+                .as_deref(),
+            Some("Review the diff")
+        );
+        assert_eq!(purpose_from_brief("  \n```\n"), None);
+        let long = format!("word {}", "x".repeat(PURPOSE_MAX_CHARS));
+        assert_eq!(
+            purpose_from_brief(&long).map(|line| line.chars().count()),
+            Some(PURPOSE_MAX_CHARS)
+        );
+    }
+
+    #[test]
+    fn purpose_sources_resolve_in_order() {
+        assert_eq!(
+            resolve_purpose(Some("explicit"), Some("slot"), Some("brief line")).as_deref(),
+            Some("explicit")
+        );
+        assert_eq!(
+            resolve_purpose(None, Some("slot purpose"), Some("brief line")).as_deref(),
+            Some("slot purpose")
+        );
+        assert_eq!(
+            resolve_purpose(None, Some("  "), Some("brief line")).as_deref(),
+            Some("brief line")
+        );
+        assert_eq!(resolve_purpose(None, None, Some("  \n")), None);
+        assert_eq!(resolve_purpose(None, None, None), None);
     }
 
     #[test]
