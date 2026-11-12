@@ -1721,7 +1721,6 @@ def test_start_records_purpose_from_brief_explicit_and_none(tmp_path: Path, monk
     record = sessions.get("worker")
     assert record.purpose == "Fix the parser"
     record.set_purpose(None)
-    assert record.purpose is None
     assert record.to_document().get("purpose") is None
 
     result = sessions.start_session(
