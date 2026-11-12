@@ -49398,12 +49398,11 @@ def test_dead_actor_absent_journal_is_recovered_by_an_unrelated_mutation(
         "--project-root", str(project), "hold", "fresh-h", "--reason", "keep",
     ]
     capsys.readouterr()
-    # The journal's actor is this live test process: the mutation refuses,
-    # naming the actor and the recover command.
-    assert wrkslots.main(hold) != 0
+    # The journal's actor is this live test process: the mutation is busy,
+    # naming the live actor, not interrupted (#1367).
+    assert wrkslots.main(hold) == 75
     refused = capsys.readouterr().err
-    assert "interrupted mutation recorded in" in refused
-    assert "recover-absent-validate-rows" in refused
+    assert "busy: live 'recover-absent-validate-rows' mutation" in refused
     assert journal.is_file()
     # Kill the actor on paper: its recorded pid no longer names a live
     # process, and no wrkslots process remains in its cgroup.

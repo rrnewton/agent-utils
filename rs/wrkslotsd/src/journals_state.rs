@@ -195,3 +195,140 @@ pub(crate) fn parse_journals(root: Option<&Path>) -> Result<Value> {
         "journals": names.iter().collect::<Vec<_>>(),
     }))
 }
+
+fn identity_from_value(value: Option<&Value>) -> Option<crate::status_state::Identity> {
+    let map = value?.as_object()?;
+    Some(crate::status_state::Identity {
+        pid: map.get("pid")?.as_i64()?,
+        start_ticks: map.get("start_ticks")?.as_i64()?,
+        boot_id: map.get("boot_id")?.as_str()?.to_string(),
+        host_id: map.get("host_id")?.as_str()?.to_string(),
+        cgroup_path: map.get("cgroup_path")?.as_str()?.to_string(),
+    })
+}
+
+fn journal_actor_identities(raw: &serde_json::Map<String, Value>) -> Vec<crate::status_state::Identity> {
+    let mut identities: Vec<crate::status_state::Identity> = Vec::new();
+    let mut push = |value: Option<&Value>| {
+        if let Some(identity) = identity_from_value(value) {
+            if !identities.contains(&identity) {
+                identities.push(identity);
+            }
+        }
+    };
+    match raw.get("kind").and_then(Value::as_str) {
+        Some("create") => {
+            push(raw.get("owner"));
+            push(raw.get("coordinator_lease"));
+        }
+        Some("import-existing") => {
+            push(raw.get("record").and_then(|record| record.get("owner")));
+        }
+        _ => {}
+    }
+    push(raw.get("actor"));
+    push(raw.get("owner"));
+    push(
+        raw.get("authorization")
+            .and_then(|authorization| authorization.get("actor")),
+    );
+    identities
+}
+
+fn journal_since(raw: &serde_json::Map<String, Value>, path: &Path) -> Option<String> {
+    for field in ["finished_at", "created_at", "recorded_at"] {
+        if let Some(value) = raw.get(field).and_then(Value::as_str) {
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let seconds = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    Some(format_unix_utc(seconds))
+}
+
+fn format_unix_utc(total_seconds: i64) -> String {
+    let days = total_seconds.div_euclid(86_400);
+    let seconds = total_seconds.rem_euclid(86_400);
+    let (hour, minute, second) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let shifted = days_since_epoch + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_prime + 2) / 5 + 1) as u32;
+    let month = if month_prime < 10 { month_prime + 3 } else { month_prime - 9 } as u32;
+    if month <= 2 {
+        year += 1;
+    }
+    (year, month, day)
+}
+
+/// Refusal text for an outstanding journal, by actor liveness (#1367).
+///
+/// Mirrors the Python `_assert_no_journal` classification: a live actor is
+/// busy, a journal with no recorded actor generation is legacy, and every
+/// other journal is interrupted.
+pub(crate) fn journal_blocker_message(control: &Path, name: &str) -> String {
+    let path = control.join(name);
+    let interrupted = format!(
+        "interrupted mutation recorded in {}; run 'wrkslots recover' first",
+        path.display()
+    );
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return interrupted;
+    };
+    let Ok(raw) = serde_json::from_str::<Value>(&contents) else {
+        return interrupted;
+    };
+    let Some(raw) = raw.as_object() else {
+        return interrupted;
+    };
+    let identities = journal_actor_identities(raw);
+    if identities.is_empty() {
+        return format!(
+            "interrupted mutation recorded in {}; unknown actor (legacy journal); \
+             if no wrkslots process is running, run 'wrkslots recover' first",
+            path.display()
+        );
+    }
+    // A create or import journal records its slot owner and coordinator,
+    // not the process writing it; never its busy actor (#1367).
+    let actor_is_writer = !matches!(
+        raw.get("kind").and_then(Value::as_str),
+        Some("create") | Some("import-existing")
+    );
+    for identity in &identities {
+        let (state, _detail) = crate::status_state::process_state(Some(identity));
+        if actor_is_writer && state == "live" {
+            let kind = raw
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(|value| format!("'{value}'"))
+                .unwrap_or_else(|| "None".to_string());
+            return match journal_since(raw, &path) {
+                Some(since) => format!(
+                    "busy: live {kind} mutation {name} by pid {} since {since}; retry",
+                    identity.pid
+                ),
+                None => format!(
+                    "busy: live {kind} mutation {name} by pid {}; retry",
+                    identity.pid
+                ),
+            };
+        }
+    }
+    interrupted
+}

@@ -139,9 +139,9 @@ pub(crate) fn release_slot(
         .unwrap_or_default();
     if seal_paths(&cfg).is_empty() {
         if let Some(first) = journal_names.first() {
-            return Err(format!(
-                "interrupted mutation recorded in {}; run 'wrkslots recover' first",
-                cfg.control.join(first).display()
+            return Err(crate::journals_state::journal_blocker_message(
+                &cfg.control,
+                first,
             ));
         }
     } else if journal_names

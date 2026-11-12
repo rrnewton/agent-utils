@@ -2502,9 +2502,9 @@ pub(crate) fn remove_slot(
         .and_then(|names| names.first())
         .and_then(Value::as_str)
     {
-        return Err(format!(
-            "interrupted mutation recorded in {}; run 'wrkslots recover' first",
-            cfg.control.join(first).display()
+        return Err(crate::journals_state::journal_blocker_message(
+            &cfg.control,
+            first,
         ));
     }
     let active = active_document(root, &cfg, &selected)?;

@@ -1192,13 +1192,18 @@ class _TargetStorageDrift(StateError):
 class _JournalBusy(Refusal):
     """A non-create journal's owner is live: retryable busy, not interrupted."""
 
-    def __init__(self, *, kind: object, pid: int, journal: str) -> None:
+    def __init__(
+        self, *, kind: object, pid: int, journal: str, since: str | None = None
+    ) -> None:
         super().__init__(
-            f"busy: live {kind!r} mutation {journal} by pid {pid}; retry"
+            f"busy: live {kind!r} mutation {journal} by pid {pid}"
+            + (f" since {since}" if since is not None else "")
+            + "; retry"
         )
         self.kind = str(kind)
         self.pid = pid
         self.journal = journal
+        self.since = since
 
 
 class _LockBusy(Refusal):
@@ -6534,13 +6539,28 @@ def _run_prevalidated_mutation(
             continue
         if lock_deadline is None:
             lock_deadline = time.monotonic() + wait_seconds
-        with _mutation_locks(config, _remaining_lock_wait(lock_deadline)):
-            current = _registry_identity(config)
-            if current == identity:
-                if facts is None:
-                    return commit(None, None)
-                return commit(identity, facts)
-            change = _describe_registry_change(identity, current)
+        try:
+            with _mutation_locks(config, _remaining_lock_wait(lock_deadline)):
+                current = _registry_identity(config)
+                if current == identity:
+                    if facts is None:
+                        return commit(None, None)
+                    return commit(identity, facts)
+                change = _describe_registry_change(identity, current)
+        except _JournalBusy:
+            # A live journaled mutation (#1367): wait without the locks, so
+            # its actor can finish and clear the journal, then re-validate.
+            if wait_seconds <= 0.0 or time.monotonic() >= lock_deadline:
+                raise
+            while time.monotonic() < lock_deadline:
+                if not _outstanding_journals(config):
+                    break
+                time.sleep(
+                    min(0.05, max(0.0, lock_deadline - time.monotonic()))
+                )
+            if _outstanding_journals(config):
+                raise
+            continue
     raise _RegistryBusy(
         f"registry is busy: another wrkslots mutation changed it during each of the "
         f"{REGISTRY_VALIDATION_ATTEMPTS} lock-free validations this {command} ran (last "
@@ -33633,12 +33653,27 @@ def _journal_actor_identities(raw: Mapping[str, object]) -> list[ProcessIdentity
             record = _record_from_obj(raw.get("record"), "import journal.record")
             if record.owner is not None:
                 identities.append(record.owner)
-        elif isinstance(raw.get("actor"), Mapping):
+        if isinstance(raw.get("actor"), Mapping):
             identity = _identity_from_obj(raw.get("actor"), "journal.actor")
-            if identity is not None:
+            if identity is not None and identity not in identities:
                 identities.append(identity)
+        # A finish journal names the removing process as its owner (#1121,
+        # #1367); ownerless journals name theirs inside the authorization.
+        for candidate, label in (
+            (raw.get("owner"), "journal.owner"),
+            (
+                raw.get("authorization", {}).get("actor")
+                if isinstance(raw.get("authorization"), Mapping)
+                else None,
+                "journal.authorization.actor",
+            ),
+        ):
+            if isinstance(candidate, Mapping):
+                identity = _identity_from_obj(candidate, label)
+                if identity is not None and identity not in identities:
+                    identities.append(identity)
     except (Refusal, StateError, KeyError, TypeError, ValueError):
-        return []
+        return identities
     return identities
 
 
@@ -33686,6 +33721,54 @@ def _journal_actor_proven_dead(raw: Mapping[str, object]) -> tuple[bool, str]:
     return True, "; ".join(reasons) + "; no wrkslots process remains in its cgroup"
 
 
+def _journal_since(raw: Mapping[str, object], path: Path) -> str | None:
+    """When the journaled operation started, for a busy report (#1367)."""
+
+    for field in ("finished_at", "created_at", "recorded_at"):
+        value = raw.get(field)
+        if isinstance(value, str) and value:
+            return value
+    try:
+        return dt.datetime.fromtimestamp(
+            path.stat().st_mtime, tz=dt.timezone.utc
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except OSError:
+        return None
+
+
+def _journal_blocker(
+    raw: Mapping[str, object], path: Path
+) -> tuple[str, ProcessIdentity | None, str | None, str]:
+    """Classify an outstanding journal by its actor's liveness (#1367).
+
+    Returns ``(classification, actor, since, reason)``: ``live`` with the
+    live actor and its start time, ``dead`` when every recorded actor is
+    proven dead, ``legacy`` when the journal records no actor process
+    generation at all, and ``indeterminate`` otherwise.
+    """
+
+    identities = _journal_actor_identities(raw)
+    if not identities:
+        return "legacy", None, None, "the journal records no actor process generation"
+    # A create or import journal records its slot owner and coordinator,
+    # not the process writing it; their liveness is adjudicated by the
+    # create classification, never as this gate's busy actor (#1367).
+    if raw.get("kind") not in {"create", "import-existing"}:
+        for identity in identities:
+            state, _detail = _process_state(identity)
+            if state == "live":
+                return (
+                    "live",
+                    identity,
+                    _journal_since(raw, path),
+                    f"actor PID {identity.pid} is live",
+                )
+    proven, reason = _journal_actor_proven_dead(raw)
+    if proven:
+        return "dead", None, None, reason
+    return "indeterminate", None, None, reason
+
+
 def _recover_dead_actor_journals(config: Config) -> None:
     """Recover an absent-row journal whose actor is provably dead (#912).
 
@@ -33727,27 +33810,55 @@ def _recover_dead_actor_journals(config: Config) -> None:
 
 
 def _assert_no_journal(
-    config: Config, *, allowed: AbstractSet[Path] = frozenset()
+    config: Config,
+    *,
+    allowed: AbstractSet[Path] = frozenset(),
+    wait_seconds: float = 0.0,
 ) -> None:
     """Refuse while any mutation journal is outstanding.
 
     ``allowed`` names journals this process wrote and still holds open: the
     fenced members of a remove-agent-batch group awaiting their finish
-    (#1201).  Every other journal refuses as always.
+    (#1201).  A journal whose recorded actor is still live is busy, not
+    interrupted (#1367): with ``wait_seconds`` this waits for it to clear,
+    otherwise it raises :class:`_JournalBusy`.  A journal recording no
+    actor generation is legacy and stays refused, with wording that says
+    so.  Every other journal refuses as interrupted, as always.
     """
 
-    _recover_dead_actor_journals(config)
-    journals = [path for path in _outstanding_journals(config) if path not in allowed]
-    if journals:
-        detail = ""
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        _recover_dead_actor_journals(config)
+        journals = [
+            path for path in _outstanding_journals(config) if path not in allowed
+        ]
+        if not journals:
+            return
         try:
             _loaded, raw = _load_journal(config, selected_path=journals[0])
-            _proven, reason = _journal_actor_proven_dead(raw)
-            detail = (
-                f" (kind {raw.get('kind')!r}, slot {raw.get('slot')!r}: {reason})"
-            )
         except (Refusal, StateError):
-            detail = ""
+            raise Refusal(
+                f"interrupted mutation recorded in {journals[0]}; run 'wrkslots recover' first"
+            ) from None
+        classification, actor, since, reason = _journal_blocker(raw, journals[0])
+        detail = f" (kind {raw.get('kind')!r}, slot {raw.get('slot')!r}: {reason})"
+        if classification == "live":
+            assert actor is not None
+            if wait_seconds > 0.0 and time.monotonic() < deadline:
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+                continue
+            raise _JournalBusy(
+                kind=raw.get("kind"),
+                pid=actor.pid,
+                journal=journals[0].name,
+                since=since,
+            )
+        if classification == "legacy":
+            raise Refusal(
+                f"interrupted mutation recorded in {journals[0]}; unknown actor "
+                "(legacy journal); if no wrkslots process is running, run "
+                f"'wrkslots recover' first{detail}"
+            )
         raise Refusal(
             f"interrupted mutation recorded in {journals[0]}; run 'wrkslots recover' first{detail}"
         )
@@ -37701,7 +37812,7 @@ def _cmd_recover_unbound_owner(args: argparse.Namespace) -> int:
     coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
-        _assert_no_journal(config)
+        _assert_no_journal(config, wait_seconds=float(args.wait_lock))
         states, archives = _validate_global_state(config)
         _assert_command_registry_storage(config, states, args)
         before = _global_rows(states, archives)
@@ -84194,6 +84305,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                                 "journal": exc.journal,
                                 "kind": exc.kind,
                                 "pid": exc.pid,
+                                "since": exc.since,
                             },
                             "status": "busy",
                         },

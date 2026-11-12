@@ -63,9 +63,9 @@ pub(crate) fn recover_unbound_owner(
     let journals = parse_journals(root)?;
     if let Some(names) = journals.get("journals").and_then(Value::as_array) {
         if let Some(first) = names.first().and_then(Value::as_str) {
-            return Err(format!(
-                "interrupted mutation recorded in {}; run 'wrkslots recover' first",
-                cfg.control.join(first).display()
+            return Err(crate::journals_state::journal_blocker_message(
+                &cfg.control,
+                first,
             ));
         }
     }
