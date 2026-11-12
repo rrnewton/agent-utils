@@ -1,6 +1,6 @@
 ---
 title: 'discuss-answer-whitespace: rendered bullets draw without blank lines'
-status: open
+status: closed
 priority: 0
 issue_type: bug
 assignee: mu-discussws
@@ -30,3 +30,7 @@ Parent: #1316 catchup-side-agent. Builds on #1349 discuss-markdown-render (lande
 # Notes
 
 Owner Slack 010 via coordb. Number reserved by coordb. Batched with #1392, #1347, #1384, #1382+#1383 under owner reply 012 (integrator: mu-discussfoot).
+
+## Resolution
+
+Landed on main as e5fc567c in the owner-reply-012 batch (integrator mu-discussfoot; gated 851343ad, replayed with --allow-overlap) and deployed live about 5:53 PM ET. The plain-text fallback keeps `pre-wrap` via `discuss-answer--plain`; rendered HTML draws with normal white-space and tight list spacing. Focused catchup test passed before the batch gate.
