@@ -172,8 +172,9 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     status = page.locator("#discuss-status").text_content() or ""
     check(status == "Read 2 unread of 12", f"the status says {status!r}")
     covers = page.locator("#discuss-covers").text_content() or ""
-    check(covers == "This summary covers 2 unread messages:", f"the footer says {covers!r}")
+    check(covers == "Other messages processed:", f"the footer says {covers!r}")
     check(page.locator("#discuss-links .discuss-link").count() == 2, "the footer links are missing")
+    check(page.locator("#discuss-links .discuss-link").first.text_content() == "09:51", "the footer links are not dense HH:MM")
     stamp = page.locator("#discuss-stamp").text_content() or ""
     check("in 4200 chars" in stamp and "out 48 chars" in stamp, f"the stamp line says {stamp!r}")
 
