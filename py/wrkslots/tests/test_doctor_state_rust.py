@@ -235,6 +235,40 @@ def test_parse_doctor_all_machines_matches_python(tmp_path: Path) -> None:
     assert kinds.count("dead-owner") == 2
 
 
+def test_doctor_closed_pipe_dies_by_sigpipe_not_panic(tmp_path: Path) -> None:
+    # A reader piped into `head` must die quietly by SIGPIPE (the
+    # shell's 141), never panic on the closed stdout (exit 101).
+    root = _root(tmp_path)
+    _fixture(root)
+    control = root / "worktrees"
+    control.joinpath("ACTIVE.node-a.json").write_text(
+        json.dumps(
+            {
+                "schema": 2,
+                "machine": "node-a",
+                "revision": 7,
+                "slots": [
+                    _record(f"slot-{index:04d}", f"agent-{index:04d}",
+                            _identity(_unused_pid(), 12345))
+                    for index in range(1500)
+                ],
+            }
+        )
+    )
+    process = subprocess.Popen(
+        [
+            str(rust_wrkslotsd()), "doctor-text", "--root", str(root),
+            "--format", "json",
+        ],
+        cwd=AU_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    assert process.stdout is not None
+    process.stdout.close()
+    _, stderr = process.communicate()
+    assert process.returncode == -13, (process.returncode, stderr)
+    assert "panic" not in stderr.lower()
+
+
 def _rust_doctor(root: Path, output_format: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [
