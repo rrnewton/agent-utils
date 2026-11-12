@@ -56499,7 +56499,6 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
         image_targets=image_targets,
         proc_scan_seconds=_proc_scan_bound_seconds(config),
     )
-    remaining_targets = [slot_path for _slot, _generation, slot_path in eligible]
     error: str | None = None
     # The item being attempted, so that an unexpected error can name it.
     current: tuple[str, int, float] | None = None
@@ -56575,12 +56574,17 @@ def _remove_agent_batch(args: argparse.Namespace) -> dict[str, object]:
             deferred: list[tuple[str, int, float, _GroupedMember]] = []
             for offset, (slot, generation, slot_path) in enumerate(group_items):
                 index = group_start + offset
-                if context.shared_census_count == 0 or (
+                if slot_path not in context.censused or (
                     time.monotonic() - context.captured_at
                     > _AGENT_REMOVE_BATCH_CENSUS_MAX_AGE_SECONDS
                 ):
                     try:
-                        context.capture(remaining_targets[index:])
+                        # One lsof scan per slot (#1367): capture only this
+                        # item's slot, at its turn, so a slow batch never
+                        # rescans every remaining slot tree when the shared
+                        # evidence ages out. The decisive check remains the
+                        # scan after this item's path fence (#1108).
+                        context.capture([slot_path])
                     except Refusal as exc:
                         stop_remaining(str(exc))
                         stopped = True

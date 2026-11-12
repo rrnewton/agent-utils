@@ -56998,7 +56998,7 @@ def test_remove_agent_batch_refuses_only_the_slot_a_live_process_uses(
     assert f"live process {sleeper.pid} uses slot" in str(refused["reason"])
     # Refused by the shared lsof scan at the first check, before the fresh scan.
     assert 'shared-lsof=command="sleep" fd="cwd"' in str(refused["reason"])
-    assert payload["shared_process_censuses"] == 1
+    assert payload["shared_process_censuses"] == 3
     assert payload["recovery_required"] is False
     assert held.is_dir()
     assert not checkout(project, "slot01").exists()
@@ -57074,12 +57074,14 @@ def test_remove_agent_batch_fresh_scan_catches_a_process_that_starts_after_the_c
 
     assert len(late) == 1
     assert returncode == 1, stderr
-    assert payload["shared_process_censuses"] == 1
+    assert payload["shared_process_censuses"] == 3
     assert batch_slots(payload, "removed") == ["slot01", "slot02"]
     assert batch_slots(payload, "refused") == ["slot03"]
     reason = str(cast(list[Mapping[str, object]], payload["refused"])[0]["reason"])
+    # Caught by slot03's own census at its turn (#1367: one lsof scan
+    # per slot, taken when the slot is reached, so it sees the entrant).
     assert f"live process {late[0].pid} uses slot" in reason
-    assert "cwd=" in reason
+    assert "shared-lsof" in reason
     assert held.is_dir()
     assert active_slot_names(project) == ["slot03"]
 
@@ -57820,7 +57822,7 @@ def test_remove_agent_batch_exit_status_counts_and_input_file(tmp_path: Path) ->
         str(listing),
     )
     assert from_file.returncode == 0, from_file.stderr + from_file.stdout
-    assert "requested=2 removed=2 refused=0 shared_process_censuses=1" in from_file.stdout
+    assert "requested=2 removed=2 refused=0 shared_process_censuses=2" in from_file.stdout
     assert "REMOVED: slot02 generation=1" in from_file.stdout
     assert "REMOVED: slot03 generation=1" in from_file.stdout
     assert active_slot_names(project) == []
@@ -58020,12 +58022,17 @@ def test_remove_agent_batch_shares_lsof_before_the_fence_and_scans_proc_after_it
         for row in removed_rows
     )
     assert payload["item_budget_seconds"] == wrkslots._AGENT_REMOVE_BATCH_ITEM_SECONDS
-    assert len(shared_calls) == 1
-    assert len(shared_calls[0]) == 3
-    assert payload["shared_process_censuses"] == 1
-    # One /proc walk for all three items, taken with the shared lsof census and
-    # read by each item before its registry locks (#1108, #1175).
-    assert payload["fresh_process_scans"] == 1
+    # One lsof scan per slot (#1367): each item captures only its own slot
+    # at its turn, never a rescan of every remaining slot tree.
+    assert [[path.name for path in call] for call in shared_calls] == [
+        ["slot03"],
+        ["slot04"],
+        ["slot05"],
+    ]
+    assert payload["shared_process_censuses"] == 3
+    # One /proc walk per item, taken with its lsof census and read before
+    # its registry locks (#1108, #1175).
+    assert payload["fresh_process_scans"] == 3
 
 
 def single_remove(project: Path, slot: str, *extra: str) -> tuple[int, str]:
@@ -58740,7 +58747,8 @@ def test_remove_agent_batch_refuses_only_the_slot_an_lsof_warning_concerns(
 
     assert returncode == 1, stderr
     calls = (tmp_path / "lsof-with-warning.calls").read_text(encoding="utf-8").splitlines()
-    assert len(calls) == 1 and calls[0].count("+D") == 2
+    # One lsof scan per slot (#1367), each naming only its own slot.
+    assert len(calls) == 2 and all(call.count("+D") == 1 for call in calls)
     assert batch_slots(payload, "removed") == ["slot02"]
     assert batch_slots(payload, "refused") == ["slot01"]
     refused = cast(list[Mapping[str, object]], payload["refused"])[0]
@@ -60053,8 +60061,9 @@ def test_remove_agent_batch_fences_groups_and_scans_each_group_once(
     assert payload["group_size_max"] == 2
     assert payload["group_fallbacks"] == 0
     assert calls == ["_agent_batch_group_fenced_uses"] * 2 + ["_agent_batch_fenced_use"]
-    # Walks: the shared census walk, plus one per group (the last group is one item).
-    assert payload["fresh_process_scans"] == 1
+    # Walks: one census walk per item (#1367), plus one per group (the
+    # last group is one item).
+    assert payload["fresh_process_scans"] == 5
     scans = [value for kind, value in seen if kind == "scan"]
     assert [sorted(cast(dict[str, object], item)) for item in scans] == [
         ["slot01", "slot02"], ["slot03", "slot04"]

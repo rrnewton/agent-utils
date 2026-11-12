@@ -1496,7 +1496,7 @@ reported. When the lock is not taken within the lock wait, the batch stops witho
 `wrkslots recover`. The human output is one summary line,
 
 ```text
-requested=3 removed=2 refused=1 shared_process_censuses=1 fresh_process_scans=1 fenced_process_scans=0 group_fenced_scans=1 fenced_lsof_fallbacks=0 item_budget_seconds=60 seconds=131.4
+requested=3 removed=2 refused=1 shared_process_censuses=3 fresh_process_scans=3 fenced_process_scans=0 group_fenced_scans=1 fenced_lsof_fallbacks=0 item_budget_seconds=60 seconds=131.4
 ```
 
 followed by one `REMOVED:` or `REFUSED:` line per slot; `--format json` prints the same content as
