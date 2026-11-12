@@ -1,6 +1,6 @@
 ---
 title: 'discuss-unknown-terms-log: log Discuss unknown terms server-side in debug mode'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 assignee: mu-discussgloss
@@ -37,4 +37,4 @@ Behind `[summaries] catchup_unknown_terms_log` (default off), append one JSONL r
 
 ## Resolution
 
-Pending landing.
+[watermelon-full-preview] Landed 5f548698d8c9b5f0021b0328f3cbf3ae4c16d449 on main: JSONL unknown-terms log behind catchup_unknown_terms_log plus unknown-terms-report; gate green (GATE_SLOTS=3, one unrelated browser flake rerun). coordb deploys and enables the switch.
