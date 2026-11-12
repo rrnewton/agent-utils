@@ -577,7 +577,9 @@ const FIXTURE_TREE = {
   // before its own padding, which the call view did not have while Type and Prompts were on it.
   //
   // `#241 voice-composer` took Type off the strip: the message box is in the transcript now.
-  "bar-pack": ["audio-source", "discord-channel", "prompts-open", "read-new"],
+  // `#1355 phone-bar-discuss-slot`: the audio toggle left for the reader row; Discuss is
+  // the pack's last member on the channel view.
+  "bar-pack": ["discord-channel", "prompts-open", "read-new", "discuss-open"],
   // The tray of canned prompts. A child of the BAR and not of the pack, and both halves of that
   // matter: of the bar because the bar is what moves between the two mounts, and not of the pack
   // because the pack scrolls sideways and a menu that can scroll out from under its own opener is

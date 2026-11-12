@@ -1191,11 +1191,9 @@ test("the Hide read button cycles Show read, Fold read and Hide read, names each
   // stays one row is measured in Chromium.)
   const words = page.el("todo-filter-label").children.map((node) => [node.className, node.textContent]);
   assert.deepStrictEqual(words, [["read-mode-verb", "Fold"], ["read-mode-noun", " read"]]);
-  const desk = "(min-width: 900px) and (pointer: fine)";
-  for (const word of ["verb", "noun"]) {
-    assert.match(cssBlockIn(desk, `#control-pane #todo-filter .read-mode-${word}`), /display:\s*block/,
-      "a desk's dock does not stand the name in two lines");
-  }
+  // `#1355 phone-bar-discuss-slot`: the mode lives in the hamburger menu, its icon at tray size.
+  assert.match(cssBlock("#action-menu #todo-filter .read-mode-icon"), /width:\s*1.15rem/,
+    "the menu's read-mode icon is not at tray size");
   assert.doesNotMatch(CSS_CODE, /\.read-mode-noun\s*\{\s*display:\s*none/, "a desk's dock cuts the name to its first word");
 });
 

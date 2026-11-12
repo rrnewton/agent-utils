@@ -252,7 +252,7 @@ MENU_JS = """() => {
   const tools = document.getElementById('scroll-tools');
   return {
     open: shown('action-menu'), expanded: document.getElementById('action-menu-open').getAttribute('aria-expanded'),
-    expand: shown('expand-all'), collapse: shown('collapse-all'), summaries: shown('summarise'),
+    expand: shown('expand-all'), collapse: shown('collapse-all'), summaries: shown('summarise'), read: shown('todo-filter'),
     floating: ['expand-all', 'collapse-all', 'summarise'].filter((id) => tools.contains(document.getElementById(id))),
     folded: document.querySelectorAll('#discord-log > li[data-collapsed="true"]').length,
     hamburger: box('action-menu-open'), switch: box('view-switch'),
@@ -381,6 +381,21 @@ def action_menu(browser: Browser, url: str, width: int, height: int, touch: bool
     now = menu_state(page)
     check(now["open"] is True and now["expanded"] == "true", f"{where}: the hamburger opened no menu: {now}")
     check(now["expand"] is True and now["summaries"] is True, f"{where}: Expand all and Summaries are not offered: {now}")
+    check(now["read"] is True, f"{where}: Show/Fold read is not offered in the menu: {now}")
+    mode_before = now["mode"]
+    press(page, "#todo-filter", touch)
+    page.wait_for_timeout(300)
+    now = menu_state(page)
+    check(now["open"] is False and now["mode"] != mode_before,
+          f"{where}: Show/Fold read in the menu did not cycle and close it: {now}")
+    page.focus("#scroll-area")
+    for _ in range(2):
+        page.keyboard.press("h")
+        page.wait_for_timeout(150)
+    check(menu_state(page)["mode"] == mode_before, f"{where}: h did not restore the read mode: {menu_state(page)}")
+    press(page, "#action-menu-open", touch)
+    page.wait_for_timeout(200)
+    now = menu_state(page)
     shot(page, shots, f"{width}x{height}-action-menu")
     press(page, "#expand-all", touch)
     page.wait_for_timeout(300)
@@ -439,6 +454,45 @@ def action_menu(browser: Browser, url: str, width: int, height: int, touch: bool
                  "row, Escape shut it onto the hamburger; the view button pressed on the call's view and not on the channel's, by a tap, Enter and Space")
 
 
+# `#1355 phone-bar-discuss-slot`: the phone bar at 375, 393 and 412px — Discuss a fixed
+# icon right of the thread picker, left of the hamburger; audio in the reader row;
+# Show/Fold in the hamburger menu; the channel name widest; no sideways scroll.
+PHONE_BAR_JS = """() => {
+  const box = (id) => { const n = document.getElementById(id); const r = n.getBoundingClientRect();
+    return {left: r.left, right: r.right, width: r.width, drawn: n.getClientRects().length > 0 && !n.hidden}; };
+  const pack = document.getElementById('bar-pack');
+  return {discuss: box('discuss-open'), thread: box('thread-select'), channel: box('discord-channel'),
+          hamburger: box('action-menu-open'), audio: box('audio-source'), read: box('todo-filter'),
+          packScroll: pack.scrollWidth, packClient: pack.clientWidth,
+          docScroll: document.documentElement.scrollWidth, width: innerWidth,
+          audioParent: document.getElementById('audio-source').parentNode.id,
+          readParent: document.getElementById('todo-filter').parentNode.id};
+}"""
+
+
+def phone_bar_fit(browser: Browser, url: str, width: int, height: int, shots: Path | None,
+                  notes: list[str]) -> None:
+    page = open_page(browser, url, width, height, mobile=True)
+    page.wait_for_timeout(300)
+    state = page.evaluate(PHONE_BAR_JS)
+    shot(page, shots, f"{width}x{height}-phone-bar")
+    check(state["discuss"]["drawn"] and abs(state["discuss"]["width"] - 44) <= 1,
+          f"{width}px: Discuss is not the fixed 44px icon: {state['discuss']}")
+    check(state["thread"]["right"] <= state["discuss"]["left"] + 12 and
+          state["discuss"]["right"] <= state["hamburger"]["left"] + 1,
+          f"{width}px: Discuss is not right of the picker, left of the hamburger: {state}")
+    check(state["channel"]["width"] > 2 * state["thread"]["width"],
+          f"{width}px: the channel name does not get more than twice the picker's width: {state}")
+    check(state["audioParent"] == "control-pane",
+          f"{width}px: the audio toggle is not in the reader row: {state}")
+    check(state["readParent"] == "action-menu", f"{width}px: Show/Fold read is not in the menu: {state}")
+    check(state["packScroll"] <= state["packClient"] + 1 and state["docScroll"] <= width + 1,
+          f"{width}px: sideways scroll in the bar or page: {state}")
+    notes.append(f"{width}x{height} phone bar: Discuss fixed at {state['discuss']['width']:.0f}px right of the "
+                 f"picker, channel {state['channel']['width']:.0f}px, audio in the reader row, no sideways scroll")
+    page.context.close()
+
+
 def phone_boxes(browser: Browser, url: str, shots: Path | None, tag: str) -> dict[str, list[dict[str, float | str]]]:
     page = open_page(browser, url, 393, 852, mobile=True)
     found: dict[str, list[dict[str, float | str]]] = {}
@@ -447,7 +501,7 @@ def phone_boxes(browser: Browser, url: str, shots: Path | None, tag: str) -> dic
         key = "thread" if value.startswith("thread:") else value
         shot(page, shots, f"393x852-{tag}-{key}")
         drawn = controls(state)
-        bar = [one for one in drawn if one["id"] not in ("todo-filter", "read-speed", "read-aloud", "speaker",
+        bar = [one for one in drawn if one["id"] not in ("todo-filter", "audio-source", "read-speed", "read-aloud", "speaker",
                                                           "clear-view", "hang-up", "talk")]
         centres = [(number(one, "top") + number(one, "bottom")) / 2 for one in bar]
         check(max(centres) - min(centres) <= 6, f"393x852 {key}: the phone's bar is more than one row: {bar}")
@@ -523,6 +577,8 @@ def main() -> int:
                 desk(browser, urls[0], width, height, args.screenshots, notes)
             for width, height in ((900, 700), (1280, 800)):
                 large_font_after_call(browser, urls[0], width, height, notes)
+            for phone_width, phone_height in ((375, 667), (390, 844), (393, 852), (412, 915)):
+                phone_bar_fit(browser, urls[0], phone_width, phone_height, args.screenshots, notes)
             phone = phone_boxes(browser, urls[0], args.screenshots, "page")
             if len(urls) > 1:
                 baseline = phone_boxes(browser, urls[1], args.screenshots, "baseline")

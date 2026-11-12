@@ -4064,18 +4064,8 @@
             wrapping or clipping when the buttons outgrow a narrow phone.
           -->
           <div id="bar-pack">
-            <button id="audio-source" class="bar-button" type="button" role="switch"
-                    aria-checked="false" aria-label="Read messages with device audio"
-                    title="Device audio. Tap to use the configured agent instead." hidden>
-              <svg id="audio-device-icon" class="mini-icon" data-icon="device" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-                <rect x="7" y="2.5" width="10" height="19" rx="2" />
-                <path d="M10 5h4M11 18.5h2" />
-              </svg>
-              <svg id="audio-agent-icon" class="mini-icon" data-icon="cloud" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" hidden>
-                <path d="M7.5 18.5h9a4.5 4.5 0 0 0 .7-8.95A6 6 0 0 0 5.8 8.2 4.25 4.25 0 0 0 7.5 18.5Z" />
-                <path d="M10 12.5v3M14 11v4.5" />
-              </svg>
-            </button>
+            <!-- `#1355 phone-bar-discuss-slot`: the device/cloud audio toggle left the pack
+                 for the hidable reader row (#control-pane, below), freeing its fixed slot. -->
             <!--
               `#83 channel-selector-in-bar`. WHICH CHANNEL you are reading, chosen from the bar
               rather than from a row at the top of the scrollback.
@@ -4200,6 +4190,7 @@
                  thread on screen, drawn by web/src/view/catchup into #discuss-panel.
                  On the channel view only (PACK_VIEWS), where its subject is. -->
             <button id="discuss-open" class="bar-button" type="button" aria-haspopup="dialog" aria-controls="discuss-panel" aria-expanded="false" title="Catch up on this channel or thread" hidden>
+              <svg class="mini-icon discuss-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h10a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2H9l-4 3v-3H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z" /><path d="M19 9h1a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-1v3l-4-3h-4a2 2 0 0 1-2-2v-1" /></svg>
               <span class="mini-label">Discuss</span>
             </button>
           </div>
@@ -4264,6 +4255,15 @@
                  panel it opens is the same. -->
             <button id="discuss-menu-open" class="tray-button" type="button" hidden>
               <span class="tray-label">Discuss</span>
+            </button>
+            <!-- `#1355 phone-bar-discuss-slot`: Show/Fold/Hide read in the hamburger menu.
+                 Same #todo-filter id, cycle, label state and `h` key as the reader-row
+                 control it replaces; choosing it closes the menu as other items do. -->
+            <button id="todo-filter" class="tray-button" type="button" aria-pressed="false" data-read-mode="show" hidden>
+              <svg class="control-icon read-mode-icon" data-mode="show" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 12s3.5-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.5 6.5-9.5 6.5S2.5 12 2.5 12z" /><circle cx="12" cy="12" r="2.6" /></svg>
+              <svg class="control-icon read-mode-icon" data-mode="fold" hidden viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16M4 19h16" /><path d="M7 12h.01M12 12h.01M17 12h.01" stroke-width="2.6" /></svg>
+              <svg class="control-icon read-mode-icon" data-mode="hide" hidden viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18l-7 8v6l-4 2v-8z" /></svg>
+              <span id="todo-filter-label" class="tray-label"><span class="read-mode-verb">Show</span><span class="read-mode-noun"> read</span></span>
             </button>
             <!--
               `#880 voice-page-menu-placement`. The reader's row of big buttons (Hide read, Pace, Read)
@@ -4450,32 +4450,14 @@
           <span id="hangup-label" class="control-label">Hang up</span>
         </button>
 
-        <!--
-          The archive filter, in the BAR. It changes what the list is, so it belongs beside the
-          other things that act on the list rather than inside the list it filters.
-
-          `#221 read-modes`: a cycle of three — Show read, Fold read, Hide read — and it names
-          the one the list is in. One icon per mode, the others `hidden` by web/voice.js: an eye for
-          everything shown, a line of dots between two rules for runs collapsed to a line, and the
-          filter it always was for read messages left out. The name is two words in two spans, so
-          a desk's one-row dock can stack them in two short lines.
-        -->
-        <button id="todo-filter" class="control control-read" type="button" aria-pressed="false" data-read-mode="show" hidden>
-          <svg class="control-icon read-mode-icon" data-mode="show" viewBox="0 0 24 24" aria-hidden="true" fill="none"
-               stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M2.5 12s3.5-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.5 6.5-9.5 6.5S2.5 12 2.5 12z" />
-            <circle cx="12" cy="12" r="2.6" />
-          </svg>
-          <svg class="control-icon read-mode-icon" data-mode="fold" hidden viewBox="0 0 24 24" aria-hidden="true" fill="none"
-               stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M4 5h16M4 19h16" />
-            <path d="M7 12h.01M12 12h.01M17 12h.01" stroke-width="2.6" />
-          </svg>
-          <svg class="control-icon read-mode-icon" data-mode="hide" hidden viewBox="0 0 24 24" aria-hidden="true" fill="none"
-               stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M3 5h18l-7 8v6l-4 2v-8z" />
-          </svg>
-          <span id="todo-filter-label" class="control-label"><span class="read-mode-verb">Show</span><span class="read-mode-noun"> read</span></span>
+        <!-- `#1355 phone-bar-discuss-slot`: the device/cloud audio toggle in the hidable
+             reader row, in the narrow column Show/Fold vacated for the hamburger menu.
+             Same #audio-source id, switch state and device/cloud icons as on the bar. -->
+        <button id="audio-source" class="bar-button" type="button" role="switch"
+                aria-checked="false" aria-label="Read messages with device audio"
+                title="Device audio. Tap to use the configured agent instead." hidden>
+          <svg id="audio-device-icon" class="mini-icon" data-icon="device" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2.5" width="10" height="19" rx="2" /><path d="M10 5h4M11 18.5h2" /></svg>
+          <svg id="audio-agent-icon" class="mini-icon" data-icon="cloud" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" hidden><path d="M7.5 18.5h9a4.5 4.5 0 0 0 .7-8.95A6 6 0 0 0 5.8 8.2 4.25 4.25 0 0 0 7.5 18.5Z" /><path d="M10 12.5v3M14 11v4.5" /></svg>
         </button>
 
         <!--

@@ -284,6 +284,31 @@
   #bar-pack > #discord-channel {
     max-width: 14rem;
   }
+
+  /* `#1355 phone-bar-discuss-slot`: tighter phone spacing and a narrower switch word,
+     so the channel name keeps more than twice the picker's 2.75rem with the fixed
+     Discuss icon in the pack and nothing scrolling sideways. Phone only. */
+  #control-bar {
+    gap: 0.2rem;
+  }
+
+  #bar-pack {
+    gap: 0.2rem;
+  }
+
+  #control-bar[data-placement="bottom"] {
+    padding: 0.1rem calc(0.4rem + env(safe-area-inset-right))
+      calc(0.35rem + env(safe-area-inset-bottom))
+      calc(0.4rem + env(safe-area-inset-left));
+  }
+
+  .switch-word {
+    min-width: 4.25rem;
+  }
+
+  #bar-pack > #discord-channel {
+    flex: 1 1 auto;
+  }
 }
 
 @media (not ((min-width: 900px) and (pointer: fine))) and (prefers-color-scheme: light) {
@@ -319,4 +344,11 @@ textarea {
 
 #action-menu-empty {
   margin: 0.3rem 0.4rem;
+}
+
+/* `#1355 phone-bar-discuss-slot`: Show/Fold read's mode icon at tray size. */
+#action-menu #todo-filter .read-mode-icon {
+  width: 1.15rem;
+  height: 1.15rem;
+  flex: 0 0 auto;
 }

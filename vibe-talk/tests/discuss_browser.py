@@ -123,10 +123,9 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
         except Exception:
             continue
     page.wait_for_selector("#discord-channel", state="visible", timeout=20_000)
-    # A bar button on a desk, the action menu's item on a phone (the bar strip
-    # there belongs to the channel name).
-    if width >= 900:
-        page.wait_for_selector("#discuss-open", state="visible", timeout=20_000)
+    # `#1355 phone-bar-discuss-slot`: a fixed-width bar icon on a phone as on a
+    # desk (the menu item stays as the second way in).
+    page.wait_for_selector("#discuss-open", state="visible", timeout=20_000)
 
     scroller_before = page.evaluate("""() => {
       const area = document.getElementById('scroll-area');
@@ -134,12 +133,7 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
       return {top: rect.top, height: rect.height};
     }""")
 
-    if width < 900:
-        page.click("#action-menu-open")
-        page.wait_for_selector("#discuss-menu-open", state="visible", timeout=20_000)
-        page.click("#discuss-menu-open")
-    else:
-        page.click("#discuss-open")
+    page.click("#discuss-open")
     page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
     page.wait_for_function(
         "() => document.getElementById('discuss-answer').textContent.includes('Ada shipped')",

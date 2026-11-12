@@ -47,7 +47,7 @@ test("`#429 keyboard-hides-bar`: both rows go while the keyboard is up, only on 
   // A reading or a call keeps one slim row: its Stop or Hang up, and nothing else of the tile. A
   // read playing makes Read its Pause, and Stop (`#442 read-strip-order`, hidden otherwise) stays.
   assert.match(body,
-    /:root\[data-keyboard="open"\]:has\(#pane-discord:not\(\[hidden\]\)\) #control-pane > :is\(\.control, \.popover\):not\(#hang-up, #read-aloud\[data-active="true"\], #read-aloud-stop\) \{\s*display:\s*none;\s*\}/,
+    /:root\[data-keyboard="open"\]:has\(#pane-discord:not\(\[hidden\]\)\) #control-pane > :is\(\.control, \.popover, #audio-source\):not\(#hang-up, #read-aloud\[data-active="true"\], #read-aloud-stop\) \{\s*display:\s*none;\s*\}/,
     "the rest of the tile stays up beside Stop");
   assert.match(body,
     /:root\[data-keyboard="open"\]:has\(#pane-discord:not\(\[hidden\]\)\) #control-pane:has\(#read-aloud-stop:not\(\[hidden\]\)\) \{\s*grid-template-columns:\s*1fr 1fr;\s*\}/,
@@ -257,7 +257,7 @@ test("READ OWNS THE THUMB POSITION, and placement is explicit so DOM order canno
   // and Pace into column 3, the easiest place on a phone to reach. #94 read-aloud-bar-layout.
   assert.match(cssBlock("#control-pane #read-aloud"), /grid-column:\s*3/, "Read is not on the thumb");
   assert.match(cssBlock("#control-pane #read-speed"), /grid-column:\s*2/, "Pace is not beside Read");
-  assert.match(cssBlock("#control-pane #todo-filter"), /grid-column:\s*1/, "the filter took a big tile");
+  assert.match(cssBlock("#control-pane #audio-source"), /grid-column:\s*1/, "the audio toggle took a big tile");
 });
 
 test("the pace popover is anchored to something, so pressing Pace actually shows it", async () => {

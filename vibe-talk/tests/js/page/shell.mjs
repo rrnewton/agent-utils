@@ -1125,6 +1125,29 @@ test("THE BAR FITS ON THE OWNER'S 375px PHONE, ON EVERY VIEW", async () => {
   const channel = barCostPx(page);
   assert.ok(channel.shown.includes("discord-channel"), "this is not the channel view's bar");
   assert.ok(channel.cost <= budget, report("the channel view", channel));
+  // `#1355 phone-bar-discuss-slot`: Discuss is the pack's last shown member, right of the
+  // thread picker and just left of the hamburger; audio and Show/Fold left the strip.
+  assert.ok(channel.shown.includes("discuss-open"), "Discuss is not on the channel view's bar");
+  assert.ok(!channel.shown.includes("audio-source"), "the audio toggle is still on the bar");
+  assert.equal(channel.shown[channel.shown.indexOf("action-menu-open") - 1], "discuss-open",
+    "Discuss is not just left of the hamburger");
+  assert.ok(HTML_CODE.indexOf('id="thread-select"') < HTML_CODE.indexOf('id="discuss-open"') &&
+    HTML_CODE.indexOf('id="discuss-open"') < HTML_CODE.indexOf('id="action-menu-open"'),
+    "Discuss is not right of the thread picker, left of the hamburger, in the markup");
+  assert.equal(markupHolds("control-pane", "audio-source"), true, "the audio toggle is not in the reader row");
+  assert.equal(markupHolds("bar-pack", "audio-source"), false, "the audio toggle is still in the pack");
+  assert.equal(markupHolds("action-menu", "todo-filter"), true, "Show/Fold read is not in the hamburger menu");
+  assert.equal(markupHolds("control-pane", "todo-filter"), false, "Show/Fold read is still in the reader row");
+  assert.equal(page.el("audio-source").hidden, false, "the audio toggle is hidden on the channel view");
+  assert.equal(page.el("todo-filter").hidden, false, "Show/Fold read is hidden on the channel view (its h key reads this)");
+  // Fixed width on a phone and the channel-name bargain: 2.75rem icon, channel up to 14rem.
+  assert.match(CSS_CODE, /#discuss-open \{[^}]*width: 2\.75rem/, "the phone Discuss icon is not fixed width");
+  assert.ok(memberPx("discuss-open") === 44, "Discuss is not priced at the fixed 2.75rem");
+  // The same channel cost fits 375, 393 and 412px phones with no sideways scroll.
+  for (const width of [375, 393, 412]) {
+    const atWidth = budget + (width - PHONE_PX);
+    assert.ok(channel.cost <= atWidth, report(`the channel view at ${width}px`, channel));
+  }
 
   // The Documents view (`#1078 bottom-bar-switcher`): an empty pack, Fetch, and the switch last.
   // The reader's bar adds Outline beside Fetch; it is priced here as arithmetic on the list's
@@ -1731,7 +1754,7 @@ test("the pane's markup runs in the order its buttons are seen, so Tab follows t
   const pane = HTML_CODE.slice(HTML_CODE.indexOf('id="control-pane"'));
   const at = (id) => pane.indexOf(`id="${id}"`);
   for (const order of [
-    ["todo-filter", "read-speed", "read-aloud", "talk"],
+    ["audio-source", "read-speed", "read-aloud", "talk"],
     ["speaker", "clear-view", "hang-up", "talk"],
   ]) {
     for (let i = 1; i < order.length; i += 1) {

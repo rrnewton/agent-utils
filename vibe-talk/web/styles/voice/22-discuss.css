@@ -315,13 +315,26 @@
   }
 }
 
-/* On a phone the bar's strip is priced to its edge — the channel's name keeps
- * its room (the view picker's bargain in 18-control-bar.css) — so the bar
- * button gives way there and Discuss is carried by the action menu's item
- * instead. The panel itself is one, however it was opened. (`#1355
- * phone-bar-discuss-slot` owns this rule's next shape; left as landed here.) */
+/* `#1355 phone-bar-discuss-slot`: on a phone the freed audio slot becomes a
+ * fixed-width Discuss icon — the pack's last member, right of the thread
+ * picker and just left of the hamburger. Icon only there; the menu item
+ * stays. The panel itself is one, however it was opened. */
 @media not ((min-width: 900px) and (pointer: fine)) {
   #discuss-open {
+    flex: 0 0 2.75rem;
+    width: 2.75rem;
+    min-width: 2.75rem;
+    max-width: 2.75rem;
+    padding: 0;
+  }
+
+  #discuss-open .mini-label {
+    display: none;
+  }
+}
+
+@media (min-width: 900px) and (pointer: fine) {
+  #discuss-open .discuss-icon {
     display: none;
   }
 }

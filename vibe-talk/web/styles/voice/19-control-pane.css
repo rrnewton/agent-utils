@@ -200,24 +200,17 @@
   color: var(--on-warn, #10131a);
 }
 
-#control-pane #todo-filter {
+/* `#1355 phone-bar-discuss-slot`: the audio toggle in the narrow column
+   Show/Fold vacated for the hamburger menu, spanning the reader row. */
+#control-pane #audio-source {
   grid-column: 1;
   grid-row: 1 / span 2;
 }
 
-/* `#221 read-modes`. The narrow column holds the mode's name, and "Collapse" was its longest word: a
-   size down, so the word stands clear of the tile's edges instead of touching both. */
-#control-pane #todo-filter .control-label {
-  font-size: 0.72rem;
-  line-height: 1.15;
-  text-align: center;
-}
-
-/* `#432 read-mode-unify`. And in two lines, its two words one above the other, as at a desk (below):
-   "Fold read", once Collapse read, is just narrow enough to stand on one line, touching both sides. */
-#control-pane #todo-filter .read-mode-verb,
-#control-pane #todo-filter .read-mode-noun {
-  display: block;
+/* Only while the reader row is the pane's content: with a call up, Sound and
+   Clear hold that column, and the toggle waits in its hidden state. */
+#control-pane:has(#read-aloud[hidden]) #audio-source {
+  display: none;
 }
 
 /*
@@ -351,7 +344,7 @@
      `:not(…)`: a rule under `:root:has(…)` whose last part names no class, id or attribute is one the
      browser can only check again on every element of the page, and it did so whenever anything on the
      page was shown or hidden — a fold, a filter, a card unpacked — about 20 ms a time on a phone. */
-  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane > :is(.control, .popover):not(#hang-up, #read-aloud[data-active="true"], #read-aloud-stop) {
+  :root[data-keyboard="open"]:has(#pane-discord:not([hidden])) #control-pane > :is(.control, .popover, #audio-source):not(#hang-up, #read-aloud[data-active="true"], #read-aloud-stop) {
     display: none;
   }
 

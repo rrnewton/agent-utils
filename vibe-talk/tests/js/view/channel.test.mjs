@@ -1504,7 +1504,7 @@ test("`#624 voice-page-modularity`: the list's tools reach the act each names, i
     "listen search-all-channels change", "listen search-further click", "listen load-older-turns click", "listen collapse-all click",
     "listen expand-all click", "listen todo-filter click", "listen clear-backlog click", "listen undo-dismiss click", "listen summarise click",
     "listen reader-toggle click", "listen autoplay-toggle click", "listen expand-all click", "listen collapse-all click", "listen summarise click",
-    "listen reader-toggle click", "listen autoplay-toggle click", "listen discuss-menu-open click", "listen jump-newest click"], "a listener was added out of the page's order");
+    "listen reader-toggle click", "listen autoplay-toggle click", "listen discuss-menu-open click", "listen todo-filter click", "listen jump-newest click"], "a listener was added out of the page's order");
   log.length = 0;
   assert.deepStrictEqual(press("load-older"), ["older asked"], "the control did not answer what it started, which the page suite waits for");
   // Each control answers what its act started, which the page suite waits for.
@@ -1516,7 +1516,7 @@ test("`#624 voice-page-modularity`: the list's tools reach the act each names, i
   assert.deepStrictEqual([press("clear-backlog"), press("undo-dismiss")], [["cleared"], ["undone"]]);
   press("jump-newest");
   assert.deepStrictEqual(log, ["older", "search in All", "server more", "all channels true", "further", "older turns", "read mode 0",
-    "clear backlog", "undo", "newest"]);
+    "menu closed", "focus action-menu-open true", "clear backlog", "undo", "newest"]);
   log.length = 0;
   // The menu's items: each one's act, then the menu closed and the keys back on the hamburger where they were in it.
   press("expand-all");

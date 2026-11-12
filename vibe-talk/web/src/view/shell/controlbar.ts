@@ -51,7 +51,8 @@ export interface ControlBar {
  * and because the fit check below is only as good as this table is complete.
  */
 export const PACK_VIEWS: Record<string, string[]> = {
-  "audio-source": ["discord", "docs"],
+  // `#1355 phone-bar-discuss-slot`: #audio-source is no longer a pack member; it lives
+  // in the hidable reader row (#control-pane) and renderControlBar states it below.
   "discord-channel": ["discord"],
   // `gchat-thread-selector`. Main, All, or one thread of the channel picked beside it.
   "thread-select": ["discord"],
@@ -105,6 +106,9 @@ export function createControlBar(deps: ControlBarDependencies): ControlBar {
     // `#1265 documents-star-hide`. Show hidden, on the Documents view only.
     deps.el("docs-show-hidden").hidden = deps.view() !== "docs";
     if (deps.actionMenuOpen()) deps.renderActionMenu();
+    // `#1355 phone-bar-discuss-slot`: the audio toggle in the reader row, on the views
+    // it served on the bar, and only where a configured agent makes it a choice.
+    deps.el("audio-source").hidden = !main || !["discord", "docs"].includes(deps.view()) || deps.readAloudAgent() === null;
     deps.el("open-settings").hidden = deps.screenHasTitle(deps.screen());
     // The pack, by the same rule and as a LOOP rather than by name: `#60 canned-prompt-buttons` adds
     // members here, and a member added later is decided by the same line as the rest.
