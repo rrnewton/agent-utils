@@ -47,3 +47,13 @@ functions will be cleared with the coordinator before editing.
 Owner reply 280, 2026-11-09 5:26 PM ET. To be gated together with
 #1166 switcher-frame-panel and #1167 jump-to-unread-chip under one
 full gate after the coordinator's all-clear.
+
+# Owner model (Slack 028, 2026-11-12)
+
+The to-do list is dropped with Hide read. Read and unread state are
+both synced client <-> server; Slack is only a slow inbound source
+(we do not go upstream for most message handling; we slowly get
+messages FROM Slack), consistent with reply 414. The server /todo
+endpoint stays for a follow-up; the page no longer reads it.
+Built as two commits with #1399 toggle-labels-active-style for the
+evening Discuss batch. [watermelon-full-preview]
