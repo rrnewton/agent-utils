@@ -7,6 +7,8 @@
 // one strip with two possible parents; where it is (`barPlacement`) stays Settings'. The
 // screens, the menus and the search are handed in; the words are the page's.
 
+import { createPromotion } from "./promotion.ts";
+
 /** What the control bar is handed by the page. */
 export interface ControlBarDependencies {
   el(id: string): HTMLElement;
@@ -77,6 +79,15 @@ export const PACK_VIEWS: Record<string, string[]> = {
 
 /** Make the control bar from the page's screens, menus and search. */
 export function createControlBar(deps: ControlBarDependencies): ControlBar {
+  // `#1470 toolbar-dynamic-promotion`. Which menu actions also stand on the bar is
+  // promotion's, decided from measured room; it refreshes below on every redraw of
+  // the bar (dock/undock, columns, view) and watches the bar's size itself.
+  const promotion = createPromotion({
+    el: (id) => deps.el(id),
+    screen: () => deps.screen(),
+    view: () => deps.view(),
+    renderActionMenu: () => deps.renderActionMenu(),
+  });
 
   /**
    * What is ON the bar right now, and whether the header is worth a row.
@@ -188,6 +199,10 @@ export function createControlBar(deps: ControlBarDependencies): ControlBar {
       deps.el("close-settings").hidden &&
       deps.el("topbar-title").hidden &&
       (deps.barWhere() !== "top" || deps.el("control-bar").hidden);
+    // `#1470 toolbar-dynamic-promotion`. Last, after every member's `hidden` above is
+    // fresh: promotion reads that availability and the pack's measured room, and
+    // moves what fits onto the bar (and only there — never in both places).
+    promotion.refresh();
   }
 
 

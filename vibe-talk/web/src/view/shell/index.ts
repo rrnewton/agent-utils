@@ -2,6 +2,8 @@
 // mounting, keyboard dispatch and boot order (the plan's step 17). Its public interface.
 
 export { PACK_VIEWS, createControlBar } from "./controlbar.ts";
+export { PROMOTION_HYSTERESIS_PX, PROMOTION_ORDER, createPromotion, decidePromotion } from "./promotion.ts";
+export type { Promotion, PromotionCandidate, PromotionDependencies } from "./promotion.ts";
 export { createChannelDirectoryView } from "./channeldirectory.ts";
 export type { ChannelDirectoryView, ChannelDirectoryViewDependencies } from "./channeldirectory.ts";
 export type { ControlBar, ControlBarDependencies } from "./controlbar.ts";
