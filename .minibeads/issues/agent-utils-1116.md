@@ -43,3 +43,23 @@ never mount or touch a live image.
 
 Part of #562 rust-primary-wrkslots P8. The 00:15-04:00 ET gate
 blackout applies: development first, gate after it ends.
+
+Dispatch wiring progress (mu-rswrk2, 2026-11-12): image status
+(#1095), sandbox show-config (#1101), limits show (#1112), and
+image set-default are wired in wrkslotsd with CLI differentials
+and landed (b3a57d10, 7edf3bf2, 048c94e2, b114b01a). Remaining:
+trim/grow/mount/unmount, then the worktrees-image family (#1141)
+and migrate/convert (#1291 signatures).
+
+Privileged-path resolution for the mount family (coordinator
+decision, 2026-11-12): no PATH lookups and no guessing. The
+python3 used to run imagehelper.py is the interpreter the editions
+launcher already runs the Python edition with, passed down as an
+absolute path (add one launcher env var for it if none is
+exported). imagehelper.py resolves through that interpreter's
+installed wrkslots package (the module file beside slotimage.py),
+and before running it the glue checks it is a regular file owned
+by the user and not group- or world-writable, refusing with a
+clear message otherwise. An env override is allowed only as an
+absolute path, only for tests or an explicit operator choice, with
+the same check applied.
