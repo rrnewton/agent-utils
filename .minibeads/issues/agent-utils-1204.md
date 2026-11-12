@@ -3,8 +3,10 @@ title: 'wrkslots-eden-checkouts: wrkslots support for EdenFS checkouts inside th
 status: open
 priority: 1
 issue_type: task
+depends_on:
+  agent-utils-1423: blocks
 created_at: 2026-11-10T12:41:39.328513866+00:00
-updated_at: 2026-11-10T14:18:02.452029495+00:00
+updated_at: 2026-11-12T21:31:40.992079197+00:00
 ---
 
 # Description
@@ -14,6 +16,8 @@ wrkslots can create, register, hold, inspect and remove an Eden checkout as a sl
 # Design
 
 Full design in ai_docs/transient/2026-11-10-wrkslots-eden-checkouts/DESIGN.md. Summary: reuse Checkout.vcs=eden for one Eden checkout per slot with the mount as a child of the slot subvolume; create refuses unless the worktrees image is verifiably mounted and the host-wide Eden count (union of eden list across the shared and per-slot config dirs) is under 3, then clones with a per-slot --config-dir inside the subvolume so overlay metadata is born in the image, establishes buck-out with an in-image target and verifies it via eden redirect list --json and mountinfo (create refuses until a target mechanism is proven in Phase 2); the shared backing repo stays outside. Remove salvages Sapling changes (sl status/id, patch plus draft bundle, verified read-back) for agent slots, runs eden remove, explicitly deletes recorded redirection targets and client state, and deletes the subvolume only after verifying the mount, binds, targets and orphaned-redirection accounting are clean. Census and holds extend to the mount, state dir and targets; audit meters usage only via eden du --json/stats, never by walking the mount. Measurement captures btrfs filesystem usage (Metadata Used and allocated) for /data and the image plus qgroup, eden du --json/stats and daemon memory before clone, after clone, after a build and after remove.
+
+**Requirement: the Eden daemon is contained before any lane gets an Eden slot.** Each Eden checkout's daemon runs as its own systemd user unit (edenfs@<state-dir>.service), OUTSIDE the slot's and the gate's systemd-run scopes: the same escape class as a build daemon outliving its caller's scope. A real trial showed a du over the mount drove the uncontained daemon to 30 GiB of memory and 25.5 GiB of writes. So wrkslots must cap that unit itself, with a drop-in on the unit (CPUQuota, MemoryMax, Nice, IOSchedulingClass) or by moving it into a limited slice, and must verify the limits are in force before a lane is given the slot. This is BLOCKED on #1423 eden-daemon-containment (recorded as a blocking dependency). Until #1423 lands, the per-host Eden cap stays at 1, trials only, and no Eden mount is ever walked.
 
 # Acceptance Criteria
 
