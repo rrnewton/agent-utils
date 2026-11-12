@@ -1014,6 +1014,9 @@ const screens = createScreens();
 /** The mounted Documents view. */
 const documentsView = createDocumentsView({
   intoView: (element, block, inline) => scrollKeeping.intoView(element, block, inline),
+  nudge: (scroller, delta) => scrollKeeping.nudge(scroller, delta),
+  toPosition: (scroller, top) => scrollKeeping.toPosition(scroller, top),
+  toFoot: (scroller) => scrollKeeping.toFoot(scroller),
   api: (path, options) => api(path, options),
   byId: (id) => el(id),
   // Per-document starred/hidden state (`#1265 documents-star-hide`): kept in

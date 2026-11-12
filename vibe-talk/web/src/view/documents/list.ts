@@ -17,6 +17,10 @@ import type { DocumentRow, DocumentsListAnswer } from "./types.ts";
 export interface DocumentsListDependencies {
   api(path: string, options?: { method?: string; body?: unknown }): Promise<unknown>;
   byId(id: string): HTMLElement;
+  /** Move the shared scroller by a measured delta, put it at a measured position, or take it to its foot, through the scroll owner (`#1251 scroll-single-owner`). */
+  nudge(scroller: HTMLElement, delta: number): void;
+  toPosition(scroller: HTMLElement, top: number): void;
+  toFoot(scroller: HTMLElement): void;
   onOpen(key: string): unknown;
   onMentions?(row: DocumentRow): unknown;
   onStatus?(text: string): unknown;
@@ -703,7 +707,7 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
       render([...rowsNow, ...older.filter((row) => !seen.has(row.key))]);
       if (scroller && listOnScreen()) {
         const grew = scroller.scrollHeight - heightBefore;
-        if (grew > 0) scroller.scrollTop += grew;
+        if (grew > 0) deps.nudge(scroller, grew);
       }
     } catch {
       // Scrolling on is its own retry.
@@ -895,7 +899,7 @@ export function createDocumentsList(deps: DocumentsListDependencies): DocumentsL
     totalNow = typeof answer?.total === "number" ? answer.total : 0;
     render(Array.isArray(answer?.documents) ? answer.documents : []);
     if (scroller && listOnScreen()) {
-      scroller.scrollTop = follow ? scroller.scrollHeight : top;
+      if (follow) deps.toFoot(scroller); else deps.toPosition(scroller, top);
     }
   }
 

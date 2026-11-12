@@ -389,6 +389,9 @@ test("documents list: refresh renders rows in order, unfetched dimmed; clicks fe
     createElement: (tag) => fakeElement(tag),
     document: { createElement: (tag) => fakeElement(tag), createElementNS: (_ns, tag) => fakeElement(tag), createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }) },
     byId: () => container,
+    nudge: (scroller, delta) => { scroller.scrollTop += delta; },
+    toPosition: (scroller, top) => { scroller.scrollTop = top; },
+    toFoot: (scroller) => { scroller.scrollTop = scroller.scrollHeight; },
   };
 
   const savedDocument = globalThis.document;
@@ -490,6 +493,7 @@ async function withList(answer, run) {
   const calls = [];
   const statuses = [];
   const list = mod.createDocumentsList({
+    nudge: (scroller, delta) => { scroller.scrollTop += delta; }, toPosition: (scroller, top) => { scroller.scrollTop = top; }, toFoot: (scroller) => { scroller.scrollTop = scroller.scrollHeight; },
     api: async (path, options) => { paths.push(path); calls.push({ path, options }); return answer(path, options); },
     byId,
     onOpen: () => {},
@@ -1738,6 +1742,7 @@ async function withDocumentsView(options, run) {
   const view = mod.createDocumentsView({
     api, byId,
     intoView: (element, block, inline) => { if (element && typeof element.scrollIntoView === "function") element.scrollIntoView(inline === undefined ? { block } : { block, inline }); },
+    nudge: (scroller, delta) => { scroller.scrollTop += delta; }, toPosition: (scroller, top) => { scroller.scrollTop = top; }, toFoot: (scroller) => { scroller.scrollTop = scroller.scrollHeight; },
     readDocument: (doc) => { reads.push(doc); },
     stopSpeaking: (key) => { stops.push(key); },
     onStatus: (text) => { statuses.push(text); options.onStatus?.(text); },
@@ -2034,6 +2039,9 @@ test("documents list: card meta is one line with a text mentions link; chips sit
     createTextNode: (text) => ({ nodeType: 3, textContent: String(text) }), querySelector: () => null };
   try {
     const list = mod.createDocumentsList({ api: async () => ({ documents: rows, total: 1 }),
+      nudge: (scroller, delta) => { scroller.scrollTop += delta; },
+      toPosition: (scroller, top) => { scroller.scrollTop = top; },
+      toFoot: (scroller) => { scroller.scrollTop = scroller.scrollHeight; },
       byId, onOpen: () => {}, onMentions: (row) => mentioned.push(row) });
     await list.refresh();
     const card = listEl.children.find((kid) => String(kid.className).includes("doc-card"));
@@ -2197,6 +2205,7 @@ async function withStateList(run) {
     "pane-docs": fakeElement("div"), "docs-list-view": fakeElement("div"),
   })[id];
   const list = listMod.createDocumentsList({
+    nudge: (scroller, delta) => { scroller.scrollTop += delta; }, toPosition: (scroller, top) => { scroller.scrollTop = top; }, toFoot: (scroller) => { scroller.scrollTop = scroller.scrollHeight; },
     api: async () => ({ documents: rows, total: rows.length }),
     byId,
     onOpen: () => {},

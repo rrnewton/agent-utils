@@ -28,6 +28,10 @@ export interface DocumentsViewDependencies {
   api(path: string, options?: { method?: string; body?: unknown }): Promise<unknown>;
   /** Bring an element into view through the scroll owner (`#1251 scroll-single-owner`). */
   intoView(element: Element, block: string, inline?: string): void;
+  /** Move the shared scroller by a measured delta, put it at a measured position, or take it to its foot, through the scroll owner (`#1251 scroll-single-owner`). */
+  nudge(scroller: HTMLElement, delta: number): void;
+  toPosition(scroller: HTMLElement, top: number): void;
+  toFoot(scroller: HTMLElement): void;
   byId(id: string): HTMLElement;
   /** Read one document aloud through the page's shared read-aloud owner (`#1039`). */
   readDocument(doc: { key: string; title?: string; texts: readonly string[] }): unknown;
@@ -147,7 +151,7 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
   /** Put the shared scroller back at `top`, where it can be written. */
   function restoreScrollTop(top: number): void {
     try {
-      deps.byId("scroll-area").scrollTop = top;
+      deps.toPosition(deps.byId("scroll-area"), top);
     } catch {
       // A host without the scroller keeps the reader where it opened.
     }
@@ -189,6 +193,9 @@ export function createDocumentsView(deps: DocumentsViewDependencies): DocumentsV
   const list = createDocumentsList({
     api: deps.api,
     byId: deps.byId,
+    nudge: deps.nudge,
+    toPosition: deps.toPosition,
+    toFoot: deps.toFoot,
     docStates,
     onOpen: (key) => {
       void openDocument(key);
