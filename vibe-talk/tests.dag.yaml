@@ -1794,7 +1794,7 @@ steps:
   # Summaries on (--summaries on): summaries landing shifted 0.22-0.24 at both sizes.
   - group: check
     job: scroll-soak-browser
-    desc: a reader parked mid-Main is sampled every frame for 60 s of background updates (live messages and replies, edits above and below, reactions incl. a folded card, read state, the Newest recount and the poll; summaries off), each update's anchor movement and layout shift reported separately beside the recorded baseline, plus a near-foot slack coda, in current Chromium at 393x852 and 1280x800 (--strict: the anchor within a pixel at every frame, at most one painted correction per act, no writes in an idle act)
+    desc: a reader parked mid-Main is sampled every frame for 60 s of background updates (live messages and replies, edits above and below, reactions incl. a folded card, read state, the Newest recount and the poll; summaries off), each update's anchor movement and layout shift reported separately beside the recorded baseline, plus a near-foot slack coda, in current Chromium at 393x852 and 1280x800 (--strict; the anchor within a pixel at every frame, at most one painted correction per act, no writes in an idle act)
     labels: [validation-vibe-talk, validation-vibe-talk-page]
     cmd: cd vibe-talk && python3 tests/scroll_soak_browser.py --strict
     jobs_flag: ""
