@@ -7,10 +7,10 @@
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 
-use claude_session::session::{Session, SessionConfig};
+use claude_stream_session::session::{Session, SessionConfig};
 
 fn fake_claude() -> (tempfile_dir::Dir, String) {
-    let dir = tempfile_dir::Dir::new("claude-session-fake");
+    let dir = tempfile_dir::Dir::new("claude-stream-fake");
     let path = dir.path().join("fake-claude");
     let script = "#!/bin/sh\n\
 while IFS= read -r line; do\n\

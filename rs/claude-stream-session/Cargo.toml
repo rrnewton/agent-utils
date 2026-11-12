@@ -1,5 +1,5 @@
 [package]
-name = "claude-session"
+name = "claude-stream-session"
 version = "0.1.0"
 description = "Persistent Claude Code stream-json sessions shared by agentctl and vibe-talk"
 keywords = ["agents", "claude", "stream-json"]

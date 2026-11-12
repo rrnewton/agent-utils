@@ -44,7 +44,7 @@
         "rs/chat-subscription-plugin/",
         "rs/chat-subscription-slack/",
         "rs/chat-subscription/",
-        "rs/claude-session/",
+        "rs/claude-stream-session/",
         "rs/term-backend/",
         "skills/agentctl/",
         "skills/herdr-agent/"
