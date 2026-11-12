@@ -1590,6 +1590,7 @@ const PY_ONLY: &[&str] = &[
     "init",
     "limits",
     "migrate",
+    "recover-tail-event",
     "relocate-repository",
     "remove-agent-batch",
     "remove-validate-batch",

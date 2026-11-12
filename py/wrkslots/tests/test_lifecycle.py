@@ -64743,3 +64743,346 @@ def test_remove_records_a_long_liveness_line_escaped_and_capped(tmp_path: Path) 
     assert len(detail.encode("utf-8")) == wrkslots._LIVENESS_DETAIL_LIMIT
     assert "\n" not in detail and "second line" not in detail
     assert evidence["detail_truncated"] is True
+
+
+# ---------------------------------------------------------------------------
+# Nothing the registry loader rejects may enter the event log (#1373).
+#
+# Every command replays the whole append-only log, so one appended event the
+# loader rejects refuses every later command, recovery included.  The shape
+# that wedged a shared registry: a flat-layout record whose checkout path was
+# <slot>/checkout instead of the slot directory itself.  Writers now judge
+# each event with the replay's own fold before appending it, and
+# recover-tail-event sets aside such an event when one is already there.
+# ---------------------------------------------------------------------------
+
+_RBA_MACHINE = "testhost"
+
+
+def _rba_config(project: Path) -> wrkslots.Config:
+    return wrkslots._load_config(str(project), _RBA_MACHINE)
+
+
+def _rba_events(project: Path) -> Path:
+    return control_directory(project) / f"EVENTS.{_RBA_MACHINE}"
+
+
+def _rba_listing(project: Path) -> list[str]:
+    return sorted(os.listdir(_rba_events(project)))
+
+
+def _rba_bytes(path: Path) -> bytes | None:
+    return path.read_bytes() if path.exists() else None
+
+
+def _rba_snapshots(project: Path) -> tuple[bytes | None, bytes | None]:
+    control = control_directory(project)
+    return (
+        _rba_bytes(control / f"ACTIVE.{_RBA_MACHINE}.json"),
+        _rba_bytes(control / f"ARCHIVED.{_RBA_MACHINE}.json"),
+    )
+
+
+def _rba_flat_project(tmp_path: Path) -> Path:
+    project, _repository, _remote = make_project(tmp_path, layout="flat")
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    return project
+
+
+def _rba_eden_shaped(config: wrkslots.Config, record: wrkslots.ActiveRecord, slot: str) -> wrkslots.ActiveRecord:
+    """A copy of ``record`` for ``slot`` whose checkout sits at ``<slot>/checkout``."""
+
+    checkout = record.checkouts[0]
+    slot_path = wrkslots._slot_directory(config, slot, record.slot_type)
+    path = (slot_path / "checkout").relative_to(config.root).as_posix()
+    return dataclasses.replace(
+        record,
+        slot=slot,
+        agent=f"agent-{slot}",
+        checkouts=(dataclasses.replace(checkout, path=path),),
+    )
+
+
+def _rba_bad_state(project: Path) -> tuple[wrkslots.Config, wrkslots.ActiveState, wrkslots.ActiveState]:
+    config = _rba_config(project)
+    previous = wrkslots._load_active(config, _RBA_MACHINE)
+    bad = _rba_eden_shaped(config, previous.slots[0], "slot02")
+    return (
+        config,
+        previous,
+        wrkslots.ActiveState(_RBA_MACHINE, previous.revision + 1, (*previous.slots, bad)),
+    )
+
+
+def _rba_append_unchecked(project: Path) -> None:
+    """Append the rejected event the way an older writer did, without the check."""
+
+    config, previous, state = _rba_bad_state(project)
+    record = next(item for item in state.slots if item.slot == "slot02")
+    wrkslots._event_writer(config, _RBA_MACHINE).append(
+        "active-state-recorded",
+        {
+            "action": "slot-created",
+            "slot": "slot02",
+            "previous_revision": previous.revision,
+            "revision": state.revision,
+            "previous_record_sha256": None,
+            "record": wrkslots._record_to_obj(record),
+            "evidence": {},
+        },
+    )
+    wrkslots._atomic_write_json(wrkslots._active_path(config, _RBA_MACHINE), wrkslots._active_to_obj(state))
+
+
+def _rba_tail_plan(project: Path) -> dict[str, object]:
+    planned = command(
+        project, "recover-tail-event", "--reason", "loader rejects it", "--format", "json"
+    )
+    assert planned.returncode == 0, planned.stderr
+    payload = json.loads(planned.stdout)
+    assert isinstance(payload, dict)
+    return payload
+
+
+def _rba_set_aside(
+    project: Path, sequence: object, digest: object
+) -> subprocess.CompletedProcess[str]:
+    return command(
+        project,
+        "recover-tail-event",
+        "--reason",
+        "loader rejects it",
+        "--yes",
+        "--sequence",
+        str(sequence),
+        "--event-sha256",
+        str(digest),
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--format",
+        "json",
+    )
+
+
+def test_writer_refuses_a_new_record_the_loader_rejects(tmp_path: Path) -> None:
+    project = _rba_flat_project(tmp_path)
+    config, previous, state = _rba_bad_state(project)
+    listing = _rba_listing(project)
+    snapshots = _rba_snapshots(project)
+
+    with pytest.raises(wrkslots.StateError) as refused:
+        wrkslots._write_active_state(
+            config, state, action="slot-created", slot="slot02", previous=previous
+        )
+
+    message = str(refused.value)
+    assert message.startswith(wrkslots._UNREPLAYABLE_PREFIX)
+    assert "path does not match its slot" in message
+    assert _rba_listing(project) == listing
+    assert _rba_snapshots(project) == snapshots
+    status = command(project, "status")
+    assert status.returncode == 0, status.stderr
+
+
+def test_writer_refuses_a_changed_record_the_loader_rejects(tmp_path: Path) -> None:
+    project = _rba_flat_project(tmp_path)
+    config = _rba_config(project)
+    previous = wrkslots._load_active(config, _RBA_MACHINE)
+    record = previous.slots[0]
+    moved = dataclasses.replace(
+        _rba_eden_shaped(config, record, record.slot), agent=record.agent
+    )
+    listing = _rba_listing(project)
+
+    with pytest.raises(wrkslots.StateError, match="path does not match its slot"):
+        wrkslots._write_active_state(
+            config,
+            wrkslots.ActiveState(_RBA_MACHINE, previous.revision + 1, (moved,)),
+            action="heartbeat",
+            slot=record.slot,
+        )
+
+    assert _rba_listing(project) == listing
+    assert command(project, "status").returncode == 0
+
+
+def test_writer_still_records_a_valid_change(tmp_path: Path) -> None:
+    project = _rba_flat_project(tmp_path)
+    config = _rba_config(project)
+    previous = wrkslots._load_active(config, _RBA_MACHINE)
+    record = previous.slots[0]
+    beat = dataclasses.replace(record, heartbeat_at=wrkslots._utc_now())
+    listing = _rba_listing(project)
+
+    wrkslots._write_active_state(
+        config,
+        wrkslots.ActiveState(_RBA_MACHINE, previous.revision + 1, (beat,)),
+        action="heartbeat",
+        slot=record.slot,
+    )
+
+    assert len(_rba_listing(project)) == len(listing) + 1
+    assert command(project, "status").returncode == 0
+
+
+def test_recover_tail_event_sets_aside_the_rejected_tail(tmp_path: Path) -> None:
+    project = _rba_flat_project(tmp_path)
+    healthy_listing = _rba_listing(project)
+    healthy_active = wrkslots._active_to_obj(wrkslots._load_active(_rba_config(project), _RBA_MACHINE))
+    _rba_append_unchecked(project)
+    tail = _rba_events(project) / _rba_listing(project)[-1]
+    tail_bytes = tail.read_bytes()
+
+    wedged = command(project, "status")
+    assert wedged.returncode == 3
+    assert "path does not match its slot" in wedged.stderr
+
+    plan = _rba_tail_plan(project)
+    assert plan["action"] == "planned"
+    assert plan["sequence"] == len(healthy_listing) + 1
+    assert plan["event_sha256"] == hashlib.sha256(tail_bytes).hexdigest()
+    assert plan["kind"] == "active-state-recorded"
+    assert plan["slot"] == "slot02"
+    assert "path does not match its slot" in str(plan["loader_refusal"])
+
+    stale = _rba_set_aside(project, plan["sequence"], "0" * 64)
+    assert stale.returncode == 3
+    assert "changed since the dry run" in stale.stderr
+    assert tail.exists()
+
+    done = _rba_set_aside(project, plan["sequence"], plan["event_sha256"])
+    assert done.returncode == 0, done.stderr
+    result = json.loads(done.stdout)
+    assert result["action"] == "set-aside"
+    assert _rba_listing(project) == healthy_listing
+    set_aside = Path(result["set_aside_path"])
+    assert set_aside.read_bytes() == tail_bytes
+    assert set_aside.parent == control_directory(project) / "quarantine" / "events" / _RBA_MACHINE
+    receipt = json.loads(Path(result["receipt_path"]).read_text(encoding="utf-8"))
+    assert receipt["event_sha256"] == plan["event_sha256"]
+    assert receipt["reason"] == "loader rejects it"
+    assert receipt["coordinator_authorized"] is True
+    assert "path does not match its slot" in receipt["loader_refusal"]
+    active_now = json.loads(
+        (control_directory(project) / f"ACTIVE.{_RBA_MACHINE}.json").read_text(encoding="utf-8")
+    )
+    assert active_now == healthy_active
+
+    status = command(project, "status")
+    assert status.returncode == 0, status.stderr
+    # The registry accepts mutations again.
+    beat = command(
+        project,
+        "heartbeat",
+        "slot01",
+        "--agent",
+        "codex-1",
+        "--owner-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+    )
+    assert beat.returncode == 0, beat.stderr
+
+
+def test_recover_tail_event_resumes_after_an_interruption(tmp_path: Path) -> None:
+    project = _rba_flat_project(tmp_path)
+    healthy_listing = _rba_listing(project)
+    _rba_append_unchecked(project)
+    plan = _rba_tail_plan(project)
+
+    interrupted = command(
+        project,
+        "recover-tail-event",
+        "--reason",
+        "loader rejects it",
+        "--yes",
+        "--sequence",
+        str(plan["sequence"]),
+        "--event-sha256",
+        str(plan["event_sha256"]),
+        "--coordinator-authorized",
+        "--coordinator-pid",
+        str(os.getpid()),
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-tail-event-snapshots"},
+    )
+    assert interrupted.returncode == 86
+    assert len(_rba_listing(project)) == len(healthy_listing) + 1
+
+    done = _rba_set_aside(project, plan["sequence"], plan["event_sha256"])
+    assert done.returncode == 0, done.stderr
+    assert _rba_listing(project) == healthy_listing
+    assert command(project, "status").returncode == 0
+
+
+def test_recover_tail_event_refuses_a_valid_tail(tmp_path: Path) -> None:
+    project = _rba_flat_project(tmp_path)
+    listing = _rba_listing(project)
+
+    refused = command(project, "recover-tail-event", "--reason", "nothing is wrong")
+
+    assert refused.returncode == 3
+    assert "replays cleanly" in refused.stderr
+    assert _rba_listing(project) == listing
+
+
+def test_recover_tail_event_refuses_a_rejected_event_that_is_not_the_tail(
+    tmp_path: Path,
+) -> None:
+    project = _rba_flat_project(tmp_path)
+    _rba_append_unchecked(project)
+    config = _rba_config(project)
+    wrkslots._event_writer(config, _RBA_MACHINE).append(
+        "partial-updates-recovered", {"note": "a later event"}
+    )
+    listing = _rba_listing(project)
+
+    refused = command(project, "recover-tail-event", "--reason", "not the tail")
+
+    assert refused.returncode == 3
+    assert "unreadable without its tail event too" in refused.stderr
+    assert _rba_listing(project) == listing
+
+
+def test_recover_tail_event_refuses_while_a_journal_is_outstanding(
+    tmp_path: Path,
+) -> None:
+    project = _rba_flat_project(tmp_path)
+    _rba_append_unchecked(project)
+    plan = _rba_tail_plan(project)
+    journal = wrkslots._journal_path(_rba_config(project))
+    journal.write_text("{}\n", encoding="utf-8")
+    listing = _rba_listing(project)
+
+    refused = _rba_set_aside(project, plan["sequence"], plan["event_sha256"])
+
+    assert refused.returncode == 3
+    assert "interrupted mutation" in refused.stderr
+    assert _rba_listing(project) == listing
+
+
+def test_recover_tail_event_requires_authorization(tmp_path: Path) -> None:
+    project = _rba_flat_project(tmp_path)
+    _rba_append_unchecked(project)
+    plan = _rba_tail_plan(project)
+    listing = _rba_listing(project)
+
+    refused = command(
+        project,
+        "recover-tail-event",
+        "--reason",
+        "loader rejects it",
+        "--yes",
+        "--sequence",
+        str(plan["sequence"]),
+        "--event-sha256",
+        str(plan["event_sha256"]),
+        "--coordinator-pid",
+        str(os.getpid()),
+    )
+
+    assert refused.returncode == 3
+    assert "--coordinator-authorized" in refused.stderr
+    assert _rba_listing(project) == listing

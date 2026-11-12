@@ -8971,17 +8971,282 @@ def _remember_replay(
     )
 
 
+def _fold_active_record_event(
+    config: Config,
+    machine: str,
+    payload: Mapping[str, object],
+    active_revision: int,
+    active_records: dict[str, ActiveRecord],
+    active_agents: dict[str, str],
+    path_checks: dict[tuple[object, ...], ActiveRecord],
+) -> int:
+    """Fold one active-state-recorded payload into derived state; return its revision.
+
+    The replay and every writer judge an active event with this one function:
+    the writer on a copy of the state it advances from, before the event is
+    appended, so the log never receives an event its own loader rejects
+    (#1373).  It mutates the mappings it is given.
+    """
+
+    _exact_keys(
+        payload,
+        {
+            "action",
+            "slot",
+            "previous_revision",
+            "revision",
+            "previous_record_sha256",
+            "record",
+            "evidence",
+        },
+        set(),
+        "append-only active-record event",
+    )
+    slot = _as_str(payload["slot"], "append-only active-record event.slot")
+    _validate_name(slot, "slot")
+    action = _as_str(
+        payload["action"], "append-only active-record event.action"
+    )
+    previous_revision = _as_int(
+        payload["previous_revision"],
+        "append-only active-record event.previous_revision",
+        minimum=0,
+    )
+    revision = _as_int(
+        payload["revision"],
+        "append-only active-record event.revision",
+        minimum=1,
+    )
+    if previous_revision != active_revision or revision != active_revision + 1:
+        raise StateError(
+            "append-only active-record event revision does not continue "
+            f"the derived state for slot {slot}"
+        )
+    current = active_records.get(slot)
+    previous_digest = (
+        None if current is None else _event_digest(_record_to_obj(current))
+    )
+    if payload["previous_record_sha256"] != previous_digest:
+        raise StateError(
+            "append-only active-record event does not match the prior record "
+            f"for slot {slot}"
+        )
+    raw_record = payload["record"]
+    if action == "absent-validation-row-recovered":
+        if current is None or raw_record is not None:
+            raise StateError(
+                "absent-validation-row recovery event must remove one active row"
+            )
+        archive_id, source_digest = _absent_validate_recovery_event_evidence(
+            payload["evidence"], "append-only active recovery event.evidence"
+        )
+        if source_digest != previous_digest:
+            raise StateError(
+                "append-only active recovery evidence does not match its source record"
+            )
+        expected_prefix = f"{machine}:{slot}:{current.generation}:"
+        if not archive_id.startswith(expected_prefix):
+            raise StateError(
+                "append-only active recovery evidence has a mismatched archive identity"
+            )
+    elif action == "absent-agent-row-recovered":
+        if current is None or current.slot_type != "agent" or raw_record is not None:
+            raise StateError(
+                "absent-agent-row recovery event must remove one active agent row"
+            )
+        archive_id, source_digest = _absent_agent_recovery_event_evidence(
+            payload["evidence"], "append-only active agent recovery evidence"
+        )
+        if source_digest != previous_digest:
+            raise StateError(
+                "append-only active agent recovery evidence does not match its source record"
+            )
+        if not archive_id.startswith(f"{machine}:{slot}:{current.generation}:"):
+            raise StateError(
+                "append-only active agent recovery evidence has a mismatched archive identity"
+            )
+    if raw_record is None:
+        if current is None:
+            raise StateError(
+                f"append-only active-record event removes absent slot {slot}"
+            )
+        active_records.pop(slot)
+        if current.slot_type == "agent" and current.import_source is None:
+            active_agents.pop(current.agent, None)
+    else:
+        record = _record_from_obj(
+            raw_record, "append-only active-record event.record"
+        )
+        if record.slot != slot or record.machine != machine:
+            raise StateError(
+                "append-only active-record event record identity does not "
+                f"match slot {slot} on machine {machine}"
+            )
+        path_key = _record_path_check_key(record)
+        if path_key not in path_checks:
+            _assert_record_paths(
+                config, record, require_repository=False, historical=True
+            )
+            path_checks[path_key] = record
+        if current is not None and current.slot_type == "agent" and current.import_source is None:
+            active_agents.pop(current.agent, None)
+        if record.slot_type == "agent" and record.import_source is None:
+            conflict = active_agents.get(record.agent)
+            if conflict is not None and conflict != slot:
+                raise StateError(
+                    "append-only active-record event gives one agent more than one slot"
+                )
+            active_agents[record.agent] = slot
+        active_records[slot] = record
+    return revision
+
+
+def _fold_archive_record_event(
+    config: Config,
+    machine: str,
+    payload: Mapping[str, object],
+    archive_revision: int,
+    archive_records: list[dict[str, object]],
+    archive_ids: set[str],
+    archived_slots: set[str],
+    absent_validate_recoveries: set[tuple[str, int, str]],
+    absent_agent_recoveries: set[tuple[str, int, str]],
+) -> int:
+    """Fold one archive-state-recorded payload into derived state; return its revision.
+
+    Shared by the replay and the archive writers, like _fold_active_record_event
+    (#1373).  It mutates the collections it is given.
+    """
+
+    _exact_keys(
+        payload,
+        {
+            "action",
+            "slot",
+            "previous_revision",
+            "revision",
+            "record",
+            "evidence",
+        },
+        set(),
+        "append-only archive-record event",
+    )
+    previous_revision = _as_int(
+        payload["previous_revision"],
+        "append-only archive-record event.previous_revision",
+        minimum=0,
+    )
+    revision = _as_int(
+        payload["revision"],
+        "append-only archive-record event.revision",
+        minimum=1,
+    )
+    if previous_revision != archive_revision or revision != archive_revision + 1:
+        raise StateError(
+            "append-only archive-record event revision does not continue "
+            "the derived archive"
+        )
+    archive_record = dict(
+        _as_mapping(payload["record"], "append-only archive-record event.record")
+    )
+    action = _as_str(
+        payload["action"], "append-only archive-record event.action"
+    )
+    slot = _as_str(payload["slot"], "append-only archive-record event.slot")
+    if archive_record.get("slot") != slot:
+        raise StateError(
+            "append-only archive-record event record identity does not "
+            f"match slot {slot}"
+        )
+    parsed = _archive_from_obj(
+        config,
+        {
+            "schema": SCHEMA,
+            "machine": machine,
+            "revision": 1,
+            "records": [archive_record],
+        },
+        machine,
+        "append-only derived archive state",
+    )
+    parsed_record = dict(parsed.records[0])
+    archive_id = _as_str(
+        parsed_record.get("archive_id"), "append-only archive record archive_id"
+    )
+    if action == "absent-validation-row-recovered":
+        evidence_archive_id, source_digest = (
+            _absent_validate_recovery_event_evidence(
+                payload["evidence"],
+                "append-only archive recovery event.evidence",
+            )
+        )
+        generation = _as_int(
+            parsed_record.get("generation"),
+            "append-only archive recovery record.generation",
+            minimum=1,
+        )
+        if (
+            parsed_record.get("machine") != machine
+            or parsed_record.get("slot_type") != "validate"
+            or parsed_record.get("physical_storage") != "removed"
+            or evidence_archive_id != archive_id
+        ):
+            raise StateError(
+                "append-only archive recovery evidence does not match its record"
+            )
+        absent_validate_recoveries.add((slot, generation, source_digest))
+    elif action == "absent-agent-row-recovered":
+        evidence_archive_id, source_digest = _absent_agent_recovery_event_evidence(
+            payload["evidence"], "append-only archive agent recovery evidence"
+        )
+        generation = _as_int(
+            parsed_record.get("generation"),
+            "append-only archive agent recovery record.generation",
+            minimum=1,
+        )
+        if (
+            parsed_record.get("machine") != machine
+            or parsed_record.get("slot_type") != "agent"
+            or parsed_record.get("physical_storage") != "removed"
+            or evidence_archive_id != archive_id
+        ):
+            raise StateError(
+                "append-only archive agent recovery evidence does not match its record"
+            )
+        absent_agent_recoveries.add((slot, generation, source_digest))
+    if archive_id in archive_ids:
+        raise StateError(f"duplicate archive_id in append-only events: {archive_id}")
+    if slot in archived_slots:
+        raise StateError(f"duplicate archived slot in append-only events: {slot}")
+    archive_ids.add(archive_id)
+    archived_slots.add(slot)
+    archive_records.append(parsed_record)
+    return revision
+
+
 def _states_from_events(
     config: Config,
     machine: str,
     *,
     require_repository: bool = True,
+    events: Sequence[Mapping[str, object]] | None = None,
 ) -> tuple[ActiveState, ArchiveState] | None:
-    events = _load_events(config, machine)
+    """Derive one machine's active and archive state from its event log.
+
+    ``events`` replays an already verified chain instead of the log on disk,
+    without the replay memo; recover-tail-event judges a log with and without
+    its tail this way (#1373).
+    """
+
+    memoize = events is None
+    if events is None:
+        events = _load_events(config, machine)
     if not events:
         return None
     memo_key = (config, machine, require_repository)
-    start, fold = _resume_replay(config, memo_key, events)
+    start, fold = (
+        _resume_replay(config, memo_key, events) if memoize else (0, _ReplayFold())
+    )
     active_revision = fold.active_revision
     active_records = fold.active_records
     active_agents = fold.active_agents
@@ -9036,224 +9301,29 @@ def _states_from_events(
         elif kind == "active-state-recorded":
             if active_revision is None:
                 raise StateError("append-only event records active state before its import")
-            _exact_keys(
+            active_revision = _fold_active_record_event(
+                config,
+                machine,
                 payload,
-                {
-                    "action",
-                    "slot",
-                    "previous_revision",
-                    "revision",
-                    "previous_record_sha256",
-                    "record",
-                    "evidence",
-                },
-                set(),
-                "append-only active-record event",
+                active_revision,
+                active_records,
+                active_agents,
+                path_checks,
             )
-            slot = _as_str(payload["slot"], "append-only active-record event.slot")
-            _validate_name(slot, "slot")
-            action = _as_str(
-                payload["action"], "append-only active-record event.action"
-            )
-            previous_revision = _as_int(
-                payload["previous_revision"],
-                "append-only active-record event.previous_revision",
-                minimum=0,
-            )
-            revision = _as_int(
-                payload["revision"],
-                "append-only active-record event.revision",
-                minimum=1,
-            )
-            if previous_revision != active_revision or revision != active_revision + 1:
-                raise StateError(
-                    "append-only active-record event revision does not continue "
-                    f"the derived state for slot {slot}"
-                )
-            current = active_records.get(slot)
-            previous_digest = (
-                None if current is None else _event_digest(_record_to_obj(current))
-            )
-            if payload["previous_record_sha256"] != previous_digest:
-                raise StateError(
-                    "append-only active-record event does not match the prior record "
-                    f"for slot {slot}"
-                )
-            raw_record = payload["record"]
-            if action == "absent-validation-row-recovered":
-                if current is None or raw_record is not None:
-                    raise StateError(
-                        "absent-validation-row recovery event must remove one active row"
-                    )
-                archive_id, source_digest = _absent_validate_recovery_event_evidence(
-                    payload["evidence"], "append-only active recovery event.evidence"
-                )
-                if source_digest != previous_digest:
-                    raise StateError(
-                        "append-only active recovery evidence does not match its source record"
-                    )
-                expected_prefix = f"{machine}:{slot}:{current.generation}:"
-                if not archive_id.startswith(expected_prefix):
-                    raise StateError(
-                        "append-only active recovery evidence has a mismatched archive identity"
-                    )
-            elif action == "absent-agent-row-recovered":
-                if current is None or current.slot_type != "agent" or raw_record is not None:
-                    raise StateError(
-                        "absent-agent-row recovery event must remove one active agent row"
-                    )
-                archive_id, source_digest = _absent_agent_recovery_event_evidence(
-                    payload["evidence"], "append-only active agent recovery evidence"
-                )
-                if source_digest != previous_digest:
-                    raise StateError(
-                        "append-only active agent recovery evidence does not match its source record"
-                    )
-                if not archive_id.startswith(f"{machine}:{slot}:{current.generation}:"):
-                    raise StateError(
-                        "append-only active agent recovery evidence has a mismatched archive identity"
-                    )
-            if raw_record is None:
-                if current is None:
-                    raise StateError(
-                        f"append-only active-record event removes absent slot {slot}"
-                    )
-                active_records.pop(slot)
-                if current.slot_type == "agent" and current.import_source is None:
-                    active_agents.pop(current.agent, None)
-            else:
-                record = _record_from_obj(
-                    raw_record, "append-only active-record event.record"
-                )
-                if record.slot != slot or record.machine != machine:
-                    raise StateError(
-                        "append-only active-record event record identity does not "
-                        f"match slot {slot} on machine {machine}"
-                    )
-                path_key = _record_path_check_key(record)
-                if path_key not in path_checks:
-                    _assert_record_paths(
-                        config, record, require_repository=False, historical=True
-                    )
-                    path_checks[path_key] = record
-                if current is not None and current.slot_type == "agent" and current.import_source is None:
-                    active_agents.pop(current.agent, None)
-                if record.slot_type == "agent" and record.import_source is None:
-                    conflict = active_agents.get(record.agent)
-                    if conflict is not None and conflict != slot:
-                        raise StateError(
-                            "append-only active-record event gives one agent more than one slot"
-                        )
-                    active_agents[record.agent] = slot
-                active_records[slot] = record
-            active_revision = revision
         elif kind == "archive-state-recorded":
             if archive_revision is None:
                 raise StateError("append-only event records archive state before its import")
-            _exact_keys(
-                payload,
-                {
-                    "action",
-                    "slot",
-                    "previous_revision",
-                    "revision",
-                    "record",
-                    "evidence",
-                },
-                set(),
-                "append-only archive-record event",
-            )
-            previous_revision = _as_int(
-                payload["previous_revision"],
-                "append-only archive-record event.previous_revision",
-                minimum=0,
-            )
-            revision = _as_int(
-                payload["revision"],
-                "append-only archive-record event.revision",
-                minimum=1,
-            )
-            if previous_revision != archive_revision or revision != archive_revision + 1:
-                raise StateError(
-                    "append-only archive-record event revision does not continue "
-                    "the derived archive"
-                )
-            archive_record = dict(
-                _as_mapping(payload["record"], "append-only archive-record event.record")
-            )
-            action = _as_str(
-                payload["action"], "append-only archive-record event.action"
-            )
-            slot = _as_str(payload["slot"], "append-only archive-record event.slot")
-            if archive_record.get("slot") != slot:
-                raise StateError(
-                    "append-only archive-record event record identity does not "
-                    f"match slot {slot}"
-                )
-            parsed = _archive_from_obj(
+            archive_revision = _fold_archive_record_event(
                 config,
-                {
-                    "schema": SCHEMA,
-                    "machine": machine,
-                    "revision": 1,
-                    "records": [archive_record],
-                },
                 machine,
-                "append-only derived archive state",
+                payload,
+                archive_revision,
+                archive_records,
+                archive_ids,
+                archived_slots,
+                absent_validate_recoveries,
+                absent_agent_recoveries,
             )
-            parsed_record = dict(parsed.records[0])
-            archive_id = _as_str(
-                parsed_record.get("archive_id"), "append-only archive record archive_id"
-            )
-            if action == "absent-validation-row-recovered":
-                evidence_archive_id, source_digest = (
-                    _absent_validate_recovery_event_evidence(
-                        payload["evidence"],
-                        "append-only archive recovery event.evidence",
-                    )
-                )
-                generation = _as_int(
-                    parsed_record.get("generation"),
-                    "append-only archive recovery record.generation",
-                    minimum=1,
-                )
-                if (
-                    parsed_record.get("machine") != machine
-                    or parsed_record.get("slot_type") != "validate"
-                    or parsed_record.get("physical_storage") != "removed"
-                    or evidence_archive_id != archive_id
-                ):
-                    raise StateError(
-                        "append-only archive recovery evidence does not match its record"
-                    )
-                absent_validate_recoveries.add((slot, generation, source_digest))
-            elif action == "absent-agent-row-recovered":
-                evidence_archive_id, source_digest = _absent_agent_recovery_event_evidence(
-                    payload["evidence"], "append-only archive agent recovery evidence"
-                )
-                generation = _as_int(
-                    parsed_record.get("generation"),
-                    "append-only archive agent recovery record.generation",
-                    minimum=1,
-                )
-                if (
-                    parsed_record.get("machine") != machine
-                    or parsed_record.get("slot_type") != "agent"
-                    or parsed_record.get("physical_storage") != "removed"
-                    or evidence_archive_id != archive_id
-                ):
-                    raise StateError(
-                        "append-only archive agent recovery evidence does not match its record"
-                    )
-                absent_agent_recoveries.add((slot, generation, source_digest))
-            if archive_id in archive_ids:
-                raise StateError(f"duplicate archive_id in append-only events: {archive_id}")
-            if slot in archived_slots:
-                raise StateError(f"duplicate archived slot in append-only events: {slot}")
-            archive_ids.add(archive_id)
-            archived_slots.add(slot)
-            archive_records.append(parsed_record)
-            archive_revision = revision
     if active_revision is None or archive_revision is None:
         raise StateError("append-only event log has no complete imported state")
     if require_repository:
@@ -9266,22 +9336,23 @@ def _states_from_events(
         # leaves the memo as it was.
         for record in active_records.values():
             _assert_record_paths(config, record, require_repository=True)
-    _remember_replay(
-        memo_key,
-        events,
-        _ReplayFold(
-            active_revision,
-            active_records,
-            active_agents,
-            archive_revision,
-            archive_records,
-            archive_ids,
-            archived_slots,
-            absent_validate_recoveries,
-            absent_agent_recoveries,
-            path_checks,
-        ),
-    )
+    if memoize:
+        _remember_replay(
+            memo_key,
+            events,
+            _ReplayFold(
+                active_revision,
+                active_records,
+                active_agents,
+                archive_revision,
+                archive_records,
+                archive_ids,
+                archived_slots,
+                absent_validate_recoveries,
+                absent_agent_recoveries,
+                path_checks,
+            ),
+        )
     return (
         ActiveState(machine, active_revision, tuple(active_records.values())),
         ArchiveState(
@@ -9292,6 +9363,105 @@ def _states_from_events(
             frozenset(absent_agent_recoveries),
         ),
     )
+
+
+_UNREPLAYABLE_PREFIX = "refusing to append an event the registry loader would reject: "
+
+
+def _loader_rejection(exc: Refusal) -> StateError:
+    """Name a pre-append refusal (#1373) with the loader's own message."""
+
+    return StateError(f"{_UNREPLAYABLE_PREFIX}{exc}")
+
+
+def _assert_active_events_replayable(
+    config: Config,
+    machine: str,
+    previous: ActiveState,
+    payloads: Sequence[Mapping[str, object]],
+    *,
+    require_repository: bool,
+) -> None:
+    """Refuse active-state events the registry loader would reject (#1373).
+
+    Each candidate is folded, in order, with the replay's own code onto the
+    state it advances from, after a JSON round trip so it is judged in the
+    form the loader reads back.  A new or path-changed record also gets the
+    current-layout check the snapshot readers and the repository-backed
+    replay apply to every active row.  Nothing is written when this raises,
+    so one bad writer can no longer wedge every later command.
+    """
+
+    records = {record.slot: record for record in previous.slots}
+    agents = {
+        record.agent: record.slot
+        for record in previous.slots
+        if record.slot_type == "agent" and record.import_source is None
+    }
+    revision = previous.revision
+    try:
+        for payload in payloads:
+            candidate = _as_mapping(
+                json.loads(json.dumps(payload)), "append-only active-record event"
+            )
+            slot = candidate.get("slot")
+            before = records.get(slot) if isinstance(slot, str) else None
+            revision = _fold_active_record_event(
+                config, machine, candidate, revision, records, agents, {}
+            )
+            after = records.get(slot) if isinstance(slot, str) else None
+            if after is not None and (
+                before is None
+                or _record_path_check_key(before) != _record_path_check_key(after)
+            ):
+                _assert_record_paths(
+                    config, after, require_repository=require_repository
+                )
+    except _LockBusy:
+        raise
+    except Refusal as exc:
+        raise _loader_rejection(exc) from exc
+
+
+def _assert_archive_events_replayable(
+    config: Config,
+    machine: str,
+    previous: ArchiveState,
+    payloads: Sequence[Mapping[str, object]],
+) -> None:
+    """Refuse archive-state events the registry loader would reject (#1373)."""
+
+    records = [dict(record) for record in previous.records]
+    archive_ids = {
+        _as_str(record.get("archive_id"), "archive record archive_id")
+        for record in previous.records
+    }
+    archived_slots = {
+        _as_str(record.get("slot"), "archive record slot") for record in previous.records
+    }
+    validate_recoveries = set(previous.absent_validate_recoveries)
+    agent_recoveries = set(previous.absent_agent_recoveries)
+    revision = previous.revision
+    try:
+        for payload in payloads:
+            candidate = _as_mapping(
+                json.loads(json.dumps(payload)), "append-only archive-record event"
+            )
+            revision = _fold_archive_record_event(
+                config,
+                machine,
+                candidate,
+                revision,
+                records,
+                archive_ids,
+                archived_slots,
+                validate_recoveries,
+                agent_recoveries,
+            )
+    except _LockBusy:
+        raise
+    except Refusal as exc:
+        raise _loader_rejection(exc) from exc
 
 
 def _load_active(
@@ -9390,6 +9560,13 @@ def _write_active_state(
         ),
         "evidence": dict(evidence or {}),
     }
+    _assert_active_events_replayable(
+        config,
+        state.machine,
+        previous,
+        (payload,),
+        require_repository=require_repository,
+    )
     event = (
         _write_event_file(config, state.machine, "active-state-recorded", payload)
         if event_writer is None
@@ -9418,13 +9595,12 @@ def _write_active_rows_removed(
     previous = _load_active(config, state.machine)
     if previous != state:
         raise StateError("active state changed before batch removal")
-    writer = event_writer or _event_writer(config, state.machine)
     revision = state.revision
-    for index, slot in enumerate(names, start=1):
+    payloads: list[dict[str, object]] = []
+    for slot in names:
         previous_revision = revision
         revision += 1
-        writer.append(
-            "active-state-recorded",
+        payloads.append(
             {
                 "action": "absent-validation-row-recovered",
                 "slot": slot,
@@ -9433,8 +9609,14 @@ def _write_active_rows_removed(
                 "previous_record_sha256": _record_sha256(current[slot]),
                 "record": None,
                 "evidence": dict((evidence_by_slot or {}).get(slot, {})),
-            },
+            }
         )
+    _assert_active_events_replayable(
+        config, state.machine, previous, payloads, require_repository=True
+    )
+    writer = event_writer or _event_writer(config, state.machine)
+    for index, payload in enumerate(payloads, start=1):
+        writer.append("active-state-recorded", payload)
         _interrupt_for_test(f"after-absent-validate-active-row-{index}")
     removed = set(names)
     updated = ActiveState(
@@ -9474,19 +9656,16 @@ def _write_archive_state(
     record = dict(state.records[-1])
     if record.get("slot") != slot:
         raise StateError("archive mutation record does not match its named slot")
-    _write_event_file(
-        config,
-        state.machine,
-        "archive-state-recorded",
-        {
-            "action": action,
-            "slot": slot,
-            "previous_revision": previous.revision,
-            "revision": state.revision,
-            "record": record,
-            "evidence": dict(evidence or {}),
-        },
-    )
+    payload: dict[str, object] = {
+        "action": action,
+        "slot": slot,
+        "previous_revision": previous.revision,
+        "revision": state.revision,
+        "record": record,
+        "evidence": dict(evidence or {}),
+    }
+    _assert_archive_events_replayable(config, state.machine, previous, (payload,))
+    _write_event_file(config, state.machine, "archive-state-recorded", payload)
     _atomic_write_json(_archive_path(config, state.machine), _archive_to_obj(state))
 
 
@@ -13234,6 +13413,302 @@ def _cmd_quarantine_journal(args: argparse.Namespace) -> int:
         print(json.dumps(payload, sort_keys=True))
     else:
         _print_quarantine_payload(payload, dry_run=False)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Unreplayable tail events (recover-tail-event, #1373)
+#
+# Every command replays the whole event log, so one appended event the loader
+# rejects refuses every later command, recovery included.  Writers now refuse
+# such an event before it is appended; this verb is the sanctioned way out for
+# one that is already there.  It sets aside exactly one event, the tail, and
+# only when the loader rejects the log with it and accepts it without it, no
+# journal is outstanding and no partial update is present.  The file is moved,
+# never deleted, beside a receipt naming the refusal, the actor and the reason.
+# ---------------------------------------------------------------------------
+
+_TAIL_EVENT_RECEIPT_SCHEMA = 1
+_TAIL_EVENT_BYTES_LIMIT = 16 * 1024 * 1024
+_TAIL_EVENT_REASON_LIMIT = 500
+
+
+@dataclasses.dataclass(frozen=True)
+class _TailEventPlan:
+    """Everything a recover-tail-event dry run proves before anything moves."""
+
+    machine: str
+    path: Path
+    sequence: int
+    file_sha256: str
+    kind: str | None
+    slot: str | None
+    refusal: str
+    prefix_tip_sha256: str
+    active: ActiveState
+    archive: ArchiveState
+
+
+def _tail_event_set_aside_directory(config: Config, machine: str) -> Path:
+    # Under quarantine/, never beside the shards: every EVENTS.* entry of the
+    # control directory is read as a machine's log.
+    return _quarantine_directory(config) / "events" / machine
+
+
+def _tail_event_reason(raw: object) -> str:
+    reason = raw.strip() if isinstance(raw, str) else ""
+    if not reason:
+        raise Refusal(
+            "recover-tail-event requires --reason saying why this event must be "
+            "set aside; nothing was changed"
+        )
+    if len(reason) > _TAIL_EVENT_REASON_LIMIT or "\x00" in reason:
+        raise Refusal(
+            f"--reason must be at most {_TAIL_EVENT_REASON_LIMIT} characters "
+            "without NUL bytes"
+        )
+    return reason
+
+
+def _tail_event_plan(config: Config) -> _TailEventPlan:
+    """Prove the local log's tail is the one event that makes it unreadable."""
+
+    machine = config.machine
+    directory = _event_directory(config, machine)
+    names = _event_file_names(directory)
+    if not names:
+        raise Refusal(f"the append-only event log {directory} has no events")
+    sequence = len(names)
+    if sequence < 2:
+        raise Refusal(
+            "the tail event is the log's first event; setting it aside would "
+            "leave no imported state to fall back to"
+        )
+    path = directory / names[-1]
+    contents, _identity = _read_regular_file_identity(
+        path, "append-only event", _TAIL_EVENT_BYTES_LIMIT
+    )
+    file_sha256 = hashlib.sha256(contents).hexdigest()
+    try:
+        prefix = _load_event_paths([directory / name for name in names[:-1]], machine)
+    except Refusal as exc:
+        raise Refusal(
+            f"the event log is broken before its tail ({exc}); setting the tail "
+            "aside would not repair it"
+        ) from exc
+    prefix_tip = _as_str(prefix[-1]["sha256"], "append-only event.sha256")
+    kind: str | None = None
+    slot: str | None = None
+    try:
+        parsed = _strict_json_object(contents, "append-only event")
+        raw_kind = parsed.get("kind")
+        kind = raw_kind if isinstance(raw_kind, str) else None
+        payload = parsed.get("payload")
+        raw_slot = payload.get("slot") if isinstance(payload, Mapping) else None
+        slot = raw_slot if isinstance(raw_slot, str) else None
+    except Refusal:
+        pass
+    refusal: str | None = None
+    try:
+        tail = _event_from_path(path, machine, sequence, prefix_tip)
+    except Refusal as exc:
+        refusal = str(exc)
+    else:
+        try:
+            _states_from_events(
+                config, machine, require_repository=False, events=(*prefix, tail)
+            )
+        except _LockBusy:
+            raise
+        except Refusal as exc:
+            refusal = str(exc)
+    if refusal is None:
+        raise Refusal(
+            f"event {sequence} ({kind}) replays cleanly; recover-tail-event only "
+            "sets aside a tail event the registry loader rejects"
+        )
+    try:
+        states = _states_from_events(
+            config, machine, require_repository=False, events=prefix
+        )
+    except _LockBusy:
+        raise
+    except Refusal as exc:
+        raise Refusal(
+            f"the event log is unreadable without its tail event too ({exc}); "
+            "setting the tail aside would not repair it"
+        ) from exc
+    assert states is not None
+    return _TailEventPlan(
+        machine=machine,
+        path=path,
+        sequence=sequence,
+        file_sha256=file_sha256,
+        kind=kind,
+        slot=slot,
+        refusal=refusal,
+        prefix_tip_sha256=prefix_tip,
+        active=states[0],
+        archive=states[1],
+    )
+
+
+def _tail_event_payload(
+    plan: _TailEventPlan,
+    *,
+    action: str,
+    reason: str,
+    set_aside_path: Path | None = None,
+    receipt_path: Path | None = None,
+) -> dict[str, object]:
+    return {
+        "action": action,
+        "machine": plan.machine,
+        "event_path": str(plan.path.absolute()),
+        "sequence": plan.sequence,
+        "event_sha256": plan.file_sha256,
+        "kind": plan.kind,
+        "slot": plan.slot,
+        "loader_refusal": plan.refusal,
+        "prefix_tip_sha256": plan.prefix_tip_sha256,
+        "prefix_active_revision": plan.active.revision,
+        "prefix_active_slots": len(plan.active.slots),
+        "prefix_archive_revision": plan.archive.revision,
+        "reason": reason,
+        "set_aside_path": None if set_aside_path is None else str(set_aside_path.absolute()),
+        "receipt_path": None if receipt_path is None else str(receipt_path.absolute()),
+    }
+
+
+def _print_tail_event_payload(payload: Mapping[str, object]) -> None:
+    print(
+        f"TAIL-EVENT machine={payload['machine']} sequence={payload['sequence']} "
+        f"kind={payload['kind']} slot={payload['slot']} "
+        f"event_sha256={payload['event_sha256']} outcome={payload['action']}"
+    )
+    print(f"  loader refusal: {payload['loader_refusal']}")
+    print(
+        f"  without it: tip={payload['prefix_tip_sha256']} "
+        f"active_revision={payload['prefix_active_revision']} "
+        f"slots={payload['prefix_active_slots']} "
+        f"archive_revision={payload['prefix_archive_revision']}"
+    )
+    if payload["action"] == "planned":
+        print(
+            "  to set it aside: rerun with --yes --sequence "
+            f"{payload['sequence']} --event-sha256 {payload['event_sha256']} "
+            "--coordinator-authorized --coordinator-pid PID"
+        )
+    else:
+        print(f"  set aside: {payload['set_aside_path']}")
+        print(f"  receipt: {payload['receipt_path']}")
+        print(
+            "  storage the event described is not touched; run 'wrkslots doctor' "
+            "to find any it left unregistered"
+        )
+
+
+def _cmd_recover_tail_event(args: argparse.Namespace) -> int:
+    """Set aside the one tail event that makes the local event log unreadable."""
+
+    reason = _tail_event_reason(args.reason)
+    config = _load_config(args.project_root, args.machine)
+    if not args.yes:
+        plan = _tail_event_plan(config)
+        payload = _tail_event_payload(plan, action="planned", reason=reason)
+        if args.format == "json":
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            _print_tail_event_payload(payload)
+        return 0
+    _require_coordinator_authorized(args, "tail event recovery")
+    if args.coordinator_pid is None:
+        raise Refusal("--yes requires --coordinator-pid")
+    if args.sequence is None or args.event_sha256 is None:
+        raise Refusal(
+            "recover-tail-event --yes requires --sequence and --event-sha256 "
+            "with the exact values the dry run printed"
+        )
+    coordinator = _capture_caller_process(args.coordinator_pid, "coordinator")
+    with _mutation_locks(config, args.wait_lock):
+        _assert_caller_process(coordinator, "coordinator")
+        _refuse_partial_state(config)
+        journals = _outstanding_journals(config)
+        if journals:
+            raise Refusal(
+                f"an interrupted mutation is recorded in {journals[0]}; the tail "
+                "event may belong to it, so it is not set aside"
+            )
+        plan = _tail_event_plan(config)
+        if (plan.sequence, plan.file_sha256) != (args.sequence, args.event_sha256):
+            raise Refusal(
+                "the tail event changed since the dry run: it is now sequence "
+                f"{plan.sequence} sha256={plan.file_sha256}; rerun the dry run"
+            )
+        directory = _tail_event_set_aside_directory(config, plan.machine)
+        stem = f"{plan.sequence:020d}-{plan.file_sha256[:16]}"
+        destination = directory / f"{stem}.json"
+        receipt = directory / f"{stem}.receipt.json"
+        if destination.exists() or destination.is_symlink():
+            raise Refusal(f"set-aside destination already exists: {destination}")
+        missing = [
+            item
+            for item in (directory, directory.parent, directory.parent.parent)
+            if not item.exists()
+        ]
+        directory.mkdir(mode=0o755, parents=True, exist_ok=True)
+        for item in reversed(missing):
+            _fsync_directory(item.parent)
+        active_path = _active_path(config, plan.machine)
+        archive_path = _archive_path(config, plan.machine)
+        payload = _tail_event_payload(
+            plan,
+            action="set-aside",
+            reason=reason,
+            set_aside_path=destination,
+            receipt_path=receipt,
+        )
+        _atomic_write_json(
+            receipt,
+            {
+                **payload,
+                "schema": _TAIL_EVENT_RECEIPT_SCHEMA,
+                "recorded_at": _utc_now(),
+                "actor": _identity_to_obj(coordinator),
+                "coordinator_authorized": True,
+                "active_sha256_before": _file_sha256(active_path),
+                "archive_sha256_before": _file_sha256(archive_path),
+                "restore": (
+                    "only while no event has been appended since: move the set-aside "
+                    "file back to event_path under wrkslots' locks; the registry is "
+                    "unreadable again until the event's cause is fixed"
+                ),
+            },
+        )
+        _interrupt_for_test("after-tail-event-receipt")
+        # Snapshots first, the move last: an interruption before the move leaves
+        # the rejected tail in place, so a rerun finds the same plan.
+        active_document = _active_to_obj(plan.active)
+        if not active_path.exists() or _read_json(active_path, "active state") != active_document:
+            _atomic_write_json(active_path, active_document)
+        archive_document = _archive_to_obj(plan.archive)
+        if not archive_path.exists() or _read_json(archive_path, "archive state") != archive_document:
+            _atomic_write_json(archive_path, archive_document)
+        _interrupt_for_test("after-tail-event-snapshots")
+        _forget_event_chain(plan.path.parent, plan.machine)
+        os.rename(plan.path, destination)
+        _fsync_directory(plan.path.parent)
+        _fsync_directory(directory)
+        states = _states_from_events(config, plan.machine, require_repository=False)
+        if states is None or states[0] != plan.active or states[1] != plan.archive:
+            raise StateError(
+                "the event log does not replay to the planned state after setting "
+                f"its tail aside; inspect {destination} and {receipt}"
+            )
+    if args.format == "json":
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        _print_tail_event_payload(payload)
     return 0
 
 
@@ -77659,18 +78134,20 @@ def _append_absent_validate_archives(
         absent_validate_recoveries=frozenset(recovery_identities),
         absent_agent_recoveries=state.absent_agent_recoveries,
     )
-    for item, entry, previous_revision, next_revision in additions:
-        writer.append(
-            "archive-state-recorded",
-            {
-                "action": "absent-validation-row-recovered",
-                "slot": item.slot,
-                "previous_revision": previous_revision,
-                "revision": next_revision,
-                "record": entry,
-                "evidence": _absent_validate_recovery_evidence(item, entry),
-            },
-        )
+    payloads = [
+        {
+            "action": "absent-validation-row-recovered",
+            "slot": item.slot,
+            "previous_revision": previous_revision,
+            "revision": next_revision,
+            "record": entry,
+            "evidence": _absent_validate_recovery_evidence(item, entry),
+        }
+        for item, entry, previous_revision, next_revision in additions
+    ]
+    _assert_archive_events_replayable(config, state.machine, state, payloads)
+    for payload in payloads:
+        writer.append("archive-state-recorded", payload)
         _interrupt_for_test("after-absent-validate-archive")
     return updated
 
@@ -80857,6 +81334,72 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--format", choices=("human", "json"), default="human"
     )
     quarantine_journal.set_defaults(handler=_cmd_quarantine_journal)
+
+    recover_tail_event = subparsers.add_parser(
+        "recover-tail-event",
+        help="set aside the one tail event that makes the event log unreadable",
+        description=(
+            "Every command replays the whole append-only event log, so one event "
+            "its loader rejects refuses every later command, recovery included. "
+            "This sets aside exactly the local log's tail event, and only when the "
+            "loader rejects the log with it and accepts it without it, no journal "
+            "is outstanding and no partial update is present. The default is a "
+            "dry run printing the event's sequence, sha256 and the loader's "
+            "refusal; --yes must echo that sequence and sha256. Under the mutation "
+            "locks it writes a receipt, rewrites the ACTIVE and ARCHIVED snapshots "
+            "from the log without the tail, and moves the event file to "
+            "<control>/quarantine/events/<machine>/; nothing is deleted. Storage "
+            "the event described is left alone for doctor to report (#1373)."
+        ),
+        epilog=(
+            "examples:\n"
+            "  wrkslots recover-tail-event --reason \"create recorded a path the loader rejects\"\n"
+            "  wrkslots recover-tail-event --reason \"...\" --yes \\\n"
+            "    --sequence 2035 --event-sha256 <digest from the dry run> \\\n"
+            "    --coordinator-authorized --coordinator-pid \"$COORDINATOR_PID\""
+        ),
+        formatter_class=_HelpFormatter,
+    )
+    recover_tail_event.add_argument(
+        "--reason",
+        required=True,
+        metavar="TEXT",
+        help=(
+            "why this event must be set aside (required, non-blank, at most "
+            f"{_TAIL_EVENT_REASON_LIMIT} characters); recorded in the receipt"
+        ),
+    )
+    recover_tail_event.add_argument(
+        "--yes",
+        action="store_true",
+        help="set the event aside; without it nothing is changed",
+    )
+    recover_tail_event.add_argument(
+        "--sequence",
+        type=int,
+        metavar="N",
+        help="required with --yes: the tail event sequence the dry run printed",
+    )
+    recover_tail_event.add_argument(
+        "--event-sha256",
+        metavar="SHA256",
+        help="required with --yes: the event file digest the dry run printed",
+    )
+    recover_tail_event.add_argument(
+        "--coordinator-pid",
+        type=int,
+        metavar="PID",
+        help="required with --yes: live coordinator PID recorded as the actor",
+    )
+    recover_tail_event.add_argument(
+        "--coordinator-authorized",
+        action="store_true",
+        help="required with --yes: the coordinator authorized setting this event aside",
+    )
+    recover_tail_event.add_argument(
+        "--format", choices=("human", "json"), default="human"
+    )
+    recover_tail_event.set_defaults(handler=_cmd_recover_tail_event)
 
     register = subparsers.add_parser(
         "register",

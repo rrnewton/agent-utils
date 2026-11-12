@@ -7010,3 +7010,81 @@ fn timestamp_instants_match_python_for_every_accepted_matrix_value() {
         );
     }
 }
+
+/// A flat-layout configuration rooted in the scratch project (#1373).
+fn flat_cfg(scratch: &Scratch) -> crate::active_state::Cfg {
+    let root = scratch.0.join("project");
+    crate::active_state::Cfg {
+        root: root.clone(),
+        worktrees: root.join("worktrees/slots"),
+        control: root.join("worktrees"),
+        layout: "flat".to_string(),
+        default_remote: "origin".to_string(),
+        default_landed_ref: "refs/remotes/origin/main".to_string(),
+        machine: "node-a".to_string(),
+    }
+}
+
+fn flat_created(slot: &str, path: &str) -> Value {
+    let mut record = active_record(slot, 1);
+    record["checkouts"][0]["path"] = json!(path);
+    json!({
+        "action": "slot-created",
+        "slot": slot,
+        "previous_revision": 0,
+        "revision": 1,
+        "previous_record_sha256": null,
+        "record": record,
+        "evidence": {},
+    })
+}
+
+fn event_names(directory: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(directory)
+        .expect("read event directory")
+        .map(|entry| {
+            entry
+                .expect("event entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn append_refuses_an_active_record_the_loader_rejects() {
+    let scratch = Scratch::new();
+    let events = scratch.events();
+    import_log(&events, vec![], vec![]);
+    let cfg = flat_cfg(&scratch);
+    let before = event_names(&events);
+
+    // The shape that wedged a shared registry: a flat-layout checkout at
+    // <slot>/checkout instead of the slot directory itself.
+    let error = crate::ensure_states::append_event(
+        &cfg,
+        "node-a",
+        "active-state-recorded",
+        flat_created("slot-a", "worktrees/slots/slot-a/checkout"),
+    )
+    .expect_err("a record the loader rejects is refused");
+    assert!(
+        error.starts_with("refusing to append an event the registry loader would reject: "),
+        "{error}"
+    );
+    assert!(error.contains("path does not match its slot"), "{error}");
+    assert_eq!(event_names(&events), before);
+
+    crate::ensure_states::append_event(
+        &cfg,
+        "node-a",
+        "active-state-recorded",
+        flat_created("slot-a", "worktrees/slots/slot-a"),
+    )
+    .expect("a record the loader accepts is appended");
+    assert_eq!(event_names(&events).len(), before.len() + 1);
+    replay(&events).expect("the log still replays");
+}

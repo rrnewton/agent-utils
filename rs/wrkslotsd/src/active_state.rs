@@ -980,6 +980,93 @@ fn assert_record_paths(cfg: &Cfg, record: &RecordRec) -> Result<()> {
     Ok(())
 }
 
+/// Every field `assert_record_paths` reads, so an unchanged key needs no
+/// second check (the replay's `_record_path_check_key`).
+fn record_path_check_key(record: &Value) -> Value {
+    let checkouts: Vec<Value> = record
+        .get("checkouts")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    json!([
+                        item.get("name"),
+                        item.get("path"),
+                        item.get("repository"),
+                        item.get("remote"),
+                        item.get("landed_ref"),
+                        item.get("vcs"),
+                    ])
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!([
+        record.get("slot"),
+        record.get("slot_type"),
+        record.get("layout"),
+        checkouts
+    ])
+}
+
+/// Refuse an active-state event whose record the loader would reject
+/// (#1373), before its file exists.
+///
+/// The record is parsed as the loader parses it and must name the event's
+/// slot and machine. A new record, or one whose path-bearing fields changed
+/// since `events` last recorded the slot, also gets the loader's path
+/// checks; an unchanged record was accepted when it was first recorded.
+pub(crate) fn assert_appendable_active_payload(
+    cfg: &Cfg,
+    machine: &str,
+    payload: &Value,
+    events: &[Value],
+) -> Result<()> {
+    let Some(record) = payload.get("record").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let slot = payload
+        .get("slot")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let parsed = record_from_obj(record, "append-only active-record event.record")?;
+    if parsed.slot != slot || parsed.machine != machine {
+        return Err(format!(
+            "append-only active-record event record identity does not match slot {slot} on machine {machine}"
+        ));
+    }
+    let mut current: Option<&Value> = None;
+    for event in events {
+        match event.get("kind").and_then(Value::as_str) {
+            Some("state-imported") => {
+                current = event
+                    .pointer("/payload/active/slots")
+                    .and_then(Value::as_array)
+                    .and_then(|slots| {
+                        slots
+                            .iter()
+                            .find(|item| item.get("slot").and_then(Value::as_str) == Some(slot))
+                    });
+            }
+            Some("active-state-recorded")
+                if event.pointer("/payload/slot").and_then(Value::as_str) == Some(slot) =>
+            {
+                current = event
+                    .pointer("/payload/record")
+                    .filter(|value| !value.is_null());
+            }
+            _ => {}
+        }
+    }
+    if current
+        .is_some_and(|previous| record_path_check_key(previous) == record_path_check_key(record))
+    {
+        return Ok(());
+    }
+    assert_record_paths(cfg, &parsed)
+}
+
 /// One active record's identity for cross-machine checks, in shard order.
 pub(crate) struct RecordOrder {
     pub(crate) slot: String,

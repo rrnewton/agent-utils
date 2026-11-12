@@ -340,6 +340,14 @@ pub(crate) fn append_event(cfg: &Cfg, machine: &str, kind: &str, payload: Value)
         }
     }
     let events = load_event_chain(&directory, machine)?;
+    if kind == "active-state-recorded" {
+        // Never append what the loader would reject: one such event refuses
+        // every later command (#1373).
+        crate::active_state::assert_appendable_active_payload(cfg, machine, &payload, &events)
+            .map_err(|error| {
+                format!("refusing to append an event the registry loader would reject: {error}")
+            })?;
+    }
     let sequence = events.len() + 1;
     let previous = events
         .last()

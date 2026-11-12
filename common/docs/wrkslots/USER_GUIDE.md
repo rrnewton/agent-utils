@@ -3441,6 +3441,41 @@ To hand-restore a quarantined journal (there is no restore command in v1):
    `wrkslots classify-create-journals <slot> --slot-type <type> --agent <agent>`
    refuses again naming the journal, and `wrkslots recover` can be retried.
 
+## Set aside an unreplayable tail event
+
+Every command replays the whole append-only event log, so one event the
+loader rejects refuses every later command, recovery included. Writers judge
+each event with the replay's own checks before appending it (#1373), so this
+should not happen; `recover-tail-event` is the sanctioned way out when an
+older or unlanded writer already appended one. It acts only on the local log's
+tail, and only when the replay rejects the log with that event and accepts it
+without it. The default is a dry run; acting requires
+`--coordinator-authorized`, a `--reason`, and `--yes` echoing the sequence and
+file sha256 the dry run printed.
+
+```sh
+# see which event is rejected, and why
+wrkslots recover-tail-event --reason "why this event must be set aside"
+# then set it aside, echoing the dry run's sequence and digest
+wrkslots recover-tail-event --reason "..." --yes --sequence <N> \
+  --event-sha256 <digest from the dry run> \
+  --coordinator-authorized --coordinator-pid "$COORDINATOR_PID"
+```
+
+It refuses while a journal is outstanding (the event may belong to it) or a
+partial update is present, when the tail replays cleanly, and when the log is
+still unreadable without its tail (the rejected event is not the tail). Under
+the mutation locks it writes a receipt (the loader's refusal, the prior
+snapshot digests, the coordinator and the reason), rewrites `ACTIVE.<machine>.json`
+and `ARCHIVED.<machine>.json` from the shorter log, and then moves the event
+file to `<control>/quarantine/events/<machine>/<sequence>-<sha16>.json`. Nothing
+is deleted, and an interrupted run is finished by running it again. Storage the
+event described is not touched; `doctor` reports any it left unregistered.
+
+To restore the event (only while no event has been appended since): move the
+file back to the path in the receipt's `event_path` with wrkslots' locks held.
+The registry is then unreadable again until the event's cause is fixed.
+
 ## Test scenarios
 
 The source package includes deterministic and stress tests for concurrent creation, owner and
