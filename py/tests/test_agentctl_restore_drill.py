@@ -62,6 +62,11 @@ import pytest
 from tests.rust_binary import rust_agentctl
 
 
+# End-to-end cases against a real server: inside a CPU-contained gate a
+# single case legitimately runs far past the 600 s shard default (#1403).
+pytestmark = pytest.mark.timeout(1800)
+
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WRKSLOTS_BIN = REPO_ROOT / "common/bin/wrkslots"
 PREVIOUS_BOOT = "00000000-1111-2222-3333-444444444444"
