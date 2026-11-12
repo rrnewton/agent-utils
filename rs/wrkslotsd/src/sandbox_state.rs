@@ -1564,6 +1564,297 @@ pub(crate) fn planned_private_sources(view: &SlotView, settings: &SandboxSetting
         .collect()
 }
 
+const PLACEHOLDERS_NAME: &str = "home-placeholders.json";
+
+/// Build the slot's private `$HOME` layer, mirroring Python
+/// `prepare_state`: placeholders for bound entries, recreated
+/// links, seeded private files, private directories, and
+/// stale-placeholder removal. Returns the warnings Python
+/// prints to stderr. Runs before any namespace exists, only
+/// under the view's state directory.
+pub(crate) fn prepare_state(
+    view: &SlotView,
+    settings: &SandboxSettings,
+    home: &Path,
+    pid: u32,
+) -> Result<Vec<String>, String> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    let mut warnings = Vec::new();
+    let layer = home_layer(view);
+    if !layer.exists() {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&layer)
+            .map_err(|error| error.to_string())?;
+    }
+    let record = view.state_directory.join(PLACEHOLDERS_NAME);
+    let previous: std::collections::BTreeSet<String> = std::fs::read_to_string(&record)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| {
+            value.as_array().map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    let mut created: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    fn lexists(path: &Path) -> bool {
+        path.symlink_metadata().is_ok()
+    }
+    let placeholder = |relative: &str,
+                       kind: &str,
+                       layer: &Path,
+                       previous: &std::collections::BTreeSet<String>,
+                       created: &mut std::collections::BTreeSet<String>,
+                       warnings: &mut Vec<String>|
+     -> Result<(), String> {
+        let target = layer.join(relative);
+        if lexists(&target) {
+            let is_link = target
+                .symlink_metadata()
+                .is_ok_and(|meta| meta.file_type().is_symlink());
+            if (kind == "dir") != (target.is_dir() && !is_link) {
+                warnings.push(format!(
+                    "wrkslots run: {} is in the way of a {kind} mount point",
+                    target.display()
+                ));
+            } else if previous.contains(relative) {
+                created.insert(relative.to_string());
+            }
+            return Ok(());
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        if kind == "dir" {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&target)
+                .map_err(|error| error.to_string())?;
+        } else {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&target)
+                .map_err(|error| error.to_string())?;
+        }
+        created.insert(relative.to_string());
+        Ok(())
+    };
+    for (relative, kind) in home_entries(settings, home)? {
+        if kind == "link" {
+            let target = layer.join(&relative);
+            if !lexists(&target) {
+                let destination =
+                    std::fs::read_link(home.join(&relative)).map_err(|error| error.to_string())?;
+                std::os::unix::fs::symlink(&destination, &target)
+                    .map_err(|error| error.to_string())?;
+                created.insert(relative);
+            } else if previous.contains(&relative) {
+                created.insert(relative);
+            }
+        } else {
+            placeholder(
+                &relative,
+                &kind,
+                &layer,
+                &previous,
+                &mut created,
+                &mut warnings,
+            )?;
+        }
+    }
+    for name in &settings.home_private_files {
+        let target = layer.join(name);
+        let real = home.join(name);
+        if !lexists(&target) && real.is_file() {
+            std::fs::copy(&real, &target).map_err(|error| error.to_string())?;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    for relative in &settings.home_private {
+        let directory = home_layer(view).join(relative);
+        if !directory.exists() {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .recursive(true)
+                .create(&directory)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    if settings.home == "hidden" {
+        for relative in &settings.home_shared {
+            let real = home.join(relative);
+            if real.exists() {
+                let kind = if real.is_dir() { "dir" } else { "file" };
+                placeholder(
+                    relative,
+                    kind,
+                    &layer,
+                    &previous,
+                    &mut created,
+                    &mut warnings,
+                )?;
+            }
+        }
+    }
+    let mut stale: Vec<String> = previous.difference(&created).cloned().collect();
+    stale.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    for relative in stale {
+        let path = layer.join(&relative);
+        let result = if path
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        {
+            std::fs::remove_file(&path)
+        } else if path.is_dir() {
+            std::fs::remove_dir(&path)
+        } else if path.is_file() && path.metadata().map(|meta| meta.len()).unwrap_or(1) == 0 {
+            std::fs::remove_file(&path)
+        } else {
+            Ok(())
+        };
+        if result.is_err() {
+            created.insert(relative.clone());
+        }
+    }
+    let record_text = py_json_compact_sorted(&Value::Array(
+        created
+            .iter()
+            .map(|item| Value::String(item.clone()))
+            .collect(),
+    ));
+    let temporary = view
+        .state_directory
+        .join(format!("{PLACEHOLDERS_NAME}.tmp.{pid}"));
+    std::fs::write(&temporary, record_text).map_err(|error| error.to_string())?;
+    std::fs::rename(&temporary, &record).map_err(|error| error.to_string())?;
+    let legacy_tmp = view.state_directory.join("tmp");
+    if legacy_tmp.is_dir()
+        && !legacy_tmp
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        let _ = std::fs::remove_dir_all(&legacy_tmp);
+    }
+    Ok(warnings)
+}
+
+const ENV_DENYLIST: [&str; 8] = [
+    "INVOCATION_ID",
+    "JOURNAL_STREAM",
+    "NOTIFY_SOCKET",
+    "LISTEN_FDS",
+    "LISTEN_PID",
+    "LISTEN_FDNAMES",
+    "MANAGERPID",
+    "SYSTEMD_EXEC_PID",
+];
+
+fn env_set(env: &mut Vec<(String, String)>, key: &str, value: String) {
+    if let Some(pair) = env.iter_mut().find(|(name, _)| name == key) {
+        pair.1 = value;
+    } else {
+        env.push((key.to_string(), value));
+    }
+}
+
+/// The caller's environment minus service-manager (and, with
+/// a private /tmp, temp) variables, mirroring Python
+/// `forwarded_environment`.
+pub(crate) fn forwarded_environment(
+    environ: &[(String, String)],
+    private_tmp: bool,
+) -> Vec<(String, String)> {
+    environ
+        .iter()
+        .filter(|(key, value)| {
+            !ENV_DENYLIST.contains(&key.as_str())
+                && !(private_tmp && ["TMPDIR", "TMP", "TEMP"].contains(&key.as_str()))
+                && !key.contains('=')
+                && !value.contains('\n')
+                && !value.contains('\0')
+        })
+        .cloned()
+        .collect()
+}
+
+/// The complete environment a boxed command starts with,
+/// mirroring Python `child_environment` (ordered pairs,
+/// Python dict-assignment order). `home` is the caller's
+/// `$HOME` (or its default when unset), as the glue resolves.
+pub(crate) fn child_environment(
+    view: &SlotView,
+    settings: &SandboxSettings,
+    environ: &[(String, String)],
+    home: &str,
+) -> Vec<(String, String)> {
+    let private_tmp = settings.isolation != "cgroup";
+    let mut environment = forwarded_environment(environ, private_tmp);
+    if private_tmp {
+        env_set(&mut environment, "TMPDIR", "/tmp".to_string());
+    }
+    env_set(
+        &mut environment,
+        "WRKSLOTS_SANDBOX",
+        settings.isolation.clone(),
+    );
+    for key in [
+        "WRKSLOTS_BOX",
+        "WRKSLOTS_BOX_WRITABLE",
+        "WRKSLOTS_PROJECT_ROOT",
+        "WRKSLOTS_SLOT",
+        "WRKSLOTS_SLOT_TYPE",
+        "WRKSLOTS_SLOT_PATH",
+        "WRKSLOTS_SLOT_REPRESENTATION",
+    ] {
+        environment.retain(|(name, _)| name != key);
+    }
+    if view.coordinator {
+        env_set(&mut environment, "WRKSLOTS_BOX", view.slot.clone());
+        env_set(
+            &mut environment,
+            "WRKSLOTS_BOX_WRITABLE",
+            view.representation.clone(),
+        );
+        env_set(
+            &mut environment,
+            "WRKSLOTS_PROJECT_ROOT",
+            view.project_root
+                .as_ref()
+                .map(|root| root.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        );
+    } else {
+        env_set(&mut environment, "WRKSLOTS_SLOT", view.slot.clone());
+        env_set(
+            &mut environment,
+            "WRKSLOTS_SLOT_TYPE",
+            view.slot_type.clone(),
+        );
+        env_set(
+            &mut environment,
+            "WRKSLOTS_SLOT_PATH",
+            view.slot_path.to_string_lossy().into_owned(),
+        );
+        env_set(
+            &mut environment,
+            "WRKSLOTS_SLOT_REPRESENTATION",
+            view.representation.clone(),
+        );
+    }
+    for (key, value) in &settings.env {
+        env_set(&mut environment, key, expand_home(value, home));
+    }
+    environment
+}
+
 #[cfg(test)]
 mod tests {
     const DRIVER: &str = r####"import argparse, io, json, os, sys
@@ -1809,6 +2100,259 @@ sys.stdout.write(json.dumps(cli._read_config(path), sort_keys=True) + "\n")
                 py_json_compact_sorted(&ours),
                 final_config.trim_end(),
                 "case {case} config"
+            );
+        }
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    const PREPARE_DRIVER: &str = r####"import io, os, sys
+from contextlib import redirect_stderr
+from pathlib import Path
+sys.path.insert(0, os.environ["WRKSLOTS_PY_ROOT"])
+from wrkslots import sandbox
+
+base = Path(sys.argv[1])
+home = base / "home"
+view = sandbox.SlotView(slot="slot-a", slot_type="agent", slot_path=base / "slot-a", state_directory=base / "state" / "slot-a", git_directories=(), control_directory=base / "control", representation="worktrees", project_root=base / "project", coordinator=False, writable=(), propagate=())
+settings = sandbox.settings_from_obj({})
+err = io.StringIO()
+def dump(label):
+    state = view.state_directory
+    rows = []
+    for path in sorted(state.rglob("*")):
+        rel = str(path.relative_to(state))
+        if path.is_symlink():
+            rows.append(f"{rel}|link|{os.readlink(path)}")
+        elif path.is_dir():
+            rows.append(f"{rel}|dir")
+        else:
+            rows.append(f"{rel}|file|{path.read_text()}")
+    sys.stdout.write(f"== {label}\n" + "\n".join(rows) + "\n")
+with redirect_stderr(err):
+    sandbox.prepare_state(view, settings, home)
+    dump("first")
+    sandbox.prepare_state(view, settings, home)
+    dump("second")
+    (home / "docs").rmdir()
+    (home / "newfile.txt").write_text("n")
+    sandbox.prepare_state(view, settings, home)
+    dump("third")
+sys.stdout.write("---STDERR---\n" + err.getvalue())
+"####;
+
+    fn prepare_fixture(tag: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("wrkslotsd-prepare-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        for dir in [
+            home.join(".claude"),
+            home.join(".cache"),
+            home.join("docs"),
+            home.join("bin"),
+            root.join("slot-a"),
+            root.join("state/slot-a"),
+            root.join("control"),
+            root.join("project"),
+        ] {
+            std::fs::create_dir_all(&dir).expect("fixture dir");
+        }
+        std::fs::write(home.join("plain.txt"), "x").expect("file");
+        std::fs::write(home.join(".claude.json"), "{}").expect("private file");
+        std::os::unix::fs::symlink(home.join("plain.txt"), home.join("alink")).expect("link");
+        root
+    }
+
+    fn dump_state(state: &Path) -> Vec<String> {
+        let mut paths = Vec::new();
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+                .expect("read state")
+                .map(|entry| entry.expect("entry").path())
+                .collect();
+            entries.sort();
+            for entry in entries {
+                out.push(entry.clone());
+                if entry.is_dir()
+                    && !entry
+                        .symlink_metadata()
+                        .is_ok_and(|meta| meta.file_type().is_symlink())
+                {
+                    walk(&entry, out);
+                }
+            }
+        }
+        walk(state, &mut paths);
+        paths
+            .iter()
+            .map(|path| {
+                let rel = path
+                    .strip_prefix(state)
+                    .expect("relative")
+                    .to_string_lossy()
+                    .into_owned();
+                if path
+                    .symlink_metadata()
+                    .is_ok_and(|meta| meta.file_type().is_symlink())
+                {
+                    format!(
+                        "{rel}|link|{}",
+                        std::fs::read_link(path)
+                            .expect("link target")
+                            .to_string_lossy()
+                    )
+                } else if path.is_dir() {
+                    format!("{rel}|dir")
+                } else {
+                    format!(
+                        "{rel}|file|{}",
+                        std::fs::read_to_string(path).expect("file text")
+                    )
+                }
+            })
+            .collect()
+    }
+
+    /// Oracle differential (#1363): Python `prepare_state`
+    /// vs the Rust port on identical fixture trees through
+    /// build, rebuild, and stale-placeholder removal.
+    #[test]
+    fn prepare_state_matches_python_oracle() {
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("repo root")
+            .to_path_buf();
+        let py_root = prepare_fixture("python");
+        let rs_root = prepare_fixture("rust");
+        // Normalise the differing roots out of the dumps.
+        let driver_path = py_root.join("prepare_driver.py");
+        std::fs::write(&driver_path, PREPARE_DRIVER).expect("driver");
+        let output = std::process::Command::new("python3")
+            .arg(&driver_path)
+            .arg(&py_root)
+            .env("WRKSLOTS_PY_ROOT", repo.join("py"))
+            .output()
+            .expect("python oracle runs");
+        assert!(output.status.success(), "{:?}", output.stderr);
+        let text = String::from_utf8(output.stdout).expect("utf8");
+        let expected = text.replace(&py_root.to_string_lossy().into_owned(), "ROOT");
+        let view = spec_view(&rs_root, false);
+        let settings = SandboxSettings::default();
+        let home = rs_root.join("home");
+        let mut out = String::new();
+        let mut warnings = Vec::new();
+        for (label, mutate) in [("first", false), ("second", false), ("third", true)] {
+            if mutate {
+                std::fs::remove_dir(home.join("docs")).expect("remove docs");
+                std::fs::write(home.join("newfile.txt"), "n").expect("new file");
+            }
+            warnings.extend(prepare_state(&view, &settings, &home, 4242).expect("prepare"));
+            out.push_str(&format!("== {label}\n"));
+            out.push_str(&dump_state(&rs_root.join("state/slot-a")).join("\n"));
+            out.push('\n');
+        }
+        out.push_str("---STDERR---\n");
+        for warning in &warnings {
+            out.push_str(&format!("{warning}\n"));
+        }
+        let ours = out.replace(&rs_root.to_string_lossy().into_owned(), "ROOT");
+        assert_eq!(ours, expected);
+        std::fs::remove_dir_all(&py_root).expect("cleanup");
+        std::fs::remove_dir_all(&rs_root).expect("cleanup");
+    }
+
+    const CHILD_ENV_DRIVER: &str = r####"import json, os, sys
+from pathlib import Path
+sys.path.insert(0, os.environ["WRKSLOTS_PY_ROOT"])
+from wrkslots import sandbox
+
+case, base = sys.argv[1], Path(sys.argv[2])
+coordinator = case == "coordinator"
+view = sandbox.SlotView(slot="box-a" if coordinator else "slot-a", slot_type="box" if coordinator else "agent", slot_path=base / "slot-a", state_directory=base / "state" / "slot-a", git_directories=(), control_directory=base / "control", representation="worktrees", project_root=base / "project", coordinator=coordinator, writable=(), propagate=())
+isolation = "cgroup" if case == "slot-cgroup" else "userns"
+settings = sandbox.settings_from_obj({"isolation": isolation, "env": {"EXTRA": "~/x"}})
+environ = {"HOME": str(base / "home"), "PATH": "/usr/bin", "INVOCATION_ID": "x", "TMPDIR": "/host-tmp", "WRKSLOTS_BOX": "old", "WRKSLOTS_SLOT": "old", "KEEP": "yes"}
+result = sandbox.child_environment(view, settings, environ)
+sys.stdout.write(json.dumps(list(result.items())) + "\n")
+"####;
+
+    /// Oracle differential (#1363): Python
+    /// `child_environment` vs the Rust port, ordered pairs.
+    #[test]
+    fn child_environment_matches_python_oracle() {
+        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("repo root")
+            .to_path_buf();
+        let root = std::env::temp_dir().join(format!("wrkslotsd-child-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("dir");
+        let driver_path = root.join("child_env_driver.py");
+        std::fs::write(&driver_path, CHILD_ENV_DRIVER).expect("driver");
+        for (case, isolation, coordinator) in [
+            ("slot-userns", "userns", false),
+            ("slot-cgroup", "cgroup", false),
+            ("coordinator", "userns", true),
+        ] {
+            let output = std::process::Command::new("python3")
+                .arg(&driver_path)
+                .arg(case)
+                .arg(&root)
+                .env("WRKSLOTS_PY_ROOT", repo.join("py"))
+                .output()
+                .expect("python oracle runs");
+            assert!(output.status.success(), "case {case}: {:?}", output.stderr);
+            let view = SlotView {
+                slot: if coordinator { "box-a" } else { "slot-a" }.to_string(),
+                slot_type: if coordinator { "box" } else { "agent" }.to_string(),
+                slot_path: root.join("slot-a"),
+                state_directory: root.join("state/slot-a"),
+                git_directories: Vec::new(),
+                control_directory: root.join("control"),
+                representation: "worktrees".to_string(),
+                project_root: Some(root.join("project")),
+                coordinator,
+                writable: Vec::new(),
+                propagate: Vec::new(),
+            };
+            let settings = settings_from_obj(&json!({
+                "isolation": isolation,
+                "env": {"EXTRA": "~/x"}
+            }))
+            .expect("settings");
+            let environ: Vec<(String, String)> = [
+                ("HOME", root.join("home").to_string_lossy().into_owned()),
+                ("PATH", "/usr/bin".to_string()),
+                ("INVOCATION_ID", "x".to_string()),
+                ("TMPDIR", "/host-tmp".to_string()),
+                ("WRKSLOTS_BOX", "old".to_string()),
+                ("WRKSLOTS_SLOT", "old".to_string()),
+                ("KEEP", "yes".to_string()),
+            ]
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.clone()))
+            .collect();
+            let ours = child_environment(
+                &view,
+                &settings,
+                &environ,
+                &root.join("home").to_string_lossy(),
+            );
+            let ours_text = format!(
+                "[{}]",
+                ours.iter()
+                    .map(|(key, value)| {
+                        format!("[{}, {}]", py_json_string(key), py_json_string(value))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            assert_eq!(
+                ours_text,
+                String::from_utf8(output.stdout).expect("utf8").trim_end(),
+                "case {case}"
             );
         }
         std::fs::remove_dir_all(&root).expect("cleanup");
