@@ -10634,8 +10634,14 @@ impl<'a, A: ManagedApi + ?Sized> ManagedAgents<'a, A> {
         self.create_presentation(record, options, project_workspace)?;
         let pane_id = record.pane_id.clone().expect("new tab has pane");
         if let Some(line) = slot_command {
-            self.client
-                .enter_slot_sandbox(&pane_id, line, options.startup_timeout)?;
+            // Entering the slot box waits on host-wide slot work under
+            // load; give it a generous backstop instead of the harness
+            // startup budget (#1403). The wait itself is condition-based.
+            self.client.enter_slot_sandbox(
+                &pane_id,
+                line,
+                options.startup_timeout.max(Duration::from_secs(300)),
+            )?;
         }
         if let Some(launch_env) = launch_env.as_ref() {
             // After the pane's (and any slot box's) interactive shell has run its startup
