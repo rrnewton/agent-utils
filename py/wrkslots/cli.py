@@ -25065,6 +25065,142 @@ def _cmd_ttl_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _command_ttl_hook(command: str, timeout_seconds: float = 120.0) -> TtlRescueHook:
+    """A rescue hook run as an external command (slice 5).
+
+    The request JSON goes to the command's stdin; its stdout must be the
+    decision JSON (``ref_names``, ``wip_message``, ``priority``). Any
+    failure — spawn, timeout, bad JSON — yields no decision, so the
+    deterministic rescue proceeds exactly as without a hook.
+    """
+
+    def hook(request: _TtlRescueHookRequest) -> _TtlRescueHookDecision | None:
+        try:
+            completed = subprocess.run(
+                shlex.split(command),
+                input=json.dumps(request),
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+            )
+            parsed = json.loads(completed.stdout)
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        return cast(_TtlRescueHookDecision, parsed)
+
+    return hook
+
+
+def _cmd_ttl_teardown(args: argparse.Namespace) -> int:
+    """Deterministic teardown of one slot at the teardown rung (#1293).
+
+    Follows the #1287 lock pattern: stage judgment and the whole rescue
+    (slow Git and bundle work) run with no registry lock held; the
+    mutation locks are taken only to re-check the slot's registry
+    identity and commit the archive/active-state records; the tree
+    deletion itself runs after the locks are released. Past the
+    teardown rung no refusal remains except that identity re-check: a
+    slot changed while rescue ran is deferred by name, never torn down
+    on stale evidence.
+    """
+    config = _load_config(args.project_root, args.machine)
+    _validate_name(args.slot, "slot")
+    thresholds = _ttl_thresholds(
+        args.warn_after_seconds,
+        args.alarm_after_seconds,
+        args.stop_after_seconds,
+        args.teardown_after_seconds,
+    )
+    now = (
+        _parse_timestamp(args.now, "--now")
+        if args.now is not None
+        else dt.datetime.now(dt.timezone.utc)
+    )
+    before = _find_record(
+        _load_active_snapshot(config, require_repository=False), args.slot
+    )
+    if args.expected_generation is not None and before.generation != args.expected_generation:
+        raise Refusal(
+            f"slot {args.slot} generation {before.generation} does not match "
+            f"--expected-generation {args.expected_generation}"
+        )
+    stage, _expired_at, _teardown_at = _ttl_slot_stage(before, now, thresholds)
+    if stage != "teardown":
+        raise Refusal(
+            f"slot {args.slot} is at TTL stage {stage}, not teardown; "
+            "deterministic teardown runs only past the teardown rung"
+        )
+    hook = (
+        _command_ttl_hook(args.rescue_hook_command)
+        if args.rescue_hook_command
+        else None
+    )
+    rescue = _execute_ttl_slot_rescue(
+        config, before, now=now, thresholds=thresholds, hook=hook
+    )
+    finished_at = _utc_now()
+    entry: dict[str, object] = {
+        "archive_id": f"{before.machine}:{before.slot}:{before.generation}:{finished_at}",
+        "slot": before.slot,
+        "agent": before.agent,
+        "task": before.task,
+        "purpose": before.purpose,
+        "machine": before.machine,
+        "generation": before.generation,
+        "created_at": before.created_at,
+        "finished_at": finished_at,
+        "mode": "remove",
+        "actor": "coordinator",
+        "physical_storage": "removed",
+        "validation": ["ttl-teardown: deterministic teardown past the TTL teardown rung"],
+        "limitations": [],
+        "continuation": "rescued to dated rescue refs or a verified bundle; see the ttl rescue receipt",
+        "checkouts": [_checkout_to_obj(checkout) for checkout in before.checkouts],
+        "slot_type": before.slot_type,
+        "salvage": [
+            {"checkout": checkout.name, "rescue": dict(checkout_receipt)}
+            for checkout, checkout_receipt in zip(before.checkouts, rescue["checkouts"])
+        ],
+    }
+    with _mutation_locks(config, args.wait_lock):
+        _refuse_partial_state(config)
+        _assert_no_journal(config)
+        current_state = _load_active(config, require_repository=False)
+        current = _find_record(current_state, args.slot)
+        if current != before:
+            raise Refusal(
+                f"slot {args.slot} changed in the registry while its rescue ran; "
+                "state: REFUSED -- rescued work is preserved, nothing was removed. "
+                "remedy: retry ttl-teardown"
+            )
+        _append_archive_once(config, _load_archive(config, require_repository=False), entry)
+        remaining = tuple(item for item in current_state.slots if item.slot != args.slot)
+        _write_active_state(
+            config,
+            ActiveState(
+                machine=current_state.machine,
+                revision=current_state.revision + 1,
+                slots=remaining,
+            ),
+            action="ttl-teardown",
+            slot=args.slot,
+            evidence={"rescue_stage": stage, "finished_at": finished_at},
+            require_repository=False,
+            previous=current_state,
+        )
+    slot_path = _slot_directory(config, before.slot, before.slot_type)
+    if slot_path.exists():
+        shutil.rmtree(slot_path)
+    print(
+        f"ttl-teardown slot={before.slot} generation={before.generation} "
+        f"stage={stage} removed={slot_path} rescue_checkouts={len(rescue['checkouts'])}"
+    )
+    return 0
+
+
 def _historical_slot_candidates(config: Config, slot: str, slot_type: str) -> list[Path]:
     """Every slot directory a historical record may legitimately name.
 
@@ -80065,6 +80201,60 @@ usage or audit gate unknown, 3 fail-closed refusal.
         ),
     )
     ttl_report.set_defaults(handler=_cmd_ttl_report)
+    ttl_teardown = subparsers.add_parser(
+        "ttl-teardown",
+        description=(
+            "deterministic teardown of one slot past its TTL teardown rung (#1293): "
+            "rescue every checkout to dated rescue refs (verified bundle fallback), "
+            "archive the registry row, then remove the slot tree"
+        ),
+        help="deterministically tear down one slot past its TTL teardown rung",
+    )
+    ttl_teardown.add_argument("slot", metavar="SLOT", help="the slot to tear down")
+    ttl_teardown.add_argument(
+        "--expected-generation", type=int, default=None, metavar="N",
+        help="require this exact slot generation (default: any generation)",
+    )
+    ttl_teardown.add_argument(
+        "--now", metavar="ISO8601", default=None,
+        help=(
+            "timestamp to judge the ladder against, with a time zone "
+            "(default: the current UTC time); tests pass a fixed value"
+        ),
+    )
+    ttl_teardown.add_argument(
+        "--rescue-hook-command", metavar="COMMAND", default=None,
+        help=(
+            "external hook command receiving the rescue request JSON on stdin and "
+            "answering the decision JSON on stdout; it may rename rescue refs and "
+            "word the WIP commit, never veto (default: no hook; any hook failure "
+            "falls back to the deterministic rescue)"
+        ),
+    )
+    ttl_teardown.add_argument(
+        "--warn-after-seconds", type=int, default=_TTL_WARN_AFTER_SECONDS,
+        metavar="SECONDS",
+        help=f"seconds past TTL expiry when the warn rung starts (default: {_TTL_WARN_AFTER_SECONDS})",
+    )
+    ttl_teardown.add_argument(
+        "--alarm-after-seconds", type=int, default=_TTL_ALARM_AFTER_SECONDS,
+        metavar="SECONDS",
+        help=f"seconds past TTL expiry when the alarm rung starts (default: {_TTL_ALARM_AFTER_SECONDS})",
+    )
+    ttl_teardown.add_argument(
+        "--stop-after-seconds", type=int, default=_TTL_STOP_AFTER_SECONDS,
+        metavar="SECONDS",
+        help=f"seconds past TTL expiry when the stop rung starts (default: {_TTL_STOP_AFTER_SECONDS})",
+    )
+    ttl_teardown.add_argument(
+        "--teardown-after-seconds", type=int, default=_TTL_TEARDOWN_AFTER_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "seconds past TTL expiry when deterministic teardown runs "
+            f"(default: {_TTL_TEARDOWN_AFTER_SECONDS})"
+        ),
+    )
+    ttl_teardown.set_defaults(handler=_cmd_ttl_teardown)
 
     unpushed = subparsers.add_parser(
         "unpushed",

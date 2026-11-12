@@ -6,6 +6,7 @@ verified bundle, both end with the checkout gone and the receipt kept.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -135,6 +136,107 @@ def test_slot_teardown_refuses_before_the_teardown_rung(tmp_path: Path) -> None:
             config, record, now=now,
             thresholds=cli._ttl_thresholds(0, 86_400, 172_800, 259_200),
         )
+
+
+def test_command_hook_answers_json_and_failures_fall_back(tmp_path: Path) -> None:
+    import json as json_module
+    import sys
+
+    good = cli._command_ttl_hook(
+        f"{sys.executable} -c \"import json,sys; json.dump("
+        "{'ref_names': {'feat/x': 'kept'}}, sys.stdout)\""
+    )
+    decision = cli._call_ttl_rescue_hook(
+        good,
+        {"slot": "s", "date": "20261114", "branches": ["feat/x"], "worktrees": []},
+    )
+    assert decision == {"ref_names": {"feat/x": "kept"}}
+    bad = cli._command_ttl_hook(f"{sys.executable} -c \"raise SystemExit(3)\"")
+    assert (
+        cli._call_ttl_rescue_hook(
+            bad, {"slot": "s", "date": "20261114", "branches": [], "worktrees": []}
+        )
+        == {}
+    )
+    assert json_module.dumps(decision)
+
+
+def test_cmd_ttl_teardown_rescues_lock_free_then_commits_under_locks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import argparse
+    import contextlib
+    import datetime as dt
+
+    config = _config(tmp_path)
+    record = _slot_record(config, config.worktrees / "slot-f" / "repo", tmp_path / "r.git")
+    state = cli.ActiveState(machine="testhost", revision=7, slots=(record,))
+    order: list[str] = []
+
+    monkeypatch.setattr(cli, "_load_config", lambda *_args: config)
+    monkeypatch.setattr(cli, "_load_active_snapshot", lambda *_args, **_kw: state)
+    monkeypatch.setattr(cli, "_load_active", lambda *_args, **_kw: state)
+    monkeypatch.setattr(
+        cli, "_load_archive",
+        lambda *_args, **_kw: cli.ArchiveState(machine="testhost", revision=1, records=()),
+    )
+    monkeypatch.setattr(cli, "_refuse_partial_state", lambda *_args, **_kw: None)
+    monkeypatch.setattr(cli, "_assert_no_journal", lambda *_args, **_kw: None)
+
+    def rescue(*_args: object, **_kwargs: object) -> cli._TtlSlotRescueReceipt:
+        order.append("rescue")
+        return {
+            "slot": "slot-f", "stage": "teardown",
+            "expired_at": "2026-11-10T01:00:00+00:00",
+            "teardown_at": "2026-11-13T01:00:00+00:00", "checkouts": [],
+        }
+
+    monkeypatch.setattr(cli, "_execute_ttl_slot_rescue", rescue)
+
+    @contextlib.contextmanager
+    def locks(*_args: object, **_kwargs: object) -> Iterator[None]:
+        order.append("locks")
+        yield
+
+    monkeypatch.setattr(cli, "_mutation_locks", locks)
+    archived: list[dict[str, object]] = []
+
+    def append_archive(
+        _config: cli.Config, archive: cli.ArchiveState,
+        entry: dict[str, object], **_kw: object,
+    ) -> cli.ArchiveState:
+        archived.append(entry)
+        return archive
+
+    monkeypatch.setattr(cli, "_append_archive_once", append_archive)
+    written: list[cli.ActiveState] = []
+
+    def write_state(
+        _config: cli.Config, new_state: cli.ActiveState, **_kw: object
+    ) -> dict[str, object]:
+        written.append(new_state)
+        return {}
+
+    monkeypatch.setattr(cli, "_write_active_state", write_state)
+    slot_dir = config.worktrees / "slot-f"
+    slot_dir.mkdir(parents=True, exist_ok=True)
+
+    result = cli._cmd_ttl_teardown(
+        argparse.Namespace(
+            project_root=None, machine=None, slot="slot-f", expected_generation=1,
+            now=dt.datetime(2026, 11, 14, tzinfo=dt.timezone.utc).isoformat(),
+            rescue_hook_command=None, warn_after_seconds=0,
+            alarm_after_seconds=86_400, stop_after_seconds=172_800,
+            teardown_after_seconds=259_200, wait_lock=0.0,
+        )
+    )
+
+    assert result == 0, capsys.readouterr().err
+    assert order == ["rescue", "locks"]  # slow work first, locks only for the commit
+    assert archived and archived[0]["mode"] == "remove"
+    assert written and written[0].slots == ()
+    assert not slot_dir.exists()
 
 
 def test_teardown_refuses_a_path_that_is_no_checkout(tmp_path: Path) -> None:
