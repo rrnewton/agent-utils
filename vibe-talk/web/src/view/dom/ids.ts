@@ -123,12 +123,12 @@ export interface ElementById {
   "discuss-close": HTMLButtonElement;
   "discuss-count": HTMLInputElement;
   "discuss-covers": HTMLParagraphElement;
+  "discuss-dock-toggle": HTMLButtonElement;
   "discuss-footer": HTMLDivElement;
+  "discuss-full-toggle": HTMLButtonElement;
   "discuss-links": HTMLUListElement;
   "discuss-mark-read": HTMLButtonElement;
   "discuss-mark-unread": HTMLButtonElement;
-  "discuss-dock-toggle": HTMLButtonElement;
-  "discuss-full-toggle": HTMLButtonElement;
   "discuss-menu-open": HTMLButtonElement;
   "discuss-open": HTMLButtonElement;
   "discuss-panel": HTMLDivElement;
