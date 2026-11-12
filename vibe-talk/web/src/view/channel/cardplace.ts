@@ -69,6 +69,9 @@ export interface CardPlacesDependencies {
   atBottom(area: HTMLElement): boolean;
   /** Keep `area` at its foot (`followFoot`). */
   followFoot(area: HTMLElement): void;
+  /** Move `area` by a measured delta, or put it at a measured position, through the scroll owner (`#1251 scroll-single-owner`). */
+  nudge(area: HTMLElement, delta: number): void;
+  toPosition(area: HTMLElement, top: number): void;
   /** The highlighted card's thread (`litCard`), or null. */
   litCard(): string | null;
   /** The selected card's id in the right column (`markOf(sidePane)`), or null. */
@@ -221,11 +224,11 @@ export function createCardPlaces(deps: CardPlacesDependencies): CardPlaces {
     }
     const stayed = follow ? null : stayedCardRow(anchor);
     if (stayed) {
-      area.scrollTop += stayed.row.getBoundingClientRect().top - area.getBoundingClientRect().top - stayed.offset;
+      deps.nudge(area, stayed.row.getBoundingClientRect().top - area.getBoundingClientRect().top - stayed.offset);
       return true;
     }
     if (anchor.id === null) {
-      area.scrollTop = anchor.offset;
+      deps.toPosition(area, anchor.offset);
       return true;
     }
     const rows = ([...deps.lookup("side-cards").children] as HTMLElement[])
@@ -237,7 +240,7 @@ export function createCardPlaces(deps: CardPlacesDependencies): CardPlaces {
       row = [rows[at + step], rows[at - step]].find((one) => one && rowShown(one)) || null;
     }
     if (!row) return false;
-    area.scrollTop += row.getBoundingClientRect().top - area.getBoundingClientRect().top - anchor.offset;
+    deps.nudge(area, row.getBoundingClientRect().top - area.getBoundingClientRect().top - anchor.offset);
     return true;
   }
 

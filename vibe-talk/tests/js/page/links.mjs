@@ -1670,7 +1670,7 @@ test("a list the filters empty is shown from its head, where it says why, and fi
   // THE CONTROLS: each half of `placeForFilter`, and the jump, taken out, and the step above that
   // needs it fails.
   const unplaced = await run(await brokenModule([{ file: "src/view/channel/filterplace.ts",
-    find: "    if (deps.listEmptied()) {\n      area.scrollTop = 0;", replace: "    if (deps.listEmptied()) {\n      void 0;" }]));
+    find: "    if (deps.listEmptied()) {\n      deps.toPosition(area, 0);", replace: "    if (deps.listEmptied()) {\n      void 0;" }]));
   await tapKind(unplaced, "pr");
   assert.ok(unplaced.el("scroll-area").scrollTop > 0, "the test cannot see a reader left below the sentence");
   const jumping = await run(await brokenModule([{ file: "src/view/channel/folding.ts",

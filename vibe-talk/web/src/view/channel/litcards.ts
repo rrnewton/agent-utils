@@ -23,6 +23,8 @@ export interface LitCardsDependencies {
   sidePane(): LitCardPane;
   channelPane(): LitCardPane;
   fitOverscroll(scroller: HTMLElement): void;
+  /** Move the scroller by a measured delta, through the scroll owner (`#1251 scroll-single-owner`). */
+  nudge(scroller: HTMLElement, delta: number): void;
   bringIntoView(pane: LitCardPane, row: HTMLElement): void;
   noteOverscrollReader(scroller: HTMLElement): void;
   sayRowShortcut(button: HTMLElement, className: string): void;
@@ -128,7 +130,7 @@ export function createLitCards(deps: LitCardsDependencies): LitCards {
     // now is before the card is put back: the last card put out would otherwise be held by the end of the list
     // the browser clamped to, and dropped by what it lost.
     deps.fitOverscroll(pane.scroller());
-    pane.scroller().scrollTop += row.getBoundingClientRect().top - before;
+    deps.nudge(pane.scroller(), row.getBoundingClientRect().top - before);
     deps.bringIntoView(pane, row);
     deps.noteOverscrollReader(pane.scroller());
   }

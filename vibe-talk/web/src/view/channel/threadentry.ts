@@ -51,6 +51,9 @@ export interface ThreadEntryDependencies {
   isOpenThreadRoot(row: HTMLElement, id: string | null): boolean;
   rowIsRead(row: HTMLElement): boolean;
   toFoot(area: HTMLElement): void;
+  /** Move the list by a measured delta, or put it at a measured position, through the scroll owner (`#1251 scroll-single-owner`). */
+  nudge(area: HTMLElement, delta: number): void;
+  toPosition(area: HTMLElement, top: number): void;
   setJumpNewest(wanted: boolean): void;
   screen(): string;
   view(): string;
@@ -188,7 +191,7 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
       placeEntryLanding(head, first);
     } else {
       const row = kept && !kept.hidden ? kept : first;
-      area.scrollTop += row.getBoundingClientRect().top - mark.top;
+      deps.nudge(area, row.getBoundingClientRect().top - mark.top);
       entryState().landing = { key: deps.channelContextKey(), row, first, at: area.scrollTop };
     }
     deps.renderScrollTools();
@@ -261,7 +264,7 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
     // A landing: on the foot, never in the room past it (`#338 column-overscroll`).
     deps.toFoot(area);
     if (deps.drawnTop(first) < deps.floatingClearance(area) + REPLY_LANDING_GAP_PX - 1) {
-      area.scrollTop = was;
+      deps.toPosition(area, was);
       return false;
     }
     entryState().landing = null;
@@ -294,7 +297,7 @@ export function createThreadEntry(deps: ThreadEntryDependencies): ThreadEntry {
   function placeEntryLanding(row: HTMLElement, first: HTMLElement): void {
     const area = deps.el("scroll-area");
     // By where the row starts, its date rule included: `#324 live-pill-covers-row`, see `drawnTop`.
-    area.scrollTop += deps.drawnTop(row) - deps.floatingClearance(area) - REPLY_LANDING_GAP_PX;
+    deps.nudge(area, deps.drawnTop(row) - deps.floatingClearance(area) - REPLY_LANDING_GAP_PX);
     entryState().landing = { key: deps.channelContextKey(), row, first, at: area.scrollTop };
   }
 

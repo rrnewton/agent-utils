@@ -306,6 +306,9 @@ export interface TimelineViewDependencies {
   openThreadName(): string;
   captureScroll(): { pinned: boolean; anchor: Element | null; top: number };
   restoreScroll(mark: { pinned: boolean; anchor: Element | null; top: number }): void;
+  /** Move the list by a measured delta, or put it at a measured position, through the scroll owner (`#1251 scroll-single-owner`). */
+  nudge(area: HTMLElement, delta: number): void;
+  toPosition(area: HTMLElement, top: number): void;
   screensView(): string;
   renderJumpNewest(): void;
 }
@@ -679,7 +682,7 @@ function holdingMessage(mutate: () => void): void {
     return;
   }
   const held = heldRowAfter(position);
-  if (held && screens.view() === "discord") area.scrollTop += held.row.getBoundingClientRect().top - held.top;
+  if (held && screens.view() === "discord") deps.nudge(area, held.row.getBoundingClientRect().top - held.top);
   renderJumpNewest();
 }
 
@@ -1876,8 +1879,8 @@ function settleAfterRead(messages: readonly Message[], how: { area: HTMLElement;
     // `#612 view-stability`: in the Threads list, not after a card a reply moved to the foot (`heldRowAfter`).
     const held = heldRowAfter(how);
     if (held && Number.isFinite(how.anchorTop)) {
-      how.area.scrollTop = how.previousTop;
-      how.area.scrollTop += held.row.getBoundingClientRect().top - held.top;
+      deps.toPosition(how.area, how.previousTop);
+      deps.nudge(how.area, held.row.getBoundingClientRect().top - held.top);
     } else if (how.heldPlaceAt !== undefined) {
       // As near as the read reaches: the top, when everything it brought is newer than the reader's
       // message — the walk back goes on from there — and otherwise the newest line.
@@ -1886,9 +1889,9 @@ function settleAfterRead(messages: readonly Message[], how: { area: HTMLElement;
         setJumpNewest(false, "discord");
         return;
       }
-      how.area.scrollTop = 0;
+      deps.toPosition(how.area, 0);
     } else {
-      how.area.scrollTop = how.previousTop;
+      deps.toPosition(how.area, how.previousTop);
     }
     if (arrived) {
       // How many, counted from the message that was newest before. When it is not in the list any

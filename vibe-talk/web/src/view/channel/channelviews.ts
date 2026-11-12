@@ -141,6 +141,9 @@ export interface ChannelViewsDependencies {
   payThreadEntry(): void;
   rowsMissDone(): boolean;
   scrollToNewest(): void;
+  /** Move the channel's list by a measured delta, or put it at a measured position, through the scroll owner (`#1251 scroll-single-owner`). */
+  nudge(area: HTMLElement, delta: number): void;
+  toPosition(area: HTMLElement, top: number): void;
   renderJumpNewest(): void;
   threadCards(threads: readonly ThreadSummary[]): HTMLElement[];
   loadDiscordTimeline(options: unknown): Promise<void>;
@@ -484,13 +487,13 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
       // A message inside a collapsed run of read messages is on screen as the run's line. `#221 read-modes`.
       const row = deps.shownRowFor(rows.find((candidate) => deps.idsOf(candidate).some((id) => seen.ids.includes(id))));
       if (!row) continue;
-      deps.el("scroll-area").scrollTop += row.getBoundingClientRect().top - seen.top;
+      deps.nudge(deps.el("scroll-area"), row.getBoundingClientRect().top - seen.top);
       deps.renderJumpNewest();
       return true;
     }
     const card = typeof place.card === "number" ? channelCard() : null;
     if (card) {
-      deps.el("scroll-area").scrollTop += card.getBoundingClientRect().top - (place.card as number);
+      deps.nudge(deps.el("scroll-area"), card.getBoundingClientRect().top - (place.card as number));
       deps.renderJumpNewest();
       return true;
     }
@@ -634,7 +637,7 @@ export function createChannelViews(deps: ChannelViewsDependencies): ChannelViews
     deps.renderOlderControl();
     deps.voiceCall().renderControls();
     if (held) {
-      deps.el("scroll-area").scrollTop = held.top;
+      deps.toPosition(deps.el("scroll-area"), held.top);
       deps.restoreScroll(held.position);
       // `#269 approval-card-inline` x `#280 scroll-stability`. A reader who could see the send card at the
       // foot, and no message this view shows — replies near All's foot, which Main lacks — is at its foot,

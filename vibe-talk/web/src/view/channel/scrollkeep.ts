@@ -126,6 +126,10 @@ export interface ScrollKeeping {
   toPosition(area: HTMLElement, top: number): void;
   /** A wheel turn's smooth scroll of `area` by `px`, by the plain write where no `scrollBy` stands (`#1251`). */
   wheelBy(area: HTMLElement, px: number): void;
+  /** Glide `area` to position `top` with `behavior` (the reader's glide preference), by the plain write where no `scrollTo` stands (`#1251`). */
+  glideTo(area: HTMLElement, top: number, behavior: string): void;
+  /** Bring `element` into view at `block`, where the browser offers it: the one `scrollIntoView` write (`#1251`). */
+  intoView(element: Element, block: string): void;
   /** `preservingScroll` for a change that resizes the list's window or the room at its head. */
   holdingReader(mutate: () => void): void;
   /** Where the reader is: which message their eye is on, and how far down the viewport it sits. */
@@ -296,6 +300,15 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     else area.scrollTop += px;
   }
 
+  function glideTo(area: HTMLElement, top: number, behavior: string): void {
+    if (typeof area.scrollTo === "function") area.scrollTo({ top, behavior: behavior as ScrollBehavior });
+    else area.scrollTop = top;
+  }
+
+  function intoView(element: Element, block: string): void {
+    if (typeof element.scrollIntoView === "function") element.scrollIntoView({ block: block as ScrollLogicalPosition });
+  }
+
   function holdingRows(mutate: () => void): void {
     if (holdDepth > 0) {
       mutate();
@@ -416,5 +429,5 @@ export function createScrollKeeping(deps: ScrollKeepingDependencies): ScrollKeep
     deps.setJumpNewest(true, view, turns);
   }
 
-  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, holdingRows, toFoot, nudge, toPosition, wheelBy, holdingReader, captureScroll, restoreScroll, followIfPinned };
+  return { visibleList, shownChannelList, scrollAnchor, preservingScroll, preservingCollapse, holdingRows, toFoot, nudge, toPosition, wheelBy, glideTo, intoView, holdingReader, captureScroll, restoreScroll, followIfPinned };
 }

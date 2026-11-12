@@ -88,6 +88,9 @@ export interface GatheringDependencies {
   threadReplies(thread: string, message: GatherMessage | null): { exact?: boolean; count?: number };
   timelineRows(): { messages: GatherMessage[] };
   renderJumpNewest(): void;
+  /** Move the list by a measured delta, or glide it to a measured position, through the scroll owner (`#1251 scroll-single-owner`). */
+  nudge(area: HTMLElement, delta: number): void;
+  glideTo(area: HTMLElement, top: number, behavior: string): void;
   renderReplyCounts(): void;
   measureReplyArrows(): void;
   cardRow(thread: string): HTMLElement | null;
@@ -554,7 +557,7 @@ export function createReplyGathering(deps: GatheringDependencies): Gathering {
   function keepOnScreen(id: string, top: number): void {
     const row = deps.rowHolding(id);
     if (row && Number.isFinite(top)) {
-      deps.el("scroll-area").scrollTop += row.getBoundingClientRect().top - top;
+      deps.nudge(deps.el("scroll-area"), row.getBoundingClientRect().top - top);
     }
     deps.renderJumpNewest();
   }
@@ -693,8 +696,7 @@ export function createReplyGathering(deps: GatheringDependencies): Gathering {
     if (!area) return;
     deps.finishPackSlide();
     const to = headOfList(area, top);
-    if (typeof area.scrollTo === "function") area.scrollTo({ top: to, behavior: deps.glideBehavior() as ScrollBehavior });
-    else area.scrollTop = to;
+    deps.glideTo(area, to, deps.glideBehavior());
   }
 
   /** Where `area` scrolls to put `node` at its head, as a landing is put there: just under the floating line. */

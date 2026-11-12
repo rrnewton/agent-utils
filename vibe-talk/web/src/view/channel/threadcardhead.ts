@@ -52,6 +52,8 @@ export interface ThreadCardHeadDependencies {
   overscrollRoom(area: HTMLElement): number;
   fitOverscroll(area: HTMLElement): void;
   followFoot(area: HTMLElement): void;
+  /** Put the list at a measured position, through the scroll owner (`#1251 scroll-single-owner`). */
+  toPosition(area: HTMLElement, top: number): void;
   sideShowing(): boolean;
   sideThreadChoice(): ThreadChoice | null;
   replyTally(): ReplyTally;
@@ -214,7 +216,7 @@ export function createThreadCardHead(deps: ThreadCardHeadDependencies): ThreadCa
     // From the scroll position read before, not the one now: a list grown under a reader near its foot has
     // been clamped to its new end by the layout that measured it, and adding to that put them further up.
     for (const { area, top, scrolled, foot } of held) {
-      area.scrollTop = scrolled + area.getBoundingClientRect().top - top;
+      deps.toPosition(area, scrolled + area.getBoundingClientRect().top - top);
       deps.fitOverscroll(area);
       if (foot) deps.followFoot(area);
     }

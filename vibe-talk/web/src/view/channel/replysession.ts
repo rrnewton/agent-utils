@@ -58,6 +58,9 @@ export interface ReplySessionDependencies {
   threadReplies(thread: string, message: ReplyMessageLike): { count: number };
   openThreadRootId(): string | null;
   knownChannel(id?: string | null): { writable?: boolean } | null;
+  /** Move a scroller by a measured delta, or bring a row into view, through the scroll owner (`#1251 scroll-single-owner`). */
+  nudge(scroller: HTMLElement, delta: number): void;
+  intoView(element: Element, block: string): void;
   setStatus(text: string): void;
   setTextIfChanged(node: HTMLElement, text: string): void;
   setHiddenIfChanged(node: HTMLElement, hidden: boolean): void;
@@ -483,7 +486,7 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
     }
     const { row, column } = found;
     deps.inColumn(column, () => {
-      row.scrollIntoView({ block: "center" });
+      deps.intoView(row, "center");
       if (draft.kind === "reply") {
         // To the draft's own message first, where the row draws it among others: Reply answers the first.
         const messages = deps.rowMessages(row);
@@ -1070,13 +1073,13 @@ export function createReplySession(deps: ReplySessionDependencies): ReplySession
     if (!anchorsSupported() || replyState.anchor === null) return;
     const pane = replyPane();
     const over = mount.getBoundingClientRect().bottom - pane.foot();
-    if (over > 0) pane.scroller().scrollTop += over;
+    if (over > 0) deps.nudge(pane.scroller(), over);
   }
 
   /** Scroll `pane` so that the row of `list` holding message `id` has its top at `top` again, where both are known. */
   function holdRowAt(pane: { scroller(): HTMLElement }, list: HTMLElement, id: string, top: number): void {
     const row = deps.rowIn(list, id);
-    if (row && deps.shownNode(row) && Number.isFinite(top)) pane.scroller().scrollTop += row.getBoundingClientRect().top - top;
+    if (row && deps.shownNode(row) && Number.isFinite(top)) deps.nudge(pane.scroller(), row.getBoundingClientRect().top - top);
   }
 
   /**

@@ -54,6 +54,8 @@ export interface ReplyArrowsDependencies {
   setSearchOpen(open: boolean): void;
   openReadRun(row: ReplyArrowRow): void;
   renderScrollTools(): void;
+  /** Move the list by a measured delta, through the scroll owner (`#1251 scroll-single-owner`). */
+  nudge(area: HTMLElement, delta: number): void;
   setStatus(text: string): void;
   channelContextKey(): string;
   heldMessage(id: string): unknown;
@@ -363,7 +365,7 @@ export function createReplyArrows(deps: ReplyArrowsDependencies): ReplyArrows {
     // as anywhere else when it is too tall to be.
     const height = row.getBoundingClientRect().bottom - drawnTop(row);
     const lead = center ? Math.max(clear, (clear + area.getBoundingClientRect().bottom - height) / 2) : clear;
-    area.scrollTop += drawnTop(row) - lead;
+    deps.nudge(area, drawnTop(row) - lead);
     const prior = replyArrows().landed;
     if (prior) {
       clearTimeout(prior.timer);

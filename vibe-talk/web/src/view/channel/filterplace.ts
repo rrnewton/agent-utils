@@ -87,6 +87,9 @@ export interface FilterPlaceDependencies {
   quickReplyHolds(area: HTMLElement): boolean;
   endSearchWalks(): void;
   scrollToNewest(): void;
+  /** Move the list by a measured delta, or put it at a measured position, through the scroll owner (`#1251 scroll-single-owner`). */
+  nudge(area: HTMLElement, delta: number): void;
+  toPosition(area: HTMLElement, top: number): void;
   renderJumpNewest(): void;
   guardQuietly<A extends unknown[]>(fn: (...args: A) => unknown): (...args: A) => unknown;
   setStatus(text: string): void;
@@ -322,7 +325,7 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
     }
     const row = held.row;
     const area = deps.el("scroll-area");
-    area.scrollTop += row.getBoundingClientRect().top - deps.listPlaceTop(area) - held.hold.offset;
+    deps.nudge(area, row.getBoundingClientRect().top - deps.listPlaceTop(area) - held.hold.offset);
     filterState().hold = { ...held.hold, row, ids: idsOf(row).length ? idsOf(row) : held.hold.ids, at: area.scrollTop };
     return true;
   }
@@ -416,7 +419,7 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
     if (deps.screen() !== "main") return;
     const area = deps.el("scroll-area");
     if (deps.listEmptied()) {
-      area.scrollTop = 0;
+      deps.toPosition(area, 0);
       // Kept for what fills the list again — the newest line too: Pinned turned on there before the pins
       // were read shows "Loading…" until they land, and they land at the newest pin, not the oldest.
       filterState().hold = anchor
@@ -451,7 +454,7 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
       return;
     }
     // The message's own top where it is part of a combined row (`messageTop`), the row's otherwise.
-    area.scrollTop += deps.messageTop(placed, row ? id : null) - deps.listPlaceTop(area) - offset;
+    deps.nudge(area, deps.messageTop(placed, row ? id : null) - deps.listPlaceTop(area) - offset);
     carrySelection(anchor, placed, substitute !== null);
     const pane = deps.view() === "discord" ? (deps.columnSide() ? deps.sidePane() : deps.channelPane()) : null;
     const mark = pane ? deps.markOf(pane) : null;
@@ -531,7 +534,7 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
     const area = deps.el("scroll-area");
     const current = () => filterChanges.isWalk(walk) && walk.context === deps.channelContextKey() && !deps.pinsView().only &&
       deps.screen() === "main" && deps.view() === "discord";
-    area.scrollTop = 0;
+    deps.toPosition(area, 0);
     deps.renderOlderControl();
     deps.renderJumpNewest();
     deps.setStatus(FILTER_WALK_STATUS);
@@ -554,7 +557,7 @@ export function createFilterPlace(deps: FilterPlaceDependencies): FilterPlace {
           return;
         }
         // The step keeps the rows the reader was looking at; the walk keeps the line saying it goes on.
-        area.scrollTop = 0;
+        deps.toPosition(area, 0);
       }
     } finally {
       if (filterChanges.isWalk(walk)) {

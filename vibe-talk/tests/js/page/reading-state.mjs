@@ -1519,7 +1519,7 @@ test("...and lands the first unread's day rule under the floating line with it, 
   assert.ok(real.tile > real.rule, "the tile is not under its rule");
   // THE CONTROL: the landing measured from the tile, as it was.
   const control = await land(await brokenModule([{ file: "src/view/channel/threadentry.ts",
-    find: "    area.scrollTop += deps.drawnTop(row) - deps.floatingClearance(area) - REPLY_LANDING_GAP_PX;\n    entryState().landing =",
+    find: "    deps.nudge(area, deps.drawnTop(row) - deps.floatingClearance(area) - REPLY_LANDING_GAP_PX);\n    entryState().landing =",
     replace: "    area.scrollTop += row.getBoundingClientRect().top - deps.floatingClearance(area) - REPLY_LANDING_GAP_PX;\n    entryState().landing =" }]));
   assert.ok(control.rule < control.line,
     "the control left the day rule clear of the floating line too, so the check above proves nothing");

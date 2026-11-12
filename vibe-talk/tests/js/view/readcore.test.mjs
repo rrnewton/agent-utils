@@ -136,6 +136,8 @@ function fakeDeps(overrides = {}) {
     openThreadName: () => "",
     captureScroll: () => ({ pinned: true, anchor: null, top: 0 }),
     restoreScroll: () => {},
+    nudge: (area, delta) => { area.scrollTop += delta; },
+    toPosition: (area, top) => { area.scrollTop = top; },
     heldRowAfter: () => null,
     screensView: () => "discord",
     renderJumpNewest: () => {},
