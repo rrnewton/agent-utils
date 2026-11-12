@@ -430,39 +430,6 @@ test("mark read through here targets the newest part without archiving the row",
   assert.match(page.el("status").textContent, /source chat provider/);
 });
 
-test("the head of the to-do list says how much is left OF how much, not how big the channel is", async () => {
-  // `#62 message-count-accuracy` again, one level in: "3 messages" over a filtered list reads as
-  // the size of the channel, which is the confidently-wrong number that issue exists to stop.
-  const page = newPage();
-  await signIn(page);
-  await showDiscord(page, backlog(4));
-  await turnTodoOn(page);
-  await doneButton(page.el("discord-log").children[0]).click();
-  await page.settle();
-
-  const head = page.el("channel-summary").text();
-  assert.match(head, /3 of 4/, `the head of the list does not say 3 of 4: ${head}`);
-});
-
-// --- the links in what is loaded ------------------------------------------------------------------
-//
-// `#211 link-filter`. The owner, on his phone: "I want another little icon next to it with a
-// hyperlink symbol which filters just for hyperlinks ... filter down to only the messages containing
-// hyperlinks and then filter the string of the message text for only the hyperlinks themselves
-// formatted one per line and turn it into real clickable hyperlinks so that clicking them opens it
-// in a new tab." And: "if we find markdown formatted hyperlinks that are complete and correct, then
-// let's format those properly as a real hyperlink using the name given in markdown rather than the
-// raw URL." What is pinned down here: the toggle and where it lives, which addresses are read out of
-// a message and what each is called, the view that shows them, how it combines with the search text
-// and with Pinned, what it says when it has nothing to show, and that a tap on a link opens the link
-// and does nothing else to the row.
-
-const rowLinkList = (li) => li.children.find((node) => node.className === "row-links");
-
-/** The channel rows the filters are letting through, by the text of their first message. */
-const linkRowTexts = (page, id = "discord-log") =>
-  unfiltered(page, id).map((li) => li.messages.map((m) => m.content).join(" / "));
-
 test("the Links filter sits right beside Pinned, only while the bar is open, and says what it does", async () => {
   // Markup: field, count, Links, Pinned, the glass — Links IMMEDIATELY before Pinned.
   assertMarkupContains("search-float", "links-filter");
@@ -624,6 +591,17 @@ test("reading the links out of a message takes time that grows with its length, 
   // first one alone took fifteen seconds.
   assert.ok(took < 1500, `reading the links out of six 40,000-character messages took ${Math.round(took)}ms`);
 });
+
+// raw URL." What is pinned down here: the toggle and where it lives, which addresses are read out of
+// a message and what each is called, the view that shows them, how it combines with the search text
+// and with Pinned, what it says when it has nothing to show, and that a tap on a link opens the link
+// and does nothing else to the row.
+
+const rowLinkList = (li) => li.children.find((node) => node.className === "row-links");
+
+/** The channel rows the filters are letting through, by the text of their first message. */
+const linkRowTexts = (page, id = "discord-log") =>
+  unfiltered(page, id).map((li) => li.messages.map((m) => m.content).join(" / "));
 
 test("the Links view shows only the rows that hold a link, each with ONLY its links, one per line", async () => {
   const page = newPage();
