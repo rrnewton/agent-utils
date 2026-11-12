@@ -57,6 +57,7 @@ from agentctl.errors import (
 )
 from agentctl.profiles import (
     blocking_question_warning,
+    load_profiles,
     reasoning_arguments,
     validate_structured_harness_argument_conflicts,
     LaunchEnv,
@@ -3351,6 +3352,12 @@ class ManagedAgents:
         if harness == "claude" and resume is None:
             conversation = str(uuid.uuid4())
             arguments = ("--session-id", conversation, *arguments)
+        # Muse ultra is env-gated (#1216): an explicit ultra effort carries
+        # the gate, as the muse-ultra profile does, unless the caller set it.
+        if (harness == "muse" and reasoning_effort == "ultra"
+                and not any(entry.startswith("MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT=")
+                            for entry in environment)):
+            environment = (*environment, "MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT=on")
         environment = environment_entries(environment)
         if brief is not None and not brief:
             raise AgentDeliveryError("brief must not be empty")
@@ -3927,6 +3934,63 @@ class ManagedAgents:
             )
         self._checked(record)
 
+    def _profile_drift(self, record: AgentRecord) -> dict[str, object] | None:
+        """Fields in which a record's launch policy differs from its profile.
+
+        The changed-field computation of the Rust edition's refreshed-profile
+        comparison (#1023), for status only; a record with no profile, or a
+        profile that cannot be read, reports no drift. The refresh and revive
+        paths stay with the Rust edition for now (#1412).
+        """
+        if record.profile is None:
+            return None
+        try:
+            _path, profiles = load_profiles(record.cwd)
+            profile = profiles.get(record.profile)
+            if profile is None:
+                return None
+            if (profile.harness != record.harness or profile.mode != record.mode
+                    or profile.agentcloud is not None):
+                return None
+            validate_structured_harness_argument_conflicts(
+                record.harness, list(profile.argv), label="refreshed profile",
+                structured_model=profile.model is not None,
+                structured_effort=profile.reasoning_effort is not None,
+                structured_resume=True,
+            )
+            structured = (*reasoning_arguments(record.harness, profile.reasoning_effort),
+                          *profile.argv)
+            launch_env = self._project_launch_env()
+            if (record.harness == "codex" and launch_env is not None
+                    and launch_env.codex_needs_non_login_shell()
+                    and not any("allow_login_shell" in item for item in profile.argv)):
+                structured = (*structured, "-c", "allow_login_shell=false")
+            argv = harness_arguments(record.harness, model=profile.model, extra=structured)
+            names = sorted({entry.partition("=")[0] for entry in profile.environment
+                            if "=" in entry})
+            recorded: list[str] = []
+            if record.launch_spec is not None:
+                spec_argv = record.launch_spec.get("argv")
+                if isinstance(spec_argv, list):
+                    recorded = [value for value in spec_argv if isinstance(value, str)]
+            if not recorded:
+                recorded = list(record.arguments)
+            changed: list[str] = []
+            if record.model != profile.model:
+                changed.append("model")
+            if record.reasoning_effort != profile.reasoning_effort:
+                changed.append("reasoning_effort")
+            if list(record.environment_names) != names:
+                changed.append("environment_names")
+            if not launch_spec.same_launch_rest(record.harness, recorded, list(argv)):
+                changed.append("argv")
+            if not changed:
+                return None
+            return {"fields": changed,
+                    "fix": f"agentctl restart {record.name} --refresh-profile"}
+        except Exception:
+            return None
+
     def status(self, name: str) -> dict[str, object]:
         """Report live state or a visible probe error, preserving every durable record."""
         record = self._load(name)
@@ -3937,6 +4001,10 @@ class ManagedAgents:
                 and record.harness in ("muse", "codex")
                 and result.get("native_session") is None):
             result["native_session_missing"] = True
+        # Reading the profile can run git, so only a single agent's status
+        # checks it (#1023).
+        if (drift := self._profile_drift(record)) is not None:
+            result["profile_drift"] = drift
         return result
 
     def move_to_project_workspace(self, name: str) -> dict[str, object]:

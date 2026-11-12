@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import subprocess
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -1445,6 +1446,34 @@ def test_interactive_muse_refuses_raw_duplicate_structured_options_before_alloca
     assert not manager.registry.exists()
     assert fake.launched == []
     assert fake.environments == []
+
+
+def test_muse_ultra_start_carries_the_gate_and_status_reports_profile_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, fake = setup(tmp_path, monkeypatch)
+    subprocess.run(["/usr/bin/git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text(".agentctl/\n", encoding="utf-8")
+    directory = tmp_path / ".agentctl"
+    directory.mkdir(mode=0o700)
+    config = directory / "profiles.json"
+    config.write_text(json.dumps({"schema": "agentctl-profiles/v1", "profiles": {
+        "watermelon": {"harness": "muse", "mode": "interactive", "model": "chosen",
+                       "reasoning_effort": "ultra", "argv": [], "env": {}},
+    }}), encoding="utf-8")
+    config.chmod(0o600)
+    result = manager.start(
+        "worker", cwd=str(tmp_path), harness="muse", model="chosen",
+        reasoning_effort="ultra", profile="watermelon",
+    )
+    assert "MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT" in cast(
+        list[str], result["environment_names"])
+    assert any("MUSE_EXPERIMENTAL_ULTRA_REASONING_EFFORT=on" in entries
+               for entries in fake.environments)
+    assert manager.status("worker").get("profile_drift") == {
+        "fields": ["environment_names"],
+        "fix": "agentctl restart worker --refresh-profile",
+    }
 
 
 def test_interactive_start_rejects_string_harness_arguments_before_allocation(

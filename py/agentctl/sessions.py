@@ -208,6 +208,9 @@ class Sessions(ManagedAgents):
                 and record.harness in ("muse", "codex")
                 and result.get("native_session") is None):
             result["native_session_missing"] = True
+        # As in the base status: report launch-profile drift (#1023).
+        if (drift := self._profile_drift(record)) is not None:
+            result["profile_drift"] = drift
         return result
 
     def _status_record(self, record: AgentRecord) -> dict[str, object]:

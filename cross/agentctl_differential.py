@@ -127,6 +127,12 @@ def _with_effort(arguments: Sequence[str]) -> tuple[str, ...]:
         return args
     if "--effort" in args or "--reasoning-effort" in args:
         return args
+    if "--harness" in args:
+        # A Herdr-native kind takes no reasoning effort; declaring one is a
+        # refusal in both editions, not a launch.
+        harness = args[args.index("--harness") + 1]
+        if harness not in ("codex", "claude", "muse"):
+            return args
     at = args.index("start")
     return (*args[: at + 2], "--effort", "medium", *args[at + 2:])
 
@@ -297,7 +303,9 @@ def _lifecycle(harness: Harness, report: Report) -> None:
         for command in (("status", "worker"), ("list",), ("wait", "worker", "--timeout", "0")):
             _pair(harness, report, case, f"primary/{kind}/{command[0]}", (*command, *_COMMON))
         expected_args = (["resume", "session-1", "--no-alt-screen"] if kind == "codex"
-                         else ["--resume", "session-1"]) + ["--model", "chosen-model", "--extra"]
+                         else ["--resume", "session-1"]) + ["--model", "chosen-model"] + (
+                             ["--config", "model_reasoning_effort=medium"] if kind == "codex"
+                             else ["--effort", "medium"]) + ["--extra"]
         report.require(f"primary/{kind}/native-launch-presets",
                        all(_state(root).get("launch_arguments") == expected_args
                            for root in (case.python_root, case.rust_root)), "native launch argv was changed or split")
@@ -358,20 +366,17 @@ def _lifecycle(harness: Harness, report: Report) -> None:
                        for root in (case.python_root, case.rust_root)), "owned pane or archival contract diverged")
 
     custom = harness.case("primary-existing-native-kind")
-    python, _ = _pair(harness, report, custom, "primary/native-kind/start", (
+    # A Herdr-native kind has no structured effort adapter, so it cannot
+    # declare the effort the launch rule requires: both editions refuse
+    # the start (rc 2, no record) rather than launch it undeclared.
+    _pair(harness, report, custom, "primary/native-kind/start", (
         "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
         "--harness", "third-party", *_COMMON,
-    ))
-    status = _json(python)
-    report.require("primary/native-kind/adapter",
-                   isinstance(status, dict) and status.get("adapter") == "herdr"
-                   and all(_state(root).get("harness") == "third-party"
-                           and _state(root).get("custom_harness") is not True
-                           for root in (custom.python_root, custom.rust_root)),
-                   f"existing Herdr-native third-party kind was rerouted: {status!r}")
-    _pair(harness, report, custom, "primary/native-kind/stop", (
-        "stop", "worker", *_COMMON,
-    ))
+    ), 2)
+    report.require("primary/native-kind/no-record",
+                   all(not (root / "registry/agents/worker").exists()
+                       for root in (custom.python_root, custom.rust_root)),
+                   "refused native-kind start recorded an agent")
 
 
 def _conversations(harness: Harness, report: Report) -> None:
@@ -526,6 +531,7 @@ def _profiles(harness: Harness, report: Report) -> None:
             },
             "sol": {
                 "harness": "codex", "mode": "interactive", "model": "gpt-5.6-sol",
+                "reasoning_effort": "medium",
                 "argv": ["--dangerously-enable-internet-mode", "--dangerously-bypass-approvals-and-sandbox"],
                 "env": {"META_CODEX_AI_GATEWAY": "azure-codex-cyber:openai"},
             },
@@ -540,7 +546,7 @@ def _profiles(harness: Harness, report: Report) -> None:
                 "argv": ["--image=private-fixture.png"], "env": {},
             },
             "muse-literal": {
-                "harness": "muse", "mode": "interactive",
+                "harness": "muse", "mode": "interactive", "reasoning_effort": "medium",
                 "argv": [
                     "--trust-workspace",
                     '--meta-tag=literal $(unexpanded) "quotes"',
@@ -572,9 +578,11 @@ def _profiles(harness: Harness, report: Report) -> None:
                          "model_reasoning_effort=ultra", "--dangerously-enable-internet-mode",
                          "--dangerously-bypass-approvals-and-sandbox"],
         "sol": ["--no-alt-screen", "--model", "gpt-5.6-sol",
+                "--config", "model_reasoning_effort=medium",
                 "--dangerously-enable-internet-mode", "--dangerously-bypass-approvals-and-sandbox"],
         "watermelon": ["--model", "kiki_gb300_mxfp8_6p2_840_nwr", "--reasoning-effort", "ultra"],
-        "muse-literal": ["--trust-workspace", '--meta-tag=literal $(unexpanded) "quotes"',
+        "muse-literal": ["--reasoning-effort", "medium", "--trust-workspace",
+                         '--meta-tag=literal $(unexpanded) "quotes"',
                          "--meta-tag=repeatable"],
         "codex-safe-config": ["--no-alt-screen", "--config=features.web_search=true"],
     }
@@ -627,7 +635,16 @@ def _profiles(harness: Harness, report: Report) -> None:
         python, rust = _pair(harness, report, case, f"primary/profile/{profile}/start", (
             "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
             "--profile", profile, *_COMMON,
-        ))
+        ), 2 if profile == "codex-safe-config" else 0)
+        if profile == "codex-safe-config":
+            # A raw --config profile cannot declare structured effort (the
+            # loader refuses that combination), so its start is the shared
+            # no-effort refusal and records nothing.
+            report.require("primary/profile/codex-safe-config/no-record", all(
+                not (root / "registry/agents/worker").exists()
+                for root in (case.python_root, case.rust_root)),
+                "refused safe-config start recorded an agent")
+            continue
         status = _json(python)
         report.require(f"primary/profile/{profile}/recorded-policy", isinstance(status, dict)
                        and status.get("profile") == profile,
@@ -2129,7 +2146,8 @@ def _registry_and_interop(harness: Harness, report: Report) -> None:
             _pair(harness, report, case, label + "/status", command("status", "worker"))
             report.require(label + "/default-record", all(
                 (root / "chosen/agents/worker/agent.json").is_file() and not (root / ".agentctl").exists()
-                and _state(root).get("launch_arguments") == ["--no-alt-screen"]
+                and _state(root).get("launch_arguments") == [
+                    "--no-alt-screen", "--config", "model_reasoning_effort=medium"]
                 for root in (case.python_root, case.rust_root)), "registry alias/placement or native defaults changed")
     for label, producer, consumer in (("python-rust", harness.python, harness.rust), ("rust-python", harness.rust, harness.python)):
         case = harness.case(f"primary/interop/{label}")
@@ -2862,7 +2880,7 @@ def _stop_recovery_quoted_globals(harness: Harness, report: Report) -> None:
         shutil.copyfile(root / "fake-herdr", root / executable)
         (root / executable).chmod(0o700)
     outcomes = harness.invoke(case, (
-        "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1", *common,
+        "start", "worker", "--effort", "medium", "--cwd", "<ROOT>", "--workspace-id", "w1", *common,
     ))
     report.require("primary/stop/quoted-globals/start", all(outcome.returncode == 0 for outcome in outcomes),
                    f"fixture could not start with literal globals: {outcomes!r}")
