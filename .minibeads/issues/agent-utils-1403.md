@@ -25,7 +25,7 @@ Under owner rule 346 (gating checks must be fast, high-signal and robust on a ho
 # Acceptance Criteria
 
 - The quarantined tests are named in the commit and in this issue, and gates no longer run them.
-- Each returning test passes 20/20 in a saturated scope (the #1250 proof bar) and fails against a deliberately broken restore path.
+- Each returning test passes 20/20 in a saturated scope (the #1250 proof bar) and fails against a deliberately broken restore path. Saturated proofs run only on a quiet host, never on an active validation's CPUs (#1411 saturation-quiet-host-caveat).
 - No wall-clock budgets in any of them.
 
 # Notes
