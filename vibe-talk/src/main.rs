@@ -40,6 +40,10 @@ USAGE:
     vibe-talk pair-link [--config PATH] [--config-overlay PATH]... [--base-url URL] [--ttl SECONDS]
     vibe-talk recap [--config PATH] [--hours N | --since WHEN] [--channel NAME] [--json]
     vibe-talk search \"<query>\" [--channel NAME] [--since DATE] [--limit N] [--json]
+    vibe-talk <tool> [--json] [--yes]     one subcommand per MCP tool, generated from the
+                                          tool manifest (recent-activity, list-channels,
+                                          read-page, post-reply, ...); `vibe-talk <tool>
+                                          --help` shows its arguments
     vibe-talk cache-stats PATH
 
 COMMANDS:
@@ -366,6 +370,24 @@ async fn main() -> anyhow::Result<()> {
         Some("pair-link") => return pair_link(argv).await,
         Some("recap") => return recap(argv).await,
         Some("search") => return search(argv).await,
+        // `#1338 vibe-talk-search-cli` slice 2: one generated subcommand per MCP tool,
+        // built from the same manifest as `tools/list`; any other first word is the
+        // server's own arguments, exactly as before.
+        Some(name)
+            if vibe_talk::tool_cli::subcommand_names()
+                .iter()
+                .any(|n| n == name) =>
+        {
+            let tool = vibe_talk::tool_cli::generated_tools()
+                .into_iter()
+                .find(|tool| vibe_talk::tool_cli::subcommand_name(tool) == name)
+                .expect("named by subcommand_names");
+            let printed = vibe_talk::tool_cli::run(&tool, argv.collect()).await?;
+            if !printed.is_empty() {
+                println!("{printed}");
+            }
+            return Ok(());
+        }
         Some("cache-stats") => return cache_stats(argv),
         _ => {}
     }

@@ -198,7 +198,7 @@ fn since_day(raw: &str) -> Option<String> {
 }
 
 /// Percent-encode one URL part (a query value, or one part of a deep link's `m`).
-fn encoded(part: &str) -> String {
+pub(crate) fn encoded(part: &str) -> String {
     let mut out = String::with_capacity(part.len());
     for byte in part.bytes() {
         match byte {
@@ -236,8 +236,9 @@ pub fn deep_link(link_base: &str, channel: &ChannelInfo, message: &Message) -> S
     format!("{place}&m={}", encoded(&parts.join(":")))
 }
 
-/// One hit as one line: ET time, author, snippet, permalink, deep link.
-fn hit_line(link_base: &str, channels: &[ChannelInfo], message: &Message) -> String {
+/// One hit as one line: ET time, author, snippet, permalink, deep link. Shared with the
+/// generated tool subcommands (`crate::tool_cli`), which print answers the same way.
+pub(crate) fn line_for(link_base: &str, channels: &[ChannelInfo], message: &Message) -> String {
     let channel = channels
         .iter()
         .find(|c| c.id == message.channel_id)
@@ -363,7 +364,7 @@ fn render(link_base: &str, answer: &SearchAnswer) -> String {
         out.push_str("No hits in the window searched.\n");
     }
     for hit in &answer.hits {
-        out.push_str(&hit_line(link_base, &channels, hit));
+        out.push_str(&line_for(link_base, &channels, hit));
         out.push('\n');
     }
     for line in coverage_lines(answer) {

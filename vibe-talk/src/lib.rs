@@ -125,6 +125,7 @@ pub mod thread_hues;
 pub mod threads;
 pub mod timeline_forward;
 pub mod timeline_served;
+pub mod tool_cli;
 pub mod untrusted;
 pub mod upstream_clear;
 pub mod upstream_profile;

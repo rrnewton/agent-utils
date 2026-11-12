@@ -5452,6 +5452,13 @@ why it was not searched: only the server's cached window is searched (a recent w
 full-history retention lands), so no hits means no match in that window, not no match ever.
 See `vibe-talk search --help` for every option.
 
+Every MCP tool also has a generated subcommand with the same arguments (`vibe-talk
+list-channels`, `vibe-talk read-page --channel-id … --limit 5`, `vibe-talk post-reply …`),
+built from the same tool manifest as MCP `tools/list`, so the shell and MCP surfaces cannot
+drift. Mutating tools take the WRITE token, and a posting tool asks for confirmation unless
+`--yes` is given; every subcommand takes `--json`, and an answer holding messages prints
+their permalinks and vibe-talk deep links. `vibe-talk <tool> --help` shows its arguments.
+
 ## Catching up: `vibe-talk recap`
 
 The owner marks messages Done as reading progress. After a day away, an agent asked "what did I
