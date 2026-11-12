@@ -188,7 +188,7 @@ def test_trial_record_shape_replays(tmp_path: Path) -> None:
             wrkslots_cli.Checkout(
                 name="main",
                 path="worktrees/validate/edentrial/checkout",
-                repository="/home/newton/local/.eden-backing-repos/fbsource",
+                repository="/backing/repo",
                 branch=eden.EDEN_BRANCH,
                 start_point=REV,
                 remote=eden.EDEN_REMOTE,
