@@ -15,4 +15,5 @@ pub mod expand;
 pub mod fold;
 pub mod index;
 pub mod pyjson;
+pub mod store;
 pub mod verdict;
