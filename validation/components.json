@@ -439,6 +439,7 @@
         "py/wrkslots/tests/test_heartbeat_write_rust.py",
         "py/wrkslots/tests/test_hold_state_rust.py",
         "py/wrkslots/tests/test_hold_write_rust.py",
+        "py/wrkslots/tests/test_image_set_default_rust.py",
         "py/wrkslots/tests/test_image_status_rust.py",
         "py/wrkslots/tests/test_journal_state_rust.py",
         "py/wrkslots/tests/test_journals_state_rust.py",

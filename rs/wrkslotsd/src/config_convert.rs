@@ -157,7 +157,7 @@ fn refuse_symlink(path: &Path, label: &str) -> Result<()> {
     }
 }
 
-fn write_config(path: &Path, payload: &Value, fmt: &str) -> Result<()> {
+pub(crate) fn write_config(path: &Path, payload: &Value, fmt: &str) -> Result<()> {
     let mut previous: Option<Vec<u8>> = None;
     if path.exists() || path.is_symlink() {
         refuse_symlink(path, "configuration")?;

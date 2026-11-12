@@ -41,6 +41,18 @@ pub(crate) enum Command {
 
 #[derive(Subcommand)]
 pub(crate) enum Writers {
+    /// Choose the representation for slots created from now on (Python `image set-default`; writer, fixture registries only until cutover)
+    ImageSetDefault {
+        /// Representation new slots will use
+        #[arg(value_name = "REPRESENTATION", value_parser = ["worktree", "image"])]
+        representation: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Override the machine shard (else WRKSLOTS_MACHINE, else the configured machine, where an absent key or the value auto means the short host name)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Remove and archive one slot (writer; fixture registries only until cutover)
     Remove {
         /// Active slot to remove
@@ -1702,6 +1714,19 @@ fn translate_python_argv_routed(
     // `image status` runs here; the other actions refuse by name.
     if cmd == "image" {
         return match rest.get(1).map(String::as_str) {
+            Some("set-default") => {
+                let mut out: Vec<String> = vec![args[0].clone(), "image-set-default".to_string()];
+                out.extend(rest[2..].iter().cloned());
+                if let Some(root) = project_root {
+                    out.push("--root".to_string());
+                    out.push(root);
+                }
+                if let Some(machine) = machine {
+                    out.push("--machine".to_string());
+                    out.push(machine);
+                }
+                Ok(Some((out, wait_lock)))
+            }
             Some("status") => {
                 let mut out: Vec<String> = vec![args[0].clone(), "image-status".to_string()];
                 out.extend(rest[2..].iter().cloned());
@@ -2026,6 +2051,25 @@ pub fn run() -> u8 {
                 Ok(text) => {
                     print!("{text}");
                     return 0;
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
+            Writers::ImageSetDefault {
+                representation,
+                root,
+                machine,
+            } => match crate::image_dispatch::image_set_default_cli(
+                root.as_deref(),
+                machine.as_deref(),
+                &representation,
+            ) {
+                Ok(outcome) => {
+                    print!("{}", outcome.stdout);
+                    eprint!("{}", outcome.stderr);
+                    return u8::try_from(outcome.exit).unwrap_or(1);
                 }
                 Err(error) => {
                     eprintln!("wrkslotsd: {error}");

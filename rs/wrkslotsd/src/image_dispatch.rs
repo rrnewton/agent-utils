@@ -346,6 +346,34 @@ pub(crate) fn limits_show_cli(memory_fraction: f64, cpu_fraction: f64) -> (i32, 
     )
 }
 
+/// `wrkslots image set-default`: fixture-gated writer. Validate,
+/// then under the config lock hand the raw document to the pure
+/// handler and write its update in the file's own format.
+pub(crate) fn image_set_default_cli(
+    root: Option<&Path>,
+    machine: Option<&str>,
+    representation: &str,
+) -> Result<HandlerOutcome> {
+    crate::ensure_states::require_fixture()?;
+    crate::config_validate::load_config(root, machine)?;
+    let (cfg, _selected) = crate::active_state::load_cfg(root, machine)?;
+    let config_path = cfg.root.join(".wrkslots.yml");
+    let _lock = crate::hold_write::acquire_config_lock(&cfg)?;
+    let text = std::fs::read_to_string(&config_path).map_err(|error| {
+        format!(
+            "cannot read configuration {}: {error}",
+            config_path.display()
+        )
+    })?;
+    let (raw, format) = crate::yamlconfig::load_document(&text)
+        .map_err(|error| format!("configuration is malformed: {error}"))?;
+    let (outcome, updated) = crate::imagecmd::image_set_default(representation, &raw);
+    if let Some(updated) = updated {
+        crate::config_convert::write_config(&config_path, &updated, format)?;
+    }
+    Ok(outcome)
+}
+
 /// `wrkslots image status`: load the config, derive live mount
 /// facts, and run the pure handler. Config errors use the native
 /// error form, like the other reader commands.
