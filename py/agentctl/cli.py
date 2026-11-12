@@ -23,6 +23,7 @@ from agentctl.profiles import (
     configuration_root, effort_levels, load_configuration, load_profiles,
     validate_raw_harness_arguments,
 )
+from agentctl.killpid import SIGNALS as _KILL_SIGNALS
 from agentctl.sessions import Sessions
 from agentctl.skill_install import install_skill
 from agentctl.stop_recovery import StopRecoveryParser, stop_refusal_message
@@ -111,6 +112,15 @@ def _delivery(parser: argparse.ArgumentParser) -> None:
              "done). The composer must be empty first and the submission verified; a prompt Claude Code never "
              "accepts is taken back out and stays pending. Codex ordinary follow-ups use Enter while working "
              "by default; slash commands and unsupported harnesses still wait")
+
+
+def _u64(value: str) -> int:
+    if not value or not value.isascii() or not value.isdigit():
+        raise argparse.ArgumentTypeError("expected an ASCII unsigned integer")
+    parsed = int(value, 10)
+    if parsed > (1 << 64) - 1:
+        raise argparse.ArgumentTypeError("value must fit in an unsigned 64-bit integer")
+    return parsed
 
 
 def _environment_entry(value: str) -> str:
@@ -428,6 +438,20 @@ def parser() -> argparse.ArgumentParser:
         "first without waiting for any lock (AGENTCTL_LAYOUT_AUTO_MIGRATE=0 turns that off). Builds older than layout 2 cannot see\n"
         "moved agents and refuse the registry: upgrade every agentctl and agent-teams that uses it, and the wrkslots\n"
         "liveness probe copies, before migrating. The old layout stays readable until 2026-11-26.")
+    kill_pid = command("kill-pid", "Signal one PID only when its command line and start time match what you "
+        "recorded, and never the user manager, a user@ service, the Herdr server, another unit's main "
+        "process, or a process this team cannot prove it owns. Refusals print the reason; every kill is "
+        "logged to REGISTRY/kill-pid.jsonl. Use this instead of a raw kill.",
+        "agentctl kill-pid 1234 --expect-cmdline 'sleep 60' --expect-start 987654")
+    kill_pid.add_argument("pid", type=_u64, metavar="PID", help="the single process to signal")
+    kill_pid.add_argument("--expect-cmdline", required=True, metavar="TEXT",
+        help="text the process's command line (argv joined with spaces) must contain; record it from "
+             "/proc/PID/cmdline before you need it (required)")
+    kill_pid.add_argument("--expect-start", required=True, type=_u64, metavar="TIME",
+        help="the process start time in clock ticks, field 22 of /proc/PID/stat; a mismatch means the "
+             "PID was reused and the kill is refused (required)")
+    kill_pid.add_argument("--signal", dest="signal_name", choices=tuple(_KILL_SIGNALS), default="TERM",
+        metavar="NAME", help="signal to send: TERM, KILL, INT, HUP, QUIT, USR1, USR2 or CONT (default: TERM)")
     command("quickstart", "Print a short working setup, available offline.", "agentctl quickstart")
     command("userguide", "Print the complete installed operator guide.", "agentctl userguide")
     profiles = command("profiles", "List safe metadata for ignored private launch profiles.",
@@ -562,6 +586,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             report = registry_layout.migrate(Path(args.registry), apply=args.apply, wait=args.wait)
             print(json.dumps(report, indent=2, sort_keys=True))
             return 1 if report["left"] or report["conflicts"] else 0
+        if args.command == "kill-pid":
+            from agentctl.killpid import KillRefused, run_kill_pid
+            try:
+                killed = run_kill_pid(
+                    pid=args.pid, expect_cmdline=args.expect_cmdline,
+                    expect_start=args.expect_start, signal_name=args.signal_name,
+                    registry=Path(args.registry),
+                )
+            except KillRefused as exc:
+                print(f"agentctl kill-pid: refused: {exc}", file=sys.stderr)
+                return 1
+            print(json.dumps({
+                "pid": killed.pid, "signal": killed.signal_name,
+                "cmdline": killed.cmdline, "starttime": killed.starttime,
+                "cwd": killed.cwd, "log": str(killed.log_path),
+            }, indent=2, sort_keys=True))
+            return 0
         if args.command in _WRITES_AGENTS and not getattr(args, "dry_run", False):
             _auto_migrate(Path(args.registry))
         sessions = Sessions(HerdrClient(herdr_bin=args.herdr_bin), args.registry)

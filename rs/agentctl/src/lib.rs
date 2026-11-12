@@ -31,6 +31,7 @@ pub mod harness;
 pub mod harness_tui;
 pub mod headless;
 pub(crate) mod inbox;
+pub mod kill_pid;
 pub mod landing_queue;
 pub mod legacy_cli;
 pub mod lineage;

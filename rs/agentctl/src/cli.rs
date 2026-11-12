@@ -223,6 +223,12 @@ enum Commands {
         after_help = "Examples:\n  agentctl stop reviewer\n  agentctl stop sub-cloud-worker\n  agentctl stop reviewer --retire-dead-adoption --expected-token TOKEN --expected-record-sha256 SHA256\n\nFor an agentcloud agent, stop runs `agentcloudctl halt` (the open run is interrupted and no new\nrun starts), closes the recorded agentterm pane, runs `agentcloudctl archive`, and archives the\nregistry record. A halt failure changes nothing locally. stop does not release the node\nreservation; the orchestrator releases it on its own schedule after the halted session goes\nidle (check `agentcloudctl inspect -s SESSION_ID`).\n\nA headless turn-runner worker is retired only when every process its runtime recorded has\nprovably exited: stop --expected-token then archives the record with its runtime home and leaves\nthe tmux window or Herdr tab in place. A live or unprovable runner exits 69 and changes nothing.\n\nA headless (run-headless) agent's stop signals nothing itself: it asks the wrapper over its control\nsocket to stop, waits for it to exit, and archives the record; the wrapper ends its harness's process\ngroup and leftover writers of the session in its own Linux session only. stop refuses, changing\nnothing, when that would end the process running it (the agent's own harness or its session, or a\ncaller that runs the session while an older wrapper still ends every writer on the host). It does not\nstop or disable a systemd unit; the result notes the unit to disable."
     )]
     Stop(Stop),
+    /// Signal one PID only when its command line and start time match what you recorded, and never the user manager, a user@ service, the Herdr server, another unit's main process, or a process this team cannot prove it owns. Use this instead of a raw kill
+    #[command(
+        name = "kill-pid",
+        after_help = "Example: agentctl kill-pid 1234 --expect-cmdline 'sleep 60' --expect-start 987654\n\nRefusals print the reason and exit 1; every kill is logged to REGISTRY/kill-pid.jsonl. Record the expectations from /proc/PID/cmdline and field 22 of /proc/PID/stat before you need them: a reused PID fails the start-time check and is refused."
+    )]
+    KillPid(KillPid),
     /// Relaunch a dead local agent by replaying its recorded launch spec and conversation, carrying its queued prompts into the new generation
     #[command(
         after_help = "Examples:\n  agentctl revive reviewer\n  agentctl revive --all --dry-run\n  agentctl revive reviewer --expected-token TOKEN\n  agentctl revive reviewer --abandon-candidate\n\nA live or unverifiable harness is never relaunched. Recovery opens a fresh tab, verifies the\nresumed runtime, archives the complete old generation, then closes only its proved stale pane.\nThe launch spec (`launch_spec` in status) is what ran: start writes it, adopt and anchor read it\nfrom the pinned process's command line. A record without one is rebuilt from its launch policy\nand profile. An adopted agent needs a spec, and its old pane is left open; the replacement is\nowned. An interrupted revive reserves the name until the same command finishes publication or\ncleanup. When its candidate is proved dead (its pane gone, or holding only an idle shell), the next\nrevive marks the attempt failed, keeps it under REGISTRY/.revives/.abandoned/ with the evidence, and\nlaunches again; --abandon-candidate does so for a candidate that cannot be proved either way, never\nfor one whose harness runs. Headless workers and remote agentcloud sessions are refused."
@@ -1426,6 +1432,22 @@ struct Stop {
     /// Stop the live designated coordinator without handing over (prints a warning; inter-team delivery to this registry loses its target until a new coordinator is designated). Not needed when its harness is gone or on the dead-record retirement and recovery paths (--retire-dead-adoption, --retire-dead-native and the adoption-recovery flag), which warn the same way
     #[arg(long)]
     force_coordinator: bool,
+}
+
+#[derive(Args)]
+struct KillPid {
+    /// The single process to signal
+    #[arg(value_name = "PID")]
+    pid: u64,
+    /// Text the process's command line (argv joined with spaces) must contain; record it from /proc/PID/cmdline before you need it
+    #[arg(long, value_name = "TEXT", required = true)]
+    expect_cmdline: String,
+    /// The process start time in clock ticks, field 22 of /proc/PID/stat; a mismatch means the PID was reused and the kill is refused
+    #[arg(long, value_name = "TIME", required = true)]
+    expect_start: u64,
+    /// Signal to send: TERM, KILL, INT, HUP, QUIT, USR1, USR2 or CONT
+    #[arg(long, value_name = "NAME", default_value = "TERM")]
+    signal: String,
 }
 
 #[derive(Args)]
@@ -3882,6 +3904,35 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
         }
     }
     match command {
+        Commands::KillPid(value) => {
+            let registry = args.registry.clone();
+            match crate::kill_pid::run_kill_pid(
+                value.pid,
+                &value.expect_cmdline,
+                value.expect_start,
+                &value.signal,
+                &registry,
+            ) {
+                Ok(report) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "pid": report.pid,
+                            "signal": report.signal_name,
+                            "cmdline": report.cmdline,
+                            "starttime": report.starttime,
+                            "cwd": report.cwd,
+                            "log": report.log_path.display().to_string(),
+                        })
+                    );
+                    return Ok(0);
+                }
+                Err(error) => {
+                    eprintln!("agentctl kill-pid: refused: {error}");
+                    return Ok(1);
+                }
+            }
+        }
         Commands::MigrateLayout(value) => {
             let report = crate::registry_layout::migrate(
                 &args.registry,
@@ -4587,6 +4638,34 @@ fn run(args: Cli, environment: &dyn Fn(&str) -> Option<String>) -> Result<i32, F
     });
     let mut send_waiting: Option<(Value, String)> = None;
     let mut result = match command {
+        Commands::KillPid(value) => {
+            match crate::kill_pid::run_kill_pid(
+                value.pid,
+                &value.expect_cmdline,
+                value.expect_start,
+                &value.signal,
+                &args.registry,
+            ) {
+                Ok(report) => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "pid": report.pid,
+                            "signal": report.signal_name,
+                            "cmdline": report.cmdline,
+                            "starttime": report.starttime,
+                            "cwd": report.cwd,
+                            "log": report.log_path.display().to_string(),
+                        })
+                    );
+                    return Ok(0);
+                }
+                Err(error) => {
+                    eprintln!("agentctl kill-pid: refused: {error}");
+                    return Ok(1);
+                }
+            }
+        }
         Commands::Mcp => {
             return Ok(crate::mcp::serve(
                 args.registry.to_string_lossy().as_ref(),

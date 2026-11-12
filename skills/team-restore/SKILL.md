@@ -92,10 +92,29 @@ Run it under nohup or with a generous timeout (it can take minutes), and keep it
   interrupted step. Pre-outage gate tickets are left to their reaper, never deleted by hand.
 - Tell the owner in one message: cause, duration, what came back, what's left.
 
+## Killing a stuck process: `kill-pid`, never a raw `kill`
+
+When a process must be stopped by PID, use `agentctl kill-pid`, never a raw `kill`, `pkill` or
+`killall`. Record the process's command line (`/proc/PID/cmdline`) and start time (field 22 of
+`/proc/PID/stat`) first, then:
+
+```sh
+agentctl --registry R kill-pid PID --expect-cmdline 'TEXT' --expect-start TICKS
+```
+
+It refuses — printing what it refused and why — unless the command line and start time still match
+(so a reused PID is refused), and it always refuses the user manager (`systemd --user`), any
+`user@UID.service` main process, the Herdr server, the main PID of a unit this team doesn't own,
+and any process whose working directory sits in another team's registry or slots or outside this
+team's root. Every kill it performs is logged to `REGISTRY/kill-pid.jsonl`. A refusal is the
+answer: identify the process properly or hand it to the team that owns it; never work around the
+guard with a raw signal.
+
 ## Never
 
-- Never signal a process you haven't identified by PID, command line and start time. Above all, never the
-  user manager (`systemd --user`): killing it stops every team on the host.
+- Never signal a process except through `agentctl kill-pid` with its recorded command line and
+  start time. Above all, never the user manager (`systemd --user`): killing it stops every team
+  on the host.
 - Never restore another team's agents while its lead is alive. Hand it what you found instead.
 - Never rewrite `restore.json` from the live list (`restore --write-agents`) as routine. A pinned list goes
   stale and silently parks lanes at the next outage.

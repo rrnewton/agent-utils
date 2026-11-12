@@ -184,6 +184,12 @@ that window. The same rule is in the agentctl-chat skill for chat requests.
 
 - Never kill processes by pattern (`pkill -f`, `killall`); other agents run look-alike
   processes. Stop only processes you started, by recorded identity.
+- When a process must be stopped by PID, use `agentctl kill-pid PID --expect-cmdline TEXT
+  --expect-start TICKS` (the command line from `/proc/PID/cmdline`, the start time from field 22
+  of `/proc/PID/stat`), never a raw `kill`. It refuses the user manager (`systemd --user`), any
+  `user@UID.service` main process, the Herdr server, another unit's main PID, and any process
+  outside your team's root, and it logs every kill to `REGISTRY/kill-pid.jsonl`. A refusal is the
+  answer; never work around it with a raw signal.
 - Close only terminal tabs and remove only files that you created.
 - Do not change host configuration (mounts, fstab, system services) to make a tool work. The
   suite is designed to run on a stock machine; if it cannot, report what is missing.
