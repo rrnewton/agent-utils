@@ -789,6 +789,7 @@ fn summaries(state: &AppState) -> Check {
                 match llm.backend {
                     crate::config::LlmBackend::MessagesApi => llm.dialect.as_str(),
                     crate::config::LlmBackend::MetaGateway => llm.backend.as_str(),
+                    crate::config::LlmBackend::ClaudeSession => llm.backend.as_str(),
                 },
                 llm.model,
                 state.summary_version

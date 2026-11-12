@@ -241,6 +241,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "claude-session"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "compression-codecs"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2229,6 +2236,7 @@ dependencies = [
  "axum",
  "base64",
  "bytes",
+ "claude-session",
  "comrak",
  "futures-util",
  "getrandom 0.3.4",

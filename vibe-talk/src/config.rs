@@ -758,6 +758,8 @@ pub enum LlmBackend {
     MessagesApi,
     /// One AI-gateway chat-completions call per summary, authenticated by client certificate.
     MetaGateway,
+    /// A warm persistent Claude Code session per pool slot. `#1331 claude-session-summarizer`.
+    ClaudeSession,
 }
 
 impl LlmBackend {
@@ -767,6 +769,7 @@ impl LlmBackend {
         match self {
             Self::MessagesApi => "messages_api",
             Self::MetaGateway => "meta_gateway",
+            Self::ClaudeSession => "claude_session",
         }
     }
 }
@@ -995,6 +998,16 @@ pub struct LlmConfig {
     pub max_tokens: u32,
     /// How long one call may take, in seconds.
     pub timeout_secs: u64,
+    /// The `claude` program for the `claude_session` backend. `#1331 claude-session-summarizer`.
+    pub claude_program: String,
+    /// Warm sessions kept by the `claude_session` backend (1-2).
+    pub pool_size: u32,
+    /// Turns one `claude_session` process serves before it is recycled.
+    pub recycle_turns: u64,
+    /// Tokens one `claude_session` process serves before it is recycled.
+    pub recycle_tokens: u64,
+    /// Effort sent as `--effort` by the `claude_session` backend, when named.
+    pub effort: Option<String>,
     /// Client-side ceiling on calls per minute, across every summary and thread name.
     pub requests_per_minute: u32,
     /// How many calls may go out back to back before the per-minute pace applies.
@@ -1039,6 +1052,14 @@ pub const DEFAULT_CATCHUP_WARMUP_MAX_CHARS: usize = 6_000;
 /// The model `[summaries.llm]` asks when none is named: a small, fast model whose alias is
 /// valid on both the Anthropic API and Google Vertex.
 pub const DEFAULT_LLM_MODEL: &str = "claude-haiku-4-5";
+/// The model the `claude_session` backend asks when none is named. `#1331`.
+pub const DEFAULT_CLAUDE_SESSION_MODEL: &str = "claude-haiku-5-5";
+/// Warm sessions the `claude_session` backend keeps when unnamed. `#1331`.
+pub const DEFAULT_CLAUDE_POOL_SIZE: u32 = 1;
+/// Turns one warm session serves before recycling when unnamed. `#1331`.
+pub const DEFAULT_CLAUDE_RECYCLE_TURNS: u64 = 50;
+/// Tokens one warm session serves before recycling when unnamed. `#1331`.
+pub const DEFAULT_CLAUDE_RECYCLE_TOKENS: u64 = 100_000;
 /// Where the Anthropic dialect sends requests by default.
 pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
 /// Default output budget: a slug and a sentence, or one sentence, with room to spare.
@@ -2124,6 +2145,11 @@ struct FileLlm {
     ca_bundle_file: Option<String>,
     extra_headers: Option<BTreeMap<String, String>>,
     models: Option<FileKindModels>,
+    claude_program: Option<String>,
+    pool_size: Option<u32>,
+    recycle_turns: Option<u64>,
+    recycle_tokens: Option<u64>,
+    effort: Option<String>,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
     requests_per_minute: Option<u32>,
@@ -3430,6 +3456,7 @@ fn llm_config(file: FileLlm) -> Result<LlmConfig, ConfigError> {
                     .to_owned(),
             ));
         }
+        None if backend == LlmBackend::ClaudeSession => DEFAULT_CLAUDE_SESSION_MODEL.to_owned(),
         None => DEFAULT_LLM_MODEL.to_owned(),
     };
     // Each of these is spliced into a URL path on the Vertex dialect, so each is held to the
@@ -3533,7 +3560,7 @@ fn llm_config(file: FileLlm) -> Result<LlmConfig, ConfigError> {
                     .to_owned(),
             ));
         }
-    } else {
+    } else if backend != LlmBackend::ClaudeSession {
         match dialect {
             LlmDialect::Anthropic => {
                 for (field, set) in [
@@ -3594,6 +3621,67 @@ fn llm_config(file: FileLlm) -> Result<LlmConfig, ConfigError> {
         }
     }
 
+    // `#1331 claude-session-summarizer`: the session backend refuses HTTP-backend keys by
+    // name, and every other backend refuses the session keys, so a copied section fails loudly.
+    let claude_keys = [
+        ("claude_program", file.claude_program.is_some()),
+        ("pool_size", file.pool_size.is_some()),
+        ("recycle_turns", file.recycle_turns.is_some()),
+        ("recycle_tokens", file.recycle_tokens.is_some()),
+        ("effort", file.effort.is_some()),
+    ];
+    if backend == LlmBackend::ClaudeSession {
+        for (field, set) in [
+            ("dialect", file.dialect.is_some()),
+            ("base_url", file.base_url.is_some()),
+            ("project", project.is_some()),
+            ("region", region.is_some()),
+            ("api_key_file", api_key_file.is_some()),
+            ("bearer_token_file", bearer_token_file.is_some()),
+            ("bearer_token_command", bearer_token_command.is_some()),
+            ("client_identity_file", client_identity_file.is_some()),
+            ("ca_bundle_file", ca_bundle_file.is_some()),
+            ("reasoning_effort", file.reasoning_effort.is_some()),
+        ] {
+            if set {
+                return Err(invalid(
+                    field,
+                    "is an HTTP-backend setting and this section says backend = \
+                     \"claude_session\"; the session backend starts a local claude process"
+                        .to_owned(),
+                ));
+            }
+        }
+    } else {
+        for (field, set) in claude_keys {
+            if set {
+                return Err(invalid(
+                    field,
+                    "is a claude_session setting and this section does not say backend = \
+                     \"claude_session\""
+                        .to_owned(),
+                ));
+            }
+        }
+    }
+    let claude_program = text(file.claude_program).unwrap_or_else(|| "claude".to_owned());
+    let pool_size = file.pool_size.unwrap_or(DEFAULT_CLAUDE_POOL_SIZE);
+    if !(1..=2).contains(&pool_size) {
+        return Err(invalid(
+            "pool_size",
+            format!("{pool_size} is outside 1 to 2 warm sessions"),
+        ));
+    }
+    let recycle_turns = file.recycle_turns.unwrap_or(DEFAULT_CLAUDE_RECYCLE_TURNS);
+    let recycle_tokens = file.recycle_tokens.unwrap_or(DEFAULT_CLAUDE_RECYCLE_TOKENS);
+    if recycle_turns == 0 || recycle_tokens == 0 {
+        return Err(invalid(
+            if recycle_turns == 0 { "recycle_turns" } else { "recycle_tokens" },
+            "must be at least 1; zero would recycle every session before its first turn"
+                .to_owned(),
+        ));
+    }
+    let effort = text(file.effort);
     let base_url = match text(file.base_url) {
         Some(url) => url.trim_end_matches('/').to_owned(),
         None if backend == LlmBackend::MetaGateway => {
@@ -3677,6 +3765,7 @@ fn llm_config(file: FileLlm) -> Result<LlmConfig, ConfigError> {
     let max_tokens = file.max_tokens.unwrap_or(match backend {
         LlmBackend::MessagesApi => DEFAULT_LLM_MAX_TOKENS,
         LlmBackend::MetaGateway => DEFAULT_META_GATEWAY_MAX_TOKENS,
+        LlmBackend::ClaudeSession => DEFAULT_LLM_MAX_TOKENS,
     });
     if !(1..=4096).contains(&max_tokens) {
         return Err(invalid(
@@ -3721,6 +3810,11 @@ fn llm_config(file: FileLlm) -> Result<LlmConfig, ConfigError> {
         client_identity_file,
         ca_bundle_file,
         extra_headers,
+        claude_program,
+        pool_size,
+        recycle_turns,
+        recycle_tokens,
+        effort,
         max_tokens,
         timeout_secs,
         requests_per_minute,

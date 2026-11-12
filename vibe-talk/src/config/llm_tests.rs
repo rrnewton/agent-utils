@@ -714,3 +714,38 @@ fn per_kind_models_fall_back_to_the_section_model() {
     )
     .is_err());
 }
+
+#[test]
+fn a_claude_session_section_takes_its_defaults() {
+    // `#1331 claude-session-summarizer`.
+    let cfg = load("[summaries.llm]\nbackend = \"claude_session\"\n").expect("valid");
+    let llm = cfg.summaries.llm.expect("the section is read");
+    assert_eq!(llm.backend, LlmBackend::ClaudeSession);
+    assert_eq!(llm.model, DEFAULT_CLAUDE_SESSION_MODEL);
+    assert_eq!(llm.claude_program, "claude");
+    assert_eq!(llm.pool_size, DEFAULT_CLAUDE_POOL_SIZE);
+    assert_eq!(llm.recycle_turns, DEFAULT_CLAUDE_RECYCLE_TURNS);
+    assert_eq!(llm.recycle_tokens, DEFAULT_CLAUDE_RECYCLE_TOKENS);
+}
+
+#[test]
+fn claude_session_keys_are_refused_on_other_backends_and_vice_versa() {
+    assert_eq!(
+        invalid_field(load(
+            "[summaries.llm]\napi_key_file = \"/k\"\npool_size = 2\n"
+        )),
+        "summaries.llm.pool_size"
+    );
+    assert_eq!(
+        invalid_field(load(
+            "[summaries.llm]\nbackend = \"claude_session\"\nbase_url = \"https://example.com\"\n"
+        )),
+        "summaries.llm.base_url"
+    );
+    assert_eq!(
+        invalid_field(load(
+            "[summaries.llm]\nbackend = \"claude_session\"\npool_size = 3\n"
+        )),
+        "summaries.llm.pool_size"
+    );
+}

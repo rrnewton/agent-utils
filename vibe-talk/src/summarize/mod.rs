@@ -73,6 +73,7 @@ pub mod agent;
 pub mod counters;
 pub mod fake;
 pub mod messages_api;
+pub mod claude_session;
 pub mod meta_gateway;
 pub mod rate_limit;
 pub mod threads;
@@ -114,6 +115,9 @@ pub fn summarizer_for(
             crate::config::LlmBackend::MetaGateway => {
                 Arc::new(meta_gateway::MetaGatewaySummarizer::new(llm.clone()))
             }
+            crate::config::LlmBackend::ClaudeSession => {
+                Arc::new(claude_session::ClaudeSessionSummarizer::new(llm.clone()))
+            }
         };
     }
     Arc::new(agent::AgentSummarizer::new(
@@ -154,6 +158,7 @@ pub fn catchup_summarizer_for(summaries: &SummariesConfig) -> Option<Arc<dyn Sum
     llm.max_tokens = llm.max_tokens.max(match llm.backend {
         crate::config::LlmBackend::MetaGateway => CATCHUP_MAX_TOKENS_GATEWAY,
         crate::config::LlmBackend::MessagesApi => CATCHUP_MAX_TOKENS_MESSAGES,
+        crate::config::LlmBackend::ClaudeSession => CATCHUP_MAX_TOKENS_MESSAGES,
     });
     llm.timeout_secs = llm.timeout_secs.max(CATCHUP_TIMEOUT_SECS);
     if llm.backend == crate::config::LlmBackend::MetaGateway {
@@ -165,6 +170,9 @@ pub fn catchup_summarizer_for(summaries: &SummariesConfig) -> Option<Arc<dyn Sum
         }
         crate::config::LlmBackend::MetaGateway => {
             Arc::new(meta_gateway::MetaGatewaySummarizer::new(llm))
+        }
+        crate::config::LlmBackend::ClaudeSession => {
+            Arc::new(claude_session::ClaudeSessionSummarizer::new(llm))
         }
     })
 }
@@ -529,6 +537,12 @@ pub fn policy_version_v2(prompt: &str, config: &SummariesConfig, backend: &str) 
                 llm.max_tokens,
                 llm.reasoning_effort.as_str()
             ),
+            crate::config::LlmBackend::ClaudeSession => format!(
+                "{}|{}|{}",
+                llm.backend.as_str(),
+                llm.model,
+                llm.effort.as_deref().unwrap_or("")
+            ),
         };
         // `#1324 per-kind-summarizer-model`: cache keys use the EFFECTIVE model per kind.
         // No overrides, no segment: existing deployments keep their keys byte for byte.
@@ -687,6 +701,11 @@ mod tests {
             client_identity_file: None,
             ca_bundle_file: None,
             extra_headers: std::collections::BTreeMap::new(),
+            claude_program: "claude".to_owned(),
+            pool_size: crate::config::DEFAULT_CLAUDE_POOL_SIZE,
+            recycle_turns: crate::config::DEFAULT_CLAUDE_RECYCLE_TURNS,
+            recycle_tokens: crate::config::DEFAULT_CLAUDE_RECYCLE_TOKENS,
+            effort: None,
             max_tokens: crate::config::DEFAULT_LLM_MAX_TOKENS,
             timeout_secs: crate::config::DEFAULT_LLM_TIMEOUT_SECS,
             requests_per_minute: crate::config::DEFAULT_LLM_REQUESTS_PER_MINUTE,

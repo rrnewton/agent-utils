@@ -785,6 +785,17 @@ enabled = true
 # thread_name = "small-elk-internal"               # preview id that may be withdrawn; rollback
 # digest = "muse-spark-1.4-internal"               # is deleting these override lines.
 # side_agent = "muse-spark-1.4-internal"
+#
+# A warm persistent Claude session (tools off), kept started so summaries pay no cold
+# startup (#1331 claude-session-summarizer):
+# [summaries.llm]
+# backend = "claude_session"
+# model = "claude-haiku-5-5"                       # default; per-kind overrides as above
+# claude_program = "claude"                        # default
+# pool_size = 1                                    # 1-2 warm sessions
+# recycle_turns = 50                               # recycle a session after this many turns
+# recycle_tokens = 100000                          # ... or this many reported tokens
+# effort = "low"                                   # optional --effort
 
 [replay]
 # RESUMING A CONVERSATION ACROSS A HANG-UP. The vendor cannot resume a closed conversation, so

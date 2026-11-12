@@ -110,6 +110,9 @@ impl Session {
     fn start(&mut self) -> Result<(), Error> {
         let mut argv = protocol::protocol_arguments();
         argv.extend(protocol::effective_arguments(&self.config.arguments, false));
+        // A summariser session never runs tools: an empty tool list, always.
+        argv.push("--tools".to_owned());
+        argv.push(String::new());
         if let Some(model) = &self.config.model {
             argv.push("--model".to_owned());
             argv.push(model.clone());
