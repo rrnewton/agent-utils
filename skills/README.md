@@ -26,6 +26,9 @@ copying its manual.
   pane, between the prompt's marker lines, and check what reached the chat.
 - `wrkslots` — provision and audit isolated Git worktree slots, protect or reclaim their caches,
   record handoff, and remove source only after verified owner absence.
+- `team-restore` — bring an agent team back after an outage with `agentctl restore`: one restorer
+  per team, a dry run that checks the desired-state source, health checks that include chat-bridge
+  targets, known failures and their fixes, and who to tell. Harnesses extend it with their own facts.
 - `agent-teams` — message another team's designated coordinator across hosts, exactly once:
   who may send (coordinators and registered services, never workers), the team tag grammar,
   reply/receipt verbs, and when the (currently off) chat route would be used sparingly.
