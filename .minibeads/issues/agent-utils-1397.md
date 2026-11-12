@@ -1,6 +1,6 @@
 ---
 title: 'discuss-dock-close: closing a docked Discuss panel frees its column'
-status: open
+status: closed
 priority: 1
 issue_type: task
 labels:
@@ -27,3 +27,7 @@ Docking the Discuss panel and then closing it still reserved the right column: t
 # Notes
 
 Owner report via the coordinator, fast-track for the Discuss batch. No Mod+8 Discuss chord exists in the page today, so there is no such exit to cover. View change does not close the panel through a separate path; it goes through the same close act.
+
+## Resolution
+
+Landed on main as e5fc567c in the 4:30 PM ET Discuss batch and deployed (live about 5:53 PM ET, as reported by the coordinator). Closing a docked or maximized Discuss panel now clears the screen mark so no column stays reserved, while the remembered mode is kept and re-applied on reopening; overlay never marks the screen. Covered by the page unit test for dock/close/reopen across every exit; the browser-walk step was added for the gate walk.
