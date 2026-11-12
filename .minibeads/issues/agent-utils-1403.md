@@ -7,7 +7,7 @@ labels:
 - agentctl
 - validation
 created_at: 2026-11-11T18:41:49+00:00
-updated_at: 2026-11-11T18:43:17+00:00
+updated_at: 2026-11-12T16:13:33.231461177+00:00
 ---
 
 # Description
@@ -15,6 +15,8 @@ updated_at: 2026-11-11T18:43:17+00:00
 [opus 5.5] Tests in py/tests/test_agentctl_restore_drill.py (#1133 restore-drill-proof) fail in rotation in the gating `python.agentctl.shard-0` and `shard-1` steps on a loaded host. A change that touches only chat latency paths (#1313 chat-latency-headless-accepted) failed three gate attempts and two solo shard reruns against current main. Each time it was a different restore-drill test, four tests rotating, while every other selected step passed (latency, Rust, the rest of agentctl). The latest failure was `test_restore_drill_one_unrestorable_lane_refused_at_74` (shard 0; shard 1 passed in that rerun). The other three rotating names come from the lane's gate logs and are added in Notes.
 
 Under owner rule 346 (gating checks must be fast, high-signal and robust on a hot machine; anything else is disabled until fixed), these tests come out of the gate until they're load-robust.
+
+Proof (mu-drill, 2026-11-12): after 70f9736a (observe_stable shell proof, 300s sandbox backstop), the quarantined file passed 10/10 consecutive saturated runs (AGENTCTL_INCLUDE_QUARANTINED=1, loads 45-209, each 4 passed). Returning the four tests to the gating shards; quarantine machinery stays for future cases.
 
 # Design
 
