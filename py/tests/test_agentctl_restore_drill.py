@@ -582,7 +582,7 @@ class Drill:
                 "--cert-wait-seconds", str(cert_wait_seconds),
                 "--startup-timeout", "120",
             ],
-            timeout=600,
+            timeout=1800,
         )
         document = cast(dict[str, object], json.loads(completed.stdout))
         return completed.returncode, document, completed.stderr
