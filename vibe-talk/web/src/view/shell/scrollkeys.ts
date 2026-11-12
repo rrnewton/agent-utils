@@ -36,6 +36,9 @@ export interface ScrollKeysDependencies<Pane extends ScrolledPane<HTMLElement>> 
   sideScroll(): HTMLElement;
   /** To the foot of `area`. */
   toFoot(area: HTMLElement): void;
+  /** Move `area` by a measured delta, or put it at its top, through the scroll owner (`#1251 scroll-single-owner`). */
+  nudge(area: HTMLElement, delta: number): void;
+  toPosition(area: HTMLElement, top: number): void;
   /** End a walk back a filter change was making (`#243 filter-keeps-selection`). */
   endFilterWalk(): void;
   /** Out of any room past the right column's foot (`#338 column-overscroll`). */
@@ -120,9 +123,9 @@ export function createScrollKeys<Pane extends ScrolledPane<HTMLElement>>(deps: S
 
   /** Move `area` for a page key, or Home or End, that the browser would have spent on something else. */
   function scrollForKey(area: HTMLElement, key: string): void {
-    if (key === "Home") area.scrollTop = 0;
+    if (key === "Home") deps.toPosition(area, 0);
     else if (key === "End") toNewest(area);
-    else area.scrollTop += (key === "PageUp" ? -1 : 1) * pageStep(area);
+    else deps.nudge(area, (key === "PageUp" ? -1 : 1) * pageStep(area));
   }
 
   /**
@@ -180,7 +183,7 @@ export function createScrollKeys<Pane extends ScrolledPane<HTMLElement>>(deps: S
       const area = deps.visibleScroller(target);
       if (!area) return false;
       if (newest) toNewest(area);
-      else area.scrollTop = 0;
+      else deps.toPosition(area, 0);
       return true;
     },
     listEdge(target, newest) {
@@ -188,7 +191,7 @@ export function createScrollKeys<Pane extends ScrolledPane<HTMLElement>>(deps: S
       const rows = pane ? deps.paneRows(pane) : [];
       if (!pane || rows.length === 0) return false;
       if (newest) toNewest(pane.scroller());
-      else pane.scroller().scrollTop = 0;
+      else deps.toPosition(pane.scroller(), 0);
       deps.selectRow(pane, rows[newest ? rows.length - 1 : 0] as HTMLElement, false);
       return true;
     },

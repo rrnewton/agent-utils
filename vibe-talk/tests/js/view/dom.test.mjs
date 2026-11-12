@@ -674,6 +674,7 @@ test("`#624 voice-page-modularity`: a scroll key no binding took goes to the lis
     scrollArea: () => (side ? "side" : area),
     sideScroll: () => "side",
     toFoot: () => log.push("foot"),
+    nudge: (area, delta) => { area.scrollTop += delta; }, toPosition: (area, top) => { area.scrollTop = top; },
     endFilterWalk: () => log.push("walk ended"),
     closeOverscroll: () => log.push("room closed"),
     openOverscroll: () => log.push("room opened"),
@@ -1567,6 +1568,7 @@ test("`#624 voice-page-modularity`: ↓ and ↑ read on through a tall message, 
     selectRow: (_pane, row, ...rest) => log.push(["select", row.id, ...rest].join(" ")),
     takeRow: (_pane, row, focus) => log.push(`take ${row.id} ${focus}`),
     landingGap: () => 8,
+    nudge: (scroller, delta) => { scroller.scrollTop += delta; },
     openOverscroll: () => log.push("room opened"),
     openRowMenu: () => state.menu,
     setStatus: (text) => log.push(`say ${text}`),
@@ -1916,6 +1918,7 @@ test("`#624 voice-page-modularity`: the selection is kept per list by message id
     focusLost: () => state.lost,
     listDrawCount: () => 0,
     landingGap: () => 10,
+    nudge: (scroller, delta) => { scroller.scrollTop += delta; },
   });
   const run = (act) => { log.length = 0; const result = act(); return result === undefined ? [...log] : [result, ...log]; };
   const was = globalThis.document;

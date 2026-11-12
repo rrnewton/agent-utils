@@ -63,6 +63,8 @@ export interface KeySelectionDependencies<Pane extends KeyPane> {
   screen(): string;
   /** An element of the page by id, in the column the code is working in, and in the left column. */
   byId(id: string): HTMLElement;
+  /** Move a pane's scroller by a measured delta, through the scroll owner (`#1251 scroll-single-owner`). */
+  nudge(scroller: HTMLElement, delta: number): void;
   leftById(id: string): HTMLElement;
   /** Whether `row` is shown; the message ids it stands for; and the row a member of a folded run is shown as. */
   rowShown(row: HTMLElement): boolean;
@@ -309,11 +311,11 @@ export function createKeySelection<Pane extends KeyPane>(deps: KeySelectionDepen
     const head = pane.head() + deps.landingGap();
     const foot = pane.foot() - deps.landingGap();
     if (from < 0 && box.height > foot - head) {
-      if (box.bottom > foot || box.bottom < head) area.scrollTop += box.bottom - foot;
+      if (box.bottom > foot || box.bottom < head) deps.nudge(area, box.bottom - foot);
       return;
     }
-    if (box.top < head) area.scrollTop += box.top - head;
-    else if (box.bottom > foot) area.scrollTop += Math.min(box.bottom - foot, box.top - head);
+    if (box.top < head) deps.nudge(area, box.top - head);
+    else if (box.bottom > foot) deps.nudge(area, Math.min(box.bottom - foot, box.top - head));
   }
 
   function rowOf(pane: Pane, node: unknown): HTMLElement | null {

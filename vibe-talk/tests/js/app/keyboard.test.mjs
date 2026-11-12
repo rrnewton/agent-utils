@@ -39,7 +39,7 @@ function fakeDeps(log, overrides = {}) {
     readerActed: () => log.push("readerActed"), putOutLanding: () => {}, noteLinkedSelection: () => {},
     focusLost: () => true, replyLandingGapPx: () => 8, replyDocked: () => false, replyPane: () => null,
     rowMenuOpen: () => false, openRowMenu: () => null,
-    toFoot: () => {}, endFilterWalk: () => {}, closeOverscroll: () => {}, openOverscroll: () => {},
+    toFoot: () => {}, nudge: () => {}, toPosition: () => {}, endFilterWalk: () => {}, closeOverscroll: () => {}, openOverscroll: () => {},
     scrollToNewest: () => {}, isTextField: () => false, scrollsItself: () => false,
     keepsOwnKeys: () => false, pressedBySpace: () => false,
     entryLandingHolds: () => false, entryLandingFirst: () => null,

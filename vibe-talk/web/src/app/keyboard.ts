@@ -138,6 +138,9 @@ export interface KeyboardCompositionDependencies<
   openRowMenu(): (SteppedMenu & { close(): void }) | null;
   // Scrolling.
   toFoot(area: HTMLElement): void;
+  /** Move `area` by a measured delta, or put it at its top, through the scroll owner (`#1251 scroll-single-owner`). */
+  nudge(area: HTMLElement, delta: number): void;
+  toPosition(area: HTMLElement, top: number): void;
   endFilterWalk(): void;
   closeOverscroll(): void;
   openOverscroll(area: HTMLElement): void;
@@ -438,6 +441,7 @@ export function createKeyboardComposition<
     screen: () => deps.screens.screen(),
     byId: (id) => deps.el(id),
     leftById: (id) => deps.leftEl(id),
+    nudge: (scroller, delta) => deps.nudge(scroller, delta),
     rowShown: (row) => deps.rowShown(row),
     idsOf: (row) => deps.idsOf(row),
     shownRowFor: (row) => deps.shownRowFor(row),
@@ -503,6 +507,8 @@ export function createKeyboardComposition<
     scrollArea: () => deps.el("scroll-area"),
     sideScroll: () => deps.leftEl("side-scroll"),
     toFoot: (area) => deps.toFoot(area),
+    nudge: (area, delta) => deps.nudge(area, delta),
+    toPosition: (area, top) => deps.toPosition(area, top),
     endFilterWalk: () => deps.endFilterWalk(),
     closeOverscroll: () => deps.closeOverscroll(),
     openOverscroll: (area) => deps.openOverscroll(area),
@@ -527,6 +533,7 @@ export function createKeyboardComposition<
     firstRowInView: (pane) => firstRowInView(pane),
     landingHolds: () => deps.entryLandingHolds(),
     landingFirst: () => deps.entryLandingFirst(),
+    nudge: (scroller, delta) => deps.nudge(scroller, delta),
     selectRow: (...args) => selectRow(...args),
     takeRow: (pane, row, focus) => takeRow(pane, row, focus),
     landingGap: () => deps.replyLandingGapPx(),

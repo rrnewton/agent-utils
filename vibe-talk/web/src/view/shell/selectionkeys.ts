@@ -48,6 +48,8 @@ export interface SelectionKeysDependencies<Pane extends SteppedPane> {
   /** Whether the place a thread was entered on still holds, and its first row (`#221 read-modes`). */
   landingHolds(): boolean;
   landingFirst(): HTMLElement | null;
+  /** Move a pane's scroller by a measured delta, through the scroll owner (`#1251 scroll-single-owner`). */
+  nudge(scroller: HTMLElement, delta: number): void;
   /** Select `row` of `pane`; `bring` false leaves the scroll where it is (its default is true); `from` the way the keys came. */
   selectRow(pane: Pane, row: HTMLElement, bring?: boolean, from?: number): void;
   /** Make `row` the selection of `pane`; `focus` takes the focus there too. */
@@ -124,11 +126,11 @@ export function createSelectionKeys<Pane extends SteppedPane>(deps: SelectionKey
     if (document.activeElement !== row) deps.selectRow(pane, row, false);
     const box = row.getBoundingClientRect();
     if (direction > 0 && box.bottom > foot + 1) {
-      area.scrollTop += Math.min(box.bottom - foot + deps.landingGap(), step);
+      deps.nudge(area, Math.min(box.bottom - foot + deps.landingGap(), step));
       return true;
     }
     if (direction < 0 && box.top < head - 1) {
-      area.scrollTop -= Math.min(head - box.top + deps.landingGap(), step);
+      deps.nudge(area, -Math.min(head - box.top + deps.landingGap(), step));
       return true;
     }
     const next = rows[at + direction];
@@ -136,7 +138,7 @@ export function createSelectionKeys<Pane extends SteppedPane>(deps: SelectionKey
     // walk back to older history above: the key scrolls on toward either, as the arrow always did.
     if (!next) {
       if (direction > 0 && !held) deps.openOverscroll(area);
-      area.scrollTop += direction * step;
+      deps.nudge(area, direction * step);
       return true;
     }
     deps.selectRow(pane, next, true, direction);
