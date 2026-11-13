@@ -1,6 +1,6 @@
 ---
 title: 'wrkslots-salvage-thin-bundle-fast: remove-agent-batch salvage writes 15 GB self-contained bundles and holds the registry lock for minutes per clean slot'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -42,3 +42,7 @@ Reported 2026-11-12 by a consumer's lead (blocking slot teardown). That consumer
 [watermelon-full-preview] Piece (2) folds in #1213 wrkslots-state-lock-deletion for the remove-agent-batch path; #1213 stays open for its other removal shapes. Piece (3) landed as 191aa5cc.
 [watermelon-full-preview] Satellite landed: the live-journal busy fix (removal journals record their actor; concurrent mutations report busy/live instead of interrupted) landed separately as d980adb453a5ee6d9185423dd68a620a50de5586 on github/main (mu-wsjournal lane). Removal changes here rebase on it.
 [watermelon-full-preview] Piece (2b): ordinary `wrkslots remove` gets the prepared treatment too, and the configuration flock is released after the config check in prepared commit/completion rounds. This supersedes #1213's "keep #1194 configuration-lock behavior unchanged" for remove (recorded in both issues).
+
+## Resolution
+
+[watermelon-full-preview] All pieces landed on github/main: (3) single census 191aa5cc, (2) batch lock narrowing 70b3f054, (1) thin bundle + rescue/salvage presence fc12d993, (2b) plain-remove configuration-lock narrowing 1a32900c; live-journal satellite d980adb4. #1213 remains open for its non-remove shapes.
