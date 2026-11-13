@@ -236,6 +236,8 @@ export { createThreadCardHead } from "./threadcardhead.ts";
 export type { ThreadCardFoldChoice, ThreadCardHead, ThreadCardHeadDependencies, ThreadCardView } from "./threadcardhead.ts";
 export { createLitCards } from "./litcards.ts";
 export type { LitCardPane, LitCards, LitCardsDependencies } from "./litcards.ts";
+export { createReadModeAct } from "./readmodeact.ts";
+export type { ReadModeAct, ReadModeActDependencies } from "./readmodeact.ts";
 export { createReadActs } from "./readacts.ts";
 export type { HeldDoneCopy, ListedMessage, ReadActs, ReadActsDependencies, ReadDismissal, ReadDismissalOffer, ReadInboxLedger } from "./readacts.ts";
 export { createThreadStrip } from "./threadstrip.ts";

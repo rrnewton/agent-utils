@@ -5676,7 +5676,30 @@ const { renderPull, clearPullOffer, pullStart, pullMove, pullEnd, pullCancel } =
 // READ_MODE_TITLES), its kept copy (READ_MODE_KEY), what an old record means (`savedReadMode`) and the
 // cycle (`nextReadMode`) are web/src/present/rows' (`createReadMode`, `#624 voice-page-modularity`):
 // `readModes.mode()` is the mode, and `readModes.hiding()` this question.
-const readModes = createReadMode({ storage: () => deviceStorage() });
+// Putting the list in a read mode is web/src/view/channel's now (`createReadModeAct`, `#624
+// voice-page-modularity`): the mode's owner made here through present/rows' factory, handed in.
+const readModeAct = createReadModeAct({
+  makeReadModes: () => createReadMode({ storage: () => deviceStorage() }),
+  keepingFilterPlace: (change) => keepingFilterPlace(change),
+  clearReadRuns: () => readRuns.clear(),
+  settleUiState: () => uiState.settle(),
+  saveUiState: () => saveUiState(),
+  disarmBacklog: () => disarmBacklog(),
+  clearLastDismissal: () => lastDismissal.set(null),
+  clearBacklogCount: () => { listState().backlog = 0; },
+  renderTodoControls: () => renderTodoControls(),
+  threading: () => providerFacts.threading(),
+  eachColumnRenderCached: () => eachColumn(renderCachedTimeline),
+  forgetCards: () => cardsDrawn.forget(),
+  sideColumnUp: () => sideColumnUp(),
+  renderSideColumn: () => renderSideColumn(),
+  loadDiscordEnter: () => timelineView.loadDiscord({ keepPosition: true, ownAct: true, readAs: "enter" }),
+  applyReadRuns: () => applyReadRuns(),
+  renderScrollTools: () => renderScrollTools(),
+  guardQuietly: (run) => guardQuietly(run),
+  requestVisibleSummaries: () => requestVisibleSummaries(),
+});
+const { readModes, setReadMode } = readModeAct;
 
 // --- the read modes: Show read, Fold read, Hide read ----------------------------------------------
 //
@@ -5782,56 +5805,6 @@ const {
 } = readRunLines;
 const foldedOnes = readRunLines.foldedOnes;
 
-
-/**
- * Put the list in read mode `mode`. `#221 read-modes`. `#243 filter-keeps-selection`: a read mode is
- * a filter like any other, and the whole change — the notes and controls over the list included — is
- * made inside `keepingFilterPlace`: the reader's message stays where it is on the screen, or the line
- * of the run it joins, or the nearest message left in its place.
- */
-function setReadMode(mode) {
-  if (!READ_MODES.includes(mode)) return;
-  if (mode === "hide") mode = "fold";
-  const wasHiding = readModes.hiding();
-  const read = keepingFilterPlace(() => {
-    readModes.set(mode);
-    // Runs opened under Fold read are a way of looking at that list, and the reader has just
-    // chosen another way: coming back to Fold read folds them all again.
-    readRuns.clear();
-    // Kept across a reload, as the reader left it. `#189 restore-ui-state`.
-    uiState.settle();
-    saveUiState();
-    // The UI-state record above is the restore; this copy is only the sync's.
-    readModes.keep();
-    disarmBacklog();
-    // An undo belongs to the act it undoes, and leaving the view is the reader moving on. Keeping
-    // it would offer to restore messages into a list they are no longer looking at. Showing or
-    // collapsing what is read leaves every message in the list, so the undo stays between those two.
-    if (readModes.hiding() !== wasHiding) lastDismissal.set(null);
-    if (!readModes.hiding()) {
-      listState().backlog = 0;
-    }
-    renderTodoControls();
-    if (providerFacts.threading()) {
-      // One read mode, for both columns. `#229 desktop-two-column`.
-      eachColumn(renderCachedTimeline);
-      // `#404 threads-unpack-all`. And inside every unpacked block.
-      cardsDrawn.forget();
-      if (sideColumnUp()) renderSideColumn();
-    } else if (readModes.hiding() !== wasHiding) {
-      // A read of another route, which keeps the reader's place as a refresh does and is placed again
-      // when it lands. What it brings is the reader's own act, not something that arrived.
-      return timelineView.loadDiscord({ keepPosition: true, ownAct: true, readAs: "enter" });
-    } else {
-      // Show read and Fold read are the same read of the channel, drawn two ways.
-      applyReadRuns();
-      renderScrollTools();
-    }
-    return undefined;
-  });
-  if (read) guardQuietly(() => read)();
-  requestVisibleSummaries();
-}
 
 // Pinned messages are web/src/view/channel's now (`createPinnedMessages`, `#624
 // voice-page-modularity`): the held list, the sync over it, every row's chip, the filter's

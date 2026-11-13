@@ -3512,3 +3512,84 @@ test("`#624 voice-page-modularity`: the scroll trace's anchor, stored choice and
   assert.deepStrictEqual(record, ["keep=true", "start", "post /api/v1/scroll-trace POST", "Scroll trace sent."]);
   assert.equal(box.checked, true);
 });
+
+test("`#624 voice-page-modularity`: putting the list in a read mode — the mode set, kept, and drawn as the route says — from the module alone", async () => {
+  const { createReadModeAct } = CHANNEL_VIEW;
+  const log = [];
+  let mode = "show";
+  let hiding = false;
+  let threading = true;
+  const modes = {
+    mode: () => mode, hiding: () => hiding,
+    set: (next) => { mode = next; hiding = next === "hide"; log.push(`set ${next}`); },
+    keep: () => log.push("keep-mode"),
+  };
+  const owner = createReadModeAct({
+    makeReadModes: () => modes,
+    keepingFilterPlace: (change) => change(),
+    clearReadRuns: () => log.push("clear-runs"),
+    settleUiState: () => log.push("settle"), saveUiState: () => log.push("save-ui"),
+    disarmBacklog: () => log.push("disarm"),
+    clearLastDismissal: () => log.push("clear-dismissal"),
+    clearBacklogCount: () => log.push("clear-count"),
+    renderTodoControls: () => log.push("controls"),
+    threading: () => threading,
+    eachColumnRenderCached: () => log.push("each-column"),
+    forgetCards: () => log.push("forget-cards"), sideColumnUp: () => true,
+    renderSideColumn: () => log.push("side"),
+    loadDiscordEnter: async () => { log.push("load-enter"); },
+    applyReadRuns: () => log.push("apply-runs"), renderScrollTools: () => log.push("tools"),
+    guardQuietly: (run) => run, requestVisibleSummaries: () => log.push("summaries"),
+  });
+  // Not a mode at all: nothing happens.
+  owner.setReadMode("bogus");
+  assert.deepStrictEqual(log, [], "an unknown mode changed something");
+  // Asking for Hide folds instead (#1168), and with threads both columns are drawn again.
+  owner.setReadMode("hide");
+  assert.equal(owner.readModes.mode(), "fold");
+  assert.deepStrictEqual(log, ["set fold", "clear-runs", "settle", "save-ui", "keep-mode", "disarm",
+    "clear-count", "controls", "each-column", "forget-cards", "side", "summaries"]);
+  // Show again, the same route: no dismissal is cleared while hiding never changed.
+  log.length = 0;
+  owner.setReadMode("show");
+  assert.deepStrictEqual(log, ["set show", "clear-runs", "settle", "save-ui", "keep-mode", "disarm",
+    "clear-count", "controls", "each-column", "forget-cards", "side", "summaries"],
+    "a change that never hid cleared the dismissal, or drew otherwise");
+  // Without threads, leaving Hide read clears the dismissal and reads the other route, guarded;
+  // and a change that hides nothing new draws the runs instead.
+  const log2 = [];
+  let mode2 = "hide";
+  let hiding2 = true;
+  const modes2 = {
+    mode: () => mode2, hiding: () => hiding2,
+    set: (next) => { mode2 = next; hiding2 = next === "hide"; log2.push(`set ${next}`); },
+    keep: () => log2.push("keep-mode"),
+  };
+  const other = createReadModeAct({
+    makeReadModes: () => modes2,
+    keepingFilterPlace: (change) => change(),
+    clearReadRuns: () => log2.push("clear-runs"),
+    settleUiState: () => log2.push("settle"), saveUiState: () => log2.push("save-ui"),
+    disarmBacklog: () => log2.push("disarm"),
+    clearLastDismissal: () => log2.push("clear-dismissal"),
+    clearBacklogCount: () => log2.push("clear-count"),
+    renderTodoControls: () => log2.push("controls"),
+    threading: () => false,
+    eachColumnRenderCached: () => log2.push("each-column"),
+    forgetCards: () => log2.push("forget-cards"), sideColumnUp: () => false,
+    renderSideColumn: () => log2.push("side"),
+    loadDiscordEnter: async () => { log2.push("load-enter"); },
+    applyReadRuns: () => log2.push("apply-runs"), renderScrollTools: () => log2.push("tools"),
+    guardQuietly: (run) => { log2.push("guarded"); return run; },
+    requestVisibleSummaries: () => log2.push("summaries"),
+  });
+  other.setReadMode("show");
+  assert.deepStrictEqual(log2, ["set show", "clear-runs", "settle", "save-ui", "keep-mode", "disarm",
+    "clear-dismissal", "clear-count", "controls", "load-enter", "guarded", "summaries"],
+    "leaving Hide read without threads did not clear the dismissal, read the other route guarded");
+  log2.length = 0;
+  other.setReadMode("fold");
+  assert.deepStrictEqual(log2, ["set fold", "clear-runs", "settle", "save-ui", "keep-mode", "disarm",
+    "clear-count", "controls", "apply-runs", "tools", "summaries"],
+    "a change hiding nothing new did not draw the runs");
+});
