@@ -203,16 +203,6 @@
   -webkit-user-select: none;
 }
 
-/* `#1470 toolbar-dynamic-promotion`. A menu item promoted to the bar keeps its tray dress
-   (the read-toggle lane's fixed label and pressed style travel with the element); in the
-   pack it only needs bar manners: never shrink, never wrap its label, and stand in the
-   pack's row height. Colour and the pressed treatment are not stated here on purpose. */
-#bar-pack .promoted-action {
-  flex: 0 0 auto;
-  white-space: nowrap;
-  min-height: 2.4rem;
-}
-
 /* The same argument as `.bar-button[aria-disabled="true"]` above, and deliberately the same
    treatment: greyed, still hoverable, and the tooltip is what says why. The tray OPENS at idle so
    that this state can be seen at all — a menu that refuses to open cannot explain itself. */
