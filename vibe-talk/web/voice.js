@@ -666,7 +666,15 @@ function readAloudOwner() {
     get showError() { return showError; },
     get eachColumn() { return eachColumn; },
     get renderChannelRows() { return renderChannelRows; },
-    get dismissMessages() { return dismissMessages; },
+    // `#1388` landing 1: read-aloud's marks restate an open summary's strike.
+    get dismissMessages() {
+      const raw = dismissMessages;
+      return (body) => {
+        const run = raw(body);
+        void Promise.resolve(run).then(refreshDiscussStrikes, refreshDiscussStrikes);
+        return run;
+      };
+    },
     // `#886 voice-page-autoplay`. What reads after a read heard to its end.
     nextAfterRead: (parts) => autoplay.nextAfter(parts),
     get currentView() { return screens.view(); },
@@ -1100,6 +1108,11 @@ const documentsView = createDocumentsView({
 // drawing are the view's. The Done acts it marks through are made below and read
 // only inside these thunks, as the Documents view's are.
 
+/** `#1388` landing 1. Restate an open summary's strike after any mark settles. */
+function refreshDiscussStrikes() {
+  try { discussView.refreshStrikes(); } catch { /* no panel yet */ }
+}
+
 /** The mounted Discuss view. */
 const discussView = createDiscussView({
   byId: (id) => el(id),
@@ -1119,6 +1132,8 @@ const discussView = createDiscussView({
   },
   dismissMessages: (body) => dismissMessages(body),
   restoreMessages: (ids) => restoreMessages(ids),
+  // `#1388` landing 1: the strike reads the channel store's read (Done) set.
+  isReadNow: (id) => channelStore.current().dismissed.has(String(id)),
   showError: (text) => showError(text),
   setStatus: (text) => setStatus(text),
   // `#1344 discuss-panel-resize`. The panel's kept layout, on this device as the
@@ -5694,14 +5709,24 @@ const readActs = createReadActs({
   readFilterKeeps: () => readFilterKeeps(),
   timelineMessages: () => timelineRows().messages,
   renderTodoControls: () => renderTodoControls(),
-  restoreMessages: (messages) => restoreMessages(messages),
+  // `#1388` landing 1: a channel mark restates an open summary's strike.
+  restoreMessages: (messages) => {
+    const run = restoreMessages(messages);
+    void Promise.resolve(run).then(refreshDiscussStrikes, refreshDiscussStrikes);
+    return run;
+  },
   undoBookmarkBump: (bump, restoring) => undoBookmarkBump(bump, restoring),
   listedMessages: () => listedMessages(),
   backlogIsArmed: () => backlogIsArmed(),
   armBacklog: () => armBacklog(),
   disarmBacklog: () => disarmBacklog(),
   setStatus: (text) => setStatus(text),
-  dismissMessages: (body, bump) => dismissMessages(body, /** @type {any} */ (bump)),
+  // `#1388` landing 1: a channel mark restates an open summary's strike.
+  dismissMessages: (body, bump) => {
+    const run = dismissMessages(body, /** @type {any} */ (bump));
+    void Promise.resolve(run).then(refreshDiscussStrikes, refreshDiscussStrikes);
+    return run;
+  },
   throughBump: (row) => throughBump(/** @type {any} */ (row)),
 });
 const { readRuns, readRunLines, lastDismissal, inboxLedger, caughtUpDone, followDoneEverywhere, rowsMissDone, undoDismissal, clearBacklog } = readActs;

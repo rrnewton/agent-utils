@@ -13,6 +13,7 @@
 // parts); the panel narrows the decoded body to the fields it reads.
 
 import { createListening, foldSectionsByHeading, insertSanitizedHtml, openSectionKeys, setAllSections, setClassWord } from "../dom/index.ts";
+import { applyStrikes } from "./strikes.ts";
 import { createComposerKeys } from "../composer/index.ts";
 import { deepLinkRefFrom } from "../../foundation/index.ts";
 import type { MessageLinkRef } from "../../foundation/index.ts";
@@ -59,6 +60,8 @@ export interface CatchupAnswer {
   markable_ids: string[];
   /** The cited subset (`#1350`), narrowed here for the record's restore. */
   cited_ids: string[];
+  /** The latest Update's cited ids (`#1388` landing 2); absent draws none fresh. */
+  fresh_ids: string[];
   footer_links: CatchupFooterLink[];
   text: string;
   /** The answer as the server's sanitized render (`#1349`); empty draws `text` plain. */
@@ -87,6 +90,13 @@ export interface DiscussPanelDependencies {
   catchupRecord(channelId: string, scope: DiscussScope): Promise<unknown>;
   /** POST one follow-up for `channelId`; answers the appended turns as `unknown`. */
   catchupFollowup(channelId: string, scope: DiscussScope, text: string): Promise<unknown>;
+  /** POST one incremental Update for `channelId` (`#1388` landing 2); answers the merged summary. */
+  catchupUpdate?(channelId: string, scope: DiscussScope): Promise<unknown>;
+  /**
+   * `#1388` landing 1. Whether message `id` is read NOW, from the page's read
+   * set; absent, nothing is ever struck. Read on every strike recompute.
+   */
+  isReadNow?(id: string): boolean;
   /** Whether a bare Enter sends (the reader's "Enter to send"), for the composer keys. */
   enterSends?(): boolean;
   /** A request started or settled, so the page can disable its entry points too. */
@@ -215,6 +225,8 @@ export interface DiscussPanel {
   mode(): DiscussLayoutMode;
   /** `#1354`. Stand the panel in `mode` and keep the choice on the device. */
   setMode(mode: DiscussLayoutMode): void;
+  /** `#1388` landing 1. Restate the strike from the read set now (a mark landed elsewhere). */
+  refreshStrikes(): void;
 }
 
 /** Why Discuss cannot work on a deployment with no direct LLM summarizer, said once. */
@@ -246,7 +258,7 @@ function stringsOf(value: unknown): string[] {
 
 /** Narrow an answer body to the fields the panel reads; an empty answer for any other shape. */
 export function asCatchupAnswer(value: unknown): CatchupAnswer {
-  const empty: CatchupAnswer = { window: null, unread_ids: [], markable_ids: [], cited_ids: [], footer_links: [], text: "", text_html: "", unknown_terms: [], stamp: null };
+  const empty: CatchupAnswer = { window: null, unread_ids: [], markable_ids: [], cited_ids: [], fresh_ids: [], footer_links: [], text: "", text_html: "", unknown_terms: [], stamp: null };
   if (typeof value !== "object" || value === null) return empty;
   const record = value as Record<string, unknown>;
   const rawWindow = typeof record.window === "object" && record.window !== null ? (record.window as Record<string, unknown>) : null;
@@ -272,6 +284,7 @@ export function asCatchupAnswer(value: unknown): CatchupAnswer {
     unread_ids: stringsOf(record.unread_ids),
     markable_ids: stringsOf(record.markable_ids),
     cited_ids: stringsOf(record.cited_ids),
+    fresh_ids: stringsOf(record.fresh_ids),
     footer_links: links,
     text: typeof record.text === "string" ? record.text : "",
     text_html: typeof record.text_html === "string" ? record.text_html : "",
@@ -333,6 +346,7 @@ function asSavedAnswer(value: unknown): { answer: CatchupAnswer; created_ms: num
       markable_ids: stringsOf(record.markable_ids),
       footer_links: links,
       cited_ids: stringsOf(record.cited_ids),
+      fresh_ids: stringsOf(record.fresh_ids),
       text: typeof record.text === "string" ? record.text : "",
       text_html: typeof record.text_html === "string" ? record.text_html : "",
       unknown_terms: stringsOf(record.unknown_terms),
@@ -820,6 +834,28 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
   }
 
   /**
+   * `#1388` landing 1. Restate the strike over the drawn answer from the
+   * page's read set now: a bullet or section whose cited messages are all
+   * read is struck (still readable, tappable, foldable); an uncited bullet
+   * never is. Class words only — read-aloud still reads struck bullets.
+   */
+  function restrike(): void {
+    if (lastAnswer === null) return;
+    const isRead = (id: string): boolean => {
+      try {
+        return deps.isReadNow?.(id) === true;
+      } catch {
+        return false;
+      }
+    };
+    try {
+      applyStrikes(deps.byId("discuss-answer") as never, isRead, new Set(lastAnswer.fresh_ids));
+    } catch {
+      // No answer box in this host: nothing to strike.
+    }
+  }
+
+  /**
    * Draw one answer (`discuss-markdown-render`): the server's sanitized render as
    * markup when it sent one, the shaped text as text otherwise. Model text reaches
    * innerHTML only through `text_html` — never directly.
@@ -870,6 +906,9 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       setClassWord(box, "discuss-answer--plain", true);
       box.textContent = answer.text;
     }
+    // `#1388` landing 1: the strike stands from this draw (a plain draw has
+    // no citation links to map, so nothing is struck there).
+    restrike();
   }
 
   /** The terms the answer did not understand, collapsed (`#1351`). */
@@ -1225,6 +1264,8 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
       marking = false;
       readButton.disabled = false;
       unreadButton.disabled = false;
+      // `#1388` landing 1: the Discuss mark buttons move the strike at once.
+      restrike();
     });
   }
 
@@ -1439,6 +1480,9 @@ export function createDiscussPanel(deps: DiscussPanelDependencies): DiscussPanel
     mode: () => layoutMode,
     setMode(mode: DiscussLayoutMode) {
       applyMode(mode, true);
+    },
+    refreshStrikes() {
+      restrike();
     },
   };
 }

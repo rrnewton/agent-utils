@@ -560,3 +560,27 @@ body:has(#discuss-panel:not([hidden])) #read-steer {
 
 .discuss-collapse-bar { display: flex; gap: 8px; margin: 0 0 6px; }
 .discuss-collapse-bar button { font: inherit; }
+
+/* `#1388 discuss-summary-staleness-update` (landing 1 strike, landing 2
+ * fresh): a bullet or section whose cited messages are all read is struck —
+ * muted, still readable, still tappable, still foldable; a section's strike
+ * is its heading only, so an uncited bullet inside is never struck. The
+ * latest Update's unread parts are green until read or the next Update. */
+#discuss-answer li.discuss-struck {
+  text-decoration: line-through;
+  color: #8a93a3;
+}
+
+#discuss-answer details.discuss-struck-section > summary {
+  text-decoration: line-through;
+  color: #8a93a3;
+}
+
+#discuss-answer li.discuss-fresh {
+  background: rgb(46 160 90 / 22%);
+  border-radius: 4px;
+}
+
+#discuss-answer details.discuss-fresh > summary {
+  color: #7ee2a0;
+}

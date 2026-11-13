@@ -20,6 +20,7 @@ const {
   createDiscussView, createDiscussPanel, formatStampLine, DISCUSS_UNAVAILABLE_HINT,
   DISCUSS_BINDING_RULES, WIDEN_OR_SIDEWAYS_ACTION, discussScopeKey, isSameDiscussScope,
   linkDecision, normalizeDiscussScope, viewChangeDecision,
+  applyStrikes, citationIdsOf, hasWord, STRUCK_BULLET_CLASS, STRUCK_SECTION_CLASS, FRESH_CLASS,
 } = VIEW;
 
 // ---- fakes -----------------------------------------------------------------------------------
@@ -1423,4 +1424,98 @@ test("catchup read: Read hands the owner all blocks under the record key; tap, h
     if (savedDocument === undefined) delete globalThis.document;
     else globalThis.document = savedDocument;
   }
+// ---- #1388 landing 1: live strike-through -------------------------------------------------------
+
+function strikeEl(tag, kids = [], href = null) {
+  const el = fakeElement(tag);
+  el.open = false;
+  if (href !== null) el.attributes.href = href;
+  for (const kid of kids) el.appendChild(kid);
+  return el;
+}
+
+const cite = (id) => strikeEl("a", [], `?c=C9&v=all&m=discord:C9:${id}`);
+const fresh = new Set();
+
+test("catchup strike: citations map to their bullet and section; uncited never struck (#1388)", () => {
+  const struck = strikeEl("li", [cite("m1")]);
+  const partial = strikeEl("li", [cite("m1"), cite("m2")]);
+  const uncited = strikeEl("li", []);
+  const issueOnly = strikeEl("li", [strikeEl("a", [], "https://github.com/rrnewton/agent-utils/issues/1388")]);
+  const list = strikeEl("ul", [struck, partial, uncited, issueOnly]);
+  const summary = strikeEl("summary", [strikeEl("h2", [])]);
+  const body = strikeEl("div", [strikeEl("p", [cite("m1")]), list]);
+  const section = strikeEl("details", [summary, body]);
+  const root = strikeEl("div", [section]);
+  assert.deepEqual(citationIdsOf(struck), ["m1"], "a bullet's citations are its links' messages");
+  assert.deepEqual(citationIdsOf(section), ["m1", "m2"], "a section's citations span its bullets");
+  const read = new Set(["m1"]);
+  const counts = applyStrikes(root, (id) => read.has(id), fresh);
+  assert.equal(hasWord(struck, STRUCK_BULLET_CLASS), true, "an all-read bullet was not struck");
+  assert.equal(hasWord(partial, STRUCK_BULLET_CLASS), false, "a partly-read bullet was struck");
+  assert.equal(hasWord(uncited, STRUCK_BULLET_CLASS), false, "an uncited bullet was struck");
+  assert.equal(hasWord(issueOnly, STRUCK_BULLET_CLASS), false, "an issue-only bullet was struck");
+  assert.equal(hasWord(section, STRUCK_SECTION_CLASS), false, "a partly-read section was struck");
+  assert.deepEqual(counts, { bullets: 1, sections: 0 });
+  // Live recompute: once m2 is read too, bullet and section strike without a redraw.
+  read.add("m2");
+  applyStrikes(root, (id) => read.has(id), fresh);
+  assert.equal(hasWord(partial, STRUCK_BULLET_CLASS), true, "the strike did not recompute live");
+  assert.equal(hasWord(section, STRUCK_SECTION_CLASS), true, "the section did not strike when all read");
+  assert.equal(hasWord(uncited, STRUCK_BULLET_CLASS), false, "an uncited bullet struck late");
+  // And back: unreading unstrikes.
+  read.delete("m1");
+  applyStrikes(root, (id) => read.has(id), fresh);
+  assert.equal(hasWord(struck, STRUCK_BULLET_CLASS), false, "unreading did not unstrike");
+});
+
+test("catchup strike: folds survive a strike; fresh is green until read (#1388)", () => {
+  const bullet = strikeEl("li", [cite("m9")]);
+  const section = strikeEl("details", [strikeEl("summary", [strikeEl("h2", [])]), strikeEl("div", [strikeEl("ul", [bullet])])]);
+  section.open = true;
+  const root = strikeEl("div", [section]);
+  const read = new Set();
+  applyStrikes(root, (id) => read.has(id), new Set(["m9"]));
+  assert.equal(hasWord(bullet, FRESH_CLASS), true, "the Update's bullet was not fresh");
+  assert.equal(section.open, true, "striking moved a fold");
+  read.add("m9");
+  applyStrikes(root, (id) => read.has(id), new Set(["m9"]));
+  assert.equal(hasWord(bullet, FRESH_CLASS), false, "a read bullet stayed green");
+  assert.equal(hasWord(bullet, STRUCK_BULLET_CLASS), true, "a read fresh bullet was not struck");
+  assert.equal(section.open, true, "the fold moved on recompute");
+});
+
+test("catchup strike: the panel strikes live from isReadNow and its mark buttons (#1388)", async () => {
+  const read = new Set();
+  const fx = fixture({ respond: () => Promise.resolve(answer({ cited_ids: ["m1", "m2"], text: "x", text_html: "<h2>S</h2><ul><li>one</li></ul>" })) });
+  fx.deps.isReadNow = (id) => read.has(id);
+  try {
+    const view = createDiscussView(fx.deps);
+    view.mountControls();
+    // Hand-draw the answer box's bullets with citation links (the one-parser
+    // fake cannot), then restate: the panel maps links, not answer fields.
+    await openAndSummarize(view, fx);
+    await flush();
+    const box = fx.els["discuss-answer"];
+    const li = fakeElement("li");
+    const link = fakeElement("a");
+    link.attributes.href = "?c=C9&v=all&m=discord:C9:m1";
+    li.appendChild(link);
+    const plain = fakeElement("li");
+    box.appendChild(li);
+    box.appendChild(plain);
+    view.refreshStrikes();
+    assert.equal(hasWord(li, STRUCK_BULLET_CLASS), false, "an unread bullet was struck");
+    read.add("m1");
+    view.refreshStrikes();
+    assert.equal(hasWord(li, STRUCK_BULLET_CLASS), true, "a read bullet was not struck live");
+    assert.equal(hasWord(plain, STRUCK_BULLET_CLASS), false, "an uncited bullet was struck");
+    // The Discuss mark-read button marks every markable id; with the page's
+    // read set following (as the store does), the strike follows on settle.
+    read.add("m2");
+    click(fx.els["discuss-mark-read"]);
+    await flush();
+    assert.deepEqual(fx.calls.dismiss, [{ messages: ["m1", "m2"] }], "Mark read sent another set");
+    assert.equal(hasWord(li, STRUCK_BULLET_CLASS), true, "the mark did not keep the strike");
+  } finally { fx.restore(); }
 });

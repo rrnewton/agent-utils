@@ -6,6 +6,8 @@
 // fetched until the controls are mounted and the panel opened.
 
 export { DISCUSS_UNAVAILABLE_HINT, asCatchupAnswer, asCatchupPreview, asCatchupRecord, boundForCount, countSince, createDiscussPanel, discussReadKey, formatStampLine, hhmm, isDiscussUnavailable } from "./panel.ts";
+export { FRESH_CLASS, STRUCK_BULLET_CLASS, STRUCK_SECTION_CLASS, applyStrikes, citationIdsOf, hasWord } from "./strikes.ts";
+export type { StrikeElement } from "./strikes.ts";
 export type {
   CatchupAnswer,
   CatchupFooterLink,
@@ -80,6 +82,10 @@ export interface DiscussViewDependencies {
   catchupRecord?(channelId: string, scope: DiscussScope): Promise<unknown>;
   /** POST one follow-up, where the page (or a test) injects its own. */
   catchupFollowup?(channelId: string, scope: DiscussScope, text: string): Promise<unknown>;
+  /** POST one incremental Update, where the page (or a test) injects its own (`#1388` landing 2). */
+  catchupUpdate?(channelId: string, scope: DiscussScope): Promise<unknown>;
+  /** `#1388` landing 1. Whether a message is read now, from the page's read set. */
+  isReadNow?(id: string): boolean;
   /** Whether a bare Enter sends, handed to the panel's composer keys. */
   enterSends?(): boolean;
   /** The channel on screen: the parent channel even in a thread. */
@@ -180,6 +186,8 @@ export interface DiscussView {
   mode(): "overlay" | "docked" | "maximized";
   /** `#1354`. Stand the panel in `mode` and keep the choice on the device. */
   setMode(mode: "overlay" | "docked" | "maximized"): void;
+  /** `#1388` landing 1. Restate the summary's strike from the read set now. */
+  refreshStrikes(): void;
 }
 
 /** Make the Discuss view from the page's thunks. Nothing is looked up yet. */
@@ -336,6 +344,15 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
         body: JSON.stringify({ thread_id: scope.threadId, text }),
       });
     },
+    catchupUpdate(channelId: string, scope: DiscussScope): Promise<unknown> {
+      if (deps.catchupUpdate) return deps.catchupUpdate(channelId, scope);
+      if (!deps.api) return Promise.reject(new Error("Discuss has no way to reach the server."));
+      return deps.api(`/api/v1/channels/${encodeURIComponent(channelId)}/catchup/update`, {
+        method: "POST",
+        body: JSON.stringify({ thread_id: scope.threadId, view: scope.view }),
+      });
+    },
+    isReadNow: (id: string) => deps.isReadNow?.(id) ?? false,
     enterSends: () => deps.enterSends?.() ?? true,
     onBusy(on) {
       busy = on;
@@ -456,6 +473,8 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
           panel.setScopeLabel(currentRaw.label);
         }
         drawAvailability();
+        // `#1388` landing 1: a view change may carry new read state with it.
+        panel.refreshStrikes();
       } catch {
         // No panel in this host yet: sync is a label only, and says nothing.
       }
@@ -501,5 +520,6 @@ export function createDiscussView(deps: DiscussViewDependencies): DiscussView {
     setSheetFull: (full: boolean) => panel.setSheetFull(full),
     mode: () => panel.mode(),
     setMode: (mode: "overlay" | "docked" | "maximized") => panel.setMode(mode),
+    refreshStrikes: () => panel.refreshStrikes(),
   };
 }
