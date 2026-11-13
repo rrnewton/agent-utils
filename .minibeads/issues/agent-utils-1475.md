@@ -1,6 +1,6 @@
 ---
 title: 'merge-queue-speculative-stacking-default: validate each root stacked on the candidates ahead of it, and land by checked fast-forward'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-11-12T00:00:00.000000000+00:00
@@ -76,3 +76,10 @@ waits. Coordination: the pipeline fill loop and `Runner::land_with`
 are owned by this change; validator-purpose, base-evidence, stop-text
 and notice-registry hunks in the same crate are owned separately and
 this change replays over them rather than rebasing.
+
+## Resolution
+
+Landed on main as [0fbbfc23](https://github.com/rrnewton/agent-utils/commit/0fbbfc23176c7689faefb22cbc537aa32ae1d824) (`bf1af1f5` +
+`0fbbfc23`; replays of gated `cc63f2b3`, `0f9c45e9`). The gate
+(`GATE_SLOTS=3` validate, exit 0) and the combined-tree check after
+main moved are recorded in the landing report to the coordinator.

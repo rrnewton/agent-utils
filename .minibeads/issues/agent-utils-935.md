@@ -1,6 +1,6 @@
 ---
 title: 'merge-queue-stale-green-stack: a candidate green on the previous base stacks even below the pass-rate gate when disjoint'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-11-06T13:09:01.430317101+00:00
@@ -18,3 +18,14 @@ On existing P1 predictor and k-roots/keep_stale_roots (#915/c0c52444), not a par
 # Acceptance Criteria
 
 Stacked when green-on-previous-base and disjoint; not stacked when paths overlap or merge-tree conflicts; red fallback; gate still applies to fresh candidates.
+
+# Notes
+
+## Resolution
+
+Closed by #1475 merge-queue-speculative-stacking-default, landed on
+main as [0fbbfc23](https://github.com/rrnewton/agent-utils/commit/0fbbfc23176c7689faefb22cbc537aa32ae1d824): speculative stacking is now the default,
+which subsumes and generalizes this stale-green stacking (the
+`stale-green-stacked` behaviour and its below-gate, disjoint and
+red-fallback rules are unchanged under the opt-out and preserved as
+exceptions under the default).

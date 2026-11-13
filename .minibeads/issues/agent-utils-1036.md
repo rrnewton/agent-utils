@@ -1,6 +1,6 @@
 ---
 title: 'merge-queue-planner-stacking: an --after change is composed off its dependency, and a prioritized stale green stacks under a non-prioritized root'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-11-08T00:44:37.000000000+00:00
@@ -51,3 +51,12 @@ Reported 2026-11-07 by a consuming project's merge queue (run
 20261107T153547Z); consumers are referred to generically here, per
 repository convention. The two are landed together because they
 share the planner's composition-parent choice.
+
+## Resolution
+
+Closed by #1475 merge-queue-speculative-stacking-default, landed on
+main as [0fbbfc23](https://github.com/rrnewton/agent-utils/commit/0fbbfc23176c7689faefb22cbc537aa32ae1d824): the `--after` dependency-parent
+composition and the prioritized stale-green rooting are preserved as
+explicit exceptions to the new stacking default, with their
+acceptance covered by the existing planner and stale-green suites
+plus the new speculative-stacking tests.
