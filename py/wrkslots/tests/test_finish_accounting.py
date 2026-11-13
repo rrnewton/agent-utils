@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import subprocess
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import pytest
@@ -303,9 +304,28 @@ def test_classify_git_invocations_constant_in_remote_refs(
     calls: list[tuple[str, ...]] = []
     original = wrkslots_cli._GitVcs._run
 
-    def counting(repository: Path, args: object, **kwargs: object) -> object:
-        calls.append(tuple(str(item) for item in args))  # type: ignore[arg-type]
-        return original(repository, args, **kwargs)  # type: ignore[arg-type]
+    def counting(
+        repository: Path,
+        args: Sequence[str],
+        *,
+        check: bool = True,
+        input_text: str | None = None,
+        env_overrides: Mapping[str, str] | None = None,
+        timeout_seconds: float | None = None,
+        timeout_refusal: str | None = None,
+        config: Sequence[tuple[str, str]] = (),
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(tuple(args))
+        return original(
+            repository,
+            args,
+            check=check,
+            input_text=input_text,
+            env_overrides=env_overrides,
+            timeout_seconds=timeout_seconds,
+            timeout_refusal=timeout_refusal,
+            config=config,
+        )
 
     monkeypatch.setattr(wrkslots_cli._GitVcs, "_run", staticmethod(counting))
     first = _classify(repo, base_sha, head)
