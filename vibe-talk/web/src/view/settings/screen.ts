@@ -230,7 +230,7 @@ export function mountReadingWidth(deps: ScreenSettingDependencies): ReadingWidth
    * The width to put on the page for the gate's answer in the layout in force. The
    * gate's full-width answer is written only where the pane is held by the variable
    * itself — one message column, docked or not. In two columns the stylesheet spans
-   * the pane (`#373`) and re-caps it only while the gate says "shown", and in the
+   * the pane (`#373`) and there is no handle, and in the
    * thread list the list follows the remembered width as it always has: in both, the
    * variable keeps the remembered value, so entering or leaving them never reflows
    * the lists drawn beside or instead of the message column.
@@ -323,13 +323,22 @@ export function mountReadingWidth(deps: ScreenSettingDependencies): ReadingWidth
     const measuredCh = measurePerCh();
     if (measuredCh > 0) perCh = measuredCh;
     const screenEl = deps.lookup("screen-main");
+    const grip = deps.lookup("width-grip") as HTMLElement;
+    if (screenEl.getAttribute("data-columns") === "two") {
+      // No handle in two columns at any width (`#373` spans Main across its half;
+      // the stylesheet takes the handle away there too). The variable keeps the
+      // remembered value, as `appliedFor` holds it, so nothing reflows.
+      gripShown = false;
+      grip.hidden = true;
+      if (appliedWidth !== readingWidth) {
+        appliedWidth = readingWidth;
+        document.documentElement.style.setProperty("--reading-width", `${appliedWidth}ch`);
+      }
+      return;
+    }
     const maximized = screenEl.getAttribute("data-discuss") === "maximized";
     const shown = !maximized && readingGripVisibility(gripShown, area.width, perCh);
-    const grip = deps.lookup("width-grip") as HTMLElement;
     grip.style.left = `${readingGripLeft(pane, screen)}px`;
-    // Said on the screen as well as on the handle: in two columns the stylesheet
-    // re-caps the main pane only while this says "shown" (`#373` spans it otherwise).
-    screenEl.setAttribute("data-reading-grip", shown ? "shown" : "hidden");
     if (shown === gripShown) {
       grip.hidden = !shown;
       return;

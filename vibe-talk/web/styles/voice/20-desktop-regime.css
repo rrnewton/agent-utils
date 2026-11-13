@@ -796,9 +796,9 @@
  *
  * The two columns are the window's two halves, each holding its list across it (`#373
  * two-column-full-width`, below; until then, in the reading column centred in it),
- * a hairline between them. The width handle stays Main's alone (`#1398
- * reading-width-handle-gate`): it stands on the left column's edge and sizes that
- * column, shown only while that column's measured width earns it. The dock, the chips and the line
+ * a hairline between them. The width handle goes (`#1398 reading-width-handle-gate`
+ * keeps it that way at every width): the reading width is one column's choice, and
+ * in two columns each half already is a column. The dock, the chips and the line
  * the pill and the search glass float on follow the left column, which is Main's; the right column
  * has a heading of its own above its list and its own jump to its newest message.
  *
@@ -868,12 +868,6 @@
     position: relative;
     border-left: 1px solid var(--edge);
   }
-
-  /* `#1398 reading-width-handle-gate`. No blanket rule takes the handle away in two
-     columns: the script shows it whenever the MAIN (left) column's measured width
-     earns it, even beside a second column or a docked panel, and hides it whenever
-     that column is squeezed, in one column as in two. Only the main column gets a
-     handle; the side column's rows span their column (`#373`) and keep full width. */
 
   /* `#261 two-column-connectors`. The links, over the whole main screen and in front of both lists, but
      behind the chips and the menus, and never in the way of a press. web/voice.js draws them in the gap
@@ -1054,15 +1048,13 @@
     max-width: none;
   }
 
-  /* `#1398 reading-width-handle-gate`. The one exception to the span above: while the
-     script's measured gate says the main column earns its handle (`data-reading-grip`
-     on the screen, set from the column's own rendered width), the main pane is held
-     to the reading width again, centred in its column, with the handle on its edge.
-     Below the gate the span stands and the text is full width, as `#373` left it. */
-  #screen-main[data-columns="two"][data-reading-grip="shown"] #pane-discord,
-  #screen-main[data-columns="two"][data-reading-grip="shown"] #pane-voice {
-    max-width: var(--reading-width);
-    margin-inline: auto;
+  /* `#1398 reading-width-handle-gate`. No handle in two columns at any width: the
+     span above is the layout's own answer there (a half of the desk is already a
+     column), and the stylesheet takes the handle away as it always has. The gate
+     governs the one message column — beside a docked panel included — where the
+     pane is held by the reading width itself. */
+  #screen-main[data-columns="two"] > #width-grip {
+    display: none;
   }
 
   /* The right column's jump over its foot, as wide as its column as the left one's chips are. */
