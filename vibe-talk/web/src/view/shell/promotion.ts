@@ -5,10 +5,19 @@
 // action in the menu is not on the toolbar. Discuss used to break it, drawn in both
 // (`#discuss-open` on the bar, `#discuss-menu-open` in the menu). On a desk the bar has
 // free room between Discuss and the rest of the bar; that room is spent, in a fixed
-// priority order, on the menu's actions: Discuss first, then Fold read, then
-// Expand all / Collapse all as one slot, then Summaries. As many as fit are promoted;
-// the rest stay in the menu. A phone has the same rule and, having little room, keeps
-// mostly the menu.
+// priority order, on the menu's actions: Fold read, then Expand all / Collapse all as
+// one slot, then Summaries. As many as fit are promoted; the rest stay in the menu. A
+// phone has the same rule and, having little room, keeps mostly the menu.
+//
+// DISCUSS IS PINNED (`#1502 discuss-button-pinned-regression`, owner request 045). `#1470`
+// made Discuss the first promotion candidate, so a shrinking bar — Hide reader then Show
+// reader on a phone — demoted it into the hamburger menu, undoing `#1355
+// phone-bar-discuss-slot`'s fixed Discuss icon. Discuss is therefore not a candidate at
+// all: it stands on the bar at every width, in every reader state, and the menu never
+// lists it while the bar has it (`#discuss-menu-open` stays hidden). Its slot is priced
+// as a fixed member of the pack, so fit for the candidates below is measured with
+// Discuss's room already taken. If the bar cannot fit Discuss beside its fixed members
+// at the narrowest supported width that is a defect to report, never a demotion.
 //
 // FIT IS MEASURED, never guessed from the viewport: the pack's own width minus the
 // members that are not candidates, re-measured whenever the bar's size changes (a
@@ -20,14 +29,12 @@
 //
 // ONE IMPLEMENTATION PER ACTION. Fold read, Expand/Collapse all and Summaries are single
 // elements that MOVE between the menu and the pack; they are never cloned, so their
-// label, `aria-pressed` state and handler are the same element in either home. Discuss
-// has an element in each place by design (a bar button and a menu item with different
-// dress), so exactly one of its pair is shown: promoted shows the bar's, demoted shows
-// the menu's. Labels and the pressed style are the read-toggle lane's (`#1399`): this
-// module writes neither, it only chooses where each element lives.
+// label, `aria-pressed` state and handler are the same element in either home. Labels
+// and the pressed style are the read-toggle lane's (`#1399`): this module writes
+// neither, it only chooses where each element lives.
 
-/** Promotion candidates, highest priority first. Expand all / Collapse all share one slot: they act on the same folding, and promoting one without the other would strand the way back. */
-export const PROMOTION_ORDER = Object.freeze(["discuss", "fold-read", "expand-collapse", "summaries"] as const);
+/** Promotion candidates, highest priority first. Expand all / Collapse all share one slot: they act on the same folding, and promoting one without the other would strand the way back. Discuss is absent on purpose: `#1502` pins it to the bar (see above). */
+export const PROMOTION_ORDER = Object.freeze(["fold-read", "expand-collapse", "summaries"] as const);
 
 /** What one candidate's promotion decision rests on: its measured width and whether it has work to do here. */
 export interface PromotionCandidate {
@@ -110,9 +117,9 @@ export interface Promotion {
   dispose(): void;
 }
 
-/** Make the promotion controller. It starts, as the page does today, with Discuss promoted. */
+/** Make the promotion controller. Nothing starts promoted; Discuss needs no promotion (`#1502`). */
 export function createPromotion(deps: PromotionDependencies): Promotion {
-  let promoted: Set<string> = new Set(["discuss"]);
+  let promoted: Set<string> = new Set();
   // Where each movable element sat in the menu, so demotion puts it back in place
   // rather than appending it wherever the menu happens to end.
   const homeNext = new Map<string, HTMLElement | null>();
@@ -164,13 +171,8 @@ export function createPromotion(deps: PromotionDependencies): Promotion {
   }
 
   function candidates(): PromotionCandidate[] {
-    const discussBar = deps.el("discuss-open");
-    const list: PromotionCandidate[] = [{
-      key: "discuss",
-      width: measureWidth(discussBar),
-      available: deps.screen() === "main" && deps.view() === "discord",
-    }];
-    for (const key of PROMOTION_ORDER.slice(1)) {
+    const list: PromotionCandidate[] = [];
+    for (const key of PROMOTION_ORDER) {
       const elements = (MOVABLE[key] ?? []).map((id) => deps.el(id));
       const offered = elements.filter((element) => available(element));
       list.push({
@@ -182,12 +184,12 @@ export function createPromotion(deps: PromotionDependencies): Promotion {
     return list;
   }
 
-  /** The pack's free width: its own width minus its visible non-candidate members and the gaps between members. */
+  /** The pack's free width: its own width minus its visible non-candidate members and the gaps between members. `#1502`: Discuss is one of those fixed members — its slot is spent before any candidate is priced. */
   function freeWidth(): number {
     const pack = deps.el("bar-pack");
     const packWidth = typeof pack.clientWidth === "number" ? pack.clientWidth : 0;
     if (packWidth <= 0) return 0;
-    const candidateIds = new Set(["discuss-open", ...Object.values(MOVABLE).flat()]);
+    const candidateIds = new Set(Object.values(MOVABLE).flat());
     let used = 0;
     let visible = 0;
     for (const child of Array.from(pack.children as unknown as ArrayLike<HTMLElement>)) {
@@ -210,12 +212,13 @@ export function createPromotion(deps: PromotionDependencies): Promotion {
     const pack = deps.el("bar-pack");
     const menu = deps.el("action-menu");
     const canMove = typeof pack.appendChild === "function" && typeof menu.appendChild === "function";
-    // Discuss: exactly one of the pair, always. Which one is the whole decision.
+    // Discuss is pinned (`#1502`): on the bar wherever it is offered, never in the
+    // menu while the bar has it — the menu item stays hidden in every state.
     const discussAvailable = deps.screen() === "main" && deps.view() === "discord";
-    deps.el("discuss-open").hidden = !(discussAvailable && promoted.has("discuss"));
-    deps.el("discuss-menu-open").hidden = !(discussAvailable && !promoted.has("discuss"));
+    deps.el("discuss-open").hidden = !discussAvailable;
+    deps.el("discuss-menu-open").hidden = true;
     if (canMove) {
-      for (const key of PROMOTION_ORDER.slice(1)) {
+      for (const key of PROMOTION_ORDER) {
         for (const id of MOVABLE[key] ?? []) {
           const element = deps.el(id);
           if (promoted.has(key)) {

@@ -1142,10 +1142,11 @@ test("THE BAR FITS ON THE OWNER'S 375px PHONE, ON EVERY VIEW", async () => {
   assert.ok(channel.cost <= budget, report("the channel view", channel));
   // `#1355 phone-bar-discuss-slot`: Discuss is the pack's last shown member, right of the
   // thread picker and just left of the hamburger; audio and Show/Fold left the strip.
-  // `#1470 toolbar-dynamic-promotion`: Discuss lives on the bar while it fits and in the
-  // menu when it does not — exactly one home, reachable either way, never both.
-  assert.ok(channel.shown.includes("discuss-open") || page.el("discuss-menu-open").hidden === false,
-    "Discuss is neither on the channel view's bar nor in its menu");
+  // `#1502 discuss-button-pinned-regression`: Discuss is pinned to the bar at every
+  // width (`#1470`'s fit demotion is gone) and the menu never lists it meanwhile.
+  assert.ok(channel.shown.includes("discuss-open"), "Discuss is not on the channel view's bar");
+  assert.equal(page.el("discuss-menu-open").hidden, true,
+    "the menu lists Discuss while the bar has it");
   assert.ok(!channel.shown.includes("audio-source"), "the audio toggle is still on the bar");
   if (channel.shown.includes("discuss-open")) {
     assert.equal(channel.shown[channel.shown.indexOf("action-menu-open") - 1], "discuss-open",

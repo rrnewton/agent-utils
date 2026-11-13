@@ -496,6 +496,40 @@ def phone_bar_fit(browser: Browser, url: str, width: int, height: int, shots: Pa
     page.context.close()
 
 
+# `#1502 discuss-button-pinned-regression` (owner request 045): Discuss stays on the
+# phone bar after Hide reader then Show reader and after a resize, at 360px and at the
+# usual phone viewport; the menu never lists it meanwhile. Condition waits only.
+DISCUSS_PINNED_JS = """() => {
+  const bar = document.getElementById('discuss-open');
+  const item = document.getElementById('discuss-menu-open');
+  return Boolean(bar && item && !bar.hidden && bar.getClientRects().length > 0 && item.hidden);
+}"""
+
+def discuss_pinned(browser: Browser, url: str, width: int, height: int,
+                   shots: Path | None, notes: list[str]) -> None:
+    where = f"{width}x{height} discuss-pinned"
+    page = open_page(browser, url, width, height, mobile=True)
+    page.wait_for_function(DISCUSS_PINNED_JS, timeout=10_000)
+    # Hide reader, then Show reader: the toggle lives in the hamburger menu.
+    for expect_pane in (False, True):
+        press(page, "#action-menu-open", True)
+        page.wait_for_selector("#reader-toggle", state="visible", timeout=10_000)
+        press(page, "#reader-toggle", True)
+        page.wait_for_function(
+            "(drawn) => { const p = document.getElementById('control-pane');"
+            " return Boolean(p && !p.hidden && p.getClientRects().length > 0) === drawn; }",
+            arg=expect_pane, timeout=10_000)
+        page.wait_for_function(DISCUSS_PINNED_JS, timeout=10_000)
+    shot(page, shots, f"{width}x{height}-discuss-pinned")
+    # A resize across the phone band, and back: still pinned at each stop.
+    for new_width in (360 if width != 360 else 412, width):
+        page.set_viewport_size({"width": new_width, "height": height})
+        page.wait_for_function(DISCUSS_PINNED_JS, timeout=10_000)
+    page.context.close()
+    notes.append(f"{where}: Discuss stayed on the bar through Hide reader, Show reader "
+                 "and a resize, never listed in the menu")
+
+
 def phone_boxes(browser: Browser, url: str, shots: Path | None, tag: str) -> dict[str, list[dict[str, float | str]]]:
     page = open_page(browser, url, 393, 852, mobile=True)
     found: dict[str, list[dict[str, float | str]]] = {}
@@ -582,6 +616,8 @@ def main() -> int:
                 large_font_after_call(browser, urls[0], width, height, notes)
             for phone_width, phone_height in ((375, 667), (390, 844), (393, 852), (412, 915)):
                 phone_bar_fit(browser, urls[0], phone_width, phone_height, args.screenshots, notes)
+            for phone_width, phone_height in ((360, 740), (390, 844)):
+                discuss_pinned(browser, urls[0], phone_width, phone_height, args.screenshots, notes)
             phone = phone_boxes(browser, urls[0], args.screenshots, "page")
             if len(urls) > 1:
                 baseline = phone_boxes(browser, urls[1], args.screenshots, "baseline")

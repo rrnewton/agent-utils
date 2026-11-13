@@ -1,6 +1,7 @@
-// Tests for web/src/view/shell/promotion.ts (`#1470 toolbar-dynamic-promotion`): the pure
-// fit decision fed measured widths, and the controller over a fake bar — no action listed
-// twice in any state, and a promoted item is the menu's own element, state included.
+// Tests for web/src/view/shell/promotion.ts (`#1470 toolbar-dynamic-promotion`, amended by
+// `#1502 discuss-button-pinned-regression`): the pure fit decision fed measured widths, and
+// the controller over a fake bar — no action listed twice in any state, a promoted item is
+// the menu's own element, state included, and Discuss pinned to the bar at any overflow.
 // Run with the other module suites: node --test tests/js/view/shell-promotion.test.mjs
 
 import { test } from "node:test";
@@ -11,9 +12,10 @@ import { moduleForTests } from "../../../web/build.mjs";
 const PROMOTION = await moduleForTests("src/view/shell/promotion.ts");
 const { decidePromotion, createPromotion, PROMOTION_ORDER } = PROMOTION;
 
-/** Candidates at fixed measured widths, in the owner's priority order. */
+/** Candidates at fixed measured widths, in the owner's priority order. Discuss is not
+ * among them: `#1502` pins it to the bar, so only these three promote by measured fit. */
 function candidates(overrides = {}) {
-  const widths = { discuss: 90, "fold-read": 80, "expand-collapse": 180, summaries: 95 };
+  const widths = { "fold-read": 80, "expand-collapse": 180, summaries: 95 };
   return PROMOTION_ORDER.map((key) => ({
     key,
     width: overrides[key]?.width ?? widths[key],
@@ -21,15 +23,19 @@ function candidates(overrides = {}) {
   }));
 }
 
+test("#1502: Discuss is not a promotion candidate at all", () => {
+  assert.deepStrictEqual([...PROMOTION_ORDER], ["fold-read", "expand-collapse", "summaries"]);
+});
+
 test("#1470: with room for everything, every candidate is promoted in priority order", () => {
   const promoted = decidePromotion(600, candidates(), new Set());
   assert.deepStrictEqual([...promoted], [...PROMOTION_ORDER]);
 });
 
 test("#1470: with room for some, a prefix is promoted and the tail stays in the menu", () => {
-  // 90 + 80 fits 200; adding the 180-wide expand/collapse slot does not.
+  // 80 fits 200; adding the 180-wide expand/collapse slot does not.
   const promoted = decidePromotion(200, candidates(), new Set());
-  assert.deepStrictEqual([...promoted], ["discuss", "fold-read"]);
+  assert.deepStrictEqual([...promoted], ["fold-read"]);
 });
 
 test("#1470: with room for none, nothing is promoted — the phone's ordinary state", () => {
@@ -39,21 +45,21 @@ test("#1470: with room for none, nothing is promoted — the phone's ordinary st
 
 test("#1470: an unavailable candidate is never promoted, however wide the bar", () => {
   const promoted = decidePromotion(900, candidates({ "fold-read": { available: false } }), new Set());
-  assert.deepStrictEqual([...promoted], ["discuss", "expand-collapse", "summaries"]);
+  assert.deepStrictEqual([...promoted], ["expand-collapse", "summaries"]);
 });
 
 test("#1470: hysteresis holds a promoted set inside the slack instead of flickering", () => {
   const all = new Set(PROMOTION_ORDER);
-  const total = 90 + 80 + 180 + 95;
+  const total = 80 + 180 + 95;
   // Ten pixels short: inside the slack, nothing moves.
   assert.deepStrictEqual([...decidePromotion(total - 10, candidates(), all)], [...PROMOTION_ORDER]);
   // Forty short: past the slack, the lowest priority goes back to the menu.
   assert.deepStrictEqual(
     [...decidePromotion(total - 40, candidates(), all)],
-    ["discuss", "fold-read", "expand-collapse"],
+    ["fold-read", "expand-collapse"],
   );
   // And from the menu side, that same width does not promote it straight back.
-  const demoted = new Set(["discuss", "fold-read", "expand-collapse"]);
+  const demoted = new Set(["fold-read", "expand-collapse"]);
   assert.deepStrictEqual([...decidePromotion(total - 40, candidates(), demoted)], [...demoted]);
 });
 
@@ -152,15 +158,31 @@ test("#1470: a wide bar promotes every action onto the toolbar, none left listed
   assert.equal(bar.els.get("discuss-menu-open").hidden, true);
 });
 
-test("#1470: a narrow bar keeps the actions in the menu and Discuss shows its menu face", () => {
+test("#1502: a narrow bar keeps the actions in the menu and Discuss stays pinned on the bar", () => {
   const bar = fakeBar(260);
   bar.promotion.refresh();
   assertNeverTwice(bar);
   for (const id of ["todo-filter", "expand-all", "collapse-all", "summarise"]) {
     assert.equal(bar.els.get(id).parentNode, bar.menu, `${id} left the menu`);
   }
-  assert.equal(bar.els.get("discuss-open").hidden, true);
-  assert.equal(bar.els.get("discuss-menu-open").hidden, false);
+  assert.equal(bar.els.get("discuss-open").hidden, false, "Discuss was demoted off the bar");
+  assert.equal(bar.els.get("discuss-menu-open").hidden, true, "Discuss is listed in the menu while on the bar");
+});
+
+test("#1502: the controller never demotes Discuss at any overflow, and the menu never lists it meanwhile", () => {
+  // Every pack width from roomy to nothing, then back up: the owner's report was
+  // Hide reader then Show reader shrinking the bar's free room on a phone, so the
+  // sweep walks the width down and up again rather than sampling two endpoints.
+  const bar = fakeBar(900);
+  for (const width of [900, 640, 460, 355, 260, 200, 120, 60, 0, 60, 260, 900]) {
+    bar.pack.width = width;
+    bar.promotion.refresh();
+    assert.equal(bar.els.get("discuss-open").hidden, false,
+      `at pack width ${width} Discuss left the bar`);
+    assert.equal(bar.els.get("discuss-menu-open").hidden, true,
+      `at pack width ${width} the menu listed Discuss while the bar has it`);
+    assertNeverTwice(bar);
+  }
 });
 
 test("#1470: promotion moves the menu's own element — its state is the same element's state", () => {
