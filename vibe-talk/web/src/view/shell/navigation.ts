@@ -190,6 +190,28 @@ export interface NavLoadState {
   freshness: string;
 }
 
+/** Where each view was left, as `showView` reads and writes it. */
+export interface NavViewScroll {
+  leave(view: string, place: { top: number; atNewest: boolean }): void;
+  enter(view: string): number | null;
+}
+
+/** A captured scroll place, as the scroll owner captures and restores it. */
+export interface NavScrollMark {
+  pinned: boolean;
+  anchor: Element | null;
+  top: number;
+  anchorId?: string | null;
+}
+
+/** The read-aloud owner, as far as leaving the channel stops or keeps a read. */
+export interface NavReadOwner {
+  readonly nowPlaying: { readonly kind?: unknown } | null;
+  readonly pendingRead: unknown;
+  readingMode: boolean;
+  stopReading(): void;
+}
+
 /** What the page injects: the core factories, created owners' ports, and every page act, all thunked. */
 export interface PageNavigationDependencies<Column, ThreadLike, Pane> {
   // The core owners' factories (the page's prelude names), injected so this package imports no core.
@@ -206,7 +228,7 @@ export interface PageNavigationDependencies<Column, ThreadLike, Pane> {
   readonly session: string;
   /** Whether something over the channel is open (`rowMenus.open` etc. are read through `openMenus`). */
   // Page state, read only inside the returned functions.
-  screens(): Pick<Screens, "screen" | "beforeSettings" | "helpReturn" | "setHelpReturn" | "view">;
+  screens(): Pick<Screens, "screen" | "beforeSettings" | "helpReturn" | "setHelpReturn" | "view" | "setView">;
   el(id: string): HTMLElement;
   leftEl(id: string): HTMLElement;
   inSide(): boolean;
@@ -259,7 +281,6 @@ export interface PageNavigationDependencies<Column, ThreadLike, Pane> {
   leaveThread(): void;
   showScreen(name: string): void;
   showHelp(entry: string | null): void;
-  showView(name: string): void;
   // Places and views.
   helpEntries(): readonly { id: unknown; open: boolean }[];
   threadListOffered(): boolean;
@@ -307,6 +328,21 @@ export interface PageNavigationDependencies<Column, ThreadLike, Pane> {
   resetSideColumn(reopen?: boolean): void;
   renderColumns(): void;
   startChannelStream(channel: unknown): void;
+  viewScroll(): NavViewScroll;
+  atBottom(area: HTMLElement): boolean;
+  viewMark(name: string): NavScrollMark | undefined;
+  setViewMark(name: string, mark: NavScrollMark): void;
+  holdChannelPlace(): void;
+  placePostCard(): void;
+  syncDocumentsSelector(): void;
+  syncDiscussView(): void;
+  forgetJumpNewest(name: string): void;
+  dismissStatus(): void;
+  readAloudOwner(): NavReadOwner;
+  renderCallControls(): void;
+  renderControlBar(): void;
+  renderChannelNavigation(): void;
+  placeChipsOverComposer(): void;
   viewKey(): string;
   viewsHas(key: string): boolean;
   readsBusy(): boolean;
@@ -351,10 +387,10 @@ export interface PageNavigationDependencies<Column, ThreadLike, Pane> {
   channelLabel(channel: string): string;
   renderedText(node: Element): string;
   inThisColumn<T>(act: (event: T) => void): (event: T) => void;
-  captureScroll(): { pinned: boolean; anchor: Element | null; top: number };
+  captureScroll(): NavScrollMark;
   listPlaceTop(area: HTMLElement): number;
   sideShowing(): boolean;
-  restoreScroll(place: { pinned: boolean; anchor: HTMLElement; top: number }): void;
+  restoreScroll(place: NavScrollMark): void;
   scrollToNewest(): void;
   bumpReplyJump(): void;
   settleUiState(): void;
@@ -431,6 +467,7 @@ export interface PageNavigation {
   pressViewSwitch(): void;
   readEnteredChannel(keepPosition: boolean): Promise<void>;
   changeSelectedChannel(): Promise<void>;
+  showView(name: string): void;
 }
 
 /** How long opening from a link waits for sign-in and a first read, in `pullWaitMs` waits. */
@@ -1050,7 +1087,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
           deepLinks.arrive(() => changeSelectedChannel());
         }
       }
-      if (deps.screens().view() !== "discord") deps.showView("discord");
+      if (deps.screens().view() !== "discord") showView("discord");
       const channel = String(deps.selectedChannelId());
       const startPlace = channelPlace();
       const startVisit = visits.position();
@@ -1347,7 +1384,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
         : linkJumpSpot();
     const enter = fromCall || fromDocs ? async (): Promise<void> => {
       deps.settleUiState();
-      deps.showView("discord");
+      showView("discord");
       // A channel the jump changes to is read as it is chosen; the one already chosen is read here.
       if (String(deps.selectedChannelId()) === ref.channel) await readEnteredChannel(deps.viewRestored());
     } : null;
@@ -1450,7 +1487,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
     if (spot.docs) {
       if (deps.screens().screen() !== "main" || deps.screens().view() === "docs") return;
       deps.settleUiState();
-      deps.showView("docs");
+      showView("docs");
       deps.stopDiscordPolling();
       deps.setStatus("Back on the Documents list.");
       return;
@@ -1459,7 +1496,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
     if (spot.call) {
       if (deps.screens().screen() !== "main" || deps.screens().view() === "voice") return;
       deps.settleUiState();
-      deps.showView("voice");
+      showView("voice");
       deps.stopDiscordPolling();
       deps.setStatus("Back on the call's view.");
       return;
@@ -1473,7 +1510,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
     if (deps.screens().view() === "docs") {
       for (let step = 0; step < 16 && deps.documentOpen(); step += 1) deps.closeDocument();
       deps.settleUiState();
-      deps.showView("discord");
+      showView("discord");
       if (String(deps.selectedChannelId() || "") === place.channel) {
         await readEnteredChannel(deps.viewRestored());
       }
@@ -1617,6 +1654,113 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
     return deps.loadDiscord(saved && deps.screens().view() === "discord" ? { keepPosition: true, reason: "enter" } : { reason: "enter" });
   }
 
+  function showView(name: string): void {
+    // `#277 reply-in-column`. The call's view is one list, with no column for a reply to be open in.
+    if (name !== "discord") deps.putDockedReplyAway();
+    // Written down BEFORE the panes swap, because after that the scroll position belongs to
+    // whichever pane is now up and says nothing about where the reader was.
+    const leaving = deps.screens().view();
+    if (leaving && leaving !== name) {
+      const area = el("scroll-area");
+      deps.viewScroll().leave(leaving, { top: area.scrollTop, atNewest: deps.atBottom(area) });
+      if (leaving === "discord") deps.setViewMark(leaving, deps.captureScroll());
+      // ...and, leaving the channel, the message the reader was on, for a reopen. `#189 restore-ui-state`.
+      if (leaving === "discord") deps.holdChannelPlace();
+    }
+    deps.screens().setView(name);
+    el("pane-voice").hidden = name !== "voice";
+    el("pane-discord").hidden = name !== "discord";
+    el("pane-docs").hidden = name !== "docs";
+    el("docs-fetch").hidden = name !== "docs";
+    // `#269 approval-card-inline`. A waiting draft is the next message of the list now on screen, put
+    // there BEFORE the place in that list is restored, which counts it.
+    deps.placePostCard();
+    const discord = name === "discord";
+    // `#845 voice-toggle-colours`. Pressed, lit in the accent, is the call's view; the channel's is the darker one.
+    el("view-switch").setAttribute("aria-pressed", name === "voice" ? "true" : "false");
+    el("view-switch-label").textContent = discord ? "Channel" : name === "docs" ? "Documents" : "Voice";
+    el("view-switch").title = discord
+      ? "Showing the channel. Press to show the documents."
+      : name === "docs"
+        ? "Showing the documents. Press to show the call."
+        : "Showing the call. Press to show the channel.";
+    deps.syncDocumentsSelector();
+    deps.syncDiscussView();
+    // Both panes share ONE scroll container, so a switch swaps the content out from under a
+    // scrollTop that belonged to the other pane. On a FIRST entry, landing on the newest message is
+    // right and landing at the top is badly wrong: arriving at the top of a long channel means
+    // scrolling past everything already read to reach the thing you opened it for.
+    //
+    // On every entry AFTER that, it is the reader's place, and throwing it away is the same defect
+    // one level up. A glance at the transcript and back should not cost forty messages of scrolling.
+    //
+    // ...unless the place they left was THE NEWEST LINE, which is an instruction rather than an
+    // offset: turns can land in the transcript while the reader is over on the channel, and putting
+    // them back at the number the bottom used to be is the same "your place moved" defect wearing the
+    // fix's clothes. See `viewScroll`.
+    const top = deps.viewScroll().enter(name);
+    const returning = top !== null;
+    if (returning) {
+      const mark = name === "discord" ? deps.viewMark(name) : undefined;
+      if (mark && mark.anchor) deps.restoreScroll(mark);
+      else deps.toPosition(el("scroll-area"), top);
+    } else {
+      deps.scrollToNewest();
+    }
+    // Only when the reader really was taken to the newest message. Clearing it on a RETURN would
+    // hide a chip that is pointing at something they have not seen.
+    if (!returning) {
+      deps.forgetJumpNewest(name);
+    }
+    // Told to the caller (`viewScroll.restored()`, kept by `enter` above), because restoring the position
+    // here is only half of it: entering the channel also RE-READS it, and a read that does not know it is a
+    // return settles to the newest message and undoes this immediately. See the view-switch handler.
+    // The chips belong to the list you are looking at, and you are now looking at a different one.
+    deps.renderScrollTools();
+    deps.renderChannelFreshness();
+    // A channel word ("fetching the channel…") is not the Documents reader's news.
+    if (name === "docs") deps.dismissStatus();
+    // Leaving the channel takes the reading with it: audio that goes on playing over the transcript
+    // is audio the reader cannot see the source of, on a list where the next thing it does is
+    // archive a message.
+    // `#1039 documents-read-parity`: kind-aware. Entering Documents stops a message read (and
+    // clears its mode) but keeps a document read — that view is its source; entering the channel
+    // or the call stops a document read, whose strip and source are the reader's.
+    const readOwner = deps.readAloudOwner();
+    const nowReading = readOwner.nowPlaying;
+    const documentReading = Boolean(
+      (nowReading && nowReading.kind === "document") ||
+      (!nowReading && typeof readOwner.pendingRead === "string" && readOwner.pendingRead.startsWith("doc:")));
+    if (!discord) {
+      readOwner.readingMode = false;
+      if (name !== "docs" || !documentReading) readOwner.stopReading();
+    } else if (documentReading) {
+      readOwner.stopReading();
+    }
+    // Read replaces Talk in this view, so the control pane has to be re-decided on every switch.
+    deps.renderCallControls();
+    // ...and so does the channel picker, which is a member of the bar now rather than a row at the
+    // top of the scrollback. LAST, and after `currentView` is set, for the same reason `showScreen`
+    // ends this way: the bar decides what it shows from the view that is now up. `#83
+    // channel-selector-in-bar`.
+    deps.renderControlBar();
+    deps.renderChannelNavigation();
+    // `#229 desktop-two-column`. One column or two is the channel's layout.
+    deps.renderColumns();
+    // `#245 done-feedback`. The chips stand on the channel's message box, which only the channel has.
+    deps.placeChipsOverComposer();
+    // The call's controls (Sound, Clear, Talk) are not the Documents view's.
+    if (deps.screens().screen() === "main") el("control-pane").hidden = name === "docs";
+    deps.saveUiState();
+    // `#224 keyboard-shortcuts`. The list on screen takes the focus, so that the scroll keys move it.
+    // Above all off the view switch: left holding the focus from the click that pressed it, it took
+    // the next Space as another press and switched straight back. Only on the main screen: a view
+    // changed behind Settings must not take the focus from the control the reader is on there.
+    if (leaving !== name && deps.screens().screen() === "main") deps.settleFocus();
+    // `#304 back-gesture-in-app`. The call's view waits in front of whatever the channel had open.
+    scheduleBackSync();
+  }
+
   return {
     backStack, visits, deepLinks, linkJumps,
     backHistory, historyIndex, mayPushHistory, openMenus, closeOpenMenu, backLevels, screenLevelsNow,
@@ -1627,6 +1771,6 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
     syncDeepLinkAddress, linkedRowShown, landOnDeepLink, waitForDeepLink, applyDeepLink, copyDeepLink,
     keepsInApp, messageLinkLabel, wireMessageLinks, onMessageLinkTap, linkJumpSpot, withLinkJumps,
     arriveOnChannel, arriveAtPlace, jumpToDocumentLink, documentBack, jumpToMessageLink, jumpToSentMessage, returnFromLinkJump,
-    putBackOnSpot, pressViewSwitch, readEnteredChannel, changeSelectedChannel,
+    putBackOnSpot, pressViewSwitch, readEnteredChannel, changeSelectedChannel, showView,
   };
 }

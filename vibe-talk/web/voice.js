@@ -749,7 +749,6 @@ const shellNavigation = createPageNavigation({
   leaveThread: () => leaveThread(),
   showScreen: (name) => showScreen(name),
   showHelp: (entry) => showHelp(entry),
-  showView: (name) => showView(name),
   helpEntries: () => helpFolds.entries(),
   threadListOffered: () => threadListOffered(),
   threadStillKnown: (id) => threadStillKnown(id),
@@ -795,6 +794,21 @@ const shellNavigation = createPageNavigation({
   resetSideColumn: (reopen) => resetSideColumn(reopen),
   renderColumns: () => renderColumns(),
   startChannelStream: (channel) => startChannelStream(/** @type {any} */ (channel)),
+  viewScroll: () => viewScroll,
+  atBottom: (area) => atBottom(area),
+  viewMark: (name) => viewMarks.get(name),
+  setViewMark: (name, mark) => viewMarks.set(name, mark),
+  holdChannelPlace: () => holdChannelPlace(),
+  placePostCard: () => voiceTranscript().placePostCard(),
+  syncDocumentsSelector: () => documentsSelector.sync(),
+  syncDiscussView: () => discussView.sync(),
+  forgetJumpNewest: (name) => { jumpNewestWanted[name] = false; },
+  dismissStatus: () => dismissStatus(),
+  readAloudOwner: () => readAloudOwner(),
+  renderCallControls: () => voiceCall().renderControls(),
+  renderControlBar: () => renderControlBar(),
+  renderChannelNavigation: () => renderChannelNavigation(),
+  placeChipsOverComposer: () => placeChipsOverComposer(),
   viewKey: () => viewKey(),
   viewsHas: (key) => channelStore.current().views.has(key),
   readsBusy: () => channelReads.busy(),
@@ -873,7 +887,7 @@ const {
   linkedRowShown, landOnDeepLink, waitForDeepLink, applyDeepLink, copyDeepLink, keepsInApp,
   messageLinkLabel, wireMessageLinks, onMessageLinkTap, linkJumpSpot, withLinkJumps,
   arriveOnChannel, arriveAtPlace, jumpToMessageLink, jumpToSentMessage, returnFromLinkJump,
-  putBackOnSpot, pressViewSwitch, readEnteredChannel, changeSelectedChannel,
+  putBackOnSpot, pressViewSwitch, readEnteredChannel, changeSelectedChannel, showView,
 } = shellNavigation;
 
 // `#890 voice-page-linked-highlight`. The message a link landed on, marked until the reader puts the mark out (Esc, its
@@ -2066,112 +2080,8 @@ const undoStamps = createUndoStamps();
 /** The next undo stamp: later acts stamp higher (web/src/view/shell `createUndoStamps`). */
 const nextUndoAt = undoStamps.next;
 
-function showView(name) {
-  // `#277 reply-in-column`. The call's view is one list, with no column for a reply to be open in.
-  if (name !== "discord") putDockedReplyAway();
-  // Written down BEFORE the panes swap, because after that the scroll position belongs to
-  // whichever pane is now up and says nothing about where the reader was.
-  const leaving = screens.view();
-  if (leaving && leaving !== name) {
-    const area = el("scroll-area");
-    viewScroll.leave(leaving, { top: area.scrollTop, atNewest: atBottom(area) });
-    if (leaving === "discord") viewMarks.set(leaving, captureScroll());
-    // ...and, leaving the channel, the message the reader was on, for a reopen. `#189 restore-ui-state`.
-    if (leaving === "discord") holdChannelPlace();
-  }
-  screens.setView(name);
-  el("pane-voice").hidden = name !== "voice";
-  el("pane-discord").hidden = name !== "discord";
-  el("pane-docs").hidden = name !== "docs";
-  el("docs-fetch").hidden = name !== "docs";
-  // `#269 approval-card-inline`. A waiting draft is the next message of the list now on screen, put
-  // there BEFORE the place in that list is restored, which counts it.
-  voiceTranscript().placePostCard();
-  const discord = name === "discord";
-  // `#845 voice-toggle-colours`. Pressed, lit in the accent, is the call's view; the channel's is the darker one.
-  el("view-switch").setAttribute("aria-pressed", name === "voice" ? "true" : "false");
-  el("view-switch-label").textContent = discord ? "Channel" : name === "docs" ? "Documents" : "Voice";
-  el("view-switch").title = discord
-    ? "Showing the channel. Press to show the documents."
-    : name === "docs"
-      ? "Showing the documents. Press to show the call."
-      : "Showing the call. Press to show the channel.";
-  documentsSelector.sync();
-  discussView.sync();
-  // Both panes share ONE scroll container, so a switch swaps the content out from under a
-  // scrollTop that belonged to the other pane. On a FIRST entry, landing on the newest message is
-  // right and landing at the top is badly wrong: arriving at the top of a long channel means
-  // scrolling past everything already read to reach the thing you opened it for.
-  //
-  // On every entry AFTER that, it is the reader's place, and throwing it away is the same defect
-  // one level up. A glance at the transcript and back should not cost forty messages of scrolling.
-  //
-  // ...unless the place they left was THE NEWEST LINE, which is an instruction rather than an
-  // offset: turns can land in the transcript while the reader is over on the channel, and putting
-  // them back at the number the bottom used to be is the same "your place moved" defect wearing the
-  // fix's clothes. See `viewScroll`.
-  const top = viewScroll.enter(name);
-  const returning = top !== null;
-  if (returning) {
-    const mark = name === "discord" ? viewMarks.get(name) : undefined;
-    if (mark && mark.anchor) restoreScroll(mark);
-    else scrollKeeping.toPosition(el("scroll-area"), top);
-  } else {
-    scrollToNewest();
-  }
-  // Only when the reader really was taken to the newest message. Clearing it on a RETURN would
-  // hide a chip that is pointing at something they have not seen.
-  if (!returning) {
-    jumpNewestWanted[name] = false;
-  }
-  // Told to the caller (`viewScroll.restored()`, kept by `enter` above), because restoring the position
-  // here is only half of it: entering the channel also RE-READS it, and a read that does not know it is a
-  // return settles to the newest message and undoes this immediately. See the view-switch handler.
-  // The chips belong to the list you are looking at, and you are now looking at a different one.
-  renderScrollTools();
-  renderChannelFreshness();
-  // A channel word ("fetching the channel…") is not the Documents reader's news.
-  if (name === "docs") dismissStatus();
-  // Leaving the channel takes the reading with it: audio that goes on playing over the transcript
-  // is audio the reader cannot see the source of, on a list where the next thing it does is
-  // archive a message.
-  // `#1039 documents-read-parity`: kind-aware. Entering Documents stops a message read (and
-  // clears its mode) but keeps a document read — that view is its source; entering the channel
-  // or the call stops a document read, whose strip and source are the reader's.
-  const readOwner = readAloudOwner();
-  const nowReading = readOwner.nowPlaying;
-  const documentReading = Boolean(
-    (nowReading && nowReading.kind === "document") ||
-    (!nowReading && typeof readOwner.pendingRead === "string" && readOwner.pendingRead.startsWith("doc:")));
-  if (!discord) {
-    readOwner.readingMode = false;
-    if (name !== "docs" || !documentReading) readOwner.stopReading();
-  } else if (documentReading) {
-    readOwner.stopReading();
-  }
-  // Read replaces Talk in this view, so the control pane has to be re-decided on every switch.
-  voiceCall().renderControls();
-  // ...and so does the channel picker, which is a member of the bar now rather than a row at the
-  // top of the scrollback. LAST, and after `currentView` is set, for the same reason `showScreen`
-  // ends this way: the bar decides what it shows from the view that is now up. `#83
-  // channel-selector-in-bar`.
-  renderControlBar();
-  renderChannelNavigation();
-  // `#229 desktop-two-column`. One column or two is the channel's layout.
-  renderColumns();
-  // `#245 done-feedback`. The chips stand on the channel's message box, which only the channel has.
-  placeChipsOverComposer();
-  // The call's controls (Sound, Clear, Talk) are not the Documents view's.
-  if (screens.screen() === "main") el("control-pane").hidden = name === "docs";
-  saveUiState();
-  // `#224 keyboard-shortcuts`. The list on screen takes the focus, so that the scroll keys move it.
-  // Above all off the view switch: left holding the focus from the click that pressed it, it took
-  // the next Space as another press and switched straight back. Only on the main screen: a view
-  // changed behind Settings must not take the focus from the control the reader is on there.
-  if (leaving !== name && screens.screen() === "main") settleFocus();
-  // `#304 back-gesture-in-app`. The call's view waits in front of whatever the channel had open.
-  scheduleBackSync();
-}
+// Showing the call's, the channel's or the Documents view: web/src/view/shell/navigation.ts
+// (`createPageNavigation`, `#624`), destructured as `showView` above.
 
 // --- connection details -------------------------------------------------------------------------
 //

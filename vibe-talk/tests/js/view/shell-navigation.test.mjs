@@ -15,7 +15,23 @@ const NAVCORE = await moduleForTests("src/core/navigation/index.ts");
 /** A page stand-in: every dep a thunk over `state`, which a test moves under the factory. */
 function makeNavigation(state) {
   const calls = [];
-  const el = (id) => ({ id, hidden: state.hidden.has(id), focus() { calls.push(["focus", id]); }, replaceChildren: () => calls.push(["clear", id]) });
+  const elements = new Map();
+  const el = (id) => {
+    if (!elements.has(id)) {
+      const element = {
+        id, scrollTop: 0, textContent: "", title: "", attrs: {},
+        focus() { calls.push(["focus", id]); }, replaceChildren: () => calls.push(["clear", id]),
+        setAttribute(name, value) { this.attrs[name] = value; },
+        getAttribute(name) { return this.attrs[name] ?? null; },
+      };
+      Object.defineProperty(element, "hidden", {
+        get: () => state.hidden.has(id),
+        set: (value) => { if (value) state.hidden.add(id); else state.hidden.delete(id); },
+      });
+      elements.set(id, element);
+    }
+    return elements.get(id);
+  };
   const nav = SHELL.createPageNavigation({
     createBackStack: NAVCORE.createBackStack, createVisits: NAVCORE.createVisits,
     createDeepLinks: NAVCORE.createDeepLinks, createLinkJumps: NAVCORE.createLinkJumps,
@@ -25,6 +41,7 @@ function makeNavigation(state) {
     screens: () => ({
       screen: () => state.screen, beforeSettings: () => "main", helpReturn: () => "settings",
       setHelpReturn: () => {}, view: () => state.view,
+      setView: (name) => { calls.push(["showView", name]); state.view = name; },
     }),
     el, leftEl: el,
     inSide: () => false, mainColumn: () => "main", inColumn: (_c, act) => act(), sideColumn: () => "side",
@@ -49,7 +66,6 @@ function makeNavigation(state) {
     closeDocumentOutline: () => { calls.push("closeOutline"); const was = state.outline === true; state.outline = false; return was; },
     openDocument: (key) => { calls.push(["openDocument", key]); state.view = "docs"; state.docs.push(key); },
     leaveThread: () => calls.push("leaveThread"), showScreen: () => {}, showHelp: () => {},
-    showView: (name) => { calls.push(["showView", name]); state.view = name; },
     helpEntries: () => [], threadListOffered: () => true, threadStillKnown: () => true, threading: () => true,
     chooseView: (which) => calls.push(["chooseView", which]), selectSideThread: () => {},
     openThreadFromList: () => {}, chooseOneColumn: (choice) => calls.push(["oneColumn", choice.view]),
@@ -66,7 +82,8 @@ function makeNavigation(state) {
     toPosition: (area, top) => { area.scrollTop = top; },
     idsOf: () => [], inAppLinksOn: () => true, channelLabel: (channel) => channel, renderedText: () => "x",
     inThisColumn: (act) => act, captureScroll: () => ({ pinned: true, anchor: null, top: 0 }),
-    listPlaceTop: () => 0, sideShowing: () => false, restoreScroll: () => {}, scrollToNewest: () => {},
+    listPlaceTop: () => 0, sideShowing: () => false,
+    restoreScroll: (place) => calls.push(["restore", place]), scrollToNewest: () => {},
     bumpReplyJump: () => {}, settleUiState: () => {},
     viewRestored: () => false, stopDiscordPolling: () => {}, storedOpenInView: () => "flat",
     cycleView: () => calls.push("cycleView"),
@@ -82,12 +99,19 @@ function makeNavigation(state) {
     hydrateChannelScope: () => false, renderChannelFreshness: () => {}, saveUiState: () => {},
     pinsOnly: () => false, ensurePins: () => {}, renderChannelRows: () => {},
     resetSideColumn: () => {}, renderColumns: () => {}, startChannelStream: () => {},
+    viewScroll: () => ({ leave: () => {}, enter: () => state.viewTop }), atBottom: () => false,
+    viewMark: () => state.viewMark, setViewMark: () => {}, holdChannelPlace: () => {},
+    placePostCard: () => {}, syncDocumentsSelector: () => {}, syncDiscussView: () => {},
+    forgetJumpNewest: () => {}, dismissStatus: () => {},
+    readAloudOwner: () => ({ nowPlaying: null, pendingRead: null, readingMode: false, stopReading: () => calls.push("stopReading") }),
+    renderCallControls: () => {}, renderControlBar: () => {}, renderChannelNavigation: () => {},
+    placeChipsOverComposer: () => {},
     writeClipboardText: async () => true, copiedRefusedText: () => "refused", pullWaitMs: () => 0,
     delay: async () => {}, userActivation: () => null, locationSearch: () => state.search,
     locationOrigin: () => "https://example.test", locationPathname: () => "/",
     navigationIndex: () => 0, historyPort: () => state.history, layoutRestoring: () => false,
   });
-  return { nav, calls };
+  return { nav, calls, elements };
 }
 
 const freshState = () => ({
@@ -96,7 +120,7 @@ const freshState = () => ({
   selection: { view: "main", threadId: null, origin: null }, replyDocked: false,
   gather: { gathered: { parent: "m1" } }, list: { rowsGathered: true, newestId: "m9" },
   rows: { messages: [{ id: "m1" }], threads: [{ id: "t1" }] }, older: { moreAbove: true, cursor: "c" },
-  load: { freshAt: 9, freshness: "stale" },
+  load: { freshAt: 9, freshness: "stale" }, viewTop: null, viewMark: undefined,
   hidden: new Set(["speed-popover", "dismissed-send-popout"]), timers: [], search: "",
   history: { state: null, replaced: [], replaceState(state, _title, url) { this.replaced.push(url); } },
 });
@@ -223,4 +247,28 @@ test("`#624` shell navigation: changing channel clears the old channel's records
   ]);
   nav.pressViewSwitch();
   assert.equal(calls.at(-1), "cycleView");
+});
+
+test("`#624` shell navigation: showView swaps the panes and names the view now up", () => {
+  const state = freshState();
+  state.view = "voice";
+  const { nav, calls, elements } = makeNavigation(state);
+  nav.showView("discord");
+  assert.equal(state.view, "discord");
+  assert.deepStrictEqual(calls.filter((call) => Array.isArray(call) && call[0] === "showView"),
+    [["showView", "discord"]]);
+  assert.equal(elements.get("pane-discord").hidden, false, "the channel pane did not come up");
+  assert.equal(elements.get("pane-voice").hidden, true, "the call pane stayed up");
+  assert.equal(elements.get("view-switch-label").textContent, "Channel");
+  assert.equal(elements.get("view-switch").attrs["aria-pressed"], "false");
+  // A return restores the captured mark whole, anchorId included, so a redrawn
+  // row can be re-found by its message id.
+  const anchor = { id: "row" };
+  state.viewTop = 120;
+  state.viewMark = { pinned: false, anchor, anchorId: "m1", top: 44 };
+  calls.length = 0;
+  nav.showView("discord");
+  assert.deepStrictEqual(calls.filter((call) => Array.isArray(call) && call[0] === "restore"),
+    [["restore", { pinned: false, anchor, anchorId: "m1", top: 44 }]],
+    "the returning restore did not pass the captured mark through whole");
 });
