@@ -613,6 +613,43 @@ slot, a dirty or on-branch submodule, and any live use of the slot (the same pro
 its shared submodules' private work first (as it does for private clones), removes only their
 worktree registrations, and never deletes the shared `.git/modules/<name>` store.
 
+## Harness layout mode
+
+A project may declare one harness repo and its product repos (#1299):
+
+```yaml
+harness_repo: harness
+product_repos: [product]
+ignorable_keys: [harness_repo, product_repos]
+```
+
+The harness is the parent repo that pins products as submodules and holds docs and
+scaffolding; products are the repos work lands in. With this declaration, `create`
+refuses a slot whose `--repo` set includes the harness repo, because such a slot copies
+every product submodule instead of checking out one product. The refusal prints the
+exact product-only create command to use instead. A genuine harness checkout needs
+both `--include-harness-checkout-i-know-this-is-heavy` and
+`--harness-checkout-reason TEXT`; the reason is recorded as `harness_checkout_reason`
+on the slot. `init --harness-repo NAME --product-repo NAME` writes the declaration.
+A repo named as both harness and product, a declaration with only one of the two keys,
+or harness mode under flat layout refuses at load, naming the repo. Without a
+declaration, behaviour is exactly as before.
+
+`status`, `audit`, and `doctor` list harness-checkout slots separately (doctor finding
+`harness-checkout-slot`), with their recorded reason and, in audit/doctor, whether they
+have unpushed work (from stored remote refs; audit and doctor do not fetch, so read it
+with `wrkslots unpushed` for a fresh answer). Existing slots are never migrated or
+deleted by adding the declaration: publish any unpushed work, `wrkslots finish`, remove
+through the normal lifecycle, then recreate a product-only slot. Retire clean slots
+(the listing says `has_unpushed_work=no`) first.
+
+Layouts: setup steers single-repo projects to the one-level-in layout — the primary
+checkout at `<project>/<repo>/` beside `<project>/worktrees/`, config at the project
+root. Putting config and worktrees inside a product checkout is supported (init inside
+the checkout works), but discouraged: gitignored state sits inside the product tree and
+slot scans walk it. Multi-repo projects with a harness repo should declare harness
+mode above instead of creating slots from the harness repo.
+
 ## Git hook installers in new submodules
 
 A repository can ship its own Git hook installer as an executable `scripts/setup-hooks.sh`, which

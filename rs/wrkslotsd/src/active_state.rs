@@ -663,9 +663,19 @@ pub(crate) fn record_from_obj(value: &Value, label: &str) -> Result<RecordRec> {
             "handoff",
             "checkouts",
         ],
-        &["slot_type", "layout", "import_source", "task_scope"],
+        &["slot_type", "layout", "import_source", "task_scope", "harness_checkout_reason"],
         label,
     )?;
+    if let Some(value) = raw.get("harness_checkout_reason") {
+        if !matches!(value, Value::Null) {
+            let reason = as_str(value, &format!("{label}.harness_checkout_reason"))?;
+            if reason.is_empty() {
+                return Err(format!(
+                    "{label}.harness_checkout_reason must be non-empty when present"
+                ));
+            }
+        }
+    }
     let mut checkouts = Vec::new();
     for (index, item) in as_list(&raw["checkouts"], &format!("{label}.checkouts"))?
         .iter()

@@ -58,6 +58,8 @@ def _expected(
         "identity": (
             None if config.identity is None else dataclasses.asdict(config.identity)
         ),
+        "harness_repo": config.harness_repo,
+        "product_repos": list(config.product_repos),
         "image": dataclasses.asdict(config.image_settings),
         "layout": config.layout,
         "liveness_batch_command": (
@@ -125,6 +127,14 @@ def test_validate_config_matches_python(tmp_path: Path) -> None:
     result = _rust(root)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == _expected(root)
+
+
+def test_validate_config_harness_mode_matches_python(tmp_path: Path) -> None:
+    root = _root(tmp_path, "harness_repo: harness\nproduct_repos: [product, other]\n")
+    result = _rust(root)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == _expected(root)
+    assert json.loads(result.stdout)["harness_repo"] == "harness"
 
 
 def test_validate_config_machine_resolution_matches_python(
@@ -265,6 +275,16 @@ def test_validate_config_worktrees_image_matches_python(
             "configuration.post_provision_hooks[0].slot_types must be a JSON array",
         ),
         ("post_provision_hooks: 'true'\n", "configuration.post_provision_hooks must be a JSON array"),
+        ("harness_repo: harness\n", "requires configuration.product_repos"),
+        ("product_repos: [product]\n", "requires configuration.harness_repo"),
+        (
+            "harness_repo: harness\nproduct_repos: [harness]\n",
+            "as both harness and product",
+        ),
+        (
+            "harness_repo: harness\nproduct_repos: []\n",
+            "must name at least one product repo",
+        ),
     ],
 )
 def test_validate_config_refusals_name_the_same_problem(tmp_path: Path, extra: str, fragment: str) -> None:

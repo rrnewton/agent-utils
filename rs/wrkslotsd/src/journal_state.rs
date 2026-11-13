@@ -144,6 +144,7 @@ fn create_shape(raw: &Map<String, Value>) -> Result<()> {
             "hook_failure",
             "failure_policy",
             "operation_id",
+            "harness_checkout_reason",
         ],
         "create journal",
     )?;

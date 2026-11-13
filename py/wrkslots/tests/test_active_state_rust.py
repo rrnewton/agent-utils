@@ -167,6 +167,16 @@ def test_parse_state_matches_python(tmp_path: Path) -> None:
     assert json.loads(result.stdout) == _expected(root)
 
 
+def test_parse_state_harness_reason_matches_python(tmp_path: Path) -> None:
+    root = _root(tmp_path)
+    record = _record("slot-a", "agent-a")
+    record["harness_checkout_reason"] = "need harness docs"
+    _write_state(root, _state(record))
+    result = _rust(root)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == _expected(root)
+
+
 def test_parse_state_imported_record_matches_python(tmp_path: Path) -> None:
     root = _root(tmp_path)
     record = _record("slot-old", "agent-old")

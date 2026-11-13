@@ -31,7 +31,7 @@ const REQUIRED: [&str; 6] = [
     "heartbeat_ttl_seconds",
     "liveness_command",
 ];
-const OPTIONAL: [&str; 24] = [
+const OPTIONAL: [&str; 26] = [
     "machine",
     "liveness_batch_command",
     "max_active_slots",
@@ -41,6 +41,8 @@ const OPTIONAL: [&str; 24] = [
     "repo_cache_globs",
     "post_provision_hooks",
     "identity",
+    "harness_repo",
+    "product_repos",
     "salvage_push_remotes",
     "ttl_rescue_ref_root",
     "reclaimable_ignored_paths",
@@ -1345,6 +1347,49 @@ pub(crate) fn raw_section(root: Option<&Path>, key: &str) -> Result<Option<Value
     Ok(raw.get(key).cloned())
 }
 
+pub(crate) fn parse_harness_declaration(
+    raw: &Map<String, Value>,
+    layout: &str,
+) -> Result<(Value, Vec<String>)> {
+    let has_harness = raw.contains_key("harness_repo");
+    let has_products = raw.contains_key("product_repos");
+    if !has_harness && !has_products {
+        return Ok((Value::Null, Vec::new()));
+    }
+    if has_harness != has_products {
+        let (present, missing) = if has_harness {
+            ("harness_repo", "product_repos")
+        } else {
+            ("product_repos", "harness_repo")
+        };
+        return Err(format!(
+            "configuration.{present} requires configuration.{missing}: harness mode declares one harness repo and its product repos together"
+        ));
+    }
+    let harness = validate_name(
+        as_str(&raw["harness_repo"], "configuration.harness_repo")?,
+        "configuration.harness_repo",
+    )?;
+    let products = string_tuple(
+        &raw["product_repos"],
+        "configuration.product_repos",
+        |v| validate_name(v, "configuration.product_repos entry"),
+        true,
+    )?;
+    if products.is_empty() {
+        return Err("configuration.product_repos must name at least one product repo".to_owned());
+    }
+    if products.iter().any(|p| p == &harness) {
+        return Err(format!(
+            "configuration.product_repos names harness repo {harness:?} as both harness and product; a repo cannot be both"
+        ));
+    }
+    if layout == "flat" {
+        return Err("configuration.harness_repo/product_repos require nested layout: flat layout holds exactly one repo per slot, so harness mode does not apply; single-repo projects should use the one-level-in layout instead".to_owned());
+    }
+    Ok((json!(harness), products))
+}
+
 pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -> Result<Value> {
     let root = discover_root(root)?;
     let path = root.join(".wrkslots.yml");
@@ -1477,6 +1522,7 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
         Some(value) => post_provision_hook_entries(value, "configuration.post_provision_hooks")?,
     };
     let identity = identity_settings(raw)?;
+    let (harness_repo, product_repos) = parse_harness_declaration(raw, &layout)?;
     let ttl_rescue_ref_root = match raw.get("ttl_rescue_ref_root") {
         None => "refs/rescue".to_owned(),
         Some(value) => validate_rescue_ref_root(value)?,
@@ -1631,6 +1677,8 @@ pub(crate) fn load_config(root: Option<&Path>, machine_override: Option<&str>) -
         "disk_provisioning_floor_bytes": provisioning,
         "heartbeat_ttl_seconds": as_int(&raw["heartbeat_ttl_seconds"], "configuration.heartbeat_ttl_seconds", 1)?,
         "identity": identity,
+        "harness_repo": harness_repo,
+        "product_repos": product_repos,
         "image": image_settings(raw)?,
         "layout": layout,
         "liveness_batch_command": liveness_batch,

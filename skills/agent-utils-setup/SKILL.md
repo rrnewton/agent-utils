@@ -243,6 +243,17 @@ chmod +x "$H/bin/agent-liveness"
   [--cache-glob GLOB ...]
 ```
 
+**Layout choice (#1299 harness-layout-mode).** Detect the shape before init. If the
+checkout is a harness repo — its submodules are the product repos and it holds harness-only
+docs/scaffolding — offer harness mode with the detected declaration pre-filled
+(`init ... --harness-repo HARNESS --product-repo PRODUCT...`, nested layout), and enable
+it only on owner confirmation, never silently; harness mode makes `wrkslots create`
+refuse harness checkouts by default. For a single product repo, keep the one-level-in
+layout above (primary checkout beside `worktrees/`) and say plainly that config and
+worktrees inside a product checkout are supported but discouraged (gitignored state
+inside the product tree, slot scans walking it); do not put `.wrkslots.yml` inside the
+product checkout.
+
 `--sandbox-isolation cgroup` means sandbox off; `userns` or `root` means sandbox on. Check with
 `"$H/worktrees/wrkslots" sandbox show-config` run from `$H`. With the sandbox on, a slot is
 reclaimed only after its time-to-live (`--heartbeat-ttl-seconds`, default one hour) has passed

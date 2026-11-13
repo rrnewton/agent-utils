@@ -277,6 +277,7 @@ _CREATE_JOURNAL_OPTIONAL = frozenset(
         "hook_failure",
         "failure_policy",
         "operation_id",
+        "harness_checkout_reason",
     }
 )
 _IMPORT_JOURNAL_REQUIRED = frozenset(
@@ -556,6 +557,8 @@ OPTIONAL_CONFIG_KEYS = frozenset(
         "repo_cache_globs",
         "post_provision_hooks",
         "identity",
+        "harness_repo",
+        "product_repos",
         "share_submodules",
         "salvage_push_remotes",
         "ttl_rescue_ref_root",
@@ -659,6 +662,19 @@ CONFIG_KEY_DOCS: dict[str, str] = {
         "Git author identity ({name, email}) that create sets privately in each new slot: "
         "`git config --worktree` in the slot's own checkout, plain `git config` in each "
         "populated submodule. Absent means create leaves the identity alone."
+    ),
+    "harness_repo": (
+        "Harness repository name (#1299 harness-layout-mode), as create names it in --repo. "
+        "With product_repos it declares harness mode: create refuses a slot that includes "
+        "this repo unless --include-harness-checkout-i-know-this-is-heavy and "
+        "--harness-checkout-reason are both given. Absent (with product_repos absent) means "
+        "no harness mode. List the key in ignorable_keys so an older wrkslots ignores it."
+    ),
+    "product_repos": (
+        "Product repository names (#1299 harness-layout-mode), as create names them in "
+        "--repo. Required with harness_repo and must not include it. Product-only slots "
+        "are the normal create in harness mode. List the key in ignorable_keys so an "
+        "older wrkslots ignores it instead of refusing."
     ),
     "share_submodules": (
         "Share submodule object stores across slots (#1206): when true, create makes each "
@@ -1301,6 +1317,10 @@ class Config:
     #: Git author identity set slot-privately in every new checkout (#1096);
     #: None, the meaning when the key is absent, leaves identity alone.
     identity: SlotIdentity | None = None
+    #: Harness mode (#1299): the harness repo name and product repo names,
+    #: as create names them. Both empty/None means no harness mode.
+    harness_repo: str | None = None
+    product_repos: tuple[str, ...] = ()
     #: #1206: create makes each slot's submodules linked worktrees of the
     #: primary module repositories instead of private clones. Opt-in,
     #: because it prepares (config only, logged) the primary submodule
@@ -1473,6 +1493,7 @@ class ActiveRecord:
     layout: str | None = None
     import_source: _ImportSource | None = None
     task_scope: TaskScopeIdentity | None = None
+    harness_checkout_reason: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4196,6 +4217,8 @@ def _config_payload(
     image: Mapping[str, object] | None = None,
     sandbox_section: Mapping[str, object] | None = None,
     salvage_push_remotes: Sequence[str] = (),
+    harness_repo: str | None = None,
+    product_repos: Sequence[str] = (),
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "schema": SCHEMA,
@@ -4235,6 +4258,9 @@ def _config_payload(
         payload["image"] = dict(image)
     if sandbox_section is not None:
         payload["sandbox"] = dict(sandbox_section)
+    if harness_repo is not None:
+        payload["harness_repo"] = harness_repo
+        payload["product_repos"] = list(product_repos)
     return payload
 
 
@@ -4256,6 +4282,8 @@ def _canonical_config_payload(value: Mapping[str, object]) -> dict[str, object]:
         canonical.pop("provisioned_allowlist")
     if canonical.get("slot_representation") == "worktree":
         canonical.pop("slot_representation")
+    if canonical.get("product_repos") == []:
+        canonical.pop("product_repos")
     return canonical
 
 
@@ -4494,6 +4522,86 @@ def _journal_forward_compatible(raw: Mapping[str, object], label: str) -> None:
         )
 
 
+def _parse_harness_declaration(
+    raw: Mapping[str, object], layout: str
+) -> tuple[str | None, tuple[str, ...]]:
+    """Validate the #1299 harness/product declaration; (None, ()) when absent."""
+    has_harness = "harness_repo" in raw
+    has_products = "product_repos" in raw
+    if not has_harness and not has_products:
+        return None, ()
+    if has_harness != has_products:
+        missing = "product_repos" if has_harness else "harness_repo"
+        present = "harness_repo" if has_harness else "product_repos"
+        raise StateError(
+            f"configuration.{present} requires configuration.{missing}: "
+            "harness mode declares one harness repo and its product repos together"
+        )
+    harness = _validate_name(
+        _as_str(raw["harness_repo"], "configuration.harness_repo"),
+        "configuration.harness_repo",
+    )
+    products = _string_tuple(
+        raw["product_repos"],
+        "configuration.product_repos",
+        lambda v: _validate_name(v, "configuration.product_repos entry"),
+    )
+    if not products:
+        raise StateError("configuration.product_repos must name at least one product repo")
+    if harness in products:
+        raise StateError(
+            f"configuration.product_repos names harness repo {harness!r} as both "
+            "harness and product; a repo cannot be both"
+        )
+    if layout == "flat":
+        raise StateError(
+            "configuration.harness_repo/product_repos require nested layout: "
+            "flat layout holds exactly one repo per slot, so harness mode does not apply; "
+            "single-repo projects should use the one-level-in layout instead"
+        )
+    return harness, products
+
+
+def _is_harness_checkout(config: Config, record: ActiveRecord) -> bool:
+    return config.harness_repo is not None and any(
+        c.name == config.harness_repo for c in record.checkouts
+    )
+
+
+def _harness_unpushed_state(
+    config: Config, record: ActiveRecord, vcs: _GitVcs | None = None
+) -> dict[str, object]:
+    """Per-checkout published state from stored refs (no fetch), for harness listings."""
+    selected = vcs or _GitVcs()
+    checkouts: list[dict[str, object]] = []
+    any_unpushed = False
+    any_unknown = False
+    for checkout in record.checkouts:
+        try:
+            path = _stored_path(config, checkout.path, "checkout path")
+            head = selected.verify_existing_worktree(
+                _stored_repository_path(config, checkout.repository)[1], path
+            )
+            containing = selected.remote_refs_containing(path, checkout.remote, head)
+            state = "PUBLISHED" if containing else "UNPUSHED-OR-STALE"
+            if not containing:
+                any_unpushed = True
+            checkouts.append(
+                {"name": checkout.name, "head": head, "state": state,
+                 "containing_remote_refs": list(containing)}
+            )
+        except Exception as exc:  # read-only listing: unknown, never clear
+            any_unknown = True
+            checkouts.append({"name": checkout.name, "head": None, "state": "UNKNOWN",
+                              "detail": str(exc), "containing_remote_refs": []})
+    return {
+        "slot": record.slot,
+        "harness_checkout_reason": record.harness_checkout_reason,
+        "has_unpushed_work": (None if any_unknown and not any_unpushed else any_unpushed),
+        "checkouts": checkouts,
+    }
+
+
 def _load_config(explicit_root: str | None, machine_override: str | None) -> Config:
     root = _discover_root(explicit_root)
     path = root / CONFIG_NAME
@@ -4618,6 +4726,7 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         if "identity" not in raw
         else _slot_identity(raw["identity"], "configuration.identity")
     )
+    harness_repo, product_repos = _parse_harness_declaration(raw, layout)
     if "share_submodules" in raw and not isinstance(raw["share_submodules"], bool):
         raise StateError("configuration.share_submodules must be true or false")
     share_submodules = raw.get("share_submodules", False) is True
@@ -4706,6 +4815,8 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         post_provision_hooks=post_provision_hooks,
         post_provision_hook_slot_types=post_provision_hook_slot_types,
         identity=identity,
+        harness_repo=harness_repo,
+        product_repos=product_repos,
         share_submodules=share_submodules,
         salvage_push_remotes=salvage_push_remotes,
         ttl_rescue_ref_root=(
@@ -5427,6 +5538,30 @@ def _init_salvage_push_remotes(
     if isinstance(existing, list) and all(isinstance(item, str) for item in existing):
         return tuple(str(item) for item in existing)
     return ()
+
+
+def _init_harness_declaration(
+    args: argparse.Namespace, config_path: Path, layout: str
+) -> tuple[str | None, tuple[str, ...]]:
+    """Harness declaration init writes; rerun without flags keeps an existing one."""
+    harness_arg = getattr(args, "harness_repo", None)
+    products_arg = tuple(getattr(args, "product_repo", None) or ())
+    if harness_arg is None and not products_arg:
+        if not config_path.exists() or config_path.is_symlink():
+            return None, ()
+        try:
+            loaded = _read_config(config_path)
+        except StateError:
+            return None, ()
+        if "harness_repo" not in loaded and "product_repos" not in loaded:
+            return None, ()
+        return _parse_harness_declaration(loaded, layout)
+    raw: dict[str, object] = {}
+    if harness_arg is not None:
+        raw["harness_repo"] = harness_arg
+    if products_arg:
+        raw["product_repos"] = list(products_arg)
+    return _parse_harness_declaration(raw, layout)
 
 
 def _refuse_eden_image_combination(config: Config, args: argparse.Namespace) -> None:
@@ -8135,6 +8270,8 @@ def _record_to_obj(record: ActiveRecord) -> dict[str, object]:
         value["import_source"] = _import_source_to_obj(record.import_source)
     if record.task_scope is not None:
         value["task_scope"] = _task_scope_to_obj(record.task_scope)
+    if record.harness_checkout_reason is not None:
+        value["harness_checkout_reason"] = record.harness_checkout_reason
     return value
 
 
@@ -8159,7 +8296,7 @@ def _record_from_obj(value: object, label: str) -> ActiveRecord:
     _exact_keys(
         raw,
         required_fields,
-        {"slot_type", "layout", "import_source", "task_scope"},
+        {"slot_type", "layout", "import_source", "task_scope", "harness_checkout_reason"},
         label,
     )
     checkouts = tuple(
@@ -8209,7 +8346,16 @@ def _record_from_obj(value: object, label: str) -> ActiveRecord:
             if "task_scope" not in raw
             else _task_scope_from_obj(raw["task_scope"], f"{label}.task_scope")
         ),
+        harness_checkout_reason=(
+            None
+            if raw.get("harness_checkout_reason") is None
+            else _as_str(
+                raw["harness_checkout_reason"], f"{label}.harness_checkout_reason"
+            )
+        ),
     )
+    if record.harness_checkout_reason is not None and not record.harness_checkout_reason:
+        raise StateError(f"{label}.harness_checkout_reason must be non-empty when present")
     _validate_name(record.slot, "slot")
     _validate_name(record.agent, "agent")
     _validate_name(record.machine, "machine")
@@ -12062,6 +12208,13 @@ def _completed_create_record(
         handoff=None,
         checkouts=created,
         task_scope=task_scope,
+        harness_checkout_reason=(
+            None
+            if raw.get("harness_checkout_reason") is None
+            else _as_str(
+                raw["harness_checkout_reason"], "create journal.harness_checkout_reason"
+            )
+        ),
     )
 
 
@@ -34715,6 +34868,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         sandbox_section = dict(sandbox_section or sandbox.default_config_obj())
         sandbox_section["isolation"] = args.sandbox_isolation
     salvage_push_remotes = _init_salvage_push_remotes(args, config_path)
+    harness_repo, product_repos = _init_harness_declaration(args, config_path, layout)
     payload = _config_payload(
         worktrees_relative,
         machine,
@@ -34735,6 +34889,8 @@ def _cmd_init(args: argparse.Namespace) -> int:
         image_section,
         sandbox_section,
         salvage_push_remotes=salvage_push_remotes,
+        harness_repo=harness_repo,
+        product_repos=product_repos,
     )
     with _locked_config(config_path, args.wait_lock):
         _recover_config_write(config_path, payload)
@@ -35221,6 +35377,9 @@ def _create_journal_payload(
     }
     if task_scope is not None:
         value["task_scope"] = _task_scope_to_obj(task_scope)
+    reason = getattr(args, "harness_checkout_reason", None)
+    if reason:
+        value["harness_checkout_reason"] = reason
     return value
 
 
@@ -35922,6 +36081,35 @@ def _share_created_submodules(
             )
 
 
+def _harness_checkout_doctor_findings(
+    config: Config, states: Sequence[ActiveState]
+) -> list[dict[str, object]]:
+    """Doctor findings for harness-checkout slots (#1299), read-only."""
+    if config.harness_repo is None:
+        return []
+    findings: list[dict[str, object]] = []
+    for state in states:
+        for record in state.slots:
+            if not _is_harness_checkout(config, record):
+                continue
+            info = _harness_unpushed_state(config, record)
+            unpushed = info["has_unpushed_work"]
+            label = "unknown" if unpushed is None else ("yes" if unpushed else "no")
+            findings.append(
+                _operational_finding(
+                    "harness-checkout-slot",
+                    record.slot,
+                    record.machine,
+                    f"slot includes harness repo {config.harness_repo!r} "
+                    f"reason={record.harness_checkout_reason!r} has_unpushed_work={label} "
+                    "(stored refs, no fetch); retire clean ones first: publish work, "
+                    "wrkslots finish, normal remove, then recreate product-only; "
+                    "never delete work by hand",
+                )
+            )
+    return findings
+
+
 def _shared_submodule_doctor_findings(
     config: Config, states: Sequence[ActiveState]
 ) -> list[dict[str, object]]:
@@ -36491,10 +36679,82 @@ def _provision_eden_slot(
     )
 
 
+def _assert_harness_create_allowed(config: Config, args: argparse.Namespace) -> None:
+    """Refuse harness-repo slots in harness mode without the heavy opt-in (#1299)."""
+    include = bool(getattr(args, "include_harness_checkout", False))
+    reason = getattr(args, "harness_checkout_reason", None)
+    if include and not (reason and str(reason).strip()):
+        raise Refusal(
+            "--include-harness-checkout-i-know-this-is-heavy requires "
+            "--harness-checkout-reason TEXT naming why a harness checkout is needed"
+        )
+    if reason and not include:
+        raise Refusal(
+            "--harness-checkout-reason requires "
+            "--include-harness-checkout-i-know-this-is-heavy"
+        )
+    if config.harness_repo is None:
+        if include or reason:
+            raise Refusal(
+                "harness checkout flags require harness_repo/product_repos in configuration"
+            )
+        return
+    try:
+        repositories = _assignments(getattr(args, "repo", None), "repository")
+    except Refusal:
+        return  # the plan path reports the malformed assignment itself
+    unknown = sorted(
+        set(repositories) - {config.harness_repo} - set(config.product_repos)
+    )
+    if unknown:
+        raise Refusal(
+            f"create names repo(s) not declared as product repos in harness mode: "
+            f"{', '.join(unknown)}; declared products are {', '.join(config.product_repos)}"
+        )
+    if config.harness_repo not in repositories:
+        return
+    if include and reason:
+        return
+    products = [n for n in repositories if n != config.harness_repo]
+    parts = [
+        "wrkslots", "create", str(args.slot),
+        "--slot-type", str(getattr(args, "slot_type", "agent")),
+        "--coordinator-authorized",
+        "--agent", str(args.agent), "--task", str(args.task),
+        "--purpose", str(args.purpose),
+        "--coordinator-pid", str(args.coordinator_pid),
+    ]
+    if getattr(args, "owner_pid", None) is not None:
+        parts += ["--owner-pid", str(args.owner_pid)]
+    branches = {}
+    try:
+        branches = _assignments(getattr(args, "branch", None), "branch")
+    except Refusal:
+        branches = {}
+    if products:
+        for name in products:
+            parts += ["--repo", f"{name}={repositories[name]}"]
+            if name in branches:
+                parts += ["--branch", f"{name}={branches[name]}"]
+    else:
+        for name in config.product_repos:
+            parts += ["--repo", f"{name}=<{name}-checkout>", "--branch", f"{name}=<new-branch>"]
+    raise Refusal(
+        f"create refuses a slot including harness repo {config.harness_repo!r} in harness "
+        f"mode: a harness checkout copies every product submodule instead of one product. "
+        f"Create the slot from the product repo the task touches instead:\n  "
+        f"{shlex.join(parts)}\n"
+        "If a harness checkout is genuinely required, pass "
+        "--include-harness-checkout-i-know-this-is-heavy together with "
+        "--harness-checkout-reason TEXT; the reason is recorded on the slot."
+    )
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     _require_coordinator_authorized(args, "worktree creation")
     args.slot_type = _require_slot_type(args, "worktree creation")
     config = _load_new_slot_config(args, "worktree creation")
+    _assert_harness_create_allowed(config, args)
     _require_worktrees_image_mounted(config, "create a slot")
     _validate_name(args.slot, "slot")
     _validate_name(args.agent, "agent")
@@ -36918,6 +37178,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             handoff=None,
             checkouts=tuple(created),
             task_scope=task_scope,
+            harness_checkout_reason=getattr(args, "harness_checkout_reason", None),
         )
         _verify_created_checkouts(config, record, vcs)
         state = _append_record(state, record)
@@ -48082,8 +48343,14 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
         gate_state = "ok"
         summary = "no worktree slot currently needs coordinator attention"
     quarantined_rows = _quarantined_journal_rows(config)
+    harness_checkouts = (
+        [_harness_unpushed_state(config, r) for r in records if _is_harness_checkout(config, r)]
+        if config.harness_repo is not None
+        else []
+    )
     payload = {
         "schema": SCHEMA,
+        "harness_checkouts": harness_checkouts,
         "worktree_count": worktree_count,
         "running_agent_count": running_agent_count,
         "leak": worktree_count > running_agent_count,
@@ -48143,6 +48410,20 @@ def _cmd_audit_scan(args: argparse.Namespace) -> int:
                 print(
                     f"  {entry['slot_type']} {entry['name']}: "
                     f"{'size unknown' if size is None else f'{size} bytes'}"
+                )
+        if harness_checkouts:
+            print(
+                f"harness-checkouts: {len(harness_checkouts)} slot(s) include harness repo "
+                f"{config.harness_repo!r} (separate listing; verdicts above unchanged; "
+                "unpushed uses stored remote refs, no fetch)"
+            )
+            for item in harness_checkouts:
+                unpushed = item["has_unpushed_work"]
+                label = "unknown" if unpushed is None else ("yes" if unpushed else "no")
+                print(
+                    f"  HARNESS-CHECKOUT {item['slot']}: reason={item['harness_checkout_reason']!r} "
+                    f"has_unpushed_work={label} retire-clean-first: publish any unpushed work, "
+                    "wrkslots finish, normal remove, then recreate product-only"
                 )
         for quarantined in quarantined_rows:
             age_seconds = quarantined["age_seconds"]
@@ -48324,6 +48605,8 @@ def _status_record(
     value["storage_inconsistencies"] = [
         item.to_obj() for item in storage_inconsistencies
     ]
+    value["harness_checkout"] = _is_harness_checkout(config, record)
+    value["harness_checkout_reason"] = record.harness_checkout_reason
     return value
 
 
@@ -49141,6 +49424,7 @@ def _cmd_doctor_scan(args: argparse.Namespace) -> int:
         # #1206 check mode: primary submodule repositories that create
         # would need to prepare, and slot submodules still privately cloned.
         findings.extend(_shared_submodule_doctor_findings(config, states))
+        findings.extend(_harness_checkout_doctor_findings(config, states))
         doctor_records = [record for state in states for record in state.slots]
         doctor_liveness = cache.owner_liveness(config, doctor_records)
         rows = [
@@ -49439,6 +49723,9 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
                     "registry_storage_inconsistencies": [
                         item.to_obj() for item in storage_inconsistencies
                     ],
+                    "harness_checkouts": [
+                        v["slot"] for v in records if v.get("harness_checkout") is True
+                    ],
                     **(
                         {"partial": True, "scan_timeout": partial_detail}
                         if partial_detail is not None
@@ -49483,6 +49770,15 @@ def _cmd_status_in_context(args: argparse.Namespace) -> int:
             print(
                 f"  {release_obj['summary']} "
                 f"(event {release_obj['event_sequence']})"
+            )
+    harness_rows = [v for v in records if v.get("harness_checkout") is True]
+    if harness_rows:
+        print(f"harness-checkouts: {len(harness_rows)} slot(s) include harness repo {config.harness_repo!r}")
+        for value in harness_rows:
+            print(
+                f"  HARNESS-CHECKOUT {value['machine']}/{value['slot']}: "
+                f"reason={value.get('harness_checkout_reason')!r} "
+                "retire: publish work, wrkslots finish, normal remove, then recreate product-only"
             )
     for item in storage_inconsistencies:
         print(f"INCONSISTENT {_format_storage_inconsistency(item)}")
@@ -81859,6 +82155,13 @@ whole project root), with no slot. Image slots it creates are mounted on the hos
      wrkslots box --isolation root --cwd worktrees -- HARNESS ...
      wrkslots shell-command --box --cwd worktrees --format json   # for agent launchers
 
+Layouts and harness mode (#1299): single-repo projects use the one-level-in layout
+(primary checkout beside worktrees/); config inside a product checkout is supported
+but discouraged. A harness repo that pins product repos as submodules declares
+`harness_repo`/`product_repos` in .wrkslots.yml (or init --harness-repo/--product-repo);
+create then refuses harness checkouts by default and prints the product-only command
+instead. See `wrkslots --userguide`, section "Harness layout mode".
+
 Use `wrkslots COMMAND --help` for the exact effects and inputs of one command.
 """
 
@@ -82297,6 +82600,23 @@ usage or audit gate unknown, 3 fail-closed refusal.
             "any other remote is kept in a verified local bundle. Rerunning init without "
             "this flag keeps the existing list (default for a new project: none)"
         ),
+    )
+    init.add_argument(
+        "--harness-repo",
+        metavar="NAME",
+        default=None,
+        help=(
+            "harness repo name as create names it (#1299); with --product-repo declares "
+            "harness mode so create refuses harness checkouts by default. Single-repo "
+            "projects should not set this: use the one-level-in layout (primary checkout "
+            "beside worktrees/), not config inside a product checkout"
+        ),
+    )
+    init.add_argument(
+        "--product-repo",
+        action="append",
+        metavar="NAME",
+        help="product repo name as create names it (repeatable; required with --harness-repo)",
     )
     init.add_argument(
         "--config-format",
@@ -82806,6 +83126,26 @@ usage or audit gate unknown, 3 fail-closed refusal.
         "--override-disk-floor",
         action="store_true",
         help="allow create below the provisioning floor, but never below the emergency floor",
+    )
+    create.add_argument(
+        "--include-harness-checkout-i-know-this-is-heavy",
+        action="store_true",
+        dest="include_harness_checkout",
+        help=(
+            "harness mode only (#1299): allow a slot including the configured harness_repo "
+            "even though it copies every product submodule; requires "
+            "--harness-checkout-reason and the reason is recorded on the slot"
+        ),
+    )
+    create.add_argument(
+        "--harness-checkout-reason",
+        metavar="TEXT",
+        default=None,
+        help=(
+            "why a harness checkout is required; required with "
+            "--include-harness-checkout-i-know-this-is-heavy and recorded as "
+            "harness_checkout_reason on the slot"
+        ),
     )
     create.add_argument(
         "--representation",
