@@ -526,3 +526,40 @@ test("`#624 voice-page-modularity`: Help's way in shows the screen, then opens t
   assert.equal(stored.storedMsgScale(), 125);
   assert.equal(stored.storedReadingWidth(), 72);
 });
+
+test("`#1398 reading-width-handle-gate`: the handle shows only past the default reading width, and full width applies below it", () => {
+  const { readingGripShown, effectiveReadingWidth, READING_GRIP_THRESHOLD_CH } = VIEW_SETTINGS;
+  // The threshold is the default reading width (DEFAULT_READING_CH, 72ch): a column no
+  // wider than the width a reader gets by default reads best at full width.
+  assert.equal(READING_GRIP_THRESHOLD_CH, 72);
+  // Fed measured widths: at 8px per character the threshold stands at 576px.
+  assert.equal(readingGripShown(575, 8), false, "a column under the threshold still showed the handle");
+  assert.equal(readingGripShown(576, 8), false, "a column exactly at the threshold showed the handle");
+  assert.equal(readingGripShown(577, 8), true, "a column past the threshold hid the handle");
+  // The same decision at a larger type size (10px per character, threshold 720px): a
+  // squeezed 700px column hides it, a 900px one-column desk keeps it.
+  assert.equal(readingGripShown(700, 10), false);
+  assert.equal(readingGripShown(900, 10), true);
+  // An unmeasured column (no layout yet, or a refused measurement) keeps the handle.
+  assert.equal(readingGripShown(0, 8), true);
+  assert.equal(readingGripShown(1200, 0), true);
+  assert.equal(readingGripShown(Number.NaN, 8), true);
+  // Below the threshold the remembered narrower width is kept, not applied: the column
+  // is applied at full width (the widest allowed, which cannot cap a column this size).
+  assert.equal(effectiveReadingWidth(54, false), 120, "a squeezed column still applied the remembered width");
+  assert.equal(effectiveReadingWidth(54, true), 54, "a wide column did not apply the remembered width");
+  assert.equal(effectiveReadingWidth(120, false), 120);
+});
+
+test("`#1398 reading-width-handle-gate`: the handle stands on the message column's own edge, never the screen's middle", () => {
+  const { readingGripLeft } = VIEW_SETTINGS;
+  // Docked at 1280px: the screen runs 0..1280, the message column ends at 700 and the
+  // Discuss panel owns the rest. Centred on the screen the handle would stand at
+  // 640 + half the reading width, inside the panel; on the column it stands at 700.
+  assert.equal(readingGripLeft({ left: 0, right: 700, width: 700 }, { left: 0, width: 1280 }), 700);
+  // The same column with the screen offset (a safe-area inset): only the screen's
+  // left edge moves the answer.
+  assert.equal(readingGripLeft({ left: 24, right: 724, width: 700 }, { left: 24, width: 1280 }), 700);
+  // Two columns on a wide screen: the main column's edge, not the second column's.
+  assert.equal(readingGripLeft({ left: 0, right: 1720, width: 1720 }, { left: 0, width: 3440 }), 1720);
+});
