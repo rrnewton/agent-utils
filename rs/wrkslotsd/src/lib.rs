@@ -114,6 +114,8 @@ mod storage_state;
 mod supersede_write;
 mod transfer_write;
 mod unpushed_state;
+#[allow(dead_code)] // wired into recovery/classify dispatch by the ownerless-validation steps
+mod validation_recovery;
 #[allow(dead_code)] // wired into cli.rs dispatch by the shared core (P8, mu-rsimg)
 mod worktrees_image;
 mod yamlconfig;
