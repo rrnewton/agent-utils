@@ -7558,7 +7558,7 @@ mod tests {
         // there are add tables, dropped here as their notes say.
         connection
             .execute_batch(
-                "DROP TABLE IF EXISTS reply_pointers; DROP TABLE IF EXISTS history_modes;
+                "DROP TABLE IF EXISTS discuss_records; DROP TABLE IF EXISTS reply_pointers; DROP TABLE IF EXISTS history_modes;
                  DROP TABLE IF EXISTS own_decided; ALTER TABLE dismissals DROP COLUMN own;
                  DROP TABLE IF EXISTS post_keys; DROP TABLE IF EXISTS thread_hue_tombstones;
                  DROP TABLE IF EXISTS read_mark_epochs; DROP TABLE IF EXISTS client_settings;

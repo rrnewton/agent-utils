@@ -4146,6 +4146,16 @@ taking the file back too. **Take a copy of `storage.path` before an upgrade.** R
 is the simplest way back to an older build. The other way is to undo the newest steps by hand, with
 the server stopped, newest first; each step's note below says how.
 
+**Step 25 (`discuss-transcript-persist`)** only adds the `discuss_records` table, one JSON
+row per channel/thread holding the saved Discuss record, so with the server stopped it can
+be undone in place; reopening Discuss then asks the model afresh:
+
+```sh
+sqlite3 /path/to/vibe-talk.sqlite3 'DROP TABLE discuss_records; PRAGMA user_version = 24;'
+```
+
+Run that only on a file at version 25, and only when the build being returned to predates the step.
+
 **Step 24 (`#934 voice-page-reply-parent-arrow`)** only adds the `reply_pointers` table, which
 message each reply this server posted answers, so with the server stopped it can be undone in place;
 replies read from a provider that keeps no pointer of its own (Slack) then lose their arrows to
