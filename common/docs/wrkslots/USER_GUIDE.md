@@ -1643,8 +1643,15 @@ directory must already exist, must be owned by the current user, must not be gro
 must have no symlink component, and must be separate from the managed project tree (the control
 directory, which is the default root, is the one exception). Wrkslots still
 tries the recorded remote first. Only after a salvage push refuses, for any reason, or after the
-initial fetch fails in the transport, does it write one self-contained Git bundle per affected
-repository under the supplied root. A fetch failure counts as a transport failure only when Git's
+initial fetch fails in the transport, does it write one Git bundle per affected
+repository under the supplied root. The bundle is thin when the remote proves a
+prerequisite at that moment (a ref it advertises under refs/heads/*, refs/tags/*,
+refs/salvage/* or refs/rescue/* whose commit is an ancestor of the salvage commit):
+it then holds only the commits the prerequisites do not reach, the receipt records
+the proof under `thin_bundle`, and verification unbundles it against those
+prerequisites. With no such proof the bundle is self-contained, as before. Commits
+reachable only from the remote's refs/rescue/* or refs/salvage/* count as published
+wherever wrkslots asks whether history is already on a remote. A fetch failure counts as a transport failure only when Git's
 combined output reports a proxy `CONNECT` refusal, an unresolved host, or a refused, timed-out, or
 unreachable connection, and reports none of the refusals listed next. Any line Git
 relays from the server (`remote:`), a `remote error:` packet, an HTTP error answer, a proxy `407`

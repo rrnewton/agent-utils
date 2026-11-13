@@ -16144,14 +16144,15 @@ def test_agent_reclaim_uses_verified_local_archive_only_after_remote_refuses(
     assert receipt["source_head"] == source_head
     assert receipt["disposition"] == "archived-local"
     assert receipt["remote_ref"] is None
-    assert receipt["complete_history"] is True
+    assert receipt["complete_history"] is False
     assert "Git refused" in receipt["remote_failure"]
     bundle = Path(receipt["archive_bundle"])
     receipt_path = Path(receipt["archive_receipt"])
     assert hashlib.sha256(bundle.read_bytes()).hexdigest() == receipt["archive_bundle_sha256"]
     assert hashlib.sha256(receipt_path.read_bytes()).hexdigest() == receipt["archive_receipt_sha256"]
     restored = tmp_path / "restored.git"
-    git(tmp_path, "clone", "--bare", str(bundle), str(restored))
+    git(tmp_path, "clone", "--bare", str(_remote), str(restored))
+    git(restored, "fetch", str(bundle), f"{receipt['archive_ref']}:{receipt['archive_ref']}")
     salvage_commit = receipt["salvage_commit"]
     assert git(restored, "rev-parse", receipt["archive_ref"]).stdout.strip() == salvage_commit
     assert git(restored, "show", f"{salvage_commit}:local.txt").stdout == "must survive\n"
@@ -16323,14 +16324,15 @@ def test_agent_reclaim_archives_locally_when_remote_transport_is_unavailable(
     # The initial fetch is what failed; no push was attempted.
     assert "git ls-remote" in receipt["remote_failure"]
     calls = network_calls(tmp_path)
-    assert [call.split()[0] for call in calls] == ["default", "false"]
+    assert [call.split()[0] for call in calls] == ["default", "false", "default"]
     assert all(" ls-remote " in call for call in calls)
     assert "CONNECT tunnel failed, response 403" in receipt["remote_failure"]
     assert git(remote, "for-each-ref", "refs/heads/salvage/").stdout == ""
     bundle = Path(receipt["archive_bundle"])
     assert hashlib.sha256(bundle.read_bytes()).hexdigest() == receipt["archive_bundle_sha256"]
     restored = tmp_path / "restored.git"
-    git(tmp_path, "clone", "--bare", str(bundle), str(restored))
+    git(tmp_path, "clone", "--bare", str(remote), str(restored))
+    git(restored, "fetch", str(bundle), f"{receipt['archive_ref']}:{receipt['archive_ref']}")
     salvage_commit = receipt["salvage_commit"]
     assert git(restored, "show", f"{salvage_commit}:local.txt").stdout == "must survive\n"
     assert git(restored, "show", f"{salvage_commit}:untracked.txt").stdout == "untracked work\n"
@@ -16877,7 +16879,8 @@ def test_salvage_to_unlisted_remote_keeps_verified_local_bundle(
     assert bundle.is_relative_to(control / "wrkslots-salvage")
     assert hashlib.sha256(bundle.read_bytes()).hexdigest() == receipt["archive_bundle_sha256"]
     restored = tmp_path / "restored.git"
-    git(tmp_path, "clone", "--bare", str(bundle), str(restored))
+    git(tmp_path, "clone", "--bare", str(remote), str(restored))
+    git(restored, "fetch", str(bundle), f"{receipt['archive_ref']}:{receipt['archive_ref']}")
     salvage_commit = receipt["salvage_commit"]
     assert git(restored, "rev-parse", receipt["archive_ref"]).stdout.strip() == salvage_commit
     assert git(restored, "show", f"{salvage_commit}:work.txt").stdout == "authored work\n"
@@ -17130,7 +17133,8 @@ def test_agent_reclaim_archives_nested_repository_when_its_remote_refuses(
     nested_receipt = receipts["product/component"]
     assert nested_receipt["disposition"] == "archived-local"
     restored = tmp_path / "restored-nested.git"
-    git(tmp_path, "clone", "--bare", nested_receipt["archive_bundle"], str(restored))
+    git(tmp_path, "clone", "--bare", str(submodule_remote), str(restored))
+    git(restored, "fetch", nested_receipt["archive_bundle"], f"{nested_receipt['archive_ref']}:{nested_receipt['archive_ref']}")
     assert (
         git(
             restored,
@@ -36772,7 +36776,7 @@ def test_agent_remove_builds_and_verifies_a_local_archive_before_the_lock(
     # registry lock; the rechecks under the lock reread only its bytes.
     assert [line for line in calls if line.split()[0] in {"bundle", "clone", "fsck"}] == [
         "bundle free",
-        "clone free",
+        "bundle free",
         "fsck free",
     ], calls
     assert all(line.endswith(" free") for line in calls), calls
@@ -47824,7 +47828,8 @@ def test_recover_ownerless_agent_worktree_keeps_unlisted_remote_work_local(
     assert receipt["destination"] == str(bundle)
     assert bundle.is_relative_to(config.control / "wrkslots-salvage")
     restored = tmp_path / "restored.git"
-    git(tmp_path, "clone", "--bare", str(bundle), str(restored))
+    git(tmp_path, "clone", "--bare", str(remote), str(restored))
+    git(restored, "fetch", str(bundle), "refs/heads/wrkslots-salvage/*:refs/heads/wrkslots-salvage/*")
     salvage_commit = wrkslots._as_str(receipt["salvage_commit"], "ownerless commit")
     archive_ref = wrkslots._as_str(receipt["archive_ref"], "ownerless archive ref")
     assert git(restored, "rev-parse", archive_ref).stdout.strip() == salvage_commit
@@ -55116,7 +55121,8 @@ def test_release_frozen_incomplete_removes_after_salvage(
         bundle = Path(salvage[0]["bundle"])
         assert bundle.is_file() and Path(salvage[0]["receipt"]).is_file()
         restored = tmp_path / "restored.git"
-        subprocess.run(["git", "clone", "--bare", str(bundle), str(restored)], check=True, capture_output=True)
+        subprocess.run(["git", "clone", "--bare", str(source), str(restored)], check=True, capture_output=True)
+        subprocess.run(["git", "--git-dir", str(restored), "fetch", str(bundle), "refs/heads/wrkslots-salvage/*:refs/heads/wrkslots-salvage/*"], check=True, capture_output=True)
         assert subprocess.run(
             ["git", "--git-dir", str(restored), "cat-file", "-t", target],
             check=True, capture_output=True, text=True,
@@ -61089,7 +61095,8 @@ def test_archive_drifted_checkouts_keeps_found_head_in_verified_bundle_then_remo
     on_disk = json.loads(Path(receipt["archive_receipt"]).read_text(encoding="utf-8"))
     assert on_disk["recorded_checkout_drift"] == receipt["recorded_checkout_drift"]
     restored = tmp_path / "restored.git"
-    git(tmp_path, "clone", "--bare", str(bundle), str(restored))
+    git(tmp_path, "clone", "--bare", str(remote), str(restored))
+    git(restored, "fetch", str(bundle), f"{receipt['archive_ref']}:{receipt['archive_ref']}")
     salvage_commit = receipt["salvage_commit"]
     assert git(restored, "rev-parse", receipt["archive_ref"]).stdout.strip() == salvage_commit
     # The unpushed commit and the untracked file are both in the bundle.
@@ -61766,7 +61773,8 @@ def test_archive_drifted_checkouts_keeps_submodule_private_history_local(
     assert kept["disposition"] == "archived-local"
     assert kept["archive_reason"] == "recorded-checkout-drift"
     restored = tmp_path / "restored-component.git"
-    git(tmp_path, "clone", "--bare", kept["archive_bundle"], str(restored))
+    git(tmp_path, "clone", "--bare", str(component_remote), str(restored))
+    git(restored, "fetch", kept["archive_bundle"], f"{kept['archive_ref']}:{kept['archive_ref']}")
     assert git(restored, "show", f"{private}:local.txt").stdout == "submodule work\n"
     assert git(restored, "merge-base", "--is-ancestor", private, kept["salvage_commit"]).returncode == 0
 
@@ -62229,12 +62237,75 @@ def test_archive_private_history_keeps_it_in_a_verified_bundle(tmp_path: Path) -
     assert "--archive-private-history keeps the unpushed private history" in removed.stderr
     assert "refs/heads/side " + branch_commit[:12] in removed.stderr
     restored = tmp_path / "restored-private.git"
-    git(tmp_path, "clone", "-q", "--bare", str(receipt["archive_bundle"]), str(restored))
+    git(tmp_path, "clone", "-q", "--bare", str(tmp_path / "leaf.git"), str(restored))
+    git(restored, "fetch", str(receipt["archive_bundle"]), f"{receipt['archive_ref']}:{receipt['archive_ref']}")
     salvage = str(receipt["salvage_commit"])
     for commit in (branch_commit, tag_commit):
         assert git(restored, "merge-base", "--is-ancestor", commit, salvage, check=False).returncode == 0
     parents = git(restored, "rev-list", "--parents", "-n", "1", salvage).stdout.split()[2:]
     assert sorted(parents) == sorted((branch_commit, tag_commit))
+
+
+def test_remove_accepts_private_history_only_on_a_remote_rescue_ref(tmp_path: Path) -> None:
+    """#1367: commits reachable only from the remote's refs/rescue/* count as published."""
+    project, tree, _component, leaf = _slot_with_primary_dropped_leaf(tmp_path)
+    branch_commit, tag_commit = _leaf_private_branch_and_tag(leaf)
+    git(leaf, "push", "-q", "origin", f"{branch_commit}:refs/rescue/keep-branch")
+    git(leaf, "push", "-q", "origin", f"{tag_commit}:refs/rescue/keep-tag")
+
+    removed = remove(project)
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    receipt = _drift_receipts(project)["product/component/leaf"]
+    assert receipt["disposition"] == "already-published"
+
+
+def test_archive_private_history_writes_a_thin_bundle_when_proven(tmp_path: Path) -> None:
+    """#1367: only private commits go in when the upstream tip is proven on the remote."""
+    project, tree, _component, leaf = _slot_with_primary_dropped_leaf(tmp_path)
+    branch_commit, _tag_commit = _leaf_private_branch_and_tag(leaf)
+    base = git(leaf, "rev-parse", "HEAD").stdout.strip()
+
+    removed = _remove_archiving(project, "--archive-private-history")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    receipt = _drift_receipts(project)["product/component/leaf"]
+    thin = receipt["thin_bundle"]
+    assert isinstance(thin, dict)
+    assert thin["prerequisites"] == [base]
+    assert receipt["complete_history"] is False
+    # The thin bundle alone does not restore; with its prerequisite it does.
+    empty = tmp_path / "thin-empty.git"
+    assert git(tmp_path, "clone", "-q", "--bare", str(receipt["archive_bundle"]), str(empty), check=False).returncode != 0
+    restored = tmp_path / "thin-restored.git"
+    git(tmp_path, "clone", "-q", "--bare", str(tmp_path / "leaf.git"), str(restored))
+    git(restored, "bundle", "unbundle", str(receipt["archive_bundle"]))
+    salvage = str(receipt["salvage_commit"])
+    assert git(restored, "merge-base", "--is-ancestor", branch_commit, salvage, check=False).returncode == 0
+
+
+def test_archive_private_history_falls_back_to_a_complete_bundle(tmp_path: Path) -> None:
+    """#1367: with no proven prerequisite the bundle stays self-contained."""
+    project, tree, _component, leaf = _slot_with_primary_dropped_leaf(tmp_path)
+    tree_sha = git(leaf, "rev-parse", "HEAD^{tree}").stdout.strip()
+    orphan = git(leaf, "commit-tree", tree_sha, "-m", "orphan").stdout.strip()
+    git(leaf, "update-ref", "refs/heads/orphan", orphan)
+    # No advertised ref reaches the salvage history any more, so no thin
+    # prerequisite can be proven.
+    for ref in git(tmp_path / "leaf.git", "for-each-ref", "--format=%(refname)").stdout.splitlines():
+        if ref.strip():
+            git(tmp_path / "leaf.git", "update-ref", "-d", ref.strip())
+
+    removed = _remove_archiving(project, "--archive-private-history")
+
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert not tree.exists()
+    receipt = _drift_receipts(project)["product/component/leaf"]
+    assert "thin_bundle" not in receipt
+    assert receipt["complete_history"] is True
+    assert _bundle_reaches(tmp_path, receipt, orphan, "orphan-restored.git")
 
 
 def test_archive_private_history_still_refuses_uncommitted_submodule_work(
@@ -62389,7 +62460,8 @@ def test_archive_private_history_bundles_a_declared_submodule(tmp_path: Path) ->
     assert receipt["disposition"] == "archived-local"
     assert receipt["archive_reason"] == "private-history-kept"
     restored = tmp_path / "restored-declared.git"
-    git(tmp_path, "clone", "-q", "--bare", str(receipt["archive_bundle"]), str(restored))
+    git(tmp_path, "clone", "-q", "--bare", str(tmp_path / "component.git"), str(restored))
+    git(restored, "fetch", str(receipt["archive_bundle"]), f"{receipt['archive_ref']}:{receipt['archive_ref']}")
     salvage = str(receipt["salvage_commit"])
     parents = git(restored, "rev-list", "--parents", "-n", "1", salvage).stdout.split()[2:]
     assert sorted(parents) == sorted((branch_commit, tag_commit))
@@ -62445,10 +62517,11 @@ def test_archive_private_history_bundles_a_blob_only_the_parent_module_store_hol
     assert receipt["excluded_incomplete_history"] == []
     bundle = Path(str(receipt["archive_bundle"]))
     empty = tmp_path / "empty.git"
-    git(tmp_path, "init", "-q", "--bare", str(empty))
+    git(tmp_path, "clone", "-q", "--bare", str(tmp_path / "component.git"), str(empty))
     assert git(empty, "bundle", "verify", str(bundle), check=False).returncode == 0
     restored = tmp_path / "restored-parent-blob.git"
-    git(tmp_path, "clone", "-q", "--bare", str(bundle), str(restored))
+    git(tmp_path, "clone", "-q", "--bare", str(tmp_path / "component.git"), str(restored))
+    git(restored, "fetch", str(bundle), f"{receipt['archive_ref']}:{receipt['archive_ref']}")
     assert git(restored, "show", f"{commit}:parent-only.txt").stdout == "only in parent\n"
     salvage = str(receipt["salvage_commit"])
     parents = git(restored, "rev-list", "--parents", "-n", "1", salvage).stdout.split()[1:]
@@ -62494,10 +62567,11 @@ def test_archive_private_history_excludes_a_promisor_gap_kept_commit(
     ]
     bundle = Path(str(receipt["archive_bundle"]))
     empty = tmp_path / "empty-gap.git"
-    git(tmp_path, "init", "-q", "--bare", str(empty))
+    git(tmp_path, "clone", "-q", "--bare", str(tmp_path / "component.git"), str(empty))
     assert git(empty, "bundle", "verify", str(bundle), check=False).returncode == 0
     restored = tmp_path / "restored-gap.git"
-    git(tmp_path, "clone", "-q", "--bare", str(bundle), str(restored))
+    git(tmp_path, "clone", "-q", "--bare", str(tmp_path / "component.git"), str(restored))
+    git(restored, "fetch", str(bundle), f"{receipt['archive_ref']}:{receipt['archive_ref']}")
     salvage = str(receipt["salvage_commit"])
     parents = git(restored, "rev-list", "--parents", "-n", "1", salvage).stdout.split()[1:]
     assert gap_commit not in parents
@@ -63314,7 +63388,23 @@ def _drift_receipts(project: Path) -> dict[str, dict[str, object]]:
 
 def _bundle_reaches(tmp_path: Path, receipt: Mapping[str, object], commit: str, name: str) -> bool:
     restored = tmp_path / name
-    git(tmp_path, "clone", "-q", "--bare", str(receipt["archive_bundle"]), str(restored))
+    bundle = str(receipt["archive_bundle"])
+    cloned = git(tmp_path, "clone", "-q", "--bare", bundle, str(restored), check=False)
+    if cloned.returncode != 0:
+        # A thin bundle (#1367) restores only with its prerequisites: seed
+        # the scratch clone from a sibling bare repository that holds one.
+        thin = receipt.get("thin_bundle")
+        prerequisites = thin.get("prerequisites") if isinstance(thin, dict) else None
+        seeded = False
+        if isinstance(prerequisites, list) and prerequisites:
+            for candidate in sorted(tmp_path.glob("*.git")):
+                if git(candidate, "cat-file", "-e", str(prerequisites[0]), check=False).returncode == 0:
+                    git(tmp_path, "clone", "-q", "--bare", str(candidate), str(restored))
+                    git(restored, "fetch", bundle, f"{receipt['archive_ref']}:{receipt['archive_ref']}")
+                    seeded = True
+                    break
+        if not seeded:
+            raise AssertionError(cloned.stdout + cloned.stderr)
     return (
         git(
             restored,
@@ -63452,7 +63542,8 @@ def test_archive_drifted_checkouts_keeps_a_commit_held_only_by_a_mirror_inside_t
     shared = control_directory(project) / "wrkslots-salvage" / "_by-commit"
     [bundle] = sorted(shared.glob("*/repository.bundle"))
     restored = tmp_path / "inside-restored.git"
-    git(tmp_path, "clone", "-q", "--bare", str(bundle), str(restored))
+    git(tmp_path, "clone", "-q", "--bare", str(tmp_path / "component.git"), str(restored))
+    git(restored, "fetch", str(bundle), "refs/heads/wrkslots-salvage/*:refs/heads/wrkslots-salvage/*")
     assert git(restored, "cat-file", "-e", f"{inside_only}^{{commit}}", check=False).returncode == 0
 
 
@@ -63901,7 +63992,7 @@ def test_remove_reuses_the_shared_bundle_of_a_pin_another_slot_bundled(
     assert one["archive_receipt"] != two["archive_receipt"]
     assert one["salvage_commit"] == two["salvage_commit"] == pinned
     bundle = Path(str(two["archive_bundle"]))
-    assert bundle.parent.name == pinned and bundle.parent.parent.name == "_by-commit"
+    assert bundle.parent.name.startswith(pinned) and bundle.parent.parent.name == "_by-commit"
     shared = [path for path in written_bundles(project) if "_by-commit" in path.parts]
     assert shared == [bundle]
     # The pin's bundle was verified (cloned) by the first removal only.

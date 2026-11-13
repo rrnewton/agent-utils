@@ -20338,9 +20338,10 @@ class _GitVcs:
         hashes, so a present object is the advertised one), and each of
         ``tips`` that those do not reach but that a commits-only fetch of the
         advertised tips missing locally brings into an empty store
-        (_fetched_proof_store).  Only refs/heads/*, refs/tags/* and
-        refs/salvage/* count (#1280: salvage refs are where wrkslots itself
-        publishes, so what they reach is durable); a
+        (_fetched_proof_store).  Only refs/heads/*, refs/tags/*,
+        refs/salvage/* and refs/rescue/* count (#1280: salvage refs are
+        where wrkslots itself publishes, so what they reach is durable;
+        rescue refs likewise, #1367); a
         local refs/remotes/* or tag ref may name what the remote has since
         deleted.  Also returns the full names of the branches it advertises.
         The answer shares remote_heads_containing's memo, under a key no
@@ -20393,6 +20394,47 @@ class _GitVcs:
             )
         return covering, branches
 
+    def remote_advertised_tips(
+        self,
+        checkout: Path,
+        remote: str,
+        authority: _RemoteAuthority,
+        *,
+        network_authority: _RemoteAuthority | None = None,
+    ) -> dict[str, str]:
+        """The remote's advertised refs and their tips, asked now (#1367).
+
+        Only refs/heads/*, refs/tags/*, refs/salvage/* and refs/rescue/*
+        are asked for, as in remote_advertised_covering. The tips are the
+        remote's own words at this moment; no local ref is consulted.
+        """
+
+        _validate_remote(remote)
+        self.assert_remote_authority(checkout, remote, authority)
+        target = authority if network_authority is None else network_authority
+        expected_digest = hashlib.sha256(target.url.encode("utf-8")).hexdigest()
+        if target.sha256 != expected_digest:
+            raise StateError("remote authority URL and digest disagree")
+        if target.url.startswith("-"):
+            raise Refusal(
+                f"remote {remote!r} URL cannot begin with '-' for isolated transport"
+            )
+        prefixes = ("refs/heads/", "refs/tags/", "refs/salvage/", "refs/rescue/")
+        common = self.common_directory(checkout)
+        objects = common / "objects"
+        with self._isolated_repository(objects) as (isolated, object_env):
+            return {
+                ref: tip
+                for ref, tip in self._ls_remote_inventory(
+                    isolated,
+                    target.url,
+                    refs=tuple(f"{prefix}*" for prefix in prefixes),
+                    env_overrides=object_env,
+                    timeout_seconds=_REMOTE_CONTAINMENT_LIST_SECONDS,
+                ).items()
+                if ref.startswith(prefixes)
+            }
+
     def _remote_advertised_covering_uncached(
         self,
         checkout: Path,
@@ -20402,7 +20444,7 @@ class _GitVcs:
     ) -> tuple[frozenset[str], frozenset[str]]:
         """Ask the remote at ``target``; see remote_advertised_covering."""
 
-        prefixes = ("refs/heads/", "refs/tags/", "refs/salvage/")
+        prefixes = ("refs/heads/", "refs/tags/", "refs/salvage/", "refs/rescue/")
         objects = common / "objects"
         with self._isolated_repository(objects) as (isolated, object_env):
             advertised = {
@@ -27052,18 +27094,26 @@ def _local_salvage_paths(
     generation: int | None,
     checkout: Checkout,
     commit: str,
+    *,
+    thin_proof: tuple[tuple[str, str], ...] = (),
 ) -> tuple[Path, Path, str]:
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", checkout.name).strip("-.") or "checkout"
     name_digest = hashlib.sha256(checkout.name.encode("utf-8")).hexdigest()[:12]
     # An ownerless worktree has no registry generation.
     epoch = "ownerless" if generation is None else str(generation)
+    thin_suffix = ""
+    if thin_proof:
+        thin_digest = hashlib.sha256(
+            "".join(f"{commit}\n" for _ref, commit in thin_proof).encode("utf-8")
+        ).hexdigest()[:12]
+        thin_suffix = f"-thin-{thin_digest}"
     directory = (
         archive_root
         / _LOCAL_SALVAGE_DIRECTORY
         / machine
         / slot
         / epoch
-        / f"{safe_name}-{name_digest}-{commit[:12]}"
+        / f"{safe_name}-{name_digest}-{commit[:12]}{thin_suffix}"
     )
     ref = (
         f"refs/heads/{_LOCAL_SALVAGE_DIRECTORY}/{machine}/{slot}/"
@@ -27097,6 +27147,48 @@ def _prepare_local_salvage_directory(root: Path, directory: Path) -> None:
             )
 
 
+def _thin_bundle_prerequisites(
+    vcs: _GitVcs, path: Path, checkout: Checkout, facts: _SalvageCandidate
+) -> tuple[tuple[str, str], ...]:
+    """Remote-proven bundle prerequisites for ``facts.commit`` (#1367).
+
+    Each entry is (remote ref, commit): the remote advertises the ref at
+    this moment (ls-remote; never a local ref), and the commit is an
+    ancestor of the salvage commit held by the stores a bundle may read.
+    An empty result means no thin bundle is proven, and the caller keeps
+    the self-contained bundle. Asking the remote never refuses salvage:
+    any refusal here falls back the same way.
+    """
+
+    try:
+        tips = vcs.remote_advertised_tips(
+            path,
+            checkout.remote,
+            facts.remote_authority,
+            network_authority=facts.network_authority,
+        )
+    except Refusal:
+        return ()
+    if not tips:
+        return ()
+    _stores, env = _salvage_bundle_object_env(vcs, path)
+    proof: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for ref, tip in sorted(tips.items()):
+        if not SHA_RE.fullmatch(tip) or tip in seen:
+            continue
+        result = vcs._run(
+            path,
+            ["merge-base", "--is-ancestor", tip, facts.commit],
+            check=False,
+            env_overrides=env,
+        )
+        if result.returncode == 0:
+            seen.add(tip)
+            proof.append((ref, tip))
+    return tuple(proof)
+
+
 def _verify_local_salvage_bundle(
     bundle: Path,
     expected_sha256: str,
@@ -27104,6 +27196,9 @@ def _verify_local_salvage_bundle(
     archive_ref: str,
     commit: str,
     vcs: _GitVcs,
+    *,
+    prerequisites: tuple[str, ...] = (),
+    prerequisite_stores: tuple[Path, ...] = (),
 ) -> None:
     observed_digest, observed_size = _sha256_regular_file(bundle, "local salvage bundle")
     if (observed_digest, observed_size) != (expected_sha256, expected_size):
@@ -27120,7 +27215,27 @@ def _verify_local_salvage_bundle(
     ) as temporary:
         root = Path(temporary)
         restored = root / "restored.git"
-        vcs._run(root, ["clone", "--bare", "--", str(bundle), str(restored)])
+        if prerequisites:
+            # A thin bundle (#1367) verifies in a scratch repository whose
+            # alternates are the stores a bundle may read, which hold the
+            # prerequisites the remote proved; the bundle must verify
+            # against them and fetch to the exact salvage commit. (A clone
+            # of one store would hardlink its dangling objects and let the
+            # fetch negotiation skip objects only another store holds.)
+            if not prerequisite_stores:
+                raise StateError("a thin salvage bundle has no prerequisite stores")
+            vcs._run(root, ["init", "--bare", "--", str(restored)])
+            alternates = restored / "objects" / "info" / "alternates"
+            alternates.write_text(
+                "".join(f"{store}\n" for store in prerequisite_stores),
+                encoding="utf-8",
+            )
+            vcs._run(restored, ["bundle", "verify", str(bundle)])
+            vcs._run(
+                restored, ["fetch", str(bundle), f"{archive_ref}:{archive_ref}"]
+            )
+        else:
+            vcs._run(root, ["clone", "--bare", "--", str(bundle), str(restored)])
         restored_commit = vcs._run(
             restored, ["rev-parse", "--verify", archive_ref]
         ).stdout.strip()
@@ -27148,12 +27263,20 @@ def _local_salvage_receipt_payload(
     *,
     drift: _CheckoutDrift | None = None,
     shared: bool = False,
+    thin_proof: tuple[tuple[str, str], ...] = (),
 ) -> dict[str, object]:
     extra: dict[str, object] = (
         {} if drift is None else {_CHECKOUT_DRIFT_RECEIPT_KEY: drift.to_obj()}
     )
     if shared:
         extra["shared_bundle"] = True
+    if thin_proof:
+        extra["thin_bundle"] = {
+            "prerequisites": [commit for _ref, commit in thin_proof],
+            "proof": [
+                {"ref": ref, "commit": commit} for ref, commit in thin_proof
+            ],
+        }
     excluded_entries = _excluded_incomplete_history_entries(facts)
     if excluded_entries:
         extra["excluded_incomplete_history"] = excluded_entries
@@ -27179,10 +27302,10 @@ def _local_salvage_receipt_payload(
         "bundle_bytes": bundle_size,
         "archive_ref": archive_ref,
         "verification": {
-            "fresh_bare_clone": True,
+            "fresh_bare_clone": not thin_proof,
             "exact_ref": True,
             "full_fsck": True,
-            "complete_history": True,
+            "complete_history": not thin_proof,
         },
     }
 
@@ -27197,8 +27320,14 @@ def _ensure_local_salvage_bundle(
     facts: _SalvageCandidate,
     archive_root: Path,
     vcs: _GitVcs,
+    *,
+    thin_proof: tuple[tuple[str, str], ...] = (),
 ) -> tuple[Path, Path, Path, str]:
-    """Create, unless it exists, and verify the self-contained bundle of ``facts.commit``.
+    """Create, unless it exists, and verify the bundle of ``facts.commit``.
+
+    With ``thin_proof`` the bundle is thin (#1367): it holds only what
+    the proven prerequisites do not reach. Without it, it is the
+    self-contained bundle of before.
 
     Returns the checked archive root, the bundle, its receipt path, and the
     archive ref. No receipt is written here; see _archive_salvage_locally.
@@ -27206,7 +27335,7 @@ def _ensure_local_salvage_bundle(
     checked_root = _local_salvage_archive_root(config, str(archive_root))
     assert checked_root is not None
     bundle, receipt_path, archive_ref = _local_salvage_paths(
-        checked_root, machine, slot, generation, checkout, facts.commit
+        checked_root, machine, slot, generation, checkout, facts.commit, thin_proof=thin_proof
     )
     _prepare_local_salvage_directory(checked_root, bundle.parent)
     _ensure_no_symlink_components(checked_root, bundle.parent, "local salvage archive")
@@ -27229,7 +27358,13 @@ def _ensure_local_salvage_bundle(
                 )
                 vcs._run(
                     stage,
-                    ["bundle", "create", str(temp_bundle), archive_ref],
+                    [
+                        "bundle",
+                        "create",
+                        str(temp_bundle),
+                        archive_ref,
+                        *[f"^{commit}" for _ref, commit in thin_proof],
+                    ],
                     env_overrides=object_env,
                 )
             except Refusal as exc:
@@ -27250,7 +27385,14 @@ def _ensure_local_salvage_bundle(
                     temp_bundle, "temporary local salvage bundle"
                 )
                 _verify_local_salvage_bundle(
-                    temp_bundle, temp_digest, temp_size, archive_ref, facts.commit, vcs
+                    temp_bundle,
+                    temp_digest,
+                    temp_size,
+                    archive_ref,
+                    facts.commit,
+                    vcs,
+                    prerequisites=tuple(commit for _ref, commit in thin_proof),
+                    prerequisite_stores=stores,
                 )
                 try:
                     os.link(temp_bundle, bundle, follow_symlinks=False)
@@ -27263,27 +27405,44 @@ def _ensure_local_salvage_bundle(
     return checked_root, bundle, receipt_path, archive_ref
 
 
-def _shared_salvage_paths(archive_root: Path, commit: str) -> tuple[Path, Path, str]:
+def _shared_salvage_paths(
+    archive_root: Path,
+    commit: str,
+    *,
+    thin_proof: tuple[tuple[str, str], ...] = (),
+) -> tuple[Path, Path, str]:
     """The shared bundle of ``commit``, its metadata file, and its archive ref (#1153).
 
     A complete-history bundle of a commit depends on nothing but the commit,
     whose name covers everything reachable from it, so the commit alone is
     the key: one bundle serves every slot, checkout and repository that
-    salvages it.
+    salvages it. A thin bundle (#1367) also depends on its prerequisites,
+    so its key names them too.
     """
 
     if not SHA_RE.fullmatch(commit):
         raise StateError(f"shared salvage bundle for an invalid commit {commit!r}")
-    directory = archive_root / _LOCAL_SALVAGE_DIRECTORY / _SHARED_SALVAGE_DIRECTORY / commit
+    directory_name = commit
+    if thin_proof:
+        thin_digest = hashlib.sha256(
+            "".join(f"{tip}\n" for _ref, tip in thin_proof).encode("utf-8")
+        ).hexdigest()[:12]
+        directory_name = f"{commit}-thin-{thin_digest}"
+    directory = archive_root / _LOCAL_SALVAGE_DIRECTORY / _SHARED_SALVAGE_DIRECTORY / directory_name
     ref = f"refs/heads/{_LOCAL_SALVAGE_DIRECTORY}/{_SHARED_SALVAGE_DIRECTORY}/{commit}"
     _validate_full_ref(ref, "shared salvage archive ref")
     return directory / "repository.bundle", directory / "bundle.json", ref
 
 
 def _shared_salvage_metadata(
-    commit: str, archive_ref: str, bundle_sha256: str, bundle_size: int
+    commit: str,
+    archive_ref: str,
+    bundle_sha256: str,
+    bundle_size: int,
+    *,
+    thin_proof: tuple[tuple[str, str], ...] = (),
 ) -> dict[str, object]:
-    return {
+    metadata: dict[str, object] = {
         "schema": _SHARED_SALVAGE_METADATA_SCHEMA,
         "kind": "wrkslots-shared-salvage-bundle",
         "commit": commit,
@@ -27291,17 +27450,28 @@ def _shared_salvage_metadata(
         "bundle_sha256": bundle_sha256,
         "bundle_bytes": bundle_size,
         "verification": {
-            "fresh_bare_clone": True,
+            "fresh_bare_clone": not thin_proof,
             "exact_ref": True,
             "full_fsck": True,
-            "complete_history": True,
+            "complete_history": not thin_proof,
             "result": "pass",
         },
     }
+    if thin_proof:
+        metadata["thin_prerequisites"] = [tip for _ref, tip in thin_proof]
+        metadata["thin_proof"] = [
+            {"ref": ref, "commit": tip} for ref, tip in thin_proof
+        ]
+    return metadata
 
 
 def _shared_salvage_bundle_verified(
-    bundle: Path, metadata: Path, archive_ref: str, commit: str
+    bundle: Path,
+    metadata: Path,
+    archive_ref: str,
+    commit: str,
+    *,
+    thin_proof: tuple[tuple[str, str], ...] = (),
 ) -> tuple[str, int]:
     """Return the digest and size of a shared bundle whose metadata records a passed verification.
 
@@ -27318,7 +27488,10 @@ def _shared_salvage_bundle_verified(
     )
     observed = _strict_json_object(contents, "shared salvage bundle metadata")
     digest, size = _sha256_regular_file(bundle, "shared salvage bundle")
-    if not _json_equal(observed, _shared_salvage_metadata(commit, archive_ref, digest, size)):
+    if not _json_equal(
+        observed,
+        _shared_salvage_metadata(commit, archive_ref, digest, size, thin_proof=thin_proof),
+    ):
         raise Refusal(
             f"shared salvage bundle {bundle} does not match the passed verification "
             f"its metadata {metadata} records"
@@ -27335,6 +27508,8 @@ def _ensure_shared_salvage_bundle(
     commit: str,
     archive_root: Path,
     vcs: _GitVcs,
+    *,
+    thin_proof: tuple[tuple[str, str], ...] = (),
 ) -> tuple[Path, Path, str, bool]:
     """Reuse, or create and verify once, the shared bundle of ``commit`` (#1153).
 
@@ -27352,7 +27527,9 @@ def _ensure_shared_salvage_bundle(
 
     checked_root = _local_salvage_archive_root(config, str(archive_root))
     assert checked_root is not None
-    bundle, metadata, archive_ref = _shared_salvage_paths(checked_root, commit)
+    bundle, metadata, archive_ref = _shared_salvage_paths(
+        checked_root, commit, thin_proof=thin_proof
+    )
     _prepare_local_salvage_directory(checked_root, bundle.parent)
     _ensure_no_symlink_components(checked_root, bundle.parent, "shared salvage archive")
     descriptor = os.open(
@@ -27364,7 +27541,9 @@ def _ensure_shared_salvage_bundle(
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         created = _CREATED_SHARED_SALVAGE_BUNDLES.get()
         if metadata.exists() or metadata.is_symlink():
-            _shared_salvage_bundle_verified(bundle, metadata, archive_ref, commit)
+            _shared_salvage_bundle_verified(
+                bundle, metadata, archive_ref, commit, thin_proof=thin_proof
+            )
             return checked_root, bundle, archive_ref, created is None or commit not in created
         if not bundle.exists():
             temp_bundle = (
@@ -27381,7 +27560,13 @@ def _ensure_shared_salvage_bundle(
                         )
                         vcs._run(
                             stage,
-                            ["bundle", "create", str(temp_bundle), archive_ref],
+                            [
+                                "bundle",
+                                "create",
+                                str(temp_bundle),
+                                archive_ref,
+                                *[f"^{tip}" for _ref, tip in thin_proof],
+                            ],
                             env_overrides=object_env,
                         )
                     except Refusal as exc:
@@ -27403,12 +27588,24 @@ def _ensure_shared_salvage_bundle(
                 with contextlib.suppress(FileNotFoundError):
                     temp_bundle.unlink()
         digest, size = _sha256_regular_file(bundle, "shared salvage bundle")
-        _verify_local_salvage_bundle(bundle, digest, size, archive_ref, commit, vcs)
+        _verify_local_salvage_bundle(
+            bundle,
+            digest,
+            size,
+            archive_ref,
+            commit,
+            vcs,
+            prerequisites=tuple(tip for _ref, tip in thin_proof),
+            prerequisite_stores=_salvage_bundle_object_env(vcs, path)[0],
+        )
         _interrupt_for_test("after-shared-salvage-bundle-before-metadata")
         _atomic_write_json(
-            metadata, _shared_salvage_metadata(commit, archive_ref, digest, size)
+            metadata,
+            _shared_salvage_metadata(commit, archive_ref, digest, size, thin_proof=thin_proof),
         )
-        _shared_salvage_bundle_verified(bundle, metadata, archive_ref, commit)
+        _shared_salvage_bundle_verified(
+            bundle, metadata, archive_ref, commit, thin_proof=thin_proof
+        )
         if created is not None:
             created.add(commit)
         return checked_root, bundle, archive_ref, False
@@ -27431,6 +27628,7 @@ def _archive_salvage_locally(
     drift: _CheckoutDrift | None = None,
     archive_reason: str | None = None,
     shared: bool = False,
+    allow_thin: bool = True,
 ) -> dict[str, object]:
     """Create and read back a self-contained bundle instead of a remote push.
 
@@ -27446,11 +27644,18 @@ def _archive_salvage_locally(
     made and verified it; the receipt is still this slot's own, and says
     ``shared_bundle`` and whether the bundle was reused (#1153).
     """
+    # A drifted checkout is never asked about a remote (#1153); every
+    # other archive proves its thin prerequisites there first (#1367).
+    thin_proof = (
+        ()
+        if drift is not None or not allow_thin
+        else _thin_bundle_prerequisites(vcs, path, checkout, facts)
+    )
     reused = False
     if shared:
         try:
             checked_root, bundle, archive_ref, reused = _ensure_shared_salvage_bundle(
-                config, path, facts.commit, archive_root, vcs
+                config, path, facts.commit, archive_root, vcs, thin_proof=thin_proof
             )
         except Refusal as exc:
             # A shared bundle that disagrees with its record is never
@@ -27462,7 +27667,13 @@ def _archive_salvage_locally(
             shared = False
     if shared:
         _slot_bundle, receipt_path, _slot_ref = _local_salvage_paths(
-            checked_root, machine, slot, generation, checkout, facts.commit
+            checked_root,
+            machine,
+            slot,
+            generation,
+            checkout,
+            facts.commit,
+            thin_proof=thin_proof,
         )
         _prepare_local_salvage_directory(checked_root, receipt_path.parent)
         _ensure_no_symlink_components(
@@ -27470,12 +27681,28 @@ def _archive_salvage_locally(
         )
     else:
         checked_root, bundle, receipt_path, archive_ref = _ensure_local_salvage_bundle(
-            config, machine, slot, generation, checkout, path, facts, archive_root, vcs
+            config,
+            machine,
+            slot,
+            generation,
+            checkout,
+            path,
+            facts,
+            archive_root,
+            vcs,
+            thin_proof=thin_proof,
         )
 
     bundle_digest, bundle_size = _sha256_regular_file(bundle, "local salvage bundle")
     _verify_local_salvage_bundle(
-        bundle, bundle_digest, bundle_size, archive_ref, facts.commit, vcs
+        bundle,
+        bundle_digest,
+        bundle_size,
+        archive_ref,
+        facts.commit,
+        vcs,
+        prerequisites=tuple(commit for _ref, commit in thin_proof),
+        prerequisite_stores=_salvage_bundle_object_env(vcs, path)[0],
     )
     expected_receipt = _local_salvage_receipt_payload(
         checked_root,
@@ -27490,6 +27717,7 @@ def _archive_salvage_locally(
         bundle_size,
         drift=drift,
         shared=shared,
+        thin_proof=thin_proof,
     )
     if receipt_path.exists() or receipt_path.is_symlink():
         contents = _read_bounded_regular_file(
@@ -27572,7 +27800,19 @@ def _archive_salvage_locally(
         "archive_bundle_sha256": bundle_digest,
         "archive_bundle_bytes": bundle_size,
         "archive_ref": archive_ref,
-        "complete_history": True,
+        "complete_history": not thin_proof,
+        **(
+            {}
+            if not thin_proof
+            else {
+                "thin_bundle": {
+                    "prerequisites": [commit for _ref, commit in thin_proof],
+                    "proof": [
+                        {"ref": ref, "commit": commit} for ref, commit in thin_proof
+                    ],
+                }
+            }
+        ),
         "excluded_incomplete_history": _excluded_incomplete_history_entries(facts),
         "private_history_counts": _facts_history_counts_obj(facts),
         "remote_failure": None if remote_failure is None else str(remote_failure),
@@ -27596,19 +27836,44 @@ def _assert_local_salvage_receipt(
     facts: _SalvageCandidate,
     salvage: Mapping[str, object],
     vcs: _GitVcs,
+    *,
+    path: Path | None = None,
 ) -> None:
     root = _local_salvage_archive_root(
         config,
         _as_str(salvage.get("archive_root"), "salvage receipt.archive_root"),
     )
     assert root is not None
+    thin_proof: tuple[tuple[str, str], ...] = ()
+    thin_record = salvage.get("thin_bundle")
+    if thin_record is not None:
+        if not isinstance(thin_record, Mapping):
+            raise StateError("salvage receipt.thin_bundle must be an object")
+        proof_entries = thin_record.get("proof")
+        if not isinstance(proof_entries, list):
+            raise StateError("salvage receipt.thin_bundle.proof must be a list")
+        parsed: list[tuple[str, str]] = []
+        for entry in proof_entries:
+            if not isinstance(entry, Mapping):
+                raise StateError("salvage receipt.thin_bundle.proof entries must be objects")
+            parsed.append(
+                (
+                    _as_str(entry.get("ref"), "salvage receipt.thin_bundle.proof.ref"),
+                    _as_str(entry.get("commit"), "salvage receipt.thin_bundle.proof.commit"),
+                )
+            )
+        thin_proof = tuple(parsed)
     bundle, receipt_path, archive_ref = _local_salvage_paths(
-        root, machine, slot, generation, checkout, facts.commit
+        root, machine, slot, generation, checkout, facts.commit, thin_proof=thin_proof
     )
     shared = salvage.get("shared_bundle") is True
     if shared:
-        bundle, metadata, archive_ref = _shared_salvage_paths(root, facts.commit)
-        _shared_salvage_bundle_verified(bundle, metadata, archive_ref, facts.commit)
+        bundle, metadata, archive_ref = _shared_salvage_paths(
+            root, facts.commit, thin_proof=thin_proof
+        )
+        _shared_salvage_bundle_verified(
+            bundle, metadata, archive_ref, facts.commit, thin_proof=thin_proof
+        )
     elif "shared_bundle" in salvage:
         raise StateError("salvage receipt.shared_bundle must be true when present")
     if _as_str(
@@ -27653,6 +27918,7 @@ def _assert_local_salvage_receipt(
         bundle_size,
         drift=_checkout_drift_from_receipt(salvage),
         shared=shared,
+        thin_proof=thin_proof,
     )
     observed_receipt = _strict_json_object(
         receipt_contents, "local salvage archive receipt"
@@ -27661,10 +27927,19 @@ def _assert_local_salvage_receipt(
         raise Refusal(
             f"local salvage archive receipt no longer binds the current checkout: {receipt_path}"
         )
-    if salvage.get("complete_history") is not True:
-        raise StateError("local salvage receipt does not assert complete history")
+    if salvage.get("complete_history") is not (not thin_proof):
+        raise StateError("local salvage receipt does not assert its bundle history")
     _verify_local_salvage_bundle(
-        bundle, bundle_digest, bundle_size, archive_ref, facts.commit, vcs
+        bundle,
+        bundle_digest,
+        bundle_size,
+        archive_ref,
+        facts.commit,
+        vcs,
+        prerequisites=tuple(commit for _ref, commit in thin_proof),
+        prerequisite_stores=(
+            () if path is None else _salvage_bundle_object_env(vcs, path)[0]
+        ),
     )
 
 
@@ -31639,6 +31914,7 @@ def _assert_salvage_still_matches(
                     facts,
                     receipt,
                     vcs,
+                    path=path,
                 )
             except Refusal:
                 if receipt.get("shared_bundle") is True and lost(checkout, path, facts, receipt):
@@ -31683,6 +31959,11 @@ def _replace_lost_salvage_receipt(
         _bundle, stale_receipt, _ref = _local_salvage_paths(
             archive_root, record.machine, record.slot, record.generation, checkout, facts.commit
         )
+        recorded_receipt = receipt.get("archive_receipt")
+        if isinstance(recorded_receipt, str):
+            # A thin bundle's receipt (#1367) sits at its own suffixed
+            # path; the recorded path names it exactly either way.
+            stale_receipt = Path(recorded_receipt)
         if str(stale_receipt) == receipt.get("archive_receipt"):
             with contextlib.suppress(FileNotFoundError):
                 stale_receipt.unlink()
@@ -31698,6 +31979,7 @@ def _replace_lost_salvage_receipt(
         None,
         vcs,
         archive_reason=_PUBLICATION_LOST_ARCHIVE_REASON,
+        allow_thin=False,
     )
     entries = [
         dict(_as_mapping(item, "finish journal.salvage entry"))
@@ -53797,7 +54079,14 @@ def _prefetch_remote_containment(
             # The shared bundle the removal under the lock archives into
             # (#1153); made and verified once, or reused, here.
             _ensure_shared_salvage_bundle(
-                config, candidate_path, facts.commit, archive_root, vcs
+                config,
+                candidate_path,
+                facts.commit,
+                archive_root,
+                vcs,
+                thin_proof=_thin_bundle_prerequisites(
+                    vcs, candidate_path, candidate, facts
+                ),
             )
         except Refusal:
             continue
@@ -65813,7 +66102,15 @@ def _assert_ownerless_salvage_still_matches(
                 raise Refusal(f"ownerless checkout {candidate.name} is no longer published")
         elif receipt.get("disposition") == "archived-local":
             _assert_local_salvage_receipt(
-                config, config.machine, slot, None, candidate, facts, receipt, vcs
+                config,
+                config.machine,
+                slot,
+                None,
+                candidate,
+                facts,
+                receipt,
+                vcs,
+                path=candidate_path,
             )
         else:
             raise StateError("ownerless salvage receipt has unknown disposition")
