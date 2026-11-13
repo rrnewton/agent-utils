@@ -813,6 +813,47 @@ impl RestoreEpoch {
     pub fn matches_report(&self, report: &Value) -> bool {
         Self::from_report(report).is_some_and(|recorded| recorded == *self)
     }
+
+    /// As [`RestoreEpoch::matches_report`], plus the one legacy proof: a
+    /// report written before epochs were recorded (no manager identity)
+    /// belongs to this epoch when the current manager had already started
+    /// when the report finished, which proves it was written under this
+    /// manager. Answers `Miss` when the report finished before this
+    /// manager started (a restart has happened since), and
+    /// `PredatesKeying` when neither can be proven (start or finish time
+    /// unknown), so watch can say so distinctly instead of alarming.
+    pub fn legacy_match(&self, report: &Value, manager_started: Option<f64>) -> LegacyMatch {
+        let Some(recorded) = Self::from_report(report) else {
+            return LegacyMatch::Miss;
+        };
+        if recorded.boot_id != self.boot_id {
+            return LegacyMatch::Miss;
+        }
+        if recorded.user_manager.is_some() {
+            return if recorded == *self {
+                LegacyMatch::Matches
+            } else {
+                LegacyMatch::Miss
+            };
+        }
+        match (manager_started, report["finished_at"].as_f64()) {
+            (Some(started), Some(finished)) if finished > started => LegacyMatch::Matches,
+            (Some(started), Some(finished)) if finished < started => LegacyMatch::Miss,
+            _ => LegacyMatch::PredatesKeying,
+        }
+    }
+}
+
+/// How a recorded report stands against the current epoch, legacy reports
+/// (written before manager identity was recorded) included.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LegacyMatch {
+    /// Proven to belong to this epoch.
+    Matches,
+    /// A pre-epoch report for this boot that nothing can prove either way.
+    PredatesKeying,
+    /// A different boot or epoch, or no readable epoch at all.
+    Miss,
 }
 
 /// A one-shot re-entry wake for a team-driver deadline: run `argv` (an absolute
@@ -857,6 +898,13 @@ pub trait Host {
     /// can be read. Defaults to unknown, which keys the epoch on the boot
     /// alone, exactly as builds before #1405 did.
     fn user_manager_id(&self) -> Option<String> {
+        None
+    }
+    /// When the current user manager started, in Unix seconds, when that
+    /// can be read. It is the proof a pre-epoch report was (or was not)
+    /// written under this manager (see [`RestoreEpoch::legacy_match`]).
+    /// Defaults to unknown.
+    fn user_manager_started(&self) -> Option<f64> {
         None
     }
     /// The current restore epoch: this boot under its current user manager.
@@ -956,6 +1004,31 @@ impl Host for SystemHost {
             }
         }
         manager_pid_start(uid)
+    }
+
+    fn user_manager_started(&self) -> Option<f64> {
+        // Monotonic microseconds since boot, placed on the wall clock
+        // with the kernel boot time: no timestamp parsing involved.
+        let uid = unsafe { libc::getuid() };
+        let outcome = self.run(
+            &strings(&[
+                "systemctl",
+                "show",
+                &format!("user@{uid}.service"),
+                "--property=ActiveEnterTimestampMonotonic",
+                "--value",
+            ]),
+            None,
+            Duration::from_secs(10),
+        );
+        if outcome.status != Some(0) {
+            return None;
+        }
+        let micros: u64 = outcome.stdout.trim().parse().ok()?;
+        if micros == 0 {
+            return None;
+        }
+        Some(self.boot_time()? as f64 + micros as f64 / 1_000_000.0)
     }
 
     fn now(&self) -> f64 {
@@ -1365,13 +1438,53 @@ pub fn completed_boot_report(
     registry: &Path,
     config: &RestoreConfig,
     epoch: &RestoreEpoch,
+    manager_started: Option<f64>,
 ) -> Option<(PathBuf, Value)> {
-    candidate_report_paths(registry, config, &epoch.boot_id)
-        .into_iter()
-        .find_map(|path| {
-            let report = read_report(&path)?;
-            (report["complete"] == true && epoch.matches_report(&report)).then_some((path, report))
-        })
+    match boot_report_state(registry, config, epoch, manager_started) {
+        BootReportState::Completed(found) => Some(found),
+        BootReportState::PredatesKeying(_) | BootReportState::Missing => None,
+    }
+}
+
+/// What this boot's recorded restore evidence proves, for readers that
+/// must tell an unprovable legacy report apart from no restore at all
+/// (the watch check: the former is reported distinctly, never alarmed).
+#[derive(Clone, Debug, PartialEq)]
+pub enum BootReportState {
+    /// A completed report proven to belong to this epoch, legacy proof
+    /// by manager start included.
+    Completed((PathBuf, Value)),
+    /// Only a pre-epoch completed report, which nothing can prove.
+    PredatesKeying(PathBuf),
+    /// No completed report for this epoch at any candidate location.
+    Missing,
+}
+
+/// [`BootReportState`] for this boot, scanning candidates in read order.
+pub fn boot_report_state(
+    registry: &Path,
+    config: &RestoreConfig,
+    epoch: &RestoreEpoch,
+    manager_started: Option<f64>,
+) -> BootReportState {
+    let mut predating: Option<PathBuf> = None;
+    for path in candidate_report_paths(registry, config, &epoch.boot_id) {
+        let Some(report) = read_report(&path) else {
+            continue;
+        };
+        if report["complete"] != true {
+            continue;
+        }
+        match epoch.legacy_match(&report, manager_started) {
+            LegacyMatch::Matches => return BootReportState::Completed((path, report)),
+            LegacyMatch::PredatesKeying => predating.get_or_insert(path),
+            LegacyMatch::Miss => continue,
+        };
+    }
+    match predating {
+        Some(path) => BootReportState::PredatesKeying(path),
+        None => BootReportState::Missing,
+    }
 }
 
 /// Move every report at an earlier registry location into the current
@@ -2876,7 +2989,8 @@ pub fn restore<A: ManagedApi + ?Sized>(
         // The replay candidate is the shared completed pick, not merely
         // the first readable report: a partial report at the current
         // location must not shadow this epoch's completed legacy one.
-        let completed = completed_boot_report(registry, config, &epoch);
+        let completed =
+            completed_boot_report(registry, config, &epoch, host.user_manager_started());
         if let Some((previous_path, previous)) = &completed {
             {
                 let previous_epoch = RestoreEpoch::from_report(previous);
@@ -4117,24 +4231,32 @@ pub fn watch_once<A: ManagedApi + ?Sized>(
             boot_id: boot_id.clone(),
             user_manager: host.user_manager_id(),
         };
-        let complete = completed_boot_report(registry, config, &epoch).is_some();
+        let report_state = boot_report_state(registry, config, &epoch, host.user_manager_started());
         let early = host
             .boot_time()
             .is_some_and(|boot| host.now() - (boot as f64) < RESTORE_GRACE_SECONDS as f64);
         if config.coordinator.is_some() {
-            findings.push(finding(
-                "restore",
-                &boot_id,
-                complete || early,
-                if complete {
-                    "this boot's restore completed"
-                } else if early {
-                    "boot is recent; restore may still run"
-                } else {
-                    "no completed restore report for this boot"
-                },
-                Value::Null,
-            ));
+            // An unprovable pre-epoch report is said distinctly and never
+            // alarmed: alarming every pass until someone forces a restore
+            // (and its notices) helps nobody (#1426).
+            let (ok, detail): (bool, String) = match &report_state {
+                BootReportState::Completed(_) => (true, "this boot's restore completed".to_owned()),
+                BootReportState::PredatesKeying(path) => (
+                    true,
+                    format!(
+                        "report predates epoch keying ({}); cannot prove it for this epoch",
+                        path.display()
+                    ),
+                ),
+                BootReportState::Missing if early => {
+                    (true, "boot is recent; restore may still run".to_owned())
+                }
+                BootReportState::Missing => (
+                    false,
+                    "no completed restore report for this boot".to_owned(),
+                ),
+            };
+            findings.push(finding("restore", &boot_id, ok, &detail, Value::Null));
         }
     }
     // Queued prompts must not sit parked (#804 agentctl-queue-only-drain): a
@@ -4805,7 +4927,7 @@ mod tests {
         let agents = registry.join("agents/restore-reports");
         fs::create_dir_all(&agents).unwrap();
         fs::write(agents.join(&file), &complete).unwrap();
-        let (path, _) = completed_boot_report(&registry, &config, &epoch).unwrap();
+        let (path, _) = completed_boot_report(&registry, &config, &epoch, None).unwrap();
         assert_eq!(path, agents.join(&file));
         // A partial report at the current location does not shadow it.
         let primary = reports_directory(&registry);
@@ -4818,7 +4940,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let (path, _) = completed_boot_report(&registry, &config, &epoch).unwrap();
+        let (path, _) = completed_boot_report(&registry, &config, &epoch, None).unwrap();
         assert_eq!(path, agents.join(&file));
         // Nor does a completed report from an earlier manager epoch: the
         // current epoch's report under restore-reports/ is the pick.
@@ -4838,8 +4960,65 @@ mod tests {
         let middle = registry.join("restore-reports");
         fs::create_dir_all(&middle).unwrap();
         fs::write(middle.join(&file), &complete).unwrap();
-        let (path, _) = completed_boot_report(&registry, &config, &epoch).unwrap();
+        let (path, _) = completed_boot_report(&registry, &config, &epoch, None).unwrap();
         assert_eq!(path, middle.join(&file));
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn completed_boot_report_proves_legacy_report_by_manager_start() {
+        // A pre-epoch report (no manager identity) finished after the
+        // current manager started was written under this manager: it
+        // counts. Finished before it started, a restart has happened
+        // since: it does not. With no start to compare, watch can say
+        // predates-keying distinctly instead of alarming.
+        let directory =
+            std::env::temp_dir().join(format!("restore-legacy-epoch-{}", std::process::id()));
+        let registry = directory.join("registry");
+        let primary = reports_directory(&registry);
+        fs::create_dir_all(&primary).unwrap();
+        let config = RestoreConfig::load(&registry).unwrap();
+        let boot = "11111111-2222-3333-4444-555555555555";
+        let epoch = RestoreEpoch {
+            boot_id: boot.to_owned(),
+            user_manager: Some("invocation:m1".to_owned()),
+        };
+        let file = primary.join(format!("{boot}.json"));
+        fs::write(
+            &file,
+            format!("{{\"boot_id\": \"{boot}\", \"complete\": true, \"finished_at\": 2000.0}}"),
+        )
+        .unwrap();
+        assert!(matches!(
+            boot_report_state(&registry, &config, &epoch, Some(1000.0)),
+            BootReportState::Completed(_)
+        ));
+        assert_eq!(
+            boot_report_state(&registry, &config, &epoch, Some(3000.0)),
+            BootReportState::Missing
+        );
+        assert!(matches!(
+            boot_report_state(&registry, &config, &epoch, None),
+            BootReportState::PredatesKeying(_)
+        ));
+        // A report carrying its own manager identity is judged strictly,
+        // however its finish time compares.
+        let other = RestoreEpoch {
+            boot_id: boot.to_owned(),
+            user_manager: Some("invocation:m0".to_owned()),
+        };
+        fs::write(
+            &file,
+            format!(
+                "{{\"boot_id\": \"{boot}\", \"epoch\": {}, \"complete\": true, \"finished_at\": 2000.0}}",
+                other.as_json()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            boot_report_state(&registry, &config, &epoch, Some(1000.0)),
+            BootReportState::Missing
+        );
         fs::remove_dir_all(&directory).unwrap();
     }
 

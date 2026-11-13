@@ -1,6 +1,6 @@
 ---
 title: 'watch-restore-epoch-legacy-report: watch alarms "no completed restore report" when the only report predates #1405 epoch keying'
-status: open
+status: closed
 priority: 2
 issue_type: bug
 labels:
@@ -28,3 +28,7 @@ Either (preferably both):
 # Notes
 
 Numbered from devbig030's interim block (1400-1469).
+
+## Resolution
+
+[watermelon-full-preview] Both halves landed: `RestoreEpoch::legacy_match` counts a pre-epoch report (no manager identity) for the current boot as this epoch's when the current user manager (new `Host::user_manager_started`, from `ActiveEnterTimestampMonotonic` placed by kernel boot time) had already started when the report finished, and the shared completed-report pick uses that proof for restore replay and watch alike — so no forced restore is needed to mint evidence. A report finished before the current manager started still reads as the earlier epoch's (watch reports the restore missing, as before); with no proof either way the watch finding says the report predates epoch keying and does not alarm. Reports carrying a manager identity are judged strictly as before. Tests (`completed_boot_report_proves_legacy_report_by_manager_start`) cover after/before/unprovable/strict; contained `boot_report` 3 passed, clippy/check/fmt clean. Rust-only: the Python edition implements neither watch nor report reading.
