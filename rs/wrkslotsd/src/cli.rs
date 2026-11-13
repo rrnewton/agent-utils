@@ -164,6 +164,40 @@ pub(crate) enum Writers {
         #[arg(long, value_name = "NAME")]
         machine: Option<String>,
     },
+    /// Migrate one slot into the worktrees image (Python `worktrees-image migrate`; writer, fixture registries only until cutover)
+    WorktreesImageMigrate {
+        /// Registered slot name
+        slot: String,
+        /// Slot type (default: agent)
+        #[arg(long, value_name = "TYPE", default_value = "agent", value_parser = ["agent", "validate"])]
+        slot_type: String,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Override the machine shard (else WRKSLOTS_MACHINE, else the configured machine, where an absent key or the value auto means the short host name)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
+    /// Convert one slot between worktree and image storage (Python `image convert`; writer, fixture registries only until cutover)
+    ImageConvert {
+        /// Registered slot name
+        slot: String,
+        /// Slot type (default: agent)
+        #[arg(long, value_name = "TYPE", default_value = "agent", value_parser = ["agent", "validate"])]
+        slot_type: String,
+        /// Target representation
+        #[arg(long = "to", value_name = "TARGET", required = true, value_parser = ["image", "worktree"])]
+        target: String,
+        /// Keep the pre-conversion copy
+        #[arg(long)]
+        keep_original: bool,
+        /// Project root containing .wrkslots.yml; discovered from the cwd when omitted
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
+        /// Override the machine shard (else WRKSLOTS_MACHINE, else the configured machine, where an absent key or the value auto means the short host name)
+        #[arg(long, value_name = "NAME")]
+        machine: Option<String>,
+    },
     /// Remove and archive one slot (writer; fixture registries only until cutover)
     Remove {
         /// Active slot to remove
@@ -1853,7 +1887,7 @@ fn translate_python_argv_routed(
     // `image status` runs here; the other actions refuse by name.
     if cmd == "image" {
         return match rest.get(1).map(String::as_str) {
-            Some(action @ ("set-default" | "trim" | "grow" | "mount" | "unmount")) => {
+            Some(action @ ("set-default" | "trim" | "grow" | "mount" | "unmount" | "convert")) => {
                 let mut out: Vec<String> = vec![args[0].clone(), format!("image-{action}")];
                 out.extend(rest[2..].iter().cloned());
                 if let Some(root) = project_root {
@@ -1922,11 +1956,13 @@ fn translate_python_argv_routed(
             _ => Err("'limits' stays with the Python edition in this slice".to_string()),
         };
     }
-    // `worktrees-image status` is wired (#1141); its writers and
-    // migrate/convert stay Python for now.
+    // The worktrees-image family is wired (#1141/#1291);
+    // migrate-layout and unbind stay Python for now.
     if cmd == "worktrees-image" {
         return match rest.get(1).map(String::as_str) {
-            Some(action @ ("status" | "create" | "mount" | "unmount" | "grow" | "trim")) => {
+            Some(
+                action @ ("status" | "create" | "mount" | "unmount" | "grow" | "trim" | "migrate"),
+            ) => {
                 let mut out: Vec<String> =
                     vec![args[0].clone(), format!("worktrees-image-{action}")];
                 out.extend(rest[2..].iter().cloned());
@@ -2245,6 +2281,27 @@ pub fn run() -> u8 {
                     return 1;
                 }
             },
+            Writers::WorktreesImageMigrate {
+                slot,
+                slot_type,
+                root,
+                machine,
+            } => match crate::image_dispatch::wt_migrate_cli(
+                root.as_deref(),
+                machine.as_deref(),
+                &slot_type,
+                &slot,
+            ) {
+                Ok(outcome) => {
+                    print!("{}", outcome.stdout);
+                    eprint!("{}", outcome.stderr);
+                    return u8::try_from(outcome.exit).unwrap_or(1);
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
             Writers::WorktreesImageCreate {
                 path,
                 size_bytes,
@@ -2376,6 +2433,30 @@ pub fn run() -> u8 {
                 &slot_type,
                 &slot,
                 ceiling_gib,
+            ) {
+                Ok(outcome) => {
+                    print!("{}", outcome.stdout);
+                    eprint!("{}", outcome.stderr);
+                    return u8::try_from(outcome.exit).unwrap_or(1);
+                }
+                Err(error) => {
+                    eprintln!("wrkslotsd: {error}");
+                    return 1;
+                }
+            },
+            Writers::ImageConvert {
+                slot,
+                slot_type,
+                target,
+                root,
+                machine,
+                ..
+            } => match crate::image_dispatch::image_convert_cli(
+                root.as_deref(),
+                machine.as_deref(),
+                &slot_type,
+                &slot,
+                &target,
             ) {
                 Ok(outcome) => {
                     print!("{}", outcome.stdout);

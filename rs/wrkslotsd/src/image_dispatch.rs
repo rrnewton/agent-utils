@@ -731,6 +731,93 @@ pub(crate) fn image_grow_cli(
     ))
 }
 
+fn image_refusal(message: &str) -> HandlerOutcome {
+    HandlerOutcome {
+        exit: 3,
+        stdout: String::new(),
+        stderr: format!(
+            "REFUSED: {message}\nREMEDY: run 'wrkslots image --help', correct the named condition, then rerun 'wrkslots image' with the required arguments\n"
+        ),
+    }
+}
+
+/// `wrkslots image convert`: the registry checks and the
+/// already-target outcome run here; the conversion itself needs
+/// slot-image provisioning, which stays Python in this slice.
+pub(crate) fn image_convert_cli(
+    root: Option<&Path>,
+    machine: Option<&str>,
+    slot_type: &str,
+    slot: &str,
+    target: &str,
+) -> Result<HandlerOutcome> {
+    crate::ensure_states::require_fixture()?;
+    let config = crate::config_validate::load_config(root, machine)?;
+    let (cfg, selected) = crate::active_state::load_cfg(root, machine)?;
+    let _locks = crate::hold_write::acquire_mutation_locks(root, machine, &cfg, &selected)?;
+    crate::ensure_states::refuse_partial_state(&cfg.control)?;
+    let state = crate::active_state::parse_state(root, machine)?;
+    let machine_name = state
+        .get("machine")
+        .and_then(Value::as_str)
+        .unwrap_or(&selected)
+        .to_string();
+    let Some(record) = state
+        .get("slots")
+        .and_then(Value::as_array)
+        .and_then(|records| {
+            records
+                .iter()
+                .find(|r| r.get("slot").and_then(Value::as_str) == Some(slot))
+        })
+    else {
+        return Ok(image_refusal(&format!(
+            "slot '{slot}' is not active on machine {machine_name}"
+        )));
+    };
+    let record_type = record
+        .get("slot_type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if record_type != slot_type {
+        return Ok(image_refusal(&format!(
+            "slot '{slot}' is a {record_type} slot, not {slot_type}"
+        )));
+    }
+    let control = config_path(&config, "control");
+    let worktrees = config_path(&config, "worktrees");
+    let slot_path = worktrees.join(slot);
+    let current = match crate::image_record::load_slot_image(&control, slot_type, slot, &slot_path)
+    {
+        Ok(Some(_)) => "image",
+        Ok(None) => "worktree",
+        Err(message) => return Ok(image_refusal(&message)),
+    };
+    if current == target {
+        return Ok(HandlerOutcome {
+            exit: 0,
+            stdout: crate::image_ops::convert_already_line(slot_type, slot, target),
+            stderr: String::new(),
+        });
+    }
+    if !slot_path.is_dir()
+        || slot_path
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+    {
+        return Ok(image_refusal(&format!(
+            "slot directory is missing or unsafe: {}",
+            slot_path.display()
+        )));
+    }
+    Ok(HandlerOutcome {
+        exit: 3,
+        stdout: String::new(),
+        stderr: "REFUSED: image conversion stays with the Python edition in this slice (slot-image provisioning is not wired in Rust yet)\nREMEDY: run 'wrkslots image --help', correct the named condition, then rerun 'wrkslots image' with the required arguments\n".to_string(),
+    })
+}
+
 /// `wrkslots image set-default`: fixture-gated writer. Validate,
 /// then under the config lock hand the raw document to the pure
 /// handler and write its update in the file's own format.
@@ -1071,6 +1158,229 @@ pub(crate) fn wt_trim_cli(root: Option<&Path>, machine: Option<&str>) -> Result<
         inputs.settings.clone(),
         &SubprocessRunner,
     ))
+}
+
+fn migrate_refusal(message: &str) -> HandlerOutcome {
+    HandlerOutcome {
+        exit: 3,
+        stdout: String::new(),
+        stderr: format!(
+            "REFUSED: {message}\nREMEDY: run 'wrkslots worktrees-image --help', correct the named condition, then rerun 'wrkslots worktrees-image' with the required arguments\n"
+        ),
+    }
+}
+
+/// Take the wrkslots image Git lock on every checkout of one slot
+/// row (`_lock_slot_checkouts`): `git worktree lock --reason`.
+fn lock_slot_checkouts(
+    config: &Value,
+    root: Option<&Path>,
+    machine: Option<&str>,
+    slot: &str,
+    slot_type: &str,
+) {
+    let Ok(state) = crate::active_state::parse_state(root, machine) else {
+        return;
+    };
+    let project_root = config_path(config, "root");
+    let Some(record) = state
+        .get("slots")
+        .and_then(Value::as_array)
+        .and_then(|records| {
+            records.iter().find(|record| {
+                record.get("slot").and_then(Value::as_str) == Some(slot)
+                    && record.get("slot_type").and_then(Value::as_str) == Some(slot_type)
+            })
+        })
+    else {
+        return;
+    };
+    let Some(checkouts) = record.get("checkouts").and_then(Value::as_array) else {
+        return;
+    };
+    for checkout in checkouts {
+        let repository = crate::image_mounts::normalize_absolute(
+            &project_root.join(
+                checkout
+                    .get("repository")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ),
+        );
+        let path = crate::image_mounts::normalize_absolute(
+            &project_root.join(
+                checkout
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            ),
+        );
+        let spec = CommandSpec::new(
+            vec![
+                "git".to_string(),
+                "-C".to_string(),
+                repository.to_string_lossy().into_owned(),
+                "worktree".to_string(),
+                "lock".to_string(),
+                "--reason".to_string(),
+                "in worktrees image".to_string(),
+                path.to_string_lossy().into_owned(),
+            ],
+            Duration::from_secs(30),
+        );
+        let _ = SubprocessRunner.run(&spec);
+    }
+}
+
+/// `wrkslots worktrees-image migrate` (binds mode; writer): the
+/// #1150 registry/hold/liveness/census gate, then the handler.
+/// Direct mode stays Python (no Rust direct handler yet).
+pub(crate) fn wt_migrate_cli(
+    root: Option<&Path>,
+    machine: Option<&str>,
+    slot_type: &str,
+    slot: &str,
+) -> Result<HandlerOutcome> {
+    crate::ensure_states::require_fixture()?;
+    let inputs = WtInputs::load(root, machine)?;
+    let Some(settings) = inputs.settings.clone() else {
+        let reason = inputs
+            .config
+            .get("worktrees_image_skipped")
+            .and_then(Value::as_str)
+            .map(|reason| format!("worktrees_image does not apply on this host: {reason}"))
+            .unwrap_or_else(|| {
+                "no worktrees_image configured; add a worktrees_image section (path, size_bytes, fs: btrfs, mount: kernel) to enable it".to_string()
+            });
+        return Ok(migrate_refusal(&reason));
+    };
+    if settings.direct() {
+        return Ok(migrate_refusal(
+            "worktrees-image migrate in mount_at: worktrees_dir (direct) layout stays with the Python edition in this slice",
+        ));
+    }
+    let ctx = inputs.ctx();
+    let state_text = {
+        let mount_dir = settings.mount_point(&inputs.control, &inputs.worktrees);
+        let (exists, empty) = dir_facts(&mount_dir);
+        classify_mount(&mount_dir, &inputs.entries, exists, empty)
+    };
+    let slot_path = inputs.worktrees.join(slot);
+    if state_text != MOUNTED {
+        return Ok(migrate_refusal(&format!(
+            "worktrees image is {state_text}; run 'wrkslots worktrees-image mount' first"
+        )));
+    }
+    // Mutation locks, then the migratable gate in Python's order.
+    let (cfg, selected) = crate::active_state::load_cfg(root, machine)?;
+    let _locks = crate::hold_write::acquire_mutation_locks(root, machine, &cfg, &selected)?;
+    if !slot_path.is_dir() {
+        return Ok(migrate_refusal(&format!(
+            "slot directory is missing: {}",
+            slot_path.display()
+        )));
+    }
+    let state = match crate::active_state::parse_state(root, machine) {
+        Ok(state) => state,
+        Err(error) => {
+            return Ok(migrate_refusal(&format!(
+                "cannot read the slot registry to prove slot {slot} is safe to migrate: {error}"
+            )));
+        }
+    };
+    let record = state
+        .get("slots")
+        .and_then(Value::as_array)
+        .and_then(|records| {
+            records.iter().find(|record| {
+                record.get("slot").and_then(Value::as_str) == Some(slot)
+                    && record.get("slot_type").and_then(Value::as_str) == Some(slot_type)
+            })
+        })
+        .cloned();
+    let config = &inputs.config;
+    let Some(record) = record else {
+        let machine_name = config
+            .get("machine")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return Ok(migrate_refusal(&format!(
+            "slot {slot} is not registered on machine {machine_name}; migrate needs its registry row to prove it is unheld and its owner is dead - create or register the slot first ('wrkslots status' lists the rows this host knows)"
+        )));
+    };
+    let (_machines, hold_entries) = crate::record_holds::load_record_holds(root)?;
+    let hold = hold_entries.iter().find(|entry| entry.slot == slot);
+    match hold {
+        Some(entry) if entry.error.is_none() && entry.hold.is_null() => {}
+        Some(entry) => {
+            let detail = entry
+                .error
+                .clone()
+                .unwrap_or_else(|| "slot is held".to_string());
+            return Ok(migrate_refusal(&format!(
+                "slot {slot}: {detail}; unhold it before migrate"
+            )));
+        }
+        None => {
+            return Ok(migrate_refusal(&format!(
+                "slot {slot}: slot is held; unhold it before migrate"
+            )));
+        }
+    }
+    let liveness = crate::remove_write::liveness_answer(&cfg, config, &record)?;
+    if liveness.state != "dead" {
+        return Ok(migrate_refusal(&format!(
+            "slot {slot}: owner is not proven dead ({}: {}); stop its agent before migrate",
+            liveness.state, liveness.detail
+        )));
+    }
+    // The displaced-original proof reuses the same census after
+    // the handler binds (its `displaced_unused` check).
+    let census = |path: &Path| -> Result<()> {
+        let snapshot = crate::remove_write::capture_process_snapshot(
+            i64::from(std::process::id()),
+            std::slice::from_ref(&path.to_path_buf()),
+        )?;
+        crate::remove_write::assert_slot_unused_snapshot(&snapshot, path)
+    };
+    if let Err(error) = census(&slot_path) {
+        return Ok(migrate_refusal(&format!(
+            "slot {slot} is in use; migrate only a stopped slot: {error}"
+        )));
+    }
+    let uid = rustix::process::getuid().as_raw();
+    let gid = rustix::process::getgid().as_raw();
+    let outcome = crate::worktrees_image::wt_migrate(
+        &ctx,
+        inputs.settings.clone(),
+        slot,
+        &slot_path,
+        state_text,
+        false,
+        (uid, gid),
+        &random_suffix(),
+        &census,
+        &|_| None,
+        &SubprocessRunner,
+    );
+    if outcome.exit == 0 {
+        lock_slot_checkouts(config, root, machine, slot, slot_type);
+    }
+    Ok(outcome)
+}
+
+/// 16 hex chars of randomness for the displaced-original name,
+/// mirroring Python `secrets.token_hex(8)`.
+fn random_suffix() -> String {
+    let mut bytes = [0u8; 8];
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = u128::from(std::process::id());
+    let mixed = seed ^ (pid << 64) ^ (pid << 32) ^ seed.rotate_left(32);
+    bytes.copy_from_slice(&mixed.to_be_bytes()[8..]);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// `wrkslots worktrees-image status`: build the full report

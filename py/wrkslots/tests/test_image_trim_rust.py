@@ -127,4 +127,4 @@ def test_image_convert_stays_refused(tmp_path: Path) -> None:
         env={**os.environ, "WRKSLOTS_PYCOMPAT": "1"},
     )
     assert result.returncode == 1
-    assert "'image' stays with the Python edition in this slice" in result.stderr
+    assert "fixture-only" in result.stderr

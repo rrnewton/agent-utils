@@ -102,7 +102,7 @@ def test_wt_status_unconfigured_refusal_matches_python(
 def test_wt_migrate_stays_refused(tmp_path: Path) -> None:
     root = _root(tmp_path)
     result = subprocess.run(
-        [str(rust_wrkslotsd()), "worktrees-image", "migrate", "slot-a"],
+        [str(rust_wrkslotsd()), "worktrees-image", "migrate-layout", "--to", "binds"],
         cwd=root, capture_output=True, text=True, check=False, timeout=900,
         env={**os.environ, "WRKSLOTS_PYCOMPAT": "1"},
     )
