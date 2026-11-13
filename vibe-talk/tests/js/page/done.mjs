@@ -1153,7 +1153,9 @@ test("`#256 reply-marks-read`: the reply's Done is the Done button's own act, ca
 });
 
 test("`#256 reply-marks-read`: Hide read leaves the message out and Fold read folds it, once the reply is sent", async () => {
-  const page = newPage();
+  // The Fold read guard is off here: this walk is about what a mark does once made, and the
+  // guard's own walk is with Mark read on reply's.
+  const page = newPage(new Map([["vibe-talk.voice.mark-read-fold-guard", "0"]]));
   await signIn(page);
   const ids = backlog(4).map((m) => m.id);
   await showDiscord(page, backlog(4));
@@ -2040,7 +2042,7 @@ test("`#311 sent-read-waits-for-done`: under Hide read without threads a reply t
   const target = "1000000000000000003";
   /** A Reply on message 3 sent under Hide read, its POST held; another device's Done read meanwhile; then the POST confirmed. */
   const elsewhere = async (script = SCRIPT) => {
-    const page = newPage(new Map(), script);
+    const page = newPage(new Map([["vibe-talk.voice.mark-read-fold-guard", "0"]]), script);
     page.upstreamReadMarkSupported = true;
     const asked = serverFloor(page);
     await signIn(page);
@@ -2070,6 +2072,7 @@ test("`#311 sent-read-waits-for-done`: under Hide read without threads a reply t
     await signIn(first);
     await showDiscord(first, conversation());
     await chooseReadMode(first, "Fold read");
+    first.storage.set("vibe-talk.voice.mark-read-fold-guard", "0");
     first.storage.set("vibe-talk.outgoing-messages", JSON.stringify([{ id: "outgoing-earlier-page", channel: CHANNEL.id,
       text: "answering", remaining: "answering", state: "failed", threadId: null, replyTo: target, marksRead: target,
       createdAt: 1, postedCount: 0, parts: [], observedParts: [], detail: "refused" }]));
@@ -2104,7 +2107,7 @@ test("`#311 sent-read-waits-for-done`: under Hide read without threads a reply t
    * off the list, and held on its way; the POST confirmed; then the Done answered `answer`, or saved.
    */
   const heldHere = async (answer, script = SCRIPT) => {
-    const page = newPage(new Map(), script);
+    const page = newPage(new Map([["vibe-talk.voice.mark-read-fold-guard", "0"]]), script);
     page.upstreamReadMarkSupported = true;
     const asked = serverFloor(page);
     await signIn(page);
