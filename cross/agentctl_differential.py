@@ -1428,10 +1428,10 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
             "workspace": "required-label",
         }), encoding="utf-8")
         config.chmod(0o600)
-    outcomes = harness.invoke(mismatch, (
+    outcomes = harness.invoke(mismatch, _with_effort((
         "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
         "--herdr-bin", "<HERDR>", "--registry", "<ROOT>/.agentctl",
-    ))
+    )))
     report.require(
         "primary/workspace/explicit-mismatch",
         all(outcome.returncode == 75 and "project configuration requires" in outcome.stderr
@@ -1563,10 +1563,10 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
         "primary-custom-missing",
         {"missing_custom_executable": True, "empty_shell": True},
     )
-    outcomes = harness.invoke(missing, (
+    outcomes = harness.invoke(missing, _with_effort((
         "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
         "--harness", "muse", *_COMMON,
-    ))
+    )))
     report.require("primary/custom/missing-executable",
                    all(outcome.returncode == 75
                    and "cannot inspect muse executable" in outcome.stderr
@@ -1583,10 +1583,10 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
     wrong_process = harness.case(
         "primary-custom-wrong-process", {"wrong_custom_process": True}
     )
-    outcomes = harness.invoke(wrong_process, (
+    outcomes = harness.invoke(wrong_process, _with_effort((
         "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
         "--harness", "muse", "--startup-timeout", "0.05", *_COMMON,
-    ))
+    )))
     report.require("primary/custom/exact-process",
                    all(outcome.returncode == 75 and "foreground process" in outcome.stderr
                        for outcome in outcomes),
@@ -1603,10 +1603,10 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
     wrong_identity = harness.case(
         "primary-custom-wrong-kernel-identity", {"wrong_custom_process_identity": True}
     )
-    outcomes = harness.invoke(wrong_identity, (
+    outcomes = harness.invoke(wrong_identity, _with_effort((
         "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
         "--harness", "muse", "--startup-timeout", "0.05", *_COMMON,
-    ))
+    )))
     report.require("primary/custom/kernel-process-identity",
                    all(outcome.returncode == 75 and "foreground process" in outcome.stderr
                        for outcome in outcomes),
@@ -1621,10 +1621,10 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
     _retire_fixture_processes(wrong_identity, report)
 
     trust = harness.case("primary-muse-trust", {"screen": "Do you trust this workspace? yes / no"})
-    outcomes = harness.invoke(trust, (
+    outcomes = harness.invoke(trust, _with_effort((
         "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
         "--harness", "muse", *_COMMON,
-    ))
+    )))
     report.require("primary/muse/trust-refusal",
                    all(outcome.returncode == 75 and "trust prompt" in outcome.stderr
                        and _submitted(root) == []
@@ -1798,10 +1798,10 @@ def _herdr_093_compatibility(harness: Harness, report: Report) -> None:
     )
     for label, state in malformed:
         failed = harness.case(f"primary-herdr-093-muse-{label}", state)
-        outcomes = harness.invoke(failed, (
+        outcomes = harness.invoke(failed, _with_effort((
             "start", "worker", "--cwd", "<ROOT>", "--workspace-id", "w1",
             "--harness", "muse", "--startup-timeout", "0.05", *_COMMON,
-        ))
+        )))
         # No cross-edition rc equality here (#1067
         # cross-differential-load-aware): whether the malformed argv is
         # read before the 0.05 startup expiry decides 69 vs 75, so load

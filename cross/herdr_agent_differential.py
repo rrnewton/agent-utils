@@ -175,6 +175,11 @@ def run_tolerant(
 
 _MESSAGE_ID = re.compile(r"\b\d{20,}-\d+\b")
 
+#: Seeded pane number per case root, recorded at case creation. The fake
+#: mutates state.pane_id on tab create and move, so output normalisation
+#: must key on the seeded base, not the current state value.
+_IDENTITY_BASES: dict[str, int] = {}
+
 
 @dataclass(frozen=True)
 class Outcome:
@@ -1385,10 +1390,12 @@ class Harness:
             # full send deadline. Outcomes and state reads normalize the
             # identity back to w1:p1 / term-1 for comparison.
             pane_number = (os.getpid() % 10000) * 10000 + self.serial * 10 + index
+            _IDENTITY_BASES[str(root)] = pane_number
             root_initial = {
                 "pane_id": f"w1:p{pane_number}",
                 "tab_id": f"w1:t{pane_number}",
                 "terminal_id": f"term-{pane_number}",
+                "identity_base": pane_number,
                 **initial,
             }
             fixture = root / "fake-herdr"
@@ -1556,18 +1563,38 @@ def _fixture_identity(root: Path) -> tuple[str, str]:
     )
 
 
+def _identity_base(root: Path) -> int:
+    """The seeded pane number for this root, stable across state mutation."""
+    recorded = _IDENTITY_BASES.get(str(root))
+    if recorded is not None:
+        return recorded
+    try:
+        state = json.loads((root / "state.json").read_text(encoding="utf-8"))
+        seeded = state.get("identity_base") if isinstance(state, dict) else None
+        if isinstance(seeded, int):
+            return seeded
+        pane = state.get("pane_id") if isinstance(state, dict) else None
+        return int(str(pane).rsplit("p", 1)[1])
+    except (OSError, ValueError, IndexError):
+        return 1
+
+
 def _normalize(outcome: Outcome, root: Path) -> Outcome:
-    pane_id, terminal_id = _fixture_identity(root)
-    tab_id = pane_id.replace(":p", ":t", 1)
+    # Canonicalise this root's whole identity family: the seeded shell
+    # pane is the base; each tab create allocates base+1, base+2, ...
+    # within the family (roots are spaced by ten). The shell and the
+    # first started pane were one pane (w1:p1) before per-root seeding,
+    # so both map to w1:p1; later allocations (revived panes,
+    # previous_pane_id, candidate journals) map to w1:p2, w1:p3, ...
+    base = _identity_base(root)
 
     def text(value: str) -> str:
         value = value.replace(str(root), "<ROOT>")
-        if pane_id != "w1:p1":
-            value = value.replace(pane_id, "w1:p1")
-        if tab_id != "w1:t1":
-            value = value.replace(tab_id, "w1:t1")
-        if terminal_id != "term-1":
-            value = value.replace(terminal_id, "term-1")
+        for offset in range(9, -1, -1):
+            canonical = max(offset, 1)
+            value = re.sub(rf"w1:p{base + offset}(?!\d)", f"w1:p{canonical}", value)
+            value = re.sub(rf"w1:t{base + offset}(?!\d)", f"w1:t{canonical}", value)
+            value = re.sub(rf"term-{base + offset}(?!\d)", f"term-{canonical}", value)
         return _MESSAGE_ID.sub("<MESSAGE_ID>", value)
 
     return Outcome(outcome.returncode, text(outcome.stdout), text(outcome.stderr))
