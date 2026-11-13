@@ -155,9 +155,14 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
     }""")
 
     if via_menu:
-        page.click("#action-menu-open")
-        page.wait_for_selector("#discuss-menu-open", state="visible", timeout=20_000)
-        page.click("#discuss-menu-open")
+        # Reopen by whichever entry this build shows (`#1470` promotion):
+        # the bar icon when promoted, the menu item when not.
+        if page.locator("#discuss-open").is_visible():
+            page.click("#discuss-open")
+        else:
+            page.click("#action-menu-open")
+            page.wait_for_selector("#discuss-menu-open", state="visible", timeout=20_000)
+            page.click("#discuss-menu-open")
     else:
         page.click("#discuss-open")
     page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
@@ -303,9 +308,14 @@ def walk(page: Page, base: str, width: int, height: int) -> None:
         check(kept == "1", f"the full height was not kept: {kept!r}")
         page.click("#discuss-close")
         page.wait_for_selector("#discuss-panel", state="hidden", timeout=20_000)
-        page.click("#action-menu-open")
-        page.wait_for_selector("#discuss-menu-open", state="visible", timeout=20_000)
-        page.click("#discuss-menu-open")
+        # Reopen by whichever entry this build shows (`#1470` promotion):
+        # the bar icon when promoted, the menu item when not.
+        if page.locator("#discuss-open").is_visible():
+            page.click("#discuss-open")
+        else:
+            page.click("#action-menu-open")
+            page.wait_for_selector("#discuss-menu-open", state="visible", timeout=20_000)
+            page.click("#discuss-menu-open")
         page.wait_for_selector("#discuss-panel", state="visible", timeout=20_000)
         page.wait_for_function(
             "() => document.getElementById('discuss-panel').getBoundingClientRect().height >= innerHeight * 0.75",
