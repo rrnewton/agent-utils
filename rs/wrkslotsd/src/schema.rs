@@ -94,7 +94,14 @@ pub(crate) fn validate_active_record(
             "handoff",
             "checkouts",
         ],
-        &["slot_type", "layout", "import_source", "task_scope"],
+        &[
+            "slot_type",
+            "layout",
+            "import_source",
+            "task_scope",
+            // Recorded by create for harness-checkout slots (#1299).
+            "harness_checkout_reason",
+        ],
         label,
     )?;
     let slot = named_string(&record["slot"], &format!("{label}.slot"))?;
@@ -391,7 +398,7 @@ fn validate_checkouts(value: &Value, parent: &str) -> Result<Vec<Checkout>, Obse
     for (index, value) in values.iter().enumerate() {
         let label = format!("{parent}.checkouts[{index}]");
         let checkout = object(value, &label)?;
-        exact_keys(
+        exact_keys_optional(
             checkout,
             &[
                 "name",
@@ -406,6 +413,9 @@ fn validate_checkouts(value: &Value, parent: &str) -> Result<Vec<Checkout>, Obse
                 "containing_remote_refs",
                 "vcs",
             ],
+            // Create records provisioned output on the checkout
+            // (#1369); the observer accepts the additive field.
+            &["provisioned"],
             &label,
         )?;
         let name = named_string(&checkout["name"], &format!("{label}.name"))?;
@@ -1215,4 +1225,78 @@ fn digest<'a>(value: &'a Value, length: usize, label: &str) -> Result<&'a str, O
 
 fn invalid(message: impl Into<String>) -> ObserverError {
     ObserverError::invalid(message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn record(checkout_extra: Value) -> Value {
+        let mut checkout = json!({
+            "name": "repo",
+            "path": "repo",
+            "repository": "../upstream",
+            "branch": "main",
+            "start_point": "a".repeat(40),
+            "remote": "origin",
+            "remote_url_sha256": "b".repeat(64),
+            "landed_ref": "refs/remotes/origin/main",
+            "head": "a".repeat(40),
+            "containing_remote_refs": ["refs/remotes/origin/main"],
+            "vcs": "git",
+        });
+        if let (Some(target), Some(extra)) = (checkout.as_object_mut(), checkout_extra.as_object())
+        {
+            for (key, value) in extra {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        json!({
+            "slot": "slot-a",
+            "agent": "agent-a",
+            "task": "task",
+            "purpose": "testing",
+            "machine": "node-a",
+            "generation": 1,
+            "created_at": "2026-11-07T00:00:00Z",
+            "heartbeat_at": "2026-11-07T00:00:00Z",
+            "heartbeat_ttl_seconds": 60,
+            "owner": null,
+            "coordinator_lease": {
+                "pid": 1,
+                "start_ticks": 1,
+                "boot_id": "boot",
+                "host_id": "host",
+                "cgroup_path": "/",
+            },
+            "coordinator_recovery_note": null,
+            "handoff": null,
+            "checkouts": [checkout],
+        })
+    }
+
+    #[test]
+    fn active_record_accepts_provisioned_checkouts() {
+        // Writers since fe29e325 record create-hook output on the
+        // checkout; the observer must not fail a whole rebuild.
+        let value = record(json!({"provisioned": [{"path": "out.o"}]}));
+        validate_active_record(&value, "node-a", "record").expect("provisioned accepted");
+    }
+
+    #[test]
+    fn active_record_accepts_harness_checkout_reason() {
+        let mut value = record(json!({}));
+        value
+            .as_object_mut()
+            .expect("object")
+            .insert("harness_checkout_reason".to_string(), json!("suite setup"));
+        validate_active_record(&value, "node-a", "record").expect("reason accepted");
+    }
+
+    #[test]
+    fn active_record_still_refuses_unknown_checkout_fields() {
+        let value = record(json!({"surprise": 1}));
+        assert!(validate_active_record(&value, "node-a", "record").is_err());
+    }
 }
