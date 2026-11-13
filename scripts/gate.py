@@ -1052,7 +1052,7 @@ def _defer_from_mapping(raw: dict[str, object], source: str) -> DeferSettings:
     excludes = _glob_list(raw.get("defer_unit_exclude", []), "defer_unit_exclude", source,
                           list_required=True)
     mode = raw.get("defer_mode", "enforce")
-    if mode not in ("enforce", "observe"):
+    if not isinstance(mode, str) or mode not in ("enforce", "observe"):
         raise DeferConfigError(
             f"gate defer config {source}: defer_mode must be \"enforce\" or \"observe\", "
             f"not {mode!r}"
