@@ -5067,6 +5067,8 @@ pub const PURGED: &[&str] = &[
     "post_keys",
     // `#934 voice-page-reply-parent-arrow`.
     "reply_pointers",
+    // `discuss-transcript-persist`.
+    "discuss_records",
     "message_cache",
 ];
 
