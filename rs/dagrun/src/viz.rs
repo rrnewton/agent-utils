@@ -15,6 +15,8 @@ use std::fmt::Write as _;
 
 use crate::model::{step_classification, DagConfig, Step};
 
+pub use dagrun_model::ascii::to_ascii_groups;
+
 // Selected steps (all, since the CLI never passes a subset). Kept as a helper to mirror the
 // Python structure and leave room for a future `--select` flag.
 fn selected_steps<'a>(cfg: &'a DagConfig, selected: Option<&HashSet<String>>) -> Vec<&'a Step> {
@@ -256,74 +258,6 @@ pub fn to_dot_groups(cfg: &DagConfig, name: &str, selected: Option<&HashSet<Stri
         ));
     }
     out.push("}".to_string());
-    out.join("\n") + "\n"
-}
-
-/// Render the DAG collapsed to one line per `group`, as compact ASCII.
-///
-/// Groups are ordered by the earliest dependency layer any of their steps occupies, then by
-/// name. Each line shows the step count and the upstream groups with their merged edge counts.
-pub fn to_ascii_groups(cfg: &DagConfig, selected: Option<&HashSet<String>>) -> String {
-    let steps = selected_steps(cfg, selected);
-    let deps = kept_deps(&steps);
-    let depth = layers_of(&steps, &deps);
-    let g = group_graph(&steps, &deps);
-
-    let mut first_layer: BTreeMap<String, i64> = BTreeMap::new();
-    for step in &steps {
-        let d = depth[&step.tag()];
-        first_layer
-            .entry(step.group.clone())
-            .and_modify(|v| *v = (*v).min(d))
-            .or_insert(d);
-    }
-    let mut upstream: BTreeMap<String, Vec<(String, usize)>> = BTreeMap::new();
-    for ((from, to), n) in &g.edges {
-        upstream
-            .entry(to.clone())
-            .or_default()
-            .push((from.clone(), *n));
-    }
-    let mut order: Vec<(&String, i64)> = first_layer.iter().map(|(k, v)| (k, *v)).collect();
-    order.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
-
-    let width = g
-        .counts
-        .keys()
-        .map(|k| k.chars().count())
-        .max()
-        .unwrap_or(1);
-    let count_width = g
-        .counts
-        .values()
-        .map(|n| step_count_text(*n).chars().count())
-        .max()
-        .unwrap_or(1);
-
-    let mut out: Vec<String> = vec![
-        format!(
-            "DAG by group - {} groups, {} steps, {} group edges ({} cross-group step edges merged; {} within groups)",
-            g.counts.len(),
-            steps.len(),
-            g.edges.len(),
-            g.cross_edges,
-            g.intra_edges
-        ),
-        String::new(),
-    ];
-    for (group, _) in order {
-        let count = step_count_text(g.counts[group]);
-        match upstream.get(group) {
-            Some(ups) => {
-                let ups: Vec<String> = ups.iter().map(|(u, n)| format!("{u} ({n})")).collect();
-                out.push(format!(
-                    "  {group:<width$}  {count:<count_width$}  <- {}",
-                    ups.join(", ")
-                ));
-            }
-            None => out.push(format!("  {group:<width$}  {count}")),
-        }
-    }
     out.join("\n") + "\n"
 }
 

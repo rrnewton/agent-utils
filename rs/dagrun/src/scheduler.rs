@@ -47,6 +47,9 @@ use crate::attribution::{
 use crate::cgroup::{
     delegated_cgroup_root, CgroupManager, DELEGATED_CGROUP_ENV, DELEGATED_UNBOXED_ENV,
 };
+pub use dagrun_model::check::steps_violating_run_timeout;
+pub use dagrun_model::clock::monotonic_now_ns;
+
 use crate::model::{
     canonical_cpu_timeout, cmdtype_env_with_inner_jobs, command_with_inner_jobs,
     effective_cpu_count, effective_cpu_timeout, env_with_inner_jobs, graph_structure_violations,
@@ -67,7 +70,7 @@ use crate::test_results::TestResultsErrorKind;
 /// The outer DAG step that launched this process. A second scheduler in that process tree must
 /// refuse by default instead of competing with its parent while reporting a whole inner graph as
 /// one outer step. Runner policy overwrites a manifest-provided value at spawn.
-pub const OUTER_RUN_ENV: &str = "DAGRUN_OUTER_RUN";
+pub use dagrun_model::env::OUTER_RUN_ENV;
 
 /// Return the refusal for a scheduler front door launched from an outer DAG step, if any.
 pub fn nested_run_refusal(allow_unwise_nest_dagruns: bool) -> Option<String> {
@@ -396,30 +399,10 @@ pub fn start_run_cpu_budget(
 /// numerically smaller timeout capable of outliving the enclosing step.  The runner owns the
 /// actual step clock, so it exports that clock's epoch before spawning the child.  Consumers add
 /// their own (smaller) allowance to this value and therefore keep one ordering across execs.
-pub const STEP_STARTED_MONOTONIC_NS_ENV: &str = "DAGRUN_STEP_STARTED_MONOTONIC_NS";
+pub use dagrun_model::env::STEP_STARTED_MONOTONIC_NS_ENV;
 
 /// Unique suffix for the scheduler-owned structured-count path of each step.
 static TEST_COUNTS_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Read Linux's process-independent monotonic clock in nanoseconds.
-///
-/// `Instant` cannot be serialized through an exec.  `CLOCK_MONOTONIC` is the same boot-scoped
-/// clock class and remains stable across fork/exec without inheriting wall-clock adjustments.
-pub fn monotonic_now_ns() -> Option<u64> {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0
-        || ts.tv_sec < 0
-        || ts.tv_nsec < 0
-    {
-        return None;
-    }
-    (ts.tv_sec as u64)
-        .checked_mul(1_000_000_000)
-        .and_then(|s| s.checked_add(ts.tv_nsec as u64))
-}
 
 /// Per-step monitor poll interval (seconds) for descendant-thread-peak sampling.
 const MONITOR_INTERVAL: Duration = Duration::from_secs(1);
@@ -5001,35 +4984,6 @@ pub fn run_dag_boxed_ordered_limited(
     run_dag_boxed_deadline_limited(
         cfg, max_steps, max_cpus, keep_going, verbosity, cgroups, order, None,
     )
-}
-
-/// Steps whose own wall budget is not STRICTLY SMALLER than the run's outer budget.
-///
-/// INNER < OUTER IS THE WHOLE ORDERING, and it is checkable before anything runs. A step allowed
-/// to run as long as (or longer than) the run itself can only ever be terminated by the outer
-/// bound, which means the failure is attributed to "the run overran" instead of to the node that
-/// caused it — precisely the report that made a real regression unexplainable. Returns the
-/// offending `(tag, step_timeout_s)` pairs, empty when the ordering holds.
-pub fn steps_violating_run_timeout(cfg: &DagConfig, run_timeout_s: i64) -> Vec<(String, i64)> {
-    if run_timeout_s <= 0 {
-        return Vec::new();
-    }
-    // The RESOLVED bound, not the declared field. A step that declares no wall budget carries
-    // the 0 sentinel, which would pass a `>= run_timeout_s` test trivially while the value it
-    // will actually run under — derived from its CPU budget, or 1800 — might not.
-    let mut bad: Vec<(String, i64)> = cfg
-        .steps
-        .iter()
-        .map(|s| {
-            (
-                s.tag(),
-                resolved_wall_timeout(s, cfg.default_step_timeout, cfg.cpu_timeout_multiplier),
-            )
-        })
-        .filter(|(_, bound)| *bound >= run_timeout_s)
-        .collect();
-    bad.sort();
-    bad
 }
 
 /// Like [`run_dag_boxed_ordered`] plus an OUTER wall budget for the whole run.

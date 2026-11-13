@@ -53,6 +53,8 @@ use crate::memory_feedback::{
     apply_memory_admissions, load_memory_admissions, memory_admission_line, DEFAULT_MARGIN_PCT,
     DEFAULT_MIN_UNCENSORED_SAMPLES,
 };
+pub use dagrun_model::select::{select_steps_by_labels, select_steps_by_tags};
+
 use crate::model::{
     step_classification, step_width_is_resizable, DagConfig, ResourceHint, Step, StepOutcome,
     DEFAULT_STEP_TIMEOUT, JOBS_ENV_ENV,
@@ -72,7 +74,6 @@ use crate::scheduler::{
 use crate::sizing::{
     box_mem_budget_bytes, cpu_count, jobs_for_budget, parse_size,
     step_mem_cap_for_inner_jobs_optional, stress_control_floor_bytes, stress_copy_footprint_bytes,
-    transitive_deps,
 };
 use crate::summary::{self, Summary, DEFAULT_MAX_BUCKETS, DEFAULT_RESERVOIR_K};
 use crate::sweep::{
@@ -2549,112 +2550,6 @@ fn parse_tag_list(raw: &str) -> Vec<String> {
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .collect()
-}
-
-/// Return the exactly named steps and, by default, every dependency they require.
-///
-/// `ignore_selected_deps` keeps only the named steps and drops dependency edges to steps outside
-/// the selection because their outputs are assumed already present. Edges among selected steps are
-/// preserved. Registration order is preserved in both modes, matching `run --selected`.
-///
-/// The source configuration is never modified. Its complete non-step policy is cloned into the
-/// returned configuration. Returns an error when the request is empty or any tag is unknown.
-pub fn select_steps_by_tags(
-    cfg: &DagConfig,
-    tags: &[String],
-    ignore_selected_deps: bool,
-) -> Result<DagConfig, String> {
-    if tags.is_empty() {
-        return Err("--selected requires at least one tag".to_string());
-    }
-    let by_tag: HashSet<String> = cfg.steps.iter().map(Step::tag).collect();
-    let unknown: Vec<String> = tags
-        .iter()
-        .filter(|tag| !by_tag.contains(*tag))
-        .cloned()
-        .collect();
-    if !unknown.is_empty() {
-        let mut known: Vec<String> = by_tag.iter().cloned().collect();
-        known.sort();
-        let known_s = if known.is_empty() {
-            "(none)".to_string()
-        } else {
-            known.join(", ")
-        };
-        return Err(format!(
-            "--selected: unknown step tag(s): {}. Known tags: {known_s}",
-            unknown.join(", ")
-        ));
-    }
-    let mut selected: HashSet<String> = tags.iter().cloned().collect();
-    if !ignore_selected_deps {
-        let dependencies = transitive_deps(&cfg.steps);
-        for tag in tags {
-            selected.extend(
-                dependencies
-                    .get(tag)
-                    .expect("selected tags were validated against the DAG")
-                    .iter()
-                    .cloned(),
-            );
-        }
-    }
-    let mut new_cfg = cfg.clone();
-    new_cfg.steps = cfg
-        .steps
-        .iter()
-        .filter(|s| selected.contains(&s.tag()))
-        .map(|s| {
-            let mut step = s.clone();
-            if ignore_selected_deps {
-                step.deps.retain(|dep| selected.contains(dep));
-                step.artifact_deps
-                    .retain(|dep| selected.contains(&dep.step));
-            }
-            step
-        })
-        .collect();
-    Ok(new_cfg)
-}
-
-/// Return every step carrying any requested label and its dependency ancestry.
-///
-/// An empty label list selects no steps, preserving the original public-library behavior. The CLI
-/// rejects an empty `--labels` value before calling this function.
-pub fn select_steps_by_labels(cfg: &DagConfig, labels: &[String]) -> Result<DagConfig, String> {
-    if labels.is_empty() {
-        return Ok(cfg.with_steps(Vec::new()));
-    }
-    let known: HashSet<String> = cfg
-        .steps
-        .iter()
-        .flat_map(|step| step.labels.iter().cloned())
-        .collect();
-    let unknown: Vec<String> = labels
-        .iter()
-        .filter(|label| !known.contains(*label))
-        .cloned()
-        .collect();
-    if !unknown.is_empty() {
-        let mut known = known.into_iter().collect::<Vec<_>>();
-        known.sort();
-        let known = if known.is_empty() {
-            "(none)".to_string()
-        } else {
-            known.join(", ")
-        };
-        return Err(format!(
-            "--labels: unknown label(s): {}. Known labels: {known}",
-            unknown.join(", ")
-        ));
-    }
-    let tags = cfg
-        .steps
-        .iter()
-        .filter(|step| labels.iter().any(|label| step.labels.contains(label)))
-        .map(Step::tag)
-        .collect::<Vec<_>>();
-    select_steps_by_tags(cfg, &tags, false)
 }
 
 // --------------------------------------------------------------------------- --args / --stress

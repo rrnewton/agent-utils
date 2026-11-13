@@ -12,4 +12,7 @@ pub mod proccpu;
 pub mod procstat;
 pub mod test_results;
 
-pub use test_results::TEST_COUNTS_PATH_ENV;
+pub use test_results::{
+    TestAttemptOutcome, TestAttemptResult, TestResult, TestResults, DIAGNOSTIC_RESULTS_SCHEMA,
+    TEST_COUNTS_PATH_ENV,
+};

@@ -36,14 +36,14 @@ const SLICE_NAME: &str = "dagrun.slice";
 /// Prefix for the per-run transient scope unit (`<prefix>-<pid>`).
 const UNIT_PREFIX: &str = "dagrun";
 /// Environment sentinel set in the re-exec'd (in-scope) child.
-const ENV_IN_SCOPE: &str = "DAGRUN_IN_SCOPE";
+const ENV_IN_SCOPE: &str = dagrun_model::env::IN_SCOPE_ENV;
 /// Exact parent-owned cgroup root offered to one nested dagrun scheduler.
-pub const DELEGATED_CGROUP_ENV: &str = "DAGRUN_DELEGATED_CGROUP";
+pub use dagrun_model::env::DELEGATED_CGROUP_ENV;
 /// Exact marker for a graph-reviewed nested step when the outer scheduler is itself unboxed.
 /// This authorizes nesting but is never evidence of cgroup containment.
-pub const DELEGATED_UNBOXED_ENV: &str = "DAGRUN_DELEGATED_UNBOXED";
+pub use dagrun_model::env::DELEGATED_UNBOXED_ENV;
 /// Env var carrying the outer scope unit name to the in-scope child.
-const ENV_SCOPE_UNIT: &str = "DAGRUN_SCOPE_UNIT";
+const ENV_SCOPE_UNIT: &str = dagrun_model::env::SCOPE_UNIT_ENV;
 /// Optional caller override that may tighten, but never widen, the derived outer cap.
 const OUTER_MEMORY_MAX_ENV: &str = "DAGRUN_OUTER_MEMORY_MAX_BYTES";
 /// Exact cap carried across the systemd re-exec for in-scope readback.
@@ -1396,7 +1396,7 @@ impl ScopeAttempt {
 /// nobody has measured precisely because the skip means the probe never runs there. This makes the
 /// question answerable on any runner without editing code or changing the default, which stays
 /// exactly as it was.
-pub const FORCE_ATTEMPT_ENV: &str = "DAGRUN_FORCE_SCOPE_ATTEMPT";
+pub use dagrun_model::env::FORCE_ATTEMPT_ENV;
 
 /// Whether policy says to skip scope setup here, and which variable said so.
 fn policy_skip_reason() -> Option<&'static str> {
@@ -2544,7 +2544,7 @@ impl Cgroups {
 /// OFF BY DEFAULT, deliberately. Turning containment on where it is currently off changes the
 /// behaviour of every lane at once, and that is an owner decision, not a library default. This
 /// makes the capability available and testable without altering a single existing run.
-pub const DIRECT_CGROUP_ENV: &str = "DAGRUN_DIRECT_CGROUP";
+pub use dagrun_model::env::DIRECT_CGROUP_ENV;
 
 impl Cgroups {
     /// Containment WITHOUT systemd: a cgroup we create under our own, torn down by `cgroup.kill`.

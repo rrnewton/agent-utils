@@ -426,7 +426,7 @@ impl From<DagManifest> for ResultManifest {
 /// producer signals readiness by atomically renaming
 /// `<dir>/<step-tag>/<name>.tmp` to `<dir>/<step-tag>/<name>`. Following the
 /// Follows the test-counts path precedent: runner-owned, never inherited.
-pub const ARTIFACT_READY_DIR_ENV: &str = "DAGRUN_ARTIFACT_READY_DIR";
+pub use crate::env::ARTIFACT_READY_DIR_ENV;
 
 /// One named artifact a step publishes mid-run via the artifact-ready signal.
 ///
