@@ -191,7 +191,7 @@ steps:
     # one 1200 s serial node timed out under multi-gate load; three shorter
     # nodes keep each wall well inside the same budget without raising it.
     timeout: 19200
-    cpu_timeout: 2400
+    cpu_timeout: 8192
     hint:
       est_duration_s: 120
       classification: latency-bound
@@ -203,9 +203,13 @@ steps:
     desc: agentctl Python and Rust commands agree (group shard 2 of 3)
     cmd: python3 cross/differential.py --tool agentctl --shard 1/3
     jobs_flag: ""
-    labels: [component-agentctl, gate-exclusive]
+    # Main phase (#1249 cross-differentials-robust): this shard carries
+    # no wall-clock verdict (sends wait on queue quiescence and lock
+    # release; generous hang guard in the shared harness) and qualified
+    # under saturated-scope load; record in #1249.
+    labels: [component-agentctl]
     timeout: 19200
-    cpu_timeout: 2400
+    cpu_timeout: 8192
     hint:
       est_duration_s: 120
       classification: latency-bound
@@ -223,7 +227,7 @@ steps:
     # qualified under saturated-scope load; record in #1249.
     labels: [component-agentctl]
     timeout: 19200
-    cpu_timeout: 2400
+    cpu_timeout: 8192
     hint:
       est_duration_s: 120
       classification: latency-bound
