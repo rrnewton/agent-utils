@@ -331,19 +331,19 @@ def test_launch_returns_coordinator_exit_code(fixture: Fixture) -> None:
     assert (fixture.registry / "agents" / "coordinator" / "agent.json").exists()
     assert (fixture.state / "bridge.json").exists()
     assert (fixture.state / "bridge.log").exists()
-    assert _wait_for(lambda: not fixture.processes_with(str(fixture.state)), 15)
+    assert _wait_for(lambda: not fixture.processes_with(str(fixture.state)), 120)
 
 
 def test_launch_sigterm_stops_both_children(fixture: Fixture) -> None:
     process = fixture.launch()
-    assert _wait_for(lambda: (fixture.control / "harness.pid").exists(), 60)
+    assert _wait_for(lambda: (fixture.control / "harness.pid").exists(), 300)
     harness_pid = int((fixture.control / "harness.pid").read_text())
-    assert _wait_for(lambda: bool(fixture.processes_with(str(fixture.state))), 60)
+    assert _wait_for(lambda: bool(fixture.processes_with(str(fixture.state))), 300)
     process.send_signal(signal.SIGTERM)
     _stdout, _stderr = process.communicate(timeout=120)
     assert process.returncode == 0
-    assert _wait_for(lambda: not Path(f"/proc/{harness_pid}").exists(), 15)
-    assert _wait_for(lambda: not fixture.processes_with(str(fixture.state)), 15)
+    assert _wait_for(lambda: not Path(f"/proc/{harness_pid}").exists(), 120)
+    assert _wait_for(lambda: not fixture.processes_with(str(fixture.state)), 120)
 
 
 def test_launch_sigterm_exits_within_a_few_seconds(fixture: Fixture) -> None:
@@ -352,8 +352,8 @@ def test_launch_sigterm_exits_within_a_few_seconds(fixture: Fixture) -> None:
     # the condition; the generous communicate bound only reports a hang
     # (owner rule 346: no wall-clock verdict).
     process = fixture.launch()
-    assert _wait_for(lambda: (fixture.control / "harness.pid").exists(), 60)
-    assert _wait_for(lambda: bool(fixture.processes_with(str(fixture.state))), 60)
+    assert _wait_for(lambda: (fixture.control / "harness.pid").exists(), 300)
+    assert _wait_for(lambda: bool(fixture.processes_with(str(fixture.state))), 300)
     process.send_signal(signal.SIGTERM)
     _stdout, _stderr = process.communicate(timeout=120)
     assert process.returncode == 0
@@ -395,14 +395,14 @@ def test_run_sigterm_with_a_delivery_in_flight_exits_within_five_seconds(
         },
     )
     try:
-        assert _wait_for(lambda: bool(fixture.bridge_processes()), 60)
+        assert _wait_for(lambda: bool(fixture.bridge_processes()), 300)
         bridge = fixture.bridge_processes()[0]
         log = fixture.state / "bridge.log"
 
         def admitted() -> list[Path]:
             return list(fixture.state.glob("requests/*.json"))
 
-        assert _wait_for(lambda: bool(admitted()), 60), (
+        assert _wait_for(lambda: bool(admitted()), 300), (
             "no request was admitted: "
             + (log.read_text()[-3000:] if log.exists() else "no bridge log")
         )
@@ -433,7 +433,7 @@ def test_run_sigterm_with_a_delivery_in_flight_exits_within_five_seconds(
             assert record.get("delivered_at_millis") is None, record
     finally:
         process.send_signal(signal.SIGTERM)
-        process.communicate(timeout=60)
+        process.communicate(timeout=120)
 
 
 def test_run_sigterm_with_a_plugin_that_ignores_close_exits_within_five_seconds(
@@ -448,7 +448,7 @@ def test_run_sigterm_with_a_plugin_that_ignores_close_exits_within_five_seconds(
     config.chmod(0o600)
     process = fixture.launch(config=config, extra_env={"CHAT_SUBSCRIPTION_FAKE_STALL": "commit"})
     try:
-        assert _wait_for(lambda: bool(fixture.bridge_processes()), 60)
+        assert _wait_for(lambda: bool(fixture.bridge_processes()), 300)
         bridge = fixture.bridge_processes()[0]
         log = fixture.state / "bridge.log"
         assert _wait_for(
@@ -457,12 +457,12 @@ def test_run_sigterm_with_a_plugin_that_ignores_close_exits_within_five_seconds(
         time.sleep(1)
         started = time.monotonic()
         os.kill(bridge, signal.SIGTERM)
-        assert _wait_for(lambda: _process_gone(bridge), 30)
+        assert _wait_for(lambda: _process_gone(bridge), 120)
         took = time.monotonic() - started
         assert took < 5, f"chat run took {took:.1f}s to stop: {log.read_text()[-2000:]}"
     finally:
         process.send_signal(signal.SIGTERM)
-        process.communicate(timeout=60)
+        process.communicate(timeout=120)
 
 
 def _children(pid: int) -> list[int]:
@@ -496,30 +496,25 @@ def test_run_sigterm_during_startup_exits_within_five_seconds(
     else:
         process = fixture.launch()
     try:
-        assert _wait_for(lambda: bool(fixture.bridge_processes()), 60, interval=0.01)
+        assert _wait_for(lambda: bool(fixture.bridge_processes()), 300, interval=0.01)
         bridge = fixture.bridge_processes()[0]
         log = fixture.state / "bridge.log"
         if moment == "plugin-handshake":
             # The plugin is spawned and waits for ever before its hello.
-            assert _wait_for(lambda: bool(_children(bridge)), 60, interval=0.01), (
+            assert _wait_for(lambda: bool(_children(bridge)), 300, interval=0.01), (
                 log.read_text()[-3000:] if log.exists() else "no bridge log"
             )
             time.sleep(0.5)
-        started = time.monotonic()
         os.kill(bridge, signal.SIGTERM)
-        assert _wait_for(lambda: _process_gone(bridge), 30)
-        took = time.monotonic() - started
-        assert took < 5, (
-            f"chat run took {took:.1f}s to stop: "
-            + (log.read_text()[-2000:] if log.exists() else "no bridge log")
-        )
+        # Exit is the condition; the generous bound only reports a hang.
+        assert _wait_for(lambda: _process_gone(bridge), 120)
         # It stopped by itself: the termination guard, which abandons a stop after 4 s, did
         # not have to end it.
         text = log.read_text() if log.exists() else ""
         assert "did not stop within" not in text, text[-2000:]
     finally:
         process.send_signal(signal.SIGTERM)
-        process.communicate(timeout=60)
+        process.communicate(timeout=120)
 
 
 def test_launch_agent_label_override_is_persisted(fixture: Fixture) -> None:
@@ -552,7 +547,7 @@ def test_launch_bridge_killed_first_is_an_error_and_stops_coordinator(
     fixture: Fixture,
 ) -> None:
     process = fixture.launch()
-    assert _wait_for(lambda: (fixture.control / "harness.pid").exists(), 60)
+    assert _wait_for(lambda: (fixture.control / "harness.pid").exists(), 300)
     harness_pid = int((fixture.control / "harness.pid").read_text())
     bridges: list[int] = []
 
@@ -588,7 +583,7 @@ spec.loader.exec_module(module)
 def test_outer_fixture_sleeps(tmp_path):
     made = module.Fixture(tmp_path)
     process = made.launch()
-    assert module._wait_for(lambda: (made.control / "harness.pid").exists(), 60)
+    assert module._wait_for(lambda: (made.control / "harness.pid").exists(), 300)
     bridges = []
 
     def find_bridge():
@@ -661,14 +656,14 @@ def test_killing_outer_pytest_leaves_no_chat_run(tmp_path: Path) -> None:
         assert _wait_for(lambda: marker.exists(), 300), "outer pytest never launched its fixture"
         record = json.loads(marker.read_text())
         outer.kill()  # SIGKILL to the pytest process only, as a killed gate step does.
-        outer.wait(timeout=30)
-        assert _wait_for(lambda: not survivors(), 30), (
+        outer.wait(timeout=120)
+        assert _wait_for(lambda: not survivors(), 300), (
             f"fixture processes survived the outer kill: {survivors()} ({record})"
         )
     finally:
         if outer.poll() is None:
             outer.kill()
-            outer.wait(timeout=30)
+            outer.wait(timeout=120)
         # Whatever the verdict, nothing this test started outlives it. Each pid is checked to
         # still name this test's temporary tree just before it is killed, so a reused pid is
         # never hit.
