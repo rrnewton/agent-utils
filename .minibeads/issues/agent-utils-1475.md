@@ -7,7 +7,7 @@ created_at: 2026-11-12T00:00:00.000000000+00:00
 updated_at: 2026-11-12T00:00:00.000000000+00:00
 ---
 
-# Summary
+# Description
 
 Owner decision (2026-11-12, approving the noon proposal: "Feel free to
 update it also."):
@@ -31,7 +31,7 @@ The default changes for every consuming queue: queues that do not opt
 out validate stacked by default after this lands. A consuming queue
 that is parked will not feel the change until it resumes.
 
-# Acceptance
+# Acceptance Criteria
 
 - With default config, a would-be root validates stacked on the tip of
   the candidates ahead of it (no disjoint-root cancellation on landing);

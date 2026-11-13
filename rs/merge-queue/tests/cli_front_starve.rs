@@ -161,7 +161,8 @@ fn an_unstarted_front_does_not_block_a_green_disjoint_root() {
         "1",
     ]);
     set_config(&fx, |config| {
-        config["donors"] = serde_json::json!({"claim_timeout_secs": 60})
+        config["donors"] = serde_json::json!({"claim_timeout_secs": 60});
+        config["speculative_stacking"] = serde_json::json!(false)
     });
     fx.branch("a", &[("tests/a", "ok\n")]);
     fx.mq_ok(&["submit", "1", "--head", "a"]);
