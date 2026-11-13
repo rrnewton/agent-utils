@@ -463,6 +463,7 @@
         "py/wrkslots/tests/test_liveness_evidence.py",
         "py/wrkslots/tests/test_load_quarantine.py",
         "py/wrkslots/tests/test_lock_scope.py",
+        "py/wrkslots/tests/test_lock_turnstile_rust.py",
         "py/wrkslots/tests/test_nested_worktree_repair.py",
         "py/wrkslots/tests/test_network.py",
         "py/wrkslots/tests/test_owner_transfer.py",

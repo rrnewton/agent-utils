@@ -81,9 +81,50 @@ pub(crate) fn flock_wait_shared(
 
 pub(crate) struct Flock {
     _file: std::fs::File,
+    path: PathBuf,
 }
 
-pub(crate) fn acquire_lock(path: &Path, subject: &Path) -> Result<Flock> {
+impl Drop for Flock {
+    fn drop(&mut self) {
+        held_lock_release(&self.path);
+    }
+}
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+thread_local! {
+    /// Registry locks this thread currently holds, mirroring
+    /// Python `_HELD_LOCKS`: a nested acquisition of a lock the
+    /// thread already holds skips the turnstile, so a writer
+    /// waiting for this very thread cannot deadlock it.
+    static HELD_LOCKS: RefCell<HashMap<PathBuf, usize>> = RefCell::new(HashMap::new());
+}
+
+fn held_lock_acquire(path: &Path) {
+    HELD_LOCKS.with(|held| {
+        *held.borrow_mut().entry(path.to_path_buf()).or_insert(0) += 1;
+    });
+}
+
+fn held_lock_release(path: &Path) {
+    HELD_LOCKS.with(|held| {
+        let mut held = held.borrow_mut();
+        if let Some(count) = held.get_mut(path) {
+            *count -= 1;
+            if *count == 0 {
+                held.remove(path);
+            }
+        }
+    });
+}
+
+fn thread_holds(path: &Path) -> bool {
+    HELD_LOCKS.with(|held| held.borrow().contains_key(path))
+}
+
+/// Open one lock file with the shared safety checks.
+fn open_lock_file(path: &Path, subject: &Path) -> Result<std::fs::File> {
     if let Some(parent) = path.parent() {
         if parent
             .symlink_metadata()
@@ -107,12 +148,72 @@ pub(crate) fn acquire_lock(path: &Path, subject: &Path) -> Result<Flock> {
     if !metadata.is_file() {
         return Err(format!(
             "state lock is not a regular file: {}",
-            path.display()
+            subject.display()
         ));
     }
+    Ok(file)
+}
+
+/// How long a reader defers to a waiting writer, mirroring
+/// Python `_REGISTRY_INTENT_DEFER_SECONDS`.
+const INTENT_DEFER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The writer-intent turnstile (#1172/#1199), mirroring Python
+/// `_enter_registry_turnstile`. Only the registry lock itself
+/// (subject `ACTIVE`) has one; its path sits beside it. A writer
+/// holds the intent lock exclusively while it polls, and returns
+/// the file to keep until the registry lock is acquired. A reader
+/// passes through shared and releases at once, deferring at most
+/// INTENT_DEFER; a reader that cannot pass in that bound proceeds
+/// anyway. Only the flock counts, never the file's existence, so
+/// a stale intent file blocks nobody. Callers that do not know
+/// the file (older releases, the other edition before its own
+/// turnstile) weaken fairness but can never deadlock.
+fn enter_turnstile(
+    path: &Path,
+    subject: &Path,
+    exclusive: bool,
+    deadline: std::time::Instant,
+) -> Result<Option<std::fs::File>> {
+    if subject.file_name().is_none_or(|name| name != "ACTIVE") || thread_holds(path) {
+        return Ok(None);
+    }
+    let Some(parent) = subject.parent() else {
+        return Ok(None);
+    };
+    let intent_path = parent.join("ACTIVE.global.intent.lock");
+    let file = open_lock_file(&intent_path, &intent_path)?;
+    if exclusive {
+        match flock_wait(&file, deadline) {
+            Ok(()) => Ok(Some(file)),
+            Err(_) => Err(format!(
+                "state lock is busy for {}; another writer is waiting for it; retry after the current command exits",
+                subject.display()
+            )),
+        }
+    } else {
+        let defer_until = std::cmp::min(deadline, std::time::Instant::now() + INTENT_DEFER);
+        if flock_wait_shared(&file, defer_until).is_ok() {
+            let _ = rustix::fs::flock(&file, rustix::fs::FlockOperation::Unlock);
+        }
+        Ok(None)
+    }
+}
+
+pub(crate) fn acquire_lock(path: &Path, subject: &Path) -> Result<Flock> {
+    let file = open_lock_file(path, subject)?;
     let deadline = std::time::Instant::now() + lock_wait();
+    // Hold the writer-intent turnstile while polling, then close
+    // it once the registry lock is acquired (#1199).
+    let _intent = enter_turnstile(path, subject, true, deadline)?;
     match flock_wait(&file, deadline) {
-        Ok(()) => Ok(Flock { _file: file }),
+        Ok(()) => {
+            held_lock_acquire(path);
+            Ok(Flock {
+                _file: file,
+                path: path.to_path_buf(),
+            })
+        }
         Err(_) => Err(format!(
             "state lock is busy for {}; retry after the current command exits",
             subject.display()
@@ -124,35 +225,19 @@ pub(crate) fn acquire_lock(path: &Path, subject: &Path) -> Result<Flock> {
 /// hold it together, and no writer holds it while they do. It waits as
 /// long as `acquire_lock` (`WRKSLOTS_WAIT_LOCK`).
 pub(crate) fn acquire_shared_lock(path: &Path, subject: &Path) -> Result<Flock> {
-    if let Some(parent) = path.parent() {
-        if parent
-            .symlink_metadata()
-            .map(|meta| meta.file_type().is_symlink() || !meta.is_dir())
-            .unwrap_or(true)
-        {
-            return Err(format!("unsafe lock parent: {}", parent.display()));
-        }
-    }
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|error| format!("cannot open state lock {}: {error}", path.display()))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("cannot inspect state lock {}: {error}", path.display()))?;
-    if !metadata.is_file() {
-        return Err(format!(
-            "state lock is not a regular file: {}",
-            path.display()
-        ));
-    }
+    let file = open_lock_file(path, subject)?;
     let deadline = std::time::Instant::now() + lock_wait();
+    // Pass the writer-intent turnstile first (#1199/#1200): a
+    // reader arriving after a waiting writer queues behind it.
+    let _passed = enter_turnstile(path, subject, false, deadline)?;
     match flock_wait_shared(&file, deadline) {
-        Ok(()) => Ok(Flock { _file: file }),
+        Ok(()) => {
+            held_lock_acquire(path);
+            Ok(Flock {
+                _file: file,
+                path: path.to_path_buf(),
+            })
+        }
         Err(_) => Err(format!(
             "state lock is busy for {}; retry after the current command exits",
             subject.display()
@@ -699,6 +784,77 @@ mod lock_wait_tests {
         let result = waiter.join().unwrap();
         assert!(result.is_ok());
         assert!(started.elapsed() >= std::time::Duration::from_millis(250));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn turnstile_fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "wrkslots-turnstile-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let subject = dir.join("ACTIVE");
+        std::fs::write(&subject, "").unwrap();
+        (subject.clone(), dir.join("ACTIVE.global.lock"), dir)
+    }
+
+    #[test]
+    fn waiting_writer_holds_the_intent_lock() {
+        std::env::set_var("WRKSLOTS_WAIT_LOCK", "10");
+        let (subject, lock_path, dir) = turnstile_fixture("holds");
+        let reader = acquire_shared_lock(&lock_path, &subject).unwrap();
+        let (writer_subject, writer_lock) = (subject.clone(), lock_path.clone());
+        let writer = std::thread::spawn(move || acquire_lock(&writer_lock, &writer_subject));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        // The waiting writer holds the intent lock exclusively.
+        let intent = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join("ACTIVE.global.intent.lock"))
+            .unwrap();
+        assert!(rustix::fs::flock(
+            &intent,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive
+        )
+        .is_err());
+        drop(intent);
+        drop(reader);
+        let acquired = writer.join().unwrap();
+        assert!(acquired.is_ok());
+        std::env::remove_var("WRKSLOTS_WAIT_LOCK");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_intent_file_blocks_nobody() {
+        let (subject, lock_path, dir) = turnstile_fixture("stale");
+        std::fs::write(dir.join("ACTIVE.global.intent.lock"), "").unwrap();
+        let reader = acquire_shared_lock(&lock_path, &subject).unwrap();
+        drop(reader);
+        let _writer = acquire_lock(&lock_path, &subject).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn second_writer_reports_another_writer_waiting() {
+        let (subject, lock_path, dir) = turnstile_fixture("busy");
+        let intent = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("ACTIVE.global.intent.lock"))
+            .unwrap();
+        rustix::fs::flock(&intent, rustix::fs::FlockOperation::LockExclusive).unwrap();
+        let error = match acquire_lock(&lock_path, &subject) {
+            Ok(_) => panic!("second writer must refuse"),
+            Err(error) => error,
+        };
+        assert!(error.contains("another writer is waiting"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

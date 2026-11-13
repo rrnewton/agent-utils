@@ -1,6 +1,6 @@
 ---
 title: "rust-writer-turnstile: Rust wrkslots writers take the intent-lock turnstile while waiting for the registry lock"
-status: open
+status: closed
 priority: 2
 issue_type: feature
 created_at: 2026-11-10T10:00:00.000000000+00:00
@@ -36,3 +36,31 @@ take no registry lock, so they need no change. Mixed versions stay deadlock-free
 
 Filed for the lead coordinator (2026-11-10) from #1172's Rust parity report. Planned for the Rust wrkslots lane after
 its scoped-readers soak opt-in lands.
+
+## Resolution
+
+[muse watermelon] Done. `ensure_states.rs` now implements the
+writer-intent turnstile: `acquire_lock` (the exclusive registry
+lock) first takes `ACTIVE.global.intent.lock` exclusively through
+`enter_turnstile` and holds it while polling, closing it once the
+registry lock is acquired; a second writer reports "another
+writer is waiting for it". `acquire_shared_lock` (the #1200
+readers' last-attempt lock) passes through the turnstile shared,
+deferring at most 10 s like Python `_REGISTRY_INTENT_DEFER_SECONDS`,
+then proceeds. Held locks are tracked per thread, so a nested
+acquisition skips the turnstile and cannot deadlock against a
+writer waiting for that same thread. Only the flock counts, so a
+stale intent file blocks nobody, and callers that never heard of
+the file weaken fairness but cannot deadlock.
+
+Proof: crate tests `waiting_writer_holds_the_intent_lock`,
+`stale_intent_file_blocks_nobody`, and
+`second_writer_reports_another_writer_waiting`; the cross-edition
+differential `test_lock_turnstile_rust.py` holds the registry
+lock shared from Python, shows the Rust `hold` writer waiting
+with the intent lock exclusively held and a new Python reader
+queued behind it, then acquiring within 5 s of release. The
+#1172 writer-wait fixture/tool lives on devbig030; the bounded
+acquire here is the same shape (writer completes as soon as the
+readers inside release, instead of polling behind overlapping
+readers indefinitely).
