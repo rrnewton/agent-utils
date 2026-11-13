@@ -239,8 +239,10 @@ def test_report_marks_live_and_held_as_blocked(
         lambda ident: ("live", "PID live"),
     )
 
-    def liveness(_cfg: object, records: object, deadline: object = None) -> dict:
-        out = {}
+    def liveness(
+        _cfg: object, records: object, deadline: object = None
+    ) -> dict[tuple[str, str, int], tuple[str, str]]:
+        out: dict[tuple[str, str, int], tuple[str, str]] = {}
         for r in records:  # type: ignore[attr-defined]
             out[(r.machine, r.slot, r.generation)] = ("dead", "dead")
         return out
