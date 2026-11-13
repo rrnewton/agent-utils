@@ -15,7 +15,7 @@ const NAVCORE = await moduleForTests("src/core/navigation/index.ts");
 /** A page stand-in: every dep a thunk over `state`, which a test moves under the factory. */
 function makeNavigation(state) {
   const calls = [];
-  const el = (id) => ({ id, hidden: state.hidden.has(id), focus() { calls.push(["focus", id]); } });
+  const el = (id) => ({ id, hidden: state.hidden.has(id), focus() { calls.push(["focus", id]); }, replaceChildren: () => calls.push(["clear", id]) });
   const nav = SHELL.createPageNavigation({
     createBackStack: NAVCORE.createBackStack, createVisits: NAVCORE.createVisits,
     createDeepLinks: NAVCORE.createDeepLinks, createLinkJumps: NAVCORE.createLinkJumps,
@@ -54,7 +54,7 @@ function makeNavigation(state) {
     chooseView: (which) => calls.push(["chooseView", which]), selectSideThread: () => {},
     openThreadFromList: () => {}, chooseOneColumn: (choice) => calls.push(["oneColumn", choice.view]),
     defaultChannelView: () => "main", threadsOfChannel: () => [], threadIdOf: (thread) => thread.id,
-    token: () => "tok", channels: () => [{ id: "C1" }], chooseChannel: () => {}, changeSelectedChannel: () => {},
+    token: () => "tok", channels: () => [{ id: "C1" }], chooseChannel: () => {},
     viewKey: () => "main", viewsHas: () => true, readsBusy: () => false, readsStarted: () => 1,
     seekMessage: async () => {}, rowHolding: () => null, answeredElsewhere: () => false,
     providerNameOf: () => "discord", providerName: () => "discord", threadOf: () => null,
@@ -67,8 +67,21 @@ function makeNavigation(state) {
     idsOf: () => [], inAppLinksOn: () => true, channelLabel: (channel) => channel, renderedText: () => "x",
     inThisColumn: (act) => act, captureScroll: () => ({ pinned: true, anchor: null, top: 0 }),
     listPlaceTop: () => 0, sideShowing: () => false, restoreScroll: () => {}, scrollToNewest: () => {},
-    bumpReplyJump: () => {}, settleUiState: () => {}, readEnteredChannel: async () => {},
+    bumpReplyJump: () => {}, settleUiState: () => {},
     viewRestored: () => false, stopDiscordPolling: () => {}, storedOpenInView: () => "flat",
+    cycleView: () => calls.push("cycleView"),
+    loadDiscord: async (options) => calls.push(["loadDiscord", options]),
+    readSideColumn: async (reason, since) => calls.push(["readSide", reason, since]),
+    scheduleDiscordPoll: () => calls.push("schedulePoll"),
+    putDockedReplyAway: () => {}, gatherState: () => state.gather, listState: () => state.list,
+    dropReplyArrowTap: () => {}, applyChannelProvider: () => {}, rememberActiveChannel: () => {},
+    rememberChannelDraft: () => {}, openChannelView: () => {}, forgetThreadPresence: () => {},
+    timelineRows: () => state.rows, clearChannelContexts: () => {}, restoreThreadHues: () => {},
+    seedServerThreadHues: async () => {}, restoreChannelComposer: () => {}, olderPages: () => state.older,
+    payReadCursor: () => {}, renderOlderControl: () => {}, loadState: () => state.load,
+    hydrateChannelScope: () => false, renderChannelFreshness: () => {}, saveUiState: () => {},
+    pinsOnly: () => false, ensurePins: () => {}, renderChannelRows: () => {},
+    resetSideColumn: () => {}, renderColumns: () => {}, startChannelStream: () => {},
     writeClipboardText: async () => true, copiedRefusedText: () => "refused", pullWaitMs: () => 0,
     delay: async () => {}, userActivation: () => null, locationSearch: () => state.search,
     locationOrigin: () => "https://example.test", locationPathname: () => "/",
@@ -81,6 +94,9 @@ const freshState = () => ({
   screen: "main", view: "discord", channel: "C1", layout: "one", sideMode: "cards", sideThread: null,
   docs: [], noDocDepth: false,
   selection: { view: "main", threadId: null, origin: null }, replyDocked: false,
+  gather: { gathered: { parent: "m1" } }, list: { rowsGathered: true, newestId: "m9" },
+  rows: { messages: [{ id: "m1" }], threads: [{ id: "t1" }] }, older: { moreAbove: true, cursor: "c" },
+  load: { freshAt: 9, freshness: "stale" },
   hidden: new Set(["speed-popover", "dismissed-send-popout"]), timers: [], search: "",
   history: { state: null, replaced: [], replaceState(state, _title, url) { this.replaced.push(url); } },
 });
@@ -186,4 +202,25 @@ test("`#624` shell navigation: syncDeepLinkAddress writes the standing place's q
   state.search = "?c=C1&v=main";
   nav.syncDeepLinkAddress();
   assert.equal(state.history.replaced.length, 1, "an address already saying this is not written again");
+});
+
+test("`#624` shell navigation: changing channel clears the old channel's records and reads the new one", async () => {
+  const state = freshState();
+  const { nav, calls } = makeNavigation(state);
+  await nav.changeSelectedChannel();
+  assert.deepStrictEqual(state.rows, { messages: [], threads: [] });
+  assert.deepStrictEqual(state.older, { moreAbove: false, cursor: null });
+  assert.deepStrictEqual(state.load, { freshAt: 0, freshness: "fresh" });
+  assert.equal(state.gather.gathered, null);
+  assert.deepStrictEqual(calls.filter((call) => Array.isArray(call) && call[0] === "loadDiscord"),
+    [["loadDiscord", { reason: "enter" }]]);
+  calls.length = 0;
+  await nav.readEnteredChannel(true);
+  assert.deepStrictEqual(calls, [
+    ["loadDiscord", { keepPosition: true, reason: "visible" }],
+    ["readSide", "visible", 1],
+    "schedulePoll",
+  ]);
+  nav.pressViewSwitch();
+  assert.equal(calls.at(-1), "cycleView");
 });

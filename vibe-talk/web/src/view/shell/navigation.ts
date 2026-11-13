@@ -158,6 +158,38 @@ export interface NavMessage {
   readonly thread?: { readonly is_root?: unknown; readonly root_message_id?: unknown } | null;
 }
 
+/** Why a timeline read was asked for, as the timeline view accepts it. */
+export interface NavReadOptions {
+  keepPosition?: boolean;
+  quiet?: boolean;
+  ownAct?: boolean;
+  reason?: string | readonly (string | undefined)[];
+  readAs?: string;
+}
+
+/** The gathered replies' record, as far as changing channel clears it. */
+export interface NavGatherState {
+  gathered: unknown;
+}
+
+/** The list record, as far as changing channel resets it. */
+export interface NavListState {
+  rowsGathered: boolean;
+  newestId: unknown;
+}
+
+/** The older-pages record, as far as changing channel resets it. */
+export interface NavOlderPages {
+  moreAbove: boolean;
+  cursor: unknown;
+}
+
+/** The load record, as far as changing channel resets it. */
+export interface NavLoadState {
+  freshAt: number;
+  freshness: string;
+}
+
 /** What the page injects: the core factories, created owners' ports, and every page act, all thunked. */
 export interface PageNavigationDependencies<Column, ThreadLike, Pane> {
   // The core owners' factories (the page's prelude names), injected so this package imports no core.
@@ -244,7 +276,37 @@ export interface PageNavigationDependencies<Column, ThreadLike, Pane> {
   token(): string;
   channels(): readonly { id: unknown }[];
   chooseChannel(id: string): void;
-  changeSelectedChannel(): void;
+  cycleView(): void;
+  loadDiscord(options: NavReadOptions): Promise<void>;
+  readSideColumn(reason: string, since: number): Promise<void>;
+  scheduleDiscordPoll(): void;
+  putDockedReplyAway(): void;
+  gatherState(): NavGatherState;
+  listState(): NavListState;
+  dropReplyArrowTap(): void;
+  applyChannelProvider(): void;
+  rememberActiveChannel(chosen?: boolean): void;
+  rememberChannelDraft(): void;
+  openChannelView(): void;
+  forgetThreadPresence(): void;
+  timelineRows(): { messages: unknown[]; threads: unknown[] };
+  clearChannelContexts(): void;
+  restoreThreadHues(channel: unknown): void;
+  seedServerThreadHues(channel: unknown): unknown;
+  restoreChannelComposer(): void;
+  olderPages(): NavOlderPages;
+  payReadCursor(): void;
+  renderOlderControl(): void;
+  loadState(): NavLoadState;
+  hydrateChannelScope(): boolean;
+  renderChannelFreshness(): void;
+  saveUiState(): void;
+  pinsOnly(): boolean;
+  ensurePins(): void;
+  renderChannelRows(): void;
+  resetSideColumn(reopen?: boolean): void;
+  renderColumns(): void;
+  startChannelStream(channel: unknown): void;
   viewKey(): string;
   viewsHas(key: string): boolean;
   readsBusy(): boolean;
@@ -296,7 +358,6 @@ export interface PageNavigationDependencies<Column, ThreadLike, Pane> {
   scrollToNewest(): void;
   bumpReplyJump(): void;
   settleUiState(): void;
-  readEnteredChannel(restored: boolean): Promise<void>;
   viewRestored(): boolean;
   stopDiscordPolling(): void;
   storedOpenInView(): "flat" | "main";
@@ -367,6 +428,9 @@ export interface PageNavigation {
   jumpToSentMessage(ref: MessageLinkRef): Promise<void>;
   returnFromLinkJump(): void;
   putBackOnSpot(spot: NavLinkSpot): boolean;
+  pressViewSwitch(): void;
+  readEnteredChannel(keepPosition: boolean): Promise<void>;
+  changeSelectedChannel(): Promise<void>;
 }
 
 /** How long opening from a link waits for sign-in and a first read, in `pullWaitMs` waits. */
@@ -983,7 +1047,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
         if (String(deps.selectedChannelId()) !== wantedChannel) {
           deps.chooseChannel(wantedChannel);
           // The link's own arrival on its channel is no choice of the reader's.
-          deepLinks.arrive(() => deps.changeSelectedChannel());
+          deepLinks.arrive(() => changeSelectedChannel());
         }
       }
       if (deps.screens().view() !== "discord") deps.showView("discord");
@@ -1240,7 +1304,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
   /** Choose channel `channel` as a link's arrival, which is no choice of the reader's (`#462`). */
   function arriveOnChannel(channel: string): void {
     deps.chooseChannel(channel);
-    deepLinks.arrive(() => deps.changeSelectedChannel());
+    deepLinks.arrive(() => changeSelectedChannel());
   }
 
   /** Put channel place `place` on as an arrival: by the views' own choosing, or a thread by its id. */
@@ -1285,7 +1349,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
       deps.settleUiState();
       deps.showView("discord");
       // A channel the jump changes to is read as it is chosen; the one already chosen is read here.
-      if (String(deps.selectedChannelId()) === ref.channel) await deps.readEnteredChannel(deps.viewRestored());
+      if (String(deps.selectedChannelId()) === ref.channel) await readEnteredChannel(deps.viewRestored());
     } : null;
     return deps.inColumn(deps.mainColumn(), () => jumpFromSpot(ref, spot, { view: deps.storedOpenInView(), center: true, enter }));
   }
@@ -1411,7 +1475,7 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
       deps.settleUiState();
       deps.showView("discord");
       if (String(deps.selectedChannelId() || "") === place.channel) {
-        await deps.readEnteredChannel(deps.viewRestored());
+        await readEnteredChannel(deps.viewRestored());
       }
     } else if (deps.screens().view() !== "discord") return;
     if (!deps.channels().some((channel) => String(channel.id) === place.channel)) return;
@@ -1446,6 +1510,113 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
     return true;
   }
 
+  // --- entering a channel, and changing it -----------------------------------------------------
+
+  /** The view switch, pressed: rotate Voice -> Channel -> Documents -> Voice (`documents-view-client`). */
+  function pressViewSwitch(): void {
+    // The selector owns the rotation and, through `chooseMajorView`, each view's
+    // entry work: entering the channel re-reads it (keeping the position on a
+    // return, as the two-way switch did), and any other view stops its polling.
+    deps.cycleView();
+  }
+
+  /** Read the channel just entered, and keep reading it while it stays on screen. */
+  function readEnteredChannel(keepPosition: boolean): Promise<void> {
+    return deps.guardQuietly(async () => {
+      try {
+        // A return finds the channel's store as it was left, so it asks only for what changed.
+        const since = deps.readsStarted();
+        await deps.loadDiscord(keepPosition ? { keepPosition: true, reason: "visible" } : { reason: "enter" });
+        // ...and the right column's thread, or its list of threads. `#229 desktop-two-column`.
+        await deps.readSideColumn(keepPosition ? "visible" : "enter", since);
+      } finally {
+        // Armed after a failure too: offline is exactly when the reader needs the page to try again.
+        if (deps.screens().view() === "discord") {
+          deps.scheduleDiscordPoll();
+        }
+      }
+    })();
+  }
+  // Both wrapped in a lambda rather than passed straight through: a DOM listener is handed the
+  // EVENT as its first argument, and `loadDiscord`'s first argument is its options object. Reading
+  // `keepPosition` off a MouseEvent happens to answer false, which is the right answer by accident
+  // and stops being right the moment another option is added.
+  //
+  // Refresh keeps your place. It is a re-read of the channel you are already looking at, and being
+  // thrown to the bottom of it is the same defect as a background poll doing so — the fact that you
+  // asked for fresh messages is not a request to stop reading the one in front of you. A reader who
+  // was at the bottom still follows, which is the case where "keep my place" and "show me the
+  // newest" are the same instruction.
+  // Changing channel is not a re-read; it is a different history, and its bottom is where to start.
+  // The walk back resets with it: a cursor from one channel means nothing in another, and carrying
+  // one across would ask the server to step back from a message that is not there.
+  function changeSelectedChannel(): Promise<void> {
+    // From the left column, whichever column the key that asked for it was in. `#229 desktop-two-column`.
+    if (deps.inSide()) return deps.inColumn(deps.mainColumn(), changeSelectedChannel);
+    noteDeepLinkReaderMove();
+    // `#277 reply-in-column`. A reply open in a column answers a message of the channel being left.
+    deps.putDockedReplyAway();
+    // `#215 reply-coalesce`. Gathered replies belong to the channel they were gathered in, whose rows
+    // are about to go — and so does a tap on an arrow still waiting to jump, which would otherwise walk
+    // this channel's history for a message of the last one.
+    deps.gatherState().gathered = null;
+    deps.listState().rowsGathered = false;
+    deps.dropReplyArrowTap();
+    deps.applyChannelProvider();
+    // This window's, and the one a new window opens on. `#265 window-channel-memory`.
+    deps.rememberActiveChannel(true);
+    deps.rememberChannelDraft();
+    // `#205 channel-view-memory`. Another channel opens in the view the reader chose there, and in ITS
+    // default — All where it has threads — when they chose none: a choice made in the last channel is
+    // that channel's, and it waits there for the reader to come back. The first read is the view's.
+    deps.settleUiState();
+    deps.openChannelView();
+    deps.forgetThreadPresence();
+    deps.timelineRows().messages = [];
+    deps.timelineRows().threads = [];
+    deps.clearChannelContexts();
+    // `#396 thread-color-memory`. The channel's own colours, as this device last drew them.
+    deps.restoreThreadHues(deps.selectedChannelId());
+    // `#427 server-thread-hues`: and offered to the server, as at sign-in — issued before this
+    // channel's first read below, not awaited by it.
+    void deps.seedServerThreadHues(deps.selectedChannelId());
+    el("thread-list").replaceChildren();
+    deps.restoreChannelComposer();
+    deps.olderPages().moreAbove = false;
+    deps.olderPages().cursor = null;
+    deps.payReadCursor();
+    deps.listState().newestId = null;
+    el("discord-log").replaceChildren();
+    // The summary goes with the rows it is about. It is written only inside `loadDiscord`, which
+    // THROWS when the read fails — so leaving it standing means a failed change of channel shows
+    // the previous channel's name and a count of messages that are no longer on the screen, which
+    // is the most confident possible way of being wrong.
+    el("channel-summary").replaceChildren();
+    deps.renderOlderControl();
+    deps.loadState().freshAt = 0;
+    deps.loadState().freshness = "fresh";
+    // `#18 offline-message-cache`. The new channel as this device last saw it, until the read below
+    // answers — which then merges into those rows rather than replacing them.
+    const saved = deps.hydrateChannelScope();
+    deps.renderChannelFreshness();
+    if (saved) deps.scrollToNewest();
+    deps.saveUiState();
+    // `#206 pin-message`. Under the Pinned filter the new channel's pins are what the reader is about
+    // to look at, so they are read now rather than after its first read reports their revision.
+    if (deps.pinsOnly()) {
+      deps.ensurePins();
+      deps.renderChannelRows();
+    }
+    // `#229 desktop-two-column`. The right column shows this channel's thread selected earlier in
+    // the session, or its cards; and a channel without threads is one column.
+    deps.resetSideColumn(true);
+    deps.renderColumns();
+    // A stream follows ONE channel, and a cursor from the old one means nothing in the new one —
+    // the same reason the walk-back cursor is dropped two lines above.
+    deps.startChannelStream(deps.selectedChannelId());
+    return deps.loadDiscord(saved && deps.screens().view() === "discord" ? { keepPosition: true, reason: "enter" } : { reason: "enter" });
+  }
+
   return {
     backStack, visits, deepLinks, linkJumps,
     backHistory, historyIndex, mayPushHistory, openMenus, closeOpenMenu, backLevels, screenLevelsNow,
@@ -1456,6 +1627,6 @@ export function createPageNavigation<Column, ThreadLike, Pane>(deps: PageNavigat
     syncDeepLinkAddress, linkedRowShown, landOnDeepLink, waitForDeepLink, applyDeepLink, copyDeepLink,
     keepsInApp, messageLinkLabel, wireMessageLinks, onMessageLinkTap, linkJumpSpot, withLinkJumps,
     arriveOnChannel, arriveAtPlace, jumpToDocumentLink, documentBack, jumpToMessageLink, jumpToSentMessage, returnFromLinkJump,
-    putBackOnSpot,
+    putBackOnSpot, pressViewSwitch, readEnteredChannel, changeSelectedChannel,
   };
 }

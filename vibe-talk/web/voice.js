@@ -764,7 +764,37 @@ const shellNavigation = createPageNavigation({
   token: () => token(),
   channels: () => channelDirectory.channels(),
   chooseChannel: (id) => chooseChannel(id),
-  changeSelectedChannel: () => changeSelectedChannel(),
+  cycleView: () => documentsSelector.cycle(),
+  loadDiscord: (options) => timelineView.loadDiscord(options),
+  readSideColumn: (reason, since) => readSideColumn(reason, since),
+  scheduleDiscordPoll: () => scheduleDiscordPoll(),
+  putDockedReplyAway: () => putDockedReplyAway(),
+  gatherState: () => gatherState(),
+  listState: () => listState(),
+  dropReplyArrowTap: () => dropReplyArrowTap(),
+  applyChannelProvider: () => applyChannelProvider(),
+  rememberActiveChannel: (chosen) => rememberActiveChannel(chosen),
+  rememberChannelDraft: () => rememberChannelDraft(),
+  openChannelView: () => openChannelView(),
+  forgetThreadPresence: () => threadPresence.forget(),
+  timelineRows: () => timelineRows(),
+  clearChannelContexts: () => channelContexts.clear(),
+  restoreThreadHues: (channel) => restoreThreadHues(/** @type {any} */ (channel)),
+  seedServerThreadHues: (channel) => seedServerThreadHues(/** @type {any} */ (channel)),
+  restoreChannelComposer: () => restoreChannelComposer(),
+  olderPages: () => olderPages(),
+  payReadCursor: () => channelReads.payCursor(),
+  renderOlderControl: () => renderOlderControl(),
+  loadState: () => loadState(),
+  hydrateChannelScope: () => hydrateChannelScope(),
+  renderChannelFreshness: () => renderChannelFreshness(),
+  saveUiState: () => saveUiState(),
+  pinsOnly: () => pinsView().only,
+  ensurePins: () => ensurePins(),
+  renderChannelRows: () => renderChannelRows(),
+  resetSideColumn: (reopen) => resetSideColumn(reopen),
+  renderColumns: () => renderColumns(),
+  startChannelStream: (channel) => startChannelStream(/** @type {any} */ (channel)),
   viewKey: () => viewKey(),
   viewsHas: (key) => channelStore.current().views.has(key),
   readsBusy: () => channelReads.busy(),
@@ -810,7 +840,6 @@ const shellNavigation = createPageNavigation({
   scrollToNewest: () => scrollToNewest(),
   bumpReplyJump: () => replyJumpTicket.bump(),
   settleUiState: () => uiState.settle(),
-  readEnteredChannel: (restored) => readEnteredChannel(restored),
   viewRestored: () => viewScroll.restored(),
   stopDiscordPolling: () => stopDiscordPolling(),
   storedOpenInView: () => storedOpenInView(),
@@ -844,7 +873,7 @@ const {
   linkedRowShown, landOnDeepLink, waitForDeepLink, applyDeepLink, copyDeepLink, keepsInApp,
   messageLinkLabel, wireMessageLinks, onMessageLinkTap, linkJumpSpot, withLinkJumps,
   arriveOnChannel, arriveAtPlace, jumpToMessageLink, jumpToSentMessage, returnFromLinkJump,
-  putBackOnSpot,
+  putBackOnSpot, pressViewSwitch, readEnteredChannel, changeSelectedChannel,
 } = shellNavigation;
 
 // `#890 voice-page-linked-highlight`. The message a link landed on, marked until the reader puts the mark out (Esc, its
@@ -8913,110 +8942,9 @@ application.track(mountReplyBox({
   pressViewSwitch: () => pressViewSwitch(),
 }));
 
-/** The view switch, pressed: rotate Voice -> Channel -> Documents -> Voice (`documents-view-client`). */
-function pressViewSwitch() {
-  // The selector owns the rotation and, through `chooseMajorView`, each view's
-  // entry work: entering the channel re-reads it (keeping the position on a
-  // return, as the two-way switch did), and any other view stops its polling.
-  documentsSelector.cycle();
-}
-
-/** Read the channel just entered, and keep reading it while it stays on screen. */
-function readEnteredChannel(keepPosition) {
-  return guardQuietly(async () => {
-    try {
-      // A return finds the channel's store as it was left, so it asks only for what changed.
-      const since = replayLedger.started();
-      await timelineView.loadDiscord(keepPosition ? { keepPosition: true, reason: "visible" } : { reason: "enter" });
-      // ...and the right column's thread, or its list of threads. `#229 desktop-two-column`.
-      await readSideColumn(keepPosition ? "visible" : "enter", since);
-    } finally {
-      // Armed after a failure too: offline is exactly when the reader needs the page to try again.
-      if (screens.view() === "discord") {
-        scheduleDiscordPoll();
-      }
-    }
-  })();
-}
-// Both wrapped in a lambda rather than passed straight through: a DOM listener is handed the
-// EVENT as its first argument, and `loadDiscord`'s first argument is its options object. Reading
-// `keepPosition` off a MouseEvent happens to answer false, which is the right answer by accident
-// and stops being right the moment another option is added.
-//
-// Refresh keeps your place. It is a re-read of the channel you are already looking at, and being
-// thrown to the bottom of it is the same defect as a background poll doing so — the fact that you
-// asked for fresh messages is not a request to stop reading the one in front of you. A reader who
-// was at the bottom still follows, which is the case where "keep my place" and "show me the
-// newest" are the same instruction.
-// Changing channel is not a re-read; it is a different history, and its bottom is where to start.
-// The walk back resets with it: a cursor from one channel means nothing in another, and carrying
-// one across would ask the server to step back from a message that is not there.
-function changeSelectedChannel() {
-  // From the left column, whichever column the key that asked for it was in. `#229 desktop-two-column`.
-  if (columnWork.side()) return inColumn(columns.main, changeSelectedChannel);
-  noteDeepLinkReaderMove();
-  // `#277 reply-in-column`. A reply open in a column answers a message of the channel being left.
-  putDockedReplyAway();
-  // `#215 reply-coalesce`. Gathered replies belong to the channel they were gathered in, whose rows
-  // are about to go — and so does a tap on an arrow still waiting to jump, which would otherwise walk
-  // this channel's history for a message of the last one.
-  gatherState().gathered = null;
-  listState().rowsGathered = false;
-  dropReplyArrowTap();
-  applyChannelProvider();
-  // This window's, and the one a new window opens on. `#265 window-channel-memory`.
-  rememberActiveChannel(true);
-  rememberChannelDraft();
-  // `#205 channel-view-memory`. Another channel opens in the view the reader chose there, and in ITS
-  // default — All where it has threads — when they chose none: a choice made in the last channel is
-  // that channel's, and it waits there for the reader to come back. The first read is the view's.
-  uiState.settle();
-  openChannelView();
-  threadPresence.forget();
-  timelineRows().messages = [];
-  timelineRows().threads = [];
-  channelContexts.clear();
-  // `#396 thread-color-memory`. The channel's own colours, as this device last drew them.
-  restoreThreadHues(selectedChannelId());
-  // `#427 server-thread-hues`: and offered to the server, as at sign-in — issued before this
-  // channel's first read below, not awaited by it.
-  void seedServerThreadHues(selectedChannelId());
-  el("thread-list").replaceChildren();
-  restoreChannelComposer();
-  olderPages().moreAbove = false;
-  olderPages().cursor = null;
-  channelReads.payCursor();
-  listState().newestId = null;
-  el("discord-log").replaceChildren();
-  // The summary goes with the rows it is about. It is written only inside `loadDiscord`, which
-  // THROWS when the read fails — so leaving it standing means a failed change of channel shows
-  // the previous channel's name and a count of messages that are no longer on the screen, which
-  // is the most confident possible way of being wrong.
-  el("channel-summary").replaceChildren();
-  renderOlderControl();
-  loadState().freshAt = 0;
-  loadState().freshness = "fresh";
-  // `#18 offline-message-cache`. The new channel as this device last saw it, until the read below
-  // answers — which then merges into those rows rather than replacing them.
-  const saved = hydrateChannelScope();
-  renderChannelFreshness();
-  if (saved) scrollToNewest();
-  saveUiState();
-  // `#206 pin-message`. Under the Pinned filter the new channel's pins are what the reader is about
-  // to look at, so they are read now rather than after its first read reports their revision.
-  if (pinsView().only) {
-    ensurePins();
-    renderChannelRows();
-  }
-  // `#229 desktop-two-column`. The right column shows this channel's thread selected earlier in
-  // the session, or its cards; and a channel without threads is one column.
-  resetSideColumn(true);
-  renderColumns();
-  // A stream follows ONE channel, and a cursor from the old one means nothing in the new one —
-  // the same reason the walk-back cursor is dropped two lines above.
-  startChannelStream(selectedChannelId());
-  return timelineView.loadDiscord(saved && screens.view() === "discord" ? { keepPosition: true, reason: "enter" } : { reason: "enter" });
-}
+// The view switch pressed, reading a channel just entered, and changing channel:
+// web/src/view/shell/navigation.ts (`createPageNavigation`, `#624`), destructured
+// under their old names above.
 // The channel box's listeners (`#349 channel-settings-all`, `#355 provider-grouped-channels`, `#232
 // upstream-mark-read`, `#602 history-settings-and-limits`, `#39 channel-alias`, `#208
 // persistent-cache`): the pickers (a channel chosen is the selection's first, before anything that
