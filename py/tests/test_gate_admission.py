@@ -447,7 +447,10 @@ def test_a_rerun_ticket_jumps_ordinary_queued_gates(tmp_path: Path) -> None:
     queue = tmp_path / "admission" / "queue"
 
     def wait_queued(count: int) -> None:
-        deadline = time.time() + 10
+        # Wait on the queue condition (ticket files appearing) with a
+        # generous bound; a 10 s wall clock flaked under load with
+        # "tickets did not queue" (agent-utils-1494).
+        deadline = time.time() + 120
         while len(list(queue.glob("*.json"))) < count:
             assert time.time() < deadline, "tickets did not queue"
             time.sleep(0.05)
@@ -464,7 +467,7 @@ def test_a_rerun_ticket_jumps_ordinary_queued_gates(tmp_path: Path) -> None:
     # No systemd scope this test created may survive it (they leaked on
     # 2026-11-10/11 when the test timed out under load). Scope teardown
     # can lag process exit, so poll briefly.
-    deadline = time.time() + 10
+    deadline = time.time() + 120
     leaked = _gate_scope_units() - scopes_before
     while leaked and time.time() < deadline:
         time.sleep(0.25)
