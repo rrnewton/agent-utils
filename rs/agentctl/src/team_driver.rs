@@ -11,6 +11,13 @@
 //! may be added within v1. State is persisted atomically before every
 //! pending effect and after each completes, so a crash repeats at most
 //! one idempotent effect.
+//!
+//! The driver and kick run only in the initial (host) PID namespace,
+//! where systemd, privileged image mounts, and queue delivery work; a
+//! future unit therefore starts on the host and creates its own scopes.
+//! The record itself carries no worker PID fields. Any PID text quoted
+//! inside `last_verify` is host evidence as the host tools reported it
+//! and must never be compared with a namespace PID.
 
 use std::fs::File;
 use std::io::Read;
@@ -23,7 +30,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::agent::AgentError;
-use crate::restore::{team_driver_dir, team_key, RestoreEpoch};
+use crate::restore::{team_driver_dir, team_key, Host, RestoreEpoch};
 use crate::team_model::{Abstract, Effect, Env, Mode, State};
 
 /// Schema of the persisted driver record.
@@ -143,19 +150,35 @@ pub fn state_name(state: State) -> &'static str {
     }
 }
 
-/// One incident id: first 12 hex of the SHA-256 of registry, boot, and
-/// manager identity, NUL-separated. A user-manager restart is therefore
-/// a new incident in the same boot; a managerless epoch hashes with an
-/// empty manager field.
+/// One incident id: first 12 hex of the SHA-256 of registry and boot,
+/// NUL-separated. Manager identity is deliberately not an input: it can
+/// be unreachable from a team PID namespace while the same boot's host
+/// side reads it, and keying on it would give one outage two incidents
+/// (and two possible escalations). The boot and manager are recorded as
+/// fields (`boot_id`, `epoch`) beside the incident; epoch comparison and
+/// NewEpoch resets still use the full epoch, while handoff message
+/// identity adds its own epoch and checklist discriminators.
 pub fn incident_id(registry: &Path, epoch: &RestoreEpoch) -> String {
     let canonical = std::fs::canonicalize(registry).unwrap_or_else(|_| registry.to_path_buf());
     let mut hasher = Sha256::new();
     hasher.update(canonical.to_string_lossy().as_bytes());
     hasher.update([0]);
     hasher.update(epoch.boot_id.as_bytes());
-    hasher.update([0]);
-    hasher.update(epoch.user_manager.as_deref().unwrap_or_default().as_bytes());
     format!("{:x}", hasher.finalize())[..12].to_owned()
+}
+
+/// Refuse driver and kick work from a descendant PID namespace, where
+/// the user manager is unreachable and restore cannot create wrkslots
+/// scopes or mount images. A half-restore there is worse than none: the
+/// host-side driver (or its future unit) owns scope creation.
+pub fn require_host_namespace(host: &dyn Host) -> Result<()> {
+    if host.in_initial_pid_namespace() {
+        Ok(())
+    } else {
+        Err(fail(
+            "kick must run in the host namespace; the driver owns scope creation",
+        ))
+    }
 }
 
 impl DriverRecord {
@@ -350,8 +373,9 @@ mod tests {
         assert_eq!(document["abstract"]["driver"], "healthy");
         assert_eq!(document["pending_effects"], json!([]));
         assert_eq!(load_record(&directory, &registry).unwrap(), Some(record));
-        // A manager restart in the same boot is a different incident.
-        assert_ne!(
+        // Manager identity is recorded beside the incident, never keyed
+        // into it: both sides of a namespace boundary derive one id.
+        assert_eq!(
             incident_id(&registry, &epoch("boot-a", Some("invocation:m1"))),
             incident_id(&registry, &epoch("boot-a", Some("invocation:m2")))
         );

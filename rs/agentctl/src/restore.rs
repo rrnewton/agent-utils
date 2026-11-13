@@ -911,6 +911,12 @@ pub trait Host {
     fn user_manager_started(&self) -> Option<f64> {
         None
     }
+    /// Whether this process runs in the initial (host) PID namespace.
+    /// Scope-creating recovery work requires it; test hosts run there by
+    /// default.
+    fn in_initial_pid_namespace(&self) -> bool {
+        true
+    }
     /// The current restore epoch: this boot under its current user manager.
     /// The team driver records it with [`RestoreEpoch::as_json`] and compares
     /// by equality only.
@@ -1033,6 +1039,11 @@ impl Host for SystemHost {
             return None;
         }
         Some(self.boot_time()? as f64 + micros as f64 / 1_000_000.0)
+    }
+
+    fn in_initial_pid_namespace(&self) -> bool {
+        fs::read_to_string("/proc/self/status")
+            .is_ok_and(|status| initial_pid_namespace_status(&status))
     }
 
     fn now(&self) -> f64 {
@@ -1234,6 +1245,17 @@ fn run_captured(
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
     }
+}
+
+/// Whether `/proc/self/status` places this process in the initial PID
+/// namespace: `NSpid` lists the process ID at every namespace level, so
+/// exactly one entry means the host namespace and more than one means a
+/// descendant team namespace.
+fn initial_pid_namespace_status(status: &str) -> bool {
+    status.lines().find_map(|line| {
+        line.strip_prefix("NSpid:")
+            .map(|pids| pids.split_whitespace().count() == 1)
+    }) == Some(true)
 }
 
 /// Fallback user-manager identity (#1405): the `systemd --user` process
@@ -4844,6 +4866,13 @@ pub fn watch<A: ManagedApi + ?Sized>(
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn initial_pid_namespace_reads_nspid_levels() {
+        assert!(initial_pid_namespace_status("Pid:\t42\nNSpid:\t42\n"));
+        assert!(!initial_pid_namespace_status("Pid:\t7\nNSpid:\t4242\t7\n"));
+        assert!(!initial_pid_namespace_status("Pid:\t7\n"));
+    }
 
     #[test]
     fn epoch_matching_requires_the_same_boot_and_manager() {
