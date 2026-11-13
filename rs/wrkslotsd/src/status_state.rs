@@ -385,8 +385,7 @@ pub(crate) fn status_records(
                     .and_then(Value::as_array)
                     .is_some_and(|checkouts| {
                         checkouts.iter().any(|checkout| {
-                            checkout.get("name").and_then(Value::as_str)
-                                == Some(harness.as_str())
+                            checkout.get("name").and_then(Value::as_str) == Some(harness.as_str())
                         })
                     })
             });

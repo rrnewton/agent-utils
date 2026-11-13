@@ -6116,30 +6116,56 @@ pub(crate) fn harness_unpushed_state(cfg: &Cfg, record: &Value) -> Value {
     let mut any_unknown = false;
     if let Some(items) = record.get("checkouts").and_then(Value::as_array) {
         for checkout in items {
-            let name = checkout.get("name").and_then(Value::as_str).unwrap_or_default().to_string();
+            let name = checkout
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
             let result: std::result::Result<(String, Vec<String>), String> = (|| {
-                let raw_path = checkout.get("path").and_then(Value::as_str).unwrap_or_default();
-                let path = stored_path(cfg, raw_path, "checkout path").map_err(|e| e.to_string())?;
-                let raw_repo = checkout.get("repository").and_then(Value::as_str).unwrap_or_default();
-                let (_rel, repo) = stored_repository_path(cfg, raw_repo).map_err(|e| e.to_string())?;
+                let raw_path = checkout
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let path =
+                    stored_path(cfg, raw_path, "checkout path").map_err(|e| e.to_string())?;
+                let raw_repo = checkout
+                    .get("repository")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let (_rel, repo) =
+                    stored_repository_path(cfg, raw_repo).map_err(|e| e.to_string())?;
                 let head = verify_existing_worktree(&repo, &path).map_err(|e| e.to_string())?;
-                let remote = checkout.get("remote").and_then(Value::as_str).unwrap_or_default();
+                let remote = checkout
+                    .get("remote")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 let out = std::process::Command::new("git")
-                    .arg("-C").arg(&path)
+                    .arg("-C")
+                    .arg(&path)
                     .args(["for-each-ref", "--format=%(refname)", "--contains", &head])
                     .arg(format!("refs/remotes/{remote}/"))
-                    .output().map_err(|e| e.to_string())?;
+                    .output()
+                    .map_err(|e| e.to_string())?;
                 if !out.status.success() {
                     return Err(String::from_utf8_lossy(&out.stderr).into_owned());
                 }
                 let refs: Vec<String> = String::from_utf8_lossy(&out.stdout)
-                    .lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string)
+                    .collect();
                 Ok((head, refs))
             })();
             match result {
                 Ok((head, containing)) => {
-                    let state = if containing.is_empty() { "UNPUSHED-OR-STALE" } else { "PUBLISHED" };
-                    if containing.is_empty() { any_unpushed = true; }
+                    let state = if containing.is_empty() {
+                        "UNPUSHED-OR-STALE"
+                    } else {
+                        "PUBLISHED"
+                    };
+                    if containing.is_empty() {
+                        any_unpushed = true;
+                    }
                     checkouts.push(json!({"name": name, "head": head, "state": state, "containing_remote_refs": containing}));
                 }
                 Err(detail) => {

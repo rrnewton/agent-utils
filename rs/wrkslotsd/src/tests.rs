@@ -7028,7 +7028,6 @@ fn flat_cfg(scratch: &Scratch) -> crate::active_state::Cfg {
         default_landed_ref: "refs/remotes/origin/main".to_string(),
         machine: "node-a".to_string(),
         harness_repo: None,
-        product_repos: Vec::new(),
     }
 }
 

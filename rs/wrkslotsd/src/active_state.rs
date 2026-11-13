@@ -39,7 +39,6 @@ pub(crate) struct Cfg {
     /// The selected local machine; event appends may only target it (#876).
     pub(crate) machine: String,
     pub(crate) harness_repo: Option<String>,
-    pub(crate) product_repos: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -665,7 +664,13 @@ pub(crate) fn record_from_obj(value: &Value, label: &str) -> Result<RecordRec> {
             "handoff",
             "checkouts",
         ],
-        &["slot_type", "layout", "import_source", "task_scope", "harness_checkout_reason"],
+        &[
+            "slot_type",
+            "layout",
+            "import_source",
+            "task_scope",
+            "harness_checkout_reason",
+        ],
         label,
     )?;
     if let Some(value) = raw.get("harness_checkout_reason") {
@@ -1222,16 +1227,6 @@ pub(crate) fn load_cfg(
             .get("harness_repo")
             .and_then(Value::as_str)
             .map(str::to_owned),
-        product_repos: config
-            .get("product_repos")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default(),
     };
     Ok((cfg, selected))
 }

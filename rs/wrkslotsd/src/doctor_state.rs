@@ -21,10 +21,7 @@ type Result<T> = std::result::Result<T, String>;
 
 const REMEDY: &str = "inspect the named condition; diagnosis alone authorizes no mutation";
 
-fn harness_findings(
-    cfg: &crate::active_state::Cfg,
-    records: &[Value],
-) -> Vec<Value> {
+fn harness_findings(cfg: &crate::active_state::Cfg, records: &[Value]) -> Vec<Value> {
     let Some(harness) = cfg.harness_repo.as_deref() else {
         return Vec::new();
     };
