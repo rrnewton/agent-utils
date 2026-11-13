@@ -18,7 +18,7 @@ from agentctl_differential import (
     _COMMON, _change, _json, _normalize, _pair, _retire_fixture_processes, _start,
     _submission_count,
 )
-from herdr_agent_differential import Harness, PairCase, Report
+from herdr_agent_differential import Harness, PairCase, Report, _fixture_identity
 
 _V2 = "agentctl-session/v2"
 _V3 = "agentctl-session/v3"
@@ -45,7 +45,9 @@ def _fixture(root: Path, schema: str, *, session_value: str | None = "session-1"
             "environment_names": [], "runtime_home": None, "runtime_ownership": "owned",
             "executable": None,
         },
-        "workspace_id": "w1", "tab_id": "w1:t1", "pane_id": "w1:p1",
+        "workspace_id": "w1",
+        "tab_id": _fixture_identity(root)[0].replace(":p", ":t", 1),
+        "pane_id": _fixture_identity(root)[0],
         "session_agent": None if session_value is None else "codex",
         "session_value": session_value,
         "startup_warning": None, "effective_reasoning_effort": None, "error": None,
@@ -77,6 +79,10 @@ def _write(case: PairCase, build: Callable[[Path], dict[str, object]]) -> None:
 def _stored(root: Path, path: Path | None = None) -> object:
     """One edition's row with its case root, token and timestamps normalized."""
     text = (path or _record_path(root)).read_text(encoding="utf-8")
+    pane_id, terminal_id = _fixture_identity(root)
+    text = (text.replace(pane_id, "w1:p1")
+            .replace(pane_id.replace(":p", ":t", 1), "w1:t1")
+            .replace(terminal_id, "term-1"))
     return _normalize(json.loads(text.replace(str(root), "<ROOT>")))
 
 

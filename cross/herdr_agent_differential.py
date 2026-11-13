@@ -250,6 +250,10 @@ current_pane = state.get("pane_id", "w1:p1")
 current_tab = state.get("tab_id", "w1:t1")
 current_workspace = state.get("workspace_id", "w1")
 current_terminal = state.get("terminal_id", "term-1")
+try:
+    pane_base = int(current_pane.rsplit("p", 1)[1])
+except (IndexError, ValueError):
+    pane_base = 1
 expected_terminal = None
 if (len(args) > 3 and args[2] == "--expect-terminal"
         and args[:2] in (["pane", "send-text"], ["pane", "send-keys"], ["agent", "prompt"])):
@@ -404,8 +408,8 @@ def revive_fixture():
                 "cmdline":executable, "argv":[executable], "executable":executable}],
         }})
     elif args[:2] == ["tab", "create"]:
-        number = state.get("revive_tabs_created", 0) + 1
-        state["revive_tabs_created"] = number
+        number = pane_base + state.get("revive_tabs_created", 0) + 1
+        state["revive_tabs_created"] = state.get("revive_tabs_created", 0) + 1
         pane_id, tab_id = "w1:p" + str(number), "w1:t" + str(number)
         panes[pane_id] = {
             "tab_id":tab_id, "workspace_id":args[args.index("--workspace") + 1],
@@ -458,7 +462,7 @@ def revive_fixture():
         envelope({"workspaces":[{"workspace_id":"w1", "label":"project"}]})
     elif args[:2] == ["pane", "read"]:
         pane = pane_at(args[2])
-        if args[2] == "w1:p1" and state.pop("revive_fail_old_read_once", False):
+        if args[2] == "w1:p" + str(pane_base + 1) and state.pop("revive_fail_old_read_once", False):
             print("injected old output read interruption", file=sys.stderr)
             save()
             raise SystemExit(1)
@@ -470,7 +474,7 @@ def revive_fixture():
             sys.stdout.write("preserved old terminal output\n")
     elif args[:2] == ["pane", "close"]:
         pane = pane_at(args[2])
-        if args[2] == "w1:p1" and state.pop("revive_fail_old_close_once", False):
+        if args[2] == "w1:p" + str(pane_base + 1) and state.pop("revive_fail_old_close_once", False):
             print("injected stale pane close interruption", file=sys.stderr)
             save()
             raise SystemExit(1)
@@ -529,13 +533,13 @@ if args[:2] == ["pane", "list"]:
         "workspace_id": current_workspace,
     }]
     if state.get("duplicate_recorded_pane"):
-        panes.append({"pane_id":"w1:p1", "tab_id":"w1:duplicate", "workspace_id":"w1"})
+        panes.append({"pane_id":current_pane, "tab_id":"w1:duplicate", "workspace_id":"w1"})
     if state.get("extra_pane"):
-        panes.append({"pane_id":"w1:p2", "tab_id":"w1:t1", "workspace_id":"w1"})
+        panes.append({"pane_id":"w1:p" + str(pane_base + 2), "tab_id":state.get("tab_id", "w1:t1"), "workspace_id":"w1"})
     envelope({"panes": panes})
 elif args[:2] == ["pane", "get"]:
     pane = args[2]
-    human = pane == "w1:p2" and state.get("extra_pane")
+    human = pane == "w1:p" + str(pane_base + 2) and state.get("extra_pane")
     if pane != current_pane and not human:
         print("missing pane", file=sys.stderr)
         save()
@@ -605,12 +609,14 @@ elif args[:2] == ["tab", "create"]:
         args[index + 1] for index, argument in enumerate(args[:-1])
         if argument == "--env"
     ]
-    state["pane_id"] = "w1:p1"
-    state["tab_id"] = "w1:t1"
+    created = state.get("tabs_created", 0) + 1
+    state["tabs_created"] = created
+    state["pane_id"] = "w1:p" + str(pane_base + created)
+    state["tab_id"] = "w1:t" + str(pane_base + created)
     state["tab_label"] = args[args.index("--label") + 1] if "--label" in args else ""
     state["workspace_id"] = args[args.index("--workspace") + 1]
-    envelope({"tab": {"tab_id": "w1:t1"}, "root_pane": {
-        "pane_id":"w1:p1", "tab_id":"w1:t1", "workspace_id":"w1",
+    envelope({"tab": {"tab_id": state["tab_id"]}, "root_pane": {
+        "pane_id": state["pane_id"], "tab_id": state["tab_id"], "workspace_id": "w1",
     }})
 elif args[:2] == ["pane", "close"]:
     if args[2] != current_pane:
@@ -1370,8 +1376,21 @@ class Harness:
         }
         if state is not None:
             initial.update(state)
-        for root in (python_root, rust_root):
+        for index, root in enumerate((python_root, rust_root)):
             root.mkdir(parents=True, mode=0o700)
+            # A pane identity unique to this root (and, via the pid, to
+            # this run): the editions' target locks are keyed by pane id
+            # alone in the host account state, so two roots (or two runs)
+            # sharing w1:p1 make their drains exclude each other for the
+            # full send deadline. Outcomes and state reads normalize the
+            # identity back to w1:p1 / term-1 for comparison.
+            pane_number = (os.getpid() % 10000) * 10000 + self.serial * 10 + index
+            root_initial = {
+                "pane_id": f"w1:p{pane_number}",
+                "tab_id": f"w1:t{pane_number}",
+                "terminal_id": f"term-{pane_number}",
+                **initial,
+            }
             fixture = root / "fake-herdr"
             fixture.write_text(f"#!{sys.executable}\n{_FAKE_HERDR}", encoding="utf-8")
             fixture.chmod(0o700)
@@ -1384,7 +1403,7 @@ class Harness:
             shutil.copyfile(sys.executable, fake_muse_runtime)
             fake_muse_runtime.chmod(0o700)
             (root / "state.json").write_text(
-                json.dumps(initial, sort_keys=True), encoding="utf-8"
+                json.dumps(root_initial, sort_keys=True), encoding="utf-8"
             )
             guard = root / HOST_CLI_GUARD_DIRECTORY
             guard.mkdir(mode=0o700)
@@ -1437,10 +1456,22 @@ class Harness:
     def _invoke_one(
         self, command: Sequence[str], root: Path, arguments: Sequence[str]
     ) -> Outcome:
-        expanded = [
-            value.replace("<ROOT>", str(root)).replace("<HERDR>", str(root / "fake-herdr"))
-            for value in arguments
-        ]
+        pane_id, terminal_id = _fixture_identity(root)
+        tab_id = pane_id.replace(":p", ":t", 1)
+
+        def expand(value: str) -> str:
+            value = value.replace("<ROOT>", str(root)).replace("<HERDR>", str(root / "fake-herdr"))
+            value = value.replace("<PANE>", pane_id).replace("<TAB>", tab_id)
+            value = value.replace("<TERMINAL>", terminal_id)
+            if value == "w1:p1":
+                return pane_id
+            if value == "w1:t1":
+                return tab_id
+            if value == "term-1":
+                return terminal_id
+            return value
+
+        expanded = [expand(value) for value in arguments]
         refusal = self.refuse_host_cli(root, expanded)
         if refusal is not None:
             return _normalize(Outcome(
@@ -1509,9 +1540,35 @@ def _decode(value: bytes | str | None) -> str:
     return value
 
 
+def _fixture_identity(root: Path) -> tuple[str, str]:
+    """This root's unique pane and terminal identities (w1:p1 / term-1 by default)."""
+    try:
+        state = json.loads((root / "state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "w1:p1", "term-1"
+    if not isinstance(state, dict):
+        return "w1:p1", "term-1"
+    pane = state.get("pane_id")
+    terminal = state.get("terminal_id")
+    return (
+        pane if isinstance(pane, str) else "w1:p1",
+        terminal if isinstance(terminal, str) else "term-1",
+    )
+
+
 def _normalize(outcome: Outcome, root: Path) -> Outcome:
+    pane_id, terminal_id = _fixture_identity(root)
+    tab_id = pane_id.replace(":p", ":t", 1)
+
     def text(value: str) -> str:
-        return _MESSAGE_ID.sub("<MESSAGE_ID>", value.replace(str(root), "<ROOT>"))
+        value = value.replace(str(root), "<ROOT>")
+        if pane_id != "w1:p1":
+            value = value.replace(pane_id, "w1:p1")
+        if tab_id != "w1:t1":
+            value = value.replace(tab_id, "w1:t1")
+        if terminal_id != "term-1":
+            value = value.replace(terminal_id, "term-1")
+        return _MESSAGE_ID.sub("<MESSAGE_ID>", value)
 
     return Outcome(outcome.returncode, text(outcome.stdout), text(outcome.stderr))
 
@@ -1553,6 +1610,21 @@ def _queue_snapshot(root: Path, queue: str) -> dict[str, object]:
                 snapshot[_MESSAGE_ID.sub("<MESSAGE_ID>", relative)] = path.read_bytes().hex()
                 continue
             if isinstance(value, dict):
+                pane_id, terminal_id = _fixture_identity(root)
+                tab_id = pane_id.replace(":p", ":t", 1)
+
+                def canon(item: object) -> object:
+                    if isinstance(item, str):
+                        return (item.replace(pane_id, "w1:p1")
+                                .replace(tab_id, "w1:t1")
+                                .replace(terminal_id, "term-1"))
+                    if isinstance(item, dict):
+                        return {key: canon(entry) for key, entry in item.items()}
+                    if isinstance(item, list):
+                        return [canon(entry) for entry in item]
+                    return item
+
+                value = cast(dict[str, object], canon(value))
                 for key in (
                     "queued_at",
                     "inflight_at",
@@ -1595,12 +1667,31 @@ def _revive_tree(path: Path) -> dict[str, tuple[int, int, int, bytes | None]]:
     return result
 
 
+def _revive_old_pane(root: Path) -> str:
+    """The revive fixture's old pane: the first tab allocated over the seeded shell pane."""
+    pane_id, _terminal_id = _fixture_identity(root)
+    try:
+        return f"w1:p{int(pane_id.rsplit('p', 1)[1]) + 1}"
+    except (IndexError, ValueError):
+        return "w1:p1"
+
+
+def _revive_new_pane(root: Path) -> str:
+    """The revive fixture's replacement pane: the second allocated tab."""
+    pane_id, _terminal_id = _fixture_identity(root)
+    try:
+        return f"w1:p{int(pane_id.rsplit('p', 1)[1]) + 2}"
+    except (IndexError, ValueError):
+        return "w1:p2"
+
+
 def _revive_pane_state(root: Path, values: Mapping[str, object]) -> None:
     state = _state(root)
     panes = state.get("revive_panes")
-    if not isinstance(panes, dict) or not isinstance(panes.get("w1:p1"), dict):
+    old_pane = _revive_old_pane(root)
+    if not isinstance(panes, dict) or not isinstance(panes.get(old_pane), dict):
         raise AssertionError("recovery fixture has no old pane")
-    panes["w1:p1"].update(values)
+    panes[old_pane].update(values)
     (root / "state.json").write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
 
 
@@ -1794,8 +1885,8 @@ def _revive_interop(harness: Harness, report: Report) -> None:
                 report.require(
                     label + "/fresh-candidate",
                     candidate.get("token") == journal.get("new_token") != old_token
-                    and candidate.get("pane_id") == "w1:p2"
-                    and candidate.get("terminal_id") == "term-2"
+                    and candidate.get("pane_id") == _revive_new_pane(root)
+                    and candidate.get("terminal_id") == "term-" + _revive_new_pane(root).rsplit("p", 1)[1]
                     and _state(root).get("revive_launch_count") == 2
                     and new_process.poll() is None,
                     "recovery reused the old generation or failed to pin a separate replacement",
@@ -1855,7 +1946,7 @@ def _revive_interop(harness: Harness, report: Report) -> None:
                 )
                 report.require(
                     label + "/exact-stale-pane-cleanup",
-                    final_state.get("closed_panes") == ["w1:p1"]
+                    final_state.get("closed_panes") == [_revive_old_pane(root)]
                     and not journal_path.exists() and not (operation / "new").exists(),
                     "cleanup closed another generation or retained a completed journal",
                 )
@@ -2301,7 +2392,7 @@ def _shared_queue_interop(harness: Harness, report: Report) -> None:
             and drained.returncode == 0
             and _submitted(root) == ["shared queue prompt"]
             and isinstance(binding, dict)
-            and binding.get("pane_id") == "w1:p1",
+            and binding.get("pane_id") == _fixture_identity(root)[0],
             f"shared queue was not interoperable: pending={pending!r} drained={drained!r}",
         )
 
@@ -2314,10 +2405,22 @@ def _cross_process_serialization(harness: Harness, report: Report) -> None:
 
     def launch(command: Sequence[str], arguments: Sequence[str], tmpdir: Path) -> subprocess.Popen[str]:
         tmpdir.mkdir(mode=0o700)
-        expanded = [
-            value.replace("<ROOT>", str(root)).replace("<HERDR>", str(root / "fake-herdr"))
-            for value in arguments
-        ]
+        pane_id, terminal_id = _fixture_identity(root)
+        tab_id = pane_id.replace(":p", ":t", 1)
+
+        def expand(value: str) -> str:
+            value = value.replace("<ROOT>", str(root)).replace("<HERDR>", str(root / "fake-herdr"))
+            value = value.replace("<PANE>", pane_id).replace("<TAB>", tab_id)
+            value = value.replace("<TERMINAL>", terminal_id)
+            if value == "w1:p1":
+                return pane_id
+            if value == "w1:t1":
+                return tab_id
+            if value == "term-1":
+                return terminal_id
+            return value
+
+        expanded = [expand(value) for value in arguments]
         refusal = Harness.refuse_host_cli(root, expanded)
         if refusal is not None:
             raise RuntimeError(f"cross harness host CLI guard: {refusal}")

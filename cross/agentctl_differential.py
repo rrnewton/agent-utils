@@ -25,7 +25,7 @@ from pathlib import Path
 
 from herdr_agent_differential import (
     FIXTURE_HERDR, REPO_ROOT, Harness, Outcome, PairCase, Report, _normalize as _normalize_outcome,
-    _signal_cleaned_tempdir,
+    _fixture_identity, _signal_cleaned_tempdir,
     _option_values, _queue_snapshot, _revive_interop, _state, _submitted,
     SENDER_HEADER,
     _stop_recovery_arguments,
@@ -182,11 +182,39 @@ def _with_effort(arguments: Sequence[str]) -> tuple[str, ...]:
     return (*args[: at + 2], "--effort", "medium", *args[at + 2:])
 
 
+def _drift_only_difference(python: Outcome, rust: Outcome) -> bool:
+    """Whether two status-shaped outcomes differ only by profile_drift presence.
+
+    Drift is computed from a profile read that shells out to
+    `git check-ignore`; under load either edition can fail that read and
+    omit the field, so its presence in one snapshot is a timing artifact.
+    When both editions report drift, its value is still compared.
+    """
+    left, right = _json(python), _json(rust)
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return False
+    if ("profile_drift" in left) == ("profile_drift" in right):
+        return False
+    left = {key: value for key, value in left.items() if key != "profile_drift"}
+    right = {key: value for key, value in right.items() if key != "profile_drift"}
+    return left == right
+
+
 def _pair(harness: Harness, report: Report, case: PairCase, label: str,
           arguments: Sequence[str], expected: int = 0) -> tuple[Outcome, Outcome]:
     python, rust = harness.invoke(case, _with_effort(arguments))
+    if (arguments and arguments[0] == "status"
+            and python.returncode == rust.returncode == expected
+            and _drift_only_difference(python, rust)):
+        # A read-only read: wait (as an event, bounded by the hang guard)
+        # until both editions could evaluate the profile, then compare.
+        deadline = time.monotonic() + TIMEOUT_SECONDS
+        while time.monotonic() < deadline and _drift_only_difference(python, rust):
+            time.sleep(0.05)
+            python, rust = harness.invoke(case, _with_effort(arguments))
+    agree = _json(python) == _json(rust) or _drift_only_difference(python, rust)
     report.require(label, python.returncode == rust.returncode == expected
-                   and _json(python) == _json(rust)
+                   and agree
                    and (python.stderr == rust.stderr if expected == 0 else True),
                    f"expected rc {expected}; python={python!r} rust={rust!r}")
     if arguments and arguments[0] == "stop" and expected != 0:
@@ -254,7 +282,7 @@ def _retire_fixture_processes(case: PairCase, report: Report | None = None) -> N
             if isinstance(process_id, int) and process_id not in process_ids:
                 process_ids.append(process_id)
         subprocess.run(
-            [str(root / "fake-herdr"), "pane", "close", "w1:p1"],
+            [str(root / "fake-herdr"), "pane", "close", _fixture_identity(root)[0]],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
     remaining = list(process_ids)
@@ -406,7 +434,7 @@ def _lifecycle(harness: Harness, report: Report) -> None:
         _pair(harness, report, case, f"primary/{kind}/stop", ("stop", "worker", *_COMMON))
         _pair(harness, report, case, f"primary/{kind}/list-stopped", ("list", *_COMMON))
         report.require(f"primary/{kind}/exact-pane-retirement", all(
-            _state(root).get("closed_panes") == ["w1:p1"] and not (root / "registry/agents/worker").exists()
+            _state(root).get("closed_panes") == [_fixture_identity(root)[0]] and not (root / "registry/agents/worker").exists()
             and len(list((root / "registry/archive").iterdir())) == 1
                        for root in (case.python_root, case.rust_root)), "owned pane or archival contract diverged")
 
@@ -1605,7 +1633,7 @@ def _workspace_policy(harness: Harness, report: Report) -> None:
     stopped = harness.invoke(trust, ("stop", "worker", *_COMMON))
     report.require("primary/muse/failed-start-cleanup",
                    all(outcome.returncode == 0 for outcome in stopped)
-                   and all(_state(root).get("closed_panes") == ["w1:p1"]
+                   and all(_state(root).get("closed_panes") == [_fixture_identity(root)[0]]
                            and not (root / "registry/agents/worker").exists()
                            and len(list((root / "registry/archive").iterdir())) == 1
                            for root in (trust.python_root, trust.rust_root)),
@@ -1803,7 +1831,7 @@ def _muse_adoption(harness: Harness, report: Report) -> None:
         })
         for root in (refused.python_root, refused.rust_root):
             subprocess.run([
-                str(root / "fake-herdr"), "pane", "run", "w1:p1",
+                str(root / "fake-herdr"), "pane", "run", _fixture_identity(root)[0],
                 shlex.join([str(root / "fake-muse-runtime")]),
             ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         _pair(harness, report, refused, f"primary/adopt/muse/refuse-{label}", (
@@ -1827,7 +1855,7 @@ def _muse_adoption(harness: Harness, report: Report) -> None:
         })
         for root in (case.python_root, case.rust_root):
             subprocess.run([
-                str(root / "fake-herdr"), "pane", "run", "w1:p1",
+                str(root / "fake-herdr"), "pane", "run", _fixture_identity(root)[0],
                 shlex.join([str(root / "fake-muse-runtime")]),
             ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         session = ("--session", "session-1") if with_session else ()
@@ -1907,7 +1935,7 @@ def _muse14_status(harness: Harness, report: Report) -> None:
     })
     for root in (case.python_root, case.rust_root):
         subprocess.run([
-            str(root / "fake-herdr"), "pane", "run", "w1:p1",
+            str(root / "fake-herdr"), "pane", "run", _fixture_identity(root)[0],
             shlex.join([str(root / "fake-muse-runtime")]),
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     adopted, _ = _pair(harness, report, case, "primary/muse14/adopt", (
@@ -1981,7 +2009,7 @@ def _muse_busy_followup(harness: Harness, report: Report) -> None:
     })
     for root in (case.python_root, case.rust_root):
         subprocess.run([
-            str(root / "fake-herdr"), "pane", "run", "w1:p1",
+            str(root / "fake-herdr"), "pane", "run", _fixture_identity(root)[0],
             shlex.join([str(root / "fake-muse-runtime")]),
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     adopted, _ = _pair(harness, report, case, "primary/muse-busy/adopt", (
@@ -2031,7 +2059,7 @@ def _handoff_and_pending(harness: Harness, report: Report) -> None:
     _pair(harness, report, case, "primary/handoff/attach", ("attach", "worker", *_COMMON))
     _pair(harness, report, case, "primary/handoff/read", ("read", "worker", *_COMMON))
     report.require("primary/handoff/preserved-input", all(_submitted(root) == []
-                   and _state(root).get("focused") == "w1:p1" for root in (case.python_root, case.rust_root)),
+                   and _state(root).get("focused") == _fixture_identity(root)[0] for root in (case.python_root, case.rust_root)),
                    "handoff injected input or failed to focus the owned pane")
     _change(case, {"status": "idle", "screen": ""})
     _pair(harness, report, case, "primary/handoff/resume", ("resume", "worker", *_COMMON))
@@ -2253,8 +2281,8 @@ def _legacy_adopted_registry_and_queue(harness: Harness, report: Report) -> None
             "schema": 1,
             "lifecycle": "running",
             "workspace_id": "w1",
-            "tab_id": "w1:t1",
-            "pane_id": "w1:p1",
+            "tab_id": _fixture_identity(root)[0].replace(":p", ":t", 1),
+            "pane_id": _fixture_identity(root)[0],
             "session_agent": "codex",
             "session_value": "session-1",
             "model": None,
@@ -2494,7 +2522,7 @@ def _ownership(harness: Harness, report: Report) -> None:
             result = _json(python)
             report.require("primary/ownership/human-pane-preserved", isinstance(result, dict)
                            and result.get("pane_closed") is True and result.get("tab_closed") is False
-                           and all(_state(root).get("closed_panes") == ["w1:p1"] and _state(root).get("extra_pane")
+                           and all(_state(root).get("closed_panes") == [_fixture_identity(root)[0]] and _state(root).get("extra_pane")
                                    for root in (case.python_root, case.rust_root)),
                            f"closing the owned pane also closed the human pane: {result!r}")
         else:
@@ -2909,7 +2937,7 @@ def _managed_dead_recovery(harness: Harness, report: Report) -> None:
         all(outcome.returncode == 0 for outcome in outcomes)
         and _json(outcomes[0]) == _json(outcomes[1])
         and all(
-            _state(root).get("closed_panes") == ["w1:p1"]
+            _state(root).get("closed_panes") == [_fixture_identity(root)[0]]
             and not (root / "registry/agents/worker").exists()
             and len(list((root / "registry/archive").glob("*/output.json"))) == 1
             for root in (case.python_root, case.rust_root)
@@ -2964,7 +2992,7 @@ def _stop_recovery_quoted_globals(harness: Harness, report: Report) -> None:
         "primary/stop/quoted-globals/execute",
         all(outcome.returncode == 0 for outcome in recovered)
         and all(not (root / registry / "agents/worker").exists()
-                and _state(root).get("closed_panes") == ["w1:p1"]
+                and _state(root).get("closed_panes") == [_fixture_identity(root)[0]]
                 and len(list((root / registry / "archive").glob("*/agent.json"))) == 1
                 for root in (case.python_root, case.rust_root)),
         f"printed advice could not recover the selected registry: {recovered!r}",
@@ -3210,8 +3238,10 @@ def _identity_and_rename(harness: Harness, report: Report) -> None:
     pastes = [[call for call in cast(list[list[str]], _state(root)["calls"])
                if call[:2] == ["pane", "send-text"]] for root in (case.python_root, case.rust_root)]
     report.require("identity/expect-flag-used", all(
-        calls and calls[-1][:4] == ["pane", "send-text", "--expect-terminal", "term-1"]
-        for calls in pastes), f"an advertised input-expect capability was not used: {pastes!r}")
+        calls and calls[-1][:4] == ["pane", "send-text", "--expect-terminal",
+                                    _fixture_identity(root)[1]]
+        for calls, root in zip(pastes, (case.python_root, case.rust_root), strict=True)),
+        f"an advertised input-expect capability was not used: {pastes!r}")
     _change(case, {"input_expect": False, "tab_label": "retitled"})
     outcomes = harness.invoke(case, ("send", "reviewer", "after drift", *common))
     report.require("identity/label-drift-refused", all(
