@@ -3229,7 +3229,7 @@ pub(crate) fn remove_slot(
 
 #[cfg(test)]
 mod link_tests {
-    use super::{assert_slot_unused_snapshot, capture_process_snapshot, link_points_into};
+    use super::{assert_slot_unused_snapshot, capture_process_snapshot_at, link_points_into};
 
     #[test]
     fn link_points_into_cases() {
@@ -3270,9 +3270,21 @@ mod link_tests {
             .current_dir(&slot)
             .spawn()
             .unwrap();
-        let snapshot =
-            capture_process_snapshot(std::process::id() as i64, &[slot.clone(), unused.clone()])
-                .unwrap();
+        // #1482: a fake /proc holding only this test's child, so an
+        // unrelated host process mid-exit can never enter the snapshot.
+        let proc_root = base.join("proc");
+        std::fs::create_dir_all(&proc_root).unwrap();
+        std::os::unix::fs::symlink(
+            format!("/proc/{}", child.id()),
+            proc_root.join(child.id().to_string()),
+        )
+        .unwrap();
+        let snapshot = capture_process_snapshot_at(
+            &proc_root,
+            std::process::id() as i64,
+            &[slot.clone(), unused.clone()],
+        )
+        .unwrap();
         // One shared capture serves every slot check in an audit.
         assert!(assert_slot_unused_snapshot(&snapshot, &unused).is_ok());
         let error = assert_slot_unused_snapshot(&snapshot, &slot).unwrap_err();
@@ -3325,12 +3337,12 @@ mod census_gone_tests {
     /// A fake /proc listing only the fixture children, each an alias of
     /// its real entry: the census reads them and no unrelated host
     /// process mid-exit can enter the snapshot (#1249).
-    fn fake_proc_root(children: &[(std::process::Child, Vec<&str>)]) -> std::path::PathBuf {
+    fn fake_proc_root(children: &[&std::process::Child]) -> std::path::PathBuf {
         let root =
             std::env::temp_dir().join(format!("wrkslots-census-gone-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        for (child, _entries) in children.iter() {
+        for child in children.iter() {
             std::os::unix::fs::symlink(
                 format!("/proc/{}", child.id()),
                 root.join(child.id().to_string()),
@@ -3381,7 +3393,12 @@ mod census_gone_tests {
             (holding_fd(&slot), vec!["fd/3"]),
             (holding_fd(&slot), vec!["fd"]),
         ];
-        let proc_root = fake_proc_root(&children);
+        let proc_root = fake_proc_root(
+            &children
+                .iter()
+                .map(|(child, _entries)| child)
+                .collect::<Vec<_>>(),
+        );
         for (child, entries) in &children {
             let (verdict, notes) = snapshot_with(&proc_root, child, &slot, &[], ESRCH);
             let error = verdict.unwrap_err();
@@ -3450,9 +3467,17 @@ mod census_gone_tests {
         format!("{}) {}\n", &text[..closing], fields.join(" ")).into_bytes()
     }
 
-    fn snapshot_verdict(slot: &Slot) -> Result<(), String> {
-        capture_process_snapshot(std::process::id() as i64, std::slice::from_ref(&slot.slot))
-            .and_then(|snapshot| assert_slot_unused_snapshot(&snapshot, &slot.slot))
+    fn snapshot_verdict(
+        proc_root: &std::path::Path,
+        slot: &Slot,
+        _child: &std::process::Child,
+    ) -> Result<(), String> {
+        capture_process_snapshot_at(
+            proc_root,
+            std::process::id() as i64,
+            std::slice::from_ref(&slot.slot),
+        )
+        .and_then(|snapshot| assert_slot_unused_snapshot(&snapshot, &slot.slot))
     }
 
     #[test]
@@ -3460,10 +3485,15 @@ mod census_gone_tests {
         // #1174: the slot's only user maps a file from it.
         let slot = Slot::new("snapshot-maps");
         let child = mapping_only(&slot, "600");
-        let base = std::path::PathBuf::from(format!("/proc/{}", child.id()));
+        // #1482: read this test's census over the fake root, like the
+        // gone-on-each-read test, so no host process can enter it. The
+        // fake entry aliases the child's real one; fault injection is
+        // keyed at the fake paths the census actually reads.
+        let proc_root = fake_proc_root(&[&child]);
+        let base = proc_root.join(child.id().to_string());
         let maps = base.join("maps");
         reset();
-        let error = snapshot_verdict(&slot).unwrap_err();
+        let error = snapshot_verdict(&proc_root, &slot, &child).unwrap_err();
         assert!(
             error.contains("uses slot") && error.contains("(mapping)"),
             "{error}"
@@ -3477,7 +3507,7 @@ mod census_gone_tests {
             &exiting_stat(&std::fs::read(base.join("stat")).unwrap()),
         );
         let started = std::time::Instant::now();
-        let error = snapshot_verdict(&slot).unwrap_err();
+        let error = snapshot_verdict(&proc_root, &slot, &child).unwrap_err();
         let notes = reset();
         assert!(started.elapsed() >= crate::proc_reads::CENSUS_EXIT_WAIT);
         assert!(
@@ -3506,8 +3536,9 @@ mod census_gone_tests {
         // gap), so today the slot reads as unused.
         reset();
         inject(&maps, EACCES);
-        assert_eq!(snapshot_verdict(&slot), Ok(()));
+        assert_eq!(snapshot_verdict(&proc_root, &slot, &child), Ok(()));
         let _ = reset();
+        let _ = std::fs::remove_dir_all(&proc_root);
         stop(child);
 
         // Our own process in do_exit that exits within the wait: gone. Read
@@ -3554,26 +3585,39 @@ mod census_gone_tests {
         let unused = Slot::new("snapshot-churn-unused");
         let user = in_cwd(&slot);
         let running = std::sync::atomic::AtomicBool::new(true);
+        // #1482: the census reads the fake root, not the host table.
+        // Every churn child is aliased into it before it is waited on,
+        // so exactly this test's own processes can enter the snapshot.
+        let proc_root = fake_proc_root(&[&user]);
+        let running = &running;
         std::thread::scope(|scope| {
             // Bounded churn: a gate runs this beside other steps under a
             // CPU limit, so the children are few and paced.
+            let slot_dir = slot.slot.clone();
             for _ in 0..2 {
-                scope.spawn(|| {
+                let proc_root = proc_root.clone();
+                let slot_dir = slot_dir.clone();
+                scope.spawn(move || {
                     for _ in 0..100 {
                         if !running.load(std::sync::atomic::Ordering::Relaxed) {
                             break;
                         }
                         let mut child = std::process::Command::new("true")
-                            .current_dir(&slot.slot)
+                            .current_dir(&slot_dir)
                             .spawn()
                             .unwrap();
+                        let _ = std::os::unix::fs::symlink(
+                            format!("/proc/{}", child.id()),
+                            proc_root.join(child.id().to_string()),
+                        );
                         child.wait().unwrap();
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
                 });
             }
             for _ in 0..5 {
-                let snapshot = capture_process_snapshot(
+                let snapshot = capture_process_snapshot_at(
+                    &proc_root,
                     std::process::id() as i64,
                     &[slot.slot.clone(), unused.slot.clone()],
                 )
@@ -3585,6 +3629,7 @@ mod census_gone_tests {
             running.store(false, std::sync::atomic::Ordering::Relaxed);
         });
         let _ = reset();
+        let _ = std::fs::remove_dir_all(&proc_root);
         stop(user);
     }
 }

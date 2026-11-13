@@ -73,8 +73,7 @@ pub(crate) fn identity_matches_value(identity: &Identity, value: &Value) -> bool
         && value.get("start_ticks").and_then(Value::as_i64) == Some(identity.start_ticks)
         && value.get("boot_id").and_then(Value::as_str) == Some(identity.boot_id.as_str())
         && value.get("host_id").and_then(Value::as_str) == Some(identity.host_id.as_str())
-        && value.get("cgroup_path").and_then(Value::as_str)
-            == Some(identity.cgroup_path.as_str())
+        && value.get("cgroup_path").and_then(Value::as_str) == Some(identity.cgroup_path.as_str())
 }
 
 pub(crate) fn optional_namespace_pid(value: &Value) -> Option<i64> {
@@ -228,9 +227,10 @@ pub(crate) fn read_process_identity(pid: i64) -> std::result::Result<Identity, S
 }
 
 fn pidfd_source(pid: i64) -> &'static str {
-    let Some(raw_pid) = u32::try_from(pid).ok().and_then(|value| {
-        i32::try_from(value).ok()
-    }) else {
+    let Some(raw_pid) = u32::try_from(pid)
+        .ok()
+        .and_then(|value| i32::try_from(value).ok())
+    else {
         return "legacy-scan";
     };
     let Some(process_pid) = rustix::process::Pid::from_raw(raw_pid) else {
@@ -411,8 +411,7 @@ pub(crate) fn status_records(
                     )
                 })?)
             };
-            let (state, detail, evidence) =
-                process_state_with_evidence(identity.as_ref());
+            let (state, detail, evidence) = process_state_with_evidence(identity.as_ref());
             // #879: one liveness source — the same authority answer
             // audit reports, beside the owner process evidence.
             let slot_type = value

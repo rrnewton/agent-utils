@@ -228,12 +228,9 @@ pub(crate) fn validate_publication(
         match event.get("kind").and_then(Value::as_str) {
             Some("handoff-write-intended") => {
                 validate_intent(&payload, slot, generation)?;
-                if !payload
-                    .get("writer")
-                    .is_some_and(|writer| {
-                        crate::status_state::identity_matches_value(supplied, writer)
-                    })
-                {
+                if !payload.get("writer").is_some_and(|writer| {
+                    crate::status_state::identity_matches_value(supplied, writer)
+                }) {
                     return Err(
                         "handoff write intent writer does not match the recorded slot owner"
                             .to_string(),
@@ -709,12 +706,9 @@ pub(crate) fn write_handoff(
         if let Some(event) = intent_event {
             let payload = event.get("payload").cloned().unwrap_or(Value::Null);
             validate_intent(&payload, slot, generation)?;
-            if !payload
-                .get("writer")
-                .is_some_and(|writer| {
-                    crate::status_state::identity_matches_value(&supplied, writer)
-                })
-            {
+            if !payload.get("writer").is_some_and(|writer| {
+                crate::status_state::identity_matches_value(&supplied, writer)
+            }) {
                 return Err(
                     "handoff write intent writer does not match the recorded slot owner"
                         .to_string(),
