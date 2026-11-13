@@ -82,6 +82,7 @@
         "py/tests/test_agentctl_client_launch.py",
         "py/tests/test_agentctl_differential_shards.py",
         "py/tests/test_agentctl_identity.py",
+        "py/tests/test_agentctl_kill_pid.py",
         "py/tests/test_agentctl_launch_spec.py",
         "py/tests/test_agentctl_lifecycle.py",
         "py/tests/test_agentctl_mcp.py",
