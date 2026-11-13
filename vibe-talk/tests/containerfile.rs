@@ -137,7 +137,11 @@ fn build_stage_copies_every_compile_time_input() {
     let copied = build_stage_copy_sources(&containerfile);
     let missing = inputs
         .iter()
-        .filter(|input| !copied.iter().any(|source| input.starts_with(source)))
+        .filter(|input| {
+            !copied
+                .iter()
+                .any(|source| Path::new("vibe-talk").join(input).starts_with(source))
+        })
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>();
 
@@ -180,7 +184,11 @@ fn build_stage_copies_what_the_build_script_reads() {
     let copied = build_stage_copy_sources(&containerfile);
     let missing = inputs
         .iter()
-        .filter(|input| !copied.iter().any(|source| input.starts_with(source)))
+        .filter(|input| {
+            !copied
+                .iter()
+                .any(|source| Path::new("vibe-talk").join(input).starts_with(source))
+        })
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>();
     assert!(
