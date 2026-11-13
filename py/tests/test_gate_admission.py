@@ -2003,7 +2003,7 @@ def test_a_malformed_defer_file_refuses_the_start(tmp_path: Path) -> None:
     assert "gate defer config" in result.stdout
 
 
-def _hold(tmp_path: Path, name: str, status_text: str, cap: object = 3600,
+def _marker_hold(tmp_path: Path, name: str, status_text: str, cap: object = 3600,
           declaration: str | None = None) -> Path:
     holds = tmp_path / "holds"
     holds.mkdir(parents=True, exist_ok=True)
@@ -2022,15 +2022,15 @@ def test_measurement_hold_fixtures(tmp_path: Path) -> None:
     """#1406 hold contract: active, ended, expired, unparseable (fails
     closed) and empty-directory cases."""
     gate = _gate_module()
-    active = _hold(tmp_path / "a", "w", "WINDOW-START 2026-11-12T11:30:00Z\n")
+    active = _marker_hold(tmp_path / "a", "w", "WINDOW-START 2026-11-12T11:30:00Z\n")
     blockers = gate.measurement_hold_blockers(str(active), _NOW)
     assert len(blockers) == 1 and blockers[0].startswith("hold w ("), blockers
-    ended = _hold(tmp_path / "b", "w",
+    ended = _marker_hold(tmp_path / "b", "w",
                   "WINDOW-START 2026-11-12T11:00:00Z\nWINDOW-END 2026-11-12T11:30:00Z\n")
     assert gate.measurement_hold_blockers(str(ended), _NOW) == []
-    expired = _hold(tmp_path / "c", "w", "WINDOW-START 2026-11-12T08:00:00Z\n", cap=3600)
+    expired = _marker_hold(tmp_path / "c", "w", "WINDOW-START 2026-11-12T08:00:00Z\n", cap=3600)
     assert gate.measurement_hold_blockers(str(expired), _NOW) == []
-    bad = _hold(tmp_path / "d", "w", "irrelevant\n", declaration="{not json")
+    bad = _marker_hold(tmp_path / "d", "w", "irrelevant\n", declaration="{not json")
     blockers = gate.measurement_hold_blockers(str(bad), _NOW)
     assert len(blockers) == 1 and "hold declaration" in blockers[0], blockers
     assert str(bad / "w.json") in blockers[0]
@@ -2052,7 +2052,7 @@ def test_measurement_hold_fixtures(tmp_path: Path) -> None:
 
 
 def test_a_measurement_hold_defers_a_gate_until_it_ends(tmp_path: Path) -> None:
-    holds = _hold(tmp_path, "w", "WINDOW-START 2026-11-12T11:30:00Z\n")
+    holds = _marker_hold(tmp_path, "w", "WINDOW-START 2026-11-12T11:30:00Z\n")
     status = tmp_path / "w-status.txt"
     env = {**_env(tmp_path), "GATE_DEFER_HOLDS_DIR": str(holds),
            "GATE_DEFER_NOW": "2026-11-12T12:00:00+00:00"}
