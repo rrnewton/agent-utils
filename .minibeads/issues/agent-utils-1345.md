@@ -1,6 +1,6 @@
 ---
 title: 'discuss-transcript-persist: the Discuss record is saved server-side; reopening never re-summarizes'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 assignee: mu-catchup
@@ -33,3 +33,7 @@ Parent: #1316 catchup-side-agent. Follow-ups on this record: #1353 discuss-follo
 # Notes
 
 Owner replies 413, 009, 418. Number reserved by coordb. Storage is one new table + store trait methods in the three stores, beside the slice-1 contract.
+
+## Resolution
+
+Landed on main as addec444 (evening seams c2f8cab8, d8583e38, 60d805fb) in the evening batch e7207edb, deployed in vibe-talk release 286446d9, live 11-12 ~8:28 PM ET. One server-side record per channel/thread holds the current summary over its timeline; reopening draws it with no model call, a new Summarize collapses the superseded summary into the timeline, and message links keep the panel open.

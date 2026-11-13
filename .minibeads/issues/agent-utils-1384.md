@@ -1,6 +1,6 @@
 ---
 title: 'discuss-exclude-owner-messages: the owner is context, never unread'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 assignee: mu-discussfoot
@@ -31,3 +31,7 @@ Owner reply 008 clarification: no prompt instruction about mentioning owner mess
 # Notes
 
 Owner replies 005/008. Sibling: #1347 discuss-footer-dense-links. Parent: #1316 catchup-side-agent.
+
+## Resolution
+
+Landed on main as 53548043 in the 4:30 PM ET batch e5fc567c, deployed in vibe-talk release 286446d9, live 11-12 ~5:53 PM ET. The owner's own messages are excluded from the unread set, the counts and the footer, and stay in the summarizer prompt as context and valid citation targets.

@@ -1,6 +1,6 @@
 ---
 title: 'discuss-footer-dense-links: the footer lists only the uncalled remainder, as HH:MM links'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 assignee: mu-catchup
@@ -30,3 +30,7 @@ Parent: #1316 catchup-side-agent. Field agreement with mu-discussq (landed): `ci
 # Notes
 
 Owner reply 418. Number reserved by coordb. Server citation pass: #1350 discuss-summary-structure (mu-discussq, landed).
+
+## Resolution
+
+Landed on main as 7950b366 and c4eb33df (browser walk b4ab3676) in the 4:30 PM ET batch e5fc567c, deployed in vibe-talk release 286446d9, live 11-12 ~5:53 PM ET. The footer is titled "Other messages processed" and lists only the uncited remainder as dense HH:MM links; Mark read/unread still target all processed ids.

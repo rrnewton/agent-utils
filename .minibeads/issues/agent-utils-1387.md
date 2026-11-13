@@ -1,6 +1,6 @@
 ---
 title: 'discuss-collapsible-sections: fold the summary by workstream, all collapsed'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: mu-discussfoot
@@ -28,3 +28,7 @@ updated_at: 2026-11-12T19:00:00+00:00
 # Notes
 
 Owner reply 007. Depends on #1349 discuss-markdown-render (landed). Helper shared with #1237.
+
+## Resolution
+
+Landed on main as e0b9cb7f (integration fix 0ce44df9) in the evening batch e7207edb, deployed in vibe-talk release 286446d9, live 11-12 ~8:28 PM ET. The shared collapse helper folds the Discuss answer by heading with every section collapsed and an Expand all / Collapse all bar at the top of the answer body.

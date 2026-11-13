@@ -1,6 +1,6 @@
 ---
 title: 'discuss-followup-composer: ask the side agent more, in the panel'
-status: open
+status: closed
 priority: 0
 issue_type: feature
 assignee: mu-catchup
@@ -31,3 +31,7 @@ Parent: #1316 catchup-side-agent. Record: #1345 discuss-transcript-persist.
 # Notes
 
 Owner reply 415. Number reserved by coordb. Composer reuse is the main message views' module, not a new text box.
+
+## Resolution
+
+Landed on main as addec444 (the follow-up half of the #1345 record commit) in the evening batch e7207edb, deployed in vibe-talk release 286446d9, live 11-12 ~8:28 PM ET. The panel composer reuses the main composer's keys (Enter-to-send per setting); each follow-up appends both turns to the record timeline with the cached window plus the transcript, and no provider call.

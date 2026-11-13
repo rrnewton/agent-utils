@@ -1,6 +1,6 @@
 ---
 title: 'discuss-scope-binding: Discuss stays with the view it was opened in'
-status: open
+status: closed
 priority: 1
 issue_type: feature
 assignee: mu-discussbind
@@ -34,3 +34,7 @@ Owner (Slack 014/017/018): a Discuss pane goes with the view it was opened in. T
 # Notes
 
 Number reserved by coordb (#1395 discuss-scope-binding). Owner picks: rule 5 = close (Slack 018); out-of-scope symbol/color to be confirmed by the owner (proposed in the landing report). Ships in the next batch after the 4:30 PM ET batch; do not take that gate slot.
+
+## Resolution
+
+Landed on main as dc3201d7 (evening seams 956aa507, c2f8cab8, d8583e38) in the evening batch e7207edb, deployed in vibe-talk release 286446d9, live 11-12 ~8:28 PM ET. Discuss stays bound to the scope it was opened in (All/Main as one global scope); widening or sideways closes it behind a history entry that Back restores with no model call, and cache-resolved citations outside the window link with the out mark (↗, amber, scope=out) instead of dropping.
