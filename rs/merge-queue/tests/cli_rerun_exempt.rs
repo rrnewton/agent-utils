@@ -122,8 +122,25 @@ fn a_failure_outside_the_named_checks_still_needs_its_second_sighting() {
     // `unit_a` is not a named check: the batch's red is confirmed by a rerun of the same commit.
     // The second probe is the base itself (#1187: the seed base is no queue landing).
     assert_eq!(purposes(&r), vec!["batch", "probe", "probe"], "{r}");
+    // Probes finish concurrently and are recorded as they land, so pick
+    // them by identity, never by position (#1478): the confirming rerun
+    // probes the whole singleton at the batch's commit; the base probe
+    // probes no changes at the base commit.
     let validations = r["validations"].as_array().unwrap();
-    assert_eq!(validations[0]["commit"], validations[1]["commit"]);
+    let batch = validations
+        .iter()
+        .find(|v| v["purpose"] == "batch")
+        .unwrap();
+    let rerun = validations
+        .iter()
+        .find(|v| v["purpose"] == "probe" && v["prs"] == serde_json::json!([1]))
+        .unwrap();
+    assert_eq!(rerun["commit"], batch["commit"], "{r}");
+    let base_probe = validations
+        .iter()
+        .find(|v| v["purpose"] == "probe" && v["prs"] == serde_json::json!([]))
+        .unwrap();
+    assert_ne!(base_probe["commit"], batch["commit"], "{r}");
     let ejected = &r["ejected"][0];
     assert_eq!(ejected["pr"], 1, "{r}");
     let reason = ejected["reason"].as_str().unwrap();
